@@ -1060,8 +1060,10 @@ pub(crate) const DIRECTIVE_STDIN: &str = "SYQ_INTERNAL_NATIVE_DIRECTIVE";
 /// coordinator puts its copy of the entry key there. An SSH command that
 /// keeps it has no identity, and fails.
 const ENTRY_KEY_PLACEHOLDER: &str = "IdentityFile=none";
+/// Set when a coordinator's `--max-delete` is the approving machine's limit.
+pub(crate) const MAX_DELETE_FROM_APPROVER: &str = "SYQ_INTERNAL_NATIVE_MAX_DELETE_FROM_APPROVER";
 /// The longest entry key a coordinator reads: a 16,384-bit RSA key.
-const MAX_ENTRY_KEY_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_ENTRY_KEY_BYTES: usize = 16 * 1024;
 
 /// The coordinator's environment for its receiver, and the directive that
 /// follows the entry key on its input.
@@ -1070,8 +1072,7 @@ pub(crate) type ReceiverInputs = (Vec<(&'static str, String)>, Option<Vec<u8>>);
 /// What the coordinator learns of the receiver from its environment, and
 /// the directive it reads from its input after the entry key. An enrolled
 /// receiver's entry key and directive never appear in the coordinator's
-/// command line or environment, only their lengths do; a copy between two
-/// servers that hostX approved passes only its marker.
+/// command line or environment, only their lengths do.
 pub(crate) fn receiver_inputs(
     restricted_grant: Option<&str>,
     entry_key: Option<&[u8]>,
@@ -1089,10 +1090,7 @@ pub(crate) fn receiver_inputs(
                 Some(directive),
             )
         }
-        (Some(marker), None) => (
-            vec![("SYQ_INTERNAL_NATIVE_RESTRICTED_GRANT", marker.to_owned())],
-            None,
-        ),
+        (Some(_), None) => bail!("a restricted receiver's directive needs its entry key"),
         (None, _) => (Vec::new(), None),
     })
 }
@@ -1169,40 +1167,6 @@ pub(crate) fn prepare_receiver_ssh_with(
             .is_some_and(crate::restricted::enrolled_grant),
         "receiver host keys require an enrolled copy grant"
     );
-    anyhow::ensure!(
-        known_hosts.len() <= 64 * 1024,
-        "invalid receiver known-hosts length"
-    );
-    let mut command = parse_rsh(&args.rsh)?;
-    for required in [
-        "IdentityAgent=none",
-        "IdentitiesOnly=yes",
-        "ControlPath=none",
-    ] {
-        anyhow::ensure!(
-            command.iter().any(|argument| argument == required),
-            "receiver SSH command is missing {required}"
-        );
-    }
-    // SSH takes the first value of each option: the configuration and what
-    // syq adds for it decide host-key checking, and nothing before them.
-    for checking in [
-        "StrictHostKeyChecking=",
-        "UserKnownHostsFile=",
-        "GlobalKnownHostsFile=",
-        "HostKeyAlias=",
-        "KnownHostsCommand=",
-        "HostKeyAlgorithms=",
-        "PubkeyAcceptedAlgorithms=",
-        "PubkeyAcceptedKeyTypes=",
-    ] {
-        anyhow::ensure!(
-            !command
-                .iter()
-                .any(|argument| argument.starts_with(checking)),
-            "receiver SSH command already sets {checking}"
-        );
-    }
     // This machine checks the receiver's host key as its own `ssh` would:
     // with its configuration for the destination, as this connection names
     // it and logs in.
@@ -1211,115 +1175,181 @@ pub(crate) fn prepare_receiver_ssh_with(
         .host
         .clone()
         .context("the receiver's host is missing")?;
-    let connection = ReceiverConnection::inspect(
-        &command,
-        destination.user.as_deref(),
-        destination.port,
-        &host,
+    let ssh = ReceiverSsh::prepare(
+        &parse_rsh(&args.rsh)?,
+        (destination.user.as_deref(), destination.port, &host),
+        known_hosts,
+        entry_key,
+        args.quiet,
     )?;
+    args.receiver_host = Some(ssh.receiver_host);
+    args.rsh = Some(shell_words::join(ssh.command));
+    Ok(ssh.directory)
+}
 
-    // Only the entry key's own algorithms may log in: a certificate or
-    // another key type the configuration names is never offered, and
-    // another key of the same type only after the entry key, if the
-    // destination refuses it.
-    let algorithms = match crate::restricted::parse_entry_key(entry_key)?.algorithm() {
-        // An ssh older than 8.5 (from 7.6) matches an RSA key by its key
-        // type.
-        ssh_key::Algorithm::Rsa { .. } if !connection.supports_known_hosts_command => {
-            "rsa-sha2-512,rsa-sha2-256,ssh-rsa".to_owned()
+/// The SSH command for an enrolled receiver's connections, with the entry
+/// key and what the approving machine knows about the receiver's host key in
+/// a private directory that lives as long as the connections.
+pub(crate) struct ReceiverSsh {
+    pub(crate) command: Vec<String>,
+    /// The host as the command names it, and how this machine reaches it.
+    pub(crate) receiver_host: (String, crate::conn::ReceiverHost),
+    pub(crate) directory: crate::private_broker::SignalCleanedDir,
+}
+
+impl ReceiverSsh {
+    /// Fill `command`, a [`receiver_rsh`], in for the receiver at
+    /// `user@host:port`, with `known_hosts`, what the approving machine's
+    /// known_hosts files list for it, and the enrollment's `entry_key`.
+    pub(crate) fn prepare(
+        command: &[String],
+        (user, port, host): (Option<&str>, Option<u16>, &str),
+        known_hosts: &str,
+        entry_key: &[u8],
+        quiet: bool,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            known_hosts.len() <= crate::directive::MAX_KNOWN_HOSTS_BYTES,
+            "invalid receiver known-hosts length"
+        );
+        let mut command = command.to_vec();
+        let host = host.to_owned();
+        for required in [
+            "IdentityAgent=none",
+            "IdentitiesOnly=yes",
+            "ControlPath=none",
+        ] {
+            anyhow::ensure!(
+                command.iter().any(|argument| argument == required),
+                "receiver SSH command is missing {required}"
+            );
         }
-        ssh_key::Algorithm::Rsa { .. } => "rsa-sha2-512,rsa-sha2-256".to_owned(),
-        algorithm => algorithm.as_str().to_owned(),
-    };
-    // What the approving machine knows, which it lists under its own name
-    // for the destination, under the name this machine's own known_hosts
-    // files use.
-    let lookup = &connection.lookup;
-    let mut approving = String::new();
-    let mut approving_entries = 0;
-    let mut approving_revokes = false;
-    let mut approving_name = None;
-    for line in known_hosts.lines() {
-        let (marker, rest) = match line.split_once(' ') {
-            Some((marker @ ("@cert-authority" | "@revoked"), rest)) => (Some(marker), rest),
-            _ => (None, line),
+        // SSH takes the first value of each option: the configuration and what
+        // syq adds for it decide host-key checking, and nothing before them.
+        for checking in [
+            "StrictHostKeyChecking=",
+            "UserKnownHostsFile=",
+            "GlobalKnownHostsFile=",
+            "HostKeyAlias=",
+            "KnownHostsCommand=",
+            "HostKeyAlgorithms=",
+            "PubkeyAcceptedAlgorithms=",
+            "PubkeyAcceptedKeyTypes=",
+        ] {
+            anyhow::ensure!(
+                !command
+                    .iter()
+                    .any(|argument| argument.starts_with(checking)),
+                "receiver SSH command already sets {checking}"
+            );
+        }
+        let connection = ReceiverConnection::inspect(&command, user, port, &host)?;
+
+        // Only the entry key's own algorithms may log in: a certificate or
+        // another key type the configuration names is never offered, and
+        // another key of the same type only after the entry key, if the
+        // destination refuses it.
+        let algorithms = match crate::restricted::parse_entry_key(entry_key)?.algorithm() {
+            // An ssh older than 8.5 (from 7.6) matches an RSA key by its key
+            // type.
+            ssh_key::Algorithm::Rsa { .. } if !connection.supports_known_hosts_command => {
+                "rsa-sha2-512,rsa-sha2-256,ssh-rsa".to_owned()
+            }
+            ssh_key::Algorithm::Rsa { .. } => "rsa-sha2-512,rsa-sha2-256".to_owned(),
+            algorithm => algorithm.as_str().to_owned(),
         };
-        let (name, key) = rest
-            .split_once(' ')
-            .context("invalid receiver known-hosts line")?;
-        approving_name.get_or_insert(name);
-        let key = ssh_key::PublicKey::from_openssh(key).context("invalid receiver host key")?;
-        if let Some(marker) = marker {
-            approving_revokes |= marker == "@revoked";
-            approving.push_str(marker);
-            approving.push(' ');
+        // What the approving machine knows, which it lists under its own name
+        // for the destination, under the name this machine's own known_hosts
+        // files use.
+        let lookup = &connection.lookup;
+        let mut approving = String::new();
+        let mut approving_entries = 0;
+        let mut approving_revokes = false;
+        let mut approving_name = None;
+        for line in known_hosts.lines() {
+            let (marker, rest) = match line.split_once(' ') {
+                Some((marker @ ("@cert-authority" | "@revoked"), rest)) => (Some(marker), rest),
+                _ => (None, line),
+            };
+            let (name, key) = rest
+                .split_once(' ')
+                .context("invalid receiver known-hosts line")?;
+            approving_name.get_or_insert(name);
+            let key = ssh_key::PublicKey::from_openssh(key).context("invalid receiver host key")?;
+            if let Some(marker) = marker {
+                approving_revokes |= marker == "@revoked";
+                approving.push_str(marker);
+                approving.push(' ');
+            }
+            approving.push_str(&format!("{lookup} {}\n", key.to_openssh()?));
+            approving_entries += 1;
         }
-        approving.push_str(&format!("{lookup} {}\n", key.to_openssh()?));
-        approving_entries += 1;
-    }
-    // The approving machine's knowledge, when it has any, joins this
-    // machine's without changing what this machine's configuration names.
-    let union = approving_entries > 0 && connection.approving_keys() != ApprovingKeys::Omitted;
-    // Leaving out a key the approving machine revokes could let this machine
-    // trust it, so that is refused rather than noted.
-    anyhow::ensure!(
+        // The approving machine's knowledge, when it has any, joins this
+        // machine's without changing what this machine's configuration names.
+        let union = approving_entries > 0 && connection.approving_keys() != ApprovingKeys::Omitted;
+        // Leaving out a key the approving machine revokes could let this machine
+        // trust it, so that is refused rather than noted.
+        anyhow::ensure!(
         union || !approving_revokes,
         "the machine that approved this copy revokes a host key for the destination, and this machine cannot check the destination's key against it: {}",
         connection.omission_cause()
     );
-    if approving_entries > 0 && !union && !args.quiet {
-        crate::output::diagnostic!(
+        if approving_entries > 0 && !union && !quiet {
+            crate::output::diagnostic!(
             "syq: checking the destination's host key without what the approving machine knows about it: {}",
             connection.omission_cause()
         );
+        }
+        // An interrupted copy removes the entry key too; only SIGKILL leaves it.
+        let directory = crate::private_broker::SignalCleanedDir::new("syq-receiver-hosts-")?;
+        let path = directory.path().join(APPROVING_KNOWN_HOSTS);
+        if union {
+            std::fs::write(&path, approving)?;
+            crate::agent_broker::validate_openssh_option_path(&path, "receiver known-hosts file")?;
+        }
+        let key = directory.path().join("entry-key");
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&key)
+                .context("write the entry key for the receiver's SSH connections")?;
+            file.write_all(entry_key)?;
+        }
+        crate::agent_broker::validate_openssh_option_path(&key, "entry key file")?;
+        command.extend(connection.arguments(union.then_some(path.as_path())));
+        command.extend([
+            "-o".to_owned(),
+            format!("{}={algorithms}", connection.accepted_algorithms),
+        ]);
+        // A refused key names the approving machine's own name for the host,
+        // when that can be shown as it is.
+        let approving = union.then(|| {
+            let name = approving_name
+                .filter(|name| name.bytes().all(|byte| byte.is_ascii_graphic()))
+                .unwrap_or(&host);
+            (connection.approving_label(), name.to_owned())
+        });
+        let identity = command
+            .iter_mut()
+            .find(|argument| *argument == ENTRY_KEY_PLACEHOLDER)
+            .context("receiver SSH command is missing its entry key placeholder")?;
+        *identity = format!("IdentityFile={}", key.display());
+        Ok(Self {
+            command,
+            receiver_host: (
+                host,
+                crate::conn::ReceiverHost {
+                    hostname: connection.hostname,
+                    approving,
+                    proxied: connection.proxied,
+                },
+            ),
+            directory,
+        })
     }
-    // An interrupted copy removes the entry key too; only SIGKILL leaves it.
-    let directory = crate::private_broker::SignalCleanedDir::new("syq-receiver-hosts-")?;
-    let path = directory.path().join(APPROVING_KNOWN_HOSTS);
-    if union {
-        std::fs::write(&path, approving)?;
-        crate::agent_broker::validate_openssh_option_path(&path, "receiver known-hosts file")?;
-    }
-    let key = directory.path().join("entry-key");
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&key)
-            .context("write the entry key for the receiver's SSH connections")?;
-        file.write_all(entry_key)?;
-    }
-    crate::agent_broker::validate_openssh_option_path(&key, "entry key file")?;
-    command.extend(connection.arguments(union.then_some(path.as_path())));
-    command.extend([
-        "-o".to_owned(),
-        format!("{}={algorithms}", connection.accepted_algorithms),
-    ]);
-    // A refused key names the approving machine's own name for the host,
-    // when that can be shown as it is.
-    let approving = union.then(|| {
-        let name = approving_name
-            .filter(|name| name.bytes().all(|byte| byte.is_ascii_graphic()))
-            .unwrap_or(&host);
-        (connection.approving_label(), name.to_owned())
-    });
-    args.receiver_host = Some((
-        host,
-        crate::conn::ReceiverHost {
-            hostname: connection.hostname,
-            approving,
-            proxied: connection.proxied,
-        },
-    ));
-    let identity = command
-        .iter_mut()
-        .find(|argument| *argument == ENTRY_KEY_PLACEHOLDER)
-        .context("receiver SSH command is missing its entry key placeholder")?;
-    *identity = format!("IdentityFile={}", key.display());
-    args.rsh = Some(shell_words::join(command));
-    Ok(directory)
 }
 
 // This bounds unauthenticated clients on the invoking machine independently of
@@ -1446,296 +1476,46 @@ fn detached_launcher_command(
     )
 }
 
-pub fn run(
-    args: &Args,
-    srcs: &[Location],
-    dst: &Location,
-    results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
-) -> Result<i32> {
-    if args.interface == Interface::Rsync {
-        bail!("syq rsync does not support remote-to-remote transfers");
-    }
-    run_remote(args, srcs, dst, false, results)
+/// What a coordinator's command depends on besides the copy's own options.
+pub(crate) struct CoordinatorCommand<'a> {
+    /// The coordinator writes its results for the syq that started it to
+    /// relay.
+    pub relay_results: bool,
+    /// The destination is an enrolled receiver, which reports its own
+    /// results.
+    pub destination_results: bool,
+    /// The coordinator's `--rsh` for its connections to the other endpoint.
+    pub remote_shell: Option<String>,
+    pub peer_login_user: Option<&'a str>,
+    pub peer_connection_host: Option<&'a str>,
+    /// The destination as a restricted receiver's rules name it.
+    pub destination_path: Option<&'a [u8]>,
+    /// The mapping arrives on the coordinator's input.
+    pub mapping: bool,
 }
 
-pub fn coordinate_at_dst(
+/// The arguments of the delegated `syq cp` that coordinates a copy between
+/// two servers, after the program name: the copy's own options, rebuilt.
+/// Placement stays explicit rather than being translated into
+/// trailing-slash heuristics.
+pub(crate) fn coordinator_arguments(
     args: &Args,
-    srcs: &[Location],
-    dst: &Location,
-    results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
-) -> Result<i32> {
-    if args.interface == Interface::Rsync {
-        bail!("--coordinate-at dst is available only through native copy syntax");
-    }
-    if !srcs[0].same_host(dst) && args.rsh.is_none() && args.peer_auth == PeerAuth::Restricted {
-        bail!(
-            "--coordinate-at dst requires a read-restricted source enrollment, which is not implemented yet; use --peer-auth broker, --peer-auth own-credentials with the coordinator's own credentials for the peer, or an explicit --rsh policy"
-        );
-    }
-    run_remote(args, srcs, dst, true, results)
-}
-
-fn run_remote(
-    args: &Args,
-    srcs: &[Location],
-    dst: &Location,
-    coordinator_at_dst: bool,
-    results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
-) -> Result<i32> {
-    let started = std::time::Instant::now();
-    // The coordinator gets the named sources on its command line. Refuse
-    // more than it can take before asking for any approval or signature.
-    if args.mapping_contents.is_none() {
-        ensure_coordinator_command_fits(
-            srcs.iter()
-                .flat_map(source_words)
-                .map(|word| word.len() + 1)
-                .sum(),
-            srcs.len(),
-        )?;
-    }
-    let mut peer_bridge = args
-        .peer_bridge
-        .as_deref()
-        .cloned()
-        .map(|selected| selected.prepare(args, srcs, dst))
-        .transpose()?;
-    let mut coordinator = if coordinator_at_dst { dst } else { &srcs[0] }.clone();
-    let mut peer = if coordinator_at_dst { &srcs[0] } else { dst }.clone();
-    let rsh = if let Some(bridge) = &peer_bridge {
-        coordinator.user = bridge.coordinator.user.clone();
-        coordinator.host = Some(bridge.coordinator.host.clone());
-        coordinator.port = bridge.coordinator.port;
-        peer.user = bridge.peer.user.clone();
-        peer.host = Some(bridge.peer.host.clone());
-        peer.port = bridge.peer.port;
-        bridge.coordinator.rsh.clone()
-    } else {
-        parse_rsh(&args.rsh)?
-    };
-    let coordinator = &coordinator;
-    let peer = &peer;
-    let coordinator_host = coordinator.host.clone().unwrap();
-    let same_host = srcs[0].same_host(dst);
-    if args.detach && args.rsh.is_none() && !same_host && args.peer_auth != PeerAuth::OwnCredentials
-    {
-        bail!(
-            "--detach needs --peer-auth own-credentials with credentials on {coordinator_host}, or an explicit --rsh policy: a restricted copy and the authentication broker both need this syq to stay attached"
-        );
-    }
-
-    let mut broker_guard = None;
-    let mut entry_key = None;
-    let mut receiver_known_hosts = None;
-    let mut peer_login_user = None;
-    let mut peer_connection_host = None;
-    let mut constrained_rsh = None;
-    let mut restricted_destination_path = None;
-    let mut restricted_grant = None;
-    // The restricted destination's results: who signs them and which copy.
-    let mut destination_results = None;
-    let default_ssh_agent_policy = if let Some(bridge) = &mut peer_bridge {
-        restricted_destination_path = Some(bridge.approved.destination.clone());
-        restricted_grant = Some(crate::destination::peer_bridge::GRANT.into());
-        destination_results = Some(crate::destination_results::Expectation {
-            public_key: bridge.approved.results_key.clone(),
-            binding: crate::destination_results::Binding {
-                enrollment_id: bridge.approved.enrollment,
-                request_id: bridge.approved.request,
-                grant_digest: bridge.approved.digest,
-            },
-            secret: bridge
-                .recipient_secret
-                .take()
-                .context("the results recipient key is unavailable")?,
-            records: results.is_some(),
-        });
-        Some(AgentForwarding::Disabled)
-    } else if args.rsh.is_some() {
-        None
-    } else if same_host || args.peer_auth == PeerAuth::OwnCredentials {
-        Some(AgentForwarding::Disabled)
-    } else if args.peer_auth == PeerAuth::FullAgent {
-        Some(AgentForwarding::Unrestricted)
-    } else {
-        if args.peer_auth == PeerAuth::Broker || coordinator_at_dst {
-            crate::conn::require_constrained_openssh(&rsh[0], "on this machine")?;
-        }
-        // The login, address and agent for each server, and what this
-        // machine knows about their keys. Only the broker needs exact keys:
-        // with an enrollment, the coordinator checks the destination's key
-        // with its own SSH configuration.
-        let coordinator_policy = crate::agent_broker::resolve_known_policy_at(
-            &rsh[0],
-            coordinator.user.as_deref(),
-            &coordinator_host,
-            coordinator.port,
-        )?;
-        let peer_policy = crate::agent_broker::resolve_known_policy_at(
-            &rsh[0],
-            peer.user.as_deref(),
-            peer.host.as_deref().unwrap(),
-            peer.port,
-        )?;
-        peer_login_user = Some(peer_policy.login_user.clone());
-        peer_connection_host = Some(peer_policy.connection_host().to_owned());
-        // Native new/existing placement forms travel in the signed grant as the
-        // root-existence precondition, so they use the receiver like any other
-        // form instead of silently keeping only the constrained broker.
-        let prepared = (!coordinator_at_dst && args.peer_auth != PeerAuth::Broker)
-            .then(|| {
-                crate::directive::validate_restricted_args(args)?;
-                crate::restricted::prepare_transfer(crate::restricted::Issue {
-                    command: crate::approval_command::copy_command(args)?,
-                    cwd: crate::approval_command::current_directory(),
-                    inputs: crate::directive::Inputs {
-                        ignore: args.ignore_lines.clone(),
-                        mapping: crate::directive::mapping_authorization(args)?,
-                    },
-                    caps: None,
-                    host: dst.host.as_deref().context("destination host missing")?,
-                    port: dst.port,
-                    login: &peer_policy.login_user,
-                    // Enrolling can go through the source when the
-                    // destination cannot be reached along this machine's
-                    // SSH configuration's route.
-                    jump: Some(crate::enrollment::SshEndpoint::from_parts(
-                        &coordinator_policy.login_user,
-                        srcs[0].host.as_deref().context("source host missing")?,
-                        srcs[0].port,
-                    )?),
-                    agent: peer_policy.agent_socket(),
-                    allow_enrollment: !args.dry_run,
-                    batch: false,
-                })
-            })
-            .transpose()
-            .context(
-                "prepare restricted destination enrollment; use --peer-auth broker to explicitly request authentication-only confinement",
-            )?;
-        if let Some(prepared) = prepared {
-            // The coordinator gets the entry key on its input and uses it
-            // for every SSH connection to the receiver, so the copy needs
-            // nothing more from this machine: no agent is forwarded.
-            receiver_known_hosts = Some(peer_policy.known_hosts_for_others()?);
-            if let Some(left_out) = peer_policy.left_out().filter(|_| !args.quiet) {
-                crate::output::diagnostic!(
-                    "syq: the source checks the destination's host key without some of what this machine knows about it: {left_out}"
-                );
-            }
-            constrained_rsh = Some(receiver_rsh(Some(peer_policy.port())));
-            restricted_destination_path = Some(prepared.destination);
-            restricted_grant = Some(prepared.directive);
-            destination_results = Some(crate::destination_results::Expectation {
-                public_key: prepared.results_public_key.clone(),
-                binding: crate::destination_results::Binding {
-                    enrollment_id: prepared.enrollment_id,
-                    request_id: prepared.request_id,
-                    grant_digest: prepared.digest,
-                },
-                secret: prepared.recipient_secret,
-                records: results.is_some(),
-            });
-            if !args.quiet {
-                crate::output::diagnostic!(
-                    "syq: using restricted destination enrollment {}",
-                    prepared.enrollment_id
-                );
-            }
-            entry_key = Some(zeroize::Zeroizing::new(
-                prepared
-                    .entry_key
-                    .to_openssh(ssh_key::LineEnding::LF)?
-                    .as_bytes()
-                    .to_vec(),
-            ));
-            Some(AgentForwarding::Disabled)
-        } else {
-            coordinator_policy.require_exact_host_keys()?;
-            peer_policy.require_exact_host_keys()?;
-            constrained_rsh = Some(constrained_destination_rsh(
-                Some(peer_policy.port()),
-                DestinationAuthentication::Broker {
-                    host_key_algorithms: &peer_policy.host_key_algorithms(),
-                },
-            ));
-            let limit = broker_connection_limit(args.connections_opt.or_else(|| {
-                args.resource_limits
-                    .as_ref()
-                    .and_then(|limits| limits.workers)
-            }))?;
-            let policy = crate::agent_broker::BrokerPolicy::new(coordinator_policy, peer_policy);
-            let broker = crate::agent_broker::ConstrainedAgentBroker::start(policy, limit)?;
-            let ambient = broker.ambient_socket().to_string_lossy().into_owned();
-            let socket = broker.socket_path().to_string_lossy().into_owned();
-            broker_guard = Some(broker);
-            Some(AgentForwarding::Constrained {
-                ambient,
-                broker: socket,
-            })
-        }
-    };
-    if (args.receiver_max_entries.is_some() || args.receiver_max_bytes.is_some())
-        && restricted_grant.is_none()
-    {
-        bail!(
-            "--receiver-max-entries and --receiver-max-bytes limit a restricted copy, but this copy logs in to the destination normally rather than through its restricted receiver"
-        );
-    }
-    let coordinator_target = endpoint_display(coordinator);
-    let rsh = coordinator_rsh(&rsh, entry_key.is_some());
-    let spec = if let Some(bridge) = &peer_bridge {
-        bridge.coordinator.clone()
-    } else if matches!(
-        default_ssh_agent_policy,
-        None | Some(AgentForwarding::Disabled)
-    ) {
-        // Only this machine selects a persistence domain. A native coordinator
-        // can reuse its local master; credential-bound forwarding below remains
-        // private to this copy. Never send the scope path to the coordinator.
-        let crate::conn::Endpoint::Remote(mut spec) = crate::transfer::endpoint(coordinator, args)?
-        else {
-            unreachable!()
-        };
-        spec.rsh = source_setup_rsh(&rsh, args.rsh.is_some());
-        spec
-    } else {
-        crate::conn::RemoteSpec {
-            local_process: false,
-            user: coordinator.user.clone(),
-            host: coordinator_host.clone(),
-            port: coordinator.port,
-            rsh: source_setup_rsh(&rsh, args.rsh.is_some()),
-            syq_path: args.syq_path.clone(),
-            bootstrap_helper: args.syq_path.is_none() && !args.no_bootstrap,
-            restricted_grant: None,
-            helper_install: Default::default(),
-            ssh_multiplexer: None,
-            quiet: args.quiet,
-            pacing: Default::default(),
-            tcp: Default::default(),
-            diagnostics: Default::default(),
-            primed_control: Default::default(),
-            forwarded: None,
-            receiver_host: None,
-            read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
-        }
-    };
-
-    // Rebuild the native command for the remote coordinator. Placement stays
-    // explicit rather than being translated into trailing-slash heuristics.
+    (srcs, dst, peer): (&[Location], &Location, &Location),
+    (coordinator_at_dst, same_host): (bool, bool),
+    command: CoordinatorCommand<'_>,
+) -> Result<Vec<String>> {
     let mut remote: Vec<String> = vec![match args.interface {
-        Interface::Rsync => unreachable!("checked above"),
+        Interface::Rsync => bail!("syq rsync does not support remote-to-remote transfers"),
         Interface::NativeCp => "cp",
         Interface::NativeRm => bail!("native rm cannot be a remote-to-remote transfer"),
         Interface::NativeMap => bail!("syq map runs locally and is never remoted"),
     }
     .into()];
     remote.push("--delegated-operands-b64".into());
-    if results.is_some() {
+    if command.relay_results {
         // The coordinator writes its results for this machine to relay.
         remote.push("--relay-results".into());
-        if destination_results.is_some() && !args.dry_run {
+        if command.destination_results && !args.dry_run {
             // This machine renders the summary from the final result it
             // composes; the coordinator's own summary could disagree.
             remote.push("--suppress-summary".into());
@@ -1873,7 +1653,7 @@ fn run_remote(
         &mut remote,
         args.syq_path.as_deref(),
         args.no_bootstrap,
-        destination_results.is_some(),
+        command.destination_results,
     );
     if args.no_tcp {
         remote.push("--no-tcp".into());
@@ -1885,19 +1665,7 @@ fn run_remote(
         remote.push(format!("--tcp-congestion={algorithm}"));
     }
     remote.push(format!("--tcp-ports={}", args.tcp_ports));
-    // With an entry key, the coordinator reaches the receiver with the entry
-    // key alone; otherwise the forwarding policy decides.
-    let remote_shell = if entry_key.is_some() {
-        constrained_rsh.clone()
-    } else {
-        destination_rsh(
-            args.rsh.as_deref(),
-            same_host,
-            default_ssh_agent_policy.as_ref(),
-            constrained_rsh.as_deref(),
-        )
-    };
-    if let Some(remote_shell) = remote_shell {
+    if let Some(remote_shell) = command.remote_shell {
         remote.push("--rsh".into());
         remote.push(remote_shell);
     }
@@ -1911,8 +1679,8 @@ fn run_remote(
         remote.push("--from".into());
         remote.push(endpoint_arg(
             &srcs[0],
-            peer_login_user.as_deref(),
-            peer_connection_host.as_deref(),
+            command.peer_login_user,
+            command.peer_connection_host,
         ));
     }
     if let Some(path) = &args.native_source_root {
@@ -1922,7 +1690,7 @@ fn run_remote(
         remote.push("--cwd".into());
         remote.push(delegated_operand(path));
     }
-    if args.mapping_contents.is_some() {
+    if command.mapping {
         remote.push("--mapping=-".into());
     } else {
         for source in srcs {
@@ -1933,14 +1701,294 @@ fn run_remote(
         remote.push("--to".into());
         remote.push(endpoint_arg(
             peer,
-            peer_login_user.as_deref(),
-            peer_connection_host.as_deref(),
+            command.peer_login_user,
+            command.peer_connection_host,
         ));
     }
     remote.push(native_placement_arg(args)?.into());
     remote.push(delegated_operand(
-        restricted_destination_path.as_deref().unwrap_or(&dst.path),
+        command.destination_path.unwrap_or(&dst.path),
     ));
+    Ok(remote)
+}
+
+pub fn run(
+    args: &Args,
+    srcs: &[Location],
+    dst: &Location,
+    results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
+) -> Result<i32> {
+    if args.interface == Interface::Rsync {
+        bail!("syq rsync does not support remote-to-remote transfers");
+    }
+    run_remote(args, srcs, dst, false, results)
+}
+
+pub fn coordinate_at_dst(
+    args: &Args,
+    srcs: &[Location],
+    dst: &Location,
+    results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
+) -> Result<i32> {
+    if args.interface == Interface::Rsync {
+        bail!("--coordinate-at dst is available only through native copy syntax");
+    }
+    if !srcs[0].same_host(dst) && args.rsh.is_none() && args.peer_auth == PeerAuth::Restricted {
+        bail!(
+            "--coordinate-at dst requires a read-restricted source enrollment, which is not implemented yet; use --peer-auth broker, --peer-auth own-credentials with the coordinator's own credentials for the peer, or an explicit --rsh policy"
+        );
+    }
+    run_remote(args, srcs, dst, true, results)
+}
+
+fn run_remote(
+    args: &Args,
+    srcs: &[Location],
+    dst: &Location,
+    coordinator_at_dst: bool,
+    results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
+) -> Result<i32> {
+    let started = std::time::Instant::now();
+    // The coordinator gets the named sources on its command line. Refuse
+    // more than it can take before asking for any approval or signature.
+    if args.mapping_contents.is_none() {
+        ensure_coordinator_command_fits(
+            srcs.iter()
+                .flat_map(source_words)
+                .map(|word| word.len() + 1)
+                .sum(),
+            srcs.len(),
+        )?;
+    }
+    // A copy a receiving machine approved runs on the source's receiver.
+    if let Some(copy) = &args.coordinated_copy {
+        anyhow::ensure!(
+            !coordinator_at_dst,
+            "a copy between two servers approved by another machine runs on its source"
+        );
+        return run_coordinated(args, dst, results, copy);
+    }
+    let coordinator = if coordinator_at_dst { dst } else { &srcs[0] };
+    let peer = if coordinator_at_dst { &srcs[0] } else { dst };
+    let rsh = parse_rsh(&args.rsh)?;
+    let coordinator_host = coordinator.host.clone().unwrap();
+    let same_host = srcs[0].same_host(dst);
+    if args.detach && args.rsh.is_none() && !same_host && args.peer_auth != PeerAuth::OwnCredentials
+    {
+        bail!(
+            "--detach needs --peer-auth own-credentials with credentials on {coordinator_host}, or an explicit --rsh policy: a restricted copy and the authentication broker both need this syq to stay attached"
+        );
+    }
+
+    let mut broker_guard = None;
+    let mut entry_key = None;
+    let mut receiver_known_hosts = None;
+    let mut peer_login_user = None;
+    let mut peer_connection_host = None;
+    let mut constrained_rsh = None;
+    let mut restricted_destination_path = None;
+    let mut restricted_grant = None;
+    // The restricted destination's results: who signs them and which copy.
+    let mut destination_results = None;
+    let default_ssh_agent_policy = if args.rsh.is_some() {
+        None
+    } else if same_host || args.peer_auth == PeerAuth::OwnCredentials {
+        Some(AgentForwarding::Disabled)
+    } else if args.peer_auth == PeerAuth::FullAgent {
+        Some(AgentForwarding::Unrestricted)
+    } else {
+        if args.peer_auth == PeerAuth::Broker || coordinator_at_dst {
+            crate::conn::require_constrained_openssh(&rsh[0], "on this machine")?;
+        }
+        // The login, address and agent for each server, and what this
+        // machine knows about their keys. Only the broker needs exact keys:
+        // with an enrollment, the coordinator checks the destination's key
+        // with its own SSH configuration.
+        let coordinator_policy = crate::agent_broker::resolve_known_policy_at(
+            &rsh[0],
+            coordinator.user.as_deref(),
+            &coordinator_host,
+            coordinator.port,
+        )?;
+        let peer_policy = crate::agent_broker::resolve_known_policy_at(
+            &rsh[0],
+            peer.user.as_deref(),
+            peer.host.as_deref().unwrap(),
+            peer.port,
+        )?;
+        peer_login_user = Some(peer_policy.login_user.clone());
+        peer_connection_host = Some(peer_policy.connection_host().to_owned());
+        // Native new/existing placement forms travel in the signed grant as the
+        // root-existence precondition, so they use the receiver like any other
+        // form instead of silently keeping only the constrained broker.
+        let prepared = (!coordinator_at_dst && args.peer_auth != PeerAuth::Broker)
+            .then(|| {
+                crate::directive::validate_restricted_args(args)?;
+                crate::restricted::prepare_transfer(crate::restricted::Issue {
+                    command: crate::approval_command::copy_command(args)?,
+                    cwd: crate::approval_command::current_directory(),
+                    inputs: crate::directive::Inputs {
+                        ignore: args.ignore_lines.clone(),
+                        mapping: crate::directive::mapping_authorization(args)?,
+                    },
+                    caps: None,
+                    host: dst.host.as_deref().context("destination host missing")?,
+                    port: dst.port,
+                    login: &peer_policy.login_user,
+                    // Enrolling can go through the source when the
+                    // destination cannot be reached along this machine's
+                    // SSH configuration's route.
+                    jump: Some(crate::enrollment::SshEndpoint::from_parts(
+                        &coordinator_policy.login_user,
+                        srcs[0].host.as_deref().context("source host missing")?,
+                        srcs[0].port,
+                    )?),
+                    agent: peer_policy.agent_socket(),
+                    allow_enrollment: !args.dry_run,
+                    batch: false,
+                    results_key: None,
+                    peer: None,
+                })
+            })
+            .transpose()
+            .context(
+                "prepare restricted destination enrollment; use --peer-auth broker to explicitly request authentication-only confinement",
+            )?;
+        if let Some(prepared) = prepared {
+            // The coordinator gets the entry key on its input and uses it
+            // for every SSH connection to the receiver, so the copy needs
+            // nothing more from this machine: no agent is forwarded.
+            receiver_known_hosts = Some(peer_policy.known_hosts_for_others()?);
+            if let Some(left_out) = peer_policy.left_out().filter(|_| !args.quiet) {
+                crate::output::diagnostic!(
+                    "syq: the source checks the destination's host key without some of what this machine knows about it: {left_out}"
+                );
+            }
+            constrained_rsh = Some(receiver_rsh(Some(peer_policy.port())));
+            restricted_destination_path = Some(prepared.destination);
+            restricted_grant = Some(prepared.directive);
+            destination_results = Some(crate::destination_results::Expectation {
+                public_key: prepared.results_public_key.clone(),
+                binding: crate::destination_results::Binding {
+                    enrollment_id: prepared.enrollment_id,
+                    request_id: prepared.request_id,
+                    grant_digest: prepared.digest,
+                },
+                secret: prepared
+                    .recipient_secret
+                    .context("the results recipient key is unavailable")?,
+                records: results.is_some(),
+            });
+            if !args.quiet {
+                crate::output::diagnostic!(
+                    "syq: using restricted destination enrollment {}",
+                    prepared.enrollment_id
+                );
+            }
+            entry_key = Some(zeroize::Zeroizing::new(
+                prepared
+                    .entry_key
+                    .to_openssh(ssh_key::LineEnding::LF)?
+                    .as_bytes()
+                    .to_vec(),
+            ));
+            Some(AgentForwarding::Disabled)
+        } else {
+            coordinator_policy.require_exact_host_keys()?;
+            peer_policy.require_exact_host_keys()?;
+            constrained_rsh = Some(constrained_destination_rsh(
+                Some(peer_policy.port()),
+                DestinationAuthentication::Broker {
+                    host_key_algorithms: &peer_policy.host_key_algorithms(),
+                },
+            ));
+            let limit = broker_connection_limit(args.connections_opt.or_else(|| {
+                args.resource_limits
+                    .as_ref()
+                    .and_then(|limits| limits.workers)
+            }))?;
+            let policy = crate::agent_broker::BrokerPolicy::new(coordinator_policy, peer_policy);
+            let broker = crate::agent_broker::ConstrainedAgentBroker::start(policy, limit)?;
+            let ambient = broker.ambient_socket().to_string_lossy().into_owned();
+            let socket = broker.socket_path().to_string_lossy().into_owned();
+            broker_guard = Some(broker);
+            Some(AgentForwarding::Constrained {
+                ambient,
+                broker: socket,
+            })
+        }
+    };
+    if (args.receiver_max_entries.is_some() || args.receiver_max_bytes.is_some())
+        && restricted_grant.is_none()
+    {
+        bail!(
+            "--receiver-max-entries and --receiver-max-bytes limit a restricted copy, but this copy logs in to the destination normally rather than through its restricted receiver"
+        );
+    }
+    let coordinator_target = endpoint_display(coordinator);
+    let rsh = coordinator_rsh(&rsh, entry_key.is_some());
+    let spec = if matches!(
+        default_ssh_agent_policy,
+        None | Some(AgentForwarding::Disabled)
+    ) {
+        // Only this machine selects a persistence domain. A native coordinator
+        // can reuse its local master; credential-bound forwarding below remains
+        // private to this copy. Never send the scope path to the coordinator.
+        let crate::conn::Endpoint::Remote(mut spec) = crate::transfer::endpoint(coordinator, args)?
+        else {
+            unreachable!()
+        };
+        spec.rsh = source_setup_rsh(&rsh, args.rsh.is_some());
+        spec
+    } else {
+        crate::conn::RemoteSpec {
+            local_process: false,
+            user: coordinator.user.clone(),
+            host: coordinator_host.clone(),
+            port: coordinator.port,
+            rsh: source_setup_rsh(&rsh, args.rsh.is_some()),
+            syq_path: args.syq_path.clone(),
+            bootstrap_helper: args.syq_path.is_none() && !args.no_bootstrap,
+            restricted_grant: None,
+            helper_install: Default::default(),
+            ssh_multiplexer: None,
+            quiet: args.quiet,
+            pacing: Default::default(),
+            tcp: Default::default(),
+            diagnostics: Default::default(),
+            primed_control: Default::default(),
+            forwarded: None,
+            receiver_host: None,
+            read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
+        }
+    };
+
+    // With an entry key, the coordinator reaches the receiver with the entry
+    // key alone; otherwise the forwarding policy decides.
+    let remote_shell = if entry_key.is_some() {
+        constrained_rsh.clone()
+    } else {
+        destination_rsh(
+            args.rsh.as_deref(),
+            same_host,
+            default_ssh_agent_policy.as_ref(),
+            constrained_rsh.as_deref(),
+        )
+    };
+    let mut remote = coordinator_arguments(
+        args,
+        (srcs, dst, peer),
+        (coordinator_at_dst, same_host),
+        CoordinatorCommand {
+            relay_results: results.is_some(),
+            destination_results: destination_results.is_some(),
+            remote_shell,
+            peer_login_user: peer_login_user.as_deref(),
+            peer_connection_host: peer_connection_host.as_deref(),
+            destination_path: restricted_destination_path.as_deref(),
+            mapping: args.mapping_contents.is_some(),
+        },
+    )?;
 
     if args.detach {
         // Detached: keep a text log without a live progress display.
@@ -1961,12 +2009,11 @@ fn run_remote(
     };
     let mut internal_environment = Vec::new();
     // An attached coordinator ends with this process; see follow_requester.
-    // Detached copies outlive it by design, and an approved peer bridge
-    // watches its own lifetime channel. A mapping arrives on the same input,
-    // so only this exact build, which reads just the manifest, can share it.
-    let follow_requester = !args.detach
-        && peer_bridge.is_none()
-        && (args.mapping_contents.is_none() || spec.runs_this_build());
+    // Detached copies outlive it by design. A mapping arrives on the same
+    // input, so only this exact build, which reads just the manifest, can
+    // share it.
+    let follow_requester =
+        !args.detach && (args.mapping_contents.is_none() || spec.runs_this_build());
     if follow_requester {
         internal_environment.push((
             REQUESTER_STDIN,
@@ -2113,23 +2160,6 @@ fn run_remote(
         )
     });
     let run = |relay: Option<Relay>| {
-        if let Some(bridge) = &peer_bridge {
-            let mapping = args.mapping_contents.clone();
-            return match relay {
-                Some(relay) => bridge.run(&remote_cmd, mapping, move |stdout| {
-                    relay_stdout(stdout, relay).map(Some)
-                }),
-                None => bridge.run(&remote_cmd, mapping, |stdout| {
-                    // A closed stdout must not fail or stall the copy.
-                    if let Some(error) =
-                        crate::output::pass_through(stdout, &mut std::io::stdout())?
-                    {
-                        crate::output::warn_stdout(&error);
-                    }
-                    Ok(None)
-                }),
-            };
-        }
         let mut cmd = make_command();
         cmd.stdin(
             if follow_requester || args.mapping_contents.is_some() || entry_key.is_some() {
@@ -2194,7 +2224,7 @@ fn run_remote(
         Ok::<_, anyhow::Error>((status, relayed?))
     };
     let (mut status, mut relay) = run(relay)?;
-    if peer_bridge.is_none() && helper_missing(status.code(), spec.bootstrap_helper) {
+    if helper_missing(status.code(), spec.bootstrap_helper) {
         spec.install_helper()?;
         (status, relay) = run(relay)?;
     }
@@ -2211,15 +2241,8 @@ fn run_remote(
         // constrained-authentication context here, and the caller settles
         // the results as failed.
         Some(c @ (1 | 23 | 25)) => Ok(c),
-        Some(c) if peer_bridge.is_some() => Err(anyhow::anyhow!(
-            "approved server-to-server copy on {coordinator_host} failed (exit {c}); check the preceding SSH error and reconnect the approved account connection if it closed"
-        )),
         Some(c) => {
-            if peer_bridge.is_none()
-                && args.rsh.is_none()
-                && args.peer_auth == PeerAuth::Broker
-                && !same_host
-            {
+            if args.rsh.is_none() && args.peer_auth == PeerAuth::Broker && !same_host {
                 bail!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); constrained authentication permits only {}@{} and requires OpenSSH session-bind/host-bound authentication. Use --peer-auth own-credentials with coordinator-host credentials, or explicitly accept full agent exposure with --peer-auth full-agent", peer_login_user.as_deref().unwrap_or("the peer user"), peer.host.as_deref().unwrap_or("the peer"))
             }
             bail!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); {coordinator_host} may not be able to reach the peer endpoint")
@@ -2243,6 +2266,323 @@ fn run_remote(
         )?;
     }
     Ok(code)
+}
+
+/// A copy between two servers that a receiving machine approved for this
+/// machine, which the source's receiver runs: what this machine presents to
+/// it, and how it checks the destination's results.
+pub(crate) struct CoordinatedCopy {
+    /// The SSH command for the source's receiver.
+    pub(crate) receiver: ReceiverSsh,
+    /// The account the source's enrollment is for, and its host as the
+    /// command names it.
+    pub(crate) login: String,
+    pub(crate) host: String,
+    /// The source's and the destination's signed directives.
+    pub(crate) source: Vec<u8>,
+    pub(crate) destination: Vec<u8>,
+    pub(crate) destination_entry_key: zeroize::Zeroizing<Vec<u8>>,
+    /// Taken by the one run of the copy.
+    pub(crate) results: std::sync::Mutex<Option<crate::destination_results::Expectation>>,
+}
+
+impl std::fmt::Debug for CoordinatedCopy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoordinatedCopy")
+            .field("login", &self.login)
+            .field("host", &self.host)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Run a copy between two servers that a receiving machine approved: log in
+/// to the source's receiver with its entry key, present both directives, and
+/// relay what its coordinator reports, checking the destination's results.
+/// The coordinator follows this process: it stops when this process ends.
+fn run_coordinated(
+    args: &Args,
+    dst: &Location,
+    results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
+    copy: &CoordinatedCopy,
+) -> Result<i32> {
+    let started = std::time::Instant::now();
+    let token = crate::destination_results::relay::new_token()?;
+    let mut expectation = copy
+        .results
+        .lock()
+        .unwrap()
+        .take()
+        .context("this copy's approval was already used")?;
+    expectation.records = results.is_some();
+    // The frame holds the destination's entry key: wiped once sent.
+    let frame = crate::restricted::Admission::Coordinate(Box::new(crate::restricted::Coordinate {
+        source: copy.source.clone(),
+        destination: copy.destination.clone(),
+        entry_key: copy.destination_entry_key.to_vec(),
+        results_token: token.clone(),
+        progress_width: (!args.no_progress && !args.quiet && std::io::stderr().is_terminal())
+            .then(|| u16::try_from(crate::progress::term_width()).unwrap_or(u16::MAX)),
+    }))
+    .frame()?;
+    let frame = std::sync::Arc::new(zeroize::Zeroizing::new(frame));
+    let (program, options) = copy
+        .receiver
+        .command
+        .split_first()
+        .context("receiver SSH command is empty")?;
+    let source = &copy.host;
+    // How ssh names the approving machine's entries for the source, when
+    // they joined this machine's, and the approving machine's name for it.
+    let approving = copy.receiver.receiver_host.1.approving.as_ref();
+    if !args.quiet {
+        crate::output::diagnostic!("syq: remote-to-remote: running on {source}");
+    }
+    let mut relay = Relay::new(
+        &token,
+        results,
+        Some(expectation),
+        (args.dry_run, args.delete),
+    );
+    // A receiver whose slots for starting sessions are all taken refuses the
+    // session before reading the frame, so the same frame can go again, as
+    // a coordinator retries such a worker.
+    let mut delay = std::time::Duration::from_millis(200);
+    let mut attempt = 0;
+    let status = loop {
+        attempt += 1;
+        let mut command = Command::new(program);
+        // The receiver's forced command runs whatever command is asked for.
+        command
+            .args(options)
+            .args(["-l", &copy.login, "--", source, "syq"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn_guarded()
+            .with_context(|| format!("spawn {program:?}"))?;
+        // ssh's and the coordinator's messages pass through as they come.
+        let diagnosis = crate::conn::ssh_auth::capture(
+            child.stderr.take().context("receiver errors missing")?,
+            approving.map(|(named, _)| *named),
+        )
+        .context("start SSH stderr reader")?;
+        let mut input = child.stdin.take().context("receiver input missing")?;
+        let sent = frame.clone();
+        // The coordinator follows this process until its input ends: keep
+        // it open until the copy is over.
+        let writer = std::thread::spawn(move || {
+            input.write_all(&sent)?;
+            // Without the marker the coordinator only stops following.
+            let _ = input.write_all(&[REQUESTER_MARKER]);
+            Ok::<_, std::io::Error>(input)
+        });
+        relay = relay_stdout(
+            child.stdout.take().context("receiver output missing")?,
+            relay,
+        )?;
+        let status = child.wait().context("wait for the source's receiver")?;
+        let written = writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("receiver input writer panicked"))?;
+        drop(written);
+        let diagnosis = diagnosis
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .ok()
+            .flatten();
+        if status.code() == Some(255) {
+            if let (Some((_, name)), Some(diagnosis)) = (approving, diagnosis) {
+                // ssh names the approving machine's entries with a label no
+                // file here has, and suggests fixing this machine's files.
+                if diagnosis.failure == Some(crate::conn::ssh_auth::Failure::HostKey)
+                    && diagnosis.names_marker
+                {
+                    crate::output::diagnostic!(
+                        "syq: the approving machine's known_hosts lists a different key for {source}; if that key is out of date, remove it there with `ssh-keygen -R {}`",
+                        shell_words::quote(name)
+                    );
+                }
+            }
+        }
+        if status.code() == Some(crate::restricted::SESSIONS_FULL_EXIT) && attempt < 6 {
+            std::thread::sleep(delay);
+            delay *= 2;
+            continue;
+        }
+        break status;
+    };
+    let code = match status.code() {
+        Some(0) => 0,
+        // Defined transfer results; the coordinator's errors are already
+        // printed, and settlement still writes the results that arrived.
+        Some(code @ (1 | 23 | 25)) => code,
+        Some(crate::restricted::SESSIONS_FULL_EXIT) => bail!(
+            "the restricted receiver on {source} is busy starting other copies; try again shortly"
+        ),
+        Some(crate::restricted::REFUSED_EXIT) => {
+            bail!("the restricted receiver on {source} refused the copy")
+        }
+        Some(255) => {
+            bail!("could not reach the restricted receiver on {source}; see the SSH error above")
+        }
+        Some(code) => bail!("the copy on {source} failed (exit {code})"),
+        None => bail!("the SSH connection to {source}'s restricted receiver was killed"),
+    };
+    settle(
+        relay,
+        Settlement {
+            src_host: source,
+            dst_host: dst.host.as_deref().unwrap_or("the destination"),
+            coordinator_exit_code: code,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            verbose: args.verbose > 0,
+            quiet: args.quiet,
+        },
+    )
+}
+
+/// Internal environment variables for a coordinator.
+pub(crate) type Environment = Vec<(&'static str, String)>;
+
+/// The arguments and environment of the coordinator a coordinating source's
+/// receiver runs for `coordinating`: what a copy started on the signing
+/// machine would run here, from the signed command alone.
+pub(crate) fn coordination_command(
+    coordinating: &crate::restricted::Coordinating,
+) -> Result<(Vec<String>, Environment)> {
+    let crate::restricted::Coordinating {
+        args,
+        peer,
+        caps,
+        frame,
+    } = coordinating;
+    let mut args = args.clone();
+    // Deletions are planned against the approving machine's limit, so that
+    // pruning stays all or nothing.
+    if let Some(caps) = caps {
+        let ceiling = caps.command_deletion_ceiling(&args);
+        crate::destination::apply_deletion_limit(&mut args, Some(ceiling));
+    }
+    let (dst, sources) = args
+        .locations
+        .split_last()
+        .context("the command names no destination")?;
+    let srcs = crate::transfer::distinct_native_sources(sources);
+    let arguments = coordinator_arguments(
+        &args,
+        (&srcs, dst, dst),
+        (false, false),
+        CoordinatorCommand {
+            relay_results: args.native_results.is_some() || args.native_results_fd.is_some(),
+            destination_results: true,
+            remote_shell: Some(receiver_rsh(dst.port)),
+            peer_login_user: Some(&peer.account),
+            // This server's own SSH configuration resolves the destination
+            // the command names.
+            peer_connection_host: None,
+            destination_path: Some(&peer.destination),
+            mapping: false,
+        },
+    )?;
+    let mut environment = vec![
+        (ENTRY_KEY_STDIN, frame.entry_key.len().to_string()),
+        (DIRECTIVE_STDIN, frame.destination.len().to_string()),
+        (RECEIVER_KNOWN_HOSTS, peer.known_hosts.clone()),
+        (REQUESTER_STDIN, "0".to_owned()),
+        (
+            crate::destination_results::relay::TOKEN_ENV,
+            frame.results_token.clone(),
+        ),
+    ];
+    if args.dry_run {
+        environment.push((
+            "SYQ_INTERNAL_NATIVE_PLAN_SOURCE_HOST",
+            endpoint_display(&srcs[0]),
+        ));
+    }
+    if args.max_delete_from_approver {
+        // Its messages name the approving machine's limit, not an option
+        // the command did not give.
+        environment.push((MAX_DELETE_FROM_APPROVER, "1".to_owned()));
+    }
+    if let Some(width) = frame
+        .progress_width
+        .filter(|_| !args.no_progress && !args.quiet)
+    {
+        environment.push(("SYQ_INTERNAL_NATIVE_PROGRESS_WIDTH", width.to_string()));
+    }
+    Ok((arguments, environment))
+}
+
+/// Run, as this server's restricted receiver, the copy between two servers
+/// that a verified directive for this account allows: the coordinator for
+/// the signed command, as a copy started on the signing machine would run
+/// here, which reaches the destination's receiver with its entry key, its
+/// directive and what the signing machine's known_hosts files list for it.
+/// The coordinator's output is the session's, and it follows the session:
+/// it stops when the requester's input ends. Returns its exit status.
+pub(crate) fn coordinate(coordinating: crate::restricted::Coordinating) -> Result<i32> {
+    use std::os::fd::AsFd;
+    use std::os::unix::process::ExitStatusExt as _;
+    let mut command = Command::new(std::env::current_exe().context("find this receiver")?);
+    // Nothing in this account's environment changes the signed command.
+    for (name, _) in std::env::vars_os() {
+        if name.as_encoded_bytes().starts_with(b"SYQ_") {
+            command.env_remove(name);
+        }
+    }
+    let (arguments, environment) = coordination_command(&coordinating)?;
+    command.args(arguments).envs(environment);
+    let crate::restricted::Coordinating { frame, .. } = coordinating;
+    // The session's own input, unbuffered: the requester's marker, and then
+    // its end when the requester goes.
+    let mut session = std::fs::File::from(
+        std::io::stdin()
+            .as_fd()
+            .try_clone_to_owned()
+            .context("take the requester's input")?,
+    );
+    // The coordinator stays in this receiver's process group, which
+    // revocation and the copy's finish-by time end.
+    let mut child = command
+        .stdin(Stdio::piped())
+        .spawn_guarded()
+        .context("start the copy's coordinator")?;
+    let mut input = child.stdin.take().context("coordinator input missing")?;
+    let entry_key = zeroize::Zeroizing::new(frame.entry_key.clone());
+    let destination = frame.destination.clone();
+    drop(frame);
+    std::thread::Builder::new()
+        .name("requester".into())
+        .spawn(move || {
+            // The coordinator reads exactly these, in this order, before
+            // anything else reads its input.
+            let sent = (|| {
+                input.write_all(&entry_key)?;
+                input.write_all(&destination)?;
+                input.write_all(&[REQUESTER_MARKER])
+            })();
+            drop(entry_key);
+            if sent.is_err() {
+                return;
+            }
+            // Its input ends when the requester's does.
+            let mut buffer = [0u8; 64];
+            loop {
+                match session.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            drop(input);
+        })
+        .context("follow the requester")?;
+    let status = child.wait().context("wait for the copy's coordinator")?;
+    Ok(status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)))
 }
 
 fn helper_missing(code: Option<i32>, automatic: bool) -> bool {

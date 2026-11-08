@@ -175,28 +175,47 @@ For uploads, quoted `~` and `~/archive` mean the destination account's home
 directory, and `~//archive` means `/archive`, as with SSH. Use `./~/archive`
 for a directory named `~`.
 
-## Approved account copies
+<a id="approved-account-copies"></a>
 
-To copy between two other servers using your laptop's access to both, select
-a provider for each server, with `--auth-from` or a saved choice (`auto` and
-`ssh` never use approvals), and approve the
-[account connections](persistence-reference.md#approved-account-connections).
-The copy runs on the source as a restricted copy without enrollment, and
-needs the default `--peer-auth restricted`. It supports `--no-tcp`, mappings,
-and `--results`; with `--coordinate-at local`, file data goes through the
-machine you run it on instead.
+## Copies between two other servers
 
-File data goes directly between the servers. The source's SSH server must
-allow remote Unix-socket forwarding, and from OpenSSH 7.8 also remote TCP
-forwarding, and the source must reach the destination itself; a `ProxyJump`
-in your own configuration does not help. The destination login must not be
-root. [Restricted-copy limits](#limits-and-unsupported-options) and
-[results from the destination](#results-from-the-destination) apply.
+To copy from hostB to hostC while working on a third server, select a
+receiving machine with `--auth-from @NAME`, or save one for either server
+(`auto` and `ssh` never ask). The receiving machine shows the command once,
+within its copy limits, and sets up or updates the [enrollment](#enrollment)
+on each account when needed, over its own SSH logins without prompts, as for
+an upload (see [Authorization selection](#authorization-selection)); a dry
+run never sets them up. If it cannot reach hostB or hostC along its own SSH
+configuration's route, it logs in through the server you run the command
+on, whose SSH server must then allow TCP forwarding and which must then reach
+that server's SSH port. Account approvals are not used, and an SSH
+authorization provider cannot approve these copies.
 
-A copy that carries file data over SSH adds a temporary line, with a comment
-starting `syq-copy-worker-`, to the destination's `~/.ssh/authorized_keys`, so
-that file must be writable. A killed copy can leave the line behind; it grants
-nothing, and you can delete it when no copy to that account is running.
+The server you run the command on logs in to hostB's restricted receiver,
+which runs the copy as the command states and reaches hostC's restricted
+receiver itself, so file data goes directly from hostB to hostC. Your server
+must reach hostB's SSH port, and hostB must reach hostC's, each with its own
+SSH configuration: hostB looks hostC up under the name in your command. Each
+checks the other's host key as
+[hostA checks hostB's](security.md#how-hosta-checks-hostbs-key), also
+trusting what your laptop's known_hosts lists. The copy stops when the
+command that started it ends.
+
+The copy supports `--no-tcp` and `--results`, and your server checks
+[results from the destination](#results-from-the-destination). It does not
+support `--mapping`, whose contents your laptop never sees, `--coordinate-at
+dst`, `--detach`, `--rsh`, `--syq-path`, `--no-bootstrap`, other `--peer-auth`
+values, or `--no-tcp-encryption`, and neither login may be root. As for an
+upload, a saved choice does not apply to a copy with one of these options:
+your server's own SSH access runs it. An explicit `--auth-from @NAME` with one
+of them is refused. [Restricted-copy limits](#limits-and-unsupported-options)
+apply. With `--coordinate-at local`, file data goes through your server
+instead, which then needs
+[account access](persistence-reference.md#account-access) to both servers.
+
+Older versions of syq added lines with a comment starting `syq-copy-worker-`
+to the destination's `~/.ssh/authorized_keys` for these copies. They grant
+nothing, and you can delete them.
 
 ## Verification
 

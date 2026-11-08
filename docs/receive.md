@@ -183,7 +183,10 @@ run any command as that account while the approval lasts**, whatever command
 the prompt shows; see [SSH account access](security.md#ssh-account-access).
 Keep the laptop connection open while you work.
 
-Later commands reuse the approval, including copies with `--auth-from @laptop`.
+Later commands reuse the approval, including copies between hostA and that
+account with `--auth-from @laptop`. A copy between two other servers asks for
+its own approval instead; see
+[Run the copy from a server](remote-to-remote.md#run-the-copy-from-a-server).
 To make your laptop the default on hostA, run `syq persist auth-from @laptop`.
 See [Account access](persistence-reference.md#account-access) for how long
 approval lasts,

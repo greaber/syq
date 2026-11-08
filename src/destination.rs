@@ -35,7 +35,6 @@ pub(crate) mod notices;
 pub(crate) use forward::{DeadlineIo, HandshakeInput};
 pub(crate) mod handoff;
 mod identity;
-pub(crate) mod peer_bridge;
 pub(crate) mod pull;
 pub(crate) mod send;
 pub(crate) mod ssh;
@@ -196,19 +195,18 @@ pub(crate) struct Approved {
     pub enrollment: crate::enrollment::EnrollmentId,
     pub request: crate::delegation::RequestId,
     pub digest: [u8; 32],
-    /// Verifies the header of the receiving machine's own results. Only a
-    /// copy between two servers asks for them (`peer_bridge`); a coordinator
-    /// on the requesting machine reads every reply itself.
+    /// Verifies the header of the receiving machine's own results; a
+    /// coordinator on the requesting machine reads every reply itself.
     pub results_key: String,
     /// The approving machine's own deletion limit for this copy, when it has
     /// one. Both machines run the same build.
     pub max_delete: Option<u64>,
 }
 
-/// One approved control channel and its direct worker transport.
+/// One approved control channel for a source the receiving machine
+/// approved. File data needs direct TCP to the source.
 #[derive(Debug)]
 pub(crate) struct ReturnConnection {
-    ssh: Option<forward::ssh::Client>,
     data_hostname: Option<String>,
     control: Mutex<Option<UnixStream>>,
 }
@@ -217,20 +215,6 @@ impl ReturnConnection {
     pub(super) fn source(stream: UnixStream, data_hostname: String) -> Result<Arc<Self>> {
         validate_data_hostname(&data_hostname)?;
         Ok(Arc::new(Self {
-            ssh: None,
-            data_hostname: Some(data_hostname),
-            control: Mutex::new(Some(stream)),
-        }))
-    }
-
-    pub(super) fn peer(
-        stream: UnixStream,
-        ssh: forward::ssh::Client,
-        data_hostname: String,
-    ) -> Result<Arc<Self>> {
-        validate_data_hostname(&data_hostname)?;
-        Ok(Arc::new(Self {
-            ssh: Some(ssh),
             data_hostname: Some(data_hostname),
             control: Mutex::new(Some(stream)),
         }))
@@ -238,14 +222,6 @@ impl ReturnConnection {
 
     pub(crate) fn data_hostname(&self) -> Option<&str> {
         self.data_hostname.as_deref()
-    }
-
-    pub(crate) fn has_ssh(&self) -> bool {
-        self.ssh.is_some()
-    }
-
-    pub(crate) fn ssh_command(&self) -> Result<Command> {
-        self.ssh.as_ref().ok_or(SshWorkersUnavailable)?.command()
     }
 
     pub(crate) fn take_control(&self) -> Result<UnixStream> {
@@ -331,15 +307,10 @@ enum Message {
         cwd: String,
         request: Box<pull::PullRequest>,
     },
-    /// A copy from the requesting server to another server, which this
-    /// machine approves with a directive for that server's enrolled
-    /// receiver. The server sends what its command read from files.
-    Forward {
-        target: String,
-        command: Vec<Vec<u8>>,
-        cwd: String,
-        inputs: crate::directive::Inputs,
-    },
+    /// A copy from the requesting server to another server, or between two
+    /// other servers, which this machine approves with directives for their
+    /// enrolled receivers.
+    Forward(Box<forward::ForwardRequest>),
     Open {
         token: String,
         control: bool,
@@ -576,13 +547,6 @@ impl Write for DeadlineSocket<'_> {
 
 /// A complete incoming envelope has an absolute deadline, including clients
 /// trickling bytes. Timeout budgets cannot be renewed by partial progress.
-pub(crate) fn read_socket_message<T: DeserializeOwned>(
-    socket: &mut UnixStream,
-    timeout: Duration,
-) -> Result<T> {
-    read_socket_framed(socket, timeout, MAX_MESSAGE, "named destination message")
-}
-/// As `read_socket_message`, for a message of at most `limit` bytes.
 /// Send `request` to the local socket at `path` and read a reply of at most
 /// `limit` bytes, all by `deadline`: neither a full listen queue nor a peer
 /// that never answers holds the caller longer.
@@ -1126,10 +1090,16 @@ pub(crate) fn forward_target(args: &crate::cli::Args) -> Result<String> {
     forward::eligible_target(args)
 }
 
+/// The source and destination of a copy between two servers that a
+/// receiving machine could approve.
+pub(crate) fn coordinated_targets(args: &crate::cli::Args) -> Result<(String, String)> {
+    forward::eligible_peer(args)
+}
+
 /// Plan deletions against the approving machine's own --max-delete, or the
 /// command's if lower, so that pruning stays all or nothing, and note when
 /// the machine's limit is the one in effect.
-fn apply_deletion_limit(args: &mut crate::cli::Args, max_delete: Option<u64>) {
+pub(crate) fn apply_deletion_limit(args: &mut crate::cli::Args, max_delete: Option<u64>) {
     let Some(limit) = max_delete.filter(|_| args.delete) else {
         return;
     };
@@ -1169,9 +1139,6 @@ fn select_copy(
     if args.coordinate_at == crate::cli::CoordinateAt::Local {
         return Ok(None);
     }
-    if peer_bridge::configure(args)? {
-        return Ok(None);
-    }
     // A helper handoff carries the already selected, identity-checked receiver.
     // Re-reading mutable defaults here could redirect the original request.
     if let Some(name) = handoff::selected_name(handoff::Kind::Forward)
@@ -1181,10 +1148,6 @@ fn select_copy(
             crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name.to_owned()));
     } else {
         crate::auth_from::apply_copy(args)?;
-        if let Some(selection) = peer_bridge::select(args)? {
-            args.peer_bridge = Some(Arc::new(selection));
-            return Ok(None);
-        }
         if account_copy::select(args)? {
             return Ok(None);
         }
@@ -1289,9 +1252,6 @@ fn select_copy(
 }
 
 pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
-    if peer_bridge::configure(args)? {
-        return Ok(());
-    }
     let selection = match args.return_selection.take() {
         Some(selection) => selection,
         None => select_copy(args, None)?,
@@ -1635,12 +1595,7 @@ impl Receiver {
                 cwd,
                 request,
             } => self.send(command, cwd, *request, stream),
-            Message::Forward {
-                target,
-                command,
-                cwd,
-                inputs,
-            } => self.forward(target, command, cwd, inputs, stream),
+            Message::Forward(request) => self.forward(*request, stream),
             Message::Request {
                 command,
                 cwd,
@@ -2882,9 +2837,6 @@ fn destinations(action: DestinationAction) -> Result<i32> {
     }
 }
 pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
-    if let Some(result) = peer_bridge::dispatch(argv) {
-        return Some(result);
-    }
     if let Some(result) = ssh::provider::dispatch(argv) {
         return Some(result);
     }

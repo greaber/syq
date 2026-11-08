@@ -290,18 +290,22 @@ fn run() {
             crate::output::exit(2);
         }
         fsops::reserve_startup_descriptors();
-        if let Err(error) = server::run_checker(enrollment, generation) {
-            if error.is::<server::ClientGone>() {
-                crate::output::exit(1);
+        match server::run_checker(enrollment, generation) {
+            Ok(0) => {}
+            Ok(code) => crate::output::exit(code),
+            Err(error) => {
+                if error.is::<server::ClientGone>() {
+                    crate::output::exit(1);
+                }
+                let code = if crate::restricted::is_sessions_full(&error) {
+                    crate::restricted::SESSIONS_FULL_EXIT
+                } else if error.is::<crate::restricted::Refused>() {
+                    crate::restricted::REFUSED_EXIT
+                } else {
+                    1
+                };
+                crate::output::exit_on_error(&error, code, "syq restricted receiver");
             }
-            let code = if crate::restricted::is_sessions_full(&error) {
-                crate::restricted::SESSIONS_FULL_EXIT
-            } else if error.is::<crate::restricted::Refused>() {
-                crate::restricted::REFUSED_EXIT
-            } else {
-                1
-            };
-            crate::output::exit_on_error(&error, code, "syq restricted receiver");
         }
         return;
     }

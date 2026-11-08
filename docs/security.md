@@ -254,6 +254,10 @@ they revoke a key: then syq refuses the copy. If your laptop trusts hostB only
 through a certificate authority and hostB presents a plain key, hostA treats
 hostB as unknown.
 
+For a copy between two other servers, the server you start it on checks
+hostB's key this way, and hostB checks hostC's, with your laptop's entries for
+hostC signed into hostB's copy.
+
 When neither machine knows hostB, nobody can answer a prompt on hostA, so its
 default `StrictHostKeyChecking ask` works like `accept-new`: it accepts the key
 it sees the first time and checks later connections against it. Your laptop's
@@ -356,7 +360,7 @@ requests of your machine:
 |---|---|
 | Send files to your machine | Required by default; `--auto-approve-root` permits unattended downloads confined to that directory |
 | Copy files from your machine | Always required |
-| Authorize one copy to or from another server | Always required |
+| Authorize one copy to, from, or between other servers | Always required |
 | Run a command on your machine | Always required |
 | Authorize an SSH login to another server account | Required unless this source and destination account pair has a session or remembered permission |
 | Use your storage credentials for a transfer | Always required |
@@ -461,6 +465,26 @@ once approved, the copy continues even if your laptop disconnects or stops
 receiving, until it finishes, someone interrupts it on the server, or you
 revoke the enrollment. The server chooses the contents written within the
 approval and keeps the entry key afterwards.
+
+A connected server, hostX, can also ask your laptop to approve a copy between
+two other servers, from hostB to hostC. Your laptop shows the command once and
+signs it for each server's receiver: for hostC as above, and for hostB naming
+hostC's enrollment, hostC's signed copy, where it writes there, and what your
+laptop's known_hosts lists for hostC. HostX logs in to hostB's receiver with
+hostB's entry key and presents both signed copies. HostB's receiver checks its
+own as hostC's does, refuses a hostC copy that was not approved with it, and
+then runs the copy as the command states: it reads the files the command names
+with the hostB account's permissions, follows symlinks only as the command
+says, and sends them only to hostC's receiver. HostB's signed copy cannot be
+used as a copy to hostB, and hostC's cannot be used to read from hostC.
+
+HostX receives the copy's progress and hostC's reports, which it checks as
+your laptop would, but no file data. It keeps both entry keys and hostC's
+signed copy, so it could write content of its choosing to hostC within that
+approval, as a server uploading to hostC can. HostB's receiver reads within
+the hostB account, so a command that names syq's own files there, or a source
+symlink that leads to them, sends those to hostC like any other file. The copy
+stops when hostX's command ends, and continues if your laptop disconnects.
 
 A server can also ask your laptop to approve a download from another server. Syq
 on the source then reads only the approved files and directory trees, applies

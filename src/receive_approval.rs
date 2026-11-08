@@ -102,6 +102,45 @@ impl std::fmt::Display for Requester {
 pub(crate) struct Remote<'a> {
     pub target: &'a str,
     pub enrollment: crate::restricted::EnrollmentState,
+    /// For a copy between two other servers, the source, which runs the
+    /// copy, and what approving it sets up there first.
+    pub source: Option<(&'a str, crate::restricted::EnrollmentState)>,
+}
+
+/// `path`, a source the command names, as it is read: inside `base`, the
+/// command's -C or --root directory, unless it is absolute or in the home
+/// directory. The source expands an exact `~` or a leading `~/` to its own
+/// home before looking at `base`, so those stay as written, in the source's
+/// home; `./~/x` is an ordinary relative path.
+fn source_path(base: Option<&[u8]>, path: &[u8]) -> Vec<u8> {
+    let in_home = path == b"~" || path.starts_with(b"~/");
+    let Some(base) = base.filter(|_| !path.starts_with(b"/") && !in_home) else {
+        return path.to_vec();
+    };
+    let mut relative = path;
+    while let Some(rest) = relative.strip_prefix(b"./") {
+        relative = rest;
+    }
+    if relative.is_empty() || relative == b"." {
+        return base.to_vec();
+    }
+    [base.strip_suffix(b"/").unwrap_or(base), b"/", relative].concat()
+}
+
+/// What approving a copy sets up on `target` before it starts, after the
+/// copy's own `permission`.
+fn setup_text(target: &str, enrollment: crate::restricted::EnrollmentState) -> String {
+    match enrollment {
+        crate::restricted::EnrollmentState::Missing => format!(
+            "Also sets up restricted copying on {target:?}: adds a key to its ~/.ssh/authorized_keys that can only start syq's receiver for copies you approve, and installs syq {} in ~/.local/lib/syq. Remove it with `syq receiver revoke`",
+            crate::identity::build()
+        ),
+        crate::restricted::EnrollmentState::Outdated => format!(
+            "Also updates restricted copying on {target:?}: installs syq {} in ~/.local/lib/syq and rewrites syq's line in its ~/.ssh/authorized_keys, whose key can only start syq's receiver for copies you approve",
+            crate::identity::build()
+        ),
+        crate::restricted::EnrollmentState::Ready => format!("Signs this copy with your SSH login key for {target:?}; the server keeps a key that can only start syq's receiver there"),
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -270,38 +309,81 @@ impl Summary {
             ),
             // Automatic approval of writes to this machine does not authorize
             // use of its SSH credentials on another host; say what that use is.
-            Some(Remote { target, enrollment }) => (
+            Some(Remote {
+                target,
+                enrollment,
+                source,
+            }) => (
                 format!(
                     "{:?} on {target:?} using your SSH access",
                     std::ffi::OsStr::from_bytes(&remote_path(&request.destination))
                 ),
-                match enrollment {
-                    crate::restricted::EnrollmentState::Missing => format!(
-                        "{permission}. Also sets up restricted copying on {target:?}: adds a key to its ~/.ssh/authorized_keys that can only start syq's receiver for copies you approve, and installs syq {} in ~/.local/lib/syq. Remove it with `syq receiver revoke`",
-                        crate::identity::build()
+                match source {
+                    None => format!("{permission}. {}", setup_text(target, enrollment)),
+                    // The source runs the copy with its own receiver, which
+                    // reads only what the command names there.
+                    Some((source, source_enrollment)) => format!(
+                        "{permission}. {source:?} runs the copy and sends the files the command names directly to {target:?}. {}. {}",
+                        setup_text(source, source_enrollment),
+                        setup_text(target, enrollment)
                     ),
-                    crate::restricted::EnrollmentState::Outdated => format!(
-                        "{permission}. Also updates restricted copying on {target:?}: installs syq {} in ~/.local/lib/syq and rewrites syq's line in its ~/.ssh/authorized_keys, whose key can only start syq's receiver for copies you approve",
-                        crate::identity::build()
-                    ),
-                    crate::restricted::EnrollmentState::Ready => format!("{permission}. Signs this copy with your SSH login key for {target:?}; the server keeps a key that can only start syq's receiver there"),
                 },
             ),
         };
         // Sources stay as the command wrote them, relative to `cwd` on the
         // server; only the destination is resolved, by this machine.
         let parsed = crate::approval_command::parse(command).ok();
+        // Files on another server are named with it, where the command reads
+        // them: from its -C or --root directory there.
+        let source_server = remote
+            .and_then(|remote| remote.source)
+            .and_then(|(source, _)| {
+                crate::cli::parse_native_endpoint(Some(source))
+                    .ok()
+                    .flatten()
+            });
         let sources = parsed
             .as_ref()
             .map(|args| {
                 let count = args.locations.len().saturating_sub(1);
+                let base = args
+                    .native_source_root
+                    .as_deref()
+                    .or(args.native_source_cwd.as_deref());
                 args.locations
                     .iter()
                     .take(count)
-                    .map(|location| crate::approval_command::quote_arg(&location.path))
+                    .map(|location| match &source_server {
+                        None => crate::approval_command::quote_arg(&location.path),
+                        Some(server) => {
+                            let label = match &server.user {
+                                Some(user) => format!("{user}@{}", server.host),
+                                None => server.host.clone(),
+                            };
+                            crate::approval_command::display_arg(
+                                &[label.as_bytes(), b":", &source_path(base, &location.path)]
+                                    .concat(),
+                            )
+                        }
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let mut notes = copy_notes(request, remote.is_some());
+        if let Some(server) = &source_server {
+            if let Some(port) = server.port {
+                notes.push(format!("the source's SSH port is {port}"));
+            }
+            if parsed
+                .as_ref()
+                .is_some_and(|args| args.follows_native_source_paths())
+            {
+                notes.push(
+                    "follows symlinks in the sources, so it can send files outside the paths shown"
+                        .to_owned(),
+                );
+            }
+        }
         let prunes = parsed.as_ref().is_some_and(|args| args.delete);
         let target = match remote {
             None => local_path(&request.copy.destination),
@@ -328,7 +410,7 @@ impl Summary {
             },
             preposition: "to",
             target,
-            notes: copy_notes(request, remote.is_some()),
+            notes,
             sources_heading: "from",
             sources,
             details: Details::Copy {
@@ -2254,6 +2336,7 @@ mod tests {
             Some(Remote {
                 target: "host-b",
                 enrollment: crate::restricted::EnrollmentState::Ready,
+                source: None,
             }),
         )
         .unwrap();
@@ -2334,6 +2417,7 @@ mod tests {
             Some(Remote {
                 target: "backup",
                 enrollment: crate::restricted::EnrollmentState::Ready,
+                source: None,
             }),
         )
         .unwrap();
@@ -2357,6 +2441,7 @@ mod tests {
             Some(Remote {
                 target: "backup",
                 enrollment: crate::restricted::EnrollmentState::Missing,
+                source: None,
             }),
         )
         .unwrap()
@@ -2374,6 +2459,7 @@ mod tests {
             Some(Remote {
                 target: "backup",
                 enrollment: crate::restricted::EnrollmentState::Outdated,
+                source: None,
             }),
         )
         .unwrap()
@@ -2381,6 +2467,145 @@ mod tests {
         assert!(
             outdated.contains(&format!("Also updates restricted copying on \"backup\": installs syq {} in ~/.local/lib/syq and rewrites syq's line in its ~/.ssh/authorized_keys", crate::identity::build())),
             "{outdated}"
+        );
+
+        // A copy between two other servers names its files on the source,
+        // says that the source runs it, and sets up both ends.
+        let between = Summary::new(
+            &requester(),
+            &command,
+            "~/rt-bench",
+            &forwarded,
+            TIMEOUT,
+            Some(Remote {
+                target: "backup",
+                enrollment: crate::restricted::EnrollmentState::Ready,
+                source: Some(("reader@source", crate::restricted::EnrollmentState::Missing)),
+            }),
+        )
+        .unwrap();
+        assert!(
+            between
+                .desktop_description(false)
+                .contains("from\n\n    reader@source:rt-bench/dbg\n\n"),
+            "{}",
+            between.desktop_description(false)
+        );
+        // Sources read from a -C or --root directory there show it; the
+        // port and followed symlinks get notes of their own.
+        let rooted = |source: &str, command: &[&str]| {
+            Summary::new(
+                &requester(),
+                &command
+                    .iter()
+                    .map(|arg| arg.as_bytes().to_vec())
+                    .collect::<Vec<_>>(),
+                "~",
+                &forwarded,
+                TIMEOUT,
+                Some(Remote {
+                    target: "backup",
+                    enrollment: crate::restricted::EnrollmentState::Ready,
+                    source: Some((source, crate::restricted::EnrollmentState::Ready)),
+                }),
+            )
+            .unwrap()
+            .desktop_description(false)
+        };
+        let desktop = rooted(
+            "reader@source:2222",
+            &[
+                "cp",
+                "--from",
+                "reader@source:2222",
+                "-C",
+                "/home/other",
+                "--srcs-in",
+                ".",
+                "--src",
+                "./a",
+                "--src",
+                "/etc/b",
+                "--to",
+                "backup",
+                "--into",
+                "out",
+            ],
+        );
+        for expected in [
+            "    reader@source:/home/other\n",
+            "    reader@source:/home/other/a\n",
+            "    reader@source:/etc/b\n",
+            "the source's SSH port is 2222",
+        ] {
+            assert!(desktop.contains(expected), "{expected}: {desktop}");
+        }
+        assert!(!desktop.contains("follows symlinks"), "{desktop}");
+        // `~` and `~/...` are in the source's home whatever -C says, and
+        // stay unexpanded; `./~/...` is a directory named `~` under -C.
+        let desktop = rooted(
+            "reader@source",
+            &[
+                "cp",
+                "--from",
+                "reader@source",
+                "-C",
+                "/srv/public",
+                "--src",
+                "~",
+                "--src",
+                "~/private",
+                "--src",
+                "./~/private",
+                "--to",
+                "backup",
+                "--into",
+                "out",
+            ],
+        );
+        for expected in [
+            "    reader@source:~\n",
+            "    reader@source:~/private\n",
+            "    reader@source:/srv/public/~/private\n",
+        ] {
+            assert!(desktop.contains(expected), "{expected}: {desktop}");
+        }
+        assert!(!desktop.contains("/srv/public/~\n"), "{desktop}");
+        let desktop = rooted(
+            "reader@source",
+            &[
+                "cp",
+                "--from",
+                "reader@source",
+                "--root",
+                "/srv/",
+                "--follow-src",
+                "--src",
+                "data",
+                "--to",
+                "backup",
+                "--into",
+                "out",
+            ],
+        );
+        assert!(
+            desktop.contains("    reader@source:/srv/data\n"),
+            "{desktop}"
+        );
+        assert!(
+            desktop.contains("follows symlinks in the sources"),
+            "{desktop}"
+        );
+        assert!(!desktop.contains("SSH port"), "{desktop}");
+
+        let details = between.details_description(str::to_owned);
+        assert!(
+            details.contains("May create and overwrite matching entries. \"reader@source\" runs the copy and sends the files the command names directly to \"backup\". Also sets up restricted copying on \"reader@source\": adds a key"),
+            "{details}"
+        );
+        assert!(
+            details.contains("Signs this copy with your SSH login key for \"backup\""),
+            "{details}"
         );
 
         // The server's directory is remote text: no line breaks or markup of
@@ -2499,6 +2724,7 @@ mod tests {
             Some(Remote {
                 target: "backup",
                 enrollment: crate::restricted::EnrollmentState::Ready,
+                source: None,
             }),
         )
         .unwrap();
@@ -2962,6 +3188,7 @@ mod tests {
             Some(Remote {
                 target: "backup",
                 enrollment: crate::restricted::EnrollmentState::Ready,
+                source: None,
             }),
         )
         .unwrap();

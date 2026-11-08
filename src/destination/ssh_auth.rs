@@ -13,6 +13,103 @@ pub(crate) use links::{AccountLinks, Closing, LinkReply, LinkRequest, CLOSE_WAIT
 const HOST_ALIAS: &str = "syq-approved-peer";
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The approved host keys and login of an account connection's endpoint,
+/// kept with its record.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Peer {
+    host: String,
+    user: String,
+    port: u16,
+    known_hosts: String,
+    algorithms: String,
+}
+impl Peer {
+    pub(crate) fn resolved_policy(&self) -> Result<ResolvedPolicy> {
+        ResolvedPolicy::new(
+            crate::cli::NativeEndpoint {
+                user: Some(self.user.clone()),
+                host: self.host.clone(),
+                port: Some(self.port),
+            },
+            &self.known_hosts,
+            &self.algorithms,
+        )
+    }
+
+    pub(crate) fn from_approved(
+        endpoint: &crate::cli::NativeEndpoint,
+        known_hosts: &str,
+        algorithms: &str,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            known_hosts.len() <= 64 * 1024,
+            "approved host keys are too long"
+        );
+        let mut normalized = String::new();
+        for line in known_hosts.lines() {
+            let (alias, key) = line.split_once(' ').context("invalid approved host key")?;
+            anyhow::ensure!(
+                matches!(alias, "syq-approved-peer" | "syq-copy-peer"),
+                "invalid approved host-key alias"
+            );
+            let key = ssh_key::PublicKey::from_openssh(key)?;
+            normalized.push_str("syq-copy-peer ");
+            normalized.push_str(&key.to_openssh()?);
+            normalized.push('\n');
+        }
+        let peer = Self {
+            host: endpoint.host.clone(),
+            user: endpoint
+                .user
+                .clone()
+                .context("approved peer has no login user")?,
+            port: endpoint.port.context("approved peer has no port")?,
+            known_hosts: normalized,
+            algorithms: algorithms.into(),
+        };
+        peer.validate_endpoint(endpoint)?;
+        Ok(peer)
+    }
+
+    pub(crate) fn validate_endpoint(&self, endpoint: &crate::cli::NativeEndpoint) -> Result<()> {
+        super::validate_data_hostname(&self.host)?;
+        anyhow::ensure!(
+            self.host == endpoint.host
+                && endpoint.user.as_deref() == Some(&self.user)
+                && endpoint.port == Some(self.port)
+                && self.port != 0,
+            "approved SSH peer differs from account endpoint"
+        );
+        anyhow::ensure!(
+            !self.user.is_empty()
+                && self.user.len() <= 1024
+                && !self.user.bytes().any(|b| b.is_ascii_control()),
+            "invalid approved SSH user"
+        );
+        anyhow::ensure!(
+            !self.algorithms.is_empty()
+                && self.algorithms.len() <= 4096
+                && self
+                    .algorithms
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_,.@".contains(&b)),
+            "invalid approved SSH algorithms"
+        );
+        anyhow::ensure!(
+            !self.known_hosts.is_empty() && self.known_hosts.len() <= 64 * 1024,
+            "invalid approved SSH host keys"
+        );
+        for line in self.known_hosts.lines() {
+            let key = line
+                .strip_prefix("syq-copy-peer ")
+                .context("invalid approved host-key alias")?;
+            ssh_key::PublicKey::from_openssh(key).context("invalid approved host key")?;
+        }
+        Ok(())
+    }
+}
+
 /// A setup refusal that can clear without changing the approved authority.
 #[derive(Debug)]
 pub(crate) struct RetryableSetupError(pub(crate) String);
@@ -26,9 +123,6 @@ impl std::error::Error for RetryableSetupError {}
 /// Only transport uncertainty and explicit temporary refusals justify another
 /// setup attempt. Validation and protocol failures cannot improve on retry.
 pub(crate) fn retryable_setup_error(error: &anyhow::Error) -> bool {
-    if super::peer_bridge::is_setup_refusal(error) {
-        return false;
-    }
     error.chain().any(|cause| {
         cause.is::<RetryableSetupError>()
             || cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
@@ -295,7 +389,7 @@ impl ResolvedPolicy {
         )
     }
 
-    pub(crate) fn from_peer(peer: &super::forward::ssh::Peer) -> Result<Self> {
+    pub(crate) fn from_peer(peer: &Peer) -> Result<Self> {
         peer.resolved_policy()
     }
 
@@ -305,12 +399,8 @@ impl ResolvedPolicy {
         Ok(())
     }
 
-    pub(crate) fn peer(&self) -> Result<super::forward::ssh::Peer> {
-        super::forward::ssh::Peer::from_approved(
-            &self.endpoint,
-            &self.known_hosts,
-            &self.host_algorithms,
-        )
+    pub(crate) fn peer(&self) -> Result<Peer> {
+        Peer::from_approved(&self.endpoint, &self.known_hosts, &self.host_algorithms)
     }
 
     fn check_expected(&self, expected: Option<&Self>) -> Result<()> {
@@ -336,7 +426,7 @@ pub(crate) struct Session {
     agent: Arc<AgentChannel>,
     _broker: PrivateBroker,
     endpoint: NativeEndpoint,
-    peer: super::forward::ssh::Peer,
+    peer: Peer,
     options: Vec<OsString>,
 }
 
@@ -345,7 +435,7 @@ impl Session {
         &self.endpoint
     }
 
-    pub(crate) fn peer(&self) -> &super::forward::ssh::Peer {
+    pub(crate) fn peer(&self) -> &Peer {
         &self.peer
     }
 

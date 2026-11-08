@@ -205,9 +205,10 @@ pub struct Args {
     pub(crate) s3_remove: crate::s3::RemoveFlags,
     #[arg(skip)]
     pub(crate) return_selection: Option<Option<crate::destination::handoff::Selection>>,
-    /// Approved account pair selected once for a direct peer copy.
+    /// A copy between two servers that a receiving machine approved, which
+    /// the source's receiver runs.
     #[arg(skip)]
-    pub(crate) peer_bridge: Option<std::sync::Arc<crate::destination::peer_bridge::Selection>>,
+    pub(crate) coordinated_copy: Option<std::sync::Arc<crate::remote_to_remote::CoordinatedCopy>>,
     /// Destination SSH connection opened while choosing automatic authorization.
     #[arg(skip)]
     pub(crate) direct_destination: Option<Box<crate::conn::RemoteSpec>>,
@@ -3290,9 +3291,6 @@ fn apply_internal_native_direct(args: &mut Args) -> Result<()> {
             })
             .transpose()
     };
-    // Only the marker of a copy between two servers that hostX approved
-    // travels here; an enrolled receiver's directive arrives on the input.
-    args.restricted_grant = utf8("SYQ_INTERNAL_NATIVE_RESTRICTED_GRANT")?;
     args.results_token = utf8(crate::destination_results::relay::TOKEN_ENV)?;
     if let Some(token) = &args.results_token {
         anyhow::ensure!(
@@ -3316,6 +3314,10 @@ fn apply_internal_native_direct(args: &mut Args) -> Result<()> {
         })
         .transpose()?;
     args.plan_source_host = utf8("SYQ_INTERNAL_NATIVE_PLAN_SOURCE_HOST")?;
+    if args.delegated {
+        args.max_delete_from_approver |=
+            utf8(crate::remote_to_remote::MAX_DELETE_FROM_APPROVER)?.as_deref() == Some("1");
+    }
     args.requester_stdin = utf8(crate::remote_to_remote::REQUESTER_STDIN)?
         .map(|bytes| {
             bytes

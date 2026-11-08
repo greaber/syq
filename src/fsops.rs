@@ -103,8 +103,6 @@ use sidecars::Sidecar;
 pub(crate) use sidecars::{sweep as sweep_sidecars, track as track_sidecars, Swept};
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use small_batch::with_coarse_change_times;
-#[cfg(test)]
-pub(crate) use stages::count as held_stage_count;
 
 /// Whether this receiver trusts read leases on the filesystem of `file`
 /// (`leases`), for tests outside these modules.

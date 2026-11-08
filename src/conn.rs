@@ -24,7 +24,7 @@ mod bootstrap;
 mod local;
 mod replies;
 mod reverse_tcp;
-mod ssh_auth;
+pub(crate) mod ssh_auth;
 pub(crate) use ssh_auth::{login_rejection, Failure as SshLoginFailure};
 mod ssh_multiplexer;
 mod tcp_socket;
@@ -518,7 +518,6 @@ fn is_non_retryable_connect_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
     is_worker_initialization_error(error)
         || error.is::<crate::restricted::CopyRefused>()
-        || crate::destination::peer_bridge::is_setup_refusal(error)
         || error.is::<crate::destination::SshWorkersUnavailable>()
         || error.chain().any(|cause| cause.is::<OpenSshVersionError>())
         || error
@@ -2298,33 +2297,6 @@ impl RemoteSpec {
         *self.primed_control.lock().unwrap() = PrimedControl::Checked(conn.map(Box::new));
     }
 
-    /// Only a failed SSH startup may reclaim idle slots from an approved
-    /// master. Successful helper launches never inspect or change the pool.
-    /// Callers retry at most once, before starting the copy or its command.
-    pub(crate) fn release_idle_helpers_after_startup_failure(
-        &self,
-        status: &std::process::ExitStatus,
-    ) -> bool {
-        if status.code() != Some(255) {
-            return false;
-        }
-        let Some(multiplexer) = &self.ssh_multiplexer else {
-            return false;
-        };
-        if !multiplexer.existing_only || !crate::session_pool::is_running(&multiplexer.path) {
-            return false;
-        }
-        if let Err(error) = crate::session_pool::stop(&multiplexer.path) {
-            // Recovery is best effort. The caller still reports the original
-            // startup failure, which explains why recovery was attempted.
-            crate::output::diagnostic!(
-                "syq: could not release idle helpers after SSH startup failed: {error:#}"
-            );
-            return false;
-        }
-        true
-    }
-
     pub(crate) fn helper_command(&self, args: &[String]) -> Command {
         let mut command = self.ssh_command(SshConnection::Independent, false);
         command.arg(self.program_command(args));
@@ -2722,8 +2694,8 @@ impl RemoteSpec {
             command.arg(self.session_command(&server_args));
             std::os::unix::process::CommandExt::process_group(&mut command, 0);
             command
-        } else if let Some(approved) = &self.forwarded {
-            approved.ssh_command()?
+        } else if self.forwarded.is_some() {
+            return Err(crate::destination::SshWorkersUnavailable.into());
         } else if self.local_process {
             let mut command = crate::process::self_command()?;
             // The same executable receives, so this internal flag is always
@@ -3133,7 +3105,7 @@ impl RemoteSpec {
         &self,
         round_trip: Option<std::time::Duration>,
     ) -> std::time::Duration {
-        if self.forwarded.as_ref().is_some_and(|copy| !copy.has_ssh()) {
+        if self.forwarded.is_some() {
             TCP_PROBE_CEILING
         } else {
             tcp_probe_wait(round_trip)
@@ -4098,7 +4070,7 @@ impl Endpoint {
                             if std::env::var_os("SYQ_TEST_REQUIRE_TCP").is_some() {
                                 return Err(e).context("TCP data transport required by test");
                             }
-                            if spec.forwarded.as_ref().is_some_and(|copy| !copy.has_ssh()) {
+                            if spec.forwarded.is_some() {
                                 return Err(e).context(crate::destination::SshWorkersUnavailable);
                             }
                             let mut g = spec.tcp.lock().unwrap();
