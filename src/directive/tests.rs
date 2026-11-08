@@ -69,7 +69,7 @@ fn a_directive_has_one_canonical_encoding() {
     let encoded = signed(&original);
     let decoded = Signed::decode(&encoded).unwrap();
     assert_eq!(decoded.directive, original);
-    assert_eq!(decoded.signature, armored(1));
+    assert_eq!(Framed::split(&encoded).unwrap().signature, armored(1));
     // The signature covers the magic and the body.
     let body = postcard::to_stdvec(&original).unwrap();
     assert_eq!(decoded.payload, [MAGIC.as_slice(), &body].concat());

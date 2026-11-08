@@ -299,6 +299,8 @@ fn run() {
                 }
                 let code = if crate::restricted::is_sessions_full(&error) {
                     crate::restricted::SESSIONS_FULL_EXIT
+                } else if crate::restricted::is_other_build(&error) {
+                    crate::restricted::OTHER_BUILD_EXIT
                 } else if error.is::<crate::restricted::Refused>() {
                     crate::restricted::REFUSED_EXIT
                 } else {

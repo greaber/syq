@@ -276,17 +276,27 @@ pub(crate) fn sign(
     Ok(out)
 }
 
-/// A decoded directive with the bytes its signature covers. The signature
-/// is not checked yet.
+/// A decoded directive with the bytes its signature covers.
 #[derive(Debug)]
 pub(crate) struct Signed {
     pub directive: Directive,
     pub payload: Vec<u8>,
-    pub signature: Vec<u8>,
 }
 
-impl Signed {
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
+/// A signed directive split at its fixed header, with its body not yet
+/// decoded: what a receiver checks the signature of before it reads
+/// anything the body says.
+pub(crate) struct Framed<'a> {
+    /// The bytes the login key signs: the magic, then the body.
+    pub payload: Vec<u8>,
+    /// The armored SSHSIG, in its one canonical spelling.
+    pub signature: &'a [u8],
+}
+
+impl<'a> Framed<'a> {
+    /// Split `bytes` by the lengths in its fixed header, and check that the
+    /// signature is canonical armor. Nothing in the body is read.
+    pub(crate) fn split(bytes: &'a [u8]) -> Result<Self> {
         if bytes.len() > MAX_SIGNED_BYTES {
             bail!("the directive exceeds its size limit");
         }
@@ -304,20 +314,35 @@ impl Signed {
         {
             bail!("the directive's lengths are noncanonical");
         }
-        let body = &bytes[HEADER_LEN..HEADER_LEN + body_len];
+        let signature = &bytes[HEADER_LEN + body_len..];
+        delegation::validate_canonical_sshsig(signature)?;
+        Ok(Self {
+            payload: payload(&bytes[HEADER_LEN..HEADER_LEN + body_len]),
+            signature,
+        })
+    }
+
+    /// Decode the body: exactly one canonical directive, within bounds.
+    pub(crate) fn decode(self) -> Result<Signed> {
+        let body = &self.payload[MAGIC.len()..];
         let (directive, rest): (Directive, &[u8]) =
             postcard::take_from_bytes(body).context("decode the directive")?;
         if !rest.is_empty() || postcard::to_stdvec(&directive)? != body {
             bail!("the directive uses a noncanonical encoding");
         }
         directive.validate()?;
-        let signature = bytes[HEADER_LEN + body_len..].to_vec();
-        delegation::validate_canonical_sshsig(&signature)?;
-        Ok(Self {
+        Ok(Signed {
             directive,
-            payload: payload(body),
-            signature,
+            payload: self.payload,
         })
+    }
+}
+
+impl Signed {
+    /// Decode `bytes` without checking its signature. A receiver that
+    /// checks a directive's signature does so first, through [`Framed`].
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
+        Framed::split(bytes)?.decode()
     }
 
     /// The digest that binds the destination's results to this directive.

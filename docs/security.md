@@ -205,13 +205,23 @@ The protection has four parts:
    connects, before it has checked a signature.
 2. **Only the entry key for hostA.** With each copy, hostA receives the entry
    key and uses it to reach the receiver, checking hostB's host key as described
-   [below](#how-hosta-checks-hostbs-key). The entry key authorizes nothing by
-   itself: anyone who holds it, including a server that ran an earlier copy,
-   still needs a copy you newly signed. Such a server can, however, keep the
-   receiver's connections busy so that new copies fail, until you revoke the
-   enrollment and enroll again. Don't add the entry key to any other
-   `authorized_keys` file: hostA holds it, so it would gain that access too.
-   Your laptop stores it unencrypted.
+   [below](#how-hosta-checks-hostbs-key). Syq on hostA deletes the key when the
+   copy ends, also when you interrupt it; only a copy killed before it can clean
+   up, for example with `kill -9`, leaves it behind, in a private temporary
+   directory named `syq-receiver-hosts-…`. The entry key authorizes nothing by
+   itself: anyone who holds it, such as a server that was compromised during an
+   earlier copy and kept it, still needs a copy you newly signed, and the
+   receiver checks that signature before it looks at anything else the
+   connection sends, apart from which syq build sent it. Such a server can,
+   however, keep some of the receiver's connections waiting. At most 32 can
+   wait to be checked at once, and at most 16 of them from one address; for
+   IPv6, from one /64 network. So a server with one address slows new copies
+   started from other addresses but does not stop them. Machines that share an
+   address, such as those behind one NAT or on one IPv6 /64, share its 16, and
+   a server that connects from two addresses, such as over both IPv4 and IPv6,
+   can make new copies fail until you revoke the enrollment and enroll again.
+   Don't add the entry key to any other `authorized_keys` file: hostA holds it,
+   so it would gain that access too. Your laptop stores it unencrypted.
 3. **A signature on each copy.** Your laptop signs the copy's command, exactly
    as you ran it, with an expiry time, using the key you log in to hostB with.
    The receiver checks the signature, requiring the touch and PIN your login
@@ -311,8 +321,9 @@ HostA cannot:
   metadata, or give them new names with hard links when the signed copy
   permits only creating new ones, or delete files without permission.
 - Exceed the signed byte, entry, or deletion limits.
-- Reuse the signed copy for another copy, use the entry key it keeps to start
-  a later copy without one you newly signed, or use that key to run a shell.
+- Reuse the signed copy for another copy, use the entry key to start a later
+  copy without one you newly signed, even if it keeps the key, or use that key
+  to run a shell.
 - Forge, alter, or cut short hostB's reports of its changes.
 
 On some filesystems, such as NFS, FAT and exFAT on macOS, and rclone mounts,
@@ -467,7 +478,7 @@ Two things differ. Your laptop does not check the destination's reports
 once approved, the copy continues even if your laptop disconnects or stops
 receiving, until it finishes, someone interrupts it on the server, or you
 revoke the enrollment. The server chooses the contents written within the
-approval and keeps the entry key afterwards.
+approval, and holds the entry key while the copy runs, as hostA does.
 
 A connected server, hostX, can also ask your laptop to approve a copy between
 two other servers, from hostB to hostC. Your laptop shows the command once and
@@ -482,25 +493,28 @@ says, and sends them only to hostC's receiver. HostB's signed copy cannot be
 used as a copy to hostB, and hostC's cannot be used to read from hostC.
 
 HostX receives the copy's progress and hostC's reports, which it checks as
-your laptop would, but no file data. It keeps both entry keys and hostC's
+your laptop would, but no file data. It receives both entry keys and hostC's
 signed copy, so it could write content of its choosing to hostC within that
-approval, as a server uploading to hostC can. HostB's receiver reads within
-the hostB account, so a command that names syq's own files there, or a source
-symlink that leads to them, sends those to hostC like any other file. The copy
-stops when hostX's command ends, and continues if your laptop disconnects.
+approval, as a server uploading to hostC can. HostB's receiver also receives
+hostC's entry key, and holds it while the copy runs, as hostA does. HostB's
+receiver reads within the hostB account, so a command that names syq's own
+files there, or a source symlink that leads to them, sends those to hostC like
+any other file. The copy stops when hostX's command ends, and continues if your
+laptop disconnects.
 
 A server can also ask your laptop to approve a download from another server,
 hostB, to itself. Your laptop shows the command and each source as hostB will
 read it, sets up or updates hostB's enrollment when needed, and signs the
 command for hostB's receiver as the copy's source. The server logs in to that
 receiver with hostB's entry key, checking hostB's host key as
-[hostA checks hostB's](#how-hosta-checks-hostbs-key), and keeps the entry key
-afterwards. The receiver checks the signature as for a destination, and then
-reads only the files and directory trees the command names, with the symlink
-behavior the command chose, accepts no writes or removals, and limits the file
-data, entries, and connections it returns to the command's and your laptop's
-limits. A signed download cannot be used as a copy to hostB, and a copy signed
-for hostB as a destination cannot be used to read from it.
+[hostA checks hostB's](#how-hosta-checks-hostbs-key), and holds the entry key
+while the copy runs, as hostA does. The receiver checks the signature as for a
+destination, and then reads only the files and directory trees the command
+names, with the symlink behavior the command chose, accepts no writes or
+removals, and limits the file data, entries, and connections it returns to the
+command's and your laptop's limits. A signed download cannot be used as a copy
+to hostB, and a copy signed for hostB as a destination cannot be used to read
+from it.
 
 Reads are not limited further within the account: a command that names
 hostB's `~/.ssh` or syq's own files there, or a symlink it follows to them,

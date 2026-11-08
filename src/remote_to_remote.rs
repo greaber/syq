@@ -789,8 +789,11 @@ fn constrained_destination_rsh(
     for option in [
         format!("IdentityAgent={agent}"),
         format!("IdentitiesOnly={only}"),
+        // No `CertificateFile`: ssh reads `none` as a file of that name, and
+        // no value removes the configuration's. The broker's command reads
+        // no configuration, and the entry key's allows only the entry key's
+        // own algorithm, so no configured certificate is offered.
         ENTRY_KEY_PLACEHOLDER.to_owned(),
-        "CertificateFile=none".to_owned(),
         "PKCS11Provider=none".to_owned(),
         format!("PubkeyAuthentication={publickey}"),
         "PreferredAuthentications=publickey".to_owned(),
@@ -1303,7 +1306,9 @@ impl ReceiverSsh {
             connection.omission_cause()
         );
         }
-        // An interrupted copy removes the entry key too; only SIGKILL leaves it.
+        // An interrupted copy (SIGINT or SIGTERM) removes the entry key too;
+        // a copy killed by a signal syq does not catch, such as SIGKILL or
+        // SIGHUP, leaves it.
         let directory = crate::private_broker::SignalCleanedDir::new("syq-receiver-hosts-")?;
         let path = directory.path().join(APPROVING_KNOWN_HOSTS);
         if union {
@@ -2604,6 +2609,12 @@ fn run_coordinated(
         ),
         Some(crate::restricted::REFUSED_EXIT) => {
             bail!("the restricted receiver on {source} refused the copy")
+        }
+        Some(crate::restricted::OTHER_BUILD_EXIT) => {
+            return Err(crate::restricted::OtherBuild(format!(
+                "the restricted receiver on {source} runs another syq build"
+            ))
+            .into())
         }
         Some(255) => {
             bail!("could not reach the restricted receiver on {source}; see the SSH error above")

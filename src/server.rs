@@ -738,7 +738,8 @@ fn record_handed_connection_for_test() {
 /// Returns the exit status: a coordinating source's is its copy's.
 pub(crate) fn run_checker(enrollment: &str, generation: &str) -> Result<i32> {
     let session = crate::restricted::admit_session(enrollment, generation).map_err(|error| {
-        if crate::restricted::is_sessions_full(&error) {
+        if crate::restricted::is_sessions_full(&error) || crate::restricted::is_other_build(&error)
+        {
             error
         } else {
             crate::restricted::Refused(error).into()

@@ -1014,6 +1014,18 @@ fn a_coordinating_source_is_admitted_only_with_its_own_destination_directive() {
             ),
             "not for a source",
         ),
+        // A source directive this receiver's login key did not sign is
+        // refused for that, before anything else in the frame is read.
+        (
+            Coordinate {
+                source: signed_destination(&source),
+                destination: b"not a directive".to_vec(),
+                entry_key: b"not a key".to_vec(),
+                results_token: "token".into(),
+                progress_width: None,
+            },
+            "does not trust",
+        ),
         // A frame whose token or entry key is not one.
         (
             {
@@ -2810,9 +2822,21 @@ fn relative_destination_resolution_rejects_parent_components() {
 fn a_session_reads_exactly_one_bounded_first_frame() {
     use std::io::Write as _;
     let deadline = || Instant::now() + std::time::Duration::from_secs(5);
+    let coordinate = |progress_width| {
+        Admission::Coordinate(Box::new(Coordinate {
+            source: b"source directive".to_vec(),
+            destination: b"destination directive".to_vec(),
+            entry_key: b"entry key".to_vec(),
+            results_token: "0".repeat(32),
+            progress_width,
+        }))
+    };
     for admission in [
         Admission::Copy(b"signed directive".to_vec()),
         Admission::Worker("w-ticket:secret".into()),
+        coordinate(None),
+        coordinate(Some(0)),
+        coordinate(Some(u16::MAX)),
     ] {
         let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
         writer.write_all(&admission.frame().unwrap()).unwrap();
@@ -2831,22 +2855,135 @@ fn a_session_reads_exactly_one_bounded_first_frame() {
             .to_string()
     };
     let long = std::time::Duration::from_secs(5);
-    // Lengths outside the bounds are refused before anything else is read.
-    assert!(refused(&[0, 0, 0, 0], long).contains("unsupported length"));
-    assert!(refused(&u32::MAX.to_be_bytes(), long).contains("unsupported length"));
-    // An unknown kind, and trailing bytes inside the frame.
-    assert!(refused(&[0, 0, 0, 2, 3, 0], long).contains("decode"));
+    // The start of a frame from this build, with `rest` after it.
+    let build = crate::identity::build().as_bytes();
+    let framed = |length: u32, rest: &[u8]| {
+        [
+            &length.to_be_bytes()[..],
+            FRAME_MAGIC,
+            &[build.len() as u8],
+            build,
+            rest,
+        ]
+        .concat()
+    };
+    let prefix = (FRAME_MAGIC.len() + 1 + build.len()) as u32;
+    // Lengths beyond the bounds are refused once the build is known.
+    assert!(refused(&framed(u32::MAX, &[]), long).contains("unsupported length"));
+    let largest = MAX_ADMISSION_BYTES as u32 + 1;
+    assert!(refused(&framed(largest, &[]), long).contains("unsupported length"));
+    // An unknown kind; a field longer than the frame or than its kind
+    // allows; a field that is not text where text belongs; and trailing
+    // bytes inside the frame.
+    assert!(refused(&framed(prefix + 1, &[9]), long).contains("malformed"));
+    let short_field = framed(prefix + 6, &[COPY_FRAME, 0, 0, 0, 2, 0]);
+    assert!(refused(&short_field, long).contains("malformed"));
+    let ticket = Admission::Worker("w".repeat(MAX_TICKET_BYTES + 1));
+    assert!(refused(&ticket.frame().unwrap(), long).contains("malformed"));
+    let mut width = coordinate(None).frame().unwrap();
+    width.extend_from_slice(&[9]);
+    let at = width.len() - 5;
+    width[at..at + 4].copy_from_slice(&1u32.to_be_bytes());
+    width[3] += 1;
+    assert!(refused(&width, long).contains("malformed"));
+    let mut binary = Admission::Worker("w".into()).frame().unwrap();
+    *binary.last_mut().unwrap() = 0xff;
+    assert!(refused(&binary, long).contains("malformed"));
     let mut trailing = Admission::Worker("w".into()).frame().unwrap();
     trailing.push(0);
     trailing[3] += 1;
     assert!(refused(&trailing, long).contains("trailing"));
+    // The largest frame holds a coordinating source's two largest
+    // directives and the largest entry key, and no more.
+    let signed = crate::directive::MAX_SIGNED_BYTES;
+    let largest = Admission::Coordinate(Box::new(Coordinate {
+        source: vec![1; signed],
+        destination: vec![2; signed],
+        entry_key: vec![3; crate::remote_to_remote::MAX_ENTRY_KEY_BYTES],
+        results_token: "0".repeat(MAX_TOKEN_BYTES),
+        progress_width: Some(80),
+    }));
+    assert_eq!(
+        largest.frame().unwrap().len() + MAX_FRAME_BUILD_BYTES - build.len(),
+        4 + MAX_ADMISSION_BYTES
+    );
+    // A field longer than its kind allows is refused from its length, before
+    // its bytes are read.
+    let long_copy = Admission::Copy(vec![0; signed + 1]).frame().unwrap();
+    let header = 4 + prefix as usize + 1 + 4;
+    assert!(refused(&long_copy[..header], long).contains("malformed"));
     // A session that sends nothing, or only part of its frame, is dropped at
     // the deadline.
     let short = std::time::Duration::from_millis(200);
     let started = Instant::now();
     refused(&[], short);
-    refused(&[0, 0, 0, 9, 0], short);
+    refused(&[0, 0, 0, 9, COPY_FRAME, 0, 0], short);
     assert!(started.elapsed() < std::time::Duration::from_secs(3));
+}
+
+/// A session from another syq build is refused for that before anything
+/// else in its frame is read: frames from builds before this frame format,
+/// kept as those builds wrote them, and frames in this format from another
+/// build, whatever their length, except a worker joining a running copy.
+#[test]
+fn a_session_from_another_build_is_refused_for_that_first() {
+    use std::io::Write as _;
+    let refused = |bytes: &[u8]| {
+        let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        writer.write_all(bytes).unwrap();
+        drop(writer);
+        Admission::read(
+            &mut reader,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap_err()
+    };
+    let ours = crate::identity::build();
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    for name in ["copy", "worker", "coordinate"] {
+        let frame =
+            fs::read(fixtures.join(format!("admission-frame-before-0.9-{name}.bin"))).unwrap();
+        let error = refused(&frame);
+        assert!(is_other_build(&error), "{name}: {error:#}");
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("this receiver runs syq {ours}")),
+            "{message}"
+        );
+        assert!(message.contains("is another build"), "{message}");
+    }
+    // A frame too short to hold the magic is no frame of this build.
+    assert!(is_other_build(&refused(&[0, 0, 0, 0])));
+    assert!(is_other_build(&refused(&[0, 0, 0, 2, 1, 0])));
+    let copy = Admission::Copy(b"directive".to_vec());
+    let error = refused(&copy.frame_from("v0.0.0-other").unwrap());
+    assert!(is_other_build(&error), "{error:#}");
+    assert!(error.to_string().contains("is v0.0.0-other;"), "{error:#}");
+    // A build that cannot be shown as it is is named as another build.
+    let error = refused(&copy.frame_from("v0.0.0\nother").unwrap());
+    assert!(error.to_string().contains("is another build"), "{error:#}");
+    // Another build's frame may be longer than this build's limit.
+    let mut long = copy.frame_from("v0.0.0-other").unwrap();
+    long[..4].copy_from_slice(&u32::MAX.to_be_bytes());
+    assert!(is_other_build(&refused(&long)));
+    // This build's own frame passes, and so does a worker joining a running
+    // copy from another build: that copy's own receiver serves it.
+    let worker = Admission::Worker("w-0123456789abcdef:ticket".into());
+    for (frame, expected) in [
+        (copy.frame().unwrap(), &copy),
+        (worker.frame_from("v0.0.0-other").unwrap(), &worker),
+    ] {
+        let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        writer.write_all(&frame).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        assert_eq!(&Admission::read(&mut reader, deadline).unwrap(), expected);
+    }
+    // Another build's frame that ends at its build has no kind to pass.
+    let mut bare = copy.frame_from("v0.0.0-other").unwrap();
+    let ends = 4 + FRAME_MAGIC.len() + 1 + "v0.0.0-other".len();
+    bare.truncate(ends);
+    bare[..4].copy_from_slice(&((ends - 4) as u32).to_be_bytes());
+    assert!(is_other_build(&refused(&bare)));
 }
 
 #[test]
@@ -2899,25 +3036,166 @@ fn unverified_sessions_beyond_the_slots_are_refused_at_once() {
     let temporary = crate::test_support::tempdir().unwrap();
     let state = temporary.path().join("state");
     fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
-    let first = UnverifiedSlot::take(&state, 2).unwrap();
-    let second = UnverifiedSlot::take(&state, 2).unwrap();
-    let error = UnverifiedSlot::take(&state, 2).err().unwrap();
+    let take = |source: &str| UnverifiedSlot::take(&state, (3, 2), source);
+    let first = take("192.0.2.7").unwrap();
+    let second = take("192.0.2.7").unwrap();
+    // One source holds at most its share of the slots...
+    let error = take("192.0.2.7").err().unwrap();
     assert!(is_sessions_full(&error), "{error:#}");
     assert!(
-        error.to_string().contains("2 other connections"),
+        error
+            .to_string()
+            .contains("2 other connections from 192.0.2.7"),
         "{error:#}"
     );
-    // A slot frees when its session is verified or ends.
+    // ...and the rest stay for other sources, up to all of them.
+    let other = take("198.51.100.1").unwrap();
+    let error = take("203.0.113.9").err().unwrap();
+    assert!(is_sessions_full(&error), "{error:#}");
+    assert!(
+        error.to_string().contains("3 other connections are"),
+        "{error:#}"
+    );
+    // A slot frees when its session is verified or ends, and a source's
+    // slot file goes with it.
+    let source_files = || {
+        fs::read_dir(&state)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("session-source-")
+            })
+            .count()
+    };
+    assert_eq!(source_files(), 3);
     drop(first);
-    let third = UnverifiedSlot::take(&state, 2).unwrap();
-    drop((second, third));
-    // A slot that is not a private regular file is refused.
-    fs::set_permissions(
-        state.join("session-slot-0"),
-        fs::Permissions::from_mode(0o644),
-    )
-    .unwrap();
-    assert!(UnverifiedSlot::take(&state, 2).is_err());
+    assert_eq!(source_files(), 2);
+    let third = take("192.0.2.7").unwrap();
+    assert!(take("192.0.2.7").is_err());
+    drop((second, third, other));
+    assert_eq!(source_files(), 0);
+    for _ in 0..2 {
+        drop(take(UNKNOWN_SOURCE).unwrap());
+    }
+    let unknown = [take(UNKNOWN_SOURCE).unwrap(), take(UNKNOWN_SOURCE).unwrap()];
+    let error = take(UNKNOWN_SOURCE).err().unwrap();
+    assert!(
+        error.to_string().contains("from an unknown address"),
+        "{error:#}"
+    );
+    drop(unknown);
+    // A source's file that a session left behind when it was killed is
+    // free, and taken again.
+    let stale = state.join(format!(
+        "session-source-{}-0",
+        "192.0.2.7"
+            .bytes()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ));
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&stale)
+        .unwrap();
+    let reused = take("192.0.2.7").unwrap();
+    assert_eq!(source_files(), 1);
+    drop(reused);
+    assert!(!stale.exists());
+    // A slot file that is not private, or has another name, is refused.
+    let path = state.join("session-slot-0");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(take("192.0.2.7").is_err());
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::hard_link(&path, state.join("linked")).unwrap();
+    assert!(take("192.0.2.7").is_err());
+    fs::remove_file(state.join("linked")).unwrap();
+    drop(take("192.0.2.7").unwrap());
+    assert_eq!(source_files(), 0);
+}
+
+/// Sessions from one source taking and releasing slots at once never hold
+/// more than its share, though a released slot's file is removed and made
+/// again while others are taking it.
+#[test]
+fn a_sources_share_holds_while_its_slots_change_hands() {
+    use std::sync::atomic::AtomicUsize;
+    let temporary = crate::test_support::tempdir().unwrap();
+    let state = temporary.path().join("state");
+    fs::DirBuilder::new().mode(0o700).create(&state).unwrap();
+    let held = AtomicUsize::new(0);
+    let most = AtomicUsize::new(0);
+    let taken = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| {
+                for _ in 0..300 {
+                    let Ok(slot) = UnverifiedSlot::take(&state, (32, 3), "192.0.2.7") else {
+                        continue;
+                    };
+                    let now = held.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(now, Ordering::SeqCst);
+                    taken.fetch_add(1, Ordering::SeqCst);
+                    std::thread::yield_now();
+                    held.fetch_sub(1, Ordering::SeqCst);
+                    drop(slot);
+                }
+            });
+        }
+    });
+    assert!(most.load(Ordering::SeqCst) <= 3, "{most:?}");
+    assert!(taken.load(Ordering::SeqCst) >= 300, "{taken:?}");
+
+    // A session that opened a slot's file just before its holder released
+    // it, and so locks the removed file, does not hold the slot: the next
+    // session makes the file again and takes it.
+    let path = state.join("session-source-00-0");
+    let holder = UnverifiedSlot::take(&state, (32, 1), "\0").unwrap();
+    let (late, metadata) = open_slot_file(&path).unwrap();
+    drop(holder);
+    assert!(!path.exists());
+    assert!(matches!(
+        lock_source_file(&path, late, &metadata).unwrap(),
+        SourceLock::Moved
+    ));
+    let next = UnverifiedSlot::take(&state, (32, 1), "\0").unwrap();
+    assert!(path.exists());
+    let (other, metadata) = open_slot_file(&path).unwrap();
+    assert!(matches!(
+        lock_source_file(&path, other, &metadata).unwrap(),
+        SourceLock::Held
+    ));
+    drop(next);
+}
+
+#[test]
+fn a_sessions_source_is_its_address_or_its_ipv6_network() {
+    for (connection, source) in [
+        (Some("192.0.2.7 51234 198.51.100.1 22"), "192.0.2.7"),
+        (
+            Some("2001:db8:1:2:3:4:5:6 51234 2001:db8::1 22"),
+            "2001:db8:1:2::/64",
+        ),
+        (
+            Some("2001:db8:1:2:ffff::9 1 2001:db8::1 22"),
+            "2001:db8:1:2::/64",
+        ),
+        (
+            Some("::ffff:192.0.2.7 51234 ::ffff:198.51.100.1 22"),
+            "192.0.2.7",
+        ),
+        (Some("fe80::1%eth0 51234 fe80::2%eth0 22"), "fe80::/64"),
+        (Some(""), UNKNOWN_SOURCE),
+        (Some("backup.example 1 2 3"), UNKNOWN_SOURCE),
+        (None, UNKNOWN_SOURCE),
+    ] {
+        assert_eq!(session_source(connection), source, "{connection:?}");
+    }
 }
 
 #[test]

@@ -6,11 +6,12 @@ key files, encrypted keys in the agent, agent-only keys, FIDO keys through
 the agent with the lab's provider, and a certificate login. Keys that cannot
 sign are refused before anything is installed. A new login key replaces only
 the trusted signer, a connection started before a refresh cannot start a new
-copy, and a copy running through a refresh finishes. Connections that have
-not shown a signed copy yet are refused once 32 are starting, which one copy
-never reaches; a copy's workers refused that way start again without the
-wait of a failed worker, and revoking works while refused connections keep
-arriving.
+copy, a session from another syq build is refused as that, and a copy running
+through a refresh to another build finishes. Connections that have not shown
+a signed copy yet are refused once 32 are starting, or 16 from one address: a
+machine holding its 16 leaves copies from another working. A copy's workers
+refused that way start again without the wait of a failed worker, and
+revoking works while refused connections keep arriving.
 """
 import json
 import os
@@ -25,7 +26,10 @@ import time
 PROVIDER = '/usr/local/lib/syq-test-sk.so'
 SOURCE_FILE = '/tmp/syq-real-ssh-key-source'
 STATE = Path.home() / '.local/state/syq/enrollments'
-REFUSED = b'other connections are starting copies on this enrollment'
+REFUSED = b'are starting copies on this enrollment'
+OTHER_BUILD_EXIT = 79
+# The entry key on the source, for sessions held from there.
+SOURCE_ENTRY_KEY = '/tmp/syq-real-ssh-held-entry-key'
 SESSIONS_FULL_EXIT = 73
 HOLD = '/tmp/syq-real-ssh-hold-restricted-workers'
 # The receiver's sessions on the destination: every session the entry key
@@ -43,6 +47,15 @@ for pid in filter(str.isdigit, os.listdir('/proc')):
     if command.split(b'\\0')[1:2] == [b'--restricted-receiver']:
         sessions.append((started, int(status.split('PPid:')[1].split()[0])))
 '''
+
+
+def admission_frame(build, directive):
+    """The first frame of a session that starts a copy, as syq of `build`
+    sends it: a 4-byte length; the magic; the build after its length in one
+    byte; the kind, 1; then the copy's directive after its 4-byte length."""
+    body = (b'SYQA' + bytes([len(build)]) + build + b'\x01'
+            + len(directive).to_bytes(4, 'big') + directive)
+    return len(body).to_bytes(4, 'big') + body
 
 
 def run(*args, **kwargs):
@@ -420,10 +433,7 @@ def rotation_and_generations(lab, parent):
         run('syq', 'receiver', 'enroll', 'destination')
         _, refreshed = enrollment()
         assert refreshed['generation'] == 3, refreshed
-        # The first frame of a session that starts a copy: a 4-byte
-        # length, then the copy's directive, here not a valid one.
-        body = b'\x00\x04AAAA'
-        frame = len(body).to_bytes(4, 'big') + body
+        frame = admission_frame(refreshed['release'].encode(), b'AAAA')
         old = attempt(*entry_ssh, '-o', f'ControlPath={control}', '-o', 'ControlMaster=no',
                       'syq@destination', 'syq --server', input=frame)
         assert old.returncode and b'outdated receiver' in old.stderr, old.stderr
@@ -432,6 +442,19 @@ def rotation_and_generations(lab, parent):
         assert new.returncode and b'outdated receiver' not in new.stderr, new.stderr
         assert b'not a syq directive' in new.stderr, new.stderr
         print('a connection from before a refresh cannot start a new copy', flush=True)
+
+        # Another build's session is refused as that, with its own status,
+        # before anything else it sent is read: in the first-frame format of
+        # builds before 0.9 (a postcard copy), and in this one.
+        for frame, theirs in [
+            ((6).to_bytes(4, 'big') + b'\x00\x04AAAA', b'is another build'),
+            (admission_frame(b'v0.0.0-other', b'AAAA'), b'is v0.0.0-other'),
+        ]:
+            other = attempt(*entry_ssh, '-o', 'ControlPath=none', 'syq@destination',
+                            'syq --server', input=frame)
+            assert other.returncode == OTHER_BUILD_EXIT, other
+            assert theirs in other.stderr and refreshed['release'].encode() in other.stderr, other
+        print('a session from another syq build was refused as that', flush=True)
     finally:
         subprocess.run([*entry_ssh, '-o', f'ControlPath={control}', '-O', 'exit', 'syq@destination'],
                        timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -455,12 +478,17 @@ print(any(p.stat().st_size > 0 for p in Path({parent!r}).glob('.rotation-large.s
             lab.add(socket, '-d', str(third.with_suffix('.pub')))
             lab.add(socket, str(second))
             lab.use(second, socket)
-            run('syq', 'receiver', 'enroll', 'destination')
+            # The refresh comes from another syq build, as right after an
+            # update, so the line now starts a receiver of that build.
+            other = run('syq-other-build', '--build-identity', stdout=subprocess.PIPE)
+            run('syq-other-build', 'receiver', 'enroll', 'destination')
             _, again = enrollment()
             assert again['generation'] == 4, again
+            assert again['release'] == other.stdout.decode().strip(), again
             # Drop the copy's worker connections: the workers that replace
-            # them start from the refreshed line, at the new generation, and
-            # join the running copy. Every session runs the receiver; the
+            # them start from the refreshed line, at the new generation and
+            # of the other build, and join the running copy, whose own
+            # receiver serves them. Every session runs the receiver; the
             # copy's control started first, and the others are its workers.
             dropped = remote_text('python3 -c ' + shlex.quote(RECEIVER_SESSIONS + '''
 import signal
@@ -481,7 +509,7 @@ print(len(sessions) - 1)
             raise
     size = remote_text('stat -c %s ' + shlex.quote(destination)).strip()
     assert size == str(32 << 20), size
-    print('a worker joined a copy running through a refresh', flush=True)
+    print('a worker joined a copy running through a refresh to another build', flush=True)
 
 
 def remount(parent):
@@ -506,8 +534,9 @@ def entry_ssh(directory):
 
 
 def session_slots(parent):
-    # One copy starts at most 32 connections at once, as many as the
-    # receiver has slots for, so none of a copy's workers is refused.
+    # One copy starts at most 32 connections at once, more than the 16 one
+    # machine may hold, but each holds its slot only until it shows its
+    # ticket. A worker refused meanwhile is retried, so the copy completes.
     files = '/tmp/syq-real-ssh-slots'
     run('ssh', 'source', f'rm -rf {files} && mkdir {files} && cd {files} && '
         'for i in $(seq 2000); do echo $i > $i; done')
@@ -515,12 +544,21 @@ def session_slots(parent):
                    '--as', f'{parent}/slots-many', '--no-tcp', '--no-progress',
                    '--performance-tuning', 'workers=64')
     log = (many.stdout + many.stderr).decode(errors='replace')
-    assert many.returncode == 0 and REFUSED.decode() not in log, log
+    assert many.returncode == 0, log
     assert remote_text(f'ls {parent}/slots-many | wc -l').strip() == '2000'
-    print('a copy with 64 workers had none refused', flush=True)
+    print(f'a copy with 64 workers completed; {log.count(REFUSED.decode())} '
+          'worker connections were refused and retried', flush=True)
 
     directory, record = enrollment()
     receivers = 'python3 -c ' + shlex.quote(RECEIVER_SESSIONS + 'print(len(sessions))')
+    # Sessions held from the source, where the copies' connections start.
+    run('ssh', 'source', f'umask 077 && cat > {SOURCE_ENTRY_KEY}',
+        input=(directory / 'entry-key').read_bytes())
+    from_source = ['ssh', 'source', ' '.join([
+        'ssh', '-F', '/dev/null', '-i', SOURCE_ENTRY_KEY, '-o', 'IdentitiesOnly=yes',
+        '-o', 'IdentityAgent=none', '-o', 'BatchMode=yes', '-o', 'ControlPath=none',
+        '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null',
+        '-o', 'LogLevel=ERROR', 'syq@destination', shlex.quote('syq --server')])]
 
     def count():
         return int(remote_text(receivers))
@@ -529,19 +567,21 @@ def session_slots(parent):
     # The receiver's sessions before the latest holders started.
     baseline = [0]
 
-    def hold_slots():
+    def hold_slots(*origins):
         # Sessions that send nothing hold their slots for 10 seconds. Start
-        # them a few at a time, within sshd's MaxStartups.
+        # them a few at a time, within sshd's MaxStartups: 16 from each of
+        # `origins`, the commands that start them.
         baseline[0] = count()
         holders = []
         try:
-            for _ in range(4):
-                holders += [subprocess.Popen(entry_ssh(directory), stdin=subprocess.PIPE,
-                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                             start_new_session=True)
-                            for _ in range(8)]
-                wait_for('sessions to take slots', lambda: (
-                    count() >= baseline[0] + len(holders), count()), seconds=8)
+            for origin in origins:
+                for _ in range(2):
+                    holders += [subprocess.Popen(origin, stdin=subprocess.PIPE,
+                                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                                 start_new_session=True)
+                                for _ in range(8)]
+                    wait_for('sessions to take slots', lambda: (
+                        count() >= baseline[0] + len(holders), count()), seconds=8)
         except BaseException:
             release(holders)
             raise
@@ -558,20 +598,35 @@ def session_slots(parent):
             holder.wait()
         wait_for('released sessions to end', lambda: (count() <= baseline[0], count()), seconds=8)
 
-    holders = hold_slots()
-    try:
+    def refused_at_once(command, expected):
         started = time.monotonic()
-        refused = attempt(*entry_ssh(directory), input=b'')
-        assert refused.returncode == SESSIONS_FULL_EXIT and REFUSED in refused.stderr, refused
+        refused = attempt(*command, input=b'')
+        assert refused.returncode == SESSIONS_FULL_EXIT and expected in refused.stderr, refused
         assert time.monotonic() - started < 5, time.monotonic() - started
+
+    # One machine holding its share leaves the rest to the others.
+    holders = hold_slots(entry_ssh(directory))
+    try:
+        refused_at_once(entry_ssh(directory), b'16 other connections from ')
+        assert count() == baseline[0] + 16, count()
+        copy(f'{parent}/slots-shared')
+    finally:
+        release(holders)
+    print('a machine holding its share of the slots left copies from another working', flush=True)
+
+    holders = hold_slots(entry_ssh(directory), from_source)
+    try:
+        refused_at_once(entry_ssh(directory), REFUSED)
+        refused_at_once(from_source, REFUSED)
         blocked = copy(f'{parent}/slots-full', check=False)
         assert blocked.returncode and REFUSED in blocked.stderr, blocked.stderr
     finally:
         release(holders)
     print('with every slot held, sessions and copies were refused at once', flush=True)
 
-    # A running copy whose workers find the slots taken starts them again
-    # as soon as the slots free, not after the wait of a failed worker.
+    # A running copy whose workers find their machine's slots taken starts
+    # them again as soon as the slots free, not after the wait of a failed
+    # worker.
     run('ssh', 'source', f'rm -f {HOLD}.control {HOLD}.waiting && touch {HOLD}')
     with tempfile.TemporaryFile() as output:
         process = subprocess.Popen(
@@ -584,7 +639,7 @@ def session_slots(parent):
             waiting = 'test -e ' + shlex.quote(f'{HOLD}.waiting') + ' && echo yes || echo no'
             wait_for('the copy\'s workers to start', lambda: (
                 attempt('ssh', 'source', waiting).stdout.strip() == b'yes', process.poll()))
-            holders = hold_slots()
+            holders = hold_slots(from_source)
             run('ssh', 'source', f'rm -f {HOLD}')
             time.sleep(1)
             release(holders)
@@ -595,7 +650,7 @@ def session_slots(parent):
             raise
         finally:
             release(holders)
-            run('ssh', 'source', f'rm -f {HOLD} {HOLD}.control {HOLD}.waiting')
+            run('ssh', 'source', f'rm -f {HOLD} {HOLD}.control {HOLD}.waiting {SOURCE_ENTRY_KEY}')
             output.seek(0)
             log = output.read().decode(errors='replace')
     assert REFUSED.decode() in log, log
@@ -613,7 +668,7 @@ def session_slots(parent):
         while not stop.is_set():
             arrivals.append(attempt(*entry_ssh(directory), input=b'').returncode)
 
-    holders = hold_slots()
+    holders = hold_slots(entry_ssh(directory))
     try:
         threads += [threading.Thread(target=arrive) for _ in range(4)]
         for thread in threads:

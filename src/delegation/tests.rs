@@ -303,7 +303,10 @@ fn an_in_process_signature_verifies_with_every_field_bound() {
     assert_eq!(verified.digest, signed.digest());
 
     // Changing any field after signing breaks the signature.
-    let signature = signed.signature;
+    let signature = crate::directive::Framed::split(&encoded)
+        .unwrap()
+        .signature
+        .to_vec();
     let tampered: [fn(&mut Directive); 7] = [
         |d| d.command[7] = b"/etc".to_vec(),
         |d| d.inputs.ignore.pop().map(drop).unwrap_or(()),
@@ -399,6 +402,11 @@ fn a_directive_for_another_receiver_is_refused_without_redeeming() {
     let mut rebuilt = context(TARGET, NOW, 0);
     rebuilt.build = "other-build";
     refused(rebuilt, "this receiver runs other-build");
+    // That refusal is the receiver's build refusal, which the client knows.
+    let mut rebuilt = context(TARGET, NOW, 0);
+    rebuilt.build = "other-build";
+    let error = verify(&encoded, &rebuilt, &fixture.policy(), &replay).unwrap_err();
+    assert!(crate::restricted::is_other_build(&error), "{error:#}");
     let wrong_namespace = signed_directive(&directive, &fixture.key, "other-protocol@example.test");
     let error = verify(
         &wrong_namespace,
@@ -561,8 +569,9 @@ fn duplicate_and_concurrent_redemption_allow_exactly_one_redeem() {
             .contains("signed request has already been redeemed")),
         "{failures:?}"
     );
-    // The replay record is checked before the signature: a signer that
-    // could not verify the directive still reports the redemption.
+    // The signature is checked before anything the directive says, its
+    // request included: for a receiver that trusts another key, a used
+    // directive is one it did not sign.
     let other = PrivateKey::new(
         ssh_key::private::Ed25519Keypair::from_seed(&[43; 32]).into(),
         "other",
@@ -571,9 +580,7 @@ fn duplicate_and_concurrent_redemption_allow_exactly_one_redeem() {
     let no_signature = TrustedSigner::new(other.public_key(), None, None).unwrap();
     let error = verify(&encoded, &context(TARGET, NOW, 0), &no_signature, &replay)
         .expect_err("duplicate request must fail");
-    assert!(error
-        .to_string()
-        .contains("signed request has already been redeemed"));
+    assert!(error.to_string().contains("does not trust"), "{error:#}");
 }
 
 #[test]
@@ -702,6 +709,51 @@ fn timestamped_request_ids_sort_chronologically_and_stay_unique() {
     earlier.validate().expect("timestamped IDs validate");
     // Pre-epoch issue times are refused rather than wrapped.
     assert!(RequestId::fresh(-1).is_err());
+}
+
+/// Whoever holds an enrollment's entry key can send a receiver any bytes,
+/// so nothing in a directive's body is read before its signature is
+/// checked: a body that cannot be decoded, or a directive for another
+/// receiver, is refused for its signature when the trusted key did not make
+/// it, and only a body the trusted key signed reaches the decoder.
+#[test]
+fn a_directives_body_is_read_only_once_its_signature_verifies() {
+    let fixture = Fixture::ordinary();
+    let directory = TestDir::new("unsigned-body");
+    let other = directory.join("other");
+    generate_key(&other);
+    let replay = fixture.replay("unsigned-body-replay");
+    let refused = |encoded: &[u8]| {
+        format!(
+            "{:#}",
+            verify(
+                encoded,
+                &context(TARGET, NOW, 0),
+                &fixture.policy(),
+                &replay
+            )
+            .unwrap_err()
+        )
+    };
+    let body = vec![0xff; 4096];
+    let payload = [b"SYQDIR1\0".as_slice(), &body].concat();
+    let framed = |signature: &[u8]| {
+        let mut out = b"SYQDIR1\0".to_vec();
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(&(signature.len() as u32).to_be_bytes());
+        out.extend_from_slice(&body);
+        out.extend_from_slice(signature);
+        out
+    };
+    let error = refused(&framed(&sign(&payload, &other, NAMESPACE)));
+    assert!(error.contains("does not trust"), "{error}");
+    let error = refused(&framed(&sign(&payload, &fixture.key, NAMESPACE)));
+    assert!(error.contains("decode the directive"), "{error}");
+    let mut misdirected = fixture_directive(62);
+    misdirected.binding.account = "root".into();
+    let error = refused(&signed_directive(&misdirected, &other, NAMESPACE));
+    assert!(error.contains("does not trust"), "{error}");
+    assert!(!redeemed(&replay, 62));
 }
 
 #[test]

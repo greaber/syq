@@ -135,7 +135,6 @@ fn setup_and_destination_connections_apply_only_the_selected_agent_policy() {
         "/dev/null",
         "IdentityAgent=SSH_AUTH_SOCK",
         "IdentityFile=none",
-        "CertificateFile=none",
         "PKCS11Provider=none",
         "PubkeyAuthentication=host-bound",
         "PreferredAuthentications=publickey",
@@ -151,6 +150,10 @@ fn setup_and_destination_connections_apply_only_the_selected_agent_policy() {
     ] {
         assert!(hardened_words.iter().any(|word| word == required));
     }
+    // ssh reads `CertificateFile=none` as a file named `none`.
+    assert!(!hardened_words
+        .iter()
+        .any(|word| word.starts_with("CertificateFile")));
     assert_eq!(
         destination_rsh(None, false, Some(&AgentForwarding::Unrestricted), None),
         Some("ssh -a -o IdentityAgent=SSH_AUTH_SOCK -o IdentitiesOnly=no".into())
@@ -1263,7 +1266,6 @@ fn receiver_ssh_uses_the_entry_key_first_and_checks_host_keys_as_this_machine_do
     for option in [
         "IdentityAgent=none",
         "IdentitiesOnly=yes",
-        "CertificateFile=none",
         "PKCS11Provider=none",
         "PubkeyAuthentication=yes",
         "PreferredAuthentications=publickey",
@@ -1285,7 +1287,12 @@ fn receiver_ssh_uses_the_entry_key_first_and_checks_host_keys_as_this_machine_do
     ] {
         assert!(command.contains(&option.to_owned()), "{option}");
     }
-    for unset in ["UserKnownHostsFile=", "HostKeyAlias=", "HostKeyAlgorithms="] {
+    for unset in [
+        "UserKnownHostsFile=",
+        "HostKeyAlias=",
+        "HostKeyAlgorithms=",
+        "CertificateFile=",
+    ] {
         assert!(
             !command.iter().any(|argument| argument.starts_with(unset)),
             "{unset}"

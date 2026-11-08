@@ -70,7 +70,11 @@ it from your agent after switching keys, the next copy logs in again and
 trusts your current key. While the old key can still sign, syq keeps using it;
 run `syq receiver enroll HOST` to switch to your current login key now.
 `syq receiver list` shows the key each enrollment trusts. After you change syq
-builds, the next copy logs in once to update the receiver.
+builds, the next copy logs in once to update the receiver. A server that
+reaches the receiver itself, to run or coordinate a copy, needs the same syq
+build as the machine that approves the copy, whose build the receiver follows.
+Otherwise the receiver refuses it and says which builds it saw; update syq on
+whichever of the two machines is older.
 
 Only `syq receiver revoke ID`, or deleting syq's line from `authorized_keys`,
 ends an enrollment. Removing or revoking your login key, certificate, or
