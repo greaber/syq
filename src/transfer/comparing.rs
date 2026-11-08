@@ -244,6 +244,8 @@ struct Flow {
     /// A window has been asked about: waits for hashes after that mean the
     /// look-ahead is too short.
     started: bool,
+    /// The look-ahead stopped the last attempt to hash another window.
+    held_back: bool,
 }
 
 impl Worker {
@@ -432,6 +434,7 @@ impl Worker {
         flow: &mut Flow,
     ) -> Result<()> {
         let ceiling = self.adaptive_ceiling();
+        flow.held_back = false;
         while !flow.claimed_all && flow.awaited.len() < sizes.destination_requests {
             // Without pipelining, the destination answers each request before
             // the next: hash a window only once the last has been used.
@@ -454,6 +457,7 @@ impl Worker {
                 flow.ahead
             };
             if held > 0 && held + window > sizes.ahead {
+                flow.held_back = true;
                 break;
             }
             let Some((start, end)) = self.claim_comparison_window(handle, window) else {
@@ -521,7 +525,7 @@ impl Worker {
     fn receive_compared_block(
         &mut self,
         job: &WorkerJob,
-        sizes: &Sizes,
+        sizes: &mut Sizes,
         flow: &mut Flow,
         credited: &mut u64,
     ) -> Result<()> {
@@ -532,7 +536,20 @@ impl Worker {
         // nothing about the link.
         let (waited, (response, started)) = match self.src.try_recv_with_arrival() {
             Some(queued) => (false, queued?),
-            None => (!sizes.source_answers_at_once, self.src.recv_with_arrival()?),
+            None => {
+                // Waiting on a remote source with every hashed block asked
+                // about, while the look-ahead keeps the next window unhashed:
+                // it is too short for this link.
+                if sizes.adaptive
+                    && !sizes.source_answers_at_once
+                    && flow.held_back
+                    && flow.windows.front().is_none_or(|w| w.hashes.is_none())
+                {
+                    self.comparison.starved();
+                    sizes.ahead = self.comparison.ahead();
+                }
+                (!sizes.source_answers_at_once, self.src.recv_with_arrival()?)
+            }
         };
         let arrived = Instant::now();
         let response = ok(response, "compare source block")?;

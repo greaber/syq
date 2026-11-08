@@ -6506,6 +6506,7 @@ fn a_failed_comparison_write_drains_both_connections_in_order() {
                 super::comparing::ComparisonSizing::starting(512, 4 << 10),
             );
             dst.lock().unwrap().auto_fail_write = Some(failing);
+            dst.lock().unwrap().peer = Some(src.clone());
             let mut credited = 0;
             let result = worker.transfer_range(&handle, &mut credited);
             let case = format!("final={final_basis} failing={failing}");
@@ -6526,9 +6527,22 @@ fn a_failed_comparison_write_drains_both_connections_in_order() {
                 assert!(state.replies.is_empty(), "{case}");
             }
             assert!(job.done.load(Relaxed) < 32 << 10, "{case}");
-            // Nothing is asked about after the failure is seen.
-            let asked = src.lock().unwrap().requests.len();
-            assert!(asked < 64, "{case}: {asked}");
+            // Nothing is sent to either endpoint once the failure is seen.
+            let dst = dst.lock().unwrap();
+            let failed = dst
+                .requests
+                .iter()
+                .position(|r| {
+                    matches!(r, Request::WriteRange { off, .. }
+                        | Request::ReuseComparedRange { off, .. } if *off == failing)
+                })
+                .unwrap();
+            assert_eq!(dst.sent_at_receive[failed], dst.requests.len(), "{case}");
+            assert_eq!(
+                dst.peer_sent_at_receive[failed],
+                src.lock().unwrap().requests.len(),
+                "{case}"
+            );
         }
     }
 }
@@ -6658,6 +6672,37 @@ fn pulls_only_make_comparison_blocks_smaller_than_where_they_start() {
         assert!(
             blocks.iter().all(|block| *block == largest),
             "remote={remote_source}: {blocks:?}"
+        );
+    }
+}
+
+#[test]
+fn waiting_on_a_slow_source_with_the_look_ahead_used_up_looks_further_ahead() {
+    for (latency, ready, grows) in [(5, false, true), (0, true, false)] {
+        let ahead = 4 << 10;
+        let (mut worker, handle, _, src, dst) = adaptive_comparison(
+            64 << 10,
+            true,
+            true,
+            std::time::Duration::ZERO,
+            |_| true,
+            super::comparing::ComparisonSizing::starting(512, ahead),
+        );
+        {
+            let mut src = src.lock().unwrap();
+            src.latency = Some(std::time::Duration::from_millis(latency));
+            src.early_range_acks = ready;
+        }
+        // The destination's hashes and acknowledgments are always there.
+        dst.lock().unwrap().early_range_acks = true;
+        let opts = Arc::get_mut(&mut worker.opts).unwrap();
+        opts.dst_remote = false;
+        let mut credited = 0;
+        worker.transfer_range(&handle, &mut credited).unwrap();
+        assert_eq!(
+            worker.comparison.ahead() > ahead,
+            grows,
+            "latency={latency} ready={ready}"
         );
     }
 }
