@@ -444,20 +444,37 @@ def main():
 
         print("case: a download through another name for user ID 0 is refused before setup", flush=True)
         # Root may serve downloads, but only under the name the server gives
-        # user ID 0; nothing is installed or left pending for toor.
-        with running(command("toor-secret", path=secret, account=alias)) as (process, output):
-            decide(setup='Also sets up restricted copying on "toor@destination"', source=alias)
-            text = finish(process, output, success=False)
-        assert ("toor@destination logs in as user ID 0, which that server calls root; restricted"
-                " copying works only under that name, so use root@destination instead") in text, text
-        assert "remains pending" not in text, text
-        absent("toor-secret")
-        assert alias_home() == alias_before
-        remote(alias, "test ! -e ~/.local/lib/syq && test ! -e ~/.local/share/syq"
-               " && ! grep -s -q syq-enrollment: ~/.ssh/authorized_keys")
-        assert pending() == []
-        assert [line for line in run("syq", "receiver", "list").splitlines()
-                if "\ttoor@destination" in line] == []
+        # user ID 0; nothing is installed or left pending for toor. The first
+        # attempt finds the pending enrollment an earlier build left, which
+        # nothing could install or revoke, and removes it.
+        leftover = "5a" * 16
+        state = Path.home() / ".local/state/syq/enrollments"
+        state.mkdir(mode=0o700, parents=True, exist_ok=True)
+        (state / leftover).mkdir(mode=0o700)
+        run("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(state / leftover / "entry-key"))
+        (state / leftover / "entry-key.pub").unlink()
+        record = state / leftover / "pending.json"
+        record.write_text(json.dumps({"version": 7, "id": list(bytes.fromhex(leftover)),
+                                      "host": "destination", "port": None, "target_login": "toor"}))
+        record.chmod(0o600)
+        assert (leftover + "\tpending\ttoor@destination") in run("syq", "receiver", "list")
+        for attempt, removed in ((1, True), (2, False)):
+            name = f"toor-secret-{attempt}"
+            with running(command(name, path=secret, account=alias)) as (process, output):
+                decide(setup='Also sets up restricted copying on "toor@destination"', source=alias)
+                text = finish(process, output, success=False)
+            assert ("toor@destination logs in as user ID 0, which that server calls root; restricted"
+                    " copying works only under that name, so use root@destination instead") in text, text
+            assert (f"removed enrollment {leftover}, which an earlier attempt left pending" in text) == removed, text
+            assert "remains pending" not in text, text
+            absent(name)
+            assert not (state / leftover).exists()
+            assert alias_home() == alias_before
+            remote(alias, "test ! -e ~/.local/lib/syq && test ! -e ~/.local/share/syq"
+                   " && ! grep -s -q syq-enrollment: ~/.ssh/authorized_keys")
+            assert pending() == []
+            assert [line for line in run("syq", "receiver", "list").splitlines()
+                    if "\ttoor@destination" in line] == []
         print("Source downloads passed", flush=True)
     finally:
         for enrollment in enrollments("root@destination"):

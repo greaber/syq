@@ -849,8 +849,14 @@ fn install_over_route(
             // Earlier builds stored the entry key before the server refused
             // this name, which it does before changing anything, and `syq
             // receiver revoke` refuses it the same way: nothing on the
-            // server uses that pending enrollment, so it goes.
-            if plan.entry_key.is_some() && !plan.refresh {
+            // server uses that pending enrollment, so it goes. Without a
+            // name, as while the server's account lookup fails, an earlier
+            // attempt may have installed it, so it stays.
+            if !name.is_empty()
+                && plan.entry_key.is_some()
+                && !plan.refresh
+                && plan.replaces.is_none()
+            {
                 remove_local_enrollment(&plan.directory)?;
                 message.push_str(&format!(
                     "; removed enrollment {}, which an earlier attempt left pending",
