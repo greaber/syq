@@ -66,11 +66,8 @@ impl Controls {
         let limit = (args.bwlimit_bytes != 0)
             .then(|| Arc::new(crate::bwlimit::BandwidthLimit::new(args.bwlimit_bytes)));
         let settings = Settings {
-            request_size: tuning.streaming_request_size(
-                super::CHUNK as u64,
-                limit.as_deref(),
-                false,
-            ) as usize,
+            request_size: tuning.streaming_request_size(super::CHUNK as u64, limit.as_deref())
+                as usize,
             algorithm: args.transfer_hash_type.unwrap_or_default(),
             verify: args.transfer_integrity,
         };

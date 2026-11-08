@@ -899,7 +899,6 @@ pub(crate) fn security_key_flags(signature: &ssh_key::SshSig) -> Result<u8> {
 /// The destination's rules beyond the copy operation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct GrantConstraints {
-    pub max_file_data_bytes_per_second: u64,
     pub filters: FilterPolicy,
     pub root_existence: RootExistence,
     pub receipt_policy: crate::destination_results::ReceiptPolicy,
@@ -916,7 +915,6 @@ pub(crate) struct GrantConstraints {
 impl Default for GrantConstraints {
     fn default() -> Self {
         Self {
-            max_file_data_bytes_per_second: 0,
             filters: FilterPolicy::default(),
             root_existence: RootExistence::Any,
             receipt_policy: test_receipt_policy(),

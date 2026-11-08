@@ -77,11 +77,16 @@ fn ensure_same<T: serde::Serialize>(requested: &T, derived: &T) -> Result<()> {
 }
 
 /// Copies to this machine, the receiving machine `receiver`.
-pub(crate) fn check_copy(
-    command: &[Vec<u8>],
-    request: &crate::destination::CopyRequest,
-    receiver: &str,
-) -> Result<()> {
+/// The copy `command` asks this machine, the receiving machine `receiver`,
+/// to approve: a `syq cp` to `@receiver`. This machine derives what the copy
+/// may do from the command (`directive::receiving_rules`). The server
+/// supplies ignore rules and the mapping's digest, which this machine does
+/// not check. Neither reaches beyond the scopes, policy and limits the
+/// command states, and ignore rules only narrow a copy, but a mapping's
+/// entries can also set the permissions and group of the files they list
+/// without the matching copy option. The prompt warns of that
+/// (`receive_approval::copy_warnings`).
+pub(crate) fn receiving_command(command: &[Vec<u8>], receiver: &str) -> Result<crate::cli::Args> {
     let args = parse(command)?;
     anyhow::ensure!(
         args.interface == crate::cli::Interface::NativeCp && args.s3.is_none(),
@@ -92,26 +97,7 @@ pub(crate) fn check_copy(
         destination.host.as_deref() == Some(&format!("@{receiver}")),
         "the requesting command copies to a different destination"
     );
-    let mut derived =
-        crate::restricted::named_request(&args, request.constraints.receipt_policy.clone())?;
-    // The server supplies ignore rules and mapping file contents; this machine
-    // does not check them. Neither reaches beyond the checked scopes, policy,
-    // and limits, and ignore rules only narrow a copy, but a mapping's entries
-    // can also set the permissions and group of the files they list without
-    // the matching copy option. The prompt warns of that
-    // (`receive_approval::copy_warnings`).
-    if args.native_mapping.is_some() {
-        derived.constraints.mapping = request.constraints.mapping.clone();
-    }
-    derived.constraints.filters.ignore = request.constraints.filters.ignore.clone();
-    ensure_same(request, &derived)
-}
-
-/// Whether `command` is a dry run of a copy that prunes. Its read-only
-/// request deletes nothing, so only the command says so.
-pub(crate) fn dry_run_prunes(command: &[Vec<u8>]) -> Result<bool> {
-    let args = parse(command)?;
-    Ok(args.dry_run && crate::directive::requests_pruning(&args))
+    Ok(args)
 }
 
 /// Validate the authorizer chosen on the requesting host. An omitted or `auto`

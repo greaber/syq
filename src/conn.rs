@@ -2554,30 +2554,46 @@ impl RemoteSpec {
         Err(last.unwrap())
     }
 
-    /// A connection over a Unix socket the receiver serves directly.
+    /// A connection over a Unix socket the receiver serves directly. A
+    /// worker's sends are paced as over SSH, the receiving machine's socket
+    /// included.
     fn stream_connection(
         &self,
         stream: std::os::unix::net::UnixStream,
         compress: bool,
         role: ConnectionRole,
     ) -> Result<RemoteConn> {
+        let pacing = (!matches!(role, ConnectionRole::Control))
+            .then(|| self.pacing.lock().unwrap().clone())
+            .flatten();
+        let handshake = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let observation =
             std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
         let replies = reply_queue(self.read_ahead, &role);
         let (rx, reader, batch_receipts) = spawn_observed_reader(
-            Box::new(stream.try_clone()?),
+            Box::new(crate::bwlimit::activity::ActivityIo {
+                inner: stream.try_clone()?,
+                bytes: pacing
+                    .as_ref()
+                    .filter(|p| p.remote_sender)
+                    .and_then(|p| p.activity.clone()),
+                handshake_pending: handshake.clone(),
+            }),
             replies,
             reply_bytes(&role),
             observation.clone(),
         )?;
         let conn = RemoteConn {
             batch_receipts,
-            transport_stop: None,
+            transport_stop: pacing.as_ref().map(|p| p.scheduler.clone()),
             observation,
             child: None,
             approved_login: None,
             worker_setup: None,
-            w: FrameWriter::new(Box::new(stream.try_clone()?), compress),
+            w: FrameWriter::new(
+                paced_output(stream.try_clone()?, pacing.as_ref(), &handshake)?,
+                compress,
+            ),
             rx: Some(rx),
             replies,
             deferred: Default::default(),
@@ -2593,6 +2609,7 @@ impl RemoteSpec {
             detached: false,
         };
         let conn = hello(conn, compress, Vec::new(), role)?;
+        handshake.store(false, std::sync::atomic::Ordering::Release);
         self.record_peer(&conn);
         Ok(conn)
     }
@@ -3003,9 +3020,11 @@ impl RemoteSpec {
                 key: None,
                 token: Vec::new(),
                 congestion_control: None,
-                reply: TcpListenReply::Reverse(
-                    self.begin_reverse_tcp_setup(ports, congestion_control)?,
-                ),
+                reply: TcpListenReply::Reverse(self.begin_reverse_tcp_setup(
+                    ports,
+                    congestion_control,
+                    pacing,
+                )?),
                 sent: std::time::Instant::now(),
             });
         }
@@ -3285,7 +3304,7 @@ impl RemoteSpec {
             }
         }
         if let Some(reverse) = &info.reverse {
-            return self.connect_reverse_tcp(reverse, compress, role);
+            return self.connect_reverse_tcp(reverse, info.pacing.as_ref(), compress, role);
         }
         // Keep network compression, but not on the local receiver's data hop.
         let compress = compress && !self.local_process;
@@ -3388,6 +3407,41 @@ impl RemoteSpec {
         self.record_peer(&conn);
         Ok(conn)
     }
+}
+
+/// `socket` as a connection's output, paced by `pacing` when this machine
+/// sends on it. Bytes before `handshake` clears count for tuning activity
+/// but wait for no budget, so a connection authenticates in time even at a
+/// tiny cap.
+fn paced_output<S>(
+    socket: S,
+    pacing: Option<&TransportPacing>,
+    handshake: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<Box<dyn Write + Send>>
+where
+    S: Write + Send + std::os::fd::AsFd + 'static,
+{
+    let Some(pacing) = pacing.filter(|p| !p.remote_sender) else {
+        return Ok(Box::new(socket));
+    };
+    let scheduler = pacing.scheduler.clone();
+    let closed = socket
+        .as_fd()
+        .try_clone_to_owned()
+        .context("watch a paced connection")?;
+    Ok(Box::new(crate::bwlimit::transport::PacedWriter {
+        handshake_pending: Some(handshake.clone()),
+        inner: crate::bwlimit::activity::ActivityIo {
+            inner: socket,
+            bytes: pacing.activity.clone(),
+            handshake_pending: handshake.clone(),
+        },
+        budget: pacing.budget.clone(),
+        stopped: move || {
+            scheduler.upgrade().is_none_or(|s| s.is_aborted())
+                || crate::bwlimit::transport::socket_closed(&closed)
+        },
+    }))
 }
 
 fn helper_needs_install(e: &anyhow::Error) -> bool {

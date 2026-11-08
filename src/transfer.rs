@@ -175,9 +175,7 @@ const LOCAL_FAST_FILE_BYTES: u64 = 64 * 1024;
 fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
     // New files have no comparison basis. Their batching ceiling follows
     // transfer payload and batch limits, independently of hash granularity.
-    let request = opts
-        .tuning
-        .request_size(opts.block, bwlimit, opts.receiver_paces_file_data);
+    let request = opts.tuning.request_size(opts.block, bwlimit);
     let limit = opts.tuning.batch_bytes().min(request);
     if opts.copy_policy(bwlimit.is_some()).prefer_whole_files() {
         limit.min(LOCAL_FAST_FILE_BYTES)
@@ -258,10 +256,6 @@ pub struct Opts {
     pub src_remote: bool,
     pub dst_remote: bool,
     pub restricted_receiver: bool,
-    /// The receiver paces file data itself, as one a receiving machine
-    /// approved does under `--bwlimit`, and refuses a request carrying more
-    /// than one burst. An enrolled receiver leaves pacing to the sender.
-    pub receiver_paces_file_data: bool,
     /// The copy keeps existing files and copies hard links: a new name goes
     /// only to a file the copy created (`Request::ConfigurePreservation`).
     pub own_links: bool,
@@ -2733,10 +2727,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         src_remote: src_ep.is_remote(),
         dst_remote: dst_ep.is_remote(),
         restricted_receiver: args.restricted_grant.is_some(),
-        receiver_paces_file_data: args
-            .restricted_grant
-            .as_deref()
-            .is_some_and(|grant| !crate::restricted::enrolled_grant(grant)),
         own_links: args.hardlinks
             && args.ignore_existing
             && crate::checks::enabled(crate::checks::Check::OwnLinks),
@@ -2768,11 +2758,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
 
     if opts.benchmark.is_some() {
         crate::output::diagnostic!(
-            "syq: tuning before transport selection: request-size={} bytes (ordinary ceiling, after logical pacing and receiver limits), adaptive-ordinary-requests={}, streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, transfer-strategy={} (block reuse {}), batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
-            opts.tuning.request_size(block, bwlimit.as_deref(), opts.receiver_paces_file_data),
+            "syq: tuning before transport selection: request-size={} bytes (ordinary ceiling, after logical pacing), adaptive-ordinary-requests={}, streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, transfer-strategy={} (block reuse {}), batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
+            opts.tuning.request_size(block, bwlimit.as_deref()),
             opts.adaptive_ranges(),
-            opts.tuning.streaming_request_size(block, bwlimit.as_deref(), opts.receiver_paces_file_data),
-            opts.tuning.pipeline_label(opts.same_host, opts.tuning.request_size(block, bwlimit.as_deref(), opts.receiver_paces_file_data)), block,
+            opts.tuning.streaming_request_size(block, bwlimit.as_deref()),
+            opts.tuning.pipeline_label(opts.same_host, opts.tuning.request_size(block, bwlimit.as_deref())), block,
             opts.tuning.copy_path.unwrap_or_default(),
             opts.transfer_strategy.as_str(),
             if opts.transfer_strategy.reuse_destination_blocks(opts.same_host) { "on" } else { "off" },
@@ -3242,8 +3232,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     if transport_paced && id == 0 && opts.verbose > 0 {
                         crate::output::diagnostic!(
                             "syq: Sender bandwidth cap counts compressed transport bytes: request-size={}, streaming-block-size={}; normal batching applies",
-                            opts.tuning.request_size(opts.block, None, opts.receiver_paces_file_data),
-                            opts.tuning.streaming_request_size(opts.block, None, opts.receiver_paces_file_data),
+                            opts.tuning.request_size(opts.block, None),
+                            opts.tuning.streaming_request_size(opts.block, None),
                         );
                     }
                     let mut worker = Worker {
@@ -3437,23 +3427,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             "source_type":source_filesystem.as_ref().map(|fs| &fs.kind)}),
         );
     }
-    // Configure each ordinary network leg before selecting TCP or SSH. Source
-    // helpers share one mapped budget; coordinator sends share one local budget.
-    // Routes a receiving machine approves keep their separately authorized
-    // resource policy; an enrolled restricted receiver is paced like any other.
-    let ordinary_grant = |grant: &Option<String>| {
-        grant
-            .as_deref()
-            .is_none_or(crate::restricted::enrolled_grant)
-    };
-    let ordinary = [&src_ep, &dst_ep].iter().all(|ep| match ep {
-        Endpoint::Remote(spec) => spec.local_process || ordinary_grant(&spec.restricted_grant),
-        _ => true,
-    });
-    let transport_budget = (args.bwlimit_bytes > 0
-        && ordinary
-        && ordinary_grant(&args.restricted_grant)
-        && (opts.src_remote || opts.dst_remote))
+    // Configure each network leg before selecting TCP or SSH. Source helpers
+    // share one mapped budget; coordinator sends share one local budget. The
+    // sender paces on every route: a receiving machine's socket and the TCP
+    // connections it opens, and a restricted receiver, are paced like any
+    // other connection, and a source that a receiving machine or an enrolled
+    // receiver approved paces its own sends at the rate its command states.
+    let transport_budget = (args.bwlimit_bytes > 0 && (opts.src_remote || opts.dst_remote))
         .then(|| Arc::new(crate::bwlimit::transport::Budget::new(args.bwlimit_bytes)));
     if let Some(budget) = &transport_budget {
         if opts.tuning.bw_pacing.is_some() {

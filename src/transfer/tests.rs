@@ -448,7 +448,6 @@ fn pipeline_worker(
         src_remote: false,
         dst_remote: true,
         restricted_receiver: false,
-        receiver_paces_file_data: false,
         own_links: false,
         skips_unmet_conditions: false,
         unchecked_keep: false,
@@ -6127,12 +6126,10 @@ fn a_restricted_receivers_listed_failures_are_left_to_it() {
     }
 }
 
-/// Only a receiver that paces file data itself refuses requests larger than
-/// one burst of the bandwidth limit, so only a copy to one sends its files
-/// in requests that small. An enrolled restricted receiver leaves pacing to
-/// the sender, as an ordinary one does.
+/// No receiver paces file data, restricted receivers included: the sender
+/// paces, so a bandwidth limit never bounds a copy's requests by one burst.
 #[test]
-fn only_a_pacing_receiver_bounds_requests_by_the_bandwidth_burst() {
+fn a_bandwidth_limit_leaves_requests_to_a_restricted_receiver_their_size() {
     let sched = Arc::new(Sched::new(512, 8192));
     let unused = Arc::new(Mutex::new(PipelineState::default()));
     let mut worker = pipeline_worker(&sched, &unused, &unused, false);
@@ -6142,12 +6139,9 @@ fn only_a_pacing_receiver_bounds_requests_by_the_bandwidth_burst() {
     opts.restricted_receiver = true;
     // Average pacing sizes requests for the bandwidth limit no further.
     opts.tuning.bw_pacing = Some(crate::transfer_tuning::BwPacing::Average);
-    let enrolled = fast_file_size_limit(opts, Some(&limit));
-    assert!(enrolled > limit.burst_bytes(), "{enrolled}");
-    opts.receiver_paces_file_data = true;
     assert_eq!(
         fast_file_size_limit(opts, Some(&limit)),
-        limit.burst_bytes()
+        fast_file_size_limit(opts, None)
     );
 }
 

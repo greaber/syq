@@ -344,14 +344,65 @@ pub(crate) fn issue(
     results_key: [u8; 32],
 ) -> Result<Directive> {
     let issued_at = now()?;
+    made(
+        (
+            issued_at,
+            issued_at.saturating_sub(CLOCK_SKEW_SECONDS),
+            issued_at
+                .checked_add(VALIDITY_SECONDS - CLOCK_SKEW_SECONDS)
+                .context("directive start-by overflow")?,
+        ),
+        binding,
+        command,
+        cwd,
+        (inputs, caps),
+        results_key,
+    )
+}
+
+/// A directive for a copy to this machine, issued now, that this machine
+/// keeps for itself (`Issued`): no other clock reads it, and its copy must
+/// start within `start_within`.
+pub(crate) fn issue_here(
+    binding: Binding,
+    command: Vec<Vec<u8>>,
+    cwd: String,
+    (inputs, caps): (Inputs, Option<Caps>),
+    results_key: [u8; 32],
+    start_within: std::time::Duration,
+) -> Result<Directive> {
+    let issued_at = now()?;
+    let start_within = i64::try_from(start_within.as_secs()).context("directive start window")?;
+    made(
+        (
+            issued_at,
+            issued_at,
+            issued_at
+                .checked_add(start_within)
+                .context("directive start-by overflow")?,
+        ),
+        binding,
+        command,
+        cwd,
+        (inputs, caps),
+        results_key,
+    )
+}
+
+fn made(
+    (issued_at, not_before, start_by): (i64, i64, i64),
+    binding: Binding,
+    command: Vec<Vec<u8>>,
+    cwd: String,
+    (inputs, caps): (Inputs, Option<Caps>),
+    results_key: [u8; 32],
+) -> Result<Directive> {
     let directive = Directive {
         build: crate::identity::build().to_owned(),
         request_id: RequestId::fresh(issued_at)?,
         issued_at,
-        not_before: issued_at.saturating_sub(CLOCK_SKEW_SECONDS),
-        start_by: issued_at
-            .checked_add(VALIDITY_SECONDS - CLOCK_SKEW_SECONDS)
-            .context("directive start-by overflow")?,
+        not_before,
+        start_by,
         finish_by: issued_at
             .checked_add(FINISH_WINDOW_SECONDS)
             .context("directive finish-by overflow")?,
@@ -368,6 +419,43 @@ pub(crate) fn issue(
     Ok(directive)
 }
 
+/// The header of a directive a machine issued for a copy to itself. It
+/// differs from a signed directive's, so neither passes as the other.
+const ISSUED_MAGIC: &[u8; 8] = b"SYQDIRL1";
+
+/// The encoding of a directive a machine issued for a copy to itself
+/// (`issue_here`), which it hands the copy's coordinator. It is never
+/// signed: the machine keeps the directives it issued in memory, and the
+/// copy's control opens only by presenting one of those encodings unchanged
+/// (`destination::Receiver`).
+#[derive(Debug)]
+pub(crate) struct Issued {
+    /// The header, then the canonical body.
+    pub encoded: Vec<u8>,
+}
+
+impl Issued {
+    pub(crate) fn new(directive: &Directive) -> Result<Self> {
+        directive.validate()?;
+        let body = postcard::to_stdvec(directive).context("encode the directive")?;
+        if body.len() > MAX_BODY_BYTES {
+            bail!("the directive exceeds {MAX_BODY_BYTES} bytes");
+        }
+        Ok(Self {
+            encoded: [ISSUED_MAGIC.as_slice(), &body].concat(),
+        })
+    }
+
+    /// The digest that binds the machine's results to this directive.
+    pub(crate) fn digest(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"syq-issued-directive-transcript@greaber.github\0");
+        hasher.update(&(self.encoded.len() as u64).to_be_bytes());
+        hasher.update(&self.encoded);
+        *hasher.finalize().as_bytes()
+    }
+}
+
 /// The rules for the destination of `directive`, on an account whose home
 /// is `home`. The receiver and the signing machine both call this, so the
 /// signing machine checks exactly what the receiver will enforce.
@@ -375,6 +463,46 @@ pub(crate) fn destination_rules(
     directive: &Directive,
     home: &Path,
 ) -> Result<(Grant, GrantConstraints)> {
+    let args = destination_command(directive)?;
+    let destination = args.locations.last().expect("a destination's command");
+    let destination_path = normalize_absolute(OsStr::from_bytes(&destination.path), home)?
+        .into_os_string()
+        .into_vec();
+    rules_at(
+        directive,
+        &args,
+        &destination_path,
+        args.follows_native_destination_paths(),
+    )
+}
+
+/// The rules for a copy to this machine that it approved itself with
+/// `directive`, writing at `destination`: the absolute path where this
+/// machine resolved the command's destination. It follows the command's
+/// `--follow-dst` when it resolves that path, so the rules follow no link at
+/// the destination; the coordinator refuses one it finds there.
+pub(crate) fn receiving_rules(
+    directive: &Directive,
+    destination: &[u8],
+) -> Result<(Grant, GrantConstraints)> {
+    let args = destination_command(directive)?;
+    rules_at(directive, &args, destination, false)
+}
+
+/// As `receiving_rules`, for the copy `args` states, in place of the command
+/// `directive` carries.
+#[cfg(test)]
+pub(crate) fn rules_for_args(
+    directive: &Directive,
+    args: &Args,
+    destination: &[u8],
+) -> Result<(Grant, GrantConstraints)> {
+    rules_at(directive, args, destination, false)
+}
+
+/// The command of a destination's `directive`, which names its destination
+/// last.
+fn destination_command(directive: &Directive) -> Result<Args> {
     ensure!(
         directive.binding.role == Role::Destination,
         "the directive is not for a copy's destination"
@@ -385,9 +513,9 @@ pub(crate) fn destination_rules(
         "a directive's command must be a syq cp between file systems"
     );
     validate_restricted_args(&args)?;
-    let (destination, sources) = args
+    let destination = args
         .locations
-        .split_last()
+        .last()
         .context("the directive's command names no destination")?;
     ensure!(
         destination.is_remote(),
@@ -397,31 +525,45 @@ pub(crate) fn destination_rules(
         args.native_mapping.is_some() == directive.inputs.mapping.is_some(),
         "the directive's mapping does not match its command"
     );
+    Ok(args)
+}
+
+/// The rules of `directive`, whose command is `args`, for a destination at
+/// the absolute path `destination_path`.
+fn rules_at(
+    directive: &Directive,
+    args: &Args,
+    destination_path: &[u8],
+    follow_dst: bool,
+) -> Result<(Grant, GrantConstraints)> {
+    let (_, sources) = args
+        .locations
+        .split_last()
+        .context("the directive's command names no destination")?;
     let sources = crate::transfer::distinct_native_sources(sources);
-    let destination_path = normalize_absolute(OsStr::from_bytes(&destination.path), home)?
-        .into_os_string()
-        .into_vec();
-    let mut copy = copy_operation(&args, &sources, &destination_path)?;
+    let mut copy = copy_operation(args, &sources, destination_path)?;
     if let Some(caps) = &directive.caps {
-        caps.apply(&mut copy, args.dry_run && requests_pruning(&args))?;
+        caps.apply(&mut copy, args.dry_run && requests_pruning(args))?;
     }
+    // A bandwidth limit is a preference, not part of the authorization: the
+    // sender paces network bytes, as for an ordinary copy.
     let mut constraints = GrantConstraints {
         tcp_congestion: args.tcp_congestion.clone(),
         mapping: directive.inputs.mapping.clone(),
-        hashing: Some(crate::hashing::CopyHashing::from_args(&args)),
-        // The sender paces network bytes, as for an ordinary copy: a
-        // bandwidth limit is a preference, not part of the authorization.
-        max_file_data_bytes_per_second: 0,
+        hashing: Some(crate::hashing::CopyHashing::from_args(args)),
         filters: FilterPolicy {
             ignore: directive.inputs.ignore.clone(),
-            destination_roots: filter_destination_roots(&args, &sources, &destination_path)?,
+            destination_roots: filter_destination_roots(args, &sources, destination_path)?,
             delete_excluded: args.delete_excluded,
         },
         root_existence: root_existence_for(args.target_existence),
         receipt_policy: crate::destination_results::ReceiptPolicy::for_recipient(
             directive.results_key,
         ),
-        extra_options: extra_copy_options(&args),
+        extra_options: delegation::ExtraCopyOptions {
+            follow_dst,
+            ..extra_copy_options(args)
+        },
     };
     delegation::validate_rules(&copy, &mut constraints)?;
     Ok((

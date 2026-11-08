@@ -1,5 +1,5 @@
 use super::*;
-use crate::cli::{Existence, Location, Placement};
+use crate::cli::{Args, Existence, Location, Placement};
 use crate::delegation::{CopyLimits, CopyOptions, CopyPolicy, PublicationPolicy};
 use crate::directive::{
     copy_operation, filter_destination_roots, normalize_absolute, validate_restricted_args,
@@ -2338,7 +2338,13 @@ fn test_authority(
     deletion: DeletionPolicy,
     maximum_bytes: u64,
 ) -> RestrictedAuthority {
-    test_authority_with_rate(root, deletion, maximum_bytes, 0)
+    test_authority_with_policy(
+        root,
+        deletion,
+        maximum_bytes,
+        FilterPolicy::default(),
+        PublicationPolicy::AtomicStaged,
+    )
 }
 
 /// Maximum authenticated worker connections granted by the test
@@ -2390,7 +2396,6 @@ pub(crate) fn in_place_update_test_authority_for(root: &Path, entries: u64) -> R
         root,
         DeletionPolicy::Forbid,
         64 << 20,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::InPlaceUpdate,
     );
@@ -2399,27 +2404,10 @@ pub(crate) fn in_place_update_test_authority_for(root: &Path, entries: u64) -> R
     authority
 }
 
-fn test_authority_with_rate(
-    root: &Path,
-    deletion: DeletionPolicy,
-    maximum_bytes: u64,
-    max_file_data_bytes_per_second: u64,
-) -> RestrictedAuthority {
-    test_authority_with_policy(
-        root,
-        deletion,
-        maximum_bytes,
-        max_file_data_bytes_per_second,
-        FilterPolicy::default(),
-        PublicationPolicy::AtomicStaged,
-    )
-}
-
 fn test_authority_with_policy(
     root: &Path,
     deletion: DeletionPolicy,
     maximum_bytes: u64,
-    max_file_data_bytes_per_second: u64,
     filters: FilterPolicy,
     publication: PublicationPolicy,
 ) -> RestrictedAuthority {
@@ -2427,7 +2415,6 @@ fn test_authority_with_policy(
         root,
         deletion,
         maximum_bytes,
-        max_file_data_bytes_per_second,
         filters,
         publication,
         ExistingDestinationPolicy::Replace,
@@ -2533,7 +2520,6 @@ fn test_authority_with_existence(
     root: &Path,
     deletion: DeletionPolicy,
     maximum_bytes: u64,
-    max_file_data_bytes_per_second: u64,
     filters: FilterPolicy,
     publication: PublicationPolicy,
     existing: ExistingDestinationPolicy,
@@ -2544,7 +2530,6 @@ fn test_authority_with_existence(
         root,
         deletion,
         maximum_bytes,
-        max_file_data_bytes_per_second,
         filters,
         publication,
         existing,
@@ -2559,7 +2544,6 @@ fn test_authority_with_results(
     root: &Path,
     deletion: DeletionPolicy,
     maximum_bytes: u64,
-    max_file_data_bytes_per_second: u64,
     filters: FilterPolicy,
     publication: PublicationPolicy,
     existing: ExistingDestinationPolicy,
@@ -2571,7 +2555,6 @@ fn test_authority_with_results(
         root,
         deletion,
         maximum_bytes,
-        max_file_data_bytes_per_second,
         filters,
         publication,
         existing,
@@ -2589,7 +2572,6 @@ fn test_authority_with_options(
     root: &Path,
     deletion: DeletionPolicy,
     maximum_bytes: u64,
-    max_file_data_bytes_per_second: u64,
     mut filters: FilterPolicy,
     publication: PublicationPolicy,
     existing: ExistingDestinationPolicy,
@@ -2655,7 +2637,6 @@ fn test_authority_with_options(
             tcp_congestion: None,
             mapping: None,
             hashing: None,
-            max_file_data_bytes_per_second,
             filters,
             root_existence,
             receipt_policy,
@@ -2765,7 +2746,6 @@ fn receivers_protect_the_syq_a_receiving_service_follows() {
         &temporary.path().join("alias"),
         DeletionPolicy::Forbid,
         1024,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::AtomicStaged,
         ExistingDestinationPolicy::Replace,
@@ -3244,7 +3224,6 @@ fn signed_filters_bind_scans_mutations_and_prune_protection() {
         &root,
         DeletionPolicy::DeleteDestinationOnly,
         16,
-        0,
         policy.clone(),
         PublicationPolicy::AtomicStaged,
     );
@@ -3297,7 +3276,6 @@ fn signed_filters_bind_scans_mutations_and_prune_protection() {
         &root,
         DeletionPolicy::DeleteDestinationOnly,
         16,
-        0,
         FilterPolicy {
             ignore: policy.ignore,
             destination_roots: Vec::new(),
@@ -3341,7 +3319,6 @@ fn mixed_filter_mappings_keep_an_explicit_named_source_root() {
         &root,
         DeletionPolicy::Forbid,
         16,
-        0,
         FilterPolicy {
             ignore: vec!["cache/".into()],
             destination_roots,
@@ -3387,7 +3364,6 @@ fn signed_in_place_policies_admit_in_place_and_staged_file_mutations() {
             &root,
             DeletionPolicy::Forbid,
             16,
-            0,
             FilterPolicy::default(),
             policy,
         );
@@ -3427,7 +3403,6 @@ fn existence_authority(
         root,
         DeletionPolicy::DeleteDestinationOnly,
         1024,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::AtomicStaged,
         existing,
@@ -4434,7 +4409,6 @@ fn publication_removes_only_its_own_earlier_partials(deletion: DeletionPolicy) {
         &root,
         deletion,
         1024,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::AtomicStaged,
         ExistingDestinationPolicy::Skip,
@@ -5064,7 +5038,6 @@ fn existence_authority_with_results(
         root,
         DeletionPolicy::DeleteDestinationOnly,
         1024,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::AtomicStaged,
         ExistingDestinationPolicy::Replace,
@@ -5247,7 +5220,6 @@ fn observation_only_prepare_releases_absent_reservation_and_skips_lifecycle() {
         &root,
         DeletionPolicy::Forbid,
         4,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::AtomicStaged,
         ExistingDestinationPolicy::Replace,
@@ -5321,7 +5293,6 @@ fn older_observation_does_not_release_newer_real_reservation() {
         &root,
         DeletionPolicy::Forbid,
         4,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::AtomicStaged,
         ExistingDestinationPolicy::Replace,
@@ -5385,7 +5356,6 @@ fn results_count_directories_as_an_ordinary_copy_does() {
             &root,
             DeletionPolicy::Forbid,
             1024,
-            0,
             FilterPolicy::default(),
             PublicationPolicy::AtomicStaged,
             ExistingDestinationPolicy::Replace,
@@ -5441,7 +5411,6 @@ fn a_small_file_batch_with_links_reports_each_failed_write() {
         &root,
         DeletionPolicy::Forbid,
         1024,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::AtomicStaged,
         ExistingDestinationPolicy::Skip,
@@ -5682,7 +5651,6 @@ fn unfinished_in_place_files_are_reported_failed() {
             &root,
             DeletionPolicy::Forbid,
             1024,
-            0,
             FilterPolicy::default(),
             PublicationPolicy::InPlaceNew,
             ExistingDestinationPolicy::Replace,
@@ -5816,7 +5784,6 @@ fn a_refused_write_to_an_unfinished_file_lists_it_once() {
         &root,
         DeletionPolicy::Forbid,
         1024,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::InPlaceNew,
         ExistingDestinationPolicy::Replace,
@@ -5898,7 +5865,6 @@ fn in_place_final_step_honors_the_fingerprint_the_receiver_takes_after_the_write
             &root,
             DeletionPolicy::Forbid,
             1024,
-            0,
             FilterPolicy::default(),
             PublicationPolicy::InPlaceNew,
             ExistingDestinationPolicy::Replace,
@@ -6070,7 +6036,6 @@ fn in_place_publication_honors_every_existing_object_policy() {
             &root,
             DeletionPolicy::Forbid,
             1024,
-            0,
             FilterPolicy::default(),
             PublicationPolicy::InPlaceNew,
             existing,
@@ -6571,61 +6536,7 @@ fn signed_hash_block_and_response_bounds_are_enforced() {
 }
 
 #[test]
-fn signed_file_data_rate_is_enforced_across_requests() {
-    let temporary = crate::test_support::tempdir().unwrap();
-    let root = temporary.path().join("root");
-    fs::create_dir(&root).unwrap();
-    let authority = test_authority_with_rate(&root, DeletionPolicy::Forbid, 1024, 1024);
-    let target = root.join("target").as_os_str().as_bytes().to_vec();
-    let request = |off| Request::WriteRange {
-        path: target.clone(),
-        inplace: false,
-        copy_id: [0; 16],
-        attempt: 0,
-        off,
-        hash: [0; 32],
-        data: vec![0; 256].into(),
-    };
-
-    let mut prepare = Request::Prepare {
-        path: target.clone(),
-        size: 1024,
-        inplace: false,
-        copy_id: [0; 16],
-        mode: 0o600,
-        flags: 0,
-        acl: false,
-        scanned: crate::proto::ScannedDestination::Unknown,
-        attempt: 0,
-        create_if_missing: true,
-        group: None,
-        update: None,
-    };
-    authority.authorize(&mut prepare, false).unwrap();
-
-    let started = Instant::now();
-    authority.authorize(&mut request(0), false).unwrap();
-    authority.authorize(&mut request(256), false).unwrap();
-    assert!(
-        started.elapsed() >= std::time::Duration::from_millis(200),
-        "signed aggregate rate limit did not pace consecutive writes"
-    );
-
-    let mut oversized = request(0);
-    if let Request::WriteRange { data, .. } = &mut oversized {
-        *data = vec![0; 513].into();
-    }
-    assert_eq!(
-        authority
-            .authorize(&mut oversized, false)
-            .unwrap_err()
-            .to_string(),
-        "request exceeds the signed file-data rate-limit burst"
-    );
-}
-
-#[test]
-fn command_restricted_validation_accepts_a_signed_rate_limit() {
+fn command_restricted_validation_accepts_a_bandwidth_limit() {
     let mut args = Args::try_parse_from(["syq", "source", "destination"]).unwrap();
     args.normalize();
     args.bwlimit_bytes = 1024;
@@ -6933,7 +6844,6 @@ fn forbidden_deletion_keeps_the_unfiltered_scan_but_refuses_removals() {
         &root,
         DeletionPolicy::Forbid,
         16,
-        0,
         FilterPolicy {
             ignore: vec!["ignored/".into()],
             destination_roots: Vec::new(),
@@ -7343,12 +7253,6 @@ fn a_root_writer_is_refused_before_enrolling() {
 }
 
 #[test]
-fn only_enrolled_grants_leave_bandwidth_to_the_sender() {
-    assert!(enrolled_grant("c2lnbmVkLWdyYW50"));
-    assert!(!enrolled_grant("named-v2:route"));
-}
-
-#[test]
 fn native_comparison_block_size_sets_the_signed_receiver_limit() {
     let args = Args::parse_args(
         &[
@@ -7637,7 +7541,6 @@ fn hardlinks_need_the_signed_option_and_keep_to_the_existing_object_policy() {
             &root,
             DeletionPolicy::Forbid,
             1024,
-            0,
             FilterPolicy::default(),
             PublicationPolicy::AtomicStaged,
             existing,
@@ -8195,7 +8098,6 @@ fn a_stale_patch_holds_no_bytes_and_leaves_its_record_to_the_retry() {
         &root,
         DeletionPolicy::Forbid,
         8,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::AtomicStaged,
         ExistingDestinationPolicy::Replace,
@@ -8432,9 +8334,8 @@ fn grouped_patches_charge_their_new_data_and_hold_their_published_size() {
     let root = temporary.path().join("root");
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
-    let authority = test_authority_with_rate(&root, DeletionPolicy::Forbid, 200_000, 4096);
+    let authority = test_authority(&root, DeletionPolicy::Forbid, 200_000);
     let block = proto::MIN_HASH_BLOCK_BYTES;
-    let burst = authority.file_data_limit.as_ref().unwrap().burst_bytes() as usize;
     let len = block + 100;
     let patch = |name: &str, data: &[u8]| {
         small_patch(
@@ -8446,19 +8347,7 @@ fn grouped_patches_charge_their_new_data_and_hold_their_published_size() {
         )
     };
 
-    // Reused blocks are not charged against the rate limit; new data is,
-    // a whole batch within one burst.
-    let mut over = Request::PatchSmallBatch(vec![
-        patch("a", &vec![0; burst / 2 + 1]),
-        patch("b", &vec![0; burst / 2 + 1]),
-    ]);
-    assert_eq!(
-        authority
-            .authorize(&mut over, false)
-            .unwrap_err()
-            .to_string(),
-        "small-file batch exceeds the signed file-data rate-limit burst"
-    );
+    // Reused blocks are not charged as written data; new data is.
     let mut within = Request::PatchSmallBatch(vec![patch("a", &[0; 100])]);
     let settlement = authority.authorize(&mut within, false).unwrap();
     {
@@ -8566,7 +8455,6 @@ fn grouped_patch_results_list_published_and_failed_files() {
         &root,
         DeletionPolicy::Forbid,
         1024,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::AtomicStaged,
         ExistingDestinationPolicy::Replace,
@@ -8666,7 +8554,6 @@ fn a_failed_patch_is_listed_unless_the_senders_retry_settles_it() {
             &root,
             DeletionPolicy::Forbid,
             1024,
-            0,
             FilterPolicy::default(),
             PublicationPolicy::AtomicStaged,
             ExistingDestinationPolicy::Replace,
@@ -8769,7 +8656,6 @@ fn a_metadata_change_does_not_settle_a_failed_patch() {
             &root,
             DeletionPolicy::Forbid,
             1024,
-            0,
             FilterPolicy::default(),
             PublicationPolicy::AtomicStaged,
             ExistingDestinationPolicy::Replace,
@@ -8852,7 +8738,6 @@ fn data_corrupted_in_transit_is_listed_as_an_integrity_failure() {
         &root,
         DeletionPolicy::Forbid,
         1024,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::AtomicStaged,
         ExistingDestinationPolicy::Replace,
@@ -8991,7 +8876,6 @@ fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
     let block = proto::MIN_HASH_BLOCK_BYTES;
     let len = 64 * block;
     let old: Vec<u8> = (0..len).map(|i| (i % 233) as u8).collect();
-    // More new data than one rate-limit burst.
     let mut new = old.clone();
     new[..20 * block as usize].fill(1);
     new[40 * block as usize] ^= 1;
@@ -9000,13 +8884,11 @@ fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
     }
     let key = generate_results_key(EnrollmentId::random()).unwrap();
     let (secret, policy) = results_policy();
-    // 8 MiB/s: a burst of 1 MiB.
     let authority = std::sync::Arc::new(
         test_authority_with_results(
             &root,
             DeletionPolicy::Forbid,
             64 << 20,
-            8 << 20,
             FilterPolicy::default(),
             PublicationPolicy::AtomicStaged,
             ExistingDestinationPolicy::Replace,
@@ -9017,8 +8899,6 @@ fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
         .unwrap(),
     );
     let mut reader = start_results(&authority, secret);
-    let burst = authority.file_data_limit.as_ref().unwrap().burst_bytes();
-    assert_eq!(burst, 1 << 20);
     let mut ops = authority.test_ops();
     let paths: Vec<_> = ["refused", "published", "dropped"]
         .iter()
@@ -9137,8 +9017,8 @@ fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
         authority.state.lock().unwrap().reserved_bytes,
         reserved + len
     );
-    // A piece is charged as written data, within one rate-limit burst; a
-    // refused piece fails its patch, which then publishes nothing.
+    // A piece is charged as written data; a refused piece fails its patch,
+    // which then publishes nothing.
     let transferred = authority
         .transferred_bytes
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -9152,9 +9032,6 @@ fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
             .load(std::sync::atomic::Ordering::Relaxed),
         transferred + block
     );
-    let oversized = vec![0; burst as usize + 1];
-    let error = execute_on_connection(&mut gate, &mut ops, piece(&oversized)).unwrap_err();
-    assert!(error.contains("rate-limit burst"), "{error}");
     let error = execute_on_connection(&mut gate, &mut ops, piece(&data)).unwrap_err();
     assert!(
         error.contains("runs past the length its begin declared"),
@@ -9360,7 +9237,6 @@ impl ParityReceiver {
                 root,
                 DeletionPolicy::Forbid,
                 1 << 20,
-                0,
                 FilterPolicy::default(),
                 publication,
             );
@@ -9906,7 +9782,6 @@ fn both_receivers_update_in_place_only_files_they_vouch_for() {
                 &root,
                 DeletionPolicy::Forbid,
                 1 << 20,
-                0,
                 FilterPolicy::default(),
                 PublicationPolicy::InPlaceUpdate,
                 ExistingDestinationPolicy::Replace,
@@ -10081,7 +9956,6 @@ fn both_receivers_settle_each_file_of_an_in_place_batch_alike() {
                 &root,
                 DeletionPolicy::Forbid,
                 4 << 20,
-                0,
                 FilterPolicy::default(),
                 PublicationPolicy::InPlaceUpdate,
                 ExistingDestinationPolicy::Replace,
@@ -10280,7 +10154,6 @@ fn both_receivers_hold_leases_on_the_files_they_compared() {
                 &root,
                 DeletionPolicy::Forbid,
                 64 << 20,
-                0,
                 FilterPolicy::default(),
                 PublicationPolicy::AtomicStaged,
                 ExistingDestinationPolicy::Replace,
@@ -10440,7 +10313,6 @@ fn in_place_updates_need_a_grant_for_them() {
             &root,
             DeletionPolicy::Forbid,
             1 << 20,
-            0,
             FilterPolicy::default(),
             publication,
         );
@@ -10539,7 +10411,6 @@ fn in_place_work_needs_a_grant_that_replaces_and_creates() {
         &root,
         DeletionPolicy::Forbid,
         1 << 20,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::InPlaceNew,
         ExistingDestinationPolicy::MustExist,
@@ -10846,7 +10717,6 @@ fn link_authority(root: &Path, existing: ExistingDestinationPolicy) -> Restricte
         root,
         DeletionPolicy::DeleteDestinationOnly,
         1024,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::AtomicStaged,
         existing,
@@ -11176,7 +11046,6 @@ fn a_new_file_under_an_in_place_grant_is_staged_and_published_without_replacing(
         &root,
         DeletionPolicy::Forbid,
         1024,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::InPlaceNew,
         ExistingDestinationPolicy::Replace,
@@ -11275,7 +11144,6 @@ fn a_refused_in_place_preparation_keeps_a_new_file_staged() {
         &root,
         DeletionPolicy::Forbid,
         1024,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::InPlaceNew,
         ExistingDestinationPolicy::Replace,
@@ -11348,7 +11216,6 @@ fn a_new_file_inside_an_in_place_grant_is_staged_and_replaces_nothing() {
         &root,
         DeletionPolicy::Forbid,
         1024,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::InPlaceNew,
         ExistingDestinationPolicy::Replace,
@@ -11452,7 +11319,6 @@ fn an_in_place_as_new_root_that_exists_is_refused_and_unchanged() {
             &root,
             DeletionPolicy::Forbid,
             1024,
-            0,
             FilterPolicy::default(),
             PublicationPolicy::InPlaceNew,
             ExistingDestinationPolicy::Replace,
@@ -11750,7 +11616,6 @@ fn files_the_keep_policy_keeps_are_neither_refused_nor_failed() {
         &root,
         DeletionPolicy::Forbid,
         1024,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::AtomicStaged,
         ExistingDestinationPolicy::Skip,
@@ -11807,7 +11672,6 @@ fn small_copies_publish_through_a_restricted_receiver() {
             &root,
             DeletionPolicy::Forbid,
             1024,
-            0,
             FilterPolicy::default(),
             PublicationPolicy::AtomicStaged,
             ExistingDestinationPolicy::Replace,
@@ -12025,7 +11889,6 @@ fn follow_dst_copies_into_the_directory_a_destination_link_leads_to() {
             &root,
             DeletionPolicy::Forbid,
             1024,
-            0,
             FilterPolicy::default(),
             PublicationPolicy::AtomicStaged,
             ExistingDestinationPolicy::Replace,
@@ -12152,7 +12015,6 @@ fn follow_dst_creates_a_destination_that_does_not_exist_yet() {
         &root,
         DeletionPolicy::Forbid,
         1024,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::AtomicStaged,
         ExistingDestinationPolicy::Replace,
@@ -12245,7 +12107,6 @@ fn followed_destinations_reaching_control_files_are_refused_by_identity() {
         &root,
         DeletionPolicy::Forbid,
         1024,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::AtomicStaged,
         ExistingDestinationPolicy::Replace,
@@ -12356,7 +12217,6 @@ fn files_count_against_the_entry_limit_from_their_first_change() {
             &root,
             DeletionPolicy::Forbid,
             1024,
-            0,
             FilterPolicy::default(),
             if inplace {
                 PublicationPolicy::InPlaceNew
@@ -12535,7 +12395,6 @@ fn a_failed_small_copy_keeps_the_entries_its_staging_made() {
         &root,
         DeletionPolicy::Forbid,
         1024,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::AtomicStaged,
         ExistingDestinationPolicy::Replace,
@@ -12661,7 +12520,6 @@ fn an_in_place_preparation_that_only_looks_changes_nothing() {
         &root,
         DeletionPolicy::Forbid,
         1024,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::InPlaceNew,
     );
@@ -12722,7 +12580,6 @@ fn a_refused_preparation_keeps_the_count_another_still_shares() {
         &root,
         DeletionPolicy::Forbid,
         1024,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::InPlaceUpdate,
     );
@@ -12799,7 +12656,6 @@ fn followed_destinations_may_not_create_a_missing_control_directory() {
         &root,
         DeletionPolicy::Forbid,
         1024,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::AtomicStaged,
         ExistingDestinationPolicy::Replace,
@@ -12840,7 +12696,6 @@ fn a_symlinked_control_path_is_protected_where_it_leads() {
             &root,
             DeletionPolicy::Forbid,
             1024,
-            0,
             FilterPolicy::default(),
             PublicationPolicy::AtomicStaged,
             ExistingDestinationPolicy::Replace,
@@ -13170,7 +13025,6 @@ fn an_empty_destination_reached_through_links_is_known_empty() {
             &root,
             DeletionPolicy::Forbid,
             1024,
-            0,
             FilterPolicy::default(),
             PublicationPolicy::AtomicStaged,
             ExistingDestinationPolicy::Skip,
@@ -13406,7 +13260,6 @@ fn must_exist_updates_existing_files_in_place_and_creates_none() {
         &root,
         DeletionPolicy::Forbid,
         1024,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::InPlaceUpdate,
         ExistingDestinationPolicy::MustExist,
@@ -13440,7 +13293,6 @@ fn a_late_settlement_leaves_a_newer_reservations_count_alone() {
         &root,
         DeletionPolicy::Forbid,
         1024,
-        0,
         FilterPolicy::default(),
         PublicationPolicy::InPlaceUpdate,
     );

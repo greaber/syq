@@ -958,8 +958,9 @@ pub enum WireRequest<Data> {
         port_lo: u16,
         port_hi: u16,
         congestion_control: Option<String>,
-        /// Compressed source-response bytes per second across this listener.
-        /// Ordinary copies only; signed receiver limits remain independent.
+        /// Compressed source-response bytes per second across this listener,
+        /// for a source. A restricted destination sends no file data and
+        /// refuses it; a restricted source paces at the rate it approved.
         send_rate: Option<u64>,
     },
     /// `ignore`: gitignore-style patterns relative to `root` (see scan.rs).

@@ -26,14 +26,13 @@ syq cp data --to server --into backup --resource-limits bandwidth=10M
 Over SSH and TCP, this limits the bytes syq sends to 10 MiB/s across all
 workers. It counts compressed bytes, so compressible files can copy faster. A
 relay between two servers applies the rate to each leg separately. Local, S3
-and descriptor copies, and copies a receiving machine approves, count file data
-before compression.
+and descriptor copies count file data before compression.
 
-Buffering allows short bursts. For local, descriptor, and receiver-approved
-copies, [`bw-pacing`](tuning.md#transfer-controls) chooses how requests are
-spaced. S3 uploads can burst by up to one part, and copies between buckets
-aren't limited, since their data doesn't pass through this machine. A capped
-local copy uses normal copying instead of filesystem cloning.
+Buffering allows short bursts. For local and descriptor copies,
+[`bw-pacing`](tuning.md#transfer-controls) chooses how requests are spaced.
+S3 uploads can burst by up to one part, and copies between buckets aren't
+limited, since their data doesn't pass through this machine. A capped local
+copy uses normal copying instead of filesystem cloning.
 
 In `syq rsync`, `--bwlimit RATE` sets the same limit.
 
