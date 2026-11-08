@@ -139,11 +139,12 @@ running. The server running the copy needs `/bin/kill` and either `setsid` or
 
 With the default `--auth-from auto`, a `syq cp` between the machine you run it
 on and one SSH server first tries that machine's own SSH access. If SSH rejects
-the login, cannot verify the host key, cannot resolve the name, or is refused,
-syq asks the first available receiving machine, in alphabetical order of
-name, to approve just this copy. After a timeout, a temporary DNS failure, or
-any other SSH error, or with no receiving machine available, syq reports the
-SSH error. A refusal or failure on the receiving machine ends the copy.
+the login or cannot verify the host key, syq asks the first available
+receiving machine, in alphabetical order of name, to approve just this copy.
+The approved copy still connects from the machine you run it on, so after any
+other SSH error, such as a name that does not resolve, a refused connection or
+a timeout, or with no receiving machine available, syq reports the SSH error.
+A refusal or failure on the receiving machine ends the copy.
 
 Per-copy approval does not work with a root login on the other server,
 `--detach`, `--rsh`, `--syq-path`, `--no-bootstrap`, other `--peer-auth` or
@@ -165,9 +166,11 @@ cannot reach the other server, it goes through the server you run the command
 on, whose SSH server must then allow TCP forwarding.
 
 The server you run the command on then logs in to the other server's
-restricted receiver itself, with its own SSH configuration, and checks its
-host key as [hostA checks hostB's](security.md#how-hosta-checks-hostbs-key).
-The copy no longer needs the receiving machine, and stops when the command
+restricted receiver itself, with its own SSH configuration, so it must resolve
+that server's name and reach its SSH port directly, without a `ProxyJump`. It
+checks the host key as
+[hostA checks hostB's](security.md#how-hosta-checks-hostbs-key). From then
+on, the copy doesn't need the receiving machine, and stops when the command
 that started it ends. File data goes over direct encrypted TCP, or over SSH
 with `--no-tcp` or when TCP cannot connect.
 

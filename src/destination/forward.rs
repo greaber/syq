@@ -144,7 +144,7 @@ pub(super) fn select(
                 args.direct_destination = Some(Box::new(spec));
                 return Ok(None);
             }
-            Err(error) if crate::conn::is_ssh_authorization_fallback_error(&error) => error,
+            Err(error) if crate::conn::is_per_copy_approval_fallback_error(&error) => error,
             Err(error) => return Err(error),
         };
         let Some(found) = names.into_iter().find_map(|name| {
@@ -517,6 +517,20 @@ impl Account {
         })
     }
 
+    /// Restricted receivers do not run as root: refuse a copy `direction`
+    /// ("to" or "from") such an account before anything is asked or set up,
+    /// with `advice` for what to do instead. An account with another name
+    /// and user ID 0 is refused when enrolling.
+    pub(super) fn refuse_root(&self, direction: &str, advice: &str) -> Result<()> {
+        if self.login == "root" {
+            bail!(
+                "syq's restricted receiver does not run as root, so a copy {direction} {} cannot be approved for one copy; {advice}",
+                self.label()
+            );
+        }
+        Ok(())
+    }
+
     /// A dry run never sets up or updates restricted copying.
     pub(super) fn ready_for_dry_run(&self) -> Result<()> {
         let account = self.label();
@@ -663,6 +677,20 @@ impl Receiver {
             .as_deref()
             .map(|source| Account::find(source, &cancelled))
             .transpose()?;
+        match &source {
+            None => destination.refuse_root(
+                "to",
+                &format!(
+                    "copy to an ordinary account on {host}, or use the requesting server's own SSH access, or account access approved with `--auth-from @NAME` (`syq persist connect {host}`)",
+                    host = destination.endpoint.host
+                ),
+            )?,
+            Some(source) => {
+                let advice = "use an ordinary account there, or copy through the requesting server with `--coordinate-at local`, which needs account access to both servers";
+                source.refuse_root("from", advice)?;
+                destination.refuse_root("to", advice)?;
+            }
+        }
         if args.dry_run {
             for account in source.iter().chain([&destination]) {
                 account.ready_for_dry_run()?;
@@ -1649,6 +1677,48 @@ mod tests {
             assert!(receiver.approvals.snapshots().is_empty());
         }
         assert_eq!(receiver.forward_count.load(Ordering::Acquire), 0);
+    }
+
+    /// A root login on the destination is refused before anything is asked
+    /// or set up, with advice that fits an upload.
+    #[test]
+    fn a_root_destination_is_refused_before_the_prompt() {
+        let root = crate::test_support::tempdir().unwrap();
+        let (_broker, receiver, registration, _) = broker(root.path(), Approval::Always);
+        let source = root.path().as_os_str().as_bytes().to_vec();
+        let command = [b"cp".to_vec(), b"--src".to_vec(), source]
+            .into_iter()
+            .chain(
+                ["--to", "root@backup", "--into", "output"]
+                    .iter()
+                    .map(|arg| arg.as_bytes().to_vec()),
+            )
+            .collect();
+        let error = exchange(
+            &registration,
+            Message::Forward(Box::new(ForwardRequest {
+                source: None,
+                target: "root@backup".into(),
+                command,
+                cwd: String::new(),
+                inputs: crate::directive::Inputs::default(),
+                results_key: None,
+            })),
+            Duration::from_secs(2),
+            Some(Duration::from_secs(2)),
+        )
+        .err()
+        .unwrap();
+        let message = format!("{error:#}");
+        for expected in [
+            "does not run as root",
+            "a copy to root@backup",
+            "copy to an ordinary account on backup",
+        ] {
+            assert!(message.contains(expected), "{expected}: {message}");
+        }
+        assert!(!message.contains("--coordinate-at"), "{message}");
+        assert!(receiver.approvals.snapshots().is_empty());
     }
 
     #[test]

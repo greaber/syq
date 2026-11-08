@@ -393,7 +393,13 @@ fn admit(
     let canonical_home = fs::canonicalize(&home)
         .with_context(|| format!("resolve receiver home {}", home.display()))?;
     let protected = receiver_control_paths(&canonical_home, None, ControlPaths::Here)?;
-    let (rules, verified) = verify_rules(state, config, (generation, build), directive, &home)?;
+    let (rules, verified) = verify_rules(
+        state,
+        config,
+        (generation, build),
+        directive,
+        (&home, &canonical_home),
+    )?;
     drop(slot);
     let (grant, constraints) = match rules {
         Rules::Destination(rules) => *rules,
@@ -443,12 +449,14 @@ fn admit(
 /// Verify a new copy's directive and derive its rules for the end of the
 /// copy it is signed for, recording it as used only when everything passes.
 /// A coordinating source's directive comes only with its destination's.
+/// `home` is the account's home directory as it is named, and where it
+/// really is, with symlinks resolved.
 pub(super) fn verify_rules(
     state: &Path,
     config: &ReceiverEnrollment,
     receiver: (u64, &str),
     directive: &[u8],
-    home: &Path,
+    (home, canonical_home): (&Path, &Path),
 ) -> Result<(Rules, delegation::VerifiedDirective)> {
     verify_with(
         state,
@@ -460,7 +468,8 @@ pub(super) fn verify_rules(
                 crate::directive::destination_rules(directive, home)?,
             ))),
             crate::directive::Role::Source => Ok(Rules::Source(crate::directive::source_rules(
-                directive, home,
+                directive,
+                canonical_home,
             )?)),
             crate::directive::Role::CoordinatingSource(_) => {
                 bail!("a coordinating source's directive comes with its destination's")

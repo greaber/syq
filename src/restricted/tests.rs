@@ -1175,7 +1175,7 @@ fn a_source_directive_is_admitted_only_for_what_its_command_reads() {
         ),
     ];
     for (directive, home, expected) in refused {
-        let Err(error) = verify_rules(&state, &config, receiver, &directive, home) else {
+        let Err(error) = verify_rules(&state, &config, receiver, &directive, (home, home)) else {
             panic!("a directive was admitted: {expected}");
         };
         assert!(format!("{error:#}").contains(expected), "{error:#}");
@@ -1191,22 +1191,25 @@ fn a_source_directive_is_admitted_only_for_what_its_command_reads() {
         "{error:#}"
     );
     assert_eq!(recorded(), 0);
+    // Relative paths start where the home really is, not where its name
+    // leads through links.
+    let resolved_home = temporary.path().join("resolved-home");
     let (Rules::Source(reads), _) =
-        verify_rules(&state, &config, receiver, &source, &home).unwrap()
+        verify_rules(&state, &config, receiver, &source, (&home, &resolved_home)).unwrap()
     else {
         panic!("a source's directive derived a destination's rules");
     };
     assert_eq!(reads.base.path.as_deref(), Some(&b"projects"[..]));
     assert_eq!(
         reads.resolved_base.as_deref(),
-        Some(home.join("projects").as_os_str().as_bytes())
+        Some(resolved_home.join("projects").as_os_str().as_bytes())
     );
     assert_eq!(reads.selections[0].path, b"data");
     assert_eq!(reads.limits.max_total_bytes, 4096);
     assert_eq!(reads.limits.max_entries, 10);
     assert_eq!(reads.limits.max_deletions, 0);
     assert_ne!(recorded(), 0);
-    let error = verify_rules(&state, &config, receiver, &source, &home)
+    let error = verify_rules(&state, &config, receiver, &source, (&home, &home))
         .err()
         .unwrap();
     assert!(format!("{error:#}").contains("already"), "{error:#}");

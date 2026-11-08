@@ -475,6 +475,18 @@ pub(crate) fn is_ssh_authorization_fallback_error(error: &anyhow::Error) -> bool
     ssh_authorization_failure(error).is_some()
 }
 
+/// Whether a receiving machine's approval of this one copy can get past
+/// `error`: ssh refused this machine's login, or could not verify the host's
+/// key. This machine still dials the server itself for the approved copy, so
+/// a name it cannot resolve, or a connection the server refuses, fails that
+/// copy too.
+pub(crate) fn is_per_copy_approval_fallback_error(error: &anyhow::Error) -> bool {
+    matches!(
+        ssh_authorization_failure(error),
+        Some(SshLoginFailure::Credentials | SshLoginFailure::HostKey)
+    )
+}
+
 /// The recognized SSH failure that permits asking another machine.
 pub(crate) fn ssh_authorization_failure(error: &anyhow::Error) -> Option<SshLoginFailure> {
     error.chain().find_map(|cause| {

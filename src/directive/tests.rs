@@ -777,6 +777,11 @@ fn a_sources_reads_come_from_the_signed_command() {
         .unwrap_err()
         .to_string()
         .contains("mapping does not match"));
-    // SSH data is not a reason to refuse it.
-    source_rules(&source_directive(&[ROUTE_4, &["--no-tcp"]].concat()), home).unwrap();
+    // SSH data is not a reason to refuse it, and then the source starts no
+    // TCP listener either.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    assert!(reads.policy(deadline).tcp.is_some());
+    let ssh_only =
+        source_rules(&source_directive(&[ROUTE_4, &["--no-tcp"]].concat()), home).unwrap();
+    assert!(ssh_only.policy(deadline).tcp.is_none());
 }

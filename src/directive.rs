@@ -434,9 +434,12 @@ pub(crate) fn destination_rules(
     ))
 }
 
-/// What the source of `directive` may read, on an account whose home is
-/// `home`: the sources its command names, read from its -C or --root
-/// directory there, which is in `home` unless it is absolute. The receiver
+/// What the source of `directive` may read, on an account whose home
+/// directory is at `home`, with any symlinks on its way resolved: the
+/// sources its command names, read from its -C or --root directory there,
+/// which is in the home unless it is absolute. A login starts in its home
+/// directory without walking the path that names it, so the command's
+/// symlink policy applies only to the paths the command gives. The receiver
 /// and the signing machine both call this, as for a destination's rules.
 pub(crate) fn source_rules(
     directive: &Directive,
@@ -461,7 +464,7 @@ pub(crate) fn source_rules(
     }
     // The receiver works in its state directory, so relative paths start in
     // the home directory, as they do for the account's own logins. A leading
-    // `~` is the home directory already.
+    // `~` is the home directory already, as `HOME` names it, as for a login.
     let base = request.base.path.as_deref();
     if !base.is_some_and(|base| base.starts_with(b"/") || base == b"~" || base.starts_with(b"~/")) {
         let home = home.as_os_str().as_bytes();
@@ -470,6 +473,8 @@ pub(crate) fn source_rules(
             Some(base) => crate::fsops::join(home, base),
         });
     }
+    // A copy approved without TCP gets no listener on the source either.
+    request.no_tcp = args.no_tcp;
     request.validate()?;
     Ok(request)
 }

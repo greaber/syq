@@ -29,6 +29,10 @@ pub(crate) struct PullRequest {
     /// Never sent: only the reading server sets it.
     #[serde(skip)]
     pub resolved_base: Option<Vec<u8>>,
+    /// Whether the command copies without TCP, so the reader starts no
+    /// listener for it. Never sent: only a source directive's rules set it.
+    #[serde(skip)]
+    pub no_tcp: bool,
 }
 
 /// A server's request to approve a copy from another server to itself,
@@ -168,6 +172,7 @@ pub(crate) fn source_request(args: &crate::cli::Args) -> Result<PullRequest> {
             max_deletions: 0,
         },
         resolved_base: None,
+        no_tcp: false,
     };
     request.validate()?;
     Ok(request)
@@ -201,7 +206,7 @@ impl PullRequest {
             preservation: self.preservation,
             sparse: self.sparse,
             compressed: self.compressed,
-            tcp: Some(SourceTcpPolicy {
+            tcp: (!self.no_tcp).then(|| SourceTcpPolicy {
                 port_lo: self.tcp_ports.0,
                 port_hi: self.tcp_ports.1,
                 congestion_control: self.tcp_congestion.clone(),
@@ -273,7 +278,7 @@ pub(super) fn select(
                 args.direct_source = Some(Box::new(spec));
                 return Ok(None);
             }
-            Err(error) if crate::conn::is_ssh_authorization_fallback_error(&error) => error,
+            Err(error) if crate::conn::is_per_copy_approval_fallback_error(&error) => error,
             Err(error) => return Err(error),
         };
         let Some(found) = names.into_iter().find_map(|name| {
@@ -445,6 +450,13 @@ impl Receiver {
                 || requester_closed(&socket)
         };
         let source = forward::Account::find(&target, &cancelled)?;
+        source.refuse_root(
+            "from",
+            &format!(
+                "download from an ordinary account on {host}, or use the requesting server's own SSH access, or account access approved with `--auth-from @NAME` (`syq persist connect {host}`)",
+                host = forward::target_endpoint(&target)?.host
+            ),
+        )?;
         if args.dry_run {
             source.ready_for_dry_run()?;
         }
@@ -620,6 +632,41 @@ mod tests {
         assert_eq!(receiver.forward_count.load(Ordering::Acquire), 0);
     }
 
+    /// A root login on the source is refused before anything is asked or set
+    /// up, a dry run too, with advice that fits a download.
+    #[test]
+    fn a_root_source_is_refused_before_the_prompt() {
+        let root = crate::test_support::tempdir().unwrap();
+        let (_broker, receiver, registration, _) = broker(root.path(), Approval::Always);
+        for extra in [&[][..], &["--dry-run"]] {
+            let command = ["cp", "--from", "root@backup"]
+                .iter()
+                .chain(extra)
+                .chain(&["--src", "selected", "--as", "output"])
+                .map(|arg| arg.as_bytes().to_vec())
+                .collect();
+            let error = exchange(
+                &registration,
+                read_request("root@backup", command),
+                Duration::from_secs(2),
+                Some(Duration::from_secs(2)),
+            )
+            .err()
+            .unwrap();
+            let message = format!("{error:#}");
+            for expected in [
+                "does not run as root",
+                "a copy from root@backup",
+                "download from an ordinary account on backup",
+            ] {
+                assert!(message.contains(expected), "{expected}: {message}");
+            }
+            assert!(!message.contains("--coordinate-at"), "{message}");
+            assert!(!message.contains("dry run"), "{message}");
+            assert!(receiver.approvals.snapshots().is_empty());
+        }
+    }
+
     #[test]
     fn source_needs_its_own_decision_even_when_copies_are_automatically_approved() {
         for revoke in [false, true] {
@@ -657,6 +704,9 @@ mod tests {
             assert!(description.contains("Filters narrow the copy"));
             assert!(description.contains("exact non-directory"));
             assert!(description.contains("restricted copying on \"backup\""));
+            // Approving sets up the source, but the copy itself only reads.
+            assert!(description.contains("The copy only reads"), "{description}");
+            assert!(!description.contains("is changed"), "{description}");
             for old in [Kind::Copy, Kind::Command, Kind::Ssh, Kind::Storage] {
                 assert!(receiver.approvals.decide(&pending.id, true, old).is_err());
             }

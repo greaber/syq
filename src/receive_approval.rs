@@ -1392,7 +1392,7 @@ impl Queue {
             ),
             _ => String::new(),
         };
-        let permission = format!("May list and read the selected directory trees or exact non-directory entries. Filters narrow the copy, not this read permission.{root} The files go directly to the server that asks; nothing on {target:?} is changed. {}.", setup_text(target, enrollment));
+        let permission = format!("May list and read the selected directory trees or exact non-directory entries. Filters narrow the copy, not this read permission.{root} The files go directly to the server that asks. The copy only reads: it cannot write or remove anything on {target:?}. {}.", setup_text(target, enrollment));
         let mut notes = vec![
             permission.clone(),
             "Read authority ends when this copy closes, or after seven days.".into(),

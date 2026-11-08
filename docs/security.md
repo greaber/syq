@@ -490,8 +490,9 @@ A server can also ask your laptop to approve a download from another server,
 hostB, to itself. Your laptop shows the command and each source as hostB will
 read it, sets up or updates hostB's enrollment when needed, and signs the
 command for hostB's receiver as the copy's source. The server logs in to that
-receiver with hostB's entry key, checking hostB's host key as hostA checks
-hostB's. The receiver checks the signature as for a destination, and then
+receiver with hostB's entry key, checking hostB's host key as
+[hostA checks hostB's](#how-hosta-checks-hostbs-key), and keeps the entry key
+afterwards. The receiver checks the signature as for a destination, and then
 reads only the files and directory trees the command names, with the symlink
 behavior the command chose, accepts no writes or removals, and limits the file
 data, entries, and connections it returns to the command's and your laptop's

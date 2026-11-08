@@ -193,9 +193,9 @@ def main():
                         + " bs=1M count=4 status=none | sha256sum").split()[0]
         attempts = {}
 
-        def command(name, extra=(), source="data", binary="syq", tcp=False):
+        def command(name, extra=(), source="data", binary="syq", tcp=False, path=None):
             attempts[name] = attempts.get(name, 0) + 1
-            argv = [binary, "cp", "--from", "destination", files + "/" + source,
+            argv = [binary, "cp", "--from", "destination", path or files + "/" + source,
                     "--as", into + "/" + name, "--auth-from", "auto", "--no-progress",
                     "--performance-tuning", "workers=2",
                     "--results", f"{into}/{name}.{attempts[name]}.ndjson", *extra]
@@ -271,6 +271,20 @@ def main():
         copied("ssh-only")
         assert "syq-copy-worker" not in authorized_keys()
 
+        print("case: relative and ~/ sources are read from the source account's home", flush=True)
+        # The receiver works in its state directory, yet reads these where
+        # the account's own login would.
+        home_dir = Path(files).name
+        remote("destination", "mkdir ~/" + shlex.quote(home_dir) + " && cp "
+               + shlex.quote(files + "/data") + " ~/" + shlex.quote(home_dir) + "/data")
+        roots["home"] = home_dir
+        for name, path in [("relative", home_dir + "/data"), ("tilde", "~/" + home_dir + "/data")]:
+            with running(command(name, path=path)) as (process, output):
+                request = decide()
+                assert any("destination:" + path in scope for scope in request["scopes"]), request
+                finish(process, output)
+            copied(name)
+
         print("case: blocked TCP falls back to SSH", flush=True)
         blocked = os.environ["SYQ_REAL_SSH_BLOCKED_TCP_PORT"]
         with running(command("blocked", ("--tcp-ports", f"{blocked}-{blocked}"))) as (process, output):
@@ -324,6 +338,8 @@ def main():
         assert terminal["bytes_unchanged"] >= 4 << 20, terminal
         print("Source downloads passed", flush=True)
     finally:
+        if "home" in roots:
+            remote("destination", "rm -rf -- ~/" + shlex.quote(roots.pop("home")))
         for host, root in roots.items():
             remote(host, "rm -rf -- " + shlex.quote(root))
 
