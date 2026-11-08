@@ -166,7 +166,8 @@ impl Admission {
 
     /// Read exactly one frame from `input` by `deadline`, and nothing after
     /// it: what follows belongs to the session. A frame from another build,
-    /// in this format or an earlier one, is refused as [`OtherBuild`] first.
+    /// in this format or an earlier one, is refused as [`OtherBuild`] first,
+    /// except a worker joining a running copy.
     /// Nothing else in the frame is interpreted here: each field is read
     /// into a buffer of its own, bounded by its kind and by the frame's
     /// length, so a session holds at most one frame's bytes until its
@@ -185,7 +186,8 @@ impl Admission {
             .read_exact(&mut length)
             .context("read the session's first frame")?;
         let length = u32::from_be_bytes(length) as usize;
-        // Another build's frame is refused as that, whatever its length.
+        // Another build's frame is refused as that, whatever its length,
+        // unless it is a worker's (below).
         let mut magic = [0u8; FRAME_MAGIC.len()];
         if length < magic.len() {
             return Err(OtherBuild::refuse(None).into());
@@ -513,9 +515,9 @@ impl std::error::Error for Refused {}
 /// The exit status of a copy the receiver [`Refused`].
 pub(crate) const REFUSED_EXIT: i32 = 74;
 
-/// A session from another syq build than the receiver's, refused before
-/// anything it sent was read but its build, or a copy approved for another
-/// build. Nothing is recorded. The receiver prints why and exits with
+/// A session starting a copy from another syq build than the receiver's,
+/// refused before anything it sent was read but its build and kind, or a
+/// copy approved for another build. Nothing is recorded. The receiver prints why and exits with
 /// [`OTHER_BUILD_EXIT`]; a client that sees that status reports this error,
 /// which no retry on its own can fix: one of the two builds must change.
 #[derive(Debug)]
