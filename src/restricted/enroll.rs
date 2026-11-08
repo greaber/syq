@@ -508,11 +508,6 @@ pub(super) fn enroll(
     refresh: bool,
     check: DestinationCheck<'_>,
 ) -> Result<(LocalEnrollment, PathBuf, Option<LoginSigner>)> {
-    // The receiver refuses to run as root; say so before creating anything.
-    // An account with another name and user ID 0 is refused when installing.
-    if login == "root" {
-        bail!(privileged_receiver_message(None));
-    }
     let base = local_state_base()?;
     let base_lock = open_directory(&base)?;
     lock_directory(&base_lock)?;

@@ -146,8 +146,8 @@ other SSH error, such as a name that does not resolve, a refused connection or
 a timeout, or with no receiving machine available, syq reports the SSH error.
 A refusal or failure on the receiving machine ends the copy.
 
-Per-copy approval does not work with a root login on the other server,
-`--detach`, `--rsh`, `--syq-path`, `--no-bootstrap`, other `--peer-auth` or
+Per-copy approval does not work for an upload to a root login, or a copy
+between two servers from one, nor with `--detach`, `--rsh`, `--syq-path`, `--no-bootstrap`, other `--peer-auth` or
 `--coordinate-at` values, or `--no-tcp-encryption`, and an approved upload
 cannot preserve hard links, ACLs, extended attributes, or access or birth
 times, or use `--open-noatime` or `--sparse`. Such copies need this machine's

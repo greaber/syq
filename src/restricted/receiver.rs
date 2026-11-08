@@ -253,7 +253,7 @@ pub(crate) struct Coordinating {
 /// read the first frame, and then either verify a new copy's directive or
 /// hand the session to the running copy whose worker ticket it shows.
 pub(crate) fn admit_session(enrollment: &str, generation: &str) -> Result<Session> {
-    refuse_privileged_receiver(Some(enrollment))?;
+    let enrollment_name = enrollment;
     let enrollment = EnrollmentId::parse(enrollment)?;
     let generation: u64 = generation
         .parse()
@@ -288,6 +288,7 @@ pub(crate) fn admit_session(enrollment: &str, generation: &str) -> Result<Sessio
             (generation, crate::identity::build()),
             &directive,
             slot,
+            enrollment_name,
         ),
         Admission::Coordinate(frame) => Ok(Session::Coordinate(admit_coordinator(
             &state,
@@ -295,6 +296,7 @@ pub(crate) fn admit_session(enrollment: &str, generation: &str) -> Result<Sessio
             (generation, crate::identity::build()),
             frame,
             slot,
+            enrollment_name,
         )?)),
     }
 }
@@ -309,7 +311,11 @@ fn admit_coordinator(
     receiver: (u64, &str),
     frame: Box<Coordinate>,
     slot: UnverifiedSlot,
+    enrollment: &str,
 ) -> Result<Box<Coordinating>> {
+    // A coordinating source runs the copy, so it is held to a destination's
+    // rule.
+    refuse_privileged_receiver(Some(enrollment))?;
     let observed_state = fs::symlink_metadata(state).context("inspect receiver enrollment")?;
     let (_, home) = current_account()?;
     let (coordinating, verified) = verify_coordination(state, config, receiver, &frame)?;
@@ -387,6 +393,7 @@ fn admit(
     (generation, build): (u64, &str),
     directive: &[u8],
     slot: UnverifiedSlot,
+    enrollment: &str,
 ) -> Result<Session> {
     let observed_state = fs::symlink_metadata(state).context("inspect receiver enrollment")?;
     let (_, home) = current_account()?;
@@ -402,7 +409,13 @@ fn admit(
     )?;
     drop(slot);
     let (grant, constraints) = match rules {
-        Rules::Destination(rules) => *rules,
+        // Writing as root could set any owner, create device files or write
+        // privileged attributes; reading as root reads only what the signed
+        // command names.
+        Rules::Destination(rules) => {
+            refuse_privileged_receiver(Some(enrollment))?;
+            *rules
+        }
         Rules::Source(reads) => {
             // Reads follow the signed command, as the account's own would:
             // the approving machine's prompt showed what it names.

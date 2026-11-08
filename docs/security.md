@@ -199,7 +199,8 @@ The protection has four parts:
 1. **A restricted entry point on hostB.** The first copy uses your normal SSH
    login to install syq's receiver and add one `authorized_keys` line, whose
    entry key can only start the receiver, with SSH forwarding disabled. The
-   receiver refuses to run as root.
+   receiver refuses to write as root; a download from a root login only
+   reads what the copy names.
 2. **Only the entry key for hostA.** With each copy, hostA receives the entry
    key and uses it to reach the receiver, checking hostB's host key as described
    [below](#how-hosta-checks-hostbs-key). The entry key authorizes nothing by

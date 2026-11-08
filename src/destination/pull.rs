@@ -450,14 +450,8 @@ impl Receiver {
                 || requester_closed(&socket)
         };
         let source = forward::Account::find(&target, &cancelled)?;
-        source.refuse_root(
-            "from",
-            &format!(
-                "download from an ordinary account on {host}, or use the requesting server's own SSH access, or account access approved with `syq persist connect {account} --auth-from @NAME`",
-                host = forward::target_endpoint(&target)?.host,
-                account = source.label()
-            ),
-        )?;
+        // A source only reads, so a root login can serve a download too:
+        // the receiver refuses root only where it would write.
         if args.dry_run {
             source.ready_for_dry_run()?;
         }
@@ -633,39 +627,56 @@ mod tests {
         assert_eq!(receiver.forward_count.load(Ordering::Acquire), 0);
     }
 
-    /// A root login on the source is refused before anything is asked or set
-    /// up, a dry run too, with advice that fits a download.
+    /// A root login on the source only reads, so its download is asked
+    /// about like any other.
     #[test]
-    fn a_root_source_is_refused_before_the_prompt() {
+    fn a_root_source_is_asked_about() {
         let root = crate::test_support::tempdir().unwrap();
         let (_broker, receiver, registration, _) = broker(root.path(), Approval::Always);
-        for extra in [&[][..], &["--dry-run"]] {
-            let command = ["cp", "--from", "root@backup"]
-                .iter()
-                .chain(extra)
-                .chain(&["--src", "selected", "--as", "output"])
-                .map(|arg| arg.as_bytes().to_vec())
-                .collect();
-            let error = exchange(
+        let task = std::thread::spawn(move || {
+            let command = [
+                "cp",
+                "--from",
+                "root@backup",
+                "--src",
+                "selected",
+                "--as",
+                "output",
+            ]
+            .iter()
+            .map(|arg| arg.as_bytes().to_vec())
+            .collect();
+            exchange(
                 &registration,
                 read_request("root@backup", command),
-                Duration::from_secs(2),
-                Some(Duration::from_secs(2)),
+                Duration::from_secs(3),
+                Some(Duration::from_secs(3)),
             )
-            .err()
-            .unwrap();
-            let message = format!("{error:#}");
-            for expected in [
-                "does not run as root",
-                "a copy from root@backup",
-                "download from an ordinary account on backup",
-            ] {
-                assert!(message.contains(expected), "{expected}: {message}");
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let pending = loop {
+            if let Some(summary) = receiver.approvals.snapshots().first() {
+                break summary.clone();
             }
-            assert!(!message.contains("--coordinate-at"), "{message}");
-            assert!(!message.contains("dry run"), "{message}");
-            assert!(receiver.approvals.snapshots().is_empty());
-        }
+            if task.is_finished() {
+                panic!(
+                    "root source request ended: {:?}",
+                    task.join().unwrap().err()
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "root source approval did not become pending"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        use crate::receive_approval::Kind;
+        assert_eq!(pending.kind(), Kind::Source);
+        receiver
+            .approvals
+            .decide(&pending.id, false, Kind::Source)
+            .unwrap();
+        assert!(task.join().unwrap().is_err());
     }
 
     #[test]
