@@ -94,8 +94,17 @@ pub(super) fn select(
             // The provider approves this copy once the command has read its
             // inputs (`prepare_through_provider`). Refuse here, before that,
             // what it would refuse in the command alone.
-            eligible_peer(args)?;
-            handoff::refuse_unsupported_preservation(args)?;
+            eligible_peer(args)
+                .and_then(|_| handoff::refuse_unsupported_preservation(args))
+                .map_err(|error| {
+                    // The provider's account access can relay such a copy
+                    // through this machine, but not with a command of the
+                    // user's own (`account_copy::approved_operation`).
+                    if args.rsh.is_some() {
+                        return error;
+                    }
+                    anyhow::anyhow!("{error:#}; to copy through this machine with the provider's account access instead, try --coordinate-at local")
+                })?;
             return Ok(None);
         }
         crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Ssh { .. }) => {
@@ -332,6 +341,9 @@ fn ask_provider(
 ) -> Result<Reply> {
     let domain = crate::persistence::Domain::select(args.pscope.as_deref())?;
     let binding = super::ssh::provider::resolve_connection(&domain, provider)?;
+    // Another syq build must not replace the connection while the provider
+    // decides and sets the copy up.
+    let _using = super::ssh::provider::hold_use(&domain, provider)?;
     let mut stream = super::ssh::provider::open(
         &domain,
         provider,
@@ -2302,7 +2314,7 @@ mod tests {
             let description =
                 pending.description(&crate::persistence::Domain::default(), str::to_owned);
             for expected in [
-                "From: \"a server logged in to provider account alice (receiving profile @laptop)\"",
+                "From: \"a server logged in to provider account alice (provider profile @laptop)\"",
                 "syq can't confirm which server is asking: any machine that can log in to provider account alice over SSH can send this request",
                 "\"reader@source-host\" runs the copy",
                 "\"~/output\" on \"backup\"",

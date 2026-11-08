@@ -107,7 +107,12 @@ impl Requester {
 }
 impl std::fmt::Display for Requester {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} (receiving profile @{})", self.server, self.profile)
+        // As a provider's account-access prompts name it.
+        let kind = match self.provider_account {
+            Some(_) => "provider",
+            None => "receiving",
+        };
+        write!(f, "{} ({kind} profile @{})", self.server, self.profile)
     }
 }
 

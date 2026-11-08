@@ -468,6 +468,41 @@ impl Drop for OwnedRecord {
 /// nothing uses them (`persistent::request_close_if_idle`).
 const CLOSE_ANSWER: Duration = Duration::from_secs(3);
 
+/// A request this build sends over its provider connection that no account
+/// connection carries, such as a copy's approval. Until it is dropped,
+/// another build does not stop the connection's keeper to replace it
+/// (`requests_use`).
+pub(crate) struct Use(#[allow(dead_code)] File);
+
+/// Mark `provider`'s connection in use until the returned `Use` is dropped:
+/// a shared lock on its `.use` file. Take it once the connection is this
+/// build's (`resolve_connection`), or it would keep this build waiting.
+pub(crate) fn hold_use(domain: &Domain, provider: &Provider) -> Result<Use> {
+    directory(domain)?;
+    let file = lock_file(&record_path(domain, provider)?.with_extension("use"), true)?;
+    // Others hold it exclusively only for a moment, to test it.
+    while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error.into());
+        }
+    }
+    Ok(Use(file))
+}
+
+/// Whether a request holds `provider`'s connection (`hold_use`); when that
+/// cannot be told, it might.
+fn requests_use(domain: &Domain, provider: &Provider) -> bool {
+    let Ok(path) = record_path(domain, provider) else {
+        return true;
+    };
+    match lock_file(&path.with_extension("use"), false) {
+        Ok(file) => lock_is_available(file).map_or(true, |available| !available),
+        Err(error) if missing(&error) => false,
+        Err(_) => true,
+    }
+}
+
 /// What became of a keeper this build cannot use.
 #[derive(Debug, PartialEq, Eq)]
 enum OtherKeeper {
@@ -549,7 +584,7 @@ fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
         if other != OtherKeeper::Stopping && Instant::now() >= next_look {
             next_look = Instant::now() + Duration::from_secs(5);
             other = stop_other_build_keeper(domain, provider, || {
-                persistent::uses_provider(domain, provider)
+                persistent::uses_provider(domain, provider) || requests_use(domain, provider)
             })?;
             if let OtherKeeper::InUse { build } = &other {
                 // Those nothing uses end, and are opened again on their
@@ -563,7 +598,7 @@ fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
                 } else {
                     persistent::withdraw_close_requests(&std::mem::take(&mut asked.1));
                     let in_use = format!(
-                        "the connection to {} that syq {build} opened is still in use by an account connection, approved or waiting for approval, and serves only that version",
+                        "the connection to {} that syq {build} opened is still in use by an account connection or a request waiting for approval, and serves only that version",
                         provider.label()
                     );
                     // In the default domain such a connection does not end
@@ -583,7 +618,7 @@ fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
         if Instant::now() >= deadline {
             if let OtherKeeper::InUse { build } = &other {
                 bail!(
-                    "the connection to {} that syq {build} opened is still in use by an account connection, approved or waiting for approval; finish what uses it, or close both with `{off}`, then retry",
+                    "the connection to {} that syq {build} opened is still in use by an account connection or a request waiting for approval; finish what uses it, or close both with `{off}`, then retry",
                     provider.label()
                 );
             }
@@ -1114,12 +1149,26 @@ pub(crate) fn cleanup_domain(domain: &Domain) -> Result<()> {
         for entry in fs::read_dir(index(domain))? {
             let path = entry?.path();
             anyhow::ensure!(
-                entry_key(&path, "lock") || entry_key(&path, "stop"),
+                entry_key(&path, "lock") || entry_key(&path, "stop") || entry_key(&path, "use"),
                 "unrecognized SSH provider state: {}",
                 path.display()
             );
             let file = lock_file(&path, false)?;
-            anyhow::ensure!(try_lock(&file)?, "SSH provider keeper is still active");
+            // A request through a keeper that has just stopped lets go of
+            // its use once it sees the connection end.
+            let deadline = Instant::now()
+                + if entry_key(&path, "use") {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::ZERO
+                };
+            while !try_lock(&file)? {
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "SSH provider keeper is still active"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
             fs::remove_file(path)?;
         }
         fs::remove_dir(index(domain))?;
@@ -1282,6 +1331,44 @@ mod tests {
         assert!(stop.exists());
         // The keeper ends at its next look at its record.
         assert!(!active(&domain, &record));
+    }
+
+    /// A copy's request waiting for the provider's decision through a keeper
+    /// another build left keeps it from being stopped, as an account
+    /// connection does; once the request ends, it is stopped, and cleanup
+    /// removes the use file.
+    #[test]
+    fn a_waiting_request_keeps_another_builds_keeper_until_it_ends() {
+        let (_root, domain, mut record) = cleanup_fixture();
+        let stop = record_path(&domain, &record.provider)
+            .unwrap()
+            .with_extension("stop");
+        record.build = "v0.0.1+other-build".into();
+        write_record(&domain, &record).unwrap();
+        assert!(!requests_use(&domain, &record.provider));
+        let using = hold_use(&domain, &record.provider).unwrap();
+        // Another request may hold it at the same time.
+        let also = hold_use(&domain, &record.provider).unwrap();
+        let in_use = || requests_use(&domain, &record.provider);
+        assert_eq!(
+            stop_other_build_keeper(&domain, &record.provider, in_use).unwrap(),
+            OtherKeeper::InUse {
+                build: "v0.0.1+other-build".into()
+            }
+        );
+        assert!(!stop.exists());
+        drop(using);
+        assert!(in_use());
+        drop(also);
+        assert_eq!(
+            stop_other_build_keeper(&domain, &record.provider, in_use).unwrap(),
+            OtherKeeper::Stopping
+        );
+        assert!(stop.exists());
+        // The old keeper has gone, leaving its lock.
+        drop(lock_file(&stop.with_extension("lock"), true).unwrap());
+        cleanup_domain(&domain).unwrap();
+        assert!(!index(&domain).exists());
     }
 
     #[cfg(target_os = "linux")]

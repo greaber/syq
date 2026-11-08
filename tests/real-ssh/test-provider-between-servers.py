@@ -266,7 +266,7 @@ def main():
                     """A provider's prompt for a copy between two servers."""
                     assert "kind" not in request, request
                     assert request["from"].startswith(
-                        '"a server logged in to provider account syq (receiving profile @'), request
+                        '"a server logged in to provider account syq (provider profile @'), request
                     assert request["permission"].startswith(
                         "syq can't confirm which server is asking: any machine that can log in"
                         " to provider account syq over SSH can send this request."), request

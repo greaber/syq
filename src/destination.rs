@@ -1751,7 +1751,7 @@ impl Receiver {
     }
 }
 
-fn requester_closed(socket: &UnixStream) -> bool {
+pub(crate) fn requester_closed(socket: &UnixStream) -> bool {
     let mut byte = 0u8;
     let result = unsafe {
         libc::recv(

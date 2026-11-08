@@ -251,17 +251,17 @@ server must reach hostB's SSH port, and hostB must reach hostC's, each with
 its own SSH configuration; hostB looks hostC up under the name in your
 command. Your server checks hostB's host key, and hostB checks hostC's, as
 [hostA checks hostB's](security.md#how-hosta-checks-hostbs-key), also
-trusting what your laptop's known_hosts lists. The copy stops when the command
-that started it ends.
+trusting what the approving machine's known_hosts lists. The copy stops when
+the command that started it ends.
 
 The copy supports `--no-tcp`, `--no-tcp-encryption` and `--results`, and your
 server checks [results from the destination](#results-from-the-destination).
-It does not support `--mapping`, whose contents your laptop never sees,
+It does not support `--mapping`, whose contents the approving machine never sees,
 `--coordinate-at dst`, `--detach`, `--rsh`, `--syq-path`, `--no-bootstrap`, or
 other `--peer-auth` values, and neither login may be root. As for an upload, a
 saved choice does not apply to a copy with one of these options:
-your server's own SSH access runs it. An explicit `--auth-from @NAME` with one
-of them is refused. [Restricted-copy limits](#limits-and-unsupported-options)
+your server's own SSH access runs it. An explicit `--auth-from` with one of
+them is refused. [Restricted-copy limits](#limits-and-unsupported-options)
 apply. With `--coordinate-at local`, file data goes through your server
 instead, which then needs
 [account access](persistence-reference.md#account-access) to both servers.

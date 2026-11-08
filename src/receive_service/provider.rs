@@ -885,6 +885,14 @@ impl Service {
                         SessionRequest::Forward(request) => {
                             // Ending the session shuts this request down.
                             let _tracked = tracked;
+                            // A completed copy request has no more bytes:
+                            // any, like the requester going, cancel it, so
+                            // that trailing data cannot hide its going.
+                            let cancelled = || {
+                                self.stop.load(Ordering::Acquire)
+                                    || session.closed.load(Ordering::Acquire)
+                                    || crate::destination::requester_closed(&socket)
+                            };
                             let settings = &session.profile.settings;
                             let requester = crate::receive_approval::Requester::provider_login(
                                 &session.identity.user,
@@ -2185,6 +2193,74 @@ mod tests {
         // Closing the session shut its socket, so no reply may reach it.
         let _ = second_handler.join().unwrap();
         wait_until(|| pending().is_empty());
+        assert_eq!(service.requests.load(Ordering::SeqCst), 0);
+        service.close();
+    }
+
+    /// A copy request has nothing after it: a byte that follows cancels it,
+    /// as the requester going does, so it cannot hide the requester going
+    /// while its login stays attached.
+    #[test]
+    fn data_after_a_copy_request_cancels_it() {
+        let (_directory, domain, _) = fixture();
+        let service = Arc::new(Service::new(domain, None).unwrap());
+        let (ticket, _session) = service.open_identified(None, identity).unwrap();
+        let (mut client, server) = pair(&service);
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let handler_service = service.clone();
+        let handler = std::thread::spawn(move || handler_service.handle(server));
+        crate::destination::write_message(
+            &mut client,
+            &Hello {
+                version: PROTOCOL,
+                build: crate::identity::build().into(),
+                control: false,
+            },
+        )
+        .unwrap();
+        let _: HelloReply = crate::destination::read_message(&mut client).unwrap();
+        let command = [
+            "cp",
+            "--from",
+            "reader@source-host",
+            "--srcs-in",
+            "data",
+            "--to",
+            "backup",
+            "--into",
+            "output",
+        ]
+        .map(|arg| arg.as_bytes().to_vec())
+        .to_vec();
+        crate::destination::write_message(
+            &mut client,
+            &Access::Request {
+                session: ticket.session,
+                operation: Box::new(SessionRequest::Forward(Box::new(
+                    crate::destination::forward::ForwardRequest {
+                        source: Some("reader@source-host".into()),
+                        target: "backup".into(),
+                        command,
+                        cwd: "~".into(),
+                        inputs: crate::directive::Inputs::default(),
+                        results_key: Some([5; 32]),
+                    },
+                ))),
+            },
+        )
+        .unwrap();
+        client.write_all(b"x").unwrap();
+        // Refused without a decision; the login stays attached.
+        let reply: serde_json::Value = crate::destination::read_message(&mut client).unwrap();
+        assert!(reply.get("Error").is_some(), "{reply}");
+        handler.join().unwrap().unwrap();
+        assert!(service
+            .snapshot(None)
+            .profiles
+            .iter()
+            .all(|profile| profile.pending.is_empty()));
         assert_eq!(service.requests.load(Ordering::SeqCst), 0);
         service.close();
     }
