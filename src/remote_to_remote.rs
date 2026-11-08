@@ -1167,9 +1167,7 @@ pub(crate) fn prepare_receiver_ssh_with(
     entry_key: &[u8],
 ) -> Result<crate::private_broker::SignalCleanedDir> {
     anyhow::ensure!(
-        args.restricted_grant
-            .as_deref()
-            .is_some_and(crate::restricted::enrolled_grant),
+        args.restricted_grant.is_some() && !crate::destination::is_named(&args.restricted_grant),
         "receiver host keys require an enrolled copy grant"
     );
     // This machine checks the receiver's host key as its own `ssh` would:

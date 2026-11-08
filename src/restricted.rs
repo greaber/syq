@@ -1,6 +1,5 @@
 //! Enrollments and the receivers that enforce restricted copies.
 
-use crate::cli::Args;
 use crate::delegation::{
     self, CopyOperation, DeletionPolicy, DestinationPlacement, DirectoryWidening,
     ExistingDestinationPolicy, FilterPolicy, Grant, GrantConstraints, MutationScope, RequestId,

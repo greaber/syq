@@ -184,9 +184,8 @@ impl TransferTuning {
         self,
         hash_block: u64,
         limit: Option<&crate::bwlimit::BandwidthLimit>,
-        receiver_paces: bool,
     ) -> u64 {
-        let size = self.request_size(hash_block, limit, receiver_paces);
+        let size = self.request_size(hash_block, limit);
         if self.request_size.is_some() {
             size
         } else {
@@ -198,17 +197,10 @@ impl TransferTuning {
         self,
         hash_block: u64,
         limit: Option<&crate::bwlimit::BandwidthLimit>,
-        receiver_paces: bool,
     ) -> u64 {
         let size = self.request_size.unwrap_or(hash_block);
-        let size = match (limit, self.bw_pacing.unwrap_or_default()) {
+        match (limit, self.bw_pacing.unwrap_or_default()) {
             (Some(limit), BwPacing::IntervalMs(ms)) => size.min(limit.bytes_for_interval(ms)),
-            _ => size,
-        };
-        // A receiver that paces file data refuses larger writes. Tuning
-        // cannot enlarge that authority; retain its request ceiling.
-        match limit {
-            Some(limit) if receiver_paces => size.min(limit.burst_bytes()),
             _ => size,
         }
     }
@@ -435,18 +427,15 @@ mod tests {
     fn tuning_preserves_defaults_and_bandwidth_burst_bound() {
         let hash_block = 4 << 20;
         let default = TransferTuning::default();
-        assert_eq!(default.request_size(hash_block, None, false), hash_block);
+        assert_eq!(default.request_size(hash_block, None), hash_block);
         assert_eq!(default.pipeline_depth(), 4);
         assert!(!default.streaming());
         let override_: TransferTuning = "request-size=8M,pipeline-depth=16".parse().unwrap();
-        assert_eq!(override_.request_size(hash_block, None, false), 8 << 20);
+        assert_eq!(override_.request_size(hash_block, None), 8 << 20);
         let limit = crate::bwlimit::BandwidthLimit::new(1 << 20);
-        assert_eq!(
-            override_.request_size(hash_block, Some(&limit), false),
-            128 << 10
-        );
+        assert_eq!(override_.request_size(hash_block, Some(&limit)), 128 << 10);
         let small: TransferTuning = "request-size=512".parse().unwrap();
-        assert_eq!(small.request_size(hash_block, Some(&limit), false), 512);
+        assert_eq!(small.request_size(hash_block, Some(&limit)), 512);
         assert_eq!(
             override_.to_string().parse::<TransferTuning>().unwrap(),
             override_
@@ -466,32 +455,26 @@ mod tests {
             4 << 20,
             64 << 20,
         ] {
-            assert_eq!(tuning.request_size(hash, None, false), hash);
-            assert_eq!(
-                tuning.streaming_request_size(hash, None, false),
-                hash.min(2 << 20)
-            );
-            let ordinary = tuning.request_size(hash, None, false);
+            assert_eq!(tuning.request_size(hash, None), hash);
+            assert_eq!(tuning.streaming_request_size(hash, None), hash.min(2 << 20));
+            let ordinary = tuning.request_size(hash, None);
             assert!(!tuning.stream_range(false, 4 * ordinary, ordinary));
             assert!(tuning.stream_range(false, 4 * ordinary + 1, ordinary));
             assert!(!tuning.stream_range(true, 64 * ordinary, ordinary));
         }
         let override_: TransferTuning = "request-size=3M".parse().unwrap();
-        assert_eq!(
-            override_.streaming_request_size(4 << 20, None, false),
-            3 << 20
-        );
+        assert_eq!(override_.streaming_request_size(4 << 20, None), 3 << 20);
         let small: TransferTuning = "request-size=512".parse().unwrap();
-        assert_eq!(small.streaming_request_size(4 << 20, None, false), 512);
+        assert_eq!(small.streaming_request_size(4 << 20, None), 512);
     }
 
     #[test]
-    fn streaming_block_size_obeys_pacing_and_receiver_limits() {
+    fn streaming_block_size_obeys_pacing_limits() {
         let limit = crate::bwlimit::BandwidthLimit::new(1 << 20);
         for options in ["copy-path=auto", "request-size=3M"] {
             let tuning: TransferTuning = options.parse().unwrap();
             assert_eq!(
-                tuning.streaming_request_size(4 << 20, Some(&limit), false),
+                tuning.streaming_request_size(4 << 20, Some(&limit)),
                 128 << 10
             );
             let average = TransferTuning {
@@ -499,11 +482,7 @@ mod tests {
                 ..tuning
             };
             assert_eq!(
-                average.streaming_request_size(4 << 20, Some(&limit), true),
-                128 << 10
-            );
-            assert_eq!(
-                average.streaming_request_size(4 << 20, Some(&limit), false),
+                average.streaming_request_size(4 << 20, Some(&limit)),
                 if tuning.request_size.is_some() {
                     3 << 20
                 } else {
@@ -529,34 +508,16 @@ mod tests {
         let average: TransferTuning = "request-size=8M,bw-pacing=average,split-min-size=1M"
             .parse()
             .unwrap();
-        assert_eq!(average.request_size(4 << 20, Some(&limit), false), 8 << 20);
+        assert_eq!(average.request_size(4 << 20, Some(&limit)), 8 << 20);
         assert_eq!(average.split_min_size(4 << 20), 8 << 20);
         let interval: TransferTuning = "bw-pacing=250ms".parse().unwrap();
-        assert_eq!(
-            interval.request_size(4 << 20, Some(&limit), false),
-            256 << 10
-        );
+        assert_eq!(interval.request_size(4 << 20, Some(&limit)), 256 << 10);
         assert!(average.validate(0).is_err());
         assert!("copy-path=ranges,batch-files=1"
             .parse::<TransferTuning>()
             .unwrap()
             .validate(0)
             .is_err());
-    }
-
-    #[test]
-    fn tuning_preserves_the_signed_receiver_request_ceiling() {
-        let limit = crate::bwlimit::BandwidthLimit::new(1 << 20);
-        for pacing in ["average", "1s"] {
-            let tuning: TransferTuning = format!("request-size=8M,bw-pacing={pacing}")
-                .parse()
-                .unwrap();
-            assert_eq!(tuning.request_size(4 << 20, Some(&limit), true), 128 << 10);
-        }
-        let tighter: TransferTuning = "bw-pacing=25ms".parse().unwrap();
-        assert_eq!(tighter.request_size(4 << 20, Some(&limit), true), 26_214);
-        let uncapped: TransferTuning = "request-size=8M".parse().unwrap();
-        assert_eq!(uncapped.request_size(4 << 20, None, true), 8 << 20);
     }
 
     #[test]

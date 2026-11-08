@@ -479,28 +479,58 @@ pub(super) fn command(source: &Path, options: &[&str]) -> Vec<Vec<u8>> {
         )
         .collect()
 }
-/// The request the receiver derives from `command`.
+/// What the requesting server sends for a copy of `source` that `options`
+/// describe: its command, and what the command read from files, here
+/// nothing.
 pub(super) fn requested(
     source: &Path,
     options: &[&str],
-) -> (
-    Vec<Vec<u8>>,
-    CopyRequest,
-    crate::destination_results::RecipientSecret,
-) {
-    let command = command(source, options);
-    let (request, secret) = request(&crate::approval_command::parse(&command).unwrap());
-    (command, request, secret)
-}
-pub(super) fn request(args: &Args) -> (CopyRequest, crate::destination_results::RecipientSecret) {
-    let (secret, public) = crate::destination_results::generate_recipient().unwrap();
+) -> (Vec<Vec<u8>>, crate::directive::Inputs) {
     (
-        crate::restricted::named_request(
-            args,
-            crate::destination_results::ReceiptPolicy::for_recipient(public),
-        )
-        .unwrap(),
-        secret,
+        command(source, options),
+        crate::directive::Inputs::default(),
+    )
+}
+/// The directive the receiving machine issues for `command` under its
+/// limits `caps`.
+fn issued(
+    command: &[Vec<u8>],
+    caps: Option<crate::directive::Caps>,
+) -> crate::directive::Directive {
+    crate::directive::issue_here(
+        crate::directive::Binding {
+            enrollment: crate::enrollment::EnrollmentId::random(),
+            generation: 0,
+            account: "@laptop".into(),
+            role: crate::directive::Role::Destination,
+        },
+        command.to_vec(),
+        String::new(),
+        (crate::directive::Inputs::default(), caps),
+        [1; 32],
+        START_TIMEOUT,
+    )
+    .unwrap()
+}
+/// The rules the receiving machine derives for the copy of `source` that
+/// `options` describe, writing at `destination` under its limits
+/// `max_entries` and `max_delete`.
+fn rules(
+    source: &Path,
+    options: &[&str],
+    destination: &Path,
+    (max_entries, max_delete): (u64, u64),
+) -> Result<(crate::delegation::Grant, GrantConstraints)> {
+    crate::directive::receiving_rules(
+        &issued(
+            &command(source, options),
+            Some(crate::directive::Caps {
+                max_bytes: 1000,
+                max_entries,
+                max_delete,
+            }),
+        ),
+        destination.as_os_str().as_bytes(),
     )
 }
 /// Every authority for a request works beneath the directory opened when
@@ -511,16 +541,18 @@ fn a_request_keeps_the_receiving_directory_it_opened() {
     let root = crate::test_support::tempdir().unwrap();
     let container_path = root.path().join("container");
     fs::create_dir(&container_path).unwrap();
-    let (request, _) = request(&args(&root.path().join("source"), "output"));
-    let request = constrain(request, &container_path.join("output"), 1024, 100, 0, false).unwrap();
+    let directive = issued(&command(&root.path().join("source"), &[]), None);
+    let output = container_path.join("output");
+    let rules =
+        || crate::directive::receiving_rules(&directive, output.as_os_str().as_bytes()).unwrap();
     let container = crate::restricted::Container::open(&container_path).unwrap();
     let opened = crate::rooted::Root::open(&container_path)
         .unwrap()
         .identity();
-    let (before, _) = crate::restricted::named_authority(&container, request.clone()).unwrap();
+    let before = crate::restricted::receiving_authority(&container, &directive, rules()).unwrap();
     fs::rename(&container_path, root.path().join("moved")).unwrap();
     fs::create_dir(&container_path).unwrap();
-    let (after, _) = crate::restricted::named_authority(&container, request).unwrap();
+    let after = crate::restricted::receiving_authority(&container, &directive, rules()).unwrap();
     assert_eq!(before.root_identity_for_test(), opened);
     assert_eq!(after.root_identity_for_test(), opened);
 }
@@ -528,13 +560,15 @@ fn a_request_keeps_the_receiving_directory_it_opened() {
 #[test]
 fn named_destination_allows_128_workers_and_preserves_smaller_allowances() {
     let temporary = crate::test_support::tempdir().unwrap();
-    let args = args(&temporary.path().join("source"), "output");
-    let (request, _) = request(&args);
     for (requested, expected) in [(2, 2), (32, 32), (64, 64), (128, 128), (256, 128)] {
-        let mut request = request.clone();
-        request.copy.limits.max_connections = requested;
-        let constrained = constrain(request, temporary.path(), 1000, 1000, 0, false).unwrap();
-        assert_eq!(constrained.copy.limits.max_connections, expected);
+        let (grant, _) = rules(
+            &temporary.path().join("source"),
+            &["--resource-limits", &format!("workers={requested}")],
+            temporary.path(),
+            (1000, 0),
+        )
+        .unwrap();
+        assert_eq!(grant.copy.limits.max_connections, expected);
     }
 }
 
@@ -661,13 +695,17 @@ fn broker_confined(
     };
     (broker, receiver, registration, requests)
 }
-fn approve(registration: &Registration, command: Vec<Vec<u8>>, request: CopyRequest) -> Approved {
+fn approve(
+    registration: &Registration,
+    command: Vec<Vec<u8>>,
+    inputs: crate::directive::Inputs,
+) -> Approved {
     let (_, reply) = exchange(
         registration,
         Message::Request {
             cwd: String::new(),
             command,
-            request: Box::new(request),
+            inputs,
         },
         Duration::from_secs(10),
         Some(Duration::from_secs(10)),
@@ -678,13 +716,13 @@ fn approve(registration: &Registration, command: Vec<Vec<u8>>, request: CopyRequ
         _ => panic!("no approval"),
     }
 }
-fn route(registration: Registration, token: String) -> String {
+fn route(registration: Registration, approved: &Approved) -> String {
     format!(
         "{PREFIX}{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(&Route {
                 registration,
-                token
+                token: approved.token.clone(),
             })
             .unwrap()
         )
@@ -692,7 +730,7 @@ fn route(registration: Registration, token: String) -> String {
 }
 fn control(registration: Registration, approved: &Approved) -> crate::conn::RemoteConn {
     let mut spec = crate::conn::RemoteSpec::local_receiver(true);
-    spec.restricted_grant = Some(route(registration, approved.token.clone()));
+    spec.restricted_grant = Some(route(registration, approved));
     spec.connect_with(false, false).unwrap()
 }
 
@@ -773,14 +811,14 @@ fn named_denial_does_not_issue_authority_or_touch_destination() {
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, receiver, registration, prompts) = broker(&root, Approval::Ask);
-    let (command, request, _) = requested(Path::new("source"), &[]);
+    let (command, inputs) = requested(Path::new("source"), &[]);
     let caller = std::thread::spawn(move || {
         exchange(
             &registration,
             Message::Request {
                 cwd: String::new(),
                 command,
-                request: Box::new(request),
+                inputs,
             },
             Duration::from_secs(5),
             Some(Duration::from_secs(5)),
@@ -801,8 +839,8 @@ fn named_control_cannot_be_replayed_and_cannot_listen_on_tcp() {
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
-    let (command, request, _) = requested(Path::new("source"), &["--no-compress"]);
-    let approved = approve(&registration, command, request);
+    let (command, inputs) = requested(Path::new("source"), &["--no-compress"]);
+    let approved = approve(&registration, command, inputs);
     let mut conn = control(registration.clone(), &approved);
     assert!(exchange(
         &registration,
@@ -881,8 +919,8 @@ fn named_control_closure_revokes_connected_workers() {
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
-    let (command, request, _) = requested(Path::new("source"), &["--no-compress"]);
-    let approved = approve(&registration, command, request);
+    let (command, inputs) = requested(Path::new("source"), &["--no-compress"]);
+    let approved = approve(&registration, command, inputs);
     let conn = control(registration.clone(), &approved);
     let worker = worker_stream(&registration, &approved);
     let authority = receiver
@@ -934,8 +972,8 @@ fn pending_hellos(
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (broker, receiver, registration, _) = broker(&root, Approval::Always);
-    let (command, request, _) = requested(Path::new("source"), &["--no-compress"]);
-    let approved = approve(&registration, command, request);
+    let (command, inputs) = requested(Path::new("source"), &["--no-compress"]);
+    let approved = approve(&registration, command, inputs);
     let control = control(registration.clone(), &approved);
     receiver
         .sessions
@@ -1017,8 +1055,8 @@ fn named_abandoned_open_releases_its_session() {
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
-    let (command, request, _) = requested(Path::new("source"), &[]);
-    let approved = approve(&registration, command, request);
+    let (command, inputs) = requested(Path::new("source"), &[]);
+    let approved = approve(&registration, command, inputs);
     let (stream, reply) = exchange(
         &registration,
         Message::Open {
@@ -1048,8 +1086,8 @@ fn named_failed_open_reply_releases_its_session() {
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
-    let (command, request, _) = requested(Path::new("source"), &[]);
-    let approved = approve(&registration, command, request);
+    let (command, inputs) = requested(Path::new("source"), &[]);
+    let approved = approve(&registration, command, inputs);
     let mut stream = UnixStream::connect(&registration.socket).unwrap();
     // Linux SHUT_RD reliably refuses the opening reply while the client
     // remains connected, exercising the failed-reply cleanup specifically.
@@ -1094,16 +1132,16 @@ fn named_copy_with_transport(tcp: bool) {
     fs::write(source.join("large"), vec![42; 5_000_000]).unwrap();
     std::os::unix::fs::symlink("hello", source.join("link")).unwrap();
     let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
-    let (command, request, _) = requested(&source, &[]);
+    let (command, inputs) = requested(&source, &[]);
     let mut args = crate::approval_command::parse(&command).unwrap();
-    let approved = approve(&registration, command, request);
+    let approved = approve(&registration, command, inputs);
     // The approval says in full where on this machine the copy goes, here
     // the profile's directory for `--into .`; the server's summary shows it.
     assert_eq!(approved.destination, root.as_os_str().as_bytes());
     // The route below replaces discovery of the named receiver.
     args.locations.last_mut().unwrap().host = Some("server".into());
     args.locations.last_mut().unwrap().path = approved.destination.clone();
-    args.restricted_grant = Some(route(registration, approved.token.clone()));
+    args.restricted_grant = Some(route(registration, &approved));
     args.no_tcp = !tcp;
     assert_eq!(crate::transfer::run(args).unwrap(), 0);
     assert_eq!(
@@ -1121,7 +1159,7 @@ fn named_copy_with_transport(tcp: bool) {
 }
 
 /// As many named sources as any copy takes, with names long enough that
-/// their request is several times the size of an ordinary message.
+/// their request is larger than an ordinary message.
 #[test]
 fn named_copy_takes_1024_sources_with_long_names() {
     let temp = crate::test_support::tempdir().unwrap();
@@ -1150,19 +1188,101 @@ fn named_copy_takes_1024_sources_with_long_names() {
         command.push(arg.as_bytes().to_vec());
     }
     let mut args = crate::approval_command::parse(&command).unwrap();
-    let (request, _) = request(&args);
-    let message = serde_json::to_vec(&request).unwrap();
-    assert!(message.len() > 2 * MAX_MESSAGE, "{}", message.len());
+    let message = serde_json::to_vec(&command).unwrap();
+    assert!(message.len() > MAX_MESSAGE, "{}", message.len());
     let (_broker, _receiver, registration, _) =
         broker_with_limits(&root, Approval::Always, 0, 10_000);
-    let approved = approve(&registration, command, request);
+    let approved = approve(&registration, command, Default::default());
     args.locations.last_mut().unwrap().host = Some("server".into());
     args.locations.last_mut().unwrap().path = approved.destination.clone();
-    args.restricted_grant = Some(route(registration, approved.token.clone()));
+    args.restricted_grant = Some(route(registration, &approved));
     assert_eq!(crate::transfer::run(args).unwrap(), 0);
     for name in &names {
         assert!(root.join(name).is_dir(), "{name}");
     }
+}
+
+/// What the receiving machine would refuse in the command alone is refused
+/// on the server, before it asks or says that it waits.
+#[test]
+fn a_named_copy_the_receiving_machine_would_refuse_fails_before_asking() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let registration = Registration {
+        version: REGISTRATION_VERSION,
+        program: b"/nonexistent/syq".to_vec(),
+        identity: crate::identity::build().into(),
+        // Nothing listens here: asking would fail with another error.
+        socket: temp.path().join("absent.sock"),
+        secret: "test".into(),
+    };
+    let mut many = vec![b"cp".to_vec()];
+    for i in 0..crate::delegation::MAX_MUTATION_SCOPES {
+        many.push(b"--src".to_vec());
+        many.push(format!("source-{i}").into_bytes());
+    }
+    many.extend(["--to", "@laptop", "--into", "."].map(|arg| arg.as_bytes().to_vec()));
+    for (command, refusal) in [
+        (
+            command(
+                Path::new("source"),
+                &["--follow-dst", "--widen-dirs", "all"],
+            ),
+            "--widen-dirs all cannot be combined with --follow-dst",
+        ),
+        (many, "its approval can list"),
+    ] {
+        let mut args = crate::approval_command::parse(&command).unwrap();
+        args.return_selection = Some(Some(handoff::Selection::new(
+            "laptop".into(),
+            registration.clone(),
+            handoff::Kind::Copy,
+            None,
+        )));
+        let error = format!("{:#}", prepare(&mut args).unwrap_err());
+        assert!(
+            error.contains(refusal) && !error.contains("absent.sock"),
+            "{error}"
+        );
+    }
+}
+
+/// The rules a server's command read from files may be as large as the
+/// request that carries them: the receiving machine keeps the directive it
+/// issues for them rather than signing or returning it, so it imposes no
+/// smaller limit.
+#[test]
+fn a_named_copy_takes_ignore_rules_larger_than_a_signed_directive() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("receiving");
+    fs::create_dir(&root).unwrap();
+    let source = fs::canonicalize(temp.path()).unwrap().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("kept"), b"kept").unwrap();
+    fs::write(source.join("skip.tmp"), b"skipped").unwrap();
+    let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
+    // 600 KiB of comments, more than a signed directive's 512 KiB, then one
+    // rule.
+    let mut ignore: Vec<String> = (0..1024)
+        .map(|i| format!("# {i:04} {}", "x".repeat(592)))
+        .collect();
+    ignore.push("*.tmp".into());
+    let (command, _) = requested(&source, &[]);
+    let mut args = crate::approval_command::parse(&command).unwrap();
+    args.ignore_lines = ignore.clone();
+    let approved = approve(
+        &registration,
+        command,
+        crate::directive::Inputs {
+            ignore,
+            mapping: None,
+        },
+    );
+    args.locations.last_mut().unwrap().host = Some("server".into());
+    args.locations.last_mut().unwrap().path = approved.destination.clone();
+    args.restricted_grant = Some(route(registration, &approved));
+    assert_eq!(crate::transfer::run(args).unwrap(), 0);
+    assert_eq!(fs::read(root.join("source/kept")).unwrap(), b"kept");
+    assert!(!root.join("source/skip.tmp").exists());
 }
 
 /// Before a message is authenticated, its sender decides its size. Only a
@@ -1240,17 +1360,16 @@ fn named_copy_accepts_ownership_and_special_files() {
     let fifo = std::ffi::CString::new(source.join("pipe").as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o640) }, 0);
     let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
-    let (command, request, _) = requested(
-        &source,
-        &["--copy-metadata", "mtime,permissions,ownership,specials"],
-    );
-    let options = &request.copy.options;
-    assert!(options.preserve_owner && options.preserve_group && options.preserve_devices);
+    let options = ["--copy-metadata", "mtime,permissions,ownership,specials"];
+    let (grant, _) = rules(&source, &options, &root, (1000, 0)).unwrap();
+    let preserved = &grant.copy.options;
+    assert!(preserved.preserve_owner && preserved.preserve_group && preserved.preserve_devices);
+    let (command, inputs) = requested(&source, &options);
     let mut args = crate::approval_command::parse(&command).unwrap();
-    let approved = approve(&registration, command, request);
+    let approved = approve(&registration, command, inputs);
     args.locations.last_mut().unwrap().host = Some("server".into());
     args.locations.last_mut().unwrap().path = approved.destination.clone();
-    args.restricted_grant = Some(route(registration, approved.token.clone()));
+    args.restricted_grant = Some(route(registration, &approved));
     assert_eq!(crate::transfer::run(args).unwrap(), 0);
     assert_eq!(
         fs::read(root.join("source/hello")).unwrap(),
@@ -1264,53 +1383,46 @@ fn named_copy_accepts_ownership_and_special_files() {
 #[test]
 fn named_requests_accept_in_place_new_and_prune_within_the_machines_limit() {
     let temporary = crate::test_support::tempdir().unwrap();
-    let mut inplace = args(&temporary.path().join("source"), "output");
-    inplace.inplace = true;
-    let (accepted, _) = request(&inplace);
+    let source = temporary.path().join("source");
+    let derive = |options: &[&str], limits| rules(&source, options, temporary.path(), limits);
+    let (accepted, _) = derive(&["--in-place=new"], (1000, 0)).unwrap();
     assert_eq!(
         accepted.copy.policy.publication,
         crate::delegation::PublicationPolicy::InPlaceNew
     );
-    constrain(accepted, temporary.path(), 1000, 1000, 0, false).unwrap();
 
-    // Without --max-delete, the request may delete what this machine allows.
-    let mut pruning = args(&temporary.path().join("source"), "output");
-    pruning.delete = true;
-    let (prune, _) = request(&pruning);
-    let error = constrain(prune.clone(), temporary.path(), 1000, 1000, 0, false).unwrap_err();
+    // Without --max-delete, the copy may delete what this machine allows.
+    let error = derive(&["--prune"], (1000, 0)).unwrap_err();
     assert!(
         error
             .to_string()
             .contains("pruning needs a positive --max-delete"),
         "{error:#}"
     );
-    let constrained = constrain(prune.clone(), temporary.path(), 1000, 1000, 5, false).unwrap();
-    assert_eq!(constrained.copy.limits.max_deletions, 5);
-    let constrained = constrain(prune.clone(), temporary.path(), 1000, 3, 5, false).unwrap();
-    assert_eq!(constrained.copy.limits.max_deletions, 3);
-    // The approval carries the ceiling that bounds the grant, for a dry
-    // run's read-only grant too, whose own limit is zero.
-    let mut stated = pruning.clone();
-    stated.max_delete = Some(2);
-    let (lower, _) = request(&stated);
-    let constrained = constrain(lower, temporary.path(), 1000, 1000, 5, false).unwrap();
-    assert_eq!(constrained.copy.limits.max_deletions, 2);
-    assert_eq!(deletion_ceiling(&constrained, 5), 5);
-    let mut preview = pruning.clone();
-    preview.dry_run = true;
-    let (preview, _) = request(&preview);
-    let constrained = constrain(preview, temporary.path(), 1000, 3, 5, false).unwrap();
-    assert_eq!(constrained.copy.limits.max_deletions, 0);
-    assert_eq!(deletion_ceiling(&constrained, 5), 3);
+    let (grant, _) = derive(&["--prune"], (1000, 5)).unwrap();
+    assert_eq!(grant.copy.limits.max_deletions, 5);
+    let (grant, _) = derive(&["--prune"], (3, 5)).unwrap();
+    assert_eq!(grant.copy.limits.max_deletions, 3);
+    // The approval carries the ceiling that bounds the rules, for a dry
+    // run's read-only rules too, whose own limit is zero.
+    let caps = |max_entries| crate::directive::Caps {
+        max_bytes: 1000,
+        max_entries,
+        max_delete: 5,
+    };
+    let (lower, _) = derive(&["--prune", "--max-delete", "2"], (1000, 5)).unwrap();
+    assert_eq!(lower.copy.limits.max_deletions, 2);
+    assert_eq!(caps(1000).deletion_ceiling(&lower.copy), 5);
+    let (preview, _) = derive(&["--prune", "--dry-run"], (3, 5)).unwrap();
+    assert_eq!(preview.copy.limits.max_deletions, 0);
+    assert_eq!(caps(3).deletion_ceiling(&preview.copy), 3);
 
+    let mut pruning = args(&source, "output");
+    pruning.delete = true;
     // The sender plans against the machine's limit, or its own if lower.
     let approved = Approved {
         token: String::new(),
         destination: Vec::new(),
-        enrollment: crate::enrollment::EnrollmentId::random(),
-        request: crate::delegation::RequestId::fresh(1).unwrap(),
-        digest: [0; 32],
-        results_key: String::new(),
         max_delete: None,
     };
     for (stated, machine, planned, from_machine) in [
@@ -1406,13 +1518,13 @@ fn a_named_pruning_dry_run_is_refused_where_pruning_is_off() {
     fs::write(root.join("source/kept"), b"kept").unwrap();
     let (_broker, _receiver, registration, _) = broker_with_max_delete(&root, Approval::Always, 0);
     let reply = |options: &[&str]| {
-        let (command, request, _) = requested(&source, options);
+        let (command, inputs) = requested(&source, options);
         exchange(
             &registration,
             Message::Request {
                 cwd: String::new(),
                 command,
-                request: Box::new(request),
+                inputs,
             },
             Duration::from_secs(10),
             Some(Duration::from_secs(10)),
@@ -1446,13 +1558,63 @@ fn a_named_pruning_dry_run_is_refused_where_pruning_is_off() {
     ));
 }
 
+/// The sender paces a copy to a receiving machine, on the bytes it sends
+/// over the machine's socket or the TCP connections the machine opens: a
+/// bandwidth limit is a preference of the command, not part of what the
+/// machine approves, and the machine does not pace what it writes. Data
+/// that compresses well goes as fast as its compressed bytes allow, which
+/// pacing file data would not.
 #[test]
-fn named_requests_sign_the_senders_bandwidth_limit() {
-    let temporary = crate::test_support::tempdir().unwrap();
-    let mut args = args(&temporary.path().join("source"), "output");
-    args.bwlimit_bytes = 1 << 20;
-    let (request, _) = request(&args);
-    assert_eq!(request.constraints.max_file_data_bytes_per_second, 1 << 20);
+fn a_copy_to_a_receiving_machine_is_paced_by_its_sender_on_network_bytes() {
+    for tcp in [false, true] {
+        let temp = crate::test_support::tempdir().unwrap();
+        let root = temp.path().join("receiving");
+        fs::create_dir(&root).unwrap();
+        let source = fs::canonicalize(temp.path()).unwrap().join("source");
+        fs::create_dir(&source).unwrap();
+        // 6 MiB that compresses to a few kilobytes, and 512 KiB that does
+        // not compress.
+        fs::write(
+            source.join("compressible"),
+            b"syq pacing test\n".repeat(6 << 16),
+        )
+        .unwrap();
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let random: Vec<u8> = (0..512 << 10)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+        fs::write(source.join("random"), &random).unwrap();
+        let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
+        let (command, inputs) =
+            requested(&source, &["--resource-limits", "workers=2,bandwidth=1M"]);
+        let mut args = crate::approval_command::parse(&command).unwrap();
+        let approved = approve(&registration, command, inputs);
+        args.locations.last_mut().unwrap().host = Some("server".into());
+        args.locations.last_mut().unwrap().path = approved.destination.clone();
+        args.restricted_grant = Some(route(registration, &approved));
+        args.no_tcp = !tcp;
+        let started = Instant::now();
+        assert_eq!(crate::transfer::run(args).unwrap(), 0);
+        let elapsed = started.elapsed();
+        assert_eq!(fs::read(root.join("source/random")).unwrap(), random);
+        assert_eq!(
+            fs::metadata(root.join("source/compressible"))
+                .unwrap()
+                .len(),
+            6 << 20
+        );
+        // At 1 MiB/s the random half-megabyte takes half a second; pacing
+        // file data would take more than six seconds for the rest.
+        assert!(
+            elapsed >= Duration::from_millis(400) && elapsed < Duration::from_secs(5),
+            "tcp {tcp}: {elapsed:?}"
+        );
+    }
 }
 
 /// Approve the next copy `receiver` asks about, returning what it showed.
@@ -1477,14 +1639,14 @@ fn approve_pending(receiver: &Arc<Receiver>) -> std::thread::JoinHandle<String> 
 
 /// Run the copy of `source` that `options` describe through `registration`.
 fn named_copy(registration: &Registration, source: &Path, options: &[&str]) -> i32 {
-    let (command, request, _) = requested(source, options);
+    let (command, inputs) = requested(source, options);
     let mut args = crate::approval_command::parse(&command).unwrap();
-    let approved = approve(registration, command, request);
+    let approved = approve(registration, command, inputs);
     // As `prepare` does with the approval.
     apply_deletion_limit(&mut args, approved.max_delete);
     args.locations.last_mut().unwrap().host = Some("server".into());
     args.locations.last_mut().unwrap().path = approved.destination.clone();
-    args.restricted_grant = Some(route(registration.clone(), approved.token.clone()));
+    args.restricted_grant = Some(route(registration.clone(), &approved));
     crate::transfer::run(args).unwrap()
 }
 
@@ -1650,8 +1812,8 @@ fn named_authorization_expires_before_control_opens() {
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
-    let (command, request, _) = requested(Path::new("source"), &[]);
-    let approved = approve(&registration, command, request);
+    let (command, inputs) = requested(Path::new("source"), &[]);
+    let approved = approve(&registration, command, inputs);
     receiver
         .sessions
         .lock()
@@ -1678,17 +1840,38 @@ fn named_limits_and_scope_validation_precede_approval() {
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
-    let (command, mut request, _) = requested(Path::new("source"), &[]);
-    request.copy.mutation_scopes[0].path = b"/SYQ-RECEIVE/../outside".to_vec();
-    assert!(exchange(
-        &registration,
-        Message::Request {
-            cwd: String::new(),
-            command,
-            request: Box::new(request),
-        },
-        Duration::from_secs(2),
-        Some(Duration::from_secs(2))
+    let ask = |command: Vec<Vec<u8>>, inputs| {
+        exchange(
+            &registration,
+            Message::Request {
+                cwd: String::new(),
+                command,
+                inputs,
+            },
+            Duration::from_secs(2),
+            Some(Duration::from_secs(2)),
+        )
+        .map(drop)
+    };
+    // A destination outside the receiving root, an ignore rule out of
+    // bounds, and a mapping the command does not name.
+    let (outside, inputs) = requested(Path::new("source"), &["--into", "../outside"]);
+    assert!(ask(outside, inputs).is_err());
+    let (command, _) = requested(Path::new("source"), &[]);
+    assert!(ask(
+        command.clone(),
+        crate::directive::Inputs {
+            ignore: vec!["bad\0rule".into()],
+            mapping: None,
+        }
+    )
+    .is_err());
+    assert!(ask(
+        command,
+        crate::directive::Inputs {
+            ignore: Vec::new(),
+            mapping: Some(crate::mapping::Authorization::from_contents(b"{}")),
+        }
     )
     .is_err());
     assert_eq!(fs::read_dir(root).unwrap().count(), 0);
@@ -1783,7 +1966,6 @@ fn a_symlink_above_a_laptop_destination_needs_follow_dst() {
         .collect()
     };
     let ask = |command: Vec<Vec<u8>>| {
-        let (request, _) = request(&crate::approval_command::parse(&command).unwrap());
         let registration = registration.clone();
         std::thread::spawn(move || {
             exchange(
@@ -1791,7 +1973,7 @@ fn a_symlink_above_a_laptop_destination_needs_follow_dst() {
                 Message::Request {
                     cwd: String::new(),
                     command,
-                    request: Box::new(request),
+                    inputs: Default::default(),
                 },
                 Duration::from_secs(10),
                 Some(Duration::from_secs(10)),
@@ -1901,13 +2083,13 @@ fn named_workers_refuse_mutations_before_transport_shutdown() {
         let temp = crate::test_support::tempdir().unwrap();
         let root = temp.path().to_path_buf();
         let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
-        let (command, request, _) = requested(Path::new("source"), &["--no-compress"]);
-        let approved = approve(&registration, command, request);
+        let (command, inputs) = requested(Path::new("source"), &["--no-compress"]);
+        let approved = approve(&registration, command, inputs);
         let authority = receiver.sessions.lock().unwrap()[&approved.token]
             .authority
             .receiving();
         let mut spec = crate::conn::RemoteSpec::local_receiver(true);
-        spec.restricted_grant = Some(route(registration, approved.token));
+        spec.restricted_grant = Some(route(registration, &approved));
         let mut control = spec.connect_with(false, false).unwrap();
         if tcp {
             let pending = spec
@@ -1979,13 +2161,13 @@ fn named_tcp_workers_obey_limits_and_revocation() {
         let root = temp.path().join("receiving");
         fs::create_dir(&root).unwrap();
         let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
-        let (command, request, _) = requested(
+        let (command, inputs) = requested(
             Path::new("source"),
             &["--no-compress", "--resource-limits", "workers=1"],
         );
-        let approved = approve(&registration, command, request);
+        let approved = approve(&registration, command, inputs);
         let mut spec = crate::conn::RemoteSpec::local_receiver(true);
-        spec.restricted_grant = Some(route(registration, approved.token.clone()));
+        spec.restricted_grant = Some(route(registration, &approved));
         let mut control = spec.connect_with(false, false).unwrap();
         let pending = spec
             .begin_tcp_setup(&mut control, false, (0, 0), None, None)
@@ -2048,10 +2230,10 @@ fn named_tcp_connect_failure_uses_approved_ssh_worker() {
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
-    let (command, request, _) = requested(Path::new("source"), &["--no-compress"]);
-    let approved = approve(&registration, command, request);
+    let (command, inputs) = requested(Path::new("source"), &["--no-compress"]);
+    let approved = approve(&registration, command, inputs);
     let mut spec = crate::conn::RemoteSpec::local_receiver(true);
-    spec.restricted_grant = Some(route(registration, approved.token.clone()));
+    spec.restricted_grant = Some(route(registration, &approved));
     let mut control = spec.connect_with(false, false).unwrap();
     let pending = spec
         .begin_tcp_setup(&mut control, false, (0, 0), None, None)
@@ -2105,13 +2287,13 @@ fn named_tcp_workers_connect_concurrently() {
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
-    let (command, request, _) = requested(
+    let (command, inputs) = requested(
         Path::new("source"),
         &["--no-compress", "--resource-limits", "workers=8"],
     );
-    let approved = approve(&registration, command, request);
+    let approved = approve(&registration, command, inputs);
     let mut spec = crate::conn::RemoteSpec::local_receiver(true);
-    spec.restricted_grant = Some(route(registration, approved.token.clone()));
+    spec.restricted_grant = Some(route(registration, &approved));
     let mut control = spec.connect_with(false, false).unwrap();
     let pending = spec
         .begin_tcp_setup(&mut control, false, (0, 0), None, None)
@@ -2155,13 +2337,13 @@ fn named_tcp_idle_and_partial_arrivals_do_not_block_worker() {
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
     let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
-    let (command, request, _) = requested(
+    let (command, inputs) = requested(
         Path::new("source"),
         &["--no-compress", "--resource-limits", "workers=1"],
     );
-    let approved = approve(&registration, command, request);
+    let approved = approve(&registration, command, inputs);
     let mut spec = crate::conn::RemoteSpec::local_receiver(true);
-    spec.restricted_grant = Some(route(registration, approved.token.clone()));
+    spec.restricted_grant = Some(route(registration, &approved));
     let mut control = spec.connect_with(false, false).unwrap();
     let pending = spec
         .begin_tcp_setup(&mut control, false, (0, 0), None, None)
@@ -2207,13 +2389,20 @@ fn data_hostnames_reject_options_paths_and_config_syntax() {
 }
 
 /// A copy to a named destination does not follow a destination symlink:
-/// its request never signs following one, even with `--follow-dst` (or
-/// `--follow`, whose source following stays the sender's).
+/// its rules never follow one, even with `--follow-dst` (or `--follow`,
+/// whose source following stays the sender's). The receiving machine
+/// follows the command's links above the destination when it resolves it.
 #[test]
-fn named_requests_never_sign_following_the_destination() {
+fn named_rules_never_follow_the_destination() {
     for follow in ["--follow-dst", "--follow"] {
-        let (_, request, _) = requested(Path::new("source"), &[follow]);
-        assert!(!request.constraints.extra_options.follow_dst, "{follow}");
+        let (_, constraints) = rules(
+            Path::new("source"),
+            &[follow],
+            Path::new("/receiving"),
+            (1000, 0),
+        )
+        .unwrap();
+        assert!(!constraints.extra_options.follow_dst, "{follow}");
     }
 }
 
@@ -2254,10 +2443,10 @@ fn a_named_route_probe_that_reaches_nothing_answers_with_no_route() {
     let temp = crate::test_support::tempdir().unwrap();
     let root = temp.path().to_path_buf();
     let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
-    let (command, request, _) = requested(Path::new("source"), &["--no-compress"]);
-    let approved = approve(&registration, command, request);
+    let (command, inputs) = requested(Path::new("source"), &["--no-compress"]);
+    let approved = approve(&registration, command, inputs);
     let mut spec = crate::conn::RemoteSpec::local_receiver(true);
-    spec.restricted_grant = Some(route(registration, approved.token));
+    spec.restricted_grant = Some(route(registration, &approved));
     let _control = spec.connect_with(false, false).unwrap();
     // Opening the control channel measured the round trip that bounds the
     // receiving machine's probes, rather than leaving them the full second.

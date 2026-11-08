@@ -2314,8 +2314,8 @@ mod tests {
             .collect()
         };
 
-        // To this machine: the request the server builds, which this
-        // machine accepts for its command.
+        // To this machine: the rules this machine derives from the command
+        // and what the server read from its files.
         let to_laptop = command("@laptop");
         let argv: Vec<OsString> = to_laptop
             .iter()
@@ -2328,12 +2328,31 @@ mod tests {
         args.mapping_contents = Some(std::sync::Arc::new(
             std::sync::Arc::unwrap_or_clone(crate::mapping::load(&args).unwrap()).input,
         ));
-        let request = crate::restricted::named_request(
-            &args,
-            crate::delegation::GrantConstraints::default().receipt_policy,
+        let inputs = crate::directive::Inputs {
+            ignore: args.ignore_lines.clone(),
+            mapping: crate::directive::mapping_authorization(&args).unwrap(),
+        };
+        let issued = crate::directive::issue_here(
+            crate::directive::Binding {
+                enrollment: crate::enrollment::EnrollmentId::random(),
+                generation: 0,
+                account: "@laptop".into(),
+                role: crate::directive::Role::Destination,
+            },
+            to_laptop.clone(),
+            "~".into(),
+            (inputs.clone(), None),
+            [1; 32],
+            Duration::from_secs(60),
         )
         .unwrap();
-        crate::approval_command::check_copy(&to_laptop, &request, "laptop").unwrap();
+        let (rules, constraints) =
+            crate::directive::receiving_rules(&issued, b"/home/me/runs").unwrap();
+        let request = crate::destination::CopyRequest {
+            destination: b"runs".to_vec(),
+            copy: rules.copy,
+            constraints,
+        };
         let summary = Summary::new(&requester(), &to_laptop, "~", &request, TIMEOUT, None).unwrap();
         assert_eq!(shown_warnings(&summary), [MAPPING_WARNING]);
 
@@ -2352,7 +2371,7 @@ mod tests {
             (
                 crate::directive::Inputs {
                     ignore: Vec::new(),
-                    mapping: request.constraints.mapping.clone(),
+                    mapping: inputs.mapping,
                 },
                 None,
             ),

@@ -95,14 +95,6 @@ impl BandwidthLimit {
         }
     }
 
-    /// Keep each transfer request to roughly one eighth of a second of data,
-    /// matching rsync's write-size pacing and avoiding multi-megabyte bursts at
-    /// low limits. The floor permits the minimum 1 KiB/s rate without tiny
-    /// protocol frames.
-    pub fn burst_bytes(&self) -> u64 {
-        self.bytes_for_interval(125)
-    }
-
     /// Request-sizing budget only, not a bound on bytes on the network.
     pub fn bytes_for_interval(&self, milliseconds: u64) -> u64 {
         ((self.bytes_per_sec as u128 * milliseconds as u128 / 1000).min(u64::MAX as u128) as u64)
@@ -205,7 +197,6 @@ mod tests {
     fn reservations_are_aggregate_and_recover_after_idle_time() {
         let limit = BandwidthLimit::new(1024);
         let now = Instant::now();
-        assert_eq!(limit.burst_bytes(), 512);
         assert_eq!(limit.reserve_at(now, 512), now);
         assert_eq!(limit.reserve_at(now, 512), now + Duration::from_millis(500));
 

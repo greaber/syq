@@ -2848,11 +2848,10 @@ impl Worker {
             return Ok(());
         }
         let job = self.job(idx);
-        let block = self.opts.tuning.streaming_request_size(
-            self.opts.block,
-            self.bwlimit.as_deref(),
-            self.opts.receiver_paces_file_data,
-        );
+        let block = self
+            .opts
+            .tuning
+            .streaming_request_size(self.opts.block, self.bwlimit.as_deref());
         // Do not advance the scheduler's claimed position when opening the
         // stream. Other workers may still steal the unread suffix. At a split
         // we notify the source at the next consumer block boundary, then
@@ -2984,11 +2983,9 @@ impl Worker {
     }
 
     pub(super) fn transfer_block(&self) -> u64 {
-        self.opts.tuning.request_size(
-            self.opts.block,
-            self.bwlimit.as_deref(),
-            self.opts.receiver_paces_file_data,
-        )
+        self.opts
+            .tuning
+            .request_size(self.opts.block, self.bwlimit.as_deref())
     }
 
     pub(super) fn limit(&self, bytes: u64) {

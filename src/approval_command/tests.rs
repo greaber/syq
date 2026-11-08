@@ -37,23 +37,9 @@ fn receiving_authorizer_checks_the_command_without_local_preferences() {
     }
 }
 
-fn policy() -> crate::destination_results::ReceiptPolicy {
-    let (_, public) = crate::destination_results::generate_recipient().unwrap();
-    crate::destination_results::ReceiptPolicy {
-        required: true,
-        hashed: false,
-        max_records: crate::destination_results::DEFAULT_MAX_RECORDS,
-        max_plaintext_bytes: crate::destination_results::DEFAULT_MAX_PLAINTEXT_BYTES,
-        delivery: crate::destination_results::ReceiptDelivery::AttachedEncrypted {
-            suite:
-                crate::destination_results::HpkeSuite::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
-            recipient_public_key: public,
-        },
-    }
-}
-/// What the requesting server sends for `command`: it parses the command as a
-/// command line, reads its ignore and mapping files, then builds the request.
-fn copy_request(command: &[Vec<u8>]) -> crate::destination::CopyRequest {
+/// The requesting server's arguments for `command`: it parses the command
+/// as a command line, then reads its ignore and mapping files.
+fn server_args(command: &[Vec<u8>]) -> crate::cli::Args {
     let argv: Vec<OsString> = command
         .iter()
         .map(|arg| OsString::from_vec(arg.clone()))
@@ -67,44 +53,61 @@ fn copy_request(command: &[Vec<u8>]) -> crate::destination::CopyRequest {
             std::sync::Arc::unwrap_or_clone(crate::mapping::load(&args).unwrap()).input,
         ));
     }
-    crate::restricted::named_request(&args, policy()).unwrap()
+    args
 }
+/// What the requesting server sends beside `args`' command.
+fn server_inputs(args: &crate::cli::Args) -> crate::directive::Inputs {
+    crate::directive::Inputs {
+        ignore: args.ignore_lines.clone(),
+        mapping: crate::directive::mapping_authorization(args).unwrap(),
+    }
+}
+/// The directive a receiving machine issues for `command` and `inputs`.
+fn issued(command: &[Vec<u8>], inputs: crate::directive::Inputs) -> crate::directive::Directive {
+    crate::directive::issue_here(
+        crate::directive::Binding {
+            enrollment: crate::enrollment::EnrollmentId::random(),
+            generation: 0,
+            account: "@laptop".into(),
+            role: crate::directive::Role::Destination,
+        },
+        command.to_vec(),
+        String::new(),
+        (inputs, None),
+        [1; 32],
+        std::time::Duration::from_secs(60),
+    )
+    .unwrap()
+}
+const RECEIVED_AT: &[u8] = b"/home/me/runs";
 fn storage_request(command: &[Vec<u8>]) -> crate::s3::authorization::Request {
     let args = parse(command).unwrap();
     crate::s3::authorization::request_for(&args, args.s3.as_ref().unwrap()).unwrap()
 }
 
 #[test]
-fn copy_requests_must_match_the_command_shown() {
-    for options in [
-        &[][..],
-        &["--prune", "--max-delete", "5"],
-        &["--if-exists=keep"],
-        &["--no-compress", "--performance-tuning", "workers=3"],
-        &["--dry-run"],
+fn a_receiving_machine_approves_only_copies_to_its_own_name() {
+    let to_laptop = command(&[
+        "cp", "--src", "results", "--to", "@laptop", "--into", "runs",
+    ]);
+    receiving_command(&to_laptop, "laptop").unwrap();
+    assert!(receiving_command(&to_laptop, "other").is_err());
+    for argv in [
+        &["cp", "--src", "results", "--to", "backup", "--into", "runs"][..],
+        &[
+            "cp",
+            "--src",
+            "results",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "runs",
+        ],
     ] {
-        let command = command(
-            &[
-                "cp", "--src", "results", "--to", "@laptop", "--into", "runs",
-            ]
-            .iter()
-            .chain(options)
-            .copied()
-            .collect::<Vec<_>>(),
+        assert!(
+            receiving_command(&command(argv), "laptop").is_err(),
+            "{argv:?}"
         );
-        let request = copy_request(&command);
-        check_copy(&command, &request, "laptop").unwrap();
-        assert!(check_copy(&command, &request, "other").is_err());
-
-        let mut changed = request.clone();
-        changed.copy.limits.max_deletions += 1;
-        assert!(check_copy(&command, &changed, "laptop").is_err());
-        let mut changed = request.clone();
-        changed.destination = b"elsewhere".to_vec();
-        assert!(check_copy(&command, &changed, "laptop").is_err());
-        let mut changed = request.clone();
-        changed.copy.options.preserve_permissions ^= true;
-        assert!(check_copy(&command, &changed, "laptop").is_err());
     }
 }
 
@@ -119,27 +122,30 @@ fn server_files_supply_only_their_own_contents() {
         argv.extend_from_slice(file_args);
         argv.extend(["--to", "@laptop", "--into", "runs"]);
         let with_file = command(&argv);
-        let args = parse(&with_file).unwrap();
-        let mut request = crate::restricted::named_request(&args, policy()).unwrap();
-        if args.native_mapping.is_some() {
-            request.constraints.mapping = Some(crate::mapping::Authorization::from_contents(b"{}"));
-        } else {
-            request.constraints.filters.ignore = vec!["*.tmp".into()];
-        }
-        check_copy(&with_file, &request, "laptop").unwrap();
-        request.copy.policy.deletion = crate::delegation::DeletionPolicy::DeleteDestinationOnly;
-        assert!(check_copy(&with_file, &request, "laptop").is_err());
+        let mapped = receiving_command(&with_file, "laptop")
+            .unwrap()
+            .native_mapping
+            .is_some();
+        let mapping = Some(crate::mapping::Authorization::from_contents(b"{}"));
+        let inputs = crate::directive::Inputs {
+            ignore: vec!["*.tmp".into()],
+            mapping: if mapped { mapping.clone() } else { None },
+        };
+        let (_, constraints) =
+            crate::directive::receiving_rules(&issued(&with_file, inputs.clone()), RECEIVED_AT)
+                .unwrap();
+        assert_eq!(constraints.filters.ignore, ["*.tmp"]);
+        assert_eq!(constraints.mapping, inputs.mapping);
+        // The server cannot leave out the mapping its command names, nor add
+        // one it does not.
+        let flipped = crate::directive::Inputs {
+            mapping: if mapped { None } else { mapping },
+            ..inputs
+        };
+        assert!(
+            crate::directive::receiving_rules(&issued(&with_file, flipped), RECEIVED_AT).is_err()
+        );
     }
-
-    // Without a mapping file, the server cannot add a mapping.
-    let inline = command(&[
-        "cp", "--src", "results", "--ignore", "*.log", "--to", "@laptop",
-    ]);
-    let mut request = copy_request(&inline);
-    assert_eq!(request.constraints.filters.ignore, ["*.log"]);
-    check_copy(&inline, &request, "laptop").unwrap();
-    request.constraints.mapping = Some(crate::mapping::Authorization::from_contents(b"{}"));
-    assert!(check_copy(&inline, &request, "laptop").is_err());
 }
 
 #[test]
@@ -158,20 +164,29 @@ fn ignore_rules_come_from_the_server_and_only_narrow() {
         "--max-delete",
         "5",
     ]);
-    let request = copy_request(&command);
-    assert_eq!(request.constraints.filters.ignore, ["a"]);
+    let rules = |ignore: &[&str]| {
+        crate::directive::receiving_rules(
+            &issued(
+                &command,
+                crate::directive::Inputs {
+                    ignore: ignore.iter().map(|line| line.to_string()).collect(),
+                    mapping: None,
+                },
+            ),
+            RECEIVED_AT,
+        )
+        .unwrap()
+    };
+    let (stated, stated_constraints) = rules(&["a"]);
+    assert_eq!(stated.copy.limits.max_deletions, 5);
+    assert!(!stated_constraints.filters.delete_excluded);
+    // Whatever rules the server read, what they restrict is the command's.
     for lines in [&[][..], &["b"], &["!a", "a"]] {
-        let mut changed = request.clone();
-        changed.constraints.filters.ignore = lines.iter().map(|line| line.to_string()).collect();
-        check_copy(&command, &changed, "laptop").unwrap();
+        let (grant, constraints) = rules(lines);
+        assert_eq!(constraints.filters.ignore, lines);
+        assert_eq!(grant.copy, stated.copy);
+        assert!(!constraints.filters.delete_excluded);
     }
-    // What the ignore rules restrict is still checked.
-    let mut changed = request.clone();
-    changed.copy.limits.max_deletions += 1;
-    assert!(check_copy(&command, &changed, "laptop").is_err());
-    let mut changed = request;
-    changed.constraints.filters.delete_excluded = true;
-    assert!(check_copy(&command, &changed, "laptop").is_err());
 }
 
 #[test]
@@ -183,12 +198,13 @@ fn derivation_ignores_this_machines_files() {
     assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
     let fifo = fifo.to_str().unwrap();
     let copy = command(&["cp", "--src", fifo, "--to", "@laptop", "--into", "runs"]);
-    let request = crate::restricted::named_request(
-        &parse_with(&copy, crate::cli::SourceProbe::AssumeFiles).unwrap(),
-        policy(),
+    receiving_command(&copy, "laptop").unwrap();
+    let (grant, _) = crate::directive::receiving_rules(
+        &issued(&copy, crate::directive::Inputs::default()),
+        RECEIVED_AT,
     )
     .unwrap();
-    check_copy(&copy, &request, "laptop").unwrap();
+    assert_eq!(grant.copy.mutation_scopes[1].path, b"/home/me/runs/fifo");
 
     // A source that is a pipe on the server becomes a stream upload there.
     let upload = command(&[
@@ -393,8 +409,9 @@ fn displayed_commands_escape_unusual_text_and_mark_server_files() {
 }
 
 /// Replay the requesting server's steps between parsing and sending: reading
-/// ignore and mapping files, then building the request. Every combination must
-/// match what this machine derives from the same command without those files.
+/// ignore and mapping files, then sending the command and what it read. The
+/// rules this machine derives from them must be those of the copy the server
+/// runs, its arguments after reading those files.
 #[test]
 fn server_side_preparation_matches_derivation_for_many_copy_options() {
     let temp = crate::test_support::tempdir().unwrap();
@@ -483,8 +500,13 @@ fn server_side_preparation_matches_derivation_for_many_copy_options() {
     ];
     for case in cases {
         let command = command(&[&["cp"][..], case].concat());
-        check_copy(&command, &copy_request(&command), "laptop")
+        let args = server_args(&command);
+        let directive = issued(&command, server_inputs(&args));
+        let received = crate::directive::receiving_rules(&directive, RECEIVED_AT)
             .unwrap_or_else(|e| panic!("{case:?}: {e:#}"));
+        let run = crate::directive::rules_for_args(&directive, &args, RECEIVED_AT)
+            .unwrap_or_else(|e| panic!("{case:?}: {e:#}"));
+        assert_eq!(received, run, "{case:?}");
     }
 }
 

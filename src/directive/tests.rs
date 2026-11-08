@@ -464,8 +464,9 @@ fn the_destination_rules_come_from_the_signed_command() {
     // A bandwidth limit is the sender's preference, not part of the rules.
     let mut limited = ROUTE_5.to_vec();
     limited.extend(["--resource-limits", "bandwidth=4M"]);
-    let (_, limited) = destination_rules(&directive(&limited), home).unwrap();
-    assert_eq!(limited.max_file_data_bytes_per_second, 0);
+    let (limited_grant, limited) = destination_rules(&directive(&limited), home).unwrap();
+    assert_eq!(limited_grant.copy, grant.copy);
+    assert_eq!(limited, constraints);
     // `~`, and an absolute destination, as on the server.
     for (destination, expected) in [
         ("~", HOME),

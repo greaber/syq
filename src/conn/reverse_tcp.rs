@@ -17,6 +17,7 @@ impl RemoteSpec {
         &self,
         ports: (u16, u16),
         congestion_control: Option<&str>,
+        pacing: Option<TransportPacing>,
     ) -> Result<PendingTcpSetup> {
         let (port, listeners) = crate::server::bind_data_listeners(ports.0, ports.1, false)?;
         let mut effective = None;
@@ -56,7 +57,7 @@ impl RemoteSpec {
             .map_err(crate::resources::allocation_error)
             .context("start reverse TCP probe")?;
         Ok(PendingTcpSetup {
-            pacing: None,
+            pacing,
             reverse: Some(reverse),
             port,
             // Every worker gets a fresh key over SSH.
@@ -68,19 +69,29 @@ impl RemoteSpec {
         })
     }
 
+    /// A worker over a TCP connection the receiving machine opened to this
+    /// one. Its sends are paced as on a connection this machine opens.
     pub(super) fn connect_reverse_tcp(
         &self,
         reverse: &ReverseTcp,
+        pacing: Option<&TransportPacing>,
         compress: bool,
         role: ConnectionRole,
     ) -> Result<RemoteConn> {
         let (stream, channel, key) = reverse.accept()?;
         stream.set_nodelay(true)?;
+        let handshake = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let observation = Arc::new(crate::transfer_observations::RemoteSample::default());
         let replies = reply_queue(self.read_ahead, &role);
         let (rx, reader, batch_receipts) = spawn_observed_reader(
             Box::new(RecordReader::new(
-                stream.try_clone()?,
+                crate::bwlimit::activity::ActivityIo {
+                    inner: stream.try_clone()?,
+                    bytes: pacing
+                        .filter(|p| p.remote_sender)
+                        .and_then(|p| p.activity.clone()),
+                    handshake_pending: handshake.clone(),
+                },
                 Some(Cipher::new(&key, 0, 2)),
             )),
             replies,
@@ -89,14 +100,14 @@ impl RemoteSpec {
         )?;
         let conn = RemoteConn {
             batch_receipts,
-            transport_stop: None,
+            transport_stop: pacing.map(|p| p.scheduler.clone()),
             observation,
             child: None,
             approved_login: None,
             worker_setup: None,
             w: FrameWriter::new(
                 Box::new(RecordWriter::new(
-                    stream.try_clone()?,
+                    super::paced_output(stream.try_clone()?, pacing, &handshake)?,
                     Some(Cipher::new(&key, 0, 1)),
                 )),
                 compress,
@@ -116,6 +127,7 @@ impl RemoteSpec {
             detached: false,
         };
         let conn = hello(conn, compress, Vec::new(), role)?;
+        handshake.store(false, std::sync::atomic::Ordering::Release);
         conn.tcp_socket.as_ref().unwrap().set_read_timeout(None)?;
         conn.tcp_socket.as_ref().unwrap().set_write_timeout(None)?;
         self.record_peer(&conn);

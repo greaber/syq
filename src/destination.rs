@@ -50,10 +50,11 @@ const REGISTRATION_VERSION: u16 = 3;
 /// The size of an ordinary message, and the most a few small values
 /// carried beside messages may take.
 const MAX_MESSAGE: usize = 256 * 1024;
-/// The largest message: a copy request whose command is as long as a
-/// receiving machine accepts (`approval_command::MAX_COMMAND_BYTES`), which
-/// JSON spells with up to four characters a byte, once in the command and
-/// twice in the request derived from it.
+/// The largest message: a request whose command is as long as a receiving
+/// machine accepts (`approval_command::MAX_COMMAND_BYTES`), which JSON spells
+/// with up to four characters a byte, beside what the command read from
+/// files or, for a copy of files on that machine, the request derived from
+/// it.
 const MAX_REQUEST_MESSAGE: usize = 4 * 1024 * 1024;
 /// How many messages larger than an ordinary one this process reads at
 /// once. A message is read before its sender is authenticated, so this keeps
@@ -179,9 +180,11 @@ pub(crate) fn run_command(command: Destinations) -> Result<i32> {
     destinations(command.action)
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// What a copy's rules let it do at its destination, as a prompt shows
+/// them: derived from the copy's command, never sent.
+#[derive(Clone, Debug)]
 pub(crate) struct CopyRequest {
+    /// The destination as the command names it.
     pub destination: Vec<u8>,
     pub copy: CopyOperation,
     pub constraints: GrantConstraints,
@@ -190,14 +193,9 @@ pub(crate) struct CopyRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Approved {
+    /// What the copy's control, once, and then its workers name to open.
     pub token: String,
     pub destination: Vec<u8>,
-    pub enrollment: crate::enrollment::EnrollmentId,
-    pub request: crate::delegation::RequestId,
-    pub digest: [u8; 32],
-    /// Verifies the header of the receiving machine's own results; a
-    /// coordinator on the requesting machine reads every reply itself.
-    pub results_key: String,
     /// The approving machine's own deletion limit for this copy, when it has
     /// one. Both machines run the same build.
     pub max_delete: Option<u64>,
@@ -248,11 +246,13 @@ enum Message {
         cwd: String,
         request: Box<crate::s3::authorization::Request>,
     },
+    /// A copy from the requesting server to this machine. This machine
+    /// derives what the copy may do from its command.
     Request {
         command: Vec<Vec<u8>>,
         #[serde(default)]
         cwd: String,
-        request: Box<CopyRequest>,
+        inputs: crate::directive::Inputs,
     },
     /// A copy from another server to the requesting server, which this
     /// machine approves with a directive for the source's enrolled receiver.
@@ -989,58 +989,6 @@ pub(crate) fn home_directory() -> Option<(PathBuf, PathBuf)> {
     named.is_absolute().then_some((named, real))
 }
 
-/// Fit `request` within this machine's limits at `destination`, or refuse it.
-/// `dry_run_prunes` marks a dry run of a pruning copy, which is refused
-/// where pruning is off, as the copy itself would be.
-fn constrain(
-    mut request: CopyRequest,
-    destination: &Path,
-    max_bytes: u64,
-    max_entries: u64,
-    max_delete: u64,
-    dry_run_prunes: bool,
-) -> Result<CopyRequest> {
-    if request.copy.mutation_scopes.len() > crate::delegation::MAX_MUTATION_SCOPES {
-        bail!("too many copy scopes");
-    }
-    request.copy.destination = rebase(&request.copy.destination, destination)?;
-    for scope in &mut request.copy.mutation_scopes {
-        scope.path = rebase(&scope.path, destination)?;
-    }
-    for filter_root in &mut request.constraints.filters.destination_roots {
-        *filter_root = rebase(filter_root, destination)?;
-    }
-    // Ownership, special files and `--in-place=new` act as for any copy by
-    // an ordinary account: the receiver never runs as root.
-    crate::directive::Caps {
-        max_bytes,
-        max_entries,
-        max_delete,
-    }
-    .apply(&mut request.copy, dry_run_prunes)?;
-    request.copy.limits.max_connections = request
-        .copy
-        .limits
-        .max_connections
-        .min(crate::delegation::MAX_CONNECTIONS);
-    Ok(request)
-}
-
-/// The most deletions a copy constrained by [`constrain`] may make here:
-/// this machine's own --max-delete, within the copy's entry limit. A pruning
-/// grant enforces it, or the sender's own --max-delete if lower. The
-/// approval carries it to the sender, which refuses every deletion when it
-/// plans more. A dry run's read-only grant deletes nothing, but its reply
-/// carries this too, so the dry run plans against what a real run would get.
-fn deletion_ceiling(request: &CopyRequest, max_delete: u64) -> u64 {
-    crate::directive::Caps {
-        max_bytes: u64::MAX,
-        max_entries: u64::MAX,
-        max_delete,
-    }
-    .deletion_ceiling(&request.copy)
-}
-
 /// The SSH destination a copy through the receiving machine's access would use.
 pub(crate) fn forward_target(args: &crate::cli::Args) -> Result<String> {
     forward::eligible_target(args)
@@ -1228,11 +1176,19 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
     let handoff::Selection {
         name, registration, ..
     } = selection;
+    // Refuse here, before asking, what the receiving machine would refuse
+    // in the command alone, such as an out-of-range limit or too many
+    // sources: it derives the copy's rules the same way.
+    let (_, sources) = args
+        .locations
+        .split_last()
+        .context("copy endpoints missing")?;
+    crate::directive::copy_operation(args, sources, &request_path(b".")?)?;
     let command = crate::approval_command::copy_command(args)?;
-    let request = crate::restricted::named_request(
-        args,
-        crate::destination_results::ReceiptPolicy::unused()?,
-    )?;
+    let inputs = crate::directive::Inputs {
+        ignore: args.ignore_lines.clone(),
+        mapping: crate::directive::mapping_authorization(args)?,
+    };
     notices::waiting(&format!("@{name}"), "this copy");
     let cwd = crate::approval_command::current_directory();
     let ask = |registration: &Registration| {
@@ -1241,7 +1197,7 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
             Message::Request {
                 command: command.clone(),
                 cwd: cwd.clone(),
-                request: Box::new(request.clone()),
+                inputs: inputs.clone(),
             },
             REQUEST_TIMEOUT + Duration::from_secs(10),
             None,
@@ -1297,7 +1253,7 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         "{PREFIX}{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&Route {
             registration,
-            token: approved.token.clone()
+            token: approved.token,
         })?)
     ));
     Ok(())
@@ -1550,183 +1506,239 @@ impl Receiver {
             Message::Request {
                 command,
                 cwd,
-                request,
-            } => {
-                crate::restricted::refuse_privileged_approved_receiver()?;
-                let _request = self.request_lock.try_lock().map_err(|_| {
-                    anyhow::anyhow!(
-                        "another transfer is awaiting approval; retry after it is decided"
-                    )
-                })?;
-                crate::approval_command::check_copy(&command, &request, &self.name)?;
-                // The command's own `--follow-dst` follows symlinks above
-                // the destination, as for any copy.
-                let follow =
-                    crate::approval_command::parse(&command)?.follows_native_destination_paths();
-                // Only a path resolved without following, outside a root,
-                // starts in the home.
-                let home = (self.root.is_none() && !follow)
-                    .then(home_directory)
-                    .flatten();
-                let (destination, mut container) = resolve_destination(
-                    &self.cwd,
-                    self.root.as_deref(),
-                    &request.destination,
-                    follow,
-                    home.as_ref()
-                        .map(|(named, real)| (named.as_path(), real.as_path())),
-                )?;
-                if self.root.as_ref() == Some(&destination)
-                    && request.copy.policy.placement == DestinationPlacement::ExactPath
-                {
-                    bail!("cannot replace the receiving root itself; use --into . or a child path");
-                }
-                let request = constrain(
-                    *request,
-                    &destination,
-                    self.max_bytes,
-                    self.max_entries,
-                    self.max_delete,
-                    crate::approval_command::dry_run_prunes(&command)?,
-                )?;
-                let max_delete = deletion_ceiling(&request, self.max_delete);
-                {
-                    let mut sessions = self.sessions.lock().unwrap();
-                    sessions.retain(|_, s| s.opened || s.issued.elapsed() < START_TIMEOUT);
-                    if sessions.len() >= 8 {
-                        bail!("too many active transfers; wait for one to finish");
-                    }
-                }
-                let generation = self.generation.load(Ordering::Acquire);
-                // ACLs, extended attributes and hard links reach beyond the
-                // files being written, so they always ask, as does widening
-                // the directory the copy goes into.
-                let extra = &request.constraints.extra_options;
-                let automatic = !(extra.acls
-                    || extra.xattrs
-                    || extra.hardlinks
-                    || extra.widen_dirs == crate::delegation::DirectoryWidening::All)
-                    && self.auto_approve_root.as_ref().is_some_and(|root| {
-                        destination.starts_with(root)
-                            && !(destination == *root
-                                && request.copy.policy.placement == DestinationPlacement::ExactPath)
-                    });
-                if automatic {
-                    // Anchor the filesystem executor above the automatic root. Its
-                    // no-follow traversal and signed scopes keep every operation
-                    // inside the selected destination, including during races.
-                    container = self
-                        .auto_approve_root
-                        .as_ref()
-                        .unwrap()
-                        .parent()
-                        .context("automatic approval root must not be filesystem root")?
-                        .to_path_buf();
-                }
-                // Every authority for this request works beneath the
-                // directory opened here, before the prompt: one whose name
-                // leads elsewhere by approval cannot redirect the copy.
-                let container = crate::restricted::Container::open(&container)?;
-                // Validate the complete operation before the local policy decision.
-                let (authority, approved) =
-                    crate::restricted::named_authority(&container, request.clone())?;
-                self.authorize_request(
-                    &command,
-                    &cwd,
-                    &request,
-                    &stream.try_clone()?,
-                    generation,
-                    automatic,
-                )?;
-                // Start the grant clock at approval, including after a long prompt.
-                let (authority, mut approved) = if !automatic {
-                    crate::restricted::named_authority(&container, request)?
-                } else {
-                    (authority, approved)
-                };
-                let mut sessions = self.sessions.lock().unwrap();
-                if self.stop.load(Ordering::Acquire)
-                    || self.generation.load(Ordering::Acquire) != generation
-                    || requester_closed(&stream.try_clone()?)
-                {
-                    bail!("copy disconnected before approval could be used");
-                }
-                approved.token = random_token()?;
-                approved.max_delete = Some(max_delete);
-                sessions.insert(
-                    approved.token.clone(),
-                    Session {
-                        tcp: None,
-                        authority: SessionAuthority::Receive(authority),
-                        issued: Instant::now(),
-                        opened: false,
-                        channels: Arc::new(crate::private_broker::ConnectionRegistry::new(
-                            Duration::from_secs(10),
-                        )),
-                    },
-                );
-                drop(sessions);
-                write_message(&mut stream, &Reply::Approved(approved))
-            }
-            Message::Open { token, control } => {
-                let (authority, channels, _permit, _channel) = {
-                    let mut sessions = self.sessions.lock().unwrap();
-                    let session = sessions
-                        .get_mut(&token)
-                        .context("transfer authorization expired or is unknown")?;
-                    if control {
-                        if session.opened || session.issued.elapsed() >= START_TIMEOUT {
-                            bail!("transfer authorization has already been used or expired");
-                        }
-                    } else if !session.opened {
-                        bail!("transfer control channel has not opened");
-                    }
-                    // Channels waiting to say hello count against the
-                    // approved connections, as later workers do.
-                    let permit = session.authority.permit(control)?;
-                    let channel = session.channels.track(stream.try_clone()?)?;
-                    if control {
-                        session.opened = true;
-                    }
-                    (
-                        session.authority.clone(),
-                        Arc::clone(&session.channels),
-                        permit,
-                        channel,
-                    )
-                };
-                let result = (|| {
-                    write_message(&mut stream, &Reply::Ready)?;
-                    let writer = stream.try_clone()?;
-                    // Keep the bounded Hello deadline until the server has
-                    // validated its complete handshake. Pending workers already
-                    // consume their per-transfer connection allowance.
-                    match &authority {
-                        SessionAuthority::Receive(authority) => {
-                            crate::server::run_named(stream, writer, Arc::clone(authority), control)
-                        }
-                        SessionAuthority::Send {
-                            authority,
-                            descriptors,
-                        } => crate::server::run_named_source(
-                            stream,
-                            writer,
-                            Arc::clone(authority),
-                            descriptors.clone(),
-                            control,
-                        ),
-                    }
-                })();
-                if control {
-                    // Opening consumes the token even if the reply fails. Do
-                    // not leave an opened session occupying a slot forever.
-                    authority.close();
-                    channels.shutdown_all();
-                    self.sessions.lock().unwrap().remove(&token);
-                }
-                result
+                inputs,
+            } => self.request(command, cwd, inputs, stream),
+            Message::Open { token, control } => self.open(token, control, stream),
+        }
+    }
+
+    /// Approve a copy from the requesting server to this machine: derive
+    /// what it may do here from its command, ask, and keep the directive it
+    /// issued for the copy, as the authority made from it, under a token
+    /// that opens the copy's control once, within `START_TIMEOUT`.
+    fn request(
+        &self,
+        command: Vec<Vec<u8>>,
+        cwd: String,
+        inputs: crate::directive::Inputs,
+        mut stream: TrackedStream,
+    ) -> Result<()> {
+        crate::restricted::refuse_privileged_approved_receiver()?;
+        let _request = self.request_lock.try_lock().map_err(|_| {
+            anyhow::anyhow!("another transfer is awaiting approval; retry after it is decided")
+        })?;
+        let args = crate::approval_command::receiving_command(&command, &self.name)?;
+        // The command's own `--follow-dst` follows symlinks above the
+        // destination, as for any copy.
+        let follow = args.follows_native_destination_paths();
+        // Only a path resolved without following, outside a root, starts in
+        // the home.
+        let home = (self.root.is_none() && !follow)
+            .then(home_directory)
+            .flatten();
+        let named = args
+            .locations
+            .last()
+            .context("copy destination missing")?
+            .path
+            .clone();
+        let (destination, mut container) = resolve_destination(
+            &self.cwd,
+            self.root.as_deref(),
+            &named,
+            follow,
+            home.as_ref()
+                .map(|(named, real)| (named.as_path(), real.as_path())),
+        )?;
+        if self.root.as_ref() == Some(&destination) && args.placement == crate::cli::Placement::As {
+            bail!("cannot replace the receiving root itself; use --into . or a child path");
+        }
+        let caps = crate::directive::Caps {
+            max_bytes: self.max_bytes,
+            max_entries: self.max_entries,
+            max_delete: self.max_delete,
+        };
+        // The coordinator on the requesting server reads every reply
+        // itself, so nobody reads this machine's results.
+        let (_, results_key) = crate::destination_results::generate_recipient()?;
+        let issue = || -> Result<_> {
+            let directive = crate::directive::issue_here(
+                crate::directive::Binding {
+                    enrollment: crate::enrollment::EnrollmentId::random(),
+                    generation: self.generation.load(Ordering::Acquire),
+                    account: format!("@{}", self.name),
+                    role: crate::directive::Role::Destination,
+                },
+                command.clone(),
+                cwd.clone(),
+                (inputs.clone(), Some(caps)),
+                results_key,
+                START_TIMEOUT,
+            )?;
+            let rules =
+                crate::directive::receiving_rules(&directive, destination.as_os_str().as_bytes())?;
+            Ok((directive, rules))
+        };
+        let (issued, rules) = issue()?;
+        let request = CopyRequest {
+            destination: named,
+            copy: rules.0.copy.clone(),
+            constraints: rules.1.clone(),
+        };
+        // The most deletions the copy may make here: this machine's own
+        // --max-delete, within the copy's entry limit. A pruning copy's
+        // rules enforce it, or the sender's own --max-delete if lower. The
+        // approval carries it to the sender, which refuses every deletion
+        // when it plans more. A dry run deletes nothing, but its reply
+        // carries this too, so the dry run plans against what a real run
+        // would get.
+        let max_delete = caps.deletion_ceiling(&request.copy);
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            sessions.retain(|_, s| s.opened || s.issued.elapsed() < START_TIMEOUT);
+            if sessions.len() >= 8 {
+                bail!("too many active transfers; wait for one to finish");
             }
         }
+        let generation = self.generation.load(Ordering::Acquire);
+        // ACLs, extended attributes and hard links reach beyond the
+        // files being written, so they always ask, as does widening
+        // the directory the copy goes into.
+        let extra = &request.constraints.extra_options;
+        let automatic = !(extra.acls
+            || extra.xattrs
+            || extra.hardlinks
+            || extra.widen_dirs == crate::delegation::DirectoryWidening::All)
+            && self.auto_approve_root.as_ref().is_some_and(|root| {
+                destination.starts_with(root)
+                    && !(destination == *root
+                        && request.copy.policy.placement == DestinationPlacement::ExactPath)
+            });
+        if automatic {
+            // Anchor the filesystem executor above the automatic root. Its
+            // no-follow traversal and its scopes keep every operation
+            // inside the selected destination, including during races.
+            container = self
+                .auto_approve_root
+                .as_ref()
+                .unwrap()
+                .parent()
+                .context("automatic approval root must not be filesystem root")?
+                .to_path_buf();
+        }
+        // Every authority for this request works beneath the directory
+        // opened here, before the prompt: one whose name leads elsewhere by
+        // approval cannot redirect the copy.
+        let container = crate::restricted::Container::open(&container)?;
+        // Validate the complete operation before the local policy decision.
+        let authority = crate::restricted::receiving_authority(&container, &issued, rules)?;
+        drop(issued);
+        self.authorize_request(
+            &command,
+            &cwd,
+            &request,
+            &stream.try_clone()?,
+            generation,
+            automatic,
+        )?;
+        // Start the directive's clocks at approval, including after a long
+        // prompt.
+        let authority = if automatic {
+            authority
+        } else {
+            let (issued, rules) = issue()?;
+            crate::restricted::receiving_authority(&container, &issued, rules)?
+        };
+        let mut sessions = self.sessions.lock().unwrap();
+        if self.stop.load(Ordering::Acquire)
+            || self.generation.load(Ordering::Acquire) != generation
+            || requester_closed(&stream.try_clone()?)
+        {
+            bail!("copy disconnected before approval could be used");
+        }
+        let token = random_token()?;
+        sessions.insert(
+            token.clone(),
+            Session {
+                tcp: None,
+                authority: SessionAuthority::Receive(authority),
+                issued: Instant::now(),
+                opened: false,
+                channels: Arc::new(crate::private_broker::ConnectionRegistry::new(
+                    Duration::from_secs(10),
+                )),
+            },
+        );
+        drop(sessions);
+        write_message(
+            &mut stream,
+            &Reply::Approved(Approved {
+                token,
+                destination: request.copy.destination,
+                max_delete: Some(max_delete),
+            }),
+        )
+    }
+
+    /// Open a channel of an approved copy: its control once, within
+    /// `START_TIMEOUT` of its approval, then its workers.
+    fn open(&self, token: String, control: bool, mut stream: TrackedStream) -> Result<()> {
+        let (authority, channels, _permit, _channel) = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let session = sessions
+                .get_mut(&token)
+                .context("transfer authorization expired or is unknown")?;
+            if control {
+                if session.opened || session.issued.elapsed() >= START_TIMEOUT {
+                    bail!("transfer authorization has already been used or expired");
+                }
+            } else if !session.opened {
+                bail!("transfer control channel has not opened");
+            }
+            // Channels waiting to say hello count against the
+            // approved connections, as later workers do.
+            let permit = session.authority.permit(control)?;
+            let channel = session.channels.track(stream.try_clone()?)?;
+            if control {
+                session.opened = true;
+            }
+            (
+                session.authority.clone(),
+                Arc::clone(&session.channels),
+                permit,
+                channel,
+            )
+        };
+        let result = (|| {
+            write_message(&mut stream, &Reply::Ready)?;
+            let writer = stream.try_clone()?;
+            // Keep the bounded Hello deadline until the server has
+            // validated its complete handshake. Pending workers already
+            // consume their per-transfer connection allowance.
+            match &authority {
+                SessionAuthority::Receive(authority) => {
+                    crate::server::run_named(stream, writer, Arc::clone(authority), control)
+                }
+                SessionAuthority::Send {
+                    authority,
+                    descriptors,
+                } => crate::server::run_named_source(
+                    stream,
+                    writer,
+                    Arc::clone(authority),
+                    descriptors.clone(),
+                    control,
+                ),
+            }
+        })();
+        if control {
+            // Opening consumes the token even if the reply fails. Do
+            // not leave an opened session occupying a slot forever.
+            authority.close();
+            channels.shutdown_all();
+            self.sessions.lock().unwrap().remove(&token);
+        }
+        result
     }
 }
 

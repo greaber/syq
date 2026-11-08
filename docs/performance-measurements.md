@@ -46,9 +46,8 @@ it isn't finding files fast enough.
 A local source has no process of its own, so its file work counts as
 `source_request` and `source_response`, as in the example. Waits for a
 [bandwidth limit](resource-limits.md#bandwidth) count as `pacing`, except on
-SSH and TCP copies other than receiver-approved ones: there they count as
-`destination_send` when sending to a server and `source_response` when pulling
-from one.
+SSH and TCP copies: there they count as `destination_send` when sending to
+another machine and `source_response` when pulling from one.
 
 ### Endpoint operations
 

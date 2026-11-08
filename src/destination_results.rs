@@ -100,12 +100,6 @@ impl ReceiptPolicy {
         }
     }
 
-    /// For a copy whose coordinator reads the destination's replies itself
-    /// and asks for no results: a valid policy whose key nobody keeps.
-    pub(crate) fn unused() -> Result<Self> {
-        Ok(Self::for_recipient(generate_recipient()?.1))
-    }
-
     pub(crate) fn validate(&self) -> Result<()> {
         if !self.required {
             bail!("receipt policy must require a receipt");

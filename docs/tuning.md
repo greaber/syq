@@ -41,10 +41,9 @@ shortcuts and streams all other ranges.
 <a id="average-rate-and-burst-patterns"></a>
 
 `bw-pacing` needs a nonzero `--resource-limits bandwidth=RATE` and applies to
-local, descriptor, and receiver-approved copies; other SSH and TCP copies
-ignore it, and S3 copies reject it. An interval sends smaller requests that far
-apart, while `average` waits for each request's byte budget, so data can arrive
-in bursts.
+local and descriptor copies; SSH and TCP copies ignore it, and S3 copies
+reject it. An interval sends smaller requests that far apart, while `average`
+waits for each request's byte budget, so data can arrive in bursts.
 
 Sizes accept `K`, `M`, and `G`, using powers of 1024. Setting a request, block,
 pipeline, split, or batch value also stops syq from adjusting it during the

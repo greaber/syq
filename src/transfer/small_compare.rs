@@ -245,17 +245,9 @@ impl Worker {
     }
 
     /// The largest file, and the most source bytes of one group, to compare
-    /// in groups. A receiver that paces file data refuses a request
-    /// carrying more file data than one burst, so a group's files, and with
-    /// them the data its patches send, stay within that.
+    /// in groups.
     pub(super) fn compare_group_limits(&self) -> (u64, u64) {
-        match &self.bwlimit {
-            Some(limit) if self.opts.receiver_paces_file_data => {
-                let burst = limit.burst_bytes();
-                (PATCH_MAX_FILE.min(burst), COMPARE_GROUP_BYTES.min(burst))
-            }
-            _ => (PATCH_MAX_FILE, COMPARE_GROUP_BYTES),
-        }
+        (PATCH_MAX_FILE, COMPARE_GROUP_BYTES)
     }
 
     /// Claim files near `idx` whose destinations can be compared, and
@@ -540,15 +532,9 @@ impl Worker {
     }
 
     /// Bytes of new data each piece of a streamed patch carries: whole
-    /// blocks, within one burst of a pacing receiver's rate limit.
+    /// blocks.
     fn patch_piece(&self, block: u64) -> u64 {
-        let piece = match &self.bwlimit {
-            Some(limit) if self.opts.receiver_paces_file_data => {
-                PATCH_PIECE_BYTES.min(limit.burst_bytes())
-            }
-            _ => PATCH_PIECE_BYTES,
-        };
-        (piece / block).max(1) * block
+        (PATCH_PIECE_BYTES / block).max(1) * block
     }
 
     /// Stream each of `streams`' patches, one after another, and record

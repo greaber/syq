@@ -251,55 +251,6 @@ pub(super) fn state_of(
     }
 }
 
-/// Whether `grant` is a signed directive for an enrolled receiver, whose
-/// sender paces network bytes as for an ordinary copy, rather than the
-/// marker of a copy to a receiving machine. Connections that a receiving
-/// machine approves are not paced at the transport, so those requests carry
-/// the bandwidth limit and the receiver enforces it on file data.
-pub(crate) fn enrolled_grant(grant: &str) -> bool {
-    !crate::destination::is_named(&Some(grant.to_owned()))
-}
-
-/// Build a request without trusting the source's eventual filesystem claims.
-/// The receiving laptop separately confines and approves every mutation scope.
-pub(crate) fn named_request(
-    args: &Args,
-    receipt_policy: crate::destination_results::ReceiptPolicy,
-) -> Result<crate::destination::CopyRequest> {
-    let (destination, sources) = args
-        .locations
-        .split_last()
-        .context("copy endpoints missing")?;
-    let mut checked = args.clone();
-    // Named channels are encrypted by SSH or laptop-initiated TCP workers.
-    checked.no_tcp = false;
-    let path = crate::destination::request_path(b".")?;
-    let copy = directive::copy_operation(&checked, sources, &path)?;
-    Ok(crate::destination::CopyRequest {
-        destination: destination.path.clone(),
-        copy,
-        constraints: GrantConstraints {
-            tcp_congestion: args.tcp_congestion.clone(),
-            mapping: directive::mapping_authorization(args)?,
-            hashing: Some(crate::hashing::CopyHashing::from_args(args)),
-            max_file_data_bytes_per_second: args.bwlimit_bytes,
-            filters: FilterPolicy {
-                ignore: args.ignore_lines.clone(),
-                destination_roots: directive::filter_destination_roots(args, sources, &path)?,
-                delete_excluded: args.delete_excluded,
-            },
-            root_existence: directive::root_existence_for(args.target_existence),
-            receipt_policy,
-            // A receiving machine does not follow a symlink at the
-            // destination; the coordinator refuses one it finds there.
-            extra_options: delegation::ExtraCopyOptions {
-                follow_dst: false,
-                ..directive::extra_copy_options(args)
-            },
-        },
-    })
-}
-
 /// The directory a receiving machine's copy works beneath, opened once when
 /// the request arrives. Every authority made for the request, before and
 /// after its approval, uses this same directory, wherever its name leads
@@ -325,29 +276,23 @@ impl Container {
     }
 }
 
-/// A fresh, in-memory authority made on the receiving machine after
-/// approval. It shares the restricted executor, but never reads or changes an
-/// enrollment, a record of used directives, or persistence preferences.
-pub(crate) fn named_authority(
+/// The authority of a copy to this machine, which it approved itself with
+/// `issued`, whose rules it derived as `rules`
+/// (`directive::receiving_rules`). The machine keeps it in memory for the
+/// copy rather than signing `issued`. It shares the restricted executor, but
+/// never reads or changes an enrollment, a record of used directives, or
+/// persistence preferences.
+pub(crate) fn receiving_authority(
     container: &Container,
-    request: crate::destination::CopyRequest,
-) -> Result<(
-    std::sync::Arc<RestrictedAuthority>,
-    crate::destination::Approved,
-)> {
-    if request.constraints.extra_options.follow_dst {
+    issued: &Directive,
+    (grant, constraints): (Grant, GrantConstraints),
+) -> Result<std::sync::Arc<RestrictedAuthority>> {
+    if constraints.extra_options.follow_dst {
         bail!("copies a receiving machine approves do not follow destination symlinks");
     }
     let (_, home) = current_account()?;
-    let id = EnrollmentId::random();
-    let request_id = RequestId::fresh(directive::now()?)?;
-    let copy = request.copy;
-    let mut constraints = request.constraints;
-    delegation::validate_rules(&copy, &mut constraints)?;
-    let key = generate_results_key(id)?;
-    // Binds the receiving machine's results to this approval.
-    let mut digest = [0u8; 32];
-    getrandom::fill(&mut digest).context("generate the approval's digest")?;
+    // Signs only the header of this machine's results for the copy.
+    let key = generate_results_key(grant.enrollment_id)?;
     let executable = fs::canonicalize(std::env::current_exe()?)?;
     let home = fs::canonicalize(home)?;
     let protected = receiver_control_paths(&home, Some(&executable), ControlPaths::Here)?;
@@ -358,27 +303,14 @@ pub(crate) fn named_authority(
             .try_clone()
             .context("hold the receiving directory")?,
     )?;
-    let approved = crate::destination::Approved {
-        token: String::new(),
-        destination: copy.destination.clone(),
-        enrollment: id,
-        request: request_id,
-        digest,
-        results_key: key.public_key().to_openssh()?,
-        max_delete: None,
-    };
     let authority = RestrictedAuthority::new(
         confined,
-        Grant {
-            enrollment_id: id,
-            request_id,
-            copy,
-        },
+        grant,
         constraints,
-        digest,
+        directive::issued_digest(issued)?,
         key,
         Instant::now() + std::time::Duration::from_secs(FINISH_WINDOW_SECONDS as u64),
         &protected,
     )?;
-    Ok((std::sync::Arc::new(authority), approved))
+    Ok(std::sync::Arc::new(authority))
 }

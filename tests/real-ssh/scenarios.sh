@@ -630,6 +630,61 @@ return_copy_pid=
 printf 'return\n' | cmp - "$receive_root/approved"
 if syq persist receive approve "$request_id"; then echo 'used approval ID was reused' >&2; exit 1; fi
 
+printf 'case: the server paces a capped copy to the laptop on the bytes it sends\n'
+ssh source python3 - <<'PY_PACED_SOURCE'
+import os
+from pathlib import Path
+
+source = Path("/tmp/syq-real-ssh/paced-return")
+source.mkdir(parents=True, exist_ok=True)
+# 8 MiB that compresses to a few kilobytes, and 1 MiB that does not.
+(source / "compressible").write_bytes(b"syq pacing test\n" * (1 << 19))
+(source / "random").write_bytes(os.urandom(1 << 20))
+PY_PACED_SOURCE
+python3 - <<'PY_PACED_RETURN'
+import hashlib
+import json
+import shlex
+import subprocess
+
+
+def run(*args):
+    return subprocess.run(args, check=True, capture_output=True, text=True, timeout=60).stdout
+
+
+# The TCP copy fails rather than falling back to SSH data.
+for label, environment, transport in [("tcp", ["env", "SYQ_TEST_REQUIRE_TCP=1"], []),
+                                      ("ssh", [], ["--no-tcp"])]:
+    results = f"/tmp/syq-real-ssh/paced-return-{label}.ndjson"
+    command = [*environment, "syq", "cp", "--srcs-in", "/tmp/syq-real-ssh/paced-return",
+               "--to", "@laptop", "--into", f"paced-{label}",
+               "--resource-limits", "bandwidth=2M", f"--results={results}", *transport]
+    copy = subprocess.Popen(["ssh", "source", shlex.join(command)], stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
+    try:
+        pending = json.loads(run("syq", "persist", "receive", "pending", "--wait",
+                                 "--timeout", "10", "--json"))
+        assert len(pending) == 1, pending
+        run("syq", "persist", "receive", "approve", pending[0]["id"])
+        output, _ = copy.communicate(timeout=60)
+    finally:
+        if copy.poll() is None:
+            copy.kill()
+            copy.wait(timeout=5)
+    assert copy.returncode == 0, output
+    terminal = json.loads(run("ssh", "source", "tail -n 1 " + shlex.quote(results)))
+    # The megabyte that does not compress takes half a second at 2 MiB/s.
+    # Pacing file data rather than the bytes sent would take four seconds
+    # more for the rest.
+    transfer_ms = terminal["timings"]["transfer_ms"]
+    assert 400 <= transfer_ms < 3000, (label, terminal)
+    expected = run("ssh", "source", "sha256sum /tmp/syq-real-ssh/paced-return/random").split()[0]
+    with open(f"/tmp/syq-real-ssh-receive/paced-{label}/random", "rb") as copied:
+        assert hashlib.sha256(copied.read()).hexdigest() == expected, label
+    print(json.dumps({"route": "to the laptop", "transport": label,
+                      "transfer_ms": transfer_ms}), flush=True)
+PY_PACED_RETURN
+
 printf 'case: disconnected requests cannot be approved later\n'
 ssh source 'timeout 2 syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as disconnected' &
 return_copy_pid=$!
@@ -765,7 +820,9 @@ ssh source 'syq persist destinations wait laptop --timeout 5'
 printf 'case: interrupted named copy fails, laptop reconnects, and retry resumes\n'
 ssh source 'dd if=/dev/urandom of=/tmp/syq-real-ssh/return-source/resume.bin bs=1M count=16 status=none'
 source_prefix=$(ssh source 'dd if=/tmp/syq-real-ssh/return-source/resume.bin bs=1M count=4 status=none | sha256sum')
-timeout 45 ssh source 'SYQ_TEST_REQUIRE_TCP=1 syq cp --resource-limits bandwidth=512 /tmp/syq-real-ssh/return-source/resume.bin --to @laptop --as interrupted' &
+# One worker writes the file from its start, so its first 4 MiB arrive
+# after 8 seconds at this rate; several would each fill a part of it.
+timeout 45 ssh source 'SYQ_TEST_REQUIRE_TCP=1 syq cp --resource-limits bandwidth=512,workers=1 /tmp/syq-real-ssh/return-source/resume.bin --to @laptop --as interrupted' &
 return_copy_pid=$!
 deadline=$(($(date +%s) + 25))
 next_progress=$(($(date +%s) + 5))

@@ -657,7 +657,6 @@ pub(crate) struct RestrictedAuthority {
     /// them. Locked after `state` when both are held.
     pub(super) results: Mutex<Option<crate::destination_results::Stream>>,
     pub(super) results_started: AtomicBool,
-    pub(super) file_data_limit: Option<crate::bwlimit::BandwidthLimit>,
     pub(super) deadline: Instant,
     pub(super) control_open: AtomicBool,
     /// Changes authorized so far, against the signed entry limit: each
@@ -760,7 +759,6 @@ impl RestrictedAuthority {
         protected: &[ReceiverControlPath],
     ) -> Result<Self> {
         let GrantConstraints {
-            max_file_data_bytes_per_second,
             filters,
             root_existence,
             receipt_policy,
@@ -907,8 +905,6 @@ impl RestrictedAuthority {
             )?;
             reject_protected_scope(&root, relative, descendants, &identities, &mut seen)?;
         }
-        let file_data_limit = (max_file_data_bytes_per_second > 0)
-            .then(|| crate::bwlimit::BandwidthLimit::new(max_file_data_bytes_per_second));
         receipt_policy.validate()?;
         let mut authority = Self {
             hashing,
@@ -938,7 +934,6 @@ impl RestrictedAuthority {
             results_key,
             results: Mutex::new(None),
             results_started: AtomicBool::new(false),
-            file_data_limit,
             deadline,
             control_open: AtomicBool::new(true),
             settled: std::sync::Condvar::new(),
@@ -2600,26 +2595,14 @@ impl RestrictedAuthority {
     }
 
     /// Check file data a request carries for `path` at `offset`: within the
-    /// per-file limit and one rate-limit burst, paced to the signed rate.
-    /// Its bytes count against the total once the request is authorized
-    /// (`charge_request`).
+    /// per-file limit. Its bytes count against the total once the request is
+    /// authorized (`charge_request`).
     pub(super) fn check_file_bytes(&self, path: &[u8], offset: u64, bytes: usize) -> Result<()> {
         self.check_mutation_path(path, false)?;
         let bytes = u64::try_from(bytes).context("request byte count overflow")?;
-        if self
-            .file_data_limit
-            .as_ref()
-            .is_some_and(|limit| bytes > limit.burst_bytes())
-        {
-            bail!("request exceeds the signed file-data rate-limit burst");
-        }
         let end = offset.checked_add(bytes).context("file offset overflow")?;
         if end > self.copy.limits.max_file_bytes {
             bail!("signed grant per-file byte limit exceeded");
-        }
-        if let Some(limit) = &self.file_data_limit {
-            limit.wait(bytes);
-            self.check_deadline()?;
         }
         Ok(())
     }
@@ -3012,16 +2995,6 @@ impl RestrictedAuthority {
         if !in_destination && !at_destination {
             bail!("small copy writes into a directory other than the signed destination");
         }
-        if let Some(limit) = &self.file_data_limit {
-            let bytes = request.files.iter().try_fold(0u64, |total, file| {
-                total
-                    .checked_add(file.size)
-                    .context("small copy byte count overflow")
-            })?;
-            if bytes > limit.burst_bytes() {
-                bail!("small copy exceeds the signed file-data rate-limit burst");
-            }
-        }
         // A content match also sets times the copy compares by.
         let flags = request.flags | (request.matching_flags & proto::flags::TIMES);
         for (index, file) in request.files.iter().enumerate() {
@@ -3061,16 +3034,6 @@ impl RestrictedAuthority {
         // otherwise hold back.
         if !proto::patch_batch_fits(patches.iter().map(|patch| patch.len)) {
             bail!("small-file patch batch describes more file bytes than the protocol allows");
-        }
-        if let Some(limit) = &self.file_data_limit {
-            let bytes = patches.iter().try_fold(0u64, |total, patch| {
-                total
-                    .checked_add(patch.data.len() as u64)
-                    .context("small-file batch byte count overflow")
-            })?;
-            if bytes > limit.burst_bytes() {
-                bail!("small-file batch exceeds the signed file-data rate-limit burst");
-            }
         }
         for (index, patch) in patches.iter_mut().enumerate() {
             if self.expected_hash(&patch.path)?.is_some() {
@@ -4105,16 +4068,6 @@ impl RestrictedAuthority {
             Request::PutSmallBatch(puts) => {
                 if puts.iter().any(|put| put.inplace) {
                     self.require_publication_mode(true, "small-file publication")?;
-                }
-                if let Some(limit) = &self.file_data_limit {
-                    let bytes = puts.iter().try_fold(0u64, |total, put| {
-                        total
-                            .checked_add(put.data.len() as u64)
-                            .context("small-file batch byte count overflow")
-                    })?;
-                    if bytes > limit.burst_bytes() {
-                        bail!("small-file batch exceeds the signed file-data rate-limit burst");
-                    }
                 }
                 for (index, put) in puts.iter_mut().enumerate() {
                     // As for `Prepare`, the receiver looks for itself
