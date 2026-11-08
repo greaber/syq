@@ -4,6 +4,84 @@ User-facing changes are recorded here starting with the release after
 [0.5.2](https://github.com/greaber/syq/releases/tag/v0.5.2).
 Earlier releases have notes on [GitHub Releases](https://github.com/greaber/syq/releases).
 
+## 0.9.0 — 2026-11-08
+
+Changes since 0.8.0. A server can now copy files from your laptop with its
+approval, copies between two other servers need only one approval per copy,
+and receiving services switch to new versions more reliably. This release
+also fixes the findings of a security review.
+
+### Upgrade notes
+
+- **Copies between two other servers** that a third server starts with
+  `--auth-from @NAME` no longer use account approvals. Your laptop approves
+  each copy once, and the source server runs it and connects to the
+  destination directly; the requesting server gets no access to either
+  account beyond that copy. The first copy enrolls the source account, as
+  uploads already did. Lines starting `syq-copy-worker-` that earlier copies
+  left in `~/.ssh/authorized_keys` grant nothing and can be deleted.
+- **SSH authorization providers** (`--auth-from USER@HOST`) can no longer
+  approve direct copies between two servers. Use `--auth-from @NAME`, or
+  `--coordinate-at local` to copy through the requesting server with the
+  provider's access.
+- **Persistent SSH connections forward nothing.** Connections that syq keeps
+  open after a command, including `syq ssh` with persistence on, no longer
+  forward your agent or the port forwards in your SSH configuration, because
+  the server could keep using them after the command ends. Use `ssh -A` when
+  you need agent forwarding. Connections an older syq opened keep their
+  forwarding until `syq persist off`.
+- **New `--into` directories follow the umask**, as `mkdir` does, instead of
+  always being `0755`. Under the common `022` umask nothing changes.
+
+### New
+
+- `syq cp --from @NAME` copies files from a receiving machine, such as your
+  laptop, to the server you run it on. The laptop shows the exact paths and
+  asks each time; these requests are read-only and `--auto-approve-root`
+  never approves them.
+- A rerun that publishes a file now removes the partial files an earlier
+  interrupted copy left for it, when nothing has them open for writing
+  (Linux local filesystems). Elsewhere, `syq clean-partials` is still needed.
+- Shell completion completes directories for `--auto-approve-root`, handles
+  quoted words in zsh and fish, and keeps a leading `~`. `--cwd`, `--root`,
+  `--auto-approve-root` and `--pscope` expand `~` after `--option=`.
+
+### Receiving and updates
+
+- After an update, `syq persist on`, `persist connect`, `persist status` and
+  `persist receive status` switch an idle receiving service from another
+  version right away, including one an older syq started. Before, receiving
+  could stay on the old version or stop until reconnected.
+- Approved account connections no longer keep the old version running after an
+  update: a switch ends the ones nothing is using and waits for the rest.
+- A switch hands the login it checked over to the new service, so receiving no
+  longer goes down if a second login fails, and hardware keys need one touch
+  fewer.
+- Services started with `--use-version` switch to the installed syq once idle,
+  instead of keeping the selected release.
+
+### Security
+
+- Approval prompts show where a request writes, and its warnings, before the
+  list of files; quote every name the server supplies; and list paths outside
+  the profile's directory and hidden paths first.
+- A command on a server checks that the receiving socket belongs to the same
+  user before sending anything, and the laptop passes the connection's secret
+  on standard input instead of the command line.
+- Servers count decompressed data against a shared memory allowance, so small
+  compressed requests can't make a receiver hold far more than was sent.
+- Other fixes to TCP connection identifiers, revocation of hostA's access, and
+  advertised addresses.
+
+### Fixes
+
+- Error messages use the same words as the help, for example for
+  `--src-dir LINK` and the `--receiver-max-*` options.
+- `syq rsync` prints "skipping non-regular file" on standard output, as rsync
+  does.
+- Tuning history shrinks to its size limit correctly.
+- S3 mappings check their selectors before starting.
+
 ## 0.8.0 — 2026-11-06
 
 Changes since 0.7.1. Copies between servers now set up one enrollment per

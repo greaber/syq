@@ -259,29 +259,33 @@ but does not start receiving.
 
 In an isolated domain, idle SSH connections close after five to ten minutes;
 in the default domain they stay open. Syq installs no login service, so
-connect again after a reboot. After you update syq, receiving and the SSH
-authorization provider switch to the new version once no copy, command, or
-approval is in progress, by themselves or when you next run syq. The new
-version of receiving logs in to the server before the old one stops and keeps
-that login, so a login that fails leaves the old version receiving.
-`syq persist status`, `syq persist on`, `syq persist connect`, and
-`syq persist receive status` switch idle receiving at once, logging in as
-`syq persist connect` does, but not with `--json`.
-`syq persist status` says why receiving still runs an older version.
-`syq persist receive on`, `receive off NAME`, and `receive remove NAME` switch
-it even when busy, which cuts off copies and approvals in progress. If
-receiving needs you to unlock or touch your SSH key, it waits until you next
-run a syq copy or ssh command, or `syq persist status`, in a terminal. An
-account connection you approved closes at the switch when nothing runs through
-it, along with any idle port forwards it holds. The next syq command that uses
-it opens it again, which asks for approval again unless you remembered it;
-export a `persist ssh-config` file again after that. While a copy, shell, or
-other session runs through it, the switch waits for it to finish. A connection
-that can't tell whether it's in use, such as one opened on macOS or in an
-isolated domain, keeps the old version until it closes. `syq persist status`
-says which connections the switch waits for and shows the command that
-switches at once and closes them. Session permissions (**Allow**) end at the
-switch, as at any reconnect.
+connect again after a reboot.
+
+After you update syq, receiving and the SSH authorization provider switch to
+the new version once no copy, command, or approval is in progress, by
+themselves or when you next run syq. The new version logs in to the server
+before the old one stops, so if that login fails, the old version keeps
+receiving; `syq persist status` says why receiving still runs an older
+version. If the login needs you to unlock or touch your SSH key, it waits
+until you next run a syq copy or ssh command, or `syq persist status`, in a
+terminal.
+
+To switch idle receiving at once, run `syq persist status`, `persist on`,
+`persist connect`, or `persist receive status` without `--json`; each logs in
+as `syq persist connect` does. `syq persist receive on`, `receive off NAME`,
+and `receive remove NAME` switch it even when busy, which cuts off copies and
+approvals in progress.
+
+An account connection you approved closes at the switch when nothing runs
+through it, along with any idle port forwards it holds. The next syq command
+that uses it opens it again, which asks for approval again unless you
+remembered it; export a `persist ssh-config` file again after that. While a
+copy, shell, or other session runs through it, the switch waits for it to
+finish. A connection that can't tell whether it's in use, such as one opened
+on macOS or in an isolated domain, makes the switch wait until it closes.
+`syq persist status` says which connections the switch waits for and shows
+the command that switches at once and closes them. Session permissions
+(**Allow**) end at the switch, as at any reconnect.
 
 To wait in a script without starting a connection, run
 `syq persist receive wait server --timeout 30` on the laptop, or

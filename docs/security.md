@@ -370,9 +370,9 @@ domain. `syq persist receive off` turns it off but keeps SSH reuse.
 
 The prompt shows the server account and the requested command. For copies and
 authorizations, that is the syq command the server ran, including options from
-its environment variables. A desktop prompt puts where a request writes, and
+its environment variables. A desktop prompt shows where a request writes, and
 its warnings, before the files the command names, and lists only three of
-those, each in quotes; `syq persist receive pending` lists them all. Paths on
+those; `syq persist receive pending` lists them all. Paths on
 your machine appear with `..` resolved, as syq uses them, except paths a
 request reads while following symlinks, which keep their spelling. Your laptop
 derives what it enforces from that command and rejects a request that does not

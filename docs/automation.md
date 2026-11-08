@@ -306,8 +306,8 @@ authorization provider when it runs another build or switches.
 `authorized_ssh` lists approved account connections, each with `authorizer`,
 `requested` (the original selection), `endpoint` (the resolved account and
 address), `control`, `connected`, and `closing` (it takes no new sessions and
-ends once those running end, as after a switch to a new version); the two endpoint objects have `user`,
-`host`, and `port`. A return authorizer is its name as a string, and an SSH
+ends once those running end, as after a switch to a new version); the two
+endpoint objects have `user`, `host`, and `port`. A return authorizer is its name as a string, and an SSH
 provider is an object whose `ssh` field holds the provider endpoint.
 `authorized_ssh_errors` lists account records that couldn't be read; the command
 then exits nonzero after printing the valid entries.
@@ -318,7 +318,7 @@ then exits nonzero after printing the valid entries.
 |---|---|
 | `profiles` | Every profile's `cwd`, `cwd_explicit`, `root`, `auto_approve_root` (null when every download asks), and `servers` (the endpoints set with `--connection`; empty means all) |
 | `settings` | The first selected profile's settings |
-| `connections` | The profiles allowed on each endpoint, and its service's build (`identity`), what keeps it from switching (`busy`: `requests` in progress, `pending` approvals, and `accounts`, the open account connections that keep it, of which `accounts_in_use` say something runs through them; the rest can't say. One that says nothing does isn't counted, since the switch closes it), the syq path it follows (`started_from`), and any `switch` to a new build |
+| `connections` | The profiles allowed on each endpoint, and its service's build (`identity`), what keeps it from switching (`busy`: `requests` in progress, `pending` approvals, and `accounts`, the open account connections the switch waits for; `accounts_in_use` of those have a session running, and the rest can't tell and count until they close), the syq path it follows (`started_from`), and any `switch` to a new build |
 | `provider` | The local SSH authorization service, or null when it isn't running; its `profiles` contain `settings`, `sessions`, and `pending` requests, and `decision_error` reports a failed local approval |
 
 `syq persist receive pending --json` prints the requests waiting for approval,
