@@ -381,11 +381,11 @@ def main():
         remote("source", "mkdir " + shlex.quote(b + "/many") + " && cd " + shlex.quote(b + "/many")
                + " && seq -f " + shlex.quote(stem + "_%04g") + " 1 1024 | xargs touch")
         remote("destination", "mkdir " + shlex.quote(c + "/many"))
-        attempts["many"] = 1
-        argv = ["--to", "destination", "--into", c + "/many", "--auth-from", "@laptop",
-                "--performance-tuning", "workers=2", "--no-progress",
-                "--results", f"{a}/many.1.ndjson"]
         def many(count):
+            attempts["many"] = attempts.get("many", 0) + 1
+            argv = ["--to", "destination", "--into", c + "/many", "--auth-from", "@laptop",
+                    "--performance-tuning", "workers=2", "--no-progress",
+                    "--results", f"{a}/many.{attempts['many']}.ndjson"]
             script = ("test -z \"${SSH_AUTH_SOCK:-}\" && set -- $(seq -f "
                       + shlex.quote(b + "/many/" + stem + "_%04g") + f" 1 {count}) && exec env "
                       + "PATH=/usr/bin:/bin:/usr/local/bin syq cp --from source \"$@\" "

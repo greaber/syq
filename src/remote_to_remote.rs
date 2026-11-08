@@ -1149,9 +1149,11 @@ fn read_input(label: &str, length: usize, maximum: usize) -> Result<zeroize::Zer
             .context("take the requesting syq's input")?,
     );
     let mut bytes = zeroize::Zeroizing::new(vec![0; length]);
-    input
-        .read_exact(&mut bytes)
-        .with_context(|| format!("the requesting syq ended before sending the {label}"))?;
+    input.read_exact(&mut bytes).map_err(|error| {
+        anyhow::anyhow!(
+            "the requesting syq ended before sending the {label} ({error}); the SSH connection must pass this coordinator its input, which `ssh -n` and `StdinNull yes` close"
+        )
+    })?;
     Ok(bytes)
 }
 
@@ -1552,14 +1554,8 @@ pub(crate) fn take_sources_from_input(argv: &mut Vec<OsString>) -> Result<()> {
     let length = std::str::from_utf8(length)
         .ok()
         .and_then(|length| length.parse().ok())
-        .filter(|length| (1..=MAX_SOURCES_INPUT).contains(length))
         .context("invalid length of the named sources on the coordinator's input")?;
-    // Only an input that ends early fails here.
-    let input = read_input("named sources", length, MAX_SOURCES_INPUT).map_err(|error| {
-        anyhow::anyhow!(
-            "{error:#}; the SSH connection must pass this coordinator its input, which `ssh -n` and `StdinNull yes` close"
-        )
-    })?;
+    let input = read_input("named sources", length, MAX_SOURCES_INPUT)?;
     let words = parse_input_sources(&input)?;
     argv.splice(position..=position, words);
     Ok(())
@@ -1966,14 +1962,14 @@ fn run_remote(
         )?;
         peer_login_user = Some(peer_policy.login_user.clone());
         peer_connection_host = Some(peer_policy.connection_host().to_owned());
-        // Native new/existing placement forms travel in the signed grant as the
-        // root-existence precondition, so they use the receiver like any other
-        // form instead of silently keeping only the constrained broker.
         // A command too long to sign is refused as such, before anything
         // is set up, rather than as an enrollment that failed.
         let command = (!coordinator_at_dst && args.peer_auth != PeerAuth::Broker)
             .then(|| crate::approval_command::copy_command(args))
             .transpose()?;
+        // Native new/existing placement forms travel in the signed grant as the
+        // root-existence precondition, so they use the receiver like any other
+        // form instead of silently keeping only the constrained broker.
         let prepared = command
             .map(|command| {
                 crate::directive::validate_restricted_args(args)?;
