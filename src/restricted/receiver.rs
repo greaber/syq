@@ -737,7 +737,7 @@ pub(super) fn verify_coordination(
 /// What a verified directive for one end of a copy allows.
 pub(super) enum Rules {
     Destination(Box<(Grant, GrantConstraints)>),
-    Source(crate::destination::pull::PullRequest),
+    Source(Box<crate::destination::pull::PullRequest>),
 }
 
 impl Rules {
@@ -849,10 +849,9 @@ pub(super) fn verify_rules(
             crate::directive::Role::Destination => Ok(Rules::Destination(Box::new(
                 crate::directive::destination_rules(directive, home)?,
             ))),
-            crate::directive::Role::Source => Ok(Rules::Source(crate::directive::source_rules(
-                directive,
-                canonical_home,
-            )?)),
+            crate::directive::Role::Source => Ok(Rules::Source(Box::new(
+                crate::directive::source_rules(directive, canonical_home)?,
+            ))),
             crate::directive::Role::CoordinatingSource(_) => {
                 bail!("a coordinating source's directive comes with its destination's")
             }
