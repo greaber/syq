@@ -641,12 +641,22 @@ fn run_session(
     plan: Plan,
     check: DestinationCheck<'_>,
 ) -> Result<(Session, PathBuf)> {
-    let retry_state = if plan.refresh {
-        "remains active with its previous state; the refresh can be retried"
-    } else {
-        "remains pending for a safe retry"
-    };
     let id = plan.id;
+    // What is left after a failure: a refresh keeps the active enrollment;
+    // a new one is pending only once its entry key is stored, which a check
+    // that refuses the copy never reaches.
+    let pending = plan.directory.join(PENDING_FILE);
+    let retry_state = || {
+        if plan.refresh {
+            Some(format!(
+                "enrollment {id} remains active with its previous state; the refresh can be retried"
+            ))
+        } else if pending.exists() {
+            Some(format!("enrollment {id} remains pending for a safe retry"))
+        } else {
+            None
+        }
+    };
     // The user's own login first, along the route the SSH configuration
     // gives; then through `jump` when that cannot connect.
     let configured = install_over_route(
@@ -666,12 +676,19 @@ fn run_session(
                 (&plan, batch),
                 check,
             )
-            .with_context(|| {
-                format!("enrollment {id} {retry_state}; enrolling along your SSH configuration's route also failed: {configured_error:#}")
+            .map_err(|error| {
+                let also = format!("enrolling along your SSH configuration's route also failed: {configured_error:#}");
+                match retry_state() {
+                    Some(state) => error.context(format!("{state}; {also}")),
+                    None => error.context(also),
+                }
             })?
         }
         (Err(error), _) => {
-            return Err(error).with_context(|| format!("enrollment {id} {retry_state}"))
+            return Err(match retry_state() {
+                Some(state) => error.context(state),
+                None => error,
+            })
         }
     };
     Ok((session, plan.directory))

@@ -432,6 +432,8 @@ def main():
             run("syq", "persist", "receive", "approve", requests[0]["id"])
             text = finish(process, output, success=False)
         assert "restricted receivers do not write or run copies as root" in text, text
+        # Nothing was left pending, so the error does not say so.
+        assert "remains pending" not in text, text
         # Nothing reached toor's home: no key line, no stored syq, no state.
         assert alias_home() == alias_before
         remote(alias, "test ! -e ~/.local/lib/syq && test ! -e ~/.local/share/syq"
