@@ -1607,12 +1607,14 @@ impl Receiver {
         let generation = self.generation.load(Ordering::Acquire);
         // ACLs, extended attributes and hard links reach beyond the
         // files being written, so they always ask, as does widening
-        // the directory the copy goes into.
+        // the directory the copy goes into, and unencrypted TCP, which
+        // `receiving_rules` refuses here before it gets this far.
         let extra = &request.constraints.extra_options;
         let automatic = !(extra.acls
             || extra.xattrs
             || extra.hardlinks
-            || extra.widen_dirs == crate::delegation::DirectoryWidening::All)
+            || extra.widen_dirs == crate::delegation::DirectoryWidening::All
+            || request.constraints.unencrypted_tcp)
             && self.auto_approve_root.as_ref().is_some_and(|root| {
                 destination.starts_with(root)
                     && !(destination == *root

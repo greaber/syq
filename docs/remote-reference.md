@@ -79,7 +79,8 @@ whichever of the two machines is older.
 A copy between two servers that you start on your laptop can also find the
 receiver running another build than your laptop recorded, for example after
 another syq on your laptop updated it. Then syq updates the receiver to its
-own build and runs the copy once more. It does this only when the server
+own build and runs the copy once more, signed as the same copy, so the
+receiver runs at most one of the two. It does this only when the server
 running the copy runs your laptop's build, as it does unless you pass
 `--syq-path` or `--no-bootstrap`, and never for a dry run.
 

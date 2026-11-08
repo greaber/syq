@@ -556,6 +556,7 @@ fn coordinator_records_wait_for_the_destination_results_to_start() {
         let (stream, expectation) = destination(true);
         let (file, writer) = results_file();
         let mut relay = Relay::new(TOKEN, Some(writer), Some(expectation), (false, false));
+        relay.hold_until_destination_starts();
         relay_output(input, &mut Vec::new(), &mut None, &mut relay).unwrap();
         (stream, file, relay)
     };
@@ -579,6 +580,7 @@ fn coordinator_records_wait_for_the_destination_results_to_start() {
     let (mut stream, expectation) = destination(true);
     let (file, writer) = results_file();
     let mut relay = Relay::new(TOKEN, Some(writer), Some(expectation), (false, false));
+    relay.hold_until_destination_starts();
     let mut input = coordinator_line(setup, 0);
     input.extend(destination_lines(&mut stream, 0));
     relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
@@ -586,6 +588,14 @@ fn coordinator_records_wait_for_the_destination_results_to_start() {
     let records = read_records(file);
     assert_eq!(records[0]["message"], "syq: setting up", "{records:?}");
     assert!(records.len() > 1, "{records:?}");
+    // More than a refused attempt sends is written at once, and the copy
+    // can no longer be run again.
+    let long = serde_json::json!({"type": "error", "message": "x".repeat(600 * 1024)});
+    let mut input = coordinator_line(long.clone(), 0);
+    input.extend(coordinator_line(long, 1));
+    let (_, file, mut relay) = relayed(&input);
+    assert_eq!(read_records(file.try_clone().unwrap()).len(), 2);
+    assert!(!relay.discard_held());
 }
 
 #[test]
@@ -744,34 +754,32 @@ fn a_source_failure_explains_a_file_the_receiver_left_unfinished_at_once() {
     let (mut stream, expectation) = destination(true);
     let (file, writer) = results_file();
     let mut relay = Relay::new(TOKEN, Some(writer), Some(expectation), (false, false));
-    let frames = |stream: &mut crate::destination_results::Stream| {
-        let mut input = Vec::new();
-        for frame in stream
-            .take_frames(std::time::Instant::now() + std::time::Duration::from_secs(1))
-            .unwrap()
-        {
-            input.extend(destination_line(&frame));
-        }
-        input
-    };
-    // The receiver's results start with the copy. A file's destination was
-    // prepared, then reading its source failed: the coordinator's error
-    // explains the failure as it happens, and the receiver, which cannot
-    // know why, lists the file unfinished at the end.
-    let mut input = frames(&mut stream);
-    input.extend(coordinator_line(
+    // A file's destination was prepared, then reading its source failed:
+    // the coordinator's error explains the failure as it happens, and the
+    // receiver, which cannot know why, lists the file unfinished at the end.
+    let input = coordinator_line(
         serde_json::json!({
             "type": "error", "class": "io", "os_kind": "permission_denied",
             "message": "syq: a: read: Permission denied (os error 13)",
             "diagnostic_for": tagged_path("a"),
         }),
         0,
-    ));
+    );
     relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
     // Written already, before the receiver's stream ends.
     let early = read_records(file.try_clone().unwrap());
     assert_eq!(early.len(), 1, "{early:?}");
     assert_eq!(early[0]["os_kind"], "permission_denied");
+    let mut input = Vec::new();
+    let mut take = |stream: &mut crate::destination_results::Stream| {
+        for frame in stream
+            .take_frames(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .unwrap()
+        {
+            input.extend(destination_line(&frame));
+        }
+    };
+    take(&mut stream);
     stream.record(
         crate::destination_results::Change::PublishFile { size: 4096 },
         Some(b"a"),
@@ -780,7 +788,7 @@ fn a_source_failure_explains_a_file_the_receiver_left_unfinished_at_once() {
         )),
     );
     stream.finish(0).unwrap();
-    let mut input = frames(&mut stream);
+    take(&mut stream);
     input.extend(coordinator_line(coordinator_terminal(), 1));
     relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
     assert_eq!(settle(relay, settlement(23)).unwrap(), 23);

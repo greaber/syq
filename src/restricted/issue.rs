@@ -37,9 +37,13 @@ pub(crate) struct Issue<'a> {
     /// Whether this may set up or refresh the enrollment: never for a dry
     /// run.
     pub allow_enrollment: bool,
-    /// Refresh the enrollment even when this machine's record says it runs
-    /// this build: its receiver refused a copy for running another one.
-    pub refresh: bool,
+    /// The request ID of this copy's directive that the receiver refused
+    /// for running another build. Refresh the enrollment even when this
+    /// machine's record says it runs this build, and sign the copy again
+    /// under the same ID: the receiver's record of used directives then
+    /// lets at most one of the two run, whatever the coordinator did with
+    /// the first.
+    pub retry_of: Option<RequestId>,
     /// Enroll without prompting, for the receiving service, which has no
     /// terminal. Where the SSH configuration would ask about a host key
     /// nobody knows, the login accepts it the first time, as `accept-new`
@@ -68,7 +72,7 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
         jump,
         agent: destination_agent,
         allow_enrollment,
-        refresh,
+        retry_of,
         batch,
         results_key,
         role,
@@ -146,13 +150,15 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
         )?;
     }
     let (metadata, directory, signer) = match found {
-        Some((metadata, directory)) if !refresh && !needs_refresh(&metadata, &directory) => {
+        Some((metadata, directory))
+            if retry_of.is_none() && !needs_refresh(&metadata, &directory) =>
+        {
             (metadata, directory, None)
         }
         _ if !allow_enrollment => bail!(
             "a dry run does not set up restricted copying on {account} for this syq build; the next copy does, or run `syq receiver enroll {account}`"
         ),
-        _ => enroll_now(refresh)?,
+        _ => enroll_now(retry_of.is_some())?,
     };
     let signer = match signer {
         Some(signer) => Some(signer),
@@ -183,7 +189,10 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
         }
     };
     let entry_key = load_entry_key(&directory)?;
-    let directive = directive_for(metadata.id, metadata.generation)?;
+    let mut directive = directive_for(metadata.id, metadata.generation)?;
+    if let Some(request_id) = retry_of {
+        directive.request_id = request_id;
+    }
     let destination_path = if is_destination {
         checked_destination(
             &directive,

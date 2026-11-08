@@ -7552,7 +7552,7 @@ fn a_root_writer_is_refused_before_enrolling() {
             jump: None,
             agent: None,
             allow_enrollment: true,
-            refresh: false,
+            retry_of: None,
             batch: true,
             results_key: None,
             role,

@@ -1473,12 +1473,28 @@ assert len(found) == 1, found
 print(found[0])
 PYTHON
 )
-cp "$rebuild_record/enrollment.json" /tmp/syq-real-ssh-rebuild-enrollment.json
-syq-other-build receiver enroll destination >/dev/null
-test "$(syq-other-build receiver list | awk -F '\t' '$3 == "syq@destination" { print $4 }')" = \
-    "$(syq-other-build --build-identity)"
-cp /tmp/syq-real-ssh-rebuild-enrollment.json "$rebuild_record/enrollment.json"
+# Let the second build update the receiver behind this build's record.
+stale_receiver() {
+    cp "$rebuild_record/enrollment.json" /tmp/syq-real-ssh-rebuild-enrollment.json
+    syq-other-build receiver enroll destination >/dev/null
+    test "$(syq-other-build receiver list | awk -F '\t' '$3 == "syq@destination" { print $4 }')" = \
+        "$(syq-other-build --build-identity)"
+    cp /tmp/syq-real-ssh-rebuild-enrollment.json "$rebuild_record/enrollment.json"
+}
+stale_receiver
 ssh destination 'rm -rf /tmp/syq-real-ssh/rebuild-destination'
+# A dry run says so and updates nothing.
+if rebuild_output=$(syq cp --no-progress --dry-run \
+    --from source --srcs-in /tmp/syq-real-ssh/rebuild-source \
+    --to destination --into /tmp/syq-real-ssh/rebuild-destination 2>&1); then
+    printf '%s\n' "$rebuild_output" >&2
+    echo 'a dry run against a receiver of another build unexpectedly succeeded' >&2
+    exit 1
+fi
+case "$rebuild_output" in
+    *'a dry run does not update it, but the next copy does'*) ;;
+    *) printf '%s\n' "$rebuild_output" >&2; exit 1 ;;
+esac
 rm -f /tmp/syq-real-ssh-rebuild.ndjson
 rebuild_output=$(syq cp --no-progress --results /tmp/syq-real-ssh-rebuild.ndjson \
     --from source --srcs-in /tmp/syq-real-ssh/rebuild-source \
@@ -1501,6 +1517,31 @@ kinds = [record["type"] for record in records]
 assert kinds.count("run") == 1 and "error" not in kinds, records
 assert records[-1]["type"] == "result" and records[-1]["status"] == "success", records[-1]
 PYTHON
+# A detached copy is run once more the same way, before it detaches.
+stale_receiver
+ssh destination 'rm -rf /tmp/syq-real-ssh/rebuild-detached'
+rebuild_output=$(syq cp --no-progress --detach \
+    --from source --srcs-in /tmp/syq-real-ssh/rebuild-source \
+    --to destination --into /tmp/syq-real-ssh/rebuild-detached 2>&1) || {
+    printf '%s\n' "$rebuild_output" >&2
+    exit 1
+}
+case "$rebuild_output" in
+    *'updating it to this build and trying once more'*'syq: started on '*) ;;
+    *) printf '%s\n' "$rebuild_output" >&2; exit 1 ;;
+esac
+rebuild_deadline=$(($(date +%s) + 60))
+until assert_same_tree source /tmp/syq-real-ssh/rebuild-source \
+    destination /tmp/syq-real-ssh/rebuild-detached rebuild-detached >/dev/null 2>&1; do
+    if [ "$(date +%s)" -ge "$rebuild_deadline" ]; then
+        assert_same_tree source /tmp/syq-real-ssh/rebuild-source \
+            destination /tmp/syq-real-ssh/rebuild-detached rebuild-detached
+        echo 'the detached copy did not finish within 60 seconds' >&2
+        exit 1
+    fi
+    echo 'waiting for the detached copy after its receiver was updated'
+    sleep 2
+done
 
 printf 'case: enrollment revocation stops active restricted receivers\n'
 python3 /usr/local/libexec/syq-test-receiver-revoke.py
