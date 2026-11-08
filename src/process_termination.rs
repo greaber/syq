@@ -357,7 +357,7 @@ mod tests {
     /// cleanup needs, because a busy runner can wake its threads hundreds of
     /// milliseconds late, and the real cap would then end the process first,
     /// as it should. A process ends as soon as its cleanup has, so this costs
-    /// no time. The modes that set a short cap test the cap itself.
+    /// no time. The modes about the cap itself set a short one.
     const FINISHES_MS: u64 = 10_000;
 
     #[test]
@@ -401,7 +401,8 @@ mod tests {
                 Some(FINISHES_MS),
                 false,
             ),
-            // The second interrupt arrives while the 300 ms cleanup runs.
+            // The second interrupt arrives 50 ms after the first, long before
+            // the 300 ms cleanup can finish.
             (
                 "repeated",
                 Signal(libc::SIGINT),
