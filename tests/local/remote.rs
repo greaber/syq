@@ -1185,7 +1185,8 @@ fn a_finished_copy_does_not_wait_for_slow_worker_logins() {
 /// first worker waits before it connects until every file has arrived, so the
 /// others do the copy. With `hold_planning`, planning also waits after its
 /// first batch until those others have connected. Returns the remote shell's
-/// log and the workers' connection events.
+/// log and the workers' connection events as they stood when every file had
+/// arrived, before the first worker was let go.
 #[cfg(debug_assertions)]
 pub(super) fn copy_with_the_first_worker_held(
     t: &Tmp,
@@ -1266,12 +1267,13 @@ pub(super) fn copy_with_the_first_worker_held(
                 .count()
         }) == list.len()
     });
-    release_confinement_barrier(&continuation);
-    assert_output_ok(&child.wait_with_output().unwrap());
-    (
+    let seen = (
         fs::read_to_string(t.path("rsh.log")).unwrap(),
         fs::read_to_string(t.path("events")).unwrap(),
-    )
+    );
+    release_confinement_barrier(&continuation);
+    assert_output_ok(&child.wait_with_output().unwrap());
+    seen
 }
 
 /// Workers started while a tree of small new files is still being planned

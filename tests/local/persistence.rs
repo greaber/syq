@@ -131,8 +131,8 @@ fn multiplexed_refusal_falls_back_for_workers_started_while_planning() {
         "no independent worker fallback was attempted:\n{invocations}"
     );
     assert!(
-        !events.lines().any(|line| line.starts_with("connected 0 ")),
-        "the first worker connected:\n{events}"
+        events.lines().any(|line| line.starts_with("connected ")),
+        "{events}"
     );
 }
 
