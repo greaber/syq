@@ -115,7 +115,7 @@ fn index(domain: &Domain) -> PathBuf {
 /// keeper serves only its own build: the provider's service must run that
 /// build too (`keeper`). When that service ends or switches builds, it
 /// ends every attachment, and an older build's keeper then ends by itself
-/// within a second or so; until then, it still serves its own build.
+/// within a few seconds; until then, it still serves its own build.
 fn record_path(domain: &Domain, provider: &Provider, build: &str) -> Result<PathBuf> {
     let name = blake3::hash(&serde_json::to_vec(&(key(provider)?, build))?).to_hex();
     Ok(index(domain).join(format!("{name}.json")))
@@ -1006,7 +1006,7 @@ pub(crate) fn cleanup_domain(domain: &Domain) -> Result<()> {
             validate_record(domain, &record.provider, &record)?;
             anyhow::ensure!(
                 path == record_path(domain, &record.provider, &record.build)?
-                    // Builds before each kept its own keeper named the
+                    // Builds from before per-build keepers named the
                     // record after its provider alone.
                     || path == index(domain).join(format!("{}.json", key(&record.provider)?)),
                 "SSH provider record name differs"
@@ -1169,11 +1169,15 @@ mod tests {
     }
 
     /// `persist off` stops and removes the keepers of every build,
-    /// including one that a build from before each kept its own named after
+    /// including one that a build from before per-build keepers named after
     /// its provider alone.
     #[test]
     fn persist_off_removes_every_builds_keeper() {
         let (_root, domain, record) = cleanup_fixture();
+        // What v0.9.0 names the record of `provider()`, and writes in its
+        // directory's `owner`: the hash of the provider alone.
+        const V0_9_0_NAME: &str =
+            "7dc1f72b06c526beb616497ea916a0e41787177fdddc0e076bf559e32919c8f2";
         let mut older = record.clone();
         older.build = "v0.0.1+other-build".into();
         older.directory = domain.runtime_path().join("provider-older");
@@ -1187,10 +1191,8 @@ mod tests {
             .mode(0o600)
             .open(older.directory.join("owner"))
             .unwrap();
-        owner
-            .write_all(key(&older.provider).unwrap().as_bytes())
-            .unwrap();
-        let legacy = index(&domain).join(format!("{}.json", key(&older.provider).unwrap()));
+        owner.write_all(V0_9_0_NAME.as_bytes()).unwrap();
+        let legacy = index(&domain).join(format!("{V0_9_0_NAME}.json"));
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)

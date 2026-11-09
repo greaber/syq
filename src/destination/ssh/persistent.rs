@@ -1462,8 +1462,8 @@ fn keeper(startup: Startup) -> Result<()> {
 }
 
 /// The lock a keeper holds for its whole life, beside the account index
-/// records, named for its master's control socket: `persist off` and the
-/// checks for connections in use see a keeper by it, including one whose
+/// records, named for its master's control socket: `persist off` and
+/// `status` see a keeper by it, including one whose
 /// master drains after it gave up its record (`Drain`). A 64-hex `.lock`,
 /// as every syq version counts keepers by.
 fn keeper_lock_path(record: &Path, control: &Path) -> Option<PathBuf> {
@@ -1794,10 +1794,10 @@ mod tests {
         fs::set_permissions(&index, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
-    /// A link's close and a newer command's close request can arrive
-    /// together. Once the first stopped the master taking new sessions,
-    /// the session that started meanwhile does not undo it, and nothing
-    /// stops the master again. The connection says it is closed only once
+    /// A link can ask a connection to close more than once. Once the first
+    /// request stopped the master taking new sessions, the session that
+    /// started meanwhile does not undo it, and nothing stops the master
+    /// again. The connection says it is closed only once
     /// its master exited: until then it is in use, so that its approving
     /// side keeps it, and revoking it still ends the master.
     #[test]
