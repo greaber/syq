@@ -1270,21 +1270,45 @@ pub(crate) fn prepare_receiver_ssh_with(
         args.quiet,
     )?;
     args.receiver_host = Some(ssh.receiver_host);
-    args.rsh = Some(shell_words::join(ssh.command));
+    args.rsh = Some(shell_words::join(ssh.remote_shell));
     Ok(ssh.directory)
+}
+
+/// `remote_shell`, a receiver's command, for one login of its own that
+/// shares no connection, whatever this machine's configuration says: an
+/// entry-key login must never join a master the configuration names, which
+/// would run the session as that master's own login, nor become one that
+/// outlives the copy and that later logins to the account would join.
+fn separate_login(remote_shell: &[String]) -> Vec<String> {
+    let mut login = remote_shell.to_vec();
+    for option in ["ControlMaster=no", "ControlPath=none"] {
+        login.extend(["-o".to_owned(), option.to_owned()]);
+    }
+    login
 }
 
 /// The SSH command for an enrolled receiver's connections, with the entry
 /// key and what the approving machine knows about the receiver's host key in
 /// a private directory that lives as long as the connections.
 pub(crate) struct ReceiverSsh {
-    pub(crate) command: Vec<String>,
+    /// The remote shell for a copy's connections to the receiver. It sets
+    /// no connection sharing: each connection sets its own on its command
+    /// line, ahead of this machine's configuration
+    /// (`conn::RemoteSpec::ssh_command`). Anything else that logs in with
+    /// it runs [`ReceiverSsh::separate_login`].
+    pub(crate) remote_shell: Vec<String>,
     /// The host as the command names it, and how this machine reaches it.
     pub(crate) receiver_host: (String, crate::conn::ReceiverHost),
     pub(crate) directory: crate::private_broker::SignalCleanedDir,
 }
 
 impl ReceiverSsh {
+    /// The command for a login to the receiver that is not one of a copy's
+    /// connections: see [`separate_login`].
+    pub(crate) fn separate_login(&self) -> Vec<String> {
+        separate_login(&self.remote_shell)
+    }
+
     /// Fill `command`, a [`receiver_rsh`], in for the receiver at
     /// `user@host:port`, with `known_hosts`, what the approving machine's
     /// known_hosts files list for it, and the enrollment's `entry_key`.
@@ -1423,7 +1447,7 @@ impl ReceiverSsh {
             .context("receiver SSH command is missing its entry key placeholder")?;
         *identity = format!("IdentityFile={}", key.display());
         Ok(Self {
-            command,
+            remote_shell: command,
             receiver_host: (
                 host,
                 crate::conn::ReceiverHost {
@@ -2768,9 +2792,9 @@ fn run_coordinated(
     }))
     .frame()?;
     let frame = std::sync::Arc::new(zeroize::Zeroizing::new(frame));
-    let (program, options) = copy
-        .receiver
-        .command
+    // One login of its own, as each attempt is.
+    let login = copy.receiver.separate_login();
+    let (program, options) = login
         .split_first()
         .context("receiver SSH command is empty")?;
     let source = &copy.host;

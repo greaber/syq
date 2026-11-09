@@ -389,7 +389,7 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
     }
     args.auth_from = crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name));
     args.source_directive = Some(directive);
-    args.rsh = Some(shell_words::join(receiver.command));
+    args.rsh = Some(shell_words::join(receiver.remote_shell));
     args.receiver_host = Some(receiver.receiver_host);
     args.receiver_keys = Some(Arc::new(receiver.directory));
     Ok(())

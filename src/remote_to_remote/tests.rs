@@ -1230,7 +1230,8 @@ fn the_entry_key_session_keeps_its_hardening_under_this_machines_configuration()
         &config,
         "Host backup\n  HostName backup.example.net\n  Port 2222\n  User someone\n  \
          IdentityAgent /tmp/agent\n  ForwardAgent yes\n  ForwardX11 yes\n  \
-         ControlMaster auto\n  ControlPath ~/.ssh/cm-%C\n  ProxyJump bastion\n  \
+         ControlMaster auto\n  ControlPath ~/.ssh/cm-%C\n  ControlPersist yes\n  \
+         ProxyJump bastion\n  \
          LocalForward 1234 localhost:22\n  RemoteForward 1235 localhost:22\n  \
          RemoteCommand echo hi\n  RequestTTY yes\n  PKCS11Provider /usr/lib/p11.so\n  \
          SecurityKeyProvider /usr/lib/sk.so\n  PermitLocalCommand yes\n  \
@@ -1296,10 +1297,24 @@ fn the_entry_key_session_keeps_its_hardening_under_this_machines_configuration()
     ] {
         assert!(has(line), "{line}\n{effective}");
     }
-    // Whether a connection shares the copy's own connection or none, each
-    // says on its command line, ahead of this configuration's `ControlMaster
-    // auto` and `ControlPath`
-    // (`conn::tests::entry_key_connections_share_only_the_copys_own_connection`).
+    // A copy's connections each say on their command line whether they share
+    // the copy's own connection, ahead of this configuration's `ControlMaster
+    // auto`, `ControlPath` and `ControlPersist`
+    // (`conn::tests::entry_key_connections_share_only_the_copys_own_connection`),
+    // so the command itself leaves sharing to them.
+    assert!(crate::conn::shareable_ssh_options(&command).is_some());
+    // A login of its own, as a coordinated copy makes, shares nothing.
+    let separate = resolved(&separate_login(&command));
+    assert!(
+        separate.lines().any(|line| line == "controlmaster false"),
+        "{separate}"
+    );
+    assert!(
+        !separate
+            .lines()
+            .any(|line| line.starts_with("controlpath ")),
+        "{separate}"
+    );
     // OpenSSH leaves these settings out when they are off.
     for name in [
         "proxyjump ",

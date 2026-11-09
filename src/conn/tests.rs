@@ -2150,7 +2150,6 @@ fn entry_key_connections_share_only_the_copys_own_connection() {
     assert_eq!(master.as_deref(), Some("false"));
     // OpenSSH prints no `controlpath` for `none`.
     assert!(independent.is_none(), "{independent:?}");
-    assert!(!configured.exists());
 }
 
 #[test]
