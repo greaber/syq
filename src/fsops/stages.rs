@@ -16,6 +16,13 @@
 //! is in flight (`transfer::publication`). So what is let go is a file that
 //! failed and was not retried.
 //!
+//! Each connection also remembers the last few files its Finalize published
+//! (`REMEMBERED`), until one of them is held again or the copy's control
+//! connection ends. When a connection drops before its Finalize reply is
+//! read, the copy sends that Finalize again on another connection, which
+//! then gets the same answer: the file was published, with the identity the
+//! first one reported.
+//!
 //! Each held file keeps the size the request that created or opened it
 //! declared, and no write goes past it: what a copy writes is bounded by
 //! what it said it would write, on every receiver.
@@ -33,6 +40,18 @@ pub(super) const MAX_HELD: usize = if cfg!(test) { 16 } else { 1024 };
 /// A new scope for one copy's held files, in a process that serves several
 /// copies. Scope 0 is the copy of a process that serves only one.
 pub(crate) fn new_scope() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Relaxed)
+}
+
+/// The published files each connection remembers: its last few. A worker
+/// has at most two Finalize replies unread, and they are for the last
+/// Finalizes its connection ran (`transfer::publication`).
+const REMEMBERED: usize = 4;
+
+/// A new number for a connection, which the files its Finalize published
+/// are remembered by (`Finalizing::published`).
+pub(super) fn new_connection() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Relaxed)
 }
@@ -136,7 +155,24 @@ struct Registry {
     held: HashMap<Key, Held>,
     /// Files whose Finalize is running; a second Finalize waits for it.
     finalizing: HashSet<Key>,
+    /// Files a Finalize published and that are not held again, with the
+    /// connection that published them and the identity it reported.
+    published: HashMap<Key, (u64, Option<(u64, u64)>)>,
+    /// The files in `published`, oldest first, by copy scope and connection.
+    published_by: HashMap<(u64, u64), VecDeque<Key>>,
     clock: u64,
+}
+
+impl Registry {
+    /// No longer remember that `key`'s file was published: another file is
+    /// held for it now.
+    fn forget_published(&mut self, key: &Key) {
+        if let Some((connection, _)) = self.published.remove(key) {
+            if let Some(keys) = self.published_by.get_mut(&(key.scope, connection)) {
+                keys.retain(|other| other != key);
+            }
+        }
+    }
 }
 
 struct Shared {
@@ -189,6 +225,7 @@ pub(super) fn hold(
             in_use: in_use.clone(),
             used: registry.clock,
         };
+        registry.forget_published(&key);
         released.extend(registry.held.insert(key.clone(), held));
         while registry.held.len() > MAX_HELD {
             let Some(oldest) = registry
@@ -251,6 +288,31 @@ pub(super) fn take(target: For<'_>) -> Option<Held> {
 /// what the first one did: the file published, or held again.
 pub(super) struct Finalizing(Key);
 
+impl Finalizing {
+    /// The Finalize published the file, as `identity`: remember that as one
+    /// of the last files `connection` published, before a Finalize waiting
+    /// for this one looks.
+    pub(super) fn published(&self, connection: u64, identity: Option<(u64, u64)>) {
+        let key = &self.0;
+        let mut guard = registry();
+        let registry = &mut *guard;
+        registry.forget_published(key);
+        let keys = registry
+            .published_by
+            .entry((key.scope, connection))
+            .or_default();
+        keys.push_back(key.clone());
+        if keys.len() > REMEMBERED {
+            if let Some(oldest) = keys.pop_front() {
+                registry.published.remove(&oldest);
+            }
+        }
+        registry
+            .published
+            .insert(key.clone(), (connection, identity));
+    }
+}
+
 impl Drop for Finalizing {
     fn drop(&mut self) {
         registry().finalizing.remove(&self.0);
@@ -258,9 +320,18 @@ impl Drop for Finalizing {
     }
 }
 
+/// What a Finalize finds for its file.
+pub(super) enum Found {
+    /// The file, held: finalize it.
+    Held(Box<Held>, Finalizing),
+    /// A Finalize published the file, as this identity, and nothing has been
+    /// held for it since.
+    Published(Option<(u64, u64)>),
+}
+
 /// Take the file held for `target` to finalize it, after any Finalize of it
-/// already running ends.
-pub(super) fn finalize(target: For<'_>) -> Option<(Held, Finalizing)> {
+/// already running ends, or find that one published it.
+pub(super) fn finalize(target: For<'_>) -> Option<Found> {
     let key = target.key();
     let mut registry = registry();
     while registry.finalizing.contains(&key) {
@@ -269,16 +340,25 @@ pub(super) fn finalize(target: For<'_>) -> Option<(Held, Finalizing)> {
             .wait(registry)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
     }
-    let held = registry.held.remove(&key)?;
+    let Some(held) = registry.held.remove(&key) else {
+        return registry
+            .published
+            .get(&key)
+            .map(|&(_, identity)| Found::Published(identity));
+    };
     registry.finalizing.insert(key.clone());
-    Some((held, Finalizing(key)))
+    Some(Found::Held(Box::new(held), Finalizing(key)))
 }
 
-/// Let go of every file held for the copy `scope`, when its control
-/// connection ends.
+/// Let go of every file held for the copy `scope`, and forget those it
+/// published, when its control connection ends.
 pub(crate) fn release(scope: u64) {
     let released: Vec<Held> = {
         let mut registry = registry();
+        registry.published.retain(|key, _| key.scope != scope);
+        registry
+            .published_by
+            .retain(|&(published, _), _| published != scope);
         let keys: Vec<Key> = registry
             .held
             .keys()
@@ -418,12 +498,12 @@ mod tests {
             inplace: false,
         };
         hold(held, &name, &file, None, true, u64::MAX).unwrap();
-        let (first, finalizing) = finalize(held).unwrap();
+        let (first, finalizing) = taken(finalize(held));
         std::thread::scope(|threads| {
             let (sender, receiver) = std::sync::mpsc::channel();
             threads.spawn(move || {
                 sender
-                    .send(finalize(held).map(|(held, _)| held.relative))
+                    .send(finalize(held).map(|found| taken(Some(found)).0.relative))
                     .unwrap();
             });
             // The first fails and holds the file again; only then does the
@@ -438,10 +518,84 @@ mod tests {
                 .unwrap();
             assert!(second == Some(name.clone()));
         });
-        // After one that published, a second finds nothing held.
+        // After one that failed and let the file go, a second finds
+        // nothing held.
         hold(held, &name, &file, None, true, u64::MAX).unwrap();
-        drop(finalize(held).unwrap());
+        drop(taken(finalize(held)));
         assert!(finalize(held).is_none());
         release(scope);
+    }
+
+    fn taken(found: Option<Found>) -> (Held, Finalizing) {
+        match found {
+            Some(Found::Held(held, finalizing)) => (*held, finalizing),
+            Some(Found::Published(_)) => panic!("published, not held"),
+            None => panic!("not held"),
+        }
+    }
+
+    fn published(found: Option<Found>) -> Option<(u64, u64)> {
+        match found {
+            Some(Found::Published(identity)) => identity,
+            Some(Found::Held(..)) => panic!("held, not published"),
+            None => panic!("not held"),
+        }
+    }
+
+    #[test]
+    fn a_finalize_sent_again_answers_as_the_one_that_published() {
+        let directory = crate::test_support::tempdir().unwrap();
+        let root = Root::open(directory.path()).unwrap();
+        let file = File::create(directory.path().join("file")).unwrap();
+        let (scope, copy_id) = (new_scope(), [4; 16]);
+        let names = names(REMEMBERED + 2);
+        let held = |name| For {
+            scope,
+            root: &root,
+            target: name,
+            copy_id: &copy_id,
+            inplace: true,
+        };
+        let publish = |name, connection, identity| {
+            hold(held(name), name, &file, None, true, 1).unwrap();
+            let (_, finalizing) = taken(finalize(held(name)));
+            finalizing.published(connection, identity);
+        };
+        let (dropped, other) = (new_connection(), new_connection());
+        publish(&names[0], dropped, Some((1, 2)));
+        publish(&names[1], dropped, None);
+        // Another connection's publications displace none of them.
+        for name in &names[2..] {
+            publish(name, other, Some((3, 4)));
+        }
+        assert_eq!(published(finalize(held(&names[0]))), Some((1, 2)));
+        assert_eq!(published(finalize(held(&names[1]))), None);
+        // The same answer again, and only for this copy and file.
+        assert_eq!(published(finalize(held(&names[0]))), Some((1, 2)));
+        let another_copy = [5; 16];
+        assert!(finalize(For {
+            copy_id: &another_copy,
+            ..held(&names[0])
+        })
+        .is_none());
+        assert!(finalize(For {
+            inplace: false,
+            ..held(&names[0])
+        })
+        .is_none());
+        // A connection remembers its last few.
+        for name in &names[2..] {
+            publish(name, dropped, Some((5, 6)));
+        }
+        assert!(finalize(held(&names[0])).is_none());
+        assert!(finalize(held(&names[1])).is_none());
+        assert_eq!(published(finalize(held(&names[2]))), Some((5, 6)));
+        // A file held again is finalized as that one; the copy's end
+        // forgets the rest.
+        hold(held(&names[2]), &names[2], &file, None, true, 1).unwrap();
+        drop(taken(finalize(held(&names[2]))));
+        assert!(finalize(held(&names[2])).is_none());
+        release(scope);
+        assert!(finalize(held(&names[3])).is_none());
     }
 }

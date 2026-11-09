@@ -1705,6 +1705,84 @@ fn lost_finalize_response_is_verified_after_reconnect() {
     assert!(partial_files(&t.0).is_empty());
 }
 
+/// A file written in place has no stage left to show that a lost Finalize
+/// reply published it. The Finalize sent again gets the first one's answer,
+/// and the file is reported copied.
+#[cfg(debug_assertions)]
+#[test]
+fn a_lost_finalize_reply_for_a_file_written_in_place_reports_it_copied() {
+    let data = prng(3 * 1024 * 1024 + 5, 907);
+    let mut failed = Vec::new();
+    for (mode, existing) in [("new", false), ("update", true)] {
+        for tcp in [false, true] {
+            for pull in [false, true] {
+                let case = format!("--in-place={mode}, tcp {tcp}, pull {pull}");
+                let t = Tmp::new();
+                let rsh = fake_rsh(&t);
+                for name in ["a", "b"] {
+                    write(&t.path(&format!("src/{name}")), &data);
+                    if existing {
+                        write(&t.path(&format!("dst/{name}")), &prng(data.len(), 11));
+                    }
+                }
+                let marker = t.path("drop-finalize-once");
+                let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+                command.arg("cp");
+                if pull {
+                    command.args(["--from", "fake"]);
+                }
+                command.args([
+                    &format!("--in-place={mode}"),
+                    "--results",
+                    &t.s("results.ndjson"),
+                    "--srcs-in",
+                    &t.s("src"),
+                    "--into",
+                    &t.s("dst"),
+                    "--rsh",
+                    rsh.to_str().unwrap(),
+                    "--syq-path",
+                    env!("CARGO_BIN_EXE_syq"),
+                    "--tcp-ports",
+                    EPHEMERAL_TCP_PORTS,
+                    "--performance-tuning=workers=1,copy-path=ranges",
+                    "--no-progress",
+                ]);
+                if !pull {
+                    command.args(["--to", "fake"]);
+                }
+                if !tcp {
+                    command.arg("--no-tcp");
+                }
+                let out = command
+                    .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                    .env("SYQ_TEST_DROP_AFTER_REQUEST", "finalize")
+                    .env("SYQ_TEST_DROP_MARKER", &marker)
+                    .run()
+                    .unwrap();
+                assert!(marker.exists(), "{case}: no Finalize reply was dropped");
+                if !out.status.success() {
+                    failed.push(format!("{case}: {}", String::from_utf8_lossy(&out.stderr)));
+                    continue;
+                }
+                for name in ["a", "b"] {
+                    assert_eq!(read(&t.path(&format!("dst/{name}"))), data, "{case}");
+                }
+                let records = fs::read_to_string(t.path("results.ndjson")).unwrap();
+                let copied = records
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .filter(|record| {
+                        record["action"] == "transfer_file" && record["disposition"] == "succeeded"
+                    })
+                    .count();
+                assert_eq!(copied, 2, "{case}: {records}");
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 #[test]
 fn hash_errors_do_not_desynchronize_worker_connections() {
     if unsafe { libc::geteuid() } == 0 {

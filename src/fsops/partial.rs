@@ -3003,7 +3003,8 @@ impl FsOps {
     /// whatever the name holds now. A finalize that fails leaves the file
     /// held while its name still leads to it, so that it can be finalized
     /// again. A Finalize sent again after its connection dropped waits for
-    /// the first one, and then finds the file published or held again.
+    /// the first one, and then finds the file held again, or published, and
+    /// then answers as the first one did.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn finalize_rooted(
         &mut self,
@@ -3017,8 +3018,11 @@ impl FsOps {
         expected: Option<&crate::hashing::ExpectedHashes>,
     ) -> Result<Option<(u64, u64)>> {
         let held_for = stages::of(self.stage_scope, target, copy_id, inplace);
-        let (held, _finalizing) =
-            stages::finalize(held_for).ok_or_else(|| stages::not_held(&target.label))?;
+        let (held, finalizing) = match stages::finalize(held_for) {
+            Some(stages::Found::Held(held, finalizing)) => (*held, finalizing),
+            Some(stages::Found::Published(identity)) => return Ok(identity),
+            None => return Err(stages::not_held(&target.label)),
+        };
         // An in-place request whose name held another file wrote a stage
         // (`create_inplace_output`), which is published as any stage is.
         let in_place = inplace && held.relative == target.relative;
@@ -3032,6 +3036,9 @@ impl FsOps {
         let result = self.finalize_held(
             target, held, in_place, meta, flags, scanned, condition, expected,
         );
+        if let Ok(identity) = &result {
+            finalizing.published(self.stage_connection, *identity);
+        }
         if let Err(error) = &result {
             let (file, opened, relative, created, declared) = kept;
             // A stage whose file the copy skips, its name taken under keep
