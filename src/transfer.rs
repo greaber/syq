@@ -1144,9 +1144,6 @@ fn small_copy_eligible(
         && args.files_from.is_none()
         && args.native_mapping.is_none()
         && args.ignore_lines.is_empty()
-        && (args.bwlimit_bytes == 0
-            || matches!(dst_ep, Endpoint::Remote(spec)
-            if spec.restricted_grant.is_none()))
         && args.max_size.is_none()
         && args.min_size.is_none()
         && !args.follows_native_destination_paths()

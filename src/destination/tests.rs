@@ -1618,6 +1618,69 @@ fn a_copy_to_a_receiving_machine_is_paced_by_its_sender_on_network_bytes() {
     }
 }
 
+/// A capped copy of a few small files to a receiving machine sends them
+/// over its control connection in one turn, as an uncapped copy does, and
+/// the sender paces that payload to the cap.
+#[test]
+fn a_capped_small_copy_to_a_receiving_machine_takes_one_turn_within_the_cap() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("receiving");
+    fs::create_dir(&root).unwrap();
+    let source = fs::canonicalize(temp.path()).unwrap().join("source");
+    fs::create_dir(&source).unwrap();
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut command = vec![b"cp".to_vec()];
+    let mut files = Vec::new();
+    for name in ["one", "two", "three"] {
+        let data: Vec<u8> = (0..128 << 10)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+        fs::write(source.join(name), &data).unwrap();
+        command.push(b"--src".to_vec());
+        command.push(source.join(name).into_os_string().into_vec());
+        files.push((name, data));
+    }
+    for arg in [
+        "--to",
+        "@laptop",
+        "--into",
+        ".",
+        "--tcp-ports",
+        "0-0",
+        "--no-compress",
+        "--resource-limits",
+        "workers=2,bandwidth=256K",
+    ] {
+        command.push(arg.as_bytes().to_vec());
+    }
+    let mut args = crate::approval_command::parse(&command).unwrap();
+    let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
+    let approved = approve(&registration, command, Default::default());
+    let channels = Arc::clone(&receiver.sessions.lock().unwrap()[&approved.token].channels);
+    args.locations.last_mut().unwrap().host = Some("server".into());
+    args.locations.last_mut().unwrap().path = approved.destination.clone();
+    args.restricted_grant = Some(route(registration, &approved));
+    // Over SSH alone, the ordinary engine's workers would open channels too.
+    args.no_tcp = true;
+    let started = Instant::now();
+    assert_eq!(crate::transfer::run(args).unwrap(), 0);
+    let elapsed = started.elapsed();
+    for (name, data) in &files {
+        assert_eq!(&fs::read(root.join(name)).unwrap(), data, "{name}");
+    }
+    assert_eq!(channels.opened(), 1, "the copy opened workers");
+    // 384 KiB at 256 KiB/s takes a second and a half.
+    assert!(
+        elapsed >= Duration::from_millis(1400) && elapsed < Duration::from_secs(10),
+        "{elapsed:?}"
+    );
+}
+
 /// Approve the next copy `receiver` asks about, returning what it showed.
 fn approve_pending(receiver: &Arc<Receiver>) -> std::thread::JoinHandle<String> {
     let approvals = receiver.approvals.clone();
