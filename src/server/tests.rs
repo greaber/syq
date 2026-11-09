@@ -1711,7 +1711,11 @@ fn a_receiver_refuses_handed_connections_beyond_its_limit() {
     use std::os::unix::net::UnixStream;
     let temp = crate::test_support::tempdir().unwrap();
     let slot = DescriptorSessionSlot::default();
-    slot.serve_handed_connections(handed_connection_handler_within(slot.clone(), 1));
+    slot.serve_handed_connections(handed_connection_handler_within(
+        slot.clone(),
+        Default::default(),
+        1,
+    ));
     let ticket = slot
         .register(std::fs::File::open(temp.path()).unwrap())
         .unwrap();
@@ -1735,6 +1739,56 @@ fn a_receiver_refuses_handed_connections_beyond_its_limit() {
         }
     }
     slot.close();
+}
+
+#[test]
+fn a_receiver_ends_after_the_workers_handed_to_it_report_their_end() {
+    use crate::descriptor_broker::hand_off_socket;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    let temp = crate::test_support::tempdir().unwrap();
+    let slot = DescriptorSessionSlot::default();
+    let live = Arc::new(AtomicU32::new(0));
+    slot.serve_handed_connections(handed_connection_handler(slot.clone(), live.clone()));
+    let ticket = slot
+        .register(std::fs::File::open(temp.path()).unwrap())
+        .unwrap();
+    let (connection, worker) = UnixStream::pair().unwrap();
+    let handed = hand_off_socket(&ticket, connection.as_raw_fd()).unwrap();
+    worker
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut writer = FrameWriter::new(worker.try_clone().unwrap(), false);
+    let mut reader = FrameReader::new(worker.try_clone().unwrap());
+    writer
+        .write_msg(&Request::Hello {
+            identity: crate::identity::build().to_string(),
+            compress: false,
+            debug: false,
+            token: Vec::new(),
+            role: ConnectionRole::DestinationWorker {
+                destination: Some(DestinationRoot {
+                    ticket,
+                    request_prefix: temp.path().as_os_str().as_bytes().to_vec(),
+                }),
+                copy_sources: Vec::new(),
+            },
+        })
+        .unwrap();
+    assert!(matches!(
+        reader.read_msg::<Response>().unwrap(),
+        Response::HelloOk { .. }
+    ));
+    // The coordinator ends the worker together with the control, whose
+    // receiver here gets there first.
+    let ending = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        writer.write_msg(&Request::Shutdown).unwrap();
+    });
+    close_after_handed(&slot, &live, Duration::from_secs(5));
+    ending.join().unwrap();
+    handed.wait().unwrap();
+    assert_eq!(live.load(Relaxed), 0);
 }
 
 #[test]
