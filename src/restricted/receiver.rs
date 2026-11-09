@@ -1053,17 +1053,10 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
                 crate::output::command_println!("{}\tpending\t{}", pending.id, target.label());
             }
             for record in records.unusable {
-                let target = record
-                    .account
-                    .as_ref()
-                    .map(|(host, port, login)| endpoint(login, host, *port))
-                    .transpose()?;
-                match target {
-                    Some(target) => crate::output::command_println!(
-                        "{}\tunusable\t{}",
-                        record.name(),
-                        target.label()
-                    ),
+                match record.account_label() {
+                    Some(label) => {
+                        crate::output::command_println!("{}\tunusable\t{label}", record.name())
+                    }
                     None => crate::output::command_println!("{}\tunusable", record.name()),
                 }
                 crate::output::diagnostic!("syq: this syq build cannot use {}", record.explain());

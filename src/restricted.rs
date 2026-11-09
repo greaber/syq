@@ -102,6 +102,13 @@ pub(crate) struct ReceiverEnrollment {
     /// Fields this build does not know, which a newer syq wrote. A refresh
     /// keeps them, so switching builds does not drop what the newer one
     /// recorded.
+    ///
+    /// An older build keeps them unchanged through whatever it changes: a
+    /// new generation, login key or build, or a recreated record of used
+    /// directives. So a field added here must stay correct, or make its
+    /// build refuse, after such a rewrite, and goes at the top level: one
+    /// inside `signer` is dropped. A field that grants access needs a new
+    /// `CONFIG_VERSION` instead, which older builds refuse to rewrite.
     #[serde(flatten)]
     pub(crate) unknown: serde_json::Map<String, serde_json::Value>,
 }
@@ -187,7 +194,10 @@ struct LocalEnrollment {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     receiving_state: Vec<PathBuf>,
     /// Fields this build does not know, which a newer syq wrote. Rewriting
-    /// the record keeps them (`complete_local_enrollment`).
+    /// the record keeps them (`complete_local_enrollment`), on the terms
+    /// [`ReceiverEnrollment::unknown`] gives. Builds that cannot use a
+    /// record read `host`, `port` and `target_login` from it to know which
+    /// account it is for, so those keep their names in every version.
     #[serde(flatten)]
     unknown: serde_json::Map<String, serde_json::Value>,
 }

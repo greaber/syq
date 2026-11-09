@@ -3792,8 +3792,7 @@ fn write_json_object(path: &Path, object: &serde_json::Map<String, serde_json::V
 /// lists the record and refuses, saying how to clear it.
 #[test]
 fn an_enrollment_record_this_build_cannot_use_is_reported_and_not_enrolled_beside() {
-    let (_, home) = current_account().unwrap();
-    let temporary = tempfile::tempdir_in(home).unwrap();
+    let temporary = crate::test_support::tempdir().unwrap();
     let base = temporary.path();
     fs::set_permissions(base, fs::Permissions::from_mode(0o700)).unwrap();
     let make = |id: EnrollmentId| {
@@ -3829,6 +3828,23 @@ fn an_enrollment_record_this_build_cannot_use_is_reported_and_not_enrolled_besid
         "{}",
         unusable.reason
     );
+    // A pending record left beside it does not make it pending.
+    atomic_write(
+        &newer_directory,
+        PENDING_FILE,
+        &serde_json::to_vec(&PendingEnrollment {
+            version: CONFIG_VERSION,
+            id: newer,
+            host: "host-b".into(),
+            port: Some(2222),
+            target_login: "backup".into(),
+        })
+        .unwrap(),
+        0o600,
+    )
+    .unwrap();
+    let records = load_enrollment_records_in(base).unwrap();
+    assert!(records.pending.is_empty() && records.unusable.len() == 1);
 
     // Its account is not enrolled again, nor is a pending enrollment for it
     // completed; the message says how to clear it.
@@ -3886,25 +3902,63 @@ fn an_enrollment_record_this_build_cannot_use_is_reported_and_not_enrolled_besid
     assert!(plan.refresh && plan.id == active);
 
     // A record that names no account it can be read for may be any
-    // account's: a damaged one, or one in a directory that is not private.
-    let damaged = make(EnrollmentId::random());
-    fs::write(damaged.join(ENROLLMENT_FILE), b"{\"version\":").unwrap();
-    fs::set_permissions(
-        damaged.join(ENROLLMENT_FILE),
-        fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
-    refused("host-c", None);
-    remove_local_enrollment(&damaged).unwrap();
-    plan_enrollment(base, ("host-c", None, "backup"), Refresh::IfOutdated).unwrap();
+    // account's: a damaged one, one whose account no server could have,
+    // or one in a directory that is not private.
+    let unusable_at = |directory: &Path| {
+        let records = load_enrollment_records_in(base).unwrap();
+        records
+            .unusable
+            .into_iter()
+            .find(|record| record.directory == directory)
+    };
+    for damage in [
+        &b"{\"version\":"[..],
+        br#"{"version":99,"host":"bad host","target_login":"backup"}"#,
+    ] {
+        let damaged = make(EnrollmentId::random());
+        fs::write(damaged.join(ENROLLMENT_FILE), damage).unwrap();
+        fs::set_permissions(
+            damaged.join(ENROLLMENT_FILE),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let record = unusable_at(&damaged).unwrap();
+        assert!(record.account.is_none() && record.account_label().is_none());
+        let error = refused("host-c", None);
+        assert!(
+            error.contains("on the server account it was made for, if any"),
+            "{error}"
+        );
+        remove_local_enrollment(&damaged).unwrap();
+        plan_enrollment(base, ("host-c", None, "backup"), Refresh::IfOutdated).unwrap();
+    }
+    // A directory that is not private holds nothing with a line on a server
+    // until it holds a record; then the message says how to repair it.
     let exposed = make(EnrollmentId::random());
     fs::set_permissions(&exposed, fs::Permissions::from_mode(0o755)).unwrap();
-    let records = load_enrollment_records_in(base).unwrap();
-    assert!(records
-        .unusable
-        .iter()
-        .any(|record| record.directory == exposed && record.account.is_none()));
-    refused("host-c", None);
+    assert!(unusable_at(&exposed).is_none());
+    plan_enrollment(base, ("host-c", None, "backup"), Refresh::IfOutdated).unwrap();
+    fs::write(exposed.join(PENDING_FILE), b"{}").unwrap();
+    let record = unusable_at(&exposed).unwrap();
+    assert!(record.account.is_none() && record.unread);
+    let error = refused("host-c", None);
+    assert!(error.contains("mode 0700"), "{error}");
+    fs::remove_dir_all(&exposed).unwrap();
+
+    // A record in another enrollment's directory, as after a rename: which
+    // line on the server is its own is not known, so syq names none.
+    let (directory_id, record_id) = (EnrollmentId::random(), EnrollmentId::random());
+    let moved = make(directory_id);
+    complete_local_enrollment(&moved, &local_record(record_id, "host-d", None)).unwrap();
+    let record = unusable_at(&moved).unwrap();
+    assert_eq!(record.record_id, Some(record_id));
+    let explanation = record.explain();
+    assert!(
+        explanation.contains(&format!("rename it back to {record_id}")),
+        "{explanation}"
+    );
+    assert!(!explanation.contains("syq-enrollment:"), "{explanation}");
+    refused("host-d", None);
 }
 
 /// A newer build's fields in an enrollment's records survive this build

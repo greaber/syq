@@ -45,6 +45,11 @@ pub(super) struct UnusableRecord {
     /// The account the record names, when it can be read: host, port and
     /// login.
     pub(super) account: Option<(String, Option<u16>, String)>,
+    /// The enrollment the record names, when that is not its directory's.
+    pub(super) record_id: Option<EnrollmentId>,
+    /// Whether the record could not be read at all, as after its owner or
+    /// mode changed, rather than read and not understood.
+    pub(super) unread: bool,
     pub(super) reason: String,
 }
 
@@ -67,24 +72,51 @@ impl UnusableRecord {
             })
     }
 
+    /// The account it names, for messages.
+    pub(super) fn account_label(&self) -> Option<String> {
+        let (host, port, login) = self.account.as_ref()?;
+        endpoint(login, host, *port)
+            .ok()
+            .map(|target| target.label())
+    }
+
     /// Which enrollment it is, what is wrong with it, and how to clear it.
     pub(super) fn explain(&self) -> String {
         let name = self.name();
-        let account = match &self.account {
-            Some((host, port, login)) => endpoint(login, host, *port)
-                .map(|target| format!(" for {}", target.label()))
+        let directory = self.directory.display();
+        let mut explanation = format!(
+            "enrollment {name}{account}, recorded in {directory}: {reason}.",
+            account = self
+                .account_label()
+                .map(|label| format!(" for {label}"))
                 .unwrap_or_default(),
-            None => String::new(),
-        };
-        format!(
-            "enrollment {name}{account}, recorded in {directory}: {reason}. \
-             If another syq build made it, its line in the server's ~/.ssh/authorized_keys still works: \
-             revoke it with that build (`syq receiver revoke {name}`), or delete the line containing \
-             `{prefix}{name}` from the server's ~/.ssh/authorized_keys and then delete {directory}",
-            directory = self.directory.display(),
             reason = self.reason,
+        );
+        if let Some(id) = self.record_id {
+            // Which of the two IDs its server line has is not known here.
+            explanation.push_str(&format!(
+                " If its directory was renamed, rename it back to {id} for syq to use it again"
+            ));
+            return explanation;
+        }
+        if self.unread {
+            explanation.push_str(
+                " If only its owner or permissions changed, make it yours again, with mode 0700 \
+                 for the directory and 0600 for its files.",
+            );
+        }
+        let server = if self.account.is_some() {
+            "the server's ~/.ssh/authorized_keys"
+        } else {
+            "~/.ssh/authorized_keys on the server account it was made for, if any"
+        };
+        explanation.push_str(&format!(
+            " If another syq build made it, its line in the server's ~/.ssh/authorized_keys still works: \
+             revoke it with that build (`syq receiver revoke {name}`), or delete the line containing \
+             `{prefix}{name}` from {server} and then delete {directory}",
             prefix = crate::enrollment::COMMENT_PREFIX,
-        )
+        ));
+        explanation
     }
 }
 
@@ -92,10 +124,7 @@ impl UnusableRecord {
 enum Record<T> {
     Missing,
     Usable(T),
-    Unusable {
-        account: Option<(String, Option<u16>, String)>,
-        reason: String,
-    },
+    Unusable(UnusableRecord),
 }
 
 /// The record `file` in `directory`, which is named `name`, as
@@ -108,37 +137,45 @@ fn read_record<T: serde::de::DeserializeOwned>(
     version: impl Fn(&T) -> (u16, EnrollmentId),
 ) -> Record<T> {
     let path = directory.join(file);
-    match fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Record::Missing,
-        Err(error) => {
-            return Record::Unusable {
-                account: None,
-                reason: format!("inspect {}: {error}", path.display()),
-            }
-        }
-        Ok(_) => {}
-    }
+    let unusable = |account, record_id, unread, reason| {
+        Record::Unusable(UnusableRecord {
+            directory: directory.to_owned(),
+            account,
+            record_id,
+            unread,
+            reason,
+        })
+    };
     let encoded = match delegation::read_private_regular(&path, label, MAX_STATE_FILE) {
         Ok(encoded) => encoded,
-        Err(error) => {
-            return Record::Unusable {
-                account: None,
-                reason: format!("{error:#}"),
-            }
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Record::Missing
         }
+        Err(error) => return unusable(None, None, true, format!("{error:#}")),
     };
-    let reason = match serde_json::from_slice::<T>(&encoded) {
+    let (record_id, reason) = match serde_json::from_slice::<T>(&encoded) {
         Ok(record) => match version(&record) {
             (CONFIG_VERSION, id) if id.to_string() == name => return Record::Usable(record),
-            (CONFIG_VERSION, id) => format!("it is the record of enrollment {id}"),
-            (record_version, _) => format!(
-                "it has version {record_version}, which another syq version wrote; this one reads version {CONFIG_VERSION}"
+            (CONFIG_VERSION, id) => (
+                Some(id),
+                format!("its record names enrollment {id}, not its directory's"),
+            ),
+            (record_version, _) => (
+                None,
+                format!(
+                    "it has version {record_version}, which another syq version wrote; this one reads version {CONFIG_VERSION}"
+                ),
             ),
         },
-        Err(error) => format!("decode {}: {error}", path.display()),
+        Err(error) => (None, format!("decode {}: {error}", path.display())),
     };
     // The account it names, as far as it can be read, to know which
-    // account it may be the enrollment of.
+    // account it may be the enrollment of. One no account could have, as
+    // in a damaged record, names none.
     let account = serde_json::from_slice::<serde_json::Value>(&encoded)
         .ok()
         .and_then(|value| {
@@ -151,8 +188,9 @@ fn read_record<T: serde::de::DeserializeOwned>(
                 port,
                 value.get("target_login")?.as_str()?.to_owned(),
             ))
-        });
-    Record::Unusable { account, reason }
+        })
+        .filter(|(host, port, login)| endpoint(login, host, *port).is_ok());
+    unusable(account, record_id, false, reason)
 }
 
 pub(super) fn load_enrollment_records() -> Result<EnrollmentRecords> {
@@ -169,11 +207,22 @@ pub(super) fn load_enrollment_records_in(base: &Path) -> Result<EnrollmentRecord
         let directory = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         if let Err(error) = delegation::validate_private_directory_path(&directory) {
-            records.unusable.push(UnusableRecord {
-                directory,
-                account: None,
-                reason: format!("{error:#}"),
+            // Only one that may hold a record may have a line on a server.
+            let may_hold_record = [ENROLLMENT_FILE, PENDING_FILE].iter().any(|file| {
+                !matches!(
+                    fs::symlink_metadata(directory.join(file)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                )
             });
+            if may_hold_record {
+                records.unusable.push(UnusableRecord {
+                    directory,
+                    account: None,
+                    record_id: None,
+                    unread: true,
+                    reason: format!("{error:#}"),
+                });
+            }
             continue;
         }
         let pending = || {
@@ -198,34 +247,31 @@ pub(super) fn load_enrollment_records_in(base: &Path) -> Result<EnrollmentRecord
                 records.active.push((record, directory));
                 continue;
             }
-            Record::Unusable { account, reason } => {
+            Record::Unusable(mut unusable) => {
                 // The pending record may still name the account.
-                let account = account.or_else(|| match pending() {
-                    Record::Usable(pending) => {
-                        Some((pending.host, pending.port, pending.target_login))
-                    }
-                    Record::Unusable { account, .. } => account,
-                    Record::Missing => None,
-                });
-                (account, reason)
+                if unusable.account.is_none() {
+                    unusable.account = match pending() {
+                        Record::Usable(pending) => {
+                            Some((pending.host, pending.port, pending.target_login))
+                        }
+                        Record::Unusable(pending) => pending.account,
+                        Record::Missing => None,
+                    };
+                }
+                unusable
             }
             Record::Missing => match pending() {
                 Record::Usable(pending) => {
                     records.pending.push((pending, directory));
                     continue;
                 }
-                Record::Unusable { account, reason } => (account, reason),
+                Record::Unusable(unusable) => unusable,
                 // Only an entry key, stored before the request was sent, or
                 // nothing: the server has no line for it.
                 Record::Missing => continue,
             },
         };
-        let (account, reason) = unusable;
-        records.unusable.push(UnusableRecord {
-            directory,
-            account,
-            reason,
-        });
+        records.unusable.push(unusable);
     }
     records
         .active
