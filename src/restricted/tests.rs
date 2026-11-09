@@ -1407,7 +1407,8 @@ fn an_enrolled_receiver_admits_tcp_only_when_its_verified_command_does() {
                 congestion_control: None,
                 send_rate: None,
             };
-            let admitted = match serve(rules, &verified, &state, (&home, &home), &[]).unwrap() {
+            let admitted = match session_for(rules, &verified, &state, (&home, &home), &[]).unwrap()
+            {
                 Session::Copy(authority) => authority.authorize(&mut listener, true).map(drop),
                 Session::Source(authority) => authority
                     .acquire(&proto::ConnectionRole::Control, compressed)

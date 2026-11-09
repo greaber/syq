@@ -405,9 +405,6 @@ impl From<crate::cli::WidenDirs> for DirectoryWidening {
 }
 
 impl ExtraCopyOptions {
-    pub(crate) fn is_default(&self) -> bool {
-        *self == Self::default()
-    }
     /// The inode metadata these options let a request apply or select.
     pub(crate) fn allows(&self, selection: crate::inode_metadata::Selection) -> bool {
         (!selection.acls || self.acls)
@@ -900,13 +897,12 @@ pub(crate) fn security_key_flags(signature: &ssh_key::SshSig) -> Result<u8> {
 /// Whether a copy's data may go over TCP, as the command an end of the copy
 /// verified says. Every end that serves a restricted copy, reading or
 /// writing, derives it from that command (`of`) and admits the copy's TCP
-/// listener only through `check_listener`, so no route admits TCP data the
-/// command refused.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// only through `check_listener`, or `check_allowed` for the TCP a receiving
+/// machine dials with its own key, so no route admits TCP data the command
+/// refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TcpPermission {
-    /// `--no-tcp`: the copy's data goes only over SSH. Where nothing derived
-    /// it, as in a field that is never sent, no TCP is allowed either.
-    #[default]
+    /// `--no-tcp`: the copy's data goes only over SSH.
     Refused,
     /// The data may go over encrypted, authenticated TCP.
     Encrypted,
@@ -952,21 +948,18 @@ impl TcpPermission {
     }
 }
 
-/// The destination's rules beyond the copy operation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// The destination's rules beyond the copy operation, derived where they
+/// are enforced and never sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GrantConstraints {
     pub filters: FilterPolicy,
     pub root_existence: RootExistence,
     pub receipt_policy: crate::destination_results::ReceiptPolicy,
     pub tcp_congestion: Option<String>,
     /// Whether the copy's data may go over TCP, and unencrypted.
-    #[serde(default)]
     pub tcp: TcpPermission,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mapping: Option<crate::mapping::Authorization>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hashing: Option<crate::hashing::CopyHashing>,
-    #[serde(default, skip_serializing_if = "ExtraCopyOptions::is_default")]
     pub extra_options: ExtraCopyOptions,
 }
 

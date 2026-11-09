@@ -783,7 +783,7 @@ fn admit(
     if privilege::refuses_privileged(&rules.role()) {
         refuse_privileged_receiver(Some(enrollment))?;
     }
-    let session = serve(
+    let session = session_for(
         rules,
         &verified,
         state,
@@ -806,7 +806,7 @@ fn admit(
 /// as `verified`, for the account whose home is `home` as it is named and
 /// where it really is: a copy's writes beneath its destination, or the
 /// reads a source's command names.
-pub(super) fn serve(
+pub(super) fn session_for(
     rules: Rules,
     verified: &delegation::VerifiedDirective,
     state: &Path,

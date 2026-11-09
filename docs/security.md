@@ -135,8 +135,8 @@ authentication token. Use it only on a network you trust. A restricted
 receiver accepts unencrypted TCP only when the signed command asks for it;
 someone on the network can then change what the copy writes, within what the
 signed command allows. When the approved command passes `--no-tcp`, neither a
-restricted receiver nor your laptop accepts any TCP data connection for that
-copy. Copies to and from your laptop through a receiving
+restricted receiver nor your laptop sets up TCP for that copy, so its data
+goes only over SSH. Copies to and from your laptop through a receiving
 connection always encrypt their data.
 
 For TCP, a server lists addresses to connect to, and syq also tries the
