@@ -1416,6 +1416,7 @@ fn an_enrolled_receiver_admits_tcp_only_when_its_verified_command_does() {
             .to_openssh()
             .unwrap(),
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
+        record_since: None,
     };
     ensure_results_key(&state, config.id).unwrap();
     let routes: [(&str, Role, &[&str]); 4] = [
