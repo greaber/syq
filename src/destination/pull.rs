@@ -28,13 +28,8 @@ pub(crate) struct PullRequest {
     /// working directory than the command's (`SourcePolicy::resolved_base`).
     /// Only a source directive's rules set it.
     pub resolved_base: Option<Vec<u8>>,
-    /// Whether the command copies without TCP, so the reader starts no
-    /// listener for it. Only a source directive's rules set it.
-    pub no_tcp: bool,
-    /// Whether the command sends TCP data without encryption, so the reader
-    /// accepts an unencrypted listener. Only a source directive's rules set
-    /// it.
-    pub unencrypted_tcp: bool,
+    /// Whether the command lets the data go over TCP, and unencrypted.
+    pub tcp: crate::delegation::TcpPermission,
 }
 
 /// A server's request to approve a copy from another server to itself,
@@ -179,8 +174,7 @@ pub(crate) fn source_request(
             max_deletions: 0,
         },
         resolved_base: None,
-        no_tcp: false,
-        unencrypted_tcp: false,
+        tcp: crate::delegation::TcpPermission::of(args),
     };
     // A source deletes nothing, so only the byte and entry limits apply.
     if let Some(caps) = caps {
@@ -221,12 +215,12 @@ impl PullRequest {
             preservation: self.preservation,
             sparse: self.sparse,
             compressed: self.compressed,
-            tcp: (!self.no_tcp).then(|| SourceTcpPolicy {
+            tcp: SourceTcpPolicy {
+                permission: self.tcp,
                 port_lo: self.tcp_ports.0,
                 port_hi: self.tcp_ports.1,
                 congestion_control: self.tcp_congestion.clone(),
-                unencrypted: self.unencrypted_tcp,
-            }),
+            },
             send_rate: self.send_rate,
             limits: self.limits.clone(),
             deadline,

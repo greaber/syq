@@ -770,18 +770,19 @@ fn a_sources_reads_come_from_the_signed_command() {
     // SSH data is not a reason to refuse it, and then the source starts no
     // TCP listener either.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    assert!(reads.policy(deadline).tcp.is_some());
+    let permission =
+        |reads: &crate::destination::pull::PullRequest| reads.policy(deadline).tcp.permission;
+    assert_eq!(permission(&reads), delegation::TcpPermission::Encrypted);
     let ssh_only =
         source_rules(&source_directive(&[ROUTE_4, &["--no-tcp"]].concat()), home).unwrap();
-    assert!(ssh_only.policy(deadline).tcp.is_none());
+    assert_eq!(permission(&ssh_only), delegation::TcpPermission::Refused);
     // Its TCP is unencrypted only when the command asks for that.
-    assert!(!reads.policy(deadline).tcp.unwrap().unencrypted);
     let plain = source_rules(
         &source_directive(&[ROUTE_4, &["--no-tcp-encryption"]].concat()),
         home,
     )
     .unwrap();
-    assert!(plain.policy(deadline).tcp.unwrap().unencrypted);
+    assert_eq!(permission(&plain), delegation::TcpPermission::Unencrypted);
 }
 
 /// A destination's TCP is unencrypted only when its signed command asks
@@ -790,13 +791,13 @@ fn a_sources_reads_come_from_the_signed_command() {
 fn unencrypted_tcp_comes_only_from_the_command() {
     let home = Path::new(HOME);
     let (_, encrypted) = destination_rules(&directive(ROUTE_5), home).unwrap();
-    assert!(!encrypted.unencrypted_tcp);
+    assert_eq!(encrypted.tcp, delegation::TcpPermission::Encrypted);
     let (_, plain) = destination_rules(
         &directive(&[ROUTE_5, &["--no-tcp-encryption"]].concat()),
         home,
     )
     .unwrap();
-    assert!(plain.unencrypted_tcp);
+    assert_eq!(plain.tcp, delegation::TcpPermission::Unencrypted);
     let to_laptop = directive(&[ROUTE_5, &["--no-tcp-encryption"]].concat());
     let error = receiving_rules(&to_laptop, b"/home/me/backup")
         .unwrap_err()

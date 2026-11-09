@@ -863,9 +863,7 @@ fn copy_warnings(request: &crate::destination::CopyRequest) -> Vec<String> {
             .publication
             .updates_existing_files_in_place()
             .then(|| UPDATE_IN_PLACE_WARNING.to_owned()),
-        request
-            .constraints
-            .unencrypted_tcp
+        (request.constraints.tcp == crate::delegation::TcpPermission::Unencrypted)
             .then(|| UNENCRYPTED_TCP_WARNING.to_owned()),
         (deletions > 0).then(|| {
             format!("can delete up to {deletions} files or folders anywhere in the destination")
@@ -2282,7 +2280,7 @@ mod tests {
         let temp = crate::test_support::tempdir().unwrap();
         let path = temp.path().canonicalize().unwrap().join("data");
         let mut request = copy_request(&path);
-        request.constraints.unencrypted_tcp = true;
+        request.constraints.tcp = crate::delegation::TcpPermission::Unencrypted;
         let warnings = |request: &crate::destination::CopyRequest| {
             shown_warnings(&Summary::new(&requester(), &[], "~", request, TIMEOUT, None).unwrap())
         };

@@ -673,8 +673,9 @@ pub(crate) struct RestrictedAuthority {
     /// Signalled whenever an in-flight request settles.
     pub(super) settled: std::sync::Condvar,
     pub(super) tcp_congestion: Option<String>,
-    /// Whether the signed command asks for TCP data without encryption.
-    pub(super) unencrypted_tcp: bool,
+    /// Whether the signed command lets the data go over TCP, and
+    /// unencrypted.
+    pub(super) tcp: crate::delegation::TcpPermission,
     pub(super) mapping: Option<Mutex<crate::mapping::Admission>>,
     pub(super) hashing: Option<crate::hashing::CopyHashing>,
     pub(super) extra_options: crate::delegation::ExtraCopyOptions,
@@ -767,7 +768,7 @@ impl RestrictedAuthority {
             root_existence,
             receipt_policy,
             tcp_congestion,
-            unencrypted_tcp,
+            tcp,
             mapping,
             hashing,
             extra_options,
@@ -938,7 +939,7 @@ impl RestrictedAuthority {
             owned: Default::default(),
             stage_scope: crate::fsops::new_stage_scope(),
             tcp_congestion,
-            unencrypted_tcp,
+            tcp,
             mapping: mapping.map(|authorization| {
                 Mutex::new(crate::mapping::Admission::new(
                     authorization,
@@ -3628,14 +3629,7 @@ impl RestrictedAuthority {
                 if !over_ssh {
                     bail!("TCP listener request is allowed only on the signed control connection");
                 }
-                // Unencrypted only when the signed command asks for it.
-                let key_valid = match key {
-                    Some(key) => key.len() == crate::tcp_records::KEY_LEN,
-                    None => self.unencrypted_tcp,
-                };
-                if !key_valid || token.len() != 16 {
-                    bail!("signed transfers require encrypted TCP data connections unless the signed command passes --no-tcp-encryption");
-                }
+                self.tcp.check_listener(key.as_deref(), token)?;
                 if (*port_lo, *port_hi)
                     != (self.copy.options.tcp_port_lo, self.copy.options.tcp_port_hi)
                 {

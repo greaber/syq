@@ -76,7 +76,7 @@ fn source_policy(path: &Path) -> SourcePolicy {
         preservation: Default::default(),
         sparse: false,
         compressed: false,
-        tcp: None,
+        tcp: crate::restricted::source::SourceTcpPolicy::refused(),
         send_rate: None,
         limits: crate::delegation::CopyLimits {
             max_entries: 100,
@@ -418,12 +418,16 @@ fn approved_source_tcp_is_unencrypted_only_when_approved_so() {
     fs::write(&file, b"approved").unwrap();
     for unencrypted in [false, true] {
         let mut policy = source_policy(&file);
-        policy.tcp = Some(crate::restricted::source::SourceTcpPolicy {
+        policy.tcp = crate::restricted::source::SourceTcpPolicy {
+            permission: if unencrypted {
+                crate::delegation::TcpPermission::Unencrypted
+            } else {
+                crate::delegation::TcpPermission::Encrypted
+            },
             port_lo: 0,
             port_hi: 0,
             congestion_control: None,
-            unencrypted,
-        });
+        };
         let register = registration(&policy);
         let mut server = SourceServer::new(policy);
         server.register(register);
@@ -449,12 +453,12 @@ fn approved_source_tcp_requires_encryption_and_keeps_workers_read_only() {
     let file = temporary.path().join("file");
     fs::write(&file, b"approved").unwrap();
     let mut policy = source_policy(&file);
-    policy.tcp = Some(crate::restricted::source::SourceTcpPolicy {
+    policy.tcp = crate::restricted::source::SourceTcpPolicy {
+        permission: crate::delegation::TcpPermission::Encrypted,
         port_lo: 0,
         port_hi: 0,
         congestion_control: None,
-        unencrypted: false,
-    });
+    };
     policy.send_rate = Some(1 << 30);
     let register = registration(&policy);
     let mut server = SourceServer::new(policy);
@@ -629,12 +633,12 @@ fn approved_source_control_disconnect_revokes_tcp_while_control_response_is_busy
     let file = temporary.path().join("file");
     fs::write(&file, b"approved").unwrap();
     let mut policy = source_policy(&file);
-    policy.tcp = Some(crate::restricted::source::SourceTcpPolicy {
+    policy.tcp = crate::restricted::source::SourceTcpPolicy {
+        permission: crate::delegation::TcpPermission::Encrypted,
         port_lo: 0,
         port_hi: 0,
         congestion_control: None,
-        unencrypted: false,
-    });
+    };
     let register = registration(&policy);
     let armed = Arc::new(AtomicBool::new(false));
     let pause = armed.clone();

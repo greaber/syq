@@ -1300,6 +1300,135 @@ fn a_source_directive_is_admitted_only_for_what_its_command_reads() {
     assert!(format!("{error:#}").contains("already"), "{error:#}");
 }
 
+/// An enrolled receiver admits a copy's TCP listener only when the command
+/// it verified lets the data go over TCP, at either end of every route that
+/// reaches it: the destination of an upload (route 3), of a copy between
+/// two servers from this machine (route 5) or from a third (route 6), and
+/// the source of a download (route 4).
+#[test]
+fn an_enrolled_receiver_admits_tcp_only_when_its_verified_command_does() {
+    use crate::directive::{Binding, Role};
+    let temporary = crate::test_support::tempdir().unwrap();
+    let state = temporary.path().join("state");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(state.join("replay"))
+        .unwrap();
+    let home = temporary.path().join("home");
+    for directory in ["backup", "archive", "data"] {
+        fs::create_dir_all(home.join(directory)).unwrap();
+    }
+    let login = generate_test_key("login").unwrap();
+    let build = crate::identity::build();
+    let config = ReceiverEnrollment {
+        version: CONFIG_VERSION,
+        id: EnrollmentId::random(),
+        target_login: "backup".into(),
+        generation: 2,
+        release: build.into(),
+        receiver_path: "/home/backup/.local/lib/syq/v0.8.0/linux-x86_64/syq".into(),
+        entry_public_key: generate_test_key("entry")
+            .unwrap()
+            .public_key()
+            .to_openssh()
+            .unwrap(),
+        signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
+    };
+    ensure_results_key(&state, config.id).unwrap();
+    let routes: [(&str, Role, &[&str]); 4] = [
+        (
+            "route 3",
+            Role::Destination,
+            &["cp", "--src", "data", "--to", "host-b", "--into", "backup"],
+        ),
+        (
+            "route 4",
+            Role::Source,
+            &["cp", "--from", "host-b", "--src", "data", "--into", "/copy"],
+        ),
+        (
+            "route 5",
+            Role::Destination,
+            &[
+                "cp", "--from", "host-a", "--src", "data", "--to", "host-b", "--into", "backup",
+            ],
+        ),
+        (
+            "route 6",
+            Role::Destination,
+            &[
+                "cp",
+                "--from",
+                "host-b",
+                "--srcs-in",
+                "data",
+                "--to",
+                "host-c",
+                "--into",
+                "archive",
+                "--auth-from",
+                "@laptop",
+            ],
+        ),
+    ];
+    for (route, role, command) in routes {
+        for no_tcp in [false, true] {
+            let command: Vec<Vec<u8>> = command
+                .iter()
+                .chain(&["--tcp-ports", "47600-47699"])
+                .chain(no_tcp.then_some(&"--no-tcp"))
+                .map(|arg| arg.as_bytes().to_vec())
+                .collect();
+            let directive = crate::directive::issue(
+                Binding {
+                    enrollment: config.id,
+                    generation: 2,
+                    account: "backup".into(),
+                    role: role.clone(),
+                },
+                command,
+                "~".into(),
+                (Default::default(), None),
+                [7; 32],
+            )
+            .unwrap();
+            let compressed = crate::approval_command::parse(&directive.command)
+                .unwrap()
+                .compress;
+            let signed = sign_test_directive(&directive, &login, crate::directive::NAMESPACE);
+            let (rules, verified) =
+                verify_rules(&state, &config, (2, build), &signed, (&home, &home)).unwrap();
+            let mut listener = Request::TcpListen {
+                key: Some(vec![7; crate::tcp_records::KEY_LEN]),
+                token: vec![8; 16],
+                port_lo: 47_600,
+                port_hi: 47_699,
+                congestion_control: None,
+                send_rate: None,
+            };
+            let admitted = match session_for(rules, &verified, &state, (&home, &home), &[]).unwrap()
+            {
+                Session::Copy(authority) => authority.authorize(&mut listener, true).map(drop),
+                Session::Source(authority) => authority
+                    .acquire(&proto::ConnectionRole::Control, compressed)
+                    .unwrap()
+                    .authorize(&listener),
+                _ => panic!("{route}: the directive made no copy's session"),
+            };
+            if no_tcp {
+                let error = admitted.expect_err(route);
+                assert!(
+                    format!("{error:#}").contains("passes --no-tcp,"),
+                    "{route}: {error:#}"
+                );
+            } else {
+                admitted.unwrap_or_else(|error| panic!("{route}: {error:#}"));
+            }
+        }
+    }
+}
+
 /// A receiver records a directive as used only after the build, the
 /// generation, the binding, the signature and the derivation of its rules
 /// are checked: a refused directive leaves the record of used directives as
@@ -2720,7 +2849,7 @@ fn test_authority_with_options(
         grant,
         GrantConstraints {
             tcp_congestion: None,
-            unencrypted_tcp: false,
+            tcp: crate::delegation::TcpPermission::Encrypted,
             mapping: None,
             hashing: None,
             filters,
@@ -6927,15 +7056,15 @@ fn authority_accepts_an_unencrypted_listener_only_when_signed() {
     let encrypted = test_authority(&root, DeletionPolicy::Forbid, 1024);
     let error = encrypted.authorize(&mut listener(), true).unwrap_err();
     assert!(
-        format!("{error:#}").contains("unless the signed command passes --no-tcp-encryption"),
+        format!("{error:#}").contains("unless the approved command passes --no-tcp-encryption"),
         "{error:#}"
     );
     let mut plain = test_authority(&root, DeletionPolicy::Forbid, 1024);
-    plain.unencrypted_tcp = true;
+    plain.tcp = crate::delegation::TcpPermission::Unencrypted;
     plain.authorize(&mut listener(), true).unwrap();
     // An encrypted listener is still fine, and the token is still checked.
     let mut plain = test_authority(&root, DeletionPolicy::Forbid, 1024);
-    plain.unencrypted_tcp = true;
+    plain.tcp = crate::delegation::TcpPermission::Unencrypted;
     let mut short_token = listener();
     if let Request::TcpListen { token, .. } = &mut short_token {
         token.pop();
