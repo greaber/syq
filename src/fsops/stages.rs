@@ -11,9 +11,10 @@
 //! for any other write error.
 //!
 //! At most `MAX_HELD` files are held. Beyond that the one used least
-//! recently is let go, unless a connection is using it. A copy has about two
-//! files in flight per worker, so what is let go is a file that failed and
-//! was not retried.
+//! recently is let go, unless a connection is using it. A worker has at most
+//! three files in flight: the one it writes and up to two whose publication
+//! is in flight (`transfer::publication`). So what is let go is a file that
+//! failed and was not retried.
 //!
 //! Each held file keeps the size the request that created or opened it
 //! declared, and no write goes past it: what a copy writes is bounded by
@@ -24,7 +25,8 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Condvar, MutexGuard};
 
-/// Files held at once, about two for each connection a receiver serves.
+/// Files held at once: four for each worker connection a receiver serves
+/// (`server::MAX_WORKER_CONNECTIONS`), more than a worker has in flight.
 /// Tests reach the bound with fewer.
 pub(super) const MAX_HELD: usize = if cfg!(test) { 16 } else { 1024 };
 

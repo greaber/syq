@@ -161,6 +161,11 @@ pub trait Conn: Send {
         let response = self.take_reply(pending)?;
         Ok((response, std::time::Instant::now()))
     }
+    /// Whether `take_reply` would return `pending`'s reply without waiting:
+    /// it was answered when sent, or read while taking a later reply.
+    fn reply_arrived(&self, pending: &PendingReply) -> bool {
+        matches!(pending, PendingReply::Ready(_))
+    }
     /// True once the transport has failed (remote process gone).
     fn is_dead(&self) -> bool {
         false
@@ -1322,6 +1327,12 @@ impl Conn for RemoteConn {
             .arrived
             .remove(&id)
             .context("deferred reply was already taken")
+    }
+    fn reply_arrived(&self, pending: &PendingReply) -> bool {
+        match pending {
+            PendingReply::Ready(_) => true,
+            PendingReply::Queued(id) => self.deferred.arrived.contains_key(id),
+        }
     }
     fn recv(&mut self) -> Result<Response> {
         self.receive_response().map(ReceivedResponse::into_inner)

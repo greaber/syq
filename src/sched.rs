@@ -1172,35 +1172,48 @@ impl Sched {
     }
 
     pub fn next(&self) -> Item {
+        self.take(true).expect("a waiting take returns an item")
+    }
+
+    /// `next` without waiting: None when there is no work yet, though the
+    /// copy has not finished.
+    pub fn try_next(&self) -> Option<Item> {
+        self.take(false)
+    }
+
+    fn take(&self, wait: bool) -> Option<Item> {
         let mut g = self.inner.lock().unwrap();
         loop {
             if g.abort {
                 self.tune_cv.notify_one();
-                return Item::Exit;
+                return Some(Item::Exit);
             }
             if g.scan_done || g.work_released {
                 if let Some((idx, off, end, split)) = g.ranges.pop() {
-                    return Item::Range(g.claim_range(idx, off, end, split));
+                    return Some(Item::Range(g.claim_range(idx, off, end, split)));
                 }
                 if let Some((idx, matched)) = g.finishes.pop() {
                     g.finishing += 1;
-                    return Item::Finish { idx, matched };
+                    return Some(Item::Finish { idx, matched });
                 }
                 if let Some((_, Reverse(order))) = g.files.pop() {
                     let idx = order.index();
                     g.probing += 1;
-                    return Item::File(idx);
+                    return Some(Item::File(idx));
                 }
                 if let Some(h) = self.steal(&mut g) {
-                    return Item::Range(h);
+                    return Some(Item::Range(h));
                 }
                 if let Some(idx) = self.steal_fast_group(&mut g) {
-                    return Item::File(idx);
+                    return Some(Item::File(idx));
                 }
             }
             if g.finished() {
                 self.tune_cv.notify_one();
-                return Item::Exit;
+                return Some(Item::Exit);
+            }
+            if !wait {
+                return None;
             }
             g.waiting_workers += 1;
             g = self.cv.wait(g).unwrap();

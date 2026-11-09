@@ -34,6 +34,7 @@ mod diagnostics;
 mod dry_run;
 mod hardlinks;
 mod planner;
+mod publication;
 mod small_compare;
 mod work_budget;
 mod worker;
@@ -3285,6 +3286,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         range_budget: None,
                         comparison: Default::default(),
                         setup_elapsed: t0.elapsed(),
+                        publications: Default::default(),
                     };
                     #[cfg(debug_assertions)]
                     crate::fsops::record_test_event(
