@@ -594,6 +594,10 @@ pub(super) fn install_for_account(
         entry_public_key: request.entry_public_key.clone(),
         signer: request.signer.clone(),
         record_since,
+        // What a newer syq recorded stays for it.
+        unknown: existing
+            .map(|existing| existing.unknown)
+            .unwrap_or_default(),
     };
     // The new generation is durable before a record of used grants is
     // recreated: receivers admit grants only for the current generation, so

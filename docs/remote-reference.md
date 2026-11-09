@@ -70,11 +70,26 @@ it from your agent after switching keys, the next copy logs in again and
 trusts your current key. While the old key can still sign, syq keeps using it;
 run `syq receiver enroll HOST` to switch to your current login key now.
 `syq receiver list` shows the key each enrollment trusts. After you change syq
-builds, the next copy logs in once to update the receiver. A server that
+builds, the next copy logs in to update the receiver to the new build. The
+receiver runs one build at a time, so if you switch back and forth between two
+builds on your laptop, for example a development build and an installed one,
+the first copy after each switch logs in again. A server that
 reaches the receiver itself, to run or coordinate a copy, needs the same syq
 build as the machine that approves the copy, whose build the receiver follows.
 Otherwise the receiver refuses it and says which builds it saw; update syq on
 whichever of the two machines is older.
+
+If `syq receiver list` shows an enrollment as `unusable`, this syq can't read
+the record your laptop keeps for it, for example because a newer syq wrote it.
+Its line in the server's `authorized_keys` still works, so this syq won't set
+up another enrollment for that account. When the record doesn't say which
+account it's for, as when it's damaged, syq won't set up a new enrollment for
+any account until you clear it. Use or revoke the enrollment with the syq that
+made it. Without that syq, delete the line containing `syq-enrollment:ID` from
+the server's `~/.ssh/authorized_keys`, then delete the enrollment's directory
+on your laptop, which syq names. If only the directory's owner or permissions
+changed, for example after restoring a backup, give it back to your account
+with mode 0700, and its files mode 0600, instead.
 
 A copy between two servers that you start on your laptop can also find the
 receiver running another build than your laptop recorded, for example after

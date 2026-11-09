@@ -14,7 +14,7 @@ syq receiver <COMMAND>
 | Command | Purpose |
 |---|---|
 | [`receiver enroll`](#syq-receiver-enroll) | Manually enroll or refresh a server account |
-| [`receiver list`](#syq-receiver-list) | List this machine's enrollments, active and pending |
+| [`receiver list`](#syq-receiver-list) | List this machine's enrollments: active, pending, and any this syq cannot use |
 | [`receiver revoke`](#syq-receiver-revoke) | Stop an enrollment's active copies and remove it from both machines |
 
 **Help (also available on subcommands)**
@@ -55,7 +55,10 @@ syq receiver enroll [OPTIONS] <[USER@]HOST>
 
 Prints one tab-separated line per enrollment: its ID, `active` or `pending`,
 and the account. Active enrollments add the receiver's release and the
-fingerprint of the login key it trusts.
+fingerprint of the login key it trusts. An enrollment whose record this syq
+can't use, such as one a newer syq wrote, is listed as `unusable`, with the
+account when its record names one; syq explains each on standard error.
+See [Changing keys and updating syq](../remote-reference.md#enrollments-from-older-versions).
 
 <!-- CLI: receiver list -->
 ```text

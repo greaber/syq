@@ -404,7 +404,7 @@ pub(crate) fn receiver() -> Command {
                     )
                     .arg(via()),
             )
-            .subcommand(Command::new("list").about("List this machine's enrollments, active and pending"))
+            .subcommand(Command::new("list").about("List this machine's enrollments: active, pending, and any this syq cannot use"))
             .subcommand(
                 Command::new("revoke")
                     .about("Stop an enrollment's active copies and remove it from both machines")

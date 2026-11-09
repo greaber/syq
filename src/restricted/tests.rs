@@ -315,11 +315,20 @@ fn released_enrollment_state_is_never_read_or_touched() {
     assert!(!notice.contains("https://"), "{notice}");
     assert!(released_enrollment_notice(&home.join("missing")).is_none());
 
-    // The enrolling machine lists only current enrollments.
+    // The enrolling machine uses only current enrollments. A released
+    // record where they live is reported, with the account it names.
     let base = home.join(".local/state/syq/enrollments");
     private(&base.join(released));
     write(&base.join(released).join(ENROLLMENT_FILE), local, 0o600);
-    assert!(load_local_enrollments_in(&base).unwrap().is_empty());
+    let records = load_enrollment_records_in(&base).unwrap();
+    assert!(records.active.is_empty() && records.pending.is_empty());
+    let [unusable] = &records.unusable[..] else {
+        panic!("{:?}", records.unusable);
+    };
+    assert_eq!(
+        unusable.account,
+        Some(("destination".into(), None, "syq".into()))
+    );
 
     // Revoking the new enrollment removes only its own line and state.
     revoke_for_account(
@@ -1070,6 +1079,7 @@ fn a_receiver_from_an_older_line_refuses_new_copies() {
             .unwrap(),
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
         record_since: None,
+        unknown: Default::default(),
     };
     require_current_receiver(&config, 4, "v0.8.0").unwrap();
     for (generation, build) in [(3, "v0.8.0"), (4, "v0.7.9"), (5, "v0.8.0")] {
@@ -1122,6 +1132,7 @@ fn a_coordinating_source_is_admitted_only_with_its_own_destination_directive() {
             .unwrap(),
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
         record_since: None,
+        unknown: Default::default(),
     };
     write_receiver_state(&state, &config);
     let command = [
@@ -1312,6 +1323,7 @@ fn a_source_directive_is_admitted_only_for_what_its_command_reads() {
             .unwrap(),
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
         record_since: None,
+        unknown: Default::default(),
     };
     write_receiver_state(&state, &config);
     let command = |extra: &[&str]| {
@@ -1479,6 +1491,7 @@ fn an_enrolled_receiver_admits_tcp_only_when_its_verified_command_does() {
             .unwrap(),
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
         record_since: None,
+        unknown: Default::default(),
     };
     write_receiver_state(&state, &config);
     ensure_results_key(&state, config.id).unwrap();
@@ -1604,6 +1617,7 @@ fn a_directive_is_recorded_only_after_every_check_passes() {
             .unwrap(),
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
         record_since: None,
+        unknown: Default::default(),
     };
     write_receiver_state(&state, &config);
     let home = temporary.path();
@@ -1829,6 +1843,7 @@ fn enrollment_state_names_no_device_or_inode_and_sessions_compare_none() {
                 .unwrap(),
             identity_file: Some(home.join("id_ed25519")),
             receiving_state: Vec::new(),
+            unknown: Default::default(),
         },
     )
     .unwrap();
@@ -3687,6 +3702,7 @@ fn local_records_track_pending_enrollments_and_unconfirmed_refreshes() {
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
         identity_file: None,
         receiving_state: Vec::new(),
+        unknown: Default::default(),
     };
     complete_local_enrollment(&directory, &metadata).unwrap();
     assert!(!directory.join(PENDING_FILE).exists());
@@ -3728,6 +3744,306 @@ fn local_records_track_pending_enrollments_and_unconfirmed_refreshes() {
     let mut other_build = metadata.clone();
     other_build.release = "v0.0.0-other".into();
     assert!(needs_refresh(&other_build, &directory));
+}
+
+/// A complete local record for enrollment `id` of `backup@host:port`.
+fn local_record(id: EnrollmentId, host: &str, port: Option<u16>) -> LocalEnrollment {
+    let login = generate_test_key("login").unwrap();
+    LocalEnrollment {
+        version: CONFIG_VERSION,
+        id,
+        host: host.into(),
+        port,
+        target_login: "backup".into(),
+        remote_home: "/home/backup".into(),
+        generation: 1,
+        release: crate::identity::build().into(),
+        receiver_path: "/home/backup/.local/lib/syq/v1/linux-x86_64/syq".into(),
+        results_public_key: generate_results_key(id)
+            .unwrap()
+            .public_key()
+            .to_openssh()
+            .unwrap(),
+        signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
+        identity_file: None,
+        receiving_state: Vec::new(),
+        unknown: Default::default(),
+    }
+}
+
+/// A JSON file's contents, to change it as another build would write it.
+fn json_object(path: &Path) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+}
+
+fn write_json_object(path: &Path, object: &serde_json::Map<String, serde_json::Value>) {
+    atomic_write(
+        path.parent().unwrap(),
+        &path.file_name().unwrap().to_string_lossy(),
+        &serde_json::to_vec(object).unwrap(),
+        0o600,
+    )
+    .unwrap();
+}
+
+/// A record this build cannot use, as another build's, may still have a
+/// working line on the server. Enrolling its account again would leave
+/// that line where `syq receiver list` and `revoke` cannot see it, so syq
+/// lists the record and refuses, saying how to clear it.
+#[test]
+fn an_enrollment_record_this_build_cannot_use_is_reported_and_not_enrolled_beside() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let base = temporary.path();
+    fs::set_permissions(base, fs::Permissions::from_mode(0o700)).unwrap();
+    let make = |id: EnrollmentId| {
+        let directory = base.join(id.to_string());
+        ensure_directory(&directory, 0o700).unwrap();
+        store_entry_key(&directory, &generate_test_key("entry").unwrap()).unwrap();
+        directory
+    };
+
+    // A newer build's record for backup@host-b:2222: another version.
+    let newer = EnrollmentId::random();
+    let newer_directory = make(newer);
+    complete_local_enrollment(&newer_directory, &local_record(newer, "host-b", Some(2222)))
+        .unwrap();
+    let path = newer_directory.join(ENROLLMENT_FILE);
+    let mut record = json_object(&path);
+    record.insert("version".into(), (CONFIG_VERSION + 1).into());
+    write_json_object(&path, &record);
+    let records = load_enrollment_records_in(base).unwrap();
+    assert!(records.active.is_empty() && records.pending.is_empty());
+    let [unusable] = &records.unusable[..] else {
+        panic!("{:?}", records.unusable);
+    };
+    assert_eq!(unusable.name(), newer.to_string());
+    assert_eq!(
+        unusable.account,
+        Some(("host-b".into(), Some(2222), "backup".into()))
+    );
+    assert!(
+        unusable
+            .reason
+            .contains(&format!("version {}", CONFIG_VERSION + 1)),
+        "{}",
+        unusable.reason
+    );
+    // A pending record left beside it does not make it pending.
+    atomic_write(
+        &newer_directory,
+        PENDING_FILE,
+        &serde_json::to_vec(&PendingEnrollment {
+            version: CONFIG_VERSION,
+            id: newer,
+            host: "host-b".into(),
+            port: Some(2222),
+            target_login: "backup".into(),
+        })
+        .unwrap(),
+        0o600,
+    )
+    .unwrap();
+    let records = load_enrollment_records_in(base).unwrap();
+    assert!(records.pending.is_empty() && records.unusable.len() == 1);
+
+    // Its account is not enrolled again, nor is a pending enrollment for it
+    // completed; the message says how to clear it.
+    let refused = |host: &str, port: Option<u16>| {
+        let Err(error) = plan_enrollment(base, (host, port, "backup"), Refresh::IfOutdated) else {
+            panic!("enrolled beside a record this build cannot use");
+        };
+        format!("{error:#}")
+    };
+    let error = refused("host-b", Some(2222));
+    for part in [
+        "backup@host-b".to_owned(),
+        format!("enrollment {newer}"),
+        format!("`syq receiver revoke {newer}`"),
+        format!("syq-enrollment:{newer}"),
+        newer_directory.display().to_string(),
+    ] {
+        assert!(error.contains(&part), "{part}: {error}");
+    }
+    let pending = EnrollmentId::random();
+    atomic_write(
+        &make(pending),
+        PENDING_FILE,
+        &serde_json::to_vec(&PendingEnrollment {
+            version: CONFIG_VERSION,
+            id: pending,
+            host: "host-b".into(),
+            port: Some(2222),
+            target_login: "backup".into(),
+        })
+        .unwrap(),
+        0o600,
+    )
+    .unwrap();
+    assert_eq!(load_enrollment_records_in(base).unwrap().pending.len(), 1);
+    refused("host-b", Some(2222));
+
+    // Another account enrolls as before.
+    let Planned::Session(plan) =
+        plan_enrollment(base, ("host-c", None, "backup"), Refresh::IfOutdated).unwrap()
+    else {
+        panic!("no enrollment to use");
+    };
+    assert!(!plan.refresh && plan.entry_key.is_none());
+
+    // An account's active enrollment is still refreshed beside it: that
+    // makes no other line.
+    let active = EnrollmentId::random();
+    complete_local_enrollment(&make(active), &local_record(active, "host-b", Some(2222))).unwrap();
+    let Planned::Session(plan) =
+        plan_enrollment(base, ("host-b", Some(2222), "backup"), Refresh::Always).unwrap()
+    else {
+        panic!("no refresh");
+    };
+    assert!(plan.refresh && plan.id == active);
+
+    // A record that names no account it can be read for may be any
+    // account's: a damaged one, one whose account no server could have,
+    // or one in a directory that is not private.
+    let unusable_at = |directory: &Path| {
+        let records = load_enrollment_records_in(base).unwrap();
+        records
+            .unusable
+            .into_iter()
+            .find(|record| record.directory == directory)
+    };
+    for damage in [
+        &b"{\"version\":"[..],
+        br#"{"version":99,"host":"bad host","target_login":"backup"}"#,
+    ] {
+        let damaged = make(EnrollmentId::random());
+        fs::write(damaged.join(ENROLLMENT_FILE), damage).unwrap();
+        fs::set_permissions(
+            damaged.join(ENROLLMENT_FILE),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let record = unusable_at(&damaged).unwrap();
+        assert!(record.account.is_none() && record.account_label().is_none());
+        let error = refused("host-c", None);
+        assert!(
+            error.contains("if it has one, still works in ~/.ssh/authorized_keys on the server account it was made for"),
+            "{error}"
+        );
+        remove_local_enrollment(&damaged).unwrap();
+        plan_enrollment(base, ("host-c", None, "backup"), Refresh::IfOutdated).unwrap();
+    }
+    // A directory that is not private holds nothing with a line on a server
+    // until it holds a record; then the message says how to repair it.
+    let exposed = make(EnrollmentId::random());
+    fs::set_permissions(&exposed, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(unusable_at(&exposed).is_none());
+    plan_enrollment(base, ("host-c", None, "backup"), Refresh::IfOutdated).unwrap();
+    fs::write(exposed.join(PENDING_FILE), b"{}").unwrap();
+    let record = unusable_at(&exposed).unwrap();
+    assert!(record.account.is_none() && record.unread);
+    let error = refused("host-c", None);
+    assert!(error.contains("mode 0700"), "{error}");
+    fs::remove_dir_all(&exposed).unwrap();
+
+    // A record in another enrollment's directory, as after a rename, of
+    // this version or another: which line on the server is its own is not
+    // known, so syq names none.
+    for record_version in [CONFIG_VERSION, CONFIG_VERSION + 1] {
+        let (directory_id, record_id) = (EnrollmentId::random(), EnrollmentId::random());
+        let moved = make(directory_id);
+        complete_local_enrollment(&moved, &local_record(record_id, "host-d", None)).unwrap();
+        let path = moved.join(ENROLLMENT_FILE);
+        let mut record = json_object(&path);
+        record.insert("version".into(), record_version.into());
+        write_json_object(&path, &record);
+        let record = unusable_at(&moved).unwrap();
+        assert_eq!(record.record_id, Some(record_id));
+        let explanation = record.explain();
+        assert!(
+            explanation.contains(&format!("rename it back to {record_id}")),
+            "{explanation}"
+        );
+        assert!(!explanation.contains("syq-enrollment:"), "{explanation}");
+        refused("host-d", None);
+        remove_local_enrollment(&moved).unwrap();
+    }
+}
+
+/// A newer build's fields in an enrollment's records survive this build
+/// rewriting them, as when two builds take turns refreshing it.
+#[test]
+fn rewriting_enrollment_records_keeps_fields_a_newer_build_wrote() {
+    let newer_field = || serde_json::json!({"kept": [1, 2]});
+    let add_newer_field = |path: &Path| {
+        let mut record = json_object(path);
+        record.insert("newer_field".into(), newer_field());
+        write_json_object(path, &record);
+    };
+
+    // The server's state, rewritten in place for a new certificate expiry,
+    // and under a new generation for another login key.
+    let (account, home) = enrollment_home();
+    let home = home.path();
+    let id = EnrollmentId::random();
+    let entry = generate_test_key("entry").unwrap();
+    let login = generate_test_key("login").unwrap();
+    installed(
+        install_for_account(
+            &install_request(&account, id, &entry, &login, false),
+            &account,
+            home,
+        )
+        .unwrap(),
+    );
+    let state = enrollment_state(home, id).join("config.json");
+    add_newer_field(&state);
+    let mut expiry = install_request(&account, id, &entry, &login, true);
+    expiry.signer =
+        delegation::TrustedSigner::new(login.public_key(), None, Some(1_900_000_000)).unwrap();
+    assert_eq!(
+        installed(install_for_account(&expiry, &account, home).unwrap()),
+        (1, true)
+    );
+    assert_eq!(json_object(&state)["newer_field"], newer_field());
+    let other_login = generate_test_key("other login").unwrap();
+    assert_eq!(
+        installed(
+            install_for_account(
+                &install_request(&account, id, &entry, &other_login, true),
+                &account,
+                home
+            )
+            .unwrap()
+        ),
+        (2, true)
+    );
+    let rewritten = json_object(&state);
+    assert_eq!(rewritten["newer_field"], newer_field());
+    assert_eq!(rewritten["generation"], 2);
+
+    // The enrolling machine's record, rewritten after a refresh.
+    let base = home.join("local");
+    ensure_directory(&base, 0o700).unwrap();
+    let directory = base.join(id.to_string());
+    ensure_directory(&directory, 0o700).unwrap();
+    let mut metadata = local_record(id, "host-b", None);
+    complete_local_enrollment(&directory, &metadata).unwrap();
+    add_newer_field(&directory.join(ENROLLMENT_FILE));
+    let [(read, _)] = &load_local_enrollments_in(&base).unwrap()[..] else {
+        panic!("a record with a newer field is not usable");
+    };
+    assert_eq!(read.unknown["newer_field"], newer_field());
+    metadata.generation = 2;
+    complete_local_enrollment(&directory, &metadata).unwrap();
+    let rewritten = json_object(&directory.join(ENROLLMENT_FILE));
+    assert_eq!(rewritten["newer_field"], newer_field());
+    assert_eq!(rewritten["generation"], 2);
+    // Another enrollment's record starts without them.
+    let other = EnrollmentId::random();
+    let other_directory = base.join(other.to_string());
+    ensure_directory(&other_directory, 0o700).unwrap();
+    complete_local_enrollment(&other_directory, &local_record(other, "host-b", None)).unwrap();
+    assert!(!json_object(&other_directory.join(ENROLLMENT_FILE)).contains_key("newer_field"));
 }
 #[test]
 fn prune_lookup_is_confined_to_authorized_observation_paths() {
