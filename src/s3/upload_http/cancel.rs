@@ -119,6 +119,24 @@ impl Cancellation {
 
 type Stop = Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
 
+/// The SDK's sleeps, such as its retry backoff, for a client this cancels.
+/// After cancellation none lasts past the abort grace, so an abort that the
+/// server asks to retry later cannot hold up cancellation; its next attempt
+/// is then refused.
+#[derive(Debug)]
+pub(in crate::s3) struct Sleep(pub Arc<Cancellation>);
+impl aws_sdk_s3::config::AsyncSleep for Sleep {
+    fn sleep(&self, duration: Duration) -> aws_sdk_s3::config::Sleep {
+        let stopped = self.0.clone().stopped(Some(ABORT_GRACE));
+        aws_sdk_s3::config::Sleep::new(async move {
+            tokio::select! {
+                () = tokio::time::sleep(duration) => {}
+                () = stopped => {}
+            }
+        })
+    }
+}
+
 // Keep cancellation active after headers arrive, including SDK deserialization
 // of control responses and streaming GET bodies. Otherwise a body with no
 // deadline could prevent the engine from draining after Ctrl-C.

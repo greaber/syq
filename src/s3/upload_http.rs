@@ -32,7 +32,7 @@ use std::{
 use tokio::sync::Notify;
 
 mod cancel;
-pub(super) use cancel::Cancellation;
+pub(super) use cancel::{Cancellation, Sleep};
 
 #[derive(Debug, Default)]
 struct Active {
