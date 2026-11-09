@@ -844,11 +844,11 @@ fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthority>) -> Res
     );
     descriptor_session.close();
     authority.close_control();
-    crate::process::termination::wait_if_terminating();
     // The closed authority grants the SSH workers nothing more.
     if let Some(workers) = workers {
         workers.end(result.is_ok(), HANDED_END_WAIT);
     }
+    crate::process::termination::wait_if_terminating();
     client_gone_result(result, client_gone.load(Relaxed))
 }
 

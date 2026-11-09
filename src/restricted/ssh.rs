@@ -480,10 +480,13 @@ mod tests {
         ));
         assert!(!root.path().join("target/a").exists());
         assert!(worker(&ticket, role()).is_err());
+        let started = Instant::now();
         writer.write_msg(&Request::Shutdown).unwrap();
         drop(writer);
         handed.wait().unwrap();
+        // The wait ends with the worker, not at its limit.
         ending.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(15));
     }
 
     #[test]
