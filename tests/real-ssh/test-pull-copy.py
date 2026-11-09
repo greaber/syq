@@ -261,6 +261,18 @@ def main():
                  lambda: probe("destination", "exited", processes=receivers))
         assert json.loads(remote("source", "syq persist status --json"))["authorized_ssh"] == []
 
+        print("case: approving a dry run of a download allows a preview, which reads no contents", flush=True)
+        # The existing file differs in time only, so the preview compares
+        # whole files by hash; the new one needs nothing read.
+        remote("source", "touch -d @1000000000 " + shlex.quote(into + "/approved"))
+        for name in ("approved", "preview"):
+            with running(command(name, ("--dry-run",))) as (process, output):
+                request = decide()
+                assert request["permission"].startswith("Preview only (a dry run)"), request
+                finish(process, output)
+        absent("preview")
+        assert digest("source", into + "/approved") == expected
+
         print("case: an approved download hands off to the receiving build", flush=True)
         with running(command("other-build", binary="syq-other-build")) as (process, output):
             decide(setup="Signs this copy with your SSH login key")

@@ -1314,11 +1314,20 @@ fn a_source_directive_is_admitted_only_for_what_its_command_reads() {
     assert_eq!(reads.limits.max_total_bytes, 4096);
     assert_eq!(reads.limits.max_entries, 10);
     assert_eq!(reads.limits.max_deletions, 0);
+    assert!(!reads.preview);
     assert_ne!(recorded(), 0);
     let error = verify_rules(&state, &config, receiver, &source, (&home, &home))
         .err()
         .unwrap();
     assert!(format!("{error:#}").contains("already"), "{error:#}");
+    // A dry run's source may list and compare its files, not read them.
+    let preview = issue(Role::Source, command(&["--dry-run"]));
+    let (Rules::Source(reads), _) =
+        verify_rules(&state, &config, receiver, &preview, (&home, &home)).unwrap()
+    else {
+        panic!("a source's directive derived a destination's rules");
+    };
+    assert!(reads.preview);
 }
 
 /// A receiver records a directive as used only after the build, the

@@ -1461,11 +1461,18 @@ impl Queue {
         } else {
             ""
         };
-        let permission = format!("May list and read the selected directory trees or exact non-directory entries. Filters narrow the copy, not this read permission.{root} The files go directly to the server that asks.{unencrypted} The copy only reads: it cannot write or remove anything on {target:?}.{as_root} {}.", setup_text(target, enrollment));
+        let permission = if request.preview {
+            format!("Preview only (a dry run): may list the selected directory trees or exact non-directory entries and compare files by their hashes, but not read their contents.{root} It cannot write or remove anything on {target:?}.{as_root} {}.", setup_text(target, enrollment))
+        } else {
+            format!("May list and read the selected directory trees or exact non-directory entries. Filters narrow the copy, not this read permission.{root} The files go directly to the server that asks.{unencrypted} The copy only reads: it cannot write or remove anything on {target:?}.{as_root} {}.", setup_text(target, enrollment))
+        };
         let mut notes = vec![
             permission.clone(),
             "Read authority ends when this copy closes, or after seven days.".into(),
         ];
+        if request.preview {
+            notes.insert(0, "preview only".to_owned());
+        }
 
         if let Some(port) = server.as_ref().and_then(|server| server.port) {
             notes.push(format!("the source's SSH port is {port}"));

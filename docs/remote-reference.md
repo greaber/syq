@@ -219,7 +219,9 @@ in the source account's home directory. A source given with `--src-non-dir`
 allows only that entry; any other source allows the whole tree if it is a
 directory. Filters narrow the copy but not what may be read, and with
 `--follow-src` symlinks are followed wherever they lead. Descriptor streams do
-not work.
+not work. Approving a dry run allows only a preview: the source lists those
+files and compares them with yours by their hashes, but doesn't send their
+contents.
 
 For uploads, quoted `~` and `~/archive` mean the destination account's home
 directory, and `~//archive` means `/archive`, as with SSH. Use `./~/archive`

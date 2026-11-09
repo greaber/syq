@@ -86,6 +86,7 @@ fn source_policy(path: &Path) -> SourcePolicy {
             max_connections: 4,
             max_deletions: 0,
         },
+        preview: false,
         deadline: Instant::now() + Duration::from_secs(30),
         outer_root: None,
     }

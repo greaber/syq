@@ -30,6 +30,7 @@ fn policy(path: &Path) -> SourcePolicy {
             max_connections: 4,
             max_deletions: 0,
         },
+        preview: false,
         deadline: Instant::now() + Duration::from_secs(30),
         outer_root: None,
     }
@@ -513,6 +514,96 @@ fn hashing_and_metadata_stay_within_the_approved_read_policy() {
         .control
         .authorize(&read(Some(fixture.source()), 1025))
         .is_err());
+}
+
+/// A dry run's approval lets the copy list its sources and compare whole
+/// files by hash, as a preview does, but no request that returns file
+/// contents or block hashes, which would read them.
+#[test]
+fn a_dry_runs_approval_lists_and_compares_but_reads_no_contents() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let file = temp.path().join("file");
+    fs::write(&file, b"approved").unwrap();
+    let mut preview = policy(&file);
+    preview.preview = true;
+    let mut fixture = Fixture::new(preview);
+    let worker = fixture.worker();
+    let source = Some(fixture.source());
+    fixture
+        .control
+        .authorize(&Request::StatMany {
+            paths: vec![b"/unused".to_vec()],
+            sources: Some(vec![fixture.source()]),
+            follow: false,
+        })
+        .unwrap();
+    let hash = Request::FileHash {
+        path: b"/unused".to_vec(),
+        source: source.clone(),
+    };
+    assert!(matches!(
+        worker.file_hash(&mut fixture.ops, &hash).unwrap(),
+        Response::FileHash { size: 8, .. }
+    ));
+    let reads = [
+        read(source.clone(), 8),
+        Request::ReadComparedRange {
+            path: Vec::new(),
+            source: source.clone(),
+            attempt: 0,
+            off: 0,
+            len: 8,
+            expected: [0; 32],
+        },
+        Request::ReadSmallBatch(vec![SmallRead {
+            path: Vec::new(),
+            source: source.clone(),
+            attempt: 0,
+            len: 8,
+        }]),
+        Request::ReadDifferingBatch {
+            block: crate::proto::MIN_HASH_BLOCK_BYTES,
+            reads: vec![crate::proto::DifferingRead {
+                path: Vec::new(),
+                source: source.clone(),
+                attempt: 0,
+                len: 8,
+                expected: Vec::new(),
+                compare_only: true,
+            }],
+        },
+        Request::ReadStream(ReadStreamRequest {
+            path: Vec::new(),
+            source: source.clone(),
+            attempt: 0,
+            off: 0,
+            end: 8,
+            block: 512,
+        }),
+        Request::HashBlocks {
+            off: 0,
+            path: Vec::new(),
+            source: source.clone(),
+            which: Which::Final,
+            copy_id: [0; 16],
+            block: crate::proto::MIN_HASH_BLOCK_BYTES,
+            len: 8,
+            attempt: 0,
+        },
+    ];
+    for request in &reads {
+        let error = worker.authorize(request).unwrap_err();
+        assert!(
+            error.to_string().contains("dry run"),
+            "{request:?}: {error}"
+        );
+    }
+    assert_eq!(fixture.authority.state.lock().unwrap().requested_bytes, 0);
+    // The same approval for a copy reads them.
+    let fixture = Fixture::new(policy(&file));
+    let worker = fixture.worker();
+    let source = Some(fixture.source());
+    worker.authorize(&read(source.clone(), 8)).unwrap();
 }
 
 #[test]
