@@ -640,7 +640,7 @@ const MAX_LIVE_HANDED_CONNECTIONS: u32 = MAX_LIVE_TCP_CONNECTIONS;
 /// How long a receiver whose control connection ended waits for the worker
 /// connections handed to it to end. The coordinator ends a copy's workers
 /// together with its control, so they normally end at once.
-const HANDED_END_WAIT: Duration = Duration::from_secs(1);
+pub(crate) const HANDED_END_WAIT: Duration = Duration::from_secs(1);
 
 /// Serve the worker connections other processes hand to this receiver,
 /// each on a thread of its own, counting in `live` those not yet ended.
@@ -661,11 +661,17 @@ fn close_after_handed(
     live: &AtomicU32,
     limit: Duration,
 ) {
+    wait_for_handed(live, limit);
+    descriptor_session.close();
+}
+
+/// Wait until the handed connections `live` counts have ended, at most
+/// `limit`, so that each has told its own process how it ended.
+pub(crate) fn wait_for_handed(live: &AtomicU32, limit: Duration) {
     let deadline = Instant::now() + limit;
     while live.load(Acquire) > 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(2));
     }
-    descriptor_session.close();
 }
 
 /// `handed_connection_handler`, refusing connections beyond `limit` live.
@@ -791,7 +797,7 @@ const RESTRICTED_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthority>) -> Result<()> {
     let _termination = clean_up_on_termination();
-    let (_workers, ticket) = match crate::restricted::start_ssh_workers(authority.clone()) {
+    let (workers, ticket) = match crate::restricted::start_ssh_workers(authority.clone()) {
         Ok((workers, ticket)) => (Some(workers), Ok(ticket)),
         Err(error) => (
             None,
@@ -838,6 +844,10 @@ fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthority>) -> Res
     );
     descriptor_session.close();
     authority.close_control();
+    // The closed authority grants the SSH workers nothing more.
+    if let Some(workers) = workers {
+        workers.end(result.is_ok(), HANDED_END_WAIT);
+    }
     crate::process::termination::wait_if_terminating();
     client_gone_result(result, client_gone.load(Relaxed))
 }
@@ -848,7 +858,7 @@ fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthority>) -> Res
 /// session ends them all.
 fn run_restricted_source(authority: Arc<crate::restricted::source::SourceAuthority>) -> Result<()> {
     let descriptor_session = DescriptorSessionSlot::default();
-    let (_workers, ticket) = match crate::restricted::start_source_ssh_workers(
+    let (workers, ticket) = match crate::restricted::start_source_ssh_workers(
         authority.clone(),
         descriptor_session.clone(),
     ) {
@@ -882,6 +892,11 @@ fn run_restricted_source(authority: Arc<crate::restricted::source::SourceAuthori
         descriptor_session,
         (Some(pending), Some(ticket)),
     );
+    // The control closed the copy's authority and sources, which grant the
+    // SSH workers nothing more.
+    if let Some(workers) = workers {
+        workers.end(result.is_ok(), HANDED_END_WAIT);
+    }
     client_gone_result(result, client_gone.load(Relaxed))
 }
 

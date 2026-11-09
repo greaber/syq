@@ -14,6 +14,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
@@ -32,10 +33,50 @@ pub(super) fn enter_state_directory(state: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The broker that admits a copy's SSH workers, counting those it serves.
+/// Dropping it closes the broker at once, which tells every worker still
+/// served that the receiver ended while serving it.
+pub(crate) struct SshWorkers {
+    broker: PrivateBroker,
+    /// Workers admitted and not yet told how their connection ended.
+    live: Arc<AtomicU32>,
+}
+
+impl SshWorkers {
+    /// End the workers once the copy's control has ended and closed the
+    /// authority they serve under. After a `normal` end, wait up to `limit`
+    /// for those still served to be told how their connections ended: the
+    /// coordinator ends its workers together with the control, and a worker
+    /// whose broker closes first fails as if this receiver had crashed.
+    /// Otherwise close at once.
+    pub(crate) fn end(self, normal: bool, limit: Duration) {
+        if normal {
+            crate::server::wait_for_handed(&self.live, limit);
+        }
+        drop(self.broker);
+    }
+}
+
+/// Counts a worker as served until it has been told how it ended.
+struct Served<'a>(&'a AtomicU32);
+
+impl<'a> Served<'a> {
+    fn new(live: &'a AtomicU32) -> Self {
+        live.fetch_add(1, Ordering::Relaxed);
+        Self(live)
+    }
+}
+
+impl Drop for Served<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
 /// Serve a copy's SSH workers with `authority`, the copy's destination
 /// rules. The standalone receiver keeps its protected enrollment directory
 /// as cwd.
-pub(crate) fn start(authority: Arc<RestrictedAuthority>) -> Result<(PrivateBroker, String)> {
+pub(crate) fn start(authority: Arc<RestrictedAuthority>) -> Result<(SshWorkers, String)> {
     start_with(move |input, output, stream, handshake| {
         crate::server::serve_handed_restricted(input, output, stream, authority.clone(), handshake)
     })
@@ -46,7 +87,7 @@ pub(crate) fn start(authority: Arc<RestrictedAuthority>) -> Result<(PrivateBroke
 pub(crate) fn start_source(
     authority: Arc<crate::restricted::source::SourceAuthority>,
     session: crate::descriptor_broker::DescriptorSessionSlot,
-) -> Result<(PrivateBroker, String)> {
+) -> Result<(SshWorkers, String)> {
     start_with(move |input, output, stream, handshake| {
         crate::server::serve_handed_source(
             input,
@@ -71,9 +112,11 @@ fn start_with(
         + Send
         + Sync
         + 'static,
-) -> Result<(PrivateBroker, String)> {
+) -> Result<(SshWorkers, String)> {
     let mut secret = [0u8; 32];
     getrandom::fill(&mut secret).context("generate SSH worker admission")?;
+    let live = Arc::new(AtomicU32::new(0));
+    let served = live.clone();
     let broker = PrivateBroker::start_managed(
         PrivateBrokerConfig {
             directory: BrokerDirectory::Ticketed {
@@ -107,6 +150,7 @@ fn start_with(
                 if !bool::from(offered.ct_eq(&secret)) {
                     bail!("invalid SSH worker admission");
                 }
+                let _served = Served::new(&served);
                 let (input, output) =
                     crate::descriptor_broker::receive_standard_streams(&stream.try_clone()?)?;
                 let handshake = deadline
@@ -120,7 +164,7 @@ fn start_with(
         },
     )?;
     let ticket = broker.ticket(secret)?.encode();
-    Ok((broker, ticket))
+    Ok((SshWorkers { broker, live }, ticket))
 }
 
 /// Connect to the running copy `ticket` names in this enrollment's state
@@ -154,6 +198,22 @@ mod tests {
         FrameReader<std::io::PipeReader>,
         FrameWriter<crate::descriptor_broker::test_support::SessionInput>,
     )> {
+        let (input, output, handed) = hand_over(ticket)?;
+        let input =
+            crate::descriptor_broker::test_support::SessionInput::closed_after(input, handed);
+        hello(input, output, role)
+    }
+
+    /// Join the copy `ticket` names and hand it a worker's session input and
+    /// output, as the worker's SSH session process does, with what that
+    /// process waits on to learn how its connection ended.
+    fn hand_over(
+        ticket: &str,
+    ) -> Result<(
+        std::io::PipeWriter,
+        std::io::PipeReader,
+        crate::descriptor_broker::HandedOff,
+    )> {
         let socket = join(ticket)?;
         let (receiver_input, input) = std::io::pipe()?;
         let (output, receiver_output) = std::io::pipe()?;
@@ -163,8 +223,15 @@ mod tests {
             receiver_output.as_raw_fd(),
         )?;
         drop((receiver_input, receiver_output));
-        let input =
-            crate::descriptor_broker::test_support::SessionInput::closed_after(input, handed);
+        Ok((input, output, handed))
+    }
+
+    /// Start a worker's session over its handed `input` and `output`.
+    fn hello<W: Write>(
+        input: W,
+        output: std::io::PipeReader,
+        role: ConnectionRole,
+    ) -> Result<(FrameReader<std::io::PipeReader>, FrameWriter<W>)> {
         let mut writer = FrameWriter::new(input, false);
         writer.write_msg(&Request::Hello {
             identity: crate::identity::build().into(),
@@ -217,6 +284,55 @@ mod tests {
         }
     }
 
+    fn prepare(path: &Path, size: u64) -> Request {
+        Request::Prepare {
+            path: path.as_os_str().as_bytes().to_vec(),
+            size,
+            inplace: false,
+            copy_id: [1; 16],
+            mode: 0o600,
+            flags: 0,
+            acl: false,
+            scanned: crate::proto::ScannedDestination::Unknown,
+            attempt: 0,
+            create_if_missing: true,
+            group: None,
+            update: None,
+        }
+    }
+
+    /// A copy into `root/target` serving its SSH workers, with one worker
+    /// joined: the test holds its session's input and output, as sshd
+    /// would, and what its session process waits on.
+    struct CopyWithAWorker {
+        authority: Arc<RestrictedAuthority>,
+        workers: SshWorkers,
+        ticket: String,
+        reader: FrameReader<std::io::PipeReader>,
+        writer: FrameWriter<std::io::PipeWriter>,
+        handed: crate::descriptor_broker::HandedOff,
+    }
+
+    impl CopyWithAWorker {
+        fn start(root: &Path) -> Self {
+            std::fs::create_dir(root.join("target")).unwrap();
+            let mut authority = super::super::tests::tcp_test_authority(root);
+            authority.copy.options.compressed_transport = false;
+            let authority = Arc::new(authority);
+            let (workers, ticket) = start(authority.clone()).unwrap();
+            let (input, output, handed) = hand_over(&ticket).unwrap();
+            let (reader, writer) = hello(input, output, role()).unwrap();
+            Self {
+                authority,
+                workers,
+                ticket,
+                reader,
+                writer,
+                handed,
+            }
+        }
+    }
+
     fn in_receiver_process(name: &str) -> bool {
         if let Some(state) = std::env::var_os("SYQ_TEST_SSH_RECEIVER_STATE") {
             enter_state_directory(Path::new(&state)).unwrap();
@@ -262,10 +378,10 @@ mod tests {
         let mut authority = super::super::tests::tcp_test_authority(root.path());
         authority.copy.options.compressed_transport = false;
         let authority = Arc::new(authority);
-        let (broker, ticket) = start(authority.clone()).unwrap();
+        let (workers, ticket) = start(authority.clone()).unwrap();
         assert!(earlier_receivers_accept(&ticket), "{ticket}");
-        assert!(broker.socket_path().as_os_str().as_bytes().len() < 32);
-        assert!(!broker.socket_path().is_absolute());
+        assert!(workers.broker.socket_path().as_os_str().as_bytes().len() < 32);
+        assert!(!workers.broker.socket_path().is_absolute());
         assert!(worker(&ticket, ConnectionRole::Control).is_err());
         let mut wrong = BrokerTicket::parse(&ticket).unwrap();
         for byte in wrong.secret_mut() {
@@ -275,20 +391,7 @@ mod tests {
         let (mut first_reader, mut first_writer) = worker(&ticket, role()).unwrap();
         let (mut second_reader, mut second_writer) = worker(&ticket, role()).unwrap();
         assert!(worker(&ticket, role()).is_err());
-        let prepare = |name: &str, size| Request::Prepare {
-            path: root.path().join(name).as_os_str().as_bytes().to_vec(),
-            size,
-            inplace: false,
-            copy_id: [1; 16],
-            mode: 0o600,
-            flags: 0,
-            acl: false,
-            scanned: crate::proto::ScannedDestination::Unknown,
-            attempt: 0,
-            create_if_missing: true,
-            group: None,
-            update: None,
-        };
+        let prepare = |name: &str, size| prepare(&root.path().join(name), size);
         first_writer.write_msg(&prepare("target/a", 1024)).unwrap();
         assert!(matches!(
             first_reader.read_msg::<Response>().unwrap(),
@@ -340,10 +443,81 @@ mod tests {
             first_reader.read_msg::<Response>().unwrap(),
             Response::Err(message) if message.contains("control is closed or expired")
         ));
-        let socket_path = broker.socket_path().to_path_buf();
-        drop(broker);
+        let socket_path = workers.broker.socket_path().to_path_buf();
+        drop(workers);
         assert!(!socket_path.exists());
         assert!(first_reader.read_msg::<Response>().is_err());
+    }
+
+    #[test]
+    fn a_copy_ends_after_its_ssh_workers_are_told_how_they_ended() {
+        if !in_receiver_process(
+            "restricted::ssh::tests::a_copy_ends_after_its_ssh_workers_are_told_how_they_ended",
+        ) {
+            return;
+        }
+        let root = crate::test_support::tempdir().unwrap();
+        let CopyWithAWorker {
+            authority,
+            workers,
+            ticket,
+            mut reader,
+            mut writer,
+            handed,
+        } = CopyWithAWorker::start(root.path());
+        // The control ended normally, and its receiver got there before the
+        // coordinator ended the worker.
+        authority.close_control();
+        let ending = std::thread::spawn(move || workers.end(true, Duration::from_secs(30)));
+        // While the copy waits, its worker gets nothing more, and no other
+        // worker joins.
+        writer
+            .write_msg(&prepare(&root.path().join("target/a"), 1))
+            .unwrap();
+        assert!(matches!(
+            reader.read_msg::<Response>().unwrap(),
+            Response::Err(message) if message.contains("control is closed or expired")
+        ));
+        assert!(!root.path().join("target/a").exists());
+        assert!(worker(&ticket, role()).is_err());
+        let started = Instant::now();
+        writer.write_msg(&Request::Shutdown).unwrap();
+        drop(writer);
+        handed.wait().unwrap();
+        // The wait ends with the worker, not at its limit.
+        ending.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(15));
+    }
+
+    #[test]
+    fn a_failed_copy_cuts_its_ssh_workers_off_at_once() {
+        if !in_receiver_process(
+            "restricted::ssh::tests::a_failed_copy_cuts_its_ssh_workers_off_at_once",
+        ) {
+            return;
+        }
+        let root = crate::test_support::tempdir().unwrap();
+        let CopyWithAWorker {
+            authority,
+            workers,
+            reader,
+            writer,
+            handed,
+            ..
+        } = CopyWithAWorker::start(root.path());
+        authority.close_control();
+        let started = Instant::now();
+        let ending = std::thread::spawn(move || workers.end(false, Duration::from_secs(30)));
+        // Told while it is still connected, not after the wait.
+        let error = handed.wait().unwrap_err();
+        assert!(
+            format!("{error:#}").contains("the receiver ended while serving this connection"),
+            "{error:#}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(15));
+        // sshd then closes the session's input and output.
+        drop((writer, reader));
+        ending.join().unwrap();
     }
 
     #[test]
@@ -360,7 +534,7 @@ mod tests {
         let root = crate::test_support::tempdir().unwrap();
         std::fs::create_dir(root.path().join("target")).unwrap();
         let authority = Arc::new(super::super::tests::tcp_test_authority(root.path()));
-        let (broker, ticket) = start(authority).unwrap();
+        let (workers, ticket) = start(authority).unwrap();
         let other = crate::test_support::tempdir().unwrap();
         std::fs::set_permissions(other.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let refused = || {
@@ -386,6 +560,6 @@ mod tests {
         )
         .unwrap();
         refused();
-        drop(broker);
+        drop(workers);
     }
 }
