@@ -5015,7 +5015,8 @@ fn signed_skip_allows_seeding_and_retrying_a_new_file() {
 
 /// A Finalize sent again on another of the copy's connections, after the
 /// first published the file and its reply was lost, is answered as the
-/// first was, and the receiver reports nothing unfinished.
+/// first was. The receiver lists the file as copied once, and nothing as
+/// unfinished.
 #[test]
 fn a_finalize_sent_again_on_another_connection_is_answered_as_published() {
     let temporary = crate::test_support::tempdir().unwrap();
@@ -5023,7 +5024,9 @@ fn a_finalize_sent_again_on_another_connection_is_answered_as_published() {
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
     let file = target.join("fresh");
-    let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
+    let (secret, policy) = results_policy();
+    let authority = existence_authority_with_results(&root, &policy, 60_000);
+    let mut reader = start_results(&authority, secret);
     let mut first = authority.test_ops();
     let prepared = execute_authorized(&authority, &mut first, prepare_request(&file));
     assert!(
@@ -5041,17 +5044,30 @@ fn a_finalize_sent_again_on_another_connection_is_answered_as_published() {
     };
     let written = execute_authorized(&authority, &mut first, write);
     assert!(matches!(written, proto::Response::Ok), "{written:?}");
+    // The file is tracked as unfinished until it is published.
+    assert_eq!(authority.state.lock().unwrap().file_lifecycles.len(), 1);
     let publish = || finalize_request(&file, proto::TargetCondition::Any);
     let published = execute_authorized(&authority, &mut first, publish());
     assert!(
         !matches!(published, proto::Response::EndpointError(_)),
         "{published:?}"
     );
+    assert!(authority.state.lock().unwrap().file_lifecycles.is_empty());
     let mut second = authority.test_ops();
     let again = execute_authorized(&authority, &mut second, publish());
     assert_eq!(format!("{again:?}"), format!("{published:?}"));
-    assert_eq!(fs::read(&file).unwrap(), b"data");
     assert!(authority.state.lock().unwrap().file_lifecycles.is_empty());
+    assert_eq!(fs::read(&file).unwrap(), b"data");
+    let results = finish_results(&authority, &mut reader);
+    assert_eq!(results.totals.failed, 0);
+    assert_eq!(
+        results.changes(),
+        [(
+            "transfer_file".to_owned(),
+            b"fresh".to_vec(),
+            "succeeded".to_owned()
+        )]
+    );
 }
 
 /// A publication the source says found earlier partials removes only the

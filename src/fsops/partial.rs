@@ -3001,8 +3001,8 @@ impl FsOps {
 
     /// Finalize the file this receiver holds for `target` (`stages`), never
     /// whatever the name holds now. A finalize that fails leaves the file
-    /// held while its name still leads to it, so that it can be finalized
-    /// again. A Finalize sent again after its connection dropped waits for
+    /// held while its name still leads to it and the copy goes on, so that
+    /// it can be finalized again. A Finalize sent again after its connection dropped waits for
     /// the first one, and then finds the file held again, or published, and
     /// then answers as the first one did.
     #[allow(clippy::too_many_arguments)]
@@ -3072,7 +3072,7 @@ impl FsOps {
                     .is_some_and(|named| (named.dev, named.ino) == (held.dev(), held.ino())))
             };
             if in_place || at_name().unwrap_or(false) {
-                stages::hold(held_for, &relative, &file, opened, created, declared)?;
+                finalizing.hold_again(&relative, &file, opened, created, declared)?;
             }
         }
         result

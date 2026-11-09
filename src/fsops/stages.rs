@@ -209,12 +209,36 @@ pub(super) fn hold(
     created: bool,
     declared: u64,
 ) -> io::Result<Arc<()>> {
+    let held = hold_if(
+        target.key(),
+        relative,
+        file,
+        opened,
+        created,
+        declared,
+        |_| true,
+    )?;
+    Ok(held.expect("held unconditionally"))
+}
+
+/// `hold`, if `allowed` says so with the registry locked.
+fn hold_if(
+    key: Key,
+    relative: &RelativePath,
+    file: &File,
+    opened: Option<fs::Metadata>,
+    created: bool,
+    declared: u64,
+    allowed: impl FnOnce(&Registry) -> bool,
+) -> io::Result<Option<Arc<()>>> {
     let file = file.try_clone()?;
     let in_use = Arc::new(());
-    let key = target.key();
     let mut released = Vec::new();
     {
         let mut registry = registry();
+        if !allowed(&registry) {
+            return Ok(None);
+        }
         registry.clock += 1;
         let held = Held {
             file,
@@ -241,7 +265,7 @@ pub(super) fn hold(
         }
     }
     drop(released);
-    Ok(in_use)
+    Ok(Some(in_use))
 }
 
 /// The file held for `target`.
@@ -314,6 +338,31 @@ impl Finalizing {
         registry
             .published
             .insert(key.clone(), (connection, identity));
+    }
+
+    /// The Finalize failed: hold the file again, as `hold` does, so that the
+    /// copy can finalize it again, unless the copy ended meanwhile. Nothing
+    /// would let the file go then, and a Finalize waiting for this one finds
+    /// nothing held.
+    pub(super) fn hold_again(
+        &self,
+        relative: &RelativePath,
+        file: &File,
+        opened: Option<fs::Metadata>,
+        created: bool,
+        declared: u64,
+    ) -> io::Result<()> {
+        let key = &self.0;
+        hold_if(
+            key.clone(),
+            relative,
+            file,
+            opened,
+            created,
+            declared,
+            |registry| registry.finalizing.get(key) == Some(&false),
+        )
+        .map(drop)
     }
 }
 
@@ -537,7 +586,9 @@ mod tests {
             assert!(receiver
                 .recv_timeout(std::time::Duration::from_millis(200))
                 .is_err());
-            hold(held, &first.relative, &first.file, None, true, u64::MAX).unwrap();
+            finalizing
+                .hold_again(&first.relative, &first.file, None, true, u64::MAX)
+                .unwrap();
             drop(finalizing);
             let second = receiver
                 .recv_timeout(std::time::Duration::from_secs(10))
@@ -550,6 +601,48 @@ mod tests {
         drop(taken(finalize(held)));
         assert!(finalize(held).is_none());
         release(scope);
+    }
+
+    #[test]
+    fn a_finalize_that_fails_after_its_copy_ended_lets_the_file_go() {
+        let directory = crate::test_support::tempdir().unwrap();
+        let root = Root::open(directory.path()).unwrap();
+        let file = File::create(directory.path().join("file")).unwrap();
+        let name = RelativePath::new(b"file").unwrap();
+        let (scope, copy_id) = (new_scope(), [6; 16]);
+        let held = For {
+            scope,
+            root: &root,
+            target: &name,
+            copy_id: &copy_id,
+            inplace: true,
+        };
+        hold(held, &name, &file, None, true, u64::MAX).unwrap();
+        let (first, finalizing) = taken(finalize(held));
+        std::thread::scope(|threads| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            threads.spawn(move || {
+                let found = finalize(held);
+                sender.send(matches!(found, Some(Found::Held(..)))).unwrap();
+            });
+            // A second Finalize waits for the first. The copy ends, then
+            // the first fails: the file is not held again, so the second
+            // finds nothing to publish or remember.
+            assert!(receiver
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err());
+            release(scope);
+            finalizing
+                .hold_again(&first.relative, &first.file, None, true, u64::MAX)
+                .unwrap();
+            drop(finalizing);
+            let found = receiver
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            assert!(!found);
+        });
+        assert_eq!(count(scope), 0);
+        assert_eq!(remembered(scope), (0, 0));
     }
 
     fn taken(found: Option<Found>) -> (Held, Finalizing) {
