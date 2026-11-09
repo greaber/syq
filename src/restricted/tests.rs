@@ -891,7 +891,6 @@ fn lost_server_state_means_a_new_enrollment_that_replaces_the_old_line() {
     }
 }
 
-/// A directive for a route-5 copy to `account`'s `/backup`.
 /// Write `config` as the enrollment's state in `state`, as an install does:
 /// a receiver reads it again once it has recorded a directive.
 fn write_receiver_state(state: &Path, config: &ReceiverEnrollment) {
@@ -900,6 +899,7 @@ fn write_receiver_state(state: &Path, config: &ReceiverEnrollment) {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
+/// A directive for a route-5 copy to `account`'s `/backup`.
 pub(super) fn test_directive(
     enrollment: EnrollmentId,
     generation: u64,
