@@ -1333,10 +1333,7 @@ fn keeper(startup: Startup) -> Result<()> {
     };
     let options = session.options();
     // Keep released endpoint records byte-compatible and separate from native masters.
-    let scope = tempfile::Builder::new()
-        .prefix("approved-")
-        .tempdir_in(ensure_master_parent(&domain)?)?;
-    crate::persistence::initialize_scope(scope.path())?;
+    let scope = cleanup::KeeperScope::create(&ensure_master_parent(&domain)?)?;
     // The record of a closing master, removed before the scope, and so
     // before the keeper's lock: status never finds it without its scope.
     let mut closing_record: Option<Index> = None;

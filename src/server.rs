@@ -8,11 +8,12 @@ use crate::tcp_records::{Cipher, RecordReader, RecordWriter};
 use anyhow::{bail, Context, Result};
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicU32,
+    Ordering::{Acquire, Relaxed, Release},
+};
 use std::sync::Arc;
-use std::time::Duration;
-#[cfg(test)]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 
 mod interfaces;
@@ -335,8 +336,11 @@ pub fn run(local_receiver: bool) -> Result<()> {
         return hand_off_worker(&ticket, &prefix);
     }
     let descriptor_session = DescriptorSessionSlot::default();
-    descriptor_session
-        .serve_handed_connections(handed_connection_handler(descriptor_session.clone()));
+    let handed = Arc::new(AtomicU32::new(0));
+    descriptor_session.serve_handed_connections(handed_connection_handler(
+        descriptor_session.clone(),
+        handed.clone(),
+    ));
     let client_gone = std::sync::atomic::AtomicBool::new(false);
     let result = serve(
         io::Cursor::new(prefix).chain(io::stdin()),
@@ -361,7 +365,7 @@ pub fn run(local_receiver: bool) -> Result<()> {
             descriptor_session: descriptor_session.clone(),
         },
     );
-    descriptor_session.close();
+    close_after_handed(&descriptor_session, &handed, HANDED_END_WAIT);
     crate::process::termination::wait_if_terminating();
     client_gone_result(result, client_gone.load(Relaxed))
 }
@@ -633,20 +637,43 @@ impl Read for PipeHandshakeReader {
 /// TCP connections.
 const MAX_LIVE_HANDED_CONNECTIONS: u32 = MAX_LIVE_TCP_CONNECTIONS;
 
+/// How long a receiver whose control connection ended waits for the worker
+/// connections handed to it to end. The coordinator ends a copy's workers
+/// together with its control, so they normally end at once.
+const HANDED_END_WAIT: Duration = Duration::from_secs(1);
+
 /// Serve the worker connections other processes hand to this receiver,
-/// each on a thread of its own.
+/// each on a thread of its own, counting in `live` those not yet ended.
 fn handed_connection_handler(
     descriptor_session: DescriptorSessionSlot,
+    live: Arc<AtomicU32>,
 ) -> crate::descriptor_broker::ConnectionHandler {
-    handed_connection_handler_within(descriptor_session, MAX_LIVE_HANDED_CONNECTIONS)
+    handed_connection_handler_within(descriptor_session, live, MAX_LIVE_HANDED_CONNECTIONS)
+}
+
+/// Close `descriptor_session` once the handed connections `live` counts
+/// have ended, waiting at most `limit`. Closing it ends the channel by
+/// which each connection's own process learns how it ended: one closed
+/// before reporting makes that process fail, as if this receiver had
+/// crashed while serving it.
+fn close_after_handed(
+    descriptor_session: &DescriptorSessionSlot,
+    live: &AtomicU32,
+    limit: Duration,
+) {
+    let deadline = Instant::now() + limit;
+    while live.load(Acquire) > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    descriptor_session.close();
 }
 
 /// `handed_connection_handler`, refusing connections beyond `limit` live.
 fn handed_connection_handler_within(
     descriptor_session: DescriptorSessionSlot,
+    live: Arc<AtomicU32>,
     limit: u32,
 ) -> crate::descriptor_broker::ConnectionHandler {
-    let live = Arc::new(AtomicU32::new(0));
     Arc::new(move |connection| {
         use crate::descriptor_broker::HandedConnection;
         if live.fetch_add(1, Relaxed) >= limit {
@@ -668,7 +695,7 @@ fn handed_connection_handler_within(
                     let result = serve_handed(prefix, transport, session);
                     HandedConnection::report_end(control, &result);
                 }
-                served.fetch_sub(1, Relaxed);
+                served.fetch_sub(1, Release);
             });
         if spawned.is_err() {
             // The connection went with the closure: its process sees no answer.

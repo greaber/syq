@@ -291,23 +291,10 @@ fn query(domain: &Domain, operation: Control) -> Result<Snapshot> {
     crate::destination::read_framed(&mut stream, MAX_STATUS, "provider status")
 }
 
+/// The provider's state, None when none runs. One that is starting or
+/// stopping, as when it switches to a new build, is given a moment to answer.
 pub(crate) fn snapshot(domain: &Domain) -> Result<Option<Snapshot>> {
-    match query(domain, Control::Status) {
-        Ok(state) => Ok(Some(state)),
-        Err(error)
-            if error.chain().any(|cause| {
-                cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
-                    matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                    )
-                })
-            }) =>
-        {
-            Ok(None)
-        }
-        Err(error) => Err(error),
-    }
+    running(domain, ANSWER_TIMEOUT, || Control::Status)
 }
 /// Query the provider holding the lock, giving one that is starting up to
 /// `timeout` to answer: it takes the lock before it binds its socket and makes
@@ -2438,6 +2425,35 @@ mod tests {
             .unwrap();
         assert_eq!(state.build, crate::identity::build());
         refresh(&domain).unwrap();
+        provider.join().unwrap();
+    }
+
+    #[test]
+    fn status_waits_for_a_starting_provider_to_answer() {
+        let (_directory, domain, _) = fixture();
+        let (provider, go) = starting_provider(&domain, true, 1);
+        go.send(()).unwrap();
+        let state = snapshot(&domain).unwrap().unwrap();
+        assert_eq!(state.build, crate::identity::build());
+        provider.join().unwrap();
+    }
+
+    #[test]
+    fn status_finds_no_provider_once_a_stopping_one_has_ended() {
+        let (_directory, domain, _) = fixture();
+        let lock = acquire_lock(&domain, true).unwrap().unwrap();
+        let path = domain.runtime_path().join(SOCKET_FILE);
+        let listener = UnixListener::bind(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        // Stopping, it accepts no more queries; it gives up its lock, then
+        // its socket, as `Runtime` does, which resets the query it never took.
+        let provider = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(lock);
+            fs::remove_file(&path).unwrap();
+            drop(listener);
+        });
+        assert!(snapshot(&domain).unwrap().is_none());
         provider.join().unwrap();
     }
 
