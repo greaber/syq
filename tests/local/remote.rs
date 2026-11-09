@@ -831,7 +831,8 @@ fn existing_destination_copy(t: &Tmp, tcp: bool, temporary: &Path) -> Command {
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("XDG_CONFIG_HOME", t.path("config"))
         .env("XDG_CACHE_HOME", t.path("cache"))
-        .env("TMPDIR", temporary);
+        .env("TMPDIR", temporary)
+        .env_remove("XDG_RUNTIME_DIR");
     command
 }
 

@@ -25,6 +25,7 @@ fn symlinked_tmpdir_resolves_fixture_roots_only() {
             ])
             .env(CHILD, "1")
             .env("TMPDIR", &alias)
+            .env_remove("XDG_RUNTIME_DIR")
             .capture_output()
             .unwrap();
         assert!(

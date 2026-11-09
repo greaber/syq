@@ -313,9 +313,9 @@ fn wait_for_child_output(mut child: std::process::Child, timeout: std::time::Dur
     }
 }
 
-/// The private directories syq left in `tmp`, a copy's `TMPDIR`: its own
-/// `syq-*` directories, and the socket directories of copies in this
-/// account's `syq-UID`, which stays.
+/// The private directories syq left in `tmp`, a copy's `TMPDIR` without
+/// `XDG_RUNTIME_DIR`: its own `syq-*` directories, and the socket
+/// directories of copies in this account's `syq-UID`, which stays.
 fn private_temporary_leftovers(tmp: &Path) -> Vec<String> {
     let account = format!("syq-{}", unsafe { libc::geteuid() });
     let names = |directory: &Path| -> Vec<String> {

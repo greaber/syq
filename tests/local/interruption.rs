@@ -405,8 +405,10 @@ fn interrupt_with_stalled_cleanup(t: &Tmp, route: &str, tmp: &Path) -> (Child, i
         "push" => remote_copy(t, route, tuning),
         _ => local_copy(t, tuning),
     };
+    // Without a runtime directory the copy's sockets go in `tmp` too.
     command
         .env("TMPDIR", tmp)
+        .env_remove("XDG_RUNTIME_DIR")
         .env("SYQ_TEST_SMALL_STAGE_READY_FILE", &staged)
         .env("SYQ_TEST_SMALL_STAGE_CONTINUE_FILE", t.path("never"))
         .env("SYQ_TEST_SIDECAR_SWEEP_READY_FILE", &sweeping)

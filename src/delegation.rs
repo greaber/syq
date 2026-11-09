@@ -1149,10 +1149,10 @@ impl ReplayStore {
 pub(crate) fn validate_private_directory(directory: &File, path: &Path) -> Result<()> {
     let metadata = directory
         .metadata()
-        .with_context(|| format!("inspect replay state directory {}", path.display()))?;
+        .with_context(|| format!("inspect private directory {}", path.display()))?;
     if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
         bail!(
-            "private directory {} must be target-owned and not a symlink",
+            "private directory {} must belong to this account and not be a symlink",
             path.display()
         );
     }

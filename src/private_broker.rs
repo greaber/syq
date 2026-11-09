@@ -18,7 +18,7 @@ use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -123,58 +123,88 @@ pub(crate) enum BrokerBase {
     /// working directory while its brokers run. A copy through one
     /// enrollment cannot reach another enrollment's copies, or ordinary ones.
     Enrollment,
-    /// `syq-UID` in the temporary directory: this account's directory for
-    /// the sockets of its ordinary copies. In a shared `/tmp` another user
-    /// could have made it first, so it must belong to this account and have
-    /// mode 0700.
+    /// `syq-UID` in the user's runtime directory, or else in the
+    /// temporary directory: this account's directory for the sockets of
+    /// its ordinary copies. It must belong to this account and have mode
+    /// 0700, since in a shared `/tmp` another user could have made it first.
     Account,
 }
 
 impl BrokerBase {
-    fn path(self) -> PathBuf {
+    /// The base, and whether it is in the temporary directory, where other
+    /// users can make it first.
+    fn locate(self) -> (PathBuf, bool) {
         match self {
-            Self::Enrollment => PathBuf::from("."),
-            Self::Account => account_directory(&std::env::temp_dir()),
+            Self::Enrollment => (PathBuf::from("."), false),
+            Self::Account => match account_parent(crate::user_dirs::runtime_dir()) {
+                Some(runtime) => (account_directory(&runtime), false),
+                None => (account_directory(&std::env::temp_dir()), true),
+            },
         }
+    }
+
+    #[cfg(test)]
+    fn path(self) -> PathBuf {
+        self.locate().0
     }
 
     /// The checked base, for a broker to listen in. The account's
     /// directory is made when it is missing.
     fn prepare(self) -> Result<PathBuf> {
-        let path = self.path();
-        self.explain(check_base(&path, self == Self::Account), &path)?;
+        let (path, shared) = self.locate();
+        self.explain(check_base(&path, self == Self::Account), &path, shared)?;
         Ok(path)
     }
 
     /// The checked base, for a ticket to be looked up in.
     fn existing(self) -> Result<PathBuf> {
-        let path = self.path();
-        self.explain(check_base(&path, false), &path)?;
+        let (path, shared) = self.locate();
+        self.explain(check_base(&path, false), &path, shared)?;
         Ok(path)
     }
 
-    fn explain(self, checked: Result<(), BaseError>, path: &Path) -> Result<()> {
-        match (self, checked) {
-            (_, Ok(())) => Ok(()),
-            (Self::Enrollment, Err(BaseError::Unavailable(error) | BaseError::NotPrivate(error))) => {
-                Err(error.context("check the enrollment directory"))
+    fn explain(self, checked: Result<(), BaseError>, path: &Path, shared: bool) -> Result<()> {
+        let error = match (self, checked) {
+            (_, Ok(())) => return Ok(()),
+            (
+                Self::Enrollment,
+                Err(BaseError::Unavailable(error) | BaseError::NotPrivate(error)),
+            ) => return Err(error.context("check the enrollment directory")),
+            (Self::Account, Err(BaseError::Unavailable(error))) => error,
+            (Self::Account, Err(BaseError::NotPrivate(error))) => {
+                let mut advice = format!(
+                    "{} must be a directory of this account's with mode 0700",
+                    path.display()
+                );
+                if shared {
+                    advice.push_str("; if another user made it, ask them or an administrator to remove it, or set TMPDIR to a directory of your own");
+                }
+                error.context(advice)
             }
-            (Self::Account, Err(BaseError::Unavailable(error))) => Err(error.context(format!(
-                "syq keeps the sockets of running copies in {}",
-                path.display()
-            ))),
-            (Self::Account, Err(BaseError::NotPrivate(error))) => Err(error.context(format!(
-                "syq keeps the sockets of running copies in {}, which must be a directory of this account's with mode 0700; if another user made it, ask them or an administrator to remove it, or set TMPDIR to a directory of your own",
-                path.display()
-            ))),
-        }
+        };
+        Err(error.context(format!(
+            "syq keeps the sockets of running copies in {}",
+            path.display()
+        )))
     }
 }
 
-/// The account's directory for the sockets of ordinary copies in
-/// `temporary`.
-fn account_directory(temporary: &Path) -> PathBuf {
-    temporary.join(format!("syq-{}", unsafe { libc::geteuid() }))
+/// The user's runtime directory `runtime`, when it is set and nobody else
+/// can add to it: a directory of this account's that only it can write to.
+/// Otherwise the account's directory goes in the temporary directory.
+fn account_parent(runtime: Option<PathBuf>) -> Option<PathBuf> {
+    runtime.filter(|runtime| {
+        std::fs::metadata(runtime).is_ok_and(|metadata| {
+            metadata.is_dir()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o022 == 0
+        })
+    })
+}
+
+/// The account's directory for the sockets of ordinary copies in `parent`.
+fn account_directory(parent: &Path) -> PathBuf {
+    parent.join(format!("syq-{}", unsafe { libc::geteuid() }))
 }
 
 /// Why a base directory cannot be used.
@@ -1047,7 +1077,10 @@ mod tests {
             panic!("another account's directory was accepted");
         };
         if unsafe { libc::geteuid() } != 0 {
-            assert!(format!("{error:#}").contains("target-owned"), "{error:#}");
+            assert!(
+                format!("{error:#}").contains("must belong to this account"),
+                "{error:#}"
+            );
         }
     }
 
@@ -1071,16 +1104,23 @@ mod tests {
     }
 
     /// The child of `ticketed_brokers_live_in_the_accounts_own_directory`,
-    /// with `TMPDIR` set to a fixture.
+    /// with `TMPDIR`, and perhaps `XDG_RUNTIME_DIR`, set to fixtures. The
+    /// account's directory is expected in `SYQ_TEST_ACCOUNT_PARENT`.
     #[test]
     fn account_brokers_subprocess() {
         let Ok(case) = std::env::var(ACCOUNT_CHILD) else {
             return;
         };
-        let account = account_directory(&std::env::temp_dir());
-        if case == "refused" {
+        let parent = std::env::var_os("SYQ_TEST_ACCOUNT_PARENT").unwrap();
+        let account = account_directory(Path::new(&parent));
+        if let Some(shared) = case.strip_prefix("refused-") {
             let error = format!("{:#}", account_broker().unwrap_err());
-            assert!(error.contains("TMPDIR"), "{error}");
+            assert!(error.contains(&account.display().to_string()), "{error}");
+            assert_eq!(
+                error.contains("another user"),
+                shared == "temporary",
+                "{error}"
+            );
             let ticket = BrokerTicket::new("fd-1-abc", [0; TICKET_SECRET_LEN]).unwrap();
             assert!(ticket.connect(BrokerBase::Account).is_err());
             return;
@@ -1109,45 +1149,119 @@ mod tests {
         assert!(account.exists());
     }
 
+    /// Run `account_brokers_subprocess` for `case` with `temporary` as
+    /// `TMPDIR` and `runtime`, if any, as `XDG_RUNTIME_DIR`, expecting the
+    /// account's directory in `parent`.
+    fn run_account_case(temporary: &Path, runtime: Option<&Path>, parent: &Path, case: &str) {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "private_broker::tests::account_brokers_subprocess",
+                "--nocapture",
+            ])
+            .env(ACCOUNT_CHILD, case)
+            .env("SYQ_TEST_ACCOUNT_PARENT", parent)
+            .env("TMPDIR", temporary);
+        match runtime {
+            Some(runtime) => command.env("XDG_RUNTIME_DIR", runtime),
+            None => command.env_remove("XDG_RUNTIME_DIR"),
+        };
+        let output = command.capture_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{case}: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn private_fixture(path: &Path, mode: u32) {
+        std::fs::create_dir(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
     /// Ordinary copies' brokers go in `syq-UID` in the temporary directory,
     /// which is made owner-only, and never in one another user planted.
     #[test]
     fn ticketed_brokers_live_in_the_accounts_own_directory() {
-        let run = |temporary: &Path, case: &str| {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "private_broker::tests::account_brokers_subprocess",
-                    "--nocapture",
-                ])
-                .env(ACCOUNT_CHILD, case)
-                .env("TMPDIR", temporary)
-                .capture_output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{case}: {} {}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        };
         let fresh = crate::test_support::short_tempdir().unwrap();
-        run(fresh.path(), "fresh");
+        run_account_case(fresh.path(), None, fresh.path(), "fresh");
 
         let linked = crate::test_support::short_tempdir().unwrap();
         let elsewhere = linked.path().join("elsewhere");
-        std::fs::create_dir(&elsewhere).unwrap();
-        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o700)).unwrap();
+        private_fixture(&elsewhere, 0o700);
         std::os::unix::fs::symlink(&elsewhere, account_directory(linked.path())).unwrap();
-        run(linked.path(), "refused");
+        run_account_case(linked.path(), None, linked.path(), "refused-temporary");
         assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
 
         let open = crate::test_support::short_tempdir().unwrap();
         let account = account_directory(open.path());
-        std::fs::create_dir(&account).unwrap();
-        std::fs::set_permissions(&account, std::fs::Permissions::from_mode(0o777)).unwrap();
-        run(open.path(), "refused");
+        private_fixture(&account, 0o777);
+        run_account_case(open.path(), None, open.path(), "refused-temporary");
         assert_eq!(mode(&account), 0o777);
         assert_eq!(std::fs::read_dir(&account).unwrap().count(), 0);
+    }
+
+    /// The user's runtime directory holds the account's directory when only
+    /// this account can write to it; otherwise the temporary directory does.
+    #[test]
+    fn ticketed_brokers_prefer_a_private_runtime_directory() {
+        let root = crate::test_support::short_tempdir().unwrap();
+        let temporary = root.path().join("t");
+        private_fixture(&temporary, 0o700);
+        for (name, runtime_mode, used) in
+            [("p", 0o700, true), ("r", 0o755, true), ("o", 0o777, false)]
+        {
+            let runtime = root.path().join(name);
+            private_fixture(&runtime, runtime_mode);
+            let parent = if used { &runtime } else { &temporary };
+            run_account_case(&temporary, Some(&runtime), parent, "fresh");
+            assert_eq!(
+                std::fs::read_dir(&runtime).unwrap().count(),
+                usize::from(used),
+                "{runtime_mode:o}"
+            );
+        }
+        // A runtime directory that is missing is passed over too.
+        run_account_case(
+            &temporary,
+            Some(&root.path().join("missing")),
+            &temporary,
+            "fresh",
+        );
+        // In the runtime directory nobody else can have made the account's
+        // directory, so a bad one gets no advice about other users.
+        let runtime = root.path().join("bad");
+        private_fixture(&runtime, 0o700);
+        private_fixture(&account_directory(&runtime), 0o755);
+        run_account_case(&temporary, Some(&runtime), &runtime, "refused-runtime");
+    }
+
+    #[test]
+    fn only_a_runtime_directory_nobody_else_can_write_is_used() {
+        let root = crate::test_support::short_tempdir().unwrap();
+        assert_eq!(account_parent(None), None);
+        for (name, runtime_mode, used) in [
+            ("p", 0o700, true),
+            ("r", 0o755, true),
+            ("g", 0o770, false),
+            ("o", 0o707, false),
+        ] {
+            let runtime = root.path().join(name);
+            private_fixture(&runtime, runtime_mode);
+            assert_eq!(
+                account_parent(Some(runtime.clone())).is_some(),
+                used,
+                "{runtime_mode:o}"
+            );
+        }
+        let file = root.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(account_parent(Some(file)), None);
+        assert_eq!(account_parent(Some(root.path().join("missing"))), None);
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(account_parent(Some(PathBuf::from("/"))), None);
+        }
     }
 }
