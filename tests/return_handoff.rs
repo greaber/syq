@@ -17,6 +17,9 @@ use std::time::{Duration, Instant};
 
 struct Fixture {
     temp: tempfile::TempDir,
+    /// Holds `runtime`, short enough for the sockets of copies beneath it
+    /// even when the ambient TMPDIR is long, as on macOS.
+    sockets: tempfile::TempDir,
 }
 
 impl Fixture {
@@ -29,7 +32,13 @@ impl Fixture {
         )
         .unwrap();
         fs::write(temp.path().join("source"), b"payload").unwrap();
-        Self { temp }
+        let sockets = crate::test_support::short_tempdir().unwrap();
+        Self { temp, sockets }
+    }
+
+    /// The runtime directory, which exists only once a test makes it.
+    fn runtime(&self) -> std::path::PathBuf {
+        self.sockets.path().join("runtime")
     }
 
     fn registration(&self, program: &str, identity: &str) {
@@ -50,7 +59,7 @@ impl Fixture {
             .current_dir(self.temp.path())
             .env("HOME", self.temp.path())
             .env("XDG_CONFIG_HOME", self.temp.path().join("config"))
-            .env("XDG_RUNTIME_DIR", self.temp.path().join("runtime"))
+            .env("XDG_RUNTIME_DIR", self.runtime())
             .env("SYQ_NO_UPDATE_CHECK", "1")
             .env_remove("SSH_AUTH_SOCK")
             .env_remove("SYQ_AUTH_FROM")
@@ -67,7 +76,7 @@ impl Fixture {
     fn source_fallback(&self, args: &[&str]) -> Output {
         let bin = self.temp.path().join("bin");
         fs::create_dir(&bin).unwrap();
-        fs::create_dir(self.temp.path().join("runtime")).unwrap();
+        fs::create_dir(self.runtime()).unwrap();
         let ssh = bin.join("ssh");
         // `ssh -G` inspects the configuration without connecting.
         executable_support::write_executable(&ssh, b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_8.9p1 >&2; exit 0; fi\nfor argument; do [ \"$argument\" = -G ] && exit 0; done\nprintf 'connect\\n' >> \"$HOME/ssh-used\"\nprintf 'Permission denied (publickey).\\n' >&2\nexit 255\n", 0o700);

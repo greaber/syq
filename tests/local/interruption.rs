@@ -405,8 +405,10 @@ fn interrupt_with_stalled_cleanup(t: &Tmp, route: &str, tmp: &Path) -> (Child, i
         "push" => remote_copy(t, route, tuning),
         _ => local_copy(t, tuning),
     };
+    // Without a runtime directory the copy's sockets go in `tmp` too.
     command
         .env("TMPDIR", tmp)
+        .env_remove("XDG_RUNTIME_DIR")
         .env("SYQ_TEST_SMALL_STAGE_READY_FILE", &staged)
         .env("SYQ_TEST_SMALL_STAGE_CONTINUE_FILE", t.path("never"))
         .env("SYQ_TEST_SIDECAR_SWEEP_READY_FILE", &sweeping)
@@ -431,12 +433,11 @@ fn interrupt_with_stalled_cleanup(t: &Tmp, route: &str, tmp: &Path) -> (Child, i
     (child, signal)
 }
 
-/// The private socket directories left in `tmp`.
+/// The descriptor sessions' socket directories left in `tmp`.
 fn broker_directories(tmp: &Path) -> Vec<String> {
-    fs::read_dir(tmp)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|name| name.starts_with("syq-fd-"))
+    private_temporary_leftovers(tmp)
+        .into_iter()
+        .filter(|name| name.contains("/fd-"))
         .collect()
 }
 

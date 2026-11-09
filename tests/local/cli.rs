@@ -1097,7 +1097,7 @@ fn auth_from_environment_sets_the_choice_below_the_command_line() {
             .args(args)
             .env("HOME", t.path(""))
             .env("XDG_CONFIG_HOME", t.path("config"))
-            .env("XDG_RUNTIME_DIR", t.path("runtime"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
             .env("PATH", &paths)
             .env("SYQ_NO_UPDATE_CHECK", "1")
             .env_remove("SSH_AUTH_SOCK")
@@ -1114,7 +1114,7 @@ fn auth_from_environment_sets_the_choice_below_the_command_line() {
         let _ = fs::remove_file(t.path("ssh-used"));
         tried
     };
-    fs::create_dir(t.path("runtime")).unwrap();
+    fs::create_dir(t.runtime()).unwrap();
     let upload = ["cp", "source", "--to", "backup"];
 
     // A local copy has no SSH endpoint for the choice to apply to.

@@ -978,7 +978,7 @@ fn receiver_destinations_require_sigil_and_never_fall_back() {
             .args(args)
             .env("HOME", t.path(""))
             .env("XDG_CONFIG_HOME", t.path("config"))
-            .env("XDG_RUNTIME_DIR", t.path("runtime"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
             .env("PATH", &path)
             .env("SSH_MARKER", t.path("ssh-used"))
             .env("SYQ_NO_UPDATE_CHECK", "1")
@@ -1502,7 +1502,7 @@ fn return_via_requires_approval_and_rejects_unsupported_routes() {
                 .current_dir(t.path(""))
                 .env("HOME", t.path(""))
                 .env("XDG_CONFIG_HOME", t.path("config"))
-                .env("XDG_RUNTIME_DIR", t.path("runtime"))
+                .env("XDG_RUNTIME_DIR", t.runtime())
                 .env("PATH", t.path("bin"))
                 .env("SYQ_NO_UPDATE_CHECK", "1")
                 .capture_output()
@@ -1530,7 +1530,7 @@ fn remote_copy_addition_preserves_approval_preferences_from_f752ee8() {
         .args(["persist", "receive", "status", "--json"])
         .env("HOME", t.path(""))
         .env("XDG_CONFIG_HOME", t.path("config"))
-        .env("XDG_RUNTIME_DIR", t.path("runtime"))
+        .env("XDG_RUNTIME_DIR", t.runtime())
         .env("SYQ_NO_UPDATE_CHECK", "1")
         .capture_output()
         .unwrap();
@@ -1779,7 +1779,7 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     use std::os::unix::net::UnixListener;
     use std::time::{Duration, Instant};
     let t = Tmp::new();
-    fs::create_dir(t.path("runtime")).unwrap();
+    fs::create_dir(t.runtime()).unwrap();
     write(&t.path("source"), b"payload");
     executable_support::write_executable(&t.path("bin/ssh"), b"#!/bin/sh\nif [ \"$1\" = -V ]; then echo OpenSSH_8.9p1 >&2; exit 0; fi\nif [ \"$1\" = -G ]; then printf 'user fixture-user\\nhostname resolved-backup\\nport 2222\\nhostkeyalgorithms ssh-ed25519\\n'; exit 0; fi\necho connect >> \"$HOME/ssh-used\"\nprintf '%s\\n' \"${SYQ_TEST_SSH_FAILURE:-Permission denied (publickey).}\" >&2\nexit 255\n", 0o700);
     let mut paths = vec![t.path("bin")];
@@ -1791,7 +1791,7 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
             .args(args)
             .env("HOME", t.path(""))
             .env("XDG_CONFIG_HOME", t.path("config"))
-            .env("XDG_RUNTIME_DIR", t.path("runtime"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
             .env("PATH", &paths)
             .env("SYQ_NO_UPDATE_CHECK", "1")
             .env_remove("SSH_AUTH_SOCK")
@@ -2109,7 +2109,7 @@ impl HeldLaptop {
         use std::os::unix::net::UnixListener;
         use std::time::Duration;
         let t = Tmp::new();
-        fs::create_dir(t.path("runtime")).unwrap();
+        fs::create_dir(t.runtime()).unwrap();
         write(&t.path("source"), b"payload");
         // ssh -G reports the default identity file; logging in is refused.
         executable_support::write_executable(
@@ -2224,7 +2224,7 @@ impl HeldLaptop {
             .args(args)
             .env("HOME", self.t.path(""))
             .env("XDG_CONFIG_HOME", self.t.path("config"))
-            .env("XDG_RUNTIME_DIR", self.t.path("runtime"))
+            .env("XDG_RUNTIME_DIR", self.t.runtime())
             .env("PATH", &self.paths)
             .env("SYQ_NO_UPDATE_CHECK", "1")
             .env_remove("SSH_AUTH_SOCK")

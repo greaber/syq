@@ -54,14 +54,20 @@ shell itself, run `eval "$(tmux show-environment -s SSH_AUTH_SOCK)"`.
 | `~/.config/syq/install.json`, `last-update-check` | Install receipt and update-check timing |
 | `~/.local/lib/syq/` | [Stored releases and helpers](#stored-releases-and-helpers) |
 | `$XDG_RUNTIME_DIR/syq-persist-UID/` | Persistent connection sockets |
+| `$XDG_RUNTIME_DIR/syq-UID/` or `$TMPDIR/syq-UID/` | Sockets of copies that are running |
 | `~/.syq-destinations-v3/` | Registered receiving names on a server |
 | `~/.local/state/syq/enrollments/` | Your [restricted-copy enrollments](remote-reference.md#enrollment), with their entry keys |
 | `~/.local/share/syq/enrollments/` | A server's enrollment state |
 
 Copies still work when caches cannot be written, but each machine needs a
 little space for private sockets in `TMPDIR`, or `/tmp` when it is unset.
-Without a writable runtime directory, a copy warns and connects without
-persistence.
+The sockets of running copies go in `syq-UID` in `XDG_RUNTIME_DIR`, or in
+`TMPDIR` when no runtime directory is set that you, and only you, can write
+to. In that case every SSH login of yours on a machine must see the same
+`TMPDIR`. `syq-UID` must be yours with mode 0700. If another user made it
+first in a shared `/tmp`, copies stop and say so; set `TMPDIR` to a
+directory of your own to get around it. Without a writable runtime
+directory, a copy warns and connects without persistence.
 
 ## Stored releases and helpers
 

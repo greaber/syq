@@ -750,8 +750,10 @@ fn authorize_expected_inner(
     let channel = agent.clone();
     let broker = PrivateBroker::start_managed(
         PrivateBrokerConfig {
-            directory_prefix: "syq-ssh-",
-            socket_name: "agent",
+            directory: BrokerDirectory::Temporary {
+                prefix: "syq-ssh-",
+                socket: "agent",
+            },
             listener_thread: "syq-ssh-agent",
             client_thread: "syq-ssh-sign",
             inline_on_thread_failure: false,

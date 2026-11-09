@@ -667,8 +667,10 @@ fn broker_confined(
     let handler = Arc::clone(&receiver);
     let broker = PrivateBroker::start_managed(
         PrivateBrokerConfig {
-            directory_prefix: "syq-named-test-",
-            socket_name: "s",
+            directory: BrokerDirectory::Temporary {
+                prefix: "syq-named-test-",
+                socket: "s",
+            },
             listener_thread: "named-test-listener",
             client_thread: "named-test-client",
             inline_on_thread_failure: false,
