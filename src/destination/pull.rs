@@ -24,6 +24,9 @@ pub(crate) struct PullRequest {
     pub tcp_congestion: Option<String>,
     pub send_rate: Option<u64>,
     pub limits: crate::delegation::CopyLimits,
+    /// A dry run's: the sources may be listed and their files compared by
+    /// hash, but no file contents are sent (`SourcePolicy::preview`).
+    pub preview: bool,
     /// Where `base` is on the server that reads, when it reads from another
     /// working directory than the command's (`SourcePolicy::resolved_base`).
     /// Only a source directive's rules set it.
@@ -173,6 +176,7 @@ pub(crate) fn source_request(
             max_connections: u16::try_from(workers + 1)?,
             max_deletions: 0,
         },
+        preview: args.dry_run,
         resolved_base: None,
         tcp: crate::delegation::TcpPermission::of(args),
     };
@@ -223,6 +227,7 @@ impl PullRequest {
             },
             send_rate: self.send_rate,
             limits: self.limits.clone(),
+            preview: self.preview,
             deadline,
             outer_root: None,
         }
@@ -559,6 +564,54 @@ mod tests {
         assert_eq!(request.symlink_policy, OperatorSymlinkPolicy::FollowAll);
         assert_eq!(request.limits.max_connections, 2);
         assert_eq!(request.send_rate, Some(4 << 20));
+    }
+
+    /// Approving a dry run's download allows a preview: its source may list
+    /// the files and compare them by hash, but not read them, and the
+    /// prompt says so.
+    #[test]
+    fn a_dry_runs_source_approval_is_a_preview() {
+        let parse = |extra: &[&str]| crate::approval_command::parse(&command(extra)).unwrap();
+        let request = source_request(&parse(&["--dry-run"]), None).unwrap();
+        assert!(request.preview && request.policy(Instant::now()).preview);
+        let copy = source_request(&parse(&[]), None).unwrap();
+        assert!(!copy.preview && !copy.policy(Instant::now()).preview);
+        let root = crate::test_support::tempdir().unwrap();
+        let (_broker, receiver, _registration, _) = broker(root.path(), Approval::Always);
+        let asking = receiver.clone();
+        let task = std::thread::spawn(move || {
+            asking.approvals.request_source(
+                &asking.requester,
+                &command(&["--dry-run"]),
+                "~/job",
+                ("backup", crate::restricted::EnrollmentState::Ready, false),
+                &request,
+                crate::receive_approval::Notifications::Off,
+                || false,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let pending = loop {
+            if let Some(summary) = receiver.approvals.snapshots().first() {
+                break summary.clone();
+            }
+            assert!(!task.is_finished(), "the preview's request ended");
+            assert!(Instant::now() < deadline, "the preview was not asked about");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let description =
+            pending.description(&crate::persistence::Domain::default(), str::to_owned);
+        assert!(
+            description.contains("Preview only (a dry run)")
+                && description.contains("but not read their contents")
+                && !description.contains("may list and read"),
+            "{description}"
+        );
+        receiver
+            .approvals
+            .decide(&pending.id, false, crate::receive_approval::Kind::Source)
+            .unwrap();
+        assert!(task.join().unwrap().is_err());
     }
 
     #[test]

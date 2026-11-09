@@ -2005,6 +2005,40 @@ fn receiving_cwd_allows_other_paths_but_root_confines_them() {
     );
 }
 
+/// With `--follow-dst`, a copy to the laptop follows a link above its
+/// destination that another account made in a sticky directory anyone can
+/// write to, such as /tmp, only as the kernel would: not at all.
+#[test]
+fn a_laptop_destination_does_not_follow_another_accounts_link_in_tmp() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let target = temp.path().join("target");
+    fs::create_dir(&target).unwrap();
+    let Some(shared) = crate::test_support::SharedDirectoryLink::new(&target) else {
+        eprintln!("skipped: no sticky directory another account owns");
+        return;
+    };
+    let named = shared.0.join("sub/file");
+    let resolve = || {
+        resolve_destination(
+            Path::new("/"),
+            None,
+            named.as_os_str().as_bytes(),
+            true,
+            None,
+        )
+    };
+    assert_eq!(
+        resolve().unwrap(),
+        (target.join("sub/file"), target.clone())
+    );
+    let other = crate::rooted::own_uid().wrapping_add(1);
+    crate::rooted::FOLLOWER_FOR_TEST.with(|cell| cell.set(Some(other)));
+    let refused = resolve();
+    crate::rooted::FOLLOWER_FOR_TEST.with(|cell| cell.set(None));
+    let error = format!("{:#}", refused.unwrap_err());
+    assert!(error.contains("anyone can write to"), "{error}");
+}
+
 /// A copy to the laptop refuses a symlink above its destination unless its
 /// command passes `--follow-dst`, as any copy does; then the destination is
 /// where the link leads, and the prompt says so.

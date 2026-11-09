@@ -50,8 +50,10 @@ Syq's own commands follow a symlink only in a path you supply, and only when you
 ask; links found inside a directory are never followed. (`syq rsync` instead
 follows the rule from
 [rsync 3.5.0's security design](https://github.com/RsyncProject/rsync/blob/v3.5.0/SECURITY.md#symlink-race-safe-path-resolution):
-it follows a link in a supplied path that root or the running user owns, or any
-link with `--insecure-links`, which applies to local paths only.)
+it follows a link in a supplied path that root or the running user owns, or,
+with `--insecure-links`, which applies to local paths only, any link except
+one another user made in a shared directory such as `/tmp`, as described
+below.)
 
 | Where the symlink appears | Treatment |
 |---|---|
@@ -60,7 +62,13 @@ link with `--insecure-links`, which applies to local paths only.)
 | Inside a source directory being copied | Copied as a link; its target is not read |
 | Inside a destination directory | Not followed. A copied file can replace the link, but a copied directory cannot use it as a directory |
 
-`--follow` enables both. See [Symlinks](reference.md#symlinks) for examples.
+`--follow` enables both. Even then, syq doesn't follow a link that another
+user made in a shared directory like `/tmp`, which anyone can add to but where
+only a file's owner can remove it (the sticky bit), unless that directory's
+owner made it: such a link could send a copy anywhere you can write. Linux
+applies the same rule to every program (`fs.protected_symlinks`), and syq
+applies it on every system, including copies through an enrollment or a
+receiving name. See [Symlinks](reference.md#symlinks) for examples.
 
 <a id="limits-to-keep-in-mind"></a>
 <a id="privileged-copies-and-hard-links"></a>
@@ -462,8 +470,10 @@ directory trees, with the symlink behavior the command chose, within the
 profile's byte and entry limits and, when the profile sets `--root`, only
 inside that root: symlinks can't lead out of it, and neither can a directory
 replaced while the copy runs. When the command follows symlinks, the prompt
-says so, since the files read may then be elsewhere than the paths shown. It
-cannot write, rename or remove anything on your laptop. As with copies between
+says so, since the files read may then be elsewhere than the paths shown.
+Approving a dry run lets the server list and compare those files by their
+hashes, but not read them. It cannot write, rename or remove anything on your
+laptop. As with copies between
 servers, the server can ask for hashes of approved files beyond the data
 limit. File data travels over your laptop's receiving connection, as downloads
 do, and reads stop when the copy ends or receiving stops.

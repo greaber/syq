@@ -74,7 +74,9 @@ ranges into sparse holes. See the
 
 Symlinks are copied with their targets unchanged. `--insecure-links` only
 relaxes the ownership check on symlinks in paths you type; it does not follow
-symlinks beneath a selected source.
+symlinks beneath a selected source, nor a link another user made in a shared
+sticky directory such as `/tmp` (see
+[Which symlinks are followed?](security.md#which-symlinks-are-followed)).
 
 ## File-list parsing and help
 

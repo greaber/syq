@@ -3,7 +3,7 @@
 use crate::process::CommandExt as _;
 #[path = "../tests/support/temp.rs"]
 mod temporary;
-pub(crate) use temporary::{short_tempdir, temp_dir, tempdir};
+pub(crate) use temporary::{short_tempdir, temp_dir, tempdir, SharedDirectoryLink};
 #[path = "../tests/support/executable.rs"]
 mod executable;
 pub(crate) use executable::write_executable;

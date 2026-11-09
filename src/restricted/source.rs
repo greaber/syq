@@ -43,6 +43,10 @@ pub(crate) struct SourcePolicy {
     pub tcp: SourceTcpPolicy,
     pub send_rate: Option<u64>,
     pub limits: CopyLimits,
+    /// For a dry run: the sources may be listed, and their files compared
+    /// by whole-file hash, as a preview does, but no request that returns
+    /// file contents, or block hashes, is served.
+    pub preview: bool,
     pub deadline: Instant,
     /// A directory the base must resolve beneath (`FsOps::set_source_outer_root`).
     pub outer_root: Option<Vec<u8>>,
@@ -488,6 +492,19 @@ impl SourceConnection {
                         | Request::ReadStream(_)
                 ),
             "source payload requires a direct data worker"
+        );
+        ensure!(
+            !policy.preview
+                || !matches!(
+                    request,
+                    Request::ReadRange { .. }
+                        | Request::ReadComparedRange { .. }
+                        | Request::ReadSmallBatch(_)
+                        | Request::ReadDifferingBatch { .. }
+                        | Request::ReadStream(_)
+                        | Request::HashBlocks { .. }
+                ),
+            "a dry run was approved to list and compare these files, not to read them"
         );
         let source = |source: &Option<RegisteredPath>| -> Result<RegisteredPath> {
             source

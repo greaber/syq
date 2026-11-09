@@ -511,6 +511,13 @@ fn an_unusable_record_of_used_grants_is_recreated_under_a_new_generation() {
         installed(install_for_account(&request, &account, home).unwrap()),
         (1, true)
     );
+    let config = |home: &Path| {
+        read_receiver_config(&enrollment_state(home, id))
+            .unwrap()
+            .unwrap()
+    };
+    // A new enrollment's record has no directive issued before it.
+    assert_eq!(config(home).record_since, None);
     let replay = enrollment_state(home, id).join("replay");
     fs::remove_dir(&replay).unwrap();
     // A refresh for a refused copy that is signed again under the same
@@ -528,11 +535,16 @@ fn an_unusable_record_of_used_grants_is_recreated_under_a_new_generation() {
     };
     assert_eq!(generation(home), 1);
     let refresh = install_request(&account, id, &entry, &login, true);
+    let before = crate::directive::now().unwrap();
     assert_eq!(
         installed(install_for_account(&refresh, &account, home).unwrap()),
         (2, true)
     );
     assert!(replay.is_dir());
+    // Receivers refuse directives issued before the record was recreated,
+    // such as a refused copy signed again after the first ran.
+    let since = config(home).record_since.unwrap();
+    assert!((before..=crate::directive::now().unwrap()).contains(&since));
     assert_eq!(fs::metadata(&replay).unwrap().mode() & 0o777, 0o700);
     let line = fs::read_to_string(home.join(".ssh/authorized_keys")).unwrap();
     assert!(line.contains("--generation=2\""), "{line}");
@@ -545,6 +557,7 @@ fn an_unusable_record_of_used_grants_is_recreated_under_a_new_generation() {
         installed(install_for_account(&keeping, &account, home).unwrap()),
         (2, false)
     );
+    assert_eq!(config(home).record_since, Some(since));
     // A record the receiver refuses, as after a restore from a backup with
     // another mode, or something else in its place, is recreated the same
     // way.
@@ -585,6 +598,54 @@ fn an_unusable_record_of_used_grants_is_recreated_under_a_new_generation() {
         installed(install_for_account(&refresh, &account, home).unwrap()),
         (6, true)
     );
+}
+
+/// A copy that ran, whose record of used copies was then lost and
+/// recreated, is refused when it is signed again as the same copy, as a
+/// retry signs it, even within the second the record was recreated. A copy
+/// approved after that runs.
+#[test]
+fn a_copy_signed_again_after_its_record_was_recreated_is_refused() {
+    let (account, home) = enrollment_home();
+    let home = home.path();
+    let id = EnrollmentId::random();
+    let entry = generate_test_key("entry").unwrap();
+    let login = generate_test_key("login").unwrap();
+    let install = |refresh| {
+        installed(
+            install_for_account(
+                &install_request(&account, id, &entry, &login, refresh),
+                &account,
+                home,
+            )
+            .unwrap(),
+        )
+    };
+    let state = enrollment_state(home, id);
+    let config = || read_receiver_config(&state).unwrap().unwrap();
+    let build = crate::identity::build();
+    let sign = |directive: &crate::directive::Directive| {
+        sign_test_directive(directive, &login, crate::directive::NAMESPACE)
+    };
+    assert_eq!(install(false), (1, true));
+    let mut directive = test_directive(id, 1, &account);
+    verify(&state, &config(), (1, build), &sign(&directive), home).unwrap();
+    // The record is lost, and an ordinary refresh recreates it.
+    fs::remove_dir_all(state.join("replay")).unwrap();
+    assert_eq!(install(true), (2, true));
+    // The copy signed again for the new generation, as it first was.
+    directive.binding.generation = 2;
+    let error = verify(&state, &config(), (2, build), &sign(&directive), home)
+        .err()
+        .unwrap();
+    assert!(
+        format!("{error:#}").contains("run the copy again"),
+        "{error:#}"
+    );
+    // A copy approved after the record was recreated runs.
+    let mut fresh = test_directive(id, 2, &account);
+    fresh.issued_at = config().record_since.unwrap() + 1;
+    verify(&state, &config(), (2, build), &sign(&fresh), home).unwrap();
 }
 
 #[test]
@@ -948,6 +1009,7 @@ fn a_receiver_from_an_older_line_refuses_new_copies() {
             .to_openssh()
             .unwrap(),
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
+        record_since: None,
     };
     require_current_receiver(&config, 4, "v0.8.0").unwrap();
     for (generation, build) in [(3, "v0.8.0"), (4, "v0.7.9"), (5, "v0.8.0")] {
@@ -959,7 +1021,16 @@ fn a_receiver_from_an_older_line_refuses_new_copies() {
     for field in ["dev", "ino", "root"] {
         assert!(!encoded.contains(&format!("\"{field}")), "{encoded}");
     }
+    // Without a recreated record, the state is as earlier builds wrote it,
+    // and theirs reads with no limit on when directives were issued.
+    assert!(!encoded.contains("record_since"), "{encoded}");
+    let read: ReceiverEnrollment = serde_json::from_str(V0_9_0_RECEIVER_STATE).unwrap();
+    assert_eq!((read.generation, read.record_since), (3, None));
+    require_issued_since_record(&read, &test_directive(read.id, 3, "backup")).unwrap();
 }
+
+/// An enrollment's state as syq 0.9.0 writes it, unchanged.
+const V0_9_0_RECEIVER_STATE: &str = r#"{"version":7,"id":[18,52,86,120,154,188,64,222,128,17,34,51,68,85,102,119],"target_login":"backup","generation":3,"release":"v0.9.0","receiver_path":"/home/backup/.local/lib/syq/v0.9.0/linux-x86_64/syq","entry_public_key":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINmbsXWDzN2/SKqZ1ON1+wirDyIMO8NcP1vkfz+523lJ","signer":{"public_key":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ46aGzAwqyVP9ooubUyd8JlH8JGgPjFXvFi/in/g/fc"}}"#;
 
 /// A coordinating source's receiver verifies its own directive as a
 /// destination's does, and records it only with the destination's directive
@@ -990,6 +1061,7 @@ fn a_coordinating_source_is_admitted_only_with_its_own_destination_directive() {
             .to_openssh()
             .unwrap(),
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
+        record_since: None,
     };
     let command = [
         "cp",
@@ -1178,6 +1250,7 @@ fn a_source_directive_is_admitted_only_for_what_its_command_reads() {
             .to_openssh()
             .unwrap(),
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
+        record_since: None,
     };
     let command = |extra: &[&str]| {
         ["cp", "--from", "host-b"]
@@ -1293,11 +1366,20 @@ fn a_source_directive_is_admitted_only_for_what_its_command_reads() {
     assert_eq!(reads.limits.max_total_bytes, 4096);
     assert_eq!(reads.limits.max_entries, 10);
     assert_eq!(reads.limits.max_deletions, 0);
+    assert!(!reads.preview);
     assert_ne!(recorded(), 0);
     let error = verify_rules(&state, &config, receiver, &source, (&home, &home))
         .err()
         .unwrap();
     assert!(format!("{error:#}").contains("already"), "{error:#}");
+    // A dry run's source may list and compare its files, not read them.
+    let preview = issue(Role::Source, command(&["--dry-run"]));
+    let (Rules::Source(reads), _) =
+        verify_rules(&state, &config, receiver, &preview, (&home, &home)).unwrap()
+    else {
+        panic!("a source's directive derived a destination's rules");
+    };
+    assert!(reads.preview);
 }
 
 /// An enrolled receiver admits a copy's TCP listener only when the command
@@ -1457,6 +1539,7 @@ fn a_directive_is_recorded_only_after_every_check_passes() {
             .to_openssh()
             .unwrap(),
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
+        record_since: None,
     };
     let home = temporary.path();
     let directive = |change: &dyn Fn(&mut crate::directive::Directive)| {
@@ -1540,6 +1623,28 @@ fn a_directive_is_recorded_only_after_every_check_passes() {
     assert_eq!(recorded(), 0);
 
     config.signer = delegation::TrustedSigner::new(login.public_key(), None, None).unwrap();
+    // A copy approved before this server recreated its record of the
+    // directives that ran, as a refused copy signed again is, may have run
+    // against the record that was lost.
+    let issued = crate::directive::Signed::decode(&valid)
+        .unwrap()
+        .directive
+        .issued_at;
+    // Issued in the second the record was recreated, it may be from before.
+    for since in [issued + 1, issued] {
+        config.record_since = Some(since);
+        let error = verify(&state, &config, current, &valid, home)
+            .err()
+            .unwrap();
+        assert!(
+            format!("{error:#}")
+                .contains("may have run already and is not run again; run the copy again"),
+            "{error:#}"
+        );
+        assert_eq!(recorded(), 0);
+    }
+
+    config.record_since = Some(issued - 1);
     let ((grant, _), _) = verify(&state, &config, current, &valid, home).unwrap();
     assert_eq!(grant.copy.destination, b"/backup");
     assert_ne!(recorded(), 0);
@@ -12616,6 +12721,40 @@ fn a_confinement_root_of_slash_names_paths_beneath_it() {
         found.existing.join(&b'/'),
         path_bytes(&root.join("target"))[1..].to_vec()
     );
+}
+
+/// With `--follow-dst`, the receiver follows a link another account made in
+/// a sticky directory anyone can write to, such as /tmp, only as the kernel
+/// would: not at all, whether the link is at the destination or above it.
+#[test]
+fn follow_dst_does_not_follow_another_accounts_link_in_tmp() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let target = temporary.path().join("target");
+    fs::create_dir(&target).unwrap();
+    let Some(shared) = crate::test_support::SharedDirectoryLink::new(&target) else {
+        eprintln!("skipped: no sticky directory another account owns");
+        return;
+    };
+    let slash = Root::open(Path::new("/")).unwrap();
+    let link = path_bytes(&shared.0);
+    let resolve = || resolve_destination_links(&slash, b"/", &link[1..]);
+    let confine = || ConfinedRoot::resolve(&path_bytes(&shared.0.join("copy")), &[], true, None);
+    // The account's own link is followed.
+    assert_eq!(
+        resolve().unwrap().unwrap().existing.join(&b'/'),
+        path_bytes(&target)[1..].to_vec()
+    );
+    confine().unwrap();
+    // Another account's is not.
+    let other = crate::rooted::own_uid().wrapping_add(1);
+    crate::rooted::FOLLOWER_FOR_TEST.with(|cell| cell.set(Some(other)));
+    let at = resolve().err().map(|error| format!("{error:#}"));
+    let above = confine().err().map(|error| format!("{error:#}"));
+    crate::rooted::FOLLOWER_FOR_TEST.with(|cell| cell.set(None));
+    for error in [at, above] {
+        let error = error.expect("another account's link was followed");
+        assert!(error.contains("anyone can write to"), "{error}");
+    }
 }
 
 /// A followed destination that reaches the receiver's control files is

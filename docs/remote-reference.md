@@ -85,8 +85,10 @@ at most one of the two. It does this only when the server running the copy
 runs your laptop's build, as it does unless you pass `--syq-path` or
 `--no-bootstrap`, and never for a dry run. It doesn't when the enrollment was
 revoked or set up again meanwhile, when hostB's record of the copies it ran
-is damaged, or when the copy may no longer start; syq then reports the
-refusal, and running the copy again starts afresh.
+is damaged or was recreated after the copy was first approved (by your
+laptop's clock and hostB's, to the second), or when the copy may no longer
+start; syq then reports the refusal, and running the copy again starts
+afresh.
 
 Only `syq receiver revoke ID`, or deleting syq's line from `authorized_keys`,
 ends an enrollment. Removing or revoking your login key, certificate, or
@@ -218,7 +220,9 @@ in the source account's home directory. A source given with `--src-non-dir`
 allows only that entry; any other source allows the whole tree if it is a
 directory. Filters narrow the copy but not what may be read, and with
 `--follow-src` symlinks are followed wherever they lead. Descriptor streams do
-not work.
+not work. Approving a dry run allows only a preview: the source lists those
+files and compares them with yours by their hashes, but doesn't send their
+contents.
 
 For uploads, quoted `~` and `~/archive` mean the destination account's home
 directory, and `~//archive` means `/archive`, as with SSH. Use `./~/archive`
