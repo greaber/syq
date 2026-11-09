@@ -3336,8 +3336,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     let dropped = result.is_err() && !invalid_range && worker.transport_dead();
                     match result {
                         Ok(()) if worker.leaving_shared_login => {
-                            // Larger files are planned: this and every later
-                            // connection logs in on its own.
+                            // A file that can't share the login is planned:
+                            // this and every later connection logs in on its
+                            // own.
                             for spec in [&src_ep, &dst_ep].into_iter().filter_map(real_remote_spec)
                             {
                                 spec.set_ssh_multiplexing(false);
@@ -3347,7 +3348,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             gate.mark_warming(id);
                             if debug() {
                                 crate::output::diagnostic!(
-                                    "syq: worker {id}: leaving the shared SSH login for a larger file"
+                                    "syq: worker {id}: leaving the shared SSH login to log in on its own"
                                 );
                             }
                         }
@@ -4743,10 +4744,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let streaming_checked_jobs = std::cell::Cell::new(0);
     let streaming_all_batched = std::cell::Cell::new(true);
     // Data workers share the copy's SSH login while every file planned so far
-    // can (`shares_ssh_login`): workers started while planning continues
-    // then need no logins of their own for a tree of small files. Once a
-    // larger file is planned, later connections log in on their own, and a
-    // worker on the shared login gives back such a file and logs in again.
+    // can (`shares_ssh_login`), so workers started before planning ends need
+    // no logins of their own for a tree of small files. Once planning finds
+    // a file that can't, later connections log in on their own, and a worker
+    // on the shared login that takes such a file hands it back and logs in
+    // again (`Worker::needs_own_login`).
     let ssh_sharing_possible = !opts.dry_run
         && !opts.tuning.force_ranges()
         && (bwlimit.is_none() || transport_budget.is_some());

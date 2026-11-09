@@ -47,12 +47,12 @@ pub(super) struct Worker {
     /// Files whose publication is in flight, oldest first
     /// (`transfer::publication`).
     pub(super) publications: std::collections::VecDeque<super::publication::Publication>,
-    /// The worker joined the copy's shared SSH login because every file
-    /// planned so far could share it (`shares_ssh_login`). The startup
-    /// workers that always share it are not counted.
+    /// The worker is a session on the copy's shared SSH login, which carries
+    /// only files that can share it (`shares_ssh_login`). The startup
+    /// workers, which may carry any file there, are not counted.
     pub(super) on_shared_login: bool,
-    /// The worker took a file that needs its own login, gave it back, and
-    /// ends this connection so that it can log in separately.
+    /// The worker took a file that needs a login of its own and gave it
+    /// back; it ends this connection to log in separately.
     pub(super) leaving_shared_login: bool,
 }
 
