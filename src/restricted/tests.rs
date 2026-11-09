@@ -648,6 +648,58 @@ fn a_copy_signed_again_after_its_record_was_recreated_is_refused() {
     verify(&state, &config(), (2, build), &sign(&fresh), home).unwrap();
 }
 
+/// A session reads its enrollment's state when it starts, and its first
+/// frame can come up to `ADMISSION_TIMEOUT` later. If a refresh recreates a
+/// lost record of used copies in between, a copy that already ran, shown
+/// in that frame, is refused: the state read after recording it shows the
+/// refresh, though the session's own does not, nor its `record_since`.
+#[test]
+fn a_session_started_before_its_record_was_recreated_cannot_run_a_used_copy() {
+    let (account, home) = enrollment_home();
+    let home = home.path();
+    let id = EnrollmentId::random();
+    let entry = generate_test_key("entry").unwrap();
+    let login = generate_test_key("login").unwrap();
+    let install = |refresh| {
+        installed(
+            install_for_account(
+                &install_request(&account, id, &entry, &login, refresh),
+                &account,
+                home,
+            )
+            .unwrap(),
+        )
+    };
+    let state = enrollment_state(home, id);
+    let config = || read_receiver_config(&state).unwrap().unwrap();
+    let build = crate::identity::build();
+    let sign = |directive: &crate::directive::Directive| {
+        sign_test_directive(directive, &login, crate::directive::NAMESPACE)
+    };
+    assert_eq!(install(false), (1, true));
+    let used = sign(&test_directive(id, 1, &account));
+    verify(&state, &config(), (1, build), &used, home).unwrap();
+    // A session of generation 1's line starts, reads the state, and waits
+    // for its first frame.
+    let started = config();
+    // Meanwhile the record is lost, and an ordinary refresh recreates it.
+    fs::remove_dir_all(state.join("replay")).unwrap();
+    assert_eq!(install(true), (2, true));
+    // The first frame shows the copy that already ran.
+    let error = verify(&state, &started, (1, build), &used, home)
+        .err()
+        .unwrap();
+    assert!(
+        format!("{error:#}").contains("outdated receiver"),
+        "{error:#}"
+    );
+    // A session that starts now runs the copies of the new generation
+    // approved after the record was recreated.
+    let mut fresh = test_directive(id, 2, &account);
+    fresh.issued_at = config().record_since.unwrap() + 1;
+    verify(&state, &config(), (2, build), &sign(&fresh), home).unwrap();
+}
+
 #[test]
 fn rotation_rewrites_only_the_signer_and_raises_the_generation() {
     let (account, home) = enrollment_home();
@@ -840,6 +892,14 @@ fn lost_server_state_means_a_new_enrollment_that_replaces_the_old_line() {
 }
 
 /// A directive for a route-5 copy to `account`'s `/backup`.
+/// Write `config` as the enrollment's state in `state`, as an install does:
+/// a receiver reads it again once it has recorded a directive.
+fn write_receiver_state(state: &Path, config: &ReceiverEnrollment) {
+    let path = state.join("config.json");
+    fs::write(&path, serde_json::to_vec(config).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
 pub(super) fn test_directive(
     enrollment: EnrollmentId,
     generation: u64,
@@ -1063,6 +1123,7 @@ fn a_coordinating_source_is_admitted_only_with_its_own_destination_directive() {
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
         record_since: None,
     };
+    write_receiver_state(&state, &config);
     let command = [
         "cp",
         "--from",
@@ -1252,6 +1313,7 @@ fn a_source_directive_is_admitted_only_for_what_its_command_reads() {
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
         record_since: None,
     };
+    write_receiver_state(&state, &config);
     let command = |extra: &[&str]| {
         ["cp", "--from", "host-b"]
             .iter()
@@ -1418,6 +1480,7 @@ fn an_enrolled_receiver_admits_tcp_only_when_its_verified_command_does() {
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
         record_since: None,
     };
+    write_receiver_state(&state, &config);
     ensure_results_key(&state, config.id).unwrap();
     let routes: [(&str, Role, &[&str]); 4] = [
         (
@@ -1542,6 +1605,7 @@ fn a_directive_is_recorded_only_after_every_check_passes() {
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
         record_since: None,
     };
+    write_receiver_state(&state, &config);
     let home = temporary.path();
     let directive = |change: &dyn Fn(&mut crate::directive::Directive)| {
         let mut directive = test_directive(config.id, 2, "backup");
