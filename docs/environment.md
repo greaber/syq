@@ -61,10 +61,11 @@ shell itself, run `eval "$(tmux show-environment -s SSH_AUTH_SOCK)"`.
 
 Copies still work when caches cannot be written, but each machine needs a
 little space for private sockets in `TMPDIR`, or `/tmp` when it is unset.
-They go in `syq-UID` there, which must be yours with mode 0700. If another
-user made it first in a shared `/tmp`, copies stop and say so; set `TMPDIR`
-to a directory of your own to get around it. Without a writable runtime
-directory, a copy warns and connects without persistence.
+The sockets of running copies go in `syq-UID` there, which must be yours
+with mode 0700. If another user made it first in a shared `/tmp`, copies
+stop and say so; set `TMPDIR` to a directory of your own to get around it.
+Without a writable runtime directory, a copy warns and connects without
+persistence.
 
 ## Stored releases and helpers
 

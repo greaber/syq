@@ -153,14 +153,21 @@ impl BrokerBase {
         Ok(path)
     }
 
-    fn explain(self, checked: Result<()>, path: &Path) -> Result<()> {
-        checked.with_context(|| match self {
-            Self::Enrollment => "check the enrollment directory".to_owned(),
-            Self::Account => format!(
+    fn explain(self, checked: Result<(), BaseError>, path: &Path) -> Result<()> {
+        match (self, checked) {
+            (_, Ok(())) => Ok(()),
+            (Self::Enrollment, Err(BaseError::Unavailable(error) | BaseError::NotPrivate(error))) => {
+                Err(error.context("check the enrollment directory"))
+            }
+            (Self::Account, Err(BaseError::Unavailable(error))) => Err(error.context(format!(
+                "syq keeps the sockets of running copies in {}",
+                path.display()
+            ))),
+            (Self::Account, Err(BaseError::NotPrivate(error))) => Err(error.context(format!(
                 "syq keeps the sockets of running copies in {}, which must be a directory of this account's with mode 0700; if another user made it, ask them or an administrator to remove it, or set TMPDIR to a directory of your own",
                 path.display()
-            ),
-        })
+            ))),
+        }
     }
 }
 
@@ -170,28 +177,55 @@ fn account_directory(temporary: &Path) -> PathBuf {
     temporary.join(format!("syq-{}", unsafe { libc::geteuid() }))
 }
 
+/// Why a base directory cannot be used.
+#[derive(Debug)]
+enum BaseError {
+    /// It is missing, or could not be made or opened.
+    Unavailable(anyhow::Error),
+    /// Something is there that is not an owner-only directory of this
+    /// account's: a link, another kind of file, another account's
+    /// directory, or one with other permissions.
+    NotPrivate(anyhow::Error),
+}
+
 /// Check that `path` is an owner-only directory of this account's, not a
 /// link to one. With `create`, make it first when nothing is there; an
 /// existing directory is never changed, only checked.
-fn check_base(path: &Path, create: bool) -> Result<()> {
+fn check_base(path: &Path, create: bool) -> Result<(), BaseError> {
     let created = create
         && match std::fs::DirBuilder::new().mode(0o700).create(path) {
             Ok(()) => true,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
-            Err(error) => return Err(error).with_context(|| format!("create {}", path.display())),
+            Err(error) => {
+                return Err(BaseError::Unavailable(
+                    anyhow::Error::new(error).context(format!("create {}", path.display())),
+                ))
+            }
         };
     let directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
-        .with_context(|| format!("open {}", path.display()))?;
+        .map_err(|error| {
+            // O_NOFOLLOW refuses a link with ELOOP, and O_DIRECTORY anything
+            // else that is not a directory with ENOTDIR.
+            let not_private = matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR));
+            let error = anyhow::Error::new(error).context(format!("open {}", path.display()));
+            if not_private {
+                BaseError::NotPrivate(error)
+            } else {
+                BaseError::Unavailable(error)
+            }
+        })?;
     // Only the umask can have narrowed the mode of a directory this call
     // made.
     if created && unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
-        return Err(io::Error::last_os_error())
-            .with_context(|| format!("restrict {}", path.display()));
+        return Err(BaseError::Unavailable(
+            anyhow::Error::new(io::Error::last_os_error())
+                .context(format!("restrict {}", path.display())),
+        ));
     }
-    crate::delegation::validate_private_directory(&directory, path)
+    crate::delegation::validate_private_directory(&directory, path).map_err(BaseError::NotPrivate)
 }
 
 /// The longest socket path this system's `sockaddr_un` holds, without its
@@ -972,7 +1006,10 @@ mod tests {
     fn a_base_directory_must_be_this_accounts_and_owner_only() {
         let root = crate::test_support::short_tempdir().unwrap();
         let base = root.path().join("base");
-        assert!(check_base(&base, false).is_err());
+        assert!(matches!(
+            check_base(&base, false),
+            Err(BaseError::Unavailable(_))
+        ));
         check_base(&base, true).unwrap();
         assert_eq!(mode(&base), 0o700);
         check_base(&base, true).unwrap();
@@ -981,22 +1018,36 @@ mod tests {
         // even when it leads to a private directory.
         let link = root.path().join("link");
         std::os::unix::fs::symlink(&base, &link).unwrap();
-        assert!(check_base(&link, true).is_err());
-        assert!(check_base(&link, false).is_err());
+        assert!(matches!(
+            check_base(&link, true),
+            Err(BaseError::NotPrivate(_))
+        ));
+        assert!(matches!(
+            check_base(&link, false),
+            Err(BaseError::NotPrivate(_))
+        ));
         // An existing directory that others can enter is refused and left
         // as it is.
         let open = root.path().join("open");
         std::fs::create_dir(&open).unwrap();
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(check_base(&open, true).is_err());
+        assert!(matches!(
+            check_base(&open, true),
+            Err(BaseError::NotPrivate(_))
+        ));
         assert_eq!(mode(&open), 0o755);
         let file = root.path().join("file");
         std::fs::write(&file, b"").unwrap();
-        assert!(check_base(&file, true).is_err());
+        assert!(matches!(
+            check_base(&file, true),
+            Err(BaseError::NotPrivate(_))
+        ));
         // Another account's directory is refused: `/` belongs to root.
-        let error = format!("{:#}", check_base(Path::new("/"), false).unwrap_err());
+        let Err(BaseError::NotPrivate(error)) = check_base(Path::new("/"), false) else {
+            panic!("another account's directory was accepted");
+        };
         if unsafe { libc::geteuid() } != 0 {
-            assert!(error.contains("target-owned"), "{error}");
+            assert!(format!("{error:#}").contains("target-owned"), "{error:#}");
         }
     }
 
@@ -1034,6 +1085,10 @@ mod tests {
             assert!(ticket.connect(BrokerBase::Account).is_err());
             return;
         }
+        // A missing directory is no sign of another user.
+        let missing = BrokerTicket::new("fd-1-abc", [0; TICKET_SECRET_LEN]).unwrap();
+        let error = format!("{:#}", missing.connect(BrokerBase::Account).unwrap_err());
+        assert!(!error.contains("another user"), "{error}");
         let broker = account_broker().unwrap();
         let ticket = broker.ticket([1; TICKET_SECRET_LEN]).unwrap();
         assert!(ticket

@@ -182,6 +182,34 @@ mod tests {
             response => bail!("worker refused: {response:?}"),
         }
     }
+    /// The worker tickets that earlier receivers accept, as their
+    /// `ticket_parts` checked them. A worker's forced command can run a
+    /// different receiver build than the copy's control, so tickets must
+    /// keep this form. Do not change this to match the current parser.
+    fn earlier_receivers_accept(ticket: &str) -> bool {
+        let Some((directory, encoded)) = ticket.split_once(':') else {
+            return false;
+        };
+        directory.starts_with("w-")
+            && directory.len() <= 32
+            && directory
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && encoded.len() == 64
+            && encoded
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+
+    #[test]
+    fn worker_tickets_keep_the_form_receivers_of_other_builds_accept() {
+        let earlier = format!("w-AbC9z0:{}", "0123456789abcdef".repeat(4));
+        assert!(earlier_receivers_accept(&earlier));
+        let parsed = BrokerTicket::parse(&earlier).unwrap();
+        assert_eq!(parsed.name(), "w-AbC9z0");
+        assert_eq!(parsed.encode(), earlier);
+    }
+
     fn role() -> ConnectionRole {
         ConnectionRole::DestinationWorker {
             destination: None,
@@ -235,6 +263,7 @@ mod tests {
         authority.copy.options.compressed_transport = false;
         let authority = Arc::new(authority);
         let (broker, ticket) = start(authority.clone()).unwrap();
+        assert!(earlier_receivers_accept(&ticket), "{ticket}");
         assert!(broker.socket_path().as_os_str().as_bytes().len() < 32);
         assert!(!broker.socket_path().is_absolute());
         assert!(worker(&ticket, ConnectionRole::Control).is_err());
