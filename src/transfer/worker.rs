@@ -121,7 +121,7 @@ impl Worker {
         loop {
             if !self.gate.allowed(self.id) {
                 // A parked worker keeps no publication waiting.
-                self.settle_all_publications()?;
+                self.settle_between_items(true)?;
                 let _parked = self
                     .observation
                     .as_ref()
@@ -140,10 +140,12 @@ impl Worker {
                 // settle them before waiting for work or leaving: settling
                 // can queue a changed file again.
                 match self.sched.try_next() {
-                    Some(Item::Exit) | None => self.settle_all_publications()?,
-                    Some(item) => self.process_item(item)?,
+                    Some(Item::Exit) | None => self.settle_between_items(true)?,
+                    Some(item) => {
+                        self.process_item(item)?;
+                        self.settle_between_items(false)?;
+                    }
                 }
-                self.settle_publications(false)?;
                 continue;
             }
             let item = {
@@ -157,7 +159,7 @@ impl Worker {
                 return Ok(());
             }
             self.process_item(item)?;
-            self.settle_publications(false)?;
+            self.settle_between_items(false)?;
         }
     }
 
@@ -1973,10 +1975,15 @@ impl Worker {
         if holds {
             self.receiver_holds(idx);
         }
-        match reply? {
-            Response::Prepared(prepared) => Ok(prepared),
+        let prepared = match reply? {
+            Response::Prepared(prepared) => prepared,
             other => bail!("unexpected response {other:?}"),
-        }
+        };
+        // Reading this reply also read the replies to an earlier file's
+        // publication sent before it: settle that file now rather than
+        // after this one.
+        self.settle_publications(false)?;
+        Ok(prepared)
     }
 
     pub(super) fn seed_request(

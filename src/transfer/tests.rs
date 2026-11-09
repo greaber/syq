@@ -947,7 +947,7 @@ fn a_finalize_shares_its_round_trip_with_the_next_files_preparation() {
     worker.handle_file(second).unwrap();
     // Reading the second Prepare's reply settled the first file.
     assert_eq!(worker.progress.files_done.load(Relaxed), 1);
-    worker.settle_all_publications().unwrap();
+    worker.settle_between_items(true).unwrap();
     assert!(worker.publications.is_empty());
     assert_eq!(worker.progress.files_done.load(Relaxed), 2);
     assert!(sched.finished());
@@ -1046,7 +1046,7 @@ fn a_deferred_recheck_that_finds_a_change_queues_the_file_again() {
         .extend([prepared_reply(), Response::Ok]);
     worker.handle_file(idx).unwrap();
     assert_eq!(worker.publications.len(), 1);
-    worker.settle_all_publications().unwrap();
+    worker.settle_between_items(true).unwrap();
     assert!(worker.publications.is_empty());
     assert_eq!(worker.job(idx).attempt, 1);
     assert_eq!(worker.progress.files_done.load(Relaxed), 0);
@@ -1101,6 +1101,99 @@ fn a_lost_connection_queues_publications_in_flight_again() {
         }
     }
     assert_eq!(finishes, [(idx, false)]);
+}
+
+/// A recheck whose reply arrives after the copy was cancelled publishes
+/// nothing, as a publication that began after the cancellation would not.
+#[test]
+fn a_recheck_answered_after_cancellation_publishes_nothing() {
+    let (sched, src, dst, mut worker) = deferred_publication_fixture(true, true);
+    let Item::File(idx) = sched.next() else {
+        panic!("expected a file")
+    };
+    let job = worker.job(idx);
+    src.lock().unwrap().replies.extend([
+        block_reply(),
+        Response::Stats(vec![Some(job.entry.clone())]),
+    ]);
+    dst.lock()
+        .unwrap()
+        .replies
+        .extend([prepared_reply(), Response::Ok]);
+    worker.handle_file(idx).unwrap();
+    assert_eq!(worker.publications.len(), 1);
+    sched.abort();
+    worker.settle_between_items(true).unwrap();
+    assert!(worker.publications.is_empty());
+    assert!(src.lock().unwrap().replies.is_empty());
+    assert!(!request_names(&dst)
+        .iter()
+        .any(|r| r.starts_with("finalize")));
+    assert_eq!(worker.progress.files_done.load(Relaxed), 0);
+    assert_eq!(worker.progress.errors.load(Relaxed), 0);
+}
+
+/// A worker whose connection fails after it has read a Finalize reply
+/// finishes that file from the reply instead of publishing it again.
+#[test]
+fn a_finalize_reply_already_read_settles_when_the_connection_fails() {
+    let (sched, src, dst, mut worker) = deferred_publication_fixture(false, true);
+    let Item::File(idx) = sched.next() else {
+        panic!("expected a file")
+    };
+    let job = worker.job(idx);
+    src.lock().unwrap().replies.extend([
+        block_reply(),
+        Response::Stats(vec![Some(job.entry.clone())]),
+    ]);
+    dst.lock().unwrap().replies.extend([
+        prepared_reply(),
+        Response::Ok,
+        Response::Ok,
+        Response::Ok,
+    ]);
+    worker.handle_file(idx).unwrap();
+    // A later exchange reads the Finalize reply, then the connection fails.
+    worker
+        .dst
+        .call(Request::ConfigureHashing(Default::default()))
+        .unwrap();
+    assert_eq!(worker.publications.len(), 1);
+    dst.lock().unwrap().dead = true;
+    worker.abandon_publications(&anyhow::anyhow!("connection lost"));
+    assert!(worker.publications.is_empty());
+    assert_eq!(worker.progress.files_done.load(Relaxed), 1);
+    assert!(matches!(sched.try_next(), Some(Item::File(_))));
+    assert!(sched.try_next().is_none(), "nothing to finish again");
+}
+
+/// A worker the tuner parks settles its publications first: a parked
+/// worker may wait indefinitely, and leaves when the copy has finished.
+#[test]
+fn a_parked_worker_settles_its_publications_first() {
+    let (sched, src, dst, mut worker) = deferred_publication_fixture(false, true);
+    for idx in 0..2 {
+        let job = worker.job(idx);
+        src.lock().unwrap().replies.extend([
+            block_reply(),
+            Response::Stats(vec![Some(job.entry.clone())]),
+        ]);
+        dst.lock()
+            .unwrap()
+            .replies
+            .extend([prepared_reply(), Response::Ok, Response::Ok]);
+    }
+    // The tuner parks this worker as the second file's write is
+    // acknowledged; that file's Finalize is still in flight.
+    dst.lock()
+        .unwrap()
+        .gate_changes
+        .push((5, worker.gate.clone(), 0));
+    worker.run_inner().unwrap();
+    assert!(worker.publications.is_empty());
+    assert_eq!(worker.progress.files_done.load(Relaxed), 2);
+    assert!(sched.finished());
+    assert!(dst.lock().unwrap().replies.is_empty());
 }
 
 #[test]

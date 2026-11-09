@@ -6,8 +6,9 @@
 //! Each step is a round trip. Rather than wait for them, a worker sends the
 //! step's request and starts its next file; its next requests travel behind
 //! it on the same connection, so their round trips overlap. The worker
-//! settles each publication when its reply has arrived, in the order the
-//! publications began, and before it waits for work, is parked, or leaves.
+//! settles each publication, in the order the publications began, once its
+//! reply has arrived: after the next file's `Prepare` reply, which follows
+//! it, between items, and before it waits for work, is parked, or leaves.
 //!
 //! Nothing a publication guarantees changes. Its source is still checked
 //! after every read of the file has completed, and the destination publishes
@@ -15,8 +16,9 @@
 //! again. Its success, failure and result record are reported as before,
 //! once its reply arrives. The copy's later work (hard links, deletion,
 //! directory metadata) waits for every worker to leave, so for every
-//! publication. A worker whose connection drops queues its unsettled
-//! publications again, as a lost `Finalize` reply already is.
+//! publication. A worker whose connection drops finishes the publications
+//! whose `Finalize` reply it has already read, and queues the rest again, as
+//! a lost `Finalize` reply already is.
 
 use super::*;
 use crate::conn::PendingReply;
@@ -156,16 +158,17 @@ impl Worker {
         Ok(())
     }
 
-    /// Settle every publication, as work, before this worker waits, parks
-    /// or leaves.
-    pub(super) fn settle_all_publications(&mut self) -> Result<()> {
+    /// Settle publications between items, as work that the tuner waits for:
+    /// those whose replies have arrived, or, when `wait`, every one, as this
+    /// worker does before it waits, parks or leaves.
+    pub(super) fn settle_between_items(&mut self, wait: bool) -> Result<()> {
         if self.publications.is_empty() {
             return Ok(());
         }
         let _work = self.gate.work(self.id);
         let progress = self.progress.clone();
         let _copying = progress.copying_interval();
-        self.settle_publications(true)
+        self.settle_publications(wait)
     }
 
     /// Take the oldest publication one step, waiting for its reply.
@@ -242,16 +245,30 @@ impl Worker {
         self.file_error(idx, error)
     }
 
-    /// This worker is leaving after `error`. Queue its unsettled
-    /// publications again when its connection failed; after another error,
-    /// which cancels the copy, collect the replies of those already sent,
-    /// unless a malformed reply makes its connections unusable.
+    /// This worker is leaving after `error`. When its connection failed,
+    /// finish the publications whose Finalize reply has already arrived and
+    /// queue the rest again; after another error, which cancels the copy,
+    /// collect the replies of those already sent, unless a malformed reply
+    /// makes its connections unusable.
     pub(super) fn abandon_publications(&mut self, error: &anyhow::Error) {
         if self.publications.is_empty() {
             return;
         }
         let malformed = error.is::<RangeReplyMismatch>();
-        if !malformed && !self.transport_dead() {
+        if malformed {
+            // Nothing more is read from these connections.
+        } else if self.transport_dead() {
+            // A reply already read needs no connection. A publication still
+            // checking its source is never ahead of one being finalized.
+            while self.publications.front().is_some_and(|oldest| {
+                matches!(&oldest.stage, Stage::Finalizing(reply) if self.dst.reply_arrived(reply))
+            }) {
+                // A failure queues the publication it concerns again.
+                if self.settle_oldest_publication().is_err() {
+                    break;
+                }
+            }
+        } else {
             // A failure here queues the publication it concerns again.
             let _ = self.settle_publications(true);
         }
