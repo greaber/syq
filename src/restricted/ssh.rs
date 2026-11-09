@@ -4,7 +4,9 @@
 //! receiver over that socket, and the receiver serves them on a thread.
 
 use super::RestrictedAuthority;
-use crate::private_broker::{PrivateBroker, PrivateBrokerConfig};
+use crate::private_broker::{
+    BrokerBase, BrokerDirectory, BrokerTicket, PrivateBroker, PrivateBrokerConfig,
+};
 #[cfg(test)]
 use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
@@ -72,10 +74,12 @@ fn start_with(
 ) -> Result<(PrivateBroker, String)> {
     let mut secret = [0u8; 32];
     getrandom::fill(&mut secret).context("generate SSH worker admission")?;
-    let broker = PrivateBroker::start_in_current_dir(
+    let broker = PrivateBroker::start_managed(
         PrivateBrokerConfig {
-            directory_prefix: "w-",
-            socket_name: "s",
+            directory: BrokerDirectory::Ticketed {
+                prefix: "w-",
+                base: BrokerBase::Enrollment,
+            },
             listener_thread: "receiver-ssh",
             client_thread: "receiver-ssh-worker",
             inline_on_thread_failure: false,
@@ -115,54 +119,20 @@ fn start_with(
             let _ = result;
         },
     )?;
-    let directory = broker
-        .socket_path()
-        .parent()
-        .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
-        .context("SSH worker directory is not UTF-8")?;
-    let secret = secret
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let ticket = format!("{directory}:{secret}");
+    let ticket = broker.ticket(secret)?.encode();
     Ok((broker, ticket))
-}
-
-fn ticket_parts(ticket: &str) -> Result<(&str, [u8; 32])> {
-    let (directory, encoded) = ticket
-        .split_once(':')
-        .context("invalid SSH worker ticket")?;
-    if !directory.starts_with("w-")
-        || directory.len() > 32
-        || !directory
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        || encoded.len() != 64
-        || !encoded
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        bail!("invalid SSH worker ticket");
-    }
-    let mut secret = [0u8; 32];
-    for (index, byte) in secret.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16)?;
-    }
-    Ok((directory, secret))
 }
 
 /// Connect to the running copy `ticket` names in this enrollment's state
 /// directory, the current directory, and present the ticket's secret.
 pub(super) fn join(ticket: &str) -> Result<UnixStream> {
-    let (directory, secret) = ticket_parts(ticket)?;
+    let ticket = BrokerTicket::parse(ticket).context("invalid SSH worker ticket")?;
     super::active::require_not_revoked(Path::new("."))?;
-    let directory = Path::new(directory);
-    crate::delegation::validate_private_directory_path(directory)?;
-    let mut socket =
-        UnixStream::connect(directory.join("s")).context("join live restricted copy")?;
+    let mut socket = ticket
+        .connect(BrokerBase::Enrollment)
+        .context("join live restricted copy")?;
     socket.set_write_timeout(Some(TIMEOUT))?;
-    socket.write_all(&secret)?;
+    socket.write_all(ticket.secret())?;
     socket.set_write_timeout(None)?;
     Ok(socket)
 }
@@ -268,16 +238,11 @@ mod tests {
         assert!(broker.socket_path().as_os_str().as_bytes().len() < 32);
         assert!(!broker.socket_path().is_absolute());
         assert!(worker(&ticket, ConnectionRole::Control).is_err());
-        let (_, secret) = ticket_parts(&ticket).unwrap();
-        let wrong = format!(
-            "{}:{}",
-            ticket.split_once(':').unwrap().0,
-            secret
-                .iter()
-                .map(|byte| format!("{:02x}", byte ^ 1))
-                .collect::<String>()
-        );
-        assert!(worker(&wrong, role()).is_err());
+        let mut wrong = BrokerTicket::parse(&ticket).unwrap();
+        for byte in wrong.secret_mut() {
+            *byte ^= 1;
+        }
+        assert!(worker(&wrong.encode(), role()).is_err());
         let (mut first_reader, mut first_writer) = worker(&ticket, role()).unwrap();
         let (mut second_reader, mut second_writer) = worker(&ticket, role()).unwrap();
         assert!(worker(&ticket, role()).is_err());
@@ -384,7 +349,8 @@ mod tests {
             );
         };
         refused();
-        let (directory, _) = ticket_parts(&ticket).unwrap();
+        let parsed = BrokerTicket::parse(&ticket).unwrap();
+        let directory = parsed.name();
         std::os::unix::fs::symlink(
             std::env::current_dir().unwrap().join(directory),
             other.path().join(directory),

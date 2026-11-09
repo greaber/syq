@@ -13,27 +13,27 @@
 //! Every worker of a copy then runs in the process that holds the copy's
 //! state.
 
-use crate::private_broker::{PrivateBroker, PrivateBrokerConfig, TrackedStream};
+use crate::private_broker::{
+    BrokerBase, BrokerDirectory, BrokerTicket, PrivateBroker, PrivateBrokerConfig, TrackedStream,
+    TICKET_SECRET_LEN,
+};
 #[cfg(test)]
 use crate::process::CommandExt as _;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem::{size_of, zeroed};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const HANDOFF_MAGIC: &[u8; 8] = b"SYQFD001";
-const SECRET_LEN: usize = 32;
+const SECRET_LEN: usize = TICKET_SECRET_LEN;
 const HANDOFF_REQUEST_LEN: usize = HANDOFF_MAGIC.len() + SECRET_LEN + size_of::<u64>() + 1;
 const RESPONSE_OK: u8 = 0;
 const RESPONSE_REJECTED: u8 = 1;
@@ -282,40 +282,26 @@ impl RegisteredRootRegistry {
     }
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+/// A registered descriptor another process can claim: the session's broker,
+/// which every process finds in this account's own directory
+/// ([`BrokerBase::Account`]), and the entry it registered there.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DescriptorTicket {
-    #[serde(with = "serde_bytes")]
-    socket_path: Vec<u8>,
-    secret: [u8; SECRET_LEN],
+    broker: BrokerTicket,
     root_id: RegisteredRootId,
     kind: RegisteredDescriptorKind,
 }
 
-impl std::fmt::Debug for DescriptorTicket {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("DescriptorTicket")
-            .field("socket_path", &self.socket_path())
-            .field("root_id", &self.root_id)
-            .field("kind", &self.kind)
-            .finish_non_exhaustive()
-    }
-}
-
 impl DescriptorTicket {
-    fn socket_path(&self) -> PathBuf {
-        PathBuf::from(OsStr::from_bytes(&self.socket_path))
-    }
-
     pub(crate) fn root_id(&self) -> RegisteredRootId {
         self.root_id
     }
 
     /// Tickets belong to the same endpoint session only when both the private
-    /// broker address and unguessable session secret match. Root IDs restart
+    /// broker's name and unguessable session secret match. Root IDs restart
     /// per registry and therefore cannot establish this relationship alone.
     pub(crate) fn same_session(&self, other: &Self) -> bool {
-        self.socket_path == other.socket_path && self.secret == other.secret
+        self.broker == other.broker
     }
 
     pub(crate) fn is_bandwidth(&self) -> bool {
@@ -339,8 +325,8 @@ impl DescriptorTicket {
     }
 
     #[cfg(test)]
-    pub(crate) fn broker_path(&self) -> PathBuf {
-        self.socket_path()
+    pub(crate) fn broker_path(&self) -> std::path::PathBuf {
+        self.broker.socket_path(BrokerBase::Account)
     }
 }
 
@@ -402,9 +388,11 @@ type HandlerCell = Arc<Mutex<Option<ConnectionHandler>>>;
 /// Owns the endpoint session's roots and its independent-worker handoff
 /// broker. Dropping it closes the broker before releasing the registered roots.
 pub(crate) struct DescriptorSession {
-    broker: PrivateBroker,
+    /// Kept until the session drops, and dropped before `registry`.
+    _broker: PrivateBroker,
     registry: RegisteredRootRegistry,
-    secret: [u8; SECRET_LEN],
+    /// What joins the broker; every ticket of this session carries it.
+    ticket: BrokerTicket,
 }
 
 impl DescriptorSession {
@@ -426,8 +414,10 @@ impl DescriptorSession {
         let server_registry = registry.clone();
         let server_secret = secret;
         let config = PrivateBrokerConfig {
-            directory_prefix: "syq-fd-",
-            socket_name: "broker.sock",
+            directory: BrokerDirectory::Ticketed {
+                prefix: "fd-",
+                base: BrokerBase::Account,
+            },
             listener_thread: "syq-fd-listener",
             client_thread: "syq-fd-client",
             inline_on_thread_failure: true,
@@ -442,10 +432,11 @@ impl DescriptorSession {
         } else {
             PrivateBroker::start(config, handler)?
         };
+        let ticket = broker.ticket(secret)?;
         Ok(Self {
-            broker,
+            _broker: broker,
             registry,
-            secret,
+            ticket,
         })
     }
 
@@ -476,17 +467,14 @@ impl DescriptorSession {
             bail!("unknown descriptor session root {}", root_id.0);
         }
         Ok(DescriptorTicket {
-            socket_path: self.broker.socket_path().as_os_str().as_bytes().to_vec(),
-            secret: self.secret,
+            broker: self.ticket.clone(),
             root_id,
             kind,
         })
     }
 
     fn acquire(&self, ticket: &DescriptorTicket) -> Result<File> {
-        if ticket.secret != self.secret
-            || ticket.socket_path != self.broker.socket_path().as_os_str().as_bytes()
-        {
+        if ticket.broker != self.ticket {
             bail!("descriptor ticket does not belong to this endpoint session");
         }
         self.registry
@@ -629,10 +617,7 @@ impl DescriptorSessionSlot {
     pub(crate) fn release_stream(&self, ticket: &DescriptorTicket) {
         let session = self.session.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(session) = session.as_ref() {
-            if ticket.secret == session.secret
-                && ticket.socket_path == session.broker.socket_path().as_os_str().as_bytes()
-                && ticket.stream_write().is_ok()
-            {
+            if ticket.broker == session.ticket && ticket.stream_write().is_ok() {
                 session
                     .registry
                     .state
@@ -761,15 +746,16 @@ impl DescriptorSessionSlot {
 /// descriptor refers to the exact registered object even if its original
 /// pathname has been renamed or replaced.
 pub(crate) fn acquire_descriptor(ticket: &DescriptorTicket) -> Result<File> {
-    let socket_path = ticket.socket_path();
-    let mut stream = UnixStream::connect(&socket_path)
-        .with_context(|| format!("connect to descriptor broker {}", socket_path.display()))?;
+    let mut stream = ticket
+        .broker
+        .connect(BrokerBase::Account)
+        .context("connect to descriptor broker")?;
     stream.set_read_timeout(Some(BROKER_IO_TIMEOUT))?;
     stream.set_write_timeout(Some(BROKER_IO_TIMEOUT))?;
     let mut request = [0u8; HANDOFF_REQUEST_LEN];
     request[..HANDOFF_MAGIC.len()].copy_from_slice(HANDOFF_MAGIC);
     let secret_start = HANDOFF_MAGIC.len();
-    request[secret_start..secret_start + SECRET_LEN].copy_from_slice(&ticket.secret);
+    request[secret_start..secret_start + SECRET_LEN].copy_from_slice(ticket.broker.secret());
     let root_start = secret_start + SECRET_LEN;
     let root_end = root_start + size_of::<u64>();
     request[root_start..root_end].copy_from_slice(&ticket.root_id.0.to_be_bytes());
@@ -905,15 +891,16 @@ fn hand_off(ticket: &DescriptorTicket, prefix: &[u8], descriptors: &[RawFd]) -> 
         prefix.len() <= MAX_HANDED_PREFIX,
         "connection prefix is too long to hand over"
     );
-    let socket_path = ticket.socket_path();
-    let mut stream = UnixStream::connect(&socket_path)
-        .with_context(|| format!("connect to descriptor broker {}", socket_path.display()))?;
+    let mut stream = ticket
+        .broker
+        .connect(BrokerBase::Account)
+        .context("connect to descriptor broker")?;
     stream.set_read_timeout(Some(BROKER_IO_TIMEOUT))?;
     stream.set_write_timeout(Some(BROKER_IO_TIMEOUT))?;
     let mut request = [0u8; HANDOFF_REQUEST_LEN];
     request[..HANDOFF_MAGIC.len()].copy_from_slice(HANDOFF_MAGIC);
     let secret_start = HANDOFF_MAGIC.len();
-    request[secret_start..secret_start + SECRET_LEN].copy_from_slice(&ticket.secret);
+    request[secret_start..secret_start + SECRET_LEN].copy_from_slice(ticket.broker.secret());
     request[HANDOFF_REQUEST_LEN - 1] = CONNECTION_REQUEST;
     stream.write_all(&request)?;
     send_message(
@@ -1519,14 +1506,9 @@ mod tests {
     }
 
     fn ticket_from_environment() -> DescriptorTicket {
-        let socket_path = std::env::var_os("SYQ_TEST_DESCRIPTOR_BROKER_SOCKET")
-            .unwrap()
-            .as_bytes()
-            .to_vec();
-        let secret_bytes = hex_decode(&std::env::var("SYQ_TEST_DESCRIPTOR_BROKER_SECRET").unwrap());
         DescriptorTicket {
-            socket_path,
-            secret: secret_bytes.try_into().unwrap(),
+            broker: BrokerTicket::parse(&std::env::var("SYQ_TEST_DESCRIPTOR_BROKER").unwrap())
+                .unwrap(),
             root_id: RegisteredRootId(
                 std::env::var("SYQ_TEST_DESCRIPTOR_BROKER_ROOT")
                     .unwrap()
@@ -1539,14 +1521,6 @@ mod tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-    }
-
-    fn hex_decode(value: &str) -> Vec<u8> {
-        value
-            .as_bytes()
-            .chunks_exact(2)
-            .map(|digits| u8::from_str_radix(std::str::from_utf8(digits).unwrap(), 16).unwrap())
-            .collect()
     }
 
     #[test]
@@ -1666,8 +1640,7 @@ mod tests {
         let status = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", CHILD_TEST, "--nocapture"])
             .env(CHILD_ENV, "1")
-            .env("SYQ_TEST_DESCRIPTOR_BROKER_SOCKET", ticket.socket_path())
-            .env("SYQ_TEST_DESCRIPTOR_BROKER_SECRET", hex(&ticket.secret))
+            .env("SYQ_TEST_DESCRIPTOR_BROKER", ticket.broker.encode())
             .env(
                 "SYQ_TEST_DESCRIPTOR_BROKER_ROOT",
                 ticket.root_id.0.to_string(),
@@ -1686,7 +1659,7 @@ mod tests {
         let root = session.register(File::open(temp.path()).unwrap()).unwrap();
 
         let mut bad_secret = session.ticket(root).unwrap();
-        bad_secret.secret[0] ^= 1;
+        bad_secret.broker.secret_mut()[0] ^= 1;
         assert!(acquire_descriptor(&bad_secret)
             .unwrap_err()
             .to_string()
@@ -1724,7 +1697,7 @@ mod tests {
         let pipes = [input.as_raw_fd(), output.as_raw_fd()];
 
         let mut wrong = ticket.clone();
-        wrong.secret[0] ^= 1;
+        wrong.broker.secret_mut()[0] ^= 1;
         assert!(hand_off_socket(&wrong, socket).is_err());
         for (prefix, descriptors) in [
             (&b""[..], &[socket, socket, socket][..]),
@@ -1784,8 +1757,10 @@ mod tests {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let broker = PrivateBroker::start_managed(
             PrivateBrokerConfig {
-                directory_prefix: "syq-inline-test-",
-                socket_name: "broker.sock",
+                directory: BrokerDirectory::Temporary {
+                    prefix: "syq-inline-test-",
+                    socket: "broker.sock",
+                },
                 listener_thread: "syq-inline-test-listener",
                 client_thread: "syq-fd-client",
                 inline_on_thread_failure: true,
@@ -1880,7 +1855,7 @@ mod tests {
         let session = DescriptorSessionSlot::default();
         let listener_clone = session.clone();
         let ticket = session.register(File::open(temp.path()).unwrap()).unwrap();
-        let broker_directory = ticket.socket_path().parent().unwrap().to_path_buf();
+        let broker_directory = ticket.broker_path().parent().unwrap().to_path_buf();
         assert!(broker_directory.exists());
 
         session.close();
@@ -1926,7 +1901,7 @@ mod tests {
         let ticket = session.ticket(root).unwrap();
         let debug = format!("{ticket:?}");
         assert!(debug.contains("root_id"));
-        assert!(!debug.contains(&hex(&ticket.secret)));
+        assert!(!debug.contains(&hex(ticket.broker.secret())));
     }
 }
 

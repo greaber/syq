@@ -26,7 +26,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use crate::delegation::{CopyOperation, DestinationPlacement, GrantConstraints};
-use crate::private_broker::{PrivateBroker, PrivateBrokerConfig, TrackedStream};
+use crate::private_broker::{BrokerDirectory, PrivateBroker, PrivateBrokerConfig, TrackedStream};
 
 pub(crate) mod account_copy;
 pub(crate) mod exec;
@@ -2149,8 +2149,10 @@ pub(crate) fn serve_background(
     let handler = receiver.clone();
     let broker = PrivateBroker::start_managed(
         PrivateBrokerConfig {
-            directory_prefix: "syq-return-",
-            socket_name: "r",
+            directory: BrokerDirectory::Temporary {
+                prefix: "syq-return-",
+                socket: "r",
+            },
             listener_thread: "syq-return-listener",
             client_thread: "syq-return-client",
             inline_on_thread_failure: false,

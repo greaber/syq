@@ -431,12 +431,11 @@ fn interrupt_with_stalled_cleanup(t: &Tmp, route: &str, tmp: &Path) -> (Child, i
     (child, signal)
 }
 
-/// The private socket directories left in `tmp`.
+/// The descriptor sessions' socket directories left in `tmp`.
 fn broker_directories(tmp: &Path) -> Vec<String> {
-    fs::read_dir(tmp)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|name| name.starts_with("syq-fd-"))
+    private_temporary_leftovers(tmp)
+        .into_iter()
+        .filter(|name| name.contains("/fd-"))
         .collect()
 }
 

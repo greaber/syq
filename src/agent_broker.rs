@@ -7,7 +7,7 @@
 //! user.
 
 use crate::private_broker::{
-    ConnectionRegistry, PrivateBroker, PrivateBrokerConfig, TrackedStream,
+    BrokerDirectory, ConnectionRegistry, PrivateBroker, PrivateBrokerConfig, TrackedStream,
 };
 #[cfg(test)]
 use crate::process::CommandExt as _;
@@ -1301,8 +1301,10 @@ impl ConstrainedAgentBroker {
         let policy = Arc::new(policy);
         let broker = PrivateBroker::start(
             PrivateBrokerConfig {
-                directory_prefix: "syq-agent-",
-                socket_name: "agent.sock",
+                directory: BrokerDirectory::Temporary {
+                    prefix: "syq-agent-",
+                    socket: "agent.sock",
+                },
                 listener_thread: "syq-agent-listener",
                 client_thread: "syq-agent-client",
                 inline_on_thread_failure: false,

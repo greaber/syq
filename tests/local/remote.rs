@@ -880,13 +880,7 @@ fn an_early_worker_connects_only_for_a_file_to_send() {
         assert_eq!(started.exists(), changed, "{case}: {out:?}");
         assert_eq!(connected > 0, changed, "{case}: {out:?}");
         // A leaked directory stays; a helper's own cleanup may trail its exit.
-        let leftovers = || {
-            fs::read_dir(&temporary)
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-                .filter(|name| name.starts_with("syq-"))
-                .collect::<Vec<_>>()
-        };
+        let leftovers = || private_temporary_leftovers(&temporary);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut left = leftovers();
         while !left.is_empty() && std::time::Instant::now() < deadline {

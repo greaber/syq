@@ -1,16 +1,24 @@
 //! Shared lifecycle for private, bounded Unix-socket brokers.
 //!
-//! The socket lives in a mode-0700 temporary directory and is itself mode
+//! The socket lives in a mode-0700 directory of its own and is itself mode
 //! 0600. Dropping the broker closes active clients, joins its listener and
 //! client threads, and removes the directory. Signal cleanup removes private
 //! broker directories before the signal ends the process.
+//!
+//! Other processes join a broker with a [`BrokerTicket`]: the name of the
+//! broker's directory and its secret. The process acting on a ticket looks
+//! for that name in a [`BrokerBase`] it chooses itself, never in a directory
+//! the ticket's sender names.
 
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
+use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -98,9 +106,250 @@ pub(crate) fn private_temp_dir(prefix: &str) -> io::Result<tempfile::TempDir> {
         .tempdir()
 }
 
+/// The socket's name in every directory a ticket names.
+const TICKET_SOCKET: &str = "s";
+/// Longest directory name a ticket carries.
+const MAX_TICKET_NAME: usize = 32;
+/// Bytes of a ticket's secret.
+pub(crate) const TICKET_SECRET_LEN: usize = 32;
+
+/// Where the directories that tickets name live. A ticket carries only a
+/// directory's name; the process acting on it chooses the base itself, so
+/// whoever sent the ticket cannot point it at a socket anywhere else.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BrokerBase {
+    /// The current directory: the enrollment directory a restricted
+    /// receiver checked and entered when it started, and keeps as its
+    /// working directory while its brokers run. A copy through one
+    /// enrollment cannot reach another enrollment's copies, or ordinary ones.
+    Enrollment,
+    /// `syq-UID` in the temporary directory: this account's directory for
+    /// the sockets of its ordinary copies. In a shared `/tmp` another user
+    /// could have made it first, so it must belong to this account and have
+    /// mode 0700.
+    Account,
+}
+
+impl BrokerBase {
+    fn path(self) -> PathBuf {
+        match self {
+            Self::Enrollment => PathBuf::from("."),
+            Self::Account => account_directory(&std::env::temp_dir()),
+        }
+    }
+
+    /// The checked base, for a broker to listen in. The account's
+    /// directory is made when it is missing.
+    fn prepare(self) -> Result<PathBuf> {
+        let path = self.path();
+        self.explain(check_base(&path, self == Self::Account), &path)?;
+        Ok(path)
+    }
+
+    /// The checked base, for a ticket to be looked up in.
+    fn existing(self) -> Result<PathBuf> {
+        let path = self.path();
+        self.explain(check_base(&path, false), &path)?;
+        Ok(path)
+    }
+
+    fn explain(self, checked: Result<()>, path: &Path) -> Result<()> {
+        checked.with_context(|| match self {
+            Self::Enrollment => "check the enrollment directory".to_owned(),
+            Self::Account => format!(
+                "syq keeps the sockets of running copies in {}, which must be a directory of this account's with mode 0700; if another user made it, ask them or an administrator to remove it, or set TMPDIR to a directory of your own",
+                path.display()
+            ),
+        })
+    }
+}
+
+/// The account's directory for the sockets of ordinary copies in
+/// `temporary`.
+fn account_directory(temporary: &Path) -> PathBuf {
+    temporary.join(format!("syq-{}", unsafe { libc::geteuid() }))
+}
+
+/// Check that `path` is an owner-only directory of this account's, not a
+/// link to one. With `create`, make it first when nothing is there; an
+/// existing directory is never changed, only checked.
+fn check_base(path: &Path, create: bool) -> Result<()> {
+    let created = create
+        && match std::fs::DirBuilder::new().mode(0o700).create(path) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(error) => return Err(error).with_context(|| format!("create {}", path.display())),
+        };
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    // Only the umask can have narrowed the mode of a directory this call
+    // made.
+    if created && unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("restrict {}", path.display()));
+    }
+    crate::delegation::validate_private_directory(&directory, path)
+}
+
+/// The longest socket path this system's `sockaddr_un` holds, without its
+/// terminating NUL.
+fn max_socket_path() -> usize {
+    // SAFETY: an all-zero sockaddr_un is a valid value.
+    let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_path.len() - 1
+}
+
+/// The name of a broker's directory as a ticket carries it: letters, digits
+/// and `-`, at most [`MAX_TICKET_NAME`] bytes. It can name only an entry
+/// directly in the base directory, never `.`, `..` or a path.
+#[derive(Clone, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
+struct TicketName(String);
+
+impl TryFrom<String> for TicketName {
+    type Error = anyhow::Error;
+
+    fn try_from(name: String) -> Result<Self> {
+        if name.is_empty()
+            || name.len() > MAX_TICKET_NAME
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            bail!("invalid broker ticket name");
+        }
+        Ok(Self(name))
+    }
+}
+
+impl From<TicketName> for String {
+    fn from(name: TicketName) -> Self {
+        name.0
+    }
+}
+
+/// What joins another process's broker: the name of its directory in a
+/// [`BrokerBase`], and the secret the broker admits. The secret alone
+/// authenticates; the name only finds the socket.
+#[derive(Clone, Deserialize, Serialize)]
+pub(crate) struct BrokerTicket {
+    name: TicketName,
+    secret: [u8; TICKET_SECRET_LEN],
+}
+
+impl PartialEq for BrokerTicket {
+    /// A peer's ticket is compared with this process's own, so the secrets
+    /// are compared in constant time.
+    fn eq(&self, other: &Self) -> bool {
+        let secret = bool::from(subtle::ConstantTimeEq::ct_eq(
+            self.secret.as_slice(),
+            other.secret.as_slice(),
+        ));
+        secret & (self.name == other.name)
+    }
+}
+
+impl Eq for BrokerTicket {}
+
+impl std::fmt::Debug for BrokerTicket {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BrokerTicket")
+            .field("name", &self.name.0)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BrokerTicket {
+    fn new(name: &str, secret: [u8; TICKET_SECRET_LEN]) -> Result<Self> {
+        Ok(Self {
+            name: TicketName::try_from(name.to_owned())?,
+            secret,
+        })
+    }
+
+    /// Read a ticket written by [`BrokerTicket::encode`].
+    pub(crate) fn parse(text: &str) -> Result<Self> {
+        let parsed = (|| {
+            let (name, encoded) = text.split_once(':')?;
+            if encoded.len() != TICKET_SECRET_LEN * 2
+                || !encoded
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return None;
+            }
+            let mut secret = [0u8; TICKET_SECRET_LEN];
+            for (index, byte) in secret.iter_mut().enumerate() {
+                *byte = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16).ok()?;
+            }
+            Self::new(name, secret).ok()
+        })();
+        parsed.context("invalid broker ticket")
+    }
+
+    /// The ticket as text: its name, `:`, and its secret in lowercase hex.
+    pub(crate) fn encode(&self) -> String {
+        let mut text = self.name.0.clone();
+        text.push(':');
+        for byte in self.secret {
+            text.push_str(&format!("{byte:02x}"));
+        }
+        text
+    }
+
+    pub(crate) fn secret(&self) -> &[u8; TICKET_SECRET_LEN] {
+        &self.secret
+    }
+
+    /// Connect to the broker this ticket names in `base`. The base and the
+    /// broker's directory must both be owner-only directories of this
+    /// account's; the broker then checks the secret.
+    pub(crate) fn connect(&self, base: BrokerBase) -> Result<UnixStream> {
+        self.connect_in(&base.existing()?)
+    }
+
+    fn connect_in(&self, base: &Path) -> Result<UnixStream> {
+        let directory = base.join(&self.name.0);
+        crate::delegation::validate_private_directory_path(&directory)?;
+        let socket = directory.join(TICKET_SOCKET);
+        UnixStream::connect(&socket).with_context(|| format!("connect to {}", socket.display()))
+    }
+
+    /// Where this ticket's socket is in `base`.
+    #[cfg(test)]
+    pub(crate) fn socket_path(&self, base: BrokerBase) -> PathBuf {
+        base.path().join(&self.name.0).join(TICKET_SOCKET)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn name(&self) -> &str {
+        &self.name.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn secret_mut(&mut self) -> &mut [u8; TICKET_SECRET_LEN] {
+        &mut self.secret
+    }
+}
+
+/// Where a broker's directory goes.
+pub(crate) enum BrokerDirectory<'a> {
+    /// A new private directory in the temporary directory, named with
+    /// `prefix`, holding the socket `socket`. For a broker whose socket path
+    /// this process hands on itself.
+    Temporary { prefix: &'a str, socket: &'a str },
+    /// A new directory in `base` that tickets name: `prefix`, this
+    /// process's ID, which tells which process a socket belongs to, and a
+    /// random suffix.
+    Ticketed { prefix: &'a str, base: BrokerBase },
+}
+
 pub(crate) struct PrivateBrokerConfig<'a> {
-    pub(crate) directory_prefix: &'a str,
-    pub(crate) socket_name: &'a str,
+    pub(crate) directory: BrokerDirectory<'a>,
     pub(crate) listener_thread: &'a str,
     pub(crate) client_thread: &'a str,
     /// Only for bounded handlers that never wait for another broker client.
@@ -116,6 +365,8 @@ pub(crate) struct PrivateBroker {
     connections: Arc<ConnectionRegistry>,
     listener_thread: Option<JoinHandle<()>>,
     socket_dir: tempfile::TempDir,
+    /// The name tickets give this broker's directory, for a ticketed one.
+    ticket_name: Option<TicketName>,
 }
 
 impl PrivateBroker {
@@ -123,7 +374,7 @@ impl PrivateBroker {
     where
         F: Fn(TrackedStream, Arc<ConnectionRegistry>) + Send + Sync + 'static,
     {
-        Self::start_inner(config, handler, true, false)
+        Self::start_inner(config, handler, true)
     }
 
     /// The caller owns signal handling and child cleanup.
@@ -131,26 +382,13 @@ impl PrivateBroker {
     where
         F: Fn(TrackedStream, Arc<ConnectionRegistry>) + Send + Sync + 'static,
     {
-        Self::start_inner(config, handler, false, false)
-    }
-
-    /// Bind a short address inside the current directory. The standalone
-    /// caller must keep this working directory for the broker's lifetime.
-    pub(crate) fn start_in_current_dir<F>(
-        config: PrivateBrokerConfig<'_>,
-        handler: F,
-    ) -> Result<Self>
-    where
-        F: Fn(TrackedStream, Arc<ConnectionRegistry>) + Send + Sync + 'static,
-    {
-        Self::start_inner(config, handler, false, true)
+        Self::start_inner(config, handler, false)
     }
 
     fn start_inner<F>(
         config: PrivateBrokerConfig<'_>,
         handler: F,
         signal_cleanup: bool,
-        in_current_dir: bool,
     ) -> Result<Self>
     where
         F: Fn(TrackedStream, Arc<ConnectionRegistry>) + Send + Sync + 'static,
@@ -158,29 +396,40 @@ impl PrivateBroker {
         if config.max_connections == 0 {
             bail!("private broker needs at least one connection slot");
         }
-        let socket_dir = if in_current_dir {
-            tempfile::Builder::new()
-                .prefix(config.directory_prefix)
-                .permissions(std::fs::Permissions::from_mode(0o700))
-                .tempdir_in(".")
-        } else {
-            private_temp_dir(config.directory_prefix)
-        }
-        .context("create private broker directory")?;
-        std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700))?;
-        // TempDir keeps an absolute path for cleanup. bind/connect must use
-        // the relative spelling here so a long parent cannot exceed sun_path.
-        let socket_path = if in_current_dir {
-            Path::new(
-                socket_dir
+        let (socket_dir, socket_path, ticket_name) = match config.directory {
+            BrokerDirectory::Temporary { prefix, socket } => {
+                let socket_dir =
+                    private_temp_dir(prefix).context("create private broker directory")?;
+                let socket_path = socket_dir.path().join(socket);
+                (socket_dir, socket_path, None)
+            }
+            BrokerDirectory::Ticketed { prefix, base } => {
+                let base = base.prepare()?;
+                let socket_dir = tempfile::Builder::new()
+                    .prefix(&format!("{prefix}{}-", std::process::id()))
+                    .permissions(std::fs::Permissions::from_mode(0o700))
+                    .tempdir_in(&base)
+                    .context("create private broker directory")?;
+                let name = socket_dir
                     .path()
                     .file_name()
-                    .context("broker directory name")?,
-            )
-            .join(config.socket_name)
-        } else {
-            socket_dir.path().join(config.socket_name)
+                    .and_then(OsStr::to_str)
+                    .context("broker directory name")?;
+                let ticket_name = TicketName::try_from(name.to_owned())?;
+                // In the enrollment directory the address stays relative,
+                // so a long parent cannot exceed sun_path.
+                let socket_path = base.join(name).join(TICKET_SOCKET);
+                if socket_path.as_os_str().len() > max_socket_path() {
+                    bail!(
+                        "the socket path {} is longer than this system allows ({} bytes); set TMPDIR to a shorter directory",
+                        socket_path.display(),
+                        max_socket_path()
+                    );
+                }
+                (socket_dir, socket_path, Some(ticket_name))
+            }
         };
+        std::fs::set_permissions(socket_dir.path(), std::fs::Permissions::from_mode(0o700))?;
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("bind private broker at {}", socket_path.display()))?;
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
@@ -228,11 +477,23 @@ impl PrivateBroker {
             connections,
             listener_thread: Some(listener_thread),
             socket_dir,
+            ticket_name,
         })
     }
 
     pub(crate) fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    /// The ticket that joins this ticketed broker with `secret`.
+    pub(crate) fn ticket(&self, secret: [u8; TICKET_SECRET_LEN]) -> Result<BrokerTicket> {
+        Ok(BrokerTicket {
+            name: self
+                .ticket_name
+                .clone()
+                .context("this broker has no ticket")?,
+            secret,
+        })
     }
 
     #[cfg(test)]
@@ -478,6 +739,7 @@ impl Write for TrackedStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::CommandExt as _;
 
     const SIGNAL_CHILD: &str = "SYQ_TEST_SIGNAL_CLEANED_DIR";
     const SIGNAL_MARKER: &str = "SYQ_TEST_SIGNAL_CLEANED_DIR_MARKER";
@@ -560,8 +822,10 @@ mod tests {
     fn broker_uses_private_modes_and_removes_its_directory() {
         let broker = PrivateBroker::start(
             PrivateBrokerConfig {
-                directory_prefix: "syq-private-broker-test-",
-                socket_name: "broker.sock",
+                directory: BrokerDirectory::Temporary {
+                    prefix: "syq-private-broker-test-",
+                    socket: "broker.sock",
+                },
                 listener_thread: "syq-private-test-listener",
                 client_thread: "syq-private-test-client",
                 inline_on_thread_failure: false,
@@ -585,5 +849,250 @@ mod tests {
 
         drop(broker);
         assert!(!directory.exists());
+    }
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    fn ticket_text(name: &str) -> String {
+        format!("{name}:{}", "0123456789abcdef".repeat(4))
+    }
+
+    #[test]
+    fn tickets_carry_only_a_short_checked_name() {
+        let ticket = BrokerTicket::parse(&ticket_text("fd-123-AbC9z0")).unwrap();
+        assert_eq!(ticket.name(), "fd-123-AbC9z0");
+        assert_eq!(ticket.secret()[..3], [0x01, 0x23, 0x45]);
+        assert_eq!(ticket.encode(), ticket_text("fd-123-AbC9z0"));
+        BrokerTicket::parse(&ticket_text(&"a".repeat(MAX_TICKET_NAME))).unwrap();
+        for name in [
+            "",
+            "a/b",
+            "/tmp/syq-fd-x",
+            "..",
+            ".",
+            "w-1/../x",
+            "a.b",
+            "a b",
+            "a\0b",
+            "\u{e9}",
+            &"a".repeat(MAX_TICKET_NAME + 1),
+        ] {
+            assert!(BrokerTicket::parse(&ticket_text(name)).is_err(), "{name:?}");
+        }
+        let hex = "0123456789abcdef".repeat(4);
+        for secret in [
+            hex[1..].to_owned(),
+            format!("{hex}0"),
+            hex.to_uppercase(),
+            hex.replacen('0', "g", 1),
+            format!("+{}", &hex[1..]),
+            String::new(),
+        ] {
+            assert!(
+                BrokerTicket::parse(&format!("fd-1:{secret}")).is_err(),
+                "{secret:?}"
+            );
+        }
+        assert!(BrokerTicket::parse("fd-1").is_err());
+        assert!(BrokerTicket::parse(&format!("a:b:{hex}")).is_err());
+    }
+
+    #[test]
+    fn decoded_tickets_check_their_names() {
+        // What a peer writes for a ticket.
+        #[derive(Serialize)]
+        struct Written<'a> {
+            name: &'a str,
+            secret: [u8; TICKET_SECRET_LEN],
+        }
+        let ticket = BrokerTicket::parse(&ticket_text("fd-1-abc")).unwrap();
+        let bytes = postcard::to_allocvec(&ticket).unwrap();
+        assert_eq!(
+            postcard::to_allocvec(&Written {
+                name: "fd-1-abc",
+                secret: *ticket.secret()
+            })
+            .unwrap(),
+            bytes
+        );
+        assert_eq!(
+            postcard::from_bytes::<BrokerTicket>(&bytes).unwrap(),
+            ticket
+        );
+        for name in ["../fd-1-abc", "/tmp/syq-fd-x/broker.sock", "..", ""] {
+            let bytes = postcard::to_allocvec(&Written {
+                name,
+                secret: [0; TICKET_SECRET_LEN],
+            })
+            .unwrap();
+            assert!(
+                postcard::from_bytes::<BrokerTicket>(&bytes).is_err(),
+                "{name:?}"
+            );
+        }
+    }
+
+    /// A socket listening in `base/name`, as a ticketed broker's does.
+    fn listening(base: &Path, name: &str) -> UnixListener {
+        let directory = base.join(name);
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        UnixListener::bind(directory.join(TICKET_SOCKET)).unwrap()
+    }
+
+    #[test]
+    fn tickets_reach_only_private_directories_in_their_base() {
+        let root = crate::test_support::short_tempdir().unwrap();
+        let base = root.path().join("base");
+        check_base(&base, true).unwrap();
+        let ticket = |name: &str| BrokerTicket::new(name, [7; TICKET_SECRET_LEN]).unwrap();
+        let _good = listening(&base, "fd-1-good");
+        ticket("fd-1-good").connect_in(&base).unwrap();
+        // A broker's directory may not be a link, even to a broker's, nor
+        // one other users can enter.
+        std::os::unix::fs::symlink(base.join("fd-1-good"), base.join("fd-1-link")).unwrap();
+        assert!(ticket("fd-1-link").connect_in(&base).is_err());
+        let _open = listening(&base, "fd-1-open");
+        std::fs::set_permissions(
+            base.join("fd-1-open"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(ticket("fd-1-open").connect_in(&base).is_err());
+        assert!(ticket("fd-1-missing").connect_in(&base).is_err());
+    }
+
+    #[test]
+    fn a_base_directory_must_be_this_accounts_and_owner_only() {
+        let root = crate::test_support::short_tempdir().unwrap();
+        let base = root.path().join("base");
+        assert!(check_base(&base, false).is_err());
+        check_base(&base, true).unwrap();
+        assert_eq!(mode(&base), 0o700);
+        check_base(&base, true).unwrap();
+        check_base(&base, false).unwrap();
+        // A link, as another user could plant in a shared /tmp, is refused
+        // even when it leads to a private directory.
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&base, &link).unwrap();
+        assert!(check_base(&link, true).is_err());
+        assert!(check_base(&link, false).is_err());
+        // An existing directory that others can enter is refused and left
+        // as it is.
+        let open = root.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(check_base(&open, true).is_err());
+        assert_eq!(mode(&open), 0o755);
+        let file = root.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert!(check_base(&file, true).is_err());
+        // Another account's directory is refused: `/` belongs to root.
+        let error = format!("{:#}", check_base(Path::new("/"), false).unwrap_err());
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(error.contains("target-owned"), "{error}");
+        }
+    }
+
+    const ACCOUNT_CHILD: &str = "SYQ_TEST_ACCOUNT_BROKERS";
+
+    fn account_broker() -> Result<PrivateBroker> {
+        PrivateBroker::start(
+            PrivateBrokerConfig {
+                directory: BrokerDirectory::Ticketed {
+                    prefix: "fd-",
+                    base: BrokerBase::Account,
+                },
+                listener_thread: "syq-account-test-listener",
+                client_thread: "syq-account-test-client",
+                inline_on_thread_failure: false,
+                max_connections: 1,
+                io_timeout: Duration::from_secs(1),
+            },
+            |_, _| {},
+        )
+    }
+
+    /// The child of `ticketed_brokers_live_in_the_accounts_own_directory`,
+    /// with `TMPDIR` set to a fixture.
+    #[test]
+    fn account_brokers_subprocess() {
+        let Ok(case) = std::env::var(ACCOUNT_CHILD) else {
+            return;
+        };
+        let account = account_directory(&std::env::temp_dir());
+        if case == "refused" {
+            let error = format!("{:#}", account_broker().unwrap_err());
+            assert!(error.contains("TMPDIR"), "{error}");
+            let ticket = BrokerTicket::new("fd-1-abc", [0; TICKET_SECRET_LEN]).unwrap();
+            assert!(ticket.connect(BrokerBase::Account).is_err());
+            return;
+        }
+        let broker = account_broker().unwrap();
+        let ticket = broker.ticket([1; TICKET_SECRET_LEN]).unwrap();
+        assert!(ticket
+            .name()
+            .starts_with(&format!("fd-{}-", std::process::id())));
+        let directory = account.join(ticket.name());
+        assert_eq!(broker.socket_path(), directory.join(TICKET_SOCKET));
+        assert_eq!(
+            ticket.socket_path(BrokerBase::Account),
+            broker.socket_path()
+        );
+        assert_eq!(mode(&account), 0o700);
+        assert_eq!(mode(&directory), 0o700);
+        assert_eq!(mode(broker.socket_path()), 0o600);
+        ticket.connect(BrokerBase::Account).unwrap();
+        drop(broker);
+        assert!(!directory.exists());
+        assert!(account.exists());
+    }
+
+    /// Ordinary copies' brokers go in `syq-UID` in the temporary directory,
+    /// which is made owner-only, and never in one another user planted.
+    #[test]
+    fn ticketed_brokers_live_in_the_accounts_own_directory() {
+        let run = |temporary: &Path, case: &str| {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "private_broker::tests::account_brokers_subprocess",
+                    "--nocapture",
+                ])
+                .env(ACCOUNT_CHILD, case)
+                .env("TMPDIR", temporary)
+                .capture_output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{case}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        let fresh = crate::test_support::short_tempdir().unwrap();
+        run(fresh.path(), "fresh");
+
+        let linked = crate::test_support::short_tempdir().unwrap();
+        let elsewhere = linked.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, account_directory(linked.path())).unwrap();
+        run(linked.path(), "refused");
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+
+        let open = crate::test_support::short_tempdir().unwrap();
+        let account = account_directory(open.path());
+        std::fs::create_dir(&account).unwrap();
+        std::fs::set_permissions(&account, std::fs::Permissions::from_mode(0o777)).unwrap();
+        run(open.path(), "refused");
+        assert_eq!(mode(&account), 0o777);
+        assert_eq!(std::fs::read_dir(&account).unwrap().count(), 0);
     }
 }

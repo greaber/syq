@@ -313,6 +313,32 @@ fn wait_for_child_output(mut child: std::process::Child, timeout: std::time::Dur
     }
 }
 
+/// The private directories syq left in `tmp`, a copy's `TMPDIR`: its own
+/// `syq-*` directories, and the socket directories of copies in this
+/// account's `syq-UID`, which stays.
+fn private_temporary_leftovers(tmp: &Path) -> Vec<String> {
+    let account = format!("syq-{}", unsafe { libc::geteuid() });
+    let names = |directory: &Path| -> Vec<String> {
+        match fs::read_dir(directory) {
+            Ok(entries) => entries
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("list {}: {error}", directory.display()),
+        }
+    };
+    let mut left: Vec<String> = names(tmp)
+        .into_iter()
+        .filter(|name| name.starts_with("syq-") && *name != account)
+        .collect();
+    left.extend(
+        names(&tmp.join(&account))
+            .into_iter()
+            .map(|name| format!("{account}/{name}")),
+    );
+    left
+}
+
 fn partial_files(dir: &Path) -> Vec<PathBuf> {
     fs::read_dir(dir)
         .into_iter()
