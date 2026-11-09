@@ -555,8 +555,7 @@ fn rules_at(
     // sender paces network bytes, as for an ordinary copy.
     let mut constraints = GrantConstraints {
         tcp_congestion: args.tcp_congestion.clone(),
-        // Without TCP, nothing is sent over it.
-        unencrypted_tcp: args.no_tcp_encryption && !args.no_tcp,
+        tcp: delegation::TcpPermission::of(args),
         mapping: directive.inputs.mapping.clone(),
         hashing: Some(crate::hashing::CopyHashing::from_args(args)),
         filters: FilterPolicy {
@@ -617,10 +616,6 @@ pub(crate) fn source_rules(
             Some(base) => crate::fsops::join(home, base),
         });
     }
-    // A copy approved without TCP gets no listener on the source either,
-    // and one approved without its encryption gets an unencrypted one.
-    request.no_tcp = args.no_tcp;
-    request.unencrypted_tcp = args.no_tcp_encryption;
     request.validate()?;
     Ok(request)
 }

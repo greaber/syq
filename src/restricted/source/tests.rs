@@ -20,7 +20,7 @@ fn policy(path: &Path) -> SourcePolicy {
         preservation: Default::default(),
         sparse: false,
         compressed: false,
-        tcp: None,
+        tcp: SourceTcpPolicy::refused(),
         send_rate: None,
         limits: CopyLimits {
             max_entries: 100,

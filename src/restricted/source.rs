@@ -40,7 +40,7 @@ pub(crate) struct SourcePolicy {
     pub preservation: crate::inode_metadata::Selection,
     pub sparse: bool,
     pub compressed: bool,
-    pub tcp: Option<SourceTcpPolicy>,
+    pub tcp: SourceTcpPolicy,
     pub send_rate: Option<u64>,
     pub limits: CopyLimits,
     pub deadline: Instant,
@@ -49,11 +49,25 @@ pub(crate) struct SourcePolicy {
 }
 
 pub(crate) struct SourceTcpPolicy {
+    /// Whether the approved command lets the data go over TCP, and
+    /// unencrypted.
+    pub permission: crate::delegation::TcpPermission,
     pub port_lo: u16,
     pub port_hi: u16,
     pub congestion_control: Option<String>,
-    /// The approved command asks for TCP data without encryption.
-    pub unencrypted: bool,
+}
+
+impl SourceTcpPolicy {
+    /// No TCP at all, as with `--no-tcp`.
+    #[cfg(test)]
+    pub(crate) fn refused() -> Self {
+        Self {
+            permission: crate::delegation::TcpPermission::Refused,
+            port_lo: 0,
+            port_hi: 0,
+            congestion_control: None,
+        }
+    }
 }
 
 struct State {
@@ -114,12 +128,10 @@ impl SourceAuthority {
                 .is_none_or(|base| base.starts_with(b"/") && !base.contains(&0)),
             "a source's resolved base must be an absolute path"
         );
-        if let Some(tcp) = &policy.tcp {
-            ensure!(
-                tcp.port_lo <= tcp.port_hi,
-                "source TCP port range is reversed"
-            );
-        }
+        ensure!(
+            policy.tcp.port_lo <= policy.tcp.port_hi,
+            "source TCP port range is reversed"
+        );
         for selection in &policy.selections {
             ensure!(
                 !selection.path.is_empty() && !selection.path.contains(&0),
@@ -156,11 +168,9 @@ impl SourceAuthority {
         let mut state = self.state.lock().unwrap();
         self.check_open(&state)?;
         ensure!(state.control_admitted, "source control has not opened");
-        let tcp = self
-            .policy
-            .tcp
-            .as_ref()
-            .context("source TCP listener was not approved")?;
+        let tcp = &self.policy.tcp;
+        // The receiving machine dials it, always with a key of its own.
+        tcp.permission.check_allowed()?;
         ensure!(
             ports == (tcp.port_lo, tcp.port_hi) && *congestion_control == tcp.congestion_control,
             "source TCP settings differ from approval"
@@ -506,19 +516,8 @@ impl SourceConnection {
                     self.control,
                     "source TCP listener requires the control connection"
                 );
-                let tcp = policy
-                    .tcp
-                    .as_ref()
-                    .context("source TCP listener was not approved")?;
-                // Unencrypted only when the approved command asks for it.
-                let key_valid = match key {
-                    Some(key) => key.len() == crate::tcp_records::KEY_LEN,
-                    None => tcp.unencrypted,
-                };
-                ensure!(
-                    key_valid && token.len() == 16,
-                    "approved source requires encrypted authenticated TCP unless its command passes --no-tcp-encryption"
-                );
+                let tcp = &policy.tcp;
+                tcp.permission.check_listener(key.as_deref(), token)?;
                 ensure!(
                     (*port_lo, *port_hi) == (tcp.port_lo, tcp.port_hi)
                         && congestion_control == &tcp.congestion_control

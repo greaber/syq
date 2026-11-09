@@ -2555,6 +2555,55 @@ fn a_named_route_probe_that_reaches_nothing_answers_with_no_route() {
     assert!(elapsed < Duration::from_millis(800), "{elapsed:?}");
 }
 
+/// This machine sets up TCP for a copy sent to it only when the copy's
+/// command lets the data go over TCP: with `--no-tcp` it refuses to probe
+/// the coordinator's listener, so no TCP data connection is made.
+#[test]
+fn a_copy_sent_here_gets_tcp_only_when_its_command_allows_it() {
+    for no_tcp in [false, true] {
+        let temp = crate::test_support::tempdir().unwrap();
+        let (_broker, receiver, registration, _) = broker(temp.path(), Approval::Always);
+        let options: &[&str] = if no_tcp {
+            &["--no-compress", "--no-tcp"]
+        } else {
+            &["--no-compress"]
+        };
+        let (command, inputs) = requested(Path::new("source"), options);
+        let approved = approve(&registration, command, inputs);
+        let mut spec = crate::conn::RemoteSpec::local_receiver(true);
+        spec.restricted_grant = Some(route(registration, &approved));
+        let _control = spec.connect_with(false, false).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let probed = tcp::probe(
+            spec.restricted_grant.as_deref().unwrap(),
+            listener.local_addr().unwrap().port(),
+            (0, 0),
+            vec![("127.0.0.1".into(), 0)],
+            None,
+            crate::conn::TCP_PROBE_FLOOR,
+        );
+        let set_up = receiver.sessions.lock().unwrap()[&approved.token]
+            .tcp
+            .is_some();
+        receiver.revoke_all();
+        if no_tcp {
+            let error = probed.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("passes --no-tcp,"),
+                "{error:#}"
+            );
+            assert!(!set_up);
+        } else {
+            let candidates = probed.unwrap();
+            assert!(
+                candidates.iter().any(|candidate| candidate.selected),
+                "{candidates:?}"
+            );
+            assert!(set_up);
+        }
+    }
+}
+
 /// A receiving connection counts as idle, for its service to switch builds,
 /// only once no request is in progress and none arrived for a quiet while:
 /// one copy's steps arrive as separate requests. Once its service closes it

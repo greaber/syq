@@ -1612,7 +1612,7 @@ impl Receiver {
             || extra.xattrs
             || extra.hardlinks
             || extra.widen_dirs == crate::delegation::DirectoryWidening::All
-            || request.constraints.unencrypted_tcp)
+            || request.constraints.tcp == crate::delegation::TcpPermission::Unencrypted)
             && self.auto_approve_root.as_ref().is_some_and(|root| {
                 destination.starts_with(root)
                     && !(destination == *root

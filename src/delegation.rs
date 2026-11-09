@@ -897,6 +897,61 @@ pub(crate) fn security_key_flags(signature: &ssh_key::SshSig) -> Result<u8> {
     Ok(bytes[index])
 }
 
+/// Whether a copy's data may go over TCP, as the command an end of the copy
+/// verified says. Every end that serves a restricted copy, reading or
+/// writing, derives it from that command (`of`) and admits the copy's TCP
+/// listener only through `check_listener`, so no route admits TCP data the
+/// command refused.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum TcpPermission {
+    /// `--no-tcp`: the copy's data goes only over SSH. Where nothing derived
+    /// it, as in a field that is never sent, no TCP is allowed either.
+    #[default]
+    Refused,
+    /// The data may go over encrypted, authenticated TCP.
+    Encrypted,
+    /// `--no-tcp-encryption`: the data may also go over TCP without
+    /// encryption or authentication.
+    Unencrypted,
+}
+
+impl TcpPermission {
+    /// What the copy `args` states.
+    pub(crate) fn of(args: &crate::cli::Args) -> Self {
+        if args.no_tcp {
+            Self::Refused
+        } else if args.no_tcp_encryption {
+            Self::Unencrypted
+        } else {
+            Self::Encrypted
+        }
+    }
+
+    /// Refuse any TCP data connection when the command refused TCP.
+    pub(crate) fn check_allowed(self) -> Result<()> {
+        anyhow::ensure!(
+            self != Self::Refused,
+            "the approved command passes --no-tcp, so this copy accepts no TCP data connections"
+        );
+        Ok(())
+    }
+
+    /// Check a request for the copy's TCP listener, whose connections `key`
+    /// encrypts (none when unencrypted) and `token` authenticates.
+    pub(crate) fn check_listener(self, key: Option<&[u8]>, token: &[u8]) -> Result<()> {
+        self.check_allowed()?;
+        let key_valid = match key {
+            Some(key) => key.len() == crate::tcp_records::KEY_LEN,
+            None => self == Self::Unencrypted,
+        };
+        anyhow::ensure!(
+            key_valid && token.len() == 16,
+            "TCP data connections must be encrypted and authenticated unless the approved command passes --no-tcp-encryption"
+        );
+        Ok(())
+    }
+}
+
 /// The destination's rules beyond the copy operation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct GrantConstraints {
@@ -904,11 +959,9 @@ pub(crate) struct GrantConstraints {
     pub root_existence: RootExistence,
     pub receipt_policy: crate::destination_results::ReceiptPolicy,
     pub tcp_congestion: Option<String>,
-    /// The command asks for TCP data without encryption
-    /// (`--no-tcp-encryption`), so the receiver accepts an unencrypted
-    /// listener.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub unencrypted_tcp: bool,
+    /// Whether the copy's data may go over TCP, and unencrypted.
+    #[serde(default)]
+    pub tcp: TcpPermission,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mapping: Option<crate::mapping::Authorization>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -925,7 +978,7 @@ impl Default for GrantConstraints {
             root_existence: RootExistence::Any,
             receipt_policy: test_receipt_policy(),
             tcp_congestion: None,
-            unencrypted_tcp: false,
+            tcp: TcpPermission::Encrypted,
             mapping: None,
             hashing: None,
             extra_options: ExtraCopyOptions::default(),

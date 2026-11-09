@@ -783,39 +783,13 @@ fn admit(
     if privilege::refuses_privileged(&rules.role()) {
         refuse_privileged_receiver(Some(enrollment))?;
     }
-    let (grant, constraints) = match rules {
-        Rules::Destination(rules) => *rules,
-        Rules::Source(reads) => {
-            // Reads follow the signed command, as the account's own would:
-            // the approving machine's prompt showed what it names.
-            let authority =
-                super::source::SourceAuthority::new(reads.policy(verified.execution_deadline))?;
-            ssh::enter_state_directory(state)?;
-            active::watch(
-                &home,
-                state,
-                (observed_state.dev(), observed_state.ino()),
-                verified.execution_deadline,
-            )?;
-            return Ok(Session::Source(authority));
-        }
-    };
-    let results_key = load_results_key(state)?;
-    let root = ConfinedRoot::resolve(
-        &grant.copy.destination,
+    let session = serve(
+        rules,
+        &verified,
+        state,
+        (&home, &canonical_home),
         &protected,
-        constraints.extra_options.follow_dst,
-        Some((&home, &canonical_home)),
     )?;
-    let authority = std::sync::Arc::new(RestrictedAuthority::new(
-        root,
-        grant,
-        constraints,
-        verified.digest,
-        results_key,
-        verified.execution_deadline,
-        &protected,
-    )?);
     ssh::enter_state_directory(state)?;
     // Verification does not hold the lifecycle lock or permit mutations. A
     // revoke during verification is caught when this receiver tries to enter.
@@ -825,7 +799,48 @@ fn admit(
         (observed_state.dev(), observed_state.ino()),
         verified.execution_deadline,
     )?;
-    Ok(Session::Copy(authority))
+    Ok(session)
+}
+
+/// The authority that serves `rules`, derived from the directive verified
+/// as `verified`, for the account whose home is `home` as it is named and
+/// where it really is: a copy's writes beneath its destination, or the
+/// reads a source's command names.
+pub(super) fn serve(
+    rules: Rules,
+    verified: &delegation::VerifiedDirective,
+    state: &Path,
+    (home, canonical_home): (&Path, &Path),
+    protected: &[ReceiverControlPath],
+) -> Result<Session> {
+    let (grant, constraints) = match rules {
+        Rules::Destination(rules) => *rules,
+        // Reads follow the signed command, as the account's own would: the
+        // approving machine's prompt showed what it names.
+        Rules::Source(reads) => {
+            return Ok(Session::Source(super::source::SourceAuthority::new(
+                reads.policy(verified.execution_deadline),
+            )?));
+        }
+    };
+    let results_key = load_results_key(state)?;
+    let root = ConfinedRoot::resolve(
+        &grant.copy.destination,
+        protected,
+        constraints.extra_options.follow_dst,
+        Some((home, canonical_home)),
+    )?;
+    Ok(Session::Copy(std::sync::Arc::new(
+        RestrictedAuthority::new(
+            root,
+            grant,
+            constraints,
+            verified.digest,
+            results_key,
+            verified.execution_deadline,
+            protected,
+        )?,
+    )))
 }
 
 /// Verify a new copy's directive and derive its rules for the end of the
