@@ -453,7 +453,7 @@ impl OperatorResolver {
                 // the link pin it first so ownership and target bytes come
                 // from the same symlink object.
                 if self.symlink_policy == OperatorSymlinkPolicy::Refuse {
-                    self.authorize_symlink(metadata, &component)?;
+                    self.authorize_symlink(metadata, &current.directory, &component)?;
                     unreachable!("the refusing policy always returns an error for a symlink");
                 }
                 symlink_count += 1;
@@ -464,7 +464,7 @@ impl OperatorResolver {
                 let target = if let Some(object) = object {
                     let opened_metadata = root_metadata_from_std(&object.metadata()?)?;
                     require_operator_identity(metadata, opened_metadata, "operator symlink")?;
-                    self.authorize_symlink(opened_metadata, &component)?;
+                    self.authorize_symlink(opened_metadata, &current.directory, &component)?;
                     hold_open_operator_symlink_for_test(&component)?;
                     match operator_read_open_link(&object)? {
                         Some(target) => {
@@ -503,7 +503,7 @@ impl OperatorResolver {
                         }
                     }
                 } else {
-                    self.authorize_symlink(metadata, &component)?;
+                    self.authorize_symlink(metadata, &current.directory, &component)?;
                     require_operator_link_fallback_allowed(self.symlink_policy)?;
                     operator_read_link_at(current.directory.as_raw_fd(), &name)?
                 };
@@ -616,7 +616,14 @@ impl OperatorResolver {
         ))
     }
 
-    pub(super) fn authorize_symlink(&self, metadata: RootMetadata, component: &[u8]) -> Result<()> {
+    /// Whether the symlink `component`, with `metadata`, in `directory`, may
+    /// be followed.
+    pub(super) fn authorize_symlink(
+        &self,
+        metadata: RootMetadata,
+        directory: &File,
+        component: &[u8],
+    ) -> Result<()> {
         let euid = unsafe { libc::geteuid() };
         match self.symlink_policy {
             OperatorSymlinkPolicy::Refuse => bail!(
@@ -633,9 +640,128 @@ impl OperatorResolver {
                     euid
                 )
             }
-            OperatorSymlinkPolicy::TrustedOwner | OperatorSymlinkPolicy::FollowAll => Ok(()),
+            OperatorSymlinkPolicy::TrustedOwner => Ok(()),
+            OperatorSymlinkPolicy::FollowAll => {
+                let parent = directory
+                    .metadata()
+                    .context("inspect the directory a symlink is in")?;
+                if !may_follow_symlink(
+                    metadata.uid,
+                    (parent.mode(), parent.uid()),
+                    symlink_follower(),
+                ) {
+                    return Err(shared_directory_symlink(
+                        &String::from_utf8_lossy(component),
+                        metadata.uid,
+                    ));
+                }
+                Ok(())
+            }
         }
     }
+}
+
+/// Linux's `fs.protected_symlinks` rule: a symlink in a sticky directory
+/// anyone can write to, such as /tmp, is followed only when `follower`, or
+/// the directory's owner, owns it. Syq applies it wherever it follows a
+/// symlink itself, which the kernel's own check never sees, and on systems
+/// without it: another user's link there could lead anywhere the follower
+/// can write. `directory` is the directory's mode and owner.
+pub(crate) fn may_follow_symlink(link_owner: u32, directory: (u32, u32), follower: u32) -> bool {
+    // Sticky, and writable by others.
+    let shared = 0o1002;
+    let (mode, owner) = directory;
+    link_owner == follower || mode & shared != shared || owner == link_owner
+}
+
+/// The account symlinks are followed for: this process's (`own_uid`).
+pub(crate) fn symlink_follower() -> u32 {
+    #[cfg(test)]
+    if let Some(uid) = FOLLOWER_FOR_TEST.with(std::cell::Cell::get) {
+        return uid;
+    }
+    own_uid()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Another account for this thread to follow symlinks as, standing in
+    /// for an account that does not own a test's links.
+    pub(crate) static FOLLOWER_FOR_TEST: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The refusal for a symlink `may_follow_symlink` does not follow.
+pub(crate) fn shared_directory_symlink(link: &str, owner: u32) -> anyhow::Error {
+    anyhow::anyhow!(
+        "refusing to follow symlink {link:?}: it is in a directory anyone can write to, such as /tmp, and another user (uid {owner}) owns it"
+    )
+}
+
+/// `path`, absolute, with every symlink in it resolved, as `realpath` finds
+/// it, except that a symlink `may_follow_symlink` refuses fails with
+/// `PermissionDenied`. A missing name fails with `NotFound`.
+pub(crate) fn canonicalize_following_protected(path: &Path) -> io::Result<PathBuf> {
+    let follower = symlink_follower();
+    let mut resolved = if path.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        std::env::current_dir()?
+    };
+    let mut pending: VecDeque<std::ffi::OsString> = path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name.to_owned()),
+            std::path::Component::ParentDir => Some("..".into()),
+            _ => None,
+        })
+        .collect();
+    let mut links = 0;
+    while let Some(name) = pending.pop_front() {
+        if name == ".." {
+            resolved.pop();
+            continue;
+        }
+        let candidate = resolved.join(&name);
+        let metadata = std::fs::symlink_metadata(&candidate)?;
+        if !metadata.file_type().is_symlink() {
+            if !pending.is_empty() && !metadata.is_dir() {
+                return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+            }
+            resolved = candidate;
+            continue;
+        }
+        links += 1;
+        if links > 40 {
+            return Err(io::Error::from_raw_os_error(libc::ELOOP));
+        }
+        let directory = std::fs::metadata(&resolved)?;
+        if !may_follow_symlink(
+            metadata.uid(),
+            (directory.mode(), directory.uid()),
+            follower,
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{:#}",
+                    shared_directory_symlink(&candidate.to_string_lossy(), metadata.uid())
+                ),
+            ));
+        }
+        let target = std::fs::read_link(&candidate)?;
+        if target.is_absolute() {
+            resolved = PathBuf::from("/");
+        }
+        for component in target.components().rev() {
+            match component {
+                std::path::Component::Normal(name) => pending.push_front(name.to_owned()),
+                std::path::Component::ParentDir => pending.push_front("..".into()),
+                _ => {}
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 #[derive(Clone, Copy, Debug)]

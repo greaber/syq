@@ -12489,6 +12489,40 @@ fn a_confinement_root_of_slash_names_paths_beneath_it() {
     );
 }
 
+/// With `--follow-dst`, the receiver follows a link another account made in
+/// a sticky directory anyone can write to, such as /tmp, only as the kernel
+/// would: not at all, whether the link is at the destination or above it.
+#[test]
+fn follow_dst_does_not_follow_another_accounts_link_in_tmp() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let target = temporary.path().join("target");
+    fs::create_dir(&target).unwrap();
+    let Some(shared) = crate::test_support::SharedDirectoryLink::new(&target) else {
+        eprintln!("skipped: no sticky directory another account owns");
+        return;
+    };
+    let slash = Root::open(Path::new("/")).unwrap();
+    let link = path_bytes(&shared.0);
+    let resolve = || resolve_destination_links(&slash, b"/", &link[1..]);
+    let confine = || ConfinedRoot::resolve(&path_bytes(&shared.0.join("copy")), &[], true, None);
+    // The account's own link is followed.
+    assert_eq!(
+        resolve().unwrap().unwrap().existing.join(&b'/'),
+        path_bytes(&target)[1..].to_vec()
+    );
+    confine().unwrap();
+    // Another account's is not.
+    let other = crate::rooted::own_uid().wrapping_add(1);
+    crate::rooted::FOLLOWER_FOR_TEST.with(|cell| cell.set(Some(other)));
+    let at = resolve().err().map(|error| format!("{error:#}"));
+    let above = confine().err().map(|error| format!("{error:#}"));
+    crate::rooted::FOLLOWER_FOR_TEST.with(|cell| cell.set(None));
+    for error in [at, above] {
+        let error = error.expect("another account's link was followed");
+        assert!(error.contains("anyone can write to"), "{error}");
+    }
+}
+
 /// A followed destination that reaches the receiver's control files is
 /// refused by identity, however the protected path or the destination is
 /// spelled.

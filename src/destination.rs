@@ -928,7 +928,7 @@ fn resolve_destination(
                     continue;
                 }
                 if follow {
-                    match fs::canonicalize(&destination) {
+                    match crate::rooted::canonicalize_following_protected(&destination) {
                         Ok(path) => {
                             if !path.is_dir() {
                                 bail!("receiving path ancestor is not a directory");

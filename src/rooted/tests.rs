@@ -771,6 +771,120 @@ fn operator_resolver_reports_the_missing_suffix_from_a_retained_parent() {
     assert!(hops.is_empty());
 }
 
+/// Linux's protected-symlinks rule: a link in a sticky directory anyone
+/// can write to is followed only for its owner, or when the directory's
+/// owner owns it.
+#[test]
+fn links_in_shared_sticky_directories_are_followed_only_for_their_owner() {
+    let shared = 0o1777;
+    // /tmp, owned by root: only the link's owner follows another user's link.
+    assert!(may_follow_symlink(1000, (shared, 0), 1000));
+    assert!(!may_follow_symlink(1000, (shared, 0), 1001));
+    assert!(!may_follow_symlink(1000, (shared, 0), 0));
+    // The directory's owner's links are followed for anyone.
+    assert!(may_follow_symlink(0, (shared, 0), 1000));
+    assert!(may_follow_symlink(1000, (shared, 1000), 1001));
+    // Not sticky, or not writable by everyone: any link is followed.
+    assert!(may_follow_symlink(1000, (0o777, 0), 1001));
+    assert!(may_follow_symlink(1000, (0o1775, 0), 1001));
+}
+
+/// Paths syq follows links in itself apply the rule, as the kernel would:
+/// a link another account made in /tmp is not followed, one in an ordinary
+/// directory is, and the owner's own link in /tmp is too.
+#[test]
+fn links_another_account_made_in_tmp_are_not_followed() {
+    let tree = TestDir::new("protected-links");
+    let target = tree.path().join("target");
+    fs::create_dir(&target).unwrap();
+    symlink(&target, tree.path().join("ordinary")).unwrap();
+    let Some(shared) = crate::test_support::SharedDirectoryLink::new(&target) else {
+        eprintln!("skipped: no sticky directory another account owns");
+        return;
+    };
+    let other = own_uid().wrapping_add(1);
+    let as_follower = |follower: Option<u32>, run: &mut dyn FnMut()| {
+        FOLLOWER_FOR_TEST.with(|cell| cell.set(follower));
+        run();
+        FOLLOWER_FOR_TEST.with(|cell| cell.set(None));
+    };
+    let resolve = |path: &Path| {
+        OperatorResolver::resolve_process(
+            path.as_os_str().as_bytes(),
+            OperatorSymlinkPolicy::FollowAll,
+            OperatorFinalComponent::Directory,
+            false,
+            &mut Vec::new(),
+        )
+    };
+    as_follower(Some(other), &mut || {
+        let error = canonicalize_following_protected(&shared.0.join("inside")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert!(error.to_string().contains("anyone can write to"), "{error}");
+        let error = resolve(&shared.0).err().unwrap();
+        assert!(
+            format!("{error:#}").contains("anyone can write to"),
+            "{error:#}"
+        );
+        assert!(resolve(&shared.0.join("missing")).is_err());
+        assert_eq!(
+            canonicalize_following_protected(&tree.path().join("ordinary")).unwrap(),
+            target
+        );
+        assert!(resolve(&tree.path().join("ordinary")).is_ok());
+    });
+    as_follower(None, &mut || {
+        assert_eq!(canonicalize_following_protected(&shared.0).unwrap(), target);
+        assert!(resolve(&shared.0).is_ok());
+    });
+    // The rsync policy, which follows only root's and the account's own
+    // links, is unchanged.
+    as_follower(Some(other), &mut || {
+        assert!(OperatorResolver::resolve_process(
+            shared.0.as_os_str().as_bytes(),
+            OperatorSymlinkPolicy::TrustedOwner,
+            OperatorFinalComponent::Directory,
+            false,
+            &mut Vec::new(),
+        )
+        .is_ok());
+    });
+}
+
+/// The path resolver finds what `realpath` finds: relative and absolute
+/// targets, `..` after a link, and a missing name.
+#[test]
+fn canonicalizing_with_the_protected_rule_resolves_as_realpath_does() {
+    let tree = TestDir::new("protected-canonical");
+    fs::create_dir_all(tree.path().join("a/b")).unwrap();
+    symlink("a/b", tree.path().join("relative")).unwrap();
+    symlink(tree.path().join("a"), tree.path().join("absolute")).unwrap();
+    symlink("loop", tree.path().join("loop")).unwrap();
+    fs::write(tree.path().join("file"), b"").unwrap();
+    for path in [
+        "relative",
+        "relative/..",
+        "absolute/b",
+        "absolute/./b/..",
+        "file",
+    ] {
+        assert_eq!(
+            canonicalize_following_protected(&tree.path().join(path)).unwrap(),
+            fs::canonicalize(tree.path().join(path)).unwrap(),
+            "{path}"
+        );
+    }
+    let missing = canonicalize_following_protected(&tree.path().join("relative/missing"));
+    assert_eq!(missing.unwrap_err().kind(), io::ErrorKind::NotFound);
+    let through_file = canonicalize_following_protected(&tree.path().join("file/x"));
+    assert_eq!(
+        through_file.unwrap_err().raw_os_error(),
+        Some(libc::ENOTDIR)
+    );
+    let looped = canonicalize_following_protected(&tree.path().join("loop"));
+    assert_eq!(looped.unwrap_err().raw_os_error(), Some(libc::ELOOP));
+}
+
 #[test]
 fn operator_symlink_trust_is_root_or_receiver_ownership() {
     assert!(operator_symlink_owner_is_trusted(0, 1000));

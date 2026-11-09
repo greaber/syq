@@ -60,7 +60,12 @@ link with `--insecure-links`, which applies to local paths only.)
 | Inside a source directory being copied | Copied as a link; its target is not read |
 | Inside a destination directory | Not followed. A copied file can replace the link, but a copied directory cannot use it as a directory |
 
-`--follow` enables both. See [Symlinks](reference.md#symlinks) for examples.
+`--follow` enables both. Even then, syq doesn't follow a link that another
+user made in a shared directory anyone can write to, such as `/tmp`, unless
+that directory's owner made it: such a link could send a copy anywhere you can
+write. Linux applies the same rule to every program (`fs.protected_symlinks`),
+and syq applies it on every system, including copies through an enrollment or
+a receiving name. See [Symlinks](reference.md#symlinks) for examples.
 
 <a id="limits-to-keep-in-mind"></a>
 <a id="privileged-copies-and-hard-links"></a>

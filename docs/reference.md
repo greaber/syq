@@ -480,7 +480,9 @@ it with `--src-non-dir` to copy the link itself. If a shell glob such as
 instead and keeps its links as links. A symlink elsewhere in a path
 you supply also stops the copy unless you pass `--follow-src` for source paths
 or `--follow-dst` for destination paths. `--follow` does both, and also
-follows paths given to options such as `--ignore-from`.
+follows paths given to options such as `--ignore-from`. None of them follows a
+link another user made in a shared directory such as `/tmp`; see
+[Which symlinks are followed?](security.md#which-symlinks-are-followed).
 
 ```sh
 # Copy the directory current-project points to as backup/current-project.

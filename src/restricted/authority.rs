@@ -225,8 +225,20 @@ pub(super) fn resolve_destination_links(
         if links > MAX_DESTINATION_LINKS {
             bail!("too many symlinks on the way to the destination");
         }
-        let target = root.read_link(&path)?;
         let link = label(&resolved);
+        // The kernel's protected-symlinks rule, judged by the directory
+        // the link is in, which has no links.
+        let directory = root.metadata(&crate::rooted::RelativePath::new(
+            &resolved[..resolved.len() - 1].join(&b'/'),
+        )?)?;
+        if !crate::rooted::may_follow_symlink(
+            metadata.uid,
+            (directory.mode, directory.uid),
+            crate::rooted::symlink_follower(),
+        ) {
+            return Err(crate::rooted::shared_directory_symlink(&link, metadata.uid));
+        }
+        let target = root.read_link(&path)?;
         resolved.pop();
         let rest = if target.starts_with(b"/") {
             let inside =
@@ -492,7 +504,7 @@ impl ConfinedRoot {
         // Where the directory really is, a path naming no symlink, which
         // the walk below then opens without following any.
         let real = if follow_dst {
-            match fs::canonicalize(parent) {
+            match crate::rooted::canonicalize_following_protected(parent) {
                 Ok(real) => real,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(missing()),
                 Err(error) => {

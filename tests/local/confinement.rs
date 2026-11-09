@@ -1942,3 +1942,61 @@ fn partial_candidates_do_not_break_empty_replacement_or_unchanged_files() {
         }
     }
 }
+
+/// With `--follow-dst`, a copy follows a link another account made in a
+/// sticky directory anyone can write to, such as /tmp, only as the kernel
+/// would: not at all, whether the link is the `--into` directory or above
+/// the destination. `--follow-src` is the same. The account's own link
+/// there is followed.
+#[cfg(debug_assertions)]
+#[test]
+fn followed_paths_skip_another_accounts_link_in_tmp() {
+    let t = Tmp::new();
+    write(&t.path("source/file"), b"data");
+    fs::create_dir(t.path("target")).unwrap();
+    let Some(shared) = test_support::SharedDirectoryLink::new(&t.path("target")) else {
+        eprintln!("skipped: no sticky directory another account owns");
+        return;
+    };
+    let link = shared.0.to_str().unwrap().to_owned();
+    let own = unsafe { libc::geteuid() };
+    // Stand in for another account than the link's owner.
+    let as_account = |uid: u32, args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(args)
+            .arg("-q")
+            .env("SYQ_TEST_OWN_UID", uid.to_string())
+            .run()
+            .expect("run syq")
+    };
+    let source = t.s("source/file");
+    let below = format!("{link}/below");
+    let through = format!("{link}/file");
+    let copies: [&[&str]; 3] = [
+        &["cp", "--follow-dst", "--src", &source, "--into", &link],
+        &["cp", "--follow-dst", "--src", &source, "--into", &below],
+        &[
+            "cp",
+            "--follow-src",
+            "--src",
+            &through,
+            "--into",
+            &t.s("read"),
+        ],
+    ];
+    for args in copies {
+        let refused = as_account(own.wrapping_add(1), args);
+        assert!(!refused.status.success(), "{args:?}");
+        let stderr = stderr_of(&refused);
+        assert!(stderr.contains("anyone can write to"), "{args:?}: {stderr}");
+    }
+    assert!(!t.path("target/file").exists());
+    assert!(!t.path("target/below").exists());
+    assert!(!t.path("read").exists());
+    for args in copies {
+        assert_output_ok(&as_account(own, args));
+    }
+    assert_eq!(read(&t.path("target/file")), b"data");
+    assert_eq!(read(&t.path("target/below/file")), b"data");
+    assert_eq!(read(&t.path("read/file")), b"data");
+}
