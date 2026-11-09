@@ -180,24 +180,102 @@ fn high_network_cap_keeps_single_read_comparison() {
     }
 }
 
+/// Under a cap, the control connection shortcut sends its files only when
+/// that takes at most about a second at the cap. Without a cap it takes any
+/// payload within its size limits.
 #[test]
-fn capped_small_push_keeps_the_control_connection_shortcut() {
-    let t = Tmp::new();
-    let data = prng(256 << 10, 4441);
-    write(&t.path("src"), &data);
-    let start = std::time::Instant::now();
-    let out = command(&t, 1, false, "128K")
-        .arg("--no-compress")
-        .args(paths(&t, false, false))
-        .run()
-        .unwrap();
-    assert_output_ok(&out);
-    assert_eq!(read(&t.path("dst")), data);
-    assert_eq!(tuning_observed(&out)["native_small_copies"], 1, "{out:?}");
-    assert!(
-        start.elapsed() >= Duration::from_millis(1800),
-        "shortcut bypassed cap: {out:?}"
-    );
+fn capped_small_push_takes_the_shortcut_only_within_a_second_at_the_cap() {
+    // Rate, file size, and whether the copy takes the shortcut.
+    for (rate, len, shortcut) in [
+        ("256K", 192 << 10, true),
+        ("256K", 320 << 10, false),
+        ("0", 320 << 10, true),
+    ] {
+        let t = Tmp::new();
+        let data = prng(len, 4441);
+        write(&t.path("src"), &data);
+        let start = std::time::Instant::now();
+        let out = command(&t, 1, false, rate)
+            .arg("--no-compress")
+            .args(paths(&t, false, false))
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst")), data);
+        assert_eq!(
+            tuning_observed(&out)["native_small_copies"],
+            u64::from(shortcut),
+            "{rate} {len}: {out:?}"
+        );
+        assert_eq!(
+            stderr_of(&out).contains("at the bandwidth cap; using the ordinary engine"),
+            !shortcut,
+            "{rate} {len}: {out:?}"
+        );
+        // Either path keeps to the cap: 192 KiB takes 0.75 s at 256 KiB/s.
+        if rate != "0" {
+            assert!(
+                start.elapsed() >= Duration::from_millis(len as u64 * 900 / (256 << 10)),
+                "{rate} {len} exceeded the cap: {out:?}"
+            );
+        }
+    }
+}
+
+/// Existing files that match but have a newer source mtime fail the quick
+/// check. When sending them in the shortcut would take over a second at the
+/// cap, the ordinary engine compares them first and sends no contents. Files
+/// that pass the quick check need no payload, so the shortcut still takes
+/// them however large they are.
+#[test]
+fn capped_push_of_touched_files_compares_them_instead_of_sending_them() {
+    for touched in [true, false] {
+        let t = Tmp::new();
+        let mut sources = Vec::new();
+        for n in 0..4 {
+            let data = prng(256 << 10, 4500 + n);
+            for directory in ["src", "dst"] {
+                write(&t.path(&format!("{directory}/{n}")), &data);
+            }
+            set_mtime(&t.path(&format!("dst/{n}")), 1);
+            if !touched {
+                set_mtime(&t.path(&format!("src/{n}")), 1);
+            }
+            sources.push(t.s(&format!("src/{n}")));
+        }
+        // Sending the 1 MiB would take four seconds at this cap.
+        let out = command(&t, 1, false, "256K")
+            .arg("--no-compress")
+            .env("SYQ_TEST_PACED_BYTES", t.path("paced"))
+            .args(&sources)
+            .args(["--to", "127.0.0.1", "--into", &t.s("dst")])
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        for n in 0..4 {
+            assert_eq!(
+                read(&t.path(&format!("dst/{n}"))),
+                read(&t.path(&format!("src/{n}")))
+            );
+        }
+        assert_eq!(
+            tuning_observed(&out)["native_small_copies"],
+            u64::from(!touched),
+            "touched {touched}: {out:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("1.00 MiB unchanged (4 files)"),
+            "touched {touched}: {out:?}"
+        );
+        #[cfg(debug_assertions)]
+        {
+            let paced = paced_bytes(&t);
+            assert!(
+                paced < 64 << 10,
+                "touched {touched}: sent {paced} bytes: {out:?}"
+            );
+        }
+    }
 }
 
 #[test]

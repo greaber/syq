@@ -1154,6 +1154,17 @@ fn small_copy_eligible(
         && clean_root(&dst.path) != b"~"
 }
 
+/// Under a bandwidth cap, a small copy whose requested files would take longer
+/// than this at the cap goes to the ordinary engine instead. The shortcut
+/// sends every file that fails the receiver's quick check, even an existing
+/// file whose contents already match, and shows no progress until it
+/// publishes. The ordinary engine compares such files before sending them and
+/// reports progress as it goes. What the shortcut saves is the engine's worker
+/// setup, a few round trips, which matters less as the payload's time at the
+/// cap grows. A second bounds what matching files with newer modification
+/// times can cost, and is how often `--results` records progress.
+const CAPPED_SMALL_COPY_SECONDS: u64 = 1;
+
 /// Offer source metadata during receiver configuration, then read and send
 /// only requested payloads. The same control session retains the destination
 /// and publishes through the ordinary staged path, without data workers.
@@ -1342,6 +1353,27 @@ fn attempt_small_copy(
             prepared = true;
             if needed.len() != entries.len() {
                 bail!("small copy returned a mismatched selection count");
+            }
+            // Only the receiver's quick check tells which files need sending,
+            // so a capped copy whose files all pass it still finishes in this
+            // turn. This counts file bytes; the cap counts compressed ones.
+            let requested: u64 = entries
+                .iter()
+                .zip(&needed)
+                .filter(|(_, needed)| **needed)
+                .map(|(entry, _)| entry.size)
+                .sum();
+            if let Some((budget, _)) = &pacing {
+                if requested > budget.rate().saturating_mul(CAPPED_SMALL_COPY_SECONDS) {
+                    if debug() {
+                        crate::output::diagnostic!(
+                            "syq: small copy: {requested} bytes would take over {CAPPED_SMALL_COPY_SECONDS} s at the bandwidth cap; using the ordinary engine on {}",
+                            fallback_connection(args)
+                        );
+                    }
+                    // Nothing was sent; as when reading the sources fails.
+                    return Ok(SmallCopy::Reconnect);
+                }
             }
             drop(planning.take());
             let setup = progress.clock.setup.begin();
