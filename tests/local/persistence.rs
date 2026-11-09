@@ -102,6 +102,46 @@ fn multiplexed_worker_refusal_falls_back_to_independent_ssh() {
     );
 }
 
+/// Workers started while a small-file tree is being planned try the shared
+/// login too; when the server refuses them, they log in on their own.
+#[test]
+fn multiplexed_refusal_falls_back_for_workers_started_while_planning() {
+    let t = Tmp::new();
+    fake_ssh_rejecting_multiplexed_workers(&t);
+    for index in 0..600 {
+        write(&t.path(&format!("src/f{index:04}")), b"small");
+    }
+    let out = compat_command()
+        .arg("--rsync-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .args(["--syq-no-tcp", "-a", "--performance-tuning", "workers=4"])
+        .arg(format!("{}/", t.s("src")))
+        .arg(format!("fake:{}/", t.s("dst")))
+        .arg("--no-progress")
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("PATH", format!("{}:/usr/bin:/bin", t.s("bin")))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .run()
+        .unwrap();
+
+    assert_output_ok(&out);
+    for index in [0, 599] {
+        assert_eq!(read(&t.path(&format!("dst/f{index:04}"))), b"small");
+    }
+    let invocations = fs::read_to_string(t.path("rsh.log")).unwrap();
+    assert!(
+        invocations
+            .lines()
+            .any(|line| line.starts_with("no|") && !line.ends_with("|none")),
+        "no multiplexed worker was attempted:\n{invocations}"
+    );
+    assert!(
+        invocations.lines().any(|line| line == "no|none"),
+        "no independent worker fallback was attempted:\n{invocations}"
+    );
+}
+
 // Persistence only saves logins, so a setting syq cannot use must not stop an
 // SSH copy. The copy warns and uses a connection for this run only.
 #[test]

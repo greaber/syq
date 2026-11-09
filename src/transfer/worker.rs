@@ -47,6 +47,13 @@ pub(super) struct Worker {
     /// Files whose publication is in flight, oldest first
     /// (`transfer::publication`).
     pub(super) publications: std::collections::VecDeque<super::publication::Publication>,
+    /// The worker joined the copy's shared SSH login because every file
+    /// planned so far could share it (`shares_ssh_login`). The startup
+    /// workers that always share it are not counted.
+    pub(super) on_shared_login: bool,
+    /// The worker took a file that needs its own login, gave it back, and
+    /// ends this connection so that it can log in separately.
+    pub(super) leaving_shared_login: bool,
 }
 
 pub(super) struct BlockDiff {
@@ -143,24 +150,42 @@ impl Worker {
                     Some(Item::Exit) | None => self.settle_between_items(true)?,
                     Some(item) => {
                         self.process_item(item)?;
-                        self.settle_between_items(false)?;
+                        self.settle_between_items(self.leaving_shared_login)?;
                     }
                 }
-                continue;
+            } else {
+                let item = {
+                    let _awaiting = self
+                        .observation
+                        .as_ref()
+                        .map(|a| a.span(crate::transfer_observations::Stage::AwaitingWork));
+                    self.sched.next()
+                };
+                if matches!(item, Item::Exit) {
+                    return Ok(());
+                }
+                self.process_item(item)?;
+                self.settle_between_items(self.leaving_shared_login)?;
             }
-            let item = {
-                let _awaiting = self
-                    .observation
-                    .as_ref()
-                    .map(|a| a.span(crate::transfer_observations::Stage::AwaitingWork));
-                self.sched.next()
-            };
-            if matches!(item, Item::Exit) {
+            if self.leaving_shared_login {
                 return Ok(());
             }
-            self.process_item(item)?;
-            self.settle_between_items(false)?;
         }
+    }
+
+    /// Whether this worker must leave the shared SSH login before it takes
+    /// `item`: the item belongs to a file that needs a login of its own.
+    pub(super) fn needs_own_login(&self, item: &Item) -> bool {
+        if !self.on_shared_login {
+            return false;
+        }
+        let idx = match item {
+            Item::File(idx) => *idx,
+            Item::Range(handle) => handle.lock().unwrap().idx,
+            // Publishing moves no file data.
+            Item::Exit | Item::Finish { .. } => return false,
+        };
+        !super::shares_ssh_login(&self.opts, &self.sched.jobs.lock().unwrap(), idx)
     }
 
     /// A scheduled operation can keep contributing progress after the tuner
@@ -172,6 +197,11 @@ impl Worker {
         // before checking the gate so any later reduction sees this operation.
         if !self.gate.allowed(self.id) {
             self.sched.return_unstarted(item);
+            return Ok(());
+        }
+        if self.needs_own_login(&item) {
+            self.sched.return_unstarted(item);
+            self.leaving_shared_login = true;
             return Ok(());
         }
         match item {
