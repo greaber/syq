@@ -259,6 +259,130 @@ async fn cancellation_retires_download_and_control_response_bodies() {
     }
 }
 
+/// After cancellation a multipart upload's abort still goes out, so an upload
+/// without a recovery record is not left on the server, but only for the
+/// grace: a server that does not answer, stalls its reply, or asks for a
+/// later retry cannot hold up cancellation.
+#[tokio::test]
+async fn multipart_aborts_still_go_out_for_a_while_after_cancellation() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let server = tokio::spawn({
+        let seen = seen.clone();
+        async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut headers = Vec::new();
+                    while !headers.ends_with(b"\r\n\r\n") {
+                        let Ok(byte) = socket.read_u8().await else {
+                            return;
+                        };
+                        headers.push(byte);
+                    }
+                    let line = String::from_utf8_lossy(&headers)
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .to_owned();
+                    seen.lock().unwrap().push(line.clone());
+                    let reply: &[u8] = if line.contains("/bucket/answered?") {
+                        b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"
+                    } else if line.contains("/bucket/throttled?") {
+                        b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 20\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                    } else if line.contains("/bucket/partial?") {
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 128\r\n\r\n<"
+                    } else {
+                        b""
+                    };
+                    socket.write_all(reply).await.unwrap();
+                    let mut buffer = [0; 1024];
+                    while matches!(socket.read(&mut buffer).await, Ok(1..)) {}
+                });
+            }
+        }
+    });
+    let cancellation = Arc::new(Cancellation::default());
+    let fallback = aws_smithy_http_client::Builder::new()
+        .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
+            aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
+        ))
+        .build_https();
+    // Retries as copies make them.
+    let sdk =
+        aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::config::Builder::new()
+                .behavior_version_latest()
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    "test", "test", None, None, "fixture",
+                ))
+                .endpoint_url(endpoint)
+                .force_path_style(true)
+                .retry_config(
+                    aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(3),
+                )
+                .retry_classifier(crate::s3::client::Throttling)
+                .sleep_impl(aws_sdk_s3::config::SharedAsyncSleep::new(Sleep(
+                    cancellation.clone(),
+                )))
+                .timeout_config(crate::s3::client::request_timeouts())
+                .stalled_stream_protection(
+                    aws_sdk_s3::config::StalledStreamProtectionConfig::disabled(),
+                )
+                .http_client(client(fallback, cancellation.clone()))
+                .build(),
+        );
+    let abort = |key: &'static str| {
+        sdk.abort_multipart_upload()
+            .bucket("bucket")
+            .key(key)
+            .upload_id("upload")
+            .send()
+    };
+    let cancelled = tokio::time::Instant::now();
+    cancellation.cancel();
+    abort("answered").await.unwrap();
+    let delete = sdk.delete_object().bucket("bucket").key("other").send();
+    let (silent, partial, throttled, delete) =
+        tokio::time::timeout(Duration::from_secs(60), async {
+            tokio::join!(
+                abort("silent"),
+                abort("partial"),
+                abort("throttled"),
+                delete
+            )
+        })
+        .await
+        .unwrap();
+    assert!(silent.is_err());
+    assert!(partial.is_err());
+    assert!(throttled.is_err());
+    assert!(delete.is_err());
+    assert!(cancelled.elapsed() >= cancel::ABORT_GRACE);
+    // Not the 20 seconds the server asked the throttled abort to wait.
+    assert!(cancelled.elapsed() < cancel::ABORT_GRACE + Duration::from_secs(3));
+    // The grace is counted from cancellation, not from each abort.
+    let late = tokio::time::Instant::now();
+    assert!(abort("answered").await.is_err());
+    assert!(late.elapsed() < Duration::from_secs(1));
+    let mut seen = seen.lock().unwrap().clone();
+    seen.sort();
+    assert_eq!(seen.len(), 4, "{seen:?}");
+    for (line, key) in seen
+        .iter()
+        .zip(["answered", "partial", "silent", "throttled"])
+    {
+        assert!(
+            line.starts_with(&format!("DELETE /bucket/{key}?")) && line.contains("uploadId=upload"),
+            "{line}"
+        );
+    }
+    server.abort();
+}
+
 #[path = "../../../tests/support/https.rs"]
 mod https;
 

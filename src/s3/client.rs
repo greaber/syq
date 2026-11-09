@@ -379,6 +379,8 @@ pub(super) async fn connect_authorized(
             aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
         ))
         .build_with_resolver(super::dns::CoalescingDns::default());
+    let sleep =
+        aws_sdk_s3::config::SharedAsyncSleep::new(super::upload_http::Sleep(uploads.clone()));
     let transport = super::upload_http::client(transport, uploads);
     let transport = match authorization {
         Some(authorization) => super::authorization::http_client(transport, authorization),
@@ -393,6 +395,7 @@ pub(super) async fn connect_authorized(
                 .unwrap_or_else(|| Region::new("us-east-1")),
         )
         .retry_config(RetryConfig::standard().with_max_attempts(options.retries + 1))
+        .sleep_impl(sleep)
         .retry_partition(super::retry::partition())
         .retry_classifier(Throttling)
         .timeout_config(request_timeouts())

@@ -32,7 +32,7 @@ use std::{
 use tokio::sync::Notify;
 
 mod cancel;
-pub(super) use cancel::Cancellation;
+pub(super) use cancel::{Cancellation, Sleep};
 
 #[derive(Debug, Default)]
 struct Active {
@@ -122,7 +122,8 @@ struct Connector {
 }
 impl HttpConnector for Connector {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
-        self.cancellation.wrap(self.call_inner(request))
+        self.cancellation
+            .wrap(request, |request| self.call_inner(request))
     }
 }
 impl Connector {

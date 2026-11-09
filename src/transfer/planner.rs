@@ -98,6 +98,8 @@ pub(super) struct Planner<'a> {
     pub(super) mapping_mode: bool,
     /// Placement root and receiver-enforced conditions for native operations.
     pub(super) dst_root: PathBytes,
+    /// `dst_root` as errors show it, with the destination's host.
+    pub(super) shown_dst_root: String,
     pub(super) exact_condition: TargetCondition,
     pub(super) mutation_root_condition: TargetCondition,
     /// A missing retained operator directory: (request prefix, creation
@@ -576,7 +578,7 @@ impl Planner<'_> {
             Some(entry) if entry.dev == dev && entry.ino == ino => Ok(Some(entry)),
             _ => bail!(
                 "target {} changed after the placement precondition was checked",
-                display(&self.dst_root)
+                self.shown_dst_root
             ),
         }
     }
@@ -634,7 +636,7 @@ impl Planner<'_> {
                         if destination.exact && destination.entry_is_dir && root.kind != Kind::Dir {
                             bail!(
                             "destination {} is an existing directory; cannot replace it with non-directory source {}",
-                            display(dst_root),
+                            pl.shown_dst_root,
                             display(src_root)
                         );
                         }
@@ -649,7 +651,7 @@ impl Planner<'_> {
                         {
                             bail!(
                             "destination {} is not a directory; cannot place directory {} inside it",
-                            display(dst_root),
+                            pl.shown_dst_root,
                             display(src_root)
                         );
                         }
@@ -1611,7 +1613,7 @@ impl Planner<'_> {
                         .unwrap_or(NEW_DIRECTORY_MODE),
                 };
                 let (selection, created) = create_operator_directory(self.dst, condition, mode)
-                    .map_err(|error| new_root_refused(error, condition, &self.dst_root))
+                    .map_err(|error| new_root_refused(error, condition, &self.shown_dst_root))
                     .map_err(|error| with_failure_hint(self.opts, error))?;
                 if is_destination_root && !created {
                     self.adopt_existing_root(&root, &selection);
@@ -1633,8 +1635,8 @@ impl Planner<'_> {
                 } else {
                     self.root_source_mode.unwrap_or(NEW_DIRECTORY_MODE)
                 };
-                let created = mkdir_root(self.dst, &root, condition, mode)
-                    .map_err(|error| new_root_refused(error, condition, &root))?;
+                let created = mkdir_root(self.dst, (&root, &self.shown_dst_root), condition, mode)
+                    .map_err(|error| new_root_refused(error, condition, &self.shown_dst_root))?;
                 self.mutation_root_condition = target_identity(&created);
             }
         }
@@ -4045,7 +4047,9 @@ impl Planner<'_> {
                     .rsplit(|&c| c == b'/')
                     .next()
                     .unwrap_or(entry_path);
-                if entry_kind == Kind::File && is_partial_name(OsStr::from_bytes(name)) {
+                if entry_kind == Kind::File
+                    && crate::fsops::is_resumable_partial_name(OsStr::from_bytes(name))
+                {
                     if self.opts.verbose > 0 {
                         self.progress.eprintln(&format!(
                                     "syq: not deleting {rel}: its name matches syq's partial-file format; use syq clean-partials after copies stop"

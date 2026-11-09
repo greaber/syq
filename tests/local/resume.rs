@@ -980,6 +980,53 @@ fn delete_preserves_recognized_partial_files() {
     );
 }
 
+/// Pruning keeps an S3 download's partial as it keeps a copy's: a later
+/// download resumes from it, or one still running is writing it.
+#[test]
+fn delete_preserves_s3_download_partials() {
+    let t = Tmp::new();
+    write(&t.path("src/real"), b"r");
+    let partial = format!(".syq-s3-{}.partial", "0123456789abcdef".repeat(4));
+    write(&t.path(&format!("dst/{partial}")), b"downloaded parts");
+    write(&t.path(&format!("dst/gone/{partial}")), b"downloaded parts");
+    write(&t.path("dst/gone/extra"), b"extra");
+    // Not the name downloads give partials: an ordinary extra.
+    write(&t.path("dst/.syq-s3-123.partial"), b"extra");
+    for dry_run in [true, false] {
+        let out = syq(&[
+            if dry_run { "-anv" } else { "-av" },
+            "--delete",
+            &t.s("src/"),
+            &t.s("dst"),
+        ]);
+        assert_output_ok(&out);
+        let diagnostic = stderr_of(&out);
+        assert!(
+            diagnostic.contains(&format!(
+                "not deleting {partial}: its name matches syq's partial-file format"
+            )),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains(&format!(
+                "not deleting gone/: it holds partial gone/{partial}"
+            )),
+            "{diagnostic}"
+        );
+        assert_eq!(t.path("dst/gone/extra").exists(), dry_run);
+        assert_eq!(t.path("dst/.syq-s3-123.partial").exists(), dry_run);
+    }
+    assert_eq!(
+        listing(&t.path("dst")),
+        [
+            partial.clone(),
+            "gone".into(),
+            format!("gone/{partial}"),
+            "real".into()
+        ]
+    );
+}
+
 #[cfg(debug_assertions)]
 #[test]
 fn delete_keeps_partials_of_filtered_files() {

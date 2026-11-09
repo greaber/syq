@@ -1,5 +1,7 @@
 //! Cancel requests, streaming responses, and blocking upload sockets.
-use aws_smithy_runtime_api::client::{http::HttpConnectorFuture, result::ConnectorError};
+use aws_smithy_runtime_api::client::{
+    http::HttpConnectorFuture, orchestrator::HttpRequest, result::ConnectorError,
+};
 use std::{
     future::Future,
     io::{self, Read, Write},
@@ -16,8 +18,23 @@ use ureq::unversioned::transport::{
 
 #[derive(Debug, Default)]
 struct State {
-    cancelled: bool,
+    /// When the copy was cancelled.
+    cancelled: Option<tokio::time::Instant>,
     sockets: Vec<Weak<TcpStream>>,
+}
+
+/// How long a multipart upload's abort may still run after cancellation.
+/// Without it, an upload that has no recovery record stays on the server,
+/// and nothing would find it again. Requests have no read deadline, so the
+/// grace is what keeps cancellation prompt when the server does not answer.
+pub(super) const ABORT_GRACE: Duration = Duration::from_secs(5);
+
+/// Whether `request` aborts a multipart upload: S3 has no other `DELETE`
+/// that names an upload.
+fn aborts_upload(request: &HttpRequest) -> bool {
+    request.method() == "DELETE"
+        && url::Url::parse(request.uri())
+            .is_ok_and(|url| url.query_pairs().any(|(key, _)| key == "uploadId"))
 }
 
 #[derive(Debug, Default)]
@@ -34,7 +51,9 @@ impl Cancellation {
     pub fn cancel(&self) {
         let sockets = {
             let mut state = self.state.lock().unwrap();
-            state.cancelled = true;
+            state
+                .cancelled
+                .get_or_insert_with(tokio::time::Instant::now);
             std::mem::take(&mut state.sockets)
         };
         self.changed.notify_waiters();
@@ -45,7 +64,7 @@ impl Cancellation {
 
     fn register(&self, socket: &Arc<TcpStream>) -> io::Result<()> {
         let mut state = self.state.lock().unwrap();
-        if state.cancelled {
+        if state.cancelled.is_some() {
             socket.shutdown(Shutdown::Both)?;
             return Err(interrupted());
         }
@@ -54,39 +73,66 @@ impl Cancellation {
         Ok(())
     }
 
-    pub(super) fn wrap(self: &Arc<Self>, request: HttpConnectorFuture) -> HttpConnectorFuture {
-        let cancellation = self.clone();
-        HttpConnectorFuture::new(async move {
-            let cancelled = cancellation.changed.notified();
-            tokio::pin!(cancelled);
-            cancelled.as_mut().enable();
-            if cancellation.state.lock().unwrap().cancelled {
-                return Err(ConnectorError::other(interrupted().into(), None));
+    /// Resolves when a request must stop: at cancellation, or `grace` after
+    /// it.
+    async fn stopped(self: Arc<Self>, grace: Option<Duration>) {
+        loop {
+            let changed = self.changed.clone().notified_owned();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let cancelled = self.state.lock().unwrap().cancelled;
+            if let Some(cancelled) = cancelled {
+                if let Some(grace) = grace {
+                    tokio::time::sleep_until(cancelled + grace).await;
+                }
+                return;
             }
+            changed.await;
+        }
+    }
+
+    pub(super) fn wrap(
+        self: &Arc<Self>,
+        request: HttpRequest,
+        send: impl FnOnce(HttpRequest) -> HttpConnectorFuture,
+    ) -> HttpConnectorFuture {
+        let grace = aborts_upload(&request).then_some(ABORT_GRACE);
+        let request = send(request);
+        let mut stop: Stop = Box::pin(self.clone().stopped(grace));
+        HttpConnectorFuture::new(async move {
             tokio::select! {
                 biased;
-                _ = &mut cancelled => Err(ConnectorError::other(interrupted().into(), None)),
+                _ = &mut stop => Err(ConnectorError::other(interrupted().into(), None)),
                 result = request => {
                     let mut response = result?;
                     let body = std::mem::replace(response.body_mut(), aws_smithy_types::body::SdkBody::empty());
-                    *response.body_mut() = cancellation.body(body);
+                    *response.body_mut() = aws_smithy_types::body::SdkBody::from_body_1_x(ResponseBody {
+                        body,
+                        stop: Some(stop),
+                    });
                     Ok(response)
                 },
             }
         })
     }
+}
 
-    fn body(
-        self: &Arc<Self>,
-        body: aws_smithy_types::body::SdkBody,
-    ) -> aws_smithy_types::body::SdkBody {
-        let mut changed = Box::pin(self.changed.clone().notified_owned());
-        changed.as_mut().enable();
-        let cancelled = self.state.lock().unwrap().cancelled;
-        aws_smithy_types::body::SdkBody::from_body_1_x(ResponseBody {
-            body,
-            changed,
-            cancelled,
+type Stop = Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
+
+/// The SDK's sleeps, such as its retry backoff, for a client this cancels.
+/// After cancellation none lasts past the abort grace, so an abort that the
+/// server asks to retry later cannot hold up cancellation; its next attempt
+/// is then refused.
+#[derive(Debug)]
+pub(in crate::s3) struct Sleep(pub Arc<Cancellation>);
+impl aws_sdk_s3::config::AsyncSleep for Sleep {
+    fn sleep(&self, duration: Duration) -> aws_sdk_s3::config::Sleep {
+        let stopped = self.0.clone().stopped(Some(ABORT_GRACE));
+        aws_sdk_s3::config::Sleep::new(async move {
+            tokio::select! {
+                () = tokio::time::sleep(duration) => {}
+                () = stopped => {}
+            }
         })
     }
 }
@@ -96,8 +142,8 @@ impl Cancellation {
 // deadline could prevent the engine from draining after Ctrl-C.
 struct ResponseBody {
     body: aws_smithy_types::body::SdkBody,
-    changed: Pin<Box<tokio::sync::futures::OwnedNotified>>,
-    cancelled: bool,
+    /// `None` once the request had to stop.
+    stop: Option<Stop>,
 }
 impl http_body::Body for ResponseBody {
     type Data = bytes::Bytes;
@@ -107,8 +153,12 @@ impl http_body::Body for ResponseBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        if self.cancelled || self.changed.as_mut().poll(cx).is_ready() {
-            self.cancelled = true;
+        if self
+            .stop
+            .as_mut()
+            .is_none_or(|stop| stop.as_mut().poll(cx).is_ready())
+        {
+            self.stop = None;
             return Poll::Ready(Some(Err(interrupted().into())));
         }
         Pin::new(&mut self.body).poll_frame(cx)
@@ -144,7 +194,7 @@ impl<In: Transport> Connector<In> for TcpConnector {
         let budget = details.timeout.not_zero().map(|d| *d);
         let mut last = io::Error::new(io::ErrorKind::NotFound, "no S3 socket addresses");
         for (index, address) in details.addrs.iter().enumerate() {
-            if self.0.state.lock().unwrap().cancelled {
+            if self.0.state.lock().unwrap().cancelled.is_some() {
                 return Err(interrupted().into());
             }
             let stream = if let Some(budget) = budget {
