@@ -1107,16 +1107,37 @@ impl RemoteConn {
     /// them, or up to the kept reply `until`. A reply that must be `Ok` and
     /// is not fails this and every later read.
     fn receive_deferred(&mut self, until: Option<u64>) -> Result<()> {
+        self.read_deferred(until, true).map(|_| ())
+    }
+
+    /// `receive_deferred` for all of them, but only as far as they have
+    /// arrived, without waiting for the next: true once none is left. The
+    /// rest of a reply that comes in parts follows its first part without a
+    /// further round trip, and is read as it comes.
+    fn receive_arrived_deferred(&mut self) -> Result<bool> {
+        self.read_deferred(None, false)
+    }
+
+    fn read_deferred(&mut self, until: Option<u64>, wait: bool) -> Result<bool> {
+        let mut all = true;
         while let Some(deferred) = self.deferred.pending.pop_front() {
+            let first = if wait {
+                self.receive_next_response()?
+            } else if let Some(first) = self.try_receive_next_response()? {
+                first
+            } else {
+                self.deferred.pending.push_front(deferred);
+                all = false;
+                break;
+            };
             match deferred {
                 Deferred::Ok(what) => {
-                    if let Err(error) = ok(self.receive_next_response()?.into_inner(), what) {
+                    if let Err(error) = ok(first.into_inner(), what) {
                         self.deferred.pending.clear();
                         self.deferred.failed = Some(format!("{error:#}"));
                     }
                 }
                 Deferred::Reply { id, expected } => {
-                    let first = self.receive_next_response()?;
                     let arrival = first.started_at;
                     let reply = assemble_reply(expected, first.into_inner(), || {
                         Ok(self.receive_next_response()?.into_inner())
@@ -1130,7 +1151,25 @@ impl RemoteConn {
         }
         match &self.deferred.failed {
             Some(failure) => Err(DeferredRequestError(failure.clone()).into()),
-            None => Ok(()),
+            None => Ok(all),
+        }
+    }
+
+    /// The next reply, if it has arrived, without waiting for it.
+    fn try_receive_next_response(&mut self) -> Result<Option<ReceivedResponse>> {
+        use std::sync::mpsc::TryRecvError;
+        let response = self
+            .rx
+            .as_ref()
+            .context("response reader is collecting streaming writes")?
+            .try_recv();
+        match response {
+            Ok(Ok(response)) => Ok(Some(response)),
+            Ok(Err(error)) => Err(self.io_err(error.into())),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(self.io_err(
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "reader stopped").into(),
+            )),
         }
     }
 
@@ -1343,26 +1382,19 @@ impl Conn for RemoteConn {
         Ok((response.into_inner(), completed))
     }
     fn try_recv_with_arrival(&mut self) -> Option<Result<(Response, std::time::Instant)>> {
-        use std::sync::mpsc::TryRecvError;
-        if let Err(error) = self.receive_deferred(None) {
-            return Some(Err(error));
+        // The replies of requests sent without waiting come first. Take
+        // those that have arrived; the next reply cannot be here before the
+        // rest.
+        match self.receive_arrived_deferred() {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(error) => return Some(Err(error)),
         }
-        let Some(rx) = &self.rx else {
-            return Some(Err(anyhow!(
-                "response reader is collecting streaming writes"
-            )));
-        };
-        match rx.try_recv() {
-            Ok(Ok(response)) => {
-                let arrived = response.started_at;
-                Some(Ok((response.into_inner(), arrived)))
-            }
-            Ok(Err(error)) => Some(Err(self.io_err(error.into()))),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => Some(Err(self.io_err(
-                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "reader stopped").into(),
-            ))),
-        }
+        let response = self.try_receive_next_response().transpose()?;
+        Some(response.map(|response| {
+            let arrived = response.started_at;
+            (response.into_inner(), arrived)
+        }))
     }
     fn track_small_batches(
         &mut self,
