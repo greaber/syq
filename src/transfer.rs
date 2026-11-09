@@ -1354,9 +1354,10 @@ fn attempt_small_copy(
             if needed.len() != entries.len() {
                 bail!("small copy returned a mismatched selection count");
             }
-            // Only the receiver's quick check tells which files need sending,
-            // so a capped copy whose files all pass it still finishes in this
-            // turn. This counts file bytes; the cap counts compressed ones.
+            // Count only the files the receiver asked for after its quick
+            // check; when every file passes, the copy has already finished in
+            // the first turn. This counts file bytes; the cap counts
+            // compressed ones.
             let requested: u64 = entries
                 .iter()
                 .zip(&needed)
@@ -1371,7 +1372,8 @@ fn attempt_small_copy(
                             fallback_connection(args)
                         );
                     }
-                    // Nothing was sent; as when reading the sources fails.
+                    // No payload was sent; fall back as when reading the
+                    // sources fails.
                     return Ok(SmallCopy::Reconnect);
                 }
             }
