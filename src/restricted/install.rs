@@ -577,6 +577,13 @@ pub(super) fn install_for_account(
     // which a retry completes.
     ensure_directory(&state, 0o700)?;
     let results_public_key = results_key(&state)?;
+    // A record recreated for an enrollment that had one: a directive
+    // issued before now may have run against the old one.
+    let record_since = match &existing {
+        Some(existing) if replay_usable => existing.record_since,
+        Some(_) => Some(crate::directive::now()?),
+        None => None,
+    };
     let config = ReceiverEnrollment {
         version: CONFIG_VERSION,
         id: request.id,
@@ -586,6 +593,7 @@ pub(super) fn install_for_account(
         receiver_path: receiver.clone(),
         entry_public_key: request.entry_public_key.clone(),
         signer: request.signer.clone(),
+        record_since,
     };
     // The new generation is durable before a record of used grants is
     // recreated: receivers admit grants only for the current generation, so

@@ -511,6 +511,13 @@ fn an_unusable_record_of_used_grants_is_recreated_under_a_new_generation() {
         installed(install_for_account(&request, &account, home).unwrap()),
         (1, true)
     );
+    let config = |home: &Path| {
+        read_receiver_config(&enrollment_state(home, id))
+            .unwrap()
+            .unwrap()
+    };
+    // A new enrollment's record has no directive issued before it.
+    assert_eq!(config(home).record_since, None);
     let replay = enrollment_state(home, id).join("replay");
     fs::remove_dir(&replay).unwrap();
     // A refresh for a refused copy that is signed again under the same
@@ -528,11 +535,16 @@ fn an_unusable_record_of_used_grants_is_recreated_under_a_new_generation() {
     };
     assert_eq!(generation(home), 1);
     let refresh = install_request(&account, id, &entry, &login, true);
+    let before = crate::directive::now().unwrap();
     assert_eq!(
         installed(install_for_account(&refresh, &account, home).unwrap()),
         (2, true)
     );
     assert!(replay.is_dir());
+    // Receivers refuse directives issued before the record was recreated,
+    // such as a refused copy signed again after the first ran.
+    let since = config(home).record_since.unwrap();
+    assert!((before..=crate::directive::now().unwrap()).contains(&since));
     assert_eq!(fs::metadata(&replay).unwrap().mode() & 0o777, 0o700);
     let line = fs::read_to_string(home.join(".ssh/authorized_keys")).unwrap();
     assert!(line.contains("--generation=2\""), "{line}");
@@ -545,6 +557,7 @@ fn an_unusable_record_of_used_grants_is_recreated_under_a_new_generation() {
         installed(install_for_account(&keeping, &account, home).unwrap()),
         (2, false)
     );
+    assert_eq!(config(home).record_since, Some(since));
     // A record the receiver refuses, as after a restore from a backup with
     // another mode, or something else in its place, is recreated the same
     // way.
@@ -948,6 +961,7 @@ fn a_receiver_from_an_older_line_refuses_new_copies() {
             .to_openssh()
             .unwrap(),
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
+        record_since: None,
     };
     require_current_receiver(&config, 4, "v0.8.0").unwrap();
     for (generation, build) in [(3, "v0.8.0"), (4, "v0.7.9"), (5, "v0.8.0")] {
@@ -959,6 +973,11 @@ fn a_receiver_from_an_older_line_refuses_new_copies() {
     for field in ["dev", "ino", "root"] {
         assert!(!encoded.contains(&format!("\"{field}")), "{encoded}");
     }
+    // Without a recreated record, the state is as earlier builds wrote it,
+    // and theirs reads with no limit on when directives were issued.
+    assert!(!encoded.contains("record_since"), "{encoded}");
+    let read: ReceiverEnrollment = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(read.record_since, None);
 }
 
 /// A coordinating source's receiver verifies its own directive as a
@@ -990,6 +1009,7 @@ fn a_coordinating_source_is_admitted_only_with_its_own_destination_directive() {
             .to_openssh()
             .unwrap(),
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
+        record_since: None,
     };
     let command = [
         "cp",
@@ -1178,6 +1198,7 @@ fn a_source_directive_is_admitted_only_for_what_its_command_reads() {
             .to_openssh()
             .unwrap(),
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
+        record_since: None,
     };
     let command = |extra: &[&str]| {
         ["cp", "--from", "host-b"]
@@ -1328,6 +1349,7 @@ fn a_directive_is_recorded_only_after_every_check_passes() {
             .to_openssh()
             .unwrap(),
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
+        record_since: None,
     };
     let home = temporary.path();
     let directive = |change: &dyn Fn(&mut crate::directive::Directive)| {
@@ -1411,6 +1433,25 @@ fn a_directive_is_recorded_only_after_every_check_passes() {
     assert_eq!(recorded(), 0);
 
     config.signer = delegation::TrustedSigner::new(login.public_key(), None, None).unwrap();
+    // A copy approved before this server recreated its record of the
+    // directives that ran, as a refused copy signed again is, may have run
+    // against the record that was lost.
+    let issued = crate::directive::Signed::decode(&valid)
+        .unwrap()
+        .directive
+        .issued_at;
+    config.record_since = Some(issued + 1);
+    let error = verify(&state, &config, current, &valid, home)
+        .err()
+        .unwrap();
+    assert!(
+        format!("{error:#}")
+            .contains("may have run already and is not run again; run the copy again"),
+        "{error:#}"
+    );
+    assert_eq!(recorded(), 0);
+
+    config.record_since = Some(issued);
     let ((grant, _), _) = verify(&state, &config, current, &valid, home).unwrap();
     assert_eq!(grant.copy.destination, b"/backup");
     assert_ne!(recorded(), 0);

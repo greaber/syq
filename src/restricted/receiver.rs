@@ -900,7 +900,29 @@ fn verify_with<T>(
         },
         clock_skew_seconds: CLOCK_SKEW_SECONDS,
     };
-    delegation::verify_and_redeem(directive, &context, &config.signer, &replay, derive)
+    delegation::verify_and_redeem(directive, &context, &config.signer, &replay, |directive| {
+        require_issued_since_record(config, directive)?;
+        derive(directive)
+    })
+}
+
+/// Refuse a directive issued before this server recreated its record of the
+/// directives that ran: it may have run against the record that was lost.
+/// A refused copy that is signed again keeps the time it was first issued.
+fn require_issued_since_record(
+    config: &ReceiverEnrollment,
+    directive: &crate::directive::Directive,
+) -> Result<()> {
+    if config
+        .record_since
+        .is_some_and(|since| directive.issued_at < since)
+    {
+        bail!(
+            "this copy was approved before this server recreated its record of the copies enrollment {} ran, so it may have run already and is not run again; run the copy again",
+            config.id
+        );
+    }
+    Ok(())
 }
 
 /// A connection started from an older line still runs the forced command it
