@@ -368,6 +368,67 @@ fn native_remote_destination_socket_policy_uses_handshake_capability() {
     assert!(!t.path("dst-linux").exists());
 }
 
+/// Errors about a remote destination name its host, so they cannot be read
+/// as paths on this machine.
+#[test]
+fn remote_destination_errors_name_the_host() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    write(&t.path("src"), b"source");
+    write(&t.path("file"), b"existing file");
+    fs::create_dir_all(t.path("dir")).unwrap();
+    for (placement, target, message) in [
+        (
+            "--into-new",
+            "dir",
+            "target fake:{} already exists, but the selected placement requires a new path",
+        ),
+        (
+            "--into",
+            "file",
+            "--into target fake:{} exists but is not a directory",
+        ),
+        (
+            "--into-existing",
+            "missing",
+            "target fake:{} does not exist, but the selected placement requires an existing path",
+        ),
+        (
+            "--as-new",
+            "file",
+            "target fake:{} already exists, but the selected placement requires a new path",
+        ),
+    ] {
+        let target = t.s(target);
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["cp", "--rsh"])
+            .arg(&rsh)
+            .args(["--syq-path", env!("CARGO_BIN_EXE_syq")])
+            .args([
+                "--no-tcp",
+                "--no-progress",
+                &t.s("src"),
+                "--to",
+                "fake",
+                placement,
+                &target,
+            ])
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .run()
+            .unwrap();
+        assert!(!output.status.success(), "{placement}: {output:?}");
+        let message = message.replace("{}", &target);
+        assert!(
+            stderr_of(&output).contains(&message),
+            "{placement}: {output:?}"
+        );
+    }
+    assert_eq!(read(&t.path("file")), b"existing file");
+    assert!(!t.path("missing").exists());
+}
+
 #[test]
 fn native_rejects_unknown_relay_option() {
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))

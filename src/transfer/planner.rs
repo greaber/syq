@@ -98,6 +98,8 @@ pub(super) struct Planner<'a> {
     pub(super) mapping_mode: bool,
     /// Placement root and receiver-enforced conditions for native operations.
     pub(super) dst_root: PathBytes,
+    /// `dst_root` as errors show it, with the destination's host.
+    pub(super) shown_dst_root: String,
     pub(super) exact_condition: TargetCondition,
     pub(super) mutation_root_condition: TargetCondition,
     /// A missing retained operator directory: (request prefix, creation
@@ -1611,7 +1613,7 @@ impl Planner<'_> {
                         .unwrap_or(NEW_DIRECTORY_MODE),
                 };
                 let (selection, created) = create_operator_directory(self.dst, condition, mode)
-                    .map_err(|error| new_root_refused(error, condition, &self.dst_root))
+                    .map_err(|error| new_root_refused(error, condition, &self.shown_dst_root))
                     .map_err(|error| with_failure_hint(self.opts, error))?;
                 if is_destination_root && !created {
                     self.adopt_existing_root(&root, &selection);
@@ -1633,8 +1635,8 @@ impl Planner<'_> {
                 } else {
                     self.root_source_mode.unwrap_or(NEW_DIRECTORY_MODE)
                 };
-                let created = mkdir_root(self.dst, &root, condition, mode)
-                    .map_err(|error| new_root_refused(error, condition, &root))?;
+                let created = mkdir_root(self.dst, (&root, &self.shown_dst_root), condition, mode)
+                    .map_err(|error| new_root_refused(error, condition, &self.shown_dst_root))?;
                 self.mutation_root_condition = target_identity(&created);
             }
         }

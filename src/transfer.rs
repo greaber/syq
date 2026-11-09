@@ -3642,10 +3642,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         .is_some_and(|entry| entry.kind == Kind::Dir);
     match args.target_existence {
         Existence::Any => {}
-        Existence::New if dst_existed => return Err(new_target_exists(&dst_root)),
+        Existence::New if dst_existed => {
+            return Err(new_target_exists(&display_plan_target(
+                dst, &dst_root, &args,
+            )))
+        }
         Existence::Existing if !dst_existed => bail!(
             "target {} does not exist, but the selected placement requires an existing path",
-            display(&dst_root)
+            display_plan_target(dst, &dst_root, &args)
         ),
         Existence::New | Existence::Existing => {}
     }
@@ -3663,7 +3667,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             {
                 bail!(
                     "--into destination {} is a symlink, and this receiver does not follow destination symlinks; name the directory the link points to",
-                    display(&dst_root)
+                    display_plan_target(dst, &dst_root, &args)
                 );
             }
             if args.interface != Interface::Rsync
@@ -3674,13 +3678,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             {
                 bail!(
                     "--into destination {} is a symlink; pass --follow-dst (or --follow) to resolve destination symlinks",
-                    display(&dst_root)
+                    display_plan_target(dst, &dst_root, &args)
                 );
             }
             if dst_existed && !dst_entry_is_dir {
                 bail!(
                     "--into target {} exists but is not a directory",
-                    display(&dst_root)
+                    display_plan_target(dst, &dst_root, &args)
                 );
             }
             true
@@ -3717,14 +3721,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     {
         bail!(
             "--into-existing target {} is not an existing directory",
-            display(&dst_root)
+            display_plan_target(dst, &dst_root, &args)
         );
     }
     if args.files_from.is_some() {
         if let Some(e) = dst_root_entry.as_ref().filter(|e| e.kind != Kind::Dir) {
             bail!(
                 "--files-from needs a directory destination; {} is a {:?}",
-                display(&dst_root),
+                display_plan_target(dst, &dst_root, &args),
                 e.kind
             );
         }
@@ -3839,7 +3843,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // created since is not adopted: the copy refuses it, as the check would
     // have, and later creates its own without replacing anything.
     if args.target_existence == Existence::New && dst_is_dir && directory_selection.is_some() {
-        return Err(new_target_exists(&dst_root));
+        return Err(new_target_exists(&display_plan_target(
+            dst, &dst_root, &args,
+        )));
     }
     if debug() {
         crate::output::diagnostic!(
@@ -3862,7 +3868,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 bail!(
                     "search destination directory {}: Permission denied (os error 13); \
                      an owned destination directory lacks the required owner permissions; {}",
-                    display(&dst_root),
+                    display_plan_target(dst, &dst_root, &args),
                     opts.hint_for(WidenDirs::All).unwrap_or_default()
                 );
             }
@@ -3889,7 +3895,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             if !appeared_matches_selection {
                 bail!(
                     "destination directory {} changed while resolving it",
-                    display(&operator_dst_root)
+                    display_plan_target(dst, &operator_dst_root, &args)
                 );
             }
             dst_root_entry = appeared;
@@ -4310,7 +4316,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     .filter(|_| dst_is_dir)
                     .map_or_else(|| root_source_mode.unwrap_or(NEW_DIRECTORY_MODE), |_| 0o700),
             )
-            .map_err(|error| new_root_refused(error, condition, &dst_root))
+            .map_err(|error| {
+                new_root_refused(
+                    error,
+                    condition,
+                    &display_plan_target(dst, &dst_root, &args),
+                )
+            })
             .map_err(|error| with_failure_hint(&opts, error))?;
             if dst_is_dir && !created {
                 // Another process created the destination root after it was
@@ -4349,9 +4361,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 .expect("destination anchor set once");
         }
     } else if create_root && !defer_destination_mutations {
+        let shown = display_plan_target(dst, &dst_root, &args);
         let created = mkdir_root(
             &mut *dst_ctl,
-            &dst_root,
+            (&dst_root, &shown),
             root_create_condition,
             if private_root.is_some() {
                 0o700
@@ -4359,7 +4372,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 root_source_mode.unwrap_or(NEW_DIRECTORY_MODE)
             },
         )
-        .map_err(|error| new_root_refused(error, root_create_condition, &dst_root))?;
+        .map_err(|error| new_root_refused(error, root_create_condition, &shown))?;
         mutation_root_condition = target_identity(&created);
     }
     if debug() {
@@ -4716,6 +4729,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         max_delete_hit: false,
         delete_walk_failed: false,
         dst_root: dst_root.clone(),
+        shown_dst_root: display_plan_target(dst, &dst_root, &args),
         exact_condition,
         mutation_root_condition,
         buffer: if defer_destination_mutations {
@@ -5562,11 +5576,11 @@ fn hold_after_target_precondition_for_test(_args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// A destination that must be new but already exists.
-fn new_target_exists(dst_root: &[u8]) -> anyhow::Error {
+/// A destination that must be new but already exists. `target` is shown as
+/// `display_plan_target` shows it.
+fn new_target_exists(target: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "target {} already exists, but the selected placement requires a new path",
-        display(dst_root)
+        "target {target} already exists, but the selected placement requires a new path"
     )
 }
 
@@ -5577,20 +5591,21 @@ fn new_target_exists(dst_root: &[u8]) -> anyhow::Error {
 fn new_root_refused(
     error: anyhow::Error,
     condition: TargetCondition,
-    dst_root: &[u8],
+    target: &str,
 ) -> anyhow::Error {
     let exists = crate::conn::wire_error_of(&error)
         .is_some_and(|error| error.io_kind == Some(WireIoKind::AlreadyExists));
     if condition == TargetCondition::Absent && exists {
-        new_target_exists(dst_root)
+        new_target_exists(target)
     } else {
         error
     }
 }
 
+/// Create the destination root `dst_root`, shown in errors as `shown`.
 fn mkdir_root(
     conn: &mut dyn Conn,
-    dst_root: &[u8],
+    (dst_root, shown): (&[u8], &str),
     condition: TargetCondition,
     mode: u32,
 ) -> Result<Entry> {
@@ -5605,7 +5620,7 @@ fn mkdir_root(
     }
     stat_one(conn, dst_root, false)?
         .filter(|entry| entry.kind == Kind::Dir)
-        .with_context(|| format!("created target {} is not a directory", display(dst_root)))
+        .with_context(|| format!("created target {shown} is not a directory"))
 }
 
 fn mkdir_apply_result(errors: Vec<Option<WireError>>) -> Result<()> {
