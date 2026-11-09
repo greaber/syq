@@ -44,6 +44,9 @@ pub(super) struct Worker {
     /// Comparison sizes this worker has learned during the copy.
     pub(super) comparison: super::comparing::ComparisonSizing,
     pub(super) setup_elapsed: std::time::Duration,
+    /// Files whose publication is in flight, oldest first
+    /// (`transfer::publication`).
+    pub(super) publications: std::collections::VecDeque<super::publication::Publication>,
 }
 
 pub(super) struct BlockDiff {
@@ -93,6 +96,9 @@ impl Worker {
             // transport. Wake peers so the whole transfer unwinds.
             self.sched.abort();
         }
+        if let Err(error) = &r {
+            self.abandon_publications(error);
+        }
         r
     }
 
@@ -114,6 +120,8 @@ impl Worker {
     pub(super) fn run_inner(&mut self) -> Result<()> {
         loop {
             if !self.gate.allowed(self.id) {
+                // A parked worker keeps no publication waiting.
+                self.settle_all_publications()?;
                 let _parked = self
                     .observation
                     .as_ref()
@@ -127,6 +135,17 @@ impl Worker {
                     return Ok(());
                 }
             }
+            if !self.publications.is_empty() {
+                // Take further work while publications are in flight, but
+                // settle them before waiting for work or leaving: settling
+                // can queue a changed file again.
+                match self.sched.try_next() {
+                    Some(Item::Exit) | None => self.settle_all_publications()?,
+                    Some(item) => self.process_item(item)?,
+                }
+                self.settle_publications(false)?;
+                continue;
+            }
             let item = {
                 let _awaiting = self
                     .observation
@@ -138,6 +157,7 @@ impl Worker {
                 return Ok(());
             }
             self.process_item(item)?;
+            self.settle_publications(false)?;
         }
     }
 
@@ -261,14 +281,8 @@ impl Worker {
                     self.sched.range_done(&h);
                     return Ok(());
                 }
-                let done = self.sched.range_done(&h);
-                if done {
-                    if let Err(e) = self.finish_file(idx) {
-                        if self.transport_dead() {
-                            self.sched.requeue_finish(idx, false);
-                        }
-                        self.file_error(idx, e)?;
-                    }
+                if self.sched.range_done(&h) {
+                    self.publish(idx, false)?;
                 }
             }
             Item::Finish { idx, matched } => {
@@ -1502,30 +1516,10 @@ impl Worker {
                     return Ok(());
                 }
                 if self.sched.range_done(&h) {
-                    if let Err(e) = self.finish_file(idx) {
-                        if self.transport_dead() {
-                            self.sched.requeue_finish(idx, false);
-                        }
-                        return Err(e);
-                    }
+                    self.publish(idx, false)?;
                 }
             }
-            None if needs_finalize => {
-                if let Err(e) = self.finish_file(idx) {
-                    if self.transport_dead() {
-                        self.sched.requeue_finish(idx, false);
-                    }
-                    return Err(e);
-                }
-            }
-            None => {
-                if let Err(e) = self.finish_matched_file(idx) {
-                    if self.transport_dead() {
-                        self.sched.requeue_finish(idx, true);
-                    }
-                    return Err(e);
-                }
-            }
+            None => self.publish(idx, !needs_finalize)?,
         }
         Ok(())
     }
@@ -2819,7 +2813,7 @@ impl Worker {
 
     /// Whether this copy writes a source file named as a partial of the
     /// file at `dst`, beside it.
-    fn writes_partial_named_payload_for(&self, dst: &[u8]) -> bool {
+    pub(super) fn writes_partial_named_payload_for(&self, dst: &[u8]) -> bool {
         let payload = self
             .progress
             .partial_named_payload
@@ -2841,48 +2835,47 @@ impl Worker {
             .any(|path| path.starts_with(&prefix) && !path[prefix.len()..].contains(&b'/'))
     }
 
+    /// Publish the file at `idx`, waiting for each round trip; `publish`
+    /// does the same without waiting.
     pub(super) fn finish_file(&mut self, idx: usize) -> Result<()> {
-        if self.sched.is_failed(idx) || self.sched.is_aborted() {
+        let Some((job, earlier_partials)) = self.publication_checks(idx, false)? else {
             return Ok(());
-        }
-        let (job, mut earlier_partials) = {
-            let jobs = self.sched.jobs.lock().unwrap();
-            (jobs.snapshot(idx), jobs.has_earlier_partials(idx))
         };
-        // A source file this copy writes beside it, named as one of its
-        // partials, is not an earlier copy's: the receiver then removes none.
-        if earlier_partials && self.writes_partial_named_payload_for(&job.dst) {
-            earlier_partials = false;
-        }
-        if job.done.load(Relaxed) != job.entry.size {
-            bail!("refusing to publish an incomplete file");
-        }
-        #[cfg(debug_assertions)]
-        crate::fsops::test_race_barrier(
-            "SYQ_TEST_SOURCE_RECHECK_READY_FILE",
-            "SYQ_TEST_SOURCE_RECHECK_CONTINUE_FILE",
-            "source recheck before publication",
-        )?;
         if !self.recheck_source(idx, &job, job.inplace)? {
             return Ok(());
         }
+        let response = self
+            .dst
+            .call(self.finalize_request(&job, earlier_partials))?;
+        self.finalized(idx, job, earlier_partials, response)
+    }
+
+    pub(super) fn finalize_request(&self, job: &WorkerJob, earlier_partials: bool) -> Request {
         let mut meta = self.opts.metadata_for(&job.rel_bytes, &job.entry);
-        meta.mode = self.create_mode(&job);
-        let finalized = change_ok(
-            self.dst.call(Request::Finalize {
-                expected_hash: self.opts.expected_hashes_for(&job),
-                path: job.dst.clone(),
-                inplace: job.inplace,
-                copy_id: self.copy_id(),
-                meta,
-                flags: self.publication_flags(&job),
-                scanned: job.scanned,
-                condition: job.target_condition,
-                earlier_partials,
-            })?,
-            "finalize destination",
-        );
-        match finalized {
+        meta.mode = self.create_mode(job);
+        Request::Finalize {
+            expected_hash: self.opts.expected_hashes_for(job),
+            path: job.dst.clone(),
+            inplace: job.inplace,
+            copy_id: self.copy_id(),
+            meta,
+            flags: self.publication_flags(job),
+            scanned: job.scanned,
+            condition: job.target_condition,
+            earlier_partials,
+        }
+    }
+
+    /// Finish publishing the file at `idx` from the destination's reply to
+    /// its `Finalize`.
+    pub(super) fn finalized(
+        &mut self,
+        idx: usize,
+        job: WorkerJob,
+        earlier_partials: bool,
+        response: Response,
+    ) -> Result<()> {
+        match change_ok(response, "finalize destination") {
             Ok(response) => {
                 // The receiver removed the partials earlier copies left for
                 // this file unless it says it kept some.
@@ -2984,10 +2977,9 @@ impl Worker {
     }
 
     pub(super) fn finish_matched_file(&mut self, idx: usize) -> Result<()> {
-        if self.sched.is_failed(idx) {
+        let Some((job, _)) = self.publication_checks(idx, true)? else {
             return Ok(());
-        }
-        let job = self.job(idx);
+        };
         if !self.recheck_source(idx, &job, true)? {
             return Ok(());
         }
@@ -3006,6 +2998,19 @@ impl Worker {
     ) -> Result<bool> {
         // Did the source change under us?
         let now = stat_one_registered(&mut *self.src, &job.src, &job.source, false)?;
+        self.source_unchanged(idx, job, destination_completed, now)
+    }
+
+    /// Whether the source of the file at `idx` is unchanged, now `now`, so
+    /// that its copy can be published. A changed file is queued to be
+    /// copied again while it has attempts left; otherwise this fails.
+    pub(super) fn source_unchanged(
+        &mut self,
+        idx: usize,
+        job: &WorkerJob,
+        destination_completed: bool,
+        now: Option<Entry>,
+    ) -> Result<bool> {
         let changed = source_changed(&job.entry, now.as_ref());
         if changed {
             // A retry is held to the same condition, which a file this

@@ -108,11 +108,142 @@ struct PipelineState {
     auto_small_size: Option<u64>,
     reject_small_puts: bool,
     immediate_batch_receipts: Option<Arc<crate::conn::BatchReceipts>>,
+    /// Answer `send_pending` as a remote connection does: its reply is read
+    /// ahead of any later one and kept until taken.
+    defers: bool,
+    deferred: std::collections::VecDeque<u64>,
+    arrived: std::collections::HashMap<u64, Response>,
+    next_deferred: u64,
 }
 
 struct PipelineConn(Arc<Mutex<PipelineState>>);
 
+impl PipelineConn {
+    /// Read the replies of deferred requests, oldest first: all of them, or
+    /// up to `until`.
+    fn receive_deferred(&mut self, until: Option<u64>) -> Result<()> {
+        loop {
+            let Some(id) = self.0.lock().unwrap().deferred.pop_front() else {
+                return Ok(());
+            };
+            let reply = self.receive()?;
+            self.0.lock().unwrap().arrived.insert(id, reply);
+            if until == Some(id) {
+                return Ok(());
+            }
+        }
+    }
+    /// Take the next reply, as an ordinary receive does.
+    fn receive(&mut self) -> Result<Response> {
+        let mut state = self.0.lock().unwrap();
+        anyhow::ensure!(!state.dead, "injected dead connection");
+        state.received += 1;
+        if let Some(progress) = &state.progress {
+            let snapshot = (
+                progress.bytes_done.load(Relaxed),
+                progress.files_done.load(Relaxed),
+            );
+            let tuning = crate::tune::Meter::files(&**progress);
+            state.progress_at_receive.push(snapshot);
+            state.tuning_at_receive.push(tuning);
+        }
+        if state
+            .steal_range_at
+            .as_ref()
+            .is_some_and(|(at, _)| *at == state.received)
+        {
+            let (_, sched) = state.steal_range_at.take().unwrap();
+            assert!(
+                sched.tuning_work(2, 0, 0).sufficient,
+                "a slow range must expose usable work to another worker"
+            );
+            let Item::Range(range) = sched.next() else {
+                panic!("expected unread range")
+            };
+            state.stolen_range = Some(range);
+        }
+        if let Some(sched) = state.steal_on_receive.take() {
+            assert!(
+                sched.tuning_work(1, 0, 0).unread_batch_files > 0,
+                "must leave shareable work before the peer claims it"
+            );
+            let Item::File(idx) = sched.next() else {
+                panic!("expected unread file group")
+            };
+            state.stolen_file = Some(idx);
+        }
+        for (at, gate, active) in &state.gate_changes {
+            if *at == state.received {
+                gate.set_active(*active);
+            }
+        }
+        if let Some((sched, gate, active)) = &state.tuning_check {
+            let snapshot = (
+                sched.tuning_work(*active, 0, 0),
+                gate.measurement_ready(*active),
+            );
+            state.tuning_snapshots.push(snapshot);
+        }
+        let sent = state.requests.len();
+        state.sent_at_receive.push(sent);
+        if let Some(peer) = &state.peer {
+            let sent = peer.lock().unwrap().requests.len();
+            state.peer_sent_at_receive.push(sent);
+        }
+        if state.fail_receive == Some(state.received) {
+            state.dead = true;
+            bail!("injected connection loss");
+        }
+        if let Some(ready) = state.ready.pop_front() {
+            std::thread::sleep(ready.saturating_duration_since(std::time::Instant::now()));
+        }
+        if state
+            .abort_receive_number
+            .is_none_or(|at| at == state.received)
+        {
+            if let Some(sched) = state.abort_on_receive.take() {
+                sched.abort();
+            }
+        }
+        Ok(state.replies.pop_front().expect("unexpected receive"))
+    }
+}
+
 impl Conn for PipelineConn {
+    fn send_pending(&mut self, request: Request) -> Result<crate::conn::PendingReply> {
+        if !self.0.lock().unwrap().defers {
+            return self.call(request).map(crate::conn::PendingReply::Ready);
+        }
+        self.send(request)?;
+        let mut state = self.0.lock().unwrap();
+        let id = state.next_deferred;
+        state.next_deferred += 1;
+        state.deferred.push_back(id);
+        Ok(crate::conn::PendingReply::Queued(id))
+    }
+    fn take_reply(&mut self, pending: crate::conn::PendingReply) -> Result<Response> {
+        let id = match pending {
+            crate::conn::PendingReply::Ready(response) => return Ok(response),
+            crate::conn::PendingReply::Queued(id) => id,
+        };
+        if !self.0.lock().unwrap().arrived.contains_key(&id) {
+            self.receive_deferred(Some(id))?;
+        }
+        self.0
+            .lock()
+            .unwrap()
+            .arrived
+            .remove(&id)
+            .context("deferred reply was already taken")
+    }
+    fn reply_arrived(&self, pending: &crate::conn::PendingReply) -> bool {
+        match pending {
+            crate::conn::PendingReply::Ready(_) => true,
+            crate::conn::PendingReply::Queued(id) => {
+                self.0.lock().unwrap().arrived.contains_key(id)
+            }
+        }
+    }
     fn track_small_batches(
         &mut self,
         progress: Arc<Progress>,
@@ -307,77 +438,8 @@ impl Conn for PipelineConn {
         Ok((response, waited))
     }
     fn recv(&mut self) -> Result<Response> {
-        let mut state = self.0.lock().unwrap();
-        anyhow::ensure!(!state.dead, "injected dead connection");
-        state.received += 1;
-        if let Some(progress) = &state.progress {
-            let snapshot = (
-                progress.bytes_done.load(Relaxed),
-                progress.files_done.load(Relaxed),
-            );
-            let tuning = crate::tune::Meter::files(&**progress);
-            state.progress_at_receive.push(snapshot);
-            state.tuning_at_receive.push(tuning);
-        }
-        if state
-            .steal_range_at
-            .as_ref()
-            .is_some_and(|(at, _)| *at == state.received)
-        {
-            let (_, sched) = state.steal_range_at.take().unwrap();
-            assert!(
-                sched.tuning_work(2, 0, 0).sufficient,
-                "a slow range must expose usable work to another worker"
-            );
-            let Item::Range(range) = sched.next() else {
-                panic!("expected unread range")
-            };
-            state.stolen_range = Some(range);
-        }
-        if let Some(sched) = state.steal_on_receive.take() {
-            assert!(
-                sched.tuning_work(1, 0, 0).unread_batch_files > 0,
-                "must leave shareable work before the peer claims it"
-            );
-            let Item::File(idx) = sched.next() else {
-                panic!("expected unread file group")
-            };
-            state.stolen_file = Some(idx);
-        }
-        for (at, gate, active) in &state.gate_changes {
-            if *at == state.received {
-                gate.set_active(*active);
-            }
-        }
-        if let Some((sched, gate, active)) = &state.tuning_check {
-            let snapshot = (
-                sched.tuning_work(*active, 0, 0),
-                gate.measurement_ready(*active),
-            );
-            state.tuning_snapshots.push(snapshot);
-        }
-        let sent = state.requests.len();
-        state.sent_at_receive.push(sent);
-        if let Some(peer) = &state.peer {
-            let sent = peer.lock().unwrap().requests.len();
-            state.peer_sent_at_receive.push(sent);
-        }
-        if state.fail_receive == Some(state.received) {
-            state.dead = true;
-            bail!("injected connection loss");
-        }
-        if let Some(ready) = state.ready.pop_front() {
-            std::thread::sleep(ready.saturating_duration_since(std::time::Instant::now()));
-        }
-        if state
-            .abort_receive_number
-            .is_none_or(|at| at == state.received)
-        {
-            if let Some(sched) = state.abort_on_receive.take() {
-                sched.abort();
-            }
-        }
-        Ok(state.replies.pop_front().expect("unexpected receive"))
+        self.receive_deferred(None)?;
+        self.receive()
     }
     fn scan(
         &mut self,
@@ -513,6 +575,7 @@ fn pipeline_worker(
         range_budget: None,
         comparison: Default::default(),
         setup_elapsed: std::time::Duration::ZERO,
+        publications: Default::default(),
     }
 }
 
@@ -788,6 +851,256 @@ fn changed_source_exhausts_retries_without_publishing() {
     }
     assert_eq!(src.lock().unwrap().requests.len(), MAX_ATTEMPTS as usize);
     assert_eq!(worker.progress.files_done.load(Relaxed), 0);
+}
+
+type PublicationFixture = (
+    Arc<Sched>,
+    Arc<Mutex<PipelineState>>,
+    Arc<Mutex<PipelineState>>,
+    Worker,
+);
+
+/// Two new 512-byte files queued for the per-file range path, with the
+/// replies each takes in order: a read and a recheck at the source, and a
+/// preparation, a write and a publication at the destination.
+fn deferred_publication_fixture(src_defers: bool, dst_defers: bool) -> PublicationFixture {
+    let sched = Arc::new(Sched::new(512, 8192));
+    for name in [&b"a"[..], b"b"] {
+        sched.push_file(pipeline_job(name, 512));
+    }
+    sched.scan_done();
+    let src = Arc::new(Mutex::new(PipelineState {
+        defers: src_defers,
+        ..Default::default()
+    }));
+    let dst = Arc::new(Mutex::new(PipelineState {
+        defers: dst_defers,
+        ..Default::default()
+    }));
+    let worker = pipeline_worker(&sched, &src, &dst, false);
+    (sched, src, dst, worker)
+}
+
+fn block_reply() -> Response {
+    let data = vec![7; 512];
+    Response::Block {
+        off: 0,
+        hash: content_digest(&data),
+        data,
+    }
+}
+
+fn prepared_reply() -> Response {
+    Response::Prepared(Preparation {
+        partial_size: None,
+        has_candidates: false,
+    })
+}
+
+fn request_names(state: &Mutex<PipelineState>) -> Vec<String> {
+    state
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .map(|request| {
+            let (name, path) = match request {
+                Request::Prepare { path, .. } => ("prepare", path),
+                Request::WriteRange { path, .. } => ("write", path),
+                Request::Finalize { path, .. } => ("finalize", path),
+                Request::ReadRange { path, .. } => ("read", path),
+                Request::StatMany { paths, .. } => ("stat", &paths[0]),
+                other => panic!("unexpected request {other:?}"),
+            };
+            format!("{name} {}", String::from_utf8_lossy(&path[..1]))
+        })
+        .collect()
+}
+
+/// With a source that answers at once, as a local one does, a file's
+/// Finalize goes out as its writes complete, and the next file's Prepare
+/// follows it before its reply is read: their round trips overlap.
+#[test]
+fn a_finalize_shares_its_round_trip_with_the_next_files_preparation() {
+    let (sched, src, dst, mut worker) = deferred_publication_fixture(false, true);
+    for idx in 0..2 {
+        let job = worker.job(idx);
+        src.lock().unwrap().replies.extend([
+            block_reply(),
+            Response::Stats(vec![Some(job.entry.clone())]),
+        ]);
+        dst.lock()
+            .unwrap()
+            .replies
+            .extend([prepared_reply(), Response::Ok, Response::Ok]);
+    }
+    let Item::File(first) = sched.next() else {
+        panic!("expected a file")
+    };
+    worker.handle_file(first).unwrap();
+    // The first file's Finalize is sent; its reply has not been read.
+    assert_eq!(worker.publications.len(), 1);
+    assert_eq!(worker.progress.files_done.load(Relaxed), 0);
+    let Item::File(second) = sched.next() else {
+        panic!("expected a file")
+    };
+    worker.handle_file(second).unwrap();
+    // Reading the second Prepare's reply settled the first file.
+    assert_eq!(worker.progress.files_done.load(Relaxed), 1);
+    worker.settle_all_publications().unwrap();
+    assert!(worker.publications.is_empty());
+    assert_eq!(worker.progress.files_done.load(Relaxed), 2);
+    assert!(sched.finished());
+    let names = request_names(&dst);
+    let (a, b) = if first == 0 { ("a", "b") } else { ("b", "a") };
+    assert_eq!(
+        names,
+        [
+            format!("prepare {a}"),
+            format!("write {a}"),
+            format!("finalize {a}"),
+            format!("prepare {b}"),
+            format!("write {b}"),
+            format!("finalize {b}"),
+        ]
+    );
+    let destination = dst.lock().unwrap();
+    // The third reply, the first Finalize's, was read after the second
+    // Prepare had been sent.
+    assert_eq!(destination.sent_at_receive[2], 4);
+    assert!(destination.replies.is_empty());
+    assert!(src.lock().unwrap().replies.is_empty());
+}
+
+/// With both ends remote, a file's source recheck travels ahead of the
+/// next file's reads and its Finalize follows once the recheck's reply has
+/// arrived, while the worker keeps copying; the worker settles everything
+/// before it leaves.
+#[test]
+fn a_source_recheck_overlaps_the_next_files_reads() {
+    let (sched, src, dst, mut worker) = deferred_publication_fixture(true, true);
+    for idx in 0..2 {
+        let job = worker.job(idx);
+        src.lock().unwrap().replies.extend([
+            block_reply(),
+            Response::Stats(vec![Some(job.entry.clone())]),
+        ]);
+    }
+    dst.lock().unwrap().replies.extend([
+        prepared_reply(),
+        Response::Ok,
+        prepared_reply(),
+        Response::Ok,
+        Response::Ok,
+        Response::Ok,
+    ]);
+    worker.run_inner().unwrap();
+    assert!(worker.publications.is_empty());
+    assert_eq!(worker.progress.files_done.load(Relaxed), 2);
+    assert!(sched.finished());
+    let first = &request_names(&src)[0][5..];
+    let second = if first == "a" { "b" } else { "a" };
+    assert_eq!(
+        request_names(&src),
+        [
+            format!("read {first}"),
+            format!("stat {first}"),
+            format!("read {second}"),
+            format!("stat {second}"),
+        ]
+    );
+    // The first recheck's reply was read after the next file's read was sent.
+    assert_eq!(src.lock().unwrap().sent_at_receive[1], 3);
+    assert_eq!(
+        request_names(&dst),
+        [
+            format!("prepare {first}"),
+            format!("write {first}"),
+            format!("prepare {second}"),
+            format!("write {second}"),
+            format!("finalize {first}"),
+            format!("finalize {second}"),
+        ]
+    );
+    assert!(src.lock().unwrap().replies.is_empty());
+    assert!(dst.lock().unwrap().replies.is_empty());
+}
+
+/// A source that changed is found by its deferred recheck as by a waiting
+/// one: nothing is published, and the file is queued again.
+#[test]
+fn a_deferred_recheck_that_finds_a_change_queues_the_file_again() {
+    let (sched, src, dst, mut worker) = deferred_publication_fixture(true, true);
+    let Item::File(idx) = sched.next() else {
+        panic!("expected a file")
+    };
+    let mut changed = worker.job(idx).entry.clone();
+    changed.mtime += 1;
+    src.lock()
+        .unwrap()
+        .replies
+        .extend([block_reply(), Response::Stats(vec![Some(changed)])]);
+    dst.lock()
+        .unwrap()
+        .replies
+        .extend([prepared_reply(), Response::Ok]);
+    worker.handle_file(idx).unwrap();
+    assert_eq!(worker.publications.len(), 1);
+    worker.settle_all_publications().unwrap();
+    assert!(worker.publications.is_empty());
+    assert_eq!(worker.job(idx).attempt, 1);
+    assert_eq!(worker.progress.files_done.load(Relaxed), 0);
+    assert!(!request_names(&dst)
+        .iter()
+        .any(|r| r.starts_with("finalize")));
+    // The changed file is queued again, behind the other.
+    let mut queued = Vec::new();
+    while let Some(Item::File(next)) = sched.try_next() {
+        queued.push(next);
+        sched.ranges_ready(next, vec![]);
+    }
+    assert!(queued.contains(&idx), "{queued:?}");
+}
+
+/// A worker whose connection fails with publications in flight queues them
+/// to be published again, as it does a Finalize whose reply was lost.
+#[test]
+fn a_lost_connection_queues_publications_in_flight_again() {
+    let (sched, src, dst, mut worker) = deferred_publication_fixture(false, true);
+    let Item::File(idx) = sched.next() else {
+        panic!("expected a file")
+    };
+    let job = worker.job(idx);
+    src.lock().unwrap().replies.extend([
+        block_reply(),
+        Response::Stats(vec![Some(job.entry.clone())]),
+    ]);
+    dst.lock()
+        .unwrap()
+        .replies
+        .extend([prepared_reply(), Response::Ok, Response::Ok]);
+    worker.handle_file(idx).unwrap();
+    assert_eq!(worker.publications.len(), 1);
+    assert_eq!(
+        request_names(&dst).last().unwrap(),
+        &format!("finalize {}", &job.rel)
+    );
+    dst.lock().unwrap().dead = true;
+    worker.abandon_publications(&anyhow::anyhow!("connection lost"));
+    assert!(worker.publications.is_empty());
+    assert_eq!(worker.progress.files_done.load(Relaxed), 0);
+    let mut finishes = Vec::new();
+    while let Some(item) = sched.try_next() {
+        match item {
+            Item::Finish { idx, matched } => finishes.push((idx, matched)),
+            Item::File(other) => {
+                sched.ranges_ready(other, vec![]);
+            }
+            Item::Range(_) => panic!("unexpected range"),
+            Item::Exit => break,
+        }
+    }
+    assert_eq!(finishes, [(idx, false)]);
 }
 
 #[test]
