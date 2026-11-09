@@ -1140,11 +1140,7 @@ fn start(domain: &Domain) -> Result<()> {
             Ok(())
         });
     }
-    let mut child = command
-        .spawn_guarded()
-        .context("start local SSH authorization provider")?;
-    let ready: Result<std::result::Result<(), String>> =
-        crate::destination::read_message(&mut startup);
+    let (mut child, ready) = launch(command, &mut startup)?;
     match ready {
         Ok(Ok(())) => {
             std::thread::spawn(move || {
@@ -1172,6 +1168,22 @@ fn start(domain: &Domain) -> Result<()> {
             }
         }
     }
+}
+
+/// Start `command`, the provider, which answers on the other end of
+/// `startup`, and read its answer.
+fn launch(
+    mut command: std::process::Command,
+    startup: &mut UnixStream,
+) -> Result<(std::process::Child, Result<std::result::Result<(), String>>)> {
+    let child = command
+        .spawn_guarded()
+        .context("start local SSH authorization provider")?;
+    // The command holds this process's copy of the provider's end. Close it,
+    // so that a provider that ends without answering ends the read at once
+    // rather than at its time limit.
+    drop(command);
+    Ok((child, crate::destination::read_message(startup)))
 }
 
 pub(crate) fn stop(domain: &Domain) -> Result<()> {
@@ -1424,6 +1436,28 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         (client, service.streams.track(server).unwrap())
+    }
+
+    /// A provider that ends without answering is noticed as soon as it ends,
+    /// not at the startup read's time limit.
+    #[test]
+    fn a_provider_that_ends_without_answering_is_noticed_at_once() {
+        let (mut startup, child_output) = UnixStream::pair().unwrap();
+        startup.set_read_timeout(Some(STOP_TIMEOUT)).unwrap();
+        let mut command = std::process::Command::new("true");
+        command
+            .stdin(Stdio::null())
+            .stdout(File::from(std::os::fd::OwnedFd::from(child_output)))
+            .stderr(Stdio::null());
+        let started = Instant::now();
+        let (mut child, ready) = launch(command, &mut startup).unwrap();
+        assert!(ready.is_err());
+        assert!(
+            started.elapsed() < STOP_TIMEOUT / 3,
+            "{:?}",
+            started.elapsed()
+        );
+        child.wait().unwrap();
     }
 
     #[test]
