@@ -692,7 +692,7 @@ mod tests {
 
     #[test]
     fn a_keeper_scope_marked_closing_while_it_is_removed_is_still_removed() {
-        let temporary = temporary();
+        let temporary = crate::test_support::short_tempdir().unwrap();
         for _ in 0..200 {
             let scope = KeeperScope::create(temporary.path()).unwrap();
             let path = scope.path().to_owned();
@@ -724,7 +724,7 @@ mod tests {
 
     #[test]
     fn a_scope_left_with_at_most_its_closing_mark_is_removed() {
-        let temporary = temporary();
+        let temporary = crate::test_support::short_tempdir().unwrap();
         let directory = |name: &str, mode: u32| {
             let scope = temporary.path().join(name);
             fs::DirBuilder::new().mode(mode).create(&scope).unwrap();
