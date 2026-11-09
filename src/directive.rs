@@ -605,13 +605,7 @@ pub(crate) fn source_rules(
         args.native_mapping.is_some() == directive.inputs.mapping.is_some(),
         "the directive's mapping does not match its command"
     );
-    let mut request = crate::destination::pull::source_request(&args)?;
-    if let Some(caps) = &directive.caps {
-        let limits = &mut request.limits;
-        limits.max_total_bytes = limits.max_total_bytes.min(caps.max_bytes);
-        limits.max_file_bytes = limits.max_file_bytes.min(limits.max_total_bytes);
-        limits.max_entries = limits.max_entries.min(caps.max_entries);
-    }
+    let mut request = crate::destination::pull::source_request(&args, directive.caps.as_ref())?;
     // The receiver works in its state directory, so relative paths start in
     // the home directory, as they do for the account's own logins. A leading
     // `~` is the home directory already, as `HOME` names it, as for a login.

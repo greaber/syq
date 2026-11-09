@@ -53,8 +53,7 @@ const MAX_MESSAGE: usize = 256 * 1024;
 /// The largest message: a request whose command is as long as a receiving
 /// machine accepts (`approval_command::MAX_COMMAND_BYTES`), which JSON spells
 /// with up to four characters a byte, beside what the command read from
-/// files or, for a copy of files on that machine, the request derived from
-/// it.
+/// files or, for storage, the request derived from it.
 const MAX_REQUEST_MESSAGE: usize = 4 * 1024 * 1024;
 /// How many messages larger than an ordinary one this process reads at
 /// once. A message is read before its sender is authenticated, so this keeps
@@ -257,11 +256,11 @@ enum Message {
     /// A copy from another server to the requesting server, which this
     /// machine approves with a directive for the source's enrolled receiver.
     Pull(Box<pull::ReadRequest>),
-    /// A copy of files on this machine to the requesting server.
+    /// A copy of files on this machine to the requesting server. This
+    /// machine derives what the copy may read from its command.
     Send {
         command: Vec<Vec<u8>>,
         cwd: String,
-        request: Box<pull::PullRequest>,
     },
     /// A copy from the requesting server to another server, or between two
     /// other servers, which this machine approves with directives for their
@@ -1504,11 +1503,7 @@ impl Receiver {
                 write_message(&mut stream, &Reply::Identity(proof))
             }
             Message::Pull(request) => self.pull(*request, stream),
-            Message::Send {
-                command,
-                cwd,
-                request,
-            } => self.send(command, cwd, *request, stream),
+            Message::Send { command, cwd } => self.send(command, cwd, stream),
             Message::Forward(request) => self.forward(*request, stream),
             Message::Request {
                 command,

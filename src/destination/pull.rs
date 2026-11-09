@@ -6,11 +6,11 @@ use super::*;
 use crate::proto::{OperatorSymlinkPolicy, SourceRootBase, SourceRootSelection};
 use crate::restricted::source::{SourceAuthority, SourcePolicy, SourceTcpPolicy};
 
-/// What a copy's sources may be read for: derived from its command, on the
-/// server that serves them (a source directive's receiver) or on the
-/// receiving machine that sends them (`send`).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// What a copy's sources may be read for: derived from its command where
+/// they are read, by a source directive's receiver
+/// (`directive::source_rules`) or by the receiving machine that sends them
+/// (`send`), and never sent.
+#[derive(Clone, Debug)]
 pub(crate) struct PullRequest {
     pub base: SourceRootBase,
     pub selections: Vec<SourceRootSelection>,
@@ -26,16 +26,14 @@ pub(crate) struct PullRequest {
     pub limits: crate::delegation::CopyLimits,
     /// Where `base` is on the server that reads, when it reads from another
     /// working directory than the command's (`SourcePolicy::resolved_base`).
-    /// Never sent: only the reading server sets it.
-    #[serde(skip)]
+    /// Only a source directive's rules set it.
     pub resolved_base: Option<Vec<u8>>,
     /// Whether the command copies without TCP, so the reader starts no
-    /// listener for it. Never sent: only a source directive's rules set it.
-    #[serde(skip)]
+    /// listener for it. Only a source directive's rules set it.
     pub no_tcp: bool,
     /// Whether the command sends TCP data without encryption, so the reader
-    /// accepts an unencrypted listener. Never sent, as `no_tcp`.
-    #[serde(skip)]
+    /// accepts an unencrypted listener. Only a source directive's rules set
+    /// it.
     pub unencrypted_tcp: bool,
 }
 
@@ -114,8 +112,14 @@ pub(crate) fn eligible_target(args: &crate::cli::Args) -> Result<String> {
     Ok(target)
 }
 
-/// The read permission a copy's sources need, wherever they are.
-pub(crate) fn source_request(args: &crate::cli::Args) -> Result<PullRequest> {
+/// The read permission a copy's sources need, wherever they are, within
+/// `caps`, the limits of the machine that approves the reads, when it has
+/// them. The machine that reads derives it from the command, as the server
+/// that asks does to refuse early what that machine would refuse.
+pub(crate) fn source_request(
+    args: &crate::cli::Args,
+    caps: Option<&crate::directive::Caps>,
+) -> Result<PullRequest> {
     let sources =
         crate::transfer::distinct_native_sources(&args.locations[..args.locations.len() - 1]);
     let (base, selections, symlink_policy) = crate::transfer::source_registration(&sources, args);
@@ -141,7 +145,7 @@ pub(crate) fn source_request(args: &crate::cli::Args) -> Result<PullRequest> {
         workers <= usize::from(crate::delegation::MAX_CONNECTIONS),
         "too many source workers"
     );
-    let request = PullRequest {
+    let mut request = PullRequest {
         base,
         selections,
         selection_types: sources.iter().map(|source| source.selection).collect(),
@@ -178,6 +182,13 @@ pub(crate) fn source_request(args: &crate::cli::Args) -> Result<PullRequest> {
         no_tcp: false,
         unencrypted_tcp: false,
     };
+    // A source deletes nothing, so only the byte and entry limits apply.
+    if let Some(caps) = caps {
+        let limits = &mut request.limits;
+        limits.max_total_bytes = limits.max_total_bytes.min(caps.max_bytes);
+        limits.max_file_bytes = limits.max_file_bytes.min(limits.max_total_bytes);
+        limits.max_entries = limits.max_entries.min(caps.max_entries);
+    }
     request.validate()?;
     Ok(request)
 }
@@ -546,7 +557,7 @@ mod tests {
         ]);
         let args = crate::approval_command::parse(&command).unwrap();
         eligible_target(&args).unwrap();
-        let request = source_request(&args).unwrap();
+        let request = source_request(&args, None).unwrap();
         assert_eq!(request.base.path, Some(b"/approved".to_vec()));
         assert!(request.base.confined);
         assert_eq!(request.selections[0].path, b"selected");
@@ -558,16 +569,17 @@ mod tests {
 
     #[test]
     fn source_filters_narrow_copy_but_do_not_change_read_scopes() {
-        let plain =
-            source_request(&crate::approval_command::parse(&command(&[])).unwrap()).unwrap();
-        let filtered = source_request(
-            &crate::approval_command::parse(&command(&["--ignore", "*.private"])).unwrap(),
+        let plain = source_request(
+            &crate::approval_command::parse(&command(&[])).unwrap(),
+            None,
         )
         .unwrap();
-        assert_eq!(
-            serde_json::to_value(&plain).unwrap(),
-            serde_json::to_value(&filtered).unwrap()
-        );
+        let filtered = source_request(
+            &crate::approval_command::parse(&command(&["--ignore", "*.private"])).unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(format!("{plain:?}"), format!("{filtered:?}"));
         // SSH data and unencrypted TCP work through the source's receiver;
         // options that choose another route do not.
         let eligible = |extra: &[&str]| {

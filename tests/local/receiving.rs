@@ -1215,10 +1215,18 @@ fn copies_from_a_receiving_machine_ask_it_and_explain_an_old_helper() {
         "{}",
         stderr_of(&denied)
     );
-    let send = &request["message"]["Send"];
+    // Only the command travels; the laptop derives what it may read.
+    let send = request["message"]["Send"].as_object().unwrap();
     assert_eq!(
-        send["request"]["selections"][0]["path"],
-        serde_json::json!(b".kube")
+        send.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["command", "cwd"]
+    );
+    assert!(
+        send["command"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(b".kube")),
+        "{request}"
     );
     assert!(!t.path("copy").exists());
     assert!(!t.path("ssh-used").exists(), "a copy from @laptop ran ssh");

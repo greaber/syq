@@ -1,5 +1,6 @@
 //! Copies from a receiving machine to the server that asks for them
-//! (`syq cp --from @NAME`). The receiving machine shows the exact paths,
+//! (`syq cp --from @NAME`). The server sends only its command; the receiving
+//! machine derives what the copy may read from it, shows the exact paths,
 //! waits for its user's approval, then serves read-only access to them over
 //! the same channels and reverse TCP that copies sent to it use.
 use super::*;
@@ -82,24 +83,25 @@ pub(crate) fn eligible(args: &crate::cli::Args) -> Result<String> {
     Ok(name)
 }
 
+/// What the copy `args` reads, before a receiving machine's limits and its
+/// receiving profile resolve it. The server derives it to refuse early what
+/// the receiving machine would refuse in the command alone, and to name the
+/// approved sources in its own arguments (`apply`).
 pub(crate) fn request(args: &crate::cli::Args) -> Result<pull::PullRequest> {
     eligible(args)?;
-    pull::source_request(args)
+    pull::source_request(args, None)
 }
 
-/// Check that `request` is what the command that produced it asks for.
-fn check(command: &[Vec<u8>], name: &str, requested: &pull::PullRequest) -> Result<()> {
+/// The copy `command` asks this machine, the receiving machine `name`, to
+/// send: a `syq cp --from @name` to the requesting server. This machine
+/// derives what the copy may read from the command alone.
+fn sending_command(command: &[Vec<u8>], name: &str) -> Result<crate::cli::Args> {
     let args = crate::approval_command::parse(command)?;
     anyhow::ensure!(
         eligible(&args)? == name,
         "the requesting command copies from a different machine"
     );
-    let derived = request(&args)?;
-    anyhow::ensure!(
-        serde_json::to_value(requested)? == serde_json::to_value(derived)?,
-        "the request does not match the command that produced it"
-    );
-    Ok(())
+    Ok(args)
 }
 
 pub(super) fn select(args: &crate::cli::Args) -> Result<Option<handoff::Selection>> {
@@ -123,6 +125,8 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
         name, registration, ..
     } = selection;
     let command = crate::approval_command::copy_command(args)?;
+    // Refuse here, before asking, what the receiving machine would refuse
+    // in the command alone: it derives the reads the same way.
     let request = request(args)?;
     notices::waiting(&format!("@{name}"), "sending these files");
     let (_, reply) = exchange(
@@ -130,7 +134,6 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
         Message::Send {
             command,
             cwd: crate::approval_command::current_directory(),
-            request: Box::new(request.clone()),
         },
         REQUEST_TIMEOUT + Duration::from_secs(10),
         None,
@@ -319,23 +322,28 @@ fn exact_paths(request: &pull::PullRequest) -> Vec<(Vec<u8>, &'static str)> {
 }
 
 impl Receiver {
+    /// Approve sending files on this machine to the requesting server:
+    /// derive what the copy may read from its command, within this
+    /// machine's limits and receiving profile, ask, and keep the authority
+    /// made from it under a token that opens the copy's control once,
+    /// within `START_TIMEOUT`.
     pub(super) fn send(
         &self,
         command: Vec<Vec<u8>>,
         cwd: String,
-        mut request: pull::PullRequest,
         mut stream: TrackedStream,
     ) -> Result<()> {
         let _request = self.request_lock.try_lock().map_err(|_| {
             anyhow::anyhow!("another transfer is awaiting approval; retry after it is decided")
         })?;
-        check(&command, &self.name, &request)?;
-        request.limits.max_total_bytes = request.limits.max_total_bytes.min(self.max_bytes);
-        request.limits.max_file_bytes = request
-            .limits
-            .max_file_bytes
-            .min(request.limits.max_total_bytes);
-        request.limits.max_entries = request.limits.max_entries.min(self.max_entries);
+        let args = sending_command(&command, &self.name)?;
+        // A source deletes nothing.
+        let caps = crate::directive::Caps {
+            max_bytes: self.max_bytes,
+            max_entries: self.max_entries,
+            max_delete: 0,
+        };
+        let mut request = pull::source_request(&args, Some(&caps))?;
         resolve(&self.cwd, self.root.as_deref(), &mut request)?;
         request.validate()?;
         {
@@ -436,8 +444,6 @@ mod tests {
         command: &[Vec<u8>],
         allow: bool,
     ) -> (Result<SendApproved>, crate::receive_approval::Summary) {
-        let args = crate::approval_command::parse(command).unwrap();
-        let request = request(&args).unwrap();
         let registration = registration.clone();
         let command = command.to_vec();
         let task = std::thread::spawn(move || {
@@ -446,7 +452,6 @@ mod tests {
                 Message::Send {
                     command,
                     cwd: "~/job".into(),
-                    request: Box::new(request),
                 },
                 Duration::from_secs(10),
                 Some(Duration::from_secs(10)),
@@ -1079,15 +1084,20 @@ mod tests {
         assert!(reached.is_err());
     }
 
+    fn words(words: &[&str]) -> Vec<Vec<u8>> {
+        words.iter().map(|word| word.as_bytes().to_vec()).collect()
+    }
+
+    /// This machine approves only a send from itself, read from its command
+    /// alone, and refuses any other command before it asks.
     #[test]
-    fn a_send_request_must_match_its_command() {
-        let command = command(&["notes"]);
-        let args = crate::approval_command::parse(&command).unwrap();
-        let mut changed = request(&args).unwrap();
-        check(&command, "laptop", &changed).unwrap();
-        assert!(check(&command, "other", &changed).is_err());
-        changed.selections[0].path = b"/etc".to_vec();
-        assert!(check(&command, "laptop", &changed).is_err());
+    fn only_a_command_that_sends_from_this_machine_is_asked_about() {
+        let notes = command(&["notes", "--into", "/server/out"]);
+        assert_eq!(
+            eligible(&sending_command(&notes, "laptop").unwrap()).unwrap(),
+            "laptop"
+        );
+        assert!(sending_command(&notes, "other").is_err());
         // Parsing refuses endpoints a receiving name cannot have, before
         // anything could hand the name to ssh.
         for refused in [
@@ -1101,19 +1111,344 @@ mod tests {
                 .collect();
             assert!(crate::cli::Args::parse_args(&argv).is_err(), "{refused:?}");
         }
-        for refused in [
-            &["notes", "--rsh", "ssh"][..],
-            &["notes", "--auth-from", "@other"],
+
+        let temp = crate::test_support::tempdir().unwrap();
+        fs::write(temp.path().join("notes"), b"notes").unwrap();
+        let (_broker, receiver, registration, _) = broker(temp.path(), Approval::Always);
+        for (refused, error) in [
+            // Another machine's files, or files this machine receives.
+            (
+                words(&["cp", "--from", "@other", "notes", "--into", "/out"]),
+                "copies from a different machine",
+            ),
+            (
+                words(&["cp", "notes", "--to", "@laptop", "--into", "in"]),
+                "not a receiving machine",
+            ),
+            (
+                words(&["cp", "--from", "backup", "notes", "--into", "/out"]),
+                "not a receiving machine",
+            ),
+            (words(&["cp", "--bogus"]), "cannot parse"),
+            // Options this route refuses, and limits no source allows.
+            (
+                command(&["--rsh", "ssh", "notes", "--into", "/out"]),
+                "own their connection",
+            ),
+            (
+                command(&["--no-tcp-encryption", "notes", "--into", "/out"]),
+                "own their connection",
+            ),
+            (
+                command(&["--auth-from", "@other", "notes", "--into", "/out"]),
+                "leave out --auth-from",
+            ),
+            (
+                words(&[
+                    "cp",
+                    "--from",
+                    "@laptop",
+                    "--performance-tuning",
+                    "workers=500",
+                    "notes",
+                    "--into",
+                    "/out",
+                ]),
+                "too many source workers",
+            ),
+            // Outside the receiving root.
+            (
+                command(&["/etc/passwd", "--into", "/out"]),
+                "inside its receiving root",
+            ),
+            (
+                command(&["--root", "..", "notes", "--into", "/out"]),
+                "inside its receiving root",
+            ),
         ] {
-            let args = crate::approval_command::parse(
-                &["cp", "--from", "@laptop"]
-                    .iter()
-                    .chain(refused)
-                    .map(|word| word.as_bytes().to_vec())
-                    .collect::<Vec<_>>(),
-            )
+            let result = exchange(
+                &registration,
+                Message::Send {
+                    command: refused.clone(),
+                    cwd: "~".into(),
+                },
+                Duration::from_secs(2),
+                Some(Duration::from_secs(2)),
+            );
+            let refused = crate::approval_command::display(&refused).join(" ");
+            let Err(refusal) = result else {
+                panic!("{refused:?} was approved");
+            };
+            assert!(
+                format!("{refusal:#}").contains(error),
+                "{refused:?}: {refusal:#}"
+            );
+            assert!(receiver.approvals.snapshots().is_empty(), "{refused:?}");
+            assert!(receiver.sessions.lock().unwrap().is_empty(), "{refused:?}");
+        }
+    }
+
+    /// The server names the approved sources in its own arguments by the
+    /// reads it derives (`apply`), so what it derives from its arguments,
+    /// after reading its files, must be what this machine derives from its
+    /// command alone. A difference would be refused only once the copy
+    /// registers its sources, after the prompt.
+    #[test]
+    fn the_server_derives_the_reads_this_machine_derives_from_its_command() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let ignore = temp.path().join("ignore");
+        fs::write(&ignore, "*.tmp\nbuild/\n").unwrap();
+        let mapping = temp.path().join("mapping.ndjson");
+        fs::write(
+            &mapping,
+            r#"{"src":{"encoding":"utf-8","value":"a"},"dst":{"encoding":"utf-8","value":"b/a"}}"#
+                .to_owned()
+                + "\n",
+        )
+        .unwrap();
+        let ignore = ignore.to_str().unwrap();
+        let mapping = mapping.to_str().unwrap();
+        let cases: &[&[&str]] = &[
+            &["notes"],
+            &["a", "b/c", "a", "--into", "out"],
+            &["--src-non-dir", "notes", "--as", "copy"],
+            &["--src-dir", "tree", "--into-new", "out"],
+            &["--srcs-in", "tree", "--into", "out"],
+            &["--srcs", "a", "b", "--src-dirs", "c", "d"],
+            &["-C", "sub", "notes"],
+            &["-C", "/abs", "notes"],
+            &["--root", "sub", "notes"],
+            &["--root", "~/sub", "notes"],
+            &["~/token", "notes"],
+            &["--follow-src", "tree"],
+            &["--follow", "tree"],
+            &["tree", "--ignore", "*.log", "--ignore-from", ignore],
+            &["--mapping", mapping, "--into", "out"],
+            &["tree", "--copy-metadata", "xattrs,acls"],
+            &["tree", "--open-noatime", "--sparse", "--hash"],
+            &["tree", "--no-compress", "--dry-run"],
+            &[
+                "tree",
+                "--tcp-ports",
+                "4000-4010",
+                "--tcp-congestion",
+                "cubic",
+            ],
+            &["tree", "--no-tcp"],
+            &["tree", "--resource-limits", "workers=4,bandwidth=4M"],
+            &["tree", "--performance-tuning", "workers=3"],
+        ];
+        for case in cases {
+            let command = words(&[&["cp", "--from", "@laptop"][..], case].concat());
+            let argv: Vec<OsString> = command
+                .iter()
+                .map(|arg| OsString::from_vec(arg.clone()))
+                .collect();
+            let mut args =
+                crate::cli::Args::parse_args(&argv).unwrap_or_else(|e| panic!("{case:?}: {e:#}"));
+            args.normalize();
+            crate::persistence::mark_explicit_scope(&mut args).unwrap();
+            args.read_copy_inputs().unwrap();
+            let server = request(&args).unwrap_or_else(|e| panic!("{case:?}: {e:#}"));
+            let here = pull::source_request(&sending_command(&command, "laptop").unwrap(), None)
+                .unwrap_or_else(|e| panic!("{case:?}: {e:#}"));
+            assert_eq!(format!("{server:?}"), format!("{here:?}"), "{case:?}");
+        }
+    }
+
+    /// What a send may read comes from its command alone. A request a
+    /// server puts beside the command names nothing more; a copy that
+    /// registers anything other than what the approved command reads is
+    /// refused; and no other file is readable, even beside the approved one.
+    #[test]
+    fn a_send_reads_only_what_its_approved_command_names() {
+        use crate::proto::{ConnectionRole, OperatorSymlinkPolicy, Request, Response};
+        let temp = crate::test_support::tempdir().unwrap();
+        let root = temp.path().join("laptop");
+        fs::create_dir_all(root.join("private")).unwrap();
+        fs::write(root.join("notes"), b"notes!!!").unwrap();
+        fs::write(root.join("secret"), b"secret!!").unwrap();
+        fs::write(root.join("private/token"), b"token!!!").unwrap();
+        let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
+        let command = command(&["--no-compress", "--src-non-dir", "notes", "--into", "/out"]);
+
+        // Ask with a request beside the command that names the whole
+        // filesystem, followed, and another file. This machine ignores
+        // fields a message does not have; if it refused them instead, this
+        // part of the test would only need the extra field removed.
+        let mut request = request(&crate::approval_command::parse(&command).unwrap()).unwrap();
+        request.base = SourceRootBase {
+            path: Some(b"/".to_vec()),
+            confined: false,
+        };
+        request.selections[0].path = b"secret".to_vec();
+        request.symlink_policy = OperatorSymlinkPolicy::FollowAll;
+        let task = {
+            let registration = registration.clone();
+            let message = serde_json::json!({
+                "version": VERSION,
+                "identity": crate::identity::build(),
+                "secret": registration.secret,
+                "message": {"Send": {
+                    "command": command,
+                    "cwd": "~",
+                    "request": {
+                        "base": request.base,
+                        "selections": request.selections,
+                        "symlink_policy": request.symlink_policy,
+                    },
+                }},
+            });
+            std::thread::spawn(move || -> Result<SendApproved> {
+                let mut stream = UnixStream::connect(&registration.socket)?;
+                stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+                write_message(&mut stream, &message)?;
+                match read_message(&mut stream)? {
+                    Reply::SendApproved(approved) => Ok(*approved),
+                    Reply::Error(error) => bail!("{error}"),
+                    _ => bail!("unexpected reply"),
+                }
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pending = loop {
+            if let Some(summary) = receiver.approvals.snapshots().first() {
+                break summary.clone();
+            }
+            assert!(!task.is_finished(), "{:?}", task.join().unwrap().err());
+            assert!(Instant::now() < deadline, "sending did not become pending");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let json = serde_json::to_value(&pending).unwrap();
+        let paths = json["paths"].as_array().unwrap();
+        assert_eq!(paths.len(), 1, "{json}");
+        let notes = root.join("notes").display().to_string();
+        assert!(
+            paths[0]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("{notes:?} (")),
+            "{json}"
+        );
+        let description =
+            pending.description(&crate::persistence::Domain::default(), str::to_owned);
+        assert!(!description.contains("secret"), "{description}");
+        assert!(!description.contains("followed"), "{description}");
+        receiver
+            .approvals
+            .decide(&pending.id, true, crate::receive_approval::Kind::Send)
             .unwrap();
-            assert!(eligible(&args).is_err(), "{refused:?}");
+        let approved = task.join().unwrap().unwrap();
+        assert_eq!(approved.selections.len(), 1);
+        assert_eq!(approved.selections[0].path, b"notes");
+        assert!(!approved.selections[0].follow_root);
+
+        // What the approved command registers, and what other commands
+        // would register in its place.
+        let register =
+            |base: &SourceRootBase,
+             selections: &[(&[u8], bool)],
+             symlink_policy,
+             allow_unconfined_paths| Request::RegisterSourceRoots {
+                base: base.clone(),
+                selections: selections
+                    .iter()
+                    .map(|(path, follow_root)| SourceRootSelection {
+                        path: path.to_vec(),
+                        follow_root: *follow_root,
+                    })
+                    .collect(),
+                symlink_policy,
+                allow_unconfined_paths,
+                shared_workers: 1,
+                independent_handoff_workers: 0,
+            };
+        let (base, refuse) = (&approved.base, OperatorSymlinkPolicy::Refuse);
+        let private = SourceRootBase {
+            path: Some(root.join("private").as_os_str().as_bytes().to_vec()),
+            confined: true,
+        };
+        let unconfined = SourceRootBase {
+            confined: false,
+            ..base.clone()
+        };
+        let (mut control, hello) =
+            Channel::open(&registration, &approved.token, ConnectionRole::Control).unwrap();
+        assert!(matches!(hello, Response::HelloOk { .. }), "{hello:?}");
+        for (other, request) in [
+            (
+                "another file",
+                register(base, &[(b"secret", false)], refuse, false),
+            ),
+            (
+                "another source too",
+                register(
+                    base,
+                    &[(b"notes", false), (b"secret", false)],
+                    refuse,
+                    false,
+                ),
+            ),
+            (
+                "another --root",
+                register(&private, &[(b"token", false)], refuse, false),
+            ),
+            (
+                "an unconfined base",
+                register(&unconfined, &[(b"notes", false)], refuse, false),
+            ),
+            (
+                "--follow-src",
+                register(
+                    base,
+                    &[(b"notes", true)],
+                    OperatorSymlinkPolicy::FollowAll,
+                    false,
+                ),
+            ),
+            (
+                "unconfined paths",
+                register(base, &[(b"notes", false)], refuse, true),
+            ),
+        ] {
+            match control.call(request).unwrap() {
+                Response::Err(error) => {
+                    assert!(error.contains("differs from approval"), "{other}: {error}")
+                }
+                response => panic!("{other} was registered: {response:?}"),
+            }
+        }
+        let approved_registration = register(base, &[(b"notes", false)], refuse, false);
+        let roots = match control.call(approved_registration).unwrap() {
+            Response::SourceRootsRegistered(roots) => roots,
+            other => panic!("registration failed: {other:?}"),
+        };
+        let mut worker = worker(&registration, &control, &roots, &receiver);
+        let block = worker.call(read(&roots[0].selection)).unwrap();
+        assert!(
+            matches!(&block, Response::Block { data, .. } if data == b"notes!!!"),
+            "{block:?}"
+        );
+        // The file beside it, named in the approved file's root.
+        let beside =
+            crate::proto::RegisteredPath::new(roots[0].selection.root(), b"secret".to_vec())
+                .unwrap();
+        for request in [
+            read(&beside),
+            Request::Scan {
+                root: b"/ignored".to_vec(),
+                source: Some(beside.clone()),
+                follow_root: false,
+                ignore: Vec::new(),
+                report_ignored: false,
+            },
+        ] {
+            match worker.call(request).unwrap() {
+                Response::Err(error) => {
+                    assert!(error.contains("does not authorize another path"), "{error}")
+                }
+                response => panic!("read beside the approved file: {response:?}"),
+            }
         }
     }
 }
