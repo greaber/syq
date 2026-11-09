@@ -4045,7 +4045,9 @@ impl Planner<'_> {
                     .rsplit(|&c| c == b'/')
                     .next()
                     .unwrap_or(entry_path);
-                if entry_kind == Kind::File && is_partial_name(OsStr::from_bytes(name)) {
+                if entry_kind == Kind::File
+                    && crate::fsops::is_resumable_partial_name(OsStr::from_bytes(name))
+                {
                     if self.opts.verbose > 0 {
                         self.progress.eprintln(&format!(
                                     "syq: not deleting {rel}: its name matches syq's partial-file format; use syq clean-partials after copies stop"

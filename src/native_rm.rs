@@ -1065,8 +1065,7 @@ fn require_unlinked_directory(_directory: &File) -> Result<()> {
 /// Names `clean-partials` removes when they are regular files: copies'
 /// partial files and S3 downloads' partial files.
 fn is_cleanable_partial(name: &[u8]) -> bool {
-    let name = OsStr::from_bytes(name);
-    crate::fsops::is_partial_name(name) || crate::fsops::is_s3_partial_name(name)
+    crate::fsops::is_resumable_partial_name(OsStr::from_bytes(name))
 }
 
 fn join_label(parent: &[u8], child: &[u8]) -> PathBytes {

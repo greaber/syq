@@ -241,6 +241,12 @@ pub(crate) fn is_s3_partial_name(name: &OsStr) -> bool {
         })
 }
 
+/// Names of the partial files that copies and S3 downloads resume from:
+/// pruning keeps them and `clean-partials` removes them.
+pub(crate) fn is_resumable_partial_name(name: &OsStr) -> bool {
+    is_partial_name(name) || is_s3_partial_name(name)
+}
+
 pub(super) const RECOVERY_PREFIX: &str = ".syq-swap-";
 
 pub(crate) fn recovery_name(process: u32, counter: u64) -> String {
