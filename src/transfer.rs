@@ -906,9 +906,12 @@ enum SmallCopy {
     /// written and the control session is untouched, so the ordinary engine
     /// continues on the same connections and reports any error itself.
     Declined,
-    /// Staging failed with nothing published, but the receiver now holds the
-    /// destination root; the engine continues on a fresh control session and
-    /// reports the failure itself.
+    /// Preparation ran but nothing was published: reading the sources failed,
+    /// the requested files would take too long at the bandwidth cap, or the
+    /// payload or its staging failed. An ordinary destination's session now
+    /// holds the destination root, so the engine continues on a fresh control
+    /// session; a restricted destination's preparation installed nothing, so
+    /// its copy continues on the same one. The engine reports any failure.
     Reconnect,
 }
 
