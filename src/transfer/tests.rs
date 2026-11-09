@@ -1196,6 +1196,49 @@ fn a_parked_worker_settles_its_publications_first() {
     assert!(dst.lock().unwrap().replies.is_empty());
 }
 
+/// A Finalize reply read before a connection failed that says the
+/// destination no longer meets the existing-file policy skips the file, as
+/// it would have with the connection intact; publishing it again could only
+/// fail, since the receiver let the file go.
+#[test]
+fn a_policy_skip_read_before_a_connection_fails_stays_a_skip() {
+    let (sched, src, dst, mut worker) = deferred_publication_fixture(false, true);
+    let Item::File(idx) = sched.next() else {
+        panic!("expected a file")
+    };
+    sched.jobs.lock().unwrap()[idx].policy_condition = true;
+    worker.progress.files_total.store(2, Relaxed);
+    let job = worker.job(idx);
+    src.lock().unwrap().replies.extend([
+        block_reply(),
+        Response::Stats(vec![Some(job.entry.clone())]),
+    ]);
+    dst.lock().unwrap().replies.extend([
+        prepared_reply(),
+        Response::Ok,
+        Response::EndpointError(WireError {
+            message: "destination changed".into(),
+            io_kind: None,
+            raw_os_error: None,
+            condition_not_met: true,
+            unchanged: true,
+        }),
+        Response::Ok,
+    ]);
+    worker.handle_file(idx).unwrap();
+    worker
+        .dst
+        .call(Request::ConfigureHashing(Default::default()))
+        .unwrap();
+    dst.lock().unwrap().dead = true;
+    worker.abandon_publications(&anyhow::anyhow!("connection lost"));
+    assert!(worker.publications.is_empty());
+    assert_eq!(worker.progress.files_excluded.load(Relaxed), 1);
+    assert_eq!(worker.progress.errors.load(Relaxed), 0);
+    assert!(matches!(sched.try_next(), Some(Item::File(_))));
+    assert!(sched.try_next().is_none(), "nothing to finish again");
+}
+
 #[test]
 fn cancelled_range_drains_without_reporting_or_publishing_an_innocent_file() {
     let (sched, range, _) = pipeline_ranges(&[(0, 4096)]);

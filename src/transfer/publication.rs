@@ -239,6 +239,15 @@ impl Worker {
         matched: bool,
         error: anyhow::Error,
     ) -> Result<()> {
+        // The receiver's answer that the destination no longer meets the
+        // existing-file policy is final, even read just before this
+        // connection failed: the receiver let the file go, so publishing it
+        // again could only fail.
+        let job = self.job(idx);
+        if self.kept_by_policy(&job, &error) {
+            self.skip_kept(idx, &job);
+            return Ok(());
+        }
         if self.transport_dead() {
             self.sched.requeue_finish(idx, matched);
         }
