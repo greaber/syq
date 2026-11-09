@@ -915,10 +915,27 @@ fn verify_with<T>(
         },
         clock_skew_seconds: CLOCK_SKEW_SECONDS,
     };
-    delegation::verify_and_redeem(directive, &context, &config.signer, &replay, |directive| {
-        require_issued_since_record(config, directive)?;
-        derive(directive)
-    })
+    let verified =
+        delegation::verify_and_redeem(directive, &context, &config.signer, &replay, |directive| {
+            require_issued_since_record(config, directive)?;
+            derive(directive)
+        })?;
+    // `config` is the state as the session read it when it started, up to
+    // `ADMISSION_TIMEOUT` before its first frame. A refresh since then can
+    // have recreated the record of used directives, which then holds no
+    // trace of this one if it ran before, and the session's state has no
+    // `record_since` for it. A refresh writes the enrollment's new
+    // generation before the new record, so the state read now, after the
+    // directive was recorded, shows it: refuse then. The directive stays
+    // recorded, and runs nowhere.
+    let current = read_receiver_config(state)?.with_context(|| {
+        format!(
+            "this server's state for enrollment {} was removed while the copy started",
+            config.id
+        )
+    })?;
+    require_current_receiver(&current, generation, build)?;
+    Ok(verified)
 }
 
 /// Refuse a directive issued before this server recreated its record of the
