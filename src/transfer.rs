@@ -186,6 +186,18 @@ fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
     }
 }
 
+/// Whether a queued file lets the copy start data workers on its shared SSH
+/// login: a new file small enough for a small-file batch. Sessions on one
+/// login share its TCP stream and its ssh and sshd processes, which suits
+/// small files; larger files keep their own logins so they get separate
+/// streams and cipher processes (`Worker::needs_own_login`).
+fn shares_ssh_login(opts: &Opts, jobs: &crate::sched::Jobs, idx: usize) -> bool {
+    let job = &jobs[idx];
+    job.entry.size <= fast_file_size_limit(opts, None)
+        && jobs.destination(idx).is_none()
+        && (!opts.inplace || job.inplace)
+}
+
 pub struct Opts {
     pub expressions: crate::expression::Policy,
     pub hash_policy: crate::hashing::HashPolicy,
@@ -3273,6 +3285,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             opts.tuning.streaming_request_size(opts.block, None),
                         );
                     }
+                    let on_shared_login =
+                        !reuse_control && (src.shares_ssh_login() || dst.shares_ssh_login());
                     let mut worker = Worker {
                         id,
                         src,
@@ -3294,6 +3308,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         comparison: Default::default(),
                         setup_elapsed: t0.elapsed(),
                         publications: Default::default(),
+                        on_shared_login,
+                        leaving_shared_login: false,
                     };
                     #[cfg(debug_assertions)]
                     crate::fsops::record_test_event(
@@ -3319,6 +3335,22 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     }
                     let dropped = result.is_err() && !invalid_range && worker.transport_dead();
                     match result {
+                        Ok(()) if worker.leaving_shared_login => {
+                            // A larger file is planned: this and every later
+                            // connection logs in on its own.
+                            for spec in [&src_ep, &dst_ep].into_iter().filter_map(real_remote_spec)
+                            {
+                                spec.set_ssh_multiplexing(false);
+                            }
+                            worker.src.detach();
+                            worker.dst.detach();
+                            gate.mark_warming(id);
+                            if debug() {
+                                crate::output::diagnostic!(
+                                    "syq: worker {id}: leaving the shared SSH login to log in on its own"
+                                );
+                            }
+                        }
                         Ok(()) => {
                             gate.mark_absent(id);
                             worker.src.detach();
@@ -4710,6 +4742,26 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let streaming_batch_limit = fast_file_size_limit(&opts, bwlimit.as_deref());
     let streaming_checked_jobs = std::cell::Cell::new(0);
     let streaming_all_batched = std::cell::Cell::new(true);
+    // Data workers share the copy's SSH login while every file planned so far
+    // can (`shares_ssh_login`), so workers started before planning ends need
+    // no logins of their own for a tree of small files. Once planning finds
+    // a file that can't, later connections log in on their own, and a worker
+    // on the shared login that takes a file too large for a small-file batch
+    // hands it back and logs in again (`Worker::needs_own_login`).
+    let ssh_sharing_possible = !opts.dry_run
+        && !opts.tuning.force_ranges()
+        && (bwlimit.is_none() || transport_budget.is_some());
+    let share_ssh_logins = |share: bool| {
+        for spec in [&src_ep, &dst_ep]
+            .into_iter()
+            .filter_map(real_remote_spec)
+            .filter(|spec| spec.data_transport() == DataTransport::Ssh)
+        {
+            spec.set_ssh_multiplexing(share);
+        }
+    };
+    let streaming_checked_sharing = std::cell::Cell::new(0);
+    let streaming_all_shareable = std::cell::Cell::new(ssh_sharing_possible);
     let start_streaming = || {
         if !streaming_ready
             || sched.is_aborted()
@@ -4739,7 +4791,21 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         } else {
             streaming_connections
         };
+        if streaming_all_shareable.get() {
+            let jobs = sched.jobs.lock().unwrap();
+            let shareable = (streaming_checked_sharing.get()..jobs.len())
+                .all(|idx| shares_ssh_login(&opts, &jobs, idx));
+            streaming_checked_sharing.set(jobs.len());
+            drop(jobs);
+            if !shareable {
+                streaming_all_shareable.set(false);
+                share_ssh_logins(false);
+            }
+        }
         if !workers_started.get() {
+            if streaming_all_shareable.get() {
+                share_ssh_logins(true);
+            }
             spawn_workers(initial, streaming_refine);
             workers_started.set(true);
         } else if autotune && initial > streaming_worker_hint.get() {
@@ -5079,28 +5145,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 let (multiplex_small_files, file_jobs, file_bytes) = {
                     let jobs = sched.jobs.lock().unwrap();
                     (
-                        !opts.dry_run
-                            && !opts.tuning.force_ranges()
-                            && (bwlimit.is_none() || transport_budget.is_some())
-                            && jobs.iter().enumerate().all(|(idx, job)| {
-                                job.entry.size <= fast_file_size_limit(&opts, None)
-                                    && jobs.destination(idx).is_none()
-                                    && (!opts.inplace || job.inplace)
-                            }),
+                        ssh_sharing_possible
+                            && (0..jobs.len()).all(|idx| shares_ssh_login(&opts, &jobs, idx)),
                         jobs.len(),
                         jobs.iter()
                             .fold(0u64, |total, job| total.saturating_add(job.entry.size)),
                     )
                 };
-                if multiplex_small_files {
-                    for spec in [&src_ep, &dst_ep]
-                        .into_iter()
-                        .filter_map(real_remote_spec)
-                        .filter(|spec| spec.data_transport() == DataTransport::Ssh)
-                    {
-                        spec.set_ssh_multiplexing(true);
-                    }
-                }
+                share_ssh_logins(multiplex_small_files);
                 if !workers_started.get() {
                     // A same-machine file normally completes wholly inside one
                     // small-file or receiver-side copy request (copy_file_range,

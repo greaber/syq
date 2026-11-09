@@ -173,6 +173,11 @@ pub trait Conn: Send {
     /// Close without waiting for the peer to exit. Every reply has been
     /// consumed, so waiting would only delay the caller by a round trip.
     fn detach(&mut self) {}
+    /// Whether this is a session on the copy's shared SSH login rather than
+    /// a login of its own.
+    fn shares_ssh_login(&self) -> bool {
+        false
+    }
     /// Whether sending several requests before receiving their responses can
     /// overlap useful work. LocalConn executes requests synchronously, so
     /// queueing several block responses there only retains their buffers.
@@ -1389,6 +1394,9 @@ impl Conn for RemoteConn {
     }
     fn detach(&mut self) {
         self.detached = true;
+    }
+    fn shares_ssh_login(&self) -> bool {
+        self.multiplexed_ssh
     }
     fn begin_streaming_writes(&mut self) -> Result<()> {
         anyhow::ensure!(

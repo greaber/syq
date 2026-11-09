@@ -102,6 +102,40 @@ fn multiplexed_worker_refusal_falls_back_to_independent_ssh() {
     );
 }
 
+/// Workers started while a small-file tree is being planned try the shared
+/// login too; when the server refuses them, they log in on their own. The
+/// first worker waits, so the refusal is not its own, which would keep the
+/// others from trying.
+#[cfg(debug_assertions)]
+#[test]
+fn multiplexed_refusal_falls_back_for_workers_started_while_planning() {
+    let t = Tmp::new();
+    let ssh = fake_ssh_rejecting_multiplexed_workers(&t);
+    let list: Vec<String> = (0..600).map(|index| format!("f{index:04}")).collect();
+    for name in &list {
+        write(&t.path(&format!("src/{name}")), name.as_bytes());
+    }
+    let (invocations, events) =
+        super::remote::copy_with_the_first_worker_held(&t, &ssh, &list, false);
+    for name in [&list[0], &list[599]] {
+        assert_eq!(read(&t.path(&format!("dst/{name}"))), name.as_bytes());
+    }
+    assert!(
+        invocations
+            .lines()
+            .any(|line| line.starts_with("no|") && !line.ends_with("|none")),
+        "no worker started while planning tried the shared login:\n{invocations}"
+    );
+    assert!(
+        invocations.lines().any(|line| line == "no|none"),
+        "no independent worker fallback was attempted:\n{invocations}"
+    );
+    assert!(
+        events.lines().any(|line| line.starts_with("connected ")),
+        "{events}"
+    );
+}
+
 // Persistence only saves logins, so a setting syq cannot use must not stop an
 // SSH copy. The copy warns and uses a connection for this run only.
 #[test]

@@ -1180,6 +1180,172 @@ fn a_finished_copy_does_not_wait_for_slow_worker_logins() {
     );
 }
 
+/// Copy `src/` to a new remote directory through the ssh-shaped `ssh`, over
+/// SSH data with four fixed workers, listing the sources in `list` order. The
+/// first worker waits before it connects until every file has arrived, so the
+/// others do the copy. With `hold_planning`, planning also waits after its
+/// first batch until those others have connected. Returns the remote shell's
+/// log and the workers' connection events as they stood when every file had
+/// arrived, before the first worker was let go.
+#[cfg(debug_assertions)]
+pub(super) fn copy_with_the_first_worker_held(
+    t: &Tmp,
+    ssh: &Path,
+    list: &[String],
+    hold_planning: bool,
+) -> (String, String) {
+    use std::os::unix::ffi::OsStrExt;
+    write(&t.path("list"), (list.join("\n") + "\n").as_bytes());
+    let (ready, continuation) = (t.path("worker-ready"), t.path("worker-continue"));
+    let (planned, planning) = (t.path("planned-ready"), t.path("planned-continue"));
+    let mut command = compat_command();
+    command
+        .arg("-e")
+        .arg(ssh)
+        .arg("--rsync-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "--syq-no-tcp",
+            "--performance-tuning=workers=4",
+            "--no-progress",
+            "-rt",
+            "--files-from",
+        ])
+        .arg(t.path("list"))
+        .arg(format!("{}/", t.s("src")))
+        .arg(format!("fake:{}/", t.s("dst")))
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
+        .env("SYQ_TEST_WORKER_EVENTS", t.path("events"))
+        .env("SYQ_TEST_WORKER_CONNECT_READY_FILE", &ready)
+        .env("SYQ_TEST_WORKER_CONNECT_CONTINUE_FILE", &continuation)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if hold_planning {
+        command
+            .env("SYQ_TEST_PLANNED_BATCH_READY_FILE", &planned)
+            .env("SYQ_TEST_PLANNED_BATCH_CONTINUE_FILE", &planning);
+    }
+    let mut child = command.start().unwrap();
+    let mut wait_until = |what: &str, condition: &dyn Fn() -> bool| {
+        let started = std::time::Instant::now();
+        while !condition() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "syq exited before {what}"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(60),
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    };
+    wait_until("the first worker's connection", &|| ready.exists());
+    if hold_planning {
+        wait_until("the first planned batch", &|| planned.exists());
+        wait_until("the other workers to connect", &|| {
+            let events = fs::read_to_string(t.path("events")).unwrap_or_default();
+            (1..4).all(|id| events.contains(&format!("connected {id} ")))
+        });
+        release_confinement_barrier(&planning);
+    }
+    wait_until("every file", &|| {
+        // Partial files are hidden; finished ones keep their names.
+        fs::read_dir(t.path("dst")).map_or(0, |entries| {
+            entries
+                .filter(|entry| {
+                    !entry
+                        .as_ref()
+                        .unwrap()
+                        .file_name()
+                        .as_bytes()
+                        .starts_with(b".")
+                })
+                .count()
+        }) == list.len()
+    });
+    let seen = (
+        fs::read_to_string(t.path("rsh.log")).unwrap(),
+        fs::read_to_string(t.path("events")).unwrap(),
+    );
+    release_confinement_barrier(&continuation);
+    assert_output_ok(&child.wait_with_output().unwrap());
+    seen
+}
+
+/// Workers started while a tree of small new files is still being planned
+/// join the copy's own SSH login rather than logging in separately.
+#[cfg(debug_assertions)]
+#[test]
+fn workers_started_while_planning_small_files_share_the_copys_ssh_login() {
+    let t = Tmp::new();
+    // Enough files that workers start before planning ends.
+    let list: Vec<String> = (0..600).map(|index| format!("f{index:04}")).collect();
+    for name in &list {
+        write(&t.path(&format!("src/{name}")), name.as_bytes());
+    }
+    let (log, events) = copy_with_the_first_worker_held(&t, &fake_ssh(&t), &list, false);
+    for name in &list {
+        assert_eq!(read(&t.path(&format!("dst/{name}"))), name.as_bytes());
+    }
+    let shared = log
+        .lines()
+        .filter(|line| line.contains("ControlMaster=no -S"))
+        .count();
+    assert!(shared >= 2, "no worker shared the login:\n{log}");
+    assert!(
+        !log.contains("ControlPath=none"),
+        "a worker logged in separately:\n{log}"
+    );
+    assert!(
+        events.lines().any(|line| line.starts_with("connected ")),
+        "{events}"
+    );
+}
+
+/// A worker on the shared login that meets a file too large to share it
+/// hands the file back and logs in on its own, and so do later connections.
+#[cfg(debug_assertions)]
+#[test]
+fn a_worker_on_the_shared_ssh_login_logs_in_separately_for_a_large_file() {
+    let t = Tmp::new();
+    // A planning batch holds 4,096 listed files, so the large file, listed
+    // last, is planned in a second batch, once the workers have connected.
+    let mut list: Vec<String> = (0..4096).map(|index| format!("f{index:04}")).collect();
+    for name in &list {
+        write(&t.path(&format!("src/{name}")), name.as_bytes());
+    }
+    let large = prng(8 << 20, 9124);
+    write(&t.path("src/large"), &large);
+    list.push("large".into());
+    let (log, events) = copy_with_the_first_worker_held(&t, &fake_ssh(&t), &list, true);
+    assert_eq!(read(&t.path("dst/large")), large);
+    assert_eq!(read(&t.path("dst/f4095")), b"f4095");
+    assert!(
+        log.contains("ControlMaster=no -S"),
+        "no worker shared the login:\n{log}"
+    );
+    assert!(
+        log.contains("ControlPath=none"),
+        "no worker logged in separately:\n{log}"
+    );
+    // Some worker connected twice: first on the shared login, then on its own.
+    let mut connected: Vec<&str> = events
+        .lines()
+        .filter(|line| line.starts_with("connected "))
+        .collect();
+    let all = connected.len();
+    connected.sort_unstable();
+    connected.dedup();
+    assert!(
+        connected.len() < all,
+        "no worker connected again:\n{events}"
+    );
+}
+
 #[test]
 fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
     let t = Tmp::new();

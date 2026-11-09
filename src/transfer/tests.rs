@@ -576,7 +576,50 @@ fn pipeline_worker(
         comparison: Default::default(),
         setup_elapsed: std::time::Duration::ZERO,
         publications: Default::default(),
+        on_shared_login: false,
+        leaving_shared_login: false,
     }
+}
+
+#[test]
+fn a_worker_on_the_shared_ssh_login_gives_back_larger_files() {
+    let sched = Arc::new(Sched::new(512, 8192));
+    sched.push_file(pipeline_job(b"small", 100));
+    let mut existing = pipeline_job(b"existing", 100);
+    existing.dst_entry = Some(existing.data.entry.clone());
+    sched.push_file(existing);
+    sched.push_file(pipeline_job(b"large", 4096));
+    let state = Arc::new(Mutex::new(PipelineState::default()));
+    let mut worker = pipeline_worker(&sched, &state, &state, true);
+    assert!((100..4096).contains(&fast_file_size_limit(&worker.opts, None)));
+    // A worker with its own login, or a startup worker, takes any file.
+    for idx in 0..3 {
+        assert!(!worker.needs_own_login(&Item::File(idx)));
+    }
+    worker.on_shared_login = true;
+    assert!(!worker.needs_own_login(&Item::File(0)));
+    // A small file goes on the shared login even where it already exists.
+    assert!(!worker.needs_own_login(&Item::File(1)));
+    assert!(worker.needs_own_login(&Item::File(2)));
+    assert!(!worker.needs_own_login(&Item::Finish {
+        idx: 2,
+        matched: false
+    }));
+
+    // It hands the larger file back untouched and stops taking work.
+    sched.scan_done();
+    let item = sched.next();
+    assert!(matches!(item, Item::File(2)), "largest file first");
+    worker.process_item(item).unwrap();
+    assert!(worker.leaving_shared_login);
+    assert!(state.lock().unwrap().requests.is_empty());
+    assert!(matches!(sched.next(), Item::File(2)));
+
+    // So does a range of a larger file.
+    let (sched, handle, _) = pipeline_ranges(&[(0, 4096)]);
+    let mut worker = pipeline_worker(&sched, &state, &state, true);
+    worker.on_shared_login = true;
+    assert!(worker.needs_own_login(&Item::Range(handle)));
 }
 
 #[test]
