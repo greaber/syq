@@ -186,11 +186,11 @@ fn fast_file_size_limit(opts: &Opts, bwlimit: Option<&BandwidthLimit>) -> u64 {
     }
 }
 
-/// Whether data workers may carry a queued file on the copy's shared SSH
+/// Whether a queued file lets the copy start data workers on its shared SSH
 /// login: a new file small enough for a small-file batch. Sessions on one
 /// login share its TCP stream and its ssh and sshd processes, which suits
 /// small files; larger files keep their own logins so they get separate
-/// streams and cipher processes.
+/// streams and cipher processes (`Worker::needs_own_login`).
 fn shares_ssh_login(opts: &Opts, jobs: &crate::sched::Jobs, idx: usize) -> bool {
     let job = &jobs[idx];
     job.entry.size <= fast_file_size_limit(opts, None)
@@ -3336,9 +3336,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     let dropped = result.is_err() && !invalid_range && worker.transport_dead();
                     match result {
                         Ok(()) if worker.leaving_shared_login => {
-                            // A file that can't share the login is planned:
-                            // this and every later connection logs in on its
-                            // own.
+                            // A larger file is planned: this and every later
+                            // connection logs in on its own.
                             for spec in [&src_ep, &dst_ep].into_iter().filter_map(real_remote_spec)
                             {
                                 spec.set_ssh_multiplexing(false);
@@ -4747,8 +4746,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // can (`shares_ssh_login`), so workers started before planning ends need
     // no logins of their own for a tree of small files. Once planning finds
     // a file that can't, later connections log in on their own, and a worker
-    // on the shared login that takes such a file hands it back and logs in
-    // again (`Worker::needs_own_login`).
+    // on the shared login that takes a file too large for a small-file batch
+    // hands it back and logs in again (`Worker::needs_own_login`).
     let ssh_sharing_possible = !opts.dry_run
         && !opts.tuning.force_ranges()
         && (bwlimit.is_none() || transport_budget.is_some());

@@ -1180,22 +1180,30 @@ fn a_finished_copy_does_not_wait_for_slow_worker_logins() {
     );
 }
 
-/// Copy `src/` to a new remote directory over SSH data with four fixed workers,
-/// listing the sources in `list` order. The first worker waits before it
-/// connects until every file has arrived, so the others do the copy. Returns
-/// the remote shell's log and the workers' connection events.
+/// Copy `src/` to a new remote directory through the ssh-shaped `ssh`, over
+/// SSH data with four fixed workers, listing the sources in `list` order. The
+/// first worker waits before it connects until every file has arrived, so the
+/// others do the copy. With `hold_planning`, planning also waits after its
+/// first batch until those others have connected. Returns the remote shell's
+/// log and the workers' connection events.
 #[cfg(debug_assertions)]
-fn copy_with_the_first_worker_held(t: &Tmp, list: &[String], files: usize) -> (String, String) {
+pub(super) fn copy_with_the_first_worker_held(
+    t: &Tmp,
+    ssh: &Path,
+    list: &[String],
+    hold_planning: bool,
+) -> (String, String) {
     use std::os::unix::ffi::OsStrExt;
-    let ssh = fake_ssh(t);
-    t.expose_remote_syq();
     write(&t.path("list"), (list.join("\n") + "\n").as_bytes());
     let (ready, continuation) = (t.path("worker-ready"), t.path("worker-continue"));
-    let mut child = compat_command()
+    let (planned, planning) = (t.path("planned-ready"), t.path("planned-continue"));
+    let mut command = compat_command();
+    command
         .arg("-e")
-        .arg(&ssh)
+        .arg(ssh)
+        .arg("--rsync-path")
+        .arg(env!("CARGO_BIN_EXE_syq"))
         .args([
-            "--syq-no-bootstrap",
             "--syq-no-tcp",
             "--performance-tuning=workers=4",
             "--no-progress",
@@ -1206,7 +1214,6 @@ fn copy_with_the_first_worker_held(t: &Tmp, list: &[String], files: usize) -> (S
         .arg(format!("{}/", t.s("src")))
         .arg(format!("fake:{}/", t.s("dst")))
         .env("FAKE_REMOTE_HOME", t.path("remote-home"))
-        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("XDG_CONFIG_HOME", t.path("config"))
         .env("XDG_CACHE_HOME", t.path("cache"))
@@ -1214,14 +1221,39 @@ fn copy_with_the_first_worker_held(t: &Tmp, list: &[String], files: usize) -> (S
         .env("SYQ_TEST_WORKER_CONNECT_READY_FILE", &ready)
         .env("SYQ_TEST_WORKER_CONNECT_CONTINUE_FILE", &continuation)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .start()
-        .unwrap();
-    wait_for_confinement_marker(&mut child, &ready, "first worker connection");
-    let started = std::time::Instant::now();
-    loop {
+        .stderr(Stdio::piped());
+    if hold_planning {
+        command
+            .env("SYQ_TEST_PLANNED_BATCH_READY_FILE", &planned)
+            .env("SYQ_TEST_PLANNED_BATCH_CONTINUE_FILE", &planning);
+    }
+    let mut child = command.start().unwrap();
+    let mut wait_until = |what: &str, condition: &dyn Fn() -> bool| {
+        let started = std::time::Instant::now();
+        while !condition() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "syq exited before {what}"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(60),
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    };
+    wait_until("the first worker's connection", &|| ready.exists());
+    if hold_planning {
+        wait_until("the first planned batch", &|| planned.exists());
+        wait_until("the other workers to connect", &|| {
+            let events = fs::read_to_string(t.path("events")).unwrap_or_default();
+            (1..4).all(|id| events.contains(&format!("connected {id} ")))
+        });
+        release_confinement_barrier(&planning);
+    }
+    wait_until("every file", &|| {
         // Partial files are hidden; finished ones keep their names.
-        let finished = fs::read_dir(t.path("dst")).map_or(0, |entries| {
+        fs::read_dir(t.path("dst")).map_or(0, |entries| {
             entries
                 .filter(|entry| {
                     !entry
@@ -1232,17 +1264,8 @@ fn copy_with_the_first_worker_held(t: &Tmp, list: &[String], files: usize) -> (S
                         .starts_with(b".")
                 })
                 .count()
-        });
-        if finished == files {
-            break;
-        }
-        assert!(child.try_wait().unwrap().is_none(), "syq exited early");
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(60),
-            "timed out with {finished} of {files} files copied"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+        }) == list.len()
+    });
     release_confinement_barrier(&continuation);
     assert_output_ok(&child.wait_with_output().unwrap());
     (
@@ -1262,7 +1285,7 @@ fn workers_started_while_planning_small_files_share_the_copys_ssh_login() {
     for name in &list {
         write(&t.path(&format!("src/{name}")), name.as_bytes());
     }
-    let (log, events) = copy_with_the_first_worker_held(&t, &list, list.len());
+    let (log, events) = copy_with_the_first_worker_held(&t, &fake_ssh(&t), &list, false);
     for name in &list {
         assert_eq!(read(&t.path(&format!("dst/{name}"))), name.as_bytes());
     }
@@ -1288,7 +1311,7 @@ fn workers_started_while_planning_small_files_share_the_copys_ssh_login() {
 fn a_worker_on_the_shared_ssh_login_logs_in_separately_for_a_large_file() {
     let t = Tmp::new();
     // A planning batch holds 4,096 listed files, so the large file, listed
-    // last, is planned after the workers have started on the small ones.
+    // last, is planned in a second batch, once the workers have connected.
     let mut list: Vec<String> = (0..4096).map(|index| format!("f{index:04}")).collect();
     for name in &list {
         write(&t.path(&format!("src/{name}")), name.as_bytes());
@@ -1296,7 +1319,7 @@ fn a_worker_on_the_shared_ssh_login_logs_in_separately_for_a_large_file() {
     let large = prng(8 << 20, 9124);
     write(&t.path("src/large"), &large);
     list.push("large".into());
-    let (log, events) = copy_with_the_first_worker_held(&t, &list, list.len());
+    let (log, events) = copy_with_the_first_worker_held(&t, &fake_ssh(&t), &list, true);
     assert_eq!(read(&t.path("dst/large")), large);
     assert_eq!(read(&t.path("dst/f4095")), b"f4095");
     assert!(

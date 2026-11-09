@@ -582,7 +582,7 @@ fn pipeline_worker(
 }
 
 #[test]
-fn a_worker_on_the_shared_ssh_login_gives_back_files_that_need_their_own() {
+fn a_worker_on_the_shared_ssh_login_gives_back_larger_files() {
     let sched = Arc::new(Sched::new(512, 8192));
     sched.push_file(pipeline_job(b"small", 100));
     let mut existing = pipeline_job(b"existing", 100);
@@ -598,7 +598,8 @@ fn a_worker_on_the_shared_ssh_login_gives_back_files_that_need_their_own() {
     }
     worker.on_shared_login = true;
     assert!(!worker.needs_own_login(&Item::File(0)));
-    assert!(worker.needs_own_login(&Item::File(1)));
+    // A small file goes on the shared login even where it already exists.
+    assert!(!worker.needs_own_login(&Item::File(1)));
     assert!(worker.needs_own_login(&Item::File(2)));
     assert!(!worker.needs_own_login(&Item::Finish {
         idx: 2,
