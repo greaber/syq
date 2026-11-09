@@ -33,7 +33,18 @@ fn symlinked_tmpdir_resolves_fixture_roots_only() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(fs::read_dir(&real).unwrap().count(), 0);
+        // Only the account's socket directory stays, which syq keeps, and
+        // nothing is left in it.
+        let account = format!("syq-{}", unsafe { libc::geteuid() });
+        let left: Vec<_> = fs::read_dir(&real)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| *name != *account)
+            .collect();
+        assert_eq!(left, Vec::<std::ffi::OsString>::new());
+        if let Ok(entries) = fs::read_dir(real.join(&account)) {
+            assert_eq!(entries.count(), 0);
+        }
         return;
     }
 
