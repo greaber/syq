@@ -186,10 +186,14 @@ fn setup_and_destination_connections_apply_only_the_selected_agent_policy() {
         "HostKeyAlgorithms=ssh-ed25519",
         "StrictHostKeyChecking=no",
         "UserKnownHostsFile=/dev/null",
+        // Every connection logs in through the broker, which checks each.
+        "ControlMaster=no",
+        "ControlPath=none",
         "2222",
     ] {
         assert!(hardened_words.iter().any(|word| word == required));
     }
+    assert!(crate::conn::shareable_ssh_options(&hardened_words).is_none());
     // ssh reads `CertificateFile=none` as a file named `none`.
     assert!(!hardened_words
         .iter()
@@ -1264,7 +1268,6 @@ fn the_entry_key_session_keeps_its_hardening_under_this_machines_configuration()
         "identitiesonly yes",
         "forwardagent no",
         "forwardx11 no",
-        "controlmaster false",
         "requesttty false",
         "securitykeyprovider internal",
         "permitlocalcommand no",
@@ -1293,9 +1296,12 @@ fn the_entry_key_session_keeps_its_hardening_under_this_machines_configuration()
     ] {
         assert!(has(line), "{line}\n{effective}");
     }
+    // Whether a connection shares the copy's own connection or none, each
+    // says on its command line, ahead of this configuration's `ControlMaster
+    // auto` and `ControlPath`
+    // (`conn::tests::entry_key_connections_share_only_the_copys_own_connection`).
     // OpenSSH leaves these settings out when they are off.
     for name in [
-        "controlpath ",
         "proxyjump ",
         "proxycommand ",
         "localforward ",
@@ -1364,8 +1370,6 @@ fn receiver_ssh_uses_the_entry_key_first_and_checks_host_keys_as_this_machine_do
         "PubkeyAuthentication=yes",
         "PreferredAuthentications=publickey",
         "BatchMode=yes",
-        "ControlMaster=no",
-        "ControlPath=none",
         "ClearAllForwardings=yes",
         "ForwardAgent=no",
         "ForwardX11=no",
@@ -1381,11 +1385,18 @@ fn receiver_ssh_uses_the_entry_key_first_and_checks_host_keys_as_this_machine_do
     ] {
         assert!(command.contains(&option.to_owned()), "{option}");
     }
+    // The copy shares a connection of its own, which each connection names
+    // or refuses on its command line ahead of the configuration
+    // (`conn::RemoteSpec::ssh_command`); the command sets none itself.
+    assert!(crate::conn::shareable_ssh_options(&command).is_some());
     for unset in [
         "UserKnownHostsFile=",
         "HostKeyAlias=",
         "HostKeyAlgorithms=",
         "CertificateFile=",
+        "ControlMaster=",
+        "ControlPath=",
+        "ControlPersist=",
     ] {
         assert!(
             !command.iter().any(|argument| argument.starts_with(unset)),

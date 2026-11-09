@@ -843,8 +843,16 @@ pub(crate) fn receiver_rsh(port: Option<u16>) -> String {
 /// checked, and overrides on the command line, where the first value wins,
 /// everything the entry key's session must not do: the entry key, whose
 /// file replaces the `IdentityFile=none` placeholder on the coordinator, is
-/// the first identity, with no agent, PKCS#11 provider, control socket,
-/// forwarding, proxy, local command or prompt.
+/// the first identity, with no agent, PKCS#11 provider, forwarding, proxy,
+/// local command or prompt.
+///
+/// Every connection through the broker logs in through it, so that command
+/// shares no connection. The entry key's command leaves connection sharing
+/// to the copy, as for an ordinary login: the copy shares one connection of
+/// its own, in a private directory, for this run only, and every connection
+/// sets the sharing options on its command line, ahead of the configuration
+/// (`transfer::endpoint`, `conn::RemoteSpec::ssh_command`). The entry key's
+/// `restrict` and forced command apply to every session on the connection.
 fn constrained_destination_rsh(
     port: Option<u16>,
     authentication: DestinationAuthentication<'_>,
@@ -856,6 +864,9 @@ fn constrained_destination_rsh(
     let mut command = vec!["ssh".to_owned()];
     if let DestinationAuthentication::Broker { .. } = authentication {
         command.extend(["-F".to_owned(), "/dev/null".to_owned()]);
+        for option in ["ControlMaster=no", "ControlPath=none"] {
+            command.extend(["-o".to_owned(), option.to_owned()]);
+        }
     }
     command.extend(["-a", "-x", "-k", "-T"].map(str::to_owned));
     for option in [
@@ -873,8 +884,6 @@ fn constrained_destination_rsh(
         "KbdInteractiveAuthentication=no".to_owned(),
         "PasswordAuthentication=no".to_owned(),
         "BatchMode=yes".to_owned(),
-        "ControlMaster=no".to_owned(),
-        "ControlPath=none".to_owned(),
         "ClearAllForwardings=yes".to_owned(),
         "ForwardAgent=no".to_owned(),
         "ForwardX11=no".to_owned(),
@@ -1292,11 +1301,7 @@ impl ReceiverSsh {
         );
         let mut command = command.to_vec();
         let host = host.to_owned();
-        for required in [
-            "IdentityAgent=none",
-            "IdentitiesOnly=yes",
-            "ControlPath=none",
-        ] {
+        for required in ["IdentityAgent=none", "IdentitiesOnly=yes"] {
             anyhow::ensure!(
                 command.iter().any(|argument| argument == required),
                 "receiver SSH command is missing {required}"
