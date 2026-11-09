@@ -1037,12 +1037,8 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
             if let Some(notice) = released_enrollment_notice(&current_account()?.1) {
                 crate::output::diagnostic!("{notice}");
             }
-            let active = load_local_enrollments()?;
-            let active_ids = active
-                .iter()
-                .map(|(metadata, _)| metadata.id)
-                .collect::<HashSet<_>>();
-            for (metadata, _) in active {
+            let records = load_enrollment_records()?;
+            for (metadata, _) in records.active {
                 let target = endpoint(&metadata.target_login, &metadata.host, metadata.port)?;
                 crate::output::command_println!(
                     "{}\tactive\t{}\t{}\t{}",
@@ -1052,11 +1048,25 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
                     metadata.signer.fingerprint()?
                 );
             }
-            for (pending, _) in load_pending_enrollments()? {
-                if !active_ids.contains(&pending.id) {
-                    let target = endpoint(&pending.target_login, &pending.host, pending.port)?;
-                    crate::output::command_println!("{}\tpending\t{}", pending.id, target.label());
+            for (pending, _) in records.pending {
+                let target = endpoint(&pending.target_login, &pending.host, pending.port)?;
+                crate::output::command_println!("{}\tpending\t{}", pending.id, target.label());
+            }
+            for record in records.unusable {
+                let target = record
+                    .account
+                    .as_ref()
+                    .map(|(host, port, login)| endpoint(login, host, *port))
+                    .transpose()?;
+                match target {
+                    Some(target) => crate::output::command_println!(
+                        "{}\tunusable\t{}",
+                        record.name(),
+                        target.label()
+                    ),
+                    None => crate::output::command_println!("{}\tunusable", record.name()),
                 }
+                crate::output::diagnostic!("syq: this syq build cannot use {}", record.explain());
             }
             Ok(0)
         })()),
@@ -1084,7 +1094,9 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
         "revoke" => Some((|| {
             let id = EnrollmentId::parse(options.get_one::<String>("id").expect("ID required"))?;
             let via = via()?;
-            let active = load_local_enrollments()?
+            let records = load_enrollment_records()?;
+            let active = records
+                .active
                 .into_iter()
                 .find(|(metadata, _)| metadata.id == id);
             let (target_login, host, port, directory) = match active {
@@ -1094,13 +1106,25 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
                     metadata.port,
                     directory,
                 ),
-                None => {
-                    let (pending, directory) = load_pending_enrollments()?
-                        .into_iter()
-                        .find(|(pending, _)| pending.id == id)
-                        .context("no local enrollment has that ID")?;
-                    (pending.target_login, pending.host, pending.port, directory)
-                }
+                None => match records
+                    .pending
+                    .into_iter()
+                    .find(|(pending, _)| pending.id == id)
+                {
+                    Some((pending, directory)) => {
+                        (pending.target_login, pending.host, pending.port, directory)
+                    }
+                    None => match records
+                        .unusable
+                        .iter()
+                        .find(|record| record.name() == id.to_string())
+                    {
+                        Some(record) => {
+                            bail!("this syq build cannot revoke {}", record.explain())
+                        }
+                        None => bail!("no local enrollment has that ID"),
+                    },
+                },
             };
             let entry_key = load_entry_key(&directory)?;
             let request = RevokeRequest {

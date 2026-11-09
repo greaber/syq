@@ -22,40 +22,220 @@ pub(super) fn needs_refresh(metadata: &LocalEnrollment, directory: &Path) -> boo
     metadata.release != crate::identity::build() || directory.join(REFRESH_FILE).exists()
 }
 
-/// The records named `file` in the enrollment directories below `base`, of
-/// this version only: state that released versions wrote lives elsewhere
-/// and is never read.
-fn load_records<T: serde::de::DeserializeOwned>(
-    base: &Path,
+/// This machine's enrollment records, from the enrollment directories below
+/// its state directory. Only this version's are used: state that released
+/// versions before 0.8.0 wrote lives elsewhere and is never read.
+#[derive(Default)]
+pub(super) struct EnrollmentRecords {
+    pub(super) active: Vec<(LocalEnrollment, PathBuf)>,
+    pub(super) pending: Vec<(PendingEnrollment, PathBuf)>,
+    /// Records this build cannot use, sorted by directory.
+    pub(super) unusable: Vec<UnusableRecord>,
+}
+
+/// An enrollment directory whose record this build cannot use: it cannot
+/// read or decode it, or another syq version wrote it. Its enrollment may
+/// still have a working line in the server's `authorized_keys`, which only
+/// the build that made it can revoke. So it is reported, and no other
+/// enrollment is made for its account while it is there: one would leave
+/// that line where `syq receiver list` and `revoke` cannot see it.
+#[derive(Debug)]
+pub(super) struct UnusableRecord {
+    pub(super) directory: PathBuf,
+    /// The account the record names, when it can be read: host, port and
+    /// login.
+    pub(super) account: Option<(String, Option<u16>, String)>,
+    pub(super) reason: String,
+}
+
+impl UnusableRecord {
+    /// The directory's name, which is the enrollment's ID.
+    pub(super) fn name(&self) -> String {
+        self.directory
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    /// Whether it may be the enrollment of `host:port` as `login`: it names
+    /// that account, or none that can be read.
+    fn may_be_for(&self, host: &str, port: Option<u16>, login: &str) -> bool {
+        self.account
+            .as_ref()
+            .is_none_or(|(record_host, record_port, record_login)| {
+                record_host == host && *record_port == port && record_login == login
+            })
+    }
+
+    /// Which enrollment it is, what is wrong with it, and how to clear it.
+    pub(super) fn explain(&self) -> String {
+        let name = self.name();
+        let account = match &self.account {
+            Some((host, port, login)) => endpoint(login, host, *port)
+                .map(|target| format!(" for {}", target.label()))
+                .unwrap_or_default(),
+            None => String::new(),
+        };
+        format!(
+            "enrollment {name}{account}, recorded in {directory}: {reason}. \
+             If another syq build made it, its line in the server's ~/.ssh/authorized_keys still works: \
+             revoke it with that build (`syq receiver revoke {name}`), or delete the line containing \
+             `{prefix}{name}` from the server's ~/.ssh/authorized_keys and then delete {directory}",
+            directory = self.directory.display(),
+            reason = self.reason,
+            prefix = crate::enrollment::COMMENT_PREFIX,
+        )
+    }
+}
+
+/// What one record file in an enrollment directory holds.
+enum Record<T> {
+    Missing,
+    Usable(T),
+    Unusable {
+        account: Option<(String, Option<u16>, String)>,
+        reason: String,
+    },
+}
+
+/// The record `file` in `directory`, which is named `name`, as
+/// [`EnrollmentRecords`] reads it.
+fn read_record<T: serde::de::DeserializeOwned>(
+    directory: &Path,
+    name: &str,
     file: &str,
     label: &str,
     version: impl Fn(&T) -> (u16, EnrollmentId),
-) -> Result<Vec<(T, PathBuf)>> {
-    let mut records = Vec::new();
+) -> Record<T> {
+    let path = directory.join(file);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Record::Missing,
+        Err(error) => {
+            return Record::Unusable {
+                account: None,
+                reason: format!("inspect {}: {error}", path.display()),
+            }
+        }
+        Ok(_) => {}
+    }
+    let encoded = match delegation::read_private_regular(&path, label, MAX_STATE_FILE) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            return Record::Unusable {
+                account: None,
+                reason: format!("{error:#}"),
+            }
+        }
+    };
+    let reason = match serde_json::from_slice::<T>(&encoded) {
+        Ok(record) => match version(&record) {
+            (CONFIG_VERSION, id) if id.to_string() == name => return Record::Usable(record),
+            (CONFIG_VERSION, id) => format!("it is the record of enrollment {id}"),
+            (record_version, _) => format!(
+                "it has version {record_version}, which another syq version wrote; this one reads version {CONFIG_VERSION}"
+            ),
+        },
+        Err(error) => format!("decode {}: {error}", path.display()),
+    };
+    // The account it names, as far as it can be read, to know which
+    // account it may be the enrollment of.
+    let account = serde_json::from_slice::<serde_json::Value>(&encoded)
+        .ok()
+        .and_then(|value| {
+            let port = match value.get("port") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(port) => Some(u16::try_from(port.as_u64()?).ok()?),
+            };
+            Some((
+                value.get("host")?.as_str()?.to_owned(),
+                port,
+                value.get("target_login")?.as_str()?.to_owned(),
+            ))
+        });
+    Record::Unusable { account, reason }
+}
+
+pub(super) fn load_enrollment_records() -> Result<EnrollmentRecords> {
+    load_enrollment_records_in(&local_state_base()?)
+}
+
+pub(super) fn load_enrollment_records_in(base: &Path) -> Result<EnrollmentRecords> {
+    let mut records = EnrollmentRecords::default();
     for entry in fs::read_dir(base).with_context(|| format!("list {}", base.display()))? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
         }
         let directory = entry.path();
-        if delegation::validate_private_directory_path(&directory).is_err() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Err(error) = delegation::validate_private_directory_path(&directory) {
+            records.unusable.push(UnusableRecord {
+                directory,
+                account: None,
+                reason: format!("{error:#}"),
+            });
             continue;
         }
-        let Ok(encoded) =
-            delegation::read_private_regular(&directory.join(file), label, MAX_STATE_FILE)
-        else {
-            continue;
+        let pending = || {
+            read_record(
+                &directory,
+                &name,
+                PENDING_FILE,
+                "pending local enrollment",
+                |record: &PendingEnrollment| (record.version, record.id),
+            )
         };
-        let Ok(record) = serde_json::from_slice::<T>(&encoded) else {
-            continue;
+        let unusable = match read_record(
+            &directory,
+            &name,
+            ENROLLMENT_FILE,
+            "local enrollment",
+            |record: &LocalEnrollment| (record.version, record.id),
+        ) {
+            // A pending record beside it is left from before the enrollment
+            // completed, and changes nothing about it.
+            Record::Usable(record) => {
+                records.active.push((record, directory));
+                continue;
+            }
+            Record::Unusable { account, reason } => {
+                // The pending record may still name the account.
+                let account = account.or_else(|| match pending() {
+                    Record::Usable(pending) => {
+                        Some((pending.host, pending.port, pending.target_login))
+                    }
+                    Record::Unusable { account, .. } => account,
+                    Record::Missing => None,
+                });
+                (account, reason)
+            }
+            Record::Missing => match pending() {
+                Record::Usable(pending) => {
+                    records.pending.push((pending, directory));
+                    continue;
+                }
+                Record::Unusable { account, reason } => (account, reason),
+                // Only an entry key, stored before the request was sent, or
+                // nothing: the server has no line for it.
+                Record::Missing => continue,
+            },
         };
-        let (record_version, id) = version(&record);
-        if record_version == CONFIG_VERSION && id.to_string() == entry.file_name().to_string_lossy()
-        {
-            records.push((record, directory));
-        }
+        let (account, reason) = unusable;
+        records.unusable.push(UnusableRecord {
+            directory,
+            account,
+            reason,
+        });
     }
-    records.sort_by_key(|(record, _)| version(record).1.to_string());
+    records
+        .active
+        .sort_by_key(|(record, _)| record.id.to_string());
+    records
+        .pending
+        .sort_by_key(|(record, _)| record.id.to_string());
+    records
+        .unusable
+        .sort_by(|left, right| left.directory.cmp(&right.directory));
     Ok(records)
 }
 
@@ -64,31 +244,56 @@ pub(super) fn load_local_enrollments() -> Result<Vec<(LocalEnrollment, PathBuf)>
 }
 
 pub(super) fn load_local_enrollments_in(base: &Path) -> Result<Vec<(LocalEnrollment, PathBuf)>> {
-    load_records(
-        base,
-        ENROLLMENT_FILE,
-        "local enrollment",
-        |record: &LocalEnrollment| (record.version, record.id),
-    )
+    Ok(load_enrollment_records_in(base)?.active)
 }
 
-pub(super) fn load_pending_enrollments() -> Result<Vec<(PendingEnrollment, PathBuf)>> {
-    load_records(
-        &local_state_base()?,
-        PENDING_FILE,
-        "pending local enrollment",
-        |record: &PendingEnrollment| (record.version, record.id),
-    )
+/// Refuse to make an enrollment for `host:port` as `login` beside one whose
+/// record this build cannot use and that may be that account's.
+pub(super) fn refuse_beside_unusable(
+    unusable: &[UnusableRecord],
+    (host, port, login): (&str, Option<u16>, &str),
+) -> Result<()> {
+    if let Some(record) = unusable
+        .iter()
+        .find(|record| record.may_be_for(host, port, login))
+    {
+        let target = endpoint(login, host, port)?;
+        let has = if record.account.is_some() {
+            "it has"
+        } else {
+            "it may have"
+        };
+        bail!(
+            "restricted copying is not set up on {} while {has} an enrollment this syq build cannot use: {}",
+            target.label(),
+            record.explain(),
+        );
+    }
+    Ok(())
 }
 
+/// Write an enrollment's record. Fields the record there has that this
+/// build does not know, which a newer syq wrote, are kept.
 pub(super) fn complete_local_enrollment(
     directory: &Path,
     metadata: &LocalEnrollment,
 ) -> Result<()> {
+    let mut metadata = metadata.clone();
+    if let Record::Usable(previous) = read_record(
+        directory,
+        &metadata.id.to_string(),
+        ENROLLMENT_FILE,
+        "local enrollment",
+        |record: &LocalEnrollment| (record.version, record.id),
+    ) {
+        for (key, value) in previous.unknown {
+            metadata.unknown.entry(key).or_insert(value);
+        }
+    }
     atomic_write(
         directory,
         ENROLLMENT_FILE,
-        &serde_json::to_vec(metadata)?,
+        &serde_json::to_vec(&metadata)?,
         0o600,
     )?;
     let directory = open_directory(directory)?;
@@ -530,51 +735,11 @@ pub(super) fn enroll(
     let account = |metadata_host: &str, metadata_port: Option<u16>, target_login: &str| {
         metadata_host == host && metadata_port == port && target_login == login
     };
-    let active = load_local_enrollments()?
-        .into_iter()
-        .find(|(metadata, _)| account(&metadata.host, metadata.port, &metadata.target_login));
     let target = endpoint(login, host, port)?;
-    if let Refresh::SameRecord(id) = refresh {
-        if !active
-            .as_ref()
-            .is_some_and(|(metadata, _)| metadata.id == id)
-        {
-            bail!(
-                "restricted copying on {} is no longer enrollment {id}, which this copy was signed for; run the copy again",
-                target.label()
-            );
-        }
-    }
-    if let Some((metadata, directory)) = &active {
-        if refresh == Refresh::IfOutdated && !needs_refresh(metadata, directory) {
-            return Ok((metadata.clone(), directory.clone(), None));
-        }
-    }
-    let mut plan = match active {
-        Some((metadata, directory)) => Plan {
-            id: metadata.id,
-            entry_key: Some(load_entry_key(&directory)?),
-            directory,
-            refresh: true,
-            replaces: None,
-            keep_used: false,
-        },
-        None => match load_pending_enrollments()?
-            .into_iter()
-            .find(|(pending, _)| account(&pending.host, pending.port, &pending.target_login))
-        {
-            Some((pending, directory)) => Plan {
-                id: pending.id,
-                entry_key: Some(load_entry_key(&directory)?),
-                directory,
-                refresh: false,
-                replaces: None,
-                keep_used: false,
-            },
-            None => new_plan(&base, None),
-        },
+    let plan = match plan_enrollment(&base, (host, port, login), refresh)? {
+        Planned::Current(metadata, directory) => return Ok((metadata, directory, None)),
+        Planned::Session(plan) => plan,
     };
-    plan.keep_used = matches!(refresh, Refresh::SameRecord(_));
     if plan.refresh {
         // Until the server's reply arrives, the server may hold a newer
         // signer and generation than this machine's record.
@@ -613,7 +778,10 @@ pub(super) fn enroll(
                 id: old_id,
                 entry_public_key: old_key.public_key().to_openssh()?,
             };
-            let pending = load_pending_enrollments()?
+            let records = load_enrollment_records_in(&base)?;
+            refuse_beside_unusable(&records.unusable, (host, port, login))?;
+            let pending = records
+                .pending
                 .into_iter()
                 .find(|(pending, _)| account(&pending.host, pending.port, &pending.target_login));
             match run_session(
@@ -637,6 +805,75 @@ pub(super) fn enroll(
         }
     };
     Ok((metadata, directory, Some(signer)))
+}
+
+/// What [`enroll`] does for an account.
+pub(super) enum Planned {
+    /// Use the active enrollment as it is.
+    Current(LocalEnrollment, PathBuf),
+    /// Log in to the server to set up or refresh one.
+    Session(Plan),
+}
+
+/// What [`enroll`] does for `login@host:port`, from this machine's records
+/// below `base`, whose lock the caller holds.
+pub(super) fn plan_enrollment(
+    base: &Path,
+    (host, port, login): (&str, Option<u16>, &str),
+    refresh: Refresh,
+) -> Result<Planned> {
+    let account = |metadata_host: &str, metadata_port: Option<u16>, target_login: &str| {
+        metadata_host == host && metadata_port == port && target_login == login
+    };
+    let records = load_enrollment_records_in(base)?;
+    let active = records
+        .active
+        .into_iter()
+        .find(|(metadata, _)| account(&metadata.host, metadata.port, &metadata.target_login));
+    if let Refresh::SameRecord(id) = refresh {
+        if !active
+            .as_ref()
+            .is_some_and(|(metadata, _)| metadata.id == id)
+        {
+            bail!(
+                "restricted copying on {} is no longer enrollment {id}, which this copy was signed for; run the copy again",
+                endpoint(login, host, port)?.label()
+            );
+        }
+    }
+    if let Some((metadata, directory)) = active {
+        if refresh == Refresh::IfOutdated && !needs_refresh(&metadata, &directory) {
+            return Ok(Planned::Current(metadata, directory));
+        }
+        return Ok(Planned::Session(Plan {
+            id: metadata.id,
+            entry_key: Some(load_entry_key(&directory)?),
+            directory,
+            refresh: true,
+            replaces: None,
+            keep_used: matches!(refresh, Refresh::SameRecord(_)),
+        }));
+    }
+    // Anything but a refresh of the active enrollment installs a line for
+    // another one.
+    refuse_beside_unusable(&records.unusable, (host, port, login))?;
+    Ok(Planned::Session(
+        match records
+            .pending
+            .into_iter()
+            .find(|(pending, _)| account(&pending.host, pending.port, &pending.target_login))
+        {
+            Some((pending, directory)) => Plan {
+                id: pending.id,
+                entry_key: Some(load_entry_key(&directory)?),
+                directory,
+                refresh: false,
+                replaces: None,
+                keep_used: false,
+            },
+            None => new_plan(base, None),
+        },
+    ))
 }
 
 /// The enrollment that replaces one whose server state was lost: one whose
@@ -1047,6 +1284,7 @@ fn install_over_route(
                 signer: login_key.trusted.clone(),
                 identity_file: login_key.identity_file.clone(),
                 receiving_state: receiving.clone(),
+                unknown: Default::default(),
             };
             complete_local_enrollment(&plan.directory, &metadata)?;
             Ok(Session::Installed(Box::new((metadata, login_key.signer))))

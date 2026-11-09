@@ -99,6 +99,11 @@ pub(crate) struct ReceiverEnrollment {
     /// receivers refuse it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) record_since: Option<i64>,
+    /// Fields this build does not know, which a newer syq wrote. A refresh
+    /// keeps them, so switching builds does not drop what the newer one
+    /// recorded.
+    #[serde(flatten)]
+    pub(crate) unknown: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The enrolling machine's request to set up or refresh an enrollment, sent
@@ -181,6 +186,10 @@ struct LocalEnrollment {
     /// destination there before anything changes on the server.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     receiving_state: Vec<PathBuf>,
+    /// Fields this build does not know, which a newer syq wrote. Rewriting
+    /// the record keeps them (`complete_local_enrollment`).
+    #[serde(flatten)]
+    unknown: serde_json::Map<String, serde_json::Value>,
 }
 
 /// An enrollment whose installation has started but not yet been confirmed,

@@ -17,7 +17,7 @@ use base64::Engine as _;
 use std::path::{Component, Path};
 
 const ENROLLMENT_ID_BYTES: usize = 16;
-const COMMENT_PREFIX: &str = "syq-enrollment:";
+pub(crate) const COMMENT_PREFIX: &str = "syq-enrollment:";
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EnrollmentId(pub(crate) [u8; ENROLLMENT_ID_BYTES]);

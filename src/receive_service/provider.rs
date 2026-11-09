@@ -279,7 +279,7 @@ fn exchange_hello(stream: &mut (impl Read + Write), control: bool) -> Result<()>
     );
     anyhow::ensure!(
         control || reply.build == crate::identity::build(),
-        "SSH authorization provider service uses build {}, but this requester/helper uses {}; install the same syq build on the requester and provider, where the service switches to it by itself once idle",
+        "SSH authorization provider service uses build {}, but this requester/helper uses {}; install the same syq build on the requester and provider. A service that follows the provider's installed syq switches to its new build once idle; `syq persist receive on` on the provider replaces one that follows another copy of syq",
         reply.build,
         crate::identity::build()
     );
@@ -1811,7 +1811,8 @@ mod tests {
         assert!(error.contains("provider-other-build"));
         assert!(error.contains(crate::identity::build()));
         assert!(error.contains("install the same syq build on the requester and provider"));
-        assert!(error.contains("switches to it by itself once idle"));
+        assert!(error.contains("switches to its new build once idle"));
+        assert!(error.contains("`syq persist receive on` on the provider replaces"));
     }
 
     #[test]
