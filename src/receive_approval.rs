@@ -1531,7 +1531,7 @@ impl Queue {
         start: &std::path::Path,
         confined: Option<&[u8]>,
         follows_symlinks: bool,
-        limits: &crate::delegation::CopyLimits,
+        (limits, preview): (&crate::delegation::CopyLimits, bool),
         notifications: Notifications,
         cancelled: impl Fn() -> bool,
     ) -> Result<()> {
@@ -1550,7 +1550,11 @@ impl Queue {
         } else {
             ""
         };
-        let permission = format!("These files leave this machine: {} may list and read them and receives their contents. Filters narrow the copy, not this read permission.{follows}{inside} Nothing on this machine is changed.", from.server);
+        let permission = if preview {
+            format!("Preview only (a dry run): {} may list these files and compare them with its own by their hashes, but not read their contents.{follows}{inside} Nothing on this machine is changed.", from.server)
+        } else {
+            format!("These files leave this machine: {} may list and read them and receives their contents. Filters narrow the copy, not this read permission.{follows}{inside} Nothing on this machine is changed.", from.server)
+        };
         let shown = |path: String, scope: &str| format!("{path} ({scope})");
         // The desktop prompt lists only a few paths: those outside the
         // profile's directory or hidden come first, and the notes count them.
@@ -1575,6 +1579,9 @@ impl Queue {
         let mut order: Vec<usize> = (0..paths.len()).collect();
         order.sort_by_key(|&index| notable[index] == (false, false));
         let mut notes = vec![permission.clone()];
+        if preview {
+            notes.insert(0, "preview only".to_owned());
+        }
         let count = |which: fn(&(bool, bool)) -> bool| notable.iter().filter(|n| which(n)).count();
         match count(|(outside, _)| *outside) {
             0 => {}
@@ -3001,14 +3008,17 @@ mod tests {
                 start,
                 None,
                 true,
-                &crate::delegation::CopyLimits {
-                    max_entries: 10,
-                    max_total_bytes: 10,
-                    max_file_bytes: 10,
-                    hash_block_bytes: 4096,
-                    max_connections: 1,
-                    max_deletions: 0,
-                },
+                (
+                    &crate::delegation::CopyLimits {
+                        max_entries: 10,
+                        max_total_bytes: 10,
+                        max_file_bytes: 10,
+                        hash_block_bytes: 4096,
+                        max_connections: 1,
+                        max_deletions: 0,
+                    },
+                    false,
+                ),
                 Notifications::Off,
                 || false,
             )
@@ -3027,6 +3037,50 @@ mod tests {
             panic!("not a send");
         };
         assert!(paths[0].starts_with("\"/home/me/project/a\" "), "{paths:?}");
+        queue.decide(&summary.id, false, Kind::Send).unwrap();
+        assert!(task.join().unwrap().is_err());
+    }
+
+    /// A dry run's request for this machine's files asks for a preview,
+    /// and says so instead of saying the files leave this machine.
+    #[test]
+    fn a_dry_run_send_asks_for_a_preview() {
+        let queue = Arc::new(Queue::default());
+        let asking = Arc::clone(&queue);
+        let task = std::thread::spawn(move || {
+            asking.request_send(
+                &requester(),
+                &[],
+                "",
+                &[(b"/home/me/a".to_vec(), "a file or other non-directory")],
+                std::path::Path::new("/home/me"),
+                None,
+                false,
+                (
+                    &crate::delegation::CopyLimits {
+                        max_entries: 10,
+                        max_total_bytes: 10,
+                        max_file_bytes: 10,
+                        hash_block_bytes: 4096,
+                        max_connections: 1,
+                        max_deletions: 0,
+                    },
+                    true,
+                ),
+                Notifications::Off,
+                || false,
+            )
+        });
+        wait_pending(&queue);
+        let summary = queue.snapshots().remove(0);
+        let desktop = summary.desktop_description(false);
+        assert!(
+            desktop.contains("preview only")
+                && desktop.contains("Preview only (a dry run)")
+                && desktop.contains("but not read their contents")
+                && !desktop.contains("leave this machine"),
+            "{desktop}"
+        );
         queue.decide(&summary.id, false, Kind::Send).unwrap();
         assert!(task.join().unwrap().is_err());
     }

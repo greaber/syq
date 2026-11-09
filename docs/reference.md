@@ -481,7 +481,7 @@ instead and keeps its links as links. A symlink elsewhere in a path
 you supply also stops the copy unless you pass `--follow-src` for source paths
 or `--follow-dst` for destination paths. `--follow` does both, and also
 follows paths given to options such as `--ignore-from`. None of them follows a
-link another user made in a shared directory such as `/tmp`; see
+link another user made in a shared sticky directory such as `/tmp`; see
 [Which symlinks are followed?](security.md#which-symlinks-are-followed).
 
 ```sh

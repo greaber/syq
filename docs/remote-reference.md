@@ -85,9 +85,10 @@ at most one of the two. It does this only when the server running the copy
 runs your laptop's build, as it does unless you pass `--syq-path` or
 `--no-bootstrap`, and never for a dry run. It doesn't when the enrollment was
 revoked or set up again meanwhile, when hostB's record of the copies it ran
-is damaged or was recreated after the copy was first approved, or when the
-copy may no longer start; syq then reports the refusal, and running the copy
-again starts afresh.
+is damaged or was recreated after the copy was first approved (by your
+laptop's clock and hostB's, to the second), or when the copy may no longer
+start; syq then reports the refusal, and running the copy again starts
+afresh.
 
 Only `syq receiver revoke ID`, or deleting syq's line from `authorized_keys`,
 ends an enrollment. Removing or revoking your login key, certificate, or

@@ -600,6 +600,54 @@ fn an_unusable_record_of_used_grants_is_recreated_under_a_new_generation() {
     );
 }
 
+/// A copy that ran, whose record of used copies was then lost and
+/// recreated, is refused when it is signed again as the same copy, as a
+/// retry signs it, even within the second the record was recreated. A copy
+/// approved after that runs.
+#[test]
+fn a_copy_signed_again_after_its_record_was_recreated_is_refused() {
+    let (account, home) = enrollment_home();
+    let home = home.path();
+    let id = EnrollmentId::random();
+    let entry = generate_test_key("entry").unwrap();
+    let login = generate_test_key("login").unwrap();
+    let install = |refresh| {
+        installed(
+            install_for_account(
+                &install_request(&account, id, &entry, &login, refresh),
+                &account,
+                home,
+            )
+            .unwrap(),
+        )
+    };
+    let state = enrollment_state(home, id);
+    let config = || read_receiver_config(&state).unwrap().unwrap();
+    let build = crate::identity::build();
+    let sign = |directive: &crate::directive::Directive| {
+        sign_test_directive(directive, &login, crate::directive::NAMESPACE)
+    };
+    assert_eq!(install(false), (1, true));
+    let mut directive = test_directive(id, 1, &account);
+    verify(&state, &config(), (1, build), &sign(&directive), home).unwrap();
+    // The record is lost, and an ordinary refresh recreates it.
+    fs::remove_dir_all(state.join("replay")).unwrap();
+    assert_eq!(install(true), (2, true));
+    // The copy signed again for the new generation, as it first was.
+    directive.binding.generation = 2;
+    let error = verify(&state, &config(), (2, build), &sign(&directive), home)
+        .err()
+        .unwrap();
+    assert!(
+        format!("{error:#}").contains("run the copy again"),
+        "{error:#}"
+    );
+    // A copy approved after the record was recreated runs.
+    let mut fresh = test_directive(id, 2, &account);
+    fresh.issued_at = config().record_since.unwrap() + 1;
+    verify(&state, &config(), (2, build), &sign(&fresh), home).unwrap();
+}
+
 #[test]
 fn rotation_rewrites_only_the_signer_and_raises_the_generation() {
     let (account, home) = enrollment_home();
@@ -976,9 +1024,13 @@ fn a_receiver_from_an_older_line_refuses_new_copies() {
     // Without a recreated record, the state is as earlier builds wrote it,
     // and theirs reads with no limit on when directives were issued.
     assert!(!encoded.contains("record_since"), "{encoded}");
-    let read: ReceiverEnrollment = serde_json::from_str(&encoded).unwrap();
-    assert_eq!(read.record_since, None);
+    let read: ReceiverEnrollment = serde_json::from_str(V0_9_0_RECEIVER_STATE).unwrap();
+    assert_eq!((read.generation, read.record_since), (3, None));
+    require_issued_since_record(&read, &test_directive(read.id, 3, "backup")).unwrap();
 }
+
+/// An enrollment's state as syq 0.9.0 writes it, unchanged.
+const V0_9_0_RECEIVER_STATE: &str = r#"{"version":7,"id":[18,52,86,120,154,188,64,222,128,17,34,51,68,85,102,119],"target_login":"backup","generation":3,"release":"v0.9.0","receiver_path":"/home/backup/.local/lib/syq/v0.9.0/linux-x86_64/syq","entry_public_key":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINmbsXWDzN2/SKqZ1ON1+wirDyIMO8NcP1vkfz+523lJ","signer":{"public_key":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ46aGzAwqyVP9ooubUyd8JlH8JGgPjFXvFi/in/g/fc"}}"#;
 
 /// A coordinating source's receiver verifies its own directive as a
 /// destination's does, and records it only with the destination's directive
@@ -1449,18 +1501,21 @@ fn a_directive_is_recorded_only_after_every_check_passes() {
         .unwrap()
         .directive
         .issued_at;
-    config.record_since = Some(issued + 1);
-    let error = verify(&state, &config, current, &valid, home)
-        .err()
-        .unwrap();
-    assert!(
-        format!("{error:#}")
-            .contains("may have run already and is not run again; run the copy again"),
-        "{error:#}"
-    );
-    assert_eq!(recorded(), 0);
+    // Issued in the second the record was recreated, it may be from before.
+    for since in [issued + 1, issued] {
+        config.record_since = Some(since);
+        let error = verify(&state, &config, current, &valid, home)
+            .err()
+            .unwrap();
+        assert!(
+            format!("{error:#}")
+                .contains("may have run already and is not run again; run the copy again"),
+            "{error:#}"
+        );
+        assert_eq!(recorded(), 0);
+    }
 
-    config.record_since = Some(issued);
+    config.record_since = Some(issued - 1);
     let ((grant, _), _) = verify(&state, &config, current, &valid, home).unwrap();
     assert_eq!(grant.copy.destination, b"/backup");
     assert_ne!(recorded(), 0);

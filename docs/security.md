@@ -50,8 +50,10 @@ Syq's own commands follow a symlink only in a path you supply, and only when you
 ask; links found inside a directory are never followed. (`syq rsync` instead
 follows the rule from
 [rsync 3.5.0's security design](https://github.com/RsyncProject/rsync/blob/v3.5.0/SECURITY.md#symlink-race-safe-path-resolution):
-it follows a link in a supplied path that root or the running user owns, or any
-link with `--insecure-links`, which applies to local paths only.)
+it follows a link in a supplied path that root or the running user owns, or,
+with `--insecure-links`, which applies to local paths only, any link except
+one another user made in a shared directory such as `/tmp`, as described
+below.)
 
 | Where the symlink appears | Treatment |
 |---|---|
@@ -61,11 +63,12 @@ link with `--insecure-links`, which applies to local paths only.)
 | Inside a destination directory | Not followed. A copied file can replace the link, but a copied directory cannot use it as a directory |
 
 `--follow` enables both. Even then, syq doesn't follow a link that another
-user made in a shared directory anyone can write to, such as `/tmp`, unless
-that directory's owner made it: such a link could send a copy anywhere you can
-write. Linux applies the same rule to every program (`fs.protected_symlinks`),
-and syq applies it on every system, including copies through an enrollment or
-a receiving name. See [Symlinks](reference.md#symlinks) for examples.
+user made in a shared directory like `/tmp`, which anyone can add to but where
+only a file's owner can remove it (the sticky bit), unless that directory's
+owner made it: such a link could send a copy anywhere you can write. Linux
+applies the same rule to every program (`fs.protected_symlinks`), and syq
+applies it on every system, including copies through an enrollment or a
+receiving name. See [Symlinks](reference.md#symlinks) for examples.
 
 <a id="limits-to-keep-in-mind"></a>
 <a id="privileged-copies-and-hard-links"></a>

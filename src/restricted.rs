@@ -94,8 +94,9 @@ pub(crate) struct ReceiverEnrollment {
     pub(crate) signer: delegation::TrustedSigner,
     /// When this server last recreated the record of the directives that
     /// ran, in seconds since the Unix epoch by its own clock. A directive
-    /// issued before then may have run against the record it replaced, as
-    /// a refused copy signed again does, so receivers refuse it.
+    /// issued before then, or in that second, may have run against the
+    /// record it replaced, as a refused copy signed again does, so
+    /// receivers refuse it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) record_since: Option<i64>,
 }

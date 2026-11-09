@@ -228,15 +228,18 @@ pub(super) fn resolve_destination_links(
         let link = label(&resolved);
         // The kernel's protected-symlinks rule, judged by the directory
         // the link is in, which has no links.
-        let directory = root.metadata(&crate::rooted::RelativePath::new(
-            &resolved[..resolved.len() - 1].join(&b'/'),
-        )?)?;
-        if !crate::rooted::may_follow_symlink(
-            metadata.uid,
-            (directory.mode, directory.uid),
-            crate::rooted::symlink_follower(),
-        ) {
-            return Err(crate::rooted::shared_directory_symlink(&link, metadata.uid));
+        let follower = crate::rooted::symlink_follower();
+        if metadata.uid != follower {
+            let directory = root.metadata(&crate::rooted::RelativePath::new(
+                &resolved[..resolved.len() - 1].join(&b'/'),
+            )?)?;
+            if !crate::rooted::may_follow_symlink(
+                metadata.uid,
+                (directory.mode, directory.uid),
+                follower,
+            ) {
+                return Err(crate::rooted::shared_directory_symlink(&link, metadata.uid));
+            }
         }
         let target = root.read_link(&path)?;
         resolved.pop();

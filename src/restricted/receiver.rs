@@ -909,13 +909,15 @@ fn verify_with<T>(
 /// Refuse a directive issued before this server recreated its record of the
 /// directives that ran: it may have run against the record that was lost.
 /// A refused copy that is signed again keeps the time it was first issued.
-fn require_issued_since_record(
+/// Both times are in whole seconds, so one issued in the second the record
+/// was recreated may be from before it, and is refused too.
+pub(super) fn require_issued_since_record(
     config: &ReceiverEnrollment,
     directive: &crate::directive::Directive,
 ) -> Result<()> {
     if config
         .record_since
-        .is_some_and(|since| directive.issued_at < since)
+        .is_some_and(|since| directive.issued_at <= since)
     {
         bail!(
             "this copy was approved before this server recreated its record of the copies enrollment {} ran, so it may have run already and is not run again; run the copy again",

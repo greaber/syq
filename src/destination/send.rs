@@ -378,7 +378,7 @@ impl Receiver {
                     .selections
                     .iter()
                     .any(|selection| selection.follow_root),
-            &request.limits,
+            (&request.limits, request.preview),
             self.notifications,
             cancelled,
         )?;

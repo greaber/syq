@@ -642,14 +642,14 @@ impl OperatorResolver {
             }
             OperatorSymlinkPolicy::TrustedOwner => Ok(()),
             OperatorSymlinkPolicy::FollowAll => {
+                let follower = symlink_follower();
+                if metadata.uid == follower {
+                    return Ok(());
+                }
                 let parent = directory
                     .metadata()
                     .context("inspect the directory a symlink is in")?;
-                if !may_follow_symlink(
-                    metadata.uid,
-                    (parent.mode(), parent.uid()),
-                    symlink_follower(),
-                ) {
+                if !may_follow_symlink(metadata.uid, (parent.mode(), parent.uid()), follower) {
                     return Err(shared_directory_symlink(
                         &String::from_utf8_lossy(component),
                         metadata.uid,
@@ -694,7 +694,7 @@ thread_local! {
 /// The refusal for a symlink `may_follow_symlink` does not follow.
 pub(crate) fn shared_directory_symlink(link: &str, owner: u32) -> anyhow::Error {
     anyhow::anyhow!(
-        "refusing to follow symlink {link:?}: it is in a directory anyone can write to, such as /tmp, and another user (uid {owner}) owns it"
+        "refusing to follow symlink {link:?}: it is in a sticky directory anyone can write to, such as /tmp, and another user (uid {owner}) owns it"
     )
 }
 
@@ -735,19 +735,21 @@ pub(crate) fn canonicalize_following_protected(path: &Path) -> io::Result<PathBu
         if links > 40 {
             return Err(io::Error::from_raw_os_error(libc::ELOOP));
         }
-        let directory = std::fs::metadata(&resolved)?;
-        if !may_follow_symlink(
-            metadata.uid(),
-            (directory.mode(), directory.uid()),
-            follower,
-        ) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "{:#}",
-                    shared_directory_symlink(&candidate.to_string_lossy(), metadata.uid())
-                ),
-            ));
+        if metadata.uid() != follower {
+            let directory = std::fs::metadata(&resolved)?;
+            if !may_follow_symlink(
+                metadata.uid(),
+                (directory.mode(), directory.uid()),
+                follower,
+            ) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "{:#}",
+                        shared_directory_symlink(&candidate.to_string_lossy(), metadata.uid())
+                    ),
+                ));
+            }
         }
         let target = std::fs::read_link(&candidate)?;
         if target.is_absolute() {
