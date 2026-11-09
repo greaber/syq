@@ -1620,9 +1620,18 @@ fn a_copy_to_a_receiving_machine_is_paced_by_its_sender_on_network_bytes() {
 
 /// A capped copy of a few small files to a receiving machine sends them
 /// over its control connection in one turn, as an uncapped copy does, and
-/// the sender paces that payload to the cap.
+/// the sender paces that payload to the cap. A payload that would take over
+/// a second at the cap goes through the ordinary engine instead.
 #[test]
 fn a_capped_small_copy_to_a_receiving_machine_takes_one_turn_within_the_cap() {
+    // 384 KiB takes three quarters of a second at 512 KiB/s, and a second
+    // and a half at 256 KiB/s.
+    for (rate, one_turn, least) in [("512K", true, 650), ("256K", false, 1300)] {
+        capped_small_copy_to_a_receiving_machine(rate, one_turn, Duration::from_millis(least));
+    }
+}
+
+fn capped_small_copy_to_a_receiving_machine(rate: &str, one_turn: bool, least: Duration) {
     let temp = crate::test_support::tempdir().unwrap();
     let root = temp.path().join("receiving");
     fs::create_dir(&root).unwrap();
@@ -1645,6 +1654,7 @@ fn a_capped_small_copy_to_a_receiving_machine_takes_one_turn_within_the_cap() {
         command.push(source.join(name).into_os_string().into_vec());
         files.push((name, data));
     }
+    let limits = format!("workers=2,bandwidth={rate}");
     for arg in [
         "--to",
         "@laptop",
@@ -1654,7 +1664,7 @@ fn a_capped_small_copy_to_a_receiving_machine_takes_one_turn_within_the_cap() {
         "0-0",
         "--no-compress",
         "--resource-limits",
-        "workers=2,bandwidth=256K",
+        &limits,
     ] {
         command.push(arg.as_bytes().to_vec());
     }
@@ -1671,13 +1681,12 @@ fn a_capped_small_copy_to_a_receiving_machine_takes_one_turn_within_the_cap() {
     assert_eq!(crate::transfer::run(args).unwrap(), 0);
     let elapsed = started.elapsed();
     for (name, data) in &files {
-        assert_eq!(&fs::read(root.join(name)).unwrap(), data, "{name}");
+        assert_eq!(&fs::read(root.join(name)).unwrap(), data, "{rate}: {name}");
     }
-    assert_eq!(channels.opened(), 1, "the copy opened workers");
-    // 384 KiB at 256 KiB/s takes a second and a half.
+    assert_eq!(channels.opened() == 1, one_turn, "{rate}: workers opened");
     assert!(
-        elapsed >= Duration::from_millis(1400) && elapsed < Duration::from_secs(10),
-        "{elapsed:?}"
+        elapsed >= least && elapsed < Duration::from_secs(10),
+        "{rate}: {elapsed:?}"
     );
 }
 

@@ -1258,12 +1258,13 @@ for small_case in new unchanged updated; do
 done
 
 printf 'case: a capped small copy to a restricted destination takes one turn within the cap\n'
-# The sender paces the one-turn payload: 256 KiB at 128 KiB/s takes two seconds.
+# The sender paces the one-turn payload: 256 KiB at 320 KiB/s takes 0.8 s.
+# The shortcut takes payloads of up to a second at the cap.
 restricted_capped=/tmp/syq-real-ssh/restricted-small-capped.bin
 small_results=/tmp/syq-real-ssh-restricted-small-capped.ndjson
 # shellcheck disable=SC2029
 ssh source "head -c 262144 /dev/urandom >$restricted_capped"
-if ! SYQ_DEBUG=1 syq cp --no-progress --no-compress --resource-limits bandwidth=128K \
+if ! SYQ_DEBUG=1 syq cp --no-progress --no-compress --resource-limits bandwidth=320K \
     --results "$small_results" --from source "$restricted_capped" \
     --to destination --into "$restricted_small" 2>"$small_debug"; then
     cat "$small_debug" >&2
@@ -1274,7 +1275,7 @@ if ! grep -q 'small copy: published' "$small_debug" ||
 import json, sys
 record = json.load(sys.stdin)
 sys.exit(not (record["status"] == "success" and record["files_transferred"] == 1
-              and record["timings"]["transfer_ms"] >= 1800))
+              and record["timings"]["transfer_ms"] >= 700))
 '; then
     echo 'capped small copy to a restricted destination skipped the one-turn path or the cap:' >&2
     cat "$small_results" "$small_debug" >&2
