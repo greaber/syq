@@ -7,7 +7,6 @@ use crate::persistence::Domain;
 use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -631,103 +630,6 @@ pub(crate) struct StatusSnapshot {
     pub rows: Vec<Status>,
     pub errors: Vec<String>,
 }
-/// Whether an account connection in this domain may still use
-/// `provider`'s connection, which carries its authorization channel from
-/// its request until it ends: a live one `provider` authorized, or one
-/// still waiting for approval or connecting. The keeper of each holds its
-/// record's lock throughout (`keeper`), but writes the record, which names
-/// the provider, only once connected; a held lock without a readable
-/// record counts, since its provider is unknown, as does an index that
-/// cannot be read.
-pub(crate) fn uses_provider(domain: &Domain, provider: &Provider) -> bool {
-    let directory = match existing_directory(domain) {
-        Ok(Some(directory)) => directory,
-        Ok(None) => return false,
-        Err(_) => return true,
-    };
-    let Ok(entries) = fs::read_dir(&directory) else {
-        return true;
-    };
-    let paths: Vec<_> = entries.flatten().map(|entry| entry.path()).collect();
-    // A keeper's own lock names its master's control socket, which its
-    // record names too (`keeper_lock_path`).
-    let keepers: HashMap<PathBuf, Provider> = paths
-        .iter()
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "json")
-        })
-        .filter_map(|path| {
-            let record = read_record(path).ok()??;
-            Some((keeper_lock_path(path, &record.control)?, record.authorizer))
-        })
-        .collect();
-    let requested = paths.iter().any(|lock| {
-        if lock.extension().is_none_or(|extension| extension != "lock") || !held(lock) {
-            return false;
-        }
-        if let Some(authorizer) = keepers.get(lock) {
-            return authorizer == provider;
-        }
-        // Without a record of its own or its master's: waiting for
-        // approval, connecting, or draining.
-        match read_record(&lock.with_extension("json")) {
-            Ok(Some(record)) => record.authorizer == *provider,
-            _ => true,
-        }
-    });
-    requested
-        || status(domain).is_ok_and(|snapshot| {
-            snapshot
-                .rows
-                .iter()
-                .any(|row| row.connected && row.authorizer == *provider)
-        })
-}
-/// Ask the account connections `provider` authorized to end if nothing
-/// uses them, as when another syq build needs `provider`'s connection;
-/// the requests to withdraw once answered or given up on
-/// (`withdraw_close_requests`). Keepers from before syq could tell
-/// whether a connection is used ignore them.
-pub(crate) fn request_close_if_idle(domain: &Domain, provider: &Provider) -> Vec<PathBuf> {
-    let Ok(Some(directory)) = existing_directory(domain) else {
-        return Vec::new();
-    };
-    let Ok(entries) = fs::read_dir(&directory) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "json")
-                && held(&path.with_extension("lock"))
-                && read_record(path)
-                    .is_ok_and(|record| record.is_some_and(|record| record.authorizer == *provider))
-        })
-        .map(|path| path.with_extension("close"))
-        .filter(|request| {
-            OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(request)
-                .is_ok()
-        })
-        .collect()
-}
-
-/// Remove close requests a keeper has not taken, so that none outlives
-/// the wait for it.
-pub(crate) fn withdraw_close_requests(requests: &[PathBuf]) {
-    for request in requests {
-        let _ = fs::remove_file(request);
-    }
-}
-
 /// Whether another process holds the lock on `path`. Looking takes a
 /// shared lock for a moment, which a keeper taking it then retries.
 fn held(path: &Path) -> bool {
@@ -1442,10 +1344,6 @@ fn keeper(startup: Startup) -> Result<()> {
     serde_json::to_writer(&mut temporary, &record)?;
     temporary.write_all(b"\n")?;
     temporary.persist(&path)?;
-    // A newer syq asks this connection to end if nothing uses it
-    // (`request_close_if_idle`); not one made for an earlier keeper.
-    let close_request = path.with_extension("close");
-    let _ = fs::remove_file(&close_request);
     let index = Index(path);
     super::super::write_message(
         &mut std::io::stdout().lock(),
@@ -1540,10 +1438,6 @@ fn keeper(startup: Startup) -> Result<()> {
                 }
             }
         }
-        if !drain.closing && drains && close_request.exists() {
-            let _ = fs::remove_file(&close_request);
-            drain.close_if_idle(&use_count, &mut stop);
-        }
         if drain.closing && index.is_some() {
             // Keep a record under the keeper lock's name, then remove the
             // account's record and release its lock.
@@ -1568,8 +1462,8 @@ fn keeper(startup: Startup) -> Result<()> {
 }
 
 /// The lock a keeper holds for its whole life, beside the account index
-/// records, named for its master's control socket: `persist off` and the
-/// checks for connections in use see a keeper by it, including one whose
+/// records, named for its master's control socket: `persist off` and
+/// `status` see a keeper by it, including one whose
 /// master drains after it gave up its record (`Drain`). A 64-hex `.lock`,
 /// as every syq version counts keepers by.
 fn keeper_lock_path(record: &Path, control: &Path) -> Option<PathBuf> {
@@ -1664,19 +1558,6 @@ impl Drain {
             Some(_) => LinkReply::InUse,
             None => LinkReply::Unknown,
         }
-    }
-
-    /// If nothing uses the master, stop it taking new sessions; whether it
-    /// is ending, now or since earlier.
-    fn close_if_idle(
-        &mut self,
-        use_count: &dyn Fn() -> Option<usize>,
-        stop: &mut dyn FnMut() -> bool,
-    ) -> bool {
-        if !self.closing && use_count() == Some(0) && stop() {
-            self.closing = true;
-        }
-        self.closing
     }
 }
 
@@ -1913,10 +1794,10 @@ mod tests {
         fs::set_permissions(&index, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
-    /// A link's close and a newer command's close request can arrive
-    /// together. Once the first stopped the master taking new sessions,
-    /// the session that started meanwhile does not undo it, and nothing
-    /// stops the master again. The connection says it is closed only once
+    /// A link can ask a connection to close more than once. Once the first
+    /// request stopped the master taking new sessions, the session that
+    /// started meanwhile does not undo it, and nothing stops the master
+    /// again. The connection says it is closed only once
     /// its master exited: until then it is in use, so that its approving
     /// side keeps it, and revoking it still ends the master.
     #[test]
@@ -1938,7 +1819,6 @@ mod tests {
             LinkReply::InUse
         );
         assert!(drain.closing);
-        assert!(drain.close_if_idle(&use_count, &mut stop));
         assert_eq!(stops.get(), 1);
         assert_eq!(
             drain.answer(LinkRequest::Query, &use_count, &mut stop, &mut ended),
@@ -1999,108 +1879,6 @@ mod tests {
             LinkReply::InUse
         );
         assert!(!drain.closing);
-    }
-
-    /// A provider's connection is in use from an account request through
-    /// it until that ends: while it waits for approval or connects, its
-    /// keeper holds its record's lock with no record yet; once connected,
-    /// the record names the provider.
-    #[test]
-    fn a_provider_is_in_use_from_an_account_request_until_it_ends() {
-        let root = crate::test_support::short_tempdir().unwrap();
-        let scope = root.path().join("scope");
-        crate::persistence::initialize_scope(&scope).unwrap();
-        let domain = Domain::select(Some(&scope)).unwrap();
-        let ssh = |host: &str| Provider::Ssh {
-            endpoint: NativeEndpoint {
-                user: Some("user".into()),
-                host: host.into(),
-                port: Some(22),
-            },
-        };
-        let (provider, other) = (ssh("provider.invalid"), ssh("other.invalid"));
-        assert!(!uses_provider(&domain, &provider));
-        let index = directory(&domain).unwrap();
-        assert!(!uses_provider(&domain, &provider));
-        let path = index.join(format!("{}.json", "0".repeat(64)));
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(path.with_extension("lock"))
-            .unwrap();
-        assert_eq!(
-            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
-        // Waiting for approval: which provider is not known yet.
-        assert!(uses_provider(&domain, &provider));
-        assert!(uses_provider(&domain, &other));
-        // Connected through the other provider.
-        let record = Record {
-            version: provider_state_version(&other),
-            authorizer: other.clone(),
-            requested: NativeEndpoint {
-                user: None,
-                host: "destination.invalid".into(),
-                port: None,
-            },
-            endpoint: NativeEndpoint {
-                user: Some("user".into()),
-                host: "destination.invalid".into(),
-                port: Some(22),
-            },
-            control: index.join("unused"),
-        };
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-            .unwrap();
-        serde_json::to_writer(&mut file, &record).unwrap();
-        assert!(!uses_provider(&domain, &provider));
-        assert!(uses_provider(&domain, &other));
-        // Asked to end if idle: only the connections of that provider,
-        // and the request is withdrawn after.
-        // Its keeper's own lock, named for its master, belongs to it too,
-        // and counts for no other provider.
-        // Taken while someone counting keepers holds it for a moment.
-        let probe = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(keeper_lock_path(&path, &record.control).unwrap())
-            .unwrap();
-        assert_eq!(unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_SH) }, 0);
-        let releasing = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
-            drop(probe);
-        });
-        let keeper = take_keeper_lock(&path, &record.control).unwrap();
-        releasing.join().unwrap();
-        assert!(!uses_provider(&domain, &provider));
-        assert!(uses_provider(&domain, &other));
-        assert!(request_close_if_idle(&domain, &provider).is_empty());
-        let requests = request_close_if_idle(&domain, &other);
-        assert_eq!(requests, [path.with_extension("close")]);
-        assert!(requests[0].exists());
-        withdraw_close_requests(&requests);
-        assert!(!requests[0].exists());
-        // Draining: the record and its lock are gone, and the keeper's own
-        // lock, whose provider is no longer known, counts for every one.
-        fs::remove_file(&path).unwrap();
-        drop(lock);
-        assert!(uses_provider(&domain, &provider));
-        assert!(uses_provider(&domain, &other));
-        // Ended: the locks are free.
-        drop(keeper);
-        assert!(!uses_provider(&domain, &other));
-        assert!(request_close_if_idle(&domain, &other).is_empty());
     }
 
     #[test]

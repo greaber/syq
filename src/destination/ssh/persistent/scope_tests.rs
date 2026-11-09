@@ -276,6 +276,8 @@ fn off_cleans_only_selected_stale_account_state_and_keeps_other_domains() {
     let index = index_path(&first, "laptop", &record.requested).unwrap();
     private_write(&index, &serde_json::to_vec(&record).unwrap());
     private_write(&index.with_extension("lock"), b"");
+    // A close request an older build left.
+    private_write(&index.with_extension("close"), b"");
     private_write(
         &first.runtime_path().join(crate::receive_service::CLOSING),
         b"",
@@ -381,4 +383,32 @@ fn status_lists_a_closing_master_while_its_keeper_runs() {
     assert!(snapshot.rows.is_empty() && snapshot.errors.is_empty());
     drop(keeper);
     assert!(status(&domain).unwrap().rows.is_empty());
+}
+
+/// Status looks at a keeper's lock by taking it for a moment (`held`); a
+/// keeper taking its lock meanwhile waits for that instead of failing.
+#[test]
+fn a_keeper_waits_while_status_looks_at_its_lock() {
+    let root = crate::test_support::short_tempdir().unwrap();
+    let domain = domain(root.path(), "a");
+    let record = new_record(&domain);
+    let path = directory(&domain)
+        .unwrap()
+        .join(format!("{}.json", "a".repeat(64)));
+    let lock = keeper_lock_path(&path, &record.control).unwrap();
+    private_write(&lock, b"");
+    let looking = File::open(&lock).unwrap();
+    assert_eq!(
+        unsafe { libc::flock(looking.as_raw_fd(), libc::LOCK_SH) },
+        0
+    );
+    let releasing = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        drop(looking);
+    });
+    let keeper = take_keeper_lock(&path, &record.control).unwrap();
+    releasing.join().unwrap();
+    assert!(held(&lock));
+    drop(keeper);
+    assert!(!held(&lock));
 }

@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
@@ -110,8 +110,15 @@ fn key(provider: &Provider) -> Result<String> {
 fn index(domain: &Domain) -> PathBuf {
     domain.runtime_path().join(INDEX)
 }
-fn record_path(domain: &Domain, provider: &Provider) -> Result<PathBuf> {
-    Ok(index(domain).join(format!("{}.json", key(provider)?)))
+/// The record of `build`'s keeper for `provider`. Each build keeps its own,
+/// so that no build stops another's keeper, or a request through it. A
+/// keeper serves only its own build: the provider's service must run that
+/// build too (`keeper`). When that service ends or switches builds, it
+/// ends every attachment, and an older build's keeper then ends by itself
+/// within a few seconds; until then, it still serves its own build.
+fn record_path(domain: &Domain, provider: &Provider, build: &str) -> Result<PathBuf> {
+    let name = blake3::hash(&serde_json::to_vec(&(key(provider)?, build))?).to_hex();
+    Ok(index(domain).join(format!("{name}.json")))
 }
 fn owned_directory(path: &Path) -> Result<bool> {
     let metadata = match fs::symlink_metadata(path) {
@@ -182,11 +189,12 @@ fn lock_is_available(lock: File) -> Result<bool> {
     }
     Ok(true)
 }
+/// The record of this build's keeper for `provider`.
 fn read_record(domain: &Domain, provider: &Provider) -> Result<Option<Record>> {
     if !owned_directory(&index(domain))? {
         return Ok(None);
     }
-    let path = record_path(domain, provider)?;
+    let path = record_path(domain, provider, crate::identity::build())?;
     let bytes =
         match crate::delegation::read_private_regular(&path, "SSH provider record", 16 * 1024) {
             Ok(bytes) => bytes,
@@ -248,7 +256,7 @@ fn validate_ticket(ticket: &Ticket) -> Result<()> {
     Ok(())
 }
 fn write_record(domain: &Domain, record: &Record) -> Result<()> {
-    let path = record_path(domain, &record.provider)?;
+    let path = record_path(domain, &record.provider, &record.build)?;
     let mut file = tempfile::NamedTempFile::new_in(index(domain))?;
     file.write_all(&serde_json::to_vec(record)?)?;
     file.persist(path)?;
@@ -257,7 +265,7 @@ fn write_record(domain: &Domain, record: &Record) -> Result<()> {
 fn active(domain: &Domain, record: &Record) -> bool {
     domain.is_current(record.scope_identity)
         && persistent::generation_open(domain, &record.generation).unwrap_or(false)
-        && !record_path(domain, &record.provider)
+        && !record_path(domain, &record.provider, &record.build)
             .is_ok_and(|path| path.with_extension("stop").exists())
 }
 fn existing(domain: &Domain, provider: &Provider) -> Result<Option<Record>> {
@@ -271,7 +279,7 @@ fn existing(domain: &Domain, provider: &Provider) -> Result<Option<Record>> {
         return Ok(None);
     }
     let lock = match lock_file(
-        &record_path(domain, provider)?.with_extension("lock"),
+        &record_path(domain, provider, &record.build)?.with_extension("lock"),
         false,
     ) {
         Ok(file) => file,
@@ -429,7 +437,8 @@ fn stop_master(record: &Record) -> Result<()> {
     );
     Ok(())
 }
-fn remove_record(domain: &Domain, record: &Record) -> Result<()> {
+/// End `record`'s master and remove its files and `path`, where it is.
+fn remove_record(path: &Path, record: &Record) -> Result<()> {
     stop_master(record)?;
     for path in [record.forwarded(), record.directory.join("owner")] {
         match fs::remove_file(path) {
@@ -443,7 +452,7 @@ fn remove_record(domain: &Domain, record: &Record) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    match fs::remove_file(record_path(domain, &record.provider)?) {
+    match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
@@ -457,170 +466,12 @@ struct OwnedRecord {
 impl Drop for OwnedRecord {
     fn drop(&mut self) {
         if self.armed {
-            if let Err(error) = remove_record(&self.domain, &self.record) {
+            let path = record_path(&self.domain, &self.record.provider, &self.record.build);
+            if let Err(error) = path.and_then(|path| remove_record(&path, &self.record)) {
                 crate::output::diagnostic!("syq: SSH provider cleanup: {error:#}");
             }
         }
     }
-}
-
-/// How long a command waits for account connections it asked to end if
-/// nothing uses them (`persistent::request_close_if_idle`).
-const CLOSE_ANSWER: Duration = Duration::from_secs(3);
-
-/// A request this build sends over its provider connection that no account
-/// connection carries, such as a copy's approval. Until it is dropped,
-/// another build does not stop the connection's keeper to replace it
-/// (`requests`).
-pub(crate) struct Use(File);
-impl Drop for Use {
-    fn drop(&mut self) {
-        // As for `Requests`: a concurrent fork can share the lock.
-        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
-    }
-}
-
-/// The record of `provider`'s keeper, opened to lock: the file this build's
-/// keeper published once, which no syq removes while the keeper runs.
-fn record_lock(domain: &Domain, provider: &Provider) -> Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        // Never written through, but NFS grants an exclusive lock only to a
-        // file open for writing.
-        .write(true)
-        // Not held up by anything but a regular file, which is checked next.
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(record_path(domain, provider)?)?;
-    let metadata = file.metadata()?;
-    anyhow::ensure!(
-        metadata.is_file()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o077 == 0,
-        "SSH provider record must be an owned private file"
-    );
-    Ok(file)
-}
-
-/// Mark `provider`'s connection in use until the returned `Use` is dropped:
-/// a shared lock on its keeper's record. Take it once the connection is this
-/// build's (`resolve_connection`), and check the connection after taking it
-/// (`open` does), which shows a stop another build published meanwhile.
-pub(crate) fn hold_use(domain: &Domain, provider: &Provider) -> Result<Use> {
-    let file = record_lock(domain, provider)
-        .context("SSH authorization provider connection ended; retry the command")?;
-    // Another build holds it exclusively only while it publishes a stop.
-    while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error.into());
-        }
-    }
-    Ok(Use(file))
-}
-
-/// What requests do with `provider`'s connection (`hold_use`).
-enum Requests {
-    /// One holds it.
-    Using,
-    /// Its keeper is starting: the record requests will lock is the ready
-    /// one it replaces this one with, so a lock on this one would not keep
-    /// them off. Look again once it is ready.
-    Starting,
-    /// None does, and none can take it until this is dropped: a stop
-    /// published meanwhile is one that a request sees before it sends.
-    Held(Option<File>),
-}
-impl Requests {
-    /// Whether the keeper record is still the one this looked at: the file
-    /// it holds, or none. Another keeper may have replaced the one looked at
-    /// meanwhile, and a request may hold that one's record.
-    fn current(&self, domain: &Domain, provider: &Provider) -> bool {
-        let Ok(path) = record_path(domain, provider) else {
-            return false;
-        };
-        match (self, fs::symlink_metadata(path)) {
-            (Self::Held(Some(file)), Ok(now)) => file
-                .metadata()
-                .is_ok_and(|held| (held.dev(), held.ino()) == (now.dev(), now.ino())),
-            (Self::Held(None), Err(error)) => error.kind() == std::io::ErrorKind::NotFound,
-            _ => false,
-        }
-    }
-}
-impl Drop for Requests {
-    fn drop(&mut self) {
-        // A concurrent fork can share the lock's open file description;
-        // closing this descriptor alone would leave it held there.
-        if let Self::Held(Some(file)) = self {
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-        }
-    }
-}
-
-fn requests(domain: &Domain, provider: &Provider) -> Requests {
-    // A request has opened the record; one that cannot be is nobody's.
-    let Ok(file) = record_lock(domain, provider) else {
-        return Requests::Held(None);
-    };
-    match try_lock(&file) {
-        Ok(true) => {}
-        Ok(false) | Err(_) => return Requests::Using,
-    }
-    // Read from the file locked: the record at its path may be newer.
-    let starting = {
-        let mut bytes = Vec::new();
-        (&file).take(16 * 1024).read_to_end(&mut bytes).is_ok()
-            && serde_json::from_slice::<serde_json::Value>(&bytes)
-                .is_ok_and(|record| record.get("ticket").is_some_and(|ticket| ticket.is_null()))
-    };
-    let held = Requests::Held(Some(file));
-    if starting {
-        return Requests::Starting;
-    }
-    held
-}
-
-/// What became of a keeper this build cannot use.
-#[derive(Debug, PartialEq, Eq)]
-enum OtherKeeper {
-    /// None, or one of this build.
-    None,
-    /// One of another build, asked to stop.
-    Stopping,
-    /// One of another build that an account connection still uses, or may
-    /// (`in_use`): stopping it would cut the copies and sessions through it,
-    /// or a request waiting for approval.
-    InUse { build: String },
-}
-
-/// A keeper another syq build left, as after this machine updated syq,
-/// cannot serve this build: ask it to stop (as `stop_all` does) instead of
-/// waiting out the setup deadline, unless `in_use`. Its record names its
-/// build; one this build cannot read is another build's too.
-fn stop_other_build_keeper(
-    domain: &Domain,
-    provider: &Provider,
-    in_use: impl FnOnce() -> bool,
-) -> Result<OtherKeeper> {
-    let build = match read_record(domain, provider) {
-        Ok(Some(record)) if record.build == crate::identity::build() => {
-            return Ok(OtherKeeper::None)
-        }
-        Ok(Some(record)) => record.build,
-        Ok(None) => return Ok(OtherKeeper::None),
-        Err(_) => "another version".into(),
-    };
-    if in_use() {
-        return Ok(OtherKeeper::InUse { build });
-    }
-    OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(record_path(domain, provider)?.with_extension("stop"))?;
-    Ok(OtherKeeper::Stopping)
 }
 
 fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
@@ -630,92 +481,15 @@ fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
     directory(domain)?;
     let generation = persistent::ensure_generation(domain)?;
     let identity = domain.identity()?;
-    let path = record_path(domain, provider)?;
+    let path = record_path(domain, provider, crate::identity::build())?;
     let lock = lock_file(&path.with_extension("lock"), true)?;
     let signals = foreground::Signals::new()?;
     let deadline = Instant::now() + SETUP;
-    let mut other = OtherKeeper::None;
-    let mut next_look = Instant::now();
-    let mut off = "syq persist off".to_owned();
-    if let Some(scope) = domain.explicit_path() {
-        off.push_str(&format!(
-            " --pscope {}",
-            shell_words::quote(&scope.to_string_lossy())
-        ));
-    }
-    // Account connections asked to end if nothing uses them, and when;
-    // requests not taken are withdrawn however this ends.
-    struct Asked(Option<Instant>, Vec<PathBuf>);
-    impl Drop for Asked {
-        fn drop(&mut self) {
-            persistent::withdraw_close_requests(&self.1);
-        }
-    }
-    let mut asked = Asked(None, Vec::new());
-    let mut waiting_shown = false;
+    // Only this build's keeper holds it: wait for one starting to be ready,
+    // or one ending to end.
     while !try_lock(&lock)? {
         if let Some(record) = existing(domain, provider)? {
             return Ok(record);
-        }
-        // Look again now and then: the account connection may end.
-        if other != OtherKeeper::Stopping && Instant::now() >= next_look {
-            next_look = Instant::now() + Duration::from_secs(5);
-            // Kept from requests until a stop is published (`Requests`).
-            match requests(domain, provider) {
-                Requests::Starting => {
-                    // A new keeper: what an earlier look found does not
-                    // apply to it, so its first look once ready decides.
-                    other = OtherKeeper::None;
-                    next_look = Instant::now() + Duration::from_millis(200);
-                }
-                requests => {
-                    other = stop_other_build_keeper(domain, provider, || {
-                        // Last, so that the stop follows at once: one for
-                        // another keeper than the one looked at waits for
-                        // the next look.
-                        matches!(requests, Requests::Using)
-                            || persistent::uses_provider(domain, provider)
-                            || !requests.current(domain, provider)
-                    })?;
-                    drop(requests);
-                }
-            }
-            if let OtherKeeper::InUse { build } = &other {
-                // Those nothing uses end, and are opened again on their
-                // next use. Keepers that can tell answer within a second.
-                let at = *asked.0.get_or_insert_with(|| {
-                    asked.1 = persistent::request_close_if_idle(domain, provider);
-                    Instant::now()
-                });
-                if at.elapsed() < CLOSE_ANSWER {
-                    next_look = Instant::now() + Duration::from_millis(200);
-                } else {
-                    persistent::withdraw_close_requests(&std::mem::take(&mut asked.1));
-                    let in_use = format!(
-                        "the connection to {} that syq {build} opened is still in use by an account connection or a request waiting for approval, and serves only that version",
-                        provider.label()
-                    );
-                    // In the default domain such a connection does not end
-                    // by itself; in an isolated one it closes once idle for
-                    // a while.
-                    if domain.is_default() {
-                        bail!(
-                            "{in_use}; finish what uses it, or close both with `{off}`, then retry"
-                        );
-                    }
-                    if !std::mem::replace(&mut waiting_shown, true) {
-                        crate::output::diagnostic!("syq: waiting: {in_use}; `{off}` closes both");
-                    }
-                }
-            }
-        }
-        if Instant::now() >= deadline {
-            if let OtherKeeper::InUse { build } = &other {
-                bail!(
-                    "the connection to {} that syq {build} opened is still in use by an account connection or a request waiting for approval; finish what uses it, or close both with `{off}`, then retry",
-                    provider.label()
-                );
-            }
         }
         anyhow::ensure!(
             Instant::now() < deadline && signals.received.load(Ordering::Acquire) == 0,
@@ -724,7 +498,7 @@ fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
         signals.wait(Duration::from_millis(100))?;
     }
     if let Some(old) = read_record(domain, provider)? {
-        remove_record(domain, &old)?;
+        remove_record(&path, &old)?;
     }
     match fs::remove_file(path.with_extension("stop")) {
         Ok(()) => {}
@@ -1004,7 +778,8 @@ fn keeper(startup: Startup) -> Result<()> {
     anyhow::ensure!(startup.lock_fd > 2, "invalid SSH provider startup lock");
     let lock = unsafe { File::from_raw_fd(startup.lock_fd) };
     let expected = lock_file(
-        &record_path(&domain, &startup.record.provider)?.with_extension("lock"),
+        &record_path(&domain, &startup.record.provider, &startup.record.build)?
+            .with_extension("lock"),
         false,
     )?;
     let actual_metadata = lock.metadata()?;
@@ -1230,10 +1005,13 @@ pub(crate) fn cleanup_domain(domain: &Domain) -> Result<()> {
             let record: Record = serde_json::from_slice(&bytes)?;
             validate_record(domain, &record.provider, &record)?;
             anyhow::ensure!(
-                path == record_path(domain, &record.provider)?,
+                path == record_path(domain, &record.provider, &record.build)?
+                    // Builds from before per-build keepers named the
+                    // record after its provider alone.
+                    || path == index(domain).join(format!("{}.json", key(&record.provider)?)),
                 "SSH provider record name differs"
             );
-            remove_record(domain, &record)
+            remove_record(&path, &record)
         })();
         if let Err(error) = result {
             errors.push(format!("{error:#}"));
@@ -1356,215 +1134,93 @@ mod tests {
         (root, domain, record)
     }
 
-    /// After this machine updates syq, the keeper the old build left is
-    /// asked to stop, which its record says, rather than waited on, unless
-    /// an approved account connection still has a channel through it; one
-    /// of this build is left alone.
+    /// Each build keeps its own keeper for a provider: another build's,
+    /// which this machine ran before it updated syq, is neither waited
+    /// for nor stopped, and keeps serving its own build until it ends.
     #[test]
-    fn a_keeper_another_build_left_is_asked_to_stop_unless_in_use() {
-        let (_root, domain, mut record) = cleanup_fixture();
-        let stop = record_path(&domain, &record.provider)
-            .unwrap()
-            .with_extension("stop");
-        let unused = || false;
+    fn each_build_keeps_its_own_keeper() {
+        let (_root, domain, record) = cleanup_fixture();
+        let mut other = record.clone();
+        other.build = "v0.0.1+other-build".into();
+        other.directory = domain.runtime_path().join("provider-other");
+        write_record(&domain, &other).unwrap();
+        let path = |record: &Record| record_path(&domain, &record.provider, &record.build).unwrap();
+        assert_ne!(path(&record), path(&other));
+        // Its keeper runs, holding its lock.
+        let other_lock = lock_file(&path(&other).with_extension("lock"), true).unwrap();
+        assert!(try_lock(&other_lock).unwrap());
+        // This build's keeper starts without waiting for it.
+        let lock = lock_file(&path(&record).with_extension("lock"), true).unwrap();
+        assert!(try_lock(&lock).unwrap());
         assert_eq!(
-            stop_other_build_keeper(&domain, &record.provider, unused).unwrap(),
-            OtherKeeper::None
+            read_record(&domain, &record.provider)
+                .unwrap()
+                .unwrap()
+                .build,
+            record.build
         );
-        assert!(!stop.exists());
-        record.build = "v0.0.1+other-build".into();
-        write_record(&domain, &record).unwrap();
-        // An account connection's channel runs through it: here one waiting
-        // for approval, whose keeper holds its record's lock but has written
-        // no record yet.
-        let request = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(
-                persistent::directory(&domain)
-                    .unwrap()
-                    .join(format!("{}.lock", "0".repeat(64))),
-            )
-            .unwrap();
-        assert_eq!(
-            unsafe { libc::flock(request.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
-        let in_use = || persistent::uses_provider(&domain, &record.provider);
-        assert_eq!(
-            stop_other_build_keeper(&domain, &record.provider, in_use).unwrap(),
-            OtherKeeper::InUse {
-                build: "v0.0.1+other-build".into()
-            }
-        );
-        assert!(!stop.exists());
         assert!(active(&domain, &record));
-        // Once it ended, its lock is free, though its file stays.
-        drop(request);
+        assert!(active(&domain, &other));
+        assert!(!path(&other).with_extension("stop").exists());
         assert_eq!(
-            stop_other_build_keeper(&domain, &record.provider, in_use).unwrap(),
-            OtherKeeper::Stopping
+            fs::read(path(&other)).unwrap(),
+            serde_json::to_vec(&other).unwrap()
         );
-        assert!(stop.exists());
-        // The keeper ends at its next look at its record.
+    }
+
+    /// `persist off` stops and removes the keepers of every build,
+    /// including one that a build from before per-build keepers named after
+    /// its provider alone.
+    #[test]
+    fn persist_off_removes_every_builds_keeper() {
+        let (_root, domain, record) = cleanup_fixture();
+        // What v0.9.0 names the record of `provider()`, and writes in its
+        // directory's `owner`: the hash of the provider alone.
+        const V0_9_0_NAME: &str =
+            "7dc1f72b06c526beb616497ea916a0e41787177fdddc0e076bf559e32919c8f2";
+        let mut older = record.clone();
+        older.build = "v0.0.1+other-build".into();
+        older.directory = domain.runtime_path().join("provider-older");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&older.directory)
+            .unwrap();
+        let mut owner = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(older.directory.join("owner"))
+            .unwrap();
+        owner.write_all(V0_9_0_NAME.as_bytes()).unwrap();
+        let legacy = index(&domain).join(format!("{V0_9_0_NAME}.json"));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&legacy)
+            .unwrap();
+        file.write_all(&serde_json::to_vec(&older).unwrap())
+            .unwrap();
+        let current = record_path(&domain, &record.provider, &record.build).unwrap();
+        for record in [&current, &legacy] {
+            drop(lock_file(&record.with_extension("lock"), true).unwrap());
+        }
+        stop_all(&domain).unwrap();
         assert!(!active(&domain, &record));
-    }
-
-    /// What a keeper publishes once ready, replacing the record it started
-    /// with.
-    fn ready(record: &mut Record) {
-        record.ticket = Some(Ticket {
-            session: "0".repeat(64),
-            profile: "laptop".into(),
-            identity: crate::receive_approval::provider_accounts::ProviderIdentity::new(
-                "user".into(),
-                ssh_key::Fingerprint::Sha256([1; 32]).to_string(),
-            )
-            .unwrap(),
-        });
-    }
-
-    /// A copy's request waiting for the provider's decision through a keeper
-    /// another build left keeps it from being stopped, as an account
-    /// connection does; once the request ends, it is stopped.
-    #[test]
-    fn a_waiting_request_keeps_another_builds_keeper_until_it_ends() {
-        let (_root, domain, mut record) = cleanup_fixture();
-        let stop = record_path(&domain, &record.provider)
-            .unwrap()
-            .with_extension("stop");
-        record.build = "v0.0.1+other-build".into();
-        ready(&mut record);
-        write_record(&domain, &record).unwrap();
-        let using = hold_use(&domain, &record.provider).unwrap();
-        // Another request may hold it at the same time.
-        let also = hold_use(&domain, &record.provider).unwrap();
-        let in_use = |requests: &Requests| matches!(requests, Requests::Using);
-        let stop_unless_used = || {
-            let requests = requests(&domain, &record.provider);
-            stop_other_build_keeper(&domain, &record.provider, || in_use(&requests)).unwrap()
-        };
-        assert_eq!(
-            stop_unless_used(),
-            OtherKeeper::InUse {
-                build: "v0.0.1+other-build".into()
-            }
-        );
-        assert!(!stop.exists());
-        drop(using);
-        assert!(in_use(&requests(&domain, &record.provider)));
-        drop(also);
-        assert_eq!(stop_unless_used(), OtherKeeper::Stopping);
-        assert!(stop.exists());
-        assert!(!active(&domain, &record));
-    }
-
-    /// A request that takes the connection while another build decides to
-    /// stop it waits until that stop is published, and so sees it before
-    /// it sends anything. A keeper still starting is not decided on: the
-    /// record requests lock is the ready one that replaces its first.
-    #[test]
-    fn a_request_that_races_a_stop_sees_it_before_sending() {
-        let (_root, domain, mut record) = cleanup_fixture();
-        record.build = "v0.0.1+other-build".into();
-        write_record(&domain, &record).unwrap();
-        let starting = requests(&domain, &record.provider);
-        assert!(matches!(starting, Requests::Starting));
-        // Ready meanwhile: what was looked at is not what requests lock.
-        ready(&mut record);
-        write_record(&domain, &record).unwrap();
-        let using = hold_use(&domain, &record.provider).unwrap();
-        drop(starting);
-        assert!(matches!(
-            requests(&domain, &record.provider),
-            Requests::Using
-        ));
-        drop(using);
-        let requests = requests(&domain, &record.provider);
-        assert!(matches!(requests, Requests::Held(Some(_))));
-        let (taken, waiting) = std::sync::mpsc::channel();
-        let request = {
-            let (domain, record) = (domain.clone(), record.clone());
-            std::thread::spawn(move || {
-                let using = hold_use(&domain, &record.provider).unwrap();
-                taken.send(()).unwrap();
-                // What `open` checks once it holds the connection.
-                let active = active(&domain, &record);
-                drop(using);
-                active
-            })
-        };
-        assert!(waiting.recv_timeout(Duration::from_millis(200)).is_err());
-        assert_eq!(
-            stop_other_build_keeper(&domain, &record.provider, || false).unwrap(),
-            OtherKeeper::Stopping
-        );
-        drop(requests);
-        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(!request.join().unwrap());
-        // With no record, nothing holds the connection and nothing is held.
-        fs::remove_file(record_path(&domain, &record.provider).unwrap()).unwrap();
-        assert!(matches!(
-            super::requests(&domain, &record.provider),
-            Requests::Held(None)
-        ));
-        assert!(hold_use(&domain, &record.provider).is_err());
-    }
-
-    /// A keeper that another took over from while this build looked is not
-    /// the one looked at: the stop waits for the next look, which sees what
-    /// the new keeper's requests hold.
-    #[test]
-    fn a_stop_decided_for_one_keeper_does_not_stop_its_successor() {
-        let (_root, domain, mut record) = cleanup_fixture();
-        let stop = record_path(&domain, &record.provider)
-            .unwrap()
-            .with_extension("stop");
-        record.build = "v0.0.1+other-build".into();
-        ready(&mut record);
-        write_record(&domain, &record).unwrap();
-        let decide = |requests: &Requests| {
-            stop_other_build_keeper(&domain, &record.provider, || {
-                matches!(requests, Requests::Using) || !requests.current(&domain, &record.provider)
-            })
-            .unwrap()
-        };
-        let looked = requests(&domain, &record.provider);
-        assert!(looked.current(&domain, &record.provider));
-        // Its successor publishes its own ready record.
-        write_record(&domain, &record).unwrap();
-        assert!(!looked.current(&domain, &record.provider));
-        assert!(matches!(decide(&looked), OtherKeeper::InUse { .. }));
-        assert!(!stop.exists());
-        drop(looked);
-        // With no record looked at, a record that appears is a successor.
-        fs::remove_file(record_path(&domain, &record.provider).unwrap()).unwrap();
-        let looked = requests(&domain, &record.provider);
-        assert!(matches!(looked, Requests::Held(None)));
-        assert!(looked.current(&domain, &record.provider));
-        write_record(&domain, &record).unwrap();
-        assert!(!looked.current(&domain, &record.provider));
-        drop(looked);
-        // The next look decides on the record there now.
-        let looked = requests(&domain, &record.provider);
-        assert_eq!(decide(&looked), OtherKeeper::Stopping);
-        assert!(stop.exists());
+        assert!(current.with_extension("stop").exists());
+        assert!(legacy.with_extension("stop").exists());
+        cleanup_domain(&domain).unwrap();
+        assert!(!index(&domain).exists());
+        assert!(!record.directory.exists());
+        assert!(!older.directory.exists());
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn abandoned_provider_socket_does_not_block_shutdown_or_reconnect_cleanup() {
         let (_root, domain, record) = cleanup_fixture();
-        let lock = lock_file(
-            &record_path(&domain, &record.provider)
-                .unwrap()
-                .with_extension("lock"),
-            true,
-        )
-        .unwrap();
+        let path = record_path(&domain, &record.provider, &record.build).unwrap();
+        let lock = lock_file(&path.with_extension("lock"), true).unwrap();
         assert!(try_lock(&lock).unwrap());
         for path in [record.control(), record.forwarded()] {
             drop(UnixListener::bind(&path).unwrap());
@@ -1572,9 +1228,9 @@ mod tests {
         }
         validate_record(&domain, &record.provider, &record).unwrap();
         // Exercise the real mux-only `ssh -O exit` refusal, not a mocked status.
-        remove_record(&domain, &record).unwrap();
+        remove_record(&path, &record).unwrap();
         assert!(!record.directory.exists());
-        assert!(!record_path(&domain, &record.provider).unwrap().exists());
+        assert!(!path.exists());
         assert!(persistent::generation_open(&domain, &record.generation).unwrap());
     }
 
@@ -1792,7 +1448,7 @@ mod tests {
         // A stale record and socket alone cannot prove a live provider lease.
         assert!(local_binding(&domain, &provider).unwrap().is_none());
         let lock = lock_file(
-            &record_path(&domain, &provider)
+            &record_path(&domain, &provider, crate::identity::build())
                 .unwrap()
                 .with_extension("lock"),
             true,

@@ -341,9 +341,6 @@ fn ask_provider(
 ) -> Result<Reply> {
     let domain = crate::persistence::Domain::select(args.pscope.as_deref())?;
     let binding = super::ssh::provider::resolve_connection(&domain, provider)?;
-    // Another syq build must not replace the connection while the provider
-    // decides and sets the copy up.
-    let _using = super::ssh::provider::hold_use(&domain, provider)?;
     let mut stream = super::ssh::provider::open(
         &domain,
         provider,

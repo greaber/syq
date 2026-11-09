@@ -119,11 +119,11 @@ try:
     wait_for("the idle account connection to end", lambda: not accounts_on_source(), 20)
 
     # A session that starts between the look and the stop runs on while
-    # its master drains, which status shows as closing; another command
-    # meanwhile opens a connection of its own beside it; and turning
-    # receiving off on the laptop still ends the draining master. The keeper
-    # is told no session uses the master, as if this one started just after
-    # it looked.
+    # its master drains, which status shows as closing, and keeps receiving
+    # from switching again; another command meanwhile opens a connection of
+    # its own beside it; and turning receiving off on the laptop still ends
+    # the draining master. The keeper is told no session uses the master, as
+    # if this one started just after it looked.
     def connect(*extra_env, command=("persist", "connect", "destination")):
         args = ["env", NATIVE_PATH, *extra_env, "syq", *command]
         if command[0] == "persist":
@@ -143,7 +143,6 @@ try:
     connect("SYQ_TEST_ACCOUNT_SESSIONS=0")
     (row,) = accounts_on_source()
     control = row["control"]
-    index = os.path.join(os.path.dirname(os.path.dirname(control)), "authorized-ssh-v1")
     command = ["env", NATIVE_PATH, "syq", "ssh", "--auth-from", "@" + NAME, "destination", "--",
                "sleep 120"]
     shell = subprocess.Popen(["ssh", "source", shlex.join(command)], stdout=subprocess.PIPE,
@@ -153,9 +152,9 @@ try:
     check = subprocess.run(["ssh", "source", shlex.join(["ssh", "-S", control, "-O", "check", "host"])],
                            capture_output=True, text=True, timeout=40)
     master = check.stderr.split("(pid=")[1].split(")")[0]
-    # Ask the keeper, as a newer syq would, to end its connection if idle.
-    source("sh", "-c", 'umask 077; for record in "$1"/*.json; do : > "${record%.json}.close"; done',
-           "sh", index)
+    # Receiving asks it to end if idle once syq at its path changes again.
+    shutil.copy2("/usr/local/bin/syq-other-build", BIN / "syq.new")
+    os.replace(BIN / "syq.new", OLD)
     wait_for("the keeper to give up its record", lambda: not accounts_on_source(), 20)
     time.sleep(1)
     rows = json.loads(source("syq", "persist", "status", "--json"))["authorized_ssh"]

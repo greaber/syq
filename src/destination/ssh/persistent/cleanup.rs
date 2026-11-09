@@ -377,6 +377,9 @@ pub(crate) fn cleanup_domain(domain: &Domain) -> Result<()> {
                 "SSH account record belongs to another persistence scope"
             );
         } else if index_name(&path, "lock") || index_name(&path, "close") {
+            // A close request is one an older build left: it asked account
+            // connections to end so that it could replace a provider
+            // connection another build kept.
             private_file(&path, 0, false)?;
         } else if path.file_name().is_some_and(|name| name == GENERATION) {
             read_generation(&path)?;
