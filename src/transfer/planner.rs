@@ -578,7 +578,7 @@ impl Planner<'_> {
             Some(entry) if entry.dev == dev && entry.ino == ino => Ok(Some(entry)),
             _ => bail!(
                 "target {} changed after the placement precondition was checked",
-                display(&self.dst_root)
+                self.shown_dst_root
             ),
         }
     }
@@ -636,7 +636,7 @@ impl Planner<'_> {
                         if destination.exact && destination.entry_is_dir && root.kind != Kind::Dir {
                             bail!(
                             "destination {} is an existing directory; cannot replace it with non-directory source {}",
-                            display(dst_root),
+                            pl.shown_dst_root,
                             display(src_root)
                         );
                         }
@@ -651,7 +651,7 @@ impl Planner<'_> {
                         {
                             bail!(
                             "destination {} is not a directory; cannot place directory {} inside it",
-                            display(dst_root),
+                            pl.shown_dst_root,
                             display(src_root)
                         );
                         }

@@ -2329,11 +2329,11 @@ fn native_remote_as_onto_an_existing_directory_fails_visibly() {
             ),
             (
                 vec!["--src-non-dir", ".kube"],
-                "destination foobar is an existing directory; cannot replace it with non-directory source .kube",
+                "destination fake.example:foobar is an existing directory; cannot replace it with non-directory source .kube",
             ),
             (
                 vec!["plain"],
-                "destination foobar is an existing directory; cannot replace it with non-directory source plain",
+                "destination fake.example:foobar is an existing directory; cannot replace it with non-directory source plain",
             ),
         ] {
             let _ = fs::remove_dir_all(t.path("remote-home"));
