@@ -853,6 +853,58 @@ fn changed_source_exhausts_retries_without_publishing() {
     assert_eq!(worker.progress.files_done.load(Relaxed), 0);
 }
 
+/// A staged file whose Finalize the receiver refuses because it no longer
+/// holds the file counts as copied once its sidecar is gone and both ends
+/// hold the same contents. A sidecar still there keeps the refusal.
+#[test]
+fn a_refused_finalize_whose_sidecar_is_gone_is_verified_by_contents() {
+    for sidecar_left in [false, true] {
+        let sched = Arc::new(Sched::new(512, 8192));
+        sched.push_file(pipeline_job(b"a", 512));
+        sched.scan_done();
+        let src = Arc::new(Mutex::new(PipelineState::default()));
+        let dst = Arc::new(Mutex::new(PipelineState::default()));
+        let mut worker = pipeline_worker(&sched, &src, &dst, false);
+        assert!(matches!(sched.next(), Item::File(0)));
+        let job = worker.job(0);
+        job.done.store(job.entry.size, Relaxed);
+        sched.ranges_ready(0, vec![]);
+        let hash = Response::FileHash {
+            size: 512,
+            hash: content_digest(&[7; 512]),
+        };
+        src.lock()
+            .unwrap()
+            .replies
+            .extend([Response::Stats(vec![Some(job.entry.clone())]), hash.clone()]);
+        dst.lock().unwrap().replies.extend([
+            Response::Err("a is not open in this receiver".into()),
+            Response::PartialSize(sidecar_left.then_some(512)),
+            hash,
+        ]);
+        let result = worker.finish_file(0);
+        let destination = dst.lock().unwrap();
+        if sidecar_left {
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains("not open in this receiver"), "{error}");
+            assert_eq!(destination.requests.len(), 2);
+            assert_eq!(worker.progress.files_done.load(Relaxed), 0);
+        } else {
+            result.unwrap();
+            assert!(matches!(
+                destination.requests[..],
+                [
+                    Request::Finalize { .. },
+                    Request::ProbePartial { .. },
+                    Request::FileHash { .. }
+                ]
+            ));
+            assert!(destination.replies.is_empty());
+            assert_eq!(worker.progress.files_done.load(Relaxed), 1);
+        }
+    }
+}
+
 type PublicationFixture = (
     Arc<Sched>,
     Arc<Mutex<PipelineState>>,

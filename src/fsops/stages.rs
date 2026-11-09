@@ -28,7 +28,6 @@
 //! what it said it would write, on every receiver.
 
 use super::*;
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Condvar, MutexGuard};
 
@@ -153,8 +152,9 @@ pub(super) struct Got {
 #[derive(Default)]
 struct Registry {
     held: HashMap<Key, Held>,
-    /// Files whose Finalize is running; a second Finalize waits for it.
-    finalizing: HashSet<Key>,
+    /// Files whose Finalize is running, and whether their copy has ended
+    /// since; a second Finalize waits for it.
+    finalizing: HashMap<Key, bool>,
     /// Files a Finalize published and that are not held again, with the
     /// connection that published them and the identity it reported.
     published: HashMap<Key, (u64, Option<(u64, u64)>)>,
@@ -291,11 +291,15 @@ pub(super) struct Finalizing(Key);
 impl Finalizing {
     /// The Finalize published the file, as `identity`: remember that as one
     /// of the last files `connection` published, before a Finalize waiting
-    /// for this one looks.
+    /// for this one looks. Nothing is remembered for a copy that ended
+    /// meanwhile: nothing would forget it.
     pub(super) fn published(&self, connection: u64, identity: Option<(u64, u64)>) {
         let key = &self.0;
         let mut guard = registry();
         let registry = &mut *guard;
+        if registry.finalizing.get(key) != Some(&false) {
+            return;
+        }
         registry.forget_published(key);
         let keys = registry
             .published_by
@@ -334,7 +338,7 @@ pub(super) enum Found {
 pub(super) fn finalize(target: For<'_>) -> Option<Found> {
     let key = target.key();
     let mut registry = registry();
-    while registry.finalizing.contains(&key) {
+    while registry.finalizing.contains_key(&key) {
         registry = shared()
             .finalized
             .wait(registry)
@@ -346,7 +350,7 @@ pub(super) fn finalize(target: For<'_>) -> Option<Found> {
             .get(&key)
             .map(|&(_, identity)| Found::Published(identity));
     };
-    registry.finalizing.insert(key.clone());
+    registry.finalizing.insert(key.clone(), false);
     Some(Found::Held(Box::new(held), Finalizing(key)))
 }
 
@@ -355,6 +359,9 @@ pub(super) fn finalize(target: For<'_>) -> Option<Found> {
 pub(crate) fn release(scope: u64) {
     let released: Vec<Held> = {
         let mut registry = registry();
+        for (key, ended) in &mut registry.finalizing {
+            *ended |= key.scope == scope;
+        }
         registry.published.retain(|key, _| key.scope != scope);
         registry
             .published_by
@@ -370,6 +377,25 @@ pub(crate) fn release(scope: u64) {
             .collect()
     };
     drop(released);
+}
+
+/// How many published files are remembered for the copy `scope`, and by
+/// how many connections.
+#[cfg(test)]
+fn remembered(scope: u64) -> (usize, usize) {
+    let registry = registry();
+    (
+        registry
+            .published
+            .keys()
+            .filter(|key| key.scope == scope)
+            .count(),
+        registry
+            .published_by
+            .keys()
+            .filter(|(published, _)| *published == scope)
+            .count(),
+    )
 }
 
 /// How many files are held for the copy `scope`.
@@ -595,7 +621,14 @@ mod tests {
         hold(held(&names[2]), &names[2], &file, None, true, 1).unwrap();
         drop(taken(finalize(held(&names[2]))));
         assert!(finalize(held(&names[2])).is_none());
+        // A Finalize that ends after its copy did leaves nothing behind.
+        hold(held(&names[0]), &names[0], &file, None, true, 1).unwrap();
+        let (_, finalizing) = taken(finalize(held(&names[0])));
         release(scope);
+        finalizing.published(dropped, Some((7, 8)));
+        drop(finalizing);
+        assert!(finalize(held(&names[0])).is_none());
         assert!(finalize(held(&names[3])).is_none());
+        assert_eq!(remembered(scope), (0, 0));
     }
 }
