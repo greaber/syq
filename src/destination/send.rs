@@ -1256,11 +1256,10 @@ mod tests {
         }
     }
 
-    /// What a send may read comes from its command alone. A server that
-    /// also sends a request of its own, as servers once did, names nothing
-    /// more; a copy that registers anything other than what the approved
-    /// command reads is refused; and no other file is readable, even beside
-    /// the approved one.
+    /// What a send may read comes from its command alone. A request a
+    /// server puts beside the command names nothing more; a copy that
+    /// registers anything other than what the approved command reads is
+    /// refused; and no other file is readable, even beside the approved one.
     #[test]
     fn a_send_reads_only_what_its_approved_command_names() {
         use crate::proto::{ConnectionRole, OperatorSymlinkPolicy, Request, Response};
@@ -1274,7 +1273,9 @@ mod tests {
         let command = command(&["--no-compress", "--src-non-dir", "notes", "--into", "/out"]);
 
         // Ask with a request beside the command that names the whole
-        // filesystem, followed, and another file.
+        // filesystem, followed, and another file. This machine ignores
+        // fields a message does not have; if it refused them instead, this
+        // part of the test would only need the extra field removed.
         let mut request = request(&crate::approval_command::parse(&command).unwrap()).unwrap();
         request.base = SourceRootBase {
             path: Some(b"/".to_vec()),
