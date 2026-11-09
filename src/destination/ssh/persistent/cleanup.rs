@@ -161,21 +161,80 @@ fn not_found(error: &anyhow::Error) -> bool {
         .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
 }
 
+/// A keeper's temporary scope, which it removes when it ends, before it
+/// releases its lock. `persist off` can create its closing mark in the
+/// directory while the keeper removes it (`mark_closing`, once the
+/// generation is gone), so that removal finds it not empty: remove it again
+/// rather than leave it without its marker.
+pub(super) struct KeeperScope(PathBuf);
+impl KeeperScope {
+    pub(super) fn create(parent: &Path) -> Result<Self> {
+        let scope = Self(
+            tempfile::Builder::new()
+                .prefix("approved-")
+                .tempdir_in(parent)?
+                .keep(),
+        );
+        crate::persistence::initialize_scope(&scope.0)?;
+        Ok(scope)
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        &self.0
+    }
+}
+impl Drop for KeeperScope {
+    fn drop(&mut self) {
+        // Once the marker is gone, `persist off` creates no more marks here,
+        // so a second pass normally finishes.
+        for _ in 0..8 {
+            match fs::remove_dir_all(&self.0) {
+                Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+                _ => return,
+            }
+        }
+    }
+}
+
 fn cleanup_master(scope: &Path) -> Result<()> {
     let result = cleanup_master_present(scope);
     match result {
-        Err(error)
-            if not_found(&error)
-                && scope
-                    .symlink_metadata()
-                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-        {
+        Err(error) if not_found(&error) => match scope.symlink_metadata() {
             // The keeper owns this temporary directory and may finish removing
             // it between our directory inventory and validation.
-            Ok(())
-        }
+            Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            _ if remove_interrupted(scope)? => Ok(()),
+            _ => Err(error),
+        },
         result => result,
     }
+}
+
+/// Remove an owner-only `scope` without its marker that holds at most a
+/// closing mark, and say whether it did. A keeper of syq 0.9.0 left one when
+/// `persist off` marked its directory closing while the keeper removed it,
+/// and one killed before it wrote its marker leaves it empty.
+fn remove_interrupted(scope: &Path) -> Result<bool> {
+    let metadata = scope.symlink_metadata()?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+    {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(scope)? {
+        if entry?.file_name() != crate::receive_service::CLOSING {
+            return Ok(false);
+        }
+    }
+    let mark = scope.join(crate::receive_service::CLOSING);
+    match private_file(&mark, 0, false) {
+        Ok(_) => fs::remove_file(&mark)?,
+        Err(error) if not_found(&error) => {}
+        Err(error) => return Err(error),
+    }
+    fs::remove_dir(scope)?;
+    Ok(true)
 }
 
 fn cleanup_master_present(scope: &Path) -> Result<()> {
@@ -629,6 +688,74 @@ mod tests {
         drop(KeeperPool::new(&control));
         assert!(!crate::session_pool::socket_path(&control).exists());
         assert!(!crate::session_pool::lock_path(&control).exists());
+    }
+
+    #[test]
+    fn a_keeper_scope_marked_closing_while_it_is_removed_is_still_removed() {
+        let temporary = crate::test_support::short_tempdir().unwrap();
+        for _ in 0..200 {
+            let scope = KeeperScope::create(temporary.path()).unwrap();
+            let path = scope.path().to_owned();
+            crate::persistence::prepare_endpoint(&path, None, "host.invalid", None, None).unwrap();
+            // As `persist off` does, mark the scope closing while its marker
+            // is there, here as often as it can.
+            let off = std::thread::spawn({
+                let path = path.clone();
+                move || {
+                    while crate::persistence::validate_scope(&path).is_ok() {
+                        let _ = OpenOptions::new()
+                            .write(true)
+                            .create(true)
+                            .truncate(false)
+                            .mode(0o600)
+                            .open(path.join(crate::receive_service::CLOSING));
+                    }
+                }
+            });
+            drop(scope);
+            off.join().unwrap();
+            assert!(
+                !path.exists(),
+                "{:?}",
+                fs::read_dir(&path).unwrap().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn a_scope_left_with_at_most_its_closing_mark_is_removed() {
+        let temporary = crate::test_support::short_tempdir().unwrap();
+        let directory = |name: &str, mode: u32| {
+            let scope = temporary.path().join(name);
+            fs::DirBuilder::new().mode(mode).create(&scope).unwrap();
+            fs::set_permissions(&scope, fs::Permissions::from_mode(mode)).unwrap();
+            scope
+        };
+        let mark = |scope: &Path| {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(scope.join(crate::receive_service::CLOSING))
+                .unwrap();
+        };
+        let empty = directory("empty", 0o700);
+        cleanup_master(&empty).unwrap();
+        assert!(!empty.exists());
+        let marked = directory("marked", 0o700);
+        mark(&marked);
+        cleanup_master(&marked).unwrap();
+        assert!(!marked.exists());
+        // Anything else stays an error, and nothing is removed.
+        let other = directory("other", 0o700);
+        mark(&other);
+        fs::write(other.join("cm-0123456789abcdef.json"), b"{}").unwrap();
+        assert!(cleanup_master(&other).is_err());
+        assert_eq!(fs::read_dir(&other).unwrap().count(), 2);
+        let public = directory("public", 0o755);
+        mark(&public);
+        assert!(cleanup_master(&public).is_err());
+        assert!(public.join(crate::receive_service::CLOSING).exists());
     }
 
     #[test]

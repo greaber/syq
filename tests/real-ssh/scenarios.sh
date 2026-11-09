@@ -483,10 +483,13 @@ scope, build = sys.argv[1], sys.argv[2]
 deadline = time.monotonic() + 90
 progress = time.monotonic()
 while True:
-    state = json.loads(subprocess.run(
+    # Status keeps answering while the service and provider switch.
+    status = subprocess.run(
         ["syq", "persist", "receive", "status", "--json", "--pscope", scope],
-        check=True, capture_output=True, text=True).stdout)
-    connections = state["connections"]
+        capture_output=True, text=True)
+    if status.returncode:
+        raise SystemExit(f"status failed during the switch: {status.stderr}")
+    connections = json.loads(status.stdout)["connections"]
     if (len(connections) == 1 and connections[0]["identity"] == build
             and connections[0]["connection"]["phase"] == "online"):
         assert connections[0]["started_from"] == "/tmp/syq-switch-bin/syq", connections
