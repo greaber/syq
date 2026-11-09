@@ -567,8 +567,14 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
             // default ssh, keyed by its options with relative file paths made
             // absolute. A remote-to-remote coordinator's shell was chosen for
             // it by the invoking machine and never persists a login on the
-            // server.
+            // server. An enrolled receiver's connections log in with the
+            // copy's entry key, and share a connection as a copy without
+            // persistence does: one of the copy's own, which ends with it.
+            let named = crate::destination::is_named(&restricted_grant);
             let sharing: Option<(Option<crate::persistence::SshOptions>, bool)> = match &args.rsh {
+                _ if restricted_grant.is_some() && !named => {
+                    crate::conn::shareable_ssh_options(&rsh).map(|_| (None, false))
+                }
                 None => Some((None, true)),
                 Some(_) if args.delegated || restricted_grant.is_some() => None,
                 Some(_) => crate::conn::shareable_ssh_options(&rsh).map(|sharing| {
@@ -588,8 +594,9 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
             };
             let ssh_multiplexer = match sharing.filter(|_| named_source.is_none()) {
                 None => None,
-                // A restricted grant keeps a private connection for this run.
-                Some(_) if restricted_grant.is_some() => Some(Arc::new(SshMultiplexer::new()?)),
+                // A receiving machine's route keeps a private connection for
+                // this run.
+                Some(_) if named => Some(Arc::new(SshMultiplexer::new()?)),
                 Some((ssh, persist)) => {
                     // Connection sharing and persistence only save logins. When
                     // their local state cannot be used, connect without them. An

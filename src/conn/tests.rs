@@ -2069,6 +2069,89 @@ fn ssh_workers_reuse_the_private_control_socket_only_when_enabled() {
     assert!(independent.iter().any(|arg| arg == "ControlPath=none"));
 }
 
+/// An enrolled receiver's connections log in with the copy's entry key.
+/// Each one names the copy's own control socket or none on its command
+/// line, so this machine's configuration can never make one join, or
+/// become, a master of its own, which would run the session as that
+/// master's login instead of the entry key's.
+#[test]
+fn entry_key_connections_share_only_the_copys_own_connection() {
+    let root = crate::test_support::tempdir().unwrap();
+    let config = root.path().join("config");
+    let configured = root.path().join("configured-master");
+    std::fs::write(
+        &config,
+        format!(
+            "Host *\n ControlMaster auto\n ControlPath {}\n ControlPersist yes\n",
+            configured.display()
+        ),
+    )
+    .unwrap();
+    let multiplexer = SshMultiplexer::new().unwrap();
+    let control_path = multiplexer.path.to_string_lossy().into_owned();
+    let mut rsh = vec!["ssh".to_owned(), "-G".to_owned(), "-F".to_owned()];
+    rsh.push(config.to_string_lossy().into_owned());
+    // The receiver's command after its program.
+    rsh.extend(
+        shell_words::split(&crate::remote_to_remote::receiver_rsh(None))
+            .unwrap()
+            .into_iter()
+            .skip(1),
+    );
+    let spec = RemoteSpec {
+        local_process: false,
+        user: None,
+        host: "receiver.example".into(),
+        port: None,
+        rsh,
+        syq_path: None,
+        bootstrap_helper: false,
+        restricted_grant: Some("signed".into()),
+        helper_install: Default::default(),
+        ssh_multiplexer: Some(std::sync::Arc::new(multiplexer)),
+        quiet: false,
+        pacing: Default::default(),
+        tcp: Default::default(),
+        diagnostics: Default::default(),
+        primed_control: Default::default(),
+        receiver_host: None,
+        read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
+    };
+    let resolved = |connection| {
+        let output = spec.ssh_command(connection, false).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let resolved = String::from_utf8(output.stdout).unwrap();
+        let value = |name: &str| {
+            resolved
+                .lines()
+                .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+                .map(str::to_owned)
+        };
+        (
+            value("controlmaster"),
+            value("controlpath"),
+            value("controlpersist"),
+        )
+    };
+    let path = Some(control_path.clone());
+    assert_eq!(
+        resolved(SshConnection::Control),
+        (Some("true".into()), path.clone(), Some("no".into()))
+    );
+    assert_eq!(
+        resolved(SshConnection::Worker),
+        (Some("false".into()), path, Some("no".into()))
+    );
+    let (master, independent, _) = resolved(SshConnection::Independent);
+    assert_eq!(master.as_deref(), Some("false"));
+    // OpenSSH prints no `controlpath` for `none`.
+    assert!(independent.is_none(), "{independent:?}");
+}
+
 #[test]
 fn first_ssh_worker_retries_independently_after_mux_rejection() {
     let temporary = crate::test_support::tempdir().unwrap();

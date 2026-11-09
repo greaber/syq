@@ -219,7 +219,10 @@ The protection has four parts:
    connects, before it has checked a signature.
 2. **Only the entry key for hostA.** With each copy, hostA receives the entry
    key and uses it to reach the receiver, checking hostB's host key as described
-   [below](#how-hosta-checks-hostbs-key). Syq on hostA deletes the key when the
+   [below](#how-hosta-checks-hostbs-key). As in any copy, some of its
+   connections can share one SSH login that the copy opens itself, through a
+   socket in a private directory, and that ends with the copy; every session
+   on that login still runs only the receiver. Syq on hostA deletes the key when the
    copy ends, also when you interrupt it or its terminal closes; only a copy
    killed before it can clean up, for example with `kill -9`, leaves it behind,
    in a private temporary directory named `syq-receiver-hosts-…`. The entry

@@ -843,8 +843,16 @@ pub(crate) fn receiver_rsh(port: Option<u16>) -> String {
 /// checked, and overrides on the command line, where the first value wins,
 /// everything the entry key's session must not do: the entry key, whose
 /// file replaces the `IdentityFile=none` placeholder on the coordinator, is
-/// the first identity, with no agent, PKCS#11 provider, control socket,
-/// forwarding, proxy, local command or prompt.
+/// the first identity, with no agent, PKCS#11 provider, forwarding, proxy,
+/// local command or prompt.
+///
+/// Every connection through the broker logs in through it, so that command
+/// shares no connection. The entry key's command leaves connection sharing
+/// to the copy, as for an ordinary login: the copy shares one connection of
+/// its own, in a private directory, for this run only, and every connection
+/// sets the sharing options on its command line, ahead of the configuration
+/// (`transfer::endpoint`, `conn::RemoteSpec::ssh_command`). The entry key's
+/// `restrict` and forced command apply to every session on the connection.
 fn constrained_destination_rsh(
     port: Option<u16>,
     authentication: DestinationAuthentication<'_>,
@@ -856,6 +864,9 @@ fn constrained_destination_rsh(
     let mut command = vec!["ssh".to_owned()];
     if let DestinationAuthentication::Broker { .. } = authentication {
         command.extend(["-F".to_owned(), "/dev/null".to_owned()]);
+        for option in ["ControlMaster=no", "ControlPath=none"] {
+            command.extend(["-o".to_owned(), option.to_owned()]);
+        }
     }
     command.extend(["-a", "-x", "-k", "-T"].map(str::to_owned));
     for option in [
@@ -873,8 +884,6 @@ fn constrained_destination_rsh(
         "KbdInteractiveAuthentication=no".to_owned(),
         "PasswordAuthentication=no".to_owned(),
         "BatchMode=yes".to_owned(),
-        "ControlMaster=no".to_owned(),
-        "ControlPath=none".to_owned(),
         "ClearAllForwardings=yes".to_owned(),
         "ForwardAgent=no".to_owned(),
         "ForwardX11=no".to_owned(),
@@ -1261,21 +1270,45 @@ pub(crate) fn prepare_receiver_ssh_with(
         args.quiet,
     )?;
     args.receiver_host = Some(ssh.receiver_host);
-    args.rsh = Some(shell_words::join(ssh.command));
+    args.rsh = Some(shell_words::join(ssh.remote_shell));
     Ok(ssh.directory)
+}
+
+/// `remote_shell`, a receiver's command, for one login of its own that
+/// shares no connection, whatever this machine's configuration says: an
+/// entry-key login must never join a master the configuration names, which
+/// would run the session as that master's own login, nor become one that
+/// outlives the copy and that later logins to the account would join.
+fn separate_login(remote_shell: &[String]) -> Vec<String> {
+    let mut login = remote_shell.to_vec();
+    for option in ["ControlMaster=no", "ControlPath=none"] {
+        login.extend(["-o".to_owned(), option.to_owned()]);
+    }
+    login
 }
 
 /// The SSH command for an enrolled receiver's connections, with the entry
 /// key and what the approving machine knows about the receiver's host key in
 /// a private directory that lives as long as the connections.
 pub(crate) struct ReceiverSsh {
-    pub(crate) command: Vec<String>,
+    /// The remote shell for a copy's connections to the receiver. It sets
+    /// no connection sharing: each connection sets its own on its command
+    /// line, ahead of this machine's configuration
+    /// (`conn::RemoteSpec::ssh_command`). Anything else that logs in with
+    /// it runs [`ReceiverSsh::separate_login`].
+    pub(crate) remote_shell: Vec<String>,
     /// The host as the command names it, and how this machine reaches it.
     pub(crate) receiver_host: (String, crate::conn::ReceiverHost),
     pub(crate) directory: crate::private_broker::SignalCleanedDir,
 }
 
 impl ReceiverSsh {
+    /// The command for a login to the receiver that is not one of a copy's
+    /// connections: see [`separate_login`].
+    pub(crate) fn separate_login(&self) -> Vec<String> {
+        separate_login(&self.remote_shell)
+    }
+
     /// Fill `command`, a [`receiver_rsh`], in for the receiver at
     /// `user@host:port`, with `known_hosts`, what the approving machine's
     /// known_hosts files list for it, and the enrollment's `entry_key`.
@@ -1292,11 +1325,7 @@ impl ReceiverSsh {
         );
         let mut command = command.to_vec();
         let host = host.to_owned();
-        for required in [
-            "IdentityAgent=none",
-            "IdentitiesOnly=yes",
-            "ControlPath=none",
-        ] {
+        for required in ["IdentityAgent=none", "IdentitiesOnly=yes"] {
             anyhow::ensure!(
                 command.iter().any(|argument| argument == required),
                 "receiver SSH command is missing {required}"
@@ -1418,7 +1447,7 @@ impl ReceiverSsh {
             .context("receiver SSH command is missing its entry key placeholder")?;
         *identity = format!("IdentityFile={}", key.display());
         Ok(Self {
-            command,
+            remote_shell: command,
             receiver_host: (
                 host,
                 crate::conn::ReceiverHost {
@@ -2763,9 +2792,9 @@ fn run_coordinated(
     }))
     .frame()?;
     let frame = std::sync::Arc::new(zeroize::Zeroizing::new(frame));
-    let (program, options) = copy
-        .receiver
-        .command
+    // One login of its own, as each attempt is.
+    let login = copy.receiver.separate_login();
+    let (program, options) = login
         .split_first()
         .context("receiver SSH command is empty")?;
     let source = &copy.host;

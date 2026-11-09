@@ -129,8 +129,8 @@ fn receiving_pins_preserve_native_identity_and_certificate_alias_tokens() {
 
 /// A copy from another server that a receiving machine approved reads it
 /// through the source's enrolled receiver: the signed directive goes to the
-/// source's control, with the SSH command the approval prepared, no shared
-/// or persistent connection and no helper installation.
+/// source's control, with the SSH command the approval prepared, a
+/// connection shared only within this copy and no helper installation.
 #[test]
 fn an_approved_source_presents_its_directive_on_a_private_connection() {
     let directory = crate::test_support::tempdir().unwrap();
@@ -145,9 +145,30 @@ fn an_approved_source_presents_its_directive_on_a_private_connection() {
         panic!("source must remain remote");
     };
     assert_eq!(source.restricted_grant.as_deref(), Some("signed"));
-    assert!(source.ssh_multiplexer.is_none());
+    // Its socket is in a private directory of this run's, not a
+    // persistence scope.
+    use std::os::unix::fs::PermissionsExt as _;
+    let multiplexer = source
+        .ssh_multiplexer
+        .as_ref()
+        .expect("a private connection");
+    let directory = multiplexer.control_path().parent().unwrap();
+    assert!(directory
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("syq-ssh-"));
+    assert_eq!(
+        std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
     assert!(!source.bootstrap_helper);
-    assert!(source.rsh.iter().any(|option| option == "ControlPath=none"));
+    // Each connection's own options choose the copy's connection or none,
+    // ahead of this machine's configuration.
+    assert!(!source
+        .rsh
+        .iter()
+        .any(|option| option.starts_with("Control")));
     // It does not make this copy's local destination restricted.
     assert!(
         crate::transfer::endpoint(args.locations.last().unwrap(), &args)
