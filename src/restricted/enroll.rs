@@ -93,9 +93,10 @@ impl UnusableRecord {
             reason = self.reason,
         );
         if let Some(id) = self.record_id {
-            // Which of the two IDs its server line has is not known here.
+            // Which of the two IDs its server line has is not known here;
+            // under its own name, the record says what to do.
             explanation.push_str(&format!(
-                " If its directory was renamed, rename it back to {id} for syq to use it again"
+                " If its directory was renamed, rename it back to {id} and run `syq receiver list` again"
             ));
             return explanation;
         }
@@ -105,15 +106,21 @@ impl UnusableRecord {
                  for the directory and 0600 for its files.",
             );
         }
-        let server = if self.account.is_some() {
-            "the server's ~/.ssh/authorized_keys"
+        let (line, file) = if self.account.is_some() {
+            (
+                "its line in the server's ~/.ssh/authorized_keys still works",
+                "the server's ~/.ssh/authorized_keys",
+            )
         } else {
-            "~/.ssh/authorized_keys on the server account it was made for, if any"
+            (
+                "its line, if it has one, still works in ~/.ssh/authorized_keys on the server account it was made for",
+                "that file",
+            )
         };
         explanation.push_str(&format!(
-            " If another syq build made it, its line in the server's ~/.ssh/authorized_keys still works: \
-             revoke it with that build (`syq receiver revoke {name}`), or delete the line containing \
-             `{prefix}{name}` from {server} and then delete {directory}",
+            " If another syq build made it, {line}: revoke it with that build \
+             (`syq receiver revoke {name}`), or delete the line containing `{prefix}{name}` \
+             from {file}, and then delete {directory}",
             prefix = crate::enrollment::COMMENT_PREFIX,
         ));
         explanation
@@ -158,19 +165,24 @@ fn read_record<T: serde::de::DeserializeOwned>(
         Err(error) => return unusable(None, None, true, format!("{error:#}")),
     };
     let (record_id, reason) = match serde_json::from_slice::<T>(&encoded) {
-        Ok(record) => match version(&record) {
-            (CONFIG_VERSION, id) if id.to_string() == name => return Record::Usable(record),
-            (CONFIG_VERSION, id) => (
-                Some(id),
-                format!("its record names enrollment {id}, not its directory's"),
-            ),
-            (record_version, _) => (
-                None,
-                format!(
-                    "it has version {record_version}, which another syq version wrote; this one reads version {CONFIG_VERSION}"
+        Ok(record) => {
+            let (record_version, id) = version(&record);
+            // Another ID than its directory's, in a record of any version.
+            let record_id = (id.to_string() != name).then_some(id);
+            match (record_version, record_id) {
+                (CONFIG_VERSION, None) => return Record::Usable(record),
+                (CONFIG_VERSION, Some(id)) => (
+                    record_id,
+                    format!("its record names enrollment {id}, not its directory's"),
                 ),
-            ),
-        },
+                (record_version, _) => (
+                    record_id,
+                    format!(
+                        "it has version {record_version}, which another syq version wrote; this one reads version {CONFIG_VERSION}"
+                    ),
+                ),
+            }
+        }
         Err(error) => (None, format!("decode {}: {error}", path.display())),
     };
     // The account it names, as far as it can be read, to know which

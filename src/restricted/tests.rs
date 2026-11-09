@@ -3926,7 +3926,7 @@ fn an_enrollment_record_this_build_cannot_use_is_reported_and_not_enrolled_besid
         assert!(record.account.is_none() && record.account_label().is_none());
         let error = refused("host-c", None);
         assert!(
-            error.contains("on the server account it was made for, if any"),
+            error.contains("if it has one, still works in ~/.ssh/authorized_keys on the server account it was made for"),
             "{error}"
         );
         remove_local_enrollment(&damaged).unwrap();
@@ -3945,20 +3945,28 @@ fn an_enrollment_record_this_build_cannot_use_is_reported_and_not_enrolled_besid
     assert!(error.contains("mode 0700"), "{error}");
     fs::remove_dir_all(&exposed).unwrap();
 
-    // A record in another enrollment's directory, as after a rename: which
-    // line on the server is its own is not known, so syq names none.
-    let (directory_id, record_id) = (EnrollmentId::random(), EnrollmentId::random());
-    let moved = make(directory_id);
-    complete_local_enrollment(&moved, &local_record(record_id, "host-d", None)).unwrap();
-    let record = unusable_at(&moved).unwrap();
-    assert_eq!(record.record_id, Some(record_id));
-    let explanation = record.explain();
-    assert!(
-        explanation.contains(&format!("rename it back to {record_id}")),
-        "{explanation}"
-    );
-    assert!(!explanation.contains("syq-enrollment:"), "{explanation}");
-    refused("host-d", None);
+    // A record in another enrollment's directory, as after a rename, of
+    // this version or another: which line on the server is its own is not
+    // known, so syq names none.
+    for record_version in [CONFIG_VERSION, CONFIG_VERSION + 1] {
+        let (directory_id, record_id) = (EnrollmentId::random(), EnrollmentId::random());
+        let moved = make(directory_id);
+        complete_local_enrollment(&moved, &local_record(record_id, "host-d", None)).unwrap();
+        let path = moved.join(ENROLLMENT_FILE);
+        let mut record = json_object(&path);
+        record.insert("version".into(), record_version.into());
+        write_json_object(&path, &record);
+        let record = unusable_at(&moved).unwrap();
+        assert_eq!(record.record_id, Some(record_id));
+        let explanation = record.explain();
+        assert!(
+            explanation.contains(&format!("rename it back to {record_id}")),
+            "{explanation}"
+        );
+        assert!(!explanation.contains("syq-enrollment:"), "{explanation}");
+        refused("host-d", None);
+        remove_local_enrollment(&moved).unwrap();
+    }
 }
 
 /// A newer build's fields in an enrollment's records survive this build
