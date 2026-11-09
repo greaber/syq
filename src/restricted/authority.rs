@@ -2925,8 +2925,7 @@ impl RestrictedAuthority {
     /// Hold an authorized request to the streamed patch open on its
     /// connection. A begin needs none to be open. Each piece must belong to
     /// the open patch and stay within the new data its begin declared, and is
-    /// charged as a written range is, within one rate-limit burst. An end
-    /// needs the patch open.
+    /// charged as a written range is. An end needs the patch open.
     fn authorize_stream(
         &self,
         request: &Request,

@@ -419,6 +419,12 @@ impl ConnectionRegistry {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len()
     }
+
+    /// Streams tracked so far, closed ones included.
+    #[cfg(test)]
+    pub(crate) fn opened(&self) -> u64 {
+        self.next_id.load(Ordering::Relaxed)
+    }
 }
 
 pub(crate) struct TrackedStream {

@@ -1144,9 +1144,6 @@ fn small_copy_eligible(
         && args.files_from.is_none()
         && args.native_mapping.is_none()
         && args.ignore_lines.is_empty()
-        && (args.bwlimit_bytes == 0
-            || matches!(dst_ep, Endpoint::Remote(spec)
-            if spec.restricted_grant.is_none()))
         && args.max_size.is_none()
         && args.min_size.is_none()
         && !args.follows_native_destination_paths()
@@ -1429,7 +1426,9 @@ fn attempt_small_copy(
             }
             source_reader = Some(reader);
             // Preparation can decline without sending payload. Leave that
-            // control session unpaced; after payload, recovery reconnects.
+            // control session unpaced. After payload, an ordinary
+            // destination's recovery reconnects; a restricted one's copy goes
+            // on over this connection, paced from here on.
             if let Some((budget, scheduler)) = pacing {
                 dst_ctl.pace_outgoing(budget, scheduler)?;
             }
@@ -3504,7 +3503,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 dst_ctl = connect_ctl(&dst_ep, &args)?;
             }
             // A restricted receiver's session is as it was before the
-            // shortcut, so its copy goes on over its one control connection.
+            // shortcut, so its copy goes on over its one control connection,
+            // which stays paced if the shortcut sent its payload.
             SmallCopy::Declined | SmallCopy::Reconnect => {
                 dst_ctl.send_expecting_ok(
                     Request::ConfigureHashing(opts.hash_policy),
