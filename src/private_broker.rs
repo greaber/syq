@@ -130,15 +130,40 @@ pub(crate) enum BrokerBase {
     Account,
 }
 
-impl BrokerBase {
-    /// The base, and whether it is in the temporary directory, where other
-    /// users can make it first.
-    fn locate(self) -> (PathBuf, bool) {
+/// The directory a base is in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BaseParent {
+    /// The base is the current directory itself.
+    Current,
+    /// The user's runtime directory, `XDG_RUNTIME_DIR`.
+    Runtime,
+    /// The temporary directory, `TMPDIR`, where other users can make the
+    /// base first.
+    Temporary,
+}
+
+impl BaseParent {
+    /// The variable that moves this parent.
+    fn variable(self) -> Option<&'static str> {
         match self {
-            Self::Enrollment => (PathBuf::from("."), false),
+            Self::Current => None,
+            Self::Runtime => Some("XDG_RUNTIME_DIR"),
+            Self::Temporary => Some("TMPDIR"),
+        }
+    }
+}
+
+impl BrokerBase {
+    /// The base, and the directory it is in.
+    fn locate(self) -> (PathBuf, BaseParent) {
+        match self {
+            Self::Enrollment => (PathBuf::from("."), BaseParent::Current),
             Self::Account => match account_parent(crate::user_dirs::runtime_dir()) {
-                Some(runtime) => (account_directory(&runtime), false),
-                None => (account_directory(&std::env::temp_dir()), true),
+                Some(runtime) => (account_directory(&runtime), BaseParent::Runtime),
+                None => (
+                    account_directory(&std::env::temp_dir()),
+                    BaseParent::Temporary,
+                ),
             },
         }
     }
@@ -148,22 +173,27 @@ impl BrokerBase {
         self.locate().0
     }
 
-    /// The checked base, for a broker to listen in. The account's
-    /// directory is made when it is missing.
-    fn prepare(self) -> Result<PathBuf> {
-        let (path, shared) = self.locate();
-        self.explain(check_base(&path, self == Self::Account), &path, shared)?;
-        Ok(path)
+    /// The checked base, for a broker to listen in, and the directory it is
+    /// in. The account's directory is made when it is missing.
+    fn prepare(self) -> Result<(PathBuf, BaseParent)> {
+        let (path, parent) = self.locate();
+        self.explain(check_base(&path, self == Self::Account), &path, parent)?;
+        Ok((path, parent))
     }
 
     /// The checked base, for a ticket to be looked up in.
     fn existing(self) -> Result<PathBuf> {
-        let (path, shared) = self.locate();
-        self.explain(check_base(&path, false), &path, shared)?;
+        let (path, parent) = self.locate();
+        self.explain(check_base(&path, false), &path, parent)?;
         Ok(path)
     }
 
-    fn explain(self, checked: Result<(), BaseError>, path: &Path, shared: bool) -> Result<()> {
+    fn explain(
+        self,
+        checked: Result<(), BaseError>,
+        path: &Path,
+        parent: BaseParent,
+    ) -> Result<()> {
         let error = match (self, checked) {
             (_, Ok(())) => return Ok(()),
             (
@@ -176,7 +206,7 @@ impl BrokerBase {
                     "{} must be a directory of this account's with mode 0700",
                     path.display()
                 );
-                if shared {
+                if parent == BaseParent::Temporary {
                     advice.push_str("; if another user made it, ask them or an administrator to remove it, or set TMPDIR to a directory of your own");
                 }
                 error.context(advice)
@@ -190,14 +220,15 @@ impl BrokerBase {
 }
 
 /// The user's runtime directory `runtime`, when it is set and nobody else
-/// can add to it: a directory of this account's that only it can write to.
-/// Otherwise the account's directory goes in the temporary directory.
+/// can add to it: a directory of this account's that it, and only it, can
+/// write to. Otherwise the account's directory goes in the temporary
+/// directory.
 fn account_parent(runtime: Option<PathBuf>) -> Option<PathBuf> {
     runtime.filter(|runtime| {
         std::fs::metadata(runtime).is_ok_and(|metadata| {
             metadata.is_dir()
                 && metadata.uid() == unsafe { libc::geteuid() }
-                && metadata.mode() & 0o022 == 0
+                && metadata.mode() & 0o322 == 0o300
         })
     })
 }
@@ -468,7 +499,7 @@ impl PrivateBroker {
                 (socket_dir, socket_path, None)
             }
             BrokerDirectory::Ticketed { prefix, base } => {
-                let base = base.prepare()?;
+                let (base, parent) = base.prepare()?;
                 let socket_dir = tempfile::Builder::new()
                     .prefix(&format!("{prefix}{}-", std::process::id()))
                     .permissions(std::fs::Permissions::from_mode(0o700))
@@ -484,8 +515,12 @@ impl PrivateBroker {
                 // so a long parent cannot exceed sun_path.
                 let socket_path = base.join(name).join(TICKET_SOCKET);
                 if socket_path.as_os_str().len() > max_socket_path() {
+                    let advice = parent
+                        .variable()
+                        .map(|variable| format!("; set {variable} to a shorter directory"))
+                        .unwrap_or_default();
                     bail!(
-                        "the socket path {} is longer than this system allows ({} bytes); set TMPDIR to a shorter directory",
+                        "the socket path {} is longer than this system allows ({} bytes){advice}",
                         socket_path.display(),
                         max_socket_path()
                     );
@@ -1113,6 +1148,14 @@ mod tests {
         };
         let parent = std::env::var_os("SYQ_TEST_ACCOUNT_PARENT").unwrap();
         let account = account_directory(Path::new(&parent));
+        if let Some(variable) = case.strip_prefix("long-") {
+            let error = format!("{:#}", account_broker().unwrap_err());
+            assert!(
+                error.contains(&format!("set {variable} to a shorter directory")),
+                "{error}"
+            );
+            return;
+        }
         if let Some(shared) = case.strip_prefix("refused-") {
             let error = format!("{:#}", account_broker().unwrap_err());
             assert!(error.contains(&account.display().to_string()), "{error}");
@@ -1210,9 +1253,12 @@ mod tests {
         let root = crate::test_support::short_tempdir().unwrap();
         let temporary = root.path().join("t");
         private_fixture(&temporary, 0o700);
-        for (name, runtime_mode, used) in
-            [("p", 0o700, true), ("r", 0o755, true), ("o", 0o777, false)]
-        {
+        for (name, runtime_mode, used) in [
+            ("p", 0o700, true),
+            ("r", 0o755, true),
+            ("o", 0o777, false),
+            ("w", 0o500, false),
+        ] {
             let runtime = root.path().join(name);
             private_fixture(&runtime, runtime_mode);
             let parent = if used { &runtime } else { &temporary };
@@ -1238,6 +1284,20 @@ mod tests {
         run_account_case(&temporary, Some(&runtime), &runtime, "refused-runtime");
     }
 
+    /// A socket path too long for `sockaddr_un` names the variable that
+    /// chose its directory.
+    #[test]
+    fn a_socket_path_too_long_names_the_variable_to_shorten() {
+        let root = crate::test_support::short_tempdir().unwrap();
+        let long = root.path().join("d".repeat(60)).join("e".repeat(60));
+        std::fs::create_dir_all(&long).unwrap();
+        std::fs::set_permissions(&long, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let temporary = root.path().join("t");
+        private_fixture(&temporary, 0o700);
+        run_account_case(&temporary, Some(&long), &long, "long-XDG_RUNTIME_DIR");
+        run_account_case(&long, None, &long, "long-TMPDIR");
+    }
+
     #[test]
     fn only_a_runtime_directory_nobody_else_can_write_is_used() {
         let root = crate::test_support::short_tempdir().unwrap();
@@ -1247,6 +1307,8 @@ mod tests {
             ("r", 0o755, true),
             ("g", 0o770, false),
             ("o", 0o707, false),
+            ("w", 0o500, false),
+            ("x", 0o600, false),
         ] {
             let runtime = root.path().join(name);
             private_fixture(&runtime, runtime_mode);
