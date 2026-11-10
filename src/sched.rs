@@ -645,6 +645,9 @@ struct Inner {
     scan_done: bool,
     /// Source-wide preflights passed; more validated jobs may still arrive.
     work_released: bool,
+    /// Files were queued a few at a time as their directories were created
+    /// (`share_with_busy_workers`).
+    share_with_busy: bool,
     abort: bool,
 }
 
@@ -716,6 +719,7 @@ impl Sched {
                 file_work_anticipated: false,
                 scan_done: false,
                 work_released: false,
+                share_with_busy: false,
                 abort: false,
             }),
             cv: Condvar::new(),
@@ -891,6 +895,14 @@ impl Sched {
         self.cv.notify_all();
     }
 
+    /// Files will be queued a few at a time, as the directories they go
+    /// into are created (`Planner::create_directories_streaming`): from now
+    /// on a small-file batch is sized against every active worker, busy ones
+    /// included (`begin_fast_batch`).
+    pub fn share_with_busy_workers(&self) {
+        self.inner.lock().unwrap().share_with_busy = true;
+    }
+
     /// Release validated jobs while the planner finishes preparing later
     /// batches. An empty queue is still a wait, not EOF, until scan_done.
     pub fn release_preflighted_work(&self) {
@@ -979,7 +991,16 @@ impl Sched {
     pub fn begin_fast_batch(&self, active: usize, max_n: usize) -> usize {
         let mut g = self.inner.lock().unwrap();
         debug_assert!(g.probing > g.fast_probing);
-        let available_workers = active.saturating_sub(g.fast_batches).max(1);
+        // Workers busy with a batch take more when they finish it. When
+        // files were queued a few at a time, busy workers hold only a few and
+        // finish soon: this one takes its share against every worker, or it
+        // would take all the files queued since while the others finish.
+        let sharing = if g.share_with_busy {
+            active
+        } else {
+            active.saturating_sub(g.fast_batches)
+        };
+        let available_workers = sharing.max(1);
         let available_files = g.files.len() + 1;
         let target = available_files.div_ceil(available_workers).clamp(1, max_n);
         g.fast_probing += 1;

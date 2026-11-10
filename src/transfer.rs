@@ -4844,8 +4844,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // created (`Planner::create_directories_streaming`).
     let streaming_during_creation = std::cell::Cell::new(false);
     let start_streaming = |anticipated: Option<directory_stream::Anticipated>| {
-        if anticipated.is_some() {
-            streaming_during_creation.set(true);
+        if anticipated.is_some() && !streaming_during_creation.replace(true) {
+            sched.share_with_busy_workers();
         }
         if !streaming_ready
             || sched.is_aborted()

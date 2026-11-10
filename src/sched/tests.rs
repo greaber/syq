@@ -812,6 +812,42 @@ fn fast_batches_share_the_queue_across_active_workers() {
 }
 
 #[test]
+fn files_queued_with_their_directories_are_shared_with_busy_workers() {
+    // Sixteen of seventeen workers are busy with a batch when 64 more files
+    // are queued. The idle one takes them all, unless files were queued as
+    // their directories were created: then it takes its share against all
+    // seventeen, after the scan ends too.
+    for (sharing, scan_done, expected) in [
+        (false, false, 65),
+        (false, true, 65),
+        (true, false, 4),
+        (true, true, 4),
+    ] {
+        let sched = Sched::new(4096, 8192);
+        if sharing {
+            sched.share_with_busy_workers();
+        }
+        {
+            let mut inner = sched.inner.lock().unwrap();
+            inner.work_released = true;
+            inner.scan_done = scan_done;
+            inner.fast_batches = 16;
+            inner.probing = 16;
+            inner.fast_probing = 16;
+            for idx in 0..65 {
+                inner.files.push_test((4096, Reverse(FileOrder::new(idx))));
+            }
+        }
+        assert!(matches!(sched.next(), Item::File(_)));
+        assert_eq!(
+            sched.begin_fast_batch(17, 2048),
+            expected,
+            "sharing={sharing} scan_done={scan_done}"
+        );
+    }
+}
+
+#[test]
 fn claimed_file_groups_cannot_be_stolen_or_request_spare_workers() {
     let sched = Sched::new(512, 8192);
     {
