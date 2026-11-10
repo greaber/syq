@@ -1,7 +1,7 @@
 //! Output failures must not replace filesystem outcomes or freeze telemetry.
 
 #[allow(dead_code)]
-#[path = "../src/process.rs"]
+#[path = "../src/process_spawn.rs"]
 mod process;
 use crate::process::CommandExt as _;
 #[path = "support/temp.rs"]

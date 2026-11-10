@@ -413,6 +413,14 @@ fn interrupt_with_stalled_cleanup(t: &Tmp, route: &str, tmp: &Path) -> (Child, i
         .env("SYQ_TEST_SMALL_STAGE_CONTINUE_FILE", t.path("never"))
         .env("SYQ_TEST_SIDECAR_SWEEP_READY_FILE", &sweeping)
         .env("SYQ_TEST_SIDECAR_SWEEP_CONTINUE_FILE", t.path("never"));
+    if route == "local-lost" {
+        // A receiver whose cleanup stalls removes its socket directory in
+        // the cap's last tenth, 50 ms of the real cap, which a loaded
+        // runner may not schedule its thread within. The test checks that
+        // directory, so it gets a longer cap here; the other routes keep the
+        // real one.
+        command.env("SYQ_TEST_TERMINATION_CAP_MS", "2000");
+    }
     let mut child = start_job(&mut command);
     wait_for_confinement_marker(&mut child, &staged, "staged small files");
     let signal = match route {
@@ -444,8 +452,8 @@ fn broker_directories(tmp: &Path) -> Vec<String> {
 #[test]
 fn an_interrupted_receiver_ends_by_its_cap_when_cleanup_stalls() {
     // The barrier would hold the cleanup for a minute; the cap of half a
-    // second ends the receiver long before, whether a signal or a lost
-    // connection started the cleanup.
+    // second (two seconds for `local-lost`) ends the receiver long before,
+    // whether a signal or a lost connection started the cleanup.
     for route in ["local", "local-lost", "push"] {
         let t = Tmp::new();
         let tmp = test_support::short_tempdir().unwrap();

@@ -1,12 +1,14 @@
 //! Integration tests: local -> local copies through the built binary.
 
 #[allow(dead_code)]
-#[path = "../src/process.rs"]
+#[path = "../src/process_spawn.rs"]
 mod process;
 use crate::process::CommandExt as _;
-use process::group as process_group;
 #[path = "support/executable.rs"]
 mod executable_support;
+#[allow(dead_code)]
+#[path = "../src/process_group.rs"]
+mod process_group;
 #[path = "support/temp.rs"]
 mod test_support;
 
@@ -661,10 +663,12 @@ fn widest_destination_lookup(lookups: &str) -> usize {
 }
 
 fn assert_output_ok(out: &Output) {
+    // The status names the signal, and any core dump, of a process that a
+    // signal ended.
     assert!(
         out.status.success(),
-        "syq failed: status {:?}\nstdout:\n{}\nstderr:\n{}",
-        out.status.code(),
+        "syq failed: {}\nstdout:\n{}\nstderr:\n{}",
+        out.status,
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
