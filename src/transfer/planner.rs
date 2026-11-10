@@ -403,6 +403,8 @@ struct DirectoryStream {
     failed_guarded: Vec<PathBytes>,
     /// Directories skipped for that, whose leaves are still to be planned.
     skipped: Vec<usize>,
+    /// Sending was held for a request with a no-replace creation.
+    held: bool,
 }
 
 /// One request of a `DirectoryStream`, waiting for its reply.
@@ -412,6 +414,8 @@ struct SentDirectories {
     /// It creates a directory only where nothing is (`TargetCondition` other
     /// than `Any`).
     guarded: bool,
+    /// It was held until such a request was answered.
+    after_hold: bool,
     /// Its directories, as indices into the batch's new directories.
     chosen: Vec<usize>,
     /// Their paths and conditions, in request order.
@@ -3002,6 +3006,7 @@ impl Planner<'_> {
             stopped: false,
             failed_guarded: Vec::new(),
             skipped: Vec::new(),
+            held: false,
         };
         if stream.queue.is_empty() && !stream.last_metadata.is_empty() {
             // Nothing to create: a private root's metadata goes by itself.
@@ -3111,6 +3116,9 @@ impl Planner<'_> {
                 continue;
             }
             let count = ops.len();
+            // Held back on purpose, it reached the receiver after the
+            // previous reply: that is no sign of a slow link.
+            let after_hold = std::mem::take(&mut stream.held);
             let guarded = targets
                 .iter()
                 .any(|(_, condition)| *condition != TargetCondition::Any);
@@ -3119,11 +3127,15 @@ impl Planner<'_> {
             stream.in_flight.push_back(SentDirectories {
                 pending,
                 sent,
+                after_hold,
                 guarded,
                 chosen,
                 targets,
                 count,
             });
+        }
+        if !stream.queue.is_empty() && stream.in_flight.iter().any(|request| request.guarded) {
+            stream.held = true;
         }
         Ok(())
     }
@@ -3149,8 +3161,9 @@ impl Planner<'_> {
                 break;
             };
             let (response, arrival) = self.dst.take_reply_with_arrival(request.pending)?;
+            let compared = if request.after_hold { None } else { previous };
             self.directory_pacing
-                .observe(request.sent, arrival, previous);
+                .observe(request.sent, arrival, compared);
             previous = Some(arrival);
             let mut errs = self.applied(response, request.count)?;
             // Failed early metadata is retried, and reported, at the end.
