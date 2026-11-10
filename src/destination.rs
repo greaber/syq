@@ -2653,6 +2653,10 @@ fn take_name(lock: &fs::File, input: RawFd, wait: Duration) -> Result<bool> {
                 break Err(error);
             }
         };
+        // The lock belongs to the open file both descriptors share, so
+        // `lock` keeps it. Closing this copy first means the name is free
+        // again as soon as the caller drops `lock`.
+        drop(waiter);
         let _ = taken.send(result);
     });
     let deadline = Instant::now() + wait;
