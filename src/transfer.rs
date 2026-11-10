@@ -31,6 +31,7 @@ use std::sync::Mutex;
 
 mod comparing;
 mod diagnostics;
+mod directory_stream;
 mod dry_run;
 mod hardlinks;
 mod planner;
@@ -4839,32 +4840,64 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     };
     let streaming_checked_sharing = std::cell::Cell::new(0);
     let streaming_all_shareable = std::cell::Cell::new(ssh_sharing_possible);
-    let start_streaming = || {
+    // Files were queued while their batch's directories were still being
+    // created (`Planner::create_directories_streaming`).
+    let streaming_during_creation = std::cell::Cell::new(false);
+    let start_streaming = |anticipated: Option<directory_stream::Anticipated>| {
+        if let Some(anticipated) = anticipated {
+            streaming_during_creation.set(true);
+            // An explicit count starts its workers once every file of a small
+            // tree is queued, and splits that queue as before: sized for a
+            // trickle, its batches split directories between workers, which
+            // then wait on each other's (4 x 4 x 8 files on SSHFS at 20 ms
+            // took 10% longer with 4 workers).
+            sched.trickling_files(
+                (autotune && anticipated.trickling)
+                    .then(|| start_rule(streaming_connections).files_per_worker(true)),
+            );
+        }
         if !streaming_ready
             || sched.is_aborted()
             || (destination_anchor_required && destination_anchor.get().is_none())
         {
             return;
         }
-        let files = progress.files_total.load(Relaxed) as usize;
-        let bytes = progress.bytes_total.load(Relaxed);
+        // The files queued so far, and those the batch will queue once the
+        // directories still being created exist.
+        let anticipated = anticipated.unwrap_or_default();
+        let queued = progress.files_total.load(Relaxed) as usize;
+        let files = queued + anticipated.files;
+        let bytes = progress
+            .bytes_total
+            .load(Relaxed)
+            .saturating_add(anticipated.bytes);
+        if autotune && network_destination && streaming_all_batched.get() {
+            let jobs = sched.jobs.lock().unwrap();
+            let checked = streaming_checked_jobs.get();
+            // Only the jobs queued since: every directory request can call this.
+            streaming_all_batched.set(
+                (checked..jobs.len()).all(|idx| jobs[idx].entry.size <= streaming_batch_limit),
+            );
+            streaming_checked_jobs.set(jobs.len());
+        }
+        let all_batched =
+            streaming_all_batched.get() && anticipated.largest <= streaming_batch_limit;
+        // On a network destination, small files queued while their
+        // directories are still being created start workers at once, with
+        // the count their batch calls for: waiting for the scan would keep
+        // them idle until every directory exists.
+        let early =
+            streaming_during_creation.get() && autotune && network_destination && all_batched;
         // An explicit count above the files queued so far waits for the
         // complete count, which can limit a small-file tree to a worker per file.
-        if files < STREAMING_START_FILES || (!autotune && streaming_connections > files) {
+        if queued == 0
+            || (files < STREAMING_START_FILES && !early)
+            || (!autotune && streaming_connections > files)
+        {
             return;
         }
         let initial = if autotune {
-            if network_destination && streaming_all_batched.get() {
-                let jobs = sched.jobs.lock().unwrap();
-                let checked = streaming_checked_jobs.get();
-                streaming_all_batched.set(
-                    jobs.iter()
-                        .skip(checked)
-                        .all(|job| job.entry.size <= streaming_batch_limit),
-                );
-                streaming_checked_jobs.set(jobs.len());
-            }
-            start_rule(streaming_connections).streaming(files, bytes, streaming_all_batched.get())
+            start_rule(streaming_connections).streaming(files, bytes, all_batched)
         } else {
             streaming_connections
         };
@@ -4909,6 +4942,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         missing_dirs: std::collections::HashSet::new(),
         blocked_directory_paths: std::collections::HashSet::new(),
         start_streaming: &start_streaming,
+        // Only where files can go to workers during planning; buffered
+        // copies decide before their replay.
+        stream_directories: network_destination && streaming_ready,
+        directory_pacing: Default::default(),
         unselected_dirs: Default::default(),
         directory_expression_sources: Default::default(),
         source_partials: 0,
@@ -5114,6 +5151,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         } else {
             None
         };
+        // Workers start before replay only with a local start: otherwise they
+        // wait for it to end, and small directory requests would gain nothing.
+        st.stream_directories = network_destination && local_start.is_some();
         if let Err(error) = st.replay_buffered(
             args.prune_before,
             |planner| {

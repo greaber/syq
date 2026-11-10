@@ -1160,6 +1160,9 @@ mod local_copy_selection;
 mod map;
 #[path = "local/metadata.rs"]
 mod metadata;
+#[cfg(debug_assertions)]
+#[path = "local/network_directories.rs"]
+mod network_directories;
 #[path = "local/own_files.rs"]
 mod own_files;
 #[path = "local/persistence.rs"]

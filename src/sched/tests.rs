@@ -812,6 +812,45 @@ fn fast_batches_share_the_queue_across_active_workers() {
 }
 
 #[test]
+fn files_queued_with_their_directories_are_shared_with_busy_workers() {
+    // Sixteen of seventeen workers are busy with a batch when more files
+    // are queued. The idle one takes them all, unless files were queued as
+    // their directories were created: then it takes its share against all
+    // seventeen, after the scan ends too, but at least the eight files each
+    // starting worker was counted for, as far as are queued.
+    for (trickling, scan_done, queued, expected) in [
+        (false, false, 65, 65),
+        (false, true, 65, 65),
+        (true, false, 65, 8),
+        (true, true, 65, 8),
+        (true, false, 400, 24),
+        (true, false, 4, 8),
+    ] {
+        let sched = Sched::new(4096, 8192);
+        if trickling {
+            sched.trickling_files(Some(8));
+        }
+        {
+            let mut inner = sched.inner.lock().unwrap();
+            inner.work_released = true;
+            inner.scan_done = scan_done;
+            inner.fast_batches = 16;
+            inner.probing = 16;
+            inner.fast_probing = 16;
+            for idx in 0..queued {
+                inner.files.push_test((4096, Reverse(FileOrder::new(idx))));
+            }
+        }
+        assert!(matches!(sched.next(), Item::File(_)));
+        assert_eq!(
+            sched.begin_fast_batch(17, 2048),
+            expected,
+            "trickling={trickling} scan_done={scan_done} queued={queued}"
+        );
+    }
+}
+
+#[test]
 fn claimed_file_groups_cannot_be_stolen_or_request_spare_workers() {
     let sched = Sched::new(512, 8192);
     {
