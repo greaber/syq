@@ -2997,9 +2997,15 @@ impl Planner<'_> {
             .collect();
         let queue = {
             let paths: Vec<&[u8]> = mkdirs.iter().map(apply_path).collect();
+            // A restricted receiver keeping what exists (`--if-exists=keep`)
+            // creates every directory only where nothing is, and looks each
+            // one up first, which fails while its new parent is in the same
+            // request.
+            let all_no_replace =
+                self.opts.restricted_receiver && self.opts.preserve_existing_directory_metadata;
             let no_replace: Vec<bool> = mkdirs
                 .iter()
-                .map(|op| op_condition(op) != TargetCondition::Any)
+                .map(|op| all_no_replace || op_condition(op) != TargetCondition::Any)
                 .collect();
             super::directory_stream::DirectoryQueue::new(&paths, &no_replace)
         };

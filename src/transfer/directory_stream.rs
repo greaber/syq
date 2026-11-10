@@ -40,7 +40,8 @@ pub(super) struct DirectoryQueue {
     levels: Vec<Level>,
     /// The first level with directories left.
     first: usize,
-    /// Each directory's parent, when this batch creates it too.
+    /// The nearest of each directory's ancestors that this batch creates
+    /// too. Those between them exist already: the scan found them.
     parent: Vec<Option<usize>>,
     /// Which directories are created only where nothing is.
     no_replace: Vec<bool>,
@@ -77,15 +78,19 @@ impl DirectoryQueue {
             .collect();
         let parent: Vec<Option<usize>> = paths
             .iter()
-            .enumerate()
-            .map(|(i, path)| {
-                parent_of(path)
-                    .and_then(|parent| index.get(parent).copied())
-                    .filter(|&parent| parent != i)
+            .map(|path| {
+                let mut current: &[u8] = path;
+                while let Some(above) = parent_of(current).filter(|above| *above != current) {
+                    if let Some(&found) = index.get(above) {
+                        return Some(found);
+                    }
+                    current = above;
+                }
+                None
             })
             .collect();
-        // Parents have fewer components than their children, so this order
-        // finds every parent's level before its children's.
+        // Ancestors have fewer components than their descendants, so this
+        // order finds every parent's level before its children's.
         let mut order: Vec<usize> = (0..paths.len()).collect();
         order.sort_by_key(|&i| paths[i].iter().filter(|&&c| c == b'/').count());
         let mut level = vec![0usize; paths.len()];
@@ -466,6 +471,15 @@ mod tests {
         assert!(queue.next(1, &sizes, usize::MAX).is_empty());
         queue.answered(&[0, 3]);
         assert_eq!(queue.next(4, &sizes, usize::MAX), vec![1, 2]);
+
+        // A directory the scan found between two new ones, say made by
+        // another process meanwhile, does not hide the one above it.
+        let (mut queue, sizes) =
+            queued_no_replace(&["/d/a", "/d/x", "/d/a/b/c"], &["/d/a", "/d/x", "/d/a/b/c"]);
+        assert_eq!(queue.next(2, &sizes, usize::MAX), vec![0, 1]);
+        assert!(queue.next(2, &sizes, usize::MAX).is_empty());
+        queue.answered(&[0, 1]);
+        assert_eq!(queue.next(2, &sizes, usize::MAX), vec![2]);
 
         // A request ends at the first directory that waits.
         let (mut queue, sizes) =
