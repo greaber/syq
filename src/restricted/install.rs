@@ -431,10 +431,10 @@ pub(crate) fn remote_install() -> Result<()> {
     Ok(())
 }
 
-/// Install `request` for `account`. A failure before anything of this
-/// enrollment is written, its state or its `authorized_keys` line, is a
-/// refusal: nothing on the server names the enrolling machine's entry key,
-/// so that machine need not keep it for a retry or a revocation.
+/// Install `request` for `account`. A failure before this request writes
+/// anything of the enrollment, its state or its `authorized_keys` line, is
+/// a refusal. Then this request left nothing on the server that names its
+/// entry key, though an earlier one for the same enrollment may have.
 pub(super) fn install_for_account(
     request: &InstallRequest,
     account: &str,

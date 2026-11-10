@@ -1333,8 +1333,10 @@ fn install_over_route(
     if let Some(error) = refused {
         if stored_pending {
             remove_local_enrollment(&plan.directory)?;
+            bail!(error);
         }
-        bail!(error);
+        // An earlier attempt may have installed what this one did not.
+        bail!("{error}; retry, or run `syq receiver revoke {}`", plan.id);
     }
     if !status.success() {
         let reason = fs::read_to_string(&trace_path)

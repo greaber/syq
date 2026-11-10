@@ -160,8 +160,9 @@ enum InstallResponse {
     /// A refresh found no server state: nothing changed, and the enrolling
     /// machine enrolls under a new ID instead of re-creating the old one.
     StateMissing { version: u16, id: EnrollmentId },
-    /// The server refused the enrollment, for `reason`, before it wrote
-    /// anything of it: no state and no `authorized_keys` line.
+    /// The server refused the enrollment, for `reason`, before this request
+    /// wrote anything of it. State or an `authorized_keys` line that an
+    /// earlier request wrote may remain.
     Refused {
         version: u16,
         id: EnrollmentId,

@@ -29,10 +29,14 @@ use std::time::Duration;
 static SIGNAL_CLEANUP_PATHS: OnceLock<Arc<Mutex<HashSet<PathBuf>>>> = OnceLock::new();
 static SIGNAL_CLEANUP: OnceLock<io::Result<()>> = OnceLock::new();
 
-fn register_signal_cleanup(path: &Path) -> Result<()> {
-    let paths = SIGNAL_CLEANUP_PATHS
+fn signal_cleanup_paths() -> Arc<Mutex<HashSet<PathBuf>>> {
+    SIGNAL_CLEANUP_PATHS
         .get_or_init(|| Arc::new(Mutex::new(HashSet::new())))
-        .clone();
+        .clone()
+}
+
+fn register_signal_cleanup(path: &Path) -> Result<()> {
+    let paths = signal_cleanup_paths();
     let result = SIGNAL_CLEANUP.get_or_init(|| {
         let cleanup_paths = Arc::clone(&paths);
         // Removing a socket directory is quick; it runs before slower
@@ -82,6 +86,20 @@ impl SignalCleanedDir {
     pub(crate) fn new(prefix: &str) -> Result<Self> {
         let directory = private_temp_dir(prefix)?;
         register_signal_cleanup(directory.path())?;
+        Ok(Self(directory))
+    }
+
+    /// A directory removed also when a termination signal ends the process,
+    /// if something in this process already handles those signals as
+    /// `new` does, such as a private broker that does not leave them to its
+    /// caller. It never takes them over itself: a caller that handles them
+    /// to cancel gracefully keeps doing so, and removes it by dropping it.
+    pub(crate) fn when_signals_are_handled(prefix: &str) -> Result<Self> {
+        let directory = private_temp_dir(prefix)?;
+        signal_cleanup_paths()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(directory.path().to_path_buf());
         Ok(Self(directory))
     }
 

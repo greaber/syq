@@ -395,8 +395,10 @@ fn an_interrupted_copy_over_ssh_removes_its_connection_directory() {
         let t = Tmp::new();
         small_tree(&t, 20);
         let ssh = fake_ssh(&t);
-        let tmp = t.path("tmp");
-        fs::create_dir_all(&tmp).unwrap();
+        // Short enough for a control socket below it, as on macOS the
+        // usual temporary root is not.
+        let short = test_support::short_tempdir().unwrap();
+        let tmp = short.path().to_path_buf();
         fs::create_dir_all(t.path("remote-home")).unwrap();
         let staged = t.path("staged");
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
