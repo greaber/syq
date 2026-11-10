@@ -21,7 +21,7 @@ syq cp large-file --to server --as /scratch/benchmark-copy -v \
 | Key | Default | Accepted values |
 |---|---|---|
 | `workers` | Automatic | 1 through 65536 filesystem workers, fewer when there is less work |
-| `comparison-block-size` | 64 KiB for replaced files up to 64 MiB; between machines, automatic for larger ones, from 64 KiB through 4 MiB, or through 256 KiB when copying from a server to this machine | 64 KiB through 64 MiB; filesystem copies only. Comparison can use up to 64 MiB of memory per worker |
+| `comparison-block-size` | 4 MiB; 64 KiB for replaced files up to 64 MiB; automatic for larger files between machines (see [Scattered edits](#scattered-edits-in-existing-files)) | 64 KiB through 64 MiB; filesystem copies only. Comparison can use up to 64 MiB of memory per worker |
 | `request-size` | Automatic, normally up to 4 MiB; at most 2 MiB for streaming | 512 bytes through 64 MiB |
 | `pipeline-depth` | 4; automatic when comparing replaced files over 64 MiB | 1 through 64 outstanding range requests per endpoint per worker |
 | `copy-path` | `auto` | `auto`, `ranges`, `streaming`, `auto-streaming`; see below |
@@ -141,12 +141,12 @@ supports reflinks.
 
 ### Scattered edits in existing files
 
-For a replaced file over 64 MiB, syq chooses the comparison block size as the
-copy runs. Smaller blocks send less around scattered edits, and larger ones
-need fewer requests, so syq uses smaller blocks on slower links and larger ones
-where whole regions changed or the link is fast. When copying from a server to
-this machine, it starts at 256 KiB and only goes smaller. To compare with one
-fixed size instead, for example to see what block size costs on your link:
+Smaller comparison blocks send less data around scattered edits, and larger
+ones need fewer requests. For a replaced file over 64 MiB copied between
+machines, syq adjusts the block size as the copy runs, between 64 KiB and
+4 MiB, or at most 256 KiB when copying from a server to this machine. To
+compare with one fixed size instead, for example to see what block size costs
+on your link:
 
 ```sh
 syq cp --srcs-in source --to host --into destination \
@@ -155,9 +155,8 @@ syq cp --srcs-in source --to host --into destination \
 
 Set `request-size` too, since it otherwise follows the comparison block size.
 In `syq rsync`, `-B` / `--block-size` sets the comparison block size. Setting
-any of `comparison-block-size`, `-B`, `request-size`, `pipeline-depth` or
-`split-min-size` fixes the comparison block: the configured one (4 MiB unless
-you set another), or `request-size` if that is smaller.
+`request-size`, `pipeline-depth` or `split-min-size` also fixes the block:
+4 MiB unless you set another, or `request-size` if that is smaller.
 
 ### Batch size and splitting
 

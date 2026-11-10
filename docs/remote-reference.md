@@ -20,12 +20,11 @@ In syq's default mode, restricted copying, hostB accepts only copies you
 signed; see [Copies between servers](security.md#copies-between-servers). The
 first copy to a server account sets this up there, once for each of your
 machines; this is called enrollment. To do it ahead of time, run
-`syq receiver enroll HOST`. Enrollment needs an SSH key or certificate login.
-A root account can be enrolled, but its receiver serves only downloads: it
-refuses copies that write to the account, and copies between servers that it
-would run. Enroll an account under the name the server gives its user ID:
-another name for the same user, such as `toor` for root, is refused before
-anything is set up.
+`syq receiver enroll HOST`. Enrollment needs an SSH key or certificate login,
+under the account's own name: another name for the same user ID, such as
+`toor` for root, is refused. A root account can be enrolled, but its receiver
+only serves downloads; it refuses copies that write to the account or that it
+would run.
 
 Enrollment adds one line to the server's `~/.ssh/authorized_keys`. Its key,
 the entry key, can only start syq's receiver, and its comment,
@@ -69,41 +68,29 @@ When the key syq recorded can no longer sign, for example because you removed
 it from your agent after switching keys, the next copy logs in again and
 trusts your current key. While the old key can still sign, syq keeps using it;
 run `syq receiver enroll HOST` to switch to your current login key now.
-`syq receiver list` shows the key each enrollment trusts. After you change syq
-builds, the next copy logs in to update the receiver to the new build. The
-receiver runs one build at a time, so if you switch back and forth between two
-builds on your laptop, for example a development build and an installed one,
-the first copy after each switch logs in again. A server that
-reaches the receiver itself, to run or coordinate a copy, needs the same syq
-build as the machine that approves the copy, whose build the receiver follows.
-Otherwise the receiver refuses it and says which builds it saw; update syq on
-whichever of the two machines is older.
+`syq receiver list` shows the key each enrollment trusts.
+
+The receiver runs one syq build at a time. After you change builds, the next
+copy logs in to update it, so switching back and forth between two builds,
+such as a development build and an installed one, logs in after each switch.
+If another syq on your laptop updated the receiver after this one last did, a
+copy between two servers that you start on your laptop updates it back and
+tries once more; the receiver runs at most one of the two attempts. A server
+that connects to the receiver itself, to run or coordinate a copy, needs the
+same build as the machine that approves the copy. Otherwise the receiver
+refuses the copy and names both builds; update syq on whichever machine is
+older.
 
 If `syq receiver list` shows an enrollment as `unusable`, this syq can't read
 the record your laptop keeps for it, for example because a newer syq wrote it.
-Its line in the server's `authorized_keys` still works, so this syq won't set
-up another enrollment for that account. When the record doesn't say which
-account it's for, as when it's damaged, syq won't set up a new enrollment for
-any account until you clear it. Use or revoke the enrollment with the syq that
-made it. Without that syq, delete the line containing `syq-enrollment:ID` from
-the server's `~/.ssh/authorized_keys`, then delete the enrollment's directory
-on your laptop, which syq names. If only the directory's owner or permissions
-changed, for example after restoring a backup, give it back to your account
-with mode 0700, and its files mode 0600, instead.
-
-A copy between two servers that you start on your laptop can also find the
-receiver running another build than your laptop recorded, for example after
-another syq on your laptop updated it. Then syq updates the receiver to its
-own build and runs the copy once more, signed as the same copy with the same
-time limits, so the receiver, keeping its record of the copies it ran, runs
-at most one of the two. It does this only when the server running the copy
-runs your laptop's build, as it does unless you pass `--syq-path` or
-`--no-bootstrap`, and never for a dry run. It doesn't when the enrollment was
-revoked or set up again meanwhile, when hostB's record of the copies it ran
-is damaged or was recreated after the copy was first approved (by your
-laptop's clock and hostB's, to the second), or when the copy may no longer
-start; syq then reports the refusal, and running the copy again starts
-afresh.
+Its line in the server's `authorized_keys` still works, so syq won't enroll
+that account again, or any account if the record doesn't say which one it's
+for, until you clear it. Use or revoke the enrollment with the syq that made
+it. Without that syq, delete the line containing `syq-enrollment:ID` from the
+server's `~/.ssh/authorized_keys`, then the enrollment's directory on your
+laptop, which syq names. If only the directory's owner or permissions changed,
+for example after restoring a backup, give it back to your account with mode
+0700, and its files mode 0600, instead.
 
 Only `syq receiver revoke ID`, or deleting syq's line from `authorized_keys`,
 ends an enrollment. Removing or revoking your login key, certificate, or
@@ -120,19 +107,18 @@ changes hostB makes: files written, directories, links and special files
 created, metadata changes, and deletions. The copy must start within 24 hours
 of authorization and finish within seven days of it.
 
-A copy between two servers can name up to 1,024 sources, like any copy. Long
-paths lower that number in two cases. A restricted copy's signed command can
-be at most 256 KiB, so 1,024 sources fit when their paths average up to about
-250 characters. With `--detach`, `--syq-path` or `--no-bootstrap`, the server
-that runs the copy gets the sources on its command line, which holds 128 KiB,
-so 1,024 sources fit only when their paths average up to about 90 characters.
+A copy between two servers can name up to 1,024 sources, like any copy, but
+long paths lower that number. A restricted copy's signed command holds at most
+256 KiB, enough for 1,024 paths of about 250 characters. With `--detach`,
+`--syq-path` or `--no-bootstrap`, the sources go on the command line of the
+server that runs the copy, which holds 128 KiB, or about 90 characters for
+each of 1,024 paths.
 
 Restricted copies cannot use `--performance-tuning workers=N` above 128, and
 `syq rm` cannot go through the receiver; use a normal SSH login for those.
-With `--no-tcp-encryption`, the receiver accepts unencrypted TCP data only
-because the signed command asks for it, and an approval prompt for such a copy
-warns that anyone on the network between the servers can read or change the
-files.
+`--no-tcp-encryption` works, and an approval prompt for such a copy warns that
+anyone on the network between the servers can read or change the files; see
+[Network security](security.md#network-security).
 
 As in any copy, a symlink in the destination path you give stops the copy
 unless you pass `--follow-dst`. With it, hostB follows the links, including
@@ -155,8 +141,8 @@ preview. The reports cannot prove that hostA sent the right files; see
 ## Other authentication modes
 
 When restricted copying does not fit, for example because hostB should pull
-from hostA, choose another mode. Each gives the server running the copy (hostA unless you set
-`--coordinate-at`) more authority:
+from hostA, choose another mode. Each gives the server running the copy
+(hostA unless you set `--coordinate-at`) more authority:
 
 | Option | Authority available to the server running the copy |
 |---|---|
@@ -182,11 +168,10 @@ syq cp --coordinate-at dst --peer-auth own-credentials --from hostA data --to ho
 job may still be running. The server running the copy needs `/bin/kill` and
 either `setsid` or `perl`.
 
-A detached restricted copy runs until it finishes, until the seven days it
-has to finish run out, or until you revoke hostB's enrollment. HostA deletes
-the entry key when the copy ends. Your laptop doesn't see hostB's reports of
-a detached copy, so the log on hostA is the copy's only record, and it is only
-as trustworthy as hostA.
+A detached restricted copy runs until it finishes, its seven days to finish
+run out, or you revoke hostB's enrollment. Your laptop doesn't see hostB's
+reports of it, so the log on hostA is the copy's only record, and only as
+trustworthy as hostA.
 
 ## Authorization selection
 
@@ -201,11 +186,11 @@ A refusal or failure on the receiving machine ends the copy.
 
 Per-copy approval does not work for an upload to a root login, nor with
 `--detach`, `--rsh`, `--syq-path`, `--no-bootstrap`, or other `--peer-auth` or
-`--coordinate-at` values, and an approved upload
-cannot preserve hard links, ACLs, extended attributes, or access or birth
-times, or use `--open-noatime` or `--sparse`. Such copies need this machine's
-own SSH access. The receiving machine's copy limits apply, including its
-`--max-delete` and `--max-entries`.
+`--coordinate-at` values, and an approved upload cannot preserve hard links,
+ACLs, extended attributes, or access or birth times, or use `--open-noatime`
+or `--sparse`. Such copies need this machine's own SSH access. The receiving
+machine's copy limits apply, including its `--max-delete` and
+`--max-entries`.
 
 The receiving machine sets up the other server's
 [enrollment](#enrollment), the destination of an upload or the source of a
@@ -275,13 +260,13 @@ the command that started it ends.
 
 The copy supports `--no-tcp`, `--no-tcp-encryption` and `--results`, and your
 server checks [results from the destination](#results-from-the-destination).
-It does not support `--mapping`, whose contents the approving machine never sees,
-`--coordinate-at dst`, `--detach`, `--rsh`, `--syq-path`, `--no-bootstrap`, or
-other `--peer-auth` values, and neither login may be root. As for an upload, a
-saved choice does not apply to a copy with one of these options:
-your server's own SSH access runs it. An explicit `--auth-from` with one of
-them is refused. [Restricted-copy limits](#limits-and-unsupported-options)
-apply. With `--coordinate-at local`, file data goes through your server
+It does not support `--mapping`, whose contents the approving machine never
+sees, `--coordinate-at dst`, `--detach`, `--rsh`, `--syq-path`,
+`--no-bootstrap`, or other `--peer-auth` values, and neither login may be
+root. As for an upload, a saved choice does not apply to a copy with one of
+these options: your server's own SSH access runs it. An explicit
+`--auth-from` with one of them is refused.
+[Restricted-copy limits](#limits-and-unsupported-options) apply. With `--coordinate-at local`, file data goes through your server
 instead, which then needs
 [account access](persistence-reference.md#account-access) to both servers.
 

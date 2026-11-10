@@ -50,10 +50,9 @@ Syq's own commands follow a symlink only in a path you supply, and only when you
 ask; links found inside a directory are never followed. (`syq rsync` instead
 follows the rule from
 [rsync 3.5.0's security design](https://github.com/RsyncProject/rsync/blob/v3.5.0/SECURITY.md#symlink-race-safe-path-resolution):
-it follows a link in a supplied path that root or the running user owns, or,
-with `--insecure-links`, which applies to local paths only, any link except
-one another user made in a shared directory such as `/tmp`, as described
-below.)
+it follows a link in a supplied path that root or the running user owns. With
+`--insecure-links`, which applies to local paths only, it follows any such
+link except those described below the table.)
 
 | Where the symlink appears | Treatment |
 |---|---|
@@ -63,11 +62,10 @@ below.)
 | Inside a destination directory | Not followed. A copied file can replace the link, but a copied directory cannot use it as a directory |
 
 `--follow` enables both. Even then, syq doesn't follow a link that another
-user made in a shared directory like `/tmp`, which anyone can add to but where
-only a file's owner can remove it (the sticky bit), unless that directory's
-owner made it: such a link could send a copy anywhere you can write. Linux
-applies the same rule to every program (`fs.protected_symlinks`), and syq
-applies it on every system, including copies through an enrollment or a
+user made in a shared sticky directory such as `/tmp`, unless that directory's
+owner made it, since such a link could send a copy anywhere you can write.
+This is the rule Linux's `fs.protected_symlinks` applies to every program;
+syq applies it on every system, also in copies through an enrollment or a
 receiving name. See [Symlinks](reference.md#symlinks) for examples.
 
 <a id="limits-to-keep-in-mind"></a>
@@ -140,12 +138,12 @@ Remote copies encrypt and authenticate file data, over SSH and over syq's
 direct TCP connections. `--no-tcp-encryption` turns this off for TCP, so
 anyone on the network can read or alter the traffic, including its
 authentication token. Use it only on a network you trust. A restricted
-receiver accepts unencrypted TCP only when the signed command asks for it;
-someone on the network can then change what the copy writes, within what the
-signed command allows. When the approved command passes `--no-tcp`, neither a
-restricted receiver nor your laptop sets up TCP for that copy, so its data
-goes only over SSH. Copies to and from your laptop through a receiving
-connection always encrypt their data.
+receiver accepts unencrypted TCP only when the signed command passes
+`--no-tcp-encryption`; someone on the network can then change what the copy
+writes, within what the command allows. Copies to and from your laptop through
+a receiving connection always encrypt their data. When the command you signed
+or approved passes `--no-tcp`, neither a restricted receiver nor your laptop
+sets up TCP for the copy.
 
 For TCP, a server lists addresses to connect to, and syq also tries the
 server's SSH address. Syq doesn't look up names a server lists, and doesn't
@@ -213,30 +211,23 @@ The protection has four parts:
 1. **A restricted entry point on hostB.** The first copy uses your normal SSH
    login to install syq's receiver and add one `authorized_keys` line, whose
    entry key can only start the receiver, with SSH forwarding disabled. The
-   receiver refuses to write or run a copy as root. A root account can serve
-   downloads, which can then read any file on the machine the copy names, and
-   its receiver runs as root whenever a server that holds the entry key
-   connects, before it has checked a signature.
+   receiver refuses to write or run a copy as root. An enrolled root account
+   can still serve downloads, which can read any file on the machine that the
+   copy names, and its receiver runs as root, before checking a signature,
+   whenever a server that holds the entry key connects.
 2. **Only the entry key for hostA.** With each copy, hostA receives the entry
    key and uses it to reach the receiver, checking hostB's host key as described
-   [below](#how-hosta-checks-hostbs-key). As in any copy, some of its
-   connections can share one SSH login that the copy opens itself, through a
-   socket in a private directory, and that ends with the copy; every session
-   on that login still runs only the receiver. Syq on hostA deletes the key when the
+   [below](#how-hosta-checks-hostbs-key). Syq on hostA deletes the key when the
    copy ends, also when you interrupt it or its terminal closes; only a copy
    killed before it can clean up, for example with `kill -9`, leaves it behind,
    in a private temporary directory named `syq-receiver-hosts-…`. The entry
    key authorizes nothing by itself: anyone who holds it, such as a server that
    was compromised during an earlier copy and kept it, still needs a copy you
-   newly signed, and the receiver checks that signature before it looks at
-   anything else the connection sends, apart from which syq build sent it.
-   Such a server can, however, keep some of the receiver's connections
-   waiting. At most 32 can wait to be checked at once, and at most 16 of them
-   from one address; for IPv6, from one /64 network. So a server with one
-   address slows new copies started from other addresses but does not stop
-   them. Machines that share an address, such as those behind one NAT or on
-   one IPv6 /64, share its 16, and a server that connects from two addresses,
-   such as over both IPv4 and IPv6, can make new copies fail until you revoke
+   newly signed, and the receiver checks that signature before reading the
+   rest of the request. Such a server can, however, keep the receiver's
+   connections waiting. That slows new copies, and can make them fail when the
+   server connects from more than one address, or when they start from a
+   machine that shares its address, such as behind one NAT, until you revoke
    the enrollment and enroll again. Don't add the entry key to any other
    `authorized_keys` file: hostA holds it, so it would gain that access too.
    Your laptop stores it unencrypted.
@@ -541,10 +532,10 @@ from it.
 Reads are not limited further within the account: a command that names
 hostB's `~/.ssh` or syq's own files there, or a symlink it follows to them,
 sends those files like any other, as a login to the account could. The prompt
-shows the paths, and says when the command follows symlinks and when your
-laptop logs in as root, so file permissions don't limit the reads. The server can
-also ask for hashes of approved files; these do not count toward the data
-limit, so that limit does not bound what the server can learn from them. Once
+shows the paths, and says when the command follows symlinks and when the
+account is root, whose reads file permissions don't limit. The server can also
+ask for hashes of approved files; these do not count toward the data limit,
+so that limit does not bound what the server can learn from them. Once
 approved, the copy goes on without your laptop until it finishes, someone
 interrupts it on the server, its signature's seven days run out, or you revoke
 the enrollment.
@@ -630,17 +621,14 @@ a source server. **Allow** lasts for the current provider connection;
 profile and domain. Stopping receiving prevents further syq authorizations but
 does not revoke SSH access to the provider.
 
-A provider can also approve each
-[copy between two other servers](remote-reference.md#copies-between-two-other-servers)
-separately, as your laptop does for hostX above, and never approves one by
-itself. Its prompt says that it can't confirm which server is asking.
-What you approve goes back only over the provider login that sent that
-request, and it allows only the copy the prompt shows, once, as the copy's
-signed command states. So if two servers send similar requests and you approve
-the wrong one, the server that sent it gets what that prompt showed: like
-hostX, it receives both entry keys and hostC's signed copy, so it could write
-content of its choosing to the destination shown, within that approval's
-limits. It can't use another request's approval, change the accounts or
-paths, or reuse the approval. A server that can log in to the provider account
-could already do more than that without asking, so the prompt guards against
-mistakes, not against those servers.
+A provider can also approve a
+[copy between two other servers](remote-reference.md#copies-between-two-other-servers),
+asking each time, as your laptop does for hostX above. Its prompt says that it
+can't confirm which server is asking. An approval goes back only over the
+provider login that sent the request, and allows only the copy the prompt
+shows, once. So if you approve the wrong one of two similar requests, the
+server that sent it gets what that prompt showed: like hostX, it could write
+content of its choosing to the destination shown, within the approval's
+limits, but it can't change the accounts or paths. Any server that can log in
+to the provider account could already do more than that, so the prompt guards
+against mistakes, not against those servers.
