@@ -386,6 +386,56 @@ fn an_interrupted_pull_removes_its_streamed_patch_stage() {
     }
 }
 
+/// A copy over ssh that a signal ends removes the private directory of the
+/// SSH connection it shares. The ssh client that served it removes only its
+/// socket, which would leave the directory behind, empty.
+#[test]
+fn an_interrupted_copy_over_ssh_removes_its_connection_directory() {
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        let t = Tmp::new();
+        small_tree(&t, 20);
+        let ssh = fake_ssh(&t);
+        let tmp = t.path("tmp");
+        fs::create_dir_all(&tmp).unwrap();
+        fs::create_dir_all(t.path("remote-home")).unwrap();
+        let staged = t.path("staged");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args(["cp", "--no-progress", "--no-tcp", "--syq-path"])
+            .arg(env!("CARGO_BIN_EXE_syq"))
+            .args(["--performance-tuning", "workers=1,batch-files=8"])
+            .args(["--srcs-in", &t.s("src"), "--to", "fake.example", "--into"])
+            .arg(t.path("dst"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+            )
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
+            .env("TMPDIR", &tmp)
+            .env_remove("XDG_RUNTIME_DIR")
+            .env("SYQ_TEST_SMALL_STAGE_READY_FILE", &staged)
+            .env("SYQ_TEST_SMALL_STAGE_CONTINUE_FILE", t.path("never"));
+        let connections = || -> Vec<String> {
+            fs::read_dir(&tmp)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("syq-ssh-"))
+                .collect()
+        };
+        let mut child = start_job(&mut command);
+        wait_for_confinement_marker(&mut child, &staged, "staged small files");
+        assert_eq!(connections().len(), 1, "{signal}");
+        signal_group(&child, signal);
+        let (status, stderr, _) = finish(child, Duration::from_secs(20));
+        assert_eq!(status.signal(), Some(signal), "{stderr}");
+        assert_eq!(connections(), Vec::<String>::new(), "{signal}: {stderr}");
+    }
+}
+
 /// Interrupt a copy whose receiver's cleanup then stalls in a test barrier,
 /// so that only its cap can end it:
 ///

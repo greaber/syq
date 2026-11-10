@@ -571,7 +571,6 @@ fn connect_receiving(
     replace: crate::receive_service::Replace,
     login: Login,
 ) -> Result<()> {
-    let when_idle = replace == crate::receive_service::Replace::WhenIdle;
     let unattended = login == Login::Unattended;
     let remote = crate::conn::RemoteSpec {
         local_process: false,
@@ -631,7 +630,7 @@ fn connect_receiving(
     };
     // Tests stand for work after the login that takes too long.
     #[cfg(debug_assertions)]
-    if let Some(millis) = when_idle
+    if let Some(millis) = (replace == crate::receive_service::Replace::WhenIdle)
         .then(|| std::env::var("SYQ_TEST_SWITCH_STALL_MS").ok())
         .flatten()
         .and_then(|millis| millis.parse().ok())

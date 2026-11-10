@@ -1311,7 +1311,9 @@ fn copy_bounded_watched(
 }
 
 /// Copy at most `limit` bytes; a longer source fails instead of being
-/// truncated to something that might still look complete.
+/// truncated to something that might still look complete. Only test
+/// fixtures are copied without a stall watch.
+#[cfg(any(test, debug_assertions))]
 fn copy_bounded(source: &mut impl Read, destination: &mut impl Write, limit: u64) -> Result<u64> {
     let copied = std::io::copy(&mut source.take(limit.saturating_add(1)), destination)?;
     if copied > limit {

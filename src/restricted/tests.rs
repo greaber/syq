@@ -393,7 +393,49 @@ fn installed(response: InstallResponse) -> (u64, bool) {
             (generation, changed)
         }
         InstallResponse::StateMissing { .. } => panic!("install reported missing state"),
+        InstallResponse::Refused { reason, .. } => panic!("install refused: {reason}"),
     }
+}
+
+/// Why an install was refused before it wrote anything.
+fn refused(response: InstallResponse) -> String {
+    match response {
+        InstallResponse::Refused { reason, .. } => reason,
+        other => panic!("install was not refused: {other:?}"),
+    }
+}
+
+/// An install that fails before it writes anything of the enrollment, here
+/// for an `authorized_keys` it could not write, says that it was refused:
+/// no state names the enrolling machine's entry key, nor does any line.
+#[test]
+fn an_install_that_fails_before_writing_is_refused() {
+    if unsafe { libc::geteuid() } == 0 {
+        // Root writes whatever the modes say.
+        return;
+    }
+    let (account, home) = enrollment_home();
+    let home = home.path();
+    let ssh = home.join(".ssh");
+    fs::create_dir_all(&ssh).unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o500)).unwrap();
+    let id = EnrollmentId::random();
+    let entry = generate_test_key("entry").unwrap();
+    let login = generate_test_key("login").unwrap();
+    let request = install_request(&account, id, &entry, &login, false);
+    let reason = refused(install_for_account(&request, &account, home).unwrap());
+    assert!(
+        reason.contains("restricted copying needs a writable"),
+        "{reason}"
+    );
+    assert!(!enrollment_state(home, id).exists());
+    assert!(!ssh.join("authorized_keys").exists());
+    // Once it can, the same enrollment installs.
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        installed(install_for_account(&request, &account, home).unwrap()),
+        (1, true)
+    );
 }
 
 /// The entry key only starts the receiver, so it must be a key hostA can
@@ -533,8 +575,8 @@ fn an_unusable_record_of_used_grants_is_recreated_under_a_new_generation() {
     // request keeps the record or fails, changing nothing.
     let mut keeping = install_request(&account, id, &entry, &login, true);
     keeping.keep_used = true;
-    let error = install_for_account(&keeping, &account, home).unwrap_err();
-    assert!(format!("{error:#}").contains("is unusable"), "{error:#}");
+    let reason = refused(install_for_account(&keeping, &account, home).unwrap());
+    assert!(reason.contains("is unusable"), "{reason}");
     assert!(!replay.exists());
     let generation = |home: &Path| {
         read_receiver_config(&enrollment_state(home, id))

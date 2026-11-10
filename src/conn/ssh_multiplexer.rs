@@ -2,10 +2,11 @@ use super::*;
 
 #[derive(Debug)]
 pub(crate) struct SshMultiplexer {
-    /// Owns the per-run private socket directory; None in persistent mode,
-    /// where the socket lives in the shared per-user runtime directory and
-    /// deliberately outlives this process.
-    pub(super) _directory: Option<tempfile::TempDir>,
+    /// Owns the per-run private socket directory, removed also when a
+    /// signal ends the run; None in persistent mode, where the socket lives
+    /// in the shared per-user runtime directory and deliberately outlives
+    /// this process.
+    pub(super) _directory: Option<crate::private_broker::SignalCleanedDir>,
     pub(super) path: PathBuf,
     pub(super) domain: Option<crate::persistence::Domain>,
     /// A managed persistence scope keeps its control master alive, so later
@@ -383,7 +384,7 @@ pub(super) fn background_notice(
 
 impl SshMultiplexer {
     pub(crate) fn new() -> Result<Self> {
-        let directory = crate::private_broker::private_temp_dir("syq-ssh-")
+        let directory = crate::private_broker::SignalCleanedDir::new("syq-ssh-")
             .context("create private SSH control directory")?;
         let path = directory.path().join("socket");
         crate::persistence::validate_openssh_socket_path(&path)?;

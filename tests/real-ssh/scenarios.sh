@@ -307,6 +307,49 @@ python3 /usr/local/libexec/syq-test-receiver-old-openssh.py --rsa-only
 printf 'case: restricted SSH worker handshake, revocation, and resume\n'
 python3 /usr/local/libexec/syq-test-receiver-revoke.py --no-tcp
 
+printf 'case: an enrollment that installs nothing leaves nothing pending\n'
+# Refused by the server before it writes anything, here for a ~/.ssh it
+# cannot write, or with no syq to install: nothing names the entry key, so
+# no pending enrollment stays on this machine, and nothing on the server.
+for refused_case in unwritable unavailable; do
+    if [ "$refused_case" = unwritable ]; then
+        ssh longhome@destination 'chmod 0500 ~/.ssh'
+        refused_status=0
+        syq receiver enroll longhome@destination \
+            > /tmp/syq-refused-enrollment.log 2>&1 || refused_status=$?
+        ssh longhome@destination 'chmod 0700 ~/.ssh'
+        refused_expected='longhome@destination refused the enrollment: restricted copying needs a writable'
+    else
+        refused_status=0
+        SYQ_TEST_MANAGEMENT_BUILD_UNAVAILABLE=1 syq receiver enroll longhome@destination \
+            > /tmp/syq-refused-enrollment.log 2>&1 || refused_status=$?
+        refused_expected='download the syq to install: unavailable (test)'
+    fi
+    refused_output=$(cat /tmp/syq-refused-enrollment.log)
+    if [ "$refused_status" -eq 0 ]; then
+        printf '%s: enrollment succeeded\n%s\n' "$refused_case" "$refused_output" >&2
+        exit 1
+    fi
+    case "$refused_output" in
+        *"remains pending"*)
+            printf '%s: enrollment left pending\n%s\n' "$refused_case" "$refused_output" >&2
+            exit 1 ;;
+        *"$refused_expected"*) ;;
+        *)
+            printf '%s: unexpected enrollment failure\n%s\n' "$refused_case" "$refused_output" >&2
+            exit 1 ;;
+    esac
+    case "$(syq receiver list)" in
+        *longhome@destination*)
+            printf '%s: enrollment listed\n' "$refused_case" >&2
+            syq receiver list >&2
+            exit 1 ;;
+    esac
+    ssh longhome@destination '! grep -s -q syq-enrollment: ~/.ssh/authorized_keys &&
+        test -z "$(ls -A ~/.local/share/syq/enrollments 2>/dev/null)" &&
+        ! ls -a ~/.local/lib/syq 2>/dev/null | grep -q "^.syq-stage"'
+done
+
 printf 'case: long receiver home supports explicit SSH and blocked-TCP fallback\n'
 ssh longhome@destination 'test "${#HOME}" -gt 36; mkdir -p /tmp/syq-long-home'
 make_tree source /tmp/syq-real-ssh/long-home-source long-home
