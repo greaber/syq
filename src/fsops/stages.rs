@@ -331,12 +331,14 @@ impl Finalizing {
     /// The Finalize published the file, as `identity`: remember that as one
     /// of the last files `connection` published, before a Finalize waiting
     /// for this one looks. Nothing is remembered for a copy that ended
-    /// meanwhile: nothing would forget it.
+    /// meanwhile: nothing would forget it. Nor while a newer file is held
+    /// for the same name, which a Finalize publishes instead: if it were let
+    /// go unpublished, this one's identity would answer for it.
     pub(super) fn published(&self, connection: u64, identity: Option<(u64, u64)>) {
         let key = &self.0;
         let mut guard = registry();
         let registry = &mut *guard;
-        if registry.finalizing.get(key) != Some(&false) {
+        if registry.finalizing.get(key) != Some(&false) || registry.held.contains_key(key) {
             return;
         }
         registry.forget_published(key);
@@ -617,6 +619,12 @@ mod tests {
         finalizing.published(new_connection(), Some((1, 2)));
         drop(finalizing);
         assert!(repeated(held).is_none());
+        // Let go unpublished, the newer file leaves no publication for a
+        // Finalize to be answered with.
+        drop(take(held));
+        assert!(finalize(held).is_none());
+        assert!(repeated(held).is_none());
+        hold(held, &name, &file, None, true, 1).unwrap();
         let (newer, finalizing) = taken(finalize(held));
         assert!(newer.relative == name);
         finalizing.published(new_connection(), Some((3, 4)));
