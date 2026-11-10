@@ -1109,12 +1109,13 @@ while [ "$#" -gt 0 ]; do
 done
 shift
 if [ -n "$independent" ]; then
-    timer=
-    trap 'if [ -n "$timer" ]; then kill "$timer"; fi; exit 143' TERM
+    # The shell sets $! as it starts the timer, before it runs the trap for
+    # a SIGTERM that came meanwhile. A variable set on the next line could
+    # still be empty then, leaving the timer to hold the login's output open.
+    trap 'if [ -n "$!" ]; then kill "$!"; fi; exit 143' TERM
     sleep "$FAKE_WORKER_LOGIN_SECONDS" &
-    timer=$!
-    printf '%s %s\n' "$$" "$timer" >> "$FAKE_WORKER_LOGINS"
-    wait "$timer"
+    printf '%s %s\n' "$$" "$!" >> "$FAKE_WORKER_LOGINS"
+    wait "$!"
     trap - TERM
 fi
 HOME="$FAKE_REMOTE_HOME"
