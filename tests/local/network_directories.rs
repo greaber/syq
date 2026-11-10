@@ -86,9 +86,9 @@ fn files_go_to_workers_before_the_last_directory_exists() {
     }
 }
 
-#[test]
-fn pruning_hard_links_and_directory_times_are_as_without_a_network_destination() {
-    let t = Tmp::new();
+/// A tree with a hard link and old directory times, and two destinations
+/// holding extras: `dst-network` and `dst-local`.
+fn tree_with_extras(t: &Tmp) {
     write(&t.path("src/a/one"), b"one");
     write(&t.path("src/a/b/two"), b"two");
     write(&t.path("src/c/three"), b"three");
@@ -100,21 +100,43 @@ fn pruning_hard_links_and_directory_times_are_as_without_a_network_destination()
         write(&t.path(&format!("{destination}/a/extra")), b"extra");
         write(&t.path(&format!("{destination}/gone/extra")), b"extra");
     }
+}
+
+fn rsync_into(t: &Tmp, flags: &str, destination: &str, network: bool) {
+    let mut command = compat_command();
+    command.args([
+        flags,
+        "--delete",
+        "--no-progress",
+        &t.s("src/"),
+        &t.s(destination),
+    ]);
+    if network {
+        command.env(NETWORK.0, NETWORK.1);
+    }
+    assert_output_ok(&command.run().unwrap());
+}
+
+#[test]
+fn pruning_and_directory_times_are_as_without_a_network_destination() {
+    let t = Tmp::new();
+    tree_with_extras(&t);
     for (destination, network) in [("dst-network", true), ("dst-local", false)] {
-        let mut command = compat_command();
-        command.args([
-            "-aH",
-            "--delete",
-            "--no-progress",
-            &t.s("src/"),
-            &t.s(destination),
-        ]);
-        if network {
-            command.env(NETWORK.0, NETWORK.1);
-        }
-        assert_output_ok(&command.run().unwrap());
+        rsync_into(&t, "-a", destination, network);
         // Extras are pruned, and each directory has its source's time: its
         // metadata came after its contents.
+        assert_same_tree(&t.path("src"), &t.path(destination));
+    }
+}
+
+#[test]
+fn hard_links_are_as_without_a_network_destination() {
+    // A copy that keeps hard links plans every file before copying any, so
+    // it creates its directories as on a local filesystem.
+    let t = Tmp::new();
+    tree_with_extras(&t);
+    for (destination, network) in [("dst-network", true), ("dst-local", false)] {
+        rsync_into(&t, "-aH", destination, network);
         assert_same_tree(&t.path("src"), &t.path(destination));
         assert_eq!(
             fs::metadata(t.path(&format!("{destination}/a/one")))
