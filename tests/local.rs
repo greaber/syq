@@ -661,10 +661,12 @@ fn widest_destination_lookup(lookups: &str) -> usize {
 }
 
 fn assert_output_ok(out: &Output) {
+    // The status names the signal, and any core dump, of a process that a
+    // signal ended.
     assert!(
         out.status.success(),
-        "syq failed: status {:?}\nstdout:\n{}\nstderr:\n{}",
-        out.status.code(),
+        "syq failed: {}\nstdout:\n{}\nstderr:\n{}",
+        out.status,
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
