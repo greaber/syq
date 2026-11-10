@@ -9933,6 +9933,7 @@ fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
     let begin = |patch: &proto::SmallPatch| Request::PatchBegin {
         patch: Box::new(patch.clone()),
         data_len: patch.new_bytes(),
+        compared_in: 0,
     };
     let piece = |data: &[u8]| Request::PatchData {
         data: data.to_vec().into(),
@@ -9984,6 +9985,7 @@ fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
             Request::PatchBegin {
                 patch: Box::new(carrying),
                 data_len: data.len() as u64,
+                compared_in: 0,
             },
             "a streamed patch carries its data in pieces",
         ),
@@ -10140,6 +10142,7 @@ fn a_streamed_patch_is_refused_wherever_a_batch_patch_is() {
     let begin = |patch: proto::SmallPatch| Request::PatchBegin {
         data_len: patch.new_bytes(),
         patch: Box::new(patch),
+        compared_in: 0,
     };
     let streamed_at = |path: &Path, len: u64, block: u64| {
         let mut reuse = vec![Some([0; 32]); len.div_ceil(block) as usize];
@@ -11360,6 +11363,7 @@ fn in_place_updates_need_a_grant_for_them() {
                 &mut Request::PatchBegin {
                     patch: Box::new(patch),
                     data_len: 3,
+                    compared_in: 0,
                 },
                 false,
             )

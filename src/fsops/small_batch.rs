@@ -419,25 +419,123 @@ enum Shown {
     Nothing,
 }
 
-/// The guards of the files the current batch of groups compared on one
-/// connection, by path, each until its patch uses it. The next batch, or
-/// the connection's end, drops those left: files no patch came for.
-#[derive(Default)]
-pub(super) struct ComparedFiles {
-    guards: HashMap<PathBytes, Guard>,
+/// A compared file, as its copy's connections name it: the copy's scope in
+/// this process (`stages::new_scope`), the destination root, and the
+/// requested path.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(super) struct ComparedKey {
+    scope: u64,
+    root: (u64, u64),
+    path: PathBytes,
+}
+
+/// A compared file's guard, the connection whose comparison took it, and
+/// that comparison's batch.
+struct Compared {
+    connection: u64,
     batch: u64,
+    guard: Guard,
+}
+
+/// The guards of the files each connection's current batch of groups
+/// compared. Every connection of a copy runs in this process (`stages`), so
+/// a patch another worker streams on its own connection
+/// (`transfer::small_compare`) finds the guard its file's comparison took.
+fn compared_guards() -> std::sync::MutexGuard<'static, HashMap<ComparedKey, Compared>> {
+    static GUARDS: OnceLock<Mutex<HashMap<ComparedKey, Compared>>> = OnceLock::new();
+    GUARDS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The guards one connection's current batch of groups took, each until a
+/// patch uses it. The connection's next batch, or its end, drops those
+/// left: files no patch came for.
+pub(super) struct ComparedFiles {
+    connection: u64,
+    batch: u64,
+    keys: Vec<ComparedKey>,
+}
+
+impl Default for ComparedFiles {
+    fn default() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self {
+            connection: NEXT.fetch_add(1, Ordering::Relaxed),
+            batch: 0,
+            keys: Vec::new(),
+        }
+    }
+}
+
+impl Drop for ComparedFiles {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 impl ComparedFiles {
     fn begin_batch(&mut self, batch: u64) {
         if batch != self.batch {
-            self.guards.clear();
+            self.release();
             self.batch = batch;
         }
     }
 
-    fn take(&mut self, path: &[u8]) -> Option<Guard> {
-        self.guards.remove(path)
+    /// Drop the guards this connection took that no patch used.
+    fn release(&mut self) {
+        let released: Vec<Compared> = {
+            let mut guards = compared_guards();
+            self.keys
+                .drain(..)
+                .filter_map(|key| {
+                    let ours = guards
+                        .get(&key)
+                        .is_some_and(|compared| compared.connection == self.connection);
+                    ours.then(|| guards.remove(&key)).flatten()
+                })
+                .collect()
+        };
+        drop(released);
+    }
+
+    /// Keep `guard` for the file at `key`, compared in this connection's
+    /// current batch. A guard an earlier comparison left for the same file
+    /// is dropped.
+    fn insert(&mut self, key: ComparedKey, guard: Guard) {
+        let replaced = compared_guards().insert(
+            key.clone(),
+            Compared {
+                connection: self.connection,
+                batch: self.batch,
+                guard,
+            },
+        );
+        self.keys.push(key);
+        drop(replaced);
+    }
+
+    /// The guard this connection's current batch took for the file at
+    /// `key`, or, given `batch`, the one that batch's comparison took on
+    /// any connection.
+    fn take(&mut self, key: Option<&ComparedKey>, batch: Option<u64>) -> Option<Guard> {
+        let key = key?;
+        let mut guards = compared_guards();
+        let compared = guards.get(key)?;
+        if compared.connection != self.connection && Some(compared.batch) != batch {
+            return None;
+        }
+        guards.remove(key).map(|compared| compared.guard)
+    }
+
+    #[cfg(test)]
+    fn holds(&self, key: Option<&ComparedKey>) -> bool {
+        key.is_some_and(|key| {
+            compared_guards()
+                .get(key)
+                .is_some_and(|compared| compared.connection == self.connection)
+        })
     }
 }
 
@@ -721,6 +819,16 @@ impl FsOps {
         hashed
     }
 
+    /// How this copy's connections name the file at `path` they compare.
+    pub(super) fn compared_key(&self, path: &[u8]) -> Option<ComparedKey> {
+        let root = self.destination_root.as_ref()?.identity();
+        Some(ComparedKey {
+            scope: self.stage_scope,
+            root: (root.dev, root.ino),
+            path: path.to_vec(),
+        })
+    }
+
     /// Guard an existing file a patch may build a stage on, before it is
     /// compared: lease it, where its filesystem lets a lease show every
     /// writer (`leases`), when it and its source are both large enough that
@@ -765,7 +873,10 @@ impl FsOps {
                 },
                 label,
             )?;
-            self.compared_files.guards.insert(read.path.clone(), guard);
+            let key = self.compared_key(&read.path);
+            if let Some(key) = key {
+                self.compared_files.insert(key, guard);
+            }
         }
         #[cfg(not(target_os = "linux"))]
         let _ = (file, label);
@@ -976,7 +1087,8 @@ impl FsOps {
             }
         };
         check_patch_layout(patch).map_err(failed(false, false))?;
-        let mut guard = self.compared_files.take(&patch.path);
+        let key = self.compared_key(&patch.path);
+        let mut guard = self.compared_files.take(key.as_ref(), None);
         // A patch that reproduces its file whole keeps it, through the
         // metadata step, as without in-place updates.
         let mut replaced = None;
@@ -4045,12 +4157,28 @@ mod tests {
         Vec<Response>,
         std::result::Result<SmallPatched, SmallPatchError>,
     ) {
+        stream_patch_compared_in(ops, patch, pieces, commit, between, 0)
+    }
+
+    /// `stream_patch`, for a patch whose file batch `compared_in` compared.
+    fn stream_patch_compared_in(
+        ops: &mut FsOps,
+        patch: &SmallPatch,
+        pieces: &[Vec<u8>],
+        commit: bool,
+        between: impl FnOnce(&mut FsOps),
+        compared_in: u64,
+    ) -> (
+        Vec<Response>,
+        std::result::Result<SmallPatched, SmallPatchError>,
+    ) {
         let algorithm = ops.hash_policy.payload_algorithm();
         let mut begin = requested(patch.clone());
         let data_len = std::mem::take(&mut begin.data).len() as u64;
         let mut replies = vec![ops.handle(&Request::PatchBegin {
             patch: Box::new(begin),
             data_len,
+            compared_in,
         })];
         for piece in pieces {
             replies.push(ops.handle(&Request::PatchData {
@@ -4078,76 +4206,96 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_patch_streamed_where_its_file_was_not_compared_reads_back_what_it_reuses() {
+    fn a_patch_streamed_on_another_connection_uses_its_comparisons_lease() {
         // Another worker may stream a patch that one worker's connection
-        // compared, and that connection holds the file's lease. A write
-        // after the comparison, which keeps the file's length and, where
-        // change times are coarse, its fingerprint, breaks that lease, but
-        // the streaming connection has no lease to see it: it reads back the
-        // blocks its stage takes from the file, and the patch fails rather
-        // than publish the write. Without one, the stage is published.
+        // compared, and leased, on a connection of its own. Naming the batch
+        // that compared the file, it takes that lease: if the lease held,
+        // the stage is trusted; a write after the comparison, which keeps
+        // the file's length and, where change times are coarse, its
+        // fingerprint, breaks it, and the stage is read back and the patch
+        // fails. A patch that finds no lease for its comparison, because
+        // the comparing connection's next batch let it go or it names
+        // another batch, has nothing to show such a write: its stage is
+        // read back too.
         use std::os::unix::fs::FileExt as _;
         let block = MIN_HASH_BLOCK_BYTES;
         let old: Vec<u8> = (0..64 * block).map(|i| (i % 241) as u8 | 1).collect();
         let mut new = old.clone();
         new[3 * block as usize..5 * block as usize].fill(0);
-        for (planted, cloning) in [(true, true), (true, false), (false, true), (false, false)] {
-            let case = format!("planted {planted} cloning {cloning}");
-            let temporary = crate::test_support::tempdir().unwrap();
-            let directory = temporary.path();
-            let path = directory.join("file");
-            fs::write(&path, &old).unwrap();
-            if !crate::fsops::leases_trusted_on(&File::open(&path).unwrap()) {
-                eprintln!("note: the test filesystem's leases are not trusted");
-                return;
-            }
-            let mut compared = receiver(directory);
-            let mut streaming = receiver(directory);
-            let algorithm = compared.hash_policy.algorithm;
-            let outcome = with_coarse_change_times(|| {
-                let hashed = compared
-                    .hash_existing_batch(
-                        block,
-                        &[ExistingRead {
-                            path: b"file".to_vec(),
-                            len: new.len() as u64,
-                            condition: TargetCondition::Any,
-                        }],
-                        1,
-                    )
-                    .remove(0)
-                    .unwrap();
-                // The comparing connection leased the file.
-                assert!(
-                    compared
-                        .compared_files
-                        .guards
-                        .contains_key(b"file".as_slice()),
-                    "{case}"
-                );
-                if planted {
-                    let writer = File::options().write(true).open(&path).unwrap();
-                    writer.write_all_at(b"planted", 40 * block + 3).unwrap();
+        for planted in [true, false] {
+            for lease in ["taken", "let go", "other batch"] {
+                for cloning in [true, false] {
+                    let case = format!("planted {planted} lease {lease} cloning {cloning}");
+                    let temporary = crate::test_support::tempdir().unwrap();
+                    let directory = temporary.path();
+                    let path = directory.join("file");
+                    fs::write(&path, &old).unwrap();
+                    if !crate::fsops::leases_trusted_on(&File::open(&path).unwrap()) {
+                        eprintln!("note: the test filesystem's leases are not trusted");
+                        return;
+                    }
+                    let mut compared = receiver(directory);
+                    let mut streaming = receiver(directory);
+                    let algorithm = compared.hash_policy.algorithm;
+                    let key = compared.compared_key(b"file");
+                    let outcome = with_coarse_change_times(|| {
+                        let hashed = compared
+                            .hash_existing_batch(
+                                block,
+                                &[ExistingRead {
+                                    path: b"file".to_vec(),
+                                    len: new.len() as u64,
+                                    condition: TargetCondition::Any,
+                                }],
+                                1,
+                            )
+                            .remove(0)
+                            .unwrap();
+                        assert!(compared.compared_files.holds(key.as_ref()), "{case}");
+                        if lease == "let go" {
+                            compared.hash_existing_batch(block, &[], 2);
+                            assert!(!compared.compared_files.holds(key.as_ref()), "{case}");
+                        }
+                        if planted {
+                            let writer = File::options().write(true).open(&path).unwrap();
+                            writer.write_all_at(b"planted", 40 * block + 3).unwrap();
+                        }
+                        let patch = patch_from("file", &new, block, &hashed, algorithm);
+                        assert!(patch.basis.is_some(), "{case}");
+                        let compared_in = if lease == "other batch" { 7 } else { 1 };
+                        refusing_clones(!cloning, || {
+                            stream_patch_compared_in(
+                                &mut streaming,
+                                &patch,
+                                &pieces(&patch, 1),
+                                true,
+                                |_| {},
+                                compared_in,
+                            )
+                        })
+                    });
+                    // The patch took the comparing connection's lease only
+                    // when it named that comparison's batch.
+                    assert_eq!(
+                        compared.compared_files.holds(key.as_ref()),
+                        lease == "other batch",
+                        "{case}"
+                    );
+                    let published = fs::read(&path).unwrap();
+                    if planted {
+                        assert!(outcome.1.is_err(), "{case}: {:?}", outcome.1);
+                        assert!(published != new, "{case}: the planted write was published");
+                        assert!(
+                            published.windows(7).any(|bytes| bytes == b"planted"),
+                            "{case}: the planted file was replaced"
+                        );
+                    } else {
+                        assert!(outcome.1.is_ok(), "{case}: {:?}", outcome.1);
+                        assert!(published == new, "{case}");
+                    }
+                    assert!(sidecars(directory).is_empty(), "{case}");
                 }
-                let patch = patch_from("file", &new, block, &hashed, algorithm);
-                assert!(patch.basis.is_some(), "{case}");
-                refusing_clones(!cloning, || {
-                    stream_patch(&mut streaming, &patch, &pieces(&patch, 1), true, |_| {})
-                })
-            });
-            let published = fs::read(&path).unwrap();
-            if planted {
-                assert!(outcome.1.is_err(), "{case}: {:?}", outcome.1);
-                assert!(published != new, "{case}: the planted write was published");
-                assert!(
-                    published.windows(7).any(|bytes| bytes == b"planted"),
-                    "{case}: the planted file was replaced"
-                );
-            } else {
-                assert!(outcome.1.is_ok(), "{case}: {:?}", outcome.1);
-                assert!(published == new, "{case}");
             }
-            assert!(sidecars(directory).is_empty(), "{case}");
         }
     }
 
@@ -4224,6 +4372,7 @@ mod tests {
                 let begun = ops.handle(&Request::PatchBegin {
                     patch: Box::new(begin),
                     data_len,
+                    compared_in: 0,
                 });
                 assert!(matches!(begun, Response::Ok), "{case}: {begun:?}");
                 // A seeded stage holds the whole old file, its private
@@ -4393,7 +4542,8 @@ mod tests {
             assert!(matches!(
                 ops.handle(&Request::PatchBegin {
                     patch: Box::new(begin),
-                    data_len
+                    data_len,
+                    compared_in: 0,
                 }),
                 Response::Ok
             ));
@@ -4505,6 +4655,7 @@ mod tests {
         let begin = || Request::PatchBegin {
             patch: Box::new(requested(patch.clone())),
             data_len: new.len() as u64,
+            compared_in: 0,
         };
         assert!(matches!(ops.handle(&begin()), Response::Ok));
         // Until it ends, the connection refuses everything else, a second

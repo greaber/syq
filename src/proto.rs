@@ -1417,6 +1417,10 @@ pub enum WireRequest<Data> {
     PatchBegin {
         patch: Box<SmallPatch>,
         data_len: u64,
+        /// The batch whose `HashExistingBatch` compared the patch's file, on
+        /// whichever connection of the copy sent it. What that comparison
+        /// left there vouches for the blocks the patch reuses.
+        compared_in: u64,
     },
     /// The next new blocks of the open patch, whole and in file order, with
     /// their payload hash. Replies as `PatchBegin` does.

@@ -34,9 +34,11 @@
 //! nothing else to do. It takes back each one no other worker has taken as
 //! its last stream's pieces are read, so its patches still follow one
 //! another on its connection. A patch another worker takes is streamed on
-//! that worker's connection, which did not compare the file and holds no
-//! lease on it: there the receiver reads back the blocks a stage takes from
-//! the file it replaces.
+//! that worker's connection. Its begin names the batch that compared the
+//! file, so that the receiver, which serves every connection of a copy,
+//! uses the lease that comparison took; if the comparing connection has let
+//! it go, the receiver reads back the blocks the stage takes from the file
+//! it replaces.
 //!
 //! Each file is complete, and counts as progress, as soon as the reply that
 //! keeps or publishes it arrives, not when its batch ends; a streamed patch's
@@ -151,12 +153,14 @@ struct PendingRead {
 }
 
 /// A file of which more differs than one patch carries: its patch, without
-/// data, until it is sent, and the new and reused bytes it publishes.
+/// data, until it is sent, the new and reused bytes it publishes, and the
+/// batch that compared it.
 struct Streamed {
     file: usize,
     patch: Option<SmallPatch>,
     sent: u64,
     reused: u64,
+    compared_in: u64,
 }
 
 /// The ranges of a patch's differing blocks, in file order, each of whole
@@ -352,6 +356,7 @@ impl Worker {
             patch,
             sent,
             reused,
+            compared_in,
             ..
         } = *shared;
         let batch = [idx];
@@ -365,6 +370,7 @@ impl Worker {
                 patch: Some(patch),
                 sent,
                 reused,
+                compared_in,
             }];
             self.stream_patches(&batch, &jobs, streams, &mut outcomes, false)
         };
@@ -510,6 +516,7 @@ impl Worker {
                     response,
                     &mut outcomes,
                     &mut streams,
+                    compare_batch,
                 )?;
                 if let Stage::Patch = stage {
                     let files = groups[group].files.iter().copied();
@@ -585,6 +592,7 @@ impl Worker {
                     sent: stream.sent,
                     reused: stream.reused,
                     comparer: self.id,
+                    compared_in: stream.compared_in,
                 }
             })
             .collect();
@@ -674,6 +682,7 @@ impl Worker {
             patch,
             sent,
             reused,
+            compared_in,
             ..
         } = *shared;
         let file = batch
@@ -687,6 +696,7 @@ impl Worker {
             patch: Some(patch),
             sent,
             reused,
+            compared_in,
         };
         states.push(self.stream_state(&stream));
         streams.push(stream);
@@ -948,6 +958,7 @@ impl Worker {
         self.dst.send(Request::PatchBegin {
             patch: Box::new(patch),
             data_len: stream.sent,
+            compared_in: stream.compared_in,
         })?;
         destination.push_back((StreamStep::Begin(index), std::time::Instant::now()));
         states[index].begun = true;
@@ -1043,6 +1054,7 @@ impl Worker {
         response: Response,
         outcomes: &mut [Option<Compared>],
         streams: &mut Vec<Streamed>,
+        compare_batch: u64,
     ) -> Result<Option<(Stage, Request)>> {
         let block = self.patch_block();
         match stage {
@@ -1193,6 +1205,7 @@ impl Worker {
                             patch: Some(patch),
                             sent,
                             reused,
+                            compared_in: compare_batch,
                         });
                         continue;
                     }

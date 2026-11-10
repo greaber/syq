@@ -1528,6 +1528,7 @@ fn shared_patch(sched: &Sched, idx: usize, comparer: usize) -> SharedPatch {
         sent: 20 << 20,
         reused: 0,
         comparer,
+        compared_in: 1,
     }
 }
 

@@ -144,6 +144,7 @@ impl FsOps {
         &mut self,
         patch: &SmallPatch,
         data_len: u64,
+        compared_in: u64,
     ) -> Response {
         let put = SmallPut {
             path: patch.path.clone(),
@@ -170,7 +171,7 @@ impl FsOps {
             stale: false,
             failure: None,
         });
-        if let Err(error) = self.open_patch_stream(&mut stream) {
+        if let Err(error) = self.open_patch_stream(&mut stream, compared_in) {
             self.fail_stream(&mut stream, error);
         }
         let reply = stream.reply();
@@ -182,14 +183,18 @@ impl FsOps {
     /// replaces reused, seed it from that file as a batch patch's stage is
     /// seeded. The reused blocks of a stage that is not seeded are read,
     /// checked and written as the pieces around them arrive.
-    fn open_patch_stream(&mut self, stream: &mut PatchStream) -> Result<()> {
+    fn open_patch_stream(&mut self, stream: &mut PatchStream, compared_in: u64) -> Result<()> {
         #[cfg(debug_assertions)]
         if std::env::var_os("SYQ_TEST_FAIL_PATCH_STREAM_BEGIN").is_some() {
             bail!("injected streamed patch begin failure");
         }
         let patch = &stream.patch;
         check_stream_layout(patch, stream.data_len)?;
-        let guard = self.compared_files.take(&patch.path);
+        // Another worker's connection may have compared the file
+        // (`transfer::small_compare`): the guard its comparison took
+        // serves here too.
+        let key = self.compared_key(&patch.path);
+        let guard = self.compared_files.take(key.as_ref(), Some(compared_in));
         let target = self.destination_mutation_target(&patch.path)?;
         if patch.reuse.iter().any(Option::is_some) {
             let old = target
@@ -209,8 +214,8 @@ impl FsOps {
                     && reused * 2 >= patch.len
                     && reuses_within(patch, basis.len) =>
             {
-                // Another worker's connection may have compared the file
-                // (`transfer::small_compare`), holding its guard there.
+                // That connection may have dropped it, as when its next
+                // batch began.
                 let guard = match guard {
                     Some(guard) => Some(guard),
                     None => guard_compared_elsewhere(old, basis.len, patch.len),

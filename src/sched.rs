@@ -406,8 +406,10 @@ pub struct SharedPatch {
     pub patch: crate::proto::SmallPatch,
     pub sent: u64,
     pub reused: u64,
-    /// The worker whose destination connection compared the file.
+    /// The worker whose destination connection compared the file, and the
+    /// batch it compared it in (`Request::PatchBegin::compared_in`).
     pub comparer: usize,
+    pub compared_in: u64,
 }
 
 /// Cancellation status and an optional immediately issuable same-file range.
