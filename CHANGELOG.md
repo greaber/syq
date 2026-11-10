@@ -4,6 +4,87 @@ User-facing changes are recorded here starting with the release after
 [0.5.2](https://github.com/greaber/syq/releases/tag/v0.5.2).
 Earlier releases have notes on [GitHub Releases](https://github.com/greaber/syq/releases).
 
+## 0.10.0 — 2026-11-10
+
+Changes since 0.9.0. Every copy that goes through an enrolled receiver is now
+approved from the command alone, downloads that a server starts read through
+the source's enrollment, and copies are faster on long links, network
+filesystems and trees of small files. This release also fixes the findings
+of a pre-release security review and bug hunt.
+
+### Upgrade notes
+
+- **Install the same version on every machine.** As before, machines running
+  different syq versions refuse to work together; a copy that finds the other
+  side on another version says so.
+- **Downloads a server starts with your laptop's approval** (`syq cp --from
+  hostB ...` on hostA with `--auth-from @NAME`) now read through hostB's
+  enrolled receiver instead of relaying through your laptop. The first such
+  download enrolls hostB's account, as uploads already did. hostA must reach
+  hostB's SSH port by itself, as for uploads.
+- **Copies to and from your laptop** (`--to @laptop`, `--from @laptop`) are
+  approved from the server's command; the laptop shows and checks the same
+  command. A bandwidth limit is applied once, by the sending side.
+
+### New
+
+- An SSH authorization provider can approve a copy between two other servers,
+  with one prompt per copy.
+- `--detach`, `--no-tcp-encryption` and `--follow-dst` (to wherever the
+  destination's links lead, outside syq's protected paths) work on copies
+  through an enrolled receiver. When a copy between two servers finds that
+  the destination's receiver runs another version than your laptop expects,
+  syq refreshes that enrollment and retries once.
+- A copy to a receiving machine prints where its files went.
+- Server-to-server copies with many long source names send them over the
+  connection instead of the SSH command line.
+
+### Performance
+
+- Large replaced files are compared with requests and block sizes that adapt
+  to the link, so long links stay busy and scattered edits send less data.
+- Each file's publication round trips overlap the next file's work.
+- On network filesystems, files start copying as soon as their directory has
+  been created, instead of after the whole batch's directories.
+- Workers started while a copy is still planning share the copy's SSH login
+  for trees of small new files, and copies through an enrolled receiver share
+  one login the way ordinary copies do.
+- An idle worker can send the changes for a file another worker compared.
+- Under a bandwidth limit, the small-file shortcut is used only when it takes
+  at most about a second at the limit, and restricted destinations use it too.
+
+### Security
+
+- A restricted receiver checks a directive's signature before reading the rest
+  of it and limits how many unverified sessions one source can hold.
+- A copy whose enrollment was refreshed while its session started is refused.
+- `--no-tcp` in the approved command is enforced on every restricted route.
+- Workers join a receiver's sockets by name in a directory the receiver
+  chooses, never at a path the other side supplies.
+- Copies through an enrolled receiver cannot write into the folder holding the
+  sockets of the account's running copies, and a link planted where syq's
+  runtime folders could be no longer blocks restricted copies.
+- A hang-up (closing the terminal or SSH session) cleans up like SIGTERM,
+  including temporary entry keys and socket folders.
+- Smaller fixes to protected symlinks, preview-only dry runs and provider
+  start-up. The bundled SQLite is updated for RUSTSEC-2026-0459.
+
+### Fixes
+
+- Restricted copies with many nested new `--mapping` folders, or with
+  `--if-exists=keep`, no longer fail partway because a folder was created
+  after its contents.
+- A folder that cannot be created reports one error instead of two.
+- Cancelled S3 copies still remove their unfinished multipart uploads,
+  `--prune` keeps S3 download partials, and destination errors name the host.
+- Each syq version keeps its own connection to an SSH authorization provider,
+  so versions no longer cut each other's requests; the build-mismatch message
+  says how to update the provider's service.
+- Enrollment records a version cannot use are reported, and fields written by
+  newer versions are kept when a record is rewritten.
+- Several races that could fail a finished copy, stall `persist off`, or keep
+  a waiting approval from ending on Ctrl-C are fixed.
+
 ## 0.9.0 — 2026-11-08
 
 Changes since 0.8.0. A server can now copy files from your laptop with its
