@@ -186,6 +186,11 @@ impl DirectoryQueue {
         chosen
     }
 
+    /// Whether directory `index` is created only where nothing is.
+    pub(super) fn no_replace(&self, index: usize) -> bool {
+        self.no_replace[index]
+    }
+
     /// The creations of `indices` have been answered, or will not be sent.
     pub(super) fn answered(&mut self, indices: &[usize]) {
         for &index in indices {

@@ -2997,10 +2997,10 @@ impl Planner<'_> {
             .collect();
         let queue = {
             let paths: Vec<&[u8]> = mkdirs.iter().map(apply_path).collect();
-            // A restricted receiver keeping what exists (`--if-exists=keep`)
-            // creates every directory only where nothing is, and looks each
-            // one up first, which fails while its new parent is in the same
-            // request.
+            // A restricted receiver keeping what exists (`--if-exists=keep`,
+            // which signs the `Skip` existing-object policy) creates every
+            // directory only where nothing is, and looks each one up first,
+            // which fails while its new parent is in the same request.
             let all_no_replace =
                 self.opts.restricted_receiver && self.opts.preserve_existing_directory_metadata;
             let no_replace: Vec<bool> = mkdirs
@@ -3194,8 +3194,13 @@ impl Planner<'_> {
             // Failed early metadata is retried, and reported, at the end.
             errs.truncate(request.targets.len());
             stream.queue.answered(&request.chosen);
-            for ((path, condition), error) in request.targets.iter().zip(&errs) {
-                if error.is_some() && *condition != TargetCondition::Any {
+            // A failed creation the queue holds as no-replace, which under
+            // `--if-exists=keep` includes those sent to be created as usual,
+            // has nothing beneath it sent.
+            for ((&index, (path, _)), error) in
+                request.chosen.iter().zip(&request.targets).zip(&errs)
+            {
+                if error.is_some() && stream.queue.no_replace(index) {
                     stream.failed_guarded.push(path.clone());
                 }
             }

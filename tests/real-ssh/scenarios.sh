@@ -943,6 +943,28 @@ for d in 0 1 2 3 4 5 6 7; do
         done
     done
 done
+# Keeping what exists, the receiver looks up each directory before creating
+# it, which fails while its new parent is in the same request: three levels
+# of new directories go one level at a time.
+ssh source sh -s <<'NETWORK_DEEP'
+set -eu
+root=/tmp/syq-real-ssh/network-deep
+for d in 0 1 2 3 4 5 6 7; do
+    for s in 0 1 2 3; do
+        install -d -m 0750 "$root/d$d/s$s/deep"
+        printf '%s\n' "d$d/s$s" >"$root/d$d/s$s/deep/f"
+    done
+done
+NETWORK_DEEP
+ssh source 'syq cp --if-exists=keep --copy-metadata permissions --srcs-in /tmp/syq-real-ssh/network-deep --to @laptop --into network-deep-keep'
+remote_manifest source /tmp/syq-real-ssh/network-deep /tmp/syq-network-deep-source.manifest
+(
+    cd "$receive_root/network-deep-keep"
+    {
+        find . -mindepth 1 -printf '%y %m %p -> %l\n'
+        find . -type f -exec sha256sum {} +
+    } | LC_ALL=C sort
+) | diff -u /tmp/syq-network-deep-source.manifest -
 syq persist off
 syq persist connect source
 syq persist receive wait source --timeout 30
