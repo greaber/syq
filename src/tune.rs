@@ -1028,6 +1028,21 @@ impl Gate {
         let _ = self.history.set(history);
     }
 
+    /// Worker slots that hold a connection or are opening one.
+    pub(crate) fn connections(&self) -> usize {
+        self.slots
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.phase,
+                    SlotPhase::Warming | SlotPhase::Ready | SlotPhase::Retiring
+                )
+            })
+            .count()
+    }
+
     fn counts(&self) -> (usize, usize, usize) {
         let slots = self.slots.lock().unwrap();
         (

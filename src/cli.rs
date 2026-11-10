@@ -1040,14 +1040,19 @@ impl Args {
         // Removing the tuner's default ceiling does not expand signed
         // receiver or approved source authority. Each endpoint still enforces
         // its particular grant; cached full-account SSH has no such ceiling.
-        if self.restricted_grant.is_some()
-            || self.source_directive.is_some()
-            || self.named_source.is_some()
-        {
+        if self.signs_connection_limits() {
             requested.min(usize::from(crate::delegation::MAX_CONNECTIONS))
         } else {
             requested
         }
+    }
+
+    /// Whether an endpoint of this copy enforces a signed grant, which
+    /// counts each worker connection against the copy's worker allowance.
+    pub fn signs_connection_limits(&self) -> bool {
+        self.restricted_grant.is_some()
+            || self.source_directive.is_some()
+            || self.named_source.is_some()
     }
 
     pub(crate) fn protects_existing_contents(&self) -> bool {

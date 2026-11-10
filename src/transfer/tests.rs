@@ -595,6 +595,8 @@ fn pipeline_worker(
         on_shared_login: false,
         own_login: Default::default(),
         leaving_shared_login: false,
+        allowance: None,
+        allowance_share: None,
     }
 }
 
@@ -720,6 +722,65 @@ fn a_worker_on_the_shared_ssh_login_logs_in_on_its_own_for_larger_files() {
     };
     assert!(requests(&source, true) > 0);
     assert_eq!(requests(&source, true), requests(&own, false));
+}
+
+/// On a copy whose endpoint enforces a signed grant, a worker logs in
+/// alongside its shared session only while the grant has room for one more
+/// connection. Otherwise it leaves the shared session first, without trying
+/// a login the receiver would refuse.
+#[test]
+fn a_worker_logs_in_alongside_the_shared_login_only_within_a_signed_allowance() {
+    let sched = Arc::new(Sched::new(512, 8192));
+    sched.push_file(pipeline_job(b"large", 4096));
+    sched.scan_done();
+    let state = Arc::new(Mutex::new(PipelineState::default()));
+    let allowance = |limit| {
+        Arc::new(ConnectionAllowance {
+            limit,
+            overlapping: Default::default(),
+        })
+    };
+    let full = allowance(1);
+    let mut worker = pipeline_worker(&sched, &state, &state, true);
+    worker.gate.mark_ready(0);
+    worker.allowance = Some(full.clone());
+    worker.on_shared_login = true;
+    worker.own_login = OwnLogin::Unopened(Box::new(|| panic!("a login the grant would refuse")));
+    assert!(worker
+        .take_own_login_before(sched.next())
+        .unwrap()
+        .is_none());
+    assert!(worker.leaving_shared_login);
+    assert_eq!(full.overlapping.load(Relaxed), 0);
+    assert!(state.lock().unwrap().requests.is_empty());
+
+    // With room, the worker holds a share while its login is under way and
+    // gives it back once it has moved.
+    let room = allowance(2);
+    let own = Arc::new(Mutex::new(PipelineState::default()));
+    let destination = own.clone();
+    let mut worker = pipeline_worker(&sched, &state, &state, true);
+    worker.gate.mark_ready(0);
+    worker.allowance = Some(room.clone());
+    worker.on_shared_login = true;
+    worker.own_login = OwnLogin::Unopened(Box::new(move || {
+        Ok((
+            None,
+            Some(Box::new(PipelineConn(destination)) as Box<dyn Conn>),
+        ))
+    }));
+    let item = worker
+        .take_own_login_before(sched.next())
+        .unwrap()
+        .expect("the worker keeps the file");
+    assert_eq!(room.overlapping.load(Relaxed), 1);
+    worker.open_own_login();
+    sched.return_unstarted(item);
+    wait_for_own_login(&worker);
+    worker.take_own_login_if_ready().unwrap();
+    assert!(!worker.on_shared_login);
+    assert!(!worker.leaving_shared_login);
+    assert_eq!(room.overlapping.load(Relaxed), 0);
 }
 
 /// A worker that takes an item, finds its own login ready, and then loses
