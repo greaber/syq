@@ -485,6 +485,9 @@ impl ComparedFiles {
 
     /// Drop the guards this connection took that no patch used.
     fn release(&mut self) {
+        if self.keys.is_empty() {
+            return;
+        }
         let released: Vec<Compared> = {
             let mut guards = compared_guards();
             self.keys
@@ -503,6 +506,7 @@ impl ComparedFiles {
     /// Keep `guard` for the file at `key`, compared in this connection's
     /// current batch. A guard an earlier comparison left for the same file
     /// is dropped.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn insert(&mut self, key: ComparedKey, guard: Guard) {
         let replaced = compared_guards().insert(
             key.clone(),
@@ -529,7 +533,12 @@ impl ComparedFiles {
         guards.remove(key).map(|compared| compared.guard)
     }
 
-    #[cfg(test)]
+    /// Whether this connection's current batch took any guard.
+    fn took_any(&self) -> bool {
+        !self.keys.is_empty()
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
     fn holds(&self, key: Option<&ComparedKey>) -> bool {
         key.is_some_and(|key| {
             compared_guards()
@@ -1087,8 +1096,13 @@ impl FsOps {
             }
         };
         check_patch_layout(patch).map_err(failed(false, false))?;
-        let key = self.compared_key(&patch.path);
-        let mut guard = self.compared_files.take(key.as_ref(), None);
+        // Only a connection that took guards may hold this one.
+        let mut guard = if self.compared_files.took_any() {
+            let key = self.compared_key(&patch.path);
+            self.compared_files.take(key.as_ref(), None)
+        } else {
+            None
+        };
         // A patch that reproduces its file whole keeps it, through the
         // metadata step, as without in-place updates.
         let mut replaced = None;

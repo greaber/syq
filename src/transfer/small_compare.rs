@@ -372,7 +372,7 @@ impl Worker {
                 reused,
                 compared_in,
             }];
-            self.stream_patches(&batch, &jobs, streams, &mut outcomes, false)
+            self.stream_patches(&batch, &jobs, streams, &mut outcomes, None)
         };
         let settled = self.settle_outcomes(&batch, outcomes);
         self.sched.patch_done();
@@ -591,13 +591,13 @@ impl Worker {
                     patch: stream.patch.expect("a patch is shared before it begins"),
                     sent: stream.sent,
                     reused: stream.reused,
-                    comparer: self.id,
                     compared_in: stream.compared_in,
                 }
             })
             .collect();
         self.sched.share_patches(shared);
-        self.stream_patches(batch, jobs, streams, outcomes, true)
+        let compared_in = streams[0].compared_in;
+        self.stream_patches(batch, jobs, streams, outcomes, Some(compared_in))
     }
 
     /// Complete each of `files` that a reply has kept or published, as soon
@@ -627,15 +627,16 @@ impl Worker {
     /// Stream each of `streams`' patches, one after another, and record
     /// their outcomes, completing each file published. The next patch begins
     /// as soon as the last has ended, and its pieces are read ahead while the
-    /// last's are still sent. With `take_back`, the patches of `batch` this
-    /// worker shared and no other worker took follow, as `streams` ends.
+    /// last's are still sent. With `take_back`, the comparison batch of
+    /// `batch`, the patches it shared that no other worker took follow, as
+    /// `streams` ends.
     fn stream_patches(
         &mut self,
         batch: &[usize],
         jobs: &[WorkerJob],
         mut streams: Vec<Streamed>,
         outcomes: &mut [Option<Compared>],
-        take_back: bool,
+        take_back: Option<u64>,
     ) -> Result<()> {
         let mut states: Vec<StreamState> = streams
             .iter()
@@ -663,32 +664,34 @@ impl Worker {
         }
     }
 
-    /// Take back a patch of `batch` that this worker shared and no other
-    /// worker has taken, to stream after `streams`: its connection still
-    /// holds what comparing the file left there. Returns whether there was
-    /// one.
+    /// Take back a patch that the comparison batch `compared_in`, of
+    /// `batch`, shared and no other worker has taken, to stream after
+    /// `streams`: this connection still holds what comparing the file left
+    /// there. Returns whether there was one.
     fn take_back_patch(
         &mut self,
         batch: &[usize],
+        compared_in: u64,
         streams: &mut Vec<Streamed>,
         states: &mut Vec<StreamState>,
         outcomes: &mut [Option<Compared>],
     ) -> bool {
-        let Some(shared) = self.sched.take_own_patch(self.id) else {
+        let Some(shared) = self.sched.take_back_patch(compared_in) else {
+            return false;
+        };
+        let Some(file) = batch.iter().position(|&i| i == shared.idx) else {
+            // Not this batch's file: it stays for any worker to take.
+            debug_assert!(false, "a comparison batch shared a file it did not compare");
+            self.sched.share_patches(vec![*shared]);
             return false;
         };
         let SharedPatch {
-            idx,
             patch,
             sent,
             reused,
             compared_in,
             ..
         } = *shared;
-        let file = batch
-            .iter()
-            .position(|&i| i == idx)
-            .expect("a worker takes back only its own batch's patches");
         // Compared again unless it is streamed to its end.
         outcomes[file] = None;
         let stream = Streamed {
@@ -719,7 +722,7 @@ impl Worker {
         streams: &mut Vec<Streamed>,
         states: &mut Vec<StreamState>,
         outcomes: &mut [Option<Compared>],
-        mut take_back: bool,
+        mut take_back: Option<u64>,
     ) -> Result<()> {
         use std::collections::VecDeque;
         // An in-process source answers each read as it is sent, and its
@@ -795,9 +798,12 @@ impl Worker {
                 reading += 1;
                 // The next patch is taken before the recheck's reply ends
                 // this one, so that it begins as this one ends.
-                if reading == streams.len() && take_back {
-                    take_back = !self.sched.is_aborted()
-                        && self.take_back_patch(batch, streams, states, outcomes);
+                if let (true, Some(compared_in)) = (reading == streams.len(), take_back) {
+                    if self.sched.is_aborted()
+                        || !self.take_back_patch(batch, compared_in, streams, states, outcomes)
+                    {
+                        take_back = None;
+                    }
                 }
             }
             let from_source = match (source.front(), destination.front()) {

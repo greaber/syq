@@ -406,9 +406,8 @@ pub struct SharedPatch {
     pub patch: crate::proto::SmallPatch,
     pub sent: u64,
     pub reused: u64,
-    /// The worker whose destination connection compared the file, and the
-    /// batch it compared it in (`Request::PatchBegin::compared_in`).
-    pub comparer: usize,
+    /// The comparison batch that compared the file
+    /// (`Request::PatchBegin::compared_in`), unique in this process.
     pub compared_in: u64,
 }
 
@@ -1489,7 +1488,7 @@ impl Sched {
     /// Leave streamed patches for any worker to take, as soon as one is idle.
     /// The worker that compared their files still holds them until it ends
     /// its batch, which it does after taking back those no other worker took
-    /// (`take_own_patch`).
+    /// (`take_back_patch`).
     pub fn share_patches(&self, patches: Vec<SharedPatch>) {
         if patches.is_empty() {
             return;
@@ -1500,15 +1499,17 @@ impl Sched {
         self.cv.notify_all();
     }
 
-    /// Take back a streamed patch that `comparer` shared and no other worker
-    /// has taken. Its batch still holds the file, so it is not counted as
-    /// claimed.
-    pub fn take_own_patch(&self, comparer: usize) -> Option<Box<SharedPatch>> {
+    /// Take back a streamed patch that the comparison batch `compared_in`
+    /// shared and no other worker has taken. That batch still holds the
+    /// file, so it is not counted as claimed. A patch left by a batch that
+    /// has ended, as when its connection failed, is taken only through
+    /// `next`.
+    pub fn take_back_patch(&self, compared_in: u64) -> Option<Box<SharedPatch>> {
         let mut g = self.inner.lock().unwrap();
         let position = g
             .patches
             .iter()
-            .position(|patch| patch.comparer == comparer)?;
+            .position(|patch| patch.compared_in == compared_in)?;
         g.patches.remove(position)
     }
 
