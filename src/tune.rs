@@ -983,6 +983,35 @@ pub struct Gate {
     slots: Mutex<Vec<Slot>>,
     cv: Condvar,
     history: std::sync::OnceLock<history::Recorder>,
+    /// The most worker connections a signed grant on one of the copy's
+    /// endpoints admits (`usize::MAX` without one).
+    connection_allowance: AtomicUsize,
+    /// Logins under way alongside workers' shared SSH sessions, which the
+    /// allowance counts too (`Gate::reserve_overlap`).
+    overlapping: AtomicUsize,
+}
+
+/// One login under way alongside a worker's shared session, counted against
+/// the connection allowance until dropped.
+pub(crate) struct OverlapReservation(Arc<Gate>);
+
+impl Drop for OverlapReservation {
+    fn drop(&mut self) {
+        self.0.overlapping.fetch_sub(1, Relaxed);
+    }
+}
+
+/// Slots that hold a connection or are opening one.
+fn connections(slots: &[Slot]) -> usize {
+    slots
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.phase,
+                SlotPhase::Warming | SlotPhase::Ready | SlotPhase::Retiring
+            )
+        })
+        .count()
 }
 
 pub(crate) struct WorkGuard {
@@ -1021,11 +1050,33 @@ impl Gate {
             slots: Mutex::new(Vec::new()),
             cv: Condvar::new(),
             history: std::sync::OnceLock::new(),
+            connection_allowance: AtomicUsize::new(usize::MAX),
+            overlapping: AtomicUsize::new(0),
         })
     }
 
     pub(crate) fn set_history(&self, history: history::Recorder) {
         let _ = self.history.set(history);
+    }
+
+    /// A signed grant counts every worker connection and admits `limit` of
+    /// them. Workers and logins made alongside shared sessions then share it.
+    pub(crate) fn set_connection_allowance(&self, limit: usize) {
+        self.connection_allowance.store(limit, Relaxed);
+    }
+
+    /// Count a login made alongside a worker's shared session against the
+    /// connection allowance, if it has room. New worker slots wait for the
+    /// room these logins take (`begin_warming`), and both are counted under
+    /// the slot lock, so together they never exceed the allowance.
+    pub(crate) fn reserve_overlap(self: &Arc<Self>) -> Option<OverlapReservation> {
+        let slots = self.slots.lock().unwrap();
+        let used = connections(&slots) + self.overlapping.load(Relaxed);
+        if used >= self.connection_allowance.load(Relaxed) {
+            return None;
+        }
+        self.overlapping.fetch_add(1, Relaxed);
+        Some(OverlapReservation(self.clone()))
     }
 
     fn counts(&self) -> (usize, usize, usize) {
@@ -1140,9 +1191,17 @@ impl Gate {
         let mut slots = self.slots.lock().unwrap();
         let n = n.min(self.resource_limit());
         grow_to(&mut slots, n);
+        // Under a signed connection allowance, leave the room that logins
+        // under way alongside shared sessions take; a later call admits the
+        // rest once they have moved.
+        let mut room = self
+            .connection_allowance
+            .load(Relaxed)
+            .saturating_sub(connections(&slots) + self.overlapping.load(Relaxed));
         let mut ids = Vec::new();
         for (id, slot) in slots.iter_mut().take(n).enumerate() {
-            if slot.phase == SlotPhase::Absent {
+            if slot.phase == SlotPhase::Absent && room > 0 {
+                room -= 1;
                 slot.phase = SlotPhase::Warming;
                 ids.push(id);
             }

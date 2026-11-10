@@ -114,6 +114,10 @@ struct PipelineState {
     deferred: std::collections::VecDeque<u64>,
     arrived: std::collections::HashMap<u64, Response>,
     next_deferred: u64,
+    /// Setting up telemetry on the connection fails.
+    fail_observe: bool,
+    /// The addresses of the actors telemetry was set up with, in order.
+    observed_by: Vec<usize>,
 }
 
 struct PipelineConn(Arc<Mutex<PipelineState>>);
@@ -210,6 +214,18 @@ impl PipelineConn {
 }
 
 impl Conn for PipelineConn {
+    fn observe(
+        &mut self,
+        _observations: &crate::transfer_observations::Observations,
+        actor: &Arc<crate::transfer_observations::Actor>,
+        _source: bool,
+        _worker_id: usize,
+    ) -> Result<()> {
+        let mut state = self.0.lock().unwrap();
+        anyhow::ensure!(!state.fail_observe, "injected telemetry failure");
+        state.observed_by.push(Arc::as_ptr(actor) as usize);
+        Ok(())
+    }
     fn send_pending(&mut self, request: Request) -> Result<crate::conn::PendingReply> {
         if !self.0.lock().unwrap().defers {
             return self.call(request).map(crate::conn::PendingReply::Ready);
@@ -577,12 +593,25 @@ fn pipeline_worker(
         setup_elapsed: std::time::Duration::ZERO,
         publications: Default::default(),
         on_shared_login: false,
+        own_login: Default::default(),
         leaving_shared_login: false,
+        allowance_share: None,
+    }
+}
+
+fn wait_for_own_login(worker: &Worker) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !worker.own_login_ready() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "own login never ended"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
 
 #[test]
-fn a_worker_on_the_shared_ssh_login_gives_back_larger_files() {
+fn a_worker_on_the_shared_ssh_login_logs_in_on_its_own_for_larger_files() {
     let sched = Arc::new(Sched::new(512, 8192));
     sched.push_file(pipeline_job(b"small", 100));
     let mut existing = pipeline_job(b"existing", 100);
@@ -606,20 +635,257 @@ fn a_worker_on_the_shared_ssh_login_gives_back_larger_files() {
         matched: false
     }));
 
-    // It hands the larger file back untouched and stops taking work.
+    // A login of its own that fails makes the worker leave the shared login
+    // at its next item, which goes back to the queue, to log in again.
+    worker.own_login = OwnLogin::Unopened(Box::new(|| anyhow::bail!("injected login failure")));
+    worker.open_own_login();
+    wait_for_own_login(&worker);
+    assert!(worker.hands_back_ranges());
     sched.scan_done();
     let item = sched.next();
     assert!(matches!(item, Item::File(2)), "largest file first");
-    worker.process_item(item).unwrap();
+    assert!(worker.take_own_login_before(item).unwrap().is_none());
     assert!(worker.leaving_shared_login);
+    assert!(!worker.on_shared_login);
     assert!(state.lock().unwrap().requests.is_empty());
     assert!(matches!(sched.next(), Item::File(2)));
 
-    // So does a range of a larger file.
-    let (sched, handle, _) = pipeline_ranges(&[(0, 4096)]);
-    let mut worker = pipeline_worker(&sched, &state, &state, true);
+    // So does a range of a larger file. Only the destination shares the
+    // login here, so only it logs in again.
+    let (sched, handle, job) = pipeline_ranges(&[(0, 4096)]);
+    let automatic = || {
+        Arc::new(Mutex::new(PipelineState {
+            auto_ranges: true,
+            ..Default::default()
+        }))
+    };
+    let (source, shared, own) = (automatic(), automatic(), automatic());
+    let mut worker = pipeline_worker(&sched, &source, &shared, false);
     worker.on_shared_login = true;
-    assert!(worker.needs_own_login(&Item::Range(handle)));
+    assert!(worker.needs_own_login(&Item::Range(handle.clone())));
+    let (finish_login, login_finishes) = std::sync::mpsc::channel::<()>();
+    let destination = own.clone();
+    worker.own_login = OwnLogin::Unopened(Box::new(move || {
+        login_finishes.recv().unwrap();
+        Ok((
+            None,
+            Some(Box::new(PipelineConn(destination)) as Box<dyn Conn>),
+        ))
+    }));
+    worker.open_own_login();
+    // Taking more work while it logs in does not start a second login.
+    worker.open_own_login();
+    // The worker keeps copying on the shared login meanwhile.
+    assert!(matches!(worker.own_login, OwnLogin::Opening(_)));
+    assert!(!worker.hands_back_ranges());
+    worker.take_own_login_if_ready().unwrap();
+    assert!(worker.on_shared_login);
+
+    // Once the login is ready, the worker hands back the rest of its range
+    // between requests,
+    finish_login.send(()).unwrap();
+    wait_for_own_login(&worker);
+    assert!(worker.hands_back_ranges());
+    let mut credited = 0;
+    worker.transfer_range(&handle, &mut credited).unwrap();
+    assert_eq!(credited, 0);
+    assert!(!sched.range_done(&handle));
+    let Item::Range(rest) = sched.next() else {
+        panic!("the rest of the range was not handed back");
+    };
+    // moves to its new destination connection, keeping its source,
+    worker.take_own_login_if_ready().unwrap();
+    assert!(!worker.on_shared_login);
+    assert!(matches!(worker.own_login, OwnLogin::None));
+    assert!(!worker.hands_back_ranges());
+    // and copies the rest there.
+    worker.transfer_range(&rest, &mut credited).unwrap();
+    assert!(sched.range_done(&rest));
+    assert_eq!(credited, 4096);
+    assert_eq!(job.done.load(Relaxed), 4096);
+    assert!(shared.lock().unwrap().requests.is_empty());
+    let requests = |state: &Arc<Mutex<PipelineState>>, read: bool| {
+        state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|request| {
+                if read {
+                    matches!(request, Request::ReadRange { .. })
+                } else {
+                    matches!(request, Request::WriteRange { .. })
+                }
+            })
+            .count()
+    };
+    assert!(requests(&source, true) > 0);
+    assert_eq!(requests(&source, true), requests(&own, false));
+}
+
+/// On a copy whose endpoint enforces a signed grant, a worker logs in
+/// alongside its shared session only while the grant has room for one more
+/// connection. Otherwise it leaves the shared session first, without trying
+/// a login the receiver would refuse. New worker slots wait for the room
+/// such logins take.
+#[test]
+fn a_worker_logs_in_alongside_the_shared_login_only_within_a_signed_allowance() {
+    let sched = Arc::new(Sched::new(512, 8192));
+    sched.push_file(pipeline_job(b"large", 4096));
+    sched.scan_done();
+    let state = Arc::new(Mutex::new(PipelineState::default()));
+    let mut worker = pipeline_worker(&sched, &state, &state, true);
+    worker.gate.mark_ready(0);
+    worker.gate.set_connection_allowance(1);
+    worker.on_shared_login = true;
+    worker.own_login = OwnLogin::Unopened(Box::new(|| panic!("a login the grant would refuse")));
+    assert!(worker
+        .take_own_login_before(sched.next())
+        .unwrap()
+        .is_none());
+    assert!(worker.leaving_shared_login);
+    assert!(worker.allowance_share.is_none());
+    assert!(state.lock().unwrap().requests.is_empty());
+
+    // With room, the worker holds a share while its login is under way, and
+    // the tuner's next worker waits for it; both get in once it has moved.
+    let own = Arc::new(Mutex::new(PipelineState::default()));
+    let destination = own.clone();
+    let mut worker = pipeline_worker(&sched, &state, &state, true);
+    worker.gate = Gate::new(2);
+    worker.gate.mark_ready(0);
+    worker.gate.set_connection_allowance(2);
+    worker.on_shared_login = true;
+    worker.own_login = OwnLogin::Unopened(Box::new(move || {
+        Ok((
+            None,
+            Some(Box::new(PipelineConn(destination)) as Box<dyn Conn>),
+        ))
+    }));
+    let item = worker
+        .take_own_login_before(sched.next())
+        .unwrap()
+        .expect("the worker keeps the file");
+    assert!(worker.allowance_share.is_some());
+    assert!(worker.gate.begin_warming(2).is_empty());
+    assert!(worker.gate.reserve_overlap().is_none());
+    worker.open_own_login();
+    sched.return_unstarted(item);
+    wait_for_own_login(&worker);
+    worker.take_own_login_if_ready().unwrap();
+    assert!(!worker.on_shared_login);
+    assert!(worker.allowance_share.is_none());
+    assert_eq!(worker.gate.begin_warming(2), vec![1]);
+}
+
+/// A worker that takes an item, finds its own login ready, and then loses
+/// the shared connection while settling a publication there gives the item
+/// back, so the copy can still finish it.
+#[test]
+fn a_failed_move_to_the_own_login_gives_back_the_item_it_took() {
+    let (sched, src, dst, mut worker) = deferred_publication_fixture(false, true);
+    let Item::File(first) = sched.next() else {
+        panic!("expected a file")
+    };
+    let job = worker.job(first);
+    src.lock().unwrap().replies.extend([
+        block_reply(),
+        Response::Stats(vec![Some(job.entry.clone())]),
+    ]);
+    dst.lock()
+        .unwrap()
+        .replies
+        .extend([prepared_reply(), Response::Ok]);
+    worker.handle_file(first).unwrap();
+    assert!(!worker.publications.is_empty());
+    dst.lock().unwrap().dead = true;
+    worker.on_shared_login = true;
+    worker.own_login = OwnLogin::Unopened(Box::new(|| Ok((None, None))));
+    worker.open_own_login();
+    wait_for_own_login(&worker);
+    let item = sched.next();
+    let Item::File(second) = item else {
+        panic!("expected the second file")
+    };
+    assert!(worker.take_own_login_before(item).is_err());
+    let mut queued = Vec::new();
+    while let Some(item) = sched.try_next() {
+        match item {
+            Item::File(idx) => queued.push(idx),
+            Item::Exit => break,
+            Item::Range(_) | Item::Finish { .. } => {}
+        }
+    }
+    assert!(queued.contains(&second), "{queued:?}");
+}
+
+/// Telemetry that fails on a worker's new connection counts as a failed
+/// login: the worker leaves the shared login to log in again, rather than
+/// failing the copy.
+#[test]
+fn failed_telemetry_on_the_own_login_is_a_failed_login() {
+    let (sched, _, _) = pipeline_ranges(&[(0, 4096)]);
+    let state = Arc::new(Mutex::new(PipelineState::default()));
+    let mut worker = pipeline_worker(&sched, &state, &state, false);
+    worker.observation = Some(worker.progress.observations.workers.actor("worker"));
+    worker.on_shared_login = true;
+    let unobservable = Arc::new(Mutex::new(PipelineState {
+        fail_observe: true,
+        ..Default::default()
+    }));
+    let replacement = unobservable.clone();
+    worker.own_login = OwnLogin::Unopened(Box::new(move || {
+        Ok((
+            None,
+            Some(Box::new(PipelineConn(replacement)) as Box<dyn Conn>),
+        ))
+    }));
+    worker.open_own_login();
+    wait_for_own_login(&worker);
+    worker.take_own_login_if_ready().unwrap();
+    assert!(worker.leaving_shared_login);
+    assert!(!sched.is_aborted());
+    assert!(matches!(worker.own_login, OwnLogin::None));
+    state.lock().unwrap().replies.push_back(Response::Ok);
+    worker
+        .dst
+        .call(Request::ConfigureHashing(Default::default()))
+        .unwrap();
+    assert_eq!(state.lock().unwrap().requests.len(), 1);
+    assert!(unobservable.lock().unwrap().requests.is_empty());
+}
+
+/// The login thread sets up the new connections' telemetry with an actor of
+/// its own, never the worker's, which the busy worker thread owns; the worker
+/// gives the connections its actor when it moves to them.
+#[test]
+fn only_the_worker_gives_its_own_login_the_workers_telemetry_actor() {
+    let (sched, _, _) = pipeline_ranges(&[(0, 4096)]);
+    let state = Arc::new(Mutex::new(PipelineState::default()));
+    let mut worker = pipeline_worker(&sched, &state, &state, false);
+    let actor = worker.progress.observations.workers.actor("worker");
+    worker.observation = Some(actor.clone());
+    worker.on_shared_login = true;
+    let own = Arc::new(Mutex::new(PipelineState::default()));
+    let destination = own.clone();
+    worker.own_login = OwnLogin::Unopened(Box::new(move || {
+        Ok((
+            None,
+            Some(Box::new(PipelineConn(destination)) as Box<dyn Conn>),
+        ))
+    }));
+    worker.open_own_login();
+    wait_for_own_login(&worker);
+    let on_login_thread = own.lock().unwrap().observed_by.clone();
+    assert_eq!(on_login_thread.len(), 1);
+    assert_ne!(on_login_thread[0], Arc::as_ptr(&actor) as usize);
+    worker.take_own_login_if_ready().unwrap();
+    assert!(!worker.on_shared_login);
+    assert!(!worker.leaving_shared_login);
+    assert_eq!(
+        own.lock().unwrap().observed_by.last(),
+        Some(&(Arc::as_ptr(&actor) as usize))
+    );
 }
 
 #[test]
