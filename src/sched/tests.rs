@@ -828,7 +828,7 @@ fn files_queued_with_their_directories_are_shared_with_busy_workers() {
     ] {
         let sched = Sched::new(4096, 8192);
         if trickling {
-            sched.trickling_files(8);
+            sched.trickling_files(Some(8));
         }
         {
             let mut inner = sched.inner.lock().unwrap();

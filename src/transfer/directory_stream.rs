@@ -165,6 +165,9 @@ pub(super) struct Anticipated {
     pub(super) bytes: u64,
     /// The largest of them, which decides whether all of them are small.
     pub(super) largest: u64,
+    /// They are queued a few at a time, as their directories are created,
+    /// rather than in bursts (`Pacing::link_bound`).
+    pub(super) trickling: bool,
 }
 
 impl Anticipated {
@@ -182,10 +185,11 @@ impl Anticipated {
 }
 
 /// How large directory requests are, kept across batches. They start small,
-/// so the first files go out early, and double whenever the receiver
-/// finished one request before the next reached it: over a slow link to a
-/// fast filesystem, small requests would leave it waiting a round trip for
-/// each.
+/// so the first files go out early, and double for each reply showing that
+/// the receiver finished a request before the next reached it: over a slow
+/// link to a fast filesystem, small requests would leave it waiting a round
+/// trip for each. Where creating directories is what takes the time, as on
+/// a slow filesystem, the receiver never waits and requests stay small.
 #[derive(Debug)]
 pub(super) struct Pacing {
     growth: usize,
@@ -208,15 +212,9 @@ impl Pacing {
         self.growth
     }
 
-    /// A request sent at `sent` with `growth` began to be answered at
-    /// `arrival`; the one before it in the same batch at `previous`.
-    pub(super) fn observe(
-        &mut self,
-        sent: Instant,
-        arrival: Instant,
-        previous: Option<Instant>,
-        growth: usize,
-    ) {
+    /// A request sent at `sent` began to be answered at `arrival`; the one
+    /// before it in the same batch at `previous`.
+    pub(super) fn observe(&mut self, sent: Instant, arrival: Instant, previous: Option<Instant>) {
         let latency = arrival.saturating_duration_since(sent);
         let floor = *self
             .floor
@@ -226,14 +224,24 @@ impl Pacing {
         };
         // Sent less than about half a round trip before the previous reply
         // began: the receiver had finished that request, and so had nothing
-        // to do, before this one reached it. Grow only from requests sent at
-        // the current size, once for each size.
-        if previous.saturating_duration_since(sent) < floor / 2
-            && growth == self.growth
-            && self.growth < MAX_GROWTH
-        {
-            self.growth *= 2;
+        // to do, before this one reached it. Or answered so soon after the
+        // previous one that the requests in flight take the receiver less
+        // than a round trip: it will wait for the next ones. Each such reply
+        // doubles the size, those of requests sent before the last doubling
+        // included, so a slow link costs a round trip or two, not one for
+        // each doubling.
+        let waited = previous.saturating_duration_since(sent) < floor / 2;
+        let outpaces =
+            arrival.saturating_duration_since(previous) < floor / (REQUESTS_IN_FLIGHT as u32 + 1);
+        if waited || outpaces {
+            self.growth = (self.growth * 2).min(MAX_GROWTH);
         }
+    }
+
+    /// Requests have grown: the link, not creating directories, takes the
+    /// time, so a batch's files come in bursts rather than a few at a time.
+    pub(super) fn link_bound(&self) -> bool {
+        self.growth > 1
     }
 }
 
@@ -338,24 +346,31 @@ mod tests {
         let ms = Duration::from_millis;
         let mut pacing = Pacing::default();
         // A local receiver on a slow filesystem: the request after the first
-        // window was sent long before the previous reply came back.
-        pacing.observe(start, start + ms(200), None, 1);
-        pacing.observe(start, start + ms(400), Some(start + ms(200)), 1);
-        pacing.observe(start + ms(200), start + ms(1000), Some(start + ms(800)), 1);
+        // window was sent long before the previous reply came back, and
+        // replies come as far apart as a request takes.
+        pacing.observe(start, start + ms(200), None);
+        pacing.observe(start, start + ms(400), Some(start + ms(200)));
+        pacing.observe(start, start + ms(600), Some(start + ms(400)));
+        pacing.observe(start + ms(200), start + ms(1000), Some(start + ms(800)));
         assert_eq!(pacing.growth(), 1);
-        // A slow link to a fast filesystem: replies come back together a round
-        // trip after their requests, and the next went out with the first.
+        assert!(!pacing.link_bound());
+        // A slow link to a fast filesystem: the first replies come back
+        // together a round trip after their requests, so the requests in
+        // flight take the receiver far less than a round trip.
         let mut pacing = Pacing::default();
-        pacing.observe(start, start + ms(61), None, 1);
-        pacing.observe(start, start + ms(62), Some(start + ms(61)), 1);
+        pacing.observe(start, start + ms(61), None);
         assert_eq!(pacing.growth(), 1);
-        pacing.observe(start + ms(61), start + ms(123), Some(start + ms(64)), 1);
+        pacing.observe(start, start + ms(62), Some(start + ms(61)));
         assert_eq!(pacing.growth(), 2);
-        // A request sent before that growth does not grow it again, even
-        // though the receiver waited for it too.
-        pacing.observe(start + ms(63), start + ms(125), Some(start + ms(65)), 1);
-        assert_eq!(pacing.growth(), 2);
-        pacing.observe(start + ms(124), start + ms(186), Some(start + ms(125)), 2);
+        assert!(pacing.link_bound());
+        // A request sent as those replies came back reached a receiver that
+        // had nothing to do, though its reply was not soon after the last.
+        pacing.observe(start + ms(61), start + ms(150), Some(start + ms(80)));
         assert_eq!(pacing.growth(), 4);
+        for step in 0..10 {
+            let sent = start + ms(200 + step);
+            pacing.observe(sent, sent + ms(61), Some(sent + ms(1)));
+        }
+        assert_eq!(pacing.growth(), MAX_GROWTH);
     }
 }

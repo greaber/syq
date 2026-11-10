@@ -896,14 +896,14 @@ impl Sched {
         self.cv.notify_all();
     }
 
-    /// Files will be queued a few at a time, as the directories they go
-    /// into are created (`Planner::create_directories_streaming`): from now
-    /// on a small-file batch is sized against every active worker, busy ones
-    /// included, and holds at least `files_per_worker`, the files each
-    /// starting worker was counted for, as far as are queued
-    /// (`begin_fast_batch`).
-    pub fn trickling_files(&self, files_per_worker: usize) {
-        self.inner.lock().unwrap().trickle_batch = Some(files_per_worker.max(1));
+    /// Files are queued a few at a time, as the directories they go into
+    /// are created (`Planner::create_directories_streaming`): a small-file
+    /// batch is sized against every active worker, busy ones included, and
+    /// holds at least `files_per_worker`, the files each starting worker was
+    /// counted for, as far as are queued (`begin_fast_batch`). None when
+    /// they come in bursts again.
+    pub fn trickling_files(&self, files_per_worker: Option<usize>) {
+        self.inner.lock().unwrap().trickle_batch = files_per_worker.map(|files| files.max(1));
     }
 
     /// Release validated jobs while the planner finishes preparing later

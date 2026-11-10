@@ -404,8 +404,6 @@ struct DirectoryStream {
 struct SentDirectories {
     pending: crate::conn::PendingReply,
     sent: std::time::Instant,
-    /// The size it was sent at (`directory_stream::Pacing`).
-    growth: usize,
     /// Its directories, as indices into the batch's new directories.
     chosen: Vec<usize>,
     /// Their paths and conditions, in request order.
@@ -2961,6 +2959,7 @@ impl Planner<'_> {
         }
         // The files still to queue once their directories exist.
         let mut pending = super::directory_stream::Anticipated::default();
+        pending.trickling = !self.directory_pacing.link_bound();
         for (leaf, _) in waiting.iter().flatten().chain(&last) {
             if leaf.e.kind == Kind::File {
                 pending.add(leaf.e.size);
@@ -3065,7 +3064,6 @@ impl Planner<'_> {
             stream.in_flight.push_back(SentDirectories {
                 pending,
                 sent,
-                growth,
                 chosen,
                 targets,
                 count,
@@ -3089,7 +3087,7 @@ impl Planner<'_> {
         while let Some(request) = stream.in_flight.pop_front() {
             let (response, arrival) = self.dst.take_reply_with_arrival(request.pending)?;
             self.directory_pacing
-                .observe(request.sent, arrival, previous, request.growth);
+                .observe(request.sent, arrival, previous);
             previous = Some(arrival);
             let mut errs = self.applied(response, request.count)?;
             // Failed early metadata is retried, and reported, at the end.
@@ -3113,6 +3111,7 @@ impl Planner<'_> {
                 }
             }
             if released {
+                pending.trickling = !self.directory_pacing.link_bound();
                 (self.start_streaming)(Some(*pending));
             }
         }
