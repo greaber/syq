@@ -854,7 +854,14 @@ for directory in 0 1 2 3 4 5 6 7; do
 done
 NETWORK_TREE
 syq persist off
-SYQ_TEST_NETWORK_FILESYSTEM=1 syq persist connect source
+# For the second copy below, the receiver also lacks a no-replace rename, and
+# holds before it creates that copy's last directory.
+SYQ_TEST_NETWORK_FILESYSTEM=1 \
+    SYQ_TEST_NO_RENAME_NOREPLACE=1 \
+    SYQ_TEST_DESTINATION_MUTATION_SUFFIX=network-keep/d7/s3 \
+    SYQ_TEST_DESTINATION_MUTATION_READY_FILE=/tmp/syq-network-held \
+    SYQ_TEST_DESTINATION_MUTATION_CONTINUE_FILE=/tmp/syq-network-continue \
+    syq persist connect source
 syq persist receive wait source --timeout 30
 ssh source 'syq persist destinations wait laptop --timeout 30'
 ssh source 'SYQ_TUNING_HISTORY=/tmp/syq-network-tree.sqlite syq cp --copy-metadata permissions --srcs-in /tmp/syq-real-ssh/network-tree --to @laptop --into network-tree'
@@ -876,6 +883,43 @@ remote_manifest source /tmp/syq-real-ssh/network-tree /tmp/syq-network-tree-sour
     } | LC_ALL=C sort
 ) > /tmp/syq-network-tree-local.manifest
 diff -u /tmp/syq-network-tree-source.manifest /tmp/syq-network-tree-local.manifest
+# A copy that keeps existing files, into a directory that holds one, on a
+# filesystem without a no-replace rename: the receiver records the
+# directories it creates, so that a file published below one needs no second
+# lookup. While it holds before creating the last directory, a file below a
+# directory it created earlier has already been published.
+mkdir -p "$receive_root/network-keep/d0"
+printf 'kept\n' >"$receive_root/network-keep/d0/existing"
+rm -f /tmp/syq-network-held /tmp/syq-network-continue
+ssh source 'syq cp --if-exists=keep --copy-metadata permissions --srcs-in /tmp/syq-real-ssh/network-tree --to @laptop --into network-keep' &
+keep_copy=$!
+waited=0
+until [ -e /tmp/syq-network-held ] && [ -e "$receive_root/network-keep/d0/s0/f0" ]; do
+    if [ "$waited" -ge 300 ]; then
+        printf 'held: %s; published below a created directory: %s\n' \
+            "$(test -e /tmp/syq-network-held && echo yes || echo no)" \
+            "$(test -e "$receive_root/network-keep/d0/s0/f0" && echo yes || echo no)" >&2
+        touch /tmp/syq-network-continue
+        exit 1
+    fi
+    sleep 0.1
+    waited=$((waited + 1))
+done
+test ! -e "$receive_root/network-keep/d7/s3"
+touch /tmp/syq-network-continue
+wait "$keep_copy"
+test "$(cat "$receive_root/network-keep/d0/existing")" = kept
+rm "$receive_root/network-keep/d0/existing"
+(
+    cd "$receive_root/network-keep"
+    {
+        find . -mindepth 1 -printf '%y %m %p -> %l\n'
+        find . -type f -exec sha256sum {} +
+    } | LC_ALL=C sort
+) > /tmp/syq-network-keep-local.manifest
+# The directory that held the existing file keeps its own mode.
+grep -v '^d [0-7]* ./d0 -> $' /tmp/syq-network-tree-source.manifest >/tmp/syq-network-keep-source.manifest
+grep -v '^d [0-7]* ./d0 -> $' /tmp/syq-network-keep-local.manifest | diff -u /tmp/syq-network-keep-source.manifest -
 syq persist off
 syq persist connect source
 syq persist receive wait source --timeout 30
