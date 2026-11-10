@@ -2901,7 +2901,12 @@ impl Planner<'_> {
             let mut errs = self.apply(mkdirs)?;
             // Failed early metadata is retried, and reported, at the end.
             errs.truncate(targets.len());
-            self.record_new_directories(&targets, errs, dst_root)?;
+            self.record_new_directories(
+                &targets,
+                errs,
+                dst_root,
+                crate::results::ReceiverListing::Listed,
+            )?;
         }
         if let Some(proposed) = root_default {
             self.open_private_root(proposed)?;
@@ -3021,7 +3026,12 @@ impl Planner<'_> {
             };
             if let Ok(mut errs) = self.applied(response, request.count) {
                 errs.truncate(request.targets.len());
-                let _ = self.record_new_directories(&request.targets, errs, dst_root);
+                let _ = self.record_new_directories(
+                    &request.targets,
+                    errs,
+                    dst_root,
+                    crate::results::ReceiverListing::Listed,
+                );
             }
         }
         outcome?;
@@ -3092,7 +3102,13 @@ impl Planner<'_> {
                         "operation skipped because the no-replace creation it depends on failed",
                     )
                 };
-                self.record_new_directories(&targets, vec![Some(error); targets.len()], dst_root)?;
+                self.record_new_directories(
+                    &targets,
+                    vec![Some(error); targets.len()],
+                    dst_root,
+                    // The receiver never saw these.
+                    crate::results::ReceiverListing::Unlisted,
+                )?;
                 stream.skipped.extend(skipped);
             }
             let mut ops: Vec<Op> = chosen
@@ -3173,7 +3189,12 @@ impl Planner<'_> {
                     stream.failed_guarded.push(path.clone());
                 }
             }
-            if let Err(error) = self.record_new_directories(&request.targets, errs, dst_root) {
+            if let Err(error) = self.record_new_directories(
+                &request.targets,
+                errs,
+                dst_root,
+                crate::results::ReceiverListing::Listed,
+            ) {
                 stream.stopped = true;
                 return Err(error);
             }
@@ -3319,12 +3340,15 @@ impl Planner<'_> {
     }
 
     /// Report the outcome of one request's directory creations, `targets`,
-    /// whose errors are `errs`, and stop on a lack of space.
+    /// whose errors are `errs`, and stop on a lack of space. `listing` says
+    /// whether the receiver lists their failures itself: not those this
+    /// planner skipped without sending.
     fn record_new_directories(
         &mut self,
         targets: &[(PathBytes, TargetCondition)],
         errs: Vec<Option<WireError>>,
         dst_root: &[u8],
+        listing: crate::results::ReceiverListing,
     ) -> Result<()> {
         let opts = self.opts;
         let capacity_error = first_capacity_error(&errs);
@@ -3342,10 +3366,7 @@ impl Planner<'_> {
                     &format!("syq: {}", self.opts.wire_error_message_at(err, name)),
                     Some("io"),
                     os_kind,
-                    Some((
-                        destination_entry(name, dst_root),
-                        crate::results::ReceiverListing::Listed,
-                    )),
+                    Some((destination_entry(name, dst_root), listing)),
                 );
                 if name == &self.dst_root && *condition != TargetCondition::Any {
                     self.collision = true;
@@ -3382,7 +3403,7 @@ impl Planner<'_> {
                     },
                     None,
                     // The receiver lists its failures itself.
-                    crate::results::ReceiverListing::Listed,
+                    listing,
                 );
             }
         }
