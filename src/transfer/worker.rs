@@ -57,8 +57,10 @@ pub(super) struct Worker {
     /// That login failed: the worker ends its shared sessions and logs in
     /// again through the worker loop, as every later connection does.
     pub(super) leaving_shared_login: bool,
-    /// While its own login is under way, the room it takes under a signed
-    /// grant's connection allowance (`Gate::reserve_overlap`).
+    /// The room its own login takes under a signed grant's connection
+    /// allowance (`Gate::reserve_overlap`), until the worker has closed its
+    /// shared sessions. While the login is under way its thread holds it
+    /// (`Login`).
     pub(super) allowance_share: Option<crate::tune::OverlapReservation>,
 }
 
@@ -85,14 +87,24 @@ pub(super) enum OwnLogin {
 }
 
 /// A login under way on a thread of its own.
-pub(super) struct PendingLogin(Option<std::thread::JoinHandle<Result<OwnConnections>>>);
+pub(super) struct PendingLogin(Option<std::thread::JoinHandle<Login>>);
+
+/// What a login's thread ends with: the connections it opened, and the room
+/// they take under a signed grant's connection allowance. A worker that ends
+/// while its login is under way leaves both to the thread, which closes the
+/// connections before giving the room back (fields drop in order): until
+/// then the receiver counts them, and a new worker would be refused.
+pub(super) struct Login {
+    connections: Result<OwnConnections>,
+    share: Option<crate::tune::OverlapReservation>,
+}
 
 impl PendingLogin {
     fn is_finished(&self) -> bool {
         self.0.as_ref().is_some_and(|login| login.is_finished())
     }
 
-    fn join(mut self) -> std::thread::Result<Result<OwnConnections>> {
+    fn join(mut self) -> std::thread::Result<Login> {
         self.0.take().expect("a pending login").join()
     }
 }
@@ -103,10 +115,15 @@ impl Drop for PendingLogin {
         // on its thread; the copy ends it once the copy is over. Finished
         // connections nobody will use close without waiting for their peers.
         if let Some(login) = self.0.take().filter(|login| login.is_finished()) {
-            if let Ok(Ok((src, dst))) = login.join() {
+            if let Ok(Login {
+                connections: Ok((src, dst)),
+                share,
+            }) = login.join()
+            {
                 for mut conn in [src, dst].into_iter().flatten() {
                     conn.detach();
                 }
+                drop(share);
             }
         }
     }
@@ -307,9 +324,14 @@ impl Worker {
         // Every reply on the shared sessions must be read before they close.
         self.settle_between_items(true)?;
         let opened = match std::mem::take(&mut self.own_login) {
-            OwnLogin::Opening(login) => login
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            OwnLogin::Opening(login) => {
+                let Login { connections, share } = login
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                // The worker keeps the room until its shared sessions close.
+                self.allowance_share = share;
+                connections
+            }
             OwnLogin::Failed(error) => Err(error),
             OwnLogin::None | OwnLogin::Unopened(_) => unreachable!("a ready login has ended"),
         };
@@ -371,17 +393,21 @@ impl Worker {
         // the worker's actor belongs to the worker's thread, which is busy.
         let observe = self.observation.is_some().then(|| self.progress.clone());
         let id = self.id;
-        let login = move || -> Result<OwnConnections> {
-            let (mut src, mut dst) = open()?;
-            if let Some(progress) = &observe {
-                let actor = crate::transfer_observations::Actor::new("worker");
-                for (source, conn) in [(true, &mut src), (false, &mut dst)] {
-                    if let Some(conn) = conn {
-                        conn.observe(&progress.observations, &actor, source, id)?;
+        let share = self.allowance_share.take();
+        let login = move || {
+            let connections = (|| -> Result<OwnConnections> {
+                let (mut src, mut dst) = open()?;
+                if let Some(progress) = &observe {
+                    let actor = crate::transfer_observations::Actor::new("worker");
+                    for (source, conn) in [(true, &mut src), (false, &mut dst)] {
+                        if let Some(conn) = conn {
+                            conn.observe(&progress.observations, &actor, source, id)?;
+                        }
                     }
                 }
-            }
-            Ok((src, dst))
+                Ok((src, dst))
+            })();
+            Login { connections, share }
         };
         match std::thread::Builder::new()
             .name(format!("syq-login-{}", self.id))
@@ -397,6 +423,7 @@ impl Worker {
                 }
             }
             Err(error) => {
+                // No login opened anything, so its share went with it.
                 self.own_login = OwnLogin::Failed(
                     anyhow::Error::new(error).context("cannot start its own login"),
                 );
