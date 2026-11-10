@@ -328,9 +328,9 @@ pub(super) fn receiver_control_paths(
                 crate::receive_service::config_path(&crate::persistence::Domain::default())
                     .ok()
                     .and_then(|path| path.parent().map(Path::to_path_buf)),
-                Some(crate::persistence::runtime_parent_path()),
-                temporary_sockets,
-                runtime_sockets,
+                own_or_missing(crate::persistence::runtime_parent_path()),
+                temporary_sockets.and_then(own_or_missing),
+                runtime_sockets.and_then(own_or_missing),
             ]
         }
         ControlPaths::Elsewhere(receiving) => receiving.iter().cloned().map(Some).collect(),
@@ -353,6 +353,17 @@ pub(super) fn receiver_control_paths(
             label,
         })
         .collect())
+}
+
+/// `path`, a directory of syq's runtime state that may be in a shared
+/// directory such as `/tmp`, unless something other than a directory of
+/// this account's is there. Syq never keeps its state behind a link or in
+/// another user's directory, and following a link another user made would
+/// protect whatever it leads to, refusing unrelated copies.
+fn own_or_missing(path: PathBuf) -> Option<PathBuf> {
+    let other = fs::symlink_metadata(&path)
+        .is_ok_and(|metadata| !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() });
+    (!other).then_some(path)
 }
 
 /// Remove `name` from the private directory `state` when it is there,

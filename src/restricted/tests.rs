@@ -3314,12 +3314,14 @@ fn receivers_protect_the_sockets_of_running_copies() {
     );
 }
 
-/// A link where the account's sockets could be, as another user can make
-/// in a shared `/tmp`, holds no copy's sockets, so it protects nothing: a
-/// copy into a directory it leads to, or below one, is not refused.
+/// A link where syq's runtime state could be, as another user can make in a
+/// shared `/tmp`, holds none of it, so it protects nothing: a copy into a
+/// directory it leads to, or below one, is not refused. That is so where
+/// the account's copies could keep their sockets, and where persistent
+/// connections keep theirs.
 #[test]
-fn a_link_where_sockets_could_be_protects_nothing() {
-    const CHILD: &str = "SYQ_TEST_SOCKETS_LINK_FIXTURE";
+fn a_link_where_runtime_state_could_be_protects_nothing() {
+    const CHILD: &str = "SYQ_TEST_STATE_LINK_FIXTURE";
     let uid = unsafe { libc::geteuid() };
     if let Some(fixture) = std::env::var_os(CHILD) {
         let fixture = PathBuf::from(fixture);
@@ -3346,36 +3348,38 @@ fn a_link_where_sockets_could_be_protects_nothing() {
             (Default::default(), &protected),
         )
         .unwrap();
-        // The other place, which nothing occupies yet, stays protected.
+        // A place nothing occupies yet stays protected.
         let runtime = fixture.join(format!("run/syq-{uid}/x"));
         reject_control_plane_path(runtime.as_os_str().as_bytes(), &protected).unwrap_err();
         return;
     }
-    let temporary = crate::test_support::tempdir().unwrap();
-    let fixture = temporary.path();
-    for directory in ["run", "tmp", "inbox"] {
-        fs::create_dir(fixture.join(directory)).unwrap();
+    for link in [format!("tmp/syq-{uid}"), format!("run/syq-persist-{uid}")] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let fixture = temporary.path();
+        for directory in ["run", "tmp", "inbox"] {
+            fs::create_dir(fixture.join(directory)).unwrap();
+        }
+        fs::set_permissions(fixture.join("run"), fs::Permissions::from_mode(0o700)).unwrap();
+        // It leads to a directory above the copy's destination.
+        symlink(fixture, fixture.join(&link)).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "restricted::tests::a_link_where_runtime_state_could_be_protects_nothing",
+                "--nocapture",
+            ])
+            .env(CHILD, fixture)
+            .env("TMPDIR", fixture.join("tmp"))
+            .env("XDG_RUNTIME_DIR", fixture.join("run"))
+            .capture_output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{link}: {stdout} {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
-    fs::set_permissions(fixture.join("run"), fs::Permissions::from_mode(0o700)).unwrap();
-    // It leads to a directory above the copy's destination.
-    symlink(fixture, fixture.join(format!("tmp/syq-{uid}"))).unwrap();
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "restricted::tests::a_link_where_sockets_could_be_protects_nothing",
-            "--nocapture",
-        ])
-        .env(CHILD, fixture)
-        .env("TMPDIR", fixture.join("tmp"))
-        .env("XDG_RUNTIME_DIR", fixture.join("run"))
-        .capture_output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success() && stdout.contains("1 passed"),
-        "{stdout} {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 #[test]
