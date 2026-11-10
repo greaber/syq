@@ -124,12 +124,12 @@ impl DirectoryQueue {
     /// The next request's directories at `growth`: at most `PER_PARENT *
     /// growth` in one parent, `PER_REQUEST * growth` in all and `growth`
     /// levels deep (`usize::MAX` for no such limit), within `byte_limit` by
-    /// `sizes` (each directory's share of the request). A deeper level joins only once the levels above it
-    /// are all in this or an earlier request, so a directory is never
-    /// created before its parent. The request ends before the first
-    /// directory that must wait for an earlier request's reply
-    /// (`DirectoryQueue`), which stays queued: it is empty when that is the
-    /// next one.
+    /// `sizes` (each directory's share of the request). A deeper level joins
+    /// only once the levels above it are all in this or an earlier request,
+    /// so a directory is never created before its parent. The request ends
+    /// before the first directory that must wait for an earlier request's
+    /// reply (`DirectoryQueue`), which stays queued: it is empty when that
+    /// is the next one.
     pub(super) fn next(&mut self, growth: usize, sizes: &[usize], byte_limit: usize) -> Vec<usize> {
         self.requests += 1;
         let request = self.requests;

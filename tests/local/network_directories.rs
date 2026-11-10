@@ -39,6 +39,44 @@ fn hold_directory(command: &mut Command, t: &Tmp, suffix: &str) -> (PathBuf, Pat
     (ready, continuation)
 }
 
+#[test]
+fn only_a_network_destination_creates_directories_in_small_requests() {
+    // 300 new directories, each with a new subdirectory: off a network
+    // destination they go in one request, and on one in requests that
+    // start small and grow.
+    for network in [false, true] {
+        let t = Tmp::new();
+        for index in 0..300 {
+            write(
+                &t.path(&format!("src/d{index:03}/sub/file")),
+                format!("{index}").as_bytes(),
+            );
+        }
+        let requests = t.path("requests");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args(["cp", "--no-progress", "--srcs-in", &t.s("src"), "--into"])
+            .arg(t.path("dst"))
+            .env("SYQ_TEST_DIRECTORY_REQUESTS", &requests);
+        if network {
+            command.env(NETWORK.0, NETWORK.1);
+        }
+        assert_output_ok(&command.run().unwrap());
+        let sizes: Vec<usize> = fs::read_to_string(&requests)
+            .unwrap()
+            .lines()
+            .map(|line| line.parse().unwrap())
+            .collect();
+        assert_eq!(sizes.iter().sum::<usize>(), 600, "network={network}");
+        if network {
+            assert_eq!(sizes[0], 2, "{sizes:?}");
+            assert!(sizes.len() > 4, "{sizes:?}");
+        } else {
+            assert_eq!(sizes, [600]);
+        }
+    }
+}
+
 fn existing_directories(t: &Tmp, count: usize) -> Vec<usize> {
     (0..count)
         .filter(|index| t.path(&format!("dst/d{index:03}")).exists())

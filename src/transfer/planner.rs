@@ -3130,6 +3130,12 @@ impl Planner<'_> {
                 continue;
             }
             let count = ops.len();
+            // Tests count the directories each request creates.
+            #[cfg(debug_assertions)]
+            crate::fsops::record_test_event(
+                "SYQ_TEST_DIRECTORY_REQUESTS",
+                format_args!("{}", targets.len()),
+            )?;
             // Held back on purpose, it reached the receiver after the
             // previous reply: that is no sign of a slow link.
             let after_hold = std::mem::take(&mut stream.held);
