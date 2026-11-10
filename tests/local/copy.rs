@@ -49,7 +49,14 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
         .map(|offset| (offset % 251) as u8)
         .collect();
     fs::create_dir_all(t.path("src")).unwrap();
-    for index in 0..10 {
+    // The first copy only leaves a run for the tuning history to seed, so it
+    // copies two files. The measured copy has twenty: the tuner compares
+    // worker counts only while a file is left for each worker, and on a
+    // loaded runner it may climb to eight or more workers before the
+    // bandwidth plateau shows; with ten files too few could be left by then
+    // for it to try fewer.
+    let (seeding, files) = (2, 20);
+    for index in 0..seeding {
         write(&t.path(&format!("src/file-{index}")), &data);
     }
     let remote = format!("fake:{}", t.s("dst"));
@@ -92,6 +99,9 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
     assert_output_ok(&command.run().unwrap());
     tuning::seed_start_from_last_run(&cache, 2);
     fs::remove_dir_all(t.path("dst")).unwrap();
+    for index in seeding..files {
+        write(&t.path(&format!("src/file-{index}")), &data);
+    }
     let out = command
         .env("SYQ_TEST_DROP_AFTER_REQUEST", "write")
         .env("SYQ_TEST_DROP_AFTER_N_REQUESTS", "32")
@@ -101,7 +111,7 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
 
     assert_output_ok(&out);
     assert!(marker.exists());
-    for index in 0..10 {
+    for index in 0..files {
         assert_eq!(read(&t.path(&format!("dst/file-{index}"))), data);
     }
     assert!(

@@ -165,23 +165,5 @@ impl Drop for ForegroundTerminal {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::unix::process::ExitStatusExt;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn a_child_in_this_group_stays_in_it_and_is_killed_alone() {
-        let mut command = Command::new("sleep");
-        command.arg("30");
-        let mut child = ProcessGroup::spawn_in_this_group(&mut command).unwrap();
-        let pid = child.child.id() as libc::pid_t;
-        assert_eq!(unsafe { libc::getpgid(pid) }, unsafe { libc::getpgrp() });
-        assert!(child.foreground().unwrap().is_none());
-        let started = Instant::now();
-        let status = child.close().unwrap();
-        assert_eq!(status.signal(), Some(libc::SIGKILL));
-        assert!(started.elapsed() < Duration::from_secs(5));
-    }
-}
+// Its tests are in `process.rs` (`group_tests`): the integration test
+// targets include this file.

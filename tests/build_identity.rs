@@ -1,6 +1,6 @@
 //! Exercise the actual Cargo build script in isolated source directories.
 #[allow(dead_code)]
-#[path = "../src/process.rs"]
+#[path = "../src/process_spawn.rs"]
 mod process;
 use crate::process::CommandExt as _;
 #[path = "support/temp.rs"]

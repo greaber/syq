@@ -15,6 +15,22 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DIRECTORY: &str = "resolution-v1";
 const MAX_FILE: u64 = 256 * 1024;
+/// How long completion and export wait for `ssh -G` on this machine.
+const CACHED_LOOKUP: Duration = Duration::from_millis(200);
+
+/// `CACHED_LOOKUP`, which debug builds take from
+/// `SYQ_TEST_CACHED_SSH_CONFIG_MS`: a test's `ssh` is a shell script, which a
+/// loaded runner can take longer than that to start.
+fn cached_lookup() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(millis) = std::env::var("SYQ_TEST_CACHED_SSH_CONFIG_MS")
+        .ok()
+        .and_then(|millis| millis.parse().ok())
+    {
+        return Duration::from_millis(millis);
+    }
+    CACHED_LOOKUP
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -166,7 +182,7 @@ pub(super) fn cached(domain: &Domain, request: &SessionRequest) -> Result<Option
             return Ok(None);
         };
         if entry.selected.local.as_ref().is_none_or(|local| {
-            LocalPlan::resolve_bounded(&request.destination, Duration::from_millis(200)).map_or(
+            LocalPlan::resolve_bounded(&request.destination, cached_lookup()).map_or(
                 true,
                 |current| {
                     current.config_digest != local.config_digest

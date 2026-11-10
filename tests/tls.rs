@@ -3,7 +3,7 @@
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
 #[allow(dead_code)]
-#[path = "../src/process.rs"]
+#[path = "../src/process_spawn.rs"]
 mod process;
 use process::CommandExt as _;
 #[path = "support/temp.rs"]

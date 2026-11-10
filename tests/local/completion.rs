@@ -2331,6 +2331,10 @@ fn approved_completion_command(t: &Tmp, words: &[&str]) -> Command {
         // replacement pool spare must not write into the next invocation's
         // trace or inherit its predecessor's fake SSH failure setting.
         .env("SYQ_TEST_POOL_IDLE_SECS", "0")
+        // Completion gives `ssh -G` 200 ms before it treats the approved
+        // connection as unusable; a loaded runner can take longer to start
+        // the fixture's shell script.
+        .env("SYQ_TEST_CACHED_SSH_CONFIG_MS", "30000")
         .env("SYQ_COMPLETION_DEBUG", "1");
     command
 }
