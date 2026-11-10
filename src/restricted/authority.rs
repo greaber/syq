@@ -3026,7 +3026,9 @@ impl RestrictedAuthority {
                     bail!("small copy payloads differ from what its preparation asked for");
                 }
             }
-            Request::PatchBegin { patch, data_len } => {
+            Request::PatchBegin {
+                patch, data_len, ..
+            } => {
                 if stream.is_some() {
                     bail!("a streamed patch is already open on this connection");
                 }
@@ -4197,7 +4199,9 @@ impl RestrictedAuthority {
             }
             // A streamed patch passes every rule a patch of a batch does. Its
             // pieces and end are checked against it in `authorize_stream`.
-            Request::PatchBegin { patch, data_len } => {
+            Request::PatchBegin {
+                patch, data_len, ..
+            } => {
                 if !patch.data.is_empty() {
                     bail!("a streamed patch carries its data in pieces");
                 }

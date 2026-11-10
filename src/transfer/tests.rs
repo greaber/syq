@@ -1191,7 +1191,7 @@ fn a_lost_connection_queues_publications_in_flight_again() {
             Item::File(other) => {
                 sched.ranges_ready(other, vec![]);
             }
-            Item::Range(_) => panic!("unexpected range"),
+            Item::Range(_) | Item::Patch(_) => panic!("unexpected range or patch"),
             Item::Exit => break,
         }
     }
@@ -5142,6 +5142,220 @@ fn a_file_of_which_more_differs_than_a_patch_carries_streams_its_patch() {
 }
 
 #[test]
+fn an_idle_worker_streams_a_patch_another_worker_compared() {
+    // One worker compares both files and streams the first; the second
+    // file's patch is left in the queue, and an idle worker streams it on
+    // its own connection, which did not compare the file. Each stage reuses
+    // more than half its file, so its blocks are taken from the file it
+    // replaces. The first worker's begin waits until the other worker's
+    // has arrived, so the patch cannot be taken back first. So too through
+    // a command-restricted receiver, whose connections authorize each begin.
+    let files: [(&str, usize, std::ops::Range<usize>); 2] = [
+        ("first", 48 << 20, 30 << 20..48 << 20),
+        ("second", 40 << 20, 0..17 << 20),
+    ];
+    for (in_process, restricted) in [(false, false), (true, false), (false, true)] {
+        let case = format!("in_process={in_process} restricted={restricted}");
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        let sched = differing_jobs(root, &files);
+        let authority = Arc::new(crate::restricted::tests::time_preserving_test_authority_of(
+            root,
+            256 << 20,
+        ));
+        let began = Arc::new((Mutex::new([false; 2]), std::sync::Condvar::new()));
+        let wait_for = |began: &(Mutex<[bool; 2]>, std::sync::Condvar), worker: usize| {
+            let (state, changed) = began;
+            let state = state.lock().unwrap();
+            let (state, timeout) = changed
+                .wait_timeout_while(state, std::time::Duration::from_secs(30), |state| {
+                    !state[worker]
+                })
+                .unwrap();
+            assert!(
+                !timeout.timed_out() || state[worker],
+                "worker {worker} never began"
+            );
+        };
+        let mut requests = Vec::new();
+        let mut workers = Vec::new();
+        for id in 0..2 {
+            let unused = Arc::new(Mutex::new(PipelineState::default()));
+            let mut worker = pipeline_worker(&sched, &unused, &unused, true);
+            worker.id = id;
+            worker.gate = Gate::new(id + 1);
+            worker.fast_batch_files = files.len();
+            worker.src = Box::new(QueuingSource {
+                ops: crate::fsops::FsOps::new(),
+                replies: Default::default(),
+                in_process,
+                most: Default::default(),
+            });
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            requests.push(seen.clone());
+            let began = began.clone();
+            let begin = move || {
+                let (state, changed) = &*began;
+                state.lock().unwrap()[id] = true;
+                changed.notify_all();
+                if id == 0 {
+                    wait_for(&began, 1);
+                }
+            };
+            worker.dst = if restricted {
+                // Every patch here is streamed, so each patch is a begin.
+                restricted_destination(authority.clone(), seen, begin)
+            } else {
+                let mut destination = crate::fsops::FsOps::test_destination(&root.join("target"));
+                Box::new(AnsweringConn {
+                    answer: move |request: Request| {
+                        if let Request::PatchBegin { .. } = request {
+                            begin();
+                        }
+                        let response = destination.handle(&request);
+                        seen.lock().unwrap().push(match request {
+                            Request::PatchData { hash, .. } => Request::PatchData {
+                                data: Vec::new().into(),
+                                hash,
+                            },
+                            request => request,
+                        });
+                        response
+                    },
+                    replies: Default::default(),
+                })
+            };
+            let opts = Arc::get_mut(&mut worker.opts).unwrap();
+            opts.block = 1 << 20;
+            if restricted {
+                opts.restricted_receiver = true;
+                opts.flags = flags::TIMES;
+                opts.matching_flags = flags::TIMES;
+            }
+            workers.push(worker);
+        }
+        std::thread::scope(|scope| {
+            let running: Vec<_> = workers
+                .into_iter()
+                .enumerate()
+                .map(|(id, mut worker)| {
+                    let (sched, began) = (&sched, &began);
+                    scope.spawn(move || {
+                        // The idle worker starts once the other has its batch.
+                        if id == 1 {
+                            wait_for(began, 0);
+                        }
+                        loop {
+                            match sched.next() {
+                                Item::Exit => break,
+                                item => worker.process_item(item).unwrap(),
+                            }
+                        }
+                        worker.progress.errors.load(Relaxed)
+                    })
+                })
+                .collect();
+            for worker in running {
+                assert_eq!(worker.join().unwrap(), 0, "{case}");
+            }
+        });
+        assert!(sched.finished(), "{case}");
+        for (name, ..) in &files {
+            assert!(
+                std::fs::read(root.join("source").join(name)).unwrap()
+                    == std::fs::read(root.join("target").join(name)).unwrap(),
+                "{case} {name}"
+            );
+        }
+        for (id, seen) in requests.iter().enumerate() {
+            let seen = seen.lock().unwrap();
+            let count = |kind: fn(&Request) -> bool| seen.iter().filter(|r| kind(r)).count();
+            assert_eq!(
+                count(|r| matches!(r, Request::PatchBegin { .. })),
+                1,
+                "{case}: worker {id}"
+            );
+            assert_eq!(
+                count(|r| matches!(r, Request::PatchEnd { commit: true })),
+                1,
+                "{case}: worker {id}"
+            );
+            // Only the comparing worker hashed the destination.
+            assert_eq!(
+                count(|r| matches!(r, Request::HashExistingBatch { .. })) > 0,
+                id == 0,
+                "{case}: worker {id}"
+            );
+        }
+        if restricted {
+            assert_eq!(authority.in_flight(), 0, "{case}");
+        }
+    }
+}
+
+#[test]
+fn a_reconnected_worker_takes_back_only_its_current_batchs_patches() {
+    // A worker's connection fails while it streams the first of its batch's
+    // patches, and the other patch stays queued. The worker reconnects under
+    // the same id and compares the interrupted file again in a new batch,
+    // whose stream takes back none of the earlier batch's patches. That
+    // patch is then taken from the queue, on the new connection, and both
+    // files are copied.
+    let files: [(&str, usize, std::ops::Range<usize>); 2] = [
+        ("first", 48 << 20, 30 << 20..48 << 20),
+        ("second", 40 << 20, 0..17 << 20),
+    ];
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let sched = differing_jobs(root, &files);
+    let unused = Arc::new(Mutex::new(PipelineState::default()));
+    let mut worker = pipeline_worker(&sched, &unused, &unused, true);
+    worker.fast_batch_files = files.len();
+    Arc::get_mut(&mut worker.opts).unwrap().block = 1 << 20;
+    let target = root.join("target");
+    let connect = |fail_piece: Option<usize>| -> (Box<dyn Conn>, Box<dyn Conn>) {
+        let source = Box::new(QueuingSource {
+            ops: crate::fsops::FsOps::new(),
+            replies: Default::default(),
+            in_process: true,
+            most: Default::default(),
+        });
+        let mut receiver = crate::fsops::FsOps::test_destination(&target);
+        let mut destination = FailingConn::new(Box::new(AnsweringConn {
+            answer: move |request: Request| receiver.handle(&request),
+            replies: Default::default(),
+        }));
+        destination.fail_piece = fail_piece;
+        (source, Box::new(destination))
+    };
+    (worker.src, worker.dst) = connect(Some(2));
+    let mut reconnects = 0;
+    loop {
+        match sched.next() {
+            Item::Exit => break,
+            item => {
+                if let Err(error) = worker.process_item(item) {
+                    assert!(worker.transport_dead(), "{error:#}");
+                    reconnects += 1;
+                    assert_eq!(reconnects, 1, "{error:#}");
+                    (worker.src, worker.dst) = connect(None);
+                }
+            }
+        }
+    }
+    assert_eq!(reconnects, 1);
+    assert!(sched.finished());
+    assert_eq!(worker.progress.errors.load(Relaxed), 0);
+    for (name, ..) in &files {
+        assert!(
+            std::fs::read(root.join("source").join(name)).unwrap()
+                == std::fs::read(target.join(name)).unwrap(),
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn a_streamed_patch_that_fails_at_its_begin_sends_none_of_its_pieces() {
     // An in-process source's pieces are ready as soon as they are read, but
     // the sender still takes the receiver's replies first: a patch whose
@@ -5435,13 +5649,16 @@ fn an_aborted_copy_sends_nothing_further_for_groups_in_flight() {
 }
 
 /// A connection that fails, and stays dead, as a dropped one does: at its
-/// `fail_recv`-th reply, or as it sends its `fail_patch`-th patch batch.
+/// `fail_recv`-th reply, as it sends its `fail_patch`-th patch batch, or as
+/// it sends its `fail_piece`-th streamed patch piece.
 struct FailingConn {
     inner: Box<dyn Conn>,
     received: usize,
     fail_recv: Option<usize>,
     patches: usize,
     fail_patch: Option<usize>,
+    pieces: usize,
+    fail_piece: Option<usize>,
     dead: bool,
 }
 
@@ -5453,6 +5670,8 @@ impl FailingConn {
             fail_recv: None,
             patches: 0,
             fail_patch: None,
+            pieces: 0,
+            fail_piece: None,
             dead: false,
         }
     }
@@ -5463,6 +5682,10 @@ impl Conn for FailingConn {
         if let Request::PatchSmallBatch(_) = request {
             self.patches += 1;
             self.dead |= self.fail_patch == Some(self.patches);
+        }
+        if let Request::PatchData { .. } = request {
+            self.pieces += 1;
+            self.dead |= self.fail_piece == Some(self.pieces);
         }
         anyhow::ensure!(!self.dead, "injected connection failure");
         self.inner.send(request)

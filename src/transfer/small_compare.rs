@@ -29,6 +29,17 @@
 //! from a remote source, and those sent await their acknowledgments within
 //! the destination's reply queue.
 //!
+//! A worker streams the first of its batch's patches itself and leaves the
+//! others in the queue (`Sched::share_patches`), for workers that have
+//! nothing else to do. It takes back each one no other worker has taken as
+//! its last stream's pieces are read, so its patches still follow one
+//! another on its connection. A patch another worker takes is streamed on
+//! that worker's connection. Its begin names the batch that compared the
+//! file, so that the receiver, which serves every connection of a copy,
+//! uses the lease that comparison took; if the comparing connection has let
+//! it go, the receiver reads back the blocks the stage takes from the file
+//! it replaces.
+//!
 //! Each file is complete, and counts as progress, as soon as the reply that
 //! keeps or publishes it arrives, not when its batch ends; a streamed patch's
 //! pieces count as they are acknowledged, and no longer count if the patch is
@@ -50,6 +61,7 @@
 
 use super::*;
 use crate::proto::PATCH_PIECE_BYTES;
+use crate::sched::SharedPatch;
 use crate::transfer_tuning::COMPARE_WINDOW;
 
 /// Each batch of groups gets its own number, so that a receiver can let go
@@ -116,6 +128,9 @@ pub(super) enum Compared {
     UpdateFailed(WireError),
     /// Kept or published, and completed when the reply that did so arrived.
     Completed,
+    /// Its patch was left for any worker to stream, and the worker that
+    /// takes it settles the file.
+    Shared,
 }
 
 #[derive(Clone, Copy)]
@@ -138,12 +153,14 @@ struct PendingRead {
 }
 
 /// A file of which more differs than one patch carries: its patch, without
-/// data, until it is sent, and the new and reused bytes it publishes.
+/// data, until it is sent, the new and reused bytes it publishes, and the
+/// batch that compared it.
 struct Streamed {
     file: usize,
     patch: Option<SmallPatch>,
     sent: u64,
     reused: u64,
+    compared_in: u64,
 }
 
 /// The ranges of a patch's differing blocks, in file order, each of whole
@@ -279,9 +296,17 @@ impl Worker {
         self.sched.mark_fast(batch.len() - 1);
         self.benchmark.compared_files += batch.len() as u64;
         let (outcomes, result) = self.compare_small_files(&batch);
-        let mut finished = Vec::new();
         // Requeue before releasing the claim, so the queue is never empty
         // while these files are still unfinished.
+        let completed = self.settle_outcomes(&batch, outcomes);
+        self.sched.complete_fast_batch(batch.len());
+        result.and(completed)
+    }
+
+    /// Act on what comparing `batch` decided for each file: complete it,
+    /// fail it, or queue it again.
+    fn settle_outcomes(&mut self, batch: &[usize], outcomes: Vec<Option<Compared>>) -> Result<()> {
+        let mut finished = Vec::new();
         for (&i, outcome) in batch.iter().zip(outcomes) {
             match outcome {
                 Some(Compared::Differs) => {
@@ -311,16 +336,47 @@ impl Worker {
                     let job = self.job(i);
                     self.retry_changed_small(i, &job, now);
                 }
-                Some(Compared::Completed) => {}
+                Some(Compared::Completed | Compared::Shared) => {}
                 Some(outcome) => finished.push((i, outcome)),
                 None => self.sched.requeue(i),
             }
         }
-        let completed = finished
+        finished
             .into_iter()
-            .try_for_each(|(i, outcome)| self.complete_compared(i, outcome));
-        self.sched.complete_fast_batch(batch.len());
-        result.and(completed)
+            .try_for_each(|(i, outcome)| self.complete_compared(i, outcome))
+    }
+
+    /// Stream a patch the worker that compared its file left for others,
+    /// and settle the file. A patch that does not reach its end is compared
+    /// again.
+    pub(super) fn stream_shared_patch(&mut self, shared: Box<SharedPatch>) -> Result<()> {
+        let SharedPatch {
+            idx,
+            job,
+            patch,
+            sent,
+            reused,
+            compared_in,
+            ..
+        } = *shared;
+        let batch = [idx];
+        let jobs = [job];
+        let mut outcomes = vec![None];
+        let result = if self.sched.is_aborted() {
+            Ok(())
+        } else {
+            let streams = vec![Streamed {
+                file: 0,
+                patch: Some(patch),
+                sent,
+                reused,
+                compared_in,
+            }];
+            self.stream_patches(&batch, &jobs, streams, &mut outcomes, None)
+        };
+        let settled = self.settle_outcomes(&batch, outcomes);
+        self.sched.patch_done();
+        result.and(settled)
     }
 
     /// Compare `batch` with the destination in pipelined groups. Returns each
@@ -460,6 +516,7 @@ impl Worker {
                     response,
                     &mut outcomes,
                     &mut streams,
+                    compare_batch,
                 )?;
                 if let Stage::Patch = stage {
                     let files = groups[group].files.iter().copied();
@@ -506,11 +563,41 @@ impl Worker {
         }
         let result = match result {
             Ok(()) if !streams.is_empty() && !self.sched.is_aborted() => {
-                self.stream_patches(batch, &jobs, streams, &mut outcomes)
+                self.share_and_stream(batch, &jobs, streams, &mut outcomes)
             }
             result => result,
         };
         (outcomes, result)
+    }
+
+    /// Stream the first of a batch's patches, and leave the others for any
+    /// worker that is idle; this worker takes back, as it goes, each that
+    /// no other worker has taken.
+    fn share_and_stream(
+        &mut self,
+        batch: &[usize],
+        jobs: &[WorkerJob],
+        mut streams: Vec<Streamed>,
+        outcomes: &mut [Option<Compared>],
+    ) -> Result<()> {
+        let shared = streams
+            .split_off(1)
+            .into_iter()
+            .map(|stream| {
+                outcomes[stream.file] = Some(Compared::Shared);
+                SharedPatch {
+                    idx: batch[stream.file],
+                    job: jobs[stream.file].clone(),
+                    patch: stream.patch.expect("a patch is shared before it begins"),
+                    sent: stream.sent,
+                    reused: stream.reused,
+                    compared_in: stream.compared_in,
+                }
+            })
+            .collect();
+        self.sched.share_patches(shared);
+        let compared_in = streams[0].compared_in;
+        self.stream_patches(batch, jobs, streams, outcomes, Some(compared_in))
     }
 
     /// Complete each of `files` that a reply has kept or published, as soon
@@ -540,26 +627,22 @@ impl Worker {
     /// Stream each of `streams`' patches, one after another, and record
     /// their outcomes, completing each file published. The next patch begins
     /// as soon as the last has ended, and its pieces are read ahead while the
-    /// last's are still sent.
+    /// last's are still sent. With `take_back`, the comparison batch of
+    /// `batch`, the patches it shared that no other worker took follow, as
+    /// `streams` ends.
     fn stream_patches(
         &mut self,
         batch: &[usize],
         jobs: &[WorkerJob],
         mut streams: Vec<Streamed>,
         outcomes: &mut [Option<Compared>],
+        take_back: Option<u64>,
     ) -> Result<()> {
-        let piece = self.patch_piece(self.patch_block());
         let mut states: Vec<StreamState> = streams
             .iter()
-            .map(|stream| StreamState {
-                ranges: stream
-                    .patch
-                    .as_ref()
-                    .map_or_else(Vec::new, |patch| differing_ranges(patch, piece)),
-                ..Default::default()
-            })
+            .map(|stream| self.stream_state(stream))
             .collect();
-        let result = self.stream_each(batch, jobs, &mut streams, &mut states, outcomes);
+        let result = self.stream_each(batch, jobs, &mut streams, &mut states, outcomes, take_back);
         // A patch that did not reach its end, as when its connection failed,
         // is compared again: its pieces no longer count.
         for state in &mut states {
@@ -568,20 +651,78 @@ impl Worker {
         result
     }
 
+    /// What streaming `stream`'s patch starts from: the ranges of its
+    /// differing blocks, to read from the source.
+    fn stream_state(&self, stream: &Streamed) -> StreamState {
+        let piece = self.patch_piece(self.patch_block());
+        StreamState {
+            ranges: stream
+                .patch
+                .as_ref()
+                .map_or_else(Vec::new, |patch| differing_ranges(patch, piece)),
+            ..Default::default()
+        }
+    }
+
+    /// Take back a patch that the comparison batch `compared_in`, of
+    /// `batch`, shared and no other worker has taken, to stream after
+    /// `streams`: this connection still holds what comparing the file left
+    /// there. Returns whether there was one.
+    fn take_back_patch(
+        &mut self,
+        batch: &[usize],
+        compared_in: u64,
+        streams: &mut Vec<Streamed>,
+        states: &mut Vec<StreamState>,
+        outcomes: &mut [Option<Compared>],
+    ) -> bool {
+        let Some(shared) = self.sched.take_back_patch(compared_in) else {
+            return false;
+        };
+        let Some(file) = batch.iter().position(|&i| i == shared.idx) else {
+            // Not this batch's file: it stays for any worker to take.
+            debug_assert!(false, "a comparison batch shared a file it did not compare");
+            self.sched.share_patches(vec![*shared]);
+            return false;
+        };
+        let SharedPatch {
+            patch,
+            sent,
+            reused,
+            compared_in,
+            ..
+        } = *shared;
+        // Compared again unless it is streamed to its end.
+        outcomes[file] = None;
+        let stream = Streamed {
+            file,
+            patch: Some(patch),
+            sent,
+            reused,
+            compared_in,
+        };
+        states.push(self.stream_state(&stream));
+        streams.push(stream);
+        true
+    }
+
     /// Take back the progress a streamed patch's acknowledged pieces counted.
     fn uncount_pieces(&self, state: &mut StreamState) {
         let counted = std::mem::take(&mut state.counted);
         self.progress.bytes_done.fetch_sub(counted, Relaxed);
     }
 
-    /// Stream the patches whose states `stream_patches` prepared.
+    /// Stream the patches whose states `stream_patches` prepared, and, with
+    /// `take_back`, those this worker takes back as the last one's pieces
+    /// have all been read.
     fn stream_each(
         &mut self,
         batch: &[usize],
         jobs: &[WorkerJob],
-        streams: &mut [Streamed],
-        states: &mut [StreamState],
+        streams: &mut Vec<Streamed>,
+        states: &mut Vec<StreamState>,
         outcomes: &mut [Option<Compared>],
+        mut take_back: Option<u64>,
     ) -> Result<()> {
         use std::collections::VecDeque;
         // An in-process source answers each read as it is sent, and its
@@ -655,6 +796,15 @@ impl Worker {
                 })?;
                 source.push_back((StreamStep::Recheck(reading), std::time::Instant::now()));
                 reading += 1;
+                // The next patch is taken before the recheck's reply ends
+                // this one, so that it begins as this one ends.
+                if let (true, Some(compared_in)) = (reading == streams.len(), take_back) {
+                    if self.sched.is_aborted()
+                        || !self.take_back_patch(batch, compared_in, streams, states, outcomes)
+                    {
+                        take_back = None;
+                    }
+                }
             }
             let from_source = match (source.front(), destination.front()) {
                 (Some(_), Some(_)) if self.src.reply_ready() => true,
@@ -814,6 +964,7 @@ impl Worker {
         self.dst.send(Request::PatchBegin {
             patch: Box::new(patch),
             data_len: stream.sent,
+            compared_in: stream.compared_in,
         })?;
         destination.push_back((StreamStep::Begin(index), std::time::Instant::now()));
         states[index].begun = true;
@@ -901,6 +1052,7 @@ impl Worker {
 
     /// Act on one group's reply: record the outcomes it decides, and return
     /// the group's next request, if any of its files go on.
+    #[allow(clippy::too_many_arguments)]
     fn compare_stage(
         &mut self,
         jobs: &[WorkerJob],
@@ -909,6 +1061,7 @@ impl Worker {
         response: Response,
         outcomes: &mut [Option<Compared>],
         streams: &mut Vec<Streamed>,
+        compare_batch: u64,
     ) -> Result<Option<(Stage, Request)>> {
         let block = self.patch_block();
         match stage {
@@ -1059,6 +1212,7 @@ impl Worker {
                             patch: Some(patch),
                             sent,
                             reused,
+                            compared_in: compare_batch,
                         });
                         continue;
                     }
@@ -1183,6 +1337,7 @@ impl Worker {
             | Compared::Differs
             | Compared::StaleCondition => unreachable!("these files are requeued"),
             Compared::Completed => unreachable!("this file is complete"),
+            Compared::Shared => unreachable!("the worker that takes its patch settles this file"),
         }
     }
 

@@ -3891,9 +3891,11 @@ impl FsOps {
             Request::PatchSmallBatch(patches) => {
                 self.patch_small_batch(patches).map(Response::PatchedBatch)
             }
-            Request::PatchBegin { patch, data_len } => {
-                Ok(self.begin_patch_stream(patch, *data_len))
-            }
+            Request::PatchBegin {
+                patch,
+                data_len,
+                compared_in,
+            } => Ok(self.begin_patch_stream(patch, *data_len, *compared_in)),
             Request::PatchData { data, hash } => self.patch_stream_data(data, *hash),
             Request::PatchEnd { commit } => self.end_patch_stream(*commit),
             Request::PutSmallBatch(puts) => {

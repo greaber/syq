@@ -1504,3 +1504,82 @@ fn queued_ranges_keep_the_split_hint_they_had_in_flight() {
         );
     }
 }
+
+/// A streamed patch of file `idx` that comparison batch `compared_in` shared.
+fn shared_patch(sched: &Sched, idx: usize, compared_in: u64) -> SharedPatch {
+    SharedPatch {
+        idx,
+        job: sched.jobs.lock().unwrap().snapshot(idx),
+        patch: crate::proto::SmallPatch {
+            path: Vec::new(),
+            copy_id: [0; 16],
+            len: 0,
+            block: crate::proto::MIN_HASH_BLOCK_BYTES,
+            reuse: Vec::new(),
+            data: Vec::new(),
+            hash: Default::default(),
+            basis: None,
+            meta: Default::default(),
+            flags: 0,
+            unchanged_flags: 0,
+            condition: crate::proto::TargetCondition::Any,
+            update_in_place: false,
+        },
+        sent: 20 << 20,
+        reused: 0,
+        compared_in,
+    }
+}
+
+#[test]
+fn shared_patches_are_queued_work_until_settled() {
+    let sched = Sched::new(64, 128);
+    for name in [b"first".as_slice(), b"second", b"queued"] {
+        sched.push_file(test_job(name, 32 << 20));
+    }
+    sched.scan_done();
+    // A worker compares two files in batch 7 and shares one's patch.
+    let Item::File(first) = sched.next() else {
+        panic!("missing file")
+    };
+    let target = sched.begin_fast_batch(1, 2);
+    let mut batch = vec![first];
+    batch.extend(sched.take_small_near(first, 64 << 20, target - 1, u64::MAX));
+    assert_eq!(batch.len(), 2);
+    sched.mark_fast(batch.len() - 1);
+    sched.share_patches(vec![shared_patch(&sched, batch[1], 7)]);
+    assert!(sched.needs_worker_capacity());
+    // A queued file is taken before the patch.
+    let Some(Item::File(queued)) = sched.try_next() else {
+        panic!("the queued file is taken first")
+    };
+    assert!(!batch.contains(&queued));
+    sched.ranges_ready(queued, Vec::new());
+    // Only its own batch takes a patch back.
+    assert!(sched.take_back_patch(8).is_none());
+    let back = sched
+        .take_back_patch(7)
+        .expect("batch 7 takes its patch back");
+    assert!(sched.take_back_patch(7).is_none());
+    sched.share_patches(vec![*back]);
+    // Another worker takes it; returned unstarted, it is queued again.
+    let Some(Item::Patch(patch)) = sched.try_next() else {
+        panic!("the shared patch is taken")
+    };
+    assert_eq!(patch.idx, batch[1]);
+    sched.return_unstarted(Item::Patch(patch));
+    let Some(Item::Patch(patch)) = sched.try_next() else {
+        panic!("the returned patch is taken again")
+    };
+    assert!(sched.take_back_patch(7).is_none());
+    assert!(!sched.needs_worker_capacity());
+    // The batch ends; the claimed patch keeps the copy unfinished until it
+    // settles.
+    sched.complete_fast_batch(batch.len());
+    assert!(!sched.finished());
+    assert!(sched.try_next().is_none());
+    drop(patch);
+    sched.patch_done();
+    assert!(sched.finished());
+    assert!(matches!(sched.try_next(), Some(Item::Exit)));
+}

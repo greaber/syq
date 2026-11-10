@@ -385,8 +385,30 @@ pub type FastBatchHandle = Arc<Mutex<FastBatchState>>;
 pub enum Item {
     File(usize),
     Range(RangeHandle),
-    Finish { idx: usize, matched: bool },
+    Finish {
+        idx: usize,
+        matched: bool,
+    },
+    /// A streamed patch the worker that compared its file left for any
+    /// worker to stream.
+    Patch(Box<SharedPatch>),
     Exit,
+}
+
+/// A patch of a file of which more differs than one patch carries, whose
+/// comparison is done: its data is streamed from the source by whichever
+/// worker takes it (`transfer::small_compare`).
+pub struct SharedPatch {
+    pub idx: usize,
+    /// The file as it was compared.
+    pub job: WorkerJob,
+    /// The patch, without data, and the new and reused bytes it publishes.
+    pub patch: crate::proto::SmallPatch,
+    pub sent: u64,
+    pub reused: u64,
+    /// The comparison batch that compared the file
+    /// (`Request::PatchBegin::compared_in`), unique in this process.
+    pub compared_in: u64,
 }
 
 /// Cancellation status and an optional immediately issuable same-file range.
@@ -600,6 +622,10 @@ struct Inner {
     finishes: Vec<(usize, bool)>,
     /// Claimed publications remain live until completed or returned to the queue.
     finishing: usize,
+    /// Streamed patches left for any worker, and those claimed and not yet
+    /// settled. Each keeps its file unfinished.
+    patches: VecDeque<Box<SharedPatch>>,
+    patching: usize,
     inflight: Vec<RangeHandle>,
     outstanding: HashMap<usize, u32>,
     failed: HashSet<usize>,
@@ -644,10 +670,12 @@ impl Inner {
         self.scan_done
             && self.probing == 0
             && self.finishing == 0
+            && self.patching == 0
             && self.inflight.is_empty()
             && self.files.is_empty()
             && self.ranges.is_empty()
             && self.finishes.is_empty()
+            && self.patches.is_empty()
     }
 }
 
@@ -675,6 +703,8 @@ impl Sched {
                 ranges: RangeQueue::default(),
                 finishes: Vec::new(),
                 finishing: 0,
+                patches: VecDeque::new(),
+                patching: 0,
                 inflight: Vec::new(),
                 outstanding: HashMap::new(),
                 failed: HashSet::new(),
@@ -760,6 +790,7 @@ impl Sched {
         inner.files = FileQueue::default();
         inner.ranges = RangeQueue::default();
         inner.finishes = Vec::new();
+        inner.patches = VecDeque::new();
         inner.inflight = Vec::new();
         inner.fast_groups = Vec::new();
         inner.outstanding = HashMap::new();
@@ -930,6 +961,7 @@ impl Sched {
         !g.files.is_empty()
             || !g.ranges.is_empty()
             || !g.finishes.is_empty()
+            || !g.patches.is_empty()
             || g.probing > g.fast_probing
             || g.fast_groups
                 .iter()
@@ -1090,12 +1122,14 @@ impl Sched {
             }
         }
         bytes += evidence.unread_batch_bytes;
+        // Streamed patches waiting for a worker are whole units of work too.
+        bytes += g.patches.iter().map(|patch| patch.sent).sum::<u64>();
         let available_files = g.files.len() + evidence.unread_batch_files;
         evidence.remaining_bytes = bytes;
         evidence.queued_files = g.files.len();
         evidence.activity =
             bytes.saturating_add((available_files as u64).saturating_mul(file_credit));
-        evidence.work_units = available_files + g.ranges.len() + g.inflight.len();
+        evidence.work_units = available_files + g.patches.len() + g.ranges.len() + g.inflight.len();
         for handle in &g.inflight {
             let range = handle.lock().unwrap();
             if let Some(split) = range.split {
@@ -1167,6 +1201,11 @@ impl Sched {
                 g.finishes.push((idx, matched));
                 g.finishing -= 1;
             }
+            Item::Patch(patch) => {
+                let mut g = self.inner.lock().unwrap();
+                g.patches.push_front(patch);
+                g.patching -= 1;
+            }
         }
         self.cv.notify_all();
     }
@@ -1200,6 +1239,12 @@ impl Sched {
                     let idx = order.index();
                     g.probing += 1;
                     return Some(Item::File(idx));
+                }
+                // A streamed patch is queued work, taken before work is
+                // stolen from another worker.
+                if let Some(patch) = g.patches.pop_front() {
+                    g.patching += 1;
+                    return Some(Item::Patch(patch));
                 }
                 if let Some(h) = self.steal(&mut g) {
                     return Some(Item::Range(h));
@@ -1436,6 +1481,42 @@ impl Sched {
     /// retry. Keep it visible until then so other workers cannot exit early.
     pub fn finish_done(&self) {
         self.inner.lock().unwrap().finishing -= 1;
+        self.cv.notify_all();
+        self.tune_cv.notify_one();
+    }
+
+    /// Leave streamed patches for any worker to take, as soon as one is idle.
+    /// The worker that compared their files still holds them until it ends
+    /// its batch, which it does after taking back those no other worker took
+    /// (`take_back_patch`).
+    pub fn share_patches(&self, patches: Vec<SharedPatch>) {
+        if patches.is_empty() {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        g.patches.extend(patches.into_iter().map(Box::new));
+        drop(g);
+        self.cv.notify_all();
+    }
+
+    /// Take back a streamed patch that the comparison batch `compared_in`
+    /// shared and no other worker has taken. That batch still holds the
+    /// file, so it is not counted as claimed. A patch left by a batch that
+    /// has ended, as when its connection failed, is taken only through
+    /// `next`.
+    pub fn take_back_patch(&self, compared_in: u64) -> Option<Box<SharedPatch>> {
+        let mut g = self.inner.lock().unwrap();
+        let position = g
+            .patches
+            .iter()
+            .position(|patch| patch.compared_in == compared_in)?;
+        g.patches.remove(position)
+    }
+
+    /// A claimed streamed patch is settled: its file is complete, failed, or
+    /// queued again.
+    pub fn patch_done(&self) {
+        self.inner.lock().unwrap().patching -= 1;
         self.cv.notify_all();
         self.tune_cv.notify_one();
     }

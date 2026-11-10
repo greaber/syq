@@ -313,6 +313,7 @@ fn a_restricted_connection_with_a_streamed_patch_open_carries_nothing_else() {
     let begin = Request::PatchBegin {
         patch: Box::new(patch("published", &existing)),
         data_len: new_data.len() as u64,
+        compared_in: 0,
     };
     assert!(matches!(
         exchange(&mut reader, &mut writer, &begin),
@@ -378,6 +379,7 @@ fn a_restricted_connection_with_a_streamed_patch_open_carries_nothing_else() {
     let begin = Request::PatchBegin {
         patch: Box::new(patch("dropped", &existing)),
         data_len: new_data.len() as u64,
+        compared_in: 0,
     };
     assert!(matches!(
         exchange(&mut reader, &mut writer, &begin),
