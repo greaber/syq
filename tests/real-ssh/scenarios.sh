@@ -831,7 +831,9 @@ case "$ssh_copy_summary" in
         ;;
 esac
 ssh source 'syq cp --dry-run --hash --srcs-in /tmp/syq-real-ssh/return-source --to @laptop --into first --results-fd 3 3>&1 1>/dev/null' > /tmp/syq-return-preview.ndjson
-assert_preview_counts /tmp/syq-return-preview.ndjson 0 3
+# Earlier cases may add files to the source; every one of them was copied.
+return_files=$(ssh source 'find /tmp/syq-real-ssh/return-source -type f | wc -l')
+assert_preview_counts /tmp/syq-return-preview.ndjson 0 "$return_files"
 ssh source 'syq cp --if-exists=keep /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as first/message.txt'
 
 ssh source 'python3 /usr/local/libexec/syq-test-restricted-mapping.py named'
@@ -969,6 +971,24 @@ syq persist off
 syq persist connect source
 syq persist receive wait source --timeout 30
 ssh source 'syq persist destinations wait laptop --timeout 30'
+# The same two copies onto the receive root's own disk, where a batch's new
+# directories go in as few requests as the receiver allows.
+ssh source 'syq cp -C /tmp/syq-real-ssh/network-tree --mapping /tmp/syq-network-mapping.ndjson --to @laptop --into local-mapping'
+for d in 0 1 2 3 4 5 6 7; do
+    for s in 0 1 2 3; do
+        for f in 0 1; do
+            test "$(cat "$receive_root/local-mapping/nested/d$d/s$s/deep/f$f")" = "d$d/s$s/f$f"
+        done
+    done
+done
+ssh source 'syq cp --if-exists=keep --copy-metadata permissions --srcs-in /tmp/syq-real-ssh/network-deep --to @laptop --into local-deep-keep'
+(
+    cd "$receive_root/local-deep-keep"
+    {
+        find . -mindepth 1 -printf '%y %m %p -> %l\n'
+        find . -type f -exec sha256sum {} +
+    } | LC_ALL=C sort
+) | diff -u /tmp/syq-network-deep-source.manifest -
 
 printf 'case: named return rejects traversal and receiver symlink escape\n'
 ln -s /tmp/syq-real-ssh-receive-other "$receive_root/escape"
