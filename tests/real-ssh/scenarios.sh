@@ -920,6 +920,29 @@ rm "$receive_root/network-keep/d0/existing"
 # The directory that held the existing file keeps its own mode.
 grep -v '^d [0-7]* ./d0 -> $' /tmp/syq-network-tree-source.manifest >/tmp/syq-network-keep-source.manifest
 grep -v '^d [0-7]* ./d0 -> $' /tmp/syq-network-keep-local.manifest | diff -u /tmp/syq-network-keep-source.manifest -
+# A mapping there puts every file four new directories deep. The receiver
+# creates those parents only where nothing is, all of a request's such
+# creations at once, so a parent and its child never go in one request.
+ssh source python3 - <<'NETWORK_MAPPING'
+import json
+with open("/tmp/syq-network-mapping.ndjson", "w") as manifest:
+    for d in range(8):
+        for s in range(4):
+            for f in range(2):
+                source = f"d{d}/s{s}/f{f}"
+                manifest.write(json.dumps({
+                    "src": {"encoding": "utf-8", "value": source},
+                    "dst": {"encoding": "utf-8", "value": f"nested/d{d}/s{s}/deep/f{f}"},
+                }) + "\n")
+NETWORK_MAPPING
+ssh source 'syq cp -C /tmp/syq-real-ssh/network-tree --mapping /tmp/syq-network-mapping.ndjson --to @laptop --into network-mapping'
+for d in 0 1 2 3 4 5 6 7; do
+    for s in 0 1 2 3; do
+        for f in 0 1; do
+            test "$(cat "$receive_root/network-mapping/nested/d$d/s$s/deep/f$f")" = "d$d/s$s/f$f"
+        done
+    done
+done
 syq persist off
 syq persist connect source
 syq persist receive wait source --timeout 30
