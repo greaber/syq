@@ -260,11 +260,20 @@ fn account_directory(parent: &Path) -> PathBuf {
 /// be: in the temporary directory, and in the user's runtime directory
 /// when one is set. Which one a copy uses depends on its environment and on
 /// the runtime directory's owner and mode, so a receiver protects both.
-/// Only absolute paths are listed.
+/// Only absolute paths are listed, where nothing is yet or a directory of
+/// this account's is: no copy keeps sockets in anything else, such as a
+/// link another user made in a shared `/tmp`, and protecting what that
+/// leads to could refuse any copy.
 pub(crate) fn account_directories() -> (Option<PathBuf>, Option<PathBuf>) {
+    let usable = |path: PathBuf| {
+        let other = std::fs::symlink_metadata(&path).is_ok_and(|metadata| {
+            !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() }
+        });
+        (path.is_absolute() && !other).then_some(path)
+    };
     (
-        Some(account_directory(&std::env::temp_dir())).filter(|path| path.is_absolute()),
-        crate::user_dirs::runtime_dir().map(|runtime| account_directory(&runtime)),
+        usable(account_directory(&std::env::temp_dir())),
+        crate::user_dirs::runtime_dir().and_then(|runtime| usable(account_directory(&runtime))),
     )
 }
 

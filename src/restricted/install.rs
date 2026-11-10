@@ -189,7 +189,10 @@ const RECEIVING_STATE_LABELS: [&str; 5] = [
 /// configuration's directory, the persistence runtime directory, and where
 /// the sockets of the account's running copies can be
 /// (`private_broker::account_directories`): in the temporary directory,
-/// then in the runtime directory when one is set.
+/// then in the runtime directory when one is set. Without `TMPDIR`, macOS
+/// uses a temporary directory of the user's own that the login does not
+/// report; `/tmp` stands in for it here, and the server's receiver still
+/// protects the real one.
 pub(super) fn server_receiving_state(
     home: &Path,
     uid: &str,

@@ -36,11 +36,12 @@ rather than deleting files.
 
 Copies cannot write the account's `~/.ssh` or syq's own programs and state, such
 as `~/.local/lib/syq`, `~/.local/libexec`, `~/.config/syq`, enrollment and
-receiving state, and the sockets of running copies. A copy that puts a
-directory's contents into, prunes, or replaces a directory holding one of these,
-such as your home directory, is refused; copy into a subdirectory instead, or
-copy named files or directories into it. A copy from the account reads
-whatever its command names, these included, as a login to the account could.
+receiving state, and the `syq-UID` directory where running copies keep their
+sockets. A copy that puts a directory's contents into, prunes, or replaces a
+directory holding one of these, such as your home directory, is refused; copy
+into a subdirectory instead, or copy named files or directories into it. A copy
+from the account reads whatever its command names, these included, as a login
+to the account could.
 
 ### Which key signs
 
