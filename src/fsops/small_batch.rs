@@ -555,6 +555,27 @@ fn seed_from(
     Ok(Some((old.try_clone()?, guard.map(|_| Guard::Refused))))
 }
 
+/// The guard of a file a patch reuses when this connection holds none for
+/// it, as when another connection compared it. Where this connection would
+/// have leased the file to compare it (`FsOps::guard_comparison`), a lease
+/// taken now could not show a write made since the comparison, so the
+/// blocks a stage takes from the file are read back, as when a lease was
+/// refused. Elsewhere its fingerprint vouches for it, as it would for a file
+/// compared here. `len` is the file's length when it was compared, and
+/// `source_len` that of the source replacing it.
+fn guard_compared_elsewhere(file: &File, len: u64, source_len: u64) -> Option<Guard> {
+    if len < leases::LEASE_MIN_BYTES || source_len < leases::LEASE_MIN_BYTES {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    if super::fs_caps::leases_show_writers(file) {
+        return Some(Guard::Refused);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = file;
+    None
+}
+
 /// Fill `buffer` from `file` at `off`. Returns false when the file ends first.
 fn read_exact_or_short(file: &File, off: u64, buffer: &mut [u8]) -> Result<bool> {
     match file.read_exact_at(buffer, off) {
@@ -4053,6 +4074,81 @@ mod tests {
             .map(|entry| entry.unwrap().path())
             .filter(|path| path.to_string_lossy().contains(".syq-tmp."))
             .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_patch_streamed_where_its_file_was_not_compared_reads_back_what_it_reuses() {
+        // Another worker may stream a patch that one worker's connection
+        // compared, and that connection holds the file's lease. A write
+        // after the comparison, which keeps the file's length and, where
+        // change times are coarse, its fingerprint, breaks that lease, but
+        // the streaming connection has no lease to see it: it reads back the
+        // blocks its stage takes from the file, and the patch fails rather
+        // than publish the write. Without one, the stage is published.
+        use std::os::unix::fs::FileExt as _;
+        let block = MIN_HASH_BLOCK_BYTES;
+        let old: Vec<u8> = (0..64 * block).map(|i| (i % 241) as u8 | 1).collect();
+        let mut new = old.clone();
+        new[3 * block as usize..5 * block as usize].fill(0);
+        for (planted, cloning) in [(true, true), (true, false), (false, true), (false, false)] {
+            let case = format!("planted {planted} cloning {cloning}");
+            let temporary = crate::test_support::tempdir().unwrap();
+            let directory = temporary.path();
+            let path = directory.join("file");
+            fs::write(&path, &old).unwrap();
+            if !crate::fsops::leases_trusted_on(&File::open(&path).unwrap()) {
+                eprintln!("note: the test filesystem's leases are not trusted");
+                return;
+            }
+            let mut compared = receiver(directory);
+            let mut streaming = receiver(directory);
+            let algorithm = compared.hash_policy.algorithm;
+            let outcome = with_coarse_change_times(|| {
+                let hashed = compared
+                    .hash_existing_batch(
+                        block,
+                        &[ExistingRead {
+                            path: b"file".to_vec(),
+                            len: new.len() as u64,
+                            condition: TargetCondition::Any,
+                        }],
+                        1,
+                    )
+                    .remove(0)
+                    .unwrap();
+                // The comparing connection leased the file.
+                assert!(
+                    compared
+                        .compared_files
+                        .guards
+                        .contains_key(b"file".as_slice()),
+                    "{case}"
+                );
+                if planted {
+                    let writer = File::options().write(true).open(&path).unwrap();
+                    writer.write_all_at(b"planted", 40 * block + 3).unwrap();
+                }
+                let patch = patch_from("file", &new, block, &hashed, algorithm);
+                assert!(patch.basis.is_some(), "{case}");
+                refusing_clones(!cloning, || {
+                    stream_patch(&mut streaming, &patch, &pieces(&patch, 1), true, |_| {})
+                })
+            });
+            let published = fs::read(&path).unwrap();
+            if planted {
+                assert!(outcome.1.is_err(), "{case}: {:?}", outcome.1);
+                assert!(published != new, "{case}: the planted write was published");
+                assert!(
+                    published.windows(7).any(|bytes| bytes == b"planted"),
+                    "{case}: the planted file was replaced"
+                );
+            } else {
+                assert!(outcome.1.is_ok(), "{case}: {:?}", outcome.1);
+                assert!(published == new, "{case}");
+            }
+            assert!(sidecars(directory).is_empty(), "{case}");
+        }
     }
 
     #[cfg(target_os = "linux")]

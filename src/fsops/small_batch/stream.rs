@@ -209,6 +209,12 @@ impl FsOps {
                     && reused * 2 >= patch.len
                     && reuses_within(patch, basis.len) =>
             {
+                // Another worker's connection may have compared the file
+                // (`transfer::small_compare`), holding its guard there.
+                let guard = match guard {
+                    Some(guard) => Some(guard),
+                    None => guard_compared_elsewhere(old, basis.len, patch.len),
+                };
                 seed_from(old, basis, guard)?.map(|(seed, guard)| PatchSource {
                     old: seed,
                     basis,

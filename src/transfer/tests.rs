@@ -1139,7 +1139,7 @@ fn a_lost_connection_queues_publications_in_flight_again() {
             Item::File(other) => {
                 sched.ranges_ready(other, vec![]);
             }
-            Item::Range(_) => panic!("unexpected range"),
+            Item::Range(_) | Item::Patch(_) => panic!("unexpected range or patch"),
             Item::Exit => break,
         }
     }
@@ -5085,6 +5085,136 @@ fn a_file_of_which_more_differs_than_a_patch_carries_streams_its_patch() {
         }
         if restricted {
             assert_eq!(authority.in_flight(), 0, "{case}");
+        }
+    }
+}
+
+#[test]
+fn an_idle_worker_streams_a_patch_another_worker_compared() {
+    // One worker compares both files and streams the first; the second
+    // file's patch is left in the queue, and an idle worker streams it on
+    // its own connection, which did not compare the file. Each stage reuses
+    // more than half its file, so its blocks are taken from the file it
+    // replaces. The first worker's begin waits until the other worker's
+    // has arrived, so the patch cannot be taken back first.
+    let files: [(&str, usize, std::ops::Range<usize>); 2] = [
+        ("first", 48 << 20, 30 << 20..48 << 20),
+        ("second", 40 << 20, 0..17 << 20),
+    ];
+    for in_process in [false, true] {
+        let case = format!("in_process={in_process}");
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        let sched = differing_jobs(root, &files);
+        let began = Arc::new((Mutex::new([false; 2]), std::sync::Condvar::new()));
+        let wait_for = |began: &(Mutex<[bool; 2]>, std::sync::Condvar), worker: usize| {
+            let (state, changed) = began;
+            let state = state.lock().unwrap();
+            let (state, timeout) = changed
+                .wait_timeout_while(state, std::time::Duration::from_secs(30), |state| {
+                    !state[worker]
+                })
+                .unwrap();
+            assert!(
+                !timeout.timed_out() || state[worker],
+                "worker {worker} never began"
+            );
+        };
+        let mut requests = Vec::new();
+        let mut workers = Vec::new();
+        for id in 0..2 {
+            let unused = Arc::new(Mutex::new(PipelineState::default()));
+            let mut worker = pipeline_worker(&sched, &unused, &unused, true);
+            worker.id = id;
+            worker.gate = Gate::new(id + 1);
+            worker.fast_batch_files = files.len();
+            worker.src = Box::new(QueuingSource {
+                ops: crate::fsops::FsOps::new(),
+                replies: Default::default(),
+                in_process,
+                most: Default::default(),
+            });
+            let mut destination = crate::fsops::FsOps::test_destination(&root.join("target"));
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            requests.push(seen.clone());
+            let began = began.clone();
+            worker.dst = Box::new(AnsweringConn {
+                answer: move |request: Request| {
+                    if let Request::PatchBegin { .. } = request {
+                        let (state, changed) = &*began;
+                        state.lock().unwrap()[id] = true;
+                        changed.notify_all();
+                        if id == 0 {
+                            wait_for(&began, 1);
+                        }
+                    }
+                    let response = destination.handle(&request);
+                    seen.lock().unwrap().push(match request {
+                        Request::PatchData { hash, .. } => Request::PatchData {
+                            data: Vec::new().into(),
+                            hash,
+                        },
+                        request => request,
+                    });
+                    response
+                },
+                replies: Default::default(),
+            });
+            Arc::get_mut(&mut worker.opts).unwrap().block = 1 << 20;
+            workers.push(worker);
+        }
+        std::thread::scope(|scope| {
+            let running: Vec<_> = workers
+                .into_iter()
+                .enumerate()
+                .map(|(id, mut worker)| {
+                    let (sched, began) = (&sched, &began);
+                    scope.spawn(move || {
+                        // The idle worker starts once the other has its batch.
+                        if id == 1 {
+                            wait_for(began, 0);
+                        }
+                        loop {
+                            match sched.next() {
+                                Item::Exit => break,
+                                item => worker.process_item(item).unwrap(),
+                            }
+                        }
+                        worker.progress.errors.load(Relaxed)
+                    })
+                })
+                .collect();
+            for worker in running {
+                assert_eq!(worker.join().unwrap(), 0, "{case}");
+            }
+        });
+        assert!(sched.finished(), "{case}");
+        for (name, ..) in &files {
+            assert!(
+                std::fs::read(root.join("source").join(name)).unwrap()
+                    == std::fs::read(root.join("target").join(name)).unwrap(),
+                "{case} {name}"
+            );
+        }
+        for (id, seen) in requests.iter().enumerate() {
+            let seen = seen.lock().unwrap();
+            let count = |kind: fn(&Request) -> bool| seen.iter().filter(|r| kind(r)).count();
+            assert_eq!(
+                count(|r| matches!(r, Request::PatchBegin { .. })),
+                1,
+                "{case}: worker {id}"
+            );
+            assert_eq!(
+                count(|r| matches!(r, Request::PatchEnd { commit: true })),
+                1,
+                "{case}: worker {id}"
+            );
+            // Only the comparing worker hashed the destination.
+            assert_eq!(
+                count(|r| matches!(r, Request::HashExistingBatch { .. })) > 0,
+                id == 0,
+                "{case}: worker {id}"
+            );
         }
     }
 }

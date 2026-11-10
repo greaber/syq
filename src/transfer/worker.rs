@@ -184,6 +184,7 @@ impl Worker {
         let idx = match item {
             Item::File(idx) => *idx,
             Item::Range(handle) => handle.lock().unwrap().idx,
+            Item::Patch(patch) => patch.idx,
             // Publishing moves no file data.
             Item::Exit | Item::Finish { .. } => return false,
         };
@@ -319,6 +320,11 @@ impl Worker {
                 if self.sched.range_done(&h) {
                     self.publish(idx, false)?;
                 }
+            }
+            Item::Patch(patch) => {
+                let progress = self.progress.clone();
+                let _copying = progress.copying_interval();
+                self.stream_shared_patch(patch)?;
             }
             Item::Finish { idx, matched } => {
                 let progress = self.progress.clone();
