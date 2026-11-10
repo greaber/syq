@@ -235,6 +235,8 @@ impl Worker {
         if !self.own_login_ready() {
             return Ok(());
         }
+        // Every reply on the shared sessions must be read before they close.
+        self.settle_between_items(true)?;
         let OwnLogin::Opening(login) = std::mem::take(&mut self.own_login) else {
             unreachable!("a ready login is being opened");
         };
@@ -254,8 +256,6 @@ impl Worker {
             }
             Err(panic) => std::panic::resume_unwind(panic),
         };
-        // Every reply on the shared sessions must be read before they close.
-        self.settle_between_items(true)?;
         for (source, new) in [(true, src), (false, dst)] {
             let Some(mut new) = new else {
                 continue;
