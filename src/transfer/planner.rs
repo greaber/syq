@@ -2958,8 +2958,10 @@ impl Planner<'_> {
             }
         }
         // The files still to queue once their directories exist.
-        let mut pending = super::directory_stream::Anticipated::default();
-        pending.trickling = !self.directory_pacing.link_bound();
+        let mut pending = super::directory_stream::Anticipated {
+            trickling: !self.directory_pacing.link_bound(),
+            ..Default::default()
+        };
         for (leaf, _) in waiting.iter().flatten().chain(&last) {
             if leaf.e.kind == Kind::File {
                 pending.add(leaf.e.size);
