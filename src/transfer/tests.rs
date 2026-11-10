@@ -114,6 +114,8 @@ struct PipelineState {
     deferred: std::collections::VecDeque<u64>,
     arrived: std::collections::HashMap<u64, Response>,
     next_deferred: u64,
+    /// Setting up telemetry on the connection fails.
+    fail_observe: bool,
 }
 
 struct PipelineConn(Arc<Mutex<PipelineState>>);
@@ -210,6 +212,19 @@ impl PipelineConn {
 }
 
 impl Conn for PipelineConn {
+    fn observe(
+        &mut self,
+        _observations: &crate::transfer_observations::Observations,
+        _actor: &Arc<crate::transfer_observations::Actor>,
+        _source: bool,
+        _worker_id: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !self.0.lock().unwrap().fail_observe,
+            "injected telemetry failure"
+        );
+        Ok(())
+    }
     fn send_pending(&mut self, request: Request) -> Result<crate::conn::PendingReply> {
         if !self.0.lock().unwrap().defers {
             return self.call(request).map(crate::conn::PendingReply::Ready);
@@ -522,6 +537,7 @@ fn pipeline_worker(
         access_limited: Default::default(),
         outer_directory: Default::default(),
         access_noted: Default::default(),
+        own_login_noted: Default::default(),
         devices: false,
         checksum: false,
         hash_or_copy: false,
@@ -697,6 +713,81 @@ fn a_worker_on_the_shared_ssh_login_logs_in_on_its_own_for_larger_files() {
     };
     assert!(requests(&source, true) > 0);
     assert_eq!(requests(&source, true), requests(&own, false));
+}
+
+/// A worker that takes an item, finds its own login ready, and then loses
+/// the shared connection while settling a publication there gives the item
+/// back, so the copy can still finish it.
+#[test]
+fn a_failed_move_to_the_own_login_gives_back_the_item_it_took() {
+    let (sched, src, dst, mut worker) = deferred_publication_fixture(false, true);
+    let Item::File(first) = sched.next() else {
+        panic!("expected a file")
+    };
+    let job = worker.job(first);
+    src.lock().unwrap().replies.extend([
+        block_reply(),
+        Response::Stats(vec![Some(job.entry.clone())]),
+    ]);
+    dst.lock()
+        .unwrap()
+        .replies
+        .extend([prepared_reply(), Response::Ok]);
+    worker.handle_file(first).unwrap();
+    assert!(!worker.publications.is_empty());
+    dst.lock().unwrap().dead = true;
+    worker.on_shared_login = true;
+    worker.own_login = OwnLogin::Unopened(Box::new(|| Ok((None, None))));
+    worker.open_own_login();
+    wait_for_own_login(&worker);
+    let item = sched.next();
+    let Item::File(second) = item else {
+        panic!("expected the second file")
+    };
+    assert!(worker.take_own_login_before(item).is_err());
+    let mut queued = Vec::new();
+    while let Some(item) = sched.try_next() {
+        match item {
+            Item::File(idx) => queued.push(idx),
+            Item::Exit => break,
+            Item::Range(_) | Item::Finish { .. } => {}
+        }
+    }
+    assert!(queued.contains(&second), "{queued:?}");
+}
+
+/// Telemetry that fails on a worker's new connection leaves the worker on
+/// the shared login, rather than failing the copy.
+#[test]
+fn failed_telemetry_on_the_own_login_keeps_the_shared_login() {
+    let (sched, _, _) = pipeline_ranges(&[(0, 4096)]);
+    let state = Arc::new(Mutex::new(PipelineState::default()));
+    let mut worker = pipeline_worker(&sched, &state, &state, false);
+    worker.observation = Some(worker.progress.observations.workers.actor("worker"));
+    worker.on_shared_login = true;
+    let unobservable = Arc::new(Mutex::new(PipelineState {
+        fail_observe: true,
+        ..Default::default()
+    }));
+    let replacement = unobservable.clone();
+    worker.own_login = OwnLogin::Unopened(Box::new(move || {
+        Ok((
+            None,
+            Some(Box::new(PipelineConn(replacement)) as Box<dyn Conn>),
+        ))
+    }));
+    worker.open_own_login();
+    wait_for_own_login(&worker);
+    worker.take_own_login_if_ready().unwrap();
+    assert!(!worker.on_shared_login);
+    assert!(matches!(worker.own_login, OwnLogin::None));
+    state.lock().unwrap().replies.push_back(Response::Ok);
+    worker
+        .dst
+        .call(Request::ConfigureHashing(Default::default()))
+        .unwrap();
+    assert_eq!(state.lock().unwrap().requests.len(), 1);
+    assert!(unobservable.lock().unwrap().requests.is_empty());
 }
 
 #[test]

@@ -238,6 +238,8 @@ pub struct Opts {
     /// Directories already named as needing temporary access; failures
     /// beneath them do not repeat the hint.
     pub access_noted: Mutex<std::collections::HashSet<PathBytes>>,
+    /// A worker already said that it stays on the shared SSH login.
+    pub own_login_noted: AtomicBool,
     pub devices: bool,
     pub checksum: bool,
     /// Don't trust matching size and time, but compare only the files block
@@ -2856,6 +2858,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         access_limited: Default::default(),
         outer_directory: Default::default(),
         access_noted: Default::default(),
+        own_login_noted: AtomicBool::new(false),
         devices: args.devices,
         checksum: args.checksum,
         hash_or_copy: args.hash_or_copy && !args.checksum,
@@ -4805,7 +4808,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // no logins of their own for a tree of small files. Once planning finds
     // a file that can't, later connections log in on their own, and a worker
     // on the shared login that takes a file too large for a small-file batch
-    // hands it back and logs in again (`Worker::needs_own_login`).
+    // logs in on its own while it keeps working, then moves over
+    // (`Worker::needs_own_login`, `OwnLogin`).
     let ssh_sharing_possible = !opts.dry_run
         && !opts.tuning.force_ranges()
         && (bwlimit.is_none() || transport_budget.is_some());

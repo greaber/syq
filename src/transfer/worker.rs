@@ -195,7 +195,7 @@ impl Worker {
                 match self.sched.try_next() {
                     Some(Item::Exit) | None => self.settle_between_items(true)?,
                     Some(item) => {
-                        self.take_own_login_if_ready()?;
+                        let item = self.take_own_login_before(item)?;
                         self.process_item(item)?;
                         self.settle_between_items(false)?;
                     }
@@ -212,7 +212,7 @@ impl Worker {
             if matches!(item, Item::Exit) {
                 return Ok(());
             }
-            self.take_own_login_if_ready()?;
+            let item = self.take_own_login_before(item)?;
             self.process_item(item)?;
             self.settle_between_items(false)?;
         }
@@ -230,6 +230,31 @@ impl Worker {
         !self.gate.allowed(self.id) || self.own_login_ready()
     }
 
+    /// Move to the worker's own login, if it is ready, before it works on
+    /// `item`. If that fails, `item` goes back to the queue unstarted.
+    pub(super) fn take_own_login_before(&mut self, item: Item) -> Result<Item> {
+        match self.take_own_login_if_ready() {
+            Ok(()) => Ok(item),
+            Err(error) => {
+                self.sched.return_unstarted(item);
+                Err(error)
+            }
+        }
+    }
+
+    /// The worker could not log in on its own: it carries every file on the
+    /// shared login from now on, as a startup worker does, and says so once
+    /// per copy, since larger files can copy more slowly there.
+    fn stay_on_shared_login(&mut self, why: std::fmt::Arguments<'_>) {
+        self.on_shared_login = false;
+        if !self.opts.quiet && (debug() || !self.opts.own_login_noted.swap(true, Relaxed)) {
+            crate::output::diagnostic!(
+                "syq: worker {} could not log in on its own and copies larger files over the copy's shared SSH login, which can be slower ({why})",
+                self.id
+            );
+        }
+    }
+
     /// Move to the worker's own login once it is ready, between requests.
     pub(super) fn take_own_login_if_ready(&mut self) -> Result<()> {
         if !self.own_login_ready() {
@@ -240,31 +265,21 @@ impl Worker {
         let OwnLogin::Opening(login) = std::mem::take(&mut self.own_login) else {
             unreachable!("a ready login is being opened");
         };
-        self.on_shared_login = false;
         let (src, dst) = match login.join() {
             Ok(Ok(connections)) => connections,
             Ok(Err(error)) => {
-                // The shared session still works: carry every file on it,
-                // as a startup worker does.
-                if debug() {
-                    crate::output::diagnostic!(
-                        "syq: worker {}: could not log in on its own; staying on the shared SSH login ({error:#})",
-                        self.id
-                    );
-                }
+                // The shared session still works.
+                self.stay_on_shared_login(format_args!("{error:#}"));
                 return Ok(());
             }
             Err(panic) => std::panic::resume_unwind(panic),
         };
+        self.on_shared_login = false;
         for (source, new) in [(true, src), (false, dst)] {
-            let Some(mut new) = new else {
-                continue;
-            };
-            if let Some(actor) = &self.observation {
-                new.observe(&self.progress.observations, actor, source, self.id)?;
+            if let Some(new) = new {
+                let old = if source { &mut self.src } else { &mut self.dst };
+                std::mem::replace(old, new).detach();
             }
-            let old = if source { &mut self.src } else { &mut self.dst };
-            std::mem::replace(old, new).detach();
         }
         #[cfg(debug_assertions)]
         crate::fsops::record_test_event(
@@ -287,9 +302,28 @@ impl Worker {
             self.own_login = own_login;
             return;
         };
+        // Telemetry for the new connections is set up there too, so its
+        // round trip doesn't hold up the worker, and its failure only keeps
+        // the worker on the shared login.
+        let observe = self
+            .observation
+            .clone()
+            .map(|actor| (self.progress.clone(), actor));
+        let id = self.id;
+        let login = move || -> Result<OwnConnections> {
+            let (mut src, mut dst) = open()?;
+            if let Some((progress, actor)) = &observe {
+                for (source, conn) in [(true, &mut src), (false, &mut dst)] {
+                    if let Some(conn) = conn {
+                        conn.observe(&progress.observations, actor, source, id)?;
+                    }
+                }
+            }
+            Ok((src, dst))
+        };
         match std::thread::Builder::new()
             .name(format!("syq-login-{}", self.id))
-            .spawn(open)
+            .spawn(login)
         {
             Ok(login) => {
                 self.own_login = OwnLogin::Opening(PendingLogin(Some(login)));
@@ -301,13 +335,7 @@ impl Worker {
                 }
             }
             Err(error) => {
-                self.on_shared_login = false;
-                if debug() {
-                    crate::output::diagnostic!(
-                        "syq: worker {}: staying on the shared SSH login; cannot start its login ({error})",
-                        self.id
-                    );
-                }
+                self.stay_on_shared_login(format_args!("cannot start its login: {error}"));
             }
         }
     }
