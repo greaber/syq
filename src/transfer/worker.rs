@@ -47,13 +47,59 @@ pub(super) struct Worker {
     /// Files whose publication is in flight, oldest first
     /// (`transfer::publication`).
     pub(super) publications: std::collections::VecDeque<super::publication::Publication>,
-    /// The worker is a session on the copy's shared SSH login, where it
-    /// carries only files small enough for a small-file batch. The startup
-    /// workers, which may carry any file there, are not counted.
+    /// The worker is a session on the copy's shared SSH login and moves to a
+    /// login of its own once it takes a file larger than a small-file
+    /// batch. The startup workers, which may carry any file there, are not
+    /// counted.
     pub(super) on_shared_login: bool,
-    /// The worker took a larger file and gave it back; it ends this
-    /// connection to log in separately.
-    pub(super) leaving_shared_login: bool,
+    /// The login of its own that a worker on the shared login opens.
+    pub(super) own_login: OwnLogin,
+}
+
+/// The connections that replace a worker's sessions on the shared SSH login:
+/// a new source, a new destination, or both, already configured.
+pub(super) type OwnConnections = (Option<Box<dyn Conn>>, Option<Box<dyn Conn>>);
+
+/// A worker on the shared SSH login logs in on its own on a thread of its
+/// own, while it keeps working on the shared login, and moves over between
+/// requests once the new connections are ready. So the login adds no wait.
+#[derive(Default)]
+pub(super) enum OwnLogin {
+    /// Nothing to open: the worker has a login of its own, or it opened one
+    /// already, or that failed and it stays on the shared login.
+    #[default]
+    None,
+    /// Opens the login when the worker first takes a larger file.
+    Unopened(Box<dyn FnOnce() -> Result<OwnConnections> + Send>),
+    Opening(PendingLogin),
+}
+
+/// A login under way on a thread of its own.
+pub(super) struct PendingLogin(Option<std::thread::JoinHandle<Result<OwnConnections>>>);
+
+impl PendingLogin {
+    fn is_finished(&self) -> bool {
+        self.0.as_ref().is_some_and(|login| login.is_finished())
+    }
+
+    fn join(mut self) -> std::thread::Result<Result<OwnConnections>> {
+        self.0.take().expect("a pending login").join()
+    }
+}
+
+impl Drop for PendingLogin {
+    fn drop(&mut self) {
+        // A worker that ends first leaves a login still under way to finish
+        // on its thread; the copy ends it once the copy is over. Finished
+        // connections nobody will use close without waiting for their peers.
+        if let Some(login) = self.0.take().filter(|login| login.is_finished()) {
+            if let Ok(Ok((src, dst))) = login.join() {
+                for mut conn in [src, dst].into_iter().flatten() {
+                    conn.detach();
+                }
+            }
+        }
+    }
 }
 
 pub(super) struct BlockDiff {
@@ -149,32 +195,125 @@ impl Worker {
                 match self.sched.try_next() {
                     Some(Item::Exit) | None => self.settle_between_items(true)?,
                     Some(item) => {
+                        self.take_own_login_if_ready()?;
                         self.process_item(item)?;
-                        self.settle_between_items(self.leaving_shared_login)?;
+                        self.settle_between_items(false)?;
                     }
                 }
-            } else {
-                let item = {
-                    let _awaiting = self
-                        .observation
-                        .as_ref()
-                        .map(|a| a.span(crate::transfer_observations::Stage::AwaitingWork));
-                    self.sched.next()
-                };
-                if matches!(item, Item::Exit) {
-                    return Ok(());
-                }
-                self.process_item(item)?;
-                self.settle_between_items(self.leaving_shared_login)?;
+                continue;
             }
-            if self.leaving_shared_login {
+            let item = {
+                let _awaiting = self
+                    .observation
+                    .as_ref()
+                    .map(|a| a.span(crate::transfer_observations::Stage::AwaitingWork));
+                self.sched.next()
+            };
+            if matches!(item, Item::Exit) {
                 return Ok(());
+            }
+            self.take_own_login_if_ready()?;
+            self.process_item(item)?;
+            self.settle_between_items(false)?;
+        }
+    }
+
+    /// Whether the worker's own login is ready to replace its sessions on
+    /// the shared SSH login (or failed, so it stays there).
+    pub(super) fn own_login_ready(&self) -> bool {
+        matches!(&self.own_login, OwnLogin::Opening(login) if login.is_finished())
+    }
+
+    /// Whether the worker hands back the rest of the range it is copying:
+    /// the tuner parked it, or its own login is ready to carry the rest.
+    pub(super) fn hands_back_ranges(&self) -> bool {
+        !self.gate.allowed(self.id) || self.own_login_ready()
+    }
+
+    /// Move to the worker's own login once it is ready, between requests.
+    pub(super) fn take_own_login_if_ready(&mut self) -> Result<()> {
+        if !self.own_login_ready() {
+            return Ok(());
+        }
+        let OwnLogin::Opening(login) = std::mem::take(&mut self.own_login) else {
+            unreachable!("a ready login is being opened");
+        };
+        self.on_shared_login = false;
+        let (src, dst) = match login.join() {
+            Ok(Ok(connections)) => connections,
+            Ok(Err(error)) => {
+                // The shared session still works: carry every file on it,
+                // as a startup worker does.
+                if debug() {
+                    crate::output::diagnostic!(
+                        "syq: worker {}: could not log in on its own; staying on the shared SSH login ({error:#})",
+                        self.id
+                    );
+                }
+                return Ok(());
+            }
+            Err(panic) => std::panic::resume_unwind(panic),
+        };
+        // Every reply on the shared sessions must be read before they close.
+        self.settle_between_items(true)?;
+        for (source, new) in [(true, src), (false, dst)] {
+            let Some(mut new) = new else {
+                continue;
+            };
+            if let Some(actor) = &self.observation {
+                new.observe(&self.progress.observations, actor, source, self.id)?;
+            }
+            let old = if source { &mut self.src } else { &mut self.dst };
+            std::mem::replace(old, new).detach();
+        }
+        #[cfg(debug_assertions)]
+        crate::fsops::record_test_event(
+            "SYQ_TEST_WORKER_EVENTS",
+            format_args!("connected {} 0", self.id),
+        )?;
+        if debug() {
+            crate::output::diagnostic!(
+                "syq: worker {}: moved from the shared SSH login to its own",
+                self.id
+            );
+        }
+        Ok(())
+    }
+
+    /// Start the worker's own login, on a thread of its own, if it has not.
+    pub(super) fn open_own_login(&mut self) {
+        let own_login = std::mem::take(&mut self.own_login);
+        let OwnLogin::Unopened(open) = own_login else {
+            self.own_login = own_login;
+            return;
+        };
+        match std::thread::Builder::new()
+            .name(format!("syq-login-{}", self.id))
+            .spawn(open)
+        {
+            Ok(login) => {
+                self.own_login = OwnLogin::Opening(PendingLogin(Some(login)));
+                if debug() {
+                    crate::output::diagnostic!(
+                        "syq: worker {}: logging in on its own for a larger file",
+                        self.id
+                    );
+                }
+            }
+            Err(error) => {
+                self.on_shared_login = false;
+                if debug() {
+                    crate::output::diagnostic!(
+                        "syq: worker {}: staying on the shared SSH login; cannot start its login ({error})",
+                        self.id
+                    );
+                }
             }
         }
     }
 
-    /// Whether this worker must leave the shared SSH login before it takes
-    /// `item`: the item belongs to a file larger than a small-file batch,
+    /// Whether `item` makes this worker on the shared SSH login log in on
+    /// its own: the item belongs to a file larger than a small-file batch,
     /// which needs a stream and cipher processes of its own. Small files go
     /// on the shared login whether or not they already exist.
     pub(super) fn needs_own_login(&self, item: &Item) -> bool {
@@ -203,9 +342,8 @@ impl Worker {
             return Ok(());
         }
         if self.needs_own_login(&item) {
-            self.sched.return_unstarted(item);
-            self.leaving_shared_login = true;
-            return Ok(());
+            // Keep working on the shared login until the new one is ready.
+            self.open_own_login();
         }
         match item {
             Item::Exit => {
@@ -2309,7 +2447,7 @@ impl Worker {
         handle: &RangeHandle,
         window: u64,
     ) -> Option<(u64, u64)> {
-        if !self.gate.allowed(self.id) {
+        if self.hands_back_ranges() {
             self.sched.release_rest(handle);
         }
         let mut range = handle.lock().unwrap();
@@ -2489,7 +2627,7 @@ impl Worker {
                         )?;
                     }
                 }
-                released |= !self.gate.allowed(self.id);
+                released |= self.hands_back_ranges();
                 if adaptive && !released {
                     if let Some(slot) = current {
                         refresh_latency |=
@@ -2732,9 +2870,7 @@ impl Worker {
             let mut expected = start;
             let mut announced_end = end;
             loop {
-                if !self.gate.allowed(self.id)
-                    || self.sched.is_failed(idx)
-                    || self.sched.is_aborted()
+                if self.hands_back_ranges() || self.sched.is_failed(idx) || self.sched.is_aborted()
                 {
                     self.sched.release_rest(h);
                 }

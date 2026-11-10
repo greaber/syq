@@ -577,12 +577,23 @@ fn pipeline_worker(
         setup_elapsed: std::time::Duration::ZERO,
         publications: Default::default(),
         on_shared_login: false,
-        leaving_shared_login: false,
+        own_login: Default::default(),
+    }
+}
+
+fn wait_for_own_login(worker: &Worker) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !worker.own_login_ready() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "own login never ended"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
 
 #[test]
-fn a_worker_on_the_shared_ssh_login_gives_back_larger_files() {
+fn a_worker_on_the_shared_ssh_login_logs_in_on_its_own_for_larger_files() {
     let sched = Arc::new(Sched::new(512, 8192));
     sched.push_file(pipeline_job(b"small", 100));
     let mut existing = pipeline_job(b"existing", 100);
@@ -606,20 +617,86 @@ fn a_worker_on_the_shared_ssh_login_gives_back_larger_files() {
         matched: false
     }));
 
-    // It hands the larger file back untouched and stops taking work.
-    sched.scan_done();
-    let item = sched.next();
-    assert!(matches!(item, Item::File(2)), "largest file first");
-    worker.process_item(item).unwrap();
-    assert!(worker.leaving_shared_login);
+    // A login of its own that fails leaves the worker on the shared login,
+    // where it then carries every file.
+    worker.own_login = OwnLogin::Unopened(Box::new(|| anyhow::bail!("injected login failure")));
+    worker.open_own_login();
+    wait_for_own_login(&worker);
+    worker.take_own_login_if_ready().unwrap();
+    assert!(!worker.needs_own_login(&Item::File(2)));
     assert!(state.lock().unwrap().requests.is_empty());
-    assert!(matches!(sched.next(), Item::File(2)));
 
-    // So does a range of a larger file.
-    let (sched, handle, _) = pipeline_ranges(&[(0, 4096)]);
-    let mut worker = pipeline_worker(&sched, &state, &state, true);
+    // So does a range of a larger file. Only the destination shares the
+    // login here, so only it logs in again.
+    let (sched, handle, job) = pipeline_ranges(&[(0, 4096)]);
+    let automatic = || {
+        Arc::new(Mutex::new(PipelineState {
+            auto_ranges: true,
+            ..Default::default()
+        }))
+    };
+    let (source, shared, own) = (automatic(), automatic(), automatic());
+    let mut worker = pipeline_worker(&sched, &source, &shared, false);
     worker.on_shared_login = true;
-    assert!(worker.needs_own_login(&Item::Range(handle)));
+    assert!(worker.needs_own_login(&Item::Range(handle.clone())));
+    let (finish_login, login_finishes) = std::sync::mpsc::channel::<()>();
+    let destination = own.clone();
+    worker.own_login = OwnLogin::Unopened(Box::new(move || {
+        login_finishes.recv().unwrap();
+        Ok((
+            None,
+            Some(Box::new(PipelineConn(destination)) as Box<dyn Conn>),
+        ))
+    }));
+    worker.open_own_login();
+    // Taking more work while it logs in does not start a second login.
+    worker.open_own_login();
+    // The worker keeps copying on the shared login meanwhile.
+    assert!(matches!(worker.own_login, OwnLogin::Opening(_)));
+    assert!(!worker.hands_back_ranges());
+    worker.take_own_login_if_ready().unwrap();
+    assert!(worker.on_shared_login);
+
+    // Once the login is ready, the worker hands back the rest of its range
+    // between requests,
+    finish_login.send(()).unwrap();
+    wait_for_own_login(&worker);
+    assert!(worker.hands_back_ranges());
+    let mut credited = 0;
+    worker.transfer_range(&handle, &mut credited).unwrap();
+    assert_eq!(credited, 0);
+    assert!(!sched.range_done(&handle));
+    let Item::Range(rest) = sched.next() else {
+        panic!("the rest of the range was not handed back");
+    };
+    // moves to its new destination connection, keeping its source,
+    worker.take_own_login_if_ready().unwrap();
+    assert!(!worker.on_shared_login);
+    assert!(matches!(worker.own_login, OwnLogin::None));
+    assert!(!worker.hands_back_ranges());
+    // and copies the rest there.
+    worker.transfer_range(&rest, &mut credited).unwrap();
+    assert!(sched.range_done(&rest));
+    assert_eq!(credited, 4096);
+    assert_eq!(job.done.load(Relaxed), 4096);
+    assert!(shared.lock().unwrap().requests.is_empty());
+    let requests = |state: &Arc<Mutex<PipelineState>>, read: bool| {
+        state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|request| {
+                if read {
+                    matches!(request, Request::ReadRange { .. })
+                } else {
+                    matches!(request, Request::WriteRange { .. })
+                }
+            })
+            .count()
+    };
+    assert!(requests(&source, true) > 0);
+    assert_eq!(requests(&source, true), requests(&own, false));
 }
 
 #[test]

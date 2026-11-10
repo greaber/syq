@@ -1181,18 +1181,20 @@ fn a_finished_copy_does_not_wait_for_slow_worker_logins() {
 }
 
 /// Copy `src/` to a new remote directory through the ssh-shaped `ssh`, over
-/// SSH data with four fixed workers, listing the sources in `list` order. The
-/// first worker waits before it connects until every file has arrived, so the
-/// others do the copy. With `hold_planning`, planning also waits after its
-/// first batch until those others have connected. Returns the remote shell's
-/// log and the workers' connection events as they stood when every file had
-/// arrived, before the first worker was let go.
+/// SSH data with four fixed workers and the further `options`, listing the
+/// sources in `list` order. The first worker waits before it connects until
+/// every file has arrived, so the others do the copy. With `hold_planning`,
+/// planning also waits after its first batch until those others have
+/// connected. Returns the remote shell's log and the workers' connection
+/// events as they stood when every file had arrived, before the first worker
+/// was let go.
 #[cfg(debug_assertions)]
 pub(super) fn copy_with_the_first_worker_held(
     t: &Tmp,
     ssh: &Path,
     list: &[String],
     hold_planning: bool,
+    options: &[&str],
 ) -> (String, String) {
     use std::os::unix::ffi::OsStrExt;
     write(&t.path("list"), (list.join("\n") + "\n").as_bytes());
@@ -1209,8 +1211,9 @@ pub(super) fn copy_with_the_first_worker_held(
             "--performance-tuning=workers=4",
             "--no-progress",
             "-rt",
-            "--files-from",
         ])
+        .args(options)
+        .arg("--files-from")
         .arg(t.path("list"))
         .arg(format!("{}/", t.s("src")))
         .arg(format!("fake:{}/", t.s("dst")))
@@ -1287,7 +1290,7 @@ fn workers_started_while_planning_small_files_share_the_copys_ssh_login() {
     for name in &list {
         write(&t.path(&format!("src/{name}")), name.as_bytes());
     }
-    let (log, events) = copy_with_the_first_worker_held(&t, &fake_ssh(&t), &list, false);
+    let (log, events) = copy_with_the_first_worker_held(&t, &fake_ssh(&t), &list, false, &[]);
     for name in &list {
         assert_eq!(read(&t.path(&format!("dst/{name}"))), name.as_bytes());
     }
@@ -1306,8 +1309,9 @@ fn workers_started_while_planning_small_files_share_the_copys_ssh_login() {
     );
 }
 
-/// A worker on the shared login that meets a file too large to share it
-/// hands the file back and logs in on its own, and so do later connections.
+/// A worker on the shared login that meets a file too large to share it logs
+/// in on its own, and so do later connections. It keeps copying on the shared
+/// login until its own login is ready, then moves the rest of its work there.
 #[cfg(debug_assertions)]
 #[test]
 fn a_worker_on_the_shared_ssh_login_logs_in_separately_for_a_large_file() {
@@ -1321,7 +1325,15 @@ fn a_worker_on_the_shared_ssh_login_logs_in_separately_for_a_large_file() {
     let large = prng(8 << 20, 9124);
     write(&t.path("src/large"), &large);
     list.push("large".into());
-    let (log, events) = copy_with_the_first_worker_held(&t, &fake_ssh(&t), &list, true);
+    // The large file takes seconds at this rate, so the worker's own login,
+    // which takes a fraction of one here, is ready before its copy ends.
+    let (log, events) = copy_with_the_first_worker_held(
+        &t,
+        &fake_ssh(&t),
+        &list,
+        true,
+        &["--resource-limits", "bandwidth=2M"],
+    );
     assert_eq!(read(&t.path("dst/large")), large);
     assert_eq!(read(&t.path("dst/f4095")), b"f4095");
     assert!(

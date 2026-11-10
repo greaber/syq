@@ -1981,6 +1981,97 @@ struct DestinationAnchor {
 type DestinationAnchorSlot = std::sync::Arc<std::sync::OnceLock<DestinationAnchor>>;
 type SourceRootsSlot = std::sync::Arc<std::sync::OnceLock<Vec<RegisteredSourceRoot>>>;
 
+/// How a data worker opens its source and destination connections.
+#[derive(Clone)]
+struct WorkerConnector {
+    src_ep: Endpoint,
+    dst_ep: Endpoint,
+    compress: bool,
+    sources: Vec<RegisteredSourceRoot>,
+    destination: Option<RegisteredDestinationRoot>,
+    copy_sources: Vec<RegisteredSourceRoot>,
+    opts: Arc<Opts>,
+    setups: Arc<crate::conn::WorkerSetups>,
+}
+
+impl WorkerConnector {
+    fn source(&self, reuse_control: bool) -> Result<Box<dyn Conn>> {
+        self.src_ep.connect_with_sources(
+            self.compress,
+            self.sources.clone(),
+            reuse_control,
+            Some(&self.setups),
+        )
+    }
+
+    fn destination(&self, reuse_control: bool) -> Result<Box<dyn Conn>> {
+        self.dst_ep.connect_with_copy_capabilities(
+            self.compress,
+            self.destination.clone(),
+            self.copy_sources.clone(),
+            reuse_control,
+            Some(&self.setups),
+        )
+    }
+
+    fn configure_source(&self, src: &mut dyn Conn) -> Result<()> {
+        configure_preservation(
+            src,
+            self.opts.inode_preservation,
+            self.opts.sparse,
+            false,
+            false,
+            (false, false, false),
+        )
+    }
+
+    fn configure_destination(&self, dst: &mut dyn Conn) -> Result<()> {
+        let opts = &self.opts;
+        configure_preservation(
+            dst,
+            opts.inode_preservation,
+            opts.sparse,
+            true,
+            opts.rsync_creation,
+            (
+                opts.own_links,
+                opts.skips_unmet_conditions,
+                opts.unchecked_keep,
+            ),
+        )
+    }
+
+    /// Log a worker on the copy's shared SSH login in on its own, for the
+    /// sides that share it (`source`, `destination`), and configure the new
+    /// connections fully, so the worker can move to them between requests.
+    fn own_login(&self, source: bool, destination: bool) -> Result<worker::OwnConnections> {
+        // This and every later connection log in on their own.
+        for spec in [&self.src_ep, &self.dst_ep]
+            .into_iter()
+            .filter_map(real_remote_spec)
+        {
+            spec.set_ssh_multiplexing(false);
+        }
+        let src = if source {
+            let mut src = self.source(false)?;
+            self.configure_source(&mut *src)?;
+            configure_hashing(&mut *src, self.opts.hash_policy)?;
+            Some(src)
+        } else {
+            None
+        };
+        let dst = if destination {
+            let mut dst = self.destination(false)?;
+            self.configure_destination(&mut *dst)?;
+            configure_hashing(&mut *dst, self.opts.hash_policy)?;
+            Some(dst)
+        } else {
+            None
+        };
+        Ok((src, dst))
+    }
+}
+
 fn handle_tcp_setup_error(
     args: &Args,
     spec: &RemoteSpec,
@@ -3119,6 +3210,20 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     .get()
                     .context("source roots were not registered before workers started")?
                     .clone();
+                let connector = WorkerConnector {
+                    src_ep: src_ep.clone(),
+                    dst_ep: dst_ep.clone(),
+                    compress,
+                    copy_sources: if opts.copy_policy(bwlimit.is_some()).allows_receiver_copy() {
+                        initial_sources.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    sources: initial_sources,
+                    destination: initial_destination,
+                    opts: opts.clone(),
+                    setups: sched.worker_setups().clone(),
+                };
                 #[cfg(debug_assertions)]
                 if id == 0 {
                     crate::fsops::test_race_barrier(
@@ -3145,32 +3250,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     // the remaining independent connections finish logging in.
                     // TCP and custom remote shells keep their existing policy.
                     let reuse_control = reuse_startup_ssh(id, autotune);
-                    let setups = Some(sched.worker_setups());
-                    let conns = src_ep
-                        .connect_with_sources(
-                            compress,
-                            initial_sources.clone(),
-                            reuse_control,
-                            setups,
-                        )
-                        .and_then(|src| {
-                            let copy_sources =
-                                if opts.copy_policy(bwlimit.is_some()).allows_receiver_copy() {
-                                    initial_sources.clone()
-                                } else {
-                                    Vec::new()
-                                };
-                            Ok((
-                                src,
-                                dst_ep.connect_with_copy_capabilities(
-                                    compress,
-                                    initial_destination.clone(),
-                                    copy_sources,
-                                    reuse_control,
-                                    setups,
-                                )?,
-                            ))
-                        });
+                    let conns = connector
+                        .source(reuse_control)
+                        .and_then(|src| Ok((src, connector.destination(reuse_control)?)));
                     // Tests fail the first worker's connection once every file
                     // is finished or the copy has failed: "reject" as a
                     // receiver rejecting its handshake, anything else as an
@@ -3254,26 +3336,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             continue;
                         }
                     };
-                    configure_preservation(
-                        &mut *src,
-                        opts.inode_preservation,
-                        opts.sparse,
-                        false,
-                        false,
-                        (false, false, false),
-                    )?;
-                    configure_preservation(
-                        &mut *dst,
-                        opts.inode_preservation,
-                        opts.sparse,
-                        true,
-                        opts.rsync_creation,
-                        (
-                            opts.own_links,
-                            opts.skips_unmet_conditions,
-                            opts.unchecked_keep,
-                        ),
-                    )?;
+                    connector.configure_source(&mut *src)?;
+                    connector.configure_destination(&mut *dst)?;
                     let fast_batch_files = opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES);
                     let transport_paced = (opts.src_remote || opts.dst_remote)
                         && (!opts.src_remote || src.transport_paced())
@@ -3285,8 +3349,18 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                             opts.tuning.streaming_request_size(opts.block, None),
                         );
                     }
-                    let on_shared_login =
-                        !reuse_control && (src.shares_ssh_login() || dst.shares_ssh_login());
+                    // A worker on the shared login logs in on its own, for
+                    // the sides that share it, when it takes a larger file.
+                    let shared = (src.shares_ssh_login(), dst.shares_ssh_login());
+                    let on_shared_login = !reuse_control && (shared.0 || shared.1);
+                    let own_login = if on_shared_login {
+                        let connector = connector.clone();
+                        OwnLogin::Unopened(Box::new(move || {
+                            connector.own_login(shared.0, shared.1)
+                        }))
+                    } else {
+                        OwnLogin::None
+                    };
                     let mut worker = Worker {
                         id,
                         src,
@@ -3309,7 +3383,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         setup_elapsed: t0.elapsed(),
                         publications: Default::default(),
                         on_shared_login,
-                        leaving_shared_login: false,
+                        own_login,
                     };
                     #[cfg(debug_assertions)]
                     crate::fsops::record_test_event(
@@ -3335,22 +3409,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     }
                     let dropped = result.is_err() && !invalid_range && worker.transport_dead();
                     match result {
-                        Ok(()) if worker.leaving_shared_login => {
-                            // A larger file is planned: this and every later
-                            // connection logs in on its own.
-                            for spec in [&src_ep, &dst_ep].into_iter().filter_map(real_remote_spec)
-                            {
-                                spec.set_ssh_multiplexing(false);
-                            }
-                            worker.src.detach();
-                            worker.dst.detach();
-                            gate.mark_warming(id);
-                            if debug() {
-                                crate::output::diagnostic!(
-                                    "syq: worker {id}: leaving the shared SSH login to log in on its own"
-                                );
-                            }
-                        }
                         Ok(()) => {
                             gate.mark_absent(id);
                             worker.src.detach();

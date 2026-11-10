@@ -116,7 +116,7 @@ fn multiplexed_refusal_falls_back_for_workers_started_while_planning() {
         write(&t.path(&format!("src/{name}")), name.as_bytes());
     }
     let (invocations, events) =
-        super::remote::copy_with_the_first_worker_held(&t, &ssh, &list, false);
+        super::remote::copy_with_the_first_worker_held(&t, &ssh, &list, false, &[]);
     for name in [&list[0], &list[599]] {
         assert_eq!(read(&t.path(&format!("dst/{name}"))), name.as_bytes());
     }
