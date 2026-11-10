@@ -1,12 +1,14 @@
 //! Integration tests: local -> local copies through the built binary.
 
 #[allow(dead_code)]
-#[path = "../src/process.rs"]
+#[path = "../src/process_spawn.rs"]
 mod process;
 use crate::process::CommandExt as _;
-use process::group as process_group;
 #[path = "support/executable.rs"]
 mod executable_support;
+#[allow(dead_code)]
+#[path = "../src/process_group.rs"]
+mod process_group;
 #[path = "support/temp.rs"]
 mod test_support;
 

@@ -1,6 +1,6 @@
 //! Keep ambient symlinks out of fixtures without hiding symlinks under test.
 #[allow(dead_code)]
-#[path = "../src/process.rs"]
+#[path = "../src/process_spawn.rs"]
 mod process;
 use crate::process::CommandExt as _;
 #[path = "support/temp.rs"]

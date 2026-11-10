@@ -1,5 +1,5 @@
 //! Coordinate process creation and bounded policy-inspection subprocesses.
-use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 
 #[path = "process_group.rs"]
 pub(crate) mod group;
@@ -10,17 +10,9 @@ pub(crate) mod signals;
 #[path = "process_termination.rs"]
 pub(crate) mod termination;
 
-/// Serialize non-atomic close-on-exec setup with child launches on Darwin.
-/// The operation must only create/protect descriptors or launch a process;
-/// do not hold this guard while waiting for peer I/O or child completion.
-pub(crate) fn with_inheritance_guard<T>(operation: impl FnOnce() -> T) -> T {
-    #[cfg(target_os = "macos")]
-    let _guard = {
-        static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        SPAWN.lock().unwrap_or_else(|error| error.into_inner())
-    };
-    operation()
-}
+#[path = "process_spawn.rs"]
+mod spawn;
+pub(crate) use spawn::{with_inheritance_guard, CommandExt};
 
 /// A command that runs this same build again, for receivers, services and
 /// other internal modes. An upgrade or rebuild can replace the file at the
@@ -312,32 +304,6 @@ pub(crate) fn restore_self_started_name() {
     }
 }
 
-pub(crate) trait CommandExt {
-    fn spawn_guarded(&mut self) -> std::io::Result<Child>;
-    fn status_guarded(&mut self) -> std::io::Result<ExitStatus>;
-    /// Capture both outputs with null stdin. For custom stdio, configure it
-    /// explicitly and use spawn_guarded followed by wait_with_output instead.
-    fn capture_output(&mut self) -> std::io::Result<Output>;
-}
-
-impl CommandExt for Command {
-    fn spawn_guarded(&mut self) -> std::io::Result<Child> {
-        with_inheritance_guard(|| self.spawn())
-    }
-
-    fn status_guarded(&mut self) -> std::io::Result<ExitStatus> {
-        self.spawn_guarded()?.wait()
-    }
-
-    fn capture_output(&mut self) -> std::io::Result<Output> {
-        self.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn_guarded()?
-            .wait_with_output()
-    }
-}
-
 /// Run an inspection command under one deadline, including descendants that
 /// retain its output pipes. Neither output nor cancellation needs a reader
 /// thread whose lifetime can outlast the command's process group.
@@ -573,6 +539,30 @@ mod tests {
                 "{error}"
             );
         }
+    }
+}
+
+/// `group`'s tests, here rather than in `process_group.rs`, which the
+/// integration test targets include.
+#[cfg(test)]
+mod group_tests {
+    use super::group::ProcessGroup;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_child_in_this_group_stays_in_it_and_is_killed_alone() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let mut child = ProcessGroup::spawn_in_this_group(&mut command).unwrap();
+        let pid = child.child.id() as libc::pid_t;
+        assert_eq!(unsafe { libc::getpgid(pid) }, unsafe { libc::getpgrp() });
+        assert!(child.foreground().unwrap().is_none());
+        let started = Instant::now();
+        let status = child.close().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }
 
