@@ -1046,6 +1046,7 @@ impl Worker {
 
     /// Act on one group's reply: record the outcomes it decides, and return
     /// the group's next request, if any of its files go on.
+    #[allow(clippy::too_many_arguments)]
     fn compare_stage(
         &mut self,
         jobs: &[WorkerJob],
