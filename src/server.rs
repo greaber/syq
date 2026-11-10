@@ -2498,7 +2498,7 @@ fn serve_tcp(
         Box::new(crate::bwlimit::transport::PacedWriter {
             inner: stream.try_clone()?,
             budget,
-            handshake_pending: Some(handshake_pending.clone()),
+            unpaced: Some(handshake_pending.clone()),
             stopped: move || {
                 session.is_closed()
                     || source.as_ref().is_some_and(|source| !source.is_open())

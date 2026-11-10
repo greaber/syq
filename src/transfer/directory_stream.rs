@@ -29,10 +29,34 @@ const MAX_GROWTH: usize = 64;
 
 /// The directories of one batch still to be created, by level: a directory
 /// whose parent this batch also creates is one level below it.
+///
+/// A restricted receiver's new `--mapping` parents are created only where
+/// nothing is (no-replace). The receiver runs a request's no-replace
+/// creations first, all at once, and skips what lies beneath a failed one
+/// only within that request. So a no-replace directory goes only once its
+/// parent's creation has been answered, and nothing beneath one goes in a
+/// later request until its reply has arrived.
 pub(super) struct DirectoryQueue {
     levels: Vec<Level>,
     /// The first level with directories left.
     first: usize,
+    /// The nearest of each directory's ancestors that this batch creates
+    /// too. Those between them exist already: the scan found them.
+    parent: Vec<Option<usize>>,
+    /// Which directories are created only where nothing is.
+    no_replace: Vec<bool>,
+    /// Where each directory's creation stands.
+    state: Vec<Creation>,
+    /// Requests taken so far.
+    requests: usize,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Creation {
+    Queued,
+    /// Taken by this request, and not yet answered.
+    Sent(usize),
+    Answered,
 }
 
 #[derive(Default)]
@@ -43,23 +67,36 @@ struct Level {
 }
 
 impl DirectoryQueue {
-    /// `paths[i]` is the destination path of the batch's `i`th new directory.
-    pub(super) fn new(paths: &[&[u8]]) -> Self {
+    /// `paths[i]` is the destination path of the batch's `i`th new
+    /// directory, and `no_replace[i]` whether it is created only where
+    /// nothing is.
+    pub(super) fn new(paths: &[&[u8]], no_replace: &[bool]) -> Self {
         let index: HashMap<&[u8], usize> = paths
             .iter()
             .enumerate()
             .map(|(i, path)| (*path, i))
             .collect();
-        // Parents have fewer components than their children, so this order
-        // finds every parent's level before its children's.
+        let parent: Vec<Option<usize>> = paths
+            .iter()
+            .map(|path| {
+                let mut current: &[u8] = path;
+                while let Some(above) = parent_of(current).filter(|above| *above != current) {
+                    if let Some(&found) = index.get(above) {
+                        return Some(found);
+                    }
+                    current = above;
+                }
+                None
+            })
+            .collect();
+        // Ancestors have fewer components than their descendants, so this
+        // order finds every parent's level before its children's.
         let mut order: Vec<usize> = (0..paths.len()).collect();
         order.sort_by_key(|&i| paths[i].iter().filter(|&&c| c == b'/').count());
         let mut level = vec![0usize; paths.len()];
         for &i in &order {
-            if let Some(&parent) = parent_of(paths[i]).and_then(|parent| index.get(parent)) {
-                if parent != i {
-                    level[i] = level[parent] + 1;
-                }
+            if let Some(parent) = parent[i] {
+                level[i] = level[parent] + 1;
             }
         }
         let depth = level.iter().max().map_or(0, |deepest| deepest + 1);
@@ -75,7 +112,14 @@ impl DirectoryQueue {
             level_of.parents[slot].push_back(i);
             level_of.remaining += 1;
         }
-        Self { levels, first: 0 }
+        Self {
+            levels,
+            first: 0,
+            parent,
+            no_replace: no_replace.to_vec(),
+            state: vec![Creation::Queued; paths.len()],
+            requests: 0,
+        }
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -87,8 +131,13 @@ impl DirectoryQueue {
     /// levels deep, within `byte_limit` by `sizes` (each directory's share
     /// of the request). A deeper level joins only once the levels above it
     /// are all in this or an earlier request, so a directory is never
-    /// created before its parent.
+    /// created before its parent. The request ends before the first
+    /// directory that must wait for an earlier request's reply
+    /// (`DirectoryQueue`), which stays queued: it is empty when that is the
+    /// next one.
     pub(super) fn next(&mut self, growth: usize, sizes: &[usize], byte_limit: usize) -> Vec<usize> {
+        self.requests += 1;
+        let request = self.requests;
         let total = PER_REQUEST * growth;
         let per_parent = PER_PARENT * growth;
         let mut chosen = Vec::new();
@@ -105,12 +154,14 @@ impl DirectoryQueue {
                     };
                     if chosen.len() == total
                         || (!chosen.is_empty() && bytes.saturating_add(sizes[index]) > byte_limit)
+                        || waits(&self.parent, &self.no_replace, &self.state, index, request)
                     {
                         full = true;
                         break;
                     }
                     queue.pop_front();
                     chosen.push(index);
+                    self.state[index] = Creation::Sent(request);
                     bytes = bytes.saturating_add(sizes[index]);
                     taken += 1;
                     current.remaining -= 1;
@@ -134,6 +185,40 @@ impl DirectoryQueue {
         }
         chosen
     }
+
+    /// Whether directory `index` is created only where nothing is.
+    pub(super) fn no_replace(&self, index: usize) -> bool {
+        self.no_replace[index]
+    }
+
+    /// The creations of `indices` have been answered, or will not be sent.
+    pub(super) fn answered(&mut self, indices: &[usize]) {
+        for &index in indices {
+            self.state[index] = Creation::Answered;
+        }
+    }
+}
+
+/// Whether directory `index` must wait for an earlier creation's reply
+/// before request `request` may take it (`DirectoryQueue`).
+fn waits(
+    parent: &[Option<usize>],
+    no_replace: &[bool],
+    state: &[Creation],
+    index: usize,
+    request: usize,
+) -> bool {
+    if no_replace[index] && parent[index].is_some_and(|p| state[p] != Creation::Answered) {
+        return true;
+    }
+    let mut ancestor = parent[index];
+    while let Some(above) = ancestor {
+        if no_replace[above] && matches!(state[above], Creation::Sent(sent) if sent != request) {
+            return true;
+        }
+        ancestor = parent[above];
+    }
+    false
 }
 
 pub(super) fn parent_of(path: &[u8]) -> Option<&[u8]> {
@@ -257,8 +342,15 @@ mod tests {
     use super::*;
 
     fn queued(paths: &[&str]) -> (DirectoryQueue, Vec<usize>) {
+        queued_no_replace(paths, &[])
+    }
+
+    /// The directories of `paths` named in `no_replace` are created only
+    /// where nothing is.
+    fn queued_no_replace(paths: &[&str], no_replace: &[&str]) -> (DirectoryQueue, Vec<usize>) {
+        let flags: Vec<bool> = paths.iter().map(|path| no_replace.contains(path)).collect();
         let paths: Vec<&[u8]> = paths.iter().map(|path| path.as_bytes()).collect();
-        (DirectoryQueue::new(&paths), vec![100; paths.len()])
+        (DirectoryQueue::new(&paths, &flags), vec![100; paths.len()])
     }
 
     fn drain(queue: &mut DirectoryQueue, sizes: &[usize], growth: usize) -> Vec<Vec<usize>> {
@@ -334,6 +426,70 @@ mod tests {
         assert_eq!(queue.next(1, &sizes, 250).len(), 2);
         // One directory goes alone even past the limit.
         assert_eq!(queue.next(1, &sizes, 50).len(), 1);
+    }
+
+    #[test]
+    fn no_replace_creations_wait_only_for_the_creations_they_depend_on() {
+        // A restricted receiver's new mapping parents in one existing
+        // directory depend on none of each other: requests keep coming while
+        // earlier ones are unanswered.
+        let siblings: Vec<String> = (0..8).map(|i| format!("/d/{i}")).collect();
+        let mut paths: Vec<&str> = siblings.iter().map(String::as_str).collect();
+        paths.extend(["/d/7/child", "/d/7/child/grandchild"]);
+        let (mut queue, sizes) = queued_no_replace(&paths, &paths);
+        let mut sent = Vec::new();
+        for expected in [[0, 1], [2, 3], [4, 5], [6, 7]] {
+            let request = queue.next(1, &sizes, usize::MAX);
+            assert_eq!(request, expected);
+            sent.extend(request);
+        }
+        // A child waits for its parent's reply.
+        assert!(queue.next(1, &sizes, usize::MAX).is_empty());
+        queue.answered(&sent);
+        // Grown requests span levels, but never take a no-replace directory
+        // with its parent: the receiver would create both at once.
+        assert_eq!(queue.next(8, &sizes, usize::MAX), vec![8]);
+        assert!(queue.next(8, &sizes, usize::MAX).is_empty());
+        queue.answered(&[8]);
+        assert_eq!(queue.next(8, &sizes, usize::MAX), vec![9]);
+        assert!(queue.is_empty());
+
+        // Nor with a parent created as usual, which the receiver creates
+        // after its no-replace creations.
+        let (mut queue, sizes) = queued_no_replace(&["/d/a", "/d/a/b"], &["/d/a/b"]);
+        assert_eq!(queue.next(4, &sizes, usize::MAX), vec![0]);
+        assert!(queue.next(4, &sizes, usize::MAX).is_empty());
+        queue.answered(&[0]);
+        assert_eq!(queue.next(4, &sizes, usize::MAX), vec![1]);
+
+        // What is created as usual beneath a no-replace directory may go in
+        // its request, where the receiver skips it if that creation fails,
+        // but not in a later one before its reply, nor deeper beneath.
+        let paths = ["/d/a", "/d/a/x", "/d/a/x/y", "/d/b"];
+        let (mut queue, sizes) = queued_no_replace(&paths, &["/d/a"]);
+        assert_eq!(queue.next(2, &sizes, usize::MAX), vec![0, 3, 1]);
+        assert!(queue.next(2, &sizes, usize::MAX).is_empty());
+        queue.answered(&[0, 3, 1]);
+        assert_eq!(queue.next(2, &sizes, usize::MAX), vec![2]);
+        let (mut queue, sizes) = queued_no_replace(&paths, &["/d/a"]);
+        assert_eq!(queue.next(1, &sizes, usize::MAX), vec![0, 3]);
+        assert!(queue.next(1, &sizes, usize::MAX).is_empty());
+        queue.answered(&[0, 3]);
+        assert_eq!(queue.next(4, &sizes, usize::MAX), vec![1, 2]);
+
+        // A directory the scan found between two new ones, say made by
+        // another process meanwhile, does not hide the one above it.
+        let (mut queue, sizes) =
+            queued_no_replace(&["/d/a", "/d/x", "/d/a/b/c"], &["/d/a", "/d/x", "/d/a/b/c"]);
+        assert_eq!(queue.next(2, &sizes, usize::MAX), vec![0, 1]);
+        assert!(queue.next(2, &sizes, usize::MAX).is_empty());
+        queue.answered(&[0, 1]);
+        assert_eq!(queue.next(2, &sizes, usize::MAX), vec![2]);
+
+        // A request ends at the first directory that waits.
+        let (mut queue, sizes) =
+            queued_no_replace(&["/d/a", "/d/b", "/d/a/x", "/d/b/x"], &["/d/b/x"]);
+        assert_eq!(queue.next(4, &sizes, usize::MAX), vec![0, 1, 2]);
     }
 
     #[test]

@@ -778,6 +778,55 @@ fn a_worker_logs_in_alongside_the_shared_login_only_within_a_signed_allowance() 
     assert_eq!(worker.gate.begin_warming(2), vec![1]);
 }
 
+/// A worker that ends while its own login is under way, here as its shared
+/// connection drops and the worker loop opens its slot again, leaves the
+/// login's share of a signed allowance to the login: the receiver counts
+/// what that login opens, so another worker gets in only once the login has
+/// ended and closed it.
+#[test]
+fn a_login_left_under_way_keeps_its_share_of_a_signed_allowance_until_it_ends() {
+    let sched = Arc::new(Sched::new(512, 8192));
+    sched.push_file(pipeline_job(b"large", 4096));
+    sched.scan_done();
+    let state = Arc::new(Mutex::new(PipelineState::default()));
+    let mut worker = pipeline_worker(&sched, &state, &state, true);
+    let gate = Gate::new(2);
+    worker.gate = gate.clone();
+    gate.mark_ready(0);
+    gate.set_connection_allowance(2);
+    worker.on_shared_login = true;
+    let own = Arc::new(Mutex::new(PipelineState::default()));
+    let destination = own.clone();
+    let (finish_login, login_finishes) = std::sync::mpsc::channel::<()>();
+    worker.own_login = OwnLogin::Unopened(Box::new(move || {
+        login_finishes.recv().unwrap();
+        Ok((
+            None,
+            Some(Box::new(PipelineConn(destination)) as Box<dyn Conn>),
+        ))
+    }));
+    let item = worker
+        .take_own_login_before(sched.next())
+        .unwrap()
+        .expect("the worker keeps the file");
+    worker.open_own_login();
+    sched.return_unstarted(item);
+    drop(worker);
+    assert!(gate.reserve_overlap().is_none());
+    finish_login.send(()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while gate.reserve_overlap().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the login never gave its share back"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    // It closed its connection first.
+    assert_eq!(Arc::strong_count(&own), 1);
+    assert_eq!(gate.begin_warming(2), vec![1]);
+}
+
 /// A worker that takes an item, finds its own login ready, and then loses
 /// the shared connection while settling a publication there gives the item
 /// back, so the copy can still finish it.

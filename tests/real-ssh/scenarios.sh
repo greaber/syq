@@ -920,6 +920,51 @@ rm "$receive_root/network-keep/d0/existing"
 # The directory that held the existing file keeps its own mode.
 grep -v '^d [0-7]* ./d0 -> $' /tmp/syq-network-tree-source.manifest >/tmp/syq-network-keep-source.manifest
 grep -v '^d [0-7]* ./d0 -> $' /tmp/syq-network-keep-local.manifest | diff -u /tmp/syq-network-keep-source.manifest -
+# A mapping there puts every file four new directories deep. The receiver
+# creates those parents only where nothing is, all of a request's such
+# creations at once, so a parent and its child never go in one request.
+ssh source python3 - <<'NETWORK_MAPPING'
+import json
+with open("/tmp/syq-network-mapping.ndjson", "w") as manifest:
+    for d in range(8):
+        for s in range(4):
+            for f in range(2):
+                source = f"d{d}/s{s}/f{f}"
+                manifest.write(json.dumps({
+                    "src": {"encoding": "utf-8", "value": source},
+                    "dst": {"encoding": "utf-8", "value": f"nested/d{d}/s{s}/deep/f{f}"},
+                }) + "\n")
+NETWORK_MAPPING
+ssh source 'syq cp -C /tmp/syq-real-ssh/network-tree --mapping /tmp/syq-network-mapping.ndjson --to @laptop --into network-mapping'
+for d in 0 1 2 3 4 5 6 7; do
+    for s in 0 1 2 3; do
+        for f in 0 1; do
+            test "$(cat "$receive_root/network-mapping/nested/d$d/s$s/deep/f$f")" = "d$d/s$s/f$f"
+        done
+    done
+done
+# Keeping what exists, the receiver looks up each directory before creating
+# it, which fails while its new parent is in the same request: three levels
+# of new directories go one level at a time.
+ssh source sh -s <<'NETWORK_DEEP'
+set -eu
+root=/tmp/syq-real-ssh/network-deep
+for d in 0 1 2 3 4 5 6 7; do
+    for s in 0 1 2 3; do
+        install -d -m 0750 "$root/d$d/s$s/deep"
+        printf '%s\n' "d$d/s$s" >"$root/d$d/s$s/deep/f"
+    done
+done
+NETWORK_DEEP
+ssh source 'syq cp --if-exists=keep --copy-metadata permissions --srcs-in /tmp/syq-real-ssh/network-deep --to @laptop --into network-deep-keep'
+remote_manifest source /tmp/syq-real-ssh/network-deep /tmp/syq-network-deep-source.manifest
+(
+    cd "$receive_root/network-deep-keep"
+    {
+        find . -mindepth 1 -printf '%y %m %p -> %l\n'
+        find . -type f -exec sha256sum {} +
+    } | LC_ALL=C sort
+) | diff -u /tmp/syq-network-deep-source.manifest -
 syq persist off
 syq persist connect source
 syq persist receive wait source --timeout 30

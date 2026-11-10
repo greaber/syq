@@ -403,7 +403,8 @@ struct DirectoryStream {
     failed_guarded: Vec<PathBytes>,
     /// Directories skipped for that, whose leaves are still to be planned.
     skipped: Vec<usize>,
-    /// Sending was held for a request with a no-replace creation.
+    /// Sending was held for a reply that a no-replace creation, or what lies
+    /// beneath one, waits for (`DirectoryQueue`).
     held: bool,
 }
 
@@ -411,10 +412,7 @@ struct DirectoryStream {
 struct SentDirectories {
     pending: crate::conn::PendingReply,
     sent: std::time::Instant,
-    /// It creates a directory only where nothing is (`TargetCondition` other
-    /// than `Any`).
-    guarded: bool,
-    /// It was held until such a request was answered.
+    /// It was held until an earlier request was answered.
     after_hold: bool,
     /// Its directories, as indices into the batch's new directories.
     chosen: Vec<usize>,
@@ -2999,7 +2997,17 @@ impl Planner<'_> {
             .collect();
         let queue = {
             let paths: Vec<&[u8]> = mkdirs.iter().map(apply_path).collect();
-            super::directory_stream::DirectoryQueue::new(&paths)
+            // A restricted receiver keeping what exists (`--if-exists=keep`,
+            // which signs the `Skip` existing-object policy) creates every
+            // directory only where nothing is, and looks each one up first,
+            // which fails while its new parent is in the same request.
+            let all_no_replace =
+                self.opts.restricted_receiver && self.opts.preserve_existing_directory_metadata;
+            let no_replace: Vec<bool> = mkdirs
+                .iter()
+                .map(|op| all_no_replace || op_condition(op) != TargetCondition::Any)
+                .collect();
+            super::directory_stream::DirectoryQueue::new(&paths, &no_replace)
         };
         let mut stream = DirectoryStream {
             queue,
@@ -3059,12 +3067,9 @@ impl Planner<'_> {
         dst_root: &[u8],
     ) -> Result<()> {
         use super::directory_stream::REQUESTS_IN_FLIGHT;
-        // A request with a no-replace creation is answered before any other
-        // is sent, so that a directory beneath one that failed is not sent.
         while !stream.stopped
             && stream.in_flight.len() < REQUESTS_IN_FLIGHT
             && !stream.queue.is_empty()
-            && !stream.in_flight.iter().any(|request| request.guarded)
         {
             if self.sched.is_aborted() {
                 stream.stopped = true;
@@ -3075,6 +3080,16 @@ impl Planner<'_> {
                 stream
                     .queue
                     .next(growth, &stream.sizes, crate::proto::METADATA_BATCH_BYTES);
+            if chosen.is_empty() {
+                // What is left waits for a request in flight. Without one it
+                // would never be sent, and its files never copied.
+                anyhow::ensure!(
+                    !stream.in_flight.is_empty(),
+                    "directory creation waits for no request"
+                );
+                stream.held = true;
+                break;
+            }
             // Nothing at or beneath a directory whose no-replace creation
             // failed is created: it holds what was there.
             let (chosen, skipped): (Vec<usize>, Vec<usize>) = chosen.into_iter().partition(|&i| {
@@ -3109,6 +3124,7 @@ impl Planner<'_> {
                     // The receiver never saw these.
                     crate::results::ReceiverListing::Unlisted,
                 )?;
+                stream.queue.answered(&skipped);
                 stream.skipped.extend(skipped);
             }
             let mut ops: Vec<Op> = chosen
@@ -3135,23 +3151,16 @@ impl Planner<'_> {
             // Held back on purpose, it reached the receiver after the
             // previous reply: that is no sign of a slow link.
             let after_hold = std::mem::take(&mut stream.held);
-            let guarded = targets
-                .iter()
-                .any(|(_, condition)| *condition != TargetCondition::Any);
             let sent = std::time::Instant::now();
             let pending = self.dst.send_pending(Request::Apply { ops })?;
             stream.in_flight.push_back(SentDirectories {
                 pending,
                 sent,
                 after_hold,
-                guarded,
                 chosen,
                 targets,
                 count,
             });
-        }
-        if !stream.queue.is_empty() && stream.in_flight.iter().any(|request| request.guarded) {
-            stream.held = true;
         }
         Ok(())
     }
@@ -3184,8 +3193,14 @@ impl Planner<'_> {
             let mut errs = self.applied(response, request.count)?;
             // Failed early metadata is retried, and reported, at the end.
             errs.truncate(request.targets.len());
-            for ((path, condition), error) in request.targets.iter().zip(&errs) {
-                if error.is_some() && *condition != TargetCondition::Any {
+            stream.queue.answered(&request.chosen);
+            // A failed creation the queue holds as no-replace, which under
+            // `--if-exists=keep` includes those sent to be created as usual,
+            // has nothing beneath it sent.
+            for ((&index, (path, _)), error) in
+                request.chosen.iter().zip(&request.targets).zip(&errs)
+            {
+                if error.is_some() && stream.queue.no_replace(index) {
                     stream.failed_guarded.push(path.clone());
                 }
             }
@@ -3513,6 +3528,11 @@ impl Planner<'_> {
                 continue;
             }
             if opts.preserve_existing_directory_metadata && !self.created_dirs.contains(p) {
+                continue;
+            }
+            // A directory the copy could not create has had its failure
+            // reported; there is nothing to give metadata to.
+            if !matches!(s, Some(d) if d.kind == Kind::Dir) && !self.created_dirs.contains(p) {
                 continue;
             }
             let depth = p.iter().filter(|&&c| c == b'/').count();
