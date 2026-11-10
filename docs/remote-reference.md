@@ -266,8 +266,9 @@ sees, `--coordinate-at dst`, `--detach`, `--rsh`, `--syq-path`,
 root. As for an upload, a saved choice does not apply to a copy with one of
 these options: your server's own SSH access runs it. An explicit
 `--auth-from` with one of them is refused.
-[Restricted-copy limits](#limits-and-unsupported-options) apply. With `--coordinate-at local`, file data goes through your server
-instead, which then needs
+[Restricted-copy limits](#limits-and-unsupported-options) apply. With
+`--coordinate-at local`, file data goes through your server instead, which
+then needs
 [account access](persistence-reference.md#account-access) to both servers.
 
 Older versions of syq added lines with a comment starting `syq-copy-worker-`

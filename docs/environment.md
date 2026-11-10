@@ -62,7 +62,8 @@ shell itself, run `eval "$(tmux show-environment -s SSH_AUTH_SOCK)"`.
 Copies still work when caches cannot be written, but each machine needs a
 little space for the private sockets in `syq-persist-UID` and `syq-UID`.
 Without a private `XDG_RUNTIME_DIR`, these go in the temporary directory
-(`TMPDIR`, or `/tmp` when it is unset).
+(`TMPDIR`, or `/tmp` when it is unset), except that persistent connection
+sockets use `/tmp` on macOS.
 Then all your SSH logins to a machine must see the same `TMPDIR`, and if
 another user creates `syq-UID` there first, copies stop and say so; set
 `TMPDIR` to a directory of your own to get around it. When syq can't keep

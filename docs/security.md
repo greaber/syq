@@ -51,8 +51,9 @@ ask; links found inside a directory are never followed. (`syq rsync` instead
 follows the rule from
 [rsync 3.5.0's security design](https://github.com/RsyncProject/rsync/blob/v3.5.0/SECURITY.md#symlink-race-safe-path-resolution):
 it follows a link in a supplied path that root or the running user owns. With
-`--insecure-links`, which applies to local paths only, it follows any such
-link except those described below the table.)
+`--insecure-links`, which applies to local paths only, it follows any link in
+a supplied path except the ones in shared directories described below the
+table.)
 
 | Where the symlink appears | Treatment |
 |---|---|
@@ -225,10 +226,11 @@ The protection has four parts:
    was compromised during an earlier copy and kept it, still needs a copy you
    newly signed, and the receiver checks that signature before reading the
    rest of the request. Such a server can, however, keep the receiver's
-   connections waiting. That slows new copies, and can make them fail when the
-   server connects from more than one address, or when they start from a
-   machine that shares its address, such as behind one NAT, until you revoke
-   the enrollment and enroll again. Don't add the entry key to any other
+   connections waiting. That slows new copies, and can make them fail when
+   that server connects from more than one address, or when the server running
+   a new copy connects from the same address or IPv6 /64 network, as machines
+   behind one NAT or in one IPv6 cloud subnet often do, until you revoke the
+   enrollment and enroll again. Don't add the entry key to any other
    `authorized_keys` file: hostA holds it, so it would gain that access too.
    Your laptop stores it unencrypted.
 3. **A signature on each copy.** Your laptop signs the copy's command, exactly
@@ -627,8 +629,8 @@ asking each time, as your laptop does for hostX above. Its prompt says that it
 can't confirm which server is asking. An approval goes back only over the
 provider login that sent the request, and allows only the copy the prompt
 shows, once. So if you approve the wrong one of two similar requests, the
-server that sent it gets what that prompt showed: like hostX, it could write
-content of its choosing to the destination shown, within the approval's
-limits, but it can't change the accounts or paths. Any server that can log in
-to the provider account could already do more than that, so the prompt guards
-against mistakes, not against those servers.
+server that sent it gets what that prompt showed: like hostX, it holds both
+entry keys and could write content of its choosing to the destination shown,
+within the approval's limits, but it can't change the accounts or paths. Any
+server that can log in to the provider account could already do more than
+that, so the prompt guards against mistakes, not against those servers.
