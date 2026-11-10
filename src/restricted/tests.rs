@@ -2009,6 +2009,16 @@ fn protected_destinations_are_refused_from_their_names_before_enrolling() {
             "/tmp/syq-persist-1000/global",
             "persistence runtime directory",
         ),
+        (
+            "into",
+            "/tmp/syq-1000",
+            "socket directory of running copies",
+        ),
+        (
+            "as",
+            "/tmp/syq-1000/fd-1-x",
+            "socket directory of running copies",
+        ),
         // Contents copied into a directory reach everything beneath it.
         ("contents", "~", "SSH configuration directory"),
         ("contents", "~/.config", "receiving configuration directory"),
@@ -2063,17 +2073,25 @@ fn protected_destinations_are_refused_from_their_names_before_enrolling() {
             home.join(".syq-receiver-identity"),
             PathBuf::from("/srv/config/syq"),
             PathBuf::from("/run/user/1000/syq-persist-1000"),
+            PathBuf::from("/var/tmp/syq-1000"),
+            PathBuf::from("/run/user/1000/syq-1000"),
         ]
     );
+    // Persistent connection sockets use /tmp on macOS; those of running
+    // copies use the temporary directory.
     assert_eq!(
-        server_receiving_state(home, "501", "Darwin", ("", "", "/var/folders/x"))[2],
-        Path::new("/tmp/syq-persist-501")
+        server_receiving_state(home, "501", "Darwin", ("", "", "/var/folders/x"))[2..],
+        [
+            PathBuf::from("/tmp/syq-persist-501"),
+            PathBuf::from("/var/folders/x/syq-501")
+        ]
     );
     assert_eq!(
         server_receiving_state(home, "7", "Linux", ("relative", "relative", "/var/tmp"))[1..],
         [
             home.join(".config/syq"),
-            PathBuf::from("/var/tmp/syq-persist-7")
+            PathBuf::from("/var/tmp/syq-persist-7"),
+            PathBuf::from("/var/tmp/syq-7")
         ]
     );
 }
@@ -3216,6 +3234,152 @@ fn receivers_protect_the_syq_a_receiving_service_follows() {
             .is_some_and(|error| error.contains("directory of the syq receiving runs")),
         "{error:?}"
     );
+}
+
+/// The account's ordinary copies keep their sockets in its `syq-UID`, in the
+/// runtime or the temporary directory. A copy cannot write there, by its
+/// name or through a link that `--follow-dst` follows, nor replace or prune
+/// a directory that holds it.
+#[test]
+fn receivers_protect_the_sockets_of_running_copies() {
+    use crate::private_broker::{BrokerBase, BrokerDirectory, PrivateBroker, PrivateBrokerConfig};
+    let broker = PrivateBroker::start_managed(
+        PrivateBrokerConfig {
+            directory: BrokerDirectory::Ticketed {
+                prefix: "t-",
+                base: BrokerBase::Account,
+            },
+            listener_thread: "syq-protect-test-listener",
+            client_thread: "syq-protect-test-client",
+            inline_on_thread_failure: false,
+            max_connections: 1,
+            io_timeout: std::time::Duration::from_secs(1),
+        },
+        |_, _| {},
+    )
+    .unwrap();
+    let sockets = broker.socket_path().parent().unwrap();
+    let account = sockets.parent().unwrap();
+    assert!(account.is_absolute(), "{}", account.display());
+    let temporary = crate::test_support::tempdir().unwrap();
+    let protected =
+        receiver_control_paths(&temporary.path().join("home"), None, ControlPaths::Here).unwrap();
+    let label = "protected socket directory of running copies";
+    for path in [account, sockets, broker.socket_path()] {
+        let error = reject_control_plane_path(path.as_os_str().as_bytes(), &protected)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(label), "{error}");
+    }
+    let parent = account.parent().unwrap();
+    let error = reject_control_plane_path(parent.as_os_str().as_bytes(), &protected)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("holds the receiver's protected"), "{error}");
+    // A link to it, followed as `--follow-dst` follows one.
+    let link = temporary.path().join("link");
+    symlink(account, &link).unwrap();
+    let followed = ConfinedRoot::resolve(
+        link.join("copy").as_os_str().as_bytes(),
+        &protected,
+        true,
+        None,
+    )
+    .err()
+    .map(|error| format!("{error:#}"));
+    assert!(
+        followed
+            .as_deref()
+            .is_some_and(|error| error.contains(label)),
+        "{followed:?}"
+    );
+    // Whatever name reaches it, a copy into it is refused by identity.
+    let error = test_authority_with_options(
+        &link,
+        DeletionPolicy::DeleteDestinationOnly,
+        1024,
+        FilterPolicy::default(),
+        PublicationPolicy::AtomicStaged,
+        ExistingDestinationPolicy::Replace,
+        DestinationPlacement::ExactPath,
+        RootExistence::Any,
+        None,
+        (Default::default(), &protected),
+    )
+    .err()
+    .map(|error| format!("{error:#}"));
+    assert!(
+        error.as_deref().is_some_and(|error| error.contains(label)),
+        "{error:?}"
+    );
+}
+
+/// A link where syq's runtime state could be, as another user can make in a
+/// shared `/tmp`, holds none of it, so it protects nothing: a copy into a
+/// directory it leads to, or below one, is not refused. That is so where
+/// the account's copies could keep their sockets, and where persistent
+/// connections keep theirs.
+#[test]
+fn a_link_where_runtime_state_could_be_protects_nothing() {
+    const CHILD: &str = "SYQ_TEST_STATE_LINK_FIXTURE";
+    let uid = unsafe { libc::geteuid() };
+    if let Some(fixture) = std::env::var_os(CHILD) {
+        let fixture = PathBuf::from(fixture);
+        let protected =
+            receiver_control_paths(&fixture.join("home"), None, ControlPaths::Here).unwrap();
+        let inbox = fixture.join("inbox");
+        ConfinedRoot::resolve(
+            inbox.join("copy").as_os_str().as_bytes(),
+            &protected,
+            false,
+            None,
+        )
+        .unwrap();
+        test_authority_with_options(
+            &inbox,
+            DeletionPolicy::DeleteDestinationOnly,
+            1024,
+            FilterPolicy::default(),
+            PublicationPolicy::AtomicStaged,
+            ExistingDestinationPolicy::Replace,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
+            None,
+            (Default::default(), &protected),
+        )
+        .unwrap();
+        // A place nothing occupies yet stays protected.
+        let runtime = fixture.join(format!("run/syq-{uid}/x"));
+        reject_control_plane_path(runtime.as_os_str().as_bytes(), &protected).unwrap_err();
+        return;
+    }
+    for link in [format!("tmp/syq-{uid}"), format!("run/syq-persist-{uid}")] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let fixture = temporary.path();
+        for directory in ["run", "tmp", "inbox"] {
+            fs::create_dir(fixture.join(directory)).unwrap();
+        }
+        fs::set_permissions(fixture.join("run"), fs::Permissions::from_mode(0o700)).unwrap();
+        // It leads to a directory above the copy's destination.
+        symlink(fixture, fixture.join(&link)).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "restricted::tests::a_link_where_runtime_state_could_be_protects_nothing",
+                "--nocapture",
+            ])
+            .env(CHILD, fixture)
+            .env("TMPDIR", fixture.join("tmp"))
+            .env("XDG_RUNTIME_DIR", fixture.join("run"))
+            .capture_output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{link}: {stdout} {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]

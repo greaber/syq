@@ -173,16 +173,26 @@ pub(super) enum ControlPaths<'a> {
     Elsewhere(&'a [PathBuf]),
 }
 
-/// What each entry of `server_receiving_state` holds.
-const RECEIVING_STATE_LABELS: [&str; 3] = [
+/// What each entry of `server_receiving_state` holds. Records of earlier
+/// enrollments hold fewer entries; later builds may add more, which this
+/// build protects with the generic label.
+const RECEIVING_STATE_LABELS: [&str; 5] = [
     "receiver identity directory",
     "receiving configuration directory",
     "persistence runtime directory",
+    "socket directory of running copies",
+    "socket directory of running copies",
 ];
 
 /// Where a server keeps its receiving state, computed as its syq does from
 /// what its login environment reports: the receiver identity, the receive
-/// configuration's directory, and the persistence runtime directory.
+/// configuration's directory, the persistence runtime directory, and where
+/// the sockets of the account's running copies can be
+/// (`private_broker::account_directories`): in the temporary directory,
+/// then in the runtime directory when one is set. Without `TMPDIR`, macOS
+/// uses a temporary directory of the user's own that the login does not
+/// report; `/tmp` stands in for it here, and the server's receiver still
+/// protects the real one.
 pub(super) fn server_receiving_state(
     home: &Path,
     uid: &str,
@@ -202,7 +212,17 @@ pub(super) fn server_receiving_state(
             }
         })
         .join(format!("syq-persist-{uid}"));
-    vec![home.join(".syq-receiver-identity"), config, runtime]
+    let sockets = format!("syq-{uid}");
+    let mut state = vec![
+        home.join(".syq-receiver-identity"),
+        config,
+        runtime,
+        absolute(tmpdir)
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(&sockets),
+    ];
+    state.extend(absolute(runtime_dir).map(|runtime| runtime.join(&sockets)));
+    state
 }
 
 /// The path this process's receiving service follows to notice updates
@@ -245,8 +265,8 @@ pub(super) fn program_directories(path: &Path) -> Vec<PathBuf> {
 /// each has in the session: the account's SSH configuration, syq's stored
 /// executables, enrollment state on both sides (including the directories
 /// released versions used), the receiving machine's approval state, the
-/// directory of the running executable, and the directories of the syq a
-/// receiving service follows.
+/// sockets of the account's running copies, the directory of the running
+/// executable, and the directories of the syq a receiving service follows.
 pub(super) fn receiver_control_paths(
     home: &Path,
     executable: Option<&Path>,
@@ -301,13 +321,18 @@ pub(super) fn receiver_control_paths(
     }
     // In the order `server_receiving_state` lists them.
     let receiving: Vec<_> = match machine {
-        ControlPaths::Here => vec![
-            crate::destination::receiver_identity_directory().ok(),
-            crate::receive_service::config_path(&crate::persistence::Domain::default())
-                .ok()
-                .and_then(|path| path.parent().map(Path::to_path_buf)),
-            Some(crate::persistence::runtime_parent_path()),
-        ],
+        ControlPaths::Here => {
+            let (temporary_sockets, runtime_sockets) = crate::private_broker::account_directories();
+            vec![
+                crate::destination::receiver_identity_directory().ok(),
+                crate::receive_service::config_path(&crate::persistence::Domain::default())
+                    .ok()
+                    .and_then(|path| path.parent().map(Path::to_path_buf)),
+                own_or_missing(crate::persistence::runtime_parent_path()),
+                temporary_sockets.and_then(own_or_missing),
+                runtime_sockets.and_then(own_or_missing),
+            ]
+        }
         ControlPaths::Elsewhere(receiving) => receiving.iter().cloned().map(Some).collect(),
     };
     for (index, path) in receiving.into_iter().enumerate() {
@@ -328,6 +353,17 @@ pub(super) fn receiver_control_paths(
             label,
         })
         .collect())
+}
+
+/// `path`, a directory of syq's runtime state that may be in a shared
+/// directory such as `/tmp`, unless something other than a directory of
+/// this account's is there. Syq never keeps its state behind a link or in
+/// another user's directory, and following a link another user made would
+/// protect whatever it leads to, refusing unrelated copies.
+fn own_or_missing(path: PathBuf) -> Option<PathBuf> {
+    let other = fs::symlink_metadata(&path)
+        .is_ok_and(|metadata| !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() });
+    (!other).then_some(path)
 }
 
 /// Remove `name` from the private directory `state` when it is there,

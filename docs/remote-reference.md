@@ -35,12 +35,15 @@ It also installs syq under `~/.local/lib/syq` and keeps state in
 rather than deleting files.
 
 Copies cannot write the account's `~/.ssh` or syq's own programs and state, such
-as `~/.local/lib/syq`, `~/.local/libexec`, `~/.config/syq`, and enrollment and
-receiving state. A copy that puts a directory's contents into, prunes, or
-replaces a directory holding one of these, such as your home directory, is
-refused; copy into a subdirectory instead, or copy named files or directories
-into it. A copy from the account reads whatever its command names, these
-included, as a login to the account could.
+as `~/.local/lib/syq`, `~/.local/libexec`, `~/.config/syq`, enrollment and
+receiving state, and the `syq-UID` directory where running copies keep their
+sockets (see [Local state](environment.md#local-state)). A copy that puts a
+directory's contents into, prunes, or replaces a directory holding one of these
+is refused. That includes your home directory, and the temporary directory
+itself, such as `/tmp`, because `syq-UID` can be there even when the account
+has an `XDG_RUNTIME_DIR`. Copy into a subdirectory instead, or copy named files
+or directories into it. A copy from the account reads whatever its command
+names, these included, as a login to the account could.
 
 ### Which key signs
 
