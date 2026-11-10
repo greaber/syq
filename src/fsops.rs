@@ -110,6 +110,7 @@ pub(crate) use small_batch::with_coarse_change_times;
 pub(crate) fn leases_trusted_on(file: &File) -> bool {
     fs_caps::leases_show_writers(file)
 }
+#[cfg(test)]
 pub(crate) use stages::new_scope as new_stage_scope;
 
 /// Let go of what the copy `scope` holds in this process when its control
@@ -118,6 +119,28 @@ pub(crate) use stages::new_scope as new_stage_scope;
 pub(crate) fn release_stages(scope: u64) {
     stages::release(scope);
     owned::release(scope);
+}
+
+/// A copy's scope (`new_stage_scope`), owned by what serves the copy, and
+/// let go when that is dropped, whether or not the copy's control
+/// connection ever started.
+#[derive(Debug)]
+pub(crate) struct StageScope(u64);
+
+impl StageScope {
+    pub(crate) fn new() -> Self {
+        Self(stages::new_scope())
+    }
+
+    pub(crate) fn get(&self) -> u64 {
+        self.0
+    }
+}
+
+impl Drop for StageScope {
+    fn drop(&mut self) {
+        release_stages(self.0);
+    }
 }
 
 /// Compare at the decimal precision suggested by the destination timestamp.

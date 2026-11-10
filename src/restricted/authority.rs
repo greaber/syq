@@ -699,7 +699,7 @@ pub(crate) struct RestrictedAuthority {
     pub(super) owned: std::sync::Arc<crate::fsops::owned::OwnedObjects>,
     /// The scope of the files this copy is writing, which the receiver holds
     /// open until the copy's control connection ends.
-    pub(super) stage_scope: u64,
+    pub(super) stage_scope: crate::fsops::StageScope,
     /// What this receiver's own lookups for the planner found, where
     /// they let a file's publication be held to the grant without looking
     /// again (`constrain_publication`): keeping existing files, or
@@ -727,7 +727,7 @@ impl RestrictedAuthority {
 
     /// The scope of the files this copy is writing (`FsOps::set_stage_scope`).
     pub(crate) fn stage_scope(&self) -> u64 {
-        self.stage_scope
+        self.stage_scope.get()
     }
 
     pub(crate) fn hash_policy(&self) -> crate::hashing::HashPolicy {
@@ -952,7 +952,7 @@ impl RestrictedAuthority {
             hashing,
             extra_options,
             owned: Default::default(),
-            stage_scope: crate::fsops::new_stage_scope(),
+            stage_scope: crate::fsops::StageScope::new(),
             tcp_congestion,
             tcp,
             mapping: mapping.map(|authorization| {
@@ -1626,6 +1626,12 @@ impl RestrictedAuthority {
             tracked,
             stream: _,
         } = settlement;
+        // Run otherwise, a Finalize the limit leaves no room for could have
+        // published a file without a count.
+        debug_assert!(
+            charged.republication != Some(Republication::RepeatOnly) || charged.executed,
+            "a Finalize the entry limit leaves no room for ran without Settlement::execute"
+        );
         self.refund_unmade(&charged, response);
         if creations.is_empty() && outcomes.is_empty() && !tracked {
             return;
@@ -2823,6 +2829,7 @@ impl RestrictedAuthority {
             file,
             republication,
             repeated: false,
+            executed: false,
         })
     }
 
@@ -4324,6 +4331,9 @@ pub(super) struct Charged {
     /// The receiver answered the Finalize as one that already published
     /// its file (`Settlement::execute`).
     repeated: bool,
+    /// The request ran through `Settlement::execute`, which alone tells the
+    /// receiver what a Finalize may do.
+    executed: bool,
 }
 
 /// How a Finalize of a file with no reservation counts against the entry
@@ -4357,6 +4367,7 @@ impl Settlement {
         let result = execute(ops);
         ops.set_finalize_repeat_only(None);
         self.charged.repeated = ops.take_finalize_repeated();
+        self.charged.executed = true;
         result
     }
 }

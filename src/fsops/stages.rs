@@ -28,6 +28,7 @@
 //! what it said it would write, on every receiver.
 
 use super::*;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Condvar, MutexGuard};
 
@@ -418,9 +419,10 @@ pub(super) fn finalize(target: For<'_>) -> Option<Found> {
 }
 
 /// The identity a Finalize reported when it published the file for
-/// `target`, if one did and nothing is held for it since, after any
-/// Finalize of it already running ends. Unlike `finalize`, this takes
-/// nothing to publish.
+/// `target`, if one did and nothing is held for it now, after any Finalize
+/// of it already running ends. Unlike `finalize`, this takes nothing to
+/// publish. A file held for `target` is one that Finalize would publish,
+/// even when a Finalize running as it was held recorded its own.
 pub(super) fn repeated(target: For<'_>) -> Option<Option<(u64, u64)>> {
     let key = target.key();
     let mut registry = registry();
@@ -429,6 +431,9 @@ pub(super) fn repeated(target: For<'_>) -> Option<Option<(u64, u64)>> {
             .finalized
             .wait(registry)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+    if registry.held.contains_key(&key) {
+        return None;
     }
     registry.published.get(&key).map(|&(_, identity)| identity)
 }
@@ -588,6 +593,45 @@ mod tests {
         release(ended);
         assert_eq!((count(ended), count(running)), (0, 2));
         release(running);
+    }
+
+    #[test]
+    fn a_repeat_finds_nothing_while_a_newer_file_is_held() {
+        let directory = crate::test_support::tempdir().unwrap();
+        let root = Root::open(directory.path()).unwrap();
+        let file = File::create(directory.path().join("file")).unwrap();
+        let name = RelativePath::new(b"file").unwrap();
+        let (scope, copy_id) = (new_scope(), [9; 16]);
+        let held = For {
+            scope,
+            root: &root,
+            target: &name,
+            copy_id: &copy_id,
+            inplace: false,
+        };
+        hold(held, &name, &file, None, true, 1).unwrap();
+        let (_, finalizing) = taken(finalize(held));
+        // A newer file is held while the first Finalize runs, which then
+        // records its publication.
+        hold(held, &name, &file, None, true, 1).unwrap();
+        finalizing.published(new_connection(), Some((1, 2)));
+        drop(finalizing);
+        assert!(repeated(held).is_none());
+        let (newer, finalizing) = taken(finalize(held));
+        assert!(newer.relative == name);
+        finalizing.published(new_connection(), Some((3, 4)));
+        drop(finalizing);
+        assert_eq!(repeated(held), Some(Some((3, 4))));
+        release(scope);
+    }
+
+    #[test]
+    fn a_scope_is_let_go_when_dropped() {
+        let scope = StageScope::new();
+        let number = scope.get();
+        assert!(registry().running(number));
+        drop(scope);
+        assert!(!registry().running(number));
     }
 
     #[test]
