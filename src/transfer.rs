@@ -238,8 +238,6 @@ pub struct Opts {
     /// Directories already named as needing temporary access; failures
     /// beneath them do not repeat the hint.
     pub access_noted: Mutex<std::collections::HashSet<PathBytes>>,
-    /// A worker already said that it stays on the shared SSH login.
-    pub own_login_noted: AtomicBool,
     pub devices: bool,
     pub checksum: bool,
     /// Don't trust matching size and time, but compare only the files block
@@ -2858,7 +2856,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         access_limited: Default::default(),
         outer_directory: Default::default(),
         access_noted: Default::default(),
-        own_login_noted: AtomicBool::new(false),
         devices: args.devices,
         checksum: args.checksum,
         hash_or_copy: args.hash_or_copy && !args.checksum,
@@ -3387,6 +3384,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         publications: Default::default(),
                         on_shared_login,
                         own_login,
+                        leaving_shared_login: false,
                     };
                     #[cfg(debug_assertions)]
                     crate::fsops::record_test_event(
@@ -3412,6 +3410,17 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     }
                     let dropped = result.is_err() && !invalid_range && worker.transport_dead();
                     match result {
+                        Ok(()) if worker.leaving_shared_login => {
+                            // Its own login failed: end the shared sessions
+                            // and log in again here, as later connections do.
+                            for spec in [&src_ep, &dst_ep].into_iter().filter_map(real_remote_spec)
+                            {
+                                spec.set_ssh_multiplexing(false);
+                            }
+                            worker.src.detach();
+                            worker.dst.detach();
+                            gate.mark_warming(id);
+                        }
                         Ok(()) => {
                             gate.mark_absent(id);
                             worker.src.detach();

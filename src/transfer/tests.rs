@@ -116,6 +116,8 @@ struct PipelineState {
     next_deferred: u64,
     /// Setting up telemetry on the connection fails.
     fail_observe: bool,
+    /// The addresses of the actors telemetry was set up with, in order.
+    observed_by: Vec<usize>,
 }
 
 struct PipelineConn(Arc<Mutex<PipelineState>>);
@@ -215,14 +217,13 @@ impl Conn for PipelineConn {
     fn observe(
         &mut self,
         _observations: &crate::transfer_observations::Observations,
-        _actor: &Arc<crate::transfer_observations::Actor>,
+        actor: &Arc<crate::transfer_observations::Actor>,
         _source: bool,
         _worker_id: usize,
     ) -> Result<()> {
-        anyhow::ensure!(
-            !self.0.lock().unwrap().fail_observe,
-            "injected telemetry failure"
-        );
+        let mut state = self.0.lock().unwrap();
+        anyhow::ensure!(!state.fail_observe, "injected telemetry failure");
+        state.observed_by.push(Arc::as_ptr(actor) as usize);
         Ok(())
     }
     fn send_pending(&mut self, request: Request) -> Result<crate::conn::PendingReply> {
@@ -537,7 +538,6 @@ fn pipeline_worker(
         access_limited: Default::default(),
         outer_directory: Default::default(),
         access_noted: Default::default(),
-        own_login_noted: Default::default(),
         devices: false,
         checksum: false,
         hash_or_copy: false,
@@ -594,6 +594,7 @@ fn pipeline_worker(
         publications: Default::default(),
         on_shared_login: false,
         own_login: Default::default(),
+        leaving_shared_login: false,
     }
 }
 
@@ -633,14 +634,20 @@ fn a_worker_on_the_shared_ssh_login_logs_in_on_its_own_for_larger_files() {
         matched: false
     }));
 
-    // A login of its own that fails leaves the worker on the shared login,
-    // where it then carries every file.
+    // A login of its own that fails makes the worker leave the shared login
+    // at its next item, which goes back to the queue, to log in again.
     worker.own_login = OwnLogin::Unopened(Box::new(|| anyhow::bail!("injected login failure")));
     worker.open_own_login();
     wait_for_own_login(&worker);
-    worker.take_own_login_if_ready().unwrap();
-    assert!(!worker.needs_own_login(&Item::File(2)));
+    assert!(worker.hands_back_ranges());
+    sched.scan_done();
+    let item = sched.next();
+    assert!(matches!(item, Item::File(2)), "largest file first");
+    assert!(worker.take_own_login_before(item).unwrap().is_none());
+    assert!(worker.leaving_shared_login);
+    assert!(!worker.on_shared_login);
     assert!(state.lock().unwrap().requests.is_empty());
+    assert!(matches!(sched.next(), Item::File(2)));
 
     // So does a range of a larger file. Only the destination shares the
     // login here, so only it logs in again.
@@ -756,10 +763,11 @@ fn a_failed_move_to_the_own_login_gives_back_the_item_it_took() {
     assert!(queued.contains(&second), "{queued:?}");
 }
 
-/// Telemetry that fails on a worker's new connection leaves the worker on
-/// the shared login, rather than failing the copy.
+/// Telemetry that fails on a worker's new connection counts as a failed
+/// login: the worker leaves the shared login to log in again, rather than
+/// failing the copy.
 #[test]
-fn failed_telemetry_on_the_own_login_keeps_the_shared_login() {
+fn failed_telemetry_on_the_own_login_is_a_failed_login() {
     let (sched, _, _) = pipeline_ranges(&[(0, 4096)]);
     let state = Arc::new(Mutex::new(PipelineState::default()));
     let mut worker = pipeline_worker(&sched, &state, &state, false);
@@ -779,7 +787,8 @@ fn failed_telemetry_on_the_own_login_keeps_the_shared_login() {
     worker.open_own_login();
     wait_for_own_login(&worker);
     worker.take_own_login_if_ready().unwrap();
-    assert!(!worker.on_shared_login);
+    assert!(worker.leaving_shared_login);
+    assert!(!sched.is_aborted());
     assert!(matches!(worker.own_login, OwnLogin::None));
     state.lock().unwrap().replies.push_back(Response::Ok);
     worker
@@ -788,6 +797,39 @@ fn failed_telemetry_on_the_own_login_keeps_the_shared_login() {
         .unwrap();
     assert_eq!(state.lock().unwrap().requests.len(), 1);
     assert!(unobservable.lock().unwrap().requests.is_empty());
+}
+
+/// The login thread sets up the new connections' telemetry with an actor of
+/// its own, never the worker's, which the busy worker thread owns; the worker
+/// gives the connections its actor when it moves to them.
+#[test]
+fn only_the_worker_gives_its_own_login_the_workers_telemetry_actor() {
+    let (sched, _, _) = pipeline_ranges(&[(0, 4096)]);
+    let state = Arc::new(Mutex::new(PipelineState::default()));
+    let mut worker = pipeline_worker(&sched, &state, &state, false);
+    let actor = worker.progress.observations.workers.actor("worker");
+    worker.observation = Some(actor.clone());
+    worker.on_shared_login = true;
+    let own = Arc::new(Mutex::new(PipelineState::default()));
+    let destination = own.clone();
+    worker.own_login = OwnLogin::Unopened(Box::new(move || {
+        Ok((
+            None,
+            Some(Box::new(PipelineConn(destination)) as Box<dyn Conn>),
+        ))
+    }));
+    worker.open_own_login();
+    wait_for_own_login(&worker);
+    let on_login_thread = own.lock().unwrap().observed_by.clone();
+    assert_eq!(on_login_thread.len(), 1);
+    assert_ne!(on_login_thread[0], Arc::as_ptr(&actor) as usize);
+    worker.take_own_login_if_ready().unwrap();
+    assert!(!worker.on_shared_login);
+    assert!(!worker.leaving_shared_login);
+    assert_eq!(
+        own.lock().unwrap().observed_by.last(),
+        Some(&(Arc::as_ptr(&actor) as usize))
+    );
 }
 
 #[test]

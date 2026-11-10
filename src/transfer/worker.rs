@@ -54,6 +54,9 @@ pub(super) struct Worker {
     pub(super) on_shared_login: bool,
     /// The login of its own that a worker on the shared login opens.
     pub(super) own_login: OwnLogin,
+    /// That login failed: the worker ends its shared sessions and logs in
+    /// again through the worker loop, as every later connection does.
+    pub(super) leaving_shared_login: bool,
 }
 
 /// The connections that replace a worker's sessions on the shared SSH login:
@@ -63,15 +66,19 @@ pub(super) type OwnConnections = (Option<Box<dyn Conn>>, Option<Box<dyn Conn>>);
 /// A worker on the shared SSH login logs in on its own on a thread of its
 /// own, while it keeps working on the shared login, and moves over between
 /// requests once the new connections are ready. So the login adds no wait.
+/// If that login fails, the worker leaves the shared login between requests
+/// and logs in through the worker loop instead.
 #[derive(Default)]
 pub(super) enum OwnLogin {
-    /// Nothing to open: the worker has a login of its own, or it opened one
-    /// already, or that failed and it stays on the shared login.
+    /// Nothing to open: the worker has a login of its own, or it has moved
+    /// to one or is leaving the shared login.
     #[default]
     None,
     /// Opens the login when the worker first takes a larger file.
     Unopened(Box<dyn FnOnce() -> Result<OwnConnections> + Send>),
     Opening(PendingLogin),
+    /// The login could not even start.
+    Failed(anyhow::Error),
 }
 
 /// A login under way on a thread of its own.
@@ -195,7 +202,9 @@ impl Worker {
                 match self.sched.try_next() {
                     Some(Item::Exit) | None => self.settle_between_items(true)?,
                     Some(item) => {
-                        let item = self.take_own_login_before(item)?;
+                        let Some(item) = self.take_own_login_before(item)? else {
+                            return Ok(());
+                        };
                         self.process_item(item)?;
                         self.settle_between_items(false)?;
                     }
@@ -212,50 +221,62 @@ impl Worker {
             if matches!(item, Item::Exit) {
                 return Ok(());
             }
-            let item = self.take_own_login_before(item)?;
+            let Some(item) = self.take_own_login_before(item)? else {
+                return Ok(());
+            };
             self.process_item(item)?;
             self.settle_between_items(false)?;
         }
     }
 
-    /// Whether the worker's own login is ready to replace its sessions on
-    /// the shared SSH login (or failed, so it stays there).
+    /// Whether the worker's own login has finished: the worker moves to it,
+    /// or leaves the shared login if it failed.
     pub(super) fn own_login_ready(&self) -> bool {
-        matches!(&self.own_login, OwnLogin::Opening(login) if login.is_finished())
+        match &self.own_login {
+            OwnLogin::Opening(login) => login.is_finished(),
+            OwnLogin::Failed(_) => true,
+            OwnLogin::None | OwnLogin::Unopened(_) => false,
+        }
     }
 
     /// Whether the worker hands back the rest of the range it is copying:
-    /// the tuner parked it, or its own login is ready to carry the rest.
+    /// the tuner parked it, or its own login has finished.
     pub(super) fn hands_back_ranges(&self) -> bool {
         !self.gate.allowed(self.id) || self.own_login_ready()
     }
 
     /// Move to the worker's own login, if it is ready, before it works on
-    /// `item`. If that fails, `item` goes back to the queue unstarted.
-    pub(super) fn take_own_login_before(&mut self, item: Item) -> Result<Item> {
-        match self.take_own_login_if_ready() {
-            Ok(()) => Ok(item),
-            Err(error) => {
-                self.sched.return_unstarted(item);
-                Err(error)
-            }
+    /// `item`. If that fails, or the worker leaves the shared login instead
+    /// (`None`), `item` goes back to the queue unstarted.
+    pub(super) fn take_own_login_before(&mut self, item: Item) -> Result<Option<Item>> {
+        let moved = self.take_own_login_if_ready();
+        if moved.is_err() || self.leaving_shared_login {
+            self.sched.return_unstarted(item);
+            return moved.map(|()| None);
         }
+        Ok(Some(item))
     }
 
-    /// The worker could not log in on its own: it carries every file on the
-    /// shared login from now on, as a startup worker does. With `-v` it says
-    /// so once per copy, since larger files can copy more slowly there; the
-    /// copy itself is unaffected, so default output stays quiet.
-    fn stay_on_shared_login(&mut self, why: std::fmt::Arguments<'_>) {
+    /// The worker's own login failed. It ends its shared sessions between
+    /// requests and logs in through the worker loop, with that loop's
+    /// retries. Ending them first also frees their share of a signed grant's
+    /// connection limit, which refuses a login made alongside them when the
+    /// copy runs as many workers as the grant allows.
+    fn leave_shared_login(&mut self, why: std::fmt::Arguments<'_>) -> Result<()> {
         self.on_shared_login = false;
-        if !self.opts.quiet
-            && (debug() || self.opts.verbose > 0 && !self.opts.own_login_noted.swap(true, Relaxed))
-        {
+        self.leaving_shared_login = true;
+        #[cfg(debug_assertions)]
+        crate::fsops::record_test_event(
+            "SYQ_TEST_WORKER_EVENTS",
+            format_args!("leaving {}", self.id),
+        )?;
+        if debug() {
             crate::output::diagnostic!(
-                "syq: worker {} could not log in on its own and copies larger files over the copy's shared SSH login, which can be slower ({why})",
+                "syq: worker {}: leaving the shared SSH login to log in on its own ({why})",
                 self.id
             );
         }
+        Ok(())
     }
 
     /// Move to the worker's own login once it is ready, between requests.
@@ -265,18 +286,35 @@ impl Worker {
         }
         // Every reply on the shared sessions must be read before they close.
         self.settle_between_items(true)?;
-        let OwnLogin::Opening(login) = std::mem::take(&mut self.own_login) else {
-            unreachable!("a ready login is being opened");
+        let opened = match std::mem::take(&mut self.own_login) {
+            OwnLogin::Opening(login) => login
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            OwnLogin::Failed(error) => Err(error),
+            OwnLogin::None | OwnLogin::Unopened(_) => unreachable!("a ready login has ended"),
         };
-        let (src, dst) = match login.join() {
-            Ok(Ok(connections)) => connections,
-            Ok(Err(error)) => {
-                // The shared session still works.
-                self.stay_on_shared_login(format_args!("{error:#}"));
-                return Ok(());
+        let (mut src, mut dst) = match opened {
+            Ok(connections) => connections,
+            Err(error) => return self.leave_shared_login(format_args!("{error:#}")),
+        };
+        // The login thread already subscribed the new connections' telemetry
+        // with an actor of its own; this only gives them the worker's actor,
+        // which only this thread may use, without another round trip.
+        let attached = match &self.observation {
+            Some(actor) => [(true, &mut src), (false, &mut dst)]
+                .into_iter()
+                .try_for_each(|(source, conn)| match conn {
+                    Some(conn) => conn.observe(&self.progress.observations, actor, source, self.id),
+                    None => Ok(()),
+                }),
+            None => Ok(()),
+        };
+        if let Err(error) = attached {
+            for mut conn in [src, dst].into_iter().flatten() {
+                conn.detach();
             }
-            Err(panic) => std::panic::resume_unwind(panic),
-        };
+            return self.leave_shared_login(format_args!("{error:#}"));
+        }
         self.on_shared_login = false;
         for (source, new) in [(true, src), (false, dst)] {
             if let Some(new) = new {
@@ -305,20 +343,18 @@ impl Worker {
             self.own_login = own_login;
             return;
         };
-        // Telemetry for the new connections is set up there too, so its
-        // round trip doesn't hold up the worker, and its failure only keeps
-        // the worker on the shared login.
-        let observe = self
-            .observation
-            .clone()
-            .map(|actor| (self.progress.clone(), actor));
+        // Telemetry for the new connections is subscribed there too, so its
+        // round trip doesn't hold up the worker. It uses an actor of its own:
+        // the worker's actor belongs to the worker's thread, which is busy.
+        let observe = self.observation.is_some().then(|| self.progress.clone());
         let id = self.id;
         let login = move || -> Result<OwnConnections> {
             let (mut src, mut dst) = open()?;
-            if let Some((progress, actor)) = &observe {
+            if let Some(progress) = &observe {
+                let actor = crate::transfer_observations::Actor::new("worker");
                 for (source, conn) in [(true, &mut src), (false, &mut dst)] {
                     if let Some(conn) = conn {
-                        conn.observe(&progress.observations, actor, source, id)?;
+                        conn.observe(&progress.observations, &actor, source, id)?;
                     }
                 }
             }
@@ -338,7 +374,9 @@ impl Worker {
                 }
             }
             Err(error) => {
-                self.stay_on_shared_login(format_args!("cannot start its login: {error}"));
+                self.own_login = OwnLogin::Failed(
+                    anyhow::Error::new(error).context("cannot start its own login"),
+                );
             }
         }
     }

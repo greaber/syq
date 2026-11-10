@@ -1358,6 +1358,67 @@ fn a_worker_on_the_shared_ssh_login_logs_in_separately_for_a_large_file() {
     );
 }
 
+/// A worker on the shared login whose own login fails ends its shared
+/// session and logs in again through the worker loop, as connections did
+/// before workers logged in while working.
+#[cfg(debug_assertions)]
+#[test]
+fn a_worker_whose_own_login_fails_leaves_the_shared_login_to_log_in() {
+    let t = Tmp::new();
+    let mut list: Vec<String> = (0..4096).map(|index| format!("f{index:04}")).collect();
+    for name in &list {
+        write(&t.path(&format!("src/{name}")), name.as_bytes());
+    }
+    let large = prng(8 << 20, 9125);
+    write(&t.path("src/large"), &large);
+    list.push("large".into());
+    // The first login of a worker's own is refused, as a helper that cannot
+    // start is; the ones after it go through.
+    let ssh = t.path("bin/refusing-ssh");
+    let refused = t.path("refused-login");
+    executable(
+        &ssh,
+        format!(
+            r#"#!/bin/sh
+case " $* " in
+    *" ControlPath=none "*)
+        if mkdir '{}' 2>/dev/null; then
+            echo 'fake: refused' >&2
+            exit 127
+        fi
+        ;;
+esac
+exec '{}' "$@"
+"#,
+            refused.display(),
+            fake_ssh(&t).display()
+        )
+        .as_bytes(),
+    );
+    let (_, events) = copy_with_the_first_worker_held(
+        &t,
+        &ssh,
+        &list,
+        true,
+        &["--resource-limits", "bandwidth=2M"],
+    );
+    assert_eq!(read(&t.path("dst/large")), large);
+    assert_eq!(read(&t.path("dst/f4095")), b"f4095");
+    assert!(refused.exists(), "no worker tried a login of its own");
+    let lines: Vec<&str> = events.lines().collect();
+    let left = lines
+        .iter()
+        .position(|line| line.starts_with("leaving "))
+        .unwrap_or_else(|| panic!("no worker left the shared login:\n{events}"));
+    let id = lines[left].trim_start_matches("leaving ");
+    assert!(
+        lines[left..]
+            .iter()
+            .any(|line| line.starts_with(&format!("connected {id} "))),
+        "worker {id} did not log in again:\n{events}"
+    );
+}
+
 #[test]
 fn tcp_copy_auto_tuning_starts_with_sixteen_connections() {
     let t = Tmp::new();
