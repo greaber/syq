@@ -3108,6 +3108,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // handshakes (at sshd's MaxStartups or a serialized ssh agent). The tuner
     // may spawn more workers later, so the handles live behind a mutex.
     let gate = Gate::new(args.connections);
+    if args.signs_connection_limits() {
+        // The grant admits the copy's worker maximum (see
+        // `Args::automatic_worker_limit`); fixed counts stay within it.
+        gate.set_connection_allowance(maximum_workers);
+    }
     if let Some(history) = progress.tuning_history.get() {
         gate.set_history(history.clone());
     }
@@ -3118,15 +3123,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         Arc::new(Mutex::new(Vec::new()));
     let connect_after_file_plan = Arc::new(AtomicBool::new(false));
     let transport_stats: Arc<Mutex<Vec<TcpPairStats>>> = Arc::new(Mutex::new(Vec::new()));
-    // A signed grant admits the copy's worker maximum (see
-    // `Args::automatic_worker_limit`); logins made alongside shared sessions
-    // must fit under it too.
-    let connection_allowance = args.signs_connection_limits().then(|| {
-        Arc::new(ConnectionAllowance {
-            limit: maximum_workers,
-            overlapping: Default::default(),
-        })
-    });
     let spawn_worker: Arc<dyn Fn(usize) + Send + Sync> = {
         let (
             src_ep,
@@ -3187,7 +3183,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 gate.mark_absent(id);
                 return;
             }
-            let connection_allowance = connection_allowance.clone();
             let admission = gate.clone();
             let failed_schedule = sched.clone();
             let failed_progress = progress.clone();
@@ -3395,7 +3390,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         on_shared_login,
                         own_login,
                         leaving_shared_login: false,
-                        allowance: connection_allowance.clone(),
                         allowance_share: None,
                     };
                     #[cfg(debug_assertions)]

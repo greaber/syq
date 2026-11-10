@@ -57,43 +57,9 @@ pub(super) struct Worker {
     /// That login failed: the worker ends its shared sessions and logs in
     /// again through the worker loop, as every later connection does.
     pub(super) leaving_shared_login: bool,
-    /// On a copy whose endpoint enforces a signed grant, the room it leaves
-    /// for logins made alongside shared sessions.
-    pub(super) allowance: Option<Arc<ConnectionAllowance>>,
-    /// This worker's share of it while its own login is under way.
-    pub(super) allowance_share: Option<AllowanceShare>,
-}
-
-/// A signed grant counts every worker connection and admits as many as the
-/// copy's worker maximum, so a login made alongside a worker's shared
-/// session needs a free one, or the receiver refuses it. Without room, the
-/// worker ends its shared session first, as before logins overlapped.
-pub(super) struct ConnectionAllowance {
-    pub(super) limit: usize,
-    /// Logins under way alongside shared sessions.
-    pub(super) overlapping: std::sync::atomic::AtomicUsize,
-}
-
-impl ConnectionAllowance {
-    fn share(self: &Arc<Self>, gate: &Gate) -> Option<AllowanceShare> {
-        let overlapping = self
-            .overlapping
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
-        let share = AllowanceShare(self.clone());
-        (gate.connections() + overlapping <= self.limit).then_some(share)
-    }
-}
-
-/// One overlapping login's share of a `ConnectionAllowance`.
-pub(super) struct AllowanceShare(Arc<ConnectionAllowance>);
-
-impl Drop for AllowanceShare {
-    fn drop(&mut self) {
-        self.0
-            .overlapping
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
+    /// While its own login is under way, the room it takes under a signed
+    /// grant's connection allowance (`Gate::reserve_overlap`).
+    pub(super) allowance_share: Option<crate::tune::OverlapReservation>,
 }
 
 /// The connections that replace a worker's sessions on the shared SSH login:
@@ -286,15 +252,20 @@ impl Worker {
     /// `item`. If that fails, or the worker leaves the shared login instead
     /// (`None`), `item` goes back to the queue unstarted.
     pub(super) fn take_own_login_before(&mut self, item: Item) -> Result<Option<Item>> {
-        if matches!(self.own_login, OwnLogin::Unopened(_)) && self.needs_own_login(&item) {
-            if let Some(allowance) = &self.allowance {
-                match allowance.share(&self.gate) {
-                    Some(share) => self.allowance_share = Some(share),
-                    None => {
-                        self.own_login = OwnLogin::Failed(anyhow::anyhow!(
-                            "the signed connection allowance has no room for a login alongside the shared one"
-                        ))
-                    }
+        // A signed grant counts every worker connection, so a login made
+        // alongside the shared session needs room under it, or the receiver
+        // refuses it. Without room the worker ends its shared session first,
+        // as before logins overlapped.
+        if matches!(self.own_login, OwnLogin::Unopened(_))
+            && self.allowance_share.is_none()
+            && self.needs_own_login(&item)
+        {
+            match self.gate.reserve_overlap() {
+                Some(share) => self.allowance_share = Some(share),
+                None => {
+                    self.own_login = OwnLogin::Failed(anyhow::anyhow!(
+                        "the signed connection allowance has no room for a login alongside the shared one"
+                    ))
                 }
             }
         }
