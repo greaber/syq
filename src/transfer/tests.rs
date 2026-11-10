@@ -813,7 +813,7 @@ fn a_failed_move_to_the_own_login_gives_back_the_item_it_took() {
         match item {
             Item::File(idx) => queued.push(idx),
             Item::Exit => break,
-            Item::Range(_) | Item::Finish { .. } => {}
+            Item::Range(_) | Item::Patch(_) | Item::Finish { .. } => {}
         }
     }
     assert!(queued.contains(&second), "{queued:?}");
