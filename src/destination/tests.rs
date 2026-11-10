@@ -1783,6 +1783,106 @@ fn named_hard_links_ask_and_link_new_names_to_existing_files() {
     );
 }
 
+/// A mapping that puts each file eight new directories deep reaches a
+/// receiving machine whose destination is on a local disk. The receiver
+/// creates new mapping parents only where nothing is, all of a request's
+/// such creations at once, so none goes with its parent.
+#[test]
+fn named_mapping_creates_nested_new_parents() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("receiving");
+    fs::create_dir(&root).unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let source = base.join("source");
+    fs::create_dir(&source).unwrap();
+    let mut manifest = Vec::new();
+    let mut expected = Vec::new();
+    for index in 0..80 {
+        let name = format!("f{index}");
+        fs::write(source.join(&name), name.as_bytes()).unwrap();
+        let destination = format!("r{}/c{}/d0/d1/d2/d3/d4/d5/{name}", index / 8, index % 8);
+        manifest.extend_from_slice(
+            serde_json::json!({
+                "src": {"encoding": "utf-8", "value": name},
+                "dst": {"encoding": "utf-8", "value": destination},
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        manifest.push(b'\n');
+        expected.push((destination, name));
+    }
+    let mapping = base.join("mapping.ndjson");
+    fs::write(&mapping, &manifest).unwrap();
+    let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
+    let command: Vec<Vec<u8>> = [
+        "cp",
+        "-C",
+        source.to_str().unwrap(),
+        "--mapping",
+        mapping.to_str().unwrap(),
+        "--to",
+        "@laptop",
+        "--into",
+        "mapped",
+        "--tcp-ports",
+        "0-0",
+        "--resource-limits",
+        "workers=2",
+    ]
+    .iter()
+    .map(|arg| arg.as_bytes().to_vec())
+    .collect();
+    let mut args = crate::approval_command::parse(&command).unwrap();
+    let approved = approve(
+        &registration,
+        command,
+        crate::directive::Inputs {
+            ignore: Vec::new(),
+            mapping: Some(crate::mapping::Authorization::from_contents(&manifest)),
+        },
+    );
+    args.locations.last_mut().unwrap().host = Some("server".into());
+    args.locations.last_mut().unwrap().path = approved.destination.clone();
+    args.restricted_grant = Some(route(registration, &approved));
+    assert_eq!(crate::transfer::run(args).unwrap(), 0);
+    for (destination, contents) in expected {
+        assert_eq!(
+            fs::read(root.join("mapped").join(&destination)).unwrap(),
+            contents.as_bytes(),
+            "{destination}"
+        );
+    }
+}
+
+/// Keeping what exists, the receiver looks up each directory it is asked to
+/// create, which fails while the directory's new parent is in the same
+/// request: a tree three new directories deep reaches it all the same.
+#[test]
+fn named_keep_copy_creates_nested_new_directories() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("receiving");
+    fs::create_dir(&root).unwrap();
+    let source = fs::canonicalize(temp.path()).unwrap().join("source");
+    for a in 0..4 {
+        for b in 0..4 {
+            let directory = source.join(format!("a{a}/b{b}/c"));
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("file"), format!("{a}{b}")).unwrap();
+        }
+    }
+    let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
+    assert_eq!(named_copy(&registration, &source, &["--if-exists=keep"]), 0);
+    for a in 0..4 {
+        for b in 0..4 {
+            assert_eq!(
+                fs::read(root.join(format!("source/a{a}/b{b}/c/file"))).unwrap(),
+                format!("{a}{b}").as_bytes()
+            );
+        }
+    }
+}
+
 /// Keeping existing files, a hard-link group with an existing member ends
 /// as rsync leaves it: the existing name and its file untouched, and the
 /// group's new names linked to a new file of their own.
