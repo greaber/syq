@@ -857,7 +857,16 @@ syq persist off
 SYQ_TEST_NETWORK_FILESYSTEM=1 syq persist connect source
 syq persist receive wait source --timeout 30
 ssh source 'syq persist destinations wait laptop --timeout 30'
-ssh source 'syq cp --copy-metadata permissions --srcs-in /tmp/syq-real-ssh/network-tree --to @laptop --into network-tree'
+ssh source 'SYQ_TUNING_HISTORY=/tmp/syq-network-tree.sqlite syq cp --copy-metadata permissions --srcs-in /tmp/syq-real-ssh/network-tree --to @laptop --into network-tree'
+# The copy took its destination for a network filesystem, which is what has it
+# create directories this way.
+ssh source python3 - <<'NETWORK_SEEN'
+import json
+import sqlite3
+rows = sqlite3.connect("/tmp/syq-network-tree.sqlite").execute(
+    "SELECT data FROM events WHERE json_extract(data, '$.kind') = 'starting_count'").fetchall()
+assert rows and all(json.loads(row[0])["data"]["network_destination"] for row in rows), rows
+NETWORK_SEEN
 remote_manifest source /tmp/syq-real-ssh/network-tree /tmp/syq-network-tree-source.manifest
 (
     cd "$receive_root/network-tree"
