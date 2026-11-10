@@ -397,6 +397,18 @@ fn installed(response: InstallResponse) -> (u64, bool) {
     }
 }
 
+/// `install_for_account`, with a refusal as the error it reports.
+fn install_or_refusal(
+    request: &InstallRequest,
+    account: &str,
+    home: &Path,
+) -> Result<InstallResponse> {
+    match install_for_account(request, account, home)? {
+        InstallResponse::Refused { reason, .. } => Err(anyhow::anyhow!(reason)),
+        response => Ok(response),
+    }
+}
+
 /// Why an install was refused before it wrote anything.
 fn refused(response: InstallResponse) -> String {
     match response {
@@ -446,7 +458,7 @@ fn the_entry_key_is_a_software_key_other_than_the_login_key() {
     let home = home.path();
     let login = generate_test_key("login").unwrap();
     let same = install_request(&account, EnrollmentId::random(), &login, &login, false);
-    let error = install_for_account(&same, &account, home).err().unwrap();
+    let error = install_or_refusal(&same, &account, home).err().unwrap();
     assert!(error.to_string().contains("must differ"), "{error:#}");
     let entry = generate_test_key("entry").unwrap();
     let mut fido = install_request(&account, EnrollmentId::random(), &entry, &login, false);
@@ -459,7 +471,7 @@ fn the_entry_key_is_a_software_key_other_than_the_login_key() {
     )
     .to_openssh()
     .unwrap();
-    let error = install_for_account(&fido, &account, home).err().unwrap();
+    let error = install_or_refusal(&fido, &account, home).err().unwrap();
     assert!(error.to_string().contains("software"), "{error:#}");
     assert!(!home.join(".ssh/authorized_keys").exists());
     assert!(!home.join(".local/share/syq").exists());
@@ -478,7 +490,7 @@ fn the_receiver_install_follows_the_binary_store_rules() {
     let install = |home: &Path| {
         let entry = generate_test_key("entry").unwrap();
         let request = install_request(&account, EnrollmentId::random(), &entry, &login, false);
-        install_for_account(&request, &account, home).map(installed)
+        install_or_refusal(&request, &account, home).map(installed)
     };
     install(home).unwrap();
     let receiver = store_receiver_path(home);
@@ -857,7 +869,7 @@ fn rotation_rewrites_only_the_signer_and_raises_the_generation() {
 
     // Another entry key for the same enrollment is refused.
     let other_entry = generate_test_key("other entry").unwrap();
-    let error = install_for_account(
+    let error = install_or_refusal(
         &install_request(&account, id, &other_entry, &second_login, true),
         &account,
         home,
