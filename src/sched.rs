@@ -645,9 +645,10 @@ struct Inner {
     scan_done: bool,
     /// Source-wide preflights passed; more validated jobs may still arrive.
     work_released: bool,
-    /// Files were queued a few at a time as their directories were created
-    /// (`share_with_busy_workers`).
-    share_with_busy: bool,
+    /// Files were queued a few at a time as their directories were created:
+    /// the files a worker's small-file batch holds at least
+    /// (`trickling_files`).
+    trickle_batch: Option<usize>,
     abort: bool,
 }
 
@@ -719,7 +720,7 @@ impl Sched {
                 file_work_anticipated: false,
                 scan_done: false,
                 work_released: false,
-                share_with_busy: false,
+                trickle_batch: None,
                 abort: false,
             }),
             cv: Condvar::new(),
@@ -898,9 +899,11 @@ impl Sched {
     /// Files will be queued a few at a time, as the directories they go
     /// into are created (`Planner::create_directories_streaming`): from now
     /// on a small-file batch is sized against every active worker, busy ones
-    /// included (`begin_fast_batch`).
-    pub fn share_with_busy_workers(&self) {
-        self.inner.lock().unwrap().share_with_busy = true;
+    /// included, and holds at least `files_per_worker`, the files each
+    /// starting worker was counted for, as far as are queued
+    /// (`begin_fast_batch`).
+    pub fn trickling_files(&self, files_per_worker: usize) {
+        self.inner.lock().unwrap().trickle_batch = Some(files_per_worker.max(1));
     }
 
     /// Release validated jobs while the planner finishes preparing later
@@ -991,18 +994,18 @@ impl Sched {
     pub fn begin_fast_batch(&self, active: usize, max_n: usize) -> usize {
         let mut g = self.inner.lock().unwrap();
         debug_assert!(g.probing > g.fast_probing);
-        // Workers busy with a batch take more when they finish it. When
-        // files were queued a few at a time, busy workers hold only a few and
-        // finish soon: this one takes its share against every worker, or it
-        // would take all the files queued since while the others finish.
-        let sharing = if g.share_with_busy {
-            active
-        } else {
-            active.saturating_sub(g.fast_batches)
-        };
-        let available_workers = sharing.max(1);
         let available_files = g.files.len() + 1;
-        let target = available_files.div_ceil(available_workers).clamp(1, max_n);
+        let target = match g.trickle_batch {
+            // Files queued a few at a time leave busy workers holding few,
+            // soon finished: this one takes its share against every worker,
+            // or it would take all the files queued since while the others
+            // finish. And it takes at least the batch the start assumed, or
+            // a few files would be split one per worker, each costing a
+            // request of its own.
+            Some(least) => available_files.div_ceil(active.max(1)).max(least),
+            None => available_files.div_ceil(active.saturating_sub(g.fast_batches).max(1)),
+        }
+        .clamp(1, max_n);
         g.fast_probing += 1;
         g.fast_batches += 1;
         target

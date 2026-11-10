@@ -813,19 +813,22 @@ fn fast_batches_share_the_queue_across_active_workers() {
 
 #[test]
 fn files_queued_with_their_directories_are_shared_with_busy_workers() {
-    // Sixteen of seventeen workers are busy with a batch when 64 more files
+    // Sixteen of seventeen workers are busy with a batch when more files
     // are queued. The idle one takes them all, unless files were queued as
     // their directories were created: then it takes its share against all
-    // seventeen, after the scan ends too.
-    for (sharing, scan_done, expected) in [
-        (false, false, 65),
-        (false, true, 65),
-        (true, false, 4),
-        (true, true, 4),
+    // seventeen, after the scan ends too, but at least the eight files each
+    // starting worker was counted for, as far as are queued.
+    for (trickling, scan_done, queued, expected) in [
+        (false, false, 65, 65),
+        (false, true, 65, 65),
+        (true, false, 65, 8),
+        (true, true, 65, 8),
+        (true, false, 400, 24),
+        (true, false, 4, 8),
     ] {
         let sched = Sched::new(4096, 8192);
-        if sharing {
-            sched.share_with_busy_workers();
+        if trickling {
+            sched.trickling_files(8);
         }
         {
             let mut inner = sched.inner.lock().unwrap();
@@ -834,7 +837,7 @@ fn files_queued_with_their_directories_are_shared_with_busy_workers() {
             inner.fast_batches = 16;
             inner.probing = 16;
             inner.fast_probing = 16;
-            for idx in 0..65 {
+            for idx in 0..queued {
                 inner.files.push_test((4096, Reverse(FileOrder::new(idx))));
             }
         }
@@ -842,7 +845,7 @@ fn files_queued_with_their_directories_are_shared_with_busy_workers() {
         assert_eq!(
             sched.begin_fast_batch(17, 2048),
             expected,
-            "sharing={sharing} scan_done={scan_done}"
+            "trickling={trickling} scan_done={scan_done} queued={queued}"
         );
     }
 }
