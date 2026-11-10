@@ -388,10 +388,17 @@ fn an_interrupted_pull_removes_its_streamed_patch_stage() {
 
 /// A copy over ssh that a signal ends removes the private directory of the
 /// SSH connection it shares. The ssh client that served it removes only its
-/// socket, which would leave the directory behind, empty.
+/// socket, which would leave the directory behind, empty. A pull starts no
+/// private broker of its own, which would handle the signal too.
 #[test]
 fn an_interrupted_copy_over_ssh_removes_its_connection_directory() {
-    for signal in [libc::SIGINT, libc::SIGTERM] {
+    for (route, signal) in [
+        ("push", libc::SIGINT),
+        ("push", libc::SIGTERM),
+        ("pull", libc::SIGINT),
+        ("pull", libc::SIGTERM),
+    ] {
+        let case = format!("{route} {signal}");
         let t = Tmp::new();
         small_tree(&t, 20);
         let ssh = fake_ssh(&t);
@@ -406,7 +413,12 @@ fn an_interrupted_copy_over_ssh_removes_its_connection_directory() {
             .args(["cp", "--no-progress", "--no-tcp", "--syq-path"])
             .arg(env!("CARGO_BIN_EXE_syq"))
             .args(["--performance-tuning", "workers=1,batch-files=8"])
-            .args(["--srcs-in", &t.s("src"), "--to", "fake.example", "--into"])
+            .args(["--srcs-in", &t.s("src")])
+            .args(match route {
+                "push" => ["--to", "fake.example"],
+                _ => ["--from", "fake.example"],
+            })
+            .arg("--into")
             .arg(t.path("dst"))
             .env(
                 "PATH",
@@ -430,11 +442,11 @@ fn an_interrupted_copy_over_ssh_removes_its_connection_directory() {
         };
         let mut child = start_job(&mut command);
         wait_for_confinement_marker(&mut child, &staged, "staged small files");
-        assert_eq!(connections().len(), 1, "{signal}");
+        assert_eq!(connections().len(), 1, "{case}");
         signal_group(&child, signal);
         let (status, stderr, _) = finish(child, Duration::from_secs(20));
-        assert_eq!(status.signal(), Some(signal), "{stderr}");
-        assert_eq!(connections(), Vec::<String>::new(), "{signal}: {stderr}");
+        assert_eq!(status.signal(), Some(signal), "{case}: {stderr}");
+        assert_eq!(connections(), Vec::<String>::new(), "{case}: {stderr}");
     }
 }
 

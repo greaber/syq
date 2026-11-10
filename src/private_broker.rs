@@ -90,10 +90,10 @@ impl SignalCleanedDir {
     }
 
     /// A directory removed also when a termination signal ends the process,
-    /// if something in this process already handles those signals as
-    /// `new` does, such as a private broker that does not leave them to its
-    /// caller. It never takes them over itself: a caller that handles them
-    /// to cancel gracefully keeps doing so, and removes it by dropping it.
+    /// if `new` or a private broker that does not leave signals to its
+    /// caller takes them over, before or after. It never takes them over
+    /// itself: it is for an operation that cancels gracefully on them, which
+    /// then removes it by dropping it.
     pub(crate) fn when_signals_are_handled(prefix: &str) -> Result<Self> {
         let directory = private_temp_dir(prefix)?;
         signal_cleanup_paths()
