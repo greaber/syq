@@ -213,6 +213,118 @@ fn response_start_precedes_payload_and_buffered_replies_have_no_wait() {
     assert!(conn.is_dead());
 }
 
+/// Taking a reply that has arrived never waits for one that has not. The
+/// replies of requests sent without waiting come first, and are taken as
+/// they arrive, so a worker that starts new requests while one is in flight
+/// is not held up by it.
+#[test]
+fn try_recv_takes_arrived_deferred_replies_and_waits_for_none() {
+    let (input, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let watchdog = peer.try_clone().unwrap();
+    let (rx, reader) = spawn_reader(Box::new(input), 4);
+    let mut peer = FrameWriter::new(peer, false);
+    peer.write_msg(&hello_ok()).unwrap();
+    assert!(matches!(
+        rx.recv().unwrap().unwrap().value,
+        Response::HelloOk { .. }
+    ));
+    let mut conn = RemoteConn {
+        batch_receipts: Default::default(),
+        deferred: Default::default(),
+        transport_stop: None,
+        observation: Default::default(),
+        child: None,
+        approved_login: None,
+        worker_setup: None,
+        w: FrameWriter::new(Box::new(std::io::sink()), false),
+        rx: Some(rx),
+        replies: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
+        reader: Some(reader),
+        label: "deferred reply test".into(),
+        dead: false,
+        rpc_observation: None,
+        write_stream: None,
+        peer: None,
+        tcp_socket: None,
+        named_socket: None,
+        multiplexed_ssh: false,
+        detached: false,
+    };
+    // Should a read wait after all, end it rather than the test run.
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let watchdog = std::thread::spawn(move || {
+        if finished
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .is_err()
+        {
+            let _ = watchdog.shutdown(std::net::Shutdown::Both);
+        }
+    });
+    let stat = || Request::StatMany {
+        paths: vec![b"file".to_vec()],
+        sources: None,
+        follow: false,
+    };
+    let pending = conn.send_pending(stat()).unwrap();
+    conn.send_expecting_ok(stat(), "checked").unwrap();
+    conn.send(stat()).unwrap();
+    let next = |conn: &mut RemoteConn| {
+        let started = std::time::Instant::now();
+        let reply = conn.try_recv_with_arrival();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "waited for a reply"
+        );
+        reply.map(|reply| reply.unwrap().0)
+    };
+    let until = |conn: &mut RemoteConn, arrived: &dyn Fn(&RemoteConn) -> bool| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !arrived(conn) {
+            assert!(next(conn).is_none());
+            assert!(std::time::Instant::now() < deadline, "reply never arrived");
+            std::thread::yield_now();
+        }
+    };
+    assert!(next(&mut conn).is_none());
+    assert!(!conn.reply_arrived(&pending));
+    // The kept reply is taken as it arrives; the next is not there yet.
+    peer.write_msg(&Response::Stats(vec![None])).unwrap();
+    until(&mut conn, &|conn| conn.reply_arrived(&pending));
+    assert!(next(&mut conn).is_none());
+    // Then the one that must be Ok, and the reply asked for.
+    peer.write_msg(&Response::Ok).unwrap();
+    peer.write_msg(&Response::Stats(vec![None])).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let reply = loop {
+        if let Some(reply) = next(&mut conn) {
+            break reply;
+        }
+        assert!(std::time::Instant::now() < deadline, "reply never arrived");
+        std::thread::yield_now();
+    };
+    assert!(matches!(reply, Response::Stats(ref entries) if entries.len() == 1));
+    assert!(matches!(
+        conn.take_reply(pending).unwrap(),
+        Response::Stats(ref entries) if entries.len() == 1
+    ));
+    // A reply that must be Ok and is not fails the read that finds it.
+    conn.send_expecting_ok(stat(), "checked").unwrap();
+    peer.write_msg(&Response::Err("refused".into())).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let error = loop {
+        match conn.try_recv_with_arrival() {
+            Some(reply) => break reply.unwrap_err(),
+            None => assert!(std::time::Instant::now() < deadline, "reply never arrived"),
+        }
+        std::thread::yield_now();
+    };
+    assert!(format!("{error:#}").contains("refused"), "{error:#}");
+    drop(done);
+    watchdog.join().unwrap();
+    drop(peer);
+    drop(conn);
+}
+
 #[test]
 fn observation_frames_do_not_enter_the_data_queue_or_bypass_identity_pinning() {
     for accepted in [true, false] {

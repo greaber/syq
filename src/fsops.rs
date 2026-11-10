@@ -932,6 +932,9 @@ pub struct FsOps {
     /// The copy whose stages and in-place files this connection's requests
     /// write (`stages`): its own in a process that serves several copies.
     stage_scope: u64,
+    /// This connection's number, which the files it publishes are
+    /// remembered by (`stages`).
+    stage_connection: u64,
     comparison_window: Option<ComparisonWindow>,
     partial_candidates: HashMap<FileLocation, HashMap<PathBytes, Vec<PathBytes>>>,
     partial_directory_order: VecDeque<FileLocation>,
@@ -1258,6 +1261,7 @@ impl FsOps {
             fd_order: Vec::new(),
             held_basis: None,
             stage_scope: 0,
+            stage_connection: stages::new_connection(),
             comparison_window: None,
             partial_candidates: HashMap::new(),
             partial_directory_order: VecDeque::new(),

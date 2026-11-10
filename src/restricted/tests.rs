@@ -5329,6 +5329,63 @@ fn signed_skip_allows_seeding_and_retrying_a_new_file() {
     assert_eq!(fs::read(&candidate).unwrap(), b"new");
 }
 
+/// A Finalize sent again on another of the copy's connections, after the
+/// first published the file and its reply was lost, is answered as the
+/// first was. The receiver lists the file as copied once, and nothing as
+/// unfinished.
+#[test]
+fn a_finalize_sent_again_on_another_connection_is_answered_as_published() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let file = target.join("fresh");
+    let (secret, policy) = results_policy();
+    let authority = existence_authority_with_results(&root, &policy, 60_000);
+    let mut reader = start_results(&authority, secret);
+    let mut first = authority.test_ops();
+    let prepared = execute_authorized(&authority, &mut first, prepare_request(&file));
+    assert!(
+        matches!(prepared, proto::Response::Prepared(_)),
+        "{prepared:?}"
+    );
+    let write = Request::WriteRange {
+        path: path_bytes(&file),
+        inplace: false,
+        copy_id: [1; 16],
+        attempt: 0,
+        off: 0,
+        hash: crate::fsops::content_digest(b"data"),
+        data: b"data".to_vec().into(),
+    };
+    let written = execute_authorized(&authority, &mut first, write);
+    assert!(matches!(written, proto::Response::Ok), "{written:?}");
+    // The file is tracked as unfinished until it is published.
+    assert_eq!(authority.state.lock().unwrap().file_lifecycles.len(), 1);
+    let publish = || finalize_request(&file, proto::TargetCondition::Any);
+    let published = execute_authorized(&authority, &mut first, publish());
+    assert!(
+        !matches!(published, proto::Response::EndpointError(_)),
+        "{published:?}"
+    );
+    assert!(authority.state.lock().unwrap().file_lifecycles.is_empty());
+    let mut second = authority.test_ops();
+    let again = execute_authorized(&authority, &mut second, publish());
+    assert_eq!(format!("{again:?}"), format!("{published:?}"));
+    assert!(authority.state.lock().unwrap().file_lifecycles.is_empty());
+    assert_eq!(fs::read(&file).unwrap(), b"data");
+    let results = finish_results(&authority, &mut reader);
+    assert_eq!(results.totals.failed, 0);
+    assert_eq!(
+        results.changes(),
+        [(
+            "transfer_file".to_owned(),
+            b"fresh".to_vec(),
+            "succeeded".to_owned()
+        )]
+    );
+}
+
 /// A publication the source says found earlier partials removes only the
 /// partials of the file it published that nothing writes: no other name,
 /// whatever the source claims, and nothing for a publication that fails.
