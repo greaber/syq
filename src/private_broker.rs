@@ -256,6 +256,18 @@ fn account_directory(parent: &Path) -> PathBuf {
     parent.join(format!("syq-{}", unsafe { libc::geteuid() }))
 }
 
+/// Where the account's directory for the sockets of ordinary copies can
+/// be: in the temporary directory, and in the user's runtime directory
+/// when one is set. Which one a copy uses depends on its environment and on
+/// the runtime directory's owner and mode, so a receiver protects both.
+/// Only absolute paths are listed.
+pub(crate) fn account_directories() -> (Option<PathBuf>, Option<PathBuf>) {
+    (
+        Some(account_directory(&std::env::temp_dir())).filter(|path| path.is_absolute()),
+        crate::user_dirs::runtime_dir().map(|runtime| account_directory(&runtime)),
+    )
+}
+
 /// Why a base directory cannot be used.
 #[derive(Debug)]
 enum BaseError {
@@ -600,6 +612,14 @@ impl PrivateBroker {
 
     pub(crate) fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    /// Remove this broker's directory also when a termination signal ends
+    /// the process, as for a broker started with `start`: for one started
+    /// with `start_managed` whose caller lets those signals end it. The
+    /// process then listens for them, if it did not already.
+    pub(crate) fn remove_on_termination(&self) -> Result<()> {
+        register_signal_cleanup(self.socket_dir.path())
     }
 
     /// The ticket that joins this ticketed broker with `secret`.

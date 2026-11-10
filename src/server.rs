@@ -897,6 +897,9 @@ fn run_restricted_source(authority: Arc<crate::restricted::source::SourceAuthori
     if let Some(workers) = workers {
         workers.end(result.is_ok(), HANDED_END_WAIT);
     }
+    // The workers' broker listens for termination signals to remove its
+    // directory; one arriving now ends the process by that signal.
+    crate::process::termination::wait_if_terminating();
     client_gone_result(result, client_gone.load(Relaxed))
 }
 

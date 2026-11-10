@@ -163,6 +163,11 @@ fn start_with(
             let _ = result;
         },
     )?;
+    // A termination signal ends the receiver after its cleanup without
+    // dropping the broker, which would leave its directory in the
+    // enrollment. As with the receiver's other cleanup, one that cannot
+    // listen for signals still copies.
+    let _ = broker.remove_on_termination();
     let ticket = broker.ticket(secret)?.encode();
     Ok((SshWorkers { broker, live }, ticket))
 }
@@ -364,6 +369,71 @@ mod tests {
             "broker directory was not cleaned up"
         );
         false
+    }
+
+    const SIGNAL_CHILD: &str = "SYQ_TEST_SSH_WORKERS_SIGNAL";
+
+    /// The child of `a_termination_signal_removes_the_ssh_workers_directory`:
+    /// a receiver in its enrollment directory starts its SSH workers, then
+    /// raises the signal it was given.
+    #[test]
+    fn ssh_workers_signal_subprocess() {
+        let (Ok(signal), Some(state)) = (
+            std::env::var(SIGNAL_CHILD),
+            std::env::var_os("SYQ_TEST_SSH_RECEIVER_STATE"),
+        ) else {
+            return;
+        };
+        enter_state_directory(Path::new(&state)).unwrap();
+        let _workers = start_with(|_, _, _, _| Ok(())).unwrap();
+        assert_eq!(std::fs::read_dir(".").unwrap().count(), 1);
+        assert_eq!(unsafe { libc::raise(signal.parse().unwrap()) }, 0);
+        std::thread::sleep(Duration::from_secs(30));
+        panic!("the signal did not end the process");
+    }
+
+    /// A receiver that SIGTERM, SIGINT or a hang-up ends removes its SSH
+    /// workers' directory from the enrollment, and still ends by that
+    /// signal.
+    #[test]
+    fn a_termination_signal_removes_the_ssh_workers_directory() {
+        use std::os::unix::process::ExitStatusExt;
+        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            let temporary = crate::test_support::tempdir().unwrap();
+            let state = temporary.path().join("enrollment");
+            std::fs::create_dir(&state).unwrap();
+            std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "restricted::ssh::tests::ssh_workers_signal_subprocess",
+                    "--nocapture",
+                ])
+                .env(SIGNAL_CHILD, signal.to_string())
+                .env("SYQ_TEST_SSH_RECEIVER_STATE", &state)
+                // A busy runner must not let the cleanup's cap end the
+                // child before the cleanup has run.
+                .env("SYQ_TEST_TERMINATION_CAP_MS", "10000");
+            let output = crate::process::capture_output_bounded(
+                &mut command,
+                Instant::now() + Duration::from_secs(20),
+                &|| false,
+                64 * 1024,
+            )
+            .unwrap();
+            let context = format!(
+                "signal {signal}: status={:?}, stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.status.signal(), Some(signal), "{context}");
+            let left: Vec<_> = std::fs::read_dir(&state)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert!(left.is_empty(), "{context}: {left:?} remains");
+        }
     }
 
     #[test]

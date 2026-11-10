@@ -2009,6 +2009,16 @@ fn protected_destinations_are_refused_from_their_names_before_enrolling() {
             "/tmp/syq-persist-1000/global",
             "persistence runtime directory",
         ),
+        (
+            "into",
+            "/tmp/syq-1000",
+            "socket directory of running copies",
+        ),
+        (
+            "as",
+            "/tmp/syq-1000/fd-1-x",
+            "socket directory of running copies",
+        ),
         // Contents copied into a directory reach everything beneath it.
         ("contents", "~", "SSH configuration directory"),
         ("contents", "~/.config", "receiving configuration directory"),
@@ -2063,17 +2073,25 @@ fn protected_destinations_are_refused_from_their_names_before_enrolling() {
             home.join(".syq-receiver-identity"),
             PathBuf::from("/srv/config/syq"),
             PathBuf::from("/run/user/1000/syq-persist-1000"),
+            PathBuf::from("/var/tmp/syq-1000"),
+            PathBuf::from("/run/user/1000/syq-1000"),
         ]
     );
+    // Persistent connection sockets use /tmp on macOS; those of running
+    // copies use the temporary directory.
     assert_eq!(
-        server_receiving_state(home, "501", "Darwin", ("", "", "/var/folders/x"))[2],
-        Path::new("/tmp/syq-persist-501")
+        server_receiving_state(home, "501", "Darwin", ("", "", "/var/folders/x"))[2..],
+        [
+            PathBuf::from("/tmp/syq-persist-501"),
+            PathBuf::from("/var/folders/x/syq-501")
+        ]
     );
     assert_eq!(
         server_receiving_state(home, "7", "Linux", ("relative", "relative", "/var/tmp"))[1..],
         [
             home.join(".config/syq"),
-            PathBuf::from("/var/tmp/syq-persist-7")
+            PathBuf::from("/var/tmp/syq-persist-7"),
+            PathBuf::from("/var/tmp/syq-7")
         ]
     );
 }
@@ -3214,6 +3232,84 @@ fn receivers_protect_the_syq_a_receiving_service_follows() {
         error
             .as_deref()
             .is_some_and(|error| error.contains("directory of the syq receiving runs")),
+        "{error:?}"
+    );
+}
+
+/// The account's ordinary copies keep their sockets in its `syq-UID`, in the
+/// runtime or the temporary directory. A copy cannot write there, by its
+/// name or through a link that `--follow-dst` follows, nor replace or prune
+/// a directory that holds it.
+#[test]
+fn receivers_protect_the_sockets_of_running_copies() {
+    use crate::private_broker::{BrokerBase, BrokerDirectory, PrivateBroker, PrivateBrokerConfig};
+    let broker = PrivateBroker::start_managed(
+        PrivateBrokerConfig {
+            directory: BrokerDirectory::Ticketed {
+                prefix: "t-",
+                base: BrokerBase::Account,
+            },
+            listener_thread: "syq-protect-test-listener",
+            client_thread: "syq-protect-test-client",
+            inline_on_thread_failure: false,
+            max_connections: 1,
+            io_timeout: std::time::Duration::from_secs(1),
+        },
+        |_, _| {},
+    )
+    .unwrap();
+    let sockets = broker.socket_path().parent().unwrap();
+    let account = sockets.parent().unwrap();
+    assert!(account.is_absolute(), "{}", account.display());
+    let temporary = crate::test_support::tempdir().unwrap();
+    let protected =
+        receiver_control_paths(&temporary.path().join("home"), None, ControlPaths::Here).unwrap();
+    let label = "protected socket directory of running copies";
+    for path in [account, sockets, broker.socket_path()] {
+        let error = reject_control_plane_path(path.as_os_str().as_bytes(), &protected)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(label), "{error}");
+    }
+    let parent = account.parent().unwrap();
+    let error = reject_control_plane_path(parent.as_os_str().as_bytes(), &protected)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("holds the receiver's protected"), "{error}");
+    // A link to it, followed as `--follow-dst` follows one.
+    let link = temporary.path().join("link");
+    symlink(account, &link).unwrap();
+    let followed = ConfinedRoot::resolve(
+        link.join("copy").as_os_str().as_bytes(),
+        &protected,
+        true,
+        None,
+    )
+    .err()
+    .map(|error| format!("{error:#}"));
+    assert!(
+        followed
+            .as_deref()
+            .is_some_and(|error| error.contains(label)),
+        "{followed:?}"
+    );
+    // Whatever name reaches it, a copy into it is refused by identity.
+    let error = test_authority_with_options(
+        &link,
+        DeletionPolicy::DeleteDestinationOnly,
+        1024,
+        FilterPolicy::default(),
+        PublicationPolicy::AtomicStaged,
+        ExistingDestinationPolicy::Replace,
+        DestinationPlacement::ExactPath,
+        RootExistence::Any,
+        None,
+        (Default::default(), &protected),
+    )
+    .err()
+    .map(|error| format!("{error:#}"));
+    assert!(
+        error.as_deref().is_some_and(|error| error.contains(label)),
         "{error:?}"
     );
 }
