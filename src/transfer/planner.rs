@@ -3532,6 +3532,11 @@ impl Planner<'_> {
             if opts.preserve_existing_directory_metadata && !self.created_dirs.contains(p) {
                 continue;
             }
+            // A directory the copy could not create has had its failure
+            // reported; there is nothing to give metadata to.
+            if !matches!(s, Some(d) if d.kind == Kind::Dir) && !self.created_dirs.contains(p) {
+                continue;
+            }
             let depth = p.iter().filter(|&&c| c == b'/').count();
             let mut meta = opts.metadata_for(dst_rel, e);
             let mut flags = if s.is_some() && !self.created_dirs.contains(p) {

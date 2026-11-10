@@ -168,6 +168,8 @@ fn a_directory_that_cannot_be_created_fails_its_files_as_without_a_network_desti
             command.args([
                 "cp",
                 "--no-progress",
+                "--results",
+                &t.s("results.ndjson"),
                 "--srcs-in",
                 &t.s("src"),
                 "--into",
@@ -180,6 +182,33 @@ fn a_directory_that_cannot_be_created_fails_its_files_as_without_a_network_desti
             fs::set_permissions(t.path("dst/locked"), fs::Permissions::from_mode(0o755)).unwrap();
             assert_eq!(read(&t.path("dst/open/sub/file")), b"open");
             assert!(!t.path("dst/locked/sub").exists());
+            // Two errors: the directory, reported once, and its file. Its
+            // final metadata is not attempted.
+            let records: Vec<serde_json::Value> = fs::read_to_string(t.path("results.ndjson"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let failed: Vec<(&str, &str)> = records
+                .iter()
+                .filter(|record| record["disposition"] == "failed")
+                .map(|record| {
+                    (
+                        record["action"].as_str().unwrap(),
+                        record["dst"]["value"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                failed,
+                [
+                    ("create_directory", "locked/sub"),
+                    ("transfer_file", "locked/sub/file")
+                ],
+                "{}",
+                stderr_of(&output)
+            );
+            assert_eq!(records.last().unwrap()["errors"], 2);
             let mut lines: Vec<String> = stderr_of(&output)
                 .replace(&t.s(""), "TMP/")
                 .lines()
