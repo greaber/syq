@@ -8,11 +8,11 @@ use std::time::{Duration, Instant};
 
 const NETWORK: (&str, &str) = ("SYQ_TEST_NETWORK_FILESYSTEM", "1");
 
-/// `count` directories `dNN` below `src`, each holding a file `file`.
+/// `count` directories `dNNN` below `src`, each holding a file `file`.
 fn directories_with_files(t: &Tmp, count: usize) {
     for index in 0..count {
         write(
-            &t.path(&format!("src/d{index:02}/file")),
+            &t.path(&format!("src/d{index:03}/file")),
             format!("file {index}\n").as_bytes(),
         );
     }
@@ -41,7 +41,7 @@ fn hold_directory(command: &mut Command, t: &Tmp, suffix: &str) -> (PathBuf, Pat
 
 fn existing_directories(t: &Tmp, count: usize) -> Vec<usize> {
     (0..count)
-        .filter(|index| t.path(&format!("dst/d{index:02}")).exists())
+        .filter(|index| t.path(&format!("dst/d{index:03}")).exists())
         .collect()
 }
 
@@ -50,7 +50,7 @@ fn files_go_to_workers_before_the_last_directory_exists() {
     let t = Tmp::new();
     directories_with_files(&t, 16);
     let mut command = copy_into_dst(&t);
-    let (ready, continuation) = hold_directory(&mut command, &t, "/d15");
+    let (ready, continuation) = hold_directory(&mut command, &t, "/d015");
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -60,7 +60,7 @@ fn files_go_to_workers_before_the_last_directory_exists() {
     // The receiver waits before creating the batch's last directory, and the
     // first directory's file has been copied meanwhile. Before, every file
     // waited for every directory of its batch.
-    let first = t.path("dst/d00/file");
+    let first = t.path("dst/d000/file");
     let deadline = Instant::now() + Duration::from_secs(60);
     while !first.exists() {
         assert!(
@@ -74,13 +74,13 @@ fn files_go_to_workers_before_the_last_directory_exists() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(read(&first), b"file 0\n");
-    assert!(!t.path("dst/d15").exists());
+    assert!(!t.path("dst/d015").exists());
     release_confinement_barrier(&continuation);
     let output = child.wait_with_output().unwrap();
     assert_output_ok(&output);
     for index in 0..16 {
         assert_eq!(
-            read(&t.path(&format!("dst/d{index:02}/file"))),
+            read(&t.path(&format!("dst/d{index:03}/file"))),
             format!("file {index}\n").as_bytes()
         );
     }
@@ -173,13 +173,15 @@ fn a_directory_that_cannot_be_created_fails_its_files_as_without_a_network_desti
 
 #[test]
 fn a_lack_of_space_while_creating_directories_stops_the_rest() {
-    // Directories go in requests of two or more, at most four requests at a
-    // time: once one fails for lack of space, the requests already sent run,
-    // and no other is sent.
+    // Directories go in requests of two per parent at first, at most four
+    // requests at a time: once one fails for lack of space, the requests
+    // already sent run, and no other is sent. Requests double at most once
+    // for each reply read, so the three sent before the failing one's reply
+    // was read hold at most 16, 32 and 64 directories (`Pacing`).
     let t = Tmp::new();
-    directories_with_files(&t, 64);
+    directories_with_files(&t, 300);
     let output = copy_into_dst(&t)
-        .env("SYQ_TEST_FAIL_APPLY_ENOSPC", "/d10")
+        .env("SYQ_TEST_FAIL_APPLY_ENOSPC", "/d010")
         .run()
         .unwrap();
     assert!(!output.status.success(), "{}", stderr_of(&output));
@@ -188,10 +190,10 @@ fn a_lack_of_space_while_creating_directories_stops_the_rest() {
         "{}",
         stderr_of(&output)
     );
-    let created = existing_directories(&t, 64);
+    let created = existing_directories(&t, 300);
     assert!(!created.contains(&10), "{created:?}");
     assert!(
-        created.iter().all(|&index| index < 40),
+        created.iter().all(|&index| index < 150),
         "directories were created after the failure: {created:?}"
     );
 }
@@ -201,7 +203,7 @@ fn an_interrupted_copy_creates_no_directories_after_the_signal() {
     let t = Tmp::new();
     directories_with_files(&t, 40);
     let mut command = copy_into_dst(&t);
-    let (ready, _) = hold_directory(&mut command, &t, "/d10");
+    let (ready, _) = hold_directory(&mut command, &t, "/d010");
     // A job of its own, which its local receiver joins, as Ctrl-C reaches both.
     let mut child = command
         .stdin(Stdio::null())
@@ -219,18 +221,19 @@ fn an_interrupted_copy_creates_no_directories_after_the_signal() {
         "{}",
         stderr_of(&output)
     );
-    // The receiver creates a request's directories in order, so nothing
-    // after the held request's pair was created.
+    // The receiver takes requests in order, so nothing after the held
+    // request was created. That request was sent before the third reply was
+    // read, so it holds at most eight directories in one parent (`Pacing`).
     let created = existing_directories(&t, 40);
     assert!(
-        created.iter().all(|&index| index < 12),
+        created.iter().all(|&index| index < 20),
         "directories were created after the signal: {created:?}"
     );
     // Running the copy again completes it.
     assert_output_ok(&copy_into_dst(&t).run().unwrap());
     for index in 0..40 {
         assert_eq!(
-            read(&t.path(&format!("dst/d{index:02}/file"))),
+            read(&t.path(&format!("dst/d{index:03}/file"))),
             format!("file {index}\n").as_bytes()
         );
     }
