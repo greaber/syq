@@ -144,6 +144,13 @@ pub(super) fn parent_of(path: &[u8]) -> Option<&[u8]> {
     }
 }
 
+/// Whether `path` is one of `roots` or lies beneath one.
+pub(super) fn beneath_any(path: &[u8], roots: &[PathBytes]) -> bool {
+    roots.iter().any(|root| {
+        path == root.as_slice() || (path.starts_with(root) && path.get(root.len()) == Some(&b'/'))
+    })
+}
+
 /// The nearest of `path`'s ancestors that `index` holds.
 pub(super) fn nearest_ancestor(path: &[u8], index: &HashMap<PathBytes, usize>) -> Option<usize> {
     let mut current = path;
@@ -337,6 +344,11 @@ mod tests {
         assert_eq!(nearest_ancestor(b"/d/a/file", &index), Some(0));
         assert_eq!(nearest_ancestor(b"/d/file", &index), None);
         assert_eq!(parent_of(b"/file"), Some(&b"/"[..]));
+        let failed = vec![b"/d/new".to_vec()];
+        assert!(beneath_any(b"/d/new", &failed));
+        assert!(beneath_any(b"/d/new/a/b", &failed));
+        assert!(!beneath_any(b"/d/newer", &failed));
+        assert!(!beneath_any(b"/d", &failed));
         assert_eq!(parent_of(b"/"), None);
     }
 

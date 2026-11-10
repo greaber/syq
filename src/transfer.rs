@@ -4846,9 +4846,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let start_streaming = |anticipated: Option<directory_stream::Anticipated>| {
         if let Some(anticipated) = anticipated {
             streaming_during_creation.set(true);
+            // An explicit count starts its workers once every file of a small
+            // tree is queued, and splits that queue as before: sized for a
+            // trickle, its batches split directories between workers, which
+            // then wait on each other's (4 x 4 x 8 files on SSHFS at 20 ms
+            // took 10% longer with 4 workers).
             sched.trickling_files(
-                anticipated
-                    .trickling
+                (autotune && anticipated.trickling)
                     .then(|| start_rule(streaming_connections).files_per_worker(true)),
             );
         }
@@ -4870,10 +4874,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         if autotune && network_destination && streaming_all_batched.get() {
             let jobs = sched.jobs.lock().unwrap();
             let checked = streaming_checked_jobs.get();
+            // Only the jobs queued since: every directory request can call this.
             streaming_all_batched.set(
-                jobs.iter()
-                    .skip(checked)
-                    .all(|job| job.entry.size <= streaming_batch_limit),
+                (checked..jobs.len()).all(|idx| jobs[idx].entry.size <= streaming_batch_limit),
             );
             streaming_checked_jobs.set(jobs.len());
         }
@@ -4939,7 +4942,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         missing_dirs: std::collections::HashSet::new(),
         blocked_directory_paths: std::collections::HashSet::new(),
         start_streaming: &start_streaming,
-        stream_directories: network_destination && !opts.dry_run,
+        // Only where files can go to workers during planning; buffered
+        // copies decide before their replay.
+        stream_directories: network_destination && streaming_ready,
         directory_pacing: Default::default(),
         unselected_dirs: Default::default(),
         directory_expression_sources: Default::default(),
@@ -5146,6 +5151,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         } else {
             None
         };
+        // Workers start before replay only with a local start: otherwise they
+        // wait for it to end, and small directory requests would gain nothing.
+        st.stream_directories = network_destination && local_start.is_some();
         if let Err(error) = st.replay_buffered(
             args.prune_before,
             |planner| {

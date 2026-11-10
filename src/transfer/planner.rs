@@ -398,12 +398,20 @@ struct DirectoryStream {
     in_flight: std::collections::VecDeque<SentDirectories>,
     /// Send nothing more: the copy was cancelled or a request failed.
     stopped: bool,
+    /// Directories whose no-replace creation failed: nothing at or beneath
+    /// them is created, as the receiver skips within one request.
+    failed_guarded: Vec<PathBytes>,
+    /// Directories skipped for that, whose leaves are still to be planned.
+    skipped: Vec<usize>,
 }
 
 /// One request of a `DirectoryStream`, waiting for its reply.
 struct SentDirectories {
     pending: crate::conn::PendingReply,
     sent: std::time::Instant,
+    /// It creates a directory only where nothing is (`TargetCondition` other
+    /// than `Any`).
+    guarded: bool,
     /// Its directories, as indices into the batch's new directories.
     chosen: Vec<usize>,
     /// Their paths and conditions, in request order.
@@ -2992,6 +3000,8 @@ impl Planner<'_> {
             sizes,
             in_flight: std::collections::VecDeque::new(),
             stopped: false,
+            failed_guarded: Vec::new(),
+            skipped: Vec::new(),
         };
         if stream.queue.is_empty() && !stream.last_metadata.is_empty() {
             // Nothing to create: a private root's metadata goes by itself.
@@ -3028,11 +3038,18 @@ impl Planner<'_> {
 
     /// Send directory requests while fewer than `REQUESTS_IN_FLIGHT` are
     /// unanswered, unless the stream has stopped or the copy was cancelled.
-    fn send_directory_requests(&mut self, stream: &mut DirectoryStream) -> Result<()> {
+    fn send_directory_requests(
+        &mut self,
+        stream: &mut DirectoryStream,
+        dst_root: &[u8],
+    ) -> Result<()> {
         use super::directory_stream::REQUESTS_IN_FLIGHT;
+        // A request with a no-replace creation is answered before any other
+        // is sent, so that a directory beneath one that failed is not sent.
         while !stream.stopped
             && stream.in_flight.len() < REQUESTS_IN_FLIGHT
             && !stream.queue.is_empty()
+            && !stream.in_flight.iter().any(|request| request.guarded)
         {
             if self.sched.is_aborted() {
                 stream.stopped = true;
@@ -3043,6 +3060,36 @@ impl Planner<'_> {
                 stream
                     .queue
                     .next(growth, &stream.sizes, crate::proto::METADATA_BATCH_BYTES);
+            // Nothing at or beneath a directory whose no-replace creation
+            // failed is created: it holds what was there.
+            let (chosen, skipped): (Vec<usize>, Vec<usize>) = chosen.into_iter().partition(|&i| {
+                !super::directory_stream::beneath_any(
+                    apply_path(stream.mkdirs[i].as_ref().expect("not yet sent")),
+                    &stream.failed_guarded,
+                )
+            });
+            if !skipped.is_empty() {
+                let ops: Vec<Op> = skipped
+                    .iter()
+                    .map(|&i| {
+                        stream.mkdirs[i]
+                            .take()
+                            .expect("each directory is created once")
+                    })
+                    .collect();
+                for &i in &skipped {
+                    stream.own_metadata[i].clear();
+                }
+                let targets = mkdir_targets(&ops);
+                let error = WireError {
+                    unchanged: true,
+                    ..WireError::from(
+                        "operation skipped because the no-replace creation it depends on failed",
+                    )
+                };
+                self.record_new_directories(&targets, vec![Some(error); targets.len()], dst_root)?;
+                stream.skipped.extend(skipped);
+            }
             let mut ops: Vec<Op> = chosen
                 .iter()
                 .map(|&i| {
@@ -3060,12 +3107,19 @@ impl Planner<'_> {
                 // subdirectories have inherited its starting group.
                 ops.append(&mut stream.last_metadata);
             }
+            if ops.is_empty() {
+                continue;
+            }
             let count = ops.len();
+            let guarded = targets
+                .iter()
+                .any(|(_, condition)| *condition != TargetCondition::Any);
             let sent = std::time::Instant::now();
             let pending = self.dst.send_pending(Request::Apply { ops })?;
             stream.in_flight.push_back(SentDirectories {
                 pending,
                 sent,
+                guarded,
                 chosen,
                 targets,
                 count,
@@ -3085,8 +3139,15 @@ impl Planner<'_> {
         leaf_ops: &mut LeafOps,
     ) -> Result<()> {
         let mut previous = None;
-        self.send_directory_requests(stream)?;
-        while let Some(request) = stream.in_flight.pop_front() {
+        self.send_directory_requests(stream, dst_root)?;
+        loop {
+            // The leaves below skipped directories are planned as before:
+            // their files fail without their directories.
+            let skipped = std::mem::take(&mut stream.skipped);
+            self.release_leaves(skipped, waiting, pending, dst_root, leaf_ops)?;
+            let Some(request) = stream.in_flight.pop_front() else {
+                break;
+            };
             let (response, arrival) = self.dst.take_reply_with_arrival(request.pending)?;
             self.directory_pacing
                 .observe(request.sent, arrival, previous);
@@ -3094,28 +3155,47 @@ impl Planner<'_> {
             let mut errs = self.applied(response, request.count)?;
             // Failed early metadata is retried, and reported, at the end.
             errs.truncate(request.targets.len());
+            for ((path, condition), error) in request.targets.iter().zip(&errs) {
+                if error.is_some() && *condition != TargetCondition::Any {
+                    stream.failed_guarded.push(path.clone());
+                }
+            }
             if let Err(error) = self.record_new_directories(&request.targets, errs, dst_root) {
                 stream.stopped = true;
                 return Err(error);
             }
-            self.send_directory_requests(stream)?;
-            if self.sched.is_aborted() {
-                continue;
-            }
-            let mut released = false;
-            for &i in &request.chosen {
-                for (leaf, entry) in std::mem::take(&mut waiting[i]) {
-                    if leaf.e.kind == Kind::File {
-                        pending.remove(leaf.e.size);
-                    }
-                    self.plan_leaf(leaf, entry, dst_root, leaf_ops)?;
-                    released = true;
+            self.send_directory_requests(stream, dst_root)?;
+            self.release_leaves(request.chosen, waiting, pending, dst_root, leaf_ops)?;
+        }
+        Ok(())
+    }
+
+    /// Plan the leaves waiting on the directories `chosen`, now created or
+    /// skipped, and let workers start on their files.
+    fn release_leaves(
+        &mut self,
+        chosen: Vec<usize>,
+        waiting: &mut [Vec<(Planned, Option<Entry>)>],
+        pending: &mut super::directory_stream::Anticipated,
+        dst_root: &[u8],
+        leaf_ops: &mut LeafOps,
+    ) -> Result<()> {
+        if chosen.is_empty() || self.sched.is_aborted() {
+            return Ok(());
+        }
+        let mut released = false;
+        for i in chosen {
+            for (leaf, entry) in std::mem::take(&mut waiting[i]) {
+                if leaf.e.kind == Kind::File {
+                    pending.remove(leaf.e.size);
                 }
+                self.plan_leaf(leaf, entry, dst_root, leaf_ops)?;
+                released = true;
             }
-            if released {
-                pending.trickling = !self.directory_pacing.link_bound();
-                (self.start_streaming)(Some(*pending));
-            }
+        }
+        if released {
+            pending.trickling = !self.directory_pacing.link_bound();
+            (self.start_streaming)(Some(*pending));
         }
         Ok(())
     }
