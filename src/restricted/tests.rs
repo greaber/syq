@@ -11090,27 +11090,30 @@ fn both_receivers_settle_each_file_of_an_in_place_batch_alike() {
     }
 }
 
-/// The read leases this process holds on the inodes `files`, as
-/// `/proc/locks` lists them.
+/// How many of `files` this process holds a read lease on, as the
+/// `/proc/self/fdinfo` entries of its open files list them. Each entry lists
+/// its file's lease consistently; `/proc/locks` is read a page at a time
+/// from a list every process on the host changes, so under load it can list
+/// a lease twice or skip it.
 #[cfg(target_os = "linux")]
 fn leases_held_on(files: &[&Path]) -> usize {
-    let inodes: Vec<u64> = files
-        .iter()
-        .filter_map(|file| fs::metadata(file).ok().map(|status| status.ino()))
-        .collect();
-    let pid = std::process::id().to_string();
-    fs::read_to_string("/proc/locks")
+    let descriptors = Path::new("/proc/self/fd");
+    let leased: std::collections::HashSet<(u64, u64)> = fs::read_dir(descriptors)
         .unwrap()
-        .lines()
-        .filter(|line| {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            fields.get(1) == Some(&"LEASE")
-                && fields.get(4) == Some(&pid.as_str())
-                && fields
-                    .get(5)
-                    .and_then(|device| device.rsplit(':').next())
-                    .and_then(|inode| inode.parse::<u64>().ok())
-                    .is_some_and(|inode| inodes.contains(&inode))
+        .filter_map(|entry| {
+            let descriptor = entry.ok()?.file_name();
+            let info = fs::read_to_string(Path::new("/proc/self/fdinfo").join(&descriptor)).ok()?;
+            let lease = info.lines().any(|line| {
+                line.starts_with("lock:") && line.split_whitespace().nth(2) == Some("LEASE")
+            });
+            let status = fs::metadata(descriptors.join(&descriptor)).ok()?;
+            lease.then(|| (status.dev(), status.ino()))
+        })
+        .collect();
+    files
+        .iter()
+        .filter(|file| {
+            fs::metadata(file).is_ok_and(|status| leased.contains(&(status.dev(), status.ino())))
         })
         .count()
 }
