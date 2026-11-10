@@ -211,11 +211,10 @@ syq ssh hostB -- hostname
 ```
 
 Approve each destination account on the provider with
-`syq persist receive pending` and `syq persist receive approve REQUEST_ID`.
-A provider can also approve each
-[copy between two other servers](remote-to-remote.md#run-the-copy-from-a-server)
-separately; a copy between your server and one other server uses account
-access.
+`syq persist receive pending` and `syq persist receive approve REQUEST_ID`;
+copies between your server and that account then use this access. The
+provider asks separately for each
+[copy between two other servers](remote-to-remote.md#run-the-copy-from-a-server).
 The provider's SSH server must allow local forwarding; see
 [SSH authorization providers](persistence-reference.md#ssh-authorization-providers).
 Anyone who can log in to the provider account can use its credentials without
