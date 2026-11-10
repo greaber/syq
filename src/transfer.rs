@@ -4844,7 +4844,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let streaming_checked_sharing = std::cell::Cell::new(0);
     let streaming_all_shareable = std::cell::Cell::new(ssh_sharing_possible);
     // Files were queued while their batch's directories were still being
-    // created (`Planner::create_directories_streaming`).
+    // created (`Planner::create_directories`).
     let streaming_during_creation = std::cell::Cell::new(false);
     let start_streaming = |anticipated: Option<directory_stream::Anticipated>| {
         if let Some(anticipated) = anticipated {

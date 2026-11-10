@@ -33,11 +33,11 @@ pub(super) struct Planner<'a> {
     /// Called after jobs are queued; starts streaming only when useful work
     /// exists. Given the files the batch will still queue when they were
     /// queued while its directories are being created
-    /// (`create_directories_streaming`).
+    /// (`create_directories`).
     pub(super) start_streaming: &'a dyn Fn(Option<super::directory_stream::Anticipated>),
     /// The destination is on a network filesystem: create a batch's new
-    /// directories in requests sent back to back, and plan each leaf once
-    /// its directory exists (`create_directories_streaming`).
+    /// directories in requests that start small and grow, and plan each leaf
+    /// once its directory exists (`create_directories`).
     pub(super) stream_directories: bool,
     /// How large those requests are, kept across batches.
     pub(super) directory_pacing: super::directory_stream::Pacing,
@@ -383,7 +383,7 @@ struct NewDirectories {
 }
 
 /// A batch's directories being created in requests sent back to back
-/// (`Planner::create_directories_streaming`).
+/// (`Planner::create_directories`).
 struct DirectoryStream {
     queue: super::directory_stream::DirectoryQueue,
     /// Each new directory's creation, until it is sent.
@@ -1839,14 +1839,20 @@ impl Planner<'_> {
                 let leaves =
                     self.leaf_entries(others, other_stats, root_entry.as_ref(), dst_root)?;
                 let mut leaf_ops = LeafOps::default();
-                if !self.create_directories_streaming(&planned, dst_root, leaves, &mut leaf_ops)? {
+                if !self.create_directories(&planned, dst_root, leaves, &mut leaf_ops)? {
                     return Ok(());
                 }
                 self.defer_directory_metadata(&planned)?;
                 self.flush_meta_fixes(leaf_ops.meta_fixes)?;
                 return self.flush_leaf_ops(leaf_ops.ops, &leaf_ops.names);
             } else {
-                if !self.create_directories(&planned, dst_root)? {
+                // Leaves are planned once every directory exists.
+                if !self.create_directories(
+                    &planned,
+                    dst_root,
+                    Vec::new(),
+                    &mut LeafOps::default(),
+                )? {
                     return Ok(());
                 }
                 self.defer_directory_metadata(&planned)?;
@@ -2878,51 +2884,22 @@ impl Planner<'_> {
 
     /// Create missing directories. A failed placement-root condition prevents
     /// operations below it. Existing directory access is prepared separately.
-    fn create_directories(&mut self, planned: &[PlannedDir], dst_root: &[u8]) -> Result<bool> {
-        let Some(NewDirectories {
-            mut mkdirs,
-            mut created_metadata,
-            root_default,
-        }) = self.prepare_new_directories(planned)?
-        else {
-            return Ok(false);
-        };
-        // A receiver applies a request's metadata after all of its
-        // creations, so new directories take their group with the last ones.
-        if mkdirs.is_empty() {
-            if !created_metadata.is_empty() {
-                self.apply(created_metadata)?;
-            }
-        } else {
-            let targets = mkdir_targets(&mkdirs);
-            mkdirs.append(&mut created_metadata);
-            let mut errs = self.apply(mkdirs)?;
-            // Failed early metadata is retried, and reported, at the end.
-            errs.truncate(targets.len());
-            self.record_new_directories(
-                &targets,
-                errs,
-                dst_root,
-                crate::results::ReceiverListing::Listed,
-            )?;
-        }
-        if let Some(proposed) = root_default {
-            self.open_private_root(proposed)?;
-        }
-        Ok(true)
-    }
-
-    /// `create_directories` on a network destination, where every creation
-    /// waits on the network. The new directories go in small requests sent
-    /// back to back (`directory_stream`), each with the early metadata of
-    /// the directories it creates, and a leaf is planned, its file handed to
-    /// workers, once the request creating the nearest new directory above it
-    /// has been answered: that directory, and so every one above it, then
-    /// already has its creation mode, group and owner. Leaves below no new
-    /// directory are planned first. A leaf directly in a directory whose
-    /// early metadata goes with the last request, a private root, waits for
-    /// everything else, as every leaf did before.
-    fn create_directories_streaming(
+    ///
+    /// The new directories go in requests sent back to back
+    /// (`directory_stream`), each with the early metadata of the
+    /// directories it creates. A directory waits for an earlier request's
+    /// reply only where the receiver needs it to (`DirectoryQueue`). On a
+    /// network destination, where every creation waits on the network,
+    /// requests start small and grow (`Pacing`), and a leaf of `leaves` is
+    /// planned, its file handed to workers, once the request creating the
+    /// nearest new directory above it has been answered: that directory, and
+    /// so every one above it, then already has its creation mode, group and
+    /// owner. Leaves below no new directory are planned first. A leaf
+    /// directly in a directory whose early metadata goes with the last
+    /// request, a private root, waits for everything else. Elsewhere requests
+    /// are as large as their bytes allow, and the caller plans the leaves
+    /// once every directory exists.
+    fn create_directories(
         &mut self,
         planned: &[PlannedDir],
         dst_root: &[u8],
@@ -2937,10 +2914,10 @@ impl Planner<'_> {
         else {
             return Ok(false);
         };
-        let index: std::collections::HashMap<PathBytes, usize> = mkdirs
+        let index: std::collections::HashMap<&[u8], usize> = mkdirs
             .iter()
             .enumerate()
-            .map(|(i, op)| (apply_path(op).to_vec(), i))
+            .map(|(i, op)| (apply_path(op), i))
             .collect();
         let mut own_metadata: Vec<Vec<Op>> = (0..mkdirs.len()).map(|_| Vec::new()).collect();
         let mut last_metadata = Vec::new();
@@ -2972,6 +2949,7 @@ impl Planner<'_> {
                 None => ready.push(leaf),
             }
         }
+        drop(index);
         // The files still to queue once their directories exist.
         let mut pending = super::directory_stream::Anticipated {
             trickling: !self.directory_pacing.link_bound(),
@@ -3075,7 +3053,11 @@ impl Planner<'_> {
                 stream.stopped = true;
                 break;
             }
-            let growth = self.directory_pacing.growth();
+            let growth = if self.stream_directories {
+                self.directory_pacing.growth()
+            } else {
+                usize::MAX
+            };
             let chosen =
                 stream
                     .queue
@@ -3148,6 +3130,12 @@ impl Planner<'_> {
                 continue;
             }
             let count = ops.len();
+            // Tests count the directories each request creates.
+            #[cfg(debug_assertions)]
+            crate::fsops::record_test_event(
+                "SYQ_TEST_DIRECTORY_REQUESTS",
+                format_args!("{}", targets.len()),
+            )?;
             // Held back on purpose, it reached the receiver after the
             // previous reply: that is no sign of a slow link.
             let after_hold = std::mem::take(&mut stream.held);
@@ -3186,10 +3174,12 @@ impl Planner<'_> {
                 break;
             };
             let (response, arrival) = self.dst.take_reply_with_arrival(request.pending)?;
-            let compared = if request.after_hold { None } else { previous };
-            self.directory_pacing
-                .observe(request.sent, arrival, compared);
-            previous = Some(arrival);
+            if self.stream_directories {
+                let compared = if request.after_hold { None } else { previous };
+                self.directory_pacing
+                    .observe(request.sent, arrival, compared);
+                previous = Some(arrival);
+            }
             let mut errs = self.applied(response, request.count)?;
             // Failed early metadata is retried, and reported, at the end.
             errs.truncate(request.targets.len());

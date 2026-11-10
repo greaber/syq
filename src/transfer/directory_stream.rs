@@ -1,8 +1,9 @@
-//! On a network destination, a batch's new directories are created in small
-//! requests sent back to back, and the files that go into each directory are
-//! handed to workers as soon as its request has been answered
-//! (`Planner::create_directories_streaming`). This module decides which
-//! directories each request creates and how large the requests are.
+//! A batch's new directories are created in requests sent back to back
+//! (`Planner::create_directories`). On a network destination the requests
+//! start small, and the files that go into each directory are handed to
+//! workers as soon as its request has been answered. This module decides
+//! which directories each request creates, which wait for an earlier
+//! request's reply, and how large the requests are.
 
 use crate::proto::PathBytes;
 use std::collections::{HashMap, VecDeque};
@@ -45,6 +46,8 @@ pub(super) struct DirectoryQueue {
     parent: Vec<Option<usize>>,
     /// Which directories are created only where nothing is.
     no_replace: Vec<bool>,
+    /// Some are: otherwise nothing waits.
+    any_no_replace: bool,
     /// Where each directory's creation stands.
     state: Vec<Creation>,
     /// Requests taken so far.
@@ -78,16 +81,7 @@ impl DirectoryQueue {
             .collect();
         let parent: Vec<Option<usize>> = paths
             .iter()
-            .map(|path| {
-                let mut current: &[u8] = path;
-                while let Some(above) = parent_of(current).filter(|above| *above != current) {
-                    if let Some(&found) = index.get(above) {
-                        return Some(found);
-                    }
-                    current = above;
-                }
-                None
-            })
+            .map(|path| nearest_ancestor(path, &index))
             .collect();
         // Ancestors have fewer components than their descendants, so this
         // order finds every parent's level before its children's.
@@ -117,6 +111,7 @@ impl DirectoryQueue {
             first: 0,
             parent,
             no_replace: no_replace.to_vec(),
+            any_no_replace: no_replace.contains(&true),
             state: vec![Creation::Queued; paths.len()],
             requests: 0,
         }
@@ -128,23 +123,23 @@ impl DirectoryQueue {
 
     /// The next request's directories at `growth`: at most `PER_PARENT *
     /// growth` in one parent, `PER_REQUEST * growth` in all and `growth`
-    /// levels deep, within `byte_limit` by `sizes` (each directory's share
-    /// of the request). A deeper level joins only once the levels above it
-    /// are all in this or an earlier request, so a directory is never
-    /// created before its parent. The request ends before the first
-    /// directory that must wait for an earlier request's reply
-    /// (`DirectoryQueue`), which stays queued: it is empty when that is the
-    /// next one.
+    /// levels deep (`usize::MAX` for no such limit), within `byte_limit` by
+    /// `sizes` (each directory's share of the request). A deeper level joins
+    /// only once the levels above it are all in this or an earlier request,
+    /// so a directory is never created before its parent. The request ends
+    /// before the first directory that must wait for an earlier request's
+    /// reply (`DirectoryQueue`), which stays queued: it is empty when that
+    /// is the next one.
     pub(super) fn next(&mut self, growth: usize, sizes: &[usize], byte_limit: usize) -> Vec<usize> {
         self.requests += 1;
         let request = self.requests;
-        let total = PER_REQUEST * growth;
-        let per_parent = PER_PARENT * growth;
+        let total = PER_REQUEST.saturating_mul(growth);
+        let per_parent = PER_PARENT.saturating_mul(growth);
         let mut chosen = Vec::new();
         let mut bytes = 0usize;
         let mut full = false;
         let mut level = self.first;
-        while level < self.levels.len() && level < self.first + growth && !full {
+        while level < self.levels.len() && level < self.first.saturating_add(growth) && !full {
             let current = &mut self.levels[level];
             for queue in &mut current.parents {
                 let mut taken = 0;
@@ -154,7 +149,8 @@ impl DirectoryQueue {
                     };
                     if chosen.len() == total
                         || (!chosen.is_empty() && bytes.saturating_add(sizes[index]) > byte_limit)
-                        || waits(&self.parent, &self.no_replace, &self.state, index, request)
+                        || (self.any_no_replace
+                            && waits(&self.parent, &self.no_replace, &self.state, index, request))
                     {
                         full = true;
                         break;
@@ -237,7 +233,7 @@ pub(super) fn beneath_any(path: &[u8], roots: &[PathBytes]) -> bool {
 }
 
 /// The nearest of `path`'s ancestors that `index` holds.
-pub(super) fn nearest_ancestor(path: &[u8], index: &HashMap<PathBytes, usize>) -> Option<usize> {
+pub(super) fn nearest_ancestor(path: &[u8], index: &HashMap<&[u8], usize>) -> Option<usize> {
     let mut current = path;
     while let Some(parent) = parent_of(current) {
         if let Some(&found) = index.get(parent) {
@@ -493,9 +489,31 @@ mod tests {
     }
 
     #[test]
+    fn unbounded_requests_take_all_their_bytes_allow_up_to_what_waits() {
+        // Off a network destination, one request takes every level, as many
+        // in one parent as its bytes allow.
+        let mut paths: Vec<String> = (0..300).map(|i| format!("/d/{i}")).collect();
+        paths.extend(["/d/0/a".into(), "/d/0/a/b".into()]);
+        let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let (mut queue, sizes) = queued(&paths);
+        assert_eq!(queue.next(usize::MAX, &sizes, usize::MAX).len(), 302);
+        assert!(queue.is_empty());
+        let (mut queue, sizes) = queued(&paths);
+        assert_eq!(queue.next(usize::MAX, &sizes, 100 * 250).len(), 250);
+        assert_eq!(queue.next(usize::MAX, &sizes, 100 * 250).len(), 52);
+        // Nested no-replace directories still go a level at a time.
+        let (mut queue, sizes) = queued_no_replace(&paths, &["/d/0/a", "/d/0/a/b"]);
+        assert_eq!(queue.next(usize::MAX, &sizes, usize::MAX).len(), 300);
+        assert!(queue.next(usize::MAX, &sizes, usize::MAX).is_empty());
+        queue.answered(&(0..300).collect::<Vec<_>>());
+        assert_eq!(queue.next(usize::MAX, &sizes, usize::MAX), vec![300]);
+        queue.answered(&[300]);
+        assert_eq!(queue.next(usize::MAX, &sizes, usize::MAX), vec![301]);
+    }
+
+    #[test]
     fn nearest_ancestor_finds_the_closest_new_directory() {
-        let index: HashMap<PathBytes, usize> =
-            [(b"/d/a".to_vec(), 0), (b"/d/a/b".to_vec(), 1)].into();
+        let index: HashMap<&[u8], usize> = [(&b"/d/a"[..], 0), (&b"/d/a/b"[..], 1)].into();
         assert_eq!(nearest_ancestor(b"/d/a/b/c/file", &index), Some(1));
         assert_eq!(nearest_ancestor(b"/d/a/file", &index), Some(0));
         assert_eq!(nearest_ancestor(b"/d/file", &index), None);

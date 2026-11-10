@@ -897,7 +897,7 @@ impl Sched {
     }
 
     /// Files are queued a few at a time, as the directories they go into
-    /// are created (`Planner::create_directories_streaming`): a small-file
+    /// are created (`Planner::create_directories`): a small-file
     /// batch is sized against every active worker, busy ones included, and
     /// holds at least `files_per_worker`, the files each starting worker was
     /// counted for, as far as are queued (`begin_fast_batch`). None when
