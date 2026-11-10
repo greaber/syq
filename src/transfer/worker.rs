@@ -243,11 +243,14 @@ impl Worker {
     }
 
     /// The worker could not log in on its own: it carries every file on the
-    /// shared login from now on, as a startup worker does, and says so once
-    /// per copy, since larger files can copy more slowly there.
+    /// shared login from now on, as a startup worker does. With `-v` it says
+    /// so once per copy, since larger files can copy more slowly there; the
+    /// copy itself is unaffected, so default output stays quiet.
     fn stay_on_shared_login(&mut self, why: std::fmt::Arguments<'_>) {
         self.on_shared_login = false;
-        if !self.opts.quiet && (debug() || !self.opts.own_login_noted.swap(true, Relaxed)) {
+        if !self.opts.quiet
+            && (debug() || self.opts.verbose > 0 && !self.opts.own_login_noted.swap(true, Relaxed))
+        {
             crate::output::diagnostic!(
                 "syq: worker {} could not log in on its own and copies larger files over the copy's shared SSH login, which can be slower ({why})",
                 self.id
