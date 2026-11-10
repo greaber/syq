@@ -81,16 +81,7 @@ impl DirectoryQueue {
             .collect();
         let parent: Vec<Option<usize>> = paths
             .iter()
-            .map(|path| {
-                let mut current: &[u8] = path;
-                while let Some(above) = parent_of(current).filter(|above| *above != current) {
-                    if let Some(&found) = index.get(above) {
-                        return Some(found);
-                    }
-                    current = above;
-                }
-                None
-            })
+            .map(|path| nearest_ancestor(path, &index))
             .collect();
         // Ancestors have fewer components than their descendants, so this
         // order finds every parent's level before its children's.
@@ -242,7 +233,7 @@ pub(super) fn beneath_any(path: &[u8], roots: &[PathBytes]) -> bool {
 }
 
 /// The nearest of `path`'s ancestors that `index` holds.
-pub(super) fn nearest_ancestor(path: &[u8], index: &HashMap<PathBytes, usize>) -> Option<usize> {
+pub(super) fn nearest_ancestor(path: &[u8], index: &HashMap<&[u8], usize>) -> Option<usize> {
     let mut current = path;
     while let Some(parent) = parent_of(current) {
         if let Some(&found) = index.get(parent) {
@@ -522,8 +513,7 @@ mod tests {
 
     #[test]
     fn nearest_ancestor_finds_the_closest_new_directory() {
-        let index: HashMap<PathBytes, usize> =
-            [(b"/d/a".to_vec(), 0), (b"/d/a/b".to_vec(), 1)].into();
+        let index: HashMap<&[u8], usize> = [(&b"/d/a"[..], 0), (&b"/d/a/b"[..], 1)].into();
         assert_eq!(nearest_ancestor(b"/d/a/b/c/file", &index), Some(1));
         assert_eq!(nearest_ancestor(b"/d/a/file", &index), Some(0));
         assert_eq!(nearest_ancestor(b"/d/file", &index), None);

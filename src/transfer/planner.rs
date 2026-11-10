@@ -2914,10 +2914,10 @@ impl Planner<'_> {
         else {
             return Ok(false);
         };
-        let index: std::collections::HashMap<PathBytes, usize> = mkdirs
+        let index: std::collections::HashMap<&[u8], usize> = mkdirs
             .iter()
             .enumerate()
-            .map(|(i, op)| (apply_path(op).to_vec(), i))
+            .map(|(i, op)| (apply_path(op), i))
             .collect();
         let mut own_metadata: Vec<Vec<Op>> = (0..mkdirs.len()).map(|_| Vec::new()).collect();
         let mut last_metadata = Vec::new();
@@ -2949,6 +2949,7 @@ impl Planner<'_> {
                 None => ready.push(leaf),
             }
         }
+        drop(index);
         // The files still to queue once their directories exist.
         let mut pending = super::directory_stream::Anticipated {
             trickling: !self.directory_pacing.link_bound(),
