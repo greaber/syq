@@ -699,7 +699,7 @@ pub(crate) struct RestrictedAuthority {
     pub(super) owned: std::sync::Arc<crate::fsops::owned::OwnedObjects>,
     /// The scope of the files this copy is writing, which the receiver holds
     /// open until the copy's control connection ends.
-    pub(super) stage_scope: u64,
+    pub(super) stage_scope: crate::fsops::StageScope,
     /// What this receiver's own lookups for the planner found, where
     /// they let a file's publication be held to the grant without looking
     /// again (`constrain_publication`): keeping existing files, or
@@ -727,7 +727,7 @@ impl RestrictedAuthority {
 
     /// The scope of the files this copy is writing (`FsOps::set_stage_scope`).
     pub(crate) fn stage_scope(&self) -> u64 {
-        self.stage_scope
+        self.stage_scope.get()
     }
 
     pub(crate) fn hash_policy(&self) -> crate::hashing::HashPolicy {
@@ -952,7 +952,7 @@ impl RestrictedAuthority {
             hashing,
             extra_options,
             owned: Default::default(),
-            stage_scope: crate::fsops::new_stage_scope(),
+            stage_scope: crate::fsops::StageScope::new(),
             tcp_congestion,
             tcp,
             mapping: mapping.map(|authorization| {
@@ -1626,6 +1626,12 @@ impl RestrictedAuthority {
             tracked,
             stream: _,
         } = settlement;
+        // Run otherwise, a Finalize the limit leaves no room for could have
+        // published a file without a count.
+        debug_assert!(
+            charged.republication != Some(Republication::RepeatOnly) || charged.executed,
+            "a Finalize the entry limit leaves no room for ran without Settlement::execute"
+        );
         self.refund_unmade(&charged, response);
         if creations.is_empty() && outcomes.is_empty() && !tracked {
             return;
@@ -1869,6 +1875,34 @@ impl RestrictedAuthority {
                     let refused = stage == FileStage::Prepare
                         && matches!(response, proto::Response::EndpointError(error)
                             if crate::fsops::vouch::is_replace_required_wire(error));
+                    // A Finalize answered as one that already published its
+                    // file changed nothing, and leaves alone any newer file
+                    // the copy writes under its name. One the entry limit
+                    // left no room for, and that was not answered so, is
+                    // refused as the limit refuses a request before it runs
+                    // (`authorize_streaming`).
+                    if stage == FileStage::Finalize && charged.repeated {
+                        continue;
+                    }
+                    if stage == FileStage::Finalize
+                        && charged.republication == Some(Republication::RepeatOnly)
+                    {
+                        if streaming {
+                            if let Some(stream) = self.results.lock().unwrap().as_mut() {
+                                let change = (
+                                    self.result_path(&path, false),
+                                    Change::PublishFile { size: 0 },
+                                );
+                                stream.refused(&format!("refused: {ENTRY_LIMIT}"), &[change]);
+                            }
+                            if let Some(lifecycle) =
+                                state.file_lifecycles.get_mut(&(path.clone(), copy_id))
+                            {
+                                lifecycle.listed = true;
+                            }
+                        }
+                        continue;
+                    }
                     // A published file is no longer in flight; what it
                     // occupies stays counted. Nor is one whose name the
                     // existing-object policy keeps.
@@ -2755,9 +2789,20 @@ impl RestrictedAuthority {
         };
         let deletions = deleting.len() as u64;
         let limits = &self.copy.limits;
-        let counted = changes + u64::from(file_charge);
+        let (mut changes, mut counted) = (changes, changes + u64::from(file_charge));
+        // A Finalize of a file with no reservation may be one sent again
+        // after the Finalize that published the file lost its reply. The
+        // receiver answers it as that one did, which changes nothing, and
+        // its count is given back. Where the entry limit leaves no room
+        // for it, it is not counted, and may only be answered so.
+        let finalize = own_file_change && matches!(request, Request::Finalize { .. });
+        let mut republication = finalize.then_some(Republication::Counted);
         if !charge(&self.changes, counted, limits.max_entries) {
-            bail!("signed grant entry limit exceeded");
+            if !finalize {
+                bail!(ENTRY_LIMIT);
+            }
+            (changes, counted) = (0, 0);
+            republication = Some(Republication::RepeatOnly);
         }
         if !charge(&self.deletions, deletions, limits.max_deletions) {
             refund(&self.changes, counted);
@@ -2782,6 +2827,9 @@ impl RestrictedAuthority {
             changes,
             deleting,
             file,
+            republication,
+            repeated: false,
+            executed: false,
         })
     }
 
@@ -2899,7 +2947,12 @@ impl RestrictedAuthority {
             proto::Response::SmallFilesCopied(_) => all(),
             _ => Vec::new(),
         };
-        let refunded = (unmade.len() as u64).min(charged.changes);
+        let mut refunded = (unmade.len() as u64).min(charged.changes);
+        // A Finalize that the receiver answered as one that already
+        // published its file changed nothing.
+        if charged.repeated && charged.republication == Some(Republication::Counted) {
+            refunded = charged.changes;
+        }
         if refunded > 0 {
             self.changes.fetch_sub(refunded, Ordering::AcqRel);
         }
@@ -4273,6 +4326,50 @@ pub(super) struct Charged {
     /// The file whose shared count against the entry limit this request
     /// holds until it settles (`EntryCharge`).
     file: Option<FileShare>,
+    /// How a Finalize of a file with no reservation counted.
+    republication: Option<Republication>,
+    /// The receiver answered the Finalize as one that already published
+    /// its file (`Settlement::execute`).
+    repeated: bool,
+    /// The request ran through `Settlement::execute`, which alone tells the
+    /// receiver what a Finalize may do.
+    executed: bool,
+}
+
+/// How a Finalize of a file with no reservation counts against the entry
+/// limit, as one that may be sent again after the Finalize that published
+/// the file lost its reply (`charge_request`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Republication {
+    /// As a change of its own, given back if the receiver answers it as
+    /// that Finalize did.
+    Counted,
+    /// Not at all, as the limit leaves no room: the receiver may only
+    /// answer it as that Finalize did, and it is refused otherwise.
+    RepeatOnly,
+}
+
+/// Why a request is refused when it would exceed the signed entry limit.
+const ENTRY_LIMIT: &str = "signed grant entry limit exceeded";
+
+impl Settlement {
+    /// Execute the authorized request with `execute` on `ops`: a Finalize
+    /// the entry limit leaves no room for may only be answered as one that
+    /// already published its file. Notes for `settle` whether it was.
+    pub(crate) fn execute<T>(
+        &mut self,
+        ops: &mut crate::fsops::FsOps,
+        execute: impl FnOnce(&mut crate::fsops::FsOps) -> T,
+    ) -> T {
+        let repeat_only = self.charged.republication == Some(Republication::RepeatOnly);
+        ops.set_finalize_repeat_only(repeat_only.then_some(ENTRY_LIMIT));
+        ops.take_finalize_repeated();
+        let result = execute(ops);
+        ops.set_finalize_repeat_only(None);
+        self.charged.repeated = ops.take_finalize_repeated();
+        self.charged.executed = true;
+        result
+    }
 }
 
 /// A file's reservation key and which reservation of it a request shares

@@ -5610,7 +5610,7 @@ fn restricted_destination(
             {
                 return Response::Err(crate::fsops::OPEN_PATCH_STREAM.into());
             }
-            let settlement = match gate.authorize(&mut request, false) {
+            let mut settlement = match gate.authorize(&mut request, false) {
                 Ok(settlement) => settlement,
                 Err(error) => {
                     let error = format!("{error:#}");
@@ -5631,7 +5631,7 @@ fn restricted_destination(
             ) {
                 before_patch();
             }
-            let response = ops.handle(&request);
+            let response = settlement.execute(&mut ops, |ops| ops.handle(&request));
             gate.settle(settlement, &response, ops.patch_stream_open());
             // Record what was executed, without the data of pieces.
             if let Request::PatchData { hash, .. } = request {

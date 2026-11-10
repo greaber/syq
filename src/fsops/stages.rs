@@ -7,8 +7,8 @@
 //!
 //! A file is held from the request that created or opened it until Finalize
 //! takes it, a later attempt replaces it, or the copy's control connection
-//! ends. A write to a file not held here is refused, and the file fails as
-//! for any other write error.
+//! ends, after which nothing is held for the copy. A write to a file not
+//! held here is refused, and the file fails as for any other write error.
 //!
 //! At most `MAX_HELD` files are held. Beyond that the one used least
 //! recently is let go, unless a connection is using it. A worker has at most
@@ -28,6 +28,7 @@
 //! what it said it would write, on every receiver.
 
 use super::*;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Condvar, MutexGuard};
 
@@ -37,10 +38,13 @@ use std::sync::{Condvar, MutexGuard};
 pub(super) const MAX_HELD: usize = if cfg!(test) { 16 } else { 1024 };
 
 /// A new scope for one copy's held files, in a process that serves several
-/// copies. Scope 0 is the copy of a process that serves only one.
+/// copies, which runs until `release`. Scope 0 is the copy of a process
+/// that serves only one.
 pub(crate) fn new_scope() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Relaxed)
+    let scope = NEXT.fetch_add(1, Relaxed);
+    registry().running.insert(scope);
+    scope
 }
 
 /// The published files each connection remembers: its last few. A worker
@@ -160,6 +164,8 @@ struct Registry {
     published: HashMap<Key, (u64, Option<(u64, u64)>)>,
     /// The files in `published`, oldest first, by copy scope and connection.
     published_by: HashMap<(u64, u64), VecDeque<Key>>,
+    /// The scopes from `new_scope` whose copy has not ended (`release`).
+    running: HashSet<u64>,
     clock: u64,
 }
 
@@ -172,6 +178,12 @@ impl Registry {
                 keys.retain(|other| other != key);
             }
         }
+    }
+
+    /// Whether the copy `scope` goes on: a file is held for it only then,
+    /// as nothing would let the file go after its copy ended.
+    fn running(&self, scope: u64) -> bool {
+        scope == 0 || self.running.contains(&scope)
     }
 }
 
@@ -198,7 +210,9 @@ fn registry() -> MutexGuard<'static, Registry> {
 /// Hold `file`, which this receiver just created (`created`) or opened at
 /// `relative`, as the file for `target`, `declared` bytes long, replacing
 /// what was held for it, and return the share of its use count for a
-/// connection that caches `file`.
+/// connection that caches `file`. A request that its copy's end overtook
+/// holds nothing, and fails: its file stays, as an interrupted copy leaves
+/// one.
 /// Descriptors let go are closed after the registry is unlocked: a close
 /// can wait for a network filesystem.
 pub(super) fn hold(
@@ -209,6 +223,7 @@ pub(super) fn hold(
     created: bool,
     declared: u64,
 ) -> io::Result<Arc<()>> {
+    let scope = target.scope;
     let held = hold_if(
         target.key(),
         relative,
@@ -216,9 +231,9 @@ pub(super) fn hold(
         opened,
         created,
         declared,
-        |_| true,
+        |registry| registry.running(scope),
     )?;
-    Ok(held.expect("held unconditionally"))
+    held.ok_or_else(|| io::Error::other("the copy has ended"))
 }
 
 /// `hold`, if `allowed` says so with the registry locked.
@@ -316,12 +331,14 @@ impl Finalizing {
     /// The Finalize published the file, as `identity`: remember that as one
     /// of the last files `connection` published, before a Finalize waiting
     /// for this one looks. Nothing is remembered for a copy that ended
-    /// meanwhile: nothing would forget it.
+    /// meanwhile: nothing would forget it. Nor while a newer file is held
+    /// for the same name, which a Finalize publishes instead: if it were let
+    /// go unpublished, this one's identity would answer for it.
     pub(super) fn published(&self, connection: u64, identity: Option<(u64, u64)>) {
         let key = &self.0;
         let mut guard = registry();
         let registry = &mut *guard;
-        if registry.finalizing.get(key) != Some(&false) {
+        if registry.finalizing.get(key) != Some(&false) || registry.held.contains_key(key) {
             return;
         }
         registry.forget_published(key);
@@ -403,11 +420,33 @@ pub(super) fn finalize(target: For<'_>) -> Option<Found> {
     Some(Found::Held(Box::new(held), Finalizing(key)))
 }
 
+/// The identity a Finalize reported when it published the file for
+/// `target`, if one did and nothing is held for it now, after any Finalize
+/// of it already running ends. Unlike `finalize`, this takes nothing to
+/// publish. A file held for `target` is one that Finalize would publish,
+/// even when a Finalize running as it was held recorded its own.
+pub(super) fn repeated(target: For<'_>) -> Option<Option<(u64, u64)>> {
+    let key = target.key();
+    let mut registry = registry();
+    while registry.finalizing.contains_key(&key) {
+        registry = shared()
+            .finalized
+            .wait(registry)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+    if registry.held.contains_key(&key) {
+        return None;
+    }
+    registry.published.get(&key).map(|&(_, identity)| identity)
+}
+
 /// Let go of every file held for the copy `scope`, and forget those it
-/// published, when its control connection ends.
+/// published, when its control connection ends. Nothing is held for it
+/// after that.
 pub(crate) fn release(scope: u64) {
     let released: Vec<Held> = {
         let mut registry = registry();
+        registry.running.remove(&scope);
         for (key, ended) in &mut registry.finalizing {
             *ended |= key.scope == scope;
         }
@@ -556,6 +595,78 @@ mod tests {
         release(ended);
         assert_eq!((count(ended), count(running)), (0, 2));
         release(running);
+    }
+
+    #[test]
+    fn a_repeat_finds_nothing_while_a_newer_file_is_held() {
+        let directory = crate::test_support::tempdir().unwrap();
+        let root = Root::open(directory.path()).unwrap();
+        let file = File::create(directory.path().join("file")).unwrap();
+        let name = RelativePath::new(b"file").unwrap();
+        let (scope, copy_id) = (new_scope(), [9; 16]);
+        let held = For {
+            scope,
+            root: &root,
+            target: &name,
+            copy_id: &copy_id,
+            inplace: false,
+        };
+        hold(held, &name, &file, None, true, 1).unwrap();
+        let (_, finalizing) = taken(finalize(held));
+        // A newer file is held while the first Finalize runs, which then
+        // records its publication.
+        hold(held, &name, &file, None, true, 1).unwrap();
+        finalizing.published(new_connection(), Some((1, 2)));
+        drop(finalizing);
+        assert!(repeated(held).is_none());
+        // Let go unpublished, the newer file leaves no publication for a
+        // Finalize to be answered with.
+        drop(take(held));
+        assert!(finalize(held).is_none());
+        assert!(repeated(held).is_none());
+        hold(held, &name, &file, None, true, 1).unwrap();
+        let (newer, finalizing) = taken(finalize(held));
+        assert!(newer.relative == name);
+        finalizing.published(new_connection(), Some((3, 4)));
+        drop(finalizing);
+        assert_eq!(repeated(held), Some(Some((3, 4))));
+        release(scope);
+    }
+
+    #[test]
+    fn a_scope_is_let_go_when_dropped() {
+        let scope = StageScope::new();
+        let number = scope.get();
+        assert!(registry().running(number));
+        drop(scope);
+        assert!(!registry().running(number));
+    }
+
+    #[test]
+    fn nothing_is_held_for_a_copy_that_ended() {
+        let directory = crate::test_support::tempdir().unwrap();
+        let root = Root::open(directory.path()).unwrap();
+        let file = File::create(directory.path().join("file")).unwrap();
+        let name = RelativePath::new(b"file").unwrap();
+        let (ended, running, copy_id) = (new_scope(), new_scope(), [8; 16]);
+        let held = |scope| For {
+            scope,
+            root: &root,
+            target: &name,
+            copy_id: &copy_id,
+            inplace: false,
+        };
+        release(ended);
+        // A request its copy's end overtook holds nothing, so nothing is
+        // left held for a copy that will not let it go.
+        let error = hold(held(ended), &name, &file, None, true, 1).unwrap_err();
+        assert_eq!(error.to_string(), "the copy has ended");
+        assert!(get(held(ended)).unwrap().is_none());
+        assert_eq!(count(ended), 0);
+        hold(held(running), &name, &file, None, true, 1).unwrap();
+        assert_eq!(count(running), 1);
+        release(running);
+        assert_eq!(count(running), 0);
     }
 
     #[test]

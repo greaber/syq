@@ -110,6 +110,7 @@ pub(crate) use small_batch::with_coarse_change_times;
 pub(crate) fn leases_trusted_on(file: &File) -> bool {
     fs_caps::leases_show_writers(file)
 }
+#[cfg(test)]
 pub(crate) use stages::new_scope as new_stage_scope;
 
 /// Let go of what the copy `scope` holds in this process when its control
@@ -118,6 +119,28 @@ pub(crate) use stages::new_scope as new_stage_scope;
 pub(crate) fn release_stages(scope: u64) {
     stages::release(scope);
     owned::release(scope);
+}
+
+/// A copy's scope (`new_stage_scope`), owned by what serves the copy, and
+/// let go when that is dropped, whether or not the copy's control
+/// connection ever started.
+#[derive(Debug)]
+pub(crate) struct StageScope(u64);
+
+impl StageScope {
+    pub(crate) fn new() -> Self {
+        Self(stages::new_scope())
+    }
+
+    pub(crate) fn get(&self) -> u64 {
+        self.0
+    }
+}
+
+impl Drop for StageScope {
+    fn drop(&mut self) {
+        release_stages(self.0);
+    }
 }
 
 /// Compare at the decimal precision suggested by the destination timestamp.
@@ -935,6 +958,13 @@ pub struct FsOps {
     /// This connection's number, which the files it publishes are
     /// remembered by (`stages`).
     stage_connection: u64,
+    /// The request being executed is a Finalize that may only be answered
+    /// as one that already published its file, and is refused otherwise,
+    /// with this reason (`set_finalize_repeat_only`).
+    finalize_repeat_only: Option<&'static str>,
+    /// A Finalize was answered as one that already published its file,
+    /// since `take_finalize_repeated`.
+    finalize_repeated: bool,
     comparison_window: Option<ComparisonWindow>,
     partial_candidates: HashMap<FileLocation, HashMap<PathBytes, Vec<PathBytes>>>,
     partial_directory_order: VecDeque<FileLocation>,
@@ -1208,6 +1238,20 @@ impl FsOps {
         self.stage_scope
     }
 
+    /// Let the next requests publish nothing new: a Finalize among them is
+    /// answered only as one that already published its file (`stages`),
+    /// and fails with `refusal` otherwise. A restricted receiver sets this
+    /// for a Finalize its signed limits leave no room for.
+    pub(crate) fn set_finalize_repeat_only(&mut self, refusal: Option<&'static str>) {
+        self.finalize_repeat_only = refusal;
+    }
+
+    /// Whether a Finalize was answered as one that already published its
+    /// file since this was last asked: it changed nothing.
+    pub(crate) fn take_finalize_repeated(&mut self) -> bool {
+        std::mem::take(&mut self.finalize_repeated)
+    }
+
     fn observed_payload_hash(&self, bytes: &[u8]) -> ContentDigest {
         let _hash = self
             .operation
@@ -1262,6 +1306,8 @@ impl FsOps {
             held_basis: None,
             stage_scope: 0,
             stage_connection: stages::new_connection(),
+            finalize_repeat_only: None,
+            finalize_repeated: false,
             comparison_window: None,
             partial_candidates: HashMap::new(),
             partial_directory_order: VecDeque::new(),

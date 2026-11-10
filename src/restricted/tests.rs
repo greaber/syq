@@ -5386,6 +5386,220 @@ fn a_finalize_sent_again_on_another_connection_is_answered_as_published() {
     );
 }
 
+/// At the entry limit, a file held without a reservation, as no copy that
+/// prepares its files through the grant holds one, is not published: the
+/// Finalize the limit has no room for is refused, and the file stays held.
+#[test]
+fn at_the_entry_limit_a_file_held_without_a_count_is_not_published() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let (first, held) = (target.join("first"), target.join("held"));
+    let mut authority = existence_authority_with_results(&root, &results_policy().1, 60_000);
+    authority.copy.limits.max_entries = 1;
+    let mut ops = authority.test_ops();
+    publish_written(&authority, &mut ops, &first, b"data");
+    // Held by requests the grant never saw.
+    let prepared = ops.handle(&prepare_request(&held));
+    assert!(
+        matches!(prepared, proto::Response::Prepared(_)),
+        "{prepared:?}"
+    );
+    let write = Request::WriteRange {
+        path: path_bytes(&held),
+        inplace: false,
+        copy_id: [1; 16],
+        attempt: 0,
+        off: 0,
+        hash: crate::fsops::content_digest(b"more"),
+        data: b"more".to_vec().into(),
+    };
+    assert!(matches!(ops.handle(&write), proto::Response::Ok));
+    let publish = || finalize_request(&held, proto::TargetCondition::Any);
+    let refused = execute_authorized(&authority, &mut ops, publish());
+    assert!(
+        format!("{refused:?}").contains("signed grant entry limit exceeded"),
+        "{refused:?}"
+    );
+    assert!(!held.exists());
+    assert_eq!(entries_counted(&authority), 1);
+    // It is still held: published without the grant, it is the file written.
+    let published = ops.handle(&publish());
+    assert!(
+        !matches!(
+            published,
+            proto::Response::EndpointError(_) | proto::Response::Err(_)
+        ),
+        "{published:?}"
+    );
+    assert_eq!(fs::read(&held).unwrap(), b"more");
+}
+
+/// A preparation that runs after its copy ended, admitted just before,
+/// fails, and leaves no file held for the ended copy.
+#[test]
+fn a_preparation_after_its_copy_ended_holds_nothing() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let file = target.join("late");
+    let authority = existence_authority_with_results(&root, &results_policy().1, 60_000);
+    let mut ops = authority.test_ops();
+    let mut request = prepare_request(&file);
+    let mut settlement = authority.authorize(&mut request, false).unwrap();
+    crate::fsops::release_stages(authority.stage_scope());
+    let response = settlement.execute(&mut ops, |ops| ops.handle(&request));
+    authority.settle(settlement, &response);
+    assert!(
+        format!("{response:?}").contains("the copy has ended"),
+        "{response:?}"
+    );
+    let write = Request::WriteRange {
+        path: path_bytes(&file),
+        inplace: false,
+        copy_id: [1; 16],
+        attempt: 0,
+        off: 0,
+        hash: crate::fsops::content_digest(b"data"),
+        data: b"data".to_vec().into(),
+    };
+    let written = execute_authorized(&authority, &mut ops, write);
+    assert!(
+        format!("{written:?}").contains("is not open in this receiver"),
+        "{written:?}"
+    );
+}
+
+/// Prepare and write `file` with `data` on `ops`, then publish it, and
+/// return the publication's answer.
+fn publish_written(
+    authority: &RestrictedAuthority,
+    ops: &mut crate::fsops::FsOps,
+    file: &Path,
+    data: &[u8],
+) -> proto::Response {
+    let prepared = execute_authorized(authority, ops, prepare_request(file));
+    assert!(
+        matches!(prepared, proto::Response::Prepared(_)),
+        "{prepared:?}"
+    );
+    let write = Request::WriteRange {
+        path: path_bytes(file),
+        inplace: false,
+        copy_id: [1; 16],
+        attempt: 0,
+        off: 0,
+        hash: crate::fsops::content_digest(data),
+        data: data.to_vec().into(),
+    };
+    let written = execute_authorized(authority, ops, write);
+    assert!(matches!(written, proto::Response::Ok), "{written:?}");
+    let published = execute_authorized(
+        authority,
+        ops,
+        finalize_request(file, proto::TargetCondition::Any),
+    );
+    assert!(
+        !matches!(
+            published,
+            proto::Response::EndpointError(_) | proto::Response::Err(_)
+        ),
+        "{published:?}"
+    );
+    published
+}
+
+fn entries_counted(authority: &RestrictedAuthority) -> u64 {
+    authority.changes.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A Finalize sent again for a file already published counts nothing: the
+/// copy still has room for its next file.
+#[test]
+fn a_finalize_sent_again_gives_back_its_count() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let (first, second) = (target.join("first"), target.join("second"));
+    let mut authority = existence_authority_with_results(&root, &results_policy().1, 60_000);
+    authority.copy.limits.max_entries = 2;
+    let mut ops = authority.test_ops();
+    let published = publish_written(&authority, &mut ops, &first, b"data");
+    assert_eq!(entries_counted(&authority), 1);
+    let mut other = authority.test_ops();
+    let again = execute_authorized(
+        &authority,
+        &mut other,
+        finalize_request(&first, proto::TargetCondition::Any),
+    );
+    assert_eq!(format!("{again:?}"), format!("{published:?}"));
+    assert_eq!(entries_counted(&authority), 1);
+    publish_written(&authority, &mut ops, &second, b"more");
+    assert_eq!(entries_counted(&authority), 2);
+    assert_eq!(fs::read(&second).unwrap(), b"more");
+}
+
+/// At the entry limit, a Finalize sent again for a file already published
+/// is answered as the first was. Any other Finalize the limit has no room
+/// for publishes nothing, and the results list it as refused.
+#[test]
+fn a_finalize_sent_again_at_the_entry_limit_is_answered_as_published() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let (file, unpublished) = (target.join("fresh"), target.join("unpublished"));
+    let (secret, policy) = results_policy();
+    let mut authority = existence_authority_with_results(&root, &policy, 60_000);
+    authority.copy.limits.max_entries = 1;
+    let mut reader = start_results(&authority, secret);
+    let mut first = authority.test_ops();
+    let published = publish_written(&authority, &mut first, &file, b"data");
+    let mut second = authority.test_ops();
+    let again = execute_authorized(
+        &authority,
+        &mut second,
+        finalize_request(&file, proto::TargetCondition::Any),
+    );
+    assert_eq!(format!("{again:?}"), format!("{published:?}"));
+    // A Finalize the limit leaves no room for, of a file never published,
+    // publishes nothing and is refused.
+    let refused = execute_authorized(
+        &authority,
+        &mut second,
+        finalize_request(&unpublished, proto::TargetCondition::Any),
+    );
+    assert!(
+        format!("{refused:?}").contains("signed grant entry limit exceeded"),
+        "{refused:?}"
+    );
+    assert!(!unpublished.exists());
+    assert_eq!(entries_counted(&authority), 1);
+    assert_eq!(fs::read(&file).unwrap(), b"data");
+    let results = finish_results(&authority, &mut reader);
+    assert_eq!((results.totals.failed, results.totals.refused), (0, 1));
+    let mut changes = results.changes();
+    changes.sort();
+    assert_eq!(
+        changes,
+        [
+            (
+                "transfer_file".to_owned(),
+                b"fresh".to_vec(),
+                "succeeded".to_owned()
+            ),
+            (
+                "transfer_file".to_owned(),
+                b"unpublished".to_vec(),
+                "failed".to_owned()
+            ),
+        ]
+    );
+}
+
 /// A publication the source says found earlier partials removes only the
 /// partials of the file it published that nothing writes: no other name,
 /// whatever the source claims, and nothing for a publication that fails.
@@ -9027,8 +9241,8 @@ fn execute_authorized(
     ops: &mut crate::fsops::FsOps,
     mut request: Request,
 ) -> proto::Response {
-    let settlement = authority.authorize(&mut request, false).unwrap();
-    let response = ops.handle(&request);
+    let mut settlement = authority.authorize(&mut request, false).unwrap();
+    let response = settlement.execute(ops, |ops| ops.handle(&request));
     authority.settle(settlement, &response);
     response
 }
@@ -10856,6 +11070,9 @@ fn both_receivers_update_in_place_only_files_they_vouch_for() {
             authority.copy.options.preserve_times = true;
             authority.copy.limits.max_entries = 1000;
             reader = Some(start_results(&authority, secret));
+            // A connection serves the copy of the authority it was set up
+            // for, whose files are let go when it is dropped.
+            receiver.ops = authority.test_ops();
             receiver.authority = Some(authority);
         }
         let case = format!("restricted={restricted}");
@@ -11030,6 +11247,9 @@ fn both_receivers_settle_each_file_of_an_in_place_batch_alike() {
             authority.copy.options.preserve_times = true;
             authority.copy.limits.max_entries = 1000;
             reader = Some(start_results(&authority, secret));
+            // A connection serves the copy of the authority it was set up
+            // for, whose files are let go when it is dropped.
+            receiver.ops = authority.test_ops();
             receiver.authority = Some(authority);
         }
         let case = format!("restricted={restricted}");
@@ -11230,6 +11450,9 @@ fn both_receivers_hold_leases_on_the_files_they_compared() {
             authority.copy.options.preserve_times = true;
             authority.copy.limits.max_entries = 1000;
             reader = Some(start_results(&authority, secret));
+            // A connection serves the copy of the authority it was set up
+            // for, whose files are let go when it is dropped.
+            receiver.ops = authority.test_ops();
             receiver.authority = Some(authority);
         }
         let case = format!("restricted={restricted} trusted={trusted}");
