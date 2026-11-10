@@ -403,7 +403,10 @@ struct DirectoryStream {
     failed_guarded: Vec<PathBytes>,
     /// Directories skipped for that, whose leaves are still to be planned.
     skipped: Vec<usize>,
-    /// Sending was held for a request with a no-replace creation.
+    /// Directories whose no-replace creation is sent but not yet answered:
+    /// nothing beneath them is sent until it is.
+    unanswered_guarded: std::collections::HashSet<PathBytes>,
+    /// Sending was held for that.
     held: bool,
 }
 
@@ -411,10 +414,8 @@ struct DirectoryStream {
 struct SentDirectories {
     pending: crate::conn::PendingReply,
     sent: std::time::Instant,
-    /// It creates a directory only where nothing is (`TargetCondition` other
-    /// than `Any`).
-    guarded: bool,
-    /// It was held until such a request was answered.
+    /// It was held until a request creating a directory above it only where
+    /// nothing is (`TargetCondition` other than `Any`) was answered.
     after_hold: bool,
     /// Its directories, as indices into the batch's new directories.
     chosen: Vec<usize>,
@@ -3011,6 +3012,7 @@ impl Planner<'_> {
             stopped: false,
             failed_guarded: Vec::new(),
             skipped: Vec::new(),
+            unanswered_guarded: Default::default(),
             held: false,
         };
         if stream.queue.is_empty() && !stream.last_metadata.is_empty() {
@@ -3059,22 +3061,35 @@ impl Planner<'_> {
         dst_root: &[u8],
     ) -> Result<()> {
         use super::directory_stream::REQUESTS_IN_FLIGHT;
-        // A request with a no-replace creation is answered before any other
-        // is sent, so that a directory beneath one that failed is not sent.
         while !stream.stopped
             && stream.in_flight.len() < REQUESTS_IN_FLIGHT
             && !stream.queue.is_empty()
-            && !stream.in_flight.iter().any(|request| request.guarded)
         {
             if self.sched.is_aborted() {
                 stream.stopped = true;
                 break;
             }
             let growth = self.directory_pacing.growth();
-            let chosen =
-                stream
-                    .queue
-                    .next(growth, &stream.sizes, crate::proto::METADATA_BATCH_BYTES);
+            // A directory beneath a no-replace creation is sent only once
+            // that creation is answered, so that nothing is sent beneath one
+            // that failed. The receiver skips such directories itself within
+            // one request.
+            let chosen = stream.queue.next(
+                growth,
+                &stream.sizes,
+                crate::proto::METADATA_BATCH_BYTES,
+                |i| {
+                    super::directory_stream::beneath_one_of(
+                        apply_path(stream.mkdirs[i].as_ref().expect("not yet sent")),
+                        &stream.unanswered_guarded,
+                    )
+                },
+            );
+            if chosen.is_empty() {
+                debug_assert!(!stream.in_flight.is_empty(), "held for an answered request");
+                stream.held = true;
+                break;
+            }
             // Nothing at or beneath a directory whose no-replace creation
             // failed is created: it holds what was there.
             let (chosen, skipped): (Vec<usize>, Vec<usize>) = chosen.into_iter().partition(|&i| {
@@ -3135,23 +3150,22 @@ impl Planner<'_> {
             // Held back on purpose, it reached the receiver after the
             // previous reply: that is no sign of a slow link.
             let after_hold = std::mem::take(&mut stream.held);
-            let guarded = targets
-                .iter()
-                .any(|(_, condition)| *condition != TargetCondition::Any);
             let sent = std::time::Instant::now();
             let pending = self.dst.send_pending(Request::Apply { ops })?;
+            stream.unanswered_guarded.extend(
+                targets
+                    .iter()
+                    .filter(|(_, condition)| *condition != TargetCondition::Any)
+                    .map(|(path, _)| path.clone()),
+            );
             stream.in_flight.push_back(SentDirectories {
                 pending,
                 sent,
                 after_hold,
-                guarded,
                 chosen,
                 targets,
                 count,
             });
-        }
-        if !stream.queue.is_empty() && stream.in_flight.iter().any(|request| request.guarded) {
-            stream.held = true;
         }
         Ok(())
     }
@@ -3185,8 +3199,11 @@ impl Planner<'_> {
             // Failed early metadata is retried, and reported, at the end.
             errs.truncate(request.targets.len());
             for ((path, condition), error) in request.targets.iter().zip(&errs) {
-                if error.is_some() && *condition != TargetCondition::Any {
-                    stream.failed_guarded.push(path.clone());
+                if *condition != TargetCondition::Any {
+                    stream.unanswered_guarded.remove(path);
+                    if error.is_some() {
+                        stream.failed_guarded.push(path.clone());
+                    }
                 }
             }
             if let Err(error) = self.record_new_directories(

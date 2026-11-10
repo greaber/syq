@@ -5,7 +5,7 @@
 //! directories each request creates and how large the requests are.
 
 use crate::proto::PathBytes;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 /// Requests kept in flight. The control connection's reader queues this many
@@ -87,8 +87,16 @@ impl DirectoryQueue {
     /// levels deep, within `byte_limit` by `sizes` (each directory's share
     /// of the request). A deeper level joins only once the levels above it
     /// are all in this or an earlier request, so a directory is never
-    /// created before its parent.
-    pub(super) fn next(&mut self, growth: usize, sizes: &[usize], byte_limit: usize) -> Vec<usize> {
+    /// created before its parent. The request ends before the first
+    /// directory that `waits`, which stays queued; it is empty when that is
+    /// the next one.
+    pub(super) fn next(
+        &mut self,
+        growth: usize,
+        sizes: &[usize],
+        byte_limit: usize,
+        waits: impl Fn(usize) -> bool,
+    ) -> Vec<usize> {
         let total = PER_REQUEST * growth;
         let per_parent = PER_PARENT * growth;
         let mut chosen = Vec::new();
@@ -105,6 +113,7 @@ impl DirectoryQueue {
                     };
                     if chosen.len() == total
                         || (!chosen.is_empty() && bytes.saturating_add(sizes[index]) > byte_limit)
+                        || waits(index)
                     {
                         full = true;
                         break;
@@ -149,6 +158,18 @@ pub(super) fn beneath_any(path: &[u8], roots: &[PathBytes]) -> bool {
     roots.iter().any(|root| {
         path == root.as_slice() || (path.starts_with(root) && path.get(root.len()) == Some(&b'/'))
     })
+}
+
+/// Whether one of `path`'s ancestors is in `directories`.
+pub(super) fn beneath_one_of(path: &[u8], directories: &HashSet<PathBytes>) -> bool {
+    let mut current = path;
+    while let Some(parent) = parent_of(current) {
+        if directories.contains(parent) {
+            return true;
+        }
+        current = parent;
+    }
+    false
 }
 
 /// The nearest of `path`'s ancestors that `index` holds.
@@ -264,7 +285,7 @@ mod tests {
     fn drain(queue: &mut DirectoryQueue, sizes: &[usize], growth: usize) -> Vec<Vec<usize>> {
         let mut requests = Vec::new();
         while !queue.is_empty() {
-            let request = queue.next(growth, sizes, usize::MAX);
+            let request = queue.next(growth, sizes, usize::MAX, |_| false);
             assert!(!request.is_empty(), "a request creates something");
             requests.push(request);
         }
@@ -331,9 +352,39 @@ mod tests {
             vec![64, 64, 64, 8]
         );
         let (mut queue, sizes) = queued(&paths);
-        assert_eq!(queue.next(1, &sizes, 250).len(), 2);
+        assert_eq!(queue.next(1, &sizes, 250, |_| false).len(), 2);
         // One directory goes alone even past the limit.
-        assert_eq!(queue.next(1, &sizes, 50).len(), 1);
+        assert_eq!(queue.next(1, &sizes, 50, |_| false).len(), 1);
+    }
+
+    #[test]
+    fn a_request_stops_at_the_first_directory_that_waits() {
+        // Many directories in one parent, as a restricted receiver's
+        // no-replace mapping parents are: none lies beneath another, so
+        // requests keep coming while earlier ones are unanswered.
+        let paths: Vec<String> = (0..8).map(|i| format!("/d/{i}")).collect();
+        let mut paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+        paths.push("/d/0/child");
+        let (mut queue, sizes) = queued(&paths);
+        let unanswered: std::cell::RefCell<HashSet<PathBytes>> = Default::default();
+        let waits = |i: usize| beneath_one_of(paths[i].as_bytes(), &unanswered.borrow());
+        for expected in [vec![0, 1], vec![2, 3], vec![4, 5], vec![6, 7]] {
+            let request = queue.next(1, &sizes, usize::MAX, waits);
+            assert_eq!(request, expected);
+            unanswered
+                .borrow_mut()
+                .extend(request.iter().map(|&i| paths[i].as_bytes().to_vec()));
+        }
+        // The child of an unanswered directory waits, and stays queued.
+        assert!(queue.next(1, &sizes, usize::MAX, waits).is_empty());
+        assert!(!queue.is_empty());
+        unanswered.borrow_mut().clear();
+        assert_eq!(queue.next(1, &sizes, usize::MAX, waits), vec![8]);
+        assert!(queue.is_empty());
+        // A grown request takes what is ahead of the first that waits.
+        let (mut queue, sizes) = queued(&["/d/a", "/d/b", "/d/c", "/d/a/x"]);
+        assert_eq!(queue.next(4, &sizes, usize::MAX, |i| i == 2), vec![0, 1]);
+        assert_eq!(queue.next(4, &sizes, usize::MAX, |_| false), vec![2, 3]);
     }
 
     #[test]
@@ -349,6 +400,10 @@ mod tests {
         assert!(beneath_any(b"/d/new/a/b", &failed));
         assert!(!beneath_any(b"/d/newer", &failed));
         assert!(!beneath_any(b"/d", &failed));
+        let unanswered: HashSet<PathBytes> = [b"/d/new".to_vec()].into();
+        assert!(beneath_one_of(b"/d/new/a/b", &unanswered));
+        assert!(!beneath_one_of(b"/d/new", &unanswered));
+        assert!(!beneath_one_of(b"/d/newer/a", &unanswered));
         assert_eq!(parent_of(b"/"), None);
     }
 
