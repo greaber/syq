@@ -30,8 +30,17 @@ pub(super) struct Planner<'a> {
     /// The destination root itself was missing at preflight. Until this copy
     /// creates it, planning treats it as absent without another lookup.
     pub(super) destination_root_known_missing: bool,
-    /// Called after jobs are queued; starts streaming only when useful work exists.
-    pub(super) start_streaming: &'a dyn Fn(),
+    /// Called after jobs are queued; starts streaming only when useful work
+    /// exists. Given the files the batch will still queue when they were
+    /// queued while its directories are being created
+    /// (`create_directories_streaming`).
+    pub(super) start_streaming: &'a dyn Fn(Option<super::directory_stream::Anticipated>),
+    /// The destination is on a network filesystem: create a batch's new
+    /// directories in requests sent back to back, and plan each leaf once
+    /// its directory exists (`create_directories_streaming`).
+    pub(super) stream_directories: bool,
+    /// How large those requests are, kept across batches.
+    pub(super) directory_pacing: super::directory_stream::Pacing,
     pub(super) source_partials: u64,
     pub(super) collision: bool,
     /// (dst path, meta, flags, depth, root condition) for directories,
@@ -362,6 +371,59 @@ struct EarlyMetadata {
     /// A private destination root to open, with owner access, to the mode
     /// creating it from this proposal would have given it.
     root_default: Option<u32>,
+}
+
+/// A batch's directory creations, ready to send (`prepare_new_directories`).
+struct NewDirectories {
+    /// `Op::Mkdir` for each new directory, in batch order.
+    mkdirs: Vec<Op>,
+    /// Early metadata sent with the creations (`EarlyMetadata::created`).
+    created_metadata: Vec<Op>,
+    root_default: Option<u32>,
+}
+
+/// A batch's directories being created in requests sent back to back
+/// (`Planner::create_directories_streaming`).
+struct DirectoryStream {
+    queue: super::directory_stream::DirectoryQueue,
+    /// Each new directory's creation, until it is sent.
+    mkdirs: Vec<Option<Op>>,
+    /// Each new directory's early metadata, sent in the same request.
+    own_metadata: Vec<Vec<Op>>,
+    /// Early metadata for directories that already exist, sent with the
+    /// last request.
+    last_metadata: Vec<Op>,
+    /// Each directory's share of its request, with its early metadata.
+    sizes: Vec<usize>,
+    in_flight: std::collections::VecDeque<SentDirectories>,
+    /// Send nothing more: the copy was cancelled or a request failed.
+    stopped: bool,
+}
+
+/// One request of a `DirectoryStream`, waiting for its reply.
+struct SentDirectories {
+    pending: crate::conn::PendingReply,
+    sent: std::time::Instant,
+    /// The size it was sent at (`directory_stream::Pacing`).
+    growth: usize,
+    /// Its directories, as indices into the batch's new directories.
+    chosen: Vec<usize>,
+    /// Their paths and conditions, in request order.
+    targets: Vec<(PathBytes, TargetCondition)>,
+    /// Operations in the request, early metadata included.
+    count: usize,
+}
+
+/// The path and condition of each `Op::Mkdir` at the start of `ops`.
+fn mkdir_targets(ops: &[Op]) -> Vec<(PathBytes, TargetCondition)> {
+    ops.iter()
+        .map_while(|op| match op {
+            Op::Mkdir {
+                path, condition, ..
+            } => Some((path.clone(), *condition)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// One scanned batch after the mapping loop: every destination claimed,
@@ -1305,7 +1367,7 @@ impl Planner<'_> {
             Some(buf) => buf.push(mapped),
             None => self.apply_mapped(mapped)?,
         }
-        (self.start_streaming)();
+        (self.start_streaming)(None);
         #[cfg(debug_assertions)]
         if self.progress.files_total.load(Relaxed) >= STREAMING_START_FILES as u64 {
             crate::fsops::test_race_barrier(
@@ -1709,7 +1771,7 @@ impl Planner<'_> {
             directory_expression_sources,
             dst_root,
             dirs,
-            mut others,
+            others,
             dir_stats,
             mut other_stats,
         } = mapped;
@@ -1762,6 +1824,19 @@ impl Planner<'_> {
             let planned = self.filter_dirs(dirs, stats, dst_root)?;
             if opts.dry_run {
                 self.trace_dry_run_dirs(&planned, dst_root);
+            } else if self.stream_directories {
+                // What each leaf's destination holds is looked up before any
+                // directory is created, so that its file can be planned as
+                // soon as its directory exists.
+                let leaves =
+                    self.leaf_entries(others, other_stats, root_entry.as_ref(), dst_root)?;
+                let mut leaf_ops = LeafOps::default();
+                if !self.create_directories_streaming(&planned, dst_root, leaves, &mut leaf_ops)? {
+                    return Ok(());
+                }
+                self.defer_directory_metadata(&planned)?;
+                self.flush_meta_fixes(leaf_ops.meta_fixes)?;
+                return self.flush_leaf_ops(leaf_ops.ops, &leaf_ops.names);
             } else {
                 if !self.create_directories(&planned, dst_root)? {
                     return Ok(());
@@ -1770,17 +1845,32 @@ impl Planner<'_> {
             }
         }
 
+        let leaves = self.leaf_entries(others, other_stats, root_entry.as_ref(), dst_root)?;
+        let mut leaf_ops = LeafOps::default();
+        for (p, dst_entry) in leaves {
+            self.plan_leaf(p, dst_entry, dst_root, &mut leaf_ops)?;
+        }
+        self.flush_meta_fixes(leaf_ops.meta_fixes)?;
+        self.flush_leaf_ops(leaf_ops.ops, &leaf_ops.names)
+    }
+
+    /// The batch's leaves that are still to be planned, each with what the
+    /// destination holds at its path.
+    fn leaf_entries(
+        &mut self,
+        mut others: Vec<Planned>,
+        mut other_stats: Option<std::collections::HashMap<PathBytes, Option<Entry>>>,
+        root_entry: Option<&Entry>,
+        dst_root: &[u8],
+    ) -> Result<Vec<(Planned, Option<Entry>)>> {
         if !self.blocked_directory_paths.is_empty() {
             others.retain(|p| !self.under_blocked_directory(&p.dst));
         }
         if others.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let stats = if self.destination_children_known_missing {
-            self.stat_fresh_descendants(
-                root_entry.as_ref(),
-                others.iter().map(|planned| &planned.dst),
-            )?
+            self.stat_fresh_descendants(root_entry, others.iter().map(|planned| &planned.dst))?
         } else if let Some(stats) = &mut other_stats {
             others
                 .iter()
@@ -1796,86 +1886,94 @@ impl Planner<'_> {
                 dst_root,
             )?
         };
-        let mut leaf_ops = LeafOps::default();
-        for (p, dst_entry) in others.into_iter().zip(stats) {
-            // A preview reported this entry's directory as not inspected.
-            if opts.dry_run && Self::under_any(&self.blocked_directory_paths, &p.dst, dst_root) {
-                continue;
+        Ok(others.into_iter().zip(stats).collect())
+    }
+
+    /// Decide what one mapped leaf needs, given what its destination holds.
+    fn plan_leaf(
+        &mut self,
+        p: Planned,
+        dst_entry: Option<Entry>,
+        dst_root: &[u8],
+        leaf_ops: &mut LeafOps,
+    ) -> Result<()> {
+        let opts = self.opts;
+        // A preview reported this entry's directory as not inspected.
+        if opts.dry_run && Self::under_any(&self.blocked_directory_paths, &p.dst, dst_root) {
+            return Ok(());
+        }
+        let target_condition = self.exact_condition_for(&p.dst);
+        let target_condition_holds = match (target_condition, &dst_entry) {
+            (TargetCondition::Any, _) | (TargetCondition::Absent, None) => true,
+            (TargetCondition::Absent, Some(_)) => false,
+            (TargetCondition::Matches { dev, ino }, Some(entry)) => {
+                entry.dev == dev && entry.ino == ino
             }
-            let target_condition = self.exact_condition_for(&p.dst);
-            let target_condition_holds = match (target_condition, &dst_entry) {
-                (TargetCondition::Any, _) | (TargetCondition::Absent, None) => true,
-                (TargetCondition::Absent, Some(_)) => false,
-                (TargetCondition::Matches { dev, ino }, Some(entry)) => {
-                    entry.dev == dev && entry.ino == ino
-                }
-                (TargetCondition::Matches { .. }, None) => false,
-                (
-                    TargetCondition::MatchesFingerprint {
-                        dev,
-                        ino,
-                        ctime,
-                        ctime_nsec,
-                    },
-                    Some(entry),
-                ) => {
-                    entry.dev == dev
-                        && entry.ino == ino
-                        && entry.ctime == ctime
-                        && entry.ctime_nsec == ctime_nsec
-                }
-                (TargetCondition::MatchesFingerprint { .. }, None) => false,
-            };
-            if !target_condition_holds {
-                self.progress.error(&format!(
-                    "syq: target {} changed after the placement precondition was checked",
-                    display(&p.dst)
-                ));
-                self.collision = true;
-                continue;
+            (TargetCondition::Matches { .. }, None) => false,
+            (
+                TargetCondition::MatchesFingerprint {
+                    dev,
+                    ino,
+                    ctime,
+                    ctime_nsec,
+                },
+                Some(entry),
+            ) => {
+                entry.dev == dev
+                    && entry.ino == ino
+                    && entry.ctime == ctime
+                    && entry.ctime_nsec == ctime_nsec
             }
-            if (opts.existing || opts.ignore_existing) && self.under_missing_dir(&p.dst, dst_root) {
-                // Below a directory we won't create: nothing to do, even if the
-                // destination has something reachable there through a symlink.
+            (TargetCondition::MatchesFingerprint { .. }, None) => false,
+        };
+        if !target_condition_holds {
+            self.progress.error(&format!(
+                "syq: target {} changed after the placement precondition was checked",
+                display(&p.dst)
+            ));
+            self.collision = true;
+            return Ok(());
+        }
+        if (opts.existing || opts.ignore_existing) && self.under_missing_dir(&p.dst, dst_root) {
+            // Below a directory we won't create: nothing to do, even if the
+            // destination has something reachable there through a symlink.
+            self.progress.files_excluded.fetch_add(1, Relaxed);
+            return Ok(());
+        }
+        if opts.expressions.update.is_some() {
+            let source = crate::expression::File::from_entry(&p.e);
+            let destination = dst_entry
+                .as_ref()
+                .map(crate::expression::File::from_entry)
+                .unwrap_or_default();
+            let relative = self
+                .src_overrides
+                .get(&p.e.path)
+                .map(Vec::as_slice)
+                .unwrap_or(&p.e.path);
+            if !opts
+                .expressions
+                .permits(
+                    &source,
+                    crate::expression::source_path(&p.src, relative),
+                    &destination,
+                    crate::expression::source_path(&p.dst, &p.dst_rel),
+                )
+                .with_context(|| format!("entry {}", p.rel))?
+            {
                 self.progress.files_excluded.fetch_add(1, Relaxed);
-                continue;
-            }
-            if opts.expressions.update.is_some() {
-                let source = crate::expression::File::from_entry(&p.e);
-                let destination = dst_entry
-                    .as_ref()
-                    .map(crate::expression::File::from_entry)
-                    .unwrap_or_default();
-                let relative = self
-                    .src_overrides
-                    .get(&p.e.path)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&p.e.path);
-                if !opts
-                    .expressions
-                    .permits(
-                        &source,
-                        crate::expression::source_path(&p.src, relative),
-                        &destination,
-                        crate::expression::source_path(&p.dst, &p.dst_rel),
-                    )
-                    .with_context(|| format!("entry {}", p.rel))?
-                {
-                    self.progress.files_excluded.fetch_add(1, Relaxed);
-                    continue;
-                }
-            }
-            match p.e.kind {
-                Kind::File => self.plan_file(p, dst_entry, target_condition, &mut leaf_ops),
-                Kind::Symlink => self.plan_symlink(p, dst_entry, &mut leaf_ops),
-                Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => {
-                    self.plan_special(p, dst_entry, &mut leaf_ops)
-                }
-                Kind::Dir | Kind::Other => unreachable!("handled in the mapping loop"),
+                return Ok(());
             }
         }
-        self.flush_meta_fixes(leaf_ops.meta_fixes)?;
-        self.flush_leaf_ops(leaf_ops.ops, &leaf_ops.names)
+        match p.e.kind {
+            Kind::File => self.plan_file(p, dst_entry, target_condition, leaf_ops),
+            Kind::Symlink => self.plan_symlink(p, dst_entry, leaf_ops),
+            Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => {
+                self.plan_special(p, dst_entry, leaf_ops)
+            }
+            Kind::Dir | Kind::Other => unreachable!("handled in the mapping loop"),
+        }
+        Ok(())
     }
 
     /// Decide what a mapped regular file needs: a skip, a metadata fix, a
@@ -2773,6 +2871,262 @@ impl Planner<'_> {
     /// Create missing directories. A failed placement-root condition prevents
     /// operations below it. Existing directory access is prepared separately.
     fn create_directories(&mut self, planned: &[PlannedDir], dst_root: &[u8]) -> Result<bool> {
+        let Some(NewDirectories {
+            mut mkdirs,
+            mut created_metadata,
+            root_default,
+        }) = self.prepare_new_directories(planned)?
+        else {
+            return Ok(false);
+        };
+        // A receiver applies a request's metadata after all of its
+        // creations, so new directories take their group with the last ones.
+        if mkdirs.is_empty() {
+            if !created_metadata.is_empty() {
+                self.apply(created_metadata)?;
+            }
+        } else {
+            let targets = mkdir_targets(&mkdirs);
+            mkdirs.append(&mut created_metadata);
+            let mut errs = self.apply(mkdirs)?;
+            // Failed early metadata is retried, and reported, at the end.
+            errs.truncate(targets.len());
+            self.record_new_directories(&targets, errs, dst_root)?;
+        }
+        if let Some(proposed) = root_default {
+            self.open_private_root(proposed)?;
+        }
+        Ok(true)
+    }
+
+    /// `create_directories` on a network destination, where every creation
+    /// waits on the network. The new directories go in small requests sent
+    /// back to back (`directory_stream`), each with the early metadata of
+    /// the directories it creates, and a leaf is planned, its file handed to
+    /// workers, once the request creating the nearest new directory above it
+    /// has been answered: that directory, and so every one above it, then
+    /// already has its creation mode, group and owner. Leaves below no new
+    /// directory are planned first. A leaf directly in a directory whose
+    /// early metadata goes with the last request, a private root, waits for
+    /// everything else, as every leaf did before.
+    fn create_directories_streaming(
+        &mut self,
+        planned: &[PlannedDir],
+        dst_root: &[u8],
+        leaves: Vec<(Planned, Option<Entry>)>,
+        leaf_ops: &mut LeafOps,
+    ) -> Result<bool> {
+        let Some(NewDirectories {
+            mkdirs,
+            created_metadata,
+            root_default,
+        }) = self.prepare_new_directories(planned)?
+        else {
+            return Ok(false);
+        };
+        let index: std::collections::HashMap<PathBytes, usize> = mkdirs
+            .iter()
+            .enumerate()
+            .map(|(i, op)| (apply_path(op).to_vec(), i))
+            .collect();
+        let mut own_metadata: Vec<Vec<Op>> = (0..mkdirs.len()).map(|_| Vec::new()).collect();
+        let mut last_metadata = Vec::new();
+        for op in created_metadata {
+            match index.get(apply_path(&op)) {
+                Some(&i) => own_metadata[i].push(op),
+                None => last_metadata.push(op),
+            }
+        }
+        let mut held_directories: std::collections::HashSet<PathBytes> = last_metadata
+            .iter()
+            .map(|op| apply_path(op).to_vec())
+            .collect();
+        if root_default.is_some() {
+            held_directories.insert(self.dst_root.clone());
+        }
+        let mut waiting: Vec<Vec<(Planned, Option<Entry>)>> =
+            (0..mkdirs.len()).map(|_| Vec::new()).collect();
+        let mut ready = Vec::new();
+        let mut last = Vec::new();
+        for leaf in leaves {
+            match super::directory_stream::nearest_ancestor(&leaf.0.dst, &index) {
+                Some(i) => waiting[i].push(leaf),
+                None if super::directory_stream::parent_of(&leaf.0.dst)
+                    .is_some_and(|parent| held_directories.contains(parent)) =>
+                {
+                    last.push(leaf)
+                }
+                None => ready.push(leaf),
+            }
+        }
+        // The files still to queue once their directories exist.
+        let mut pending = super::directory_stream::Anticipated::default();
+        for (leaf, _) in waiting.iter().flatten().chain(&last) {
+            if leaf.e.kind == Kind::File {
+                pending.add(leaf.e.size);
+            }
+        }
+        if !ready.is_empty() {
+            for (leaf, entry) in ready {
+                self.plan_leaf(leaf, entry, dst_root, leaf_ops)?;
+            }
+            (self.start_streaming)((!mkdirs.is_empty()).then_some(pending));
+        }
+        let sizes: Vec<usize> = mkdirs
+            .iter()
+            .zip(&own_metadata)
+            .map(|(op, metadata)| {
+                op.size_hint() + metadata.iter().map(Op::size_hint).sum::<usize>()
+            })
+            .collect();
+        let queue = {
+            let paths: Vec<&[u8]> = mkdirs.iter().map(apply_path).collect();
+            super::directory_stream::DirectoryQueue::new(&paths)
+        };
+        let mut stream = DirectoryStream {
+            queue,
+            mkdirs: mkdirs.into_iter().map(Some).collect(),
+            own_metadata,
+            last_metadata,
+            sizes,
+            in_flight: std::collections::VecDeque::new(),
+            stopped: false,
+        };
+        if stream.queue.is_empty() && !stream.last_metadata.is_empty() {
+            // Nothing to create: a private root's metadata goes by itself.
+            self.apply(std::mem::take(&mut stream.last_metadata))?;
+        }
+        let outcome =
+            self.run_directory_stream(&mut stream, &mut waiting, &mut pending, dst_root, leaf_ops);
+        // However the stream ended, record what the requests already sent did.
+        while let Some(request) = stream.in_flight.pop_front() {
+            let Ok(response) = self.dst.take_reply(request.pending) else {
+                break;
+            };
+            if let Ok(mut errs) = self.applied(response, request.count) {
+                errs.truncate(request.targets.len());
+                let _ = self.record_new_directories(&request.targets, errs, dst_root);
+            }
+        }
+        outcome?;
+        if stream.stopped || self.sched.is_aborted() {
+            // The copy was cancelled: nothing more is created or planned.
+            return Ok(false);
+        }
+        if let Some(proposed) = root_default {
+            self.open_private_root(proposed)?;
+        }
+        if !last.is_empty() {
+            for (leaf, entry) in last {
+                self.plan_leaf(leaf, entry, dst_root, leaf_ops)?;
+            }
+            (self.start_streaming)(None);
+        }
+        Ok(true)
+    }
+
+    /// Send directory requests while fewer than `REQUESTS_IN_FLIGHT` are
+    /// unanswered, unless the stream has stopped or the copy was cancelled.
+    fn send_directory_requests(&mut self, stream: &mut DirectoryStream) -> Result<()> {
+        use super::directory_stream::REQUESTS_IN_FLIGHT;
+        while !stream.stopped
+            && stream.in_flight.len() < REQUESTS_IN_FLIGHT
+            && !stream.queue.is_empty()
+        {
+            if self.sched.is_aborted() {
+                stream.stopped = true;
+                break;
+            }
+            let growth = self.directory_pacing.growth();
+            let chosen =
+                stream
+                    .queue
+                    .next(growth, &stream.sizes, crate::proto::METADATA_BATCH_BYTES);
+            let mut ops: Vec<Op> = chosen
+                .iter()
+                .map(|&i| {
+                    stream.mkdirs[i]
+                        .take()
+                        .expect("each directory is created once")
+                })
+                .collect();
+            let targets = mkdir_targets(&ops);
+            for &i in &chosen {
+                ops.append(&mut stream.own_metadata[i]);
+            }
+            if stream.queue.is_empty() {
+                // A private root changes group only after this batch's
+                // subdirectories have inherited its starting group.
+                ops.append(&mut stream.last_metadata);
+            }
+            let count = ops.len();
+            let sent = std::time::Instant::now();
+            let pending = self.dst.send_pending(Request::Apply { ops })?;
+            stream.in_flight.push_back(SentDirectories {
+                pending,
+                sent,
+                growth,
+                chosen,
+                targets,
+                count,
+            });
+        }
+        Ok(())
+    }
+
+    /// Take each directory request's reply in turn, keeping the next ones in
+    /// flight, and plan the leaves whose directories it created.
+    fn run_directory_stream(
+        &mut self,
+        stream: &mut DirectoryStream,
+        waiting: &mut [Vec<(Planned, Option<Entry>)>],
+        pending: &mut super::directory_stream::Anticipated,
+        dst_root: &[u8],
+        leaf_ops: &mut LeafOps,
+    ) -> Result<()> {
+        let mut previous = None;
+        self.send_directory_requests(stream)?;
+        while let Some(request) = stream.in_flight.pop_front() {
+            let (response, arrival) = self.dst.take_reply_with_arrival(request.pending)?;
+            self.directory_pacing
+                .observe(request.sent, arrival, previous, request.growth);
+            previous = Some(arrival);
+            let mut errs = self.applied(response, request.count)?;
+            // Failed early metadata is retried, and reported, at the end.
+            errs.truncate(request.targets.len());
+            if let Err(error) = self.record_new_directories(&request.targets, errs, dst_root) {
+                stream.stopped = true;
+                return Err(error);
+            }
+            self.send_directory_requests(stream)?;
+            if self.sched.is_aborted() {
+                continue;
+            }
+            let mut released = false;
+            for &i in &request.chosen {
+                for (leaf, entry) in std::mem::take(&mut waiting[i]) {
+                    if leaf.e.kind == Kind::File {
+                        pending.remove(leaf.e.size);
+                    }
+                    self.plan_leaf(leaf, entry, dst_root, leaf_ops)?;
+                    released = true;
+                }
+            }
+            if released {
+                (self.start_streaming)(Some(*pending));
+            }
+        }
+        Ok(())
+    }
+
+    /// The early metadata of `planned`'s directories, applied to the ones
+    /// that exist, and the creations of the rest. A new exact target is
+    /// created first, by itself. None when that fails and nothing below it
+    /// may be changed.
+    fn prepare_new_directories(
+        &mut self,
+        planned: &[PlannedDir],
+    ) -> Result<Option<NewDirectories>> {
         let opts = self.opts;
         if !self.opts.access_limited.lock().unwrap().is_empty() {
             for (path, _, _, st) in planned {
@@ -2847,7 +3201,7 @@ impl Planner<'_> {
                     return Err(endpoint_error(error)).context("apply destination changes");
                 }
                 self.collision = true;
-                return Ok(false);
+                return Ok(None);
             }
             self.created_dirs.insert(self.dst_root.clone());
             self.progress.directories_created.fetch_add(1, Relaxed);
@@ -2863,111 +3217,88 @@ impl Planner<'_> {
             self.exact_condition = target_identity(&created);
             self.mutation_root_condition = target_identity(&created);
         }
-        // A receiver applies a request's metadata after all of its
-        // creations, so new directories take their group with the last ones.
-        let mut batches = if new_dirs.is_empty() {
-            Vec::new()
-        } else {
-            vec![new_dirs]
-        };
-        match batches.last_mut() {
-            Some(last) => last.append(&mut early.created),
-            None if !early.created.is_empty() => {
-                self.apply(std::mem::take(&mut early.created))?;
+        Ok(Some(NewDirectories {
+            mkdirs: new_dirs,
+            created_metadata: std::mem::take(&mut early.created),
+            root_default: early.root_default.take(),
+        }))
+    }
+
+    /// Report the outcome of one request's directory creations, `targets`,
+    /// whose errors are `errs`, and stop on a lack of space.
+    fn record_new_directories(
+        &mut self,
+        targets: &[(PathBytes, TargetCondition)],
+        errs: Vec<Option<WireError>>,
+        dst_root: &[u8],
+    ) -> Result<()> {
+        let opts = self.opts;
+        let capacity_error = first_capacity_error(&errs);
+        let mut failed = 0;
+        for ((name, condition), err) in targets.iter().zip(errs) {
+            let succeeded = err.is_none();
+            let created = succeeded;
+            if created {
+                self.created_dirs.insert(name.clone());
             }
-            None => {}
-        }
-        for mut new_dirs in batches {
-            let n = new_dirs
-                .iter()
-                .position(|op| !matches!(op, Op::Mkdir { .. }))
-                .unwrap_or(new_dirs.len());
-            let op_info: Vec<(PathBytes, TargetCondition)> = new_dirs[..n]
-                .iter()
-                .map(|op| match op {
-                    Op::Mkdir {
-                        path, condition, ..
-                    } => (path.clone(), *condition),
-                    _ => unreachable!(),
-                })
-                .collect();
-            let mut errs = self.apply(std::mem::take(&mut new_dirs))?;
-            // Failed early metadata is retried, and reported, at the end.
-            errs.truncate(n);
-            let capacity_error = first_capacity_error(&errs);
-            let mut failed = 0;
-            for ((name, condition), err) in op_info.iter().zip(errs) {
-                let succeeded = err.is_none();
-                let created = succeeded;
-                if created {
-                    self.created_dirs.insert(name.clone());
-                }
-                let os_kind = err.as_ref().and_then(wire_os_kind);
-                if let Some(err) = &err {
-                    failed += 1;
-                    self.progress.entry_error_classified(
-                        &format!("syq: {}", self.opts.wire_error_message_at(err, name)),
-                        Some("io"),
-                        os_kind,
-                        Some((
-                            destination_entry(name, dst_root),
-                            crate::results::ReceiverListing::Listed,
-                        )),
-                    );
-                    if name == &self.dst_root && *condition != TargetCondition::Any {
-                        self.collision = true;
-                    }
-                } else if opts.verbose > 0 {
-                    self.progress.println(&format!("{}/", display(name)));
-                }
-                if let (Some(results), Some(dst_rel)) = (
-                    self.progress.results_writer(),
-                    strip_dst_root(name, dst_root),
-                ) {
-                    // An implicit --mapping ancestor has no source and
-                    // is not independently retryable: the entries
-                    // beneath it carry the actionable retry records.
-                    let implicit = self.implicit_dirs.contains(name);
-                    let src = if implicit {
-                        None
-                    } else {
-                        self.mapping_source_rel(dst_rel)
-                    };
-                    results.emit_operation_listed(
-                        &crate::results::OperationRecord {
-                            action: "create_directory",
-                            dst: dst_rel,
-                            src: src.as_deref(),
-                            kind: "dir",
-                            disposition: if created { "succeeded" } else { "failed" },
-                            bytes: None,
-                            attempts: None,
-                            retryable: (!created).then_some(if implicit {
-                                "no"
-                            } else {
-                                "unknown"
-                            }),
-                            class: (!created).then_some("io"),
-                            os_kind,
-                            message: err.as_ref().map(WireError::as_str),
-                        },
-                        None,
-                        // The receiver lists its failures itself.
+            let os_kind = err.as_ref().and_then(wire_os_kind);
+            if let Some(err) = &err {
+                failed += 1;
+                self.progress.entry_error_classified(
+                    &format!("syq: {}", self.opts.wire_error_message_at(err, name)),
+                    Some("io"),
+                    os_kind,
+                    Some((
+                        destination_entry(name, dst_root),
                         crate::results::ReceiverListing::Listed,
-                    );
+                    )),
+                );
+                if name == &self.dst_root && *condition != TargetCondition::Any {
+                    self.collision = true;
                 }
+            } else if opts.verbose > 0 {
+                self.progress.println(&format!("{}/", display(name)));
             }
-            self.progress
-                .directories_created
-                .fetch_add((n - failed) as u64, Relaxed);
-            if let Some(error) = capacity_error {
-                return Err(endpoint_error(error)).context("apply destination changes");
+            if let (Some(results), Some(dst_rel)) = (
+                self.progress.results_writer(),
+                strip_dst_root(name, dst_root),
+            ) {
+                // An implicit --mapping ancestor has no source and
+                // is not independently retryable: the entries
+                // beneath it carry the actionable retry records.
+                let implicit = self.implicit_dirs.contains(name);
+                let src = if implicit {
+                    None
+                } else {
+                    self.mapping_source_rel(dst_rel)
+                };
+                results.emit_operation_listed(
+                    &crate::results::OperationRecord {
+                        action: "create_directory",
+                        dst: dst_rel,
+                        src: src.as_deref(),
+                        kind: "dir",
+                        disposition: if created { "succeeded" } else { "failed" },
+                        bytes: None,
+                        attempts: None,
+                        retryable: (!created).then_some(if implicit { "no" } else { "unknown" }),
+                        class: (!created).then_some("io"),
+                        os_kind,
+                        message: err.as_ref().map(WireError::as_str),
+                    },
+                    None,
+                    // The receiver lists its failures itself.
+                    crate::results::ReceiverListing::Listed,
+                );
             }
         }
-        if let Some(proposed) = early.root_default.take() {
-            self.open_private_root(proposed)?;
+        self.progress
+            .directories_created
+            .fetch_add((targets.len() - failed) as u64, Relaxed);
+        if let Some(error) = capacity_error {
+            return Err(endpoint_error(error)).context("apply destination changes");
         }
-        Ok(true)
+        Ok(())
     }
 
     /// Record what a live run would do to this batch's directories.
@@ -4628,7 +4959,13 @@ impl Planner<'_> {
             return Ok(results);
         }
         let count = ops.len();
-        match self.dst.call(Request::Apply { ops })? {
+        let response = self.dst.call(Request::Apply { ops })?;
+        self.applied(response, count)
+    }
+
+    /// The outcome of each of an `Apply` request's `count` operations.
+    fn applied(&self, response: Response, count: usize) -> Result<Vec<Option<WireError>>> {
+        match response {
             // A restricted receiver refuses a request whole when it would
             // break the grant, a limit say, and lists that refusal itself:
             // its operations fail as one, and the copy goes on to end its

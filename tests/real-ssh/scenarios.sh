@@ -836,6 +836,42 @@ ssh source 'syq cp --if-exists=keep /tmp/syq-real-ssh/return-source/message.txt 
 
 ssh source 'python3 /usr/local/libexec/syq-test-restricted-mapping.py named'
 
+printf 'case: a restricted receiver on a network filesystem gets files while it creates directories\n'
+# The laptop's receiving service, which serves the restricted receivers of
+# the copies servers send it, counts its destination as a network filesystem
+# (a debug-build hook). The server's copy then creates each batch's
+# directories in small requests and sends a directory's files once it exists.
+ssh source sh -s <<'NETWORK_TREE'
+set -eu
+root=/tmp/syq-real-ssh/network-tree
+for directory in 0 1 2 3 4 5 6 7; do
+    for sub in 0 1 2 3; do
+        install -d -m 0750 "$root/d$directory/s$sub"
+        for file in 0 1; do
+            printf '%s\n' "d$directory/s$sub/f$file" >"$root/d$directory/s$sub/f$file"
+        done
+    done
+done
+NETWORK_TREE
+syq persist off
+SYQ_TEST_NETWORK_FILESYSTEM=1 syq persist connect source
+syq persist receive wait source --timeout 30
+ssh source 'syq persist destinations wait laptop --timeout 30'
+ssh source 'syq cp --copy-metadata permissions --srcs-in /tmp/syq-real-ssh/network-tree --to @laptop --into network-tree'
+remote_manifest source /tmp/syq-real-ssh/network-tree /tmp/syq-network-tree-source.manifest
+(
+    cd "$receive_root/network-tree"
+    {
+        find . -mindepth 1 -printf '%y %m %p -> %l\n'
+        find . -type f -exec sha256sum {} +
+    } | LC_ALL=C sort
+) > /tmp/syq-network-tree-local.manifest
+diff -u /tmp/syq-network-tree-source.manifest /tmp/syq-network-tree-local.manifest
+syq persist off
+syq persist connect source
+syq persist receive wait source --timeout 30
+ssh source 'syq persist destinations wait laptop --timeout 30'
+
 printf 'case: named return rejects traversal and receiver symlink escape\n'
 ln -s /tmp/syq-real-ssh-receive-other "$receive_root/escape"
 if ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as escape/escaped'; then
