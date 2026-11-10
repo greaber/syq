@@ -3057,6 +3057,29 @@ fn transport_paced_receive_stops_when_scheduler_aborts() {
     assert!(receiving.join().unwrap().is_err());
 }
 
+/// A control connection paced only for the small-copy shortcut's payload
+/// carries the rest of a restricted destination's copy as before: unpaced,
+/// and reading its replies after a failure cancels the copy, as finishing
+/// the destination's results does.
+#[test]
+fn a_control_connection_paced_for_a_shortcut_is_unpaced_after_it() {
+    let mut connection = connection_replaying(&[Response::Ok]);
+    let scheduler = std::sync::Arc::new(crate::sched::Sched::new(4 << 20, 32 << 20));
+    // One byte a second: a paced send would wait, or fail once cancelled.
+    let budget = std::sync::Arc::new(crate::bwlimit::transport::Budget::new(1));
+    let pacing = connection
+        .pace_outgoing(budget, std::sync::Arc::downgrade(&scheduler))
+        .unwrap();
+    assert!(connection.transport_paced());
+    connection.end_outgoing_pacing(pacing);
+    assert!(!connection.transport_paced());
+    scheduler.abort();
+    let started = std::time::Instant::now();
+    connection.send(Request::FinishDestinationResults).unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    assert!(matches!(connection.recv().unwrap(), Response::Ok));
+}
+
 #[test]
 fn ssh_remote_shells_share_connections_unless_they_configure_sharing() {
     let words = |command: &str| shell_words::split(command).unwrap();

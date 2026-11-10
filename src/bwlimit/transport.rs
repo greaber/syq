@@ -184,7 +184,11 @@ pub(crate) struct PacedWriter<W, S, B = std::sync::Arc<Budget>> {
     pub(crate) inner: W,
     pub(crate) budget: B,
     pub(crate) stopped: S,
-    pub(crate) handshake_pending: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// While set, writes go out unpaced: during a connection's handshake,
+    /// which the budget does not count, and on a control connection once
+    /// the small-copy shortcut that paced it is over
+    /// (`Conn::end_outgoing_pacing`).
+    pub(crate) unpaced: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl<W: Write, S: Fn() -> bool, B: std::borrow::Borrow<Budget>> Write for PacedWriter<W, S, B> {
@@ -193,7 +197,7 @@ impl<W: Write, S: Fn() -> bool, B: std::borrow::Borrow<Budget>> Write for PacedW
             return Ok(0);
         }
         if self
-            .handshake_pending
+            .unpaced
             .as_ref()
             .is_some_and(|active| active.load(std::sync::atomic::Ordering::Acquire))
         {
@@ -207,7 +211,7 @@ impl<W: Write, S: Fn() -> bool, B: std::borrow::Borrow<Budget>> Write for PacedW
 
     fn write_vectored(&mut self, buffers: &[io::IoSlice<'_>]) -> io::Result<usize> {
         if self
-            .handshake_pending
+            .unpaced
             .as_ref()
             .is_some_and(|active| active.load(std::sync::atomic::Ordering::Acquire))
         {
@@ -263,7 +267,7 @@ impl<W: Write, S: Fn() -> bool> Write for SessionWriter<W, S> {
                 inner: &mut self.inner,
                 budget: &**budget,
                 stopped: &self.stopped,
-                handshake_pending: None,
+                unpaced: None,
             }
             .write(bytes),
         }
@@ -275,7 +279,7 @@ impl<W: Write, S: Fn() -> bool> Write for SessionWriter<W, S> {
                 inner: &mut self.inner,
                 budget: &**budget,
                 stopped: &self.stopped,
-                handshake_pending: None,
+                unpaced: None,
             }
             .write_vectored(buffers),
         }
@@ -322,7 +326,7 @@ mod tests {
     #[test]
     fn cancellation_writes_nothing_and_is_not_retryable() {
         let mut writer = PacedWriter {
-            handshake_pending: None,
+            unpaced: None,
             inner: Vec::new(),
             budget: std::sync::Arc::new(Budget::new(1024)),
             stopped: || true,
@@ -338,7 +342,7 @@ mod tests {
         budget.reserve(clock_ns(), budget.chunk());
         let checks = std::cell::Cell::new(0);
         let mut writer = PacedWriter {
-            handshake_pending: None,
+            unpaced: None,
             inner: Vec::new(),
             budget,
             stopped: || {
@@ -358,7 +362,7 @@ mod tests {
         let budget = std::sync::Arc::new(Budget::new(u64::MAX));
         let input = vec![42; 3 * MAX_CHUNK as usize + 17];
         let mut writer = PacedWriter {
-            handshake_pending: None,
+            unpaced: None,
             inner: Vec::new(),
             budget,
             stopped: || false,
@@ -383,7 +387,7 @@ mod tests {
         // The default vectored writer uses only the first slice. Short writes
         // exercise partial progress and the boundary across header and body.
         let mut writer = PacedWriter {
-            handshake_pending: None,
+            unpaced: None,
             inner: ShortWriter(Vec::new()),
             budget: std::sync::Arc::new(Budget::new(u64::MAX)),
             stopped: || false,
@@ -408,7 +412,7 @@ mod tests {
         let socket = server.try_clone().unwrap();
         let writer = std::thread::spawn(move || {
             let mut writer = PacedWriter {
-                handshake_pending: None,
+                unpaced: None,
                 inner: server,
                 budget: std::sync::Arc::new(Budget::new(1)),
                 stopped: || socket_closed(&socket),

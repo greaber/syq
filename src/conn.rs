@@ -37,18 +37,28 @@ pub(crate) use local::*;
 pub(crate) use ssh_multiplexer::*;
 pub(crate) use tcp_socket::*;
 
+/// The pacing that `Conn::pace_outgoing` gave a control connection: setting
+/// it lets the paced writer send unpaced (`PacedWriter::unpaced`).
+pub(crate) struct OutgoingPacing(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
 pub trait Conn: Send {
     /// True when this data connection has a sender-side transport budget.
     fn transport_paced(&self) -> bool {
         false
     }
+    /// Pace this control connection's sends with `budget`, and stop waiting
+    /// for a reply once `scheduler` is cancelled, until
+    /// `end_outgoing_pacing`.
     fn pace_outgoing(
         &mut self,
         _budget: std::sync::Arc<crate::bwlimit::transport::Budget>,
         _scheduler: std::sync::Weak<crate::sched::Sched>,
-    ) -> Result<()> {
+    ) -> Result<OutgoingPacing> {
         bail!("outgoing transport pacing requires a remote connection")
     }
+    /// Send unpaced again, and wait for replies after the copy is cancelled,
+    /// as before `pace_outgoing`.
+    fn end_outgoing_pacing(&mut self, _pacing: OutgoingPacing) {}
     fn observe(
         &mut self,
         _observations: &crate::transfer_observations::Observations,
@@ -1233,7 +1243,7 @@ impl Conn for RemoteConn {
         &mut self,
         budget: std::sync::Arc<crate::bwlimit::transport::Budget>,
         scheduler: std::sync::Weak<crate::sched::Sched>,
-    ) -> Result<()> {
+    ) -> Result<OutgoingPacing> {
         anyhow::ensure!(
             self.transport_stop.is_none() && self.tcp_socket.is_none(),
             "sender budget already configured or not an SSH control connection"
@@ -1244,15 +1254,20 @@ impl Conn for RemoteConn {
         );
         let compress = old.compress;
         let stopped = scheduler.clone();
+        let unpaced = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writer = crate::bwlimit::transport::PacedWriter {
             inner: old.into_inner()?,
             budget,
-            handshake_pending: None,
+            unpaced: Some(unpaced.clone()),
             stopped: move || stopped.upgrade().is_none_or(|s| s.is_aborted()),
         };
         self.w = FrameWriter::with_preamble_written(Box::new(writer), compress);
         self.transport_stop = Some(scheduler);
-        Ok(())
+        Ok(OutgoingPacing(unpaced))
+    }
+    fn end_outgoing_pacing(&mut self, pacing: OutgoingPacing) {
+        pacing.0.store(true, std::sync::atomic::Ordering::Release);
+        self.transport_stop = None;
     }
     fn observe(
         &mut self,
@@ -2865,7 +2880,7 @@ impl RemoteSpec {
                         handshake_pending: handshake.clone(),
                     },
                     budget: pacing.budget.clone(),
-                    handshake_pending: Some(handshake.clone()),
+                    unpaced: Some(handshake.clone()),
                     stopped: move || scheduler.upgrade().is_none_or(|s| s.is_aborted()),
                 })
             } else {
@@ -3403,7 +3418,7 @@ impl RemoteSpec {
                 let scheduler = pacing.scheduler.clone();
                 let socket = stream.try_clone()?;
                 Box::new(crate::bwlimit::transport::PacedWriter {
-                    handshake_pending: Some(pacing_handshake.clone()),
+                    unpaced: Some(pacing_handshake.clone()),
                     inner: crate::bwlimit::activity::ActivityIo {
                         inner: stream.try_clone()?,
                         bytes: pacing.activity.clone(),
@@ -3492,7 +3507,7 @@ where
         .try_clone_to_owned()
         .context("watch a paced connection")?;
     Ok(Box::new(crate::bwlimit::transport::PacedWriter {
-        handshake_pending: Some(handshake.clone()),
+        unpaced: Some(handshake.clone()),
         inner: crate::bwlimit::activity::ActivityIo {
             inner: socket,
             bytes: pacing.activity.clone(),
