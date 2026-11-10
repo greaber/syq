@@ -3004,7 +3004,8 @@ impl FsOps {
     /// held while its name still leads to it and the copy goes on, so that
     /// it can be finalized again. A Finalize sent again after its connection dropped waits for
     /// the first one, and then finds the file held again, or published, and
-    /// then answers as the first one did.
+    /// then answers as the first one did. One that may publish nothing new
+    /// (`set_finalize_repeat_only`) only answers so.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn finalize_rooted(
         &mut self,
@@ -3018,9 +3019,18 @@ impl FsOps {
         expected: Option<&crate::hashing::ExpectedHashes>,
     ) -> Result<Option<(u64, u64)>> {
         let held_for = stages::of(self.stage_scope, target, copy_id, inplace);
-        let (held, finalizing) = match stages::finalize(held_for) {
+        let found = match self.finalize_repeat_only {
+            Some(refusal) => Some(stages::Found::Published(
+                stages::repeated(held_for).ok_or_else(|| anyhow!(refusal))?,
+            )),
+            None => stages::finalize(held_for),
+        };
+        let (held, finalizing) = match found {
             Some(stages::Found::Held(held, finalizing)) => (*held, finalizing),
-            Some(stages::Found::Published(identity)) => return Ok(identity),
+            Some(stages::Found::Published(identity)) => {
+                self.finalize_repeated = true;
+                return Ok(identity);
+            }
             None => return Err(stages::not_held(&target.label)),
         };
         // An in-place request whose name held another file wrote a stage

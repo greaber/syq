@@ -935,6 +935,13 @@ pub struct FsOps {
     /// This connection's number, which the files it publishes are
     /// remembered by (`stages`).
     stage_connection: u64,
+    /// The request being executed is a Finalize that may only be answered
+    /// as one that already published its file, and is refused otherwise,
+    /// with this reason (`set_finalize_repeat_only`).
+    finalize_repeat_only: Option<&'static str>,
+    /// A Finalize was answered as one that already published its file,
+    /// since `take_finalize_repeated`.
+    finalize_repeated: bool,
     comparison_window: Option<ComparisonWindow>,
     partial_candidates: HashMap<FileLocation, HashMap<PathBytes, Vec<PathBytes>>>,
     partial_directory_order: VecDeque<FileLocation>,
@@ -1208,6 +1215,20 @@ impl FsOps {
         self.stage_scope
     }
 
+    /// Let the next requests publish nothing new: a Finalize among them is
+    /// answered only as one that already published its file (`stages`),
+    /// and fails with `refusal` otherwise. A restricted receiver sets this
+    /// for a Finalize its signed limits leave no room for.
+    pub(crate) fn set_finalize_repeat_only(&mut self, refusal: Option<&'static str>) {
+        self.finalize_repeat_only = refusal;
+    }
+
+    /// Whether a Finalize was answered as one that already published its
+    /// file since this was last asked: it changed nothing.
+    pub(crate) fn take_finalize_repeated(&mut self) -> bool {
+        std::mem::take(&mut self.finalize_repeated)
+    }
+
     fn observed_payload_hash(&self, bytes: &[u8]) -> ContentDigest {
         let _hash = self
             .operation
@@ -1262,6 +1283,8 @@ impl FsOps {
             held_basis: None,
             stage_scope: 0,
             stage_connection: stages::new_connection(),
+            finalize_repeat_only: None,
+            finalize_repeated: false,
             comparison_window: None,
             partial_candidates: HashMap::new(),
             partial_directory_order: VecDeque::new(),

@@ -1639,7 +1639,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
             w.write_msg(&Response::WriteStreamDone)?;
             continue;
         }
-        let settlement = match &mut stream_gate {
+        let mut settlement = match &mut stream_gate {
             Some(gate) => match gate.authorize(&mut req, over_ssh) {
                 Ok(settlement) => Some(settlement),
                 Err(error) => {
@@ -2092,10 +2092,16 @@ fn serve<R: Read + Send + 'static, W: Write>(
                         Err(error) => Response::Err(format!("{error:#}")),
                     }
                 } else {
-                    ops.handle_with_copy_progress(&mut other, &mut |bytes| {
-                        w.write_msg(&Response::CopyLocalProgress(bytes))?;
-                        Ok(())
-                    })
+                    let mut execute = |ops: &mut FsOps| {
+                        ops.handle_with_copy_progress(&mut other, &mut |bytes| {
+                            w.write_msg(&Response::CopyLocalProgress(bytes))?;
+                            Ok(())
+                        })
+                    };
+                    match &mut settlement {
+                        Some(settlement) => settlement.execute(&mut ops, execute),
+                        None => execute(&mut ops),
+                    }
                 };
                 if let (Some(gate), Some(settlement)) = (&mut stream_gate, settlement) {
                     gate.settle(settlement, &resp, ops.patch_stream_open());
