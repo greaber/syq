@@ -617,6 +617,11 @@ impl ManagementBuild {
     /// release helper downloaded and verified, or taken from this machine's
     /// store.
     pub(super) fn bytes(self) -> Result<Vec<u8>> {
+        // Tests stand for a release helper that cannot be downloaded.
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYQ_TEST_MANAGEMENT_BUILD_UNAVAILABLE").is_some() {
+            bail!("download the syq to install: unavailable (test)");
+        }
         match self {
             Self::Local(file) => read_all(&file),
             Self::Release(helper) => crate::update::verified_current_helper(&helper),
@@ -1167,6 +1172,9 @@ fn install_over_route(
     };
     // Everything before the request is checked with nothing installed: an
     // error closes the session's input, and the remote shell stops.
+    // Whether this attempt stored the pending record, which it removes when
+    // the server is found to have installed nothing.
+    let mut stored_pending = false;
     let prepared = (|| -> Result<_> {
         // A copy the receiver would refuse leaves no enrollment.
         if let Some(check) = check {
@@ -1241,6 +1249,7 @@ fn install_over_route(
                     })?,
                     0o600,
                 )?;
+                stored_pending = true;
                 key
             }
         };
@@ -1264,15 +1273,23 @@ fn install_over_route(
             return Err(error);
         }
     };
+    // A build that cannot be fetched is never sent, and the session
+    // installs nothing without one.
+    let mut unsent = None;
     let write = (|| -> Result<()> {
         let mut build = Some(build);
+        let mut fetch = |build: ManagementBuild| {
+            build
+                .bytes()
+                .inspect_err(|error| unsent = Some(format!("{error:#}")))
+        };
         serde_json::to_writer(&mut input, &request)?;
         match &offer {
             Some((target, digest)) => writeln!(input, "\n{target}\n{digest}")?,
             None => {
                 input.write_all(b"\n\n\n")?;
                 // Nothing to compare: the session needs this build.
-                let bytes = build.take().expect("the build is sent once").bytes()?;
+                let bytes = fetch(build.take().expect("the build is sent once"))?;
                 input.write_all(&bytes)?;
             }
         }
@@ -1283,7 +1300,7 @@ fn install_over_route(
             "stored" => {}
             "upload" => {
                 if let Some(build) = build.take() {
-                    input.write_all(&build.bytes()?)?;
+                    input.write_all(&fetch(build)?)?;
                 }
             }
             _ => bail!("the enrollment session gave an unexpected answer"),
@@ -1299,6 +1316,28 @@ fn install_over_route(
         bail!("enrollment response too large");
     }
     let status = group.wait()?;
+    // Nothing on the server names an entry key it refused, or one that no
+    // build arrived to install, so a pending record this attempt stored
+    // goes. Its retry is a new enrollment.
+    let refused = match serde_json::from_slice(&response) {
+        Ok(InstallResponse::Refused {
+            version,
+            id,
+            reason,
+        }) if version == CONFIG_VERSION && id == plan.id && write.is_ok() => Some(format!(
+            "{} refused the enrollment: {reason}",
+            target.label()
+        )),
+        _ => unsent.filter(|_| write.is_err()),
+    };
+    if let Some(error) = refused {
+        if stored_pending {
+            remove_local_enrollment(&plan.directory)?;
+            bail!(error);
+        }
+        // An earlier attempt may have installed what this one did not.
+        bail!("{error}; retry, or run `syq receiver revoke {}`", plan.id);
+    }
     if !status.success() {
         let reason = fs::read_to_string(&trace_path)
             .ok()

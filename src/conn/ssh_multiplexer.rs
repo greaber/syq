@@ -2,10 +2,11 @@ use super::*;
 
 #[derive(Debug)]
 pub(crate) struct SshMultiplexer {
-    /// Owns the per-run private socket directory; None in persistent mode,
-    /// where the socket lives in the shared per-user runtime directory and
-    /// deliberately outlives this process.
-    pub(super) _directory: Option<tempfile::TempDir>,
+    /// Owns the per-run private socket directory, removed also when a
+    /// signal ends the run; None in persistent mode, where the socket lives
+    /// in the shared per-user runtime directory and deliberately outlives
+    /// this process.
+    pub(super) _directory: Option<crate::private_broker::SignalCleanedDir>,
     pub(super) path: PathBuf,
     pub(super) domain: Option<crate::persistence::Domain>,
     /// A managed persistence scope keeps its control master alive, so later
@@ -383,8 +384,14 @@ pub(super) fn background_notice(
 
 impl SshMultiplexer {
     pub(crate) fn new() -> Result<Self> {
-        let directory = crate::private_broker::private_temp_dir("syq-ssh-")
-            .context("create private SSH control directory")?;
+        // An operation that cancels gracefully on a signal keeps it; its
+        // directory goes only if something else ends the process on one.
+        let directory = if crate::process::signals::operation_cancels_on_signals() {
+            crate::private_broker::SignalCleanedDir::when_signals_are_handled("syq-ssh-")
+        } else {
+            crate::private_broker::SignalCleanedDir::new("syq-ssh-")
+        }
+        .context("create private SSH control directory")?;
         let path = directory.path().join("socket");
         crate::persistence::validate_openssh_socket_path(&path)?;
         Ok(Self {

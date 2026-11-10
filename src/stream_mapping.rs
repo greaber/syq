@@ -52,6 +52,7 @@ impl Totals {
 }
 
 pub(crate) fn run(args: Args) -> Result<i32> {
+    crate::process::signals::mark_operation_cancels_on_signals();
     let started = std::time::Instant::now();
     let writer = results::start(
         &args,

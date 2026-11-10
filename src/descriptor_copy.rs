@@ -102,6 +102,7 @@ pub(crate) enum Operation {
 pub(crate) use file::{resolve_source, FileWorker, Session};
 
 pub(crate) fn run(mut args: Args) -> Result<i32> {
+    crate::process::signals::mark_operation_cancels_on_signals();
     let report = report::Report::start(&args)?;
     let plan = args.descriptor_copy.take().unwrap();
     let controls = Arc::new(Controls::new(&args, report));

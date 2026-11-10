@@ -393,7 +393,61 @@ fn installed(response: InstallResponse) -> (u64, bool) {
             (generation, changed)
         }
         InstallResponse::StateMissing { .. } => panic!("install reported missing state"),
+        InstallResponse::Refused { reason, .. } => panic!("install refused: {reason}"),
     }
+}
+
+/// `install_for_account`, with a refusal as the error it reports.
+fn install_or_refusal(
+    request: &InstallRequest,
+    account: &str,
+    home: &Path,
+) -> Result<InstallResponse> {
+    match install_for_account(request, account, home)? {
+        InstallResponse::Refused { reason, .. } => Err(anyhow::anyhow!(reason)),
+        response => Ok(response),
+    }
+}
+
+/// Why an install was refused before it wrote anything.
+fn refused(response: InstallResponse) -> String {
+    match response {
+        InstallResponse::Refused { reason, .. } => reason,
+        other => panic!("install was not refused: {other:?}"),
+    }
+}
+
+/// An install that fails before it writes anything of the enrollment, here
+/// for an `authorized_keys` it could not write, says that it was refused:
+/// no state names the enrolling machine's entry key, nor does any line.
+#[test]
+fn an_install_that_fails_before_writing_is_refused() {
+    if unsafe { libc::geteuid() } == 0 {
+        // Root writes whatever the modes say.
+        return;
+    }
+    let (account, home) = enrollment_home();
+    let home = home.path();
+    let ssh = home.join(".ssh");
+    fs::create_dir_all(&ssh).unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o500)).unwrap();
+    let id = EnrollmentId::random();
+    let entry = generate_test_key("entry").unwrap();
+    let login = generate_test_key("login").unwrap();
+    let request = install_request(&account, id, &entry, &login, false);
+    let reason = refused(install_for_account(&request, &account, home).unwrap());
+    assert!(
+        reason.contains("restricted copying needs a writable"),
+        "{reason}"
+    );
+    assert!(!enrollment_state(home, id).exists());
+    assert!(!ssh.join("authorized_keys").exists());
+    // Once it can, the same enrollment installs.
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        installed(install_for_account(&request, &account, home).unwrap()),
+        (1, true)
+    );
 }
 
 /// The entry key only starts the receiver, so it must be a key hostA can
@@ -404,7 +458,7 @@ fn the_entry_key_is_a_software_key_other_than_the_login_key() {
     let home = home.path();
     let login = generate_test_key("login").unwrap();
     let same = install_request(&account, EnrollmentId::random(), &login, &login, false);
-    let error = install_for_account(&same, &account, home).err().unwrap();
+    let error = install_or_refusal(&same, &account, home).err().unwrap();
     assert!(error.to_string().contains("must differ"), "{error:#}");
     let entry = generate_test_key("entry").unwrap();
     let mut fido = install_request(&account, EnrollmentId::random(), &entry, &login, false);
@@ -417,7 +471,7 @@ fn the_entry_key_is_a_software_key_other_than_the_login_key() {
     )
     .to_openssh()
     .unwrap();
-    let error = install_for_account(&fido, &account, home).err().unwrap();
+    let error = install_or_refusal(&fido, &account, home).err().unwrap();
     assert!(error.to_string().contains("software"), "{error:#}");
     assert!(!home.join(".ssh/authorized_keys").exists());
     assert!(!home.join(".local/share/syq").exists());
@@ -436,7 +490,7 @@ fn the_receiver_install_follows_the_binary_store_rules() {
     let install = |home: &Path| {
         let entry = generate_test_key("entry").unwrap();
         let request = install_request(&account, EnrollmentId::random(), &entry, &login, false);
-        install_for_account(&request, &account, home).map(installed)
+        install_or_refusal(&request, &account, home).map(installed)
     };
     install(home).unwrap();
     let receiver = store_receiver_path(home);
@@ -533,8 +587,8 @@ fn an_unusable_record_of_used_grants_is_recreated_under_a_new_generation() {
     // request keeps the record or fails, changing nothing.
     let mut keeping = install_request(&account, id, &entry, &login, true);
     keeping.keep_used = true;
-    let error = install_for_account(&keeping, &account, home).unwrap_err();
-    assert!(format!("{error:#}").contains("is unusable"), "{error:#}");
+    let reason = refused(install_for_account(&keeping, &account, home).unwrap());
+    assert!(reason.contains("is unusable"), "{reason}");
     assert!(!replay.exists());
     let generation = |home: &Path| {
         read_receiver_config(&enrollment_state(home, id))
@@ -815,7 +869,7 @@ fn rotation_rewrites_only_the_signer_and_raises_the_generation() {
 
     // Another entry key for the same enrollment is refused.
     let other_entry = generate_test_key("other entry").unwrap();
-    let error = install_for_account(
+    let error = install_or_refusal(
         &install_request(&account, id, &other_entry, &second_login, true),
         &account,
         home,

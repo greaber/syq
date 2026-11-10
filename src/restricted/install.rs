@@ -419,16 +419,45 @@ pub(crate) fn remote_install() -> Result<()> {
     }
     request.id.validate()?;
     // A root enrollment serves downloads; its receiver refuses writes.
-    let (account, home) = current_account()?;
-    let response = install_for_account(&request, &account, &home)?;
+    let response = match current_account() {
+        Ok((account, home)) => install_for_account(&request, &account, &home)?,
+        Err(error) => InstallResponse::Refused {
+            version: CONFIG_VERSION,
+            id: request.id,
+            reason: format!("{error:#}"),
+        },
+    };
     serde_json::to_writer(std::io::stdout().lock(), &response)?;
     Ok(())
 }
 
+/// Install `request` for `account`. A failure before this request writes
+/// anything of the enrollment, its state or its `authorized_keys` line, is
+/// a refusal. Then this request left nothing on the server that names its
+/// entry key, though an earlier one for the same enrollment may have.
 pub(super) fn install_for_account(
     request: &InstallRequest,
     account: &str,
     home: &Path,
+) -> Result<InstallResponse> {
+    let mut writing = false;
+    match install_changes(request, account, home, &mut writing) {
+        Err(error) if !writing => Ok(InstallResponse::Refused {
+            version: CONFIG_VERSION,
+            id: request.id,
+            reason: format!("{error:#}"),
+        }),
+        result => result,
+    }
+}
+
+/// `install_for_account`, noting in `writing` when it starts to write
+/// what is this enrollment's own.
+fn install_changes(
+    request: &InstallRequest,
+    account: &str,
+    home: &Path,
+    writing: &mut bool,
 ) -> Result<InstallResponse> {
     if account != request.target_login {
         bail!("enrollment target login does not match the remote account");
@@ -551,6 +580,7 @@ pub(super) fn install_for_account(
                 // The line already names this login key, so connections it
                 // opened stay valid. Only the key's policy or certificate
                 // expiry can differ, and receivers read them for each copy.
+                *writing = true;
                 let changed = existing.signer != request.signer;
                 if changed {
                     let config = ReceiverEnrollment {
@@ -575,6 +605,7 @@ pub(super) fn install_for_account(
     // leave a usable key, and a later failure leaves only inert private
     // state, or a line for an older generation that refuses new copies,
     // which a retry completes.
+    *writing = true;
     ensure_directory(&state, 0o700)?;
     let results_public_key = results_key(&state)?;
     // A record recreated for an enrollment that had one: a directive

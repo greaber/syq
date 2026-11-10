@@ -5,8 +5,22 @@
 //! applies the normal termination action when no live operation handles it.
 use std::io;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
+
+static OPERATION_CANCELS: AtomicBool = AtomicBool::new(false);
+
+/// This process runs an operation that cancels gracefully on SIGINT and
+/// SIGTERM (`interrupt_and_terminate`), such as a descriptor copy: nothing
+/// it starts should take those signals over to end the process.
+pub(crate) fn mark_operation_cancels_on_signals() {
+    OPERATION_CANCELS.store(true, Ordering::Relaxed);
+}
+
+/// Whether `mark_operation_cancels_on_signals` was called.
+pub(crate) fn operation_cancels_on_signals() -> bool {
+    OPERATION_CANCELS.load(Ordering::Relaxed)
+}
 
 struct State {
     signal: i32,
