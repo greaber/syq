@@ -110,7 +110,7 @@ pub(crate) use small_batch::with_coarse_change_times;
 pub(crate) fn leases_trusted_on(file: &File) -> bool {
     fs_caps::leases_show_writers(file)
 }
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) use stages::new_scope as new_stage_scope;
 
 /// Let go of what the copy `scope` holds in this process when its control
