@@ -150,12 +150,12 @@ def readiness(tag):
     # Before the SSH lab and CI: a repair replaces the candidate they would test.
     lint = macos_lint(certification)
     if lint == "failed":
-        missing("the macOS lint fails, so the macOS suite would fail at its first step",
-                "Repair what scripts/check-macos-lint.py reports through a PR, then use the "
-                "repaired commit as the candidate. Start no validation for this one.")
-    elif lint == "unavailable":
-        missing("the macOS lint could not run",
-                "Run scripts/check-macos-lint.py and fix what stops it.")
+        missing("the macOS lint failed; errors in syq's own code would fail the macOS suite "
+                "at its first step",
+                "If scripts/check-macos-lint.py reports errors in syq's code, repair them through a "
+                "PR and use the repaired commit as the candidate, starting no validation for this "
+                "one. Other errors mean the lint could not run; macOS CI still validates the "
+                "candidate.")
     try:
         evidence = ssh_evidence()
     except ValueError as error:
@@ -172,6 +172,10 @@ def readiness(tag):
                           "validate a different commit. Inspect existing candidate runs or deliberately "
                           "select a newer merged candidate before dispatching.")
             missing(workflow["message"], action)
+    # The lint only gives early warning, so a broken lint setup never comes first.
+    if lint == "unavailable":
+        missing("the macOS lint could not run; macOS CI still validates the candidate",
+                "Optionally run scripts/check-macos-lint.py and fix what stops it.")
     return {"schema": 1, "tag": tag, "commit": commit, "remote_master": master,
             "ready": not issues, "ssh": evidence, "ci": certification, "macos_lint": lint,
             "missing": issues,

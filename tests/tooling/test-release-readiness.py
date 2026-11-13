@@ -180,6 +180,8 @@ FAKE_CARGO = '''#!{python}
 import json, os, pathlib, sys
 with pathlib.Path(os.environ["FIXTURE_LOG"]).open("a") as log:
     log.write("cargo " + " ".join(sys.argv[1:]) + "\\n")
+    if sys.argv[1] == "fetch":
+        sys.exit(int(os.environ.get("FIXTURE_FETCH_STATUS", "0")))
     log.write(json.dumps({{"cwd": os.getcwd(), "env": {{
         key: value for key, value in os.environ.items()
         if key.endswith(("apple-darwin", "apple_darwin"))}}}}) + "\\n")
@@ -220,13 +222,14 @@ class MacosLintTests(unittest.TestCase):
     def test_lints_the_current_checkout_for_macos_without_its_compilers(self):
         result, calls = self.lint()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(calls[:4], [
+        self.assertEqual(calls[:5], [
             "rustup component list --installed",
             "rustup target add aarch64-apple-darwin",
             "rustup component add clippy",
+            "cargo fetch --locked",
             "cargo clippy --locked --all-targets --all-features --target aarch64-apple-darwin "
             "-- -D warnings"])
-        cargo = json.loads(calls[4])
+        cargo = json.loads(calls[5])
         self.assertTrue(os.path.samefile(cargo["cwd"], self.checkout))
         # Every spelling cc-rs checks first, so a caller's compiler cannot win.
         stubs = {f"{variable}_{target}" for variable in ("CC", "CXX", "AR")
@@ -249,6 +252,11 @@ class MacosLintTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("cannot add aarch64-apple-darwin", result.stderr)
         self.assertFalse(any(call.startswith("cargo") for call in calls))
+        # Cargo exits 101 for a download or lockfile problem too; that is not a lint failure.
+        result, calls = self.lint(FIXTURE_FETCH_STATUS="101")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("cannot download the locked crates", result.stderr)
+        self.assertFalse(any(call.startswith("cargo clippy") for call in calls))
         result, calls = self.lint("unexpected")
         self.assertEqual(result.returncode, 2)
         self.assertEqual(calls, [])

@@ -830,7 +830,7 @@ class PreflightTests(Scratch):
         self.assertTrue(os.path.samefile(marker.read_text(), self.repo))
         self.assertIn("fake lint output", stderr)
         self.assertEqual(report["macos_lint"], "failed")
-        self.assertIn("macOS lint fails", report["missing"][0]["message"])
+        self.assertIn("macOS lint failed", report["missing"][0]["message"])
         self.assertIn("scripts/check-macos-lint.py", report["next_action"])
         self.assertIn("--check-ssh", report["missing"][1]["next_action"])
 
@@ -839,9 +839,12 @@ class PreflightTests(Scratch):
         self.assertFalse(any("macOS lint" in item["message"] for item in report["missing"]))
         self.assertIn("--check-ssh", report["next_action"])
 
+        # A lint that cannot run is listed last and never becomes the next action.
         status, report, _ = readiness(2, **uncertified)
         self.assertEqual(report["macos_lint"], "unavailable")
-        self.assertIn("could not run", report["missing"][0]["message"])
+        self.assertIn("could not run", report["missing"][-1]["message"])
+        self.assertTrue(any("macos.yml" in item["message"] for item in report["missing"][:-1]))
+        self.assertIn("--check-ssh", report["next_action"])
 
 
 FAKE_STATUS_GH = """#!{python}

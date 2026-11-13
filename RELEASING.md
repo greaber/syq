@@ -124,20 +124,25 @@ Start with `scripts/release-readiness.py v<version>` (add `--json` for automatio
 Exit 0 means the candidate is ready for preflight, 1 means work is missing, and
 2 means inspection failed. The report includes the candidate SHA, remote master,
 local real-SSH evidence, all three CI certifications, and next actions. Apart
-from build output, it is read-only unless `--check-ssh` is supplied. It never
+from `--check-ssh` and the macOS lint described next, it is read-only. It never
 tags, publishes, dispatches CI, or merges a PR. If the requested tag exists,
 inspect `release-status.py` and resume or verify that release rather than
 preparing another version.
 
 Until `macos.yml` certifies the candidate, readiness also runs
 `scripts/check-macos-lint.py`. It runs the macOS suite's first step, clippy on
-every Rust target, for Apple Silicon on any host and without a macOS SDK: about
-a minute from a cold build. Code gated to one platform, such as an import that
-only Linux tests use, fails there as it would on the macOS runner. A lint
-failure is listed before the SSH and CI items. Repair it through a PR and use
-the repaired commit as the candidate, so no validation is spent on one that
-cannot pass. C and Objective-C sources are not compiled, because checking never
-links, so the macOS suite remains the release gate.
+every Rust target, for Apple Silicon on any host: about a minute from a cold
+build. It adds that target's standard library and clippy to the pinned Rust
+toolchain when they are missing, downloads the locked crates, and writes build
+output. No macOS SDK is needed: C and Objective-C sources get a compiler that
+writes nothing, which is safe because checking never links. Code gated to one
+platform, such as an import that only Linux tests use, fails there as it would
+on the macOS runner. A lint failure is listed before the SSH and CI items. When
+its errors are in syq's own code, repair them through a PR and use the repaired
+commit as the candidate, so no validation is spent on one that cannot pass.
+Other errors, and a lint that cannot run at all (listed last), do not hold up
+validation. The macOS suite remains the release gate: the lint skips C warnings
+and runs no tests.
 
 For an already-prepared version with matching evidence, start at step 2. A new
 release request does not require another preparation PR or another test run.

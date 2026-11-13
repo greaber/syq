@@ -6,11 +6,17 @@ Usage: scripts/check-macos-lint.py
 Runs the macOS suite's first check, clippy on every Rust target with warnings
 as errors, for aarch64-apple-darwin in the checkout containing the current
 directory. Code gated to one platform, such as an import only Linux tests use,
-fails here as it does on a macOS runner. Clippy compiles without linking, so C
-and Objective-C sources are skipped: their warnings and every macOS test still
-need the macOS suite.
+fails here as it does on a macOS runner.
 
-Exit 0 when the lint passes, 1 when it fails, and 2 when it cannot run.
+It adds that target's standard library and clippy to the pinned rustup
+toolchain when they are missing, and downloads the locked crates. C and
+Objective-C sources get a compiler that writes nothing, which is safe because
+checking never links; their warnings and every macOS test still need the
+macOS suite.
+
+Exit 0 when the lint passes, 1 when clippy fails, and 2 when the lint cannot
+run. Clippy failing usually means errors in syq's own code, but a dependency's
+build script that needs a real C compiler fails the same way.
 """
 import os
 import shutil
@@ -38,6 +44,12 @@ def main():
             status, _ = children.run("rustup", *command)
             if status:
                 raise ToolError(f"cannot add {command[-1]} to the pinned Rust toolchain", 2)
+    # Download first, so a network, registry, or lockfile problem means the lint
+    # could not run rather than that it failed. Fetching for one target would
+    # miss the host's build scripts and proc macros.
+    status, _ = children.run("cargo", "fetch", "--locked")
+    if status:
+        raise ToolError("cannot download the locked crates", 2)
     # Build scripts compile C for the target, which needs Apple's SDK. Checking
     # never links those objects, so a compiler that writes nothing suffices.
     environment = dict(os.environ)

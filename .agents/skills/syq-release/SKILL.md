@@ -61,10 +61,12 @@ CI workflow's state and next action. Perform only missing work:
   explicitly owned task work. Changed executable documentation needs only its
   focused tests; ordinary release version and notes preparation leaves those
   examples unchanged.
-- A failed macOS lint in the report means the macOS suite would fail at its
-  first step. Repair it through a PR before `--check-ssh` or any validation,
-  then continue from the repaired commit. `scripts/check-macos-lint.py` checks
-  the repair locally; it needs no macOS runner.
+- When the report shows a failed macOS lint, read its errors. Errors in syq's
+  own code would fail the macOS suite at its first step: repair them through a
+  PR before `--check-ssh` or any validation, then continue from the repaired
+  commit. `scripts/check-macos-lint.py` checks the repair locally; it needs no
+  macOS runner. Any other lint failure, or a lint that cannot run, does not
+  hold up validation: macOS CI still validates the candidate.
 - Merge needed preparation/repair PRs after branch-status and exact PR-head
   checks. Use a clean task checkout at the actual remote master SHA afterward.
 - Once preparation reaches the exact remote master commit, start
