@@ -50,6 +50,7 @@ class LinkChecker(unittest.TestCase):
             (root / "sdk").mkdir()
             (root / "docs").mkdir()
             (root / "sdk/API.md").write_text(
+                "<!-- ANCHOR: part-title -->\n## Title\n<!-- ANCHOR_END: part-title -->\n"
                 "## Outside\n<!-- ANCHOR: part -->\n## Inside\n<!-- ANCHOR_END: part -->\n")
             page = root / "docs/page.md"
             page.write_text("# Page\n\n{{#include ../sdk/API.md:part}}\n")

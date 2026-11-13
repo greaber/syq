@@ -159,8 +159,10 @@ file rejected for its contents keeps its metadata too. `--as-new` and
 every entry the copy writes.
 
 `keep`, `error`, `error-if-different` and `--as-new` also keep a file that
-another program creates at the same name during the copy, with
-[exceptions on some filesystems](security.md#limits-of-path-protection).
+another program creates at the same name during the copy. A file created just
+before syq moves its copy into place can still be replaced under `keep` on
+filesystems without an atomic no-replace rename, such as NFS, and under all of
+them on FAT and exFAT on macOS and on rclone mounts.
 
 See [Update policies](commands/cp.md#update-policies) for supported
 combinations.

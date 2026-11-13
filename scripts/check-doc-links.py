@@ -26,9 +26,12 @@ def expand_includes(path, text):
         source = (path.parent / match[1]).resolve()
         body = source.read_text()
         if match[2]:
-            start = f"ANCHOR: {match[2]}"
-            end = f"ANCHOR_END: {match[2]}"
-            body = body.partition(start)[2].partition(end)[0]
+            # Match the whole name, as mdBook does: `part` must not match `part-title`.
+            name = re.escape(match[2])
+            start = re.search(rf"ANCHOR:\s*{name}(?![\w-])[^\n]*\n?", body)
+            body = body[start.end():] if start else ""
+            end = re.search(rf"ANCHOR_END:\s*{name}(?![\w-])", body)
+            body = body[:end.start()] if end else body
         return expand_includes(source, body)
     return INCLUDE.sub(include, text)
 
