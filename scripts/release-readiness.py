@@ -3,7 +3,8 @@
 
 Exit 0: ready for preflight (or the requested SSH check passed).
 Exit 1: preparation/validation is incomplete. Exit 2: inspection/tooling failed.
-No tags, publications, PRs, or CI runs are created. --check-ssh runs the local lab.
+No tags, publications, PRs, or CI runs are created. Until macos.yml certifies the
+candidate, this lints its macOS build locally. --check-ssh runs the local lab.
 """
 import argparse
 import datetime
@@ -90,6 +91,17 @@ def check_ssh():
     print(f"Real-SSH evidence recorded for {commit} (default profile, tree {tree}).", file=sys.stderr)
 
 
+def macos_lint(certification):
+    """Lint the macOS build until the macOS suite certifies these inputs. A failure
+    would stop that suite at its first step, so it shows here in about a minute,
+    before any validation runs on a candidate the repair must replace."""
+    if all(workflow["state"] == "ready" for workflow in certification["workflows"]
+           if workflow["workflow"] == "macos.yml"):
+        return "skipped"
+    status = subprocess.run([str(SCRIPTS / "check-macos-lint.py")], stdout=sys.stderr).returncode
+    return {0: "passed", 1: "failed"}.get(status, "unavailable")
+
+
 def readiness(tag):
     commit = run("git", "rev-parse", "HEAD")
     issues = []
@@ -106,7 +118,7 @@ def readiness(tag):
         missing("the requested tag already exists; inspect or resume it, do not choose another version",
                 f"scripts/release-status.py {tag}")
         return {"schema": 1, "tag": tag, "commit": commit, "remote_master": None,
-                "ready": False, "ssh": None, "ci": None, "missing": issues,
+                "ready": False, "ssh": None, "ci": None, "macos_lint": None, "missing": issues,
                 "next_action": issues[0]["next_action"]}
     master = run("git", "ls-remote", "origin", "refs/heads/master").split()[0]
     tracking = subprocess.run(["git", "rev-parse", "--verify", "refs/remotes/origin/master"],
@@ -130,6 +142,20 @@ def readiness(tag):
     if api.returncode:
         missing("Python native API synchronization failed: " + (api.stderr or api.stdout).strip(),
                 "Resolve native API follow-ups before release.")
+    ci = subprocess.run([str(SCRIPTS / "verify-release-ci.py"), "--json", REPOSITORY, commit],
+                        capture_output=True, text=True)
+    if ci.returncode not in (0, 1):
+        raise ValueError("CI inspection failed: " + ci.stderr.strip())
+    certification = json.loads(ci.stdout)
+    # Before the SSH lab and CI: a repair replaces the candidate they would test.
+    lint = macos_lint(certification)
+    if lint == "failed":
+        missing("the macOS lint fails, so the macOS suite would fail at its first step",
+                "Repair what scripts/check-macos-lint.py reports through a PR, then use the "
+                "repaired commit as the candidate. Start no validation for this one.")
+    elif lint == "unavailable":
+        missing("the macOS lint could not run",
+                "Run scripts/check-macos-lint.py and fix what stops it.")
     try:
         evidence = ssh_evidence()
     except ValueError as error:
@@ -138,11 +164,6 @@ def readiness(tag):
     if not evidence:
         missing("default real-SSH validation is missing for these test inputs",
                 f"scripts/release-readiness.py {tag} --check-ssh")
-    ci = subprocess.run([str(SCRIPTS / "verify-release-ci.py"), "--json", REPOSITORY, commit],
-                        capture_output=True, text=True)
-    if ci.returncode not in (0, 1):
-        raise ValueError("CI inspection failed: " + ci.stderr.strip())
-    certification = json.loads(ci.stdout)
     for workflow in certification["workflows"]:
         if workflow["state"] != "ready":
             action = workflow["next_action"]
@@ -152,7 +173,8 @@ def readiness(tag):
                           "select a newer merged candidate before dispatching.")
             missing(workflow["message"], action)
     return {"schema": 1, "tag": tag, "commit": commit, "remote_master": master,
-            "ready": not issues, "ssh": evidence, "ci": certification, "missing": issues,
+            "ready": not issues, "ssh": evidence, "ci": certification, "macos_lint": lint,
+            "missing": issues,
             "next_action": issues[0]["next_action"] if issues else f"scripts/release-preflight.py {tag}"}
 
 

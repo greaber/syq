@@ -61,6 +61,10 @@ CI workflow's state and next action. Perform only missing work:
   explicitly owned task work. Changed executable documentation needs only its
   focused tests; ordinary release version and notes preparation leaves those
   examples unchanged.
+- A failed macOS lint in the report means the macOS suite would fail at its
+  first step. Repair it through a PR before `--check-ssh` or any validation,
+  then continue from the repaired commit. `scripts/check-macos-lint.py` checks
+  the repair locally; it needs no macOS runner.
 - Merge needed preparation/repair PRs after branch-status and exact PR-head
   checks. Use a clean task checkout at the actual remote master SHA afterward.
 - Once preparation reaches the exact remote master commit, start
@@ -72,10 +76,12 @@ CI workflow's state and next action. Perform only missing work:
   requires new builds. A failed candidate stops publication; investigate it
   before deliberately rerunning its failed jobs. Reuse successful platform jobs
   and rerun the failed publication jobs after the candidate passes.
-- Wait for existing CI with the reported `gh run watch --exit-status` command.
-  Dispatch only missing certifications. Investigate failed latest runs; do
-  not hide them with older successes or create duplicate runs. An explicit
-  user requirement for fresh manual runs still takes precedence.
+- Wait for existing CI with the reported `gh run watch --exit-status` command,
+  one watcher per run, so the first failure reaches you when it happens rather
+  than after the slowest run. Dispatch only missing certifications.
+  Investigate failed latest runs; do not hide them with older successes or
+  create duplicate runs. An explicit user requirement for fresh manual runs
+  still takes precedence.
 - If readiness is already satisfied, go directly to preflight. Do not create
   another PR, bump the version, or repeat completed checks.
 

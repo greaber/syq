@@ -717,13 +717,17 @@ intended generated changes before reporting the SHA.
 
 Choose checks from the behavior changed, not every workflow available. For
 Rust changes, run `cargo fmt --all -- --check`, a build, and the unit or
-integration tests that exercise the change. Prefer exact or narrow filters in
-the `local` target (`tests/local.rs` holds the shared helpers and
-`tests/local/<topic>.rs` the tests, named `<topic>::<test>`); those tests
-invoke the built binary against temporary trees. For a substantial runtime
-change, dispatch `suites=rust` rather than running clippy and every target
-locally. `scripts/branch-status.py --check` runs this local baseline when you
-want it:
+integration tests that exercise the change. When a change adds, removes, or
+narrows a platform `cfg`, such as making tests Linux-only, also run
+`scripts/check-macos-lint.py`. It lints the macOS build on Linux in about a
+minute, while post-merge CI builds macOS only for macOS-specific files, so the
+nightly or a release would otherwise be the first to find the problem. Prefer
+exact or narrow filters in the `local` target (`tests/local.rs` holds the
+shared helpers and `tests/local/<topic>.rs` the tests, named
+`<topic>::<test>`); those tests invoke the built binary against temporary
+trees. For a substantial runtime change, dispatch `suites=rust` rather than
+running clippy and every target locally. `scripts/branch-status.py --check`
+runs this local baseline when you want it:
 
 ```bash
 cargo fmt --all -- --check
