@@ -87,6 +87,6 @@ syq help [COMMAND...] [--help-all]
 
 ## Build identity
 
-`syq --build-identity` prints the release tag, such as `v0.7.1`. A build from
-source adds its revision, as in `v0.7.1+dev.0123456789ab`; see
+`syq --build-identity` prints the release tag, such as `v0.10.0`. A build from
+source adds its revision, as in `v0.10.0+dev.0123456789ab`; see
 [development builds](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md#another-platform-with-your-own-helpers).

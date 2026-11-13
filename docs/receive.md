@@ -104,9 +104,9 @@ optional settings with `syq persist receive on` on your laptop:
   [Receivers](security.md#receivers).
 - `--notify off` turns off desktop prompts, so you approve only in a terminal.
 
-Changing any of these except `--notify` cancels active copies, commands and
-pending requests. Copies you approved between two servers keep running; see
-[Copying between servers](security.md#copying-between-servers) to stop them.
+Changing any of these except `--notify` cancels the profile's running copies,
+commands, and pending requests; see
+[Change or stop a profile](persistence-reference.md#change-or-stop-a-profile).
 
 <a id="copy-files-from-your-laptop"></a>
 

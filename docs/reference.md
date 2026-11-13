@@ -159,10 +159,8 @@ file rejected for its contents keeps its metadata too. `--as-new` and
 every entry the copy writes.
 
 `keep`, `error`, `error-if-different` and `--as-new` also keep a file that
-another program creates at the same name during the copy. A file created just
-before syq moves its copy into place can still be replaced under `keep` on
-filesystems without an atomic no-replace rename, such as NFS, and under all of
-them on FAT and exFAT on macOS and on rclone mounts.
+another program creates at the same name during the copy, with
+[exceptions on some filesystems](security.md#limits-of-path-protection).
 
 See [Update policies](commands/cp.md#update-policies) for supported
 combinations.
@@ -291,10 +289,9 @@ placement or `--if-exists=error` refuses entries the first run created, and
 `error-if-different` refuses files that differ, because it can't tell a partly
 written file from one it must leave alone. To finish such a copy, rerun with
 `--if-exists=update`, which also updates every other differing file the first
-policy protected, or, for a `-new` placement, with `--into` or `--as`.
-Directories the first run created can keep temporary
-permissions; add `--copy-metadata=permissions,mtime` to the rerun to make them
-match the source.
+policy protected, or, for a `-new` placement, with `--into` or `--as`. To
+give directories the first run created their source permissions, add
+`--copy-metadata=permissions,mtime` to the rerun.
 
 When a rerun finishes a file, it also removes the partial files that earlier
 copies left for it, as long as no other program has them open for writing. It
@@ -326,10 +323,6 @@ syq cp --hash --srcs-in project --into backup
 the [transfer strategy](#choose-a-transfer-strategy) compares blocks, and
 recopies other files whole. With the default strategy, it recopies every file
 in a copy within one machine.
-
-On FAT, which keeps times in two-second steps, times less than two seconds
-apart count as matching. This doesn't apply when syq updates one named file
-or copies with `--existing`.
 
 To require known contents, give
 [expected hashes in a mapping](integrity-checking.md#expected-hashes). See

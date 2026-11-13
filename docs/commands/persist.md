@@ -18,7 +18,7 @@ syq persist [OPTIONS] <COMMAND>
 | [`persist destinations`](#syq-persist-destinations) | On a server, list or release receiving names |
 | [`persist connect`](#syq-persist-connect) | Connect to a server now and keep the connection open for later commands |
 | [`persist on`](#syq-persist-on) | Keep SSH connections open for later syq commands |
-| [`persist off`](#syq-persist-off) | Turn persistence off and close its SSH connections, including receiving; a set made |
+| [`persist off`](#syq-persist-off) | Turn persistence off and close its SSH connections, including receiving; a set made by on --ephemeral is deleted with its settings |
 | [`persist status`](#syq-persist-status) | Show connection readiness and any receiving problem |
 
 **Options (also available on subcommands)**
@@ -219,9 +219,9 @@ Settings you leave out keep their saved values. A new profile asks for
 approval with desktop prompts, starts relative paths in your home directory
 without confining copies to it, and accepts requests through every connection.
 Use `--root` to confine copies to one directory and `--connection` to limit
-which servers can use the profile. Changing access settings cancels the
-profile's active requests. See
-[profile settings](../persistence-reference.md#names-and-profiles) and
+which servers can use the profile. See
+[profile settings](../persistence-reference.md#names-and-profiles), including
+[what a change cancels](../persistence-reference.md#change-or-stop-a-profile), and
 [copy limits](../persistence-reference.md#copy-limits).
 
 <!-- CLI: persist receive on -->

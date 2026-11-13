@@ -175,7 +175,7 @@ callback entry, with a zero-based `entry` index. Each endpoint is
 `{"path": <tagged path>}` or `{"entry": N, "callback": true}`, and failed
 entries include `message`. These records can't become a pathname retry
 manifest; the
-[Python callback reference](https://greaber.github.io/syq/python-streams.html#callback-mappings)
+[Python callback reference](python-streams.md#callback-mappings)
 describes publication and application retries. Pathname entries in the same
 mapping still emit their usual records. These runs don't emit `stream_ready`:
 the [stream-mapping protocol](stream-mappings.md#entry-lifecycle) starts each
@@ -307,8 +307,10 @@ authorization provider when it runs another build or switches.
 `requested` (the original selection), `endpoint` (the resolved account and
 address), `control`, `connected`, and `closing` (it takes no new sessions and
 ends once those running end, as after a switch to a new version); the two
-endpoint objects have `user`, `host`, and `port`. A return authorizer is its name as a string, and an SSH
-provider is an object whose `ssh` field holds the provider endpoint.
+endpoint objects have `user`, `host`, and `port`. When a receiving machine
+approved the connection, `authorizer` is that machine's name as a string; for
+an SSH authorization provider, it is an object whose `ssh` field holds the
+provider endpoint.
 `authorized_ssh_errors` lists account records that couldn't be read; the command
 then exits nonzero after printing the valid entries.
 
@@ -364,10 +366,11 @@ shows. Don't treat an unknown kind as a copy request.
 `id` and `permission`; pass the ID to `persist receive permissions remove`.
 Both take `--pscope PATH` to select the authorizing domain.
 
-Return-channel permissions contain `profile`, `source`, and `destination`, and
-SSH-provider permissions contain `profile`, `provider`, and `destination`, with
-identities as in [Connection status](#connection-status). There is no `kind`
-field; tell them apart by `source` or `provider`. Removing a remembered
+Permissions approved through receiving contain `profile`, `source`, and
+`destination`, and those for an SSH authorization provider contain `profile`,
+`provider`, and `destination`, with identities as in
+[Connection status](#connection-status). There is no `kind` field; tell them
+apart by `source` or `provider`. Removing a remembered
 permission doesn't close a connection that already authenticated. See
 [account permissions](persistence-reference.md#account-permissions).
 

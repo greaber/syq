@@ -71,8 +71,13 @@ def parse_help(text):
             match = re.match(r"^  (\S+)\s{2,}(.*)", line)
             if match:
                 name, description = match.groups()
-                if name != "help":  # automatic help dispatch is documented at the root
-                    children.append((name, description.removeprefix("Advanced: ")))
+                # Automatic help dispatch is documented at the root.
+                row = None if name == "help" else [name, description.removeprefix("Advanced: ")]
+                if row is not None:
+                    children.append(row)
+            elif row is not None and line.startswith("   ") and line.strip():
+                # Clap wraps a long description onto deeper-indented lines.
+                row[1] += " " + line.strip()
             continue
         match = re.match(r"^ {2,6}(\S.*)$", line)
         if match and groups:
@@ -82,7 +87,7 @@ def parse_help(text):
             row[1].append(line.strip())
     if not usage or not groups:
         raise ValueError("unrecognized full-help layout")
-    return usage, groups, children
+    return usage, groups, [tuple(child) for child in children]
 
 
 def cell(text):

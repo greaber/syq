@@ -51,6 +51,9 @@ shell itself, run `eval "$(tmux show-environment -s SSH_AUTH_SOCK)"`.
 | `~/.cache/syq/tuning.history-v1.sqlite` | Tuning timelines and filesystem startup hints |
 | `~/.cache/syq/completion-endpoints.json` | Hosts offered by completion |
 | `~/.config/syq/persistence.json`, `receive.json` | Persistence setting and receiving profiles |
+| `~/.config/syq/auth-from.json` | Choices saved with [`syq persist auth-from`](commands/persist.md#syq-persist-auth-from) |
+| `~/.config/syq/account-permissions-v1.json` | [Account permissions](persistence-reference.md#account-permissions) you chose to remember |
+| `~/.syq-receiver-identity/` | The key your [receiving names](persistence-reference.md#back-up-the-receiving-identity) are tied to; keep it in private backups |
 | `~/.config/syq/install.json`, `last-update-check` | Install receipt and update-check timing |
 | `~/.local/lib/syq/` | [Stored releases and helpers](#stored-releases-and-helpers) |
 | `$XDG_RUNTIME_DIR/syq-persist-UID/` | Persistent connection sockets |
@@ -74,13 +77,13 @@ persistent connection sockets, a copy warns and connects without persistence.
 ## Stored releases and helpers
 
 Syq keeps exact releases at paths such as
-`~/.local/lib/syq/v0.7.1/linux-x86_64/syq`: releases you select with
+`~/.local/lib/syq/v0.10.0/linux-x86_64/syq`: releases you select with
 [`--use-version`](install.md#choose-a-version-for-a-script), helpers (the
 copies of syq that run on SSH servers) that it uploads, and, on a server, the
 helper installed there, which also receives restricted copies.
 
 Syq never removes old releases. To remove one you no longer use, or replace a
-damaged one, delete its directory, such as `~/.local/lib/syq/v0.7.1`; syq
+damaged one, delete its directory, such as `~/.local/lib/syq/v0.10.0`; syq
 downloads or installs it again when needed. On a server that accepts
 restricted copies, keep every release that a syq line in
 `~/.ssh/authorized_keys` names.

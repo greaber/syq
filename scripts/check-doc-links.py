@@ -17,6 +17,20 @@ PACKAGED_DIRS = {"docs", "src", "tests"}
 PACKAGED_FILES = {"README.md", "LICENSE", "Cargo.toml", "Cargo.lock", "build.rs"}
 LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
 FENCE = re.compile(r"```.*?```", re.S)
+INCLUDE = re.compile(r"\{\{#include ([^:}\s]+)(?::([A-Za-z][\w-]*))?\}\}")
+
+
+def expand_includes(path, text):
+    """Inline mdBook includes so headings they bring in count as anchors."""
+    def include(match):
+        source = (path.parent / match[1]).resolve()
+        body = source.read_text()
+        if match[2]:
+            start = f"ANCHOR: {match[2]}"
+            end = f"ANCHOR_END: {match[2]}"
+            body = body.partition(start)[2].partition(end)[0]
+        return expand_includes(source, body)
+    return INCLUDE.sub(include, text)
 
 
 def anchors(text):
@@ -50,7 +64,8 @@ def main():
             if parts[0] not in PACKAGED_DIRS and parts[0] not in PACKAGED_FILES:
                 print(f"{rel}: link leaves the crate package: {target}")
                 problems += 1
-            if fragment and resolved.suffix == ".md" and fragment not in anchors(resolved.read_text()):
+            if fragment and resolved.suffix == ".md" and fragment not in anchors(
+                    expand_includes(resolved, resolved.read_text())):
                 print(f"{rel}: missing anchor {target}")
                 problems += 1
     print(f"checked {len(FILES)} files; {problems} problems")
