@@ -29,11 +29,15 @@ def main():
         if not shutil.which(tool):
             raise ToolError(f"the macOS lint needs {tool}", 2)
     children = ForwardSignals()
-    # rust-toolchain.toml in this checkout selects the pinned toolchain.
-    if TARGET not in output("rustup", "target", "list", "--installed", status=2).split():
-        status, _ = children.run("rustup", "target", "add", TARGET)
-        if status:
-            raise ToolError(f"cannot add {TARGET} to the pinned Rust toolchain", 2)
+    # rust-toolchain.toml in this checkout selects the pinned toolchain, which a
+    # fresh CI runner installs without clippy.
+    installed = output("rustup", "component", "list", "--installed", status=2).split()
+    for component, command in [(f"rust-std-{TARGET}", ("target", "add", TARGET)),
+                               ("clippy-", ("component", "add", "clippy"))]:
+        if not any(name.startswith(component) for name in installed):
+            status, _ = children.run("rustup", *command)
+            if status:
+                raise ToolError(f"cannot add {command[-1]} to the pinned Rust toolchain", 2)
     # Build scripts compile C for the target, which needs Apple's SDK. Checking
     # never links those objects, so a compiler that writes nothing suffices.
     environment = dict(os.environ)

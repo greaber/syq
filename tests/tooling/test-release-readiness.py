@@ -170,9 +170,9 @@ FAKE_RUSTUP = '''#!{python}
 import os, pathlib, sys
 with pathlib.Path(os.environ["FIXTURE_LOG"]).open("a") as log:
     log.write("rustup " + " ".join(sys.argv[1:]) + "\\n")
-if sys.argv[1:3] == ["target", "list"]:
-    print(os.environ["FIXTURE_INSTALLED"])
-elif sys.argv[1:3] == ["target", "add"]:
+if sys.argv[1:3] == ["component", "list"]:
+    print(os.environ["FIXTURE_INSTALLED"].replace(" ", "\\n"))
+elif sys.argv[2:3] == ["add"]:
     sys.exit(int(os.environ.get("FIXTURE_ADD_STATUS", "0")))
 '''
 
@@ -201,8 +201,11 @@ class MacosLintTests(unittest.TestCase):
         self.checkout = root / "checkout"
         self.checkout.mkdir()
         self.log = root / "log"
+        # A fresh CI runner's minimal toolchain: no clippy, no macOS target.
         self.env = {**os.environ, "PATH": str(fakebin) + os.pathsep + os.environ["PATH"],
-                    "FIXTURE_LOG": str(self.log), "FIXTURE_INSTALLED": "x86_64-unknown-linux-gnu"}
+                    "FIXTURE_LOG": str(self.log),
+                    "FIXTURE_INSTALLED": "cargo-x86_64-unknown-linux-gnu "
+                                         "rust-std-x86_64-unknown-linux-gnu"}
 
     def tearDown(self):
         self.temp.cleanup()
@@ -217,12 +220,13 @@ class MacosLintTests(unittest.TestCase):
     def test_lints_the_current_checkout_for_macos_without_its_compilers(self):
         result, calls = self.lint()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(calls[:3], [
-            "rustup target list --installed",
+        self.assertEqual(calls[:4], [
+            "rustup component list --installed",
             "rustup target add aarch64-apple-darwin",
+            "rustup component add clippy",
             "cargo clippy --locked --all-targets --all-features --target aarch64-apple-darwin "
             "-- -D warnings"])
-        cargo = json.loads(calls[3])
+        cargo = json.loads(calls[4])
         self.assertTrue(os.path.samefile(cargo["cwd"], self.checkout))
         # Every spelling cc-rs checks first, so a caller's compiler cannot win.
         stubs = {f"{variable}_{target}" for variable in ("CC", "CXX", "AR")
@@ -232,10 +236,11 @@ class MacosLintTests(unittest.TestCase):
             self.assertEqual(subprocess.run([path]).returncode, 0)
             self.assertEqual(Path(path).name, "true")
 
-    def test_installed_target_is_not_added_again(self):
-        result, calls = self.lint(FIXTURE_INSTALLED="aarch64-apple-darwin\nx86_64-unknown-linux-gnu")
+    def test_installed_components_are_not_added_again(self):
+        result, calls = self.lint(FIXTURE_INSTALLED="clippy-x86_64-unknown-linux-gnu "
+                                                    "rust-std-aarch64-apple-darwin")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("rustup target add aarch64-apple-darwin", calls)
+        self.assertFalse(any(" add " in call for call in calls), calls)
 
     def test_lint_failure_and_setup_failure_have_distinct_statuses(self):
         result, _ = self.lint(FIXTURE_CARGO_STATUS="101")
