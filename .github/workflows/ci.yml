@@ -344,9 +344,10 @@ jobs:
         env:
           SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
         run: scripts/setup.sh github python
-      # The build output is for aarch64-apple-darwin plus the host's build
-      # scripts and proc macros, so it has its own entry. Only master saves it.
-      - name: Restore Cargo dependencies and build output
+      # Only the crate downloads are cached: the repository's cache budget is
+      # full, and the compile this job would save finishes behind the rust job
+      # anyway. Only master saves the entry.
+      - name: Restore Cargo dependencies
         id: cargo-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -354,27 +355,26 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
           key: cargo-ci-macos-lint-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             cargo-ci-macos-lint-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
-      # Exit 1 is a lint failure. Exit 2 means the lint could not run (toolchain
-      # or crate download); that fails the job too, so a broken check is noticed
-      # instead of passing silently.
+      # Exit 1 is a lint failure and fails the job. Exit 2 means the lint could
+      # not run (toolchain or crate download); the lint is early warning and
+      # macos.yml is the macOS gate, so that only warns.
       - name: Lint every Rust target for macOS
         id: lint
         run: |
           status=0
           scripts/check-macos-lint.py || status=$?
-          if [ "$status" -eq 2 ]; then
-            echo '::error title=macOS lint could not run::scripts/check-macos-lint.py could not set up the toolchain or download crates; see the log above.'
-          else
-            echo 'linted=true' >> "$GITHUB_OUTPUT"
-          fi
+          case "$status" in
+            0|1) echo 'linted=true' >> "$GITHUB_OUTPUT" ;;
+            2) echo '::warning title=macOS lint could not run::scripts/check-macos-lint.py could not set up the toolchain or download crates; see the log above.'
+               status=0 ;;
+          esac
           exit "$status"
       # Save once clippy has run, even if it failed, but not after a setup
       # failure that may have left the crates half downloaded.
-      - name: Save Cargo dependencies and build output
+      - name: Save Cargo dependencies
         if: >-
           !cancelled() &&
           github.ref == 'refs/heads/master' &&
@@ -386,7 +386,6 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   sdk-languages:
