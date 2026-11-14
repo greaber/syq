@@ -686,10 +686,11 @@ gh workflow run ci.yml --ref <task-branch> -f suites='real-ssh s3'
 ```
 
 `suites` takes the names listed in `SUITES` in `scripts/ci-scope.py`,
-including `rust` (formatting, clippy, and every Rust target), `tooling`,
-`python-sdk`, `linux-arm64`, `macos-intel`, `s3`, `real-ssh`, and single
-real-SSH profiles. Report such checks as running in your reply; GitHub keeps
-their results, so the pull request needs no update when they finish. They
+including `rust` (formatting, clippy, and every Rust target), `macos-lint`
+(clippy for Apple Silicon on Linux), `tooling`, `python-sdk`, `linux-arm64`,
+`macos-intel`, `s3`, `real-ssh`, and single real-SSH profiles. Report such
+checks as running in your reply; GitHub keeps their results, so the pull
+request needs no update when they finish. They
 keep running if the pull request merges. A later run with the same `suites`
 value on the branch cancels the earlier run of those jobs, so dispatch once
 the change has settled rather than after every commit.
@@ -720,8 +721,8 @@ Rust changes, run `cargo fmt --all -- --check`, a build, and the unit or
 integration tests that exercise the change. When a change adds, removes, or
 narrows a platform `cfg`, such as making tests Linux-only, also run
 `scripts/check-macos-lint.py`. It lints the macOS build on Linux in about a
-minute, while post-merge CI builds macOS only for macOS-specific files, so the
-nightly or a release would otherwise be the first to find the problem. Prefer
+minute. Post-merge CI runs it as the `macos-lint` job with every Rust change,
+but running it before merge keeps the failure off `master`. Prefer
 exact or narrow filters in the `local` target (`tests/local.rs` holds the
 shared helpers and `tests/local/<topic>.rs` the tests, named
 `<topic>::<test>`); those tests invoke the built binary against temporary

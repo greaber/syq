@@ -62,6 +62,7 @@ jobs:
       s3: ${{ steps.changes.outputs.s3 }}
       repository_checks: ${{ steps.changes.outputs.repository_checks }}
       macos_intel: ${{ steps.changes.outputs.macos_intel }}
+      macos_lint: ${{ steps.changes.outputs.macos_lint }}
       real_ssh_matrix: ${{ steps.changes.outputs.real_ssh_matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -304,6 +305,80 @@ jobs:
           github.ref == 'refs/heads/master' &&
           needs.scope.outputs.full_suite == 'true' &&
           (steps.native-tests.outcome == 'success' || steps.native-tests.outcome == 'failure') &&
+          steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+  # Clippy for Apple Silicon on Linux catches code gated to one platform, such
+  # as an import only Linux tests use, with every Rust change rather than only
+  # in the nightly or release macOS suite. It runs beside the rust job, which
+  # takes several times as long, so it adds no wall time to a run.
+  macos-lint:
+    # Cancel only matching automatic checks and later selections of the same
+    # suite on the same branch; other manual runs keep a unique group.
+    concurrency:
+      group: ${{ github.workflow }}-macos-lint-${{ github.event_name == 'push' && github.ref || needs.scope.outputs.suite_selection == 'true' && format('{0}-selected', github.ref) || github.run_id }}
+      cancel-in-progress: ${{ github.event_name == 'push' || needs.scope.outputs.suite_selection == 'true' }}
+    needs: scope
+    if: >-
+      needs.scope.result == 'success' &&
+      needs.scope.outputs.macos_lint == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Cache pinned development tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/syq-tools
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-python-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
+      - name: Install pinned development tools
+        env:
+          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
+        run: scripts/setup.sh github python
+      # The build output is for aarch64-apple-darwin plus the host's build
+      # scripts and proc macros, so it has its own entry. Only master saves it.
+      - name: Restore Cargo dependencies and build output
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-ci-macos-lint-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-ci-macos-lint-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+      # Exit 1 is a lint failure. Exit 2 means the lint could not run (toolchain
+      # or crate download); that fails the job too, so a broken check is noticed
+      # instead of passing silently.
+      - name: Lint every Rust target for macOS
+        id: lint
+        run: |
+          status=0
+          scripts/check-macos-lint.py || status=$?
+          if [ "$status" -eq 2 ]; then
+            echo '::error title=macOS lint could not run::scripts/check-macos-lint.py could not set up the toolchain or download crates; see the log above.'
+          else
+            echo 'linted=true' >> "$GITHUB_OUTPUT"
+          fi
+          exit "$status"
+      # Save once clippy has run, even if it failed, but not after a setup
+      # failure that may have left the crates half downloaded.
+      - name: Save Cargo dependencies and build output
+        if: >-
+          !cancelled() &&
+          github.ref == 'refs/heads/master' &&
+          steps.lint.outputs.linted == 'true' &&
           steps.cargo-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
