@@ -140,9 +140,12 @@ platform, such as an import that only Linux tests use, fails there as it would
 on the macOS runner. A lint failure is listed before the SSH and CI items. When
 its errors are in syq's own code, repair them through a PR and use the repaired
 commit as the candidate, so no validation is spent on one that cannot pass.
-Other errors, and a lint that cannot run at all (listed last), do not hold up
-validation. The macOS suite remains the release gate: the lint skips C warnings
-and runs no tests.
+`ci.yml` runs the same lint as its `macos-lint` job, so any lint failure there,
+in syq's code or in a dependency build script that needs a real C compiler,
+fails the full run and blocks certification just as `macos.yml` would. A lint
+that cannot run at all only warns in that job, and readiness lists it last; it
+does not hold up validation. The macOS suite remains the release gate: the lint
+skips C warnings and runs no tests.
 
 For an already-prepared version with matching evidence, start at step 2. A new
 release request does not require another preparation PR or another test run.
