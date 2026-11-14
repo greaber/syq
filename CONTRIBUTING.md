@@ -169,6 +169,12 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo nextest run --locked --bin syq
 ```
 
+Code gated to one platform, such as tests that only run on Linux, can leave an
+unused import or other warning on another. `scripts/check-macos-lint.py` runs
+the clippy check above for macOS on any host, without a macOS SDK. It adds the
+macOS standard library and clippy to the pinned Rust toolchain if they are
+missing.
+
 `cargo nextest run` runs each Rust test in a separate process. Tests time out
 at two minutes, with five seconds to stop before forced termination; the
 remaining tests still run. The settings live in `.config/nextest.toml` and

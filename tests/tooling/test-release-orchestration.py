@@ -231,6 +231,7 @@ class PathScopeTests(Scratch):
                              ("tests/tooling/test-rust-test-timeouts.py", "setup workflows"),
                              ("tests/tooling/test-release-orchestration.py",
                               "orchestration workflows"),
+                             ("scripts/check-macos-lint.py", "orchestration workflows"),
                              (".github/workflows/macos.yml", "orchestration workflows"),
                              (".github/workflows/ci.yml", "orchestration workflows"),
                              ("scripts/check-script-references.py",
@@ -791,6 +792,59 @@ class PreflightTests(Scratch):
         self.assertEqual(status, 1)
         self.assertIsNone(report["ci"])
         self.assertEqual(report["next_action"], "scripts/release-status.py v9.9.9")
+
+    def test_macos_lint_runs_first_until_the_macos_suite_certifies(self):
+        # A copy of readiness beside a fake lint; the real one would build syq.
+        scripts = self.work / "lint-scripts"
+        scripts.mkdir()
+        shutil.copy(SCRIPTS / "release-readiness.py", scripts)
+        for name in ["verify-release-ci.py", "release_test_inputs.py", "tooling.py",
+                     "check-python-api-sync.py"]:
+            (scripts / name).symlink_to(SCRIPTS / name)
+        marker = self.work / "lint-ran"
+        write_executable(scripts / "check-macos-lint.py", textwrap.dedent(f"""\
+            #!{sys.executable}
+            import os, pathlib, sys
+            pathlib.Path({str(marker)!r}).write_text(os.getcwd())
+            print("fake lint output")
+            sys.exit(int(os.environ["SYQ_TEST_LINT_STATUS"]))
+            """))
+        def readiness(lint_status, **env):
+            marker.unlink(missing_ok=True)
+            result = self.tool(scripts / "release-readiness.py", "v9.9.9", "--json",
+                               SYQ_TEST_LINT_STATUS=str(lint_status), **env)
+            return result.returncode, json.loads(result.stdout), result.stderr
+
+        # A certified macOS suite already covers the lint.
+        status, report, _ = readiness(1)
+        self.assertEqual(status, 0, report)
+        self.assertEqual(report["macos_lint"], "skipped")
+        self.assertFalse(marker.exists())
+
+        # Without that certificate, a lint failure comes before the SSH lab and CI,
+        # and its output stays off the JSON report.
+        self.receipt.unlink()
+        uncertified = {"SYQ_TEST_WORKFLOW_RUNS_JSON": '{"workflow_runs":[]}'}
+        status, report, stderr = readiness(1, **uncertified)
+        self.assertEqual(status, 1)
+        self.assertTrue(os.path.samefile(marker.read_text(), self.repo))
+        self.assertIn("fake lint output", stderr)
+        self.assertEqual(report["macos_lint"], "failed")
+        self.assertIn("macOS lint failed", report["missing"][0]["message"])
+        self.assertIn("scripts/check-macos-lint.py", report["next_action"])
+        self.assertIn("--check-ssh", report["missing"][1]["next_action"])
+
+        status, report, _ = readiness(0, **uncertified)
+        self.assertEqual(report["macos_lint"], "passed")
+        self.assertFalse(any("macOS lint" in item["message"] for item in report["missing"]))
+        self.assertIn("--check-ssh", report["next_action"])
+
+        # A lint that cannot run is listed last and never becomes the next action.
+        status, report, _ = readiness(2, **uncertified)
+        self.assertEqual(report["macos_lint"], "unavailable")
+        self.assertIn("could not run", report["missing"][-1]["message"])
+        self.assertTrue(any("macos.yml" in item["message"] for item in report["missing"][:-1]))
+        self.assertIn("--check-ssh", report["next_action"])
 
 
 FAKE_STATUS_GH = """#!{python}
