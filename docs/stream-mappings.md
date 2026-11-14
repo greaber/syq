@@ -1,8 +1,8 @@
 # Stream-mapping protocol
 
 Use this subprocess interface when your program supplies or consumes several
-byte streams in one `syq cp` process; [Python callback mappings](https://greaber.github.io/syq/python-streams.html#callback-mappings)
-use it for you. For a single stream in a shell pipeline, use
+byte streams in one `syq cp` process;
+[Python callback mappings](python-streams.md#callback-mappings) use it for you. For a single stream in a shell pipeline, use
 [`--src-fd` or `--as-fd`](commands/cp.md#file-descriptors).
 
 ## Start a session
@@ -22,8 +22,8 @@ syq cp --mapping entries.jsonl --stream-mapping-fd FD \
 consumer, or both, with its own descriptors. Keep reading the control
 connection and results while they run.
 
-The manifest uses the [mapping format](mappings.md), with a stream endpoint in
-place of either tagged path:
+The manifest uses the [mapping format](commands/map.md#mapping-format), with
+a stream endpoint in place of either tagged path:
 
 ```json
 {"src":{"stream":0},"dst":{"encoding":"utf-8","value":"first.tar"}}

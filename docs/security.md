@@ -392,8 +392,11 @@ requests of your machine:
 | Authorize an SSH login to another server account | Required unless this source and destination account pair has a session or remembered permission |
 | Use your storage credentials for a transfer | Always required |
 
-Receiving is on by default in the default domain and off in a fresh isolated
-domain. `syq persist receive off` turns it off but keeps SSH reuse.
+Persistence is off by default, and nothing receives while it is off. Once
+persistence is on, the default domain receives unless you turn receiving off;
+`syq persist receive on` also turns persistence on. A fresh isolated domain
+starts with receiving off. `syq persist receive off` turns receiving off but
+keeps SSH reuse.
 
 The prompt shows the server account and the requested command. For copies and
 authorizations, that is the syq command the server ran, including options from

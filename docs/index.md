@@ -56,15 +56,16 @@ updated when they differ, and other files there stay unless you add
 | I want to… | Start here |
 |---|---|
 | Look up commands and options | [Command reference](commands/index.md) |
-| Choose exactly where files land | [Copy and placement](reference.md) |
-| Preview changes | [Dry runs](reference.md#preview-changes) |
+| Choose exactly where files land | [Copy files](reference.md) |
+| Preview changes | [Preview changes](reference.md#preview-changes) |
 | Skip build files or use `.gitignore` | [Ignoring paths](reference.md#ignoring-paths) |
-| Mirror a directory | [Mirroring](reference.md#mirror-a-directory) |
-| Remove files in parallel | [Removal](remove.md) |
-| Send files to my laptop from a server’s shell | [Receiving files](receive.md) |
-| Run a build or open an artifact on my desktop from a server | [Commands on your receiving machine](receive.md#run-commands-on-your-laptop) |
-| Copy between two servers | [Remote-to-remote transfers](remote-to-remote.md) |
-| Rename or reorganize files during a copy | [Mappings](mappings.md) |
+| Mirror a directory | [Mirror a directory](reference.md#mirror-a-directory) |
+| Remove files in parallel | [Remove files](remove.md) |
+| Send files to my laptop from a server’s shell | [Use your laptop from a server](receive.md) |
+| Run a build or open an artifact on my desktop from a server | [Run commands on your laptop](receive.md#run-commands-on-your-laptop) |
+| Copy between two servers | [Copy between servers](remote-to-remote.md) |
+| Copy to, from, or between S3 buckets | [Use S3 storage](object-storage.md) |
+| Rename or reorganize files during a copy | [Rename and reorganize](mappings.md) |
 | Use syq from Python | [Python SDK](python.md) |
 | Read results from a script | [Automation results](automation.md) |
 | Make copies faster | [Speed](speed.md) |

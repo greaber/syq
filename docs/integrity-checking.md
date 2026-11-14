@@ -9,9 +9,10 @@ By default, syq skips files whose size and modification time match. `syq cp`
 compares timestamps at the precision the destination keeps, so a destination
 that truncates fractions of a second still matches. `syq rsync` compares whole
 seconds, as rsync does. When the destination is on FAT, which keeps times in
-two-second steps, times less than two seconds apart match
-([exceptions](reference.md#check-file-contents)). A larger difference counts as
-a change, even when the source is older.
+two-second steps, times less than two seconds apart match, except when you
+copy to one existing file named as the destination or use `syq rsync
+--existing`. A larger difference counts as a change, even when the source is
+older.
 
 Copies between local files and S3 compare timestamps exactly, using the time
 syq stores with each uploaded object. Downloads of objects without one use

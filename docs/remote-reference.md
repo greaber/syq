@@ -76,11 +76,8 @@ run `syq receiver enroll HOST` to switch to your current login key now.
 The receiver runs one syq build at a time. After you change builds, the next
 copy logs in to update it, so switching back and forth between two builds,
 such as a development build and an installed one, logs in after each switch.
-If another syq on your laptop updated the receiver after this one last did, a
-copy between two servers that you start on your laptop updates it back and
-tries once more; the receiver runs at most one of the two attempts. A server
-that connects to the receiver itself, to run or coordinate a copy, needs the
-same build as the machine that approves the copy. Otherwise the receiver
+A server that connects to the receiver itself, to run or coordinate a copy,
+needs the same build as the machine that approves the copy. Otherwise the receiver
 refuses the copy and names both builds; update syq on whichever machine is
 older.
 

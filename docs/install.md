@@ -31,15 +31,15 @@ Put `--use-version VERSION` after `syq`, before the command and its options,
 to run an exact official release:
 
 ```sh
-syq --use-version 0.7.1 cp photos --into backup
+syq --use-version 0.10.0 cp photos --into backup
 ```
 
 The first time, syq downloads and verifies that release and keeps it in
 `~/.local/lib/syq`; later runs work offline. Your normal installation stays
 unchanged. The selected release runs the whole command, including on servers,
-so an older release brings its older limitations and bugs too. Receiving or the
-SSH authorization provider that such a command starts on your laptop outlasts
-it; your normal installation switches them to its own version, [as after an
+so an older release brings its older limitations and bugs too. If such a
+command starts receiving or the SSH authorization provider on your laptop,
+your normal installation later switches them to its own version, [as after an
 update](persistence-reference.md#connection-lifetime-and-waits). Stored
 releases stay until you delete them; see
 [stored releases](environment.md#stored-releases-and-helpers).
@@ -50,7 +50,7 @@ Use `--version-is EXPR` to check the version of the syq you invoked before it
 runs your command:
 
 ```sh
-syq --version-is '>=0.7.1, <0.8.0 | >=1.0.0' cp photos --into backup
+syq --version-is '>=0.10.0, <0.11.0 | >=1.0.0' cp photos --into backup
 ```
 
 Compare with `==`, `!=`, `<`, `<=`, `>`, or `>=`; `,` means and, and `|` means
@@ -76,11 +76,9 @@ helpers and installation exceptions.
 ## Updates
 
 Use `syq --self-update` for a standalone installation, or `brew upgrade syq`
-for Homebrew. Commands already running keep their own version. Receiving
-switches to the new version once nothing is in progress, by itself or when you
-next run syq, and `syq persist status` says why it hasn't yet. If it needs you
-to unlock or touch your SSH key, it waits until you next run a syq copy or ssh
-command, or `syq persist status`, in a terminal.
+for Homebrew. Commands already running keep their own version, and receiving
+[switches to the new version](persistence-reference.md#connection-lifetime-and-waits)
+once nothing is in progress.
 
 When a newer release is out, standalone and Homebrew installs remind you in a
 terminal, at most once a day after a successful command, and name the upgrade

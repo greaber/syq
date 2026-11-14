@@ -19,6 +19,7 @@ QUICK_TESTS = (
     "tests/tooling/test-dispatched-checks-status.py",
     "tests/tooling/test-doc-selector.cjs",
     "tests/tooling/test-doc-site.py",
+    "tests/tooling/test-doc-tools.py",
     "tests/tooling/test-find-release-build.py",
     "tests/tooling/test-generated-sdk-post-merge-ci.py",
     "tests/tooling/test-installer.py",
