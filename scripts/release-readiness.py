@@ -150,8 +150,8 @@ def readiness(tag):
     # Before the SSH lab and CI: a repair replaces the candidate they would test.
     lint = macos_lint(certification)
     if lint == "failed":
-        missing("the macOS lint failed; it would fail the macOS suite at its first step and "
-                "the full ci.yml run's macos-lint job, blocking certification",
+        missing("the macOS lint failed, which fails the full ci.yml run's macos-lint job and "
+                "blocks certification; errors in syq's code would also fail the macOS suite",
                 "If scripts/check-macos-lint.py reports errors in syq's code, repair them through a "
                 "PR and use the repaired commit as the candidate, starting no validation for this "
                 "one. Errors outside syq's code, such as a dependency build script that needs a "
