@@ -176,6 +176,11 @@ see [existing-file policies](../reference.md#choose-which-existing-files-to-upda
 and, before retrying a failed copy,
 [resuming a copy](../reference.md#resume-an-interrupted-copy).
 
+`error-if-different` compares the contents of a file whose time differs before
+rejecting it; between S3 buckets it compares metadata instead (see
+[Copies between S3 buckets](../object-storage.md#copies-between-s3-buckets)).
+A file rejected for its contents keeps its metadata too.
+
 `--in-place` cannot be combined with `--if-exists=keep` or `update-if-older`,
 because a retry would then skip a file left incomplete. Even with `--in-place`,
 a new file that must not replace anything (`--as-new`, or a new file under
@@ -209,6 +214,48 @@ setgid, and sticky bits are copied only with `--copy-metadata=permissions`.
 Ownership and ACL entries are copied as numeric IDs (UUIDs for macOS ACLs), not
 translated to account names, so on another host they apply to whichever
 account has that ID there.
+
+By default, a new `--into` directory, and any missing directory above an
+`--into` or `--as` target, gets the mode `mkdir` would give it: `0777` limited
+by the umask on the destination.
+
+### ACLs and extended attributes
+
+`acls` copies POSIX ACLs on Linux and native ACLs on macOS, and refuses to copy
+them between the two. On a Linux source, `xattrs` copies `user.*` attributes
+for a non-root user, and for root every namespace except `system.*`, including
+`security.selinux` and `security.capability`. Both remove destination entries
+the source lacks, and a failure to read or set them makes the copy fail.
+
+### How syq changes existing files and directories
+
+When only an existing file's metadata differs, syq changes the metadata in
+place if all of these hold:
+
+- syq can tell the file has no other names (hard links),
+- the file belongs to the account syq runs as, and
+- the change adds no set-ID bit and changes no security attribute.
+
+Run as root, syq changes in place whatever the file's owner could change, and
+replaces the file to give it another owner or group.
+
+Otherwise syq rewrites the file as if its contents had changed. That takes as
+long as copying it, needs room for a second copy, gives the file a new inode
+number, and drops attributes the copy doesn't select, such as ACLs. Access
+times are always set in place.
+
+Syq can't tell whether a file has other names on some filesystems, such as
+SMB, SSHFS and other FUSE filesystems, and on macOS anything but APFS and
+HFS+. There every metadata-only change rewrites the file, and
+`--in-place=update` replaces files instead of updating them.
+
+A directory gets its copied permissions after its contents, so an interrupted
+copy can leave a new directory open only to its owner.
+
+If a directory you own lacks the write or search permission a change needs,
+`syq cp` names it and the changes in it fail;
+[`--widen-dirs`](#metadata-and-symlinks) lets syq briefly add the missing
+owner permission and restore it afterwards, as `syq rsync` does by default.
 
 ## File descriptors
 

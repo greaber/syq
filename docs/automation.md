@@ -115,7 +115,7 @@ For regular files in filesystem copies, `content_differs` means the sizes or
 compared hashes differ; `metadata_differs` also covers files selected by the
 size-and-time check. A `transfer_file` trace has no `bytes` when only metadata
 would change in place, but has them when syq would
-[replace the file](reference.md#how-syq-changes-existing-files-and-directories)
+[replace the file](commands/cp.md#how-syq-changes-existing-files-and-directories)
 to change its metadata; that file counts as transferred.
 
 ### `operation_result`
