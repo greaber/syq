@@ -5,7 +5,7 @@
 # Using syq
 
 - [Install and setup](install.md)
-- [Copy files](reference.md)
+- [Copy files](copy-files.md)
   - [Select entries with expressions](expressions.md)
 - [Use S3 storage](object-storage.md)
 - [Remove files](remove.md)

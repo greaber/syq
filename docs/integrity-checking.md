@@ -28,7 +28,7 @@ syq cp --hash --srcs-in project --into backup
 A file whose contents already match keeps its inode and any other hard links;
 only its metadata is updated. `--hash-or-copy` (rsync `-I`) also stops trusting
 size and timestamp, but can rewrite files that already match; see
-[Check file contents](reference.md#check-file-contents).
+[Check file contents](copy-files.md#check-file-contents).
 
 Syq stores a hash with each object it uploads. In copies between local files
 and S3, when sizes match but timestamps differ, syq compares the local file

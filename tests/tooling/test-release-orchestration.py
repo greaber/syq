@@ -205,7 +205,7 @@ class PathScopeTests(Scratch):
     def test_pull_request_190_surface(self):
         # The surface touched by PR #190 should run the Rust baseline, Python SDK, and
         # shell lint without promoting the pull request to unrelated suites.
-        scope = self.scope("docs/reference.md", "sdk/python/native-api.json",
+        scope = self.scope("docs/copy-files.md", "sdk/python/native-api.json",
                            "sdk/python/src/syq/client.py", "src/cli.rs", "tests/local.rs",
                            "tests/real-ssh/scenarios.sh")
         self.assertScope(scope, native="true", sdks="true", python_sdk="true", shellcheck="true")

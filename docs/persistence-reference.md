@@ -4,7 +4,7 @@ This page answers questions that come up after setup. To set up, start with
 [Keep connections open](persistence.md) or
 [Use your laptop from a server](receive.md);
 [`syq persist`](commands/persist.md) lists every option. Commands use the
-default persistence domain unless you pass `--pscope PATH` for an
+default scope unless you pass `--pscope PATH` for an
 [isolated one](#isolated-script-scopes).
 
 ## Account access
@@ -96,7 +96,7 @@ available. An agent that requires confirmation or a touch asks for each one.
 
 An [SSH authorization provider](receive.md#use-an-ssh-authorization-provider)
 needs the same syq build as the machines that use it. The first receiving
-profile in its default domain (the one `receive status` lists first) must be
+profile in its default scope (the one `receive status` lists first) must be
 enabled. Its SSH server must allow local forwarding (`AllowTcpForwarding` and
 `AllowStreamLocalForwarding` set to `local` or `yes`), and the login key's
 `authorized_keys` entry must not disable it with `restrict` or
@@ -117,8 +117,8 @@ syq persist receive permissions remove PERMISSION_ID
 To cut off access, run `syq persist off` on the requesting server and
 `syq persist receive off` on the laptop; see
 [SSH account access](security.md#ssh-account-access) for what this does not
-undo. Remembered permissions belong to the laptop's domain. Creating a new
-domain on the server does not revoke what that server account was already
+undo. Remembered permissions belong to the laptop's scope. Creating a new
+scope on the server does not revoke what that server account was already
 granted.
 
 ## Names and profiles
@@ -168,7 +168,7 @@ syq persist receive on --name work-inbox --connection work \
 On `work`, use `syq cp results --to @work-inbox`. Other servers cannot use
 that profile, and your general profile can still ask before every download.
 
-Without `--connection`, a profile accepts every SSH connection in its domain.
+Without `--connection`, a profile accepts every SSH connection in its scope.
 Each `--connection` matches the destination exactly as your laptop connects to
 it, as `persist status` shows it (`work`, `alice@work`, or `alice@work:2222`),
 without expanding aliases. Because the match uses your laptop's name for the
@@ -186,7 +186,7 @@ the server, then run `syq persist connect server` on the new laptop.
 ### Back up the receiving identity
 
 Your receiving names are tied to the key in `~/.syq-receiver-identity/`, which
-all profiles, domains, and syq versions share. Keep it in private backups; if
+all profiles, scopes, and syq versions share. Keep it in private backups; if
 you lose it, you have to `forget` your names on each server. Another machine
 with a copy of it has the same identity, but only one machine can hold a name at
 a time, so give machines that receive at the same time different profile names.
@@ -257,9 +257,9 @@ until receiving is ready. `--timeout 30` limits that wait, not the SSH login
 or installing syq on the server. `syq ssh` reuses or opens a persistent login
 but does not start receiving.
 
-In an isolated domain, idle SSH connections close after five to ten minutes;
-in the default domain they stay open. Syq installs no login service, so
-connect again after a reboot.
+In a scope made with `--ephemeral`, idle SSH connections close after five to
+ten minutes; in the default scope they stay open. Syq installs no login
+service, so connect again after a reboot.
 
 After you update syq, receiving and the SSH authorization provider switch to
 the new version once no copy, command, or approval is in progress, by
@@ -282,9 +282,9 @@ that uses it opens it again, which asks for approval again unless you
 remembered it; export a `persist ssh-config` file again after that. While a
 copy, shell, or other session runs through it, the switch waits for it to
 finish. A connection that can't tell whether it's in use, such as one opened
-on macOS or in an isolated domain, makes the switch wait until it closes.
-`syq persist status` says which connections the switch waits for and shows
-the command that switches at once and closes them. Session permissions
+on macOS or in a scope made with `--ephemeral`, makes the switch wait until it
+closes. `syq persist status` says which connections the switch waits for and
+shows the command that switches at once and closes them. Session permissions
 (**Allow**) end at the switch, as at any reconnect.
 
 To wait in a script without starting a connection, run
@@ -294,7 +294,7 @@ structured status, see [connection status](automation.md#connection-status).
 
 ## Isolated script scopes
 
-To keep a script's connections and settings apart, create an isolated domain
+To keep a script's connections and settings apart, create a scope
 and pass its path to each command with `--pscope PATH` (`--syq-pscope PATH`
 for rsync):
 
@@ -306,8 +306,8 @@ syq cp --pscope "$scope" report --to hostB --as report
 syq persist --pscope "$scope" off
 ```
 
-A new domain starts with receiving off and default authorization choices, and
-shares none of the default domain's settings or connections. To receive
+A new scope starts with receiving off and default authorization choices, and
+shares none of the default scope's settings or connections. To receive
 through one on your laptop, run
 `syq persist --pscope PATH receive on --name project --connection server` with
 a name not already connected to that server account.
@@ -316,11 +316,11 @@ a name not already connected to that server account.
 turns on debug output, or asks for agent, port, or tunnel forwarding, because
 syq keeps no connection open for such a command.
 
-`persist off` on an isolated domain closes its connections and deletes its
+`persist off` on such a scope closes its connections and deletes its
 settings and remembered permissions; the path cannot be reused. On the default
-domain, it only closes connections. A domain does not isolate processes of the
+scope, it only closes connections. A scope does not isolate processes of the
 same account from each other (see
-[Persistent connections](security.md#persistent-connections)), and all domains
+[Persistent connections](security.md#persistent-connections)), and all scopes
 share receiving names.
 
 <a id="updating-connections"></a>

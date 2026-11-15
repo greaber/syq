@@ -26,15 +26,14 @@ again.
 ## Receiving
 
 With persistence on, copies, other file commands, and `persist connect` also
-start *receiving* on their connections, unless you turn it off. Receiving lets
-connected servers request file copies to your machine, commands on it, and
-access to other servers, each with your approval; see
+start *receiving* on their connections unless you turn it off. Connections made
+by an `--rsh` (or rsync `-e`) command that gives ssh its own options never
+receive. Receiving lets connected servers request file copies to your machine,
+commands on it, and access to other servers, each with your approval; see
 [Use your laptop from a server](receive.md). If you don't need it, run
 `syq persist receive off`.
 
-A custom `--rsh` (or rsync `-e`) command that runs `ssh` with its own options
-gets a separate connection for each set of options, and doesn't start
-receiving.
+<a id="reuse-laptop-authorized-account-access"></a>
 
 ## What keeps running
 
@@ -49,21 +48,14 @@ so that the next command to that server starts sooner:
 
 The command that starts them says so, naming `syq persist off`.
 
-<a id="reuse-laptop-authorized-account-access"></a>
-
-On a server, connections opened with your laptop's SSH access, as by
-`syq ssh --auth-from @laptop hostB`, are kept for later commands whether or not
-persistence is on, and `syq persist off` closes them; see
-[Open a shell on another server](receive.md#open-a-shell-on-another-server).
-
 ## Separate connections for scripts
 
-A script can keep its own connections and settings, apart from yours, in an
-[isolated domain](persistence-reference.md#isolated-script-scopes). Create one
+A script can keep its own connections and settings, apart from yours, in a
+[scope](persistence-reference.md#isolated-script-scopes). Create one
 with `syq persist on --ephemeral`, which prints its path, and pass that path
 to later commands with `--pscope PATH`. Its connections close after a few idle
 minutes, receiving starts off, and `syq persist --pscope PATH off` removes the
-domain with its settings.
+scope with its settings.
 
 See [Persistence details](persistence-reference.md) for troubleshooting, or
 [`syq persist`](commands/persist.md) for all commands and options.

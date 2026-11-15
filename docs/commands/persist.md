@@ -25,7 +25,7 @@ syq persist [OPTIONS] <COMMAND>
 
 | Argument / option | Meaning |
 |---|---|
-| `--pscope <PATH>` | Use the isolated connections and settings at PATH instead of the default ones |
+| `--pscope <PATH>` | Use the scope at PATH, with its own connections and settings, instead of the default scope |
 
 **Help (also available on subcommands)**
 
@@ -329,7 +329,7 @@ syq persist receive wait [OPTIONS] <HOST>
 
 Run these on a server. Receiving names belong to the whole OS account, so
 `--pscope` does not filter them, and forgetting one releases it in every
-persistence domain.
+scope.
 
 <!-- CLI: persist destinations -->
 ```text
@@ -429,7 +429,7 @@ syq persist on [OPTIONS]
 
 | Argument / option | Meaning |
 |---|---|
-| `--ephemeral` | Create a new isolated set of connections and settings and print its path for --pscope, instead of turning persistence on for your user |
+| `--ephemeral` | Create a new scope, with its own connections and settings, and print its path for --pscope, instead of turning persistence on for your user |
 
 <!-- /CLI -->
 

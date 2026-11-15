@@ -75,7 +75,7 @@ timeout. Invalid combinations raise
 `cp(*sources, **options)` → [CpResult](https://greaber.github.io/syq/python-results.html#cpresult)
 copies files. Choose one placement argument unless every destination is a
 callback. Besides the shared arguments, it accepts the following;
-[Copy files](https://greaber.github.io/syq/reference.html),
+[Copy files](https://greaber.github.io/syq/copy-files.html),
 [Remote copy details](https://greaber.github.io/syq/remote-reference.html), and
 [Object storage](https://greaber.github.io/syq/object-storage.html) describe
 what they do.
@@ -103,7 +103,7 @@ what they do.
 | `sparse` | Write zero ranges as sparse holes on filesystem destinations |
 | `in_place` | `"new"`: write new files at their final names instead of under a temporary name, except a new file that must not replace anything (`as_new`, or under `if_exists="error"` or `"error-if-different"`). `"update"`: also update existing files in place, as `--in-place=update` describes |
 | `no_compress` | Disable compression |
-| `transfer_strategy` | `"whole-file"`, `"aligned-block"`, or `"locality"` (default); filesystem copies only; see [transfer strategies](https://greaber.github.io/syq/reference.html#choose-a-transfer-strategy) |
+| `transfer_strategy` | `"whole-file"`, `"aligned-block"`, or `"locality"` (default); filesystem copies only; see [transfer strategies](https://greaber.github.io/syq/copy-files.html#choose-a-transfer-strategy) |
 | `performance_tuning` | Overrides such as `"workers=4"` or `"s3-objects=4,s3-parts-per-object=8"`; default: automatic |
 | `resource_limits` | Ceilings such as `"bandwidth=10M,workers=4"`, below which tuning stays automatic; a concurrency key cannot also appear in `performance_tuning` |
 | `s3_endpoint`, `s3_region`, `s3_profile` | S3 endpoint URL, signing region, and AWS profile |
@@ -111,7 +111,7 @@ what they do.
 | `s3_write_header` | Like `s3_header`, but only on requests that create or replace objects |
 | `s3_retries` | Retries per S3 request after a temporary failure or throttling, 0 to 100; default 10 |
 | `coordinate_at`, `rsh`, `peer_auth` | As `--coordinate-at`, `--rsh`, and `--peer-auth` |
-| `pscope` | An [isolated persistence domain](https://greaber.github.io/syq/persistence-reference.html#isolated-script-scopes) for connections and saved authorization choices |
+| `pscope` | A [persistence scope](https://greaber.github.io/syq/persistence-reference.html#isolated-script-scopes) for connections and saved authorization choices |
 | `syq_path`, `no_bootstrap` | Use this remote syq, or the one on the remote `PATH`, instead of installing one |
 | `no_tcp_encryption`, `no_tcp`, `tcp_ports`, `tcp_congestion` | As the CLI options of the same names |
 | `receiver_max_entries`, `receiver_max_bytes` | Limits for a restricted copy: an entry count, and a size string or byte count |

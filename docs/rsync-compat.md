@@ -8,7 +8,7 @@ See [`syq rsync`](commands/rsync.md) for all accepted options.
 | Area | Syq behavior |
 |---|---|
 | Filters | Gitignore syntax via `--syq-ignore` / `--syq-ignore-from`; rsync filters are unsupported |
-| Deletion timing | Extras are deleted after copying, and not at all after scan or copy errors; no delete-before or delete-during mode ([rules](reference.md#mirror-a-directory)) |
+| Deletion timing | Extras are deleted after copying, and not at all after scan or copy errors; no delete-before or delete-during mode ([rules](copy-files.md#mirror-a-directory)) |
 | Positive `--max-delete N` | Deletes nothing if the plan exceeds N; rsync deletes up to N |
 | Destination collisions | Distinct sources claiming the same destination fail before copying |
 | `--ignore-existing` | Keeps an existing non-directory even where the source would create a directory |
@@ -28,13 +28,13 @@ sees the change. In these cases syq instead replaces the file at the name it
 copies to, and other hard links keep the old file:
 
 - With `--inplace`, a file with other hard links, another owner, or wider
-  permissions than the copy gives it ([In-place writes](reference.md#in-place-writes)).
+  permissions than the copy gives it ([In-place writes](copy-files.md#in-place-writes)).
 - When only metadata changed, a file with other hard links or an unexpected
   owner, and any file where syq can't tell it has no other names, such as on
   SMB, SSHFS, and some NFS and macOS volumes.
 - Symlinks, named pipes, and devices whose metadata changes.
 
-See [Copy metadata](reference.md#copy-metadata) for the details.
+See [Copy metadata](copy-files.md#copy-metadata) for the details.
 
 ### Comparison
 
@@ -49,7 +49,7 @@ match can be rewritten. `-c` wins when both are given.
 
 `--numeric-ids` and `--partial` are accepted and change nothing: syq always
 uses numeric IDs and keeps
-[partial files to resume from](reference.md#resume-an-interrupted-copy). `-P`
+[partial files to resume from](copy-files.md#resume-an-interrupted-copy). `-P`
 shows progress. Compression is on by default, so `-z` adds nothing. `-B` /
 `--block-size` sets syq's comparison and reuse block size, within the range in
 the [tuning table](tuning.md#transfer-controls).
@@ -57,7 +57,7 @@ the [tuning table](tuning.md#transfer-controls).
 `-H` preserves hardlinks between selected regular files. On Linux and macOS,
 `-A` preserves ACLs and `-X` extended attributes. `-S` turns written zero
 ranges into sparse holes. See the
-[preservation rules and limits](reference.md#copy-metadata).
+[preservation rules and limits](copy-files.md#copy-metadata).
 
 ## Unsupported features
 
@@ -98,7 +98,7 @@ syq's `--performance-tuning`, `--resource-limits`, and
 [`--integrity-checking`](integrity-checking.md) for extra payload checks.
 
 Filters are last-match-wins with `!` re-inclusion, unlike rsync's first-match
-rules. Check the [gitignore examples](reference.md#ignoring-paths) when
+rules. Check the [gitignore examples](copy-files.md#ignoring-paths) when
 converting a filtered command.
 
 ## Compare without copying

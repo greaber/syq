@@ -56,10 +56,10 @@ updated when they differ, and other files there stay unless you add
 | I want to… | Start here |
 |---|---|
 | Look up commands and options | [Command reference](commands/index.md) |
-| Choose exactly where files land | [Copy files](reference.md) |
-| Preview changes | [Preview changes](reference.md#preview-changes) |
-| Skip build files or use `.gitignore` | [Ignoring paths](reference.md#ignoring-paths) |
-| Mirror a directory | [Mirror a directory](reference.md#mirror-a-directory) |
+| Choose exactly where files land | [Copy files](copy-files.md) |
+| Preview changes | [Preview changes](copy-files.md#preview-changes) |
+| Skip build files or use `.gitignore` | [Ignoring paths](copy-files.md#ignoring-paths) |
+| Mirror a directory | [Mirror a directory](copy-files.md#mirror-a-directory) |
 | Remove files in parallel | [Remove files](remove.md) |
 | Send files to my laptop from a server’s shell | [Use your laptop from a server](receive.md) |
 | Run a build or open an artifact on my desktop from a server | [Run commands on your laptop](receive.md#run-commands-on-your-laptop) |
