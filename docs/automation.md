@@ -321,8 +321,22 @@ then exits nonzero after printing the valid entries.
 |---|---|
 | `profiles` | Every profile's `cwd`, `cwd_explicit`, `root`, `auto_approve_root` (null when every download asks), and `servers` (the endpoints set with `--connection`; empty means all) |
 | `settings` | The first selected profile's settings |
-| `connections` | The profiles allowed on each endpoint, and its service's build (`identity`), what keeps it from switching (`busy`: `requests` in progress, `pending` approvals, and `accounts`, the open account connections the switch waits for; `accounts_in_use` of those have a session running, and the rest can't tell and count until they close), the syq path it follows (`started_from`), and any `switch` to a new build |
+| `connections` | One entry for each endpoint's receiving service, described below |
 | `provider` | The local SSH authorization service, or null when it isn't running; its `profiles` contain `settings`, `sessions`, and `pending` requests, and `decision_error` reports a failed local approval |
+
+Each `connections` entry includes:
+
+| Field | Meaning |
+|---|---|
+| `profiles` | The profiles allowed on this endpoint |
+| `identity` | The syq build the service runs |
+| `busy` | What keeps the service from switching to a new build, described below |
+| `started_from` | The syq path the service follows to switch to a new build, when it can |
+| `switch` | Its switch to a new build, while it waits for one or after one failed |
+
+`busy` counts `requests` in progress, `pending` approvals, and `accounts`, the
+open account connections the switch waits for. Of those, `accounts_in_use`
+have a session running; the rest can't tell and count until they close.
 
 `syq persist receive pending --json` prints the requests waiting for approval,
 from receiving connections and the local SSH provider. Each has `id`, `from`,
