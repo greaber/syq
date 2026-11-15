@@ -4,6 +4,31 @@ User-facing changes are recorded here starting with the release after
 [0.5.2](https://github.com/greaber/syq/releases/tag/v0.5.2).
 Earlier releases have notes on [GitHub Releases](https://github.com/greaber/syq/releases).
 
+## 0.10.1 — 2026-11-15
+
+Changes since 0.10.0: clearer help text and documentation.
+
+### Changed
+
+- Help text and messages call the separate set of connections and settings
+  that `syq persist on --ephemeral` creates and `--pscope` selects a *scope*,
+  replacing "isolated set" and "persistence domain".
+- The message for rsync's `--exclude`, `--include` and `--filter` now links to
+  [Ignoring paths](https://greaber.github.io/syq/copy-files.html#ignoring-paths)
+  in the published guide.
+
+### Documentation
+
+- The Copy files guide moved from `reference.html` to `copy-files.html`; the
+  old address is not redirected.
+- Fixed a truncated command description, an option `syq cp` doesn't have, and
+  a version example that rejected the current release. The list of files syq
+  writes now includes the authorization, account-permission and receiving
+  identity files.
+- Details that belong in reference moved out of the guides, "Copying between
+  servers" in the security page is now a table of what each machine holds and
+  can do, and repeated caveats appear once.
+
 ## 0.10.0 — 2026-11-10
 
 Changes since 0.9.0. Every copy that goes through an enrolled receiver is now
