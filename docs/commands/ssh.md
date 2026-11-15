@@ -37,7 +37,7 @@ syq ssh [OPTIONS] <HOST> [-- [COMMAND]...]
 | Argument / option | Meaning |
 |---|---|
 | `--auth-from <auto\|ssh\|@NAME\|HOST>` | Whose SSH access to use: this machine's own (auto or ssh), or access approved by a receiving machine (@NAME) or SSH authorization provider (HOST); omitted uses SYQ_AUTH_FROM, then the saved choice, then auto |
-| `--pscope <PATH>` | Use the isolated connections and settings that `syq persist on --ephemeral` created at PATH |
+| `--pscope <PATH>` | Use the scope that `syq persist on --ephemeral` created at PATH, with its own connections and settings |
 | `-t` | Request a terminal, including when running a command |
 | `-T` | Disable terminal allocation |
 

@@ -362,8 +362,8 @@ consistency, and durability in general, see
 
 While a persistent connection is open, any process running as your local user
 can use it to reach the server without another key touch or agent approval, even
-with receiving off. `syq persist off` closes the default domain's connections,
-including receiving; add `--pscope PATH` for an isolated domain.
+with receiving off. `syq persist off` closes the default scope's connections,
+including receiving; add `--pscope PATH` for another scope.
 
 A server can use a forwarded SSH agent for as long as the connection stays
 open, not just while your command runs. The connections that persistence keeps
@@ -373,7 +373,7 @@ agent. A connection that an older version of syq opened keeps what it forwarded
 until `syq persist off` closes it. An `--rsh` command that asks for forwarding,
 as with `-A`, gets its own connection that closes when the command ends.
 
-Persistence domains keep separate connections, authorization choices,
+Scopes keep separate connections, authorization choices,
 receiving profiles, and remembered account permissions, but share your
 account's SSH configuration, keys, agents, and receiver identity. They are not
 a security boundary between processes running as that account.
@@ -393,8 +393,8 @@ requests of your machine:
 | Use your storage credentials for a transfer | Always required |
 
 Persistence is off by default, and nothing receives while it is off. Once
-persistence is on, the default domain receives unless you turn receiving off;
-`syq persist receive on` also turns persistence on. A fresh isolated domain
+persistence is on, the default scope receives unless you turn receiving off;
+`syq persist receive on` also turns persistence on. A new scope
 starts with receiving off. `syq persist receive off` turns receiving off but
 keeps SSH reuse.
 
@@ -416,7 +416,7 @@ name destinations inside the approved destination, but it can set the
 permissions, including set-ID bits, the modification times, and the group of
 the files it lists, even when the command copies no metadata.
 
-By default, every connected server in a domain can use that domain's enabled
+By default, every connected server in a scope can use that scope's enabled
 receiving profiles; a profile's `--connection` list limits it to the servers you
 name, matched by the name your laptop connects with. All processes in an allowed
 server account share this authority, and a different profile name does not
@@ -586,7 +586,7 @@ their own narrower scope.
 
 **Allow** covers this pair of source and destination accounts for the current
 receiving connection from your laptop to the source. **Remember** also covers
-later connections through the same receiving profile and domain, while your
+later connections through the same receiving profile and scope, while your
 laptop is available. Either is bound to both accounts, the route, and the host
 names and plain host keys your laptop trusts for them; a request cannot add a
 host key, and a changed one needs fresh approval. With `ProxyJump`, each jump
@@ -623,7 +623,7 @@ asks for access to each destination account. The provider cannot tell which
 machine made that login, so its prompts name the provider account rather than
 a source server. **Allow** lasts for the current provider connection;
 **Remember** covers later logins to that provider account through the same
-profile and domain. Stopping receiving prevents further syq authorizations but
+profile and scope. Stopping receiving prevents further syq authorizations but
 does not revoke SSH access to the provider.
 
 A provider can also approve a

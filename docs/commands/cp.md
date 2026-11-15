@@ -113,7 +113,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--tcp-congestion <ALGO>` | Use this congestion-control algorithm for TCP data sockets (Linux only) |
 | `--detach` | Return as soon as the copy starts on the server that runs it |
 | `--peer-auth <MODE>` | How the server running the copy logs in to the other server; --rsh takes over this choice<br><br>Possible values:<br>- restricted: Let the other server accept only this copy, through restricted copying (see syq receiver); forwards no agent<br>- broker: Let it use your agent for that host and user, with full access to that account<br>- own-credentials: Forward nothing; it must have its own credentials for the other server<br>- full-agent: Forward your whole SSH agent, as ssh -A does<br><br>[default: restricted] |
-| `--pscope <PATH>` | Use the isolated connections and settings that `syq persist on --ephemeral` created at PATH |
+| `--pscope <PATH>` | Use the scope that `syq persist on --ephemeral` created at PATH, with its own connections and settings |
 
 ## S3 connection settings
 

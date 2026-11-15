@@ -111,7 +111,7 @@ what they do.
 | `s3_write_header` | Like `s3_header`, but only on requests that create or replace objects |
 | `s3_retries` | Retries per S3 request after a temporary failure or throttling, 0 to 100; default 10 |
 | `coordinate_at`, `rsh`, `peer_auth` | As `--coordinate-at`, `--rsh`, and `--peer-auth` |
-| `pscope` | An [isolated persistence domain](https://greaber.github.io/syq/persistence-reference.html#isolated-script-scopes) for connections and saved authorization choices |
+| `pscope` | A [persistence scope](https://greaber.github.io/syq/persistence-reference.html#isolated-script-scopes) for connections and saved authorization choices |
 | `syq_path`, `no_bootstrap` | Use this remote syq, or the one on the remote `PATH`, instead of installing one |
 | `no_tcp_encryption`, `no_tcp`, `tcp_ports`, `tcp_congestion` | As the CLI options of the same names |
 | `receiver_max_entries`, `receiver_max_bytes` | Limits for a restricted copy: an entry count, and a size string or byte count |

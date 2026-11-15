@@ -364,7 +364,7 @@ shows. Don't treat an unknown kind as a copy request.
 
 `syq persist receive permissions list --json` prints an array of objects with
 `id` and `permission`; pass the ID to `persist receive permissions remove`.
-Both take `--pscope PATH` to select the authorizing domain.
+Both take `--pscope PATH` to select the authorizing scope.
 
 Permissions approved through receiving contain `profile`, `source`, and
 `destination`, and those for an SSH authorization provider contain `profile`,

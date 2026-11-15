@@ -225,7 +225,7 @@ fn validate_record(domain: &Domain, provider: &Provider, record: &Record) -> Res
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with("provider-")),
-        "SSH provider directory is outside its persistence domain"
+        "SSH provider directory is outside its scope"
     );
     if owned_directory(&record.directory)? {
         let owner = crate::delegation::read_private_regular(

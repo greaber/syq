@@ -58,12 +58,12 @@ persistence is on, and `syq persist off` closes them; see
 
 ## Separate connections for scripts
 
-A script can keep its own connections and settings, apart from yours, in an
-[isolated domain](persistence-reference.md#isolated-script-scopes). Create one
+A script can keep its own connections and settings, apart from yours, in a
+[scope](persistence-reference.md#isolated-script-scopes). Create one
 with `syq persist on --ephemeral`, which prints its path, and pass that path
 to later commands with `--pscope PATH`. Its connections close after a few idle
 minutes, receiving starts off, and `syq persist --pscope PATH off` removes the
-domain with its settings.
+scope with its settings.
 
 See [Persistence details](persistence-reference.md) for troubleshooting, or
 [`syq persist`](commands/persist.md) for all commands and options.
