@@ -271,10 +271,6 @@ these options: your server's own SSH access runs it. An explicit
 then needs
 [account access](persistence-reference.md#account-access) to both servers.
 
-Older versions of syq added lines with a comment starting `syq-copy-worker-`
-to the destination's `~/.ssh/authorized_keys` for these copies. They grant
-nothing, and you can delete them.
-
 ## Verification
 
 To compare files on two servers without enrolling either, use

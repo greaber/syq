@@ -369,9 +369,8 @@ A server can use a forwarded SSH agent for as long as the connection stays
 open, not just while your command runs. The connections that persistence keeps
 for later commands therefore forward neither your agent nor the port forwards
 in your SSH configuration, and receiving's connection doesn't forward your
-agent. A connection that an older version of syq opened keeps what it forwarded
-until `syq persist off` closes it. An `--rsh` command that asks for forwarding,
-as with `-A`, gets its own connection that closes when the command ends.
+agent. An `--rsh` command that asks for forwarding, as with `-A`, gets its own
+connection that closes when the command ends.
 
 Scopes keep separate connections, authorization choices,
 receiving profiles, and remembered account permissions, but share your
