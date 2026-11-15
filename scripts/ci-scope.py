@@ -325,7 +325,7 @@ def classify(paths, preparation_only):
             native = macos = True
         elif matches(path, "rust-toolchain.toml", "build.rs", "src/*", "tests/*.rs", "schemas/*"):
             native = True
-        elif matches(path, ".github/workflows/*"):
+        elif matches(path, ".github/workflows/*", ".github/actionlint.yaml"):
             path_tooling = True
         elif matches(path, "nix/python-dist.nix", "scripts/build-python-dist.sh",
                      "scripts/package-python-wheel.py", "scripts/pin-python-native-source.py",
@@ -353,7 +353,7 @@ def classify(paths, preparation_only):
             # Unknown inputs fail safe until their dependency boundary is explicit.
             native = python_sdk = path_tooling = shellcheck = mapping_docs = conformance = True
 
-        if matches(path, ".github/workflows/*", "scripts/check-workflows.py",
+        if matches(path, ".github/workflows/*", ".github/actionlint.yaml", "scripts/check-workflows.py",
                    "scripts/check-script-references.py"):
             path_tooling_checks += ["workflows", "orchestration"]
         elif matches(path, "Cargo.toml", "Cargo.lock", "rust-toolchain.toml"):

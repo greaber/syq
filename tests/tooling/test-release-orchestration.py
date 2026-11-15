@@ -242,6 +242,7 @@ class PathScopeTests(Scratch):
                              ("scripts/check-macos-lint.py", "orchestration workflows"),
                              (".github/workflows/macos.yml", "orchestration workflows"),
                              (".github/workflows/ci.yml", "orchestration workflows"),
+                             (".github/actionlint.yaml", "orchestration workflows"),
                              ("scripts/check-script-references.py",
                               "orchestration workflows")]:
             with self.subTest(path=path):
