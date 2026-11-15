@@ -67,7 +67,7 @@ user made in a shared sticky directory such as `/tmp`, unless that directory's
 owner made it, since such a link could send a copy anywhere you can write.
 This is the rule Linux's `fs.protected_symlinks` applies to every program;
 syq applies it on every system, also in copies through an enrollment or a
-receiving name. See [Symlinks](reference.md#symlinks) for examples.
+receiving name. See [Symlinks](copy-files.md#symlinks) for examples.
 
 <a id="limits-to-keep-in-mind"></a>
 <a id="privileged-copies-and-hard-links"></a>
@@ -85,11 +85,11 @@ who has it open, keeps the old contents. `--in-place=update`
 (`syq rsync --inplace`) instead writes into the existing file, so anyone who
 has it open sees the new contents; syq does that only when it gives no one
 access the copy would not, and replaces the file otherwise (see
-[In-place writes](reference.md#in-place-writes)).
+[In-place writes](copy-files.md#in-place-writes)).
 
 Syq changes an existing file's metadata in place only when that cannot affect
 another name or grant privileges, and otherwise replaces the file (see
-[How syq changes existing files](reference.md#how-syq-changes-existing-files-and-directories)).
+[How syq changes existing files](copy-files.md#how-syq-changes-existing-files-and-directories)).
 So a hard link planted in the destination never takes the copy's metadata, and
 root never gives a file another user planted there another owner, group, or
 privileges. The exception is access times copied with `--copy-metadata=atimes`,

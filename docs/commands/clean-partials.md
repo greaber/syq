@@ -1,7 +1,7 @@
 # syq clean-partials
 
 An interrupted copy keeps partial files so that a retry can resume (see
-[Resume an interrupted copy](../reference.md#resume-an-interrupted-copy)).
+[Resume an interrupted copy](../copy-files.md#resume-an-interrupted-copy)).
 A successful retry removes the ones it can; when you no longer need to resume,
 or a retry left some, remove them with this command. Let copies into the
 directories finish first, and preview:

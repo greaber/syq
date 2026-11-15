@@ -116,7 +116,7 @@ For regular files in filesystem copies, `content_differs` means the sizes or
 compared hashes differ; `metadata_differs` also covers files selected by the
 size-and-time check. A `transfer_file` trace has no `bytes` when only metadata
 would change in place, but has them when syq would
-[replace the file](reference.md#how-syq-changes-existing-files-and-directories)
+[replace the file](copy-files.md#how-syq-changes-existing-files-and-directories)
 to change its metadata; that file counts as transferred.
 
 ### `operation_result`
@@ -257,7 +257,7 @@ With `--in-place=update`, `replaced_not_in_place` counts the existing files syq
 replaced instead of updating them in place, by reason: `not_regular`,
 `other_names`, `untrusted_filesystem`, `owner`, `privileges`,
 `wider_permissions` and `not_writable`, each present only when nonzero (see
-[In-place writes](reference.md#in-place-writes)). In a dry run these counts are
+[In-place writes](copy-files.md#in-place-writes)). In a dry run these counts are
 estimates.
 
 A fatal failure reports what finished before it stopped. Dry-run totals

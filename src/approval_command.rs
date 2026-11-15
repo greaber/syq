@@ -8,7 +8,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 /// The longest command an approval carries, counting a terminator for each
 /// argument. It bounds a copy on an approval to as many named sources as
-/// fit, which `docs/reference.md` states, and keeps a hostile request cheap
+/// fit, which `docs/copy-files.md` states, and keeps a hostile request cheap
 /// to reject.
 pub(crate) const MAX_COMMAND_BYTES: usize = 256 * 1024;
 

@@ -1,7 +1,7 @@
 # Command reference
 
 Look up commands and options here. For copy examples, start with
-[Copy files](../reference.md). Three option groups have their own pages:
+[Copy files](../copy-files.md). Three option groups have their own pages:
 
 - [Performance tuning](../tuning.md): workers, request sizes, and copy methods.
 - [Resource limits](../resource-limits.md): bandwidth and concurrency ceilings.

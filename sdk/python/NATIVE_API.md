@@ -75,7 +75,7 @@ timeout. Invalid combinations raise
 `cp(*sources, **options)` → [CpResult](https://greaber.github.io/syq/python-results.html#cpresult)
 copies files. Choose one placement argument unless every destination is a
 callback. Besides the shared arguments, it accepts the following;
-[Copy files](https://greaber.github.io/syq/reference.html),
+[Copy files](https://greaber.github.io/syq/copy-files.html),
 [Remote copy details](https://greaber.github.io/syq/remote-reference.html), and
 [Object storage](https://greaber.github.io/syq/object-storage.html) describe
 what they do.
@@ -103,7 +103,7 @@ what they do.
 | `sparse` | Write zero ranges as sparse holes on filesystem destinations |
 | `in_place` | `"new"`: write new files at their final names instead of under a temporary name, except a new file that must not replace anything (`as_new`, or under `if_exists="error"` or `"error-if-different"`). `"update"`: also update existing files in place, as `--in-place=update` describes |
 | `no_compress` | Disable compression |
-| `transfer_strategy` | `"whole-file"`, `"aligned-block"`, or `"locality"` (default); filesystem copies only; see [transfer strategies](https://greaber.github.io/syq/reference.html#choose-a-transfer-strategy) |
+| `transfer_strategy` | `"whole-file"`, `"aligned-block"`, or `"locality"` (default); filesystem copies only; see [transfer strategies](https://greaber.github.io/syq/copy-files.html#choose-a-transfer-strategy) |
 | `performance_tuning` | Overrides such as `"workers=4"` or `"s3-objects=4,s3-parts-per-object=8"`; default: automatic |
 | `resource_limits` | Ceilings such as `"bandwidth=10M,workers=4"`, below which tuning stays automatic; a concurrency key cannot also appear in `performance_tuning` |
 | `s3_endpoint`, `s3_region`, `s3_profile` | S3 endpoint URL, signing region, and AWS profile |
