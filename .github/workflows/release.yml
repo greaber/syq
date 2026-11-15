@@ -22,7 +22,7 @@ env:
 jobs:
   verify-tag:
     name: verify signed release tag
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Check out release tooling
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -56,7 +56,7 @@ jobs:
   candidate-build:
     name: find prepared release binaries
     needs: verify-tag
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       run-id: ${{ steps.candidate.outputs.run-id }}
     steps:
@@ -86,7 +86,7 @@ jobs:
       needs.candidate-build.result == 'success' &&
       (needs.build.result == 'success' ||
        (needs.build.result == 'skipped' && needs.candidate-build.outputs.run-id != ''))
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     environment: release
     permissions:
       actions: read

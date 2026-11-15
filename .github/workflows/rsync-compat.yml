@@ -18,7 +18,7 @@ env:
 
 jobs:
   scope:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       conformance: ${{ steps.changes.outputs.conformance }}
       full_suite: ${{ steps.changes.outputs.full_suite }}
@@ -54,7 +54,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJSON(needs.scope.outputs.full_suite == 'true' && '[{"os":"ubuntu-latest","label":"linux"},{"os":"macos-26","label":"macos"}]' || '[{"os":"ubuntu-latest","label":"linux"}]') }}
+        include: ${{ fromJSON(needs.scope.outputs.full_suite == 'true' && '[{"os":"ubuntu-26.04","label":"linux"},{"os":"macos-26","label":"macos"}]' || '[{"os":"ubuntu-26.04","label":"linux"}]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
@@ -151,7 +151,7 @@ jobs:
   conformance:
     needs: [scope, conformance_platforms]
     if: always() && needs.conformance_platforms.result != 'cancelled'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Require successful path classification
         if: needs.scope.result != 'success'
@@ -176,7 +176,7 @@ jobs:
     if: >-
       needs.scope.outputs.full_suite == 'true' &&
       needs.scope.outputs.conformance == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - run: echo 'Every release validation suite in this workflow succeeded.'
 
@@ -184,6 +184,6 @@ jobs:
   nightly-unchanged:
     needs: scope
     if: github.event_name == 'schedule' && needs.scope.outputs.conformance == 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - run: echo 'Nightly test inputs are unchanged; reuse earlier certified evidence.'

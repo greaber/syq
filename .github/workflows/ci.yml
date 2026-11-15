@@ -36,7 +36,7 @@ env:
 
 jobs:
   scope:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       native: ${{ steps.changes.outputs.native }}
       sdks: ${{ steps.changes.outputs.sdks }}
@@ -373,7 +373,7 @@ jobs:
     if: >-
       always() &&
       (needs.scope.outputs.skip_unselected != 'true' || needs.scope.outputs.python_sdk == 'true')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Require successful path classification
         if: needs.scope.result != 'success'
@@ -490,7 +490,7 @@ jobs:
     if: >-
       always() &&
       (needs.scope.outputs.skip_unselected != 'true' || needs.scope.outputs.python_sdk == 'true')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Require successful SDK validation
         env:
@@ -636,7 +636,7 @@ jobs:
       always() && needs.macos_intel.result != 'cancelled' &&
       (needs.scope.outputs.skip_unselected != 'true' ||
        (needs.scope.outputs.macos_intel == 'true' && needs.scope.outputs.full_suite == 'true'))
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Require successful path classification
         if: needs.scope.result != 'success'
@@ -915,7 +915,7 @@ jobs:
       needs.scope.outputs.python_sdk == 'true' &&
       needs.scope.outputs.linux_arm64 == 'true' &&
       needs.scope.outputs.macos == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - run: echo 'Every release validation suite in this workflow succeeded.'
 
@@ -923,6 +923,6 @@ jobs:
   nightly-unchanged:
     needs: scope
     if: github.event_name == 'schedule' && needs.scope.outputs.native == 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - run: echo 'Nightly test inputs are unchanged; reuse earlier certified evidence.'

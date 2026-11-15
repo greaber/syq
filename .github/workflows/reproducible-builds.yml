@@ -16,7 +16,7 @@ permissions:
 jobs:
   source-crate:
     name: validate source crate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     env:
       # Incremental compilation data only costs time and cache space here.
       CARGO_INCREMENTAL: "0"

@@ -45,7 +45,7 @@ jobs:
     concurrency:
       group: dispatched-checks-${{ github.event.pull_request.head.ref || github.event.workflow_run.head_branch || github.run_id }}
       cancel-in-progress: false
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

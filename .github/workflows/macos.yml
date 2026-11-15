@@ -107,7 +107,7 @@ jobs:
 
   scope:
     if: github.event_name != 'workflow_dispatch' || inputs.test_name == ''
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       needed: ${{ steps.changes.outputs.needed }}
       sdk: ${{ steps.changes.outputs.sdk }}
@@ -377,7 +377,7 @@ jobs:
       needs.scope.outputs.needed == 'true' &&
       needs.scope.outputs.sdk == 'true' &&
       needs.scope.outputs.release_tooling == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - run: echo 'The complete Apple Silicon native, SDK, and release-tool suites passed.'
 
@@ -385,6 +385,6 @@ jobs:
   nightly-unchanged:
     needs: scope
     if: github.event_name == 'schedule' && needs.scope.outputs.needed == 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - run: echo 'Nightly test inputs are unchanged; reuse earlier certified evidence.'
