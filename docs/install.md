@@ -31,11 +31,13 @@ Put `--use-version VERSION` after `syq`, before the command and its options,
 to run an exact official release:
 
 ```sh
-syq --use-version 0.10.0 cp photos --into backup
+syq --use-version X.Y.Z cp photos --into backup
 ```
 
-The first time, syq downloads and verifies that release and keeps it in
-`~/.local/lib/syq`; later runs work offline. Your normal installation stays
+Replace `X.Y.Z` with a version from the
+[releases page](https://github.com/greaber/syq/releases). The first time, syq
+downloads and verifies that release and keeps it in `~/.local/lib/syq`; later
+runs work offline. Your normal installation stays
 unchanged. The selected release runs the whole command, including on servers,
 so an older release brings its older limitations and bugs too. If such a
 command starts receiving or the SSH authorization provider on your laptop,
