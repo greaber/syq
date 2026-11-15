@@ -152,11 +152,10 @@ update only older ones, choose another policy with `--if-exists`:
 A file counts as unchanged when its size and modification time match, unless
 you add [`--hash`](#check-file-contents). `error-if-different` compares
 contents before rejecting a file whose time differs, so it accepts identical
-files (between S3 buckets it compares metadata instead; see
-[Copies between S3 buckets](object-storage.md#copies-between-s3-buckets)). A
-file rejected for its contents keeps its metadata too. `--as-new` and
-`--into-new` check only the destination you name; `--if-exists` applies to
-every entry the copy writes.
+files, except between S3 buckets (see
+[Copies between S3 buckets](object-storage.md#copies-between-s3-buckets)).
+`--as-new` and `--into-new` check only the destination you name; `--if-exists`
+applies to every entry the copy writes.
 
 `keep`, `error`, `error-if-different` and `--as-new` also keep a file that
 another program creates at the same name during the copy. A file created just
@@ -296,20 +295,19 @@ give directories the first run created their source permissions, add
 `--copy-metadata=permissions,mtime` to the rerun.
 
 When a rerun finishes a file, it also removes the partial files that earlier
-copies left for it, as long as no other program has them open for writing. It
-can tell that only on Linux, on local filesystems such as ext4, XFS, Btrfs, ZFS
-and tmpfs. Elsewhere, such as on macOS or a network filesystem, or while
-another copy may still be writing them, it leaves them and says how many files
-have them. Temporary files from a copy that was killed can also remain beside
-files a local rerun copies whole. To remove leftovers:
+copies left for it, as long as no other program has them open for writing.
+Where another copy may still be writing them, or where syq can't tell, such as
+on macOS or a network filesystem, it leaves them and says how many files have
+them. To remove leftovers:
 
 ```sh
 syq clean-partials --dry-run -v backup
 syq clean-partials backup
 ```
 
-See [`syq clean-partials`](commands/clean-partials.md) for remote cleanup and
-recovery entries that need inspection before removal.
+See [`syq clean-partials`](commands/clean-partials.md) for when a rerun can
+remove them, remote cleanup, and recovery entries that need inspection before
+removal.
 
 ## Check file contents
 
@@ -357,7 +355,7 @@ Syq writes into an existing file only when doing so gives nobody access to
 the new contents that an ordinary copy wouldn't. It replaces other files as
 usual, such as a file with other hard links or another owner, or one on a
 filesystem
-[where syq can't tell whether it has other names](#how-syq-changes-existing-files-and-directories);
+[where syq can't tell whether it has other names](commands/cp.md#how-syq-changes-existing-files-and-directories);
 the summary says how many and why. Until the copy succeeds, files written in
 place stay writable by their owner, and some are readable only by their
 owner; an interrupted copy can leave them that way, and a rerun fixes this
@@ -372,9 +370,7 @@ writes with other policies.
 By default, new and updated files get the source's modification time. New
 files also get the source's read, write and execute permissions, limited by
 the umask or the directory's default ACL; existing files and directories keep
-theirs. A new `--into` directory, and any missing directory above an `--into`
-or `--as` target, gets the mode `mkdir` would give it: `0777` limited by the
-umask on the destination. Files whose contents already match keep all their metadata, so if
+theirs. Files whose contents already match keep all their metadata, so if
 their times differ, they can be read again on every run; add
 `--copy-metadata=mtime` (alias `times`) to make the times match.
 
@@ -426,45 +422,18 @@ reconstructed. A large tree takes longer to start copying. On a filesystem
 without hard links, such as FAT, exFAT or an rclone mount, syq copies one name
 of each group and reports the others as failed.
 
-`acls` copies POSIX ACLs on Linux and native ACLs on macOS, along with
-permissions; copying ACLs between Linux and macOS is refused. `xattrs` copies
-extended attributes: on a Linux source, a non-root user copies `user.*`
-attributes, and root copies every namespace except `system.*`, including
-`security.selinux` and `security.capability`. Both remove destination entries
-the source lacks, and a failure to read or set them makes the copy fail.
+`acls` copies ACLs along with permissions, and `xattrs` copies extended
+attributes; see
+[ACLs and extended attributes](commands/cp.md#acls-and-extended-attributes)
+for which ones, between which systems, and what happens to the destination's
+own.
 
-### How syq changes existing files and directories
+<a id="how-syq-changes-existing-files-and-directories"></a>
 
-Read this if destination files have other hard links or another owner, or if
-updating only metadata is unexpectedly slow. When only an existing file's
-metadata differs, syq changes the metadata in place if all of these
-hold:
-
-- syq can tell the file has no other names (hard links),
-- the file belongs to the account syq runs as, and
-- the change adds no set-ID bit and changes no security attribute.
-
-Run as root, syq changes in place whatever the file's owner could change, and
-replaces the file to give it another owner or group.
-
-Otherwise syq rewrites the file as if its contents had changed. That takes as
-long as copying it, needs room for a second copy, gives the file a new inode
-number, and drops attributes the copy doesn't select, such as ACLs. Access
-times are always set in place.
-
-Syq can't tell whether a file has other names on some filesystems, such as
-SMB, SSHFS and other FUSE filesystems, and on macOS anything but APFS and
-HFS+. There every metadata-only change rewrites the file, and
-`--in-place=update` replaces files instead of updating them.
-
-A directory gets its copied permissions after its contents, so an interrupted
-copy can leave a new directory open only to its owner.
-
-If a directory you own lacks the write or search permission a change needs,
-`syq cp` names it and the changes in it fail;
-[`--widen-dirs`](commands/cp.md#metadata-and-symlinks) lets syq briefly add
-the missing owner permission and restore it afterwards, as `syq rsync` does by
-default.
+If destination files have other hard links or another owner, a directory's
+permissions block a change, or updating only metadata is unexpectedly slow,
+see
+[How syq changes existing files and directories](commands/cp.md#how-syq-changes-existing-files-and-directories).
 
 ## Symlinks
 

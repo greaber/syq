@@ -89,7 +89,7 @@ access the copy would not, and replaces the file otherwise (see
 
 Syq changes an existing file's metadata in place only when that cannot affect
 another name or grant privileges, and otherwise replaces the file (see
-[How syq changes existing files](copy-files.md#how-syq-changes-existing-files-and-directories)).
+[How syq changes existing files](commands/cp.md#how-syq-changes-existing-files-and-directories)).
 So a hard link planted in the destination never takes the copy's metadata, and
 root never gives a file another user planted there another owner, group, or
 privileges. The exception is access times copied with `--copy-metadata=atimes`,
@@ -220,19 +220,15 @@ The protection has four parts:
    key and uses it to reach the receiver, checking hostB's host key as described
    [below](#how-hosta-checks-hostbs-key). Syq on hostA deletes the key when the
    copy ends, also when you interrupt it or its terminal closes; only a copy
-   killed before it can clean up, for example with `kill -9`, leaves it behind,
-   in a private temporary directory named `syq-receiver-hosts-…`. The entry
-   key authorizes nothing by itself: anyone who holds it, such as a server that
-   was compromised during an earlier copy and kept it, still needs a copy you
-   newly signed, and the receiver checks that signature before reading the
-   rest of the request. Such a server can, however, keep the receiver's
-   connections waiting. That slows new copies, and can make them fail when
-   that server connects from more than one address, or when the server running
-   a new copy connects from the same address or IPv6 /64 network, as machines
-   behind one NAT or in one IPv6 cloud subnet often do, until you revoke the
-   enrollment and enroll again. Don't add the entry key to any other
-   `authorized_keys` file: hostA holds it, so it would gain that access too.
-   Your laptop stores it unencrypted.
+   killed before it can clean up, for example with `kill -9`, leaves it behind
+   in a private temporary directory. The entry key authorizes nothing by
+   itself: anyone who holds it, such as a server that was compromised during an
+   earlier copy and kept it, still needs a copy you newly signed, and the
+   receiver checks that signature before reading the rest of the request. Such
+   a server can, however, tie up the receiver's connections, which slows or
+   fails new copies until you revoke the enrollment and enroll again. Don't add
+   the entry key to any other `authorized_keys` file: hostA holds it, so it
+   would gain that access too. Your laptop stores it unencrypted.
 3. **A signature on each copy.** Your laptop signs the copy's command, exactly
    as you ran it, with an expiry time, using the key you log in to hostB with.
    The receiver checks the signature, requiring the touch and PIN your login
@@ -499,25 +495,37 @@ approval, and holds the entry key while the copy runs, as hostA does.
 
 A connected server, hostX, can also ask your laptop to approve a copy between
 two other servers, from hostB to hostC. Your laptop shows the command once and
-signs it for each server's receiver: for hostC as above, and for hostB naming
+signs a copy for each server's receiver: hostC's as above, and hostB's naming
 hostC's enrollment, hostC's signed copy, where it writes there, and what your
-laptop's known_hosts lists for hostC. HostX logs in to hostB's receiver with
-hostB's entry key and presents both signed copies. HostB's receiver checks its
-own as hostC's does, refuses a hostC copy that was not approved with it, and
-then runs the copy as the command states: it reads the files the command names
-with the hostB account's permissions, follows symlinks only as the command
-says, and sends them only to hostC's receiver. HostB's signed copy cannot be
-used as a copy to hostB, and hostC's cannot be used to read from hostC.
+laptop's known_hosts lists for hostC. HostX then logs in to hostB's receiver
+with hostB's entry key and presents both signed copies, and hostB sends the
+files directly to hostC. Your login key stays on your laptop.
 
-HostX receives the copy's progress and hostC's reports, which it checks as
-your laptop would, but no file data. It receives both entry keys and hostC's
-signed copy, so it could write content of its choosing to hostC within that
-approval, as a server uploading to hostC can. HostB's receiver also receives
-hostC's entry key, and holds it while the copy runs, as hostA does. HostB's
-receiver reads within the hostB account, so a command that names syq's own
-files there, or a source symlink that leads to them, sends those to hostC like
-any other file. The copy stops when hostX's command ends, and continues if your
-laptop disconnects.
+| Server | Holds | Can | Can't |
+|---|---|---|---|
+| hostX | Both entry keys and both signed copies, while the copy runs | Start and end the copy, and choose what hostC gets, as far as hostC's signed copy allows | See file data, or change or reuse a signed copy |
+| hostB | hostC's entry key and signed copy, while the copy runs | Read the files the copy names, as the hostB account | Send them to any server but hostC, or accept writes |
+| hostC | Its own signed copy | Write only what its signed copy allows | Send files |
+
+In more detail:
+
+- HostX receives the copy's progress and hostC's reports, and checks the
+  reports as your laptop would. Because it holds hostC's entry key and signed
+  copy while the copy runs, it can do what a
+  [compromised source server](#a-compromised-source-server) uploading to
+  hostC can.
+- HostB's receiver checks its signed copy as hostC's does and refuses a hostC
+  copy that wasn't approved with it. It follows symlinks only as the command
+  says, and only the hostB account's permissions limit what it reads: a
+  command that names syq's own files there, or a source symlink that leads to
+  them, sends those to hostC like any other file. It holds hostC's entry key
+  while the copy runs, as hostA does.
+- HostC's receiver also enforces your laptop's copy limits and reports each
+  change. Neither signed copy works in the other direction: hostB's can't be
+  used as a copy to hostB, and hostC's can't be used to read from hostC.
+
+The copy stops when hostX's command ends, and continues if your laptop
+disconnects.
 
 A server can also ask your laptop to approve a download from another server,
 hostB, to itself. Your laptop shows the command and each source as hostB will
