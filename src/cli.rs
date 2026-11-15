@@ -541,7 +541,7 @@ pub struct Args {
         conflicts_with = "no_tcp"
     )]
     pub tcp_congestion: Option<String>,
-    /// Syq extension: use the isolated connections and settings that `syq persist on --ephemeral` created at PATH; requires the default ssh or an -e ssh command
+    /// Syq extension: use the scope that `syq persist on --ephemeral` created at PATH, with its own connections and settings; requires the default ssh or an -e ssh command
     #[arg(long = "syq-pscope", value_name = "PATH")]
     pub pscope: Option<PathBuf>,
     /// Whether --syq-pscope was supplied rather than selected by the user-level policy
@@ -1707,7 +1707,7 @@ struct NativeCopyCommand {
     copy: NativeCopyFields,
     #[command(flatten)]
     remote: NativeRemoteArgs,
-    /// Use the isolated connections and settings that `syq persist on --ephemeral` created at PATH
+    /// Use the scope that `syq persist on --ephemeral` created at PATH, with its own connections and settings
     #[arg(long, value_name = "PATH")]
     pscope: Option<PathBuf>,
     /// After copying, remove destination entries the source does not have, within the copied
@@ -1803,7 +1803,7 @@ struct NativeMapCommand {
     /// Whose SSH access to use: this machine's own (auto or ssh), or access approved by a receiving machine (@NAME) or SSH authorization provider (HOST)
     #[arg(long, value_name = "auto|ssh|@NAME|HOST", value_parser = parse_auth_from)]
     auth_from: Option<AuthFrom>,
-    /// Use the isolated connections and settings that `syq persist on --ephemeral` created at PATH
+    /// Use the scope that `syq persist on --ephemeral` created at PATH, with its own connections and settings
     #[arg(long, value_name = "PATH")]
     pscope: Option<PathBuf>,
     #[command(flatten)]
@@ -1840,7 +1840,7 @@ struct NativeRmCommand {
     helper: NativeRemoteHelperArgs,
     #[command(flatten)]
     results_output: NativeResultsArgs,
-    /// Use the isolated connections and settings that `syq persist on --ephemeral` created at PATH
+    /// Use the scope that `syq persist on --ephemeral` created at PATH, with its own connections and settings
     #[arg(long, value_name = "PATH")]
     pscope: Option<PathBuf>,
 }
@@ -1873,7 +1873,7 @@ struct CleanPartialsCommand {
     /// Whose SSH access to use: this machine's own (auto or ssh), or access approved by a receiving machine (@NAME) or SSH authorization provider (HOST)
     #[arg(long, value_name = "auto|ssh|@NAME|HOST", value_parser = parse_auth_from)]
     auth_from: Option<AuthFrom>,
-    /// Use the isolated connections and settings that `syq persist on --ephemeral` created at PATH
+    /// Use the scope that `syq persist on --ephemeral` created at PATH, with its own connections and settings
     #[arg(long, value_name = "PATH")]
     pscope: Option<PathBuf>,
     #[command(flatten)]
@@ -3632,7 +3632,7 @@ fn unsupported_message(tok: &str) -> Option<String> {
     None
 }
 
-const FILTER_MSG: &str = "syq has no --exclude/--include/--filter. The Syq extension --syq-ignore (or --syq-ignore-from) takes gitignore-style patterns: e.g. `--exclude node_modules` becomes `--syq-ignore node_modules`. See \"Ignoring paths\" in docs/reference.md.";
+const FILTER_MSG: &str = "syq has no --exclude/--include/--filter. The Syq extension --syq-ignore (or --syq-ignore-from) takes gitignore-style patterns: e.g. `--exclude node_modules` becomes `--syq-ignore node_modules`. See https://greaber.github.io/syq/copy-files.html#ignoring-paths";
 const ITEMIZE_MSG: &str = "syq does not implement rsync's -i/--itemize-changes. Use -n -c to preview content changes; this does not produce rsync's itemized output.";
 const DELETE_MSG: &str = "syq deletes only after the transfer (--delete; --delete-after and --delete-delay are synonyms); --delete-before, --delete-during and --force are not supported.";
 const SOURCE_LINK_TRAVERSAL_MSG: &str = "syq does not implement rsync's source descendant-link traversal (-L/--copy-links, --copy-unsafe-links, or -k/--copy-dirlinks); -l copies symlinks as symlinks, and --insecure-links does not enable these modes.";

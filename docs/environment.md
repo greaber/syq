@@ -77,13 +77,14 @@ persistent connection sockets, a copy warns and connects without persistence.
 ## Stored releases and helpers
 
 Syq keeps exact releases at paths such as
-`~/.local/lib/syq/v0.10.0/linux-x86_64/syq`: releases you select with
+`~/.local/lib/syq/vX.Y.Z/linux-x86_64/syq` for version `X.Y.Z`. These are the
+releases you select with
 [`--use-version`](install.md#choose-a-version-for-a-script), helpers (the
 copies of syq that run on SSH servers) that it uploads, and, on a server, the
 helper installed there, which also receives restricted copies.
 
 Syq never removes old releases. To remove one you no longer use, or replace a
-damaged one, delete its directory, such as `~/.local/lib/syq/v0.10.0`; syq
+damaged one, delete its directory, such as `~/.local/lib/syq/vX.Y.Z`; syq
 downloads or installs it again when needed. On a server that accepts
 restricted copies, keep every release that a syq line in
 `~/.ssh/authorized_keys` names.

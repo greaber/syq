@@ -344,7 +344,7 @@ fn prepare(
     crate::persistence::validate_scope(scope)?;
     anyhow::ensure!(
         Domain::select(Some(scope))? == *domain,
-        "receiving control belongs to a different persistence domain"
+        "receiving control belongs to a different scope"
     );
     let mut line = String::new();
     input.read_line(&mut line)?;

@@ -44,7 +44,7 @@ result = syq.cp(srcs_in="data", into="backup")
 
 Arguments use the command-line names, with underscores for hyphens and a
 trailing underscore on Python keywords such as `from_` and `as_`. The
-[copy guide](https://greaber.github.io/syq/reference.html) explains the
+[copy guide](https://greaber.github.io/syq/copy-files.html) explains the
 options.
 
 ## Copy over SSH

@@ -580,7 +580,7 @@ impl Service {
     fn admit(&self) -> Result<()> {
         anyhow::ensure!(
             self.domain.is_current(self.domain_identity) && self.domain.enabled()?,
-            "provider persistence domain ended; run syq persist receive on locally"
+            "provider scope ended; run syq persist receive on locally"
         );
         self.refresh()?;
         // While a stop is tentative, wait for it to be decided.
@@ -1206,7 +1206,7 @@ impl Runtime {
         let scope = domain.ensure_runtime()?;
         anyhow::ensure!(
             domain.enabled()? && preferences(&domain)?.enabled(),
-            "receiving is off in this domain"
+            "receiving is off in this scope"
         );
         let lock = lock_for_start(|| acquire_lock(&domain, true))?
             .context("local SSH authorization provider is already running")?;
@@ -1373,7 +1373,7 @@ pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
         // The domain, and the path the user runs syq by (`switch`).
         anyhow::ensure!(
             (3..=4).contains(&argv.len()),
-            "local provider service needs its persistence domain path"
+            "local provider service needs its scope path"
         );
         crate::fsops::reserve_startup_descriptors();
         let runtime = Domain::select(Some(Path::new(&argv[2])))
@@ -2331,7 +2331,7 @@ mod tests {
             .admit()
             .unwrap_err()
             .to_string()
-            .contains("domain ended"));
+            .contains("scope ended"));
         service.close();
     }
 

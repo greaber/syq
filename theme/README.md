@@ -56,10 +56,10 @@ Documentation walkthroughs use semantic HTML styled in `docs.css`, keeping text
 selectable and readable without JavaScript, in both palettes and on narrow
 screens. Prefer a compact example or flow diagram where it replaces a long
 explanation; keep tuning details in the tuning reference rather than
-the installation path. The install-page table uses the public syq-bench
+the installation path. The speed-page table uses the public syq-bench
 Germany → US East Coast large-file comparison: one 1.07 GB file in memory,
-three verified runs per tool, with reported speeds of 159.1 MB/s for syq,
-87.2 MB/s for syq over SSH, and 18.0 MB/s for rsync. The caption links to
+three verified runs per tool, with reported speeds of 159.9 MB/s for syq,
+88.3 MB/s for syq over SSH, and 18.3 MB/s for rsync. The caption links to
 `all-results.html#public-wan-forward` and identifies syq-bench as a separate
 project; these are not results from the quick script. Keep the measured
 workload and source attached to any replacement figures.
@@ -88,8 +88,9 @@ constraints are described separately and do not enable a comparison.
 The landing-actions buttons offer installation and benchmarks. Quickstart
 examples follow under Try a copy, with task links below the comparison widget.
 Familiar commands appear first; Differences disclosures explain closer-match
-commands and remaining behavioral differences. Code wrapping is scoped to code
-elements so clipboard confirmations stay on one line.
+commands and remaining behavioral differences. Explanations shared by every
+rsync task live once, in the "About these rsync commands" note. Code wrapping
+is scoped to code elements so clipboard confirmations stay on one line.
 
 head.hbs adds Open Graph and Twitter card metadata so shared documentation
 links render a titled card rather than a bare URL. Title varies per page;

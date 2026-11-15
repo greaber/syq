@@ -220,7 +220,7 @@ and network filesystems are much faster.
   other metadata unless `--copy-metadata` selects it, for example
   `--copy-metadata=mtime`. `--if-exists` chooses how existing files are
   handled; the default, `update`, updates files whose contents differ. See
-  [choose which existing files to update](docs/reference.md#choose-which-existing-files-to-update).
+  [choose which existing files to update](docs/copy-files.md#choose-which-existing-files-to-update).
 - **`syq map` lists only `src` and `dst`** unless you add fields with
   `--include`, for example `--include kind,size,mtime`.
 - **Automation output** now uses schema 4 for ordinary calls and schema 5 for
@@ -621,7 +621,7 @@ transfers, and receiving names that remain assigned while a machine is offline.
 - Scan or copy errors now prevent pruning. Pruning also protects recognized
   partials, replacement recovery entries, and their parent directories, and
   refuses source overlap it can identify. See
-  [pruning rules and coverage](docs/reference.md#mirror-a-directory).
+  [pruning rules and coverage](docs/copy-files.md#mirror-a-directory).
 - Failed non-directory replacements preserve the previous destination when
   staging fails. Truncated local copies and failed or cancelled range writes
   cannot be published as complete files.

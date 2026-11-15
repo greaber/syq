@@ -32,10 +32,10 @@ const SCOPE_MARKER_CONTENT: &[u8] = b"syq persistence scope\n";
 #[command(
     name = "syq persist",
     about = "Keep SSH connections open, and receive files and requests from connected servers",
-    long_about = "syq persist on keeps SSH connections open for later syq commands, and syq persist connect HOST connects now. Receiving lets connected servers send files and requests to this machine, each with your approval by default; set it up with syq persist receive. For an isolated setup, see on --ephemeral and --pscope."
+    long_about = "syq persist on keeps SSH connections open for later syq commands, and syq persist connect HOST connects now. Receiving lets connected servers send files and requests to this machine, each with your approval by default; set it up with syq persist receive. For a separate scope with its own connections and settings, see on --ephemeral and --pscope."
 )]
 struct PersistCommand {
-    /// Use the isolated connections and settings at PATH instead of the default ones
+    /// Use the scope at PATH, with its own connections and settings, instead of the default scope
     #[arg(long, global = true, value_name = "PATH")]
     pscope: Option<PathBuf>,
     #[command(subcommand)]
@@ -78,7 +78,7 @@ enum PersistAction {
     },
     /// Keep SSH connections open for later syq commands
     On {
-        /// Create a new isolated set of connections and settings and print its path for --pscope, instead of turning persistence on for your user
+        /// Create a new scope, with its own connections and settings, and print its path for --pscope, instead of turning persistence on for your user
         #[arg(long, conflicts_with = "pscope")]
         ephemeral: bool,
     },

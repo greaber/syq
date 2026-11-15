@@ -97,6 +97,10 @@ records from filesystem copies carry an `activity` object
 (`ProgressEvent.activity` in Python); S3 and descriptor copies have none. Treat
 it as optional: a remote process can stop reporting while the copy continues.
 
+These fields are diagnostics for reading a slow copy, not a scripting
+interface: they can change between versions and are not part of the
+[automation results](automation.md) contract.
+
 Besides `sample_duration_ms` (time since the previous progress record) and
 `summary` (the text `--stats` prints, without idle parts), `activity` has the
 objects below. Fields starting with `cumulative_` cover the copy so far; the

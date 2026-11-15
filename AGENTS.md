@@ -435,7 +435,7 @@ it is intentional" is not that decision.
   `README.md` is a brief front door and `docs/` is the source of the
   documentation site published with GitHub Pages (mdBook, configured by
   `book.toml`; every page must be listed in `docs/SUMMARY.md`;
-  `scripts/check-doc-links.py` checks links). `docs/reference.md` carries the
+  `scripts/check-doc-links.py` checks links). `docs/copy-files.md` carries the
   detailed behavior. Write these documents directly and conversationally, in
   plain words; a reader should not need project jargon such as "retained" or
   "the ordinary engine" to follow them. The code is authoritative for
@@ -469,7 +469,7 @@ it is intentional" is not that decision.
   complex to maintain well in Bash, so do not spend effort on Bash 3.2
   compatibility for development scripts.
 - Keep CLI behavior, help text, `README.md`, `docs/`, and integration tests in
-  sync. A behavior change lands in `docs/reference.md` (or the topical
+  sync. A behavior change lands in `docs/copy-files.md` (or the topical
   document that owns it), not in a new README section.
 - `README.md` and `docs/` are written for users. They describe what the code
   on `master` does. Plans, roadmap items, design directions, internal status,

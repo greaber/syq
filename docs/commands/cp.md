@@ -1,7 +1,7 @@
 # syq cp
 
 Copy files, directories, and symlinks between local paths, SSH servers, and S3
-buckets. For examples, start with [Copy files](../reference.md).
+buckets. For examples, start with [Copy files](../copy-files.md).
 
 ```sh
 syq cp --srcs-in project --to server --into backup --dry-run -v
@@ -113,7 +113,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--tcp-congestion <ALGO>` | Use this congestion-control algorithm for TCP data sockets (Linux only) |
 | `--detach` | Return as soon as the copy starts on the server that runs it |
 | `--peer-auth <MODE>` | How the server running the copy logs in to the other server; --rsh takes over this choice<br><br>Possible values:<br>- restricted: Let the other server accept only this copy, through restricted copying (see syq receiver); forwards no agent<br>- broker: Let it use your agent for that host and user, with full access to that account<br>- own-credentials: Forward nothing; it must have its own credentials for the other server<br>- full-agent: Forward your whole SSH agent, as ssh -A does<br><br>[default: restricted] |
-| `--pscope <PATH>` | Use the isolated connections and settings that `syq persist on --ephemeral` created at PATH |
+| `--pscope <PATH>` | Use the scope that `syq persist on --ephemeral` created at PATH, with its own connections and settings |
 
 ## S3 connection settings
 
@@ -172,9 +172,9 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 ## Update policies
 
 `--if-exists` decides what happens to destination files that already exist;
-see [existing-file policies](../reference.md#choose-which-existing-files-to-update)
+see [existing-file policies](../copy-files.md#choose-which-existing-files-to-update)
 and, before retrying a failed copy,
-[resuming a copy](../reference.md#resume-an-interrupted-copy).
+[resuming a copy](../copy-files.md#resume-an-interrupted-copy).
 
 `error-if-different` compares the contents of a file whose time differs before
 rejecting it; between S3 buckets it compares metadata instead (see
@@ -186,7 +186,7 @@ because a retry would then skip a file left incomplete. Even with `--in-place`,
 a new file that must not replace anything (`--as-new`, or a new file under
 `--if-exists=error` or `error-if-different`) is written under a temporary name
 first. S3 destinations do not support `--in-place`. See
-[In-place writes](../reference.md#in-place-writes).
+[In-place writes](../copy-files.md#in-place-writes).
 
 ## Pruning
 
@@ -263,7 +263,7 @@ Use a descriptor copy to connect syq to another program without a temporary
 file. It streams raw bytes through an inherited file descriptor, a named pipe,
 or a process substitution. `--src-fd 0` reads standard input and `--as-fd 1`
 writes standard output;
-[Shell pipelines and file descriptors](../reference.md#shell-pipelines-and-file-descriptors)
+[Shell pipelines and file descriptors](../copy-files.md#shell-pipelines-and-file-descriptors)
 has examples. Process substitution and named pipes work as sources:
 
 ```sh

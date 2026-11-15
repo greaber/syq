@@ -34,7 +34,7 @@ Each option can be given once; combine conditions with `and` and `or`.
 `--where` doesn't filter directories: they are copied even when none of their
 contents are selected. A false `--copy-if` skips only a directory's own
 metadata, not its contents. To skip a whole subtree without reading it, use
-[ignore rules](reference.md#ignoring-paths) instead; an expression can't
+[ignore rules](copy-files.md#ignoring-paths) instead; an expression can't
 re-include an ignored path.
 
 With `--prune`, a source entry an expression excludes still protects its

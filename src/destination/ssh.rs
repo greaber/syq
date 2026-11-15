@@ -25,7 +25,7 @@ struct SshCommand {
     /// Whose SSH access to use: this machine's own (auto or ssh), or access approved by a receiving machine (@NAME) or SSH authorization provider (HOST); omitted uses SYQ_AUTH_FROM, then the saved choice, then auto
     #[arg(long, value_name = "auto|ssh|@NAME|HOST", value_parser = crate::cli::parse_auth_from)]
     auth_from: Option<AuthFrom>,
-    /// Use the isolated connections and settings that `syq persist on --ephemeral` created at PATH
+    /// Use the scope that `syq persist on --ephemeral` created at PATH, with its own connections and settings
     #[arg(long, value_name = "PATH")]
     pscope: Option<PathBuf>,
     /// Request a terminal, including when running a command

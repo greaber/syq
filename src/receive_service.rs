@@ -1998,7 +1998,7 @@ fn ensure_inner(
     crate::persistence::validate_scope(scope)?;
     anyhow::ensure!(
         Domain::select(Some(scope))? == *domain,
-        "receiving control belongs to a different persistence domain"
+        "receiving control belongs to a different scope"
     );
     if !domain.enabled()? {
         return Ok(Receiving::Off);
@@ -2703,7 +2703,7 @@ fn run(domain: &Domain, control: &Path, started_from: Option<PathBuf>) -> Result
     crate::persistence::validate_scope(scope)?;
     anyhow::ensure!(
         Domain::select(Some(scope))? == *domain,
-        "receiving control belongs to a different persistence domain"
+        "receiving control belongs to a different scope"
     );
     if scope.join(CLOSING).exists() || !domain.enabled()? {
         return Ok(());

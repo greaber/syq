@@ -1,13 +1,13 @@
 # syq clean-partials
 
 An interrupted copy keeps partial files so that a retry can resume (see
-[Resume an interrupted copy](../reference.md#resume-an-interrupted-copy)).
+[Resume an interrupted copy](../copy-files.md#resume-an-interrupted-copy)).
 A retry removes the partial files of each file it finishes, but only where it
 can tell that no other program has them open for writing: on Linux, on local
 filesystems such as ext4, XFS, Btrfs, ZFS and tmpfs. Temporary files from a
-killed copy can also remain beside files a local retry copies whole. When you no longer need to
-resume, or a retry left some, remove them with this command. Let copies into
-the directories finish first, and preview:
+killed copy can also remain beside files a local retry copies whole. When you
+no longer need to resume, or a retry left some, remove them with this command.
+Let copies into the directories finish first, and preview:
 
 ```sh
 syq clean-partials --dry-run -v backup
@@ -75,7 +75,7 @@ syq clean-partials [OPTIONS] <TREE>...
 | `--syq-path <PATH>` | Run the remote syq at PATH instead of syq's automatically installed copy |
 | `--no-bootstrap` | Run the syq found in the remote $PATH instead of syq's automatically installed copy |
 | `--auth-from <auto\|ssh\|@NAME\|HOST>` | Whose SSH access to use: this machine's own (auto or ssh), or access approved by a receiving machine (@NAME) or SSH authorization provider (HOST) |
-| `--pscope <PATH>` | Use the isolated connections and settings that `syq persist on --ephemeral` created at PATH |
+| `--pscope <PATH>` | Use the scope that `syq persist on --ephemeral` created at PATH, with its own connections and settings |
 
 ## Help and version
 

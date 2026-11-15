@@ -101,7 +101,8 @@ About once a second, for progress displays rather than accounting: bytes,
 files, exclusions, scan state, `timings`, and optional `rate_bytes_per_second`
 and `eta_ms` estimates. With `--stats`, a filesystem copy's progress records
 also carry [performance measurements](performance-measurements.md) in
-`activity`. Removal reports zero bytes and zero unchanged and excluded counts.
+`activity`, a diagnostic object whose fields can change between versions.
+Removal reports zero bytes and zero unchanged and excluded counts.
 A copy that finishes transferring always emits a final progress record.
 
 ### `trace`
@@ -256,7 +257,7 @@ With `--in-place=update`, `replaced_not_in_place` counts the existing files syq
 replaced instead of updating them in place, by reason: `not_regular`,
 `other_names`, `untrusted_filesystem`, `owner`, `privileges`,
 `wider_permissions` and `not_writable`, each present only when nonzero (see
-[In-place writes](reference.md#in-place-writes)). In a dry run these counts are
+[In-place writes](copy-files.md#in-place-writes)). In a dry run these counts are
 estimates.
 
 A fatal failure reports what finished before it stopped. Dry-run totals
@@ -320,8 +321,22 @@ then exits nonzero after printing the valid entries.
 |---|---|
 | `profiles` | Every profile's `cwd`, `cwd_explicit`, `root`, `auto_approve_root` (null when every download asks), and `servers` (the endpoints set with `--connection`; empty means all) |
 | `settings` | The first selected profile's settings |
-| `connections` | The profiles allowed on each endpoint, and its service's build (`identity`), what keeps it from switching (`busy`: `requests` in progress, `pending` approvals, and `accounts`, the open account connections the switch waits for; `accounts_in_use` of those have a session running, and the rest can't tell and count until they close), the syq path it follows (`started_from`), and any `switch` to a new build |
+| `connections` | One entry for each endpoint's receiving service, described below |
 | `provider` | The local SSH authorization service, or null when it isn't running; its `profiles` contain `settings`, `sessions`, and `pending` requests, and `decision_error` reports a failed local approval |
+
+Each `connections` entry includes:
+
+| Field | Meaning |
+|---|---|
+| `profiles` | The profiles allowed on this endpoint |
+| `identity` | The syq build the service runs |
+| `busy` | What keeps the service from switching to a new build, described below |
+| `started_from` | The syq path the service follows to switch to a new build, when it can |
+| `switch` | Its switch to a new build, while it waits for one or after one failed |
+
+`busy` counts `requests` in progress, `pending` approvals, and `accounts`, the
+open account connections the switch waits for. Of those, `accounts_in_use`
+have a session running; the rest can't tell and count until they close.
 
 `syq persist receive pending --json` prints the requests waiting for approval,
 from receiving connections and the local SSH provider. Each has `id`, `from`,
@@ -339,7 +354,7 @@ depend on the request:
 | `send` | Send files from this machine to the requesting server | `paths`, `permission`, `max_bytes`, `max_entries` |
 | `storage` | Storage access | `description` |
 
-`destination`, `paths` and `scopes` are display text, as the prompt shows them:
+`destination`, `paths` and `scopes` (the selected source paths) are display text, as the prompt shows them:
 each path is quoted, and a destination is the place the copy writes, such as
 `/data` for another server's `~//data`.
 
@@ -364,7 +379,7 @@ shows. Don't treat an unknown kind as a copy request.
 
 `syq persist receive permissions list --json` prints an array of objects with
 `id` and `permission`; pass the ID to `persist receive permissions remove`.
-Both take `--pscope PATH` to select the authorizing domain.
+Both take `--pscope PATH` to select the authorizing scope.
 
 Permissions approved through receiving contain `profile`, `source`, and
 `destination`, and those for an SSH authorization provider contain `profile`,

@@ -1,7 +1,7 @@
 # Command reference
 
 Look up commands and options here. For copy examples, start with
-[Copy files](../reference.md). Three option groups have their own pages:
+[Copy files](../copy-files.md). Three option groups have their own pages:
 
 - [Performance tuning](../tuning.md): workers, request sizes, and copy methods.
 - [Resource limits](../resource-limits.md): bandwidth and concurrency ceilings.
@@ -87,6 +87,6 @@ syq help [COMMAND...] [--help-all]
 
 ## Build identity
 
-`syq --build-identity` prints the release tag, such as `v0.10.0`. A build from
-source adds its revision, as in `v0.10.0+dev.0123456789ab`; see
+`syq --build-identity` prints the release tag, `vX.Y.Z` for version `X.Y.Z`.
+A build from source adds its revision, as in `vX.Y.Z+dev.0123456789ab`; see
 [development builds](https://github.com/greaber/syq/blob/master/CONTRIBUTING.md#another-platform-with-your-own-helpers).

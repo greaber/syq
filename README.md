@@ -51,7 +51,7 @@ syq cp project --to server --into backup
 This creates or updates `backup/project` in your home directory on the server.
 Add `--dry-run` to preview the copy. If interrupted, rerun the same command;
 it reuses completed files and matching parts of interrupted ones. See
-[Copy files](https://greaber.github.io/syq/reference.html) for more examples.
+[Copy files](https://greaber.github.io/syq/copy-files.html) for more examples.
 
 ## Developing syq
 

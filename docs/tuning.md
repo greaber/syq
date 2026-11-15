@@ -132,7 +132,7 @@ script.
 
 ### Compare block reuse with full replacement
 
-To measure what [block reuse](reference.md#choose-a-transfer-strategy) costs
+To measure what [block reuse](copy-files.md#choose-a-transfer-strategy) costs
 and saves, run the same copy with `--transfer-strategy aligned-block` and with
 `whole-file`, adding `--performance-tuning copy-path=ranges` to both so that
 copy shortcuts don't hide the difference. Block reuse saves network traffic,

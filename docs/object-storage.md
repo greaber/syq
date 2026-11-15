@@ -47,7 +47,7 @@ syq cp --from s3://backups laptop/photos --into restored
 The first command copies `photos` under `laptop/photos` in the bucket; the
 second downloads it into `restored/photos`. Add `--dry-run` to preview either
 copy. Use `--srcs-in` when you want a directory or prefix's contents instead
-of its name. See [Copy files](reference.md) for placement and filtering.
+of its name. See [Copy files](copy-files.md) for placement and filtering.
 
 To copy between buckets in the same service:
 
