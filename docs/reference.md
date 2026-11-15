@@ -152,7 +152,8 @@ update only older ones, choose another policy with `--if-exists`:
 A file counts as unchanged when its size and modification time match, unless
 you add [`--hash`](#check-file-contents). `error-if-different` compares
 contents before rejecting a file whose time differs, so it accepts identical
-files. `--as-new` and `--into-new` check only the destination you name;
+files, except between S3 buckets (see
+[Copies between S3 buckets](object-storage.md#copies-between-s3-buckets)). `--as-new` and `--into-new` check only the destination you name;
 `--if-exists` applies to every entry the copy writes.
 
 `keep`, `error`, `error-if-different` and `--as-new` also keep a file that
@@ -420,16 +421,17 @@ reconstructed. A large tree takes longer to start copying. On a filesystem
 without hard links, such as FAT, exFAT or an rclone mount, syq copies one name
 of each group and reports the others as failed.
 
-`acls` copies POSIX ACLs on Linux and native ACLs on macOS, along with
-permissions; copying ACLs between Linux and macOS is refused. `xattrs` copies
-extended attributes; see
+`acls` copies ACLs along with permissions, and `xattrs` copies extended
+attributes; see
 [ACLs and extended attributes](commands/cp.md#acls-and-extended-attributes)
-for which ones.
+for which ones, between which systems, and what happens to the destination's
+own.
 
 <a id="how-syq-changes-existing-files-and-directories"></a>
 
-If destination files have other hard links or another owner, or updating
-only metadata is unexpectedly slow, see
+If destination files have other hard links or another owner, a directory's
+permissions block a change, or updating only metadata is unexpectedly slow,
+see
 [How syq changes existing files and directories](commands/cp.md#how-syq-changes-existing-files-and-directories).
 
 ## Symlinks

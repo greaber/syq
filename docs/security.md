@@ -504,7 +504,7 @@ files directly to hostC. Your login key stays on your laptop.
 
 | Server | Holds | Can | Can't |
 |---|---|---|---|
-| hostX | Both entry keys and both signed copies | Start and end the copy, and choose what hostC gets, as far as hostC's signed copy allows | See file data, or change or reuse a signed copy |
+| hostX | Both entry keys and both signed copies, while the copy runs | Start and end the copy, and choose what hostC gets, as far as hostC's signed copy allows | See file data, or change or reuse a signed copy |
 | hostB | hostC's entry key and signed copy, while the copy runs | Read the files the copy names, as the hostB account | Send them to any server but hostC, or accept writes |
 | hostC | Its own signed copy | Write only what its signed copy allows | Send files |
 
@@ -512,7 +512,9 @@ In more detail:
 
 - HostX receives the copy's progress and hostC's reports, and checks the
   reports as your laptop would. Because it holds hostC's entry key and signed
-  copy, it is trusted as much as a server uploading to hostC.
+  copy while the copy runs, it can do what a
+  [compromised source server](#a-compromised-source-server) uploading to
+  hostC can.
 - HostB's receiver checks its signed copy as hostC's does and refuses a hostC
   copy that wasn't approved with it. It follows symlinks only as the command
   says, and only the hostB account's permissions limit what it reads: a
