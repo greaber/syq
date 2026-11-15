@@ -45,34 +45,19 @@ Use the same data, a fresh destination, and both transfer directions.
 If BBR is missing, see the
 [administrator setup guidance](https://github.com/google/bbr/blob/master/Documentation/bbr-faq.md#how-can-i-try-out-linux-tcp-bbr).
 
-## Let SSH connections start promptly
-
-OpenSSH's `MaxStartups` limit can slow parallel logins. For servers handling
-parallel transfers, an administrator can consider:
-
-```text
-MaxStartups 100:30:200
-```
-
-This allows 100 unauthenticated connections before random rejection begins,
-and rejects all new ones at 200. It also admits larger bursts from unrelated
-clients. `MaxSessions` controls channels sharing a connection; very low values
-can force extra logins.
-
-Validate changes with `sshd -t`, then reload SSH using your system's procedure.
-Keep an administrative session open. See [OpenSSH's settings](https://man.openbsd.org/sshd_config#MaxStartups).
-
+<a id="let-ssh-connections-start-promptly"></a>
+<a id="reduce-allocation-contention"></a>
 <a id="check-local-storage-placement"></a>
 <a id="keep-free-space-available"></a>
 
-## Reduce allocation contention
+## Other server limits
 
-XFS divides a filesystem into allocation groups, and the
-[`mkfs.xfs` manual](https://man7.org/linux/man-pages/man8/mkfs.xfs.8.html)
-notes that more groups allow more blocks and inodes to be allocated in
-parallel. A filesystem with only a few groups can therefore slow copies that
-write many files at once. The count is set with `-d agcount=N` when the
-filesystem is created.
+- OpenSSH's [`MaxStartups`](https://man.openbsd.org/sshd_config#MaxStartups)
+  limit drops some logins when many start at once, which slows the start of a
+  copy with many workers while syq retries them.
+- An XFS filesystem with few allocation groups (`agcount` in the
+  [`mkfs.xfs` manual](https://man7.org/linux/man-pages/man8/mkfs.xfs.8.html))
+  can slow copies that write many files at once.
 
 ## Measure and track improvements
 
