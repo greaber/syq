@@ -10,6 +10,12 @@ download_started = threading.Event()
 download_finished = threading.Event()
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args): pass
+    def send_response(self, *args):
+        super().send_response(*args)
+        # This HTTP/1.0 server closes every connection after one response. Say
+        # so: a client that pools the connection may otherwise send its next
+        # request just as the server closes, and see a broken pipe.
+        self.send_header("Connection", "close")
     def respond(self, status, body=b"", headers=None):
         self.send_response(status)
         self.send_header("Content-Length", str(len(body)))
