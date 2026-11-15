@@ -89,8 +89,8 @@ The landing-actions buttons offer installation and benchmarks. Quickstart
 examples follow under Try a copy, with task links below the comparison widget.
 Familiar commands appear first; Differences disclosures explain closer-match
 commands and remaining behavioral differences. Explanations shared by every
-rsync task live once, in the "About these rsync commands" note. Code wrapping is scoped to code
-elements so clipboard confirmations stay on one line.
+rsync task live once, in the "About these rsync commands" note. Code wrapping
+is scoped to code elements so clipboard confirmations stay on one line.
 
 head.hbs adds Open Graph and Twitter card metadata so shared documentation
 links render a titled card rather than a bare URL. Title varies per page;
