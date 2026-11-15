@@ -457,6 +457,14 @@ jobs:
           env -u PYTHONPATH uv run --isolated --python "$UV_PYTHON" \
             --with "$1" \
             python scripts/check-python-wheel.py --version "$SYQ_CANDIDATE_VERSION"
+          # Run the tests against the wheel on the oldest Python it supports.
+          floor=$(sed -n 's/^requires-python = ">=\(.*\)"/\1/p' sdk/python/pyproject.toml)
+          test -n "$floor"
+          uv export --project sdk/python --frozen --only-dev --no-emit-project \
+            --quiet --output-file target/sdk-python-dev-requirements.txt
+          env -u PYTHONPATH uv run --isolated --python "$floor" \
+            --with "$1" --with-requirements target/sdk-python-dev-requirements.txt \
+            python -m unittest discover -s sdk/python/tests
           rm -rf -- target/sdk-python-from-sdist
           # Rebuild syq from the archive, reusing only its compiled dependencies.
           # Archive mtimes can repeat across commits, so discard syq artifacts first.

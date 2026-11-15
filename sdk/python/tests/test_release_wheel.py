@@ -7,9 +7,15 @@ import io
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 import zipfile
+
+# The release scripts run on the interpreter pinned by scripts/setup.sh and
+# use tomllib, which the oldest Python the package supports does not have.
+if sys.version_info < (3, 11):
+    raise unittest.SkipTest("release tooling needs Python 3.11 or newer")
 
 SCRIPT = Path(__file__).resolve().parents[3] / "scripts/package-python-wheel.py"
 spec = importlib.util.spec_from_file_location("release_wheel", SCRIPT)
