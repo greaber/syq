@@ -43,6 +43,7 @@ SUITES = {
     "python-sdk": {"sdks": True, "python_sdk": True},
     "linux-arm64": {"linux_arm64": True},
     "macos-intel": {"macos": True, "macos_intel": True},
+    "macos-lint": {"macos_lint": True},
     "s3": {"s3": True},
     "repository-checks": {"repository_checks": True},
     **{name: {"real_ssh": [entry]} for name, entry in REAL_SSH.items()},
@@ -59,6 +60,7 @@ def run_everything():
         "s3=true",
         "repository_checks=true",
         "macos_intel=true",
+        "macos_lint=true",
         f"real_ssh_matrix={json.dumps(list(REAL_SSH.values()))}",
         "native=true",
         "sdks=true",
@@ -172,7 +174,7 @@ def select_suites(names):
         raise ToolError(f"unknown suite: {' '.join(unknown)} (choose from {' '.join(SUITES)})", 2)
     selection = {"native": False, "sdks": False, "python_sdk": False, "tooling": False,
                  "shellcheck": False, "mapping_docs": False, "linux_arm64": False,
-                 "macos": False, "macos_intel": False, "s3": False, "repository_checks": False,
+                 "macos": False, "macos_intel": False, "macos_lint": False, "s3": False, "repository_checks": False,
                  "all_tooling": False, "quick_tooling": False,
                  "integration_targets": "", "tooling_checks": "", "real_ssh": []}
     for name in names:
@@ -235,7 +237,7 @@ def main():
 
     print(f"tooling_checks={selection['tooling_checks']}")
     keys = ["native", "sdks", "python_sdk", "tooling", "shellcheck", "mapping_docs",
-            "conformance", "macos", "linux_arm64", "full_suite"]
+            "conformance", "macos", "macos_lint", "linux_arm64", "full_suite"]
     for key in keys:
         print(f"{key}={str(selection[key]).lower()}")
     print(f"integration_targets={selection['integration_targets']}")
@@ -251,7 +253,7 @@ def main():
 
 def classify(paths, preparation_only):
     native = sdks = python_sdk = tooling = shellcheck = mapping_docs = False
-    conformance = macos = linux_arm64 = full_suite = False
+    conformance = macos = macos_lint = linux_arm64 = full_suite = False
     integration_targets = []
     tooling_checks = []
     saw_path = False
@@ -265,6 +267,10 @@ def classify(paths, preparation_only):
         # Keep it selected even when the rules below deliberately ignore the path.
         if path.endswith(".sh"):
             shellcheck = True
+        # The macOS cross-target lint runs with every Rust selection below, and
+        # when its own script changes.
+        if path == "scripts/check-macos-lint.py":
+            macos_lint = True
 
         for patterns, target in [
             (("tests/local.rs", "tests/local/*"), "local"),
@@ -415,10 +421,13 @@ def classify(paths, preparation_only):
         tooling = True
     if python_sdk:
         sdks = True
+    if native:
+        macos_lint = True
     return {
         "tooling_checks": checks, "native": native, "sdks": sdks, "python_sdk": python_sdk,
         "tooling": tooling, "shellcheck": shellcheck, "mapping_docs": mapping_docs,
-        "conformance": conformance, "macos": macos, "linux_arm64": linux_arm64,
+        "conformance": conformance, "macos": macos, "macos_lint": macos_lint,
+        "linux_arm64": linux_arm64,
         "full_suite": full_suite,
         # Canonicalize selections so equivalent changes share a cancellation group.
         "integration_targets": " ".join(sorted(set(integration_targets))),

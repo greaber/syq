@@ -18,7 +18,7 @@ import textwrap
 import unittest
 
 SCOPE_KEYS = ["native", "sdks", "python_sdk", "tooling", "shellcheck", "mapping_docs",
-              "conformance", "macos", "linux_arm64", "full_suite"]
+              "conformance", "macos", "macos_lint", "linux_arm64", "full_suite"]
 ALL_TOOLING = "benchmark branch focused installer orchestration package release setup workflows"
 # Scope fixtures below supply their own events and overrides.
 INHERITED = ("SYQ_TEST_CHANGED_PATHS_FILE", "SYQ_CI_SCOPE_COMMIT", "SYQ_CI_DOCUMENTATION_ONLY",
@@ -167,6 +167,14 @@ class PathScopeTests(Scratch):
                          conformance="true", native="false")
         self.assertScope(self.scope("src/main.rs"), native="true", sdks="false",
                          conformance="false", macos="false", linux_arm64="false")
+        # The macOS cross-target lint accompanies every Rust selection and its own
+        # script, without promoting either to the other.
+        for path in ["src/main.rs", "Cargo.lock", "build.rs", "tests/local/transfer.rs"]:
+            with self.subTest(path=path):
+                self.assertScope(self.scope(path), native="true", macos_lint="true")
+        self.assertScope(self.scope("scripts/check-macos-lint.py"), macos_lint="true",
+                         native="false", tooling="true")
+        self.assertScope(self.scope(".github/workflows/ci.yml"), macos_lint="false")
         for path in ["docs/example.sh", "tests/real-ssh/scenarios.sh"]:
             with self.subTest(path=path):
                 self.assertScope(self.scope(path), shellcheck="true", tooling="false",
@@ -396,7 +404,11 @@ class EventScopeTests(Scratch):
                          macos_intel="true", s3="false", tooling="false", full_suite="false")
         self.assertEqual(len(json.loads(scope["real_ssh_matrix"])), 4)
         # On task branches the rust job's name records what it ran.
-        self.assertScope(scope, rust_label="native:all", all_tooling="false")
+        self.assertScope(scope, rust_label="native:all", all_tooling="false", macos_lint="false")
+        scope = self.scope(event=dispatch, cwd=self.repo,
+                           env=dict(branch, SYQ_CI_SUITES="macos-lint"))
+        self.assertScope(scope, macos_lint="true", native="false", tooling="false",
+                         rust_label="none", real_ssh_matrix="[]", full_suite="false")
         scope = self.scope(event=dispatch, cwd=self.repo,
                            env=dict(branch, SYQ_CI_SUITES="shellcheck tooling"))
         self.assertScope(scope, rust_label="tooling:all shellcheck", all_tooling="true",
