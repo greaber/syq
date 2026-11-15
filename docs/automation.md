@@ -101,7 +101,8 @@ About once a second, for progress displays rather than accounting: bytes,
 files, exclusions, scan state, `timings`, and optional `rate_bytes_per_second`
 and `eta_ms` estimates. With `--stats`, a filesystem copy's progress records
 also carry [performance measurements](performance-measurements.md) in
-`activity`. Removal reports zero bytes and zero unchanged and excluded counts.
+`activity`, a diagnostic object whose fields can change between versions.
+Removal reports zero bytes and zero unchanged and excluded counts.
 A copy that finishes transferring always emits a final progress record.
 
 ### `trace`
