@@ -26,10 +26,10 @@ again.
 ## Receiving
 
 With persistence on, copies, other file commands, and `persist connect` also
-start *receiving* on their connections, except those made by a custom `--rsh`
-command, unless you turn it off. Receiving lets connected servers request file
-copies to your machine, commands on it, and access to other servers, each with
-your approval; see [Use your laptop from a server](receive.md). If you don't
+start *receiving* on their connections unless you turn it off. Connections made
+by a custom `--rsh` (or rsync `-e`) command never receive. Receiving lets
+connected servers request file copies to your machine, commands on it, and
+access to other servers, each with your approval; see [Use your laptop from a server](receive.md). If you don't
 need it, run `syq persist receive off`.
 
 <a id="reuse-laptop-authorized-account-access"></a>

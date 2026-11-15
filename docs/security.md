@@ -581,7 +581,7 @@ requesting server that account's full authority: it can run any command and
 read or change any file the account can. The command the prompt shows is
 context from the requester, not a restriction, and copy paths, download roots,
 and byte limits do not apply. Copies your laptop approves one at a time keep
-their own narrower scope.
+their own narrower limits.
 
 **Allow** covers this pair of source and destination accounts for the current
 receiving connection from your laptop to the source. **Remember** also covers

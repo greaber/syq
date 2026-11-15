@@ -354,7 +354,7 @@ depend on the request:
 | `send` | Send files from this machine to the requesting server | `paths`, `permission`, `max_bytes`, `max_entries` |
 | `storage` | Storage access | `description` |
 
-`destination`, `paths` and `scopes` are display text, as the prompt shows them:
+`destination`, `paths` and `scopes` (the selected source paths) are display text, as the prompt shows them:
 each path is quoted, and a destination is the place the copy writes, such as
 `/data` for another server's `~//data`.
 

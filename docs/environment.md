@@ -77,7 +77,7 @@ persistent connection sockets, a copy warns and connects without persistence.
 ## Stored releases and helpers
 
 Syq keeps exact releases at paths such as
-`~/.local/lib/syq/vX.Y.Z/linux-x86_64/syq`, where `X.Y.Z` is the version:
+`~/.local/lib/syq/vX.Y.Z/linux-x86_64/syq` for version `X.Y.Z`. These are the
 releases you select with
 [`--use-version`](install.md#choose-a-version-for-a-script), helpers (the
 copies of syq that run on SSH servers) that it uploads, and, on a server, the
