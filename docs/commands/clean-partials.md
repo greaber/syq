@@ -4,8 +4,8 @@ An interrupted copy keeps partial files so that a retry can resume (see
 [Resume an interrupted copy](../reference.md#resume-an-interrupted-copy)).
 A retry removes the partial files of each file it finishes, but only where it
 can tell that no other program has them open for writing: on Linux, on local
-filesystems such as ext4, XFS, Btrfs, ZFS and tmpfs. Temporary files from a killed copy can also
-remain beside files a local retry copies whole. When you no longer need to
+filesystems such as ext4, XFS, Btrfs, ZFS and tmpfs. Temporary files from a
+killed copy can also remain beside files a local retry copies whole. When you no longer need to
 resume, or a retry left some, remove them with this command. Let copies into
 the directories finish first, and preview:
 

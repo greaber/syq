@@ -153,8 +153,9 @@ A file counts as unchanged when its size and modification time match, unless
 you add [`--hash`](#check-file-contents). `error-if-different` compares
 contents before rejecting a file whose time differs, so it accepts identical
 files, except between S3 buckets (see
-[Copies between S3 buckets](object-storage.md#copies-between-s3-buckets)). `--as-new` and `--into-new` check only the destination you name;
-`--if-exists` applies to every entry the copy writes.
+[Copies between S3 buckets](object-storage.md#copies-between-s3-buckets)).
+`--as-new` and `--into-new` check only the destination you name; `--if-exists`
+applies to every entry the copy writes.
 
 `keep`, `error`, `error-if-different` and `--as-new` also keep a file that
 another program creates at the same name during the copy. A file created just
