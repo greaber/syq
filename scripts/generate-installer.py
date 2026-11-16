@@ -29,21 +29,16 @@ version='@VERSION@'
 tag='@TAG@'
 base_url=${SYQ_INSTALL_BASE_URL:-'@DOWNLOAD_BASE@/@TAG@'}
 bin_dir=${HOME:+$HOME/.local/bin}
-replace=
 
 usage() {
   cat <<USAGE
 Install syq @VERSION@ without sudo.
 
-Usage: install.sh [--bin-dir DIR] [--replace]
+Usage: install.sh [--bin-dir DIR]
 
 The default is $HOME/.local/bin. The installer detects this host, downloads
 the pinned release archive, checks its embedded SHA-256 and size, verifies the
 binary's version and release identity, then replaces the destination atomically.
-
-It stops without installing where syq belongs to a Python package (installed
-with pip, pipx, or uv) or is a symbolic link. Uninstall that one first, or
-pass --replace to install over it.
 USAGE
 }
 
@@ -54,36 +49,11 @@ while [ $# -gt 0 ]; do
       bin_dir=$2
       shift 2
       ;;
-    --replace) replace=1; shift ;;
     --help|-h) usage; exit 0 ;;
     *) echo "install.sh: unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 [ -n "${bin_dir:-}" ] || { echo 'install.sh: HOME is not set; pass --bin-dir DIR' >&2; exit 1; }
-
-# Another tool's syq is not replaced silently: that tool would go on treating
-# the file as its own, and uninstalling it there would remove this copy. pipx
-# and uv tool link the command into their own directory, and a Python package
-# lists its bin/syq in a RECORD under the lib directory beside the bin
-# directory, which stays that package's whether or not the file is there now.
-if [ -z "$replace" ]; then
-  if [ -L "$bin_dir/syq" ]; then
-    echo "install.sh: $bin_dir/syq is a symbolic link that this installer did not make (pipx and uv tool make such links)" >&2
-    echo 'install.sh: uninstall that syq or remove the link first, or pass --replace to install over it' >&2
-    exit 1
-  fi
-  case ${bin_dir%/} in
-    bin|*/bin)
-      for record in "$bin_dir"/../lib*/python*/*-packages/syq-*.dist-info/RECORD; do
-        [ -f "$record" ] || continue
-        grep '^\.\./\.\./\.\./bin/syq,' "$record" >/dev/null 2>&1 || continue
-        echo "install.sh: $bin_dir/syq belongs to the syq Python package ($record lists it)" >&2
-        echo 'install.sh: uninstall that package first, for example with "pip uninstall syq", or pass --replace to install over it' >&2
-        exit 1
-      done
-      ;;
-  esac
-fi
 
 case "$(uname -s):$(uname -m)" in
 '''

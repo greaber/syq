@@ -3,8 +3,8 @@
 //! Package-manager and source installs deliberately have no install receipt,
 //! so this module will never replace them; an executable that a Python
 //! package installed is refused even when a receipt names its path. Homebrew
-//! and Python installs still receive update reminders that name their own
-//! upgrade command. Official release builds embed
+//! installs still receive update reminders that point at `brew upgrade`.
+//! Official release builds embed
 //! the Ed25519 public key supplied by the release workflow at compile time.
 
 use crate::process::CommandExt as _;
@@ -272,9 +272,9 @@ pub fn after_success(quiet: bool) {
         return;
     }
     crate::output::diagnostic!(
-        "syq: update {} is available; {}",
+        "syq: update {} is available; run `{}`",
         release.version,
-        install.upgrade_hint()
+        install.upgrade_command()
     );
 }
 
@@ -283,33 +283,27 @@ pub fn after_success(quiet: bool) {
 const PYTHON_UPGRADE: &str = "upgrade the syq Python package with the tool that installed it, such as `pip install --upgrade syq`, `uv tool upgrade syq`, or `pipx upgrade syq`";
 
 /// Installations that receive update reminders, each with its own upgrade
-/// hint. Source builds have no receipt, Homebrew path, or Python package.
+/// command. Source builds have neither a receipt nor a Homebrew path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RemindedInstall {
     Standalone,
     Homebrew,
-    Python,
 }
 
 impl RemindedInstall {
-    fn upgrade_hint(self) -> &'static str {
+    fn upgrade_command(self) -> &'static str {
         match self {
-            RemindedInstall::Standalone => "run `syq --self-update`",
-            RemindedInstall::Homebrew => "run `brew upgrade syq`",
-            RemindedInstall::Python => PYTHON_UPGRADE,
+            RemindedInstall::Standalone => "syq --self-update",
+            RemindedInstall::Homebrew => "brew upgrade syq",
         }
     }
 }
 
 fn reminded_install() -> Option<RemindedInstall> {
-    let executable = canonical_current_exe().ok()?;
-    // Python first, as in `self_update`: a stale receipt may name this path.
-    if is_python_package_executable(&executable) {
-        return Some(RemindedInstall::Python);
-    }
     if managed_receipt().is_ok() {
         return Some(RemindedInstall::Standalone);
     }
+    let executable = canonical_current_exe().ok()?;
     is_homebrew_keg_path(&executable).then_some(RemindedInstall::Homebrew)
 }
 
@@ -1937,14 +1931,13 @@ mod tests {
             assert!(!is_homebrew_keg_path(Path::new(path)), "{path}");
         }
         assert_eq!(
-            RemindedInstall::Homebrew.upgrade_hint(),
-            "run `brew upgrade syq`"
+            RemindedInstall::Homebrew.upgrade_command(),
+            "brew upgrade syq"
         );
         assert_eq!(
-            RemindedInstall::Standalone.upgrade_hint(),
-            "run `syq --self-update`"
+            RemindedInstall::Standalone.upgrade_command(),
+            "syq --self-update"
         );
-        assert_eq!(RemindedInstall::Python.upgrade_hint(), PYTHON_UPGRADE);
     }
 
     #[test]

@@ -23,6 +23,11 @@ python -m pip install syq
 Prebuilt wheels include the matching syq executable, also available as the
 `syq` command in the Python environment.
 
+Install it into a virtual environment. `pip install --user syq` puts the
+`syq` command in `~/.local/bin`, the same place the
+[standalone installer](https://greaber.github.io/syq/install.html) uses, so
+whichever you ran last replaces the other's command.
+
 <a id="try-a-copy"></a>
 
 ## Copy files
