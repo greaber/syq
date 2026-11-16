@@ -260,27 +260,42 @@ esac
         self.assertIn("is a symbolic link", result.stdout)
         self.assertTrue(command.is_symlink())
 
-        # pip records its package beside the bin directory, whether or not an
-        # earlier standalone install left its receipt there.
+        def package(prefix, packages, name="syq-0.0.9.dist-info", listed=True):
+            metadata = prefix / packages / name
+            metadata.mkdir(parents=True)
+            files = ["../../../bin/syq,sha256=abc,10"] if listed else []
+            (metadata / "RECORD").write_text("\n".join(files + ["syq/__init__.py,,"]) + "\n")
+
+        # pip lists the command in its package's record beside the bin
+        # directory, whether or not an earlier standalone install left its
+        # receipt there.
         for name, packages in [("user", "lib/python3.13/site-packages"),
                                ("lib64", "lib64/python3.13/site-packages"),
                                ("debian", "lib/python3/dist-packages")]:
             with self.subTest(layout=name):
                 bin_dir, command = foreign(name)
                 executable(command, "#!/bin/sh\necho 'syq 0.0.9'\n")
-                (bin_dir.parent / packages / "syq-0.0.9.dist-info").mkdir(parents=True)
-                refused(bin_dir, "was installed by a Python package")
+                package(bin_dir.parent, packages)
+                refused(bin_dir, "belongs to the syq Python package")
                 replaced(bin_dir)
 
-        # Python packages beside the bin directory do not make a syq theirs.
+        # The path stays the package's when its command was removed by hand,
+        # as self-update would treat a syq installed there.
+        bin_dir = self.work / "removed/bin"
+        bin_dir.mkdir(parents=True)
+        package(bin_dir.parent, "lib/python3.13/site-packages")
+        result = self.install(bin_dir)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("belongs to the syq Python package", result.stdout)
+        self.assertEqual(list(bin_dir.iterdir()), [])
+
+        # Other packages beside the bin directory do not make a syq theirs,
+        # nor does a version of the syq package that shipped no command.
         bin_dir = self.work / "others/bin"
-        (bin_dir.parent / "lib/python3.13/site-packages/syq_tools-1.0.dist-info").mkdir(parents=True)
-        (bin_dir.parent / "lib/python3.13/site-packages/pip-26.0.dist-info").mkdir()
+        package(bin_dir.parent, "lib/python3.13/site-packages", "syq_tools-1.0.dist-info")
+        package(bin_dir.parent, "lib/python3.11/site-packages", "syq-0.6.0.dist-info",
+                listed=False)
         self.assertEqual(self.install(bin_dir).returncode, 0)
-        self.assertEqual(self.install(bin_dir).returncode, 0)
-        # Nor does the package when it has no command here to replace.
-        bin_dir = self.work / "no-command/bin"
-        (bin_dir.parent / "lib/python3.13/site-packages/syq-0.0.9.dist-info").mkdir(parents=True)
         self.assertEqual(self.install(bin_dir).returncode, 0)
 
     def test_reinstalling_over_the_installers_own_copy_needs_no_option(self):

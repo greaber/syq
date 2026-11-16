@@ -314,12 +314,18 @@ fn reminded_install() -> Option<RemindedInstall> {
 }
 
 /// Whether a Python package manager installed this resolved executable. A
-/// wheel puts it in `<prefix>/bin` and records the package in
-/// `<prefix>/lib/python*/site-packages/syq-<version>.dist-info`, whether the
-/// prefix is a virtual environment (as pipx, `uv tool`, and `uvx` make), the
-/// `pip install --user` directory, or the interpreter's own. Some systems
-/// name the directories `lib64` or `dist-packages`.
+/// wheel puts it at `<prefix>/bin/syq` and lists it as `../../../bin/syq` in
+/// the package's record of installed files,
+/// `<prefix>/lib/python*/site-packages/syq-<version>.dist-info/RECORD`,
+/// whether the prefix is a virtual environment (as pipx, `uv tool`, and `uvx`
+/// make), the `pip install --user` directory, or the interpreter's own. Some
+/// systems name the directories `lib64` or `dist-packages`. Versions of the
+/// package that shipped no executable do not list one, so a syq beside them
+/// is not theirs.
 fn is_python_package_executable(executable: &Path) -> bool {
+    if !executable.ends_with("bin/syq") {
+        return false;
+    }
     let Some(prefix) = executable.parent().and_then(Path::parent) else {
         return false;
     };
@@ -329,8 +335,13 @@ fn is_python_package_executable(executable: &Path) -> bool {
                 entries_named(&python.join(packages), |name| {
                     name.starts_with("syq-") && name.ends_with(".dist-info")
                 })
-                .next()
-                .is_some()
+                .any(|metadata| {
+                    fs::read_to_string(metadata.join("RECORD")).is_ok_and(|record| {
+                        record
+                            .lines()
+                            .any(|line| line.starts_with("../../../bin/syq,"))
+                    })
+                })
             })
         })
     })
@@ -1937,8 +1948,17 @@ mod tests {
     }
 
     #[test]
-    fn python_package_executables_are_recognized_by_their_package_metadata() {
+    fn python_package_executables_are_recognized_by_their_package_record() {
+        const LISTED: &str = "../../../bin/syq,sha256=abc,10\nsyq/__init__.py,sha256=def,20\n";
         let dir = crate::test_support::tempdir().unwrap();
+        let package = |name: &str, metadata: &str, record: Option<&str>| {
+            let prefix = dir.path().join(name);
+            fs::create_dir_all(prefix.join(metadata)).unwrap();
+            if let Some(record) = record {
+                fs::write(prefix.join(metadata).join("RECORD"), record).unwrap();
+            }
+            prefix
+        };
         for (name, metadata) in [
             ("user", "lib/python3.13/site-packages/syq-0.10.1.dist-info"),
             (
@@ -1948,34 +1968,52 @@ mod tests {
             ("debian", "lib/python3/dist-packages/syq-0.10.1.dist-info"),
             ("framework", "lib/python/site-packages/syq-0.10.1.dist-info"),
         ] {
-            let prefix = dir.path().join(name);
-            fs::create_dir_all(prefix.join(metadata)).unwrap();
+            let prefix = package(name, metadata, Some(LISTED));
             assert!(
                 is_python_package_executable(&prefix.join("bin/syq")),
                 "{name}"
             );
+            assert!(
+                !is_python_package_executable(&prefix.join("bin/other")),
+                "{name}"
+            );
+            assert!(
+                !is_python_package_executable(&prefix.join("sbin/syq")),
+                "{name}"
+            );
         }
-        for (name, other) in [
-            ("empty", "bin"),
+        for (name, metadata, record) in [
+            ("empty", "bin", None),
+            // A version of the package that shipped no executable.
+            (
+                "no-executable",
+                "lib/python3.11/site-packages/syq-0.6.0.dist-info",
+                Some("syq/__init__.py,sha256=def,20\n"),
+            ),
+            (
+                "no-record",
+                "lib/python3.13/site-packages/syq-0.10.1.dist-info",
+                None,
+            ),
             (
                 "other-package",
                 "lib/python3.13/site-packages/syq_tools-1.0.dist-info",
+                Some(LISTED),
             ),
-            ("module-only", "lib/python3.13/site-packages/syq"),
-            ("not-python", "lib/syq/site-packages/syq-0.10.1.dist-info"),
             (
-                "venv-without-syq",
-                "lib/python3.13/site-packages/pip-26.0.dist-info",
+                "not-python",
+                "lib/syq/site-packages/syq-0.10.1.dist-info",
+                Some(LISTED),
             ),
         ] {
-            let prefix = dir.path().join(name);
-            fs::create_dir_all(prefix.join(other)).unwrap();
+            let prefix = package(name, metadata, record);
             assert!(
                 !is_python_package_executable(&prefix.join("bin/syq")),
                 "{name}"
             );
         }
         assert!(!is_python_package_executable(Path::new("/syq")));
+        assert!(!is_python_package_executable(Path::new("/bin/syq")));
     }
 
     #[test]

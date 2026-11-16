@@ -15,18 +15,19 @@ directory is on your `PATH`. To choose another directory, download the script
 and run `sh install.sh --bin-dir DIR`.
 
 Running the script again replaces the copy it installed earlier. If the `syq`
-already there came from somewhere else, the script stops without changing it:
-that's a `syq` a Python package installed (with pip, pipx, or uv), or one that
-is a symbolic link, as pipx and `uv tool` make. Uninstall that copy first, or
-add `--replace` to install over it:
+there came from somewhere else, the script stops without changing it: that's a
+`syq` that belongs to a Python package (installed with pip, pipx, or uv), or
+one that is a symbolic link, as pipx and `uv tool` make. Uninstall that copy
+first, or add `--replace` to install over it:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf https://dl.syq.christmas/latest/install.sh | sh -s -- --replace
 ```
 
 Installing over a Python package's `syq` leaves the package in place, so
-`syq --self-update` keeps declining to update it, and uninstalling the package
-later removes the command.
+`syq --self-update` keeps declining to update it, the package's Python code
+runs the copy you installed, and uninstalling the package later removes the
+command.
 
 ## Homebrew
 

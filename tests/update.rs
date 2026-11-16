@@ -476,9 +476,16 @@ fn self_update_refuses_a_signed_downgrade() {
     fixture.assert_original_unchanged();
 }
 
-/// The package metadata a wheel installer leaves beside `<prefix>/bin`.
+/// The package metadata a wheel installer leaves beside `<prefix>/bin`,
+/// whose record lists the executable.
 fn add_python_package(prefix: &Path, packages: &str) {
-    fs::create_dir_all(prefix.join(packages).join("syq-0.10.1.dist-info")).unwrap();
+    let metadata = prefix.join(packages).join("syq-0.10.1.dist-info");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(
+        metadata.join("RECORD"),
+        "../../../bin/syq,sha256=abc,10\nsyq/__init__.py,sha256=def,20\n",
+    )
+    .unwrap();
 }
 
 /// A virtual environment holding the syq package, as pip, pipx, `uv tool`,
@@ -523,8 +530,15 @@ fn self_update_refuses_a_python_package_despite_a_stale_receipt() {
     add_python_package(&fixture.temp.0, "lib/python3.13/site-packages");
     assert_python_refusal(&fixture, &fixture.installed, "user install");
     fixture.assert_original_unchanged();
-    // Without the package, the same receipted copy updates.
-    fs::remove_dir_all(fixture.temp.path("lib")).unwrap();
+    // The same receipted copy updates beside a version of the package that
+    // shipped no executable, and so does not list one.
+    fs::write(
+        fixture
+            .temp
+            .path("lib/python3.13/site-packages/syq-0.10.1.dist-info/RECORD"),
+        "syq/__init__.py,sha256=def,20\n",
+    )
+    .unwrap();
     assert_success(&fixture.command("--self-update"));
 }
 
