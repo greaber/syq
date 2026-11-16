@@ -297,6 +297,7 @@ esac
             (prefix / name).mkdir()
             self.assertEqual(self.install(prefix / name).returncode, 0)
             self.assertEqual(self.install(prefix / name).returncode, 0)
+        (prefix / "bin").mkdir()
         self.assertEqual(self.install(f"{prefix}/bin/").returncode, 1)
 
         # Other packages beside the bin directory do not make a syq theirs,
