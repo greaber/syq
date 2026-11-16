@@ -218,6 +218,79 @@ esac
         self.expect_failure("destination is a directory",
                             ["sh", str(self.installer), "--bin-dir", str(destination)], self.env())
 
+    def test_another_tools_syq_is_replaced_only_on_request(self):
+        def foreign(name):
+            """A bin directory holding another tool's syq, and that file."""
+            bin_dir = self.work / name / "bin"
+            bin_dir.mkdir(parents=True)
+            return bin_dir, bin_dir / "syq"
+
+        def refused(bin_dir, expected):
+            before = sha256(bin_dir / "syq")
+            result = self.install(bin_dir)
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn(expected, result.stdout)
+            self.assertIn("pass --replace", result.stdout)
+            self.assertEqual(sha256(bin_dir / "syq"), before)
+            self.assertEqual(sorted(path.name for path in bin_dir.iterdir()), ["syq"])
+
+        def replaced(bin_dir):
+            result = subprocess.run(
+                ["sh", str(self.installer), "--replace", "--bin-dir", str(bin_dir)],
+                env=self.env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertFalse((bin_dir / "syq").is_symlink())
+            self.assertEqual(self.run_program(bin_dir / "syq", "--version"), "syq 0.1.0")
+
+        # pipx and uv tool link the command into their own environment.
+        tool = self.work / "tool-environment-syq"
+        executable(tool, "#!/bin/sh\necho 'syq 0.0.9'\n")
+        bin_dir, command = foreign("linked")
+        command.symlink_to(tool)
+        refused(bin_dir, "is a symbolic link that this installer did not make")
+        replaced(bin_dir)
+        self.assertEqual(self.run_program(tool), "syq 0.0.9")
+        # Once replaced, the copy is the installer's own.
+        self.assertEqual(self.install(bin_dir).returncode, 0)
+
+        bin_dir, command = foreign("dangling")
+        command.symlink_to(self.work / "missing")
+        result = self.install(bin_dir)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("is a symbolic link", result.stdout)
+        self.assertTrue(command.is_symlink())
+
+        # pip records its package beside the bin directory, whether or not an
+        # earlier standalone install left its receipt there.
+        for name, packages in [("user", "lib/python3.13/site-packages"),
+                               ("lib64", "lib64/python3.13/site-packages"),
+                               ("debian", "lib/python3/dist-packages")]:
+            with self.subTest(layout=name):
+                bin_dir, command = foreign(name)
+                executable(command, "#!/bin/sh\necho 'syq 0.0.9'\n")
+                (bin_dir.parent / packages / "syq-0.0.9.dist-info").mkdir(parents=True)
+                refused(bin_dir, "was installed by a Python package")
+                replaced(bin_dir)
+
+        # Python packages beside the bin directory do not make a syq theirs.
+        bin_dir = self.work / "others/bin"
+        (bin_dir.parent / "lib/python3.13/site-packages/syq_tools-1.0.dist-info").mkdir(parents=True)
+        (bin_dir.parent / "lib/python3.13/site-packages/pip-26.0.dist-info").mkdir()
+        self.assertEqual(self.install(bin_dir).returncode, 0)
+        self.assertEqual(self.install(bin_dir).returncode, 0)
+        # Nor does the package when it has no command here to replace.
+        bin_dir = self.work / "no-command/bin"
+        (bin_dir.parent / "lib/python3.13/site-packages/syq-0.0.9.dist-info").mkdir(parents=True)
+        self.assertEqual(self.install(bin_dir).returncode, 0)
+
+    def test_reinstalling_over_the_installers_own_copy_needs_no_option(self):
+        bin_dir = self.work / "own/bin"
+        self.assertEqual(self.install(bin_dir).returncode, 0)
+        (bin_dir / ".syq-install.json").write_text("{}\n")
+        result = self.install(bin_dir)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("installed syq 0.1.0", result.stdout)
+
     def test_an_endless_download_stops_after_the_archive_size(self):
         for downloader, path in [("curl", None), ("wget", str(self.wget_only_path()))]:
             with self.subTest(downloader=downloader):

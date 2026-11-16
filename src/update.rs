@@ -1,8 +1,10 @@
 //! Signed standalone release updates and remote-helper artifact verification.
 //!
 //! Package-manager and source installs deliberately have no install receipt,
-//! so this module will never replace them; Homebrew installs still receive
-//! update reminders that point at `brew upgrade`. Official release builds embed
+//! so this module will never replace them; an executable that a Python
+//! package installed is refused even when a receipt names its path. Homebrew
+//! and Python installs still receive update reminders that name their own
+//! upgrade command. Official release builds embed
 //! the Ed25519 public key supplied by the release workflow at compile time.
 
 use crate::process::CommandExt as _;
@@ -116,6 +118,13 @@ enum FetchMode {
 /// Install the latest release when this executable came from the standalone
 /// installer. A package-manager binary cannot accidentally overwrite itself.
 pub fn self_update() -> Result<()> {
+    // Before the receipt: one left by an earlier standalone install may still
+    // name this path after a Python package manager wrote its own file there.
+    if is_python_package_executable(&canonical_current_exe()?) {
+        bail!(
+            "this syq was installed as a Python package, so self-update will not replace it; {PYTHON_UPGRADE}"
+        );
+    }
     let (receipt_path, mut receipt) = managed_receipt().context(
         "self-update is only available for installs made by the standalone installer; Homebrew installs should use `brew upgrade syq`, and source builds should be rebuilt or replaced with a standalone install",
     )?;
@@ -263,35 +272,82 @@ pub fn after_success(quiet: bool) {
         return;
     }
     crate::output::diagnostic!(
-        "syq: update {} is available; run `{}`",
+        "syq: update {} is available; {}",
         release.version,
-        install.upgrade_command()
+        install.upgrade_hint()
     );
 }
 
+/// How to upgrade a syq that a Python package installed. pip, uv, and pipx
+/// leave the same files next to the executable, so the hint names all three.
+const PYTHON_UPGRADE: &str = "upgrade the syq Python package with the tool that installed it, such as `pip install --upgrade syq`, `uv tool upgrade syq`, or `pipx upgrade syq`";
+
 /// Installations that receive update reminders, each with its own upgrade
-/// command. Source builds have neither a receipt nor a Homebrew path.
+/// hint. Source builds have no receipt, Homebrew path, or Python package.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RemindedInstall {
     Standalone,
     Homebrew,
+    Python,
 }
 
 impl RemindedInstall {
-    fn upgrade_command(self) -> &'static str {
+    fn upgrade_hint(self) -> &'static str {
         match self {
-            RemindedInstall::Standalone => "syq --self-update",
-            RemindedInstall::Homebrew => "brew upgrade syq",
+            RemindedInstall::Standalone => "run `syq --self-update`",
+            RemindedInstall::Homebrew => "run `brew upgrade syq`",
+            RemindedInstall::Python => PYTHON_UPGRADE,
         }
     }
 }
 
 fn reminded_install() -> Option<RemindedInstall> {
+    let executable = canonical_current_exe().ok()?;
+    // Python first, as in `self_update`: a stale receipt may name this path.
+    if is_python_package_executable(&executable) {
+        return Some(RemindedInstall::Python);
+    }
     if managed_receipt().is_ok() {
         return Some(RemindedInstall::Standalone);
     }
-    let executable = canonical_current_exe().ok()?;
     is_homebrew_keg_path(&executable).then_some(RemindedInstall::Homebrew)
+}
+
+/// Whether a Python package manager installed this resolved executable. A
+/// wheel puts it in `<prefix>/bin` and records the package in
+/// `<prefix>/lib/python*/site-packages/syq-<version>.dist-info`, whether the
+/// prefix is a virtual environment (as pipx, `uv tool`, and `uvx` make), the
+/// `pip install --user` directory, or the interpreter's own. Some systems
+/// name the directories `lib64` or `dist-packages`.
+fn is_python_package_executable(executable: &Path) -> bool {
+    let Some(prefix) = executable.parent().and_then(Path::parent) else {
+        return false;
+    };
+    ["lib", "lib64"].iter().any(|lib| {
+        entries_named(&prefix.join(lib), |name| name.starts_with("python")).any(|python| {
+            ["site-packages", "dist-packages"].iter().any(|packages| {
+                entries_named(&python.join(packages), |name| {
+                    name.starts_with("syq-") && name.ends_with(".dist-info")
+                })
+                .next()
+                .is_some()
+            })
+        })
+    })
+}
+
+/// The entries of `directory` whose names `matches` accepts; none when it
+/// cannot be read.
+fn entries_named(
+    directory: &Path,
+    matches: impl Fn(&str) -> bool,
+) -> impl Iterator<Item = PathBuf> {
+    fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(move |entry| entry.file_name().to_str().is_some_and(&matches))
+        .map(|entry| entry.path())
 }
 
 /// Homebrew installs the formula's binary as `<prefix>/Cellar/syq/<version>/bin/syq`
@@ -1870,13 +1926,56 @@ mod tests {
             assert!(!is_homebrew_keg_path(Path::new(path)), "{path}");
         }
         assert_eq!(
-            RemindedInstall::Homebrew.upgrade_command(),
-            "brew upgrade syq"
+            RemindedInstall::Homebrew.upgrade_hint(),
+            "run `brew upgrade syq`"
         );
         assert_eq!(
-            RemindedInstall::Standalone.upgrade_command(),
-            "syq --self-update"
+            RemindedInstall::Standalone.upgrade_hint(),
+            "run `syq --self-update`"
         );
+        assert_eq!(RemindedInstall::Python.upgrade_hint(), PYTHON_UPGRADE);
+    }
+
+    #[test]
+    fn python_package_executables_are_recognized_by_their_package_metadata() {
+        let dir = crate::test_support::tempdir().unwrap();
+        for (name, metadata) in [
+            ("user", "lib/python3.13/site-packages/syq-0.10.1.dist-info"),
+            (
+                "fedora",
+                "lib64/python3.13/site-packages/syq-0.10.1.dist-info",
+            ),
+            ("debian", "lib/python3/dist-packages/syq-0.10.1.dist-info"),
+            ("framework", "lib/python/site-packages/syq-0.10.1.dist-info"),
+        ] {
+            let prefix = dir.path().join(name);
+            fs::create_dir_all(prefix.join(metadata)).unwrap();
+            assert!(
+                is_python_package_executable(&prefix.join("bin/syq")),
+                "{name}"
+            );
+        }
+        for (name, other) in [
+            ("empty", "bin"),
+            (
+                "other-package",
+                "lib/python3.13/site-packages/syq_tools-1.0.dist-info",
+            ),
+            ("module-only", "lib/python3.13/site-packages/syq"),
+            ("not-python", "lib/syq/site-packages/syq-0.10.1.dist-info"),
+            (
+                "venv-without-syq",
+                "lib/python3.13/site-packages/pip-26.0.dist-info",
+            ),
+        ] {
+            let prefix = dir.path().join(name);
+            fs::create_dir_all(prefix.join(other)).unwrap();
+            assert!(
+                !is_python_package_executable(&prefix.join("bin/syq")),
+                "{name}"
+            );
+        }
+        assert!(!is_python_package_executable(Path::new("/syq")));
     }
 
     #[test]

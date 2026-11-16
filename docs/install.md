@@ -14,6 +14,20 @@ The script installs syq into `~/.local/bin` without `sudo`; make sure that
 directory is on your `PATH`. To choose another directory, download the script
 and run `sh install.sh --bin-dir DIR`.
 
+Running the script again replaces the copy it installed earlier. If the `syq`
+already there came from somewhere else, the script stops without changing it:
+that's a `syq` a Python package installed (with pip, pipx, or uv), or one that
+is a symbolic link, as pipx and `uv tool` make. Uninstall that copy first, or
+add `--replace` to install over it:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://dl.syq.christmas/latest/install.sh | sh -s -- --replace
+```
+
+Installing over a Python package's `syq` leaves the package in place, so
+`syq --self-update` keeps declining to update it, and uninstalling the package
+later removes the command.
+
 ## Homebrew
 
 ```sh
@@ -78,13 +92,16 @@ helpers and installation exceptions.
 ## Updates
 
 Use `syq --self-update` for a standalone installation, or `brew upgrade syq`
-for Homebrew. Commands already running keep their own version, and receiving
+for Homebrew. A `syq` that a Python package installed is upgraded with the tool
+that installed it, such as `pip install --upgrade syq`, `uv tool upgrade syq`,
+or `pipx upgrade syq`; `syq --self-update` declines to replace it and says so.
+Commands already running keep their own version, and receiving
 [switches to the new version](persistence-reference.md#connection-lifetime-and-waits)
 once nothing is in progress.
 
-When a newer release is out, standalone and Homebrew installs remind you in a
-terminal, at most once a day after a successful command, and name the upgrade
-command. Nothing updates automatically. Set `SYQ_NO_UPDATE_CHECK=1` or
+When a newer release is out, standalone, Homebrew, and Python package installs
+remind you in a terminal, at most once a day after a successful command, and
+say how to upgrade. Nothing updates automatically. Set `SYQ_NO_UPDATE_CHECK=1` or
 `DO_NOT_TRACK=1` to turn reminders off.
 
 ### Update-check data

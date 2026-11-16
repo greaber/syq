@@ -29,16 +29,21 @@ version='@VERSION@'
 tag='@TAG@'
 base_url=${SYQ_INSTALL_BASE_URL:-'@DOWNLOAD_BASE@/@TAG@'}
 bin_dir=${HOME:+$HOME/.local/bin}
+replace=
 
 usage() {
   cat <<USAGE
 Install syq @VERSION@ without sudo.
 
-Usage: install.sh [--bin-dir DIR]
+Usage: install.sh [--bin-dir DIR] [--replace]
 
 The default is $HOME/.local/bin. The installer detects this host, downloads
 the pinned release archive, checks its embedded SHA-256 and size, verifies the
 binary's version and release identity, then replaces the destination atomically.
+
+It leaves alone a syq that a Python package installed there (with pip, pipx,
+or uv), and a syq that is a symbolic link, and stops. Uninstall that one
+first, or pass --replace to install over it.
 USAGE
 }
 
@@ -49,11 +54,32 @@ while [ $# -gt 0 ]; do
       bin_dir=$2
       shift 2
       ;;
+    --replace) replace=1; shift ;;
     --help|-h) usage; exit 0 ;;
     *) echo "install.sh: unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 [ -n "${bin_dir:-}" ] || { echo 'install.sh: HOME is not set; pass --bin-dir DIR' >&2; exit 1; }
+
+# Another tool's syq is not replaced silently: that tool would go on treating
+# the file as its own, and uninstalling it there would remove this copy. pipx
+# and uv tool link the command into their own directory, and a Python package
+# leaves its metadata under the lib directory beside the bin directory.
+if [ -z "$replace" ]; then
+  if [ -L "$bin_dir/syq" ]; then
+    echo "install.sh: $bin_dir/syq is a symbolic link that this installer did not make (pipx and uv tool make such links)" >&2
+    echo 'install.sh: uninstall that syq or remove the link first, or pass --replace to install over it' >&2
+    exit 1
+  fi
+  if [ -e "$bin_dir/syq" ]; then
+    for metadata in "$bin_dir"/../lib*/python*/*-packages/syq-*.dist-info; do
+      [ -d "$metadata" ] || continue
+      echo "install.sh: $bin_dir/syq was installed by a Python package ($metadata)" >&2
+      echo 'install.sh: uninstall it first, for example with "pip uninstall syq", or pass --replace to install over it' >&2
+      exit 1
+    done
+  fi
+fi
 
 case "$(uname -s):$(uname -m)" in
 '''

@@ -476,6 +476,208 @@ fn self_update_refuses_a_signed_downgrade() {
     fixture.assert_original_unchanged();
 }
 
+/// The package metadata a wheel installer leaves beside `<prefix>/bin`.
+fn add_python_package(prefix: &Path, packages: &str) {
+    fs::create_dir_all(prefix.join(packages).join("syq-0.10.1.dist-info")).unwrap();
+}
+
+/// A virtual environment holding the syq package, as pip, pipx, `uv tool`,
+/// and `uvx` make, and the path of its executable.
+fn python_environment(fixture: &UpdateFixture, name: &str) -> PathBuf {
+    let prefix = fixture.temp.path(name);
+    let executable = prefix.join("bin/syq");
+    fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    fs::write(prefix.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+    add_python_package(&prefix, "lib/python3.13/site-packages");
+    executable_support::copy_executable(&fixture.installed, &executable, 0o755);
+    executable
+}
+
+fn assert_python_refusal(fixture: &UpdateFixture, executable: &Path, what: &str) {
+    let output = fixture.command_at(executable, "--self-update");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{what}: {stderr}");
+    assert!(
+        stderr.contains("this syq was installed as a Python package")
+            && stderr.contains(
+                "`pip install --upgrade syq`, `uv tool upgrade syq`, or `pipx upgrade syq`"
+            ),
+        "{what}: {stderr}"
+    );
+    assert!(
+        !stderr.contains("install.json")
+            && !stderr.contains("No such file")
+            && !stderr.contains("standalone installer"),
+        "{what}: {stderr}"
+    );
+    assert_eq!(fs::read(executable).unwrap(), fixture.original, "{what}");
+}
+
+#[test]
+fn self_update_refuses_a_python_package_despite_a_stale_receipt() {
+    let version = next_release_version();
+    let fixture = UpdateFixture::new(&version, &format!("v{version}"));
+    // `pip install --user` wrote ~/.local/bin/syq over a standalone install,
+    // whose receipt still names that path.
+    fixture.register();
+    add_python_package(&fixture.temp.0, "lib/python3.13/site-packages");
+    assert_python_refusal(&fixture, &fixture.installed, "user install");
+    fixture.assert_original_unchanged();
+    // Without the package, the same receipted copy updates.
+    fs::remove_dir_all(fixture.temp.path("lib")).unwrap();
+    assert_success(&fixture.command("--self-update"));
+}
+
+#[test]
+fn self_update_refuses_python_environments_and_links_into_them() {
+    let version = next_release_version();
+    let fixture = UpdateFixture::new(&version, &format!("v{version}"));
+    let environment = python_environment(&fixture, "venv");
+    assert_python_refusal(&fixture, &environment, "virtual environment");
+
+    // pipx and `uv tool` link ~/.local/bin/syq into their environment. A
+    // receipt from an earlier standalone install names the link, by either
+    // of the places releases have kept receipts.
+    let link = fixture.home.join(".local/bin/syq");
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&environment, &link).unwrap();
+    assert_python_refusal(&fixture, &link, "tool link");
+    let receipt = serde_json::to_vec(&serde_json::json!({
+        "schema": 1,
+        "provider": "standalone",
+        "version": env!("CARGO_PKG_VERSION"),
+        "target": release_target(),
+        "binary": link,
+    }))
+    .unwrap();
+    write_legacy_receipt(&fixture.config.join("syq/install.json"), &receipt);
+    assert_python_refusal(&fixture, &link, "tool link with a legacy receipt");
+    fs::write(environment.with_file_name(".syq-install.json"), &receipt).unwrap();
+    assert_python_refusal(&fixture, &link, "tool link with an adjacent receipt");
+
+    // Interpreters that keep packages under lib64 or dist-packages.
+    for (name, packages) in [
+        ("fedora", "lib64/python3.13/site-packages"),
+        ("debian", "lib/python3/dist-packages"),
+    ] {
+        let executable = fixture.temp.path(&format!("{name}/bin/syq"));
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        executable_support::copy_executable(&fixture.installed, &executable, 0o755);
+        add_python_package(&fixture.temp.path(name), packages);
+        assert_python_refusal(&fixture, &executable, name);
+    }
+}
+
+/// Run a successful copy with standard error on a terminal, as the update
+/// reminder requires, and return what it wrote there.
+fn terminal_stderr_of_a_copy(fixture: &UpdateFixture, executable: &Path, name: &str) -> String {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let source = fixture.temp.path(&format!("{name}-source"));
+    fs::write(&source, b"data").unwrap();
+    let into = fixture.temp.path(&format!("{name}-destination"));
+    fs::create_dir_all(&into).unwrap();
+    let destination = into.join(source.file_name().unwrap());
+    let (mut terminal, mut side) = (0, 0);
+    // SAFETY: openpty writes two new descriptors that the OwnedFds then own.
+    let (terminal, side) = unsafe {
+        assert_eq!(
+            libc::openpty(
+                &mut terminal,
+                &mut side,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ),
+            0
+        );
+        (OwnedFd::from_raw_fd(terminal), OwnedFd::from_raw_fd(side))
+    };
+    let status = fixture
+        .command_builder(
+            executable,
+            &[
+                "cp",
+                source.to_str().unwrap(),
+                "--into",
+                into.to_str().unwrap(),
+            ],
+        )
+        .env_remove("SYQ_NO_UPDATE_CHECK")
+        .env_remove("DO_NOT_TRACK")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(side.try_clone().unwrap())
+        .status()
+        .unwrap();
+    // The command has exited, so everything it wrote is already queued; this
+    // side stays open until then so the terminal keeps it.
+    // SAFETY: the descriptor is open and the buffer is valid for its length.
+    let mut output = Vec::new();
+    unsafe {
+        let flags = libc::fcntl(terminal.as_raw_fd(), libc::F_GETFL);
+        libc::fcntl(
+            terminal.as_raw_fd(),
+            libc::F_SETFL,
+            flags | libc::O_NONBLOCK,
+        );
+        let mut buffer = [0u8; 4096];
+        loop {
+            let count = libc::read(
+                terminal.as_raw_fd(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+            );
+            if count <= 0 {
+                break;
+            }
+            output.extend_from_slice(&buffer[..count as usize]);
+        }
+    }
+    drop(side);
+    let output = String::from_utf8_lossy(&output).into_owned();
+    assert!(status.success(), "{output}");
+    assert_eq!(fs::read(&destination).unwrap(), b"data");
+    output
+}
+
+#[test]
+fn update_reminders_name_each_install_methods_upgrade() {
+    let version = next_release_version();
+    let fixture = UpdateFixture::new(&version, &format!("v{version}"));
+    let stamp = fixture.config.join("syq/last-update-check");
+
+    // No reminder for a copy nothing manages, and no check recorded.
+    let unmanaged = terminal_stderr_of_a_copy(&fixture, &fixture.installed, "unmanaged");
+    assert!(!unmanaged.contains("is available"), "{unmanaged}");
+    assert!(!stamp.exists());
+
+    fixture.register();
+    let standalone = terminal_stderr_of_a_copy(&fixture, &fixture.installed, "standalone");
+    assert!(
+        standalone.contains(&format!(
+            "syq: update {version} is available; run `syq --self-update`"
+        )),
+        "{standalone}"
+    );
+    // At most one check a day.
+    assert!(stamp.exists());
+    let again = terminal_stderr_of_a_copy(&fixture, &fixture.installed, "again");
+    assert!(!again.contains("is available"), "{again}");
+
+    // A Python package gets its own hint, even where a stale receipt names it.
+    fs::remove_file(&stamp).unwrap();
+    add_python_package(&fixture.temp.0, "lib/python3.13/site-packages");
+    let python = terminal_stderr_of_a_copy(&fixture, &fixture.installed, "python");
+    assert!(
+        python.contains(&format!(
+            "syq: update {version} is available; upgrade the syq Python package with the tool that installed it, such as `pip install --upgrade syq`, `uv tool upgrade syq`, or `pipx upgrade syq`"
+        )),
+        "{python}"
+    );
+    assert!(!python.contains("--self-update"), "{python}");
+    fixture.assert_original_unchanged();
+}
+
 #[test]
 fn receipt_is_bound_to_the_exact_installed_executable() {
     let release_version = next_release_version();
