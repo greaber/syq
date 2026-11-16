@@ -72,13 +72,17 @@ if [ -z "$replace" ]; then
     echo 'install.sh: uninstall that syq or remove the link first, or pass --replace to install over it' >&2
     exit 1
   fi
-  for record in "$bin_dir"/../lib*/python*/*-packages/syq-*.dist-info/RECORD; do
-    [ -f "$record" ] || continue
-    grep '^\.\./\.\./\.\./bin/syq,' "$record" >/dev/null 2>&1 || continue
-    echo "install.sh: $bin_dir/syq belongs to the syq Python package ($record lists it)" >&2
-    echo 'install.sh: uninstall that package first, for example with "pip uninstall syq", or pass --replace to install over it' >&2
-    exit 1
-  done
+  case ${bin_dir%/} in
+    bin|*/bin)
+      for record in "$bin_dir"/../lib*/python*/*-packages/syq-*.dist-info/RECORD; do
+        [ -f "$record" ] || continue
+        grep '^\.\./\.\./\.\./bin/syq,' "$record" >/dev/null 2>&1 || continue
+        echo "install.sh: $bin_dir/syq belongs to the syq Python package ($record lists it)" >&2
+        echo 'install.sh: uninstall that package first, for example with "pip uninstall syq", or pass --replace to install over it' >&2
+        exit 1
+      done
+      ;;
+  esac
 fi
 
 case "$(uname -s):$(uname -m)" in

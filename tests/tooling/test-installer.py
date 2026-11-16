@@ -289,6 +289,16 @@ esac
         self.assertIn("belongs to the syq Python package", result.stdout)
         self.assertEqual(list(bin_dir.iterdir()), [])
 
+        # The package's command is the one in bin, not a syq in another
+        # directory beside it.
+        prefix = self.work / "beside"
+        package(prefix, "lib/python3.13/site-packages")
+        for name in ("standalone", "sbin"):
+            (prefix / name).mkdir()
+            self.assertEqual(self.install(prefix / name).returncode, 0)
+            self.assertEqual(self.install(prefix / name).returncode, 0)
+        self.assertEqual(self.install(f"{prefix}/bin/").returncode, 1)
+
         # Other packages beside the bin directory do not make a syq theirs,
         # nor does a version of the syq package that shipped no command.
         bin_dir = self.work / "others/bin"
