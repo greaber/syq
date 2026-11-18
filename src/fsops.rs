@@ -3005,10 +3005,6 @@ impl FsOps {
         Ok(())
     }
 
-    pub fn scan_root(&self, root: &[u8]) -> Result<PathBytes> {
-        self.destination_relative(root)
-    }
-
     fn completion_entries(
         directory: &[u8],
         confined_root: Option<&[u8]>,

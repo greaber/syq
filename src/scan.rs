@@ -1,8 +1,7 @@
 //! Parallel directory walk producing `Entry` batches in parent-before-child order.
 
 use crate::fsops::{
-    join, lstat_entry, path_bytes, require_source_leaf_identity, rooted_entry_in_directory,
-    rooted_source_entry,
+    join, require_source_leaf_identity, rooted_entry_in_directory, rooted_source_entry,
 };
 #[cfg(test)]
 use crate::process::CommandExt as _;
@@ -10,8 +9,7 @@ use crate::proto::{Entry, PathBytes, ScanWarning, SourceLeafIdentity};
 use crate::rooted::{RelativePath, Root, RootMetadata};
 use anyhow::{Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use jwalk::WalkDirGeneric;
-use std::fs::{self, File};
+use std::fs::File;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
@@ -24,19 +22,6 @@ const FIRST_BATCH_MAX_DELAY: Duration = Duration::from_millis(50);
 const DESCRIPTOR_STAT_THREADS: usize = 8;
 const DESCRIPTOR_STAT_PAR_MIN: usize = 32;
 const DESCRIPTOR_DIRECTORY_FDS: usize = 8;
-
-/// Per-entry result of the parallel read_dir hook.
-#[derive(Clone, Default, Debug)]
-enum State {
-    /// lstat failed and will be warned about.
-    #[default]
-    Failed,
-    /// Ignored path: silently dropped, subtree pruned.
-    Skipped,
-    /// Ignored path the caller wants to hear about (still pruned).
-    Ignored,
-    Keep(Entry),
-}
 
 /// Build a gitignore-style matcher from `lines` (the lines of a virtual .gitignore
 /// anchored at the scan root). Returns None when there is nothing to match.
@@ -92,124 +77,6 @@ fn send_scan_chunk(
     *entries_in_chunk = 0;
     tx.send(std::mem::replace(chunk, Vec::with_capacity(FIRST_BATCH)))
         .is_ok()
-}
-
-fn produce_scan(
-    root: std::path::PathBuf,
-    ignore: Option<Gitignore>,
-    report_ignored: bool,
-    tx: SyncSender<ScanChunk>,
-) -> u64 {
-    let mut ignored_count = 0;
-    let mut chunk = Vec::with_capacity(FIRST_BATCH);
-    let mut entries_sent = 1; // The root entry is already waiting in the consumer.
-    let mut entries_in_chunk = 0;
-    let match_root = root.clone();
-    let walk = WalkDirGeneric::<((), State)>::new(&root)
-        .follow_links(false)
-        .skip_hidden(false)
-        .process_read_dir(move |_depth, _path, _state, children| {
-            for child in children.iter_mut().flatten() {
-                let full = child.path();
-                let Ok(entry) = lstat_entry(Vec::new(), &full) else {
-                    child.client_state = State::Failed;
-                    continue;
-                };
-                if let Some(ig) = &ignore {
-                    let rel = full.strip_prefix(&match_root).unwrap_or(&full);
-                    let is_dir = entry.kind == crate::proto::Kind::Dir;
-                    if ig.matched(rel, is_dir).is_ignore() {
-                        // Pruned: neither listed nor descended into.
-                        child.read_children = None;
-                        child.client_state = if report_ignored {
-                            State::Ignored
-                        } else {
-                            State::Skipped
-                        };
-                        continue;
-                    }
-                }
-                child.client_state = State::Keep(entry);
-            }
-        });
-    for item in walk {
-        let mut de = match item {
-            Ok(de) => de,
-            Err(e) => {
-                chunk.push(ScanEvent::Warning(ScanWarning {
-                    path: None,
-                    message: format!("scan: {e}"),
-                    error: e.to_string(),
-                }));
-                if chunk.len() >= FIRST_BATCH
-                    && !send_scan_chunk(&tx, &mut chunk, &mut entries_sent, &mut entries_in_chunk)
-                {
-                    return ignored_count;
-                }
-                continue;
-            }
-        };
-        // Check this before skipping the root: an unreadable root is the
-        // most important warning there is (--delete relies on it).
-        if let Some(e) = de
-            .read_children
-            .as_ref()
-            .and_then(|children| children.error())
-        {
-            let full = de.path();
-            chunk.push(ScanEvent::Warning(ScanWarning {
-                path: Some(path_bytes(full.strip_prefix(&root).unwrap_or(&full))),
-                error: e.to_string(),
-                message: format!("scan: {}: {e}", full.display()),
-            }));
-        }
-        if de.depth == 0 {
-            if chunk.len() >= FIRST_BATCH
-                && !send_scan_chunk(&tx, &mut chunk, &mut entries_sent, &mut entries_in_chunk)
-            {
-                return ignored_count;
-            }
-            continue;
-        }
-        let event = match std::mem::take(&mut de.client_state) {
-            State::Keep(mut entry) => {
-                let full = de.path();
-                let rel = full.strip_prefix(&root).unwrap_or(&full);
-                entry.path = path_bytes(rel);
-                entries_in_chunk += 1;
-                ScanEvent::Entry(entry)
-            }
-            State::Skipped => {
-                ignored_count += 1;
-                continue;
-            }
-            State::Ignored => {
-                ignored_count += 1;
-                let full = de.path();
-                ScanEvent::Ignored(path_bytes(full.strip_prefix(&root).unwrap_or(&full)))
-            }
-            State::Failed => {
-                let full = de.path();
-                ScanEvent::Warning(ScanWarning {
-                    path: Some(path_bytes(full.strip_prefix(&root).unwrap_or(&full))),
-                    error: "cannot stat".into(),
-                    message: format!("scan: cannot stat {}", full.display()),
-                })
-            }
-        };
-        chunk.push(event);
-        // Publish exactly when the consumer has its first 1,000 entries. Later
-        // chunks are only an amortization detail and can use the same size cap.
-        let first_batch_ready =
-            entries_sent < FIRST_BATCH && entries_sent + entries_in_chunk >= FIRST_BATCH;
-        if (first_batch_ready || chunk.len() >= FIRST_BATCH)
-            && !send_scan_chunk(&tx, &mut chunk, &mut entries_sent, &mut entries_in_chunk)
-        {
-            return ignored_count;
-        }
-    }
-    let _ = send_scan_chunk(&tx, &mut chunk, &mut entries_sent, &mut entries_in_chunk);
-    ignored_count
 }
 
 fn inspect_descriptor_children(
@@ -582,75 +449,6 @@ fn receive_scan(
     Ok(())
 }
 
-/// Walk `root`, calling `sink` with batches of entries (root first, as path "").
-/// Every entry is reported, syq's own `.name.syq-tmp.<random>` sidecars included (the
-/// planner decides what they mean). `warn` receives non-fatal errors
-/// (unreadable directories etc.). `ignore` holds gitignore-style patterns
-/// relative to `root`; a matching directory is pruned with its whole subtree.
-/// The root itself is never ignored. With `report_ignored`, the pruned paths
-/// are handed to `ignored` (in batches).
-#[allow(clippy::too_many_arguments)]
-pub fn scan(
-    root: &Path,
-    follow_root: bool,
-    ignore: &[String],
-    report_ignored: bool,
-    sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
-    ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
-    warn: &mut dyn FnMut(ScanWarning),
-) -> Result<u64> {
-    let ignore = build_ignore(ignore)?;
-    let md = if follow_root {
-        fs::metadata(root)
-    } else {
-        fs::symlink_metadata(root)
-    }
-    .with_context(|| format!("stat {}", root.display()))?;
-    let mut root_entry = crate::fsops::entry_from_meta(Vec::new(), root, &md);
-    if follow_root && md.is_dir() {
-        root_entry.kind = crate::proto::Kind::Dir;
-        root_entry.link = None;
-    }
-    if !md.is_dir() {
-        sink(vec![root_entry])?;
-        return Ok(0);
-    }
-    // Preserve bounded first-byte progress on slow/NFS walks without splitting
-    // a small, fast scan into several serialized WAN planning round trips. The
-    // producer is separate so a stalled metadata operation cannot hide a ready
-    // first batch past its deadline; the bounded channel limits scan-ahead.
-    let mut batch = Vec::with_capacity(FIRST_BATCH);
-    let scan_started = Instant::now();
-    batch.push(root_entry);
-    let mut ignored_batch: Vec<PathBytes> = Vec::new();
-    let root_buf = root.to_path_buf();
-    let (tx, rx) = mpsc::sync_channel(BATCH / FIRST_BATCH);
-    let producer = std::thread::Builder::new()
-        .name("syq-scan-producer".into())
-        .spawn(move || produce_scan(root_buf, ignore, report_ignored, tx))
-        .context("start scan producer")?;
-    let received = receive_scan(
-        &rx,
-        scan_started,
-        &mut batch,
-        &mut ignored_batch,
-        sink,
-        ignored,
-        warn,
-    );
-    drop(rx);
-    let produced = producer.join();
-    received?;
-    let ignored_count = produced.map_err(|_| anyhow::anyhow!("scan producer panicked"))?;
-    if !batch.is_empty() {
-        sink(batch)?;
-    }
-    if !ignored_batch.is_empty() {
-        ignored(ignored_batch)?;
-    }
-    Ok(ignored_count)
-}
-
 /// Walk a subtree beneath an already-adopted endpoint authority root. The
 /// request supplies only a strict path relative to that root; no pathname is
 /// reconstructed and descendant symlinks are reported rather than traversed.
@@ -794,7 +592,7 @@ pub(crate) fn scan_descriptor_selected(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::File;
+    use std::fs;
     use std::os::unix::ffi::OsStringExt;
     use std::process::Command;
 
@@ -864,17 +662,6 @@ mod tests {
         };
         set_mode("unlisted", 0o300);
         set_mode("unsearchable", 0o600);
-        let mut walked = Vec::new();
-        scan(
-            &tree,
-            false,
-            &[],
-            false,
-            &mut |_| Ok(()),
-            &mut |_| Ok(()),
-            &mut |warning| walked.push(warning),
-        )
-        .unwrap();
         let root = Arc::new(Root::from_directory(File::open(&tree).unwrap()).unwrap());
         let mut described = Vec::new();
         scan_descriptor(
@@ -899,24 +686,6 @@ mod tests {
                 .unwrap_or_else(|| panic!("{warnings:?}"))
                 .clone()
         };
-        let unlisted = find(&walked, b"unlisted");
-        assert_eq!(
-            unlisted.message,
-            format!(
-                "scan: {}: {}",
-                tree.join("unlisted").display(),
-                unlisted.error
-            )
-        );
-        let unstated = find(&walked, b"unsearchable/f");
-        assert_eq!(
-            unstated.to_string(),
-            format!(
-                "scan: cannot stat {}",
-                tree.join("unsearchable/f").display()
-            )
-        );
-        // This scan opens each directory, so it names the directory instead.
         for path in ["unlisted", "unsearchable"] {
             let warning = find(&described, path.as_bytes());
             assert_eq!(warning.message, format!("scan: {path}: {}", warning.error));
@@ -1040,50 +809,30 @@ mod tests {
         let root = Arc::new(Root::open(temp.path()).unwrap());
         let rules = ["skip/".into(), "*.tmp".into()];
         for report_ignored in [false, true] {
-            for route in ["pathname", "descriptor"] {
-                let mut paths = Vec::new();
-                let mut ignored_paths = Vec::new();
-                let mut sink = |batch: Vec<Entry>| {
+            let mut paths = Vec::new();
+            let mut ignored_paths = Vec::new();
+            let count = scan_descriptor(
+                root.clone(),
+                b"",
+                None,
+                false,
+                false,
+                &rules,
+                report_ignored,
+                &mut |batch: Vec<Entry>| {
                     paths.extend(batch.into_iter().map(|entry| entry.path));
                     Ok(())
-                };
-                let mut ignored = |batch| {
+                },
+                &mut |batch| {
                     ignored_paths.extend(batch);
                     Ok(())
-                };
-                let mut warn = |warning| panic!("{route}: {warning}");
-                let count = match route {
-                    "pathname" => scan(
-                        temp.path(),
-                        false,
-                        &rules,
-                        report_ignored,
-                        &mut sink,
-                        &mut ignored,
-                        &mut warn,
-                    ),
-                    _ => scan_descriptor(
-                        root.clone(),
-                        b"",
-                        None,
-                        false,
-                        false,
-                        &rules,
-                        report_ignored,
-                        &mut sink,
-                        &mut ignored,
-                        &mut warn,
-                    ),
-                }
-                .unwrap();
-                assert_eq!(count, 160, "{route}, paths={report_ignored}");
-                assert_eq!(paths.len(), 81, "{route}");
-                assert_eq!(
-                    ignored_paths.len(),
-                    if report_ignored { 160 } else { 0 },
-                    "{route}"
-                );
-            }
+                },
+                &mut |warning| panic!("{warning}"),
+            )
+            .unwrap();
+            assert_eq!(count, 160, "paths={report_ignored}");
+            assert_eq!(paths.len(), 81);
+            assert_eq!(ignored_paths.len(), if report_ignored { 160 } else { 0 });
         }
     }
 

@@ -3679,3 +3679,33 @@ fn a_receiver_that_refused_the_copy_is_reported_once_without_retrying() {
     assert!(!helper_needs_install(&error), "{message}");
     assert_eq!(std::fs::read_to_string(&log).unwrap(), "attempt\n");
 }
+
+#[test]
+fn a_local_scan_without_a_registered_source_is_refused() {
+    let tree = crate::test_support::tempdir().unwrap();
+    std::fs::write(tree.path().join("file"), b"data").unwrap();
+    let mut conn = LocalConn::new(&ConnectionRole::Control, Default::default());
+    let mut entries = 0;
+    let error = conn
+        .scan(
+            tree.path().as_os_str().as_bytes(),
+            None,
+            false,
+            &[],
+            false,
+            &mut |batch| {
+                entries += batch.len();
+                Ok(())
+            },
+            &mut |_| Ok(()),
+            &mut |_| {},
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("neither a registered source nor a destination root"),
+        "{error:#}"
+    );
+    assert_eq!(entries, 0);
+}

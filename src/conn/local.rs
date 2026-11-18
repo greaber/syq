@@ -177,22 +177,6 @@ impl Conn for LocalConn {
             _ => None,
         })
     }
-    fn copy_local(
-        &mut self,
-        mut req: Request,
-        progress: &mut dyn FnMut(u64) -> Result<()>,
-    ) -> Result<Response> {
-        anyhow::ensure!(
-            self.role == LocalConnectionRole::DestinationWorker
-                && matches!(req, Request::CopyLocal { .. })
-                && self.pending.is_empty()
-                && self.read_stream.is_none()
-                && self.write_stream.is_none(),
-            "local copy requires an idle destination worker"
-        );
-        let _wait = self.rpc_observation.as_ref().map(|o| o.span(true));
-        Ok(self.ops.handle_with_copy_progress(&mut req, progress))
-    }
     fn recv(&mut self) -> Result<Response> {
         let _wait = self.rpc_observation.as_ref().map(|o| o.span(false));
         if self.pending.is_empty() {
@@ -293,30 +277,9 @@ impl Conn for LocalConn {
                 warn,
             );
         }
-        if let Some((destination_root, relative)) = self.ops.destination_scan_root(root)? {
-            return crate::scan::scan_descriptor(
-                destination_root,
-                &relative,
-                None,
-                follow_root,
-                true,
-                ignore,
-                report_ignored,
-                &mut capture,
-                ignored,
-                warn,
-            );
-        }
-        let root = self.ops.scan_root(root)?;
-        crate::scan::scan(
-            &fsops::resolve(&root),
-            follow_root,
-            ignore,
-            report_ignored,
-            &mut capture,
-            ignored,
-            warn,
-        )
+        // Every destination is served by a receiver process, so a local
+        // connection only scans registered sources.
+        bail!("scan names neither a registered source nor a destination root")
     }
 
     fn scan_selected(

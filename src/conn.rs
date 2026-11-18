@@ -1,6 +1,6 @@
 //! Connections to endpoints: local (in-process) or remote (over an ssh child).
 
-use crate::fsops::{self, FsOps};
+use crate::fsops::FsOps;
 use crate::process::CommandExt as _;
 #[allow(unused_imports)]
 use crate::proto::SizeHint;

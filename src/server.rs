@@ -2,7 +2,7 @@
 //! TCP data connections (see `crypto.rs`) when the client asks for them.
 
 use crate::descriptor_broker::DescriptorSessionSlot;
-use crate::fsops::{self, FsOps};
+use crate::fsops::FsOps;
 use crate::proto::*;
 use crate::tcp_records::{Cipher, RecordReader, RecordWriter};
 use anyhow::{bail, Context, Result};
@@ -1791,13 +1791,12 @@ fn serve<R: Read + Send + 'static, W: Write>(
                         continue;
                     }
                 };
-                let root = match ops.scan_root(&root) {
-                    Ok(root) => root,
-                    Err(error) => {
-                        w.write_msg(&Response::Err(format!("{error:#}")))?;
-                        continue;
-                    }
-                };
+                if source_scan.is_none() && destination_scan.is_none() {
+                    w.write_msg(&Response::Err(
+                        "scan names neither a registered source nor a destination root".into(),
+                    ))?;
+                    continue;
+                }
                 // Warnings are collected and sent between batches so a single
                 // writer borrow suffices.
                 let warns = std::cell::RefCell::new(Vec::new());
@@ -1858,23 +1857,15 @@ fn serve<R: Read + Send + 'static, W: Write>(
                         &mut ignored,
                         &mut |msg| warns.borrow_mut().push(msg),
                     )
-                } else if let Some((destination_root, relative)) = destination_scan {
+                } else {
+                    let (destination_root, relative) =
+                        destination_scan.expect("checked before the scan");
                     crate::scan::scan_descriptor(
                         destination_root,
                         &relative,
                         None,
                         follow_root,
                         true,
-                        &ignore,
-                        report_ignored,
-                        &mut sink,
-                        &mut ignored,
-                        &mut |msg| warns.borrow_mut().push(msg),
-                    )
-                } else {
-                    crate::scan::scan(
-                        &fsops::resolve(&root),
-                        follow_root,
                         &ignore,
                         report_ignored,
                         &mut sink,

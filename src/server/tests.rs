@@ -1,3 +1,5 @@
+use crate::fsops;
+
 #[test]
 fn read_stream_shrinks_before_the_next_read_and_fences_late_updates() {
     use std::sync::mpsc;
@@ -1804,4 +1806,65 @@ fn client_output_notes_only_a_closed_pipe() {
         assert!(output.write_all(b"reply").is_err());
         assert_eq!(gone.load(std::sync::atomic::Ordering::Relaxed), noted);
     }
+}
+
+#[test]
+fn a_scan_without_a_registered_source_or_destination_root_is_refused() {
+    let tree = crate::test_support::tempdir().unwrap();
+    std::fs::write(tree.path().join("file"), b"data").unwrap();
+    let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+    let served = std::thread::spawn(move || {
+        serve(
+            server.try_clone().unwrap(),
+            server,
+            true,
+            None,
+            None,
+            None,
+            ServeSession {
+                owns_process: false,
+                handshake_pending: None,
+                ssh_worker_ticket: None,
+                allow_tcp: false,
+                loopback_only: false,
+                named_socket: None,
+                authority: None,
+                source_authority: None,
+                descriptor_session: DescriptorSessionSlot::default(),
+            },
+        )
+    });
+    let mut writer = FrameWriter::new(client.try_clone().unwrap(), false);
+    let mut reader = FrameReader::new(client);
+    writer
+        .write_msg(&Request::Hello {
+            compress: false,
+            debug: false,
+            token: Vec::new(),
+            role: ConnectionRole::Control,
+        })
+        .unwrap();
+    assert!(matches!(
+        reader.read_msg::<Response>().unwrap(),
+        Response::HelloOk { .. }
+    ));
+    writer
+        .write_msg(&Request::Scan {
+            root: tree.path().as_os_str().as_bytes().to_vec(),
+            source: None,
+            follow_root: false,
+            ignore: Vec::new(),
+            report_ignored: false,
+        })
+        .unwrap();
+    let response = reader.read_msg::<Response>().unwrap();
+    assert!(
+        matches!(&response, Response::Err(error)
+            if error.contains("neither a registered source nor a destination root")),
+        "{response:?}"
+    );
+    writer.write_msg(&Request::Shutdown).unwrap();
+    drop(writer);
+    drop(reader);
+    served.join().unwrap().unwrap();
 }

@@ -185,6 +185,7 @@ pub(super) fn entry_from_root_metadata(
     }
 }
 
+#[cfg(test)]
 pub fn lstat_entry(rel: PathBytes, full: &Path) -> io::Result<Entry> {
     let md = fs::symlink_metadata(full)?;
     Ok(entry_from_meta(rel, full, &md))
