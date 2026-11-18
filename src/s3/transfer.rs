@@ -26,7 +26,6 @@ use aws_sdk_s3::{
     types::{CompletedMultipartUpload, CompletedPart},
     Client,
 };
-use aws_smithy_types::byte_stream::Length;
 use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
@@ -3406,14 +3405,14 @@ pub(super) fn retryable<E: aws_sdk_s3::error::ProvideErrorMetadata>(
 }
 async fn file_body(source: &Source, offset: u64, length: u64) -> Result<ByteStream> {
     let source = source.clone();
-    let file = tokio::task::spawn_blocking(move || source.open()).await??;
-    Ok(ByteStream::read_from()
-        .file(tokio::fs::File::from_std(file))
-        .offset(offset)
-        .length(Length::Exact(length))
-        .buffer_size(length.clamp(1, 1024 * 1024) as usize)
-        .build()
-        .await?)
+    let (source, file) = tokio::task::spawn_blocking(move || {
+        let file = source.open()?;
+        anyhow::Ok((source, file))
+    })
+    .await??;
+    Ok(ByteStream::new(super::file_body::body(
+        source, file, offset, length,
+    )))
 }
 fn upload_identity(
     algorithm: Algorithm,
