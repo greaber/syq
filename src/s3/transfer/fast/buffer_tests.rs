@@ -296,6 +296,7 @@ pub(super) fn planning_engine(extra: &[&str]) -> Engine {
         progress: Progress::new(false, false, None),
         pace: Mutex::new(tokio::time::Instant::now()),
         upload_keys: OnceLock::new(),
+        discovery: OnceLock::new(),
         authorization: None,
         copy_checksum_unsupported: Default::default(),
         content_md5: Default::default(),

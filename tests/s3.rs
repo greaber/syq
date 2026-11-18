@@ -1619,6 +1619,7 @@ fn serve(
         if method == "HEAD"
             && (url.path() == "/bucket/data"
                 || fault.starts_with("listing-budget")
+                || fault == "listing-present"
                 || fault == "listing-complete")
         {
             reply(&mut socket, 404, &[], b"", true);
@@ -1672,16 +1673,20 @@ fn serve(
                     assert_eq!(query.get("max-keys").map(|s| s.as_ref()), Some("1"));
                     (object("data/other"), true)
                 }
-                "listing-budget-many" => (
-                    object("data/other"),
-                    !query.contains_key("continuation-token"),
-                ),
-                "listing-budget" => {
+                "listing-budget" | "listing-budget-many" => {
                     assert!(
                         !query.contains_key("continuation-token"),
                         "upload enumerated a large destination"
                     );
                     (object("data/other"), true)
+                }
+                "listing-present" => {
+                    assert_eq!(
+                        query.get("start-after").map(|s| s.as_ref()),
+                        Some("data/ond"),
+                        "the listing starts at the first planned key"
+                    );
+                    (object("data/one"), false)
                 }
                 "listing-complete" => (String::new(), false),
                 "listing-adaptive" | "listing-all-ignored" | "listing-wide" => {
@@ -4726,8 +4731,12 @@ fn s3_listing_costs_are_bounded_without_changing_selection() {
 fn s3_upload_destination_discovery_is_bounded() {
     for (fault, placement, success, expected_requests) in [
         ("listing-exists", "--into-new", false, 2),
-        ("listing-budget", "--into", true, 3),
-        ("listing-budget-many", "--into", true, 2),
+        // One page shows `one` absent and ends before the other keys. Too
+        // few remain to be worth another page, so each gets a HEAD.
+        ("listing-budget", "--into", true, 2),
+        ("listing-budget-many", "--into", true, 3),
+        // Only the listed key gets a HEAD.
+        ("listing-present", "--into", true, 2),
         ("listing-complete", "--into", true, 1),
     ] {
         let server = Server::start(fault);
