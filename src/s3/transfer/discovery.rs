@@ -45,6 +45,13 @@ pub(super) fn trusts_absence(args: &Args) -> bool {
     }
 }
 
+/// Whether a copy to `bucket` lists its destination to learn which planned
+/// keys are absent. A directory bucket's keys come in no order, so its listing
+/// decides absence only when complete, never from a key's place in a page.
+pub(super) fn lists_destination(args: &Args, bucket: &str) -> bool {
+    !listing::lists_in_key_order(bucket) || trusts_absence(args)
+}
+
 /// What the destination listing says about one planned key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Listed {

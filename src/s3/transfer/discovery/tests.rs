@@ -345,6 +345,9 @@ fn absence_is_trusted_only_where_a_wrong_answer_costs_no_more_than_an_upload() {
                 .collect();
             let args = Args::parse_args(&argv).unwrap();
             assert_eq!(trusts_absence(&args), trusted, "{route:?} {flags:?}");
+            assert_eq!(lists_destination(&args, "bucket"), trusted);
+            // A directory bucket's listing decides nothing from order.
+            assert!(lists_destination(&args, "bucket--usw2-az1--x-s3"));
         }
     }
 }

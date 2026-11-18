@@ -876,8 +876,8 @@ impl Engine {
     }
     /// Learn which planned destination keys exist, so that new ones need no
     /// HEAD. Pruning lists the whole destination first. Otherwise, where the
-    /// copy may rely on a listing page to show a key absent, this puts `plan`
-    /// in key order, the order that listing follows.
+    /// copy lists its destination, this puts `plan` in key order, the order
+    /// that listing follows.
     async fn discover_destination<T>(
         &self,
         plan: &mut [T],
@@ -893,7 +893,7 @@ impl Engine {
             format!("{target}/")
         };
         if !self.args.delete {
-            if !discovery::trusts_absence(&self.args) {
+            if !discovery::lists_destination(&self.args, &self.options.bucket) {
                 // Every key gets its HEAD, so a listing would save nothing.
                 return Ok(());
             }
