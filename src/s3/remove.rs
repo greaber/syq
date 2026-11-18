@@ -432,7 +432,7 @@ pub(super) fn run(args: Args) -> Result<i32> {
         progress.set_results(writer);
     }
     let mut summary = RmResultRecord {
-        status: "success",
+        status: crate::results::Status::Success,
         exit_code: 0,
         dry_run: args.dry_run,
         selectors_total: args.locations.len() as u64,
@@ -576,10 +576,10 @@ pub(super) fn run(args: Args) -> Result<i32> {
         progress.error(&format!("syq: {error:#}"));
         summary.errors += 1;
         summary.exit_code = 1;
-        summary.status = "failed";
+        summary.status = crate::results::Status::Failed;
     } else if summary.entries_failed != 0 {
         summary.exit_code = 23;
-        summary.status = "partial";
+        summary.status = crate::results::Status::Partial;
     }
     summary.elapsed_ms = progress.start.elapsed().as_millis() as u64;
     progress.scan_done.store(true, Relaxed);

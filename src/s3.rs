@@ -423,36 +423,13 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
             .map_err(|_| anyhow::anyhow!("progress thread panicked"))?;
     }
     if let Some(writer) = progress.results_writer() {
-        writer.emit_result(&crate::results::ResultRecord {
-            status: match code {
-                0 => "success",
-                23 => "partial",
-                25 => "refused",
-                _ => "failed",
-            },
-            exit_code: code,
-            dry_run: args.dry_run,
-            files_transferred: progress.files_done.load(Relaxed),
-            files_unchanged: progress.files_unchanged.load(Relaxed),
-            files_excluded: progress.excluded(),
-            directories_created: progress.directories_created.load(Relaxed),
-            symlinks_created: progress.symlinks_created.load(Relaxed),
-            specials_created: 0,
-            errors,
-            bytes_transferred: progress.bytes_done.load(Relaxed),
-            bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
-            timings: progress.timings(),
-            deletions_planned: args
-                .delete
-                .then(|| progress.deletions_planned.load(Relaxed)),
-            deletions_completed: args
-                .delete
-                .then(|| progress.deletions_completed.load(Relaxed)),
-            deletions_blocked: args
-                .delete
-                .then(|| progress.deletions_blocked.load(Relaxed)),
-            replaced_not_in_place: None,
-        });
+        let status = match code {
+            0 => crate::results::Status::Success,
+            23 => crate::results::Status::Partial,
+            25 => crate::results::Status::Refused,
+            _ => crate::results::Status::Failed,
+        };
+        writer.emit_result(&progress.result_record(status, code, args.dry_run, args.delete, false));
         if writer.is_dead() {
             bail!("S3 result stream could not be completed");
         }

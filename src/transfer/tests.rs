@@ -7832,6 +7832,48 @@ fn kept_small_files_are_listed_by_whoever_saw_them_fail() {
     }
 }
 
+/// A remote coordinator's error records reach this machine's stream as they
+/// arrive. When the copy then fails here before the relay settles the
+/// stream, as when a coordinator refuses to run for another build, the
+/// final record counts them with this machine's own.
+#[test]
+fn a_fatal_failure_counts_the_errors_relayed_before_it() {
+    use std::io::{Read, Seek};
+    let file = tempfile::tempfile().unwrap();
+    let writer = Arc::new(crate::results::ResultsWriter::new(Box::new(
+        file.try_clone().unwrap(),
+    )));
+    let progress = Progress::new(false, false, None);
+    progress.set_results(writer.clone());
+    // Relayed: a counted error, and one that only explains another record.
+    writer.emit_value(serde_json::json!({"type": "error", "message": "coordinator"}));
+    writer.emit_value(serde_json::json!({"type": "error", "message": "why",
+        crate::results::DIAGNOSTIC_FOR: {"encoding": "utf-8", "value": "a"}}));
+    record_failure(
+        &progress,
+        Some(&anyhow::anyhow!("run the copy again")),
+        (false, false, false),
+    );
+    let mut text = String::new();
+    let mut file = file;
+    file.rewind().unwrap();
+    file.read_to_string(&mut text).unwrap();
+    let records: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let counted = records
+        .iter()
+        .filter(|record| {
+            record["type"] == "error" && record.get(crate::results::DIAGNOSTIC_FOR).is_none()
+        })
+        .count();
+    let terminal = records.last().unwrap();
+    assert_eq!(terminal["type"], "result");
+    assert_eq!(counted, 2);
+    assert_eq!(terminal["errors"], 2, "{text}");
+}
+
 fn summary_record(
     files_transferred: u64,
     bytes_transferred: u64,
@@ -7839,23 +7881,11 @@ fn summary_record(
     bytes_unchanged: u64,
 ) -> crate::results::ResultRecord {
     crate::results::ResultRecord {
-        status: "success",
-        exit_code: 0,
-        dry_run: false,
         files_transferred,
         files_unchanged,
-        files_excluded: 0,
-        directories_created: 0,
-        symlinks_created: 0,
-        specials_created: 0,
-        errors: 0,
         bytes_transferred,
         bytes_unchanged,
-        timings: Default::default(),
-        deletions_planned: None,
-        deletions_completed: None,
-        deletions_blocked: None,
-        replaced_not_in_place: None,
+        ..crate::results::ResultRecord::new(crate::results::Status::Success, 0, false)
     }
 }
 

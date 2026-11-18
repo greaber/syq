@@ -706,3 +706,58 @@ fn validation_rejects_bad_buckets_and_scope_counts_on_both_sides() {
     });
     request.validate().unwrap();
 }
+
+/// A refusal ends the signing session; later requests it has not prepared
+/// report that refusal, not a disconnection, and preparation cannot finish.
+#[test]
+fn later_requests_report_an_earlier_refusal() {
+    let (socket, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    // Sign the first request, then refuse the next.
+    let authorizer = std::thread::spawn(move || {
+        crate::destination::read_message::<serde_json::Value>(&mut peer).unwrap();
+        crate::destination::write_message(
+            &mut peer,
+            &serde_json::json!({ "Signed": ["https://storage.example/fixture/allowed/a?X-Amz-Signature=a"] }),
+        )
+        .unwrap();
+        crate::destination::read_message::<serde_json::Value>(&mut peer).unwrap();
+        crate::destination::write_message(
+            &mut peer,
+            &serde_json::json!({ "Error": "outside approved paths" }),
+        )
+        .unwrap();
+    });
+    let authorization = Authorization::new(
+        "fixture".into(),
+        Configuration {
+            endpoint: "https://storage.example".into(),
+            region: "auto".into(),
+            expires_at: now().unwrap() + 60,
+            requested_lifetime: 60,
+        },
+        socket,
+    );
+    authorization
+        .signed(Unsigned::new("GET", "allowed/a"))
+        .unwrap();
+    let refused = authorization
+        .signed(Unsigned::new("GET", "outside/b"))
+        .unwrap_err();
+    assert_eq!(
+        format!("{refused:#}"),
+        "authorizing machine: outside approved paths"
+    );
+    let earlier = "storage authorization ended after an earlier request failed (authorizing machine: outside approved paths); rerun the copy for fresh approval";
+    let later = authorization
+        .signed(Unsigned::new("GET", "allowed/c"))
+        .unwrap_err();
+    assert_eq!(format!("{later:#}"), earlier);
+    // A request prepared before the refusal is still signed, so cleanup can
+    // use it, but preparation does not finish: the copy stops there.
+    authorization
+        .signed(Unsigned::new("GET", "allowed/a"))
+        .unwrap();
+    let finish = authorization.finish_preparation().unwrap_err();
+    assert_eq!(format!("{finish:#}"), earlier);
+    authorizer.join().unwrap();
+}
