@@ -376,6 +376,10 @@ impl Engine {
             );
             self.progress.scan_done.store(true, Relaxed);
             if self.authorization.is_some() {
+                // Preparation checks and hashes every file without asking the
+                // authorizing machine: the checks' requests are signed together
+                // first and the uploads' requests together afterwards.
+                self.authorize_upload_checks(&plan).await?;
                 let prepared = Arc::new(Mutex::new(Vec::with_capacity(plan.len())));
                 parallel(plan, workers, |source| {
                     let engine = self.clone();
@@ -398,7 +402,10 @@ impl Engine {
                     }
                 })
                 .await?;
+                let prepared = std::mem::take(&mut *prepared.lock().await);
                 let authorized = async {
+                    self.authorize_uploads(prepared.iter().map(|(_, _, _, _, work)| work))
+                        .await?;
                     self.prepare_pruning(&prune).await?;
                     self.finish_authorization().await?;
                     if self.args.prune_before {
@@ -407,7 +414,6 @@ impl Engine {
                     Ok::<_, anyhow::Error>(())
                 }
                 .await;
-                let prepared = std::mem::take(&mut *prepared.lock().await);
                 if let Err(error) = authorized {
                     for (_, _, _, _, work) in &prepared {
                         if let UploadPreparation::Ready(work) = work {
@@ -1031,10 +1037,6 @@ impl Engine {
         )
         .await?;
         drop(_slot);
-        if let Err(error) = self.authorize_requests(update.requests()).await {
-            update.abort(&self.client, &self.options.bucket).await;
-            return Err(error);
-        }
         Ok(UploadPreparation::Ready(Box::new(PreparedUpload {
             source,
             size,
@@ -1330,10 +1332,6 @@ impl Engine {
             multipart,
             metadata_update: None,
         };
-        if let Err(error) = self.authorize_upload(&prepared).await {
-            self.abort_unrecorded_preparation(&prepared).await;
-            return Err(error);
-        }
         Ok(UploadPreparation::Ready(Box::new(prepared)))
     }
 

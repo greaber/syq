@@ -14,6 +14,25 @@ pub(super) use transport::{http_client, signed_header};
 
 pub(crate) const DEFAULT_LIFETIME: u64 = 7 * 24 * 60 * 60;
 
+/// The most requests a caller hands to one signing exchange. An exchange
+/// pipelines its bounded wire messages, so it costs about one round trip to
+/// the authorizing machine however many requests it carries. The limit bounds
+/// the descriptions and signed URLs held outside the prepared set at once.
+pub(super) const EXCHANGE_REQUESTS: usize = 128 * 128;
+
+/// Groups requests into signing exchanges of at most `limit` requests each,
+/// without first collecting every request.
+pub(super) fn exchanges(
+    requests: impl Iterator<Item = Unsigned>,
+    limit: usize,
+) -> impl Iterator<Item = Vec<Unsigned>> {
+    let mut requests = requests.fuse();
+    std::iter::from_fn(move || {
+        let exchange: Vec<_> = requests.by_ref().take(limit).collect();
+        (!exchange.is_empty()).then_some(exchange)
+    })
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Scope {
@@ -513,6 +532,27 @@ impl Signer {
             request,
             credentials,
         })
+    }
+
+    /// A signer for an already approved request, with fixture credentials.
+    #[cfg(test)]
+    pub(crate) fn fixture(request: Request) -> Self {
+        Self {
+            request,
+            configuration: Configuration {
+                endpoint: "https://storage.example".into(),
+                region: "auto".into(),
+                expires_at: now().unwrap() + DEFAULT_LIFETIME,
+                requested_lifetime: DEFAULT_LIFETIME,
+            },
+            credentials: aws_sdk_s3::config::Credentials::new(
+                "fixture-key",
+                "fixture-secret",
+                None,
+                None,
+                "test",
+            ),
+        }
     }
 
     pub(crate) fn sign(&self, request: &Unsigned) -> Result<String> {

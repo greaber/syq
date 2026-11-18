@@ -31,12 +31,52 @@ impl Engine {
         };
         authorization.finish().await
     }
-    pub(super) async fn authorize_upload(&self, prepared: &PreparedUpload) -> Result<()> {
+    /// Signs many requests in a few exchanges with the authorizing machine,
+    /// so preparation does not wait for one round trip per file.
+    pub(super) async fn authorize_all(
+        &self,
+        requests: impl Iterator<Item = Unsigned>,
+    ) -> Result<()> {
         if self.authorization.is_none() {
             return Ok(());
         }
+        let limit = crate::s3::authorization::EXCHANGE_REQUESTS;
+        for exchange in crate::s3::authorization::exchanges(requests, limit) {
+            self.check_cancelled()?;
+            self.authorize_requests(exchange).await?;
+        }
+        Ok(())
+    }
+    /// The existence checks `prepare_upload` will send, signed together
+    /// before preparation starts.
+    pub(super) async fn authorize_upload_checks(&self, plan: &[Source]) -> Result<()> {
+        let listed = self.upload_keys.get();
+        self.authorize_all(
+            plan.iter()
+                .filter(|source| listed.is_none_or(|keys| keys.contains_key(&source.key)))
+                .map(|source| Unsigned::new("HEAD", &source.key)),
+        )
+        .await
+    }
+    /// Every request the prepared uploads will send, signed together after
+    /// hashing and before any data moves.
+    pub(super) async fn authorize_uploads<'a>(
+        &self,
+        prepared: impl Iterator<Item = &'a UploadPreparation>,
+    ) -> Result<()> {
+        self.authorize_all(
+            prepared
+                .filter_map(|work| match work {
+                    UploadPreparation::Ready(work) => Some(work),
+                    UploadPreparation::Skipped | UploadPreparation::Preview(_) => None,
+                })
+                .flat_map(|work| Self::upload_requests(work)),
+        )
+        .await
+    }
+    fn upload_requests(prepared: &PreparedUpload) -> Vec<Unsigned> {
         if let Some(update) = &prepared.metadata_update {
-            return self.authorize_requests(update.requests()).await;
+            return update.requests();
         }
         let key = &prepared.source.key;
         let mut requests = vec![Unsigned::new("HEAD", key)];
@@ -82,7 +122,7 @@ impl Engine {
             }
             requests.push(request);
         }
-        self.authorize_requests(requests).await
+        requests
     }
     pub(super) async fn authorize_downloads(&self, jobs: &mut [Download]) -> Result<()> {
         if self.authorization.is_none() {
