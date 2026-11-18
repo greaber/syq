@@ -746,6 +746,9 @@ fn keeper(startup: Startup) -> Result<()> {
     let domain = Domain::select(startup.scope.as_deref())?;
     validate_record(&domain, &startup.record.provider, &startup.record)?;
     anyhow::ensure!(startup.lock_fd > 2, "invalid SSH provider startup lock");
+    // Not a LockFile: until `ensure` finishes the handoff, the parent holds
+    // the same open file description, so unlocking here when the keeper
+    // fails early would release the parent's lock too. Closing does not.
     let lock = unsafe { File::from_raw_fd(startup.lock_fd) };
     let expected = lock_file(
         &record_path(&domain, &startup.record.provider, &startup.record.build)?
@@ -1359,7 +1362,6 @@ mod tests {
         // does, without needing a concurrent fork to reproduce the race.
         let inherited = probe.file().try_clone().unwrap();
         assert!(!probe.held().unwrap());
-        drop(probe);
         let keeper = lock_file(&path, false).unwrap();
         let acquired = keeper.try_exclusive().unwrap();
         let available_while_owned = !lock_file(&path, false).unwrap().held().unwrap();

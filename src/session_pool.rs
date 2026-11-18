@@ -115,18 +115,34 @@ pub(crate) fn is_running(control: &Path) -> bool {
 
 /// Take the lock for a starting pool, or None when another pool has it.
 /// The start retries for [`PROBE_GRACE`], so that a concurrent
-/// `is_running` cannot make it exit as a duplicate.
+/// `is_running` cannot make it exit as a duplicate. A pool that exits
+/// removes its lock file before releasing it, so a start that waited may
+/// get the lock on a removed file: it then opens the file now named.
 fn lock_for_start(control: &Path) -> Result<Option<LockFile>> {
     let path = lock_path(control);
-    let lock = LockFile::open(&path, true).with_context(|| format!("open {}", path.display()))?;
-    if lock
-        .try_exclusive_within(PROBE_GRACE)
-        .with_context(|| format!("lock {}", path.display()))?
-    {
-        Ok(Some(lock))
-    } else {
-        Ok(None)
+    let deadline = Instant::now() + PROBE_GRACE;
+    for _ in 0..8 {
+        let lock =
+            LockFile::open(&path, true).with_context(|| format!("open {}", path.display()))?;
+        if !lock
+            .try_exclusive_within(deadline.saturating_duration_since(Instant::now()))
+            .with_context(|| format!("lock {}", path.display()))?
+        {
+            return Ok(None);
+        }
+        let locked = lock.file().metadata()?;
+        match fs::symlink_metadata(&path) {
+            Ok(named) if (named.dev(), named.ino()) == (locked.dev(), locked.ino()) => {
+                return Ok(Some(lock));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", path.display()));
+            }
+        }
     }
+    Ok(None)
 }
 
 /// Start a pool for this endpoint unless one is running. Best effort and
@@ -932,12 +948,31 @@ mod tests {
         let probe = LockFile::open(&lock_path(&control), true).unwrap();
         assert!(probe.try_shared().unwrap());
         let probing = std::thread::spawn(move || {
-            std::thread::sleep(PROBE_GRACE / 4);
+            std::thread::sleep(PROBE_GRACE / 10);
             drop(probe);
         });
         let lock = lock_for_start(&control).unwrap();
         probing.join().unwrap();
         assert!(lock.is_some(), "a probe made a starting pool exit");
+    }
+
+    #[test]
+    fn a_start_that_waited_for_an_exiting_pool_locks_the_file_now_named() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let control = temporary.path().join("cm-00112233aabbccdd");
+        let exiting = PoolLock::new(&control, lock_for_start(&control).unwrap().unwrap()).unwrap();
+        let exit = std::thread::spawn(move || {
+            std::thread::sleep(PROBE_GRACE / 10);
+            // Removes the file, then releases the lock on it.
+            drop(exiting);
+        });
+        let lock = lock_for_start(&control).unwrap();
+        exit.join().unwrap();
+        let lock = lock.expect("the exiting pool's lock was not taken over");
+        let named = fs::symlink_metadata(lock_path(&control)).unwrap();
+        let locked = lock.file().metadata().unwrap();
+        assert_eq!((named.dev(), named.ino()), (locked.dev(), locked.ino()));
+        assert!(is_running(&control));
     }
 
     /// A pool counts the sessions using its master apart from its own

@@ -4428,7 +4428,7 @@ mod tests {
         let probe = LockFile::open(&suffixed(&control, LOCK), true).unwrap();
         assert!(probe.try_shared().unwrap());
         let probing = std::thread::spawn(move || {
-            std::thread::sleep(PROBE_GRACE / 4);
+            std::thread::sleep(PROBE_GRACE / 10);
             drop(probe);
         });
         let lock = try_lock(&control).unwrap();

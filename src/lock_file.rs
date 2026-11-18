@@ -107,13 +107,10 @@ impl LockFile {
     }
 
     /// Whether another open file holds this lock. Looking takes a shared
-    /// lock for a moment and releases it at once.
-    pub(crate) fn held(&self) -> io::Result<bool> {
-        if !self.try_shared()? {
-            return Ok(true);
-        }
-        flock(&self.0, libc::LOCK_UN)?;
-        Ok(false)
+    /// lock for a moment, which dropping this handle releases at once, so
+    /// a probe uses a handle that holds no lock of its own.
+    pub(crate) fn held(self) -> io::Result<bool> {
+        Ok(!self.try_shared()?)
     }
 
     /// Whether another process holds the dedicated lock file at `path`,
@@ -188,7 +185,7 @@ mod tests {
         assert!(!probe.held().unwrap());
         let owner = LockFile::open(&path, false).unwrap();
         assert!(owner.try_exclusive().unwrap());
-        assert!(probe.held().unwrap());
+        assert!(LockFile::open(&path, false).unwrap().held().unwrap());
         drop(inherited);
     }
 
