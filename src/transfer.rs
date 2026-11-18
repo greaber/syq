@@ -2337,7 +2337,12 @@ fn os_kind_of(error: &anyhow::Error) -> Option<&'static str> {
     let io = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<std::io::Error>())?;
-    Some(match io.kind() {
+    Some(io_os_kind(io))
+}
+
+/// The results `os_kind` of a local OS error.
+pub(crate) fn io_os_kind(io: &std::io::Error) -> &'static str {
+    match io.kind() {
         std::io::ErrorKind::NotFound => "not_found",
         std::io::ErrorKind::PermissionDenied => "permission_denied",
         std::io::ErrorKind::AlreadyExists => "already_exists",
@@ -2348,12 +2353,12 @@ fn os_kind_of(error: &anyhow::Error) -> Option<&'static str> {
             Some(libc::EROFS) => "read_only",
             _ => "other",
         },
-    })
+    }
 }
 
 /// The OS error kind of an error the receiver sent; none for data
 /// corrupted in transit, which no OS error caused.
-fn wire_os_kind(error: &WireError) -> Option<&'static str> {
+pub(crate) fn wire_os_kind(error: &WireError) -> Option<&'static str> {
     Some(match error.io_kind? {
         WireIoKind::CorruptedInTransit => return None,
         WireIoKind::NotFound => "not_found",
