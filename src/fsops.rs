@@ -470,12 +470,11 @@ fn inspect_file_system(file: &File, key: FileSystemKey) -> FileSystemTraits {
     // Unknown mount flags are treated as synchronous so a metadata-query
     // failure cannot opt an unmeasured topology into the shortcut.
     // SAFETY: fstatvfs writes only into the local structure.
-    let synchronous = unsafe {
-        if libc::fstatvfs(file.as_raw_fd(), mount_stats.as_mut_ptr()) == 0 {
-            mount_stats.assume_init().f_flag & libc::ST_SYNCHRONOUS != 0
-        } else {
-            true
-        }
+    let synchronous = match crate::sys::retry_zero(|| unsafe {
+        libc::fstatvfs(file.as_raw_fd(), mount_stats.as_mut_ptr())
+    }) {
+        Ok(()) => unsafe { mount_stats.assume_init() }.f_flag & libc::ST_SYNCHRONOUS != 0,
+        Err(_) => true,
     };
     FileSystemTraits {
         is_nfs: file_system_type == fs_caps::NFS_SUPER_MAGIC,

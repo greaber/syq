@@ -226,7 +226,10 @@ pub(crate) struct Root {
     partial_name_limits: OnceLock<Mutex<HashMap<Vec<Vec<u8>>, usize>>>,
     /// What the root's filesystem type implies, once read: its descriptor
     /// keeps that filesystem mounted, so its device number cannot be given
-    /// to another while the root exists.
+    /// to another while the root exists. A file with the root's device
+    /// number is not always on the root's filesystem: an overlay whose
+    /// layers are on other filesystems shows some of its files with their
+    /// layer's device (kernels before 5.7, without `xino`).
     #[cfg(target_os = "linux")]
     type_facts: OnceLock<&'static crate::fsops::TypeFacts>,
     network: OnceLock<bool>,
@@ -355,15 +358,18 @@ impl Root {
     }
 
     /// Whether a read lease on `file`, on device `dev`, shows every write
-    /// to it (`fsops::leases_show_writers`). On the root's own device this
-    /// asks nothing of the filesystem once the root's type is known.
+    /// to it (`fsops::leases_show_writers`). On the root's own device, where
+    /// the root's type does not trust leases, the answer is no without
+    /// asking the filesystem, which on NFS is a request to the server. Only
+    /// that conservative answer is taken from the root: a file with its
+    /// device number can be on an overlay (see `type_facts`), so a yes is
+    /// asked of the file's own filesystem.
     #[cfg(target_os = "linux")]
     pub(crate) fn leases_show_writers_on(&self, dev: u64, file: &File) -> bool {
-        if dev == self.identity.dev {
-            crate::fsops::leases_trusted(self.type_facts())
-        } else {
-            crate::fsops::leases_show_writers(file)
+        if dev == self.identity.dev && !crate::fsops::leases_trusted(self.type_facts()) {
+            return false;
         }
+        crate::fsops::leases_show_writers(file)
     }
 
     /// Whether this root lies on a network filesystem, where each operation

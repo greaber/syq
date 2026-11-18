@@ -337,7 +337,7 @@ const fn of_type(magic: u32, base: TypeFacts) -> TypeFacts {
 /// to an overlay's layers changes a file without opening it here, and FUSE
 /// grants leases that such writes leave intact.
 #[cfg(target_os = "linux")]
-const KNOWN_TYPES: [TypeFacts; 32] = [
+const KNOWN_TYPES: [TypeFacts; 31] = [
     // ext2, ext3, ext4: ext4_rename2
     TypeFacts {
         magic: EXT_SUPER_MAGIC,
@@ -491,7 +491,6 @@ const KNOWN_TYPES: [TypeFacts; 32] = [
         owners: Owners::ByMount,
         ..UNKNOWN_TYPE
     },
-    of_type(PROC_SUPER_MAGIC, UNKNOWN_TYPE),
 ];
 
 /// The facts of filesystem type `magic`, or those of an unknown type.
