@@ -534,10 +534,7 @@ fn print_summary(terminal: &crate::results::ResultRecord) {
         (_, Some(deleted)) => format!(", {deleted} deleted"),
         _ => String::new(),
     };
-    let elapsed_ms = terminal
-        .timings
-        .transfer_ms
-        .unwrap_or(terminal.timings.total_ms);
+    let elapsed_ms = summary_elapsed_ms(terminal);
     crate::transfer::print_transfer_summary(
         terminal,
         // The coordinator's results do not separate data reused inside
@@ -547,6 +544,21 @@ fn print_summary(terminal: &crate::results::ResultRecord) {
         &deletions,
         "",
     );
+}
+
+/// The copying time the summary shows. Timings relayed as sent, which this
+/// build could not read whole, are read measurement by measurement.
+fn summary_elapsed_ms(terminal: &crate::results::ResultRecord) -> u64 {
+    match terminal.extra.get("timings") {
+        Some(timings) => timings["transfer_ms"]
+            .as_u64()
+            .or_else(|| timings["total_ms"].as_u64())
+            .unwrap_or(0),
+        None => terminal
+            .timings
+            .transfer_ms
+            .unwrap_or(terminal.timings.total_ms),
+    }
 }
 
 /// A final result with every count zero, for a run without the

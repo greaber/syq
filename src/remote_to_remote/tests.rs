@@ -415,21 +415,52 @@ fn a_relayed_final_result_lacking_a_count_reads_it_as_zero() {
     }
     assert_eq!(written, terminal);
 
-    // Through a restricted receiver, the fields this machine sets are its
-    // own; the rest stay as the coordinator sent them.
-    let mut composed = crate::results::ResultRecord::from_record(terminal.clone()).unwrap();
-    composed.status = crate::results::Status::Partial.into();
-    composed.exit_code = 23;
-    composed.dry_run = false;
-    composed.settle(&["status", "exit_code"]);
+    // Through a restricted receiver, the fields settlement sets are this
+    // machine's; the rest stay as the coordinator sent them.
+    let mut pruning = terminal.clone();
+    pruning["deletions_completed"] = serde_json::Value::Null;
+    pruning["timings"] = serde_json::json!({"total_ms": 5, "transfer_ms": null});
     let (file, writer) = results_file();
+    let mut relay = Relay::new(TOKEN, Some(writer.clone()), None, (false, true));
+    let input = coordinator_line(pruning.clone(), 0);
+    relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
+    let totals = crate::destination_results::Totals {
+        files_transferred: 7,
+        deletions_completed: 2,
+        ..Default::default()
+    };
+    let composed = compose_terminal(
+        &relay,
+        &totals,
+        settlement_outcome(DestinationStatus::Clean, 0, 23),
+        0,
+    );
     writer.emit_result(&composed);
     let written = read_records(file).pop().unwrap();
     assert_eq!(written["status"], "partial");
     assert_eq!(written["exit_code"], 23);
+    assert_eq!(written["files_transferred"], 7);
+    assert_eq!(written["deletions_completed"], 2);
     assert_eq!(written["dry_run"], "maybe");
     assert_eq!(written["future_count"], 3);
+    assert_eq!(written["timings"], pruning["timings"]);
     assert!(written.get("files_unchanged").is_none(), "{written}");
+}
+
+/// The summary reads the copying time from timings relayed as sent, as it
+/// did from any relayed record, even when one measurement is unreadable.
+#[test]
+fn the_summary_reads_timings_this_build_could_not_read_whole() {
+    let mut terminal = coordinator_terminal();
+    terminal["timings"] =
+        serde_json::json!({"total_ms": 1000, "transfer_ms": 500, "setup_ms": "unknown"});
+    let record = crate::results::ResultRecord::from_record(terminal.clone()).unwrap();
+    assert_eq!(summary_elapsed_ms(&record), 500);
+    terminal["timings"] = serde_json::json!({"total_ms": 1000, "transfer_ms": "soon"});
+    let record = crate::results::ResultRecord::from_record(terminal.clone()).unwrap();
+    assert_eq!(summary_elapsed_ms(&record), 1000);
+    let record = crate::results::ResultRecord::from_record(coordinator_terminal()).unwrap();
+    assert_eq!(summary_elapsed_ms(&record), 3);
 }
 
 #[test]

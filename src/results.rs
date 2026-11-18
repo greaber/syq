@@ -306,9 +306,12 @@ pub struct ResultRecord {
     pub(crate) as_sent: Vec<&'static str>,
 }
 
+/// Whether a relayed value reads as its typed field and writes back the same.
+type FieldCheck = fn(&serde_json::Value) -> bool;
+
 /// Each typed field of a final record with whether a relayed value has its
 /// type. `status` is not among them: a record without one is not a result.
-const RELAYED_FIELDS: [(&str, fn(&serde_json::Value) -> bool); 17] = [
+const RELAYED_FIELDS: [(&str, FieldCheck); 17] = [
     ("exit_code", |value| {
         value
             .as_i64()
@@ -324,8 +327,13 @@ const RELAYED_FIELDS: [(&str, fn(&serde_json::Value) -> bool); 17] = [
     ("errors", serde_json::Value::is_u64),
     ("bytes_transferred", serde_json::Value::is_u64),
     ("bytes_unchanged", serde_json::Value::is_u64),
+    // Typed only when it reads back as it came: a known measurement given
+    // as null, or in another type, keeps the whole object as sent.
     ("timings", |value| {
-        serde_json::from_value::<crate::progress::Timings>(value.clone()).is_ok()
+        serde_json::from_value::<crate::progress::Timings>(value.clone())
+            .ok()
+            .and_then(|timings| serde_json::to_value(timings).ok())
+            .is_some_and(|written| written == *value)
     }),
     ("bytes_total_known", serde_json::Value::is_boolean),
     ("deletions_planned", serde_json::Value::is_u64),
@@ -403,6 +411,9 @@ impl ResultRecord {
 
     /// The fields this machine set, written from now on as typed.
     pub(crate) fn settle(&mut self, keys: &[&str]) {
+        debug_assert!(keys
+            .iter()
+            .all(|key| *key == "status" || RELAYED_FIELDS.iter().any(|(name, _)| name == key)));
         self.as_sent.retain(|key| !keys.contains(key));
         for key in keys {
             self.extra.remove(*key);
@@ -1107,6 +1118,33 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// Every field a final record writes is either `type`, `status`, or one
+    /// the relay reads leniently, so a relayed record of another release
+    /// never fails over a field this list forgot.
+    #[test]
+    fn every_final_record_field_is_read_leniently_when_relayed() {
+        let record = ResultRecord {
+            bytes_total_known: Some(true),
+            deletions_planned: Some(1),
+            deletions_completed: Some(1),
+            deletions_blocked: Some(1),
+            replaced_not_in_place: Some(ReplacedNotInPlace::default()),
+            ..ResultRecord::new(Status::Success, 0, false)
+        };
+        let written = record.to_record();
+        let mut keys: Vec<&str> = written
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        let mut expected: Vec<&str> = RELAYED_FIELDS.iter().map(|(name, _)| *name).collect();
+        expected.extend(["type", "status"]);
+        expected.sort_unstable();
+        assert_eq!(keys, expected);
     }
 
     #[test]
