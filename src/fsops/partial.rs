@@ -2378,9 +2378,9 @@ impl FsOps {
             "SYQ_TEST_SOURCE_RECHECK_CONTINUE_FILE",
             "small-file source recheck before sending",
         )?;
-        // Keep the existing parallel metadata lookup and return its results
-        // alongside the data, avoiding a separate round trip. Never substitute
-        // a diagnostic path for a registered source's capability.
+        // Return the metadata alongside the data, avoiding a separate round
+        // trip. Never substitute a diagnostic path for a registered source's
+        // capability.
         for registered in [true, false] {
             let indices: Vec<_> = reads
                 .iter()
@@ -2399,7 +2399,7 @@ impl FsOps {
                     .map(|&i| reads[i].source().cloned().unwrap())
                     .collect()
             });
-            let entries = self.stat_many_request(&paths, sources.as_deref(), false)?;
+            let entries = self.stat_sources_request(&paths, sources.as_deref(), false, true)?;
             for (i, entry) in indices.into_iter().zip(entries) {
                 blocks[i].as_mut().unwrap().set_source(entry);
             }
