@@ -407,6 +407,64 @@ fn source_byte_connection_and_entry_limits_are_shared_and_atomic() {
 }
 
 #[test]
+fn the_entry_count_is_exact_for_distinct_paths_named_many_times() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let mut approved = policy(temp.path());
+    approved.limits.max_entries = 3000;
+    approved.limits.max_total_bytes = u64::MAX;
+    let fixture = Fixture::new(approved);
+    let (first, second) = (fixture.worker(), fixture.worker());
+    let name = |index: usize| format!("dir/file-{index}").into_bytes();
+    let path = |index: usize| fixture.source().join(&name(index)).unwrap();
+    // Scan the first thousand, then read every path twice in a row on one
+    // connection, a third time on another, and once more in a batch.
+    let names = (0..1000).map(name).collect::<Vec<_>>();
+    first
+        .record_scan(&fixture.source(), names.iter().map(Vec::as_slice))
+        .unwrap();
+    for index in 0..3000 {
+        first.authorize(&read(Some(path(index)), 1)).unwrap();
+        first.authorize(&read(Some(path(index)), 1)).unwrap();
+        second
+            .authorize(&read(Some(path(2999 - index)), 1))
+            .unwrap();
+    }
+    let batch = (0..3000)
+        .step_by(7)
+        .map(|index| SmallRead {
+            path: Vec::new(),
+            source: Some(path(index)),
+            attempt: 0,
+            len: 1,
+        })
+        .collect();
+    second.authorize(&Request::ReadSmallBatch(batch)).unwrap();
+    assert_eq!(fixture.authority.state.lock().unwrap().paths.len(), 3000);
+    // The limit is full: one more distinct path is refused, on either
+    // connection, while repeats still pass.
+    assert!(first.authorize(&read(Some(path(3000)), 1)).is_err());
+    assert!(second
+        .record_scan(&fixture.source(), [name(3000).as_slice()])
+        .is_err());
+    first.authorize(&read(Some(path(0)), 1)).unwrap();
+    first.authorize(&read(Some(path(0)), 1)).unwrap();
+    assert_eq!(fixture.authority.state.lock().unwrap().paths.len(), 3000);
+}
+
+#[test]
+fn each_authority_keys_its_path_digests_differently() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let one = Fixture::new(policy(temp.path()));
+    let two = Fixture::new(policy(temp.path()));
+    assert_ne!(one.authority.path_key, two.authority.path_key);
+    let path = one.source().join(b"file").unwrap();
+    assert_ne!(
+        one.authority.path_digest(&path),
+        two.authority.path_digest(&path)
+    );
+}
+
+#[test]
 fn rejected_batches_do_not_consume_authority_and_streams_charge_each_chunk() {
     let temp = crate::test_support::tempdir().unwrap();
     let mut approved = policy(temp.path());
