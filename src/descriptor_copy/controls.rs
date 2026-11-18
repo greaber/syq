@@ -9,17 +9,14 @@ use std::{
 
 pub(crate) fn validate_controls(args: &mut Args) -> Result<()> {
     let tuning = args.tuning_options.unwrap_or_default();
-    tuning.validate(args.bwlimit_bytes)?;
+    tuning.validate()?;
     let s3 = args.s3.is_some();
     for control in args.performance_tuning.iter().flat_map(|s| s.split(',')) {
         let key = control.split('=').next().unwrap_or("").trim();
         let supported = if s3 {
             key.starts_with("s3-")
         } else {
-            matches!(
-                key,
-                "workers" | "request-size" | "pipeline-depth" | "bw-pacing"
-            )
+            matches!(key, "workers" | "request-size" | "pipeline-depth")
         };
         if !supported {
             bail!("performance control {key:?} is not supported with this descriptor copy: streams transfer one object without file comparison or small-file batching; S3 uses its part controls");
@@ -164,8 +161,7 @@ impl Controls {
     pub async fn pace(&self, bytes: u64) {
         if let Some(limit) = &self.limit {
             if bytes != 0 {
-                tokio::time::sleep_until(limit.reserve_prepaid_at(Instant::now(), bytes).into())
-                    .await;
+                tokio::time::sleep_until(limit.reserve(Instant::now(), bytes).into()).await;
             }
         }
     }

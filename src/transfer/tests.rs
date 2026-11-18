@@ -3543,7 +3543,6 @@ fn bandwidth_limited_remote_sources_compare_before_pacing_only_differing_reads()
             let opts = Arc::get_mut(&mut worker.opts).unwrap();
             opts.src_remote = true;
             opts.dst_remote = relay;
-            opts.tuning.bw_pacing = Some(crate::transfer_tuning::BwPacing::Average);
             if basis == "candidate-reuse-off" {
                 opts.transfer_strategy = crate::cli::TransferStrategy::WholeFile;
             }
@@ -7330,13 +7329,10 @@ fn a_bandwidth_limit_leaves_requests_to_a_restricted_receiver_their_size() {
     let limit = BandwidthLimit::new(1 << 20);
     let opts = Arc::get_mut(&mut worker.opts).unwrap();
     opts.block = 4 << 20;
+    let unrestricted = fast_file_size_limit(opts, Some(&limit));
     opts.restricted_receiver = true;
-    // Average pacing sizes requests for the bandwidth limit no further.
-    opts.tuning.bw_pacing = Some(crate::transfer_tuning::BwPacing::Average);
-    assert_eq!(
-        fast_file_size_limit(opts, Some(&limit)),
-        fast_file_size_limit(opts, None)
-    );
+    // Only the sender's own request budget sizes requests.
+    assert_eq!(fast_file_size_limit(opts, Some(&limit)), unrestricted);
 }
 
 /// A restricted receiver lists the failure of a kept small-copy file only

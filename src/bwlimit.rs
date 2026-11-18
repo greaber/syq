@@ -95,47 +95,35 @@ impl BandwidthLimit {
         }
     }
 
-    /// Request-sizing budget only, not a bound on bytes on the network.
-    pub fn bytes_for_interval(&self, milliseconds: u64) -> u64 {
-        ((self.bytes_per_sec as u128 * milliseconds as u128 / 1000).min(u64::MAX as u128) as u64)
-            .max(512)
+    /// The largest request a capped copy sends: 125 ms of the rate, at
+    /// least 512 bytes. This sizes requests; it does not bound bytes on the
+    /// network.
+    pub fn request_bytes(&self) -> u64 {
+        ((self.bytes_per_sec as u128 * 125 / 1000).min(u64::MAX as u128) as u64).max(512)
     }
 
-    /// Pay the entire reservation before admitting the request. With no
-    /// request-size cap, this avoids a free, arbitrarily large first chunk.
-    pub fn wait_prepaid(&self, bytes: u64) {
-        if bytes == 0 {
-            return;
-        }
-        let now = Instant::now();
-        let at = self.reserve_prepaid_at(now, bytes);
-        if at > now {
-            std::thread::sleep(at - now);
-        }
+    /// Reserve `bytes` of the shared budget and return when the caller may
+    /// send them. The whole reservation is paid before it is admitted, so
+    /// the first request is not free. Synchronous callers sleep until the
+    /// returned instant; asynchronous ones use their runtime's sleep.
+    pub(crate) fn reserve(&self, now: Instant, bytes: u64) -> Instant {
+        let duration = Duration::from_secs_f64(bytes as f64 / self.bytes_per_sec as f64);
+        let mut next = self.next.lock().unwrap();
+        let at = next.map_or(now, |n| n.max(now)) + duration;
+        *next = Some(at);
+        at
     }
 
-    pub(crate) fn reserve_prepaid_at(&self, now: Instant, bytes: u64) -> Instant {
-        self.reserve_at(now, bytes)
-            + Duration::from_secs_f64(bytes as f64 / self.bytes_per_sec as f64)
-    }
-
+    /// Reserve `bytes` and sleep this thread until they may be sent.
     pub fn wait(&self, bytes: u64) {
         if bytes == 0 {
             return;
         }
         let now = Instant::now();
-        let at = self.reserve_at(now, bytes);
+        let at = self.reserve(now, bytes);
         if at > now {
             std::thread::sleep(at - now);
         }
-    }
-
-    fn reserve_at(&self, now: Instant, bytes: u64) -> Instant {
-        let duration = Duration::from_secs_f64(bytes as f64 / self.bytes_per_sec as f64);
-        let mut next = self.next.lock().unwrap();
-        let at = next.map_or(now, |n| n.max(now));
-        *next = Some(at + duration);
-        at
     }
 }
 
@@ -165,42 +153,25 @@ mod tests {
     }
 
     #[test]
-    fn prepaid_reservations_cover_the_first_request_and_share_one_budget() {
+    fn reservations_are_prepaid_aggregate_and_recover_after_idle_time() {
         let limit = BandwidthLimit::new(1 << 20);
         let now = Instant::now();
+        assert_eq!(limit.reserve(now, 4 << 20), now + Duration::from_secs(4));
         assert_eq!(
-            limit.reserve_prepaid_at(now, 4 << 20),
-            now + Duration::from_secs(4)
-        );
-        assert_eq!(
-            limit.reserve_prepaid_at(now, 1 << 19),
+            limit.reserve(now, 1 << 19),
             now + Duration::from_millis(4500)
         );
         let later = now + Duration::from_secs(10);
         assert_eq!(
-            limit.reserve_prepaid_at(later, 1 << 20),
+            limit.reserve(later, 1 << 20),
             later + Duration::from_secs(1)
         );
     }
 
     #[test]
-    fn interval_budget_handles_rounding_and_large_rates() {
-        assert_eq!(BandwidthLimit::new(1024).bytes_for_interval(1), 512);
-        assert_eq!(BandwidthLimit::new(2 << 20).bytes_for_interval(25), 52_428);
-        assert_eq!(
-            BandwidthLimit::new(u64::MAX).bytes_for_interval(10_000),
-            u64::MAX
-        );
-    }
-
-    #[test]
-    fn reservations_are_aggregate_and_recover_after_idle_time() {
-        let limit = BandwidthLimit::new(1024);
-        let now = Instant::now();
-        assert_eq!(limit.reserve_at(now, 512), now);
-        assert_eq!(limit.reserve_at(now, 512), now + Duration::from_millis(500));
-
-        let later = now + Duration::from_secs(2);
-        assert_eq!(limit.reserve_at(later, 512), later);
+    fn request_budget_handles_rounding_and_large_rates() {
+        assert_eq!(BandwidthLimit::new(1024).request_bytes(), 512);
+        assert_eq!(BandwidthLimit::new(1 << 20).request_bytes(), 128 << 10);
+        assert_eq!(BandwidthLimit::new(u64::MAX).request_bytes(), u64::MAX / 8);
     }
 }

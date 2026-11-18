@@ -150,12 +150,8 @@ impl Session {
     async fn pace(&self, length: u64) {
         if let Some(limit) = &self.bandwidth {
             if length != 0 {
-                tokio::time::sleep_until(
-                    limit
-                        .reserve_prepaid_at(std::time::Instant::now(), length)
-                        .into(),
-                )
-                .await;
+                tokio::time::sleep_until(limit.reserve(std::time::Instant::now(), length).into())
+                    .await;
             }
         }
     }

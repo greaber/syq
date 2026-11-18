@@ -1458,7 +1458,7 @@ fn stream_controls_check_hashes_pace_and_keep_payload_clean() {
             "--resource-limits",
             "bandwidth=512K,workers=1",
             "--performance-tuning",
-            "request-size=16K,pipeline-depth=2,bw-pacing=25ms",
+            "request-size=16K,pipeline-depth=2",
             "--stats",
             "-v",
         ],

@@ -892,40 +892,55 @@ fn tuning_options_control_the_native_small_copy_shortcut() {
 }
 
 #[test]
-fn tuning_options_average_pacing_pays_for_one_large_request() {
+fn a_bandwidth_cap_sends_requests_of_125_ms_of_its_rate() {
     let t = Tmp::new();
     let data = prng(2 << 20, 910);
     write(&t.path("source"), &data);
-    for (pacing, expected_max) in [("average", 2 << 20), ("25ms", 52_428)] {
-        let start = std::time::Instant::now();
-        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
-            .args([
-                "cp",
-                &t.s("source"),
-                "--as",
-                &t.s(pacing),
-                "--performance-tuning",
-                "workers=1",
-                "-v",
-                "--no-progress",
-                "--resource-limits=bandwidth=2M",
-                "--performance-tuning",
-                &format!("copy-path=ranges,request-size=2M,bw-pacing={pacing}"),
-            ])
-            .run()
-            .unwrap();
-        assert_output_ok(&out);
-        assert!(
-            start.elapsed() >= std::time::Duration::from_millis(900),
-            "{out:?}"
-        );
-        let observed = tuning_observed(&out);
-        assert_eq!(observed["max_request_bytes"], expected_max, "{observed}");
-        if pacing == "average" {
-            assert_eq!(observed["range_requests"], 1);
-        }
-        assert_eq!(read(&t.path(pacing)), data);
-    }
+    let start = std::time::Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            &t.s("source"),
+            "--as",
+            &t.s("destination"),
+            "--performance-tuning",
+            "workers=1",
+            "-v",
+            "--no-progress",
+            "--resource-limits=bandwidth=2M",
+            "--performance-tuning",
+            "copy-path=ranges,request-size=2M",
+        ])
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert!(
+        start.elapsed() >= std::time::Duration::from_millis(900),
+        "{out:?}"
+    );
+    let observed = tuning_observed(&out);
+    assert_eq!(observed["max_request_bytes"], 256 << 10, "{observed}");
+    assert_eq!(read(&t.path("destination")), data);
+
+    // The removed bw-pacing key is named as removed.
+    let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            &t.s("source"),
+            "--as",
+            &t.s("removed"),
+            "--resource-limits=bandwidth=2M",
+            "--performance-tuning",
+            "bw-pacing=average",
+        ])
+        .run()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        stderr_of(&out).contains("bw-pacing is no longer a --performance-tuning key"),
+        "{out:?}"
+    );
+    assert!(!t.path("removed").exists());
 }
 
 #[test]

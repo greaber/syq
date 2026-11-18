@@ -2389,7 +2389,7 @@ assert_same_tree \
 
 printf 'case: tuning overrides for range uploads, downloads, direct copies, and relay\n'
 dd if=/dev/urandom of=/tmp/syq-real-ssh-tuning.bin bs=1M count=9 status=none
-exercise_tuning tuning 1 copy-path=ranges,request-size=2M,pipeline-depth=64,split-min-size=8M,bw-pacing=average 120s
+exercise_tuning tuning 1 copy-path=ranges,request-size=2M,pipeline-depth=64,split-min-size=8M 120s
 
 printf 'case: restricted authorization accepts 128 workers\n'
 syq cp --from source /tmp/syq-real-ssh/tuning-tcp --to destination \
@@ -2414,7 +2414,7 @@ for transport in tcp ssh; do
 done
 
 printf 'case: experimental streaming over TCP/SSH and each coordinator\n'
-exercise_tuning streaming 2 copy-path=streaming,request-size=128K,split-min-size=1M,bw-pacing=average 25s
+exercise_tuning streaming 2 copy-path=streaming,request-size=128K,split-min-size=1M 25s
 
 printf 'case: batch overrides through a command-restricted receiver\n'
 ssh source 'mkdir /tmp/syq-real-ssh/tuning-batches; for n in 1 2 3 4 5 6 7; do dd if=/dev/urandom of=/tmp/syq-real-ssh/tuning-batches/$n bs=1024 count=600 status=none; done'

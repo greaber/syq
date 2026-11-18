@@ -16,9 +16,9 @@ const MAX_REQUEST_BYTES: u64 = 64 << 20;
 pub(crate) const DEFAULT_BATCH_BYTES: u64 = 16 << 20;
 pub(crate) const DEFAULT_SPLIT_BYTES: u64 = 32 << 20;
 
-pub(crate) const HELP: &str = "Fix settings syq normally chooses itself, as comma-separated KEY=VALUE pairs, for troubleshooting and benchmarks. Keys: workers, s3-requests, s3-objects, s3-parts-per-object, s3-part-size, comparison-block-size, request-size, pipeline-depth, copy-path, batch-files, batch-bytes, split-min-size, bw-pacing. See the performance tuning reference.";
+pub(crate) const HELP: &str = "Fix settings syq normally chooses itself, as comma-separated KEY=VALUE pairs, for troubleshooting and benchmarks. Keys: workers, s3-requests, s3-objects, s3-parts-per-object, s3-part-size, comparison-block-size, request-size, pipeline-depth, copy-path, batch-files, batch-bytes, split-min-size. See the performance tuning reference.";
 /// rsync copies never use S3, so they accept only the filesystem keys.
-pub(crate) const RSYNC_HELP: &str = "Fix settings syq normally chooses itself, as comma-separated KEY=VALUE pairs, for troubleshooting and benchmarks. Keys: workers, comparison-block-size, request-size, pipeline-depth, copy-path, batch-files, batch-bytes, split-min-size, bw-pacing. See the performance tuning reference.";
+pub(crate) const RSYNC_HELP: &str = "Fix settings syq normally chooses itself, as comma-separated KEY=VALUE pairs, for troubleshooting and benchmarks. Keys: workers, comparison-block-size, request-size, pipeline-depth, copy-path, batch-files, batch-bytes, split-min-size. See the performance tuning reference.";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum CopyPath {
@@ -40,50 +40,6 @@ impl std::fmt::Display for CopyPath {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BwPacing {
-    Average,
-    IntervalMs(u64),
-}
-
-impl Default for BwPacing {
-    fn default() -> Self {
-        Self::IntervalMs(125)
-    }
-}
-
-impl std::fmt::Display for BwPacing {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Average => f.write_str("average"),
-            Self::IntervalMs(ms) => write!(f, "{ms}ms"),
-        }
-    }
-}
-
-impl FromStr for BwPacing {
-    type Err = anyhow::Error;
-    fn from_str(value: &str) -> Result<Self> {
-        if value == "average" {
-            return Ok(Self::Average);
-        }
-        let (n, scale) = if let Some(n) = value.strip_suffix("ms") {
-            (n, 1)
-        } else if let Some(n) = value.strip_suffix('s') {
-            (n, 1000)
-        } else {
-            bail!("bw-pacing needs average or an integer interval with ms or s units");
-        };
-        let ms = n
-            .parse::<u64>()
-            .ok()
-            .and_then(|n| n.checked_mul(scale))
-            .filter(|ms| (1..=10_000).contains(ms))
-            .ok_or_else(|| anyhow::anyhow!("bw-pacing interval must be between 1ms and 10s"))?;
-        Ok(Self::IntervalMs(ms))
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TransferTuning {
     pub workers: Option<usize>,
@@ -98,7 +54,6 @@ pub(crate) struct TransferTuning {
     pub batch_files: Option<usize>,
     pub batch_bytes: Option<u64>,
     pub split_min_size: Option<u64>,
-    pub bw_pacing: Option<BwPacing>,
 }
 
 impl TransferTuning {
@@ -167,14 +122,11 @@ impl TransferTuning {
             .unwrap_or(DEFAULT_SPLIT_BYTES)
             .max(2 * hash_block)
     }
-    pub fn validate(self, rate: u64) -> Result<()> {
+    pub fn validate(self) -> Result<()> {
         if self.streaming() && self.pipeline_depth.is_some() {
             bail!(
                 "--performance-tuning streaming copy paths cannot be combined with pipeline-depth"
             );
-        }
-        if self.bw_pacing.is_some() && rate == 0 {
-            bail!("--performance-tuning bw-pacing requires a nonzero resource-limits bandwidth");
         }
         if self.force_ranges() && self.batch_override() {
             bail!("--performance-tuning range copy paths cannot be combined with batch controls");
@@ -202,10 +154,7 @@ impl TransferTuning {
         limit: Option<&crate::bwlimit::BandwidthLimit>,
     ) -> u64 {
         let size = self.request_size.unwrap_or(hash_block);
-        match (limit, self.bw_pacing.unwrap_or_default()) {
-            (Some(limit), BwPacing::IntervalMs(ms)) => size.min(limit.bytes_for_interval(ms)),
-            _ => size,
-        }
+        limit.map_or(size, |limit| size.min(limit.request_bytes()))
     }
 }
 
@@ -308,7 +257,9 @@ impl FromStr for TransferTuning {
                     size(value, Some(key), 1, 1 << 30)?,
                     key,
                 )?,
-                "bw-pacing" => set_once(&mut tuning.bw_pacing, value.parse()?, key)?,
+                "bw-pacing" => bail!(
+                    "bw-pacing is no longer a --performance-tuning key; a bandwidth cap always sends requests of up to 125 ms of its rate"
+                ),
                 // An S3 option since it left this group.
                 "s3-retries" => {
                     bail!("s3-retries is no longer a --performance-tuning key; use --s3-retries N")
@@ -342,7 +293,6 @@ impl std::fmt::Display for TransferTuning {
         pair!("batch-files", self.batch_files);
         pair!("batch-bytes", self.batch_bytes);
         pair!("split-min-size", self.split_min_size);
-        pair!("bw-pacing", self.bw_pacing);
         f.write_str(&pairs.join(","))
     }
 }
@@ -403,6 +353,17 @@ mod tests {
             format!("{error:#}").contains("use --s3-retries N"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn the_removed_bw_pacing_key_is_named_as_removed() {
+        for value in ["bw-pacing=average", "request-size=1M,bw-pacing=125ms"] {
+            let error = value.parse::<TransferTuning>().unwrap_err();
+            assert!(
+                format!("{error:#}").contains("bw-pacing is no longer a --performance-tuning key"),
+                "{error:#}"
+            );
+        }
     }
 
     #[test]
@@ -480,46 +441,30 @@ mod tests {
                 tuning.streaming_request_size(4 << 20, Some(&limit)),
                 128 << 10
             );
-            let average = TransferTuning {
-                bw_pacing: Some(BwPacing::Average),
-                ..tuning
-            };
-            assert_eq!(
-                average.streaming_request_size(4 << 20, Some(&limit)),
-                if tuning.request_size.is_some() {
-                    3 << 20
-                } else {
-                    2 << 20
-                }
-            );
         }
     }
 
     #[test]
     fn tuning_round_trips_every_key_for_remote_coordinators() {
         for value in [
-            "copy-path=streaming,request-size=1M,split-min-size=1M,bw-pacing=average",
+            "copy-path=streaming,request-size=1M,split-min-size=1M",
             "copy-path=auto-streaming,request-size=1M,batch-files=32,batch-bytes=2M",
-            "request-size=8M,pipeline-depth=16,copy-path=ranges,split-min-size=1M,bw-pacing=average",
-            "copy-path=auto,batch-files=4096,batch-bytes=64M,split-min-size=1G,bw-pacing=2s",
+            "request-size=8M,pipeline-depth=16,copy-path=ranges,split-min-size=1M",
+            "copy-path=auto,batch-files=4096,batch-bytes=64M,split-min-size=1G",
         ] {
             let tuning: TransferTuning = value.parse().unwrap();
-            tuning.validate(1 << 20).unwrap();
-            assert_eq!(tuning.to_string().parse::<TransferTuning>().unwrap(), tuning);
+            tuning.validate().unwrap();
+            assert_eq!(
+                tuning.to_string().parse::<TransferTuning>().unwrap(),
+                tuning
+            );
         }
-        let limit = crate::bwlimit::BandwidthLimit::new(1 << 20);
-        let average: TransferTuning = "request-size=8M,bw-pacing=average,split-min-size=1M"
-            .parse()
-            .unwrap();
-        assert_eq!(average.request_size(4 << 20, Some(&limit)), 8 << 20);
-        assert_eq!(average.split_min_size(4 << 20), 8 << 20);
-        let interval: TransferTuning = "bw-pacing=250ms".parse().unwrap();
-        assert_eq!(interval.request_size(4 << 20, Some(&limit)), 256 << 10);
-        assert!(average.validate(0).is_err());
+        let split: TransferTuning = "request-size=8M,split-min-size=1M".parse().unwrap();
+        assert_eq!(split.split_min_size(4 << 20), 8 << 20);
         assert!("copy-path=ranges,batch-files=1"
             .parse::<TransferTuning>()
             .unwrap()
-            .validate(0)
+            .validate()
             .is_err());
     }
 
@@ -549,11 +494,6 @@ mod tests {
             "batch-bytes=65M",
             "split-min-size=0",
             "split-min-size=2G",
-            "bw-pacing=0ms",
-            "bw-pacing=11s",
-            "bw-pacing=125",
-            "bw-pacing=0.1s",
-            "bw-pacing=18446744073709551615s",
         ] {
             assert!(
                 value.parse::<TransferTuning>().is_err(),
@@ -565,15 +505,15 @@ mod tests {
     #[test]
     fn forced_streaming_rejects_irrelevant_controls() {
         let streaming: TransferTuning = "copy-path=streaming".parse().unwrap();
-        streaming.validate(0).unwrap();
+        streaming.validate().unwrap();
         assert!(streaming.streaming() && streaming.force_ranges());
         let automatic: TransferTuning = "copy-path=auto-streaming".parse().unwrap();
-        automatic.validate(0).unwrap();
+        automatic.validate().unwrap();
         assert!(automatic.streaming() && !automatic.force_ranges());
         "copy-path=auto-streaming,batch-files=8"
             .parse::<TransferTuning>()
             .unwrap()
-            .validate(0)
+            .validate()
             .unwrap();
         for value in [
             "copy-path=streaming,pipeline-depth=4",
@@ -581,11 +521,7 @@ mod tests {
             "copy-path=streaming,batch-files=1",
             "copy-path=streaming,batch-bytes=1M",
         ] {
-            assert!(value
-                .parse::<TransferTuning>()
-                .unwrap()
-                .validate(0)
-                .is_err());
+            assert!(value.parse::<TransferTuning>().unwrap().validate().is_err());
         }
     }
 
