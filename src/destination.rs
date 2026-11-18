@@ -2218,8 +2218,9 @@ pub(crate) fn serve_background(
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            // Its own process group, which polling and dropping it kill with
-            // any ProxyCommand helpers before reaping ssh.
+            // ssh runs in its own process group. Polling or dropping `child`
+            // kills that group, including any ProxyCommand helpers, before
+            // reaping ssh, so the group id cannot be reused in between.
             let mut child = crate::process_group::ProcessGroup::spawn(&mut command)
                 .context("start receiving SSH connection")?;
             // A pipe takes this short line at once. If ssh has already
