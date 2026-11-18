@@ -261,7 +261,7 @@ class StreamTests(unittest.TestCase):
                 raise error
         self.assertIs(caught.exception, error)
         self.assertEqual(target.read_bytes(), b'old')
-        self.assertFalse(list(self.root.glob('.syq-stream-*')))
+        self.assertFalse(list(self.root.glob('.*.syq-tmp.*')))
 
     def test_empty_commit_abort_and_repeated_eof(self):
         target = self.root / 'target'
@@ -354,7 +354,7 @@ class StreamTests(unittest.TestCase):
                             self.assertFalse(fail)
                         self.assertEqual(target.read_bytes(), b'old' if fail else b'partial')
                         self.assertIsNotNone(output._process.process.poll())
-                        self.assertFalse(list(self.root.glob('.syq-stream-*')))
+                        self.assertFalse(list(self.root.glob('.*.syq-tmp.*')))
 
     def test_explicit_commit_and_abort_after_payload_close(self):
         target = self.root / 'explicit'
@@ -379,7 +379,7 @@ class StreamTests(unittest.TestCase):
                     self.assertEqual(target.read_bytes(), b'old')
             finally:
                 output.abort()
-        self.assertFalse(list(self.root.glob('.syq-stream-*')))
+        self.assertFalse(list(self.root.glob('.*.syq-tmp.*')))
 
     def test_explicit_abort_inside_context_cancels_normal_exit(self):
         target = self.root / 'abort-in-context'
