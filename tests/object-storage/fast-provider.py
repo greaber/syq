@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Opt-in provider checks for the automatic transfer path; owns one key prefix."""
-import hashlib, importlib.util, os, pathlib, subprocess, sys, tempfile
-spec=importlib.util.spec_from_file_location('checks',pathlib.Path(__file__).with_name('check.py'))
-c=importlib.util.module_from_spec(spec);spec.loader.exec_module(c)
+import hashlib, os, pathlib, subprocess, sys, tempfile
+import check as c
 binary=str(pathlib.Path(sys.argv[1]).resolve())
 with tempfile.TemporaryDirectory(prefix='syq-fast-check-') as tmp:
     root=pathlib.Path(tmp).resolve();source=root/'source';source.mkdir();cache=root/'cache'

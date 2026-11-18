@@ -1229,6 +1229,7 @@ fn ancestry_requires_an_available_source_directory() {
         temp.path().as_os_str().as_bytes(),
         false,
         OperatorSymlinkPolicy::Refuse,
+        false,
     )
     .unwrap();
     let check = || {
@@ -1462,6 +1463,7 @@ fn shared_ancestry_matches_masters_pairwise_check() {
         root.join("dst").as_os_str().as_bytes(),
         false,
         OperatorSymlinkPolicy::Refuse,
+        false,
     )
     .unwrap();
     let pairwise = |source: &Path, is_directory: bool, suffix: &str| {
@@ -1630,6 +1632,7 @@ fn shared_ancestry_matches_comparing_each_pair() {
         root.join("dst").as_os_str().as_bytes(),
         false,
         OperatorSymlinkPolicy::Refuse,
+        false,
     )
     .unwrap();
     let combined = |shared: &[PathBytes]| {
@@ -1880,7 +1883,7 @@ fn safe_partial_must_have_one_link() {
     fs::hard_link(&file, &alias).unwrap();
 
     let opened = open_existing_regular(&file, true).unwrap();
-    let rejected = require_safe_partial(&opened, &file).is_err();
+    let rejected = !is_safe_partial(&opened.metadata().unwrap());
     drop(opened);
     fs::remove_dir_all(&dir).unwrap();
 
@@ -4000,57 +4003,6 @@ fn rooted_mkdir_race_accepts_only_an_existing_real_directory() {
 }
 
 #[test]
-fn name_limit_discovery_does_not_follow_an_intermediate_symlink() {
-    let dir = test_dir();
-    fs::create_dir(&dir).unwrap();
-    let target = dir.join("symlink-target");
-    let existing = target.join("existing");
-    let link = dir.join("in-tree-link");
-    fs::create_dir_all(&existing).unwrap();
-    symlink(&target, &link).unwrap();
-    let cache = Mutex::new(NameMaxCache::default());
-    let queried = Mutex::new(Vec::new());
-    let expected = fs::metadata(&dir).unwrap();
-
-    let limit = name_max_cached(&link.join("existing"), &cache, |candidate, directory| {
-        let metadata = directory.metadata().unwrap();
-        queried
-            .lock()
-            .unwrap()
-            .push((candidate.to_path_buf(), metadata.dev(), metadata.ino()));
-        143
-    });
-
-    assert_eq!(limit, 143);
-    assert_eq!(
-        *queried.lock().unwrap(),
-        vec![(lexical_absolute(&dir), expected.dev(), expected.ino())]
-    );
-    fs::remove_dir_all(&dir).unwrap();
-}
-
-#[test]
-fn name_limit_discovery_uses_the_nearest_existing_directory() {
-    let dir = test_dir();
-    fs::create_dir(&dir).unwrap();
-    let cache = Mutex::new(NameMaxCache::default());
-    let queried = Mutex::new(Vec::new());
-
-    let limit = name_max_cached(
-        &dir.join("not-yet-created/deeper"),
-        &cache,
-        |candidate, _directory| {
-            queried.lock().unwrap().push(candidate.to_path_buf());
-            143
-        },
-    );
-
-    assert_eq!(limit, 143);
-    assert_eq!(*queried.lock().unwrap(), vec![lexical_absolute(&dir)]);
-    fs::remove_dir_all(&dir).unwrap();
-}
-
-#[test]
 fn seed_basis_copies_only_selected_final_blocks_and_hashes_current_bytes() {
     let block = MIN_HASH_BLOCK_BYTES;
     for truncate in [false, true] {
@@ -4805,6 +4757,26 @@ fn on_a_device_with_fixed_wide_modes_a_retry_reuses_its_sidecar() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The sidecar `held` names at `relative`: the one held there, unless wider
+/// than `widest`, or else a new one created exclusively in `mode`, as
+/// `FsOps::open_stage` settles on one, at a name of the test's choosing.
+fn open_held_or_new(
+    ops: &mut FsOps,
+    held: stages::For<'_>,
+    relative: &RelativePath,
+    label: &Path,
+    mode: u32,
+    widest: Option<u32>,
+) -> Result<(File, OpenedPartial)> {
+    let root = held.root;
+    if let HeldStage::Reused(file, len) = ops.reuse_held_stage(held, relative, label, widest)? {
+        return Ok((file, OpenedPartial::Reused(len)));
+    }
+    let policy = StagePolicy::new(Sidecar::Partial).mode(mode);
+    let (file, created) = ops.create_stage_file(root, relative, label, policy)?;
+    Ok((file, OpenedPartial::Created(created)))
+}
+
 #[test]
 fn a_refused_mode_probe_leaves_the_device_checked() {
     // Whether a file's mode may be changed can depend on that file's own
@@ -4824,7 +4796,8 @@ fn a_refused_mode_probe_leaves_the_device_checked() {
     FORCED_MODE.set(Some(0o644));
     REFUSE_MODE_PROBE.set(true);
     let probe = RelativePath::new(b"probe").unwrap();
-    let probed = ops.open_private_partial_rooted(
+    let probed = open_held_or_new(
+        &mut ops,
         stages::For {
             scope: 0,
             root: &root,
@@ -4834,13 +4807,12 @@ fn a_refused_mode_probe_leaves_the_device_checked() {
         },
         &probe,
         &temporary.path().join("probe"),
-        true,
         0o600,
         Some(0o600),
     );
     FORCED_MODE.set(None);
     REFUSE_MODE_PROBE.set(false);
-    probed.unwrap().unwrap();
+    probed.unwrap();
     // A retry on the same connection, with a narrower mode.
     let path = temporary.path().join("file");
     let id = [44; 16];
@@ -4914,23 +4886,21 @@ fn one_connections_probe_does_not_decide_for_another() {
     let copy_id = [62; 16];
     let open = |ops: &mut FsOps, name: &str| {
         let relative = RelativePath::new(name.as_bytes()).unwrap();
-        let (file, basis) = ops
-            .open_private_partial_rooted(
-                stages::For {
-                    scope: 0,
-                    root: &root,
-                    target: &relative,
-                    copy_id: &copy_id,
-                    inplace: false,
-                },
-                &relative,
-                &temporary.path().join(name),
-                true,
-                0o600,
-                Some(0o600),
-            )
-            .unwrap()
-            .unwrap();
+        let (file, basis) = open_held_or_new(
+            ops,
+            stages::For {
+                scope: 0,
+                root: &root,
+                target: &relative,
+                copy_id: &copy_id,
+                inplace: false,
+            },
+            &relative,
+            &temporary.path().join(name),
+            0o600,
+            Some(0o600),
+        )
+        .unwrap();
         (file.metadata().unwrap().ino(), basis.basis_size().is_some())
     };
     // A sidecar an earlier attempt in this receiver created, and holds.
@@ -4991,7 +4961,8 @@ fn only_a_device_that_ignores_a_chmod_skips_the_width_check() {
     let widen = || fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
     widen();
     let mut ops = FsOps::new();
-    ops.note_created_mode(&file, &file.metadata().unwrap(), 0o600);
+    let probed = ops.note_created_mode(&file, &file.metadata().unwrap(), 0o600);
+    assert_eq!(probed.map(|probed| probed.mode() & 0o777), Some(0o600));
     assert_eq!(ops.fixed_wide_modes(dev), Some(false));
     assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);
     assert!(ops.wider_than(0o644, dev, Some(0o600)));
@@ -4999,8 +4970,9 @@ fn only_a_device_that_ignores_a_chmod_skips_the_width_check() {
     widen();
     let mut ops = FsOps::new();
     REFUSE_MODE_PROBE.set(true);
-    ops.note_created_mode(&file, &file.metadata().unwrap(), 0o600);
+    let probed = ops.note_created_mode(&file, &file.metadata().unwrap(), 0o600);
     REFUSE_MODE_PROBE.set(false);
+    assert!(probed.is_none());
     assert_eq!(ops.fixed_wide_modes(dev), Some(false));
     assert!(ops.wider_than(0o644, dev, Some(0o600)));
     // Every file reports 0755 and a chmod does not show.
@@ -5012,6 +4984,53 @@ fn only_a_device_that_ignores_a_chmod_skips_the_width_check() {
     assert!(!ops.wider_than(0o644, dev, Some(0o600)));
     assert!(ops.wider_than(0o644, dev.wrapping_add(1), Some(0o600)));
     assert!(!ops.wider_than(0o600, dev.wrapping_add(1), Some(0o600)));
+}
+
+#[test]
+fn a_held_stage_that_is_not_resumed_is_replaced_owner_only() {
+    // Whoever opened a held sidecar while it was wider can read what is
+    // written to it, so one wider than this attempt's mode is replaced, and
+    // by an exclusive owner-only creation, whatever the policy allows a
+    // stage that nothing was held for.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let mut ops = destination_ops(temporary.path());
+    let target = ops.destination_mutation_target(b"file").unwrap();
+    let copy_id = [46; 16];
+    let (relative, _) = rooted_partial_target(&target, &copy_id).unwrap();
+    let path = temporary.path().join(relative.to_path_buf());
+    fs::write(&path, b"an earlier attempt").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    let held = File::options().read(true).write(true).open(&path).unwrap();
+    let held_for = stages::of(0, &target, &copy_id, false);
+    stages::hold(held_for, &relative, &held, None, true, u64::MAX).unwrap();
+    let policy = StagePolicy::new(Sidecar::Partial)
+        .mode(0o644)
+        .keeps_owner_access()
+        .new_contents_only()
+        .resume(Some(0o600));
+    let stage = ops.open_stage(&target, &copy_id, policy).unwrap();
+    assert!(matches!(stage.opened, OpenedPartial::Created(_)));
+    let created = stage.file.metadata().unwrap();
+    assert_ne!(created.ino(), held.metadata().unwrap().ino());
+    assert_eq!(created.mode() & 0o777, 0o600);
+    assert_eq!(created.len(), 0);
+}
+
+#[test]
+fn a_new_stage_shows_the_mode_its_probe_left() {
+    // Publication skips the chmod to the wanted mode when the stage's
+    // metadata already shows it. A stage that came out wider than asked and
+    // was narrowed by the device probe must not show the wider mode, or a
+    // file wanted in that mode would be published narrower.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let mut ops = destination_ops(temporary.path());
+    let target = ops.destination_mutation_target(b"file").unwrap();
+    WIDEN_NEW_STAGES.set(Some(0o644));
+    let stage = ops.open_stage(&target, &[45; 16], StagePolicy::new(Sidecar::Stage));
+    WIDEN_NEW_STAGES.set(None);
+    let stage = stage.unwrap();
+    assert_eq!(stage.file.metadata().unwrap().mode() & 0o777, 0o600);
+    assert_eq!(stage.metadata().unwrap().mode() & 0o777, 0o600);
 }
 
 #[test]
@@ -5574,6 +5593,43 @@ fn destination_worker_claims_copy_sources_from_the_foreign_session() {
     assert!(
         matches!(response, Response::FileHash { size: 11, hash } if hash == content_digest(b"destination"))
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn copy_worker_claims_every_named_source_over_one_broker_connection() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&destination).unwrap();
+    let files: Vec<_> = (0..20)
+        .map(|index| {
+            let file = source.join(format!("f{index}"));
+            fs::write(&file, b"source").unwrap();
+            file
+        })
+        .collect();
+    let source_session = DescriptorSessionSlot::default();
+    let mut source_control = FsOps::with_descriptor_session(source_session.clone());
+    let response = source_control.handle(&crate::test_support::register_source_roots(&files, 1));
+    let Response::SourceRootsRegistered(roots) = response else {
+        panic!("unexpected source registration response: {response:?}")
+    };
+    assert!(roots.iter().all(|root| root.leaf_ticket.is_some()));
+
+    let destination_session = DescriptorSessionSlot::default();
+    destination_session
+        .register(File::open(&destination).unwrap())
+        .unwrap();
+    let mut worker = FsOps::with_descriptor_session(destination_session);
+    worker.destination_root = Some(Arc::new(Root::open(&destination).unwrap()));
+    worker.destination_prefix = Some(b".".to_vec());
+    // Each source's directory and exact file: 40 claims, one connection.
+    let opened = source_session.broker_connections();
+    worker.initialize_copy_sources(&roots).unwrap();
+    assert_eq!(source_session.broker_connections() - opened, 1);
+    assert_eq!(worker.source_roots.len(), files.len());
 }
 
 #[test]
@@ -6820,6 +6876,66 @@ fn destination_worker_rejects_source_only_content_requests() {
     }
 }
 
+/// A session no destination root was installed on, such as a control
+/// connection before it anchored a destination, refuses the requests that
+/// read a destination's sidecars and bases instead of following pathnames.
+#[test]
+fn unrooted_session_refuses_destination_basis_and_sidecar_requests() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let path = temporary.path().join("file");
+    fs::write(&path, b"contents").unwrap();
+    let id = [57; 16];
+    // A sidecar a pathname lookup would have found and reported.
+    fs::write(partial_path(&path, &id).unwrap(), b"partial").unwrap();
+    let mut ops = FsOps::new();
+    let path = path_bytes(&path);
+    let digest = crate::hashing::Digest::hash_bytes(ops.hash_policy.algorithm, b"contents").into();
+    let hash = |off, which| Request::HashBlocks {
+        off,
+        path: path.clone(),
+        source: None,
+        which,
+        copy_id: id,
+        block: MIN_HASH_BLOCK_BYTES,
+        len: 8,
+        attempt: 0,
+    };
+    for request in [
+        Request::ProbePartial {
+            path: path.clone(),
+            copy_id: id,
+        },
+        Request::HashAndHold {
+            off: 0,
+            path: path.clone(),
+            copy_id: id,
+            block: MIN_HASH_BLOCK_BYTES,
+            len: 8,
+            condition: TargetCondition::Any,
+            update: None,
+        },
+        hash(0, Which::Partial),
+        Request::ValidateDigest {
+            path: path.clone(),
+            expected: digest,
+        },
+    ] {
+        let message = match ops.handle(&request) {
+            Response::Err(message) => message,
+            Response::EndpointError(error) => error.message,
+            response => panic!("{request:?} was served without a root: {response:?}"),
+        };
+        assert!(message.contains(UNROOTED_MUTATION), "{message}");
+    }
+    assert!(ops.held_basis.is_none());
+    // The final file's own bytes are still read by pathname where no root
+    // confines them (`--insecure-links` and pre-anchor lookups).
+    assert!(matches!(
+        ops.handle(&hash(0, Which::Final)),
+        Response::Hashes(_)
+    ));
+}
+
 #[test]
 fn source_descriptor_budget_accounts_for_registry_control_and_workers() {
     assert_eq!(SOURCE_SHARED_WORKER_FD_RESERVE, 16 + 5 + 1);
@@ -7238,10 +7354,8 @@ fn acl_resume_replaces_previously_readable_staging_inodes() {
             copy_id: &[0; 16],
             inplace: false,
         };
-        let (mut file, basis) = ops
-            .open_private_partial_rooted(held, &relative, &path, true, 0o644, None)
-            .unwrap()
-            .unwrap();
+        let (mut file, basis) =
+            open_held_or_new(&mut ops, held, &relative, &path, 0o644, None).unwrap();
         assert!(basis.basis_size().is_none());
         assert_ne!(file.metadata().unwrap().ino(), old_inode);
         assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);
@@ -7594,8 +7708,8 @@ fn retained_comparison_bytes_survive_donor_mutation_and_reject_replay() {
         ops.handle(&reuse(id, 2, 0, 9)),
         Response::EndpointError(_)
     ));
-    let staged = ops.partial_path(Path::new("file"), &id).unwrap();
-    assert_eq!(fs::read(tree.path().join(staged)).unwrap(), b"old bytes");
+    let staged = partial_path(&path, &id).unwrap();
+    assert_eq!(fs::read(staged).unwrap(), b"old bytes");
     assert_eq!(fs::read(&path).unwrap(), b"new bytes");
 }
 
@@ -7646,8 +7760,8 @@ fn prefetched_comparison_window_keeps_current_bytes() {
             Response::Ok
         ));
     }
-    let staged = ops.partial_path(Path::new("file"), &id).unwrap();
-    assert_eq!(fs::read(tree.path().join(staged)).unwrap(), b"firstsecond");
+    let staged = partial_path(&path, &id).unwrap();
+    assert_eq!(fs::read(staged).unwrap(), b"firstsecond");
 }
 
 #[test]
@@ -7845,8 +7959,8 @@ fn comparison_workers_release_donor_descriptors_before_publication() {
         assert!(matches!(ops.handle(&request), Response::Ok));
         assert!(ops.comparison_window.is_none());
     }
-    let partial = creator.partial_path(Path::new("file"), &id).unwrap();
-    fs::rename(tree.path().join(partial), &path).unwrap();
+    let partial = partial_path(&path, &id).unwrap();
+    fs::rename(partial, &path).unwrap();
     assert_eq!(fs::read(&path).unwrap(), b"abcdWXYZ");
     // Keep all sessions alive while checking every descriptor, including those
     // owned by workers which never execute Finalize.
@@ -7922,11 +8036,11 @@ fn staged_basis_uses_apfs_clone_and_keeps_an_independent_snapshot() {
             ),
             "APFS clone was not used: {response:?}"
         );
-        let partial = ops.partial_path(Path::new("file"), &id).unwrap();
+        let partial = partial_path(&path, &id).unwrap();
         fs::write(&path, vec![9; 8192]).unwrap();
         let mut expected = vec![7; 8192];
         expected.resize(len as usize, 0);
-        assert_eq!(fs::read(tree.path().join(partial)).unwrap(), expected);
+        assert_eq!(fs::read(partial).unwrap(), expected);
     }
 }
 
@@ -8436,6 +8550,7 @@ fn ancestry_access_restores_after_request_error() {
         destination.as_os_str().as_bytes(),
         false,
         OperatorSymlinkPolicy::Refuse,
+        false,
     )
     .unwrap();
     fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
@@ -8475,6 +8590,7 @@ fn ancestry_access_widens_only_directories_inside_the_copy() {
             selected.as_os_str().as_bytes(),
             true,
             OperatorSymlinkPolicy::Refuse,
+            false,
         )?;
         ops.check_operator_directory_ancestry(
             &[DirectoryAncestryCheck {
@@ -8542,10 +8658,11 @@ fn searchable_destination_selection_checks_kernel_access_without_chmod() {
         fs::set_permissions(&destination, fs::Permissions::from_mode(mode)).unwrap();
         let before = fs::metadata(&destination).unwrap();
         let mut ops = FsOps::new();
-        let response = ops.handle(&Request::CheckSearchableOperatorDirectory {
+        let response = ops.handle(&Request::CheckOperatorDirectory {
             path: path_bytes(&destination),
             allow_missing: false,
             symlink_policy: OperatorSymlinkPolicy::Refuse,
+            require_search: true,
         });
         assert_eq!(
             matches!(response, Response::DirectorySelection(Some(_))),
@@ -8566,6 +8683,7 @@ fn searchable_destination_selection_checks_kernel_access_without_chmod() {
             path: path_bytes(&destination),
             allow_missing: false,
             symlink_policy: OperatorSymlinkPolicy::Refuse,
+            require_search: false,
         }),
         Response::DirectorySelection(Some(_))
     ));
@@ -8573,10 +8691,11 @@ fn searchable_destination_selection_checks_kernel_access_without_chmod() {
     let link = temporary.path().join("link");
     std::os::unix::fs::symlink(&destination, &link).unwrap();
     assert!(!matches!(
-        FsOps::new().handle(&Request::CheckSearchableOperatorDirectory {
+        FsOps::new().handle(&Request::CheckOperatorDirectory {
             path: path_bytes(&link),
             allow_missing: false,
             symlink_policy: OperatorSymlinkPolicy::Refuse,
+            require_search: true,
         }),
         Response::DirectorySelection(_)
     ));

@@ -26,6 +26,7 @@ QUICK_TESTS = (
     "tests/tooling/test-installer.py",
     "tests/tooling/test-nightly-ci.py",
     "tests/tooling/test-python-sdk-release-tools.py",
+    "tests/tooling/test-real-ssh-scenarios.py",
     "tests/tooling/test-release-readiness.py",
     "tests/tooling/test-release-test-inputs.py",
     "tests/tooling/test-release-timings.py",
@@ -54,7 +55,7 @@ GROUPS = {
                "test-dispatched-checks-status.py"),
     # ci.yml also checks workflow syntax and script references for this group.
     "workflows": ("test-doc-selector.cjs", "test-doc-site.py", "test-doc-tools.py",
-                  "test-tool-examples.py"),
+                  "test-real-ssh-scenarios.py", "test-tool-examples.py"),
     "setup": ("test-rust-test-timeouts.py", "test-setup.sh"),
 }
 

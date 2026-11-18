@@ -107,7 +107,6 @@ pub(super) struct SmallStage {
     partial: RelativePath,
     label: PathBuf,
     file: File,
-    reused: bool,
     /// Made as a clone of the file its patch replaces, as macOS clones.
     cloned: bool,
     /// Read right after the sidecar was opened, when an NFS client answers
@@ -117,6 +116,7 @@ pub(super) struct SmallStage {
 }
 
 impl SmallStage {
+    #[cfg(target_os = "macos")]
     fn register(&self, creation: sidecars::Creation<'_>) {
         creation.register(
             &self.target.root,
@@ -986,23 +986,24 @@ impl FsOps {
         }
         // A file the receiver cannot vouch for is replaced instead, by a
         // stage built from its blocks (`vouch`).
-        if let Some(reason) = vouch::declines(target, file, &current, meta, flags)? {
-            return Ok(Keep::Replace(Some(reason)));
-        }
-        #[cfg(debug_assertions)]
-        fail_set_meta_for_test(&target.label)?;
-        set_meta_file_known(file, meta, flags, &current)
-            .with_context(|| format!("set metadata {}", target.label.display()))?;
-        if condition != TargetCondition::Any {
-            require_rooted_named_identity(
-                &target.root,
-                &target.relative,
-                &target.label,
+        let keeping = keep::Keeping {
+            handle: keep::Handle::Open,
+            recheck_any: false,
+            setting: Some("set metadata"),
+        };
+        Ok(
+            match keep::keep_existing(
+                target.into(),
                 file,
+                &current,
+                (meta, flags),
                 condition,
-            )?;
-        }
-        Ok(Keep::Kept(published_identity(file, flags)?))
+                keeping,
+            )? {
+                keep::Keep::Kept(identity) => Keep::Kept(identity),
+                keep::Keep::Replace(error) => Keep::Replace(vouch::replace_reason(&error)),
+            },
+        )
     }
 
     /// Publish each patch as `put_small_batch` publishes a whole file, from
@@ -1376,7 +1377,7 @@ impl FsOps {
     /// or copied in the kernel, with the differing blocks written over it
     /// (`seed_patch_stage`). A stage made as the clone, as on macOS, holds it
     /// already; any other stage that can take the copy was created empty for
-    /// it (`create_seeded_stage`). When the file cannot be copied so, or
+    /// it (`create_stage`). When the file cannot be copied so, or
     /// changed after it was hashed, the stage holds the assembled file
     /// instead, its reused blocks read and checked again. The write is
     /// observed unless `unobserved` collects its bytes for a caller that
@@ -1936,25 +1937,19 @@ impl FsOps {
     /// blocks of, with `mode`. On macOS, where a clone is a new file, a
     /// cloning patch's stage is made as a clone of that file when it can be,
     /// private until publication. On Linux a patch's stage takes a clone or
-    /// copy of that file once created, so it is created as a new file
-    /// (`create_seeded_stage`); so is any stage that is to be `fresh`, as a
-    /// streamed patch's, which may place that file's blocks itself. The
-    /// stage is registered, so that an interrupted receiver removes it.
+    /// copy of that file once created; so may any stage that is to be
+    /// `fresh`, as a streamed patch's, which may place that file's blocks
+    /// itself. Those bytes may be kept from others: the wanted mode, the
+    /// group a new file gets, or an ACL inherited from the directory could
+    /// let them read them beside the target. So such a stage is created
+    /// exclusively (`StagePolicy`), with only the owner's permissions of
+    /// `mode`, and publication sets the wanted mode. One whose reused blocks
+    /// may be read back and checked before they are kept
+    /// (`seed_patch_stage`) is opened for reading too. Nothing reads any
+    /// other stage, which holds only the new contents, so it is opened for
+    /// writing only, which spares an NFS client a delegation. The stage is
+    /// registered, so that an interrupted receiver removes it.
     fn create_stage(
-        &mut self,
-        put: &SmallPut,
-        source: Option<&PatchSource<'_>>,
-        target: RootedTarget,
-        mode: u32,
-        fresh: bool,
-    ) -> Result<SmallStage> {
-        let creation = sidecars::begin()?;
-        let stage = self.create_unregistered_stage(put, source, target, mode, fresh)?;
-        stage.register(creation);
-        Ok(stage)
-    }
-
-    fn create_unregistered_stage(
         &mut self,
         put: &SmallPut,
         source: Option<&PatchSource<'_>>,
@@ -1964,65 +1959,43 @@ impl FsOps {
     ) -> Result<SmallStage> {
         #[cfg(target_os = "macos")]
         if let Some(source) = source {
+            let creation = sidecars::begin()?;
             if let Some((partial, label, file)) = self.clone_patch_stage(put, source, &target)? {
                 let created = file.metadata()?;
-                return Ok(SmallStage {
+                let stage = SmallStage {
                     target,
                     partial,
                     label,
                     file,
-                    reused: false,
                     cloned: true,
                     created,
-                });
+                };
+                stage.register(creation);
+                return Ok(stage);
             }
         }
-        if fresh || (cfg!(target_os = "linux") && source.is_some()) {
+        let policy = StagePolicy::new(Sidecar::Stage);
+        let policy = if fresh || (cfg!(target_os = "linux") && source.is_some()) {
             // A stage that may be read back is opened for reading too.
             let checked =
                 source.is_some_and(|source| source.patch.update_in_place || source.guard.is_some());
-            return self.create_seeded_stage(put, target, mode, checked);
-        }
-        self.create_small_stage_with_mode(put, target, mode)
-    }
-
-    /// The stage of a patch that will take a clone or copy of the file it
-    /// replaces. Those bytes may be kept from others: the wanted mode, the
-    /// group a new file gets, or an ACL inherited from the directory could
-    /// let them read them beside the target, and whoever opened a sidecar
-    /// left at the name while its mode was wider can read what is written to
-    /// it. So the stage is created exclusively, replacing anything at the
-    /// name, with only the owner's permissions of `mode`, and publication
-    /// sets the wanted mode. It is new whatever mode the filesystem gave it.
-    /// A stage whose reused blocks may be read back and checked before they
-    /// are kept (`seed_patch_stage`) is opened for reading too; others are
-    /// opened only to write, which spares an NFS client a delegation.
-    fn create_seeded_stage(
-        &mut self,
-        put: &SmallPut,
-        target: RootedTarget,
-        mode: u32,
-        checked: bool,
-    ) -> Result<SmallStage> {
+            let policy = policy.mode(mode & 0o700);
+            if checked {
+                policy
+            } else {
+                policy.write_only()
+            }
+        } else {
+            policy.mode(mode).write_only().new_contents_only()
+        };
         self.uncache_rooted(&target.root, &target.relative);
-        let mode = mode & 0o700;
-        let (partial, label, (file, created)) =
-            with_rooted_partial(&target, &put.copy_id, |relative, label| {
-                self.uncache_rooted(&target.root, relative);
-                create_fresh_rooted_partial(&target.root, relative, label, || {
-                    if checked {
-                        target.root.create_file(relative, mode)
-                    } else {
-                        target.root.create_write_only_file(relative, mode)
-                    }
-                })
-            })?;
+        let stage = self.open_stage(&target, &put.copy_id, policy)?;
+        let created = stage.metadata()?;
         Ok(SmallStage {
             target,
-            partial,
-            label,
-            file,
-            reused: false,
+            partial: stage.relative,
+            label: stage.label,
+            file: stage.file,
             cloned: false,
             created,
         })
@@ -2069,91 +2042,7 @@ impl FsOps {
         target: RootedTarget,
     ) -> Result<SmallStage> {
         let mode = staged_file_mode(&put.meta, put.flags);
-        let creation = sidecars::begin()?;
-        let stage = self.create_small_stage_with_mode(put, target, mode)?;
-        stage.register(creation);
-        Ok(stage)
-    }
-
-    fn create_small_stage_with_mode(
-        &mut self,
-        put: &SmallPut,
-        target: RootedTarget,
-        mode: u32,
-    ) -> Result<SmallStage> {
-        self.uncache_rooted(&target.root, &target.relative);
-        let (partial, label, opened) =
-            with_rooted_partial(&target, &put.copy_id, |relative, label| {
-                // Nothing reads a small file's sidecar, so it is opened for
-                // writing only, and, where the root's filesystem's link
-                // counts can be trusted, without exclusive creation, which
-                // costs an NFS client a further request. Whatever the name
-                // held is opened too: a new empty file of ours, on a
-                // filesystem whose counts are trusted (judged through the
-                // file: another can be mounted below the root), is used as
-                // created, and anything else, or an open the kernel
-                // refused, takes the checked path that ranged writes apply.
-                if !target.root.link_counts_trusted()
-                    || creates_foreign_owners(target.root.identity().dev)
-                {
-                    return self.checked_small_stage(
-                        stages::of(self.stage_scope, &target, &put.copy_id, false),
-                        relative,
-                        label,
-                        mode,
-                    );
-                }
-                self.uncache_rooted(&target.root, relative);
-                match self.open_or_create_partial(&target.root, relative, mode, true) {
-                    Ok((file, created))
-                        if is_fresh_partial(&created, mode)
-                            && target.root.link_counts_trusted_on(created.dev(), &file) =>
-                    {
-                        Ok(Some((file, created, None)))
-                    }
-                    Ok(_) => self.checked_small_stage(
-                        stages::of(self.stage_scope, &target, &put.copy_id, false),
-                        relative,
-                        label,
-                        mode,
-                    ),
-                    Err(error) if existing_leaf_refused(&error) => self.checked_small_stage(
-                        stages::of(self.stage_scope, &target, &put.copy_id, false),
-                        relative,
-                        label,
-                        mode,
-                    ),
-                    Err(error) => Err(error),
-                }
-            })?;
-        let (file, created, basis_size) = opened.context("sidecar creation was requested")?;
-        Ok(SmallStage {
-            target,
-            partial,
-            label,
-            file,
-            reused: basis_size.is_some(),
-            cloned: false,
-            created,
-        })
-    }
-
-    /// The checked reuse of whatever the sidecar name holds, with the
-    /// metadata of the file it settles on.
-    fn checked_small_stage(
-        &mut self,
-        held: stages::For<'_>,
-        relative: &RelativePath,
-        label: &Path,
-        mode: u32,
-    ) -> Result<Option<(File, fs::Metadata, Option<u64>)>> {
-        let Some((file, opened)) =
-            self.open_private_partial_rooted(held, relative, label, true, mode, Some(mode))?
-        else {
-            return Ok(None);
-        };
-        let metadata = file.metadata()?;
-        Ok(Some((file, metadata, opened.basis_size())))
+        self.create_stage(put, None, target, mode, false)
     }
 
     /// Write a staged file's data and metadata, from a patch source when
@@ -2176,9 +2065,6 @@ impl FsOps {
         if let Some(source) = source {
             self.write_patch_stage(source, stage, unobserved)?;
         } else {
-            if stage.reused {
-                stage.file.set_len(0)?;
-            }
             self.preallocate_stage(stage, put.data.len() as u64)?;
             match unobserved {
                 None => observed_write(&self.operation, &stage.file, &put.data, 0, self.sparse),
@@ -3813,7 +3699,6 @@ mod tests {
         let target = ops.small_target(&file).unwrap();
         let stage = ops.create_small_stage(&file, target).unwrap();
         assert_eq!(access(&stage), libc::O_WRONLY);
-        assert!(!stage.reused);
         // An attempt interrupted before it wrote anything leaves an empty
         // sidecar, which is what a new one would be; the copy uses it as
         // created. One interrupted after writing takes the checked path,
@@ -3822,12 +3707,10 @@ mod tests {
         drop(stage);
         let target = ops.small_target(&file).unwrap();
         let stage = ops.create_small_stage(&file, target).unwrap();
-        assert!(!stage.reused);
         ops.write_small_stage(&file, None, &stage, None).unwrap();
         drop(stage);
         let target = ops.small_target(&file).unwrap();
         let stage = ops.create_small_stage(&file, target).unwrap();
-        assert!(!stage.reused);
         ops.write_small_stage(&file, None, &stage, None).unwrap();
         let published = ops.publish_small_stage(&file, &stage).unwrap();
         assert_eq!(
@@ -3846,9 +3729,8 @@ mod tests {
         // The sidecar is created without O_EXCL, so the open can land on
         // something already at its name. Only a new empty file of ours is
         // used as opened; a symlink, a FIFO, a second link to a file of ours,
-        // and a file holding data are left to the checked path, which
-        // replaces what is not a safe sidecar and reuses what is. Nothing
-        // planted at the name receives the copy's data.
+        // and a file holding data are replaced by an exclusive creation.
+        // Nothing planted at the name receives the copy's data.
         let temporary = crate::test_support::tempdir().unwrap();
         let mut ops = receiver(temporary.path());
         let mut wanted = put("file", b"contents");
@@ -3873,7 +3755,6 @@ mod tests {
                     let planted = File::open(&sidecar).unwrap();
                     let target = ops.small_target(&wanted).unwrap();
                     let stage = ops.create_small_stage(&wanted, target).unwrap();
-                    assert!(!stage.reused);
                     assert_ne!(stage.created.ino(), planted.metadata().unwrap().ino());
                     drop(planted);
                     assert_eq!(stage.created.mode() & 0o777, 0o600);

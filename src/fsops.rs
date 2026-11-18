@@ -2,23 +2,24 @@
 //! by `syq --server` for remote endpoints, so both sides behave identically.
 
 use crate::descriptor_broker::{
-    acquire_descriptor, DescriptorSessionSlot, DescriptorTicket, RegisteredRootId, MAX_SOURCE_ROOTS,
+    acquire_descriptor, acquire_descriptors, DescriptorSessionSlot, DescriptorTicket,
+    RegisteredRootId, MAX_SOURCE_ROOTS,
 };
 use crate::proto::*;
 use crate::rooted::{
     open_operator_directory_at, read_open_symlink, root_metadata_from_std, OperatorFinalComponent,
     OperatorResolver, PinnedPath, RelativePath, Root, RootIdentity, RootMetadata,
 };
+#[cfg(test)]
+use crate::sys::COMMON_NAME_MAX;
 use crate::sys::{
-    absent_or_nondirectory, COMMON_NAME_MAX, MODE_BLOCK, MODE_CHAR, MODE_DIRECTORY, MODE_FIFO,
-    MODE_REGULAR, MODE_SOCKET, MODE_SYMLINK, NAME_MAX_CACHE_CAP,
+    absent_or_nondirectory, MODE_BLOCK, MODE_CHAR, MODE_DIRECTORY, MODE_FIFO, MODE_REGULAR,
+    MODE_SOCKET, MODE_SYMLINK,
 };
 use crate::write_gate::CachedFile;
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
-#[cfg(target_os = "linux")]
-use std::collections::HashSet;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 #[cfg(target_os = "linux")]
@@ -73,6 +74,7 @@ pub(crate) fn copy_donor_range(
 mod btrfs;
 mod entry;
 mod fs_caps;
+pub(crate) mod keep;
 mod leases;
 mod limits;
 pub(crate) mod lookups;
@@ -100,7 +102,9 @@ pub(crate) use operator::*;
 pub(crate) use partial::*;
 pub(crate) use paths::*;
 use sidecars::Sidecar;
-pub(crate) use sidecars::{sweep as sweep_sidecars, track as track_sidecars, Swept};
+pub(crate) use sidecars::{
+    forget as forget_sidecar, sweep as sweep_sidecars, track as track_sidecars, Swept,
+};
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use small_batch::with_coarse_change_times;
 
@@ -1340,23 +1344,15 @@ impl FsOps {
         path: &[u8],
         allow_missing: bool,
         symlink_policy: OperatorSymlinkPolicy,
+        require_search: bool,
     ) -> Result<Option<DirectoryAnchor>> {
         let (selection, anchor) = select_operator_directory(path, allow_missing, symlink_policy)?;
-        self.operator_selection = Some(selection);
-        Ok(anchor)
-    }
-
-    fn check_searchable_operator_directory(
-        &mut self,
-        path: &[u8],
-        allow_missing: bool,
-        symlink_policy: OperatorSymlinkPolicy,
-    ) -> Result<Option<DirectoryAnchor>> {
-        let (selection, anchor) = select_operator_directory(path, allow_missing, symlink_policy)?;
-        // Looking up "." through the retained handle asks the kernel about
-        // search permission, including ACLs and the receiving user's identity.
-        open_operator_directory_at(&selection.directory, b".")
-            .context("search selected destination directory")?;
+        if require_search {
+            // Looking up "." through the retained handle asks the kernel about
+            // search permission, including ACLs and the receiving user's identity.
+            open_operator_directory_at(&selection.directory, b".")
+                .context("search selected destination directory")?;
+        }
         self.operator_selection = Some(selection);
         Ok(anchor)
     }
@@ -2023,23 +2019,29 @@ impl FsOps {
                                 // readable inode that was hashed; O_PATH metadata
                                 // handles intentionally cannot change timestamps.
                                 (|| -> Result<()> {
-                                    require_rooted_named_identity(
+                                    let current = held.metadata()?;
+                                    require_rooted_named_identity_known(
                                         &target.root,
                                         &target.relative,
                                         &target.label,
-                                        &held,
+                                        &current,
                                         condition,
                                     )?;
-                                    let current = held.metadata()?;
-                                    vouch::require(&target, &held, &current, &file.meta, checked)?;
-                                    set_meta_file_known(&held, &file.meta, repair, &current)?;
-                                    require_rooted_named_identity(
-                                        &target.root,
-                                        &target.relative,
-                                        &target.label,
+                                    let keeping = keep::Keeping {
+                                        handle: keep::Handle::Open,
+                                        recheck_any: true,
+                                        setting: None,
+                                    };
+                                    keep::keep_existing(
+                                        (&target).into(),
                                         &held,
+                                        &current,
+                                        (&file.meta, checked),
                                         condition,
-                                    )
+                                        keeping,
+                                    )?
+                                    .required()
+                                    .map(drop)
                                 })()
                                 .err()
                                 .map(|error| wire_error(&error))
@@ -2092,30 +2094,16 @@ impl FsOps {
         self.resolve_publication(&rooted, &mut meta, &mut flags, &mut None, replaced)?;
         let meta = &meta;
         self.uncache_rooted(&rooted.root, &rooted.relative);
-        let creation = sidecars::begin()?;
-        let staged = staged_file_mode(meta, flags);
-        let (partial, label, opened) = with_rooted_partial(&rooted, copy_id, |partial, label| {
-            self.open_private_partial_rooted(
-                stages::of(self.stage_scope, &rooted, copy_id, false),
-                partial,
-                label,
-                true,
-                staged,
-                Some(staged),
-            )
-        })?;
-        let (file, opened) = opened.context("sidecar creation was requested")?;
-        creation.register_with(&rooted.root, &partial, Sidecar::Stage, || {
-            match opened.identity() {
-                Some(identity) => Ok(identity),
-                None => file
-                    .metadata()
-                    .map(|metadata| (metadata.dev(), metadata.ino())),
-            }
-        })?;
-        if opened.basis_size().is_some() {
-            file.set_len(0)?;
-        }
+        let Stage {
+            relative: partial,
+            label,
+            file,
+            ..
+        } = self.open_stage(
+            &rooted,
+            copy_id,
+            StagePolicy::new(Sidecar::Stage).mode(staged_file_mode(meta, flags)),
+        )?;
         observed_write(&self.operation, &file, data, 0, false)
             .with_context(|| format!("write {}", label.display()))?;
         check_destination_writes(&file, &label)?;
@@ -2426,32 +2414,48 @@ impl FsOps {
         if sources.len() > MAX_SOURCE_ROOTS {
             bail!(too_many_sources(sources.len()));
         }
-        let mut roots = HashMap::with_capacity(sources.len());
         let endpoint_ticket = &sources[0].ticket;
+        let mut ids = HashSet::with_capacity(sources.len());
+        let mut tickets = Vec::with_capacity(sources.len() * 2);
         for source in sources {
             source.validate()?;
             if !source.ticket.same_session(endpoint_ticket) {
                 bail!("source roots belong to different endpoint sessions");
             }
             let id = source.selection.root();
-            if roots.contains_key(&id) {
+            if !ids.insert(id) {
                 bail!(
                     "source worker received duplicate registered root {}",
                     id.get()
                 );
             }
-            let acquire = |ticket: &DescriptorTicket| {
-                if claim_foreign_session {
-                    acquire_descriptor(ticket)
-                } else {
-                    self.descriptor_session.acquire(ticket)
-                }
+            tickets.push(&source.ticket);
+            if let (Some(ticket), Some(_)) = (&source.leaf_ticket, &source.expected_leaf) {
+                tickets.push(ticket);
+            }
+        }
+        // Claim every descriptor at once: over one broker connection when
+        // they belong to another process's session, rather than a
+        // connection (and a broker thread) for each.
+        let mut descriptors = if claim_foreign_session {
+            acquire_descriptors(&tickets)?
+        } else {
+            self.descriptor_session.acquire_many(&tickets)?
+        }
+        .into_iter();
+        let mut roots = HashMap::with_capacity(sources.len());
+        for source in sources {
+            let id = source.selection.root();
+            let mut acquire = || {
+                descriptors
+                    .next()
+                    .context("descriptor broker returned too few source descriptors")
             };
-            let directory = acquire(&source.ticket)?;
+            let directory = acquire()?;
             let root = Arc::new(Root::from_directory(directory)?);
             let leaf_object = match (&source.leaf_ticket, &source.expected_leaf) {
-                (Some(ticket), Some(expected)) => {
-                    let object = acquire(ticket)?;
+                (Some(_), Some(expected)) => {
+                    let object = acquire()?;
                     let metadata = root_metadata_from_std(
                         &object
                             .metadata()
@@ -2821,24 +2825,6 @@ impl FsOps {
         join(prefix, relative)
     }
 
-    fn partial_path(&self, final_path: &Path, copy_id: &CopyId) -> Result<PathBuf> {
-        if self.destination_prefix.is_none() {
-            return partial_path(final_path, copy_id);
-        }
-        let relative = path_bytes(final_path);
-        let strict_relative = RelativePath::new(&relative)?;
-        let logical = PathBuf::from(OsStr::from_bytes(&self.destination_full(&relative)));
-        let component_limit = self
-            .destination_root
-            .as_ref()
-            .context("destination prefix has no retained root")?
-            .partial_name_max(&strict_relative)?;
-        let logical_partial = partial_path_with_name_max(&logical, copy_id, component_limit)?;
-        Ok(PathBuf::from(OsStr::from_bytes(
-            &self.destination_relative(logical_partial.as_os_str().as_bytes())?,
-        )))
-    }
-
     fn logical_destination_path(&self, relative: &Path) -> PathBuf {
         if self.destination_prefix.is_some() {
             PathBuf::from(OsStr::from_bytes(
@@ -2849,20 +2835,28 @@ impl FsOps {
         }
     }
 
+    /// The authority this session's destination requests resolve under.
+    fn destination_scope(&self) -> apply::DestinationScope<'_> {
+        apply::DestinationScope {
+            root: self.destination_root.as_ref(),
+            prefix: self.destination_prefix.as_deref(),
+            create_missing_parents: self.create_missing_parents,
+        }
+    }
+
     fn rooted_destination_target(&self, path: &[u8]) -> Result<Option<RootedTarget>> {
-        let Some(root) = &self.destination_root else {
+        if self.destination_root.is_none() {
             return Ok(None);
-        };
-        let relative = RelativePath::new(path)?;
-        Ok(Some(RootedTarget {
-            root: root.clone(),
-            relative,
-            label: self.logical_destination_path(Path::new(OsStr::from_bytes(path))),
+        }
+        apply::DestinationScope {
             // The plan/apply phase owns directory creation. Regular-file
             // requests must not silently expand either a registered root or a
             // signed receiver's mutation authority.
             create_missing_parents: false,
-        }))
+            ..self.destination_scope()
+        }
+        .target(path)
+        .map(Some)
     }
 
     /// Resolve the authority a destination mutation acts under.
@@ -2970,14 +2964,10 @@ impl FsOps {
             | Request::Hello { .. }
             | Request::TcpListen { .. }
             | Request::ListDir { .. }
-            | Request::ListDirDetails { .. }
-            | Request::ListDirNoFollowFinal { .. }
             | Request::NativeMap(_)
             | Request::NativeRemove { .. }
             | Request::CheckOperatorDirectory { .. }
             | Request::CheckOperatorDirectoryAncestry { .. }
-            | Request::CheckOperatorDirectoryAncestryWithAccess { .. }
-            | Request::CheckSearchableOperatorDirectory { .. }
             | Request::PrepareDestinationPath { .. }
             | Request::RestoreDestinationPath
             | Request::RegisterSourceRoots { .. }
@@ -3014,57 +3004,16 @@ impl FsOps {
         follow_final_symlinks: bool,
     ) -> Result<Response> {
         const MAX_COMPLETION_ENTRIES: usize = 1_000;
-        if directory.contains(&0)
-            || confined_root.is_some_and(|root| root.contains(&0))
-            || prefix.contains(&0)
-            || prefix.contains(&b'/')
-        {
-            bail!("invalid completion directory or prefix");
-        }
-        check_completion_directory(directory, confined_root, symlink_policy)?;
-        let limit = usize::from(requested_limit).min(MAX_COMPLETION_ENTRIES);
-        if limit == 0 {
-            return Ok(if detailed {
-                Response::DetailedDirectoryEntries {
-                    entries: Vec::new(),
-                    details: Vec::new(),
-                    truncated: false,
-                }
-            } else {
-                Response::DirectoryEntries {
-                    entries: Vec::new(),
-                    truncated: false,
-                }
-            });
-        }
-        let mut entries = Vec::new();
-        let mut truncated = false;
-        for item in std::fs::read_dir(resolve(directory))? {
-            let item = item?;
-            let name = item.file_name().into_vec();
-            if name == b"." || name == b".." || !name.starts_with(prefix) {
-                continue;
-            }
-            if !prefix.starts_with(b".") && name.starts_with(b".") {
-                continue;
-            }
-            if entries.len() == limit {
-                truncated = true;
-                break;
-            }
-            let file_type = item.file_type()?;
-            let directory = file_type.is_dir()
-                || (file_type.is_symlink()
-                    && follow_final_symlinks
-                    && check_completion_directory(
-                        item.path().as_os_str().as_bytes(),
-                        confined_root,
-                        symlink_policy,
-                    )
-                    .is_ok());
-            entries.push(CompletionEntry { name, directory });
-        }
-        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        let (entries, truncated) = list_completion_directory(
+            directory,
+            confined_root,
+            prefix,
+            usize::from(requested_limit).min(MAX_COMPLETION_ENTRIES),
+            symlink_policy,
+            follow_final_symlinks,
+            false,
+            false,
+        )?;
         if detailed {
             let details = crate::completion_details::describe(&resolve(directory), &entries);
             Ok(Response::DetailedDirectoryEntries {
@@ -3092,6 +3041,15 @@ impl FsOps {
         Ok(Some((root.clone(), relative)))
     }
 
+    /// Close the oldest cached descriptor if the cache is full, before
+    /// another is opened for it.
+    fn make_cache_room(&mut self) {
+        if self.fds.len() >= FD_CACHE_MAX {
+            let victim = self.fd_order.remove(0);
+            self.fds.remove(&victim);
+        }
+    }
+
     fn cached(&mut self, p: &Path, attempt: u32) -> Result<&CachedFile> {
         let key = FdKey {
             location: FileLocation::Path(p.to_path_buf()),
@@ -3099,10 +3057,7 @@ impl FsOps {
             private: false,
         };
         if !self.fds.contains_key(&key) {
-            if self.fds.len() >= FD_CACHE_MAX {
-                let victim = self.fd_order.remove(0);
-                self.fds.remove(&victim);
-            }
+            self.make_cache_room();
             let f = open_existing_regular(p, false)?;
             crate::inode_metadata::prepare_read(&f, self.inode_preservation.open_noatime);
             self.fds.insert(key.clone(), CachedFile::new(f));
@@ -3119,10 +3074,7 @@ impl FsOps {
         entry: CachedFile,
     ) {
         self.uncache_location(&location);
-        if self.fds.len() >= FD_CACHE_MAX {
-            let victim = self.fd_order.remove(0);
-            self.fds.remove(&victim);
-        }
+        self.make_cache_room();
         let key = FdKey {
             location,
             attempt,
@@ -3201,10 +3153,7 @@ impl FsOps {
         if !self.fds.contains_key(&key(relative)) {
             let got = stages::get(held)?.ok_or_else(|| stages::not_held(label))?;
             if !self.fds.contains_key(&key(&got.relative)) {
-                if self.fds.len() >= FD_CACHE_MAX {
-                    let victim = self.fd_order.remove(0);
-                    self.fds.remove(&victim);
-                }
+                self.make_cache_room();
                 self.fds.insert(
                     key(&got.relative),
                     CachedFile::held(got.file, got.in_use, got.declared),
@@ -3232,10 +3181,7 @@ impl FsOps {
             private: false,
         };
         if !self.fds.contains_key(&key) {
-            if self.fds.len() >= FD_CACHE_MAX {
-                let victim = self.fd_order.remove(0);
-                self.fds.remove(&victim);
-            }
+            self.make_cache_room();
             self.fds.insert(
                 key.clone(),
                 CachedFile::new(open_registered_source(
@@ -3531,11 +3477,7 @@ impl FsOps {
                 } else {
                     Vec::new()
                 };
-            let selected = apply::selected_removals(
-                ops,
-                self.destination_root.clone(),
-                self.destination_prefix.as_deref(),
-            );
+            let selected = apply::selected_removals(ops, self.destination_scope());
             let results: Vec<Option<WireError>> = self
                 .deletions
                 .get_or_insert_with(Default::default)
@@ -3584,9 +3526,7 @@ impl FsOps {
             parallel_minimum(!short.is_empty() && self.destination_on_network_file_system(&short));
         let directories = &self.receiver_directories;
         let owned = self.owned.as_deref();
-        let destination_root = self.destination_root.clone();
-        let destination_prefix = self.destination_prefix.as_deref();
-        let create_missing_parents = self.create_missing_parents;
+        let scope = self.destination_scope();
         let lookups = self.planning_lookups.as_deref();
         let mut out: Vec<Option<WireError>> = vec![None; ops.len()];
         // A directory this request creates and then gives a group starts
@@ -3611,7 +3551,7 @@ impl FsOps {
             // receiver made, empty: recorded through the directory it was
             // made in, on the same filesystem.
             let record = |parent: &File| {
-                if let (Some(lookups), Some(root)) = (lookups, &destination_root) {
+                if let (Some(lookups), Some(root)) = (lookups, scope.root) {
                     lookups.record_empty(root, op_path(op), parent);
                 }
             };
@@ -3627,24 +3567,10 @@ impl FsOps {
             let result = match op {
                 Op::Mkdir { path, mode, .. }
                     if groups.get(path.as_slice()).is_some_and(|&group| {
-                        apply::starting_group_may_differ(
-                            path,
-                            group,
-                            &parents,
-                            destination_root.clone(),
-                            destination_prefix,
-                        )
+                        apply::starting_group_may_differ(path, group, &parents, scope)
                     }) =>
                 {
-                    apply::create_identified_directory(
-                        op,
-                        destination_root.clone(),
-                        destination_prefix,
-                        create_missing_parents,
-                        true,
-                        made,
-                    )
-                    .map(|created| {
+                    apply::create_identified_directory(op, scope, true, made).map(|created| {
                         if let Some((dev, ino, created)) = created {
                             private
                                 .lock()
@@ -3665,27 +3591,13 @@ impl FsOps {
                     if mode & 0o7777 == 0o700 || (narrow && mode & 0o700 != 0o700) =>
                 {
                     let narrowing = mode & 0o700 != 0o700;
-                    apply::create_identified_directory(
-                        op,
-                        destination_root.clone(),
-                        destination_prefix,
-                        create_missing_parents,
-                        !narrowing,
-                        made,
-                    )
-                    .map(|created| {
+                    apply::create_identified_directory(op, scope, !narrowing, made).map(|created| {
                         if let Some((dev, ino, created)) = created {
                             directories.created((dev, ino), created, narrowing);
                         }
                     })
                 }
-                _ => apply_one(
-                    op,
-                    destination_root.clone(),
-                    destination_prefix,
-                    create_missing_parents,
-                    (owned, made),
-                ),
+                _ => apply_one(op, scope, (owned, made)),
             };
             result.err().as_ref().map(wire_error)
         };
@@ -3733,25 +3645,13 @@ impl FsOps {
         let mres = parallel_map_from(minimum, &meta_idx, |&i| {
             // A receiver-chosen mode is decided here, in parallel, once the
             // request's creations are done.
-            let op = directories.resolve_op(&ops[i], destination_root.clone(), destination_prefix);
-            let result = apply_one(
-                &op,
-                destination_root.clone(),
-                destination_prefix,
-                create_missing_parents,
-                (owned, None),
-            );
+            let op = directories.resolve_op(&ops[i], scope);
+            let result = apply_one(&op, scope, (owned, None));
             // After its group change, even a refused one, as creating it
             // directly and then changing its group would have left it.
             let opened = match &ops[i] {
                 Op::SetMeta { path, .. } => private.get(path).map(|&(proposed, created)| {
-                    apply::open_created_directory(
-                        path,
-                        proposed,
-                        created,
-                        destination_root.clone(),
-                        destination_prefix,
-                    )
+                    apply::open_created_directory(path, proposed, created, scope)
                 }),
                 _ => None,
             };
@@ -4354,12 +4254,14 @@ mod completion_details_tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("alpha"), b"hello").unwrap();
         std::fs::write(root.join("alpine"), b"other").unwrap();
-        let request = |directory: &Path, limit| Request::ListDirDetails {
+        let request = |directory: &Path, limit| Request::ListDir {
             directory: directory.as_os_str().as_bytes().to_vec(),
             confined_root: Some(root.as_os_str().as_bytes().to_vec()),
             prefix: b"al".to_vec(),
             limit,
             symlink_policy: OperatorSymlinkPolicy::Refuse,
+            detailed: true,
+            follow_final_symlinks: true,
         };
         let response = FsOps::new().handle(&request(&root, 1));
         let Response::DetailedDirectoryEntries {

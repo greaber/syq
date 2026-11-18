@@ -11,37 +11,33 @@ const UPDATE_IN_PLACE: &str = "update it in place";
 
 impl FsOps {
     pub fn probe_partial(&mut self, path: &[u8], copy_id: &CopyId) -> Result<Response> {
-        if let Some(target) = self.rooted_destination_target(path)? {
-            let (_, _, metadata) = with_rooted_partial(&target, copy_id, |relative, _| {
-                target.root.metadata_optional(relative)
-            })?;
-            let partial_size = metadata
-                .filter(|metadata| is_owned_rooted_partial(*metadata))
-                .map(|metadata| metadata.len);
-            return Ok(Response::PartialSize(partial_size));
-        }
-        let p = resolve(path);
-        let pp = self.partial_path(&p, copy_id)?;
-        let partial_size = match fs::symlink_metadata(&pp) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Ok(metadata) if is_owned_partial(&metadata) => Some(metadata.len()),
-            Ok(_) => None,
-            Err(error) => return Err(error).with_context(|| format!("stat {}", pp.display())),
-        };
+        let target = self.destination_mutation_target(path)?;
+        let (_, _, metadata) = with_rooted_partial(&target, copy_id, |relative, _| {
+            target.root.metadata_optional(relative)
+        })?;
+        let partial_size = metadata
+            .filter(|metadata| is_owned_rooted_partial(*metadata))
+            .map(|metadata| metadata.len);
         Ok(Response::PartialSize(partial_size))
     }
 
+    /// Create a sidecar exclusively, read-write or for writing only.
     fn create_partial_rooted(
         &self,
         root: &Root,
         relative: &RelativePath,
         mode: u32,
+        write_only: bool,
     ) -> Result<File> {
         #[cfg(target_os = "macos")]
         if self.inode_preservation.acls {
             return root.create_private_file(relative);
         }
-        root.create_file(relative, mode)
+        if write_only {
+            root.create_write_only_file(relative, mode)
+        } else {
+            root.create_file(relative, mode)
+        }
     }
 
     /// Open or create a sidecar, read-write or for writing only, with the
@@ -172,13 +168,68 @@ impl FsOps {
         Ok(None)
     }
 
+    /// What an in-place request at `target` writes (`stages`): the file this
+    /// copy already holds for it, as on a retry or for a worker that
+    /// connected again; else, under `--in-place=update`, the existing file it
+    /// can vouch for (`open_inplace_update`); else, when it may `create`
+    /// (with the creation mode and the group publication gives), a new one
+    /// (`create_inplace_output`). `None` when it may not. When the
+    /// coordinator `compared` a file, whose hashes it reuses, that must be
+    /// the file written.
+    pub(super) fn open_inplace_output(
+        &mut self,
+        target: &RootedTarget,
+        copy_id: &CopyId,
+        update: Option<&InPlaceUpdate>,
+        compared: Option<&HeldBasis>,
+        create: Option<(u32, Option<u32>)>,
+        declared: u64,
+    ) -> Result<Option<InplaceOutput>> {
+        if let Some(held) = self.held_inplace(target, copy_id)? {
+            if let Some(compared) = compared {
+                let (compared, written) = (compared.file.metadata()?, held.file.metadata()?);
+                if (compared.dev(), compared.ino()) != (written.dev(), written.ino()) {
+                    bail!(
+                        "destination {} changed after it was compared",
+                        target.label.display()
+                    );
+                }
+            }
+            return Ok(Some(InplaceOutput::Held(held)));
+        }
+        if let Some(update) = update {
+            if let Some((file, in_use)) =
+                self.open_inplace_update(target, copy_id, update, compared, declared)?
+            {
+                return Ok(Some(InplaceOutput::Updated(file, in_use)));
+            }
+            if update.only.is_some() {
+                return Err(condition_not_met(format!(
+                    "destination {} is gone, and nothing is created there (--only-existing)",
+                    target.label.display()
+                )));
+            }
+        }
+        if compared.is_some() {
+            // Its blocks would be skipped in a file that lacks them.
+            bail!(
+                "destination {} was compared, but this copy does not hold it",
+                target.label.display()
+            );
+        }
+        let Some((mode, group)) = create else {
+            return Ok(None);
+        };
+        self.create_inplace_output(target, copy_id, mode, group, declared)
+            .map(Some)
+    }
+
     /// Create what an in-place request at `target` writes, and hold it for
     /// the request's file (`stages`): a new file at the target's name,
     /// created exclusively in `mode`, or, when the name already holds a
     /// file, a new stage beside it. syq writes contents only into files it
     /// created, so an existing file is replaced as any changed file is: the
-    /// stage is published over it when the file is finalized. Returns the
-    /// file, its metadata read at creation, and whether it is a stage.
+    /// stage is published over it when the file is finalized.
     fn create_inplace_output(
         &mut self,
         target: &RootedTarget,
@@ -186,7 +237,7 @@ impl FsOps {
         mode: u32,
         group: Option<u32>,
         declared: u64,
-    ) -> Result<(File, fs::Metadata, Arc<()>, bool)> {
+    ) -> Result<InplaceOutput> {
         let held_for = stages::of(self.stage_scope, target, copy_id, true);
         match self.create_inplace_file(
             &target.root,
@@ -200,11 +251,15 @@ impl FsOps {
                     held_for,
                     &target.relative,
                     &file,
-                    Some(created.clone()),
+                    Some(created),
                     true,
                     declared,
                 )?;
-                return Ok((file, created, in_use, false));
+                return Ok(InplaceOutput::Created {
+                    file,
+                    in_use,
+                    stage: None,
+                });
             }
             Err(error) if !error_is_kind(&error, io::ErrorKind::AlreadyExists) => {
                 return Err(error);
@@ -212,29 +267,20 @@ impl FsOps {
             Err(_) => {}
         }
         // The stage is private until finalize gives it its final mode.
-        let creation = sidecars::begin()?;
-        let (relative, _, (file, created)) =
-            with_rooted_partial(target, copy_id, |relative, label| {
-                self.uncache_rooted(&target.root, relative);
-                create_fresh_rooted_partial(&target.root, relative, label, || {
-                    self.create_partial_rooted(&target.root, relative, PRIVATE_PARTIAL_MODE)
-                })
-            })?;
-        creation.register(
-            &target.root,
-            &relative,
-            identity_of(&created),
-            Sidecar::Partial,
-        );
+        let stage = self.open_stage(target, copy_id, StagePolicy::new(Sidecar::Partial))?;
         let in_use = stages::hold(
             held_for,
-            &relative,
-            &file,
-            Some(created.clone()),
+            &stage.relative,
+            &stage.file,
+            Some(stage.metadata()?),
             true,
             declared,
         )?;
-        Ok((file, created, in_use, true))
+        Ok(InplaceOutput::Created {
+            file: stage.file,
+            in_use,
+            stage: Some(stage.relative),
+        })
     }
 
     /// For `--in-place=update`: open the existing regular file at `target`
@@ -389,66 +435,199 @@ impl FsOps {
         Ok(true)
     }
 
-    /// The sidecar at `relative` for `copy_id`: the one this receiver holds
-    /// there, to resume, or else, when `create_if_missing`, a new one created
-    /// exclusively in `create_mode` after removing whatever the name holds.
-    /// A sidecar this receiver does not hold is never written: whoever could
-    /// rename a file into its place could have chosen it, and a chmod does
-    /// not stop someone who opened it while its mode was wider. A held one
-    /// whose group or other bits exceed `widest`, the mode this attempt would
-    /// create it in, is replaced instead. `None` leaves that check to the
-    /// Prepare that came first in the attempt.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn open_private_partial_rooted(
+    /// The sidecar this receiver holds at `relative` for its target, to
+    /// resume, with its length. A sidecar this receiver does not hold is
+    /// never written: whoever could rename a file into its place could have
+    /// chosen it, and a chmod does not stop someone who opened it while its
+    /// mode was wider. A held one whose group or other bits exceed `widest`,
+    /// the mode this attempt would create it in, is removed instead, and one
+    /// someone renamed away is let go. `None` for `widest` leaves that check
+    /// to the Prepare that came first in the attempt.
+    pub(super) fn reuse_held_stage(
         &mut self,
         held: stages::For<'_>,
         relative: &RelativePath,
         label: &Path,
-        create_if_missing: bool,
-        create_mode: u32,
         widest: Option<u32>,
-    ) -> Result<Option<(File, OpenedPartial)>> {
+    ) -> Result<HeldStage> {
         let root = held.root;
         self.uncache_rooted(root, relative);
-        if let Some(file) = stages::get(held)?
+        let Some(file) = stages::get(held)?
             .filter(|got| &got.relative == relative)
             .map(|got| got.file)
+        else {
+            return Ok(HeldStage::NotHeld);
+        };
+        let opened = file.metadata()?;
+        // A held sidecar someone has renamed away is let go: what its name
+        // holds now is replaced, and the held one is never published.
+        let named = root.metadata_optional(relative)?;
+        if named.is_none_or(|named| (named.dev, named.ino) != (opened.dev(), opened.ino())) {
+            stages::take(held);
+        } else if !self.reusable_partial_permissions(&file)?
+            || self.wider_than(opened.mode(), opened.dev(), widest)
         {
-            let opened = file.metadata()?;
-            // A held sidecar someone has renamed away is let go: what its
-            // name holds now is replaced below, and the held one is never
-            // published.
-            let named = root.metadata_optional(relative)?;
-            if named.is_none_or(|named| (named.dev, named.ino) != (opened.dev(), opened.ino())) {
-                stages::take(held);
-            } else if !self.reusable_partial_permissions(&file)?
-                || self.wider_than(opened.mode(), opened.dev(), widest)
-            {
-                stages::take(held);
-                drop(file);
-                discard_safe_rooted_partial_if_same(
-                    root,
-                    relative,
-                    opened.dev(),
-                    opened.ino(),
-                    label,
-                )?;
-            } else {
-                return Ok(Some((file, OpenedPartial::Reused(opened.len()))));
+            stages::take(held);
+            drop(file);
+            discard_safe_rooted_partial_if_same(root, relative, opened.dev(), opened.ino(), label)?;
+        } else {
+            return Ok(HeldStage::Reused(file, opened.len()));
+        }
+        Ok(HeldStage::LetGo)
+    }
+
+    /// The stage (sidecar) of `target` for `copy_id`, beside it under its
+    /// partial name, obtained as `policy` says: the one this receiver holds
+    /// there when the policy resumes, or else a new one, removing whatever
+    /// the name holds. A held stage it does not resume is replaced
+    /// exclusively and owner-only (`StagePolicy::new`), whatever else the
+    /// policy allows. A stage this creates is registered, so that an
+    /// interrupted receiver removes it (`sidecars`).
+    pub(super) fn open_stage(
+        &mut self,
+        target: &RootedTarget,
+        copy_id: &CopyId,
+        policy: StagePolicy,
+    ) -> Result<Stage> {
+        self.open_stage_with(target, copy_id, policy, |_| ())
+            .map(|(stage, ())| stage)
+    }
+
+    /// `open_stage`, calling `inspect` with the stage's name before
+    /// anything is opened or created there.
+    pub(super) fn open_stage_with<T>(
+        &mut self,
+        target: &RootedTarget,
+        copy_id: &CopyId,
+        policy: StagePolicy,
+        mut inspect: impl FnMut(&RelativePath) -> T,
+    ) -> Result<(Stage, T)> {
+        let creation = sidecars::begin()?;
+        let (relative, label, (file, opened, inspected)) =
+            with_rooted_partial(target, copy_id, |relative, label| {
+                let inspected = inspect(relative);
+                let mut create = policy;
+                if let Some(widest) = policy.resume {
+                    let held = stages::of(self.stage_scope, target, copy_id, false);
+                    match self.reuse_held_stage(held, relative, label, widest)? {
+                        HeldStage::Reused(file, len) => {
+                            return Ok((file, OpenedPartial::Reused(len), inspected));
+                        }
+                        HeldStage::LetGo => create = StagePolicy::new(policy.kind),
+                        HeldStage::NotHeld => {}
+                    }
+                } else {
+                    self.uncache_rooted(&target.root, relative);
+                }
+                let (file, created) =
+                    self.create_stage_file(&target.root, relative, label, create)?;
+                Ok((file, OpenedPartial::Created(created), inspected))
+            })?;
+        if let Some(identity) = opened.identity() {
+            creation.register(&target.root, &relative, identity, policy.kind);
+        }
+        Ok((
+            Stage {
+                relative,
+                label,
+                file,
+                opened,
+            },
+            inspected,
+        ))
+    }
+
+    /// The stage of a descriptor copy's destination `target` below `root`,
+    /// under a partial name of a copy of its own: a new file, created
+    /// exclusively and owner-only, and registered, as any stage is, with
+    /// its metadata read as it was created.
+    pub(crate) fn open_descriptor_stage(
+        &mut self,
+        root: &Arc<Root>,
+        target: &RelativePath,
+    ) -> Result<(RelativePath, File, fs::Metadata)> {
+        let mut copy_id = CopyId::default();
+        getrandom::fill(&mut copy_id).context("generate a descriptor copy's identity")?;
+        let target = RootedTarget {
+            root: Arc::clone(root),
+            relative: target.clone(),
+            label: target.to_path_buf(),
+            create_missing_parents: false,
+        };
+        let stage = self.open_stage(&target, &copy_id, StagePolicy::new(Sidecar::Stage))?;
+        let created = stage.metadata()?;
+        Ok((stage.relative, stage.file, created))
+    }
+
+    /// Create a new stage at `relative` as `policy` says, with its metadata
+    /// read as it was created.
+    pub(super) fn create_stage_file(
+        &mut self,
+        root: &Root,
+        relative: &RelativePath,
+        label: &Path,
+        policy: StagePolicy,
+    ) -> Result<(File, fs::Metadata)> {
+        let StagePolicy {
+            mode, write_only, ..
+        } = policy;
+        let as_asked = |created: &fs::Metadata| {
+            is_fresh_partial(created, mode)
+                && (!policy.keeps_owner_access || created.mode() & 0o600 == 0o600)
+        };
+        // Where the root's filesystem's link counts can be trusted
+        // (`Profile::link_counts_trusted`), a stage that will hold only new
+        // contents is opened without exclusive creation, which costs an NFS
+        // client a further request. Whatever the name held is opened too:
+        // a new empty file of ours, on a filesystem whose counts are trusted
+        // (judged through the file: another can be mounted below the root),
+        // is used as created; a count of one shows that no other name leads
+        // to it. Anything else, or an open the kernel refused, is replaced
+        // by an exclusive creation, as everywhere else.
+        if policy.new_contents_only
+            && root.link_counts_trusted()
+            && !creates_foreign_owners(root.identity().dev)
+        {
+            match self.open_or_create_partial(root, relative, mode, write_only) {
+                Ok((file, created))
+                    if as_asked(&created) && root.link_counts_trusted_on(created.dev(), &file) =>
+                {
+                    return Ok((file, created));
+                }
+                Ok(_) => {}
+                Err(error) if existing_leaf_refused(&error) => {}
+                Err(error) => return Err(error),
             }
         }
-        if !create_if_missing {
-            return Ok(None);
+        let create = |mode| {
+            create_fresh_rooted_partial(root, relative, label, || {
+                self.create_partial_rooted(root, relative, mode, write_only)
+            })
+        };
+        let (mut file, mut created) = create(mode)?;
+        let mut mode = mode;
+        if policy.keeps_owner_access && mode != PRIVATE_PARTIAL_MODE && !as_asked(&created) {
+            // A umask or default ACL took owner access away, or the
+            // filesystem made it wider than asked or another owner's: it is
+            // created owner-only instead.
+            mode = PRIVATE_PARTIAL_MODE;
+            (file, created) = create(mode)?;
         }
-        let (file, created) = create_fresh_rooted_partial(root, relative, label, || {
-            self.create_partial_rooted(root, relative, create_mode)
-        })?;
-        self.note_created_mode(&file, &created, create_mode);
-        Ok(Some((file, OpenedPartial::Created(created))))
+        #[cfg(test)]
+        if let Some(wider) = WIDEN_NEW_STAGES.get() {
+            file.set_permissions(fs::Permissions::from_mode(wider))?;
+            created = file.metadata()?;
+        }
+        // Publication decides its chmod from this metadata, so it must show
+        // what a probe left.
+        if let Some(probed) = self.note_created_mode(&file, &created, mode) {
+            created = probed;
+        }
+        Ok((file, created))
     }
 
     /// Remove this copy's sidecar when its group or other bits exceed
-    /// `widest`, as `open_private_partial_rooted` replaces such a sidecar.
+    /// `widest`, as `reuse_held_stage` replaces such a sidecar.
     fn discard_wider_partial(
         &mut self,
         target: &RootedTarget,
@@ -651,80 +830,53 @@ impl FsOps {
             // restricted receiver counts it (`charge_request`), and reports
             // that it found nothing to resume.
             let looks_only = !create_if_missing && update.is_none();
-            // A retry, or a worker that connected again, writes the file
-            // this copy already holds.
-            if let Some(held) = self.held_inplace(&target, copy_id)? {
-                if let Some(compared) = compared {
-                    let (compared, written) = (compared.file.metadata()?, held.file.metadata()?);
-                    if (compared.dev(), compared.ino()) != (written.dev(), written.ino()) {
-                        bail!(
-                            "destination {} changed after it was compared",
-                            target.label.display()
-                        );
+            let output = self.open_inplace_output(
+                &target,
+                copy_id,
+                update,
+                compared.as_ref(),
+                create_if_missing.then_some((mode, group)),
+                size,
+            )?;
+            let (file, in_use) = match output {
+                None => return Ok(Preparation::default()),
+                Some(InplaceOutput::Held(held)) => {
+                    if looks_only {
+                        return Ok(Preparation::default());
                     }
+                    self.set_copy_length(&held.file, size).with_context(|| {
+                        format!("resize confined file {}", target.label.display())
+                    })?;
+                    stages::declare(stages::of(self.stage_scope, &target, copy_id, true), size);
+                    (held.file, held.in_use)
                 }
-                if looks_only {
-                    return Ok(Preparation::default());
-                }
-                self.set_copy_length(&held.file, size)
-                    .with_context(|| format!("resize confined file {}", target.label.display()))?;
-                stages::declare(stages::of(self.stage_scope, &target, copy_id, true), size);
-                self.cache_entry(
-                    target.location(),
-                    attempt,
-                    false,
-                    CachedFile::held(held.file, held.in_use, size),
-                );
-                return Ok(Preparation::default());
-            }
-            // `--in-place=update` writes an existing file it can vouch for
-            // where it is.
-            if let Some(update) = update {
-                if let Some((file, in_use)) =
-                    self.open_inplace_update(&target, copy_id, update, compared.as_ref(), size)?
-                {
+                Some(InplaceOutput::Updated(file, in_use)) => {
                     self.set_copy_length(&file, size).with_context(|| {
                         format!("resize confined file {}", target.label.display())
                     })?;
-                    self.cache_entry(
-                        target.location(),
-                        attempt,
-                        false,
-                        CachedFile::held(file, in_use, size),
-                    );
-                    return Ok(Preparation::default());
+                    (file, in_use)
                 }
-                if update.only.is_some() {
-                    return Err(condition_not_met(format!(
-                        "destination {} is gone, and nothing is created there (--only-existing)",
-                        target.label.display()
-                    )));
+                Some(InplaceOutput::Created {
+                    file,
+                    in_use,
+                    stage,
+                }) => {
+                    if stage.is_some() {
+                        self.preallocate_new_partial(&file, size)?;
+                    } else {
+                        self.set_copy_length(&file, size).with_context(|| {
+                            format!("resize confined file {}", target.label.display())
+                        })?;
+                        #[cfg(debug_assertions)]
+                        test_race_barrier(
+                            "SYQ_TEST_INPLACE_CREATED_READY_FILE",
+                            "SYQ_TEST_INPLACE_CREATED_CONTINUE_FILE",
+                            "in-place file created",
+                        )?;
+                    }
+                    (file, in_use)
                 }
-            }
-            if compared.is_some() {
-                // Its blocks would be skipped in a file that lacks them.
-                bail!(
-                    "destination {} was compared, but this copy does not hold it",
-                    target.label.display()
-                );
-            }
-            if !create_if_missing {
-                return Ok(Preparation::default());
-            }
-            let (file, _, in_use, staged) =
-                self.create_inplace_output(&target, copy_id, mode, group, size)?;
-            if staged {
-                self.preallocate_new_partial(&file, size)?;
-            } else {
-                self.set_copy_length(&file, size)
-                    .with_context(|| format!("resize confined file {}", target.label.display()))?;
-                #[cfg(debug_assertions)]
-                test_race_barrier(
-                    "SYQ_TEST_INPLACE_CREATED_READY_FILE",
-                    "SYQ_TEST_INPLACE_CREATED_CONTINUE_FILE",
-                    "in-place file created",
-                )?;
-            }
+            };
             self.cache_entry(
                 target.location(),
                 attempt,
@@ -733,91 +885,58 @@ impl FsOps {
             );
             return Ok(Preparation::default());
         }
-        // A partial this creates is registered, so that an interrupted
-        // receiver removes it when it is too short to be worth resuming.
-        let creation = create_if_missing.then(sidecars::begin).transpose()?;
-        let (relative, _label, opened) =
-            with_rooted_partial(&target, copy_id, |relative, label| {
-                if create_if_missing
-                    && !stages::holds(
-                        stages::of(self.stage_scope, &target, copy_id, false),
-                        relative,
-                    )
-                {
-                    // A new sidecar is created in its staged mode after
-                    // removing whatever the name held: only a file this
-                    // receiver created is written. Its metadata, read at
-                    // once, serves publication. It is opened read-write, so
-                    // that a resume, a comparison or a retry reads it
-                    // through the descriptor too, and keeps owner access
-                    // until publication sets the final mode, as an in-place
-                    // file does; that chmod is paid only by files whose
-                    // final mode lacks it. Where the root's filesystem's
-                    // link counts can be trusted
-                    // (`Profile::link_counts_trusted`), it is opened without
-                    // exclusive creation, which costs an NFS client a
-                    // SETATTR, and used only when the open landed on a new
-                    // empty file of ours on a filesystem whose counts are
-                    // trusted too, judged through the file itself, since
-                    // another filesystem can be mounted below the root: a
-                    // count of one shows that no other name leads to it.
-                    // Elsewhere it is created exclusively.
-                    let staged = mode | 0o600;
-                    self.uncache_rooted(&target.root, relative);
-                    let fresh = |created: &fs::Metadata| {
-                        is_fresh_partial(created, staged) && created.mode() & 0o600 == 0o600
-                    };
-                    if target.root.link_counts_trusted()
-                        && !creates_foreign_owners(target.root.identity().dev)
-                    {
-                        match self.open_or_create_partial(&target.root, relative, staged, false) {
-                            Ok((file, created))
-                                if fresh(&created)
-                                    && target.root.link_counts_trusted_on(created.dev(), &file) =>
-                            {
-                                return Ok(Some((file, None, Some(created), None)));
-                            }
-                            Ok(_) => {}
-                            Err(error) if existing_leaf_refused(&error) => {}
-                            Err(error) => return Err(error),
-                        }
-                    }
-                    let (file, created) =
-                        create_fresh_rooted_partial(&target.root, relative, label, || {
-                            self.create_partial_rooted(&target.root, relative, staged)
-                        })?;
-                    if fresh(&created) {
-                        return Ok(Some((file, None, Some(created), None)));
-                    }
-                    // A umask or default ACL took owner access away, or the
-                    // filesystem made it wider than asked or another owner's:
-                    // create it owner-only instead, below, which checks the
-                    // device's modes.
-                }
-                self.open_private_partial_rooted(
+        // A new sidecar is created in its staged mode after removing
+        // whatever the name held: only a file this receiver created is
+        // written. Its metadata, read at once, serves publication. It is
+        // opened read-write, so that a resume, a comparison or a retry reads
+        // it through the descriptor too, and keeps owner access until
+        // publication sets the final mode, as an in-place file does; that
+        // chmod is paid only by files whose final mode lacks it. It holds
+        // only what the copy sends; one that seeding fills with other bytes
+        // is created again (`seed_basis_impl`). It is registered, so that an
+        // interrupted receiver removes it when it is too short to be worth
+        // resuming.
+        let staged = mode | 0o600;
+        let opened = if create_if_missing {
+            let stage = self.open_stage(
+                &target,
+                copy_id,
+                StagePolicy::new(Sidecar::Partial)
+                    .mode(staged)
+                    .keeps_owner_access()
+                    .new_contents_only()
+                    .resume(Some(staged)),
+            )?;
+            let created = match &stage.opened {
+                OpenedPartial::Created(created) => Some(created.clone()),
+                OpenedPartial::Reused(_) => None,
+            };
+            Some((
+                stage.relative,
+                stage.file,
+                stage.opened.basis_size(),
+                created,
+            ))
+        } else {
+            let (relative, _, held) = with_rooted_partial(&target, copy_id, |relative, label| {
+                self.reuse_held_stage(
                     stages::of(self.stage_scope, &target, copy_id, false),
                     relative,
                     label,
-                    create_if_missing,
-                    PRIVATE_PARTIAL_MODE,
-                    Some(mode | 0o600),
+                    Some(staged),
                 )
-                .map(|opened| {
-                    opened
-                        .map(|(file, opened)| (file, opened.basis_size(), None, opened.identity()))
-                })
             })?;
-        let Some((file, basis_size, created, identity)) = opened else {
+            match held {
+                HeldStage::Reused(file, len) => Some((relative, file, Some(len), None)),
+                HeldStage::LetGo | HeldStage::NotHeld => None,
+            }
+        };
+        let Some((relative, file, basis_size, created)) = opened else {
             return Ok(Preparation {
                 partial_size: None,
                 has_candidates: !self.candidate_partials(&target).is_empty(),
             });
         };
-        if let (Some(creation), Some(identity)) =
-            (creation, identity.or(created.as_ref().map(identity_of)))
-        {
-            creation.register(&target.root, &relative, identity, Sidecar::Partial);
-        }
         if let Some(old_size) = basis_size {
             if old_size > size {
                 self.set_copy_length(&file, size)?;
@@ -887,11 +1006,8 @@ impl FsOps {
             block > 0 && off.is_multiple_of(block) && off.checked_add(len).is_some(),
             "invalid hash interval"
         );
-        let rooted = self.rooted_destination_target(path)?;
-        let location = rooted
-            .as_ref()
-            .map(|target| target.location())
-            .unwrap_or_else(|| FileLocation::Path(resolve(path)));
+        let target = self.destination_mutation_target(path)?;
+        let location = target.location();
         let (mut file, location, label, mut update_check) = if off > 0 {
             let held = self
                 .held_basis
@@ -902,18 +1018,13 @@ impl FsOps {
                 "retained comparison basis does not match requested file"
             );
             (held.file, held.location, held.label, held.update_check)
-        } else if let Some(target) = &rooted {
+        } else {
             (
                 target.root.open_regular_read(&target.relative)?,
                 target.location(),
                 target.label.clone(),
                 None,
             )
-        } else {
-            let p = resolve(path);
-            open_existing_regular(&p, false)
-                .with_context(|| format!("open {} as repair basis", p.display()))
-                .map(|file| (file, FileLocation::Path(p.clone()), p, None))?
         };
         require_open_target(&file, &label, condition)?;
         // `--in-place=update`: the sender learns with the hashes whether the
@@ -921,15 +1032,15 @@ impl FsOps {
         // file through its metadata, and replaces a differing one it may not
         // update from this held file. A preparation to update it then reuses
         // the answer.
-        if let (Some(update), Some(target), 0) = (update, &rooted, off) {
+        if let (Some(update), 0) = (update, off) {
             let current = file.metadata()?;
             let refused = vouch::update_refusal(
-                target.into(),
+                (&target).into(),
                 &file,
                 &current,
                 &update.meta,
                 update.flags,
-                || self.inherited_acl(target),
+                || self.inherited_acl(&target),
             )?;
             update_check = Some(UpdateCheck::new(refused, &current));
         }
@@ -1041,9 +1152,22 @@ impl FsOps {
             // left: the complete file there remains the winner, and the old
             // one needs nothing.
             if current.nlink() > 0 {
-                vouch::require(&target, &held.file, &current, meta, flags)?;
-                set_meta_file_known(&held.file, meta, flags, &current)
-                    .with_context(|| format!("set metadata on basis {}", held.label.display()))?;
+                // `Any` may finish through the retained inode after a
+                // concurrent publication.
+                let keeping = keep::Keeping {
+                    handle: keep::Handle::Open,
+                    recheck_any: false,
+                    setting: Some("set metadata on basis"),
+                };
+                return keep::keep_existing(
+                    (&target).into(),
+                    &held.file,
+                    &current,
+                    (meta, flags),
+                    condition,
+                    keeping,
+                )?
+                .required();
             }
         }
         // `Any` may finish through the retained inode after a concurrent
@@ -1132,38 +1256,30 @@ impl FsOps {
         }
         #[cfg(not(target_os = "macos"))]
         let _ = clone_final;
-        let creation = sidecars::begin()?;
-        let (relative, label, (opened, own_donor)) =
-            with_rooted_partial(&target, copy_id, |relative, label| {
+        let scope = self.stage_scope;
+        // Prepare has replaced an earlier attempt's sidecar that is wider
+        // than this attempt's staged mode, which is not sent here. One that
+        // is not is resumed as it is.
+        let (stage, own_donor) = self.open_stage_with(
+            &target,
+            copy_id,
+            StagePolicy::new(Sidecar::Partial).resume(None),
+            |relative| {
                 // A sidecar of this copy that this receiver does not hold,
                 // as one a receiver that has since ended left, is only a
                 // donor: it is opened for reading before the new sidecar
                 // replaces it at the name.
-                let own_donor = (!stages::holds(
-                    stages::of(self.stage_scope, &target, copy_id, false),
-                    relative,
-                ))
-                .then(|| target.root.open_regular_read(relative).ok())
-                .flatten()
-                .filter(|file| {
-                    file.metadata()
-                        .is_ok_and(|m| is_owned_partial(&m) && m.len() > 0)
-                });
-                // Prepare has replaced an earlier attempt's sidecar that is
-                // wider than this attempt's staged mode, which is not sent
-                // here. One that is not is resumed as it is.
-                self.open_private_partial_rooted(
-                    stages::of(self.stage_scope, &target, copy_id, false),
-                    relative,
-                    label,
-                    true,
-                    PRIVATE_PARTIAL_MODE,
-                    None,
-                )
-                .map(|opened| (opened, own_donor))
-            })?;
-        let (output, opened) = opened.context("sidecar creation was requested")?;
-        let (basis_size, created) = (opened.basis_size(), opened.identity());
+                (!stages::holds(stages::of(scope, &target, copy_id, false), relative))
+                    .then(|| target.root.open_regular_read(relative).ok())
+                    .flatten()
+                    .filter(|file| {
+                        file.metadata()
+                            .is_ok_and(|m| is_owned_partial(&m) && m.len() > 0)
+                    })
+            },
+        )?;
+        let basis_size = stage.opened.basis_size();
+        let (relative, label, output) = (stage.relative, stage.label, stage.file);
         let location = FileLocation::Rooted {
             root: target.root.identity(),
             relative: relative.clone(),
@@ -1235,29 +1351,21 @@ impl FsOps {
         // wider, as when an earlier attempt created it in the final mode.
         let (output, basis_size) = if input.is_some() && basis_size.is_some() {
             drop(output);
-            self.uncache_rooted(&target.root, &relative);
-            let (output, created) =
-                create_fresh_rooted_partial(&target.root, &relative, &label, || {
-                    self.create_partial_rooted(&target.root, &relative, PRIVATE_PARTIAL_MODE)
-                })?;
-            creation.register(
-                &target.root,
-                &relative,
-                identity_of(&created),
-                Sidecar::Partial,
+            let stage = self.open_stage(&target, copy_id, StagePolicy::new(Sidecar::Partial))?;
+            anyhow::ensure!(
+                stage.relative == relative,
+                "partial {} changed its name while creating it",
+                label.display()
             );
             // The new sidecar takes the directory's entries as they are now.
-            let access = SeedAccess::new(&output);
+            let access = SeedAccess::new(&stage.file);
             if seeds_other_bytes && !input.as_ref().is_some_and(|donor| access.admits(donor)) {
                 input = None;
                 selected_final = None;
                 final_donor = false;
             }
-            (output, None)
+            (stage.file, None)
         } else {
-            if let Some(identity) = created {
-                creation.register(&target.root, &relative, identity, Sidecar::Partial);
-            }
             (output, basis_size)
         };
         if stage_only {
@@ -1682,50 +1790,29 @@ impl FsOps {
         let mut created_inplace = true;
         let d = if inplace {
             // A retry writes the file this copy already holds, and
-            // `--in-place=update` an existing one it can vouch for.
-            let held = self.held_inplace(&target, copy_id)?;
-            let updated = match (&held, update) {
-                (None, Some(update)) => {
-                    let opened = self.open_inplace_update(&target, copy_id, update, None, size)?;
-                    if opened.is_none() && update.only.is_some() {
-                        return Err(condition_not_met(format!(
-                            "destination {} is gone, and nothing is created there (--only-existing)",
-                            target.label.display()
-                        )));
-                    }
-                    opened
-                }
-                _ => None,
-            };
-            let (file, fresh) = match (held, updated) {
-                (Some(held), _) => {
-                    // A stage, when the name held another file.
-                    if held.relative != target.relative {
-                        target_label = stages::label(&target, &held.relative);
-                        target_relative = held.relative;
-                    }
+            // `--in-place=update` an existing one it can vouch for. The
+            // coordinator sends the in-place creation mode
+            // (`inplace_creation_mode`).
+            let output = self
+                .open_inplace_output(&target, copy_id, update, None, Some((mode, group)), size)?
+                .context("in-place creation was requested")?;
+            let (file, fresh, stage) = match output {
+                InplaceOutput::Held(held) => {
                     created_inplace = held.created;
-                    (held.file, false)
+                    // A stage, when the name held another file.
+                    let stage = (held.relative != target.relative).then_some(held.relative);
+                    (held.file, false, stage)
                 }
-                (None, Some((file, _))) => {
+                InplaceOutput::Updated(file, _) => {
                     created_inplace = false;
-                    (file, false)
+                    (file, false, None)
                 }
-                (None, None) => {
-                    // The coordinator sends the in-place creation mode
-                    // (`inplace_creation_mode`).
-                    let (file, _, _, staged) =
-                        self.create_inplace_output(&target, copy_id, mode, group, size)?;
-                    if staged {
-                        let held =
-                            stages::get(stages::of(self.stage_scope, &target, copy_id, true))?
-                                .ok_or_else(|| stages::not_held(&target.label))?;
-                        target_label = stages::label(&target, &held.relative);
-                        target_relative = held.relative;
-                    }
-                    (file, true)
-                }
+                InplaceOutput::Created { file, stage, .. } => (file, true, stage),
             };
+            if let Some(stage) = stage {
+                target_label = stages::label(&target, &stage);
+                target_relative = stage;
+            }
             if !fresh {
                 let metadata = file.metadata()?;
                 if metadata.dev() == source_metadata.dev()
@@ -1751,32 +1838,21 @@ impl FsOps {
             }
             file
         } else {
-            let creation = sidecars::begin()?;
-            let (relative, label, opened) =
-                with_rooted_partial(&target, copy_id, |relative, label| {
-                    self.open_private_partial_rooted(
-                        stages::of(self.stage_scope, &target, copy_id, false),
-                        relative,
-                        label,
-                        true,
-                        PRIVATE_PARTIAL_MODE,
-                        Some(PRIVATE_PARTIAL_MODE),
-                    )
-                })?;
-            target_relative = relative;
-            target_label = label;
-            let (d, opened) = opened.context("sidecar creation was requested")?;
             // A later copy on this machine copies the file whole again,
             // into a partial of its own, so this one is never resumed:
             // an interrupted copy removes it whatever its length.
-            if let Some(identity) = opened.identity() {
-                creation.register(
-                    &destination_root,
-                    &target_relative,
-                    identity,
-                    Sidecar::Stage,
-                );
-            }
+            let Stage {
+                relative,
+                label,
+                file: d,
+                opened,
+            } = self.open_stage(
+                &target,
+                copy_id,
+                StagePolicy::new(Sidecar::Stage).resume(Some(PRIVATE_PARTIAL_MODE)),
+            )?;
+            target_relative = relative;
+            target_label = label;
             if opened.basis_size().is_some() {
                 if !replace_partial {
                     // Preserve resumable data unless the coordinator chose
@@ -1789,10 +1865,6 @@ impl FsOps {
             d
         };
         let mut userspace_fallback = copy_pair_unsupported && use_userspace_fallback;
-        if copy_pair_unsupported && !use_userspace_fallback {
-            // Only an in-place copy reaches this point; it has no sidecar.
-            return Ok(CopyLocalOutcome::Unsupported);
-        }
         #[cfg(debug_assertions)]
         if std::env::var_os("SYQ_TEST_COPY_LOCAL_EXDEV").is_some() {
             unsupported_copy_pairs().lock().unwrap().insert(copy_pair);
@@ -2523,25 +2595,17 @@ impl FsOps {
                 self.hash_policy.algorithm,
             );
         }
+        // A sidecar is only ever read beneath a destination root.
+        if which == Which::Partial {
+            bail!("{UNROOTED_MUTATION}");
+        }
         let p = resolve(target.path);
-        let p = if which == Which::Partial {
-            self.partial_path(&p, copy_id)?
-        } else {
-            p
-        };
         let mut f = self
-            .cached_clone(
-                FileLocation::Path(p.clone()),
-                attempt,
-                which == Which::Partial,
-            )?
+            .cached_clone(FileLocation::Path(p.clone()), attempt, false)?
             .map(Ok)
             .unwrap_or_else(|| open_existing_regular(&p, false))?;
         crate::inode_metadata::prepare_read(&f, self.inode_preservation.open_noatime);
         f.seek(SeekFrom::Start(off))?;
-        if which == Which::Partial {
-            require_safe_partial(&f, &p)?;
-        }
         hash_reader_observed(
             &mut f,
             block,
@@ -2932,11 +2996,8 @@ impl FsOps {
         path: &[u8],
         expected: &crate::hashing::ExpectedHashes,
     ) -> Result<()> {
-        let file = if let Some(target) = self.rooted_destination_target(path)? {
-            target.root.open_regular_read(&target.relative)?
-        } else {
-            open_existing_regular(&resolve(path), false)?
-        };
+        let target = self.destination_mutation_target(path)?;
+        let file = target.root.open_regular_read(&target.relative)?;
         Self::verify_expected_file(&file, expected)
     }
 
@@ -3368,11 +3429,17 @@ impl FsOps {
                         "descriptor copies require a separate unrestricted control session"
                     ))
                 } else {
-                    crate::descriptor_copy::Session::handle(
-                        &mut self.descriptor_copy,
+                    // The session creates its stages through this one.
+                    let mut session = std::mem::take(&mut self.descriptor_copy);
+                    let descriptors = self.descriptor_session.clone();
+                    let handled = crate::descriptor_copy::Session::handle(
+                        &mut session,
                         operation,
-                        &self.descriptor_session,
-                    )
+                        &descriptors,
+                        self,
+                    );
+                    self.descriptor_copy = session;
+                    handled
                 }
             }
             Request::ConfigurePreservation {
@@ -3414,37 +3481,8 @@ impl FsOps {
                 prefix,
                 limit,
                 symlink_policy,
-            } => Self::completion_entries(
-                directory,
-                confined_root.as_deref(),
-                prefix,
-                *limit,
-                *symlink_policy,
-                false,
-                true,
-            ),
-            Request::ListDirDetails {
-                directory,
-                confined_root,
-                prefix,
-                limit,
-                symlink_policy,
-            } => Self::completion_entries(
-                directory,
-                confined_root.as_deref(),
-                prefix,
-                *limit,
-                *symlink_policy,
-                true,
-                true,
-            ),
-            Request::ListDirNoFollowFinal {
-                directory,
-                confined_root,
-                prefix,
-                limit,
-                symlink_policy,
                 detailed,
+                follow_final_symlinks,
             } => Self::completion_entries(
                 directory,
                 confined_root.as_deref(),
@@ -3452,7 +3490,7 @@ impl FsOps {
                 *limit,
                 *symlink_policy,
                 *detailed,
-                false,
+                *follow_final_symlinks,
             ),
             Request::StatMany {
                 paths,
@@ -3465,23 +3503,17 @@ impl FsOps {
                 path,
                 allow_missing,
                 symlink_policy,
+                require_search,
             } => self
-                .check_operator_directory(path, *allow_missing, *symlink_policy)
-                .with_context(|| format!("resolve operator directory {}", resolve(path).display()))
-                .map(Response::DirectorySelection),
-            Request::CheckSearchableOperatorDirectory {
-                path,
-                allow_missing,
-                symlink_policy,
-            } => self
-                .check_searchable_operator_directory(path, *allow_missing, *symlink_policy)
+                .check_operator_directory(path, *allow_missing, *symlink_policy, *require_search)
                 .with_context(|| format!("resolve operator directory {}", resolve(path).display()))
                 .map(Response::DirectorySelection),
             Request::CheckOperatorDirectoryAncestry {
                 checks,
                 shared_suffixes,
+                access,
             } => self
-                .check_operator_directory_ancestry(checks, shared_suffixes, None)
+                .check_operator_directory_ancestry(checks, shared_suffixes, *access)
                 .map(Response::DirectoryRelations),
             Request::ReceiverUser => Ok(Response::ReceiverUser(crate::rooted::own_uid())),
             Request::NewFileOwner { path, probe } => {
@@ -3532,17 +3564,6 @@ impl FsOps {
                 .destination_path_access
                 .restore()
                 .map(|()| Response::Ok),
-            Request::CheckOperatorDirectoryAncestryWithAccess {
-                checks,
-                shared_suffixes,
-                selection_in_copy,
-            } => self
-                .check_operator_directory_ancestry(
-                    checks,
-                    shared_suffixes,
-                    Some(*selection_in_copy),
-                )
-                .map(Response::DirectoryRelations),
             Request::RegisterSourceRoots {
                 base,
                 selections,
@@ -4054,11 +4075,9 @@ impl FsOps {
                     )
                 }
             }
-            (
-                Request::CheckOperatorDirectory { path, .. }
-                | Request::CheckSearchableOperatorDirectory { path, .. },
-                Response::EndpointError(error),
-            ) => self.annotate_operator_failure(Some(path), error),
+            (Request::CheckOperatorDirectory { path, .. }, Response::EndpointError(error)) => {
+                self.annotate_operator_failure(Some(path), error)
+            }
             (Request::CreateOperatorDirectory { .. }, Response::EndpointError(error)) => {
                 self.annotate_operator_failure(None, error)
             }
@@ -4241,17 +4260,6 @@ pub(super) fn open_existing_regular_with_metadata(
     Ok((file, metadata))
 }
 
-pub(super) fn require_safe_partial(file: &File, target: &Path) -> Result<()> {
-    let metadata = file.metadata()?;
-    if !is_safe_partial(&metadata) {
-        bail!(
-            "partial {} is not a singly-linked regular file",
-            target.display()
-        );
-    }
-    Ok(())
-}
-
 /// Whether a file this process has created exclusively on `dev` showed
 /// another owner than the account it runs as: sshfs without uid mapping,
 /// squashed NFS, a CIFS mount with a forced uid. Ownership cannot show
@@ -4384,21 +4392,25 @@ impl FsOps {
     /// it. A refusal proves nothing about the device, since whether a file's
     /// mode may change can depend on that file's own ACL (NFSv4
     /// ACE4_WRITE_ACL), so the device keeps the check. Either way the device
-    /// is probed once per connection.
+    /// is probed once per connection. Returns the file's metadata as the
+    /// probe left it, when it changed the mode: `created` no longer shows it.
     pub(super) fn note_created_mode(
         &mut self,
         file: &File,
         created: &fs::Metadata,
         requested: u32,
-    ) {
+    ) -> Option<fs::Metadata> {
         let requested = requested & 0o777;
         let wider = |mode: u32| reported_mode(mode) & 0o777 & !requested != 0;
         if !wider(created.mode()) || self.fixed_wide_modes(created.dev()).is_some() {
-            return;
+            return None;
         }
-        let fixed = probe_mode_change(file, requested).is_ok()
-            && file.metadata().is_ok_and(|now| wider(now.mode()));
+        let now = probe_mode_change(file, requested)
+            .ok()
+            .and_then(|()| file.metadata().ok());
+        let fixed = now.as_ref().is_some_and(|now| wider(now.mode()));
         self.fixed_wide_mode_devices.insert(created.dev(), fixed);
+        now
     }
 }
 
@@ -4411,6 +4423,10 @@ thread_local! {
     /// Refuses the mode change that probes a device, as a file's own ACL can.
     pub(super) static REFUSE_MODE_PROBE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// A mode this thread's new stages are widened to once created, as a
+    /// directory's inherited ACL can widen a new file.
+    pub(super) static WIDEN_NEW_STAGES: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Change the mode of a probed file, or refuse as a test asks.
@@ -4885,7 +4901,7 @@ pub(super) fn set_meta_file_known(
     flags: u8,
     current: &fs::Metadata,
 ) -> Result<()> {
-    set_meta_file_inner(f, meta, flags, current, false, true)
+    set_meta_file_inner(f, keep::Handle::Open, meta, flags, current, false, true)
 }
 
 /// Set a written file's metadata from the metadata read when it was created.
@@ -4898,7 +4914,7 @@ pub(super) fn set_meta_written_file(
     flags: u8,
     created: &fs::Metadata,
 ) -> Result<()> {
-    set_meta_file_inner(f, meta, flags, created, false, false)
+    set_meta_file_inner(f, keep::Handle::Open, meta, flags, created, false, false)
 }
 
 /// Give an existing file `--in-place=update` wrote its final metadata,
@@ -4929,7 +4945,15 @@ pub(super) fn finish_updated_metadata(
 }
 
 pub(super) fn set_meta_file_for_publication(f: &File, meta: &Meta, flags: u8) -> Result<()> {
-    set_meta_file_inner(f, meta, flags, &f.metadata()?, true, true)
+    set_meta_file_inner(
+        f,
+        keep::Handle::Open,
+        meta,
+        flags,
+        &f.metadata()?,
+        true,
+        true,
+    )
 }
 
 /// The same for a staged file about to be published.
@@ -4939,11 +4963,16 @@ pub(super) fn set_meta_written_file_for_publication(
     flags: u8,
     created: &fs::Metadata,
 ) -> Result<()> {
-    set_meta_file_inner(f, meta, flags, created, true, false)
+    set_meta_file_inner(f, keep::Handle::Open, meta, flags, created, true, false)
 }
 
-fn set_meta_file_inner(
+/// Apply `meta` under `flags` to the file `f` refers to, whose metadata
+/// `current` was read through it, through `f` alone. A `Handle::Path`
+/// handle on Linux goes through the calls that take a handle with an empty
+/// path, and cannot set times; an open descriptor through the plain ones.
+pub(super) fn set_meta_file_inner(
     f: &File,
+    handle: keep::Handle,
     meta: &Meta,
     flags: u8,
     current: &fs::Metadata,
@@ -4967,10 +4996,20 @@ fn set_meta_file_inner(
         // Do not hand that account the staging inode's owner read permission.
         f.set_permissions(fs::Permissions::from_mode(0o000))?;
     }
+    // A metadata-only handle cannot set times on Linux: refuse before
+    // changing anything.
+    let path_handle = cfg!(target_os = "linux") && handle == keep::Handle::Path;
+    if path_handle && flags & flags::TIMES != 0 {
+        bail!("metadata-only O_PATH repair does not support timestamp changes");
+    }
     // Owner first: chown clears setuid/setgid, so final mode follows it.
     let owner_changed =
         apply_owner_if_changed(flags, meta, current.uid(), current.gid(), |uid, gid| {
-            std::os::unix::fs::fchown(f, uid, gid)
+            if path_handle {
+                chown_path_handle(f, uid, gid)
+            } else {
+                std::os::unix::fs::fchown(f, uid, gid)
+            }
         })?;
     if owner_changed {
         super::access_changed(f);
@@ -5012,7 +5051,11 @@ fn set_meta_file_inner(
         let cur = narrowed.unwrap_or(current.mode() & 0o7777);
         let want = meta.mode & 0o7777;
         if cur != want || ((owner_changed || !times_current) && want & 0o6000 != 0) {
-            f.set_permissions(fs::Permissions::from_mode(want))?;
+            if path_handle {
+                set_mode_handle(f, want)?;
+            } else {
+                f.set_permissions(fs::Permissions::from_mode(want))?;
+            }
             super::access_changed(f);
         }
     }
@@ -5025,6 +5068,29 @@ fn set_meta_file_inner(
     } else {
         crate::inode_metadata::apply_after_acls(f, meta.inode_metadata.as_deref(), meta.mode)
     }
+}
+
+/// Change the owner and group of the file an `O_PATH` handle refers to.
+fn chown_path_handle(f: &File, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let r = unsafe {
+            libc::fchownat(
+                f.as_raw_fd(),
+                c"".as_ptr(),
+                uid.unwrap_or(u32::MAX),
+                gid.unwrap_or(u32::MAX),
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        if r == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    std::os::unix::fs::fchown(f, uid, gid)
 }
 
 /// Apply only ownership fields whose requested values differ from the
@@ -5137,7 +5203,130 @@ impl SmallSourceResult for DifferingBlocks {
     }
 }
 
-/// How `open_private_partial_rooted` settled on its partial.
+/// How `FsOps::open_stage` obtains a stage. `StagePolicy::new` gives the
+/// strictest: a new file, created exclusively, owner-only and read-write,
+/// replacing whatever the name holds. Each relaxation is asked for by name.
+///
+/// Exclusive creation is what shows that a file is new, whatever mode the
+/// filesystem gives it, and so that no one else can have it open: whoever
+/// opened a leftover while its mode was wider can read what is later
+/// written to it. So a stage that will hold anything but the new contents,
+/// such as bytes of the file it replaces or of another sidecar, is always
+/// created exclusively; only `new_contents_only` allows anything else.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct StagePolicy {
+    mode: u32,
+    write_only: bool,
+    new_contents_only: bool,
+    /// `Some(widest)` resumes a held stage (`FsOps::reuse_held_stage`).
+    resume: Option<Option<u32>>,
+    keeps_owner_access: bool,
+    kind: Sidecar,
+}
+
+impl StagePolicy {
+    pub(super) const fn new(kind: Sidecar) -> Self {
+        Self {
+            mode: PRIVATE_PARTIAL_MODE,
+            write_only: false,
+            new_contents_only: false,
+            resume: None,
+            keeps_owner_access: false,
+            kind,
+        }
+    }
+
+    /// Create it with these permission bits rather than owner-only.
+    pub(super) const fn mode(self, mode: u32) -> Self {
+        Self { mode, ..self }
+    }
+
+    /// Open it for writing only, which spares an NFS client a delegation,
+    /// when nothing reads it back.
+    pub(super) const fn write_only(self) -> Self {
+        Self {
+            write_only: true,
+            ..self
+        }
+    }
+
+    /// It will hold only the new contents, which this receiver writes:
+    /// where the root's filesystem's link counts can be trusted, it may be
+    /// opened without exclusive creation, and used when that lands on a
+    /// new empty file of ours (`is_fresh_partial`).
+    pub(super) const fn new_contents_only(self) -> Self {
+        Self {
+            new_contents_only: true,
+            ..self
+        }
+    }
+
+    /// Resume the stage this receiver holds at the name, unless its group
+    /// or other bits exceed `widest` (`FsOps::reuse_held_stage`).
+    pub(super) const fn resume(self, widest: Option<u32>) -> Self {
+        Self {
+            resume: Some(widest),
+            ..self
+        }
+    }
+
+    /// It must keep the owner's read and write access and be no wider than
+    /// its mode, which then includes them: a new one that does not is
+    /// created owner-only instead.
+    pub(super) const fn keeps_owner_access(self) -> Self {
+        Self {
+            keeps_owner_access: true,
+            ..self
+        }
+    }
+}
+
+/// What `FsOps::reuse_held_stage` found.
+pub(super) enum HeldStage {
+    /// The held stage, to resume, and its length.
+    Reused(File, u64),
+    /// A held stage it would not resume, let go and, if still at its name,
+    /// removed.
+    LetGo,
+    NotHeld,
+}
+
+/// What `FsOps::open_inplace_output` settled on.
+pub(super) enum InplaceOutput {
+    /// The file this copy already holds for the request.
+    Held(stages::Got),
+    /// The existing file, updated where it is (`--in-place=update`).
+    Updated(File, Arc<()>),
+    /// A new file at the target's name, or, when the name held a file, a
+    /// new stage beside it at `stage`.
+    Created {
+        file: File,
+        in_use: Arc<()>,
+        stage: Option<RelativePath>,
+    },
+}
+
+/// A stage `FsOps::open_stage` obtained.
+pub(super) struct Stage {
+    /// Its name below the root.
+    pub(super) relative: RelativePath,
+    /// Its name as shown.
+    pub(super) label: PathBuf,
+    pub(super) file: File,
+    pub(super) opened: OpenedPartial,
+}
+
+impl Stage {
+    /// Its metadata: as read when it was created, or else read now.
+    pub(super) fn metadata(&self) -> io::Result<fs::Metadata> {
+        match &self.opened {
+            OpenedPartial::Created(created) => Ok(created.clone()),
+            OpenedPartial::Reused(_) => self.file.metadata(),
+        }
+    }
+}
+
+/// How `FsOps::open_stage` settled on its stage.
 pub(super) enum OpenedPartial {
     /// It created the file, whose metadata was read as it was created.
     Created(fs::Metadata),

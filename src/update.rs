@@ -1,10 +1,13 @@
 //! Signed standalone release updates and remote-helper artifact verification.
 //!
 //! Package-manager and source installs deliberately have no install receipt,
-//! so this module will never replace them; Homebrew installs still receive
-//! update reminders that point at `brew upgrade`. Official release builds embed
+//! so this module will never replace them; an executable that a Python
+//! package installed is refused even when a receipt names its path. Homebrew
+//! installs still receive update reminders that point at `brew upgrade`.
+//! Official release builds embed
 //! the Ed25519 public key supplied by the release workflow at compile time.
 
+use crate::lock_file::LockFile;
 use crate::process::CommandExt as _;
 use crate::remote_helper::Target;
 use anyhow::{anyhow, bail, Context, Result};
@@ -116,9 +119,27 @@ enum FetchMode {
 /// Install the latest release when this executable came from the standalone
 /// installer. A package-manager binary cannot accidentally overwrite itself.
 pub fn self_update() -> Result<()> {
+    // Before the receipt: one left by an earlier standalone install may still
+    // name this path after a Python package manager wrote its own file there.
+    if is_python_package_executable(&canonical_current_exe()?) {
+        bail!(
+            "this syq was installed as a Python package, so self-update will not replace it; {PYTHON_UPGRADE}"
+        );
+    }
     let (receipt_path, mut receipt) = managed_receipt().context(
         "self-update is only available for installs made by the standalone installer; Homebrew installs should use `brew upgrade syq`, and source builds should be rebuilt or replaced with a standalone install",
     )?;
+    // An install from before 0.6.0 gets its receipt beside the executable
+    // now, read from the old one, which stays (`managed_receipt`). Until
+    // that works, the old one keeps serving.
+    if matches!(fs::symlink_metadata(&receipt_path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        if let Err(error) = write_receipt(&receipt_path, &receipt) {
+            crate::output::diagnostic!(
+                "syq: could not copy the install receipt beside syq: {error:#}"
+            );
+        }
+    }
     let release = fetch_latest(FetchMode::Interactive)?;
     match release.version.cmp(&current_version()?) {
         std::cmp::Ordering::Less => bail!(
@@ -269,6 +290,10 @@ pub fn after_success(quiet: bool) {
     );
 }
 
+/// How to upgrade a syq that a Python package installed. pip, uv, and pipx
+/// leave the same files next to the executable, so the hint names all three.
+const PYTHON_UPGRADE: &str = "upgrade the syq Python package with the tool that installed it, such as `pip install --upgrade syq`, `uv tool upgrade syq`, or `pipx upgrade syq`";
+
 /// Installations that receive update reminders, each with its own upgrade
 /// command. Source builds have neither a receipt nor a Homebrew path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -292,6 +317,54 @@ fn reminded_install() -> Option<RemindedInstall> {
     }
     let executable = canonical_current_exe().ok()?;
     is_homebrew_keg_path(&executable).then_some(RemindedInstall::Homebrew)
+}
+
+/// Whether a Python package manager installed this resolved executable. A
+/// wheel puts it at `<prefix>/bin/syq` and lists it as `../../../bin/syq` in
+/// the package's record of installed files,
+/// `<prefix>/lib/python*/site-packages/syq-<version>.dist-info/RECORD`,
+/// whether the prefix is a virtual environment (as pipx, `uv tool`, and `uvx`
+/// make), the `pip install --user` directory, or the interpreter's own. Some
+/// systems name the directories `lib64` or `dist-packages`. Versions of the
+/// package that shipped no executable do not list one, so a syq beside them
+/// is not theirs.
+fn is_python_package_executable(executable: &Path) -> bool {
+    if !executable.ends_with("bin/syq") {
+        return false;
+    }
+    let Some(prefix) = executable.parent().and_then(Path::parent) else {
+        return false;
+    };
+    ["lib", "lib64"].iter().any(|lib| {
+        entries_named(&prefix.join(lib), |name| name.starts_with("python")).any(|python| {
+            ["site-packages", "dist-packages"].iter().any(|packages| {
+                entries_named(&python.join(packages), |name| {
+                    name.starts_with("syq-") && name.ends_with(".dist-info")
+                })
+                .any(|metadata| {
+                    fs::read_to_string(metadata.join("RECORD")).is_ok_and(|record| {
+                        record
+                            .lines()
+                            .any(|line| line.starts_with("../../../bin/syq,"))
+                    })
+                })
+            })
+        })
+    })
+}
+
+/// The entries of `directory` whose names `matches` accepts; none when it
+/// cannot be read.
+fn entries_named(
+    directory: &Path,
+    matches: impl Fn(&str) -> bool,
+) -> impl Iterator<Item = PathBuf> {
+    fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(move |entry| entry.file_name().to_str().is_some_and(&matches))
+        .map(|entry| entry.path())
 }
 
 /// Homebrew installs the formula's binary as `<prefix>/Cellar/syq/<version>/bin/syq`
@@ -974,17 +1047,11 @@ fn install_release(
 /// another syq that holds it. Where the filesystem cannot lock a directory,
 /// as some network filesystems cannot, the update goes ahead unlocked, and
 /// says so.
-fn lock_directory(directory: &Path) -> Result<Option<File>> {
-    use std::os::fd::AsRawFd;
-    let file = File::open(directory).with_context(|| format!("open {}", directory.display()))?;
-    let lock = |operation| {
-        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
-    };
-    let failed = |error: std::io::Error| -> Result<Option<File>> {
+fn lock_directory(directory: &Path) -> Result<Option<LockFile>> {
+    let lock = LockFile::adopt(
+        File::open(directory).with_context(|| format!("open {}", directory.display()))?,
+    );
+    let failed = |error: std::io::Error| -> Result<Option<LockFile>> {
         if !locking_unsupported(&error) {
             return Err(error).with_context(|| format!("lock {}", directory.display()));
         }
@@ -994,21 +1061,18 @@ fn lock_directory(directory: &Path) -> Result<Option<File>> {
         );
         Ok(None)
     };
-    match lock(libc::LOCK_EX | libc::LOCK_NB) {
-        Ok(()) => return Ok(Some(file)),
-        Err(error) if error.raw_os_error() == Some(libc::EWOULDBLOCK) => {}
+    match lock.try_exclusive() {
+        Ok(true) => return Ok(Some(lock)),
+        Ok(false) => {}
         Err(error) => return failed(error),
     }
     crate::output::diagnostic!(
         "syq: waiting for another syq update in {} to finish",
         directory.display()
     );
-    loop {
-        match lock(libc::LOCK_EX) {
-            Ok(()) => return Ok(Some(file)),
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return failed(error),
-        }
+    match lock.exclusive() {
+        Ok(()) => Ok(Some(lock)),
+        Err(error) => failed(error),
     }
 }
 
@@ -1439,6 +1503,11 @@ fn fetch_into(url: &str, sink: &mut dyn DownloadSink, mode: FetchMode, limit: u6
     Err(crate::tls::download_error(last_error.unwrap())).with_context(|| format!("download {url}"))
 }
 
+/// The receipt for this executable, and the path beside it where updates
+/// write it. That is where it is read from too, except for an install whose
+/// only receipt is the one releases before 0.6.0 kept in the configuration
+/// directory, which every later release went on updating there; a
+/// self-update writes that one beside the executable (`self_update`).
 fn managed_receipt() -> Result<(PathBuf, InstallReceipt)> {
     // Replacing an installed release with a custom build must not let a stale
     // receipt turn that custom executable back into an upstream release.
@@ -1446,8 +1515,8 @@ fn managed_receipt() -> Result<(PathBuf, InstallReceipt)> {
         bail!("source builds must be rebuilt or replaced with a standalone install");
     }
     let current = canonical_current_exe()?;
-    let path = receipt_read_path(receipt_path_for(&current)?)?;
-    let receipt = read_receipt(&path)?;
+    let adjacent = receipt_path_for(&current)?;
+    let receipt = read_receipt(&receipt_read_path(adjacent.clone())?)?;
     if canonical_or_original(&receipt.binary) != current {
         bail!(
             "standalone install receipt belongs to {}, not {}",
@@ -1455,7 +1524,7 @@ fn managed_receipt() -> Result<(PathBuf, InstallReceipt)> {
             current.display()
         );
     }
-    Ok((path, receipt))
+    Ok((adjacent, receipt))
 }
 
 fn read_receipt(path: &Path) -> Result<InstallReceipt> {
@@ -1475,7 +1544,7 @@ fn is_legacy_receipt(path: &Path) -> bool {
     legacy_receipt_path().is_ok_and(|legacy| legacy == path)
 }
 
-/// Read the receipt that released versions kept in the configuration
+/// Read the receipt that releases before 0.6.0 kept in the configuration
 /// directory, away from the executable it names. It must be a regular file
 /// of this user's that group and others cannot write, as syq wrote it, and
 /// is read without following a link: whoever could put it there could
@@ -1558,8 +1627,9 @@ fn receipt_path_for(binary: &Path) -> Result<PathBuf> {
 }
 
 fn receipt_read_path(adjacent: PathBuf) -> Result<PathBuf> {
-    // Released versions stored their receipt in XDG_CONFIG_HOME. Read it only
-    // when no adjacent receipt exists, keeping malformed new state visible.
+    // Releases before 0.6.0 stored their receipt in XDG_CONFIG_HOME, and
+    // later ones updated it there. Read it only when no adjacent receipt
+    // exists, keeping malformed new state visible.
     match fs::symlink_metadata(&adjacent) {
         Ok(_) => Ok(adjacent),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => legacy_receipt_path(),
@@ -1878,6 +1948,75 @@ mod tests {
             RemindedInstall::Standalone.upgrade_command(),
             "syq --self-update"
         );
+    }
+
+    #[test]
+    fn python_package_executables_are_recognized_by_their_package_record() {
+        const LISTED: &str = "../../../bin/syq,sha256=abc,10\nsyq/__init__.py,sha256=def,20\n";
+        let dir = crate::test_support::tempdir().unwrap();
+        let package = |name: &str, metadata: &str, record: Option<&str>| {
+            let prefix = dir.path().join(name);
+            fs::create_dir_all(prefix.join(metadata)).unwrap();
+            if let Some(record) = record {
+                fs::write(prefix.join(metadata).join("RECORD"), record).unwrap();
+            }
+            prefix
+        };
+        for (name, metadata) in [
+            ("user", "lib/python3.13/site-packages/syq-0.10.1.dist-info"),
+            (
+                "fedora",
+                "lib64/python3.13/site-packages/syq-0.10.1.dist-info",
+            ),
+            ("debian", "lib/python3/dist-packages/syq-0.10.1.dist-info"),
+            ("framework", "lib/python/site-packages/syq-0.10.1.dist-info"),
+        ] {
+            let prefix = package(name, metadata, Some(LISTED));
+            assert!(
+                is_python_package_executable(&prefix.join("bin/syq")),
+                "{name}"
+            );
+            assert!(
+                !is_python_package_executable(&prefix.join("bin/other")),
+                "{name}"
+            );
+            assert!(
+                !is_python_package_executable(&prefix.join("sbin/syq")),
+                "{name}"
+            );
+        }
+        for (name, metadata, record) in [
+            ("empty", "bin", None),
+            // A version of the package that shipped no executable.
+            (
+                "no-executable",
+                "lib/python3.11/site-packages/syq-0.6.0.dist-info",
+                Some("syq/__init__.py,sha256=def,20\n"),
+            ),
+            (
+                "no-record",
+                "lib/python3.13/site-packages/syq-0.10.1.dist-info",
+                None,
+            ),
+            (
+                "other-package",
+                "lib/python3.13/site-packages/syq_tools-1.0.dist-info",
+                Some(LISTED),
+            ),
+            (
+                "not-python",
+                "lib/syq/site-packages/syq-0.10.1.dist-info",
+                Some(LISTED),
+            ),
+        ] {
+            let prefix = package(name, metadata, record);
+            assert!(
+                !is_python_package_executable(&prefix.join("bin/syq")),
+                "{name}"
+            );
+        }
+        assert!(!is_python_package_executable(Path::new("/syq")));
+        assert!(!is_python_package_executable(Path::new("/bin/syq")));
     }
 
     #[test]
