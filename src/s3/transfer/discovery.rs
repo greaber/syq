@@ -9,6 +9,7 @@ use super::super::listing::{
     self,
     engine::{Page, Store},
 };
+use crate::cli::{Args, IfExists};
 use crate::progress::Progress;
 use anyhow::{ensure, Result};
 use std::{
@@ -20,6 +21,29 @@ use std::{
     },
 };
 use tokio::sync::watch;
+
+/// Whether a planned key that the listing shows absent may go without its
+/// HEAD. The listing concludes absence from where a key would fall in a page,
+/// so a provider that orders keys differently could show an existing object
+/// as absent. That may cost an upload the comparison would have skipped. It
+/// must not change what the copy does, so these copies ask about every key.
+pub(super) fn trusts_absence(args: &Args) -> bool {
+    // The object would be skipped by --only-existing, refused instead of kept
+    // by keep, overwritten though newer by update-if-older, and judged by
+    // --copy-if as if nothing were there.
+    if args.existing || args.ignore_existing || args.update || args.expressions.update.is_some() {
+        return false;
+    }
+    match args.if_exists {
+        // An object with the same contents is accepted, where a write that
+        // must create its object would be refused.
+        Some(IfExists::ErrorIfDifferent) => false,
+        // Either way the object is refused, here by the write's
+        // `If-None-Match: *`. A dry run sends no write and would report nothing.
+        Some(IfExists::Error) => !args.dry_run,
+        _ => true,
+    }
+}
 
 /// What the destination listing says about one planned key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

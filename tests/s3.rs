@@ -5333,6 +5333,48 @@ fn s3_upload_pages_through_a_large_destination_while_copying() {
 }
 
 #[test]
+fn s3_upload_asks_about_every_key_where_a_wrong_absence_would_change_the_result() {
+    for flags in [
+        &["--if-exists=update-if-older"][..],
+        &["--if-exists=error-if-different"][..],
+        // This fixture's copies are dry runs, which send no conditional write.
+        &["--if-exists=error"][..],
+        &["--copy-if", "not dst.exists or src.size != dst.size"][..],
+    ] {
+        let server = Server::start("upload-pages");
+        let temp = crate::test_support::tempdir().unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        for n in (0..3000).step_by(10) {
+            std::fs::write(data.join(format!("f{n:04}")), b"x").unwrap();
+        }
+        for n in 0..5 {
+            std::fs::write(data.join(format!("zz{n}")), b"x").unwrap();
+        }
+        let mut args = vec![
+            "--srcs-in",
+            "data",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "data",
+            "--dry-run",
+        ];
+        args.extend(flags);
+        let output = server.cp(temp.path(), &args);
+        assert!(
+            output.status.success(),
+            "{flags:?}: {}",
+            output_text(&output)
+        );
+        // No listing decides that a key is absent: all 305 keys get a HEAD,
+        // including the five new ones the default policy leaves to the listing.
+        assert_eq!(server.probes.load(Ordering::Relaxed), 0, "{flags:?}");
+        assert_eq!(server.requests.load(Ordering::Relaxed), 305, "{flags:?}");
+    }
+}
+
+#[test]
 fn s3_upload_continues_with_head_when_a_later_listing_page_fails() {
     let server = Server::start("upload-pages-fail");
     let temp = crate::test_support::tempdir().unwrap();

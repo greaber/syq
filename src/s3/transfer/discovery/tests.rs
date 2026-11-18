@@ -309,6 +309,47 @@ async fn decisions_match_the_bucket_for_varied_plans() {
 }
 
 #[test]
+fn absence_is_trusted_only_where_a_wrong_answer_costs_no_more_than_an_upload() {
+    for (flags, trusted) in [
+        (&[][..], true),
+        (&["--if-exists=update"][..], true),
+        (&["--where", "src.size > 0B"][..], true),
+        // The write carries `If-None-Match: *`; a dry run sends none.
+        (&["--if-exists=error"][..], true),
+        (&["--if-exists=error", "--dry-run"][..], false),
+        (&["--dry-run"][..], true),
+        (&["--if-exists=error-if-different"][..], false),
+        (&["--if-exists=update-if-older"][..], false),
+        (&["--if-exists=keep"][..], false),
+        (&["--only-existing"][..], false),
+        (&["--copy-if", "not dst.exists"][..], false),
+        (&["--copy-if", "src.size > 0B"][..], false),
+    ] {
+        for route in [
+            &["cp", "tree", "--to", "s3://bucket", "--into", "data"][..],
+            &[
+                "cp",
+                "--from",
+                "s3://source",
+                "tree",
+                "--to",
+                "s3://bucket",
+                "--into",
+                "data",
+            ][..],
+        ] {
+            let argv: Vec<_> = route
+                .iter()
+                .chain(flags)
+                .map(std::ffi::OsString::from)
+                .collect();
+            let args = Args::parse_args(&argv).unwrap();
+            assert_eq!(trusts_absence(&args), trusted, "{route:?} {flags:?}");
+        }
+    }
+}
+
+#[test]
 fn predecessor_sorts_just_below_its_key() {
     for (key, below) in [
         ("data/file", "data/fild"),
