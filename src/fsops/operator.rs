@@ -194,8 +194,11 @@ pub(crate) fn check_completion_directory(
 
 /// List the names in `directory` that start with `prefix`, sorted, for shell
 /// completion; hidden names only when the prefix starts with a dot. Returns
-/// at most `limit` entries and whether more matched. An entry whose type
-/// cannot be read fails the listing, or with `skip_unreadable` is left out.
+/// at most `limit` entries and whether the listing stopped at a further
+/// matching name. `directories_only` returns only directories. An entry whose
+/// type cannot be read fails the listing, or with `skip_unreadable` is left
+/// out.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn list_completion_directory(
     directory: &[u8],
     confined_root: Option<&[u8]>,
@@ -203,6 +206,7 @@ pub(crate) fn list_completion_directory(
     limit: usize,
     symlink_policy: OperatorSymlinkPolicy,
     follow_final_symlinks: bool,
+    directories_only: bool,
     skip_unreadable: bool,
 ) -> Result<(Vec<CompletionEntry>, bool)> {
     if directory.contains(&0)
@@ -249,6 +253,9 @@ pub(crate) fn list_completion_directory(
                     symlink_policy,
                 )
                 .is_ok());
+        if directories_only && !directory {
+            continue;
+        }
         entries.push(CompletionEntry { name, directory });
     }
     entries.sort_by(|left, right| left.name.cmp(&right.name));

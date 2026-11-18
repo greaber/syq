@@ -2998,6 +2998,7 @@ impl FsOps {
             symlink_policy,
             follow_final_symlinks,
             false,
+            false,
         )?;
         if detailed {
             let details = crate::completion_details::describe(&resolve(directory), &entries);

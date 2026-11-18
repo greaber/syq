@@ -1928,20 +1928,18 @@ fn local_path_candidates_at(
     };
     // Local completion lists the whole directory and leaves out entries it
     // cannot read, where an endpoint caps its reply and fails instead.
-    let Ok((mut entries, _)) = crate::fsops::list_completion_directory(
+    let Ok((entries, _)) = crate::fsops::list_completion_directory(
         &directory.path,
         directory.confined_root.as_deref(),
         &prefix,
         usize::MAX,
         policy.parents,
         policy.follow_final_symlinks,
+        directories_only,
         true,
     ) else {
         return Vec::new();
     };
-    if directories_only {
-        entries.retain(|entry| entry.directory);
-    }
     let details = if details_requested() {
         let path = crate::fsops::resolve(&directory.path);
         let detail_entries = entries.clone();
