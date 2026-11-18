@@ -1,15 +1,12 @@
 //! Private recovery records. Their identity includes the endpoint and request
 //! policy; values of custom headers and credentials are never written here.
+use crate::lock_file::LockFile;
 use crate::rooted::{RelativePath, Root};
 use anyhow::{bail, Context, Result};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
-    fs::File,
     io::{Read, Write},
-    os::{
-        fd::AsRawFd,
-        unix::fs::{MetadataExt, PermissionsExt},
-    },
+    os::unix::fs::{MetadataExt, PermissionsExt},
     sync::{
         atomic::{AtomicBool, Ordering::Relaxed},
         Arc,
@@ -143,7 +140,7 @@ struct PersistentState {
     directory: std::path::PathBuf,
     root: Arc<Root>,
     name: String,
-    _lock: File,
+    _lock: LockFile,
 }
 impl PersistentState {
     fn open(path: std::path::PathBuf, identity: &[u8]) -> Result<Self> {
@@ -181,15 +178,12 @@ impl PersistentState {
         if m.nlink() != 1 || m.uid() != unsafe { libc::geteuid() } {
             bail!("S3 recovery lock is not a private file owned by this user");
         }
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::WouldBlock {
-                return Err(Blocked(
-                    "another S3 copy is using this recovery record; retry after it finishes".into(),
-                )
-                .into());
-            }
-            return Err(error).context("lock S3 recovery record");
+        let lock = LockFile::adopt(lock);
+        if !lock.try_exclusive().context("lock S3 recovery record")? {
+            return Err(Blocked(
+                "another S3 copy is using this recovery record; retry after it finishes".into(),
+            )
+            .into());
         }
         let state = Self {
             directory: path,

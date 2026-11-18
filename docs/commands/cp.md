@@ -287,8 +287,10 @@ Bash's `set -o pipefail`; Python
 do this for you. Likewise, check syq's exit status before using what it wrote
 to an output descriptor, which can be incomplete after a failure.
 
-A killed copy can leave a `.syq-stream-*` file beside the destination; delete it
-once no copy is writing there.
+A killed copy can leave a `.FILENAME.syq-tmp.RANDOM` file beside the
+destination; once no copy is writing there, remove it with
+[`syq clean-partials`](clean-partials.md). Older versions named it
+`.syq-stream-*`; delete such a file yourself.
 
 <a id="options-and-file-behavior"></a>
 

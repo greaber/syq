@@ -53,7 +53,8 @@ syq --self-update
 
 ## syq --self-update
 
-Update a standalone installation. For Homebrew and source installations, see
+Update a standalone installation. For Homebrew, Python package, and source
+installations, see
 [installation updates](../install.md#updates).
 
 <!-- CLI: --self-update -->
