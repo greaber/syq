@@ -4,7 +4,6 @@
 //! receivers directly.
 use super::*;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::AtomicUsize;
 
 pub(super) const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -228,6 +227,46 @@ impl EntryKeyText {
 impl Drop for EntryKeyText {
     fn drop(&mut self) {
         zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+impl Issued {
+    /// The reply for the directives `prepared` signed, with how to reach
+    /// the destination's receiver, as `destination` says, and, for a copy
+    /// between two other servers, the source's, as `source` says.
+    pub(super) fn new(
+        prepared: Signed,
+        destination: &crate::agent_broker::HostPolicy,
+        known_hosts: String,
+        max_delete: u64,
+        source: Option<&crate::agent_broker::HostPolicy>,
+    ) -> Result<Self> {
+        let coordinated = match (prepared.source, source) {
+            (Some(signed), Some(policy)) => Some(Coordinated {
+                directive: signed.directive,
+                entry_key: signed.entry_key,
+                login: policy.login_user.clone(),
+                known_hosts: policy.known_hosts_for_others()?,
+                known_hosts_left_out: policy.left_out_kind().map(str::to_owned),
+                results_public_key: signed.results.public_key,
+                enrollment: signed.results.enrollment,
+                request: signed.results.request,
+                digest: signed.results.digest,
+            }),
+            (None, None) => None,
+            _ => bail!("the copy's setup did not sign its source's directive"),
+        };
+        Ok(Self {
+            directive: prepared.directive,
+            entry_key: prepared.entry_key,
+            login: destination.login_user.clone(),
+            known_hosts,
+            // The configured value stays here: it can hold commands and paths.
+            known_hosts_left_out: destination.left_out_kind().map(str::to_owned),
+            destination: prepared.destination,
+            max_delete,
+            coordinated,
+        })
     }
 }
 
@@ -563,13 +602,6 @@ fn ssh_login(target: &str, deadline: Instant, cancelled: &dyn Fn() -> bool) -> R
         .with_context(|| format!("the SSH configuration for {target:?} did not report its user"))
 }
 
-pub(super) struct Slot<'a>(pub(super) &'a AtomicUsize);
-impl Drop for Slot<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
 /// A server's request to approve a copy to another server, which this
 /// machine approves with a directive for that server's enrolled receiver.
 /// The server sends what its command read from files.
@@ -593,7 +625,8 @@ pub(crate) struct ForwardRequest {
 /// say about the account's enrollment.
 pub(super) struct Account {
     endpoint: crate::cli::NativeEndpoint,
-    target: String,
+    /// The account as the command names it.
+    pub(super) target: String,
     login: String,
     pub(super) enrollment: crate::restricted::EnrollmentState,
 }
@@ -603,6 +636,10 @@ impl Account {
     /// root.
     pub(super) fn is_root(&self) -> bool {
         self.login == "root"
+    }
+
+    pub(super) fn host(&self) -> &str {
+        &self.endpoint.host
     }
 
     pub(super) fn label(&self) -> String {
@@ -683,288 +720,6 @@ impl Account {
             login: self.login.clone(),
             agent: policy.agent_socket().map(Path::to_path_buf),
         }
-    }
-}
-
-/// Where a request to approve a copy to another server arrives, which
-/// decides what its command may select and how this machine reaches the
-/// accounts.
-pub(crate) enum Origin<'a> {
-    /// A receiving connection to the server that asked, which its command
-    /// selects by `name`. Enrolling can go through that server, `via` the
-    /// login, host and port this machine's receiving connection uses.
-    Receiving {
-        name: &'a str,
-        via: (Option<String>, String, Option<u16>),
-    },
-    /// A login to this SSH authorization provider, which cannot tell which
-    /// server made it. It approves only copies between two other servers:
-    /// an upload that selects a provider uses its account access instead.
-    Provider,
-}
-
-/// Who approves a server's copy to another server here, and what it applies
-/// to the copy: a receiving connection's profile, or an SSH authorization
-/// provider's.
-pub(crate) struct Approver<'a> {
-    pub(crate) origin: Origin<'a>,
-    /// Who asks, as the prompt names them.
-    pub(crate) requester: &'a crate::receive_approval::Requester,
-    pub(crate) approvals: &'a crate::receive_approval::Queue,
-    pub(crate) notifications: crate::receive_approval::Notifications,
-    pub(crate) caps: crate::directive::Caps,
-    /// Held while a decision is pending, so that one is pending at a time.
-    pub(crate) request_lock: &'a Mutex<()>,
-    /// Copies to other servers waiting here for approval or setup.
-    pub(crate) forward_count: &'a AtomicUsize,
-    /// Whether the request ended: the server that asked went, or approving
-    /// stopped.
-    pub(crate) cancelled: &'a dyn Fn() -> bool,
-}
-
-impl Receiver {
-    /// Approve a server's copy to another server, or between two other
-    /// servers, as `approve` does, for as long as this receiving connection
-    /// and its server last.
-    pub(super) fn forward(&self, request: ForwardRequest, mut stream: TrackedStream) -> Result<()> {
-        let (generation, _channel) = {
-            // Serialize registration with revocation, including reconnects.
-            let _sessions = self.sessions.lock().unwrap();
-            (
-                self.generation.load(Ordering::Acquire),
-                self.active_streams.track(stream.try_clone()?)?,
-            )
-        };
-        let socket = stream.try_clone()?;
-        let cancelled = || {
-            self.stop.load(Ordering::Acquire)
-                || self.generation.load(Ordering::Acquire) != generation
-                || requester_closed(&socket)
-        };
-        Approver {
-            origin: Origin::Receiving {
-                name: &self.name,
-                via: (
-                    self.server_user.clone(),
-                    self.tcp_peer.host.clone(),
-                    self.tcp_peer.port,
-                ),
-            },
-            requester: &self.requester,
-            approvals: &self.approvals,
-            notifications: self.notifications,
-            caps: crate::directive::Caps {
-                max_bytes: self.max_bytes,
-                max_entries: self.max_entries,
-                max_delete: self.max_delete,
-            },
-            request_lock: &self.request_lock,
-            forward_count: &self.forward_count,
-            cancelled: &cancelled,
-        }
-        .approve(request, &mut stream)
-    }
-}
-
-impl Approver<'_> {
-    /// Approve a server's copy to another server, or between two other
-    /// servers: show the command, then, over this machine's own SSH, set up
-    /// or refresh the accounts' enrollments and sign their directives, and
-    /// reply on `stream`. The server connects to the receivers itself; this
-    /// machine is not part of the copy after it replies.
-    pub(crate) fn approve(&self, request: ForwardRequest, stream: &mut impl Write) -> Result<()> {
-        let ForwardRequest {
-            source,
-            target,
-            command,
-            cwd,
-            inputs,
-            results_key,
-        } = request;
-        // The server waits this long for the reply, from when it asked: the
-        // decision, then the setup. Cancellation ends the setup sooner when
-        // the server goes.
-        let budget = Instant::now() + REQUEST_TIMEOUT + SETUP_TIMEOUT;
-        let request_lock = self.request_lock.try_lock().map_err(|_| {
-            anyhow::anyhow!("another transfer is awaiting approval; retry after it is decided")
-        })?;
-        let via = match &self.origin {
-            Origin::Receiving { name, via } => {
-                crate::approval_command::check_authorizer(&command, name)?;
-                Some(via.clone())
-            }
-            Origin::Provider => {
-                anyhow::ensure!(
-                    source.is_some(),
-                    "an SSH authorization provider approves only copies between two other servers; this copy uses the provider's account access"
-                );
-                crate::approval_command::check_provider_authorizer(&command)?;
-                None
-            }
-        };
-        let args = crate::approval_command::parse(&command)?;
-        match &source {
-            None => anyhow::ensure!(
-                eligible_target(&args)? == target,
-                "the requesting command copies to a different server"
-            ),
-            Some(source) => anyhow::ensure!(
-                eligible_peer(&args)? == (source.clone(), target.clone()),
-                "the requesting command copies between different servers"
-            ),
-        }
-        // Only the server that starts a copy between two others checks the
-        // destination's results itself.
-        anyhow::ensure!(
-            results_key.is_some() == source.is_some(),
-            "invalid request to approve a copy to another server"
-        );
-        let caps = self.caps;
-        // The rules the receiver will derive, before the server's home is
-        // known: the prompt names the destination as the command does.
-        let preview = crate::directive::issue(
-            crate::directive::Binding {
-                enrollment: crate::enrollment::EnrollmentId::random(),
-                generation: 1,
-                account: "preview".into(),
-                role: crate::directive::Role::Destination,
-            },
-            command.clone(),
-            cwd.clone(),
-            (inputs.clone(), Some(caps)),
-            // Unused: the preview has no results.
-            [1; 32],
-        )?;
-        let (rules, constraints) = crate::directive::destination_rules(
-            &preview,
-            Path::new(std::ffi::OsStr::from_bytes(REQUEST_ROOT)),
-        )?;
-        let max_delete = caps.deletion_ceiling(&rules.copy);
-        let request = CopyRequest {
-            destination: args
-                .locations
-                .last()
-                .context("copy destination missing")?
-                .path
-                .clone(),
-            copy: rules.copy,
-            constraints,
-        };
-        let count = self.forward_count.fetch_add(1, Ordering::AcqRel);
-        let _slot = Slot(self.forward_count);
-        if count >= 8 {
-            bail!("too many copies to other servers are waiting for approval or setup here; retry after one is decided");
-        }
-        let cancelled = self.cancelled;
-        let destination = Account::find(&target, &cancelled)?;
-        let source = source
-            .as_deref()
-            .map(|source| Account::find(source, &cancelled))
-            .transpose()?;
-        match &source {
-            None => destination.refuse_root(
-                "to",
-                &format!(
-                    "copy to an ordinary account on {host}, or use the requesting server's own SSH access, or account access approved with `syq persist connect {account} --auth-from @NAME`",
-                    host = destination.endpoint.host,
-                    account = destination.label()
-                ),
-            )?,
-            Some(source) => {
-                let advice = "use an ordinary account there, or copy through the requesting server with `--coordinate-at local`, which needs account access to both servers";
-                source.refuse_root("from", advice)?;
-                destination.refuse_root("to", advice)?;
-            }
-        }
-        if args.dry_run {
-            for account in source.iter().chain([&destination]) {
-                account.ready_for_dry_run()?;
-            }
-        }
-        // Automatic approval of writes to this machine does not authorize
-        // use of its SSH credentials on another host.
-        self.approvals.request_remote(
-            self.requester,
-            &command,
-            &cwd,
-            crate::receive_approval::Remote {
-                target: &target,
-                enrollment: destination.enrollment,
-                source: source
-                    .as_ref()
-                    .map(|source| (source.target.as_str(), source.enrollment)),
-            },
-            &request,
-            self.notifications,
-            cancelled,
-        )?;
-        anyhow::ensure!(!cancelled(), "remote copy disconnected before setup");
-        // This lock only serializes decisions, not enrollment.
-        drop(request_lock);
-        let destination_policy = destination.policy(&cancelled)?;
-        let source_policy = source
-            .as_ref()
-            .map(|source| source.policy(&cancelled))
-            .transpose()?;
-        // The destination's known hosts go to the server that dials it: the
-        // source, in its signed directive, or the server that asked.
-        let destination_known_hosts = destination_policy.known_hosts_for_others()?;
-        let mut setup = crate::process::self_command()?;
-        setup.arg("--return-prepare");
-        let prepared = prepare_in_child(
-            setup,
-            &Prepare {
-                command,
-                cwd,
-                inputs,
-                caps,
-                accounts: match source.as_ref().zip(source_policy.as_ref()) {
-                    None => Accounts::Destination(destination.setup(&destination_policy)),
-                    Some((source, policy)) => Accounts::BetweenServers {
-                        source: source.setup(policy),
-                        destination: destination.setup(&destination_policy),
-                        known_hosts: destination_known_hosts.clone(),
-                    },
-                },
-                results_key,
-                via,
-                allow_enrollment: !args.dry_run,
-            },
-            // Setting restricted copying up can upload syq, which takes a
-            // while on a slow link: give it what is left of the server's
-            // wait, not only the time after the decision.
-            budget,
-            &cancelled,
-        )
-        .with_context(|| format!("approve the copy to {target:?}"))?;
-        anyhow::ensure!(!cancelled(), "remote copy disconnected before setup");
-        let coordinated = match (prepared.source, source_policy) {
-            (Some(signed), Some(policy)) => Some(Coordinated {
-                directive: signed.directive,
-                entry_key: signed.entry_key,
-                login: policy.login_user.clone(),
-                known_hosts: policy.known_hosts_for_others()?,
-                known_hosts_left_out: policy.left_out_kind().map(str::to_owned),
-                results_public_key: signed.results.public_key,
-                enrollment: signed.results.enrollment,
-                request: signed.results.request,
-                digest: signed.results.digest,
-            }),
-            (None, None) => None,
-            _ => bail!("the copy's setup did not sign its source's directive"),
-        };
-        let issued = Issued {
-            directive: prepared.directive,
-            entry_key: prepared.entry_key,
-            login: destination_policy.login_user.clone(),
-            known_hosts: destination_known_hosts,
-            // The configured value stays here: it can hold commands and paths.
-            known_hosts_left_out: destination_policy.left_out_kind().map(str::to_owned),
-            destination: prepared.destination,
-            max_delete,
-            coordinated,
-        };
-        write_message(stream, &Reply::Directive(Box::new(issued)))
     }
 }
 
@@ -1467,6 +1222,7 @@ pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
 mod tests {
     use super::*;
     use crate::destination::tests::{args, broker};
+    use std::sync::atomic::AtomicUsize;
 
     fn prepare_request() -> Prepare {
         Prepare {
@@ -2088,8 +1844,8 @@ mod tests {
             let lock = Mutex::new(());
             let socket = server.try_clone().unwrap();
             let cancelled = || requester_closed(&socket);
-            Approver {
-                origin: Origin::Provider,
+            crate::destination::approve::Approver {
+                origin: crate::destination::approve::Origin::Provider,
                 requester: &requester,
                 approvals: &approvals,
                 notifications: crate::receive_approval::Notifications::Off,
@@ -2102,7 +1858,7 @@ mod tests {
                 forward_count: &count,
                 cancelled: &cancelled,
             }
-            .approve(request, &mut server)
+            .approve(request.into(), &mut server)
         });
         (task, client)
     }

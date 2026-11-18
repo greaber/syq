@@ -2,6 +2,9 @@
 
 The old executable must be the verified v0.4.0 release. This checks actual old
 serialization and deserialization, independently of the candidate's Rust types.
+The service answers as services have since 0.8.0, saying what it has in
+progress (`busy`), which a v0.4.0 client ignores; the candidate no longer reads
+a service from before then.
 """
 import argparse
 import fcntl
@@ -96,6 +99,7 @@ with tempfile.TemporaryDirectory(prefix="syq-old-") as tmp:
                                 "pending": list(pending if selected is listener else other_pending),
                                 "decision_error": None,
                                 "connection": {"phase": "online", "error": None, "ssh_pid": None}}
+                    response["busy"] = {"requests": 0, "pending": len(response["pending"])}
                     data = json.dumps(response).encode()
                     peer.sendall(struct.pack(">I", len(data)) + data)
                     if request.get("stop"):
