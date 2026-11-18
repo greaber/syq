@@ -205,4 +205,32 @@ mod tests {
         );
         assert_eq!(file.metadata().unwrap().mode() & 0o7777, 0o600);
     }
+
+    /// A metadata-only handle cannot set times on Linux; a change that asks
+    /// for them fails before changing anything else.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_metadata_handle_refuses_times_before_changing_the_mode() {
+        let dir = tempdir().unwrap();
+        let root = Root::open(dir.path()).unwrap();
+        let path = dir.path().join("kept");
+        fs::write(&path, b"same").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let handle = root
+            .open_metadata(&RelativePath::new(b"kept").unwrap())
+            .unwrap();
+        let current = handle.metadata().unwrap();
+        let meta = Meta {
+            inode_metadata: None,
+            mode: 0o640,
+            uid: current.uid(),
+            gid: current.gid(),
+            mtime: 1_500_000_000,
+            mtime_nsec: 0,
+        };
+        let error = set_meta_handle_known(&handle, &meta, flags::MODE | flags::TIMES, &current)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("timestamp"), "{error:#}");
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o7777, 0o600);
+    }
 }
