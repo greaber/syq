@@ -254,7 +254,9 @@ impl Engine {
                 let engine = self.clone();
                 let prepared = prepared.clone();
                 async move {
-                    match engine.prepare_copy(&mut job, listed.await).await {
+                    // Boxed when the job first runs, so that admitting it
+                    // moves a small future rather than the copy's state.
+                    match Box::pin(engine.prepare_copy(&mut job, listed.await)).await {
                         Ok(work) => prepared.lock().await.push((job, work)),
                         Err(error) => engine.settle(
                             job.key.as_bytes(),
@@ -309,8 +311,9 @@ impl Engine {
                 let engine = self.clone();
                 async move {
                     engine.check_cancelled()?;
-                    let result = engine
-                        .copy_object(&mut job, listed.await)
+                    // Boxed when the job first runs, so that admitting it
+                    // moves a small future rather than the copy's state.
+                    let result = Box::pin(engine.copy_object(&mut job, listed.await))
                         .await
                         .map_err(|error| engine.copy_error(error));
                     engine.settle(job.key.as_bytes(), &job.path, job.kind, &result, None);

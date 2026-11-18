@@ -394,7 +394,9 @@ impl Engine {
                         let label = source.label.clone();
                         let kind = source.kind();
                         let expected = source.expected_hash.clone();
-                        match engine.prepare_upload(source, listed.await).await {
+                        // Boxed when the job first runs, so that admitting it
+                        // moves a small future rather than the upload's state.
+                        match Box::pin(engine.prepare_upload(source, listed.await)).await {
                             Ok(work) => prepared
                                 .lock()
                                 .await
@@ -462,7 +464,9 @@ impl Engine {
                         let kind = source.kind();
                         engine.check_cancelled()?;
                         let expected = source.expected_hash.as_ref().cloned();
-                        let result = engine.upload(source, listed.await).await;
+                        // Boxed when the job first runs, so that admitting it
+                        // moves a small future rather than the upload's state.
+                        let result = Box::pin(engine.upload(source, listed.await)).await;
                         engine.settle(&label, &key, kind, &result, expected.as_ref());
                         Ok(result.ok().flatten())
                     }
