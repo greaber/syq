@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Classify a GitHub Actions change set for post-merge and manual validation.
 
-Usage: scripts/ci-scope.py [GITHUB_EVENT_PATH]
+Usage: scripts/ci-scope.py [--macos] [GITHUB_EVENT_PATH]
 
 Prints `key=value` lines for $GITHUB_OUTPUT. SYQ_TEST_CHANGED_PATHS_FILE
 replaces the event with a list of changed paths for tests.
+
+The macos_* outputs drive macos.yml. With --macos, a manual run on a task
+branch classifies the branch's own changes against origin/master instead of
+running everything, and SYQ_CI_COMPLETE=true (its `complete` input) selects
+every macOS step.
 
 SYQ_CI_SUITES, set from ci.yml's `suites` dispatch input, selects named suites
 instead of classifying paths; see SUITES below. Each selected suite's job then
@@ -19,11 +24,14 @@ import re
 import subprocess
 import sys
 
+from release_test_inputs import EXAMPLE_PAGES
 from tooling import ToolError, output, report_errors
 
 SCRIPTS = Path(os.path.abspath(__file__)).parent
+# The groups of scripts/run-tooling-tests.py.
 ALL_TOOLING = "package installer benchmark release orchestration focused branch workflows setup"
-DOCUMENTATION_PATHS = "docs/mappings.md\ndocs/automation.md\ndocs/commands/map.md"
+# Tooling groups that macos.yml's release tooling step runs.
+MACOS_TOOLING = {"release", "orchestration", "installer"}
 REAL_SSH = {
     "real-ssh-core": {"suite": "core", "profile": "default"},
     # Omit unaffected cases and workflows that require concurrent sessions
@@ -40,41 +48,51 @@ SUITES = {
     "tooling": {"tooling": True, "tooling_checks": ALL_TOOLING, "all_tooling": True},
     "shellcheck": {"shellcheck": True},
     "mapping-docs": {"mapping_docs": True},
-    "python-sdk": {"sdks": True, "python_sdk": True},
+    "python-sdk": {"python_sdk": True},
     "linux-arm64": {"linux_arm64": True},
     "macos-intel": {"macos": True, "macos_intel": True},
     "macos-lint": {"macos_lint": True},
     "s3": {"s3": True},
     "repository-checks": {"repository_checks": True},
-    **{name: {"real_ssh": [entry]} for name, entry in REAL_SSH.items()},
-    "real-ssh": {"real_ssh": list(REAL_SSH.values())},
+    **{name: {"real_ssh_matrix": [entry]} for name, entry in REAL_SSH.items()},
+    "real-ssh": {"real_ssh_matrix": list(REAL_SSH.values())},
 }
+# Every output, as path classification sets it when nothing is affected.
+DEFAULTS = {
+    "suite_selection": False, "native": False, "integration_targets": "",
+    "python_sdk": False, "tooling": False, "tooling_checks": "", "all_tooling": False,
+    "quick_tooling": False, "shellcheck": False, "mapping_docs": False, "conformance": False,
+    "macos": False, "macos_intel": False, "macos_lint": False, "linux_arm64": False,
+    "s3": False, "repository_checks": False, "real_ssh_matrix": [], "full_suite": False,
+}
+EVERYTHING = {**{key: True for key, value in DEFAULTS.items() if value is False},
+              "suite_selection": False, "quick_tooling": False, "tooling_checks": ALL_TOOLING,
+              "real_ssh_matrix": list(REAL_SSH.values()), "rust_label": "full"}
+
+
+def emit(values, task_branch=False):
+    """Print every output: DEFAULTS overridden by `values`, then the macOS selection."""
+    scope = {**DEFAULTS, **values}
+    scope.setdefault("rust_label", rust_label(scope))
+    # Only explicit macOS changes select that platform after a merge; manual and
+    # changed-input nightly runs select everything, and a manual run on a task
+    # branch always starts the suite.
+    complete = scope["full_suite"] or os.environ.get("SYQ_CI_COMPLETE") == "true"
+    scope["macos_needed"] = scope["macos"] or task_branch
+    scope["macos_sdk"] = complete or scope["python_sdk"]
+    scope["macos_release_tooling"] = complete or bool(
+        MACOS_TOOLING & set(scope["tooling_checks"].split()))
+    for key, value in scope.items():
+        if isinstance(value, bool):
+            value = str(value).lower()
+        elif isinstance(value, list):
+            value = json.dumps(value)
+        print(f"{key}={value}")
+    return scope
 
 
 def run_everything():
-    print("\n".join([
-        "suite_selection=false",
-        "rust_label=full",
-        "all_tooling=true",
-        "quick_tooling=false",
-        "s3=true",
-        "repository_checks=true",
-        "macos_intel=true",
-        "macos_lint=true",
-        f"real_ssh_matrix={json.dumps(list(REAL_SSH.values()))}",
-        "native=true",
-        "sdks=true",
-        "python_sdk=true",
-        "tooling=true",
-        f"tooling_checks={ALL_TOOLING}",
-        "shellcheck=true",
-        "mapping_docs=true",
-        "conformance=true",
-        "macos=true",
-        "linux_arm64=true",
-        "full_suite=true",
-        'sdk_matrix=["python"]',
-    ]))
+    emit(EVERYTHING)
 
 
 def matches(path, *patterns):
@@ -104,11 +122,7 @@ def read_event(event_path):
 def changed_paths_from_event(event):
     """Return (changed paths, base, head), or None after printing a full scope."""
     try:
-        if "pull_request" in event:
-            base = event["pull_request"]["base"]["sha"]
-            head = event["pull_request"]["head"]["sha"]
-            diff_range = f"{base}...{head}"
-        elif "before" in event:
+        if "before" in event:
             base, head = event["before"], event["after"]
             if re.fullmatch(r"0+", base):
                 run_everything()
@@ -137,6 +151,10 @@ def changed_paths_from_event(event):
         raise ToolError("the GitHub event has no usable commit range") from None
     if not isinstance(base, str) or not isinstance(head, str):
         raise ToolError("the GitHub event has no usable commit range")
+    return diff_paths(base, head, diff_range)
+
+
+def diff_paths(base, head, diff_range):
     if not commit_exists(base):
         raise ToolError(f"CI scope base commit is unavailable: {base}")
     if not commit_exists(head):
@@ -172,34 +190,29 @@ def select_suites(names):
     unknown = [name for name in names if name not in SUITES]
     if unknown:
         raise ToolError(f"unknown suite: {' '.join(unknown)} (choose from {' '.join(SUITES)})", 2)
-    selection = {"native": False, "sdks": False, "python_sdk": False, "tooling": False,
-                 "shellcheck": False, "mapping_docs": False, "linux_arm64": False,
-                 "macos": False, "macos_intel": False, "macos_lint": False, "s3": False, "repository_checks": False,
-                 "all_tooling": False, "quick_tooling": False,
-                 "integration_targets": "", "tooling_checks": "", "real_ssh": []}
+    selection = {"suite_selection": True, "real_ssh_matrix": []}
     for name in names:
         for key, value in SUITES[name].items():
-            if key == "real_ssh":
-                selection[key] += value
-            elif isinstance(value, str):
-                selection[key] = value
+            if key == "real_ssh_matrix":
+                selection[key] = selection[key] + value
             else:
-                selection[key] = True
+                selection[key] = value
     # Keep the matrix in a fixed order so equal selections share cancellation groups.
-    selected_real_ssh = selection.pop("real_ssh")
-    real_ssh = [entry for entry in REAL_SSH.values() if entry in selected_real_ssh]
-    for key, value in selection.items():
-        print(f"{key}={str(value).lower() if isinstance(value, bool) else value}")
-    print(f"rust_label={rust_label(selection)}")
-    print(f"real_ssh_matrix={json.dumps(real_ssh)}")
-    print("suite_selection=true\nconformance=false\nfull_suite=false")
-    print('sdk_matrix=["python"]' if selection["python_sdk"] else 'sdk_matrix=["none"]')
+    selection["real_ssh_matrix"] = [entry for entry in REAL_SSH.values()
+                                    if entry in selection["real_ssh_matrix"]]
+    emit(selection)
     print(f"CI scope: selected suites {' '.join(names)}", file=sys.stderr)
     return 0
 
 
 def main():
-    event_path = (sys.argv[1] if len(sys.argv) > 1 else "") or os.environ.get("GITHUB_EVENT_PATH")
+    arguments = sys.argv[1:]
+    macos = arguments[:1] == ["--macos"]
+    if macos:
+        arguments = arguments[1:]
+    event_path = (arguments[0] if arguments else "") or os.environ.get("GITHUB_EVENT_PATH")
+    task_branch = (macos and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+                   and os.environ.get("GITHUB_REF") != "refs/heads/master")
     base = head = ""
     suites = os.environ.get("SYQ_CI_SUITES", "").replace(",", " ").split()
     if suites:
@@ -220,7 +233,11 @@ def main():
         # No changed test inputs: emit the ordinary all-false scope below.
         changed_paths = "README.md"
     elif os.environ.get("SYQ_CI_DOCUMENTATION_ONLY", "") == "true":
-        changed_paths = DOCUMENTATION_PATHS
+        changed_paths = "\n".join(sorted(EXAMPLE_PAGES))
+    elif task_branch:
+        # Classify a task branch's changes as its pull request would be.
+        base, head = git("rev-parse", "origin/master"), git("rev-parse", "HEAD")
+        changed_paths, base, head = diff_paths(base, head, f"{base}...{head}")
     elif event_path and os.path.isfile(event_path):
         result = changed_paths_from_event(read_event(event_path))
         if result is None:
@@ -235,24 +252,18 @@ def main():
         "--equivalent-to", base]).returncode == 0
     selection = classify(changed_paths.split("\n"), preparation_only)
 
-    print(f"tooling_checks={selection['tooling_checks']}")
-    keys = ["native", "sdks", "python_sdk", "tooling", "shellcheck", "mapping_docs",
+    scope = emit(selection, task_branch)
+    keys = ["native", "python_sdk", "tooling", "shellcheck", "mapping_docs",
             "conformance", "macos", "macos_lint", "linux_arm64", "full_suite"]
-    for key in keys:
-        print(f"{key}={str(selection[key]).lower()}")
-    print(f"integration_targets={selection['integration_targets']}")
-    # Only full runs and selected suites run these.
-    print(f"rust_label={rust_label(selection)}")
-    print("suite_selection=false\nall_tooling=false\nquick_tooling=false\ns3=false\n"
-          "repository_checks=false\nmacos_intel=false\nreal_ssh_matrix=[]")
-    print("CI scope: " + " ".join(f"{key}={str(selection[key]).lower()}" for key in keys),
+    if macos:
+        keys += ["macos_needed", "macos_sdk", "macos_release_tooling"]
+    print("CI scope: " + " ".join(f"{key}={str(scope[key]).lower()}" for key in keys),
           file=sys.stderr)
-    print('sdk_matrix=["python"]' if selection["python_sdk"] else 'sdk_matrix=["none"]')
     return 0
 
 
 def classify(paths, preparation_only):
-    native = sdks = python_sdk = tooling = shellcheck = mapping_docs = False
+    native = python_sdk = tooling = shellcheck = mapping_docs = False
     conformance = macos = macos_lint = linux_arm64 = full_suite = False
     integration_targets = []
     tooling_checks = []
@@ -307,8 +318,7 @@ def classify(paths, preparation_only):
         elif matches(path, "sdk/*"):
             # Files shared across sdk/ can affect the Python SDK.
             python_sdk = True
-        elif matches(path, "MAPPINGS.md", "docs/mappings.md", "docs/automation.md",
-                     "docs/commands/map.md"):
+        elif path in EXAMPLE_PAGES:
             # The documented jq programs are executable integration-test inputs.
             mapping_docs = True
         elif matches(path, "tests/rsync-compat/*", "scripts/rsync-compat.py"):
@@ -419,12 +429,10 @@ def classify(paths, preparation_only):
     checks = " ".join(sorted(set(tooling_checks)))
     if checks:
         tooling = True
-    if python_sdk:
-        sdks = True
     if native:
         macos_lint = True
     return {
-        "tooling_checks": checks, "native": native, "sdks": sdks, "python_sdk": python_sdk,
+        "tooling_checks": checks, "native": native, "python_sdk": python_sdk,
         "tooling": tooling, "shellcheck": shellcheck, "mapping_docs": mapping_docs,
         "conformance": conformance, "macos": macos, "macos_lint": macos_lint,
         "linux_arm64": linux_arm64,

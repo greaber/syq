@@ -7,6 +7,7 @@ creates a tag, a publication, or a CI run.
 from support import ROOT, SCRIPTS
 
 import base64
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -17,12 +18,12 @@ import tempfile
 import textwrap
 import unittest
 
-SCOPE_KEYS = ["native", "sdks", "python_sdk", "tooling", "shellcheck", "mapping_docs",
+SCOPE_KEYS = ["native", "python_sdk", "tooling", "shellcheck", "mapping_docs",
               "conformance", "macos", "macos_lint", "linux_arm64", "full_suite"]
 ALL_TOOLING = "benchmark branch focused installer orchestration package release setup workflows"
 # Scope fixtures below supply their own events and overrides.
 INHERITED = ("SYQ_TEST_CHANGED_PATHS_FILE", "SYQ_CI_SCOPE_COMMIT", "SYQ_CI_DOCUMENTATION_ONLY",
-             "SYQ_CI_SUITES", "GITHUB_REF")
+             "SYQ_CI_SUITES", "GITHUB_REF", "GITHUB_EVENT_NAME", "SYQ_CI_COMPLETE")
 BASE_ENV = {key: value for key, value in os.environ.items() if key not in INHERITED}
 DISPATCH_EVENT = {}
 
@@ -60,10 +61,10 @@ class Scratch(unittest.TestCase):
         path.write_text(json.dumps(value))
         return path
 
-    def scope(self, *paths, event=None, cwd=None, env=None):
+    def scope(self, *paths, event=None, cwd=None, env=None, macos=False):
         """Run ci-scope on changed paths (or an event) and return its key=value output."""
         run_env = dict(BASE_ENV, **(env or {}))
-        args = [str(SCRIPTS / "ci-scope.py")]
+        args = [str(SCRIPTS / "ci-scope.py")] + (["--macos"] if macos else [])
         if event is None:
             changed = self.work / "paths"
             changed.write_text("".join(path + "\n" for path in paths))
@@ -114,6 +115,21 @@ class WorkflowTextTests(unittest.TestCase):
                         "--run-ignored", "all", "--no-tests", "fail", "--", "--exact",
                         "fixture::test"])
 
+    def test_macos_workflow_uses_the_scope_it_computes(self):
+        # ci-scope.py decides when macOS runs release tooling; the step must run
+        # those same groups and pass the inputs ci-scope reads.
+        workflow = (ROOT / ".github/workflows/macos.yml").read_text()
+        spec = importlib.util.spec_from_file_location("ci_scope", SCRIPTS / "ci-scope.py")
+        ci_scope = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ci_scope)
+        step = workflow.split("      - name: Release tooling suites\n", 1)[1].split("\n      - ", 1)[0]
+        groups = step.split("scripts/run-tooling-tests.py --group ", 1)[1].split(" ||", 1)[0]
+        self.assertEqual(set(groups.split()), ci_scope.MACOS_TOOLING)
+        self.assertIn('scripts/ci-scope.py --macos "$GITHUB_EVENT_PATH"', workflow)
+        self.assertIn("SYQ_CI_COMPLETE: ${{ inputs.complete }}", workflow)
+        for output in ("needed", "sdk", "release_tooling"):
+            self.assertIn(f"{output}: ${{{{ steps.changes.outputs.macos_{output} }}}}", workflow)
+
     def test_release_workflow_requires_checks_and_notes(self):
         release = (ROOT / ".github/workflows/release.yml").read_text()
         self.assertIn("rust,sdks,macos,linux-arm64,conformance", release)
@@ -141,13 +157,13 @@ class PathScopeTests(Scratch):
                 self.assertScope(self.scope(path), python_sdk="true")
         self.assertScope(self.scope("docs/mappings.md"), mapping_docs="true", native="false")
         self.assertScope(self.scope("sdk/python/src/syq/syq-release-manifest.json"),
-                         native="false", sdks="true", python_sdk="true")
+                         native="false", python_sdk="true")
         self.assertScope(self.scope("sdk/python/native-api.json"),
-                         native="true", sdks="true", python_sdk="true")
+                         native="true", python_sdk="true")
 
     def test_new_tooling_tests_do_not_select_product_suites(self):
         self.assertScope(self.scope("tests/tooling/test-new.py"), tooling="true",
-                         native="false", sdks="false", conformance="false")
+                         native="false", python_sdk="false", conformance="false")
 
     def test_python_sdk_tooling(self):
         for path in ["nix/python-dist.nix", "scripts/build-python-dist.sh",
@@ -159,13 +175,13 @@ class PathScopeTests(Scratch):
                      "tests/tooling/test-python-sdk-release-tools.py",
                      "scripts/verify-python-release-preparation.py"]:
             with self.subTest(path=path):
-                self.assertScope(self.scope(path), tooling="true", sdks="true",
-                                 python_sdk="true", native="false")
+                self.assertScope(self.scope(path), tooling="true", python_sdk="true",
+                                 native="false")
 
     def test_single_path_classification(self):
         self.assertScope(self.scope("tests/rsync-compat/LEDGER.md"),
                          conformance="true", native="false")
-        self.assertScope(self.scope("src/main.rs"), native="true", sdks="false",
+        self.assertScope(self.scope("src/main.rs"), native="true", python_sdk="false",
                          conformance="false", macos="false", linux_arm64="false")
         # The macOS cross-target lint accompanies every Rust selection and its own
         # script, without promoting either to the other.
@@ -182,16 +198,16 @@ class PathScopeTests(Scratch):
         self.assertScope(self.scope("tests/tooling/test-installer.py"), tooling="true", native="false")
         scope = self.scope(".github/workflows/ci.yml")
         self.assertScope(scope, tooling="true")
-        self.assertAll(scope, ["native", "sdks", "python_sdk", "shellcheck", "mapping_docs",
+        self.assertAll(scope, ["native", "python_sdk", "shellcheck", "mapping_docs",
                                "conformance", "macos", "linux_arm64", "full_suite"], "false")
         self.assertScope(self.scope(".github/workflows/rsync-compat.yml"), tooling="true",
                          conformance="false", native="false")
         self.assertScope(self.scope(".github/workflows/python-api-sync.yml"), tooling="true",
-                         sdks="false", python_sdk="false", native="false")
+                         python_sdk="false", native="false")
 
     def test_pinned_tools_run_everything_that_uses_them(self):
         scope = self.scope("scripts/setup.lock")
-        self.assertAll(scope, ["native", "sdks", "python_sdk", "tooling", "shellcheck",
+        self.assertAll(scope, ["native", "python_sdk", "tooling", "shellcheck",
                                "mapping_docs", "conformance"], "true")
         self.assertScope(scope, tooling_checks=ALL_TOOLING)
         self.assertAll(scope, ["macos", "linux_arm64", "full_suite"], "false")
@@ -208,7 +224,7 @@ class PathScopeTests(Scratch):
         scope = self.scope("docs/copy-files.md", "sdk/python/native-api.json",
                            "sdk/python/src/syq/client.py", "src/cli.rs", "tests/local.rs",
                            "tests/real-ssh/scenarios.sh")
-        self.assertScope(scope, native="true", sdks="true", python_sdk="true", shellcheck="true")
+        self.assertScope(scope, native="true", python_sdk="true", shellcheck="true")
         self.assertAll(scope, ["tooling", "mapping_docs", "conformance", "macos", "linux_arm64",
                                "full_suite"], "false")
 
@@ -216,13 +232,6 @@ class PathScopeTests(Scratch):
         self.assertScope(self.scope("tests/local/transfer.rs"), integration_targets="local")
         self.assertScope(self.scope("tests/support/temp.rs"), integration_targets="all")
         self.assertScope(self.scope("tests/tls.rs"), integration_targets="tls")
-
-    def test_sdk_matrix(self):
-        # The SDK matrix runs Python when it is affected; the no-work case keeps one stub.
-        self.assertScope(self.scope("sdk/python/source"), sdk_matrix='["python"]')
-        self.assertScope(self.scope("src/main.rs"), sdk_matrix='["none"]')
-        dispatch = self.event("workflow-dispatch-event.json", DISPATCH_EVENT)
-        self.assertScope(self.scope(event=dispatch), sdk_matrix='["python"]')
 
     def test_tooling_changes_select_their_own_suites(self):
         # Tooling changes select their own suites, without product builds. Any
@@ -248,7 +257,7 @@ class PathScopeTests(Scratch):
             with self.subTest(path=path):
                 scope = self.scope(path)
                 self.assertScope(scope, tooling_checks=checks)
-                self.assertAll(scope, ["native", "sdks", "conformance", "macos"], "false")
+                self.assertAll(scope, ["native", "python_sdk", "conformance", "macos"], "false")
         self.assertScope(self.scope("scripts/rsync-compat.py"), conformance="true",
                          tooling_checks="workflows")
         scope = self.scope("tests/tooling/test-installer.py", "tests/tooling/test-release-tools.py",
@@ -272,7 +281,7 @@ class PathScopeTests(Scratch):
 
 
 class EventScopeTests(Scratch):
-    """Scope real pull request, push, and dispatch events in a scratch repository."""
+    """Scope real task branch, push, and dispatch events in a scratch repository."""
 
     @classmethod
     def setUpClass(cls):
@@ -331,27 +340,35 @@ class EventScopeTests(Scratch):
     def tearDownClass(cls):
         cls.repo_temp.cleanup()
 
-    def pull_request(self, base, head):
-        return self.event("pull-request-event.json",
-                          {"pull_request": {"base": {"sha": base}, "head": {"sha": head}}})
+    def branch_scope(self, base, head):
+        """Scope a manual macOS run on a task branch at `head` with origin/master at `base`."""
+        dispatch = self.event("workflow-dispatch-event.json", DISPATCH_EVENT)
+        tree = self.work / "branch"
+        self.git(self.repo, "update-ref", "refs/remotes/origin/master", base)
+        try:
+            self.git(self.repo, "worktree", "add", "-q", "--detach", str(tree), head)
+            return self.scope(event=dispatch, cwd=tree, macos=True,
+                              env={"GITHUB_EVENT_NAME": "workflow_dispatch",
+                                   "GITHUB_REF": "refs/heads/task"})
+        finally:
+            self.git(self.repo, "worktree", "remove", "--force", str(tree))
+            self.git(self.repo, "update-ref", "-d", "refs/remotes/origin/master")
 
     def push(self, before, after):
         return self.event("push-event.json", {"before": before, "after": after})
 
-    def test_pull_request_scopes_its_own_diff(self):
-        scope = self.scope(event=self.pull_request(self.base, self.head), cwd=self.repo)
-        self.assertScope(scope, native="false", sdks="true", python_sdk="true", full_suite="false")
-        # Scope the pull request's own three-dot diff rather than treating unrelated
-        # base-branch changes as part of the pull request.
-        scope = self.scope(event=self.pull_request(self.advanced_base, self.docs_head),
-                           cwd=self.repo)
+    def test_task_branch_scopes_its_own_diff(self):
+        scope = self.branch_scope(self.base, self.head)
+        self.assertScope(scope, native="false", python_sdk="true", full_suite="false")
+        # Scope the branch's own three-dot diff rather than treating unrelated
+        # base-branch changes as part of the branch.
+        scope = self.branch_scope(self.advanced_base, self.docs_head)
         self.assertAll(scope, SCOPE_KEYS, "false")
 
     def test_rename_exposes_both_sides(self):
         # Rename detection must expose both the affected source and inert destination.
-        scope = self.scope(event=self.pull_request(self.advanced_base, self.rename_head),
-                           cwd=self.repo)
-        self.assertScope(scope, mapping_docs="true", native="false", sdks="false")
+        scope = self.branch_scope(self.advanced_base, self.rename_head)
+        self.assertScope(scope, mapping_docs="true", native="false", python_sdk="false")
         # Both sides of a rename remain visible even when the destination is one of
         # the explicitly excluded SDK documents.
         scope = self.scope(event=self.push(self.advanced_base, self.sdk_rename_head),
@@ -361,7 +378,7 @@ class EventScopeTests(Scratch):
     def test_push_scopes(self):
         scope = self.scope(event=self.push(self.head, self.advanced_base), cwd=self.repo)
         self.assertScope(scope, native="true")
-        self.assertAll(scope, ["sdks", "python_sdk", "conformance", "macos", "linux_arm64",
+        self.assertAll(scope, ["python_sdk", "conformance", "macos", "linux_arm64",
                                "full_suite"], "false")
         # Reproduce a documentation-only post-merge push, including the SDK guide and
         # executable mapping examples. Only the focused example checks are selected.
@@ -378,7 +395,7 @@ class EventScopeTests(Scratch):
         # full-suite request.
         scope = self.scope(event=dispatch, cwd=self.repo,
                            env={"SYQ_CI_SCOPE_COMMIT": self.scoped_dispatch_head})
-        self.assertScope(scope, native="false", sdks="true", python_sdk="true")
+        self.assertScope(scope, native="false", python_sdk="true")
         self.assertAll(scope, ["tooling", "shellcheck", "mapping_docs", "conformance", "macos",
                                "linux_arm64", "full_suite"], "false")
         result = subprocess.run(
@@ -449,33 +466,11 @@ class EventScopeTests(Scratch):
                 self.assertIn(message, result.stderr)
                 self.assertEqual(result.stdout, "")
 
-    def macos_step(self):
-        """The real macOS classification step, rather than a copy of its logic.
-        Missing or renamed step boundaries fail this check."""
-        lines = (ROOT / ".github/workflows/macos.yml").read_text().splitlines()
-        start = next(index for index, line in enumerate(lines)
-                     if line.startswith("          event=$GITHUB_EVENT_PATH"))
-        end = next(index for index in range(start, len(lines))
-                   if lines[index].endswith('tee -a "$GITHUB_OUTPUT"'))
-        step = "\n".join(lines[start:end + 1])
-        self.assertIn("scripts/ci-scope.py", step)
-        return step.replace("scripts/ci-scope.py", str(SCRIPTS / "ci-scope.py"))
-
     def macos_scope(self, event, *paths, ref="refs/heads/master", event_name="push",
                     complete="", cwd=ROOT):
-        output = self.work / "macos-output"
-        output.write_text("")
-        env = dict(BASE_ENV, GITHUB_EVENT_PATH=str(event), GITHUB_OUTPUT=str(output),
-                   GITHUB_EVENT_NAME=event_name, GITHUB_REF=ref, RUNNER_TEMP=str(self.work),
-                   COMPLETE=complete)
-        if paths:
-            changed = self.work / "paths"
-            changed.write_text("".join(path + "\n" for path in paths))
-            env["SYQ_TEST_CHANGED_PATHS_FILE"] = str(changed)
-        subprocess.run(["bash", "-euo", "pipefail", "-c", self.macos_step()], cwd=cwd, env=env,
-                       check=True, stdout=subprocess.DEVNULL)
-        scope = parse(output.read_text())
-        return scope["needed"], scope["sdk"], scope["release_tooling"]
+        env = dict(GITHUB_EVENT_NAME=event_name, GITHUB_REF=ref, SYQ_CI_COMPLETE=complete)
+        scope = self.scope(*paths, event=None if paths else event, cwd=cwd, env=env, macos=True)
+        return scope["macos_needed"], scope["macos_sdk"], scope["macos_release_tooling"]
 
     def test_macos_classification_step(self):
         push = self.push(self.head, self.advanced_base)

@@ -17,6 +17,9 @@ from tooling import ToolError
 spec = importlib.util.spec_from_file_location("runner", SCRIPTS / "run-tooling-tests.py")
 runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
+spec = importlib.util.spec_from_file_location("ci_scope", SCRIPTS / "ci-scope.py")
+ci_scope = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ci_scope)
 
 
 class DiscoveryTests(unittest.TestCase):
@@ -72,6 +75,26 @@ class DiscoveryTests(unittest.TestCase):
             harness.unlink()
             with self.assertRaisesRegex(ToolError, "test not found"):
                 runner.select_tests(root)
+
+    def test_every_tooling_test_belongs_to_one_group(self):
+        # CI runs tests by group after a merge; an ungrouped test would run only
+        # in full and quick runs.
+        root = SCRIPTS.parent
+        grouped = [name for names in runner.GROUPS.values() for name in names]
+        self.assertEqual(len(grouped), len(set(grouped)), "a test is in two groups")
+        self.assertEqual(sorted(grouped),
+                         [path.name for path in runner.discover(root / "tests/tooling")])
+        self.assertEqual(set(runner.GROUPS), set(ci_scope.ALL_TOOLING.split()))
+        self.assertLessEqual(ci_scope.MACOS_TOOLING, set(runner.GROUPS))
+        # Selecting every group runs the whole tooling directory, in discovery order.
+        self.assertEqual(runner.select_tests(root, groups=list(runner.GROUPS)),
+                         runner.discover(root / "tests/tooling"))
+        selected = runner.select_tests(root, groups=["release", "package"])
+        self.assertEqual([path.name for path in selected],
+                         ["test-cargo-package.py", "test-python-sdk-release-tools.py",
+                          "test-release-tools.py"])
+        with self.assertRaisesRegex(ToolError, "unknown group: bogus"):
+            runner.select_tests(root, groups=["bogus"])
 
     def test_python_children_cache_imports_despite_the_callers_environment(self):
         with tempfile.TemporaryDirectory(prefix="syq-bytecode-test-") as temporary:

@@ -149,7 +149,8 @@ class PythonTests(Tests):
         workflow = (root / ".github/workflows/publish-sdks.yml").read_text()
         gate = workflow.split("  verify-tag:\n", 1)[1].split("  candidate-python:\n", 1)[0]
         step = gate.split("      - name: Require Python tag version to match package\n", 1)[1]
-        self.assertIn("if: startsWith(github.ref, 'refs/tags/sdk-python-v')", step)
+        # The workflow's tag pattern is the only push trigger, so the step is unconditional.
+        self.assertNotIn("        if:", step.split("        run: |\n", 1)[0])
         command = textwrap.dedent(step.split("        run: |\n", 1)[1])
         with tempfile.TemporaryDirectory() as directory:
             package = Path(directory) / "sdk/python/pyproject.toml"
