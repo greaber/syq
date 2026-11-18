@@ -285,7 +285,6 @@ pub(crate) fn drain_range_replies_with<T>(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerInfo {
     pub(crate) descriptors: Option<crate::resources::Descriptors>,
-    pub identity: String,
     pub platform: String,
     pub supports_confined_socket_nodes: bool,
     pub(crate) ssh_worker_ticket: Option<std::result::Result<String, String>>,
@@ -846,8 +845,7 @@ fn spawn_observed_reader(
             // background reader to allocate any ordinary data frame. This also
             // covers pooled sessions, whose Hello was sent by another process.
             let accepted = matches!(&hello, Ok(message)
-            if matches!(&message.value, Response::HelloOk { identity, .. }
-                if identity == crate::identity::build()));
+            if matches!(&message.value, Response::HelloOk { .. }));
             if !send(hello) || !accepted {
                 return;
             }
@@ -3939,7 +3937,6 @@ pub(crate) fn hello_request(
     role: ConnectionRole,
 ) -> Request {
     Request::Hello {
-        identity: crate::identity::build().to_string(),
         compress,
         debug,
         token,
@@ -3962,25 +3959,16 @@ fn receive_hello(mut conn: RemoteConn, worker: bool) -> Result<RemoteConn> {
     match conn.recv() {
         Ok(Response::HelloOk {
             descriptors,
-            identity,
             platform,
             supports_confined_socket_nodes,
             ssh_worker_ticket,
-        }) if identity == crate::identity::build() => {
+        }) => {
             conn.peer = Some(PeerInfo {
                 descriptors,
-                identity,
                 platform,
                 supports_confined_socket_nodes,
                 ssh_worker_ticket,
             });
-        }
-        Ok(Response::HelloOk { identity, .. }) => {
-            bail!(
-                "{}: build identity mismatch (remote {identity}, local {})",
-                conn.label,
-                crate::identity::build()
-            )
         }
         Ok(Response::Err(error)) if worker => {
             return Err(WorkerInitializationError(format!("{}: {error}", conn.label)).into());

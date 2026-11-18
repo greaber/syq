@@ -944,7 +944,6 @@ pub type Request = WireRequest<Payload>;
 ))]
 pub enum WireRequest<Data> {
     Hello {
-        identity: String,
         compress: bool,
         debug: bool,
         token: Vec<u8>,
@@ -1682,7 +1681,6 @@ impl Request {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Response {
     HelloOk {
-        identity: String,
         descriptors: Option<crate::resources::Descriptors>,
         platform: String,
         supports_confined_socket_nodes: bool,
@@ -1701,9 +1699,6 @@ pub enum Response {
     /// failures, for which the coordinator may safely fall back to SSH.
     TcpCongestionRejected(String),
     ScanBatch(Vec<Entry>),
-    /// No longer sent; ScanWarnAt replaced it. Kept so later responses keep
-    /// their wire numbers.
-    ScanWarn(String),
     /// Paths (relative to the root) skipped because the ignore patterns matched them.
     ScanIgnored(Vec<PathBytes>),
     ScanDone,
@@ -1834,8 +1829,7 @@ pub enum Response {
     },
     /// Reply to ReceiverUser: the receiving process's effective user ID.
     ReceiverUser(u32),
-    /// A scan warning with its path. Replaces ScanWarn, which carried only
-    /// text.
+    /// A scan warning with its path.
     ScanWarnAt(ScanWarning),
     /// Reply to NewFileOwner.
     NewFileOwner(NewFileOwner),
@@ -2376,13 +2370,6 @@ impl<W: Write> FrameWriter<W> {
         self.w.into_inner().map_err(|error| error.into_error())
     }
 
-    fn compressor() -> crate::compression::Compressor {
-        // SYQ_HELPER_RELEASE=v0.6.0 explicitly selects released helpers. Their
-        // codec byte only accepts raw and Zstd; preserve that concrete case.
-        // Other peers must match our exact build before reading any frame.
-        crate::compression::Compressor::new(crate::identity::build() == "v0.6.0")
-    }
-
     pub fn new(w: W, compress: bool) -> Self {
         Self::with_admission(w, compress, Vec::new())
     }
@@ -2395,7 +2382,7 @@ impl<W: Write> FrameWriter<W> {
             compress,
             preamble_written: false,
             admission,
-            compression: Self::compressor(),
+            compression: crate::compression::Compressor::new(),
         }
     }
 
@@ -2407,7 +2394,7 @@ impl<W: Write> FrameWriter<W> {
             compress,
             preamble_written: true,
             admission: Vec::new(),
-            compression: Self::compressor(),
+            compression: crate::compression::Compressor::new(),
         }
     }
 

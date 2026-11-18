@@ -35,7 +35,6 @@ impl Channel {
 
     fn hello(&mut self, role: ConnectionRole) -> Response {
         self.request(Request::Hello {
-            identity: crate::identity::build().into(),
             compress: false,
             debug: false,
             token: Vec::new(),
@@ -167,9 +166,8 @@ impl SourceServer {
         let input = self.connections.track(server).unwrap();
         let source = self.authority.clone();
         let descriptors = self.session.clone();
-        let thread = std::thread::spawn(move || {
-            run_authorized_source_worker(input, output, source, descriptors)
-        });
+        let thread =
+            std::thread::spawn(move || run_named_source(input, output, source, descriptors, false));
         let mut worker = Channel::new(client, thread);
         let hello = worker.hello(role);
         (worker, hello)
@@ -526,7 +524,6 @@ fn approved_source_tcp_requires_encryption_and_keeps_workers_read_only() {
     ));
     writer
         .write_msg(&Request::Hello {
-            identity: crate::identity::build().into(),
             compress: false,
             debug: false,
             token,
@@ -696,7 +693,6 @@ fn approved_source_control_disconnect_revokes_tcp_while_control_response_is_busy
     ));
     writer
         .write_msg(&Request::Hello {
-            identity: crate::identity::build().into(),
             compress: false,
             debug: false,
             token,

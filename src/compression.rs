@@ -20,23 +20,21 @@ enum Mode {
 
 struct Policy {
     mode: Mode,
-    legacy: bool,
     bytes: usize,
     elapsed: Duration,
 }
 
 impl Policy {
-    fn new(legacy: bool) -> Self {
+    fn new() -> Self {
         Self {
-            mode: if legacy { Mode::Zstd1 } else { Mode::Lz4 },
-            legacy,
+            mode: Mode::Lz4,
             bytes: 0,
             elapsed: Duration::ZERO,
         }
     }
 
     fn observe(&mut self, bytes: usize, elapsed: Duration) -> bool {
-        if self.legacy || elapsed.is_zero() {
+        if elapsed.is_zero() {
             return false;
         }
         self.bytes = self.bytes.saturating_add(bytes);
@@ -72,9 +70,9 @@ pub(crate) struct Compressor {
 }
 
 impl Compressor {
-    pub(crate) fn new(legacy: bool) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            policy: Policy::new(legacy),
+            policy: Policy::new(),
             output: Vec::new(),
             zstd: None,
         }
@@ -199,7 +197,7 @@ mod tests {
 
     #[test]
     fn transport_rate_selects_codecs_in_both_directions_with_hysteresis() {
-        let mut policy = Policy::new(false);
+        let mut policy = Policy::new();
         assert_eq!(policy.mode, Mode::Lz4);
         for rate in [256, 200, 175, 150] {
             observe(&mut policy, rate);
@@ -214,7 +212,7 @@ mod tests {
         observe(&mut policy, 201);
         assert_eq!(policy.mode, Mode::Lz4);
         for rate in [64, 100, 112] {
-            let mut intermediate = Policy::new(false);
+            let mut intermediate = Policy::new();
             assert_eq!(intermediate.mode, Mode::Lz4);
             observe(&mut intermediate, rate);
             assert_eq!(intermediate.mode, Mode::Zstd1);
@@ -235,26 +233,11 @@ mod tests {
 
     #[test]
     fn small_writes_accumulate_without_treating_a_tiny_reply_as_a_rate_probe() {
-        let mut policy = Policy::new(false);
+        let mut policy = Policy::new();
         policy.observe(100, Duration::from_secs(1));
         assert_eq!(policy.mode, Mode::Lz4);
         policy.observe(64 << 10, Duration::from_millis(100));
         assert_eq!(policy.mode, Mode::Zstd3);
-    }
-
-    #[test]
-    fn release_helper_compatibility_always_emits_zstd() {
-        let mut compressor = Compressor::new(true);
-        for rate in [4, 32, 1024] {
-            observe(&mut compressor.policy, rate);
-            assert_eq!(compressor.policy.mode, Mode::Zstd1);
-            let (flag, len) = compressor.encode(&vec![b'x'; 65536]).unwrap().unwrap();
-            assert_eq!(flag, ZSTD);
-            assert_eq!(
-                zstd::bulk::decompress(compressor.output(len), 65536).unwrap(),
-                vec![b'x'; 65536]
-            );
-        }
     }
 
     #[test]
@@ -268,7 +251,7 @@ mod tests {
             *b = state as u8;
         }
         let text = b"the next block is compressible\n".repeat(8192);
-        let mut compressor = Compressor::new(false);
+        let mut compressor = Compressor::new();
         for mode in [Mode::Lz4, Mode::Zstd1, Mode::Zstd3, Mode::Lz4] {
             compressor.policy.mode = mode;
             assert!(compressor.encode(&random).unwrap().is_none());

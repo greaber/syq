@@ -919,7 +919,6 @@ fn worker_stream(registration: &Registration, approved: &Approved) -> UnixStream
     let mut writer = crate::proto::FrameWriter::new(stream.try_clone().unwrap(), false);
     writer
         .write_msg(&Request::Hello {
-            identity: crate::identity::build().into(),
             compress: false,
             debug: false,
             token: Vec::new(),

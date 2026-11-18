@@ -73,7 +73,6 @@ fn streaming_fence_survives_revocation_without_authorizing_more_writes() {
                 handshake_pending: None,
                 ssh_worker_ticket: None,
                 allow_tcp: true,
-                metadata_control: false,
                 loopback_only: false,
                 named_socket: None,
                 authority: Some(server_authority),
@@ -94,7 +93,6 @@ fn streaming_fence_survives_revocation_without_authorizing_more_writes() {
     let mut writer = FrameWriter::new(socket.try_clone().unwrap(), true);
     writer
         .write_msg(&Request::Hello {
-            identity: crate::identity::build().to_string(),
             compress: true,
             debug: false,
             token: Vec::new(),
@@ -202,7 +200,6 @@ fn a_restricted_connection_with_a_streamed_patch_open_carries_nothing_else() {
                     handshake_pending: None,
                     ssh_worker_ticket: None,
                     allow_tcp: true,
-                    metadata_control: false,
                     loopback_only: false,
                     named_socket: None,
                     authority: Some(server_authority.clone()),
@@ -223,7 +220,6 @@ fn a_restricted_connection_with_a_streamed_patch_open_carries_nothing_else() {
         let mut writer = FrameWriter::new(socket.try_clone().unwrap(), true);
         writer
             .write_msg(&Request::Hello {
-                identity: crate::identity::build().to_string(),
                 compress: true,
                 debug: false,
                 token: Vec::new(),
@@ -608,7 +604,6 @@ fn a_read_stream_does_not_hold_room_its_stop_needs() {
                 handshake_pending: None,
                 ssh_worker_ticket: None,
                 allow_tcp: true,
-                metadata_control: false,
                 loopback_only: false,
                 named_socket: None,
                 authority: None,
@@ -625,7 +620,6 @@ fn a_read_stream_does_not_hold_room_its_stop_needs() {
     let mut reader = FrameReader::new(socket.try_clone().unwrap());
     writer
         .write_msg(&Request::Hello {
-            identity: crate::identity::build().to_string(),
             compress: false,
             debug: false,
             token: Vec::new(),
@@ -758,7 +752,6 @@ fn tcp_server_joins_request_reader_on_shutdown() {
                 handshake_pending: None,
                 ssh_worker_ticket: None,
                 allow_tcp: true,
-                metadata_control: false,
                 loopback_only: false,
                 named_socket: None,
                 authority: None,
@@ -777,7 +770,6 @@ fn tcp_server_joins_request_reader_on_shutdown() {
     let mut reader = FrameReader::new(socket);
     writer
         .write_msg(&Request::Hello {
-            identity: crate::identity::build().to_string(),
             compress: false,
             debug: false,
             token: Vec::new(),
@@ -1015,7 +1007,6 @@ fn rejected_destination_ticket_is_not_acknowledged_as_ready() {
                 handshake_pending: None,
                 ssh_worker_ticket: None,
                 allow_tcp: true,
-                metadata_control: false,
                 loopback_only: false,
                 named_socket: None,
                 authority: None,
@@ -1031,7 +1022,6 @@ fn rejected_destination_ticket_is_not_acknowledged_as_ready() {
     let mut reader = FrameReader::new(socket);
     writer
         .write_msg(&Request::Hello {
-            identity: crate::identity::build().to_string(),
             compress: false,
             debug: false,
             token: Vec::new(),
@@ -1085,7 +1075,6 @@ fn rejected_source_ticket_is_not_acknowledged_as_ready() {
                 handshake_pending: None,
                 ssh_worker_ticket: None,
                 allow_tcp: true,
-                metadata_control: false,
                 loopback_only: false,
                 named_socket: None,
                 authority: None,
@@ -1101,7 +1090,6 @@ fn rejected_source_ticket_is_not_acknowledged_as_ready() {
     let mut reader = FrameReader::new(socket);
     writer
         .write_msg(&Request::Hello {
-            identity: crate::identity::build().to_string(),
             compress: false,
             debug: false,
             token: Vec::new(),
@@ -1120,7 +1108,6 @@ fn rejected_source_ticket_is_not_acknowledged_as_ready() {
 
 fn tcp_test_hello(token: &[u8]) -> Request {
     Request::Hello {
-        identity: crate::identity::build().to_string(),
         compress: true,
         debug: false,
         token: token.to_vec(),
@@ -1171,11 +1158,8 @@ fn tcp_rejects_replayed_hello_with_high_connection_id_bits() {
         client.shutdown(std::net::Shutdown::Write).unwrap();
         let result = serve_tcp(
             server,
-            0,
             Some(key.clone()),
             token.to_vec(),
-            false,
-            false,
             &seen,
             Some(authority.clone()),
             None,
@@ -1228,11 +1212,8 @@ fn tcp_unauthenticated_connection_does_not_take_its_id() {
     let serve = |stream| {
         serve_tcp(
             stream,
-            0,
             Some(key.clone()),
             token.to_vec(),
-            false,
-            false,
             &seen,
             Some(authority.clone()),
             None,
@@ -1299,11 +1280,8 @@ fn tcp_partial_handshakes_time_out_without_reserving_ids() {
                 let seen = std::sync::Mutex::new(std::collections::HashSet::new());
                 let result = serve_tcp(
                     server,
-                    0,
                     key,
                     b"timeout-test".to_vec(),
-                    false,
-                    false,
                     &seen,
                     None,
                     None,
@@ -1340,11 +1318,8 @@ fn tcp_hello_clears_timeouts_only_after_authentication() {
             let seen = std::sync::Mutex::new(std::collections::HashSet::new());
             serve_tcp(
                 server,
-                0,
                 server_key,
                 b"valid-token".to_vec(),
-                false,
-                false,
                 &seen,
                 Some(authority),
                 None,
@@ -1414,7 +1389,6 @@ fn authenticated_worker(port: u16, token: &[u8]) -> std::result::Result<TcpStrea
     let mut writer = FrameWriter::new(RecordWriter::new(socket.try_clone()?, None), false);
     let mut reader = FrameReader::new(RecordReader::new(socket.try_clone()?, None));
     writer.write_msg(&Request::Hello {
-        identity: crate::identity::build().to_string(),
         compress: true,
         debug: false,
         token: token.to_vec(),
@@ -1447,7 +1421,6 @@ fn unauthenticated_sockets_do_not_consume_signed_worker_permits() {
         0,
         false,
         false,
-        true,
         None,
         None,
         Some(authority.clone()),
@@ -1553,7 +1526,6 @@ fn stream_worker_rebinds_only_live_files_from_its_original_session() {
                 handshake_pending: None,
                 ssh_worker_ticket: None,
                 allow_tcp: false,
-                metadata_control: false,
                 loopback_only: false,
                 named_socket: None,
                 authority: None,
@@ -1574,7 +1546,6 @@ fn stream_worker_rebinds_only_live_files_from_its_original_session() {
     let mut writer = FrameWriter::new(socket.try_clone().unwrap(), true);
     writer
         .write_msg(&Request::Hello {
-            identity: crate::identity::build().to_string(),
             compress: true,
             debug: false,
             token: Vec::new(),
@@ -1764,7 +1735,6 @@ fn a_receiver_ends_after_the_workers_handed_to_it_report_their_end() {
     let mut reader = FrameReader::new(worker.try_clone().unwrap());
     writer
         .write_msg(&Request::Hello {
-            identity: crate::identity::build().to_string(),
             compress: false,
             debug: false,
             token: Vec::new(),

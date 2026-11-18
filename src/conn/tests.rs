@@ -77,7 +77,6 @@ use std::os::unix::ffi::OsStrExt;
 fn hello_ok() -> Response {
     Response::HelloOk {
         descriptors: None,
-        identity: crate::identity::build().into(),
         platform: crate::identity::platform(),
         supports_confined_socket_nodes: crate::identity::supports_confined_socket_nodes(),
         ssh_worker_ticket: None,
@@ -325,16 +324,15 @@ fn try_recv_takes_arrived_deferred_replies_and_waits_for_none() {
 }
 
 #[test]
-fn observation_frames_do_not_enter_the_data_queue_or_bypass_identity_pinning() {
+fn observation_frames_do_not_enter_the_data_queue_or_bypass_the_hello() {
     for accepted in [true, false] {
         let mut wire = Vec::new();
         let mut writer = FrameWriter::new(&mut wire, false);
-        let mut hello = hello_ok();
-        if !accepted {
-            if let Response::HelloOk { identity, .. } = &mut hello {
-                *identity = "v0.6.0".into();
-            }
-        }
+        let hello = if accepted {
+            hello_ok()
+        } else {
+            Response::Err("refused".into())
+        };
         writer.write_msg(&hello).unwrap();
         for solicited in [false, false, true] {
             writer
@@ -356,10 +354,8 @@ fn observation_frames_do_not_enter_the_data_queue_or_bypass_identity_pinning() {
             observation.clone(),
         )
         .unwrap();
-        assert!(matches!(
-            rx.recv().unwrap().unwrap().value,
-            Response::HelloOk { .. }
-        ));
+        let first = rx.recv().unwrap().unwrap().value;
+        assert_eq!(matches!(first, Response::HelloOk { .. }), accepted);
         if accepted {
             assert!(matches!(
                 rx.recv().unwrap().unwrap().value,
@@ -416,12 +412,11 @@ fn client_reader_requires_accepted_hello_before_large_data() {
     for accepted in [false, true] {
         let mut wire = Vec::new();
         let mut writer = FrameWriter::new(&mut wire, false);
-        let mut hello = hello_ok();
-        if let Response::HelloOk { identity, .. } = &mut hello {
-            if !accepted {
-                *identity = "wrong-build".into();
-            }
-        }
+        let hello = if accepted {
+            hello_ok()
+        } else {
+            Response::Err("refused".into())
+        };
         writer.write_msg(&hello).unwrap();
         writer
             .write_msg(&Response::Block {
@@ -432,10 +427,8 @@ fn client_reader_requires_accepted_hello_before_large_data() {
             .unwrap();
         drop(writer);
         let (rx, thread) = spawn_reader(Box::new(std::io::Cursor::new(wire)), 4);
-        assert!(matches!(
-            rx.recv().unwrap().unwrap().value,
-            Response::HelloOk { .. }
-        ));
+        let first = rx.recv().unwrap().unwrap().value;
+        assert_eq!(matches!(first, Response::HelloOk { .. }), accepted);
         if accepted {
             assert!(
                 matches!(rx.recv().unwrap().unwrap().value, Response::Block { data, .. } if data.len() == 2 << 20)
@@ -1251,7 +1244,6 @@ fn hello_carries_destination_initialization_before_readiness() {
         writer
             .write_msg(&Response::HelloOk {
                 descriptors: None,
-                identity: crate::identity::build().to_string(),
                 platform: crate::identity::platform(),
                 supports_confined_socket_nodes: crate::identity::supports_confined_socket_nodes(),
                 ssh_worker_ticket: None,
@@ -1411,7 +1403,6 @@ fn ssh_exit_255_wins_over_a_missing_wire_preamble() {
     assert!(is_ssh_connect_error(&error));
     conn.peer = Some(PeerInfo {
         descriptors: None,
-        identity: crate::identity::build().into(),
         platform: crate::identity::platform(),
         supports_confined_socket_nodes: false,
         ssh_worker_ticket: None,
@@ -3012,7 +3003,6 @@ fn only_sessions_within_a_run_use_the_handshake_platform() {
     assert_eq!(spec.session_command_for(&server, true), before);
     spec.diagnostics.lock().unwrap().peer = Some(PeerInfo {
         descriptors: None,
-        identity: crate::identity::build().into(),
         platform: "linux-aarch64".into(),
         supports_confined_socket_nodes: true,
         ssh_worker_ticket: None,

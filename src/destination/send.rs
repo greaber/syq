@@ -512,7 +512,6 @@ mod tests {
                 stream,
             };
             let hello = channel.call(crate::proto::Request::Hello {
-                identity: crate::identity::build().into(),
                 compress: false,
                 debug: false,
                 token: Vec::new(),
