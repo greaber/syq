@@ -3538,11 +3538,11 @@ fn bandwidth_limited_remote_sources_compare_before_pacing_only_differing_reads()
             let opts = Arc::get_mut(&mut worker.opts).unwrap();
             opts.src_remote = true;
             opts.dst_remote = relay;
-            opts.tuning.bw_pacing = Some(crate::transfer_tuning::BwPacing::Average);
             if basis == "candidate-reuse-off" {
                 opts.transfer_strategy = crate::cli::TransferStrategy::WholeFile;
             }
-            worker.bwlimit = Some(Arc::new(BandwidthLimit::new(5120)));
+            // 512 bytes cost 500 ms, beyond the 125 ms of idle credit.
+            worker.bwlimit = Some(Arc::new(BandwidthLimit::new(1024)));
             worker.progress.bytes_total.store(1536, Relaxed);
             worker.progress.files_total.store(1, Relaxed);
             worker.handle_file(0).unwrap();
@@ -7315,9 +7315,9 @@ fn a_restricted_receivers_listed_failures_are_left_to_it() {
 }
 
 /// No receiver paces file data, restricted receivers included: the sender
-/// paces, so a bandwidth limit never bounds a copy's requests by one burst.
+/// paces, so only the sender's own request budget sizes requests.
 #[test]
-fn a_bandwidth_limit_leaves_requests_to_a_restricted_receiver_their_size() {
+fn a_bandwidth_limit_sizes_requests_to_a_restricted_receiver_by_the_sender_budget() {
     let sched = Arc::new(Sched::new(512, 8192));
     let unused = Arc::new(Mutex::new(PipelineState::default()));
     let mut worker = pipeline_worker(&sched, &unused, &unused, false);
@@ -7325,11 +7325,9 @@ fn a_bandwidth_limit_leaves_requests_to_a_restricted_receiver_their_size() {
     let opts = Arc::get_mut(&mut worker.opts).unwrap();
     opts.block = 4 << 20;
     opts.restricted_receiver = true;
-    // Average pacing sizes requests for the bandwidth limit no further.
-    opts.tuning.bw_pacing = Some(crate::transfer_tuning::BwPacing::Average);
     assert_eq!(
         fast_file_size_limit(opts, Some(&limit)),
-        fast_file_size_limit(opts, None)
+        limit.request_bytes()
     );
 }
 
