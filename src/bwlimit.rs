@@ -78,6 +78,10 @@ pub fn parse_rate(value: &str) -> Result<u64> {
     Ok(rate as u64)
 }
 
+/// The credit a capped copy may build up while idle or busy with I/O, and
+/// the size of its filesystem requests.
+const BURST: Duration = Duration::from_millis(125);
+
 /// A virtual-clock pacer. Each caller reserves the next interval under one
 /// mutex, then sleeps without holding the lock. Sharing one instance makes the
 /// cap aggregate across all worker threads.
@@ -95,21 +99,26 @@ impl BandwidthLimit {
         }
     }
 
-    /// The largest request a capped copy sends: 125 ms of the rate, at
-    /// least 512 bytes. This sizes requests; it does not bound bytes on the
-    /// network.
+    /// The largest request a capped filesystem copy sends: `BURST` of the
+    /// rate, at least 512 bytes. This sizes requests; it does not bound
+    /// bytes on the network.
     pub fn request_bytes(&self) -> u64 {
-        ((self.bytes_per_sec as u128 * 125 / 1000).min(u64::MAX as u128) as u64).max(512)
+        ((self.bytes_per_sec as u128 * BURST.as_millis() / 1000).min(u64::MAX as u128) as u64)
+            .max(512)
     }
 
     /// Reserve `bytes` of the shared budget and return when the caller may
-    /// send them. The whole reservation is paid before it is admitted, so
-    /// the first request is not free. Synchronous callers sleep until the
-    /// returned instant; asynchronous ones use their runtime's sleep.
+    /// send them: once the clock has passed their cost. The clock may lag
+    /// `now` by up to `BURST`, so a caller that spends time on I/O or wakes
+    /// late between requests keeps the full rate, and after an idle period
+    /// at most `BURST` of the rate goes out early, however large the
+    /// request. Synchronous callers sleep until the returned instant;
+    /// asynchronous ones use their runtime's sleep.
     pub(crate) fn reserve(&self, now: Instant, bytes: u64) -> Instant {
         let duration = Duration::from_secs_f64(bytes as f64 / self.bytes_per_sec as f64);
+        let floor = now.checked_sub(BURST).unwrap_or(now);
         let mut next = self.next.lock().unwrap();
-        let at = next.map_or(now, |n| n.max(now)) + duration;
+        let at = next.map_or(floor, |n| n.max(floor)) + duration;
         *next = Some(at);
         at
     }
@@ -153,17 +162,28 @@ mod tests {
     }
 
     #[test]
-    fn reservations_are_prepaid_aggregate_and_recover_after_idle_time() {
+    fn reservations_are_aggregate_and_bound_idle_credit_to_one_burst() {
         let limit = BandwidthLimit::new(1 << 20);
-        let now = Instant::now();
-        assert_eq!(limit.reserve(now, 4 << 20), now + Duration::from_secs(4));
+        let now = Instant::now() + Duration::from_secs(1);
+        // A large first request waits for all but one burst of its cost.
+        assert_eq!(
+            limit.reserve(now, 4 << 20),
+            now + Duration::from_millis(3875)
+        );
         assert_eq!(
             limit.reserve(now, 1 << 19),
-            now + Duration::from_millis(4500)
+            now + Duration::from_millis(4375)
         );
+        // After idle time, only one burst of credit remains.
         let later = now + Duration::from_secs(10);
         assert_eq!(
             limit.reserve(later, 1 << 20),
+            later + Duration::from_millis(875)
+        );
+        // A caller back from I/O within one burst keeps the full rate.
+        let back = later + Duration::from_millis(875) + Duration::from_millis(100);
+        assert_eq!(
+            limit.reserve(back, 128 << 10),
             later + Duration::from_secs(1)
         );
     }

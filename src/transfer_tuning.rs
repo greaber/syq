@@ -242,7 +242,8 @@ impl TuningRoute {
                 if self == Self::S3Removal { "removal" } else { "copies" }
             ),
             Self::Stream => format!("performance control {key:?} is not supported with this descriptor copy: streams transfer one object without file comparison or small-file batching; S3 uses its part controls"),
-            _ => "removal supports only performance-tuning workers for filesystems or s3-requests for S3".into(),
+            Self::Removal | Self::S3Removal => "removal supports only performance-tuning workers for filesystems or s3-requests for S3".into(),
+            Self::Copy | Self::S3Copy => format!("performance-tuning {key} is not supported for this copy"),
         }
     }
 }
@@ -341,7 +342,7 @@ impl FromStr for TransferTuning {
                         "s3-retries is no longer a --performance-tuning key; use --s3-retries N"
                     ),
                     "bw-pacing" => bail!(
-                        "bw-pacing is no longer a --performance-tuning key; a bandwidth cap always sends requests of up to 125 ms of its rate"
+                        "bw-pacing is no longer a --performance-tuning key; under a bandwidth cap, filesystem copies always use requests of up to 125 ms of the rate"
                     ),
                     _ => bail!("unknown tuning option {name:?}; see --help-all"),
                 }

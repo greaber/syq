@@ -39,9 +39,9 @@ shortcuts and streams all other ranges.
 
 <a id="average-rate-and-burst-patterns"></a>
 
-Under a `--resource-limits bandwidth=RATE` cap, local and descriptor copies
-send requests of at most 125 ms of the rate, even when `request-size` is
-larger, so data arrives evenly rather than in bursts.
+Under a `--resource-limits bandwidth=RATE` cap, local copies and filesystem
+descriptor copies split file data into requests of at most 125 ms of the rate
+(and at least 512 bytes), even when `request-size` is larger.
 
 Sizes accept `K`, `M`, and `G`, using powers of 1024. Setting a request, block,
 pipeline, split, or batch value also stops syq from adjusting it during the
