@@ -8230,7 +8230,7 @@ fn only_network_filesystem_types_count_as_network_destinations() {
         libc::OVERLAYFS_SUPER_MAGIC as u32,
         0x2fc1_2fc1, // ZFS
     ] {
-        assert!(!network_file_system_type(local), "{local:#x}");
+        assert!(!fs_caps::type_facts(local).network, "{local:#x}");
     }
     for network in [
         libc::NFS_SUPER_MAGIC as u32,
@@ -8240,7 +8240,7 @@ fn only_network_filesystem_types_count_as_network_destinations() {
         0xff53_4d42,
         0x00c3_6400,
     ] {
-        assert!(network_file_system_type(network), "{network:#x}");
+        assert!(fs_caps::type_facts(network).network, "{network:#x}");
     }
 }
 

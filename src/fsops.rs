@@ -35,8 +35,14 @@ mod apply;
 mod basis_copy;
 #[cfg(test)]
 pub(crate) use fs_caps::distrust_owners_for_test;
+pub(crate) use fs_caps::file_system_of;
 pub(crate) use fs_caps::fixed_owners_and_modes;
 pub(crate) use fs_caps::reports_owners_faithfully;
+#[cfg(target_os = "linux")]
+pub(crate) use fs_caps::{
+    leases_show_writers, leases_trusted, TypeFacts, FUSE_SUPER_MAGIC, PROC_SUPER_MAGIC,
+    UNKNOWN_TYPE,
+};
 pub(crate) use partial::SeedAccess;
 
 /// Copy the first `len` bytes of `input` into `output`, which this receiver
@@ -436,42 +442,15 @@ fn reject_copy_source_claim_for_test() -> Result<()> {
 /// No pathname re-resolution, subprocess or additional remote round trip.
 /// f_fsid is an OS/filesystem hint, not a globally unique storage identifier.
 fn filesystem_hint(file: &File) -> Option<FilesystemHint> {
-    let mut stats = std::mem::MaybeUninit::<libc::statfs>::zeroed();
-    // SAFETY: the syscall initializes stats; zero initialization also covers padding.
-    if unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
-        return None;
-    }
-    let stats = unsafe { stats.assume_init() };
-    let fsid = unsafe {
-        std::slice::from_raw_parts(
-            (&stats.f_fsid as *const libc::fsid_t).cast::<u8>(),
-            std::mem::size_of_val(&stats.f_fsid),
-        )
-    };
+    let file_system = file_system_of(file).ok()?;
+    let fsid = file_system.fsid();
     if fsid.iter().all(|b| *b == 0) {
         return None;
     }
     #[cfg(target_os = "linux")]
-    let kind = match stats.f_type as u64 {
-        0xef53 => "ext",
-        0x58465342 => "xfs",
-        0x01021994 => "tmpfs",
-        0x6969 => "nfs",
-        0x9123683e => "btrfs",
-        0x794c7630 => "overlay",
-        other => fs_caps::linux_kind(other as u32).unwrap_or("other"),
-    }
-    .to_string();
+    let kind = file_system.facts().kind.to_string();
     #[cfg(target_os = "macos")]
-    let kind = String::from_utf8_lossy(
-        &stats
-            .f_fstypename
-            .iter()
-            .take_while(|b| **b != 0)
-            .map(|b| *b as u8)
-            .collect::<Vec<_>>(),
-    )
-    .into_owned();
+    let kind = String::from_utf8_lossy(file_system.kind()).into_owned();
     let mut hasher = blake3::Hasher::new();
     hasher.update(kind.as_bytes());
     hasher.update(fsid);
@@ -482,61 +461,33 @@ fn filesystem_hint(file: &File) -> Option<FilesystemHint> {
     })
 }
 
-/// Filesystems where each operation can cost a network round trip. Local
-/// disk and memory filesystems (ext4, XFS, Btrfs, ZFS, tmpfs) are not.
-#[cfg(target_os = "linux")]
-fn network_file_system_type(file_system_type: u32) -> bool {
-    [
-        libc::NFS_SUPER_MAGIC as u32,
-        libc::FUSE_SUPER_MAGIC as u32,
-        libc::SMB_SUPER_MAGIC as u32,
-        0xfe53_4d42, // SMB2
-        0xff53_4d42, // CIFS
-        0x00c3_6400, // Ceph
-    ]
-    .contains(&file_system_type)
-}
-
 #[cfg(target_os = "linux")]
 fn inspect_file_system(file: &File, key: FileSystemKey) -> FileSystemTraits {
-    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    unsafe {
-        if libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) != 0 {
-            return FileSystemTraits::default();
-        }
-        let stats = stats.assume_init();
-        let file_system_type = stats.f_type as u32;
-        let mut mount_stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-        // Unknown mount flags are treated as synchronous so a metadata-query
-        // failure cannot opt an unmeasured topology into the shortcut.
-        let synchronous = if libc::fstatvfs(file.as_raw_fd(), mount_stats.as_mut_ptr()) == 0 {
-            mount_stats.assume_init().f_flag & libc::ST_SYNCHRONOUS != 0
-        } else {
-            true
-        };
-        FileSystemTraits {
-            is_nfs: file_system_type == libc::NFS_SUPER_MAGIC as u32,
-            btrfs_compression: (file_system_type == libc::BTRFS_SUPER_MAGIC as u32)
-                .then(|| btrfs::Compression::for_mount(file, key)),
-            network: network_file_system_type(file_system_type),
-            synchronous,
-            // Keep unknown and network-backed filesystems on adaptive ranges.
-            // tmpfs also provides a real cross-filesystem control for this path.
-            local_userspace_copy: matches!(
-                file_system_type,
-                t if t == libc::EXT4_SUPER_MAGIC as u32
-                    || t == libc::XFS_SUPER_MAGIC as u32
-                    || t == libc::TMPFS_MAGIC as u32
-            ),
-            // Preserve the independently measured ext-family/XFS -> NFS scope.
-            measured_local_source: matches!(
-                file_system_type,
-                t if t == libc::EXT4_SUPER_MAGIC as u32
-                    || t == libc::XFS_SUPER_MAGIC as u32
-            ),
-            file_system_type,
-            profile: None,
-        }
+    let Ok(file_system) = file_system_of(file) else {
+        return FileSystemTraits::default();
+    };
+    let file_system_type = file_system.magic();
+    let facts = file_system.facts();
+    let mut mount_stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // Unknown mount flags are treated as synchronous so a metadata-query
+    // failure cannot opt an unmeasured topology into the shortcut.
+    // SAFETY: fstatvfs writes only into the local structure.
+    let synchronous = match crate::sys::retry_zero(|| unsafe {
+        libc::fstatvfs(file.as_raw_fd(), mount_stats.as_mut_ptr())
+    }) {
+        Ok(()) => unsafe { mount_stats.assume_init() }.f_flag & libc::ST_SYNCHRONOUS != 0,
+        Err(_) => true,
+    };
+    FileSystemTraits {
+        is_nfs: file_system_type == fs_caps::NFS_SUPER_MAGIC,
+        btrfs_compression: (file_system_type == fs_caps::BTRFS_SUPER_MAGIC)
+            .then(|| btrfs::Compression::for_mount(file, key)),
+        network: facts.network,
+        synchronous,
+        local_userspace_copy: facts.local_userspace_copy,
+        measured_local_source: facts.measured_local_source,
+        file_system_type,
+        profile: None,
     }
 }
 

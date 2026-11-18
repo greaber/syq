@@ -844,6 +844,7 @@ impl FsOps {
     fn guard_comparison(
         &mut self,
         read: &ExistingRead,
+        (root, dev): (&Root, u64),
         file: &File,
         len: u64,
         label: &Path,
@@ -856,7 +857,7 @@ impl FsOps {
         }
         #[cfg(target_os = "linux")]
         {
-            if !super::fs_caps::leases_show_writers(file) {
+            if !root.leases_show_writers_on(dev, file) {
                 #[cfg(debug_assertions)]
                 record_reuse_event("untrusted", label)?;
                 return Ok(());
@@ -886,7 +887,7 @@ impl FsOps {
             }
         }
         #[cfg(not(target_os = "linux"))]
-        let _ = (file, label);
+        let _ = (root, dev, file, label);
         Ok(())
     }
 
@@ -916,10 +917,17 @@ impl FsOps {
                 partials,
             });
         };
-        let fingerprint = fingerprint(&file.metadata()?);
+        let metadata = file.metadata()?;
+        let fingerprint = fingerprint(&metadata);
         if !partials {
             // Before anything of it is read.
-            self.guard_comparison(read, &file, fingerprint.len, &target.label)?;
+            self.guard_comparison(
+                read,
+                (&target.root, metadata.dev()),
+                &file,
+                fingerprint.len,
+                &target.label,
+            )?;
         }
         let algorithm = self.hash_policy.algorithm;
         // Only blocks the file holds whole are hashed: every block up to the
