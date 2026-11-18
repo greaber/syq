@@ -2116,6 +2116,177 @@ fn final_directory_metadata_refuses_another_directory_put_in_place_of_an_existin
         .is_none());
 }
 
+/// `syq rsync OPTIONS src/ dst/` to a local destination, or to the same one
+/// through a remote shell, recording each final directory metadata request
+/// (`final_metadata_requests`).
+#[cfg(debug_assertions)]
+fn copy_recording_final_metadata(t: &Tmp, options: &str, remote: bool) -> Command {
+    let (src, dst) = (t.s("src/"), t.s("dst/"));
+    let mut command = if remote {
+        let host_dst = format!("host:{dst}");
+        remote_syq_command(
+            t,
+            &fake_rsh(t),
+            &[
+                options,
+                "--rsync-path",
+                env!("CARGO_BIN_EXE_syq"),
+                &src,
+                &host_dst,
+            ],
+        )
+    } else {
+        let mut command = compat_command();
+        command.args([options, "--no-progress", &src, &dst]);
+        command
+    };
+    command.env(
+        "SYQ_TEST_DIRECTORY_METADATA_REQUESTS",
+        t.path("final-requests"),
+    );
+    command
+}
+
+/// For each final directory metadata request the copy sent, in order: how
+/// many directories it changes, and how many earlier requests were still
+/// unanswered when it was sent.
+#[cfg(debug_assertions)]
+fn final_metadata_requests(t: &Tmp) -> Vec<(usize, usize)> {
+    fs::read_to_string(t.path("final-requests"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| {
+            let (directories, unanswered) = line.split_once(' ').unwrap();
+            (directories.parse().unwrap(), unanswered.parse().unwrap())
+        })
+        .collect()
+}
+
+/// `count` empty directories `dNNNN` below `root`, each with its own time.
+#[cfg(debug_assertions)]
+fn timed_directories(t: &Tmp, root: &str, count: i64, first_time: i64) {
+    for index in 0..count {
+        let directory = t.path(&format!("{root}/d{index:04}"));
+        fs::create_dir_all(&directory).unwrap();
+        set_mtime(&directory, first_time + index);
+    }
+}
+
+#[cfg(debug_assertions)]
+fn directory_time(t: &Tmp, root: &str, index: i64) -> i64 {
+    fs::metadata(t.path(&format!("{root}/d{index:04}")))
+        .unwrap()
+        .mtime()
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn final_directory_metadata_is_sent_ahead_of_the_replies() {
+    // 4,300 directories and the destination itself take five requests of at
+    // most 1,000 directories. The receiver, a process of its own even for a
+    // local destination, is sent four before the first is answered and the
+    // fifth when that reply arrives. Every directory gets its time.
+    for remote in [true, false] {
+        let t = Tmp::new();
+        timed_directories(&t, "src", 4300, 1_500_000_000);
+        set_mtime(&t.path("src"), 1_400_000_000);
+        let out = copy_recording_final_metadata(&t, "-a", remote)
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+        assert_eq!(
+            final_metadata_requests(&t),
+            [(1000, 0), (1000, 1), (1000, 2), (1000, 3), (301, 3)],
+            "remote={remote}"
+        );
+        for index in 0..4300 {
+            assert_eq!(
+                directory_time(&t, "dst", index),
+                1_500_000_000 + index,
+                "remote={remote}, d{index:04}"
+            );
+        }
+        assert_eq!(
+            fs::metadata(t.path("dst")).unwrap().mtime(),
+            1_400_000_000,
+            "remote={remote}"
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_full_destination_ends_final_directory_metadata_after_the_requests_already_sent() {
+    // The first request reports that the destination is full. Three more
+    // had been sent by then: those are answered, and their directories keep
+    // the times they were given. The fifth request is not sent.
+    for remote in [true, false] {
+        let t = Tmp::new();
+        timed_directories(&t, "src", 4300, 1_500_000_000);
+        timed_directories(&t, "dst", 4300, 1_000_000_000);
+        let out = copy_recording_final_metadata(&t, "-a", remote)
+            .env("SYQ_TEST_FAIL_APPLY_ENOSPC", "/d0000")
+            .run()
+            .unwrap();
+        assert!(!out.status.success(), "remote={remote}: {out:?}");
+        assert!(
+            stderr_of(&out).contains("No space left on device"),
+            "remote={remote}: {}",
+            stderr_of(&out)
+        );
+        assert_eq!(
+            final_metadata_requests(&t),
+            [(1000, 0), (1000, 1), (1000, 2), (1000, 3)],
+            "remote={remote}"
+        );
+        let changed = |index| directory_time(&t, "dst", index) == 1_500_000_000 + index;
+        // The first request: the directory that failed, and another.
+        assert!(!changed(0), "remote={remote}");
+        assert!(changed(999), "remote={remote}");
+        // The requests sent before its reply arrived.
+        assert!(changed(1000), "remote={remote}");
+        assert!(changed(3999), "remote={remote}");
+        // The request never sent.
+        assert!(!changed(4000), "remote={remote}");
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_directory_loses_search_access_only_once_the_requests_before_it_are_answered() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    // Without -p the receiver opens the read-only `closed` to fill it and
+    // gives it its mode back at the end. That waits in a request of its own
+    // behind the 1,200 directories inside, which could not be reached after
+    // it: the receiver runs the three requests in the order sent, though it
+    // has all of them before it answers the first.
+    let t = Tmp::new();
+    timed_directories(&t, "src/closed", 1200, 1_500_000_000);
+    fs::create_dir_all(t.path("dst/closed")).unwrap();
+    fs::set_permissions(t.path("dst/closed"), fs::Permissions::from_mode(0o400)).unwrap();
+    let out = copy_recording_final_metadata(&t, "-rt", true)
+        .run()
+        .unwrap();
+    let mode = fs::metadata(t.path("dst/closed")).unwrap().mode() & 0o777;
+    fs::set_permissions(t.path("dst/closed"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_output_ok(&out);
+    assert_eq!(mode, 0o400);
+    assert_eq!(
+        final_metadata_requests(&t),
+        // `closed` goes with the destination itself, which is above it.
+        [(1000, 0), (200, 1), (2, 2)]
+    );
+    for index in 0..1200 {
+        assert_eq!(
+            directory_time(&t, "dst/closed", index),
+            1_500_000_000 + index,
+            "d{index:04}"
+        );
+    }
+}
+
 #[test]
 fn new_destination_directories_follow_the_umask() {
     // Under umask 0002 a new --into directory and the missing directory

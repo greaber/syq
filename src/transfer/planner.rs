@@ -5671,7 +5671,8 @@ impl Planner<'_> {
             };
             let response = match self.dst.take_reply(reply) {
                 Ok(response) => response,
-                // The connection is lost, and the other replies with it.
+                // No usable reply came: the connection is lost or out of
+                // step, so the replies after it are not waited for.
                 Err(error) => return Err(failure.unwrap_or(error)),
             };
             let errors = match self.applied(response, directories.len()) {
@@ -6114,6 +6115,59 @@ mod directory_metadata_tests {
         assert_eq!(directory_metadata_batch_len(&entries), 12);
         entries[7].2 = flags::RECEIVER_MODE;
         assert_eq!(directory_metadata_batch_len(&entries), 7);
+    }
+
+    #[test]
+    fn final_metadata_too_large_for_one_request_goes_in_halves_with_its_directories() {
+        // Nine directories whose paths together exceed the frame budget, then
+        // one at a shallower depth that removes search access.
+        let long = crate::proto::METADATA_BATCH_BYTES / 4;
+        let entry = |name: u8, len: usize, mode, depth| {
+            (
+                vec![name; len],
+                Meta {
+                    mode,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                    mtime_nsec: 0,
+                    inode_metadata: None,
+                },
+                flags::MODE,
+                depth,
+                TargetCondition::Any,
+            )
+        };
+        let mut entries: Vec<DirectoryMetadata> =
+            (0..9).map(|name| entry(name, long, 0o755, 2)).collect();
+        entries.push(entry(9, 1, 0o600, 1));
+        let requests: Vec<_> = DirectoryMetadataRequests::new(&entries).collect();
+        let names: Vec<Vec<u8>> = requests
+            .iter()
+            .map(|(directories, ops)| {
+                let paths: Vec<_> = directories.iter().map(|(path, ..)| path).collect();
+                let sent: Vec<_> = ops
+                    .iter()
+                    .map(|op| match op {
+                        Op::SetMeta {
+                            path,
+                            directory: true,
+                            ..
+                        } => path,
+                        other => panic!("unexpected operation {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(paths, sent);
+                paths.iter().map(|path| path[0]).collect()
+            })
+            .collect();
+        // Halved as `Planner::apply` halves any request, until at most three
+        // of these paths go together: 9 into 4 and 5, the 4 into 2 and 2, the
+        // 5 into 2 and 3. The narrowed directory waits for all of them.
+        assert_eq!(
+            names,
+            [vec![0, 1], vec![2, 3], vec![4, 5], vec![6, 7, 8], vec![9]]
+        );
     }
 
     #[test]
