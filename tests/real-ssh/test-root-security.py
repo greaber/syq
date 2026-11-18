@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Privileged-copy checks confined to the disposable OpenSSH runner container."""
 import ctypes
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -327,6 +328,17 @@ def in_place_update_by_the_change(root):
     print("Root updates in place only files that already have the owner they end with", flush=True)
 
 
+def read_together(lookups, count, preview, context):
+    """The destination lookups recorded in `lookups` read the groups of
+    `count` directories in one request. Each directory asked by itself
+    would be a lookup of one path, which only a preview makes, once, for
+    the destination."""
+    asked = lookups.read_text().splitlines()
+    assert (asked.count(f"stat {count}"), asked.count("stat 1")) == (1, int(preview)), (
+        f"expected one lookup of the {count} directories whose groups planning reads "
+        f"and {int(preview)} of a single path", context, asked)
+
+
 def directory_groups_are_read_together(root):
     """Without -g, root writes into an existing file, or gives it new hard
     links, only when it has the group a new file would get in its directory:
@@ -393,12 +405,7 @@ def directory_groups_are_read_together(root):
                 rewritten = [record for record in records
                              if record.get("action") == "transfer_file" and record.get("bytes")]
                 assert len(rewritten) == replaced, (case, rewritten)
-            # One request reads the group of every directory with files.
-            # Each directory asked by itself would be a lookup of one path,
-            # which only a preview makes, once, for the destination.
-            asked = lookups.read_text().splitlines()
-            assert (asked.count(f"stat {count}"), asked.count("stat 1")) == (1, step == "preview"), (
-                case, step, asked)
+            read_together(lookups, count, step == "preview", (case, step))
         for target, inode in inodes.items():
             kind, _, _, new_group = kinds[int(target.parent.name[1:]) % len(kinds)]
             kept, group = expected(kind, new_group, target.name)
@@ -408,6 +415,36 @@ def directory_groups_are_read_together(root):
             assert target.read_bytes() == payload, (case, str(target))
             if case == "links":
                 assert target.with_name(target.name + ".second").stat().st_ino == status.st_ino, (case, str(target))
+
+    # A mapping that gives a file's hash has the copy read the file even
+    # when its size and time match, so its directory is asked about too.
+    source = root / "groups-hash-source"
+    destination = root / "groups-hash-destination"
+    entries = []
+    # Three files in new directories keep the lookup counts distinct.
+    for index in range(count + 3):
+        name = f"d{index:02}/file"
+        for tree, contents in ((source, payload), (destination, old)):
+            if tree == destination and index >= count:
+                continue
+            (tree / name).parent.mkdir(parents=True)
+            (tree / name).write_bytes(contents)
+            os.utime(tree / name, (1_700_000_000, 1_700_000_000))
+        path = {"encoding": "utf-8", "value": name}
+        entries.append({"src": path, "dst": path, "kind": "file", "expected_hash": {
+            "algorithm": "sha256", "value": hashlib.sha256(payload).hexdigest()}})
+    mapping = root / "groups-hash.jsonl"
+    mapping.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+    inodes = {index: (destination / f"d{index:02}/file").stat().st_ino for index in range(count)}
+    lookups = root / "groups-hash.lookups"
+    run(["syq", "cp", "--mapping", str(mapping), "-C", str(source), "--into", str(destination),
+         "--copy-metadata=mtime", "--in-place=update", "--no-progress"],
+        env={**os.environ, "SYQ_TEST_DESTINATION_LOOKUPS": str(lookups)})
+    read_together(lookups, count, False, "expected hashes")
+    for index in range(count + 3):
+        target = destination / f"d{index:02}/file"
+        assert target.read_bytes() == payload, str(target)
+        assert index >= count or target.stat().st_ino == inodes[index], str(target)
     print("Root reads the groups of a batch's directories together and replaces files by them", flush=True)
 
 

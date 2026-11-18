@@ -1986,8 +1986,9 @@ impl Planner<'_> {
     /// The directories whose group planning `leaves` may ask a root
     /// receiver (`new_file_group_may_differ`) and has not read: those of the
     /// existing files the copy would write in place or link new names to,
-    /// where it does not copy the group. Only a file that changed is
-    /// written in place (`plan_file`); one missed here is asked by itself.
+    /// where it does not copy the group. Only a file the copy does not
+    /// keep by its size and time is written in place (`plan_file`); one
+    /// missed here is asked by itself.
     pub(super) fn group_question_parents<'l>(
         &self,
         leaves: impl Iterator<Item = (&'l Planned, Option<&'l Entry>)>,
@@ -2006,7 +2007,7 @@ impl Planner<'_> {
                 && opts.flags_for(&leaf.dst_rel) & flags::GROUP == 0
                 && ((opts.hardlinks && leaf.e.nlink > 1)
                     || (opts.inplace_update
-                        && !(opts.trusts_size_and_time()
+                        && !(opts.keeps_matching_file(&leaf.dst_rel)
                             && opts.metadata_matches(&leaf.dst_rel, &leaf.e, destination))));
             let Some(parent) = super::directory_stream::parent_of(&leaf.dst).filter(|_| asks)
             else {
@@ -2221,9 +2222,7 @@ impl Planner<'_> {
         // Content is up to date, but its metadata differs, and the receiver
         // cannot change it in place: the file is replaced as a changed file
         // is (`must_replace`).
-        let quick = same
-            && opts.trusts_size_and_time()
-            && (opts.dry_run || opts.expected_for(&dst_rel).is_none());
+        let quick = same && opts.keeps_matching_file(&dst_rel);
         let replace = quick
             && dst_entry.as_ref().is_some_and(|d| {
                 (opts.metadata_fix_flags(&dst_rel, &e, d) != 0
@@ -5476,14 +5475,16 @@ impl Planner<'_> {
     /// other directories the leaves being planned may ask about
     /// (`leaf_parents`): a tree of small directories otherwise waits a
     /// round trip for each. A directory that cannot be read counts as
-    /// missing, so a file there is replaced.
+    /// missing, so a file there is replaced. This is a plain lookup, not
+    /// the planner's own (`Planner::stat_many`): that one fails as a whole
+    /// when a `--copy-if` copy sees an entry change between its two reads,
+    /// as these directories do while workers publish into them.
     fn read_parent_groups(&mut self, parent: PathBytes) -> Option<(u32, u32)> {
         let mut parents = std::mem::take(&mut self.leaf_parents);
         parents.push(parent.clone());
         parents.sort_unstable();
         parents.dedup();
-        let mut stats = self
-            .stat_many(parents.clone())
+        let mut stats = stat_many(self.dst, parents.clone(), false)
             .unwrap_or_default()
             .into_iter();
         for path in parents {
