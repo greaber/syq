@@ -958,7 +958,7 @@ fn requester_loss_counts_only_input_that_ends_after_the_marker() {
     ] {
         let description = format!("{reads:?}");
         assert_eq!(
-            wait_for_requester_loss(&mut Reads(reads.into())),
+            wait_for_requester_loss(&mut Reads(reads.into()), None),
             lost,
             "{description}"
         );
@@ -1796,6 +1796,7 @@ fn a_coordinator_without_its_sources_names_their_input_in_their_place() {
         destination_path: None,
         mapping: false,
         sources_on_input: None,
+        storage: None,
     };
     let listed =
         coordinator_arguments(&args, (srcs, dst, dst), (false, false), command.clone()).unwrap();
@@ -2075,4 +2076,241 @@ fn a_coordinating_source_runs_the_signed_command_against_the_destinations_receiv
         "{arguments:?}"
     );
     assert!(environment.contains(&(MAX_DELETE_FROM_APPROVER, "1".to_owned())));
+}
+
+mod storage_signing {
+    use super::*;
+    use crate::s3::authorization::{started, Authorization, Signer, Unsigned};
+    use std::os::unix::net::UnixStream;
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    fn command(words: &[&str]) -> Args {
+        Args::parse_args(&words.iter().map(OsString::from).collect::<Vec<_>>()).unwrap()
+    }
+
+    /// Both machines of a copy between a server and a bucket, joined as the
+    /// SSH session joins them: the server's requests leave as marked lines
+    /// that this machine's relay picks out of the server's output, and this
+    /// machine's replies arrive on the server's input after the marker.
+    struct Session {
+        /// The server's authorization, as its copy uses it.
+        authorization: Authorization,
+        /// Closing this is losing the machine that started the copy.
+        requester: Option<UnixStream>,
+        /// Whether the server saw its requester end after the marker.
+        lost: std::thread::JoinHandle<bool>,
+        served: std::thread::JoinHandle<Result<Option<String>>>,
+    }
+
+    /// The starting machine ends, or its connection drops: the server's
+    /// input ends.
+    fn lose(requester: &mut Option<UnixStream>) {
+        let requester = requester.take().unwrap();
+        requester.shutdown(std::net::Shutdown::Both).unwrap();
+    }
+
+    fn session(words: &[&str]) -> Session {
+        let request = started::request(&command(words)).unwrap();
+        let bucket = request.bucket.clone();
+        let signer = Signer::fixture(request);
+        // The server: its copy's end of the session, and the bridge to its
+        // standard input and output.
+        let (local, remote) = UnixStream::pair().unwrap();
+        let outgoing = remote.try_clone().unwrap();
+        // The SSH session: the server's output and input.
+        let (mut server_output, relay_input) = UnixStream::pair().unwrap();
+        let (mut server_input, requester) = UnixStream::pair().unwrap();
+        std::thread::spawn(move || {
+            let prefix = started::line_prefix(TOKEN);
+            started::send_lines(outgoing, |line| {
+                // Other output of the copy shares the stream.
+                writeln!(server_output, "Copied some file\n{prefix}{line}")
+            })
+        });
+        let lost = std::thread::spawn(move || {
+            let lost = wait_for_requester_loss(&mut server_input, Some(&remote));
+            let _ = remote.shutdown(std::net::Shutdown::Both);
+            lost
+        });
+        // This machine: the relay of the server's output, and the signer.
+        let (requests, to_signer) = UnixStream::pair().unwrap();
+        std::thread::spawn(move || {
+            let mut relay = Relay::new(TOKEN, None, None, (false, false));
+            relay.storage = Some(to_signer);
+            let mut other_output = Vec::new();
+            relay_output(relay_input, &mut other_output, &mut None, &mut relay).unwrap();
+            assert!(relay.failure.is_none(), "{:?}", relay.failure);
+            assert!(!String::from_utf8(other_output).unwrap().contains("syq-storage-"));
+        });
+        let mut replies = requester.try_clone().unwrap();
+        let served = std::thread::spawn(move || {
+            replies.write_all(&[REQUESTER_MARKER])?;
+            let mut session = SigningSession { requests, replies };
+            crate::destination::storage::serve_started_copy(
+                &mut session,
+                &signer,
+                vec![("x-amz-storage-class".into(), "STANDARD_IA".into())],
+                vec![],
+            )
+        });
+        let (authorization, headers, write_headers) = started::open(bucket, local).unwrap();
+        assert_eq!(headers.len(), 1);
+        assert_eq!((headers[0].0.as_str(), headers[0].1.as_str()), ("x-amz-storage-class", "STANDARD_IA"));
+        assert!(write_headers.is_empty());
+        assert!(authorization.started_elsewhere());
+        Session {
+            authorization,
+            requester: Some(requester),
+            lost,
+            served,
+        }
+    }
+
+    const UPLOAD: &[&str] = &[
+        "cp", "--from", "server", "--srcs-in", "dataset", "--to", "s3://bucket", "--into",
+        "dataset",
+    ];
+
+    #[test]
+    fn the_server_gets_urls_for_the_command_and_nothing_else() {
+        let session = session(UPLOAD);
+        // Many requests, so the session spans several lines each way.
+        let requests: Vec<_> = (0..3000)
+            .map(|index| Unsigned::new("PUT", &format!("dataset/file-{index}")))
+            .collect();
+        session.authorization.authorize(requests.clone()).unwrap();
+        let url = session.authorization.signed(requests[7].clone()).unwrap();
+        assert!(
+            url.starts_with("https://storage.example/bucket/dataset/file-7?")
+                && url.contains("X-Amz-Signature="),
+            "{url}"
+        );
+        // A key the command does not name ends the session unsigned.
+        let error = session
+            .authorization
+            .authorize(vec![Unsigned::new("PUT", "elsewhere/file")])
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the machine that started this copy: storage request is outside the approved paths"
+        );
+        assert_eq!(
+            session.served.join().unwrap().unwrap().as_deref(),
+            Some("storage request is outside the approved paths")
+        );
+        assert!(session
+            .authorization
+            .authorize(vec![Unsigned::new("PUT", "dataset/later")])
+            .is_err());
+    }
+
+    #[test]
+    fn losing_the_starting_machine_while_signing_fails_the_copy_and_stops_it() {
+        let mut session = session(UPLOAD);
+        session
+            .authorization
+            .authorize(vec![Unsigned::new("PUT", "dataset/first")])
+            .unwrap();
+        lose(&mut session.requester);
+        assert!(session.lost.join().unwrap(), "the server did not notice");
+        let error = session
+            .authorization
+            .authorize(vec![Unsigned::new("PUT", "dataset/second")])
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("the machine that started this copy disconnected"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn losing_the_starting_machine_after_signing_still_stops_the_copy() {
+        let mut session = session(UPLOAD);
+        let request = Unsigned::new("PUT", "dataset/first");
+        session.authorization.authorize(vec![request.clone()]).unwrap();
+        session.authorization.finish_preparation().unwrap();
+        assert_eq!(session.served.join().unwrap().unwrap(), None);
+        // Data moves with the URLs already signed; nothing more is signed.
+        session.authorization.signed(request).unwrap();
+        let error = session
+            .authorization
+            .signed(Unsigned::new("PUT", "dataset/late"))
+            .unwrap_err();
+        assert!(error.to_string().contains("was not signed before the copy started moving data"), "{error}");
+        lose(&mut session.requester);
+        assert!(session.lost.join().unwrap(), "the server did not notice");
+    }
+
+    #[test]
+    fn the_server_command_is_an_ordinary_storage_copy_without_this_machines_storage_options() {
+        let args = command(&[
+            "cp", "--from", "user@server:2222", "--srcs-in", "dataset", "--to", "s3://bucket",
+            "--into", "dataset", "--prune", "-n", "--s3-profile", "work", "--s3-endpoint",
+            "https://objects.example", "--s3-region", "auto", "--s3-header",
+            "x-amz-server-side-encryption-customer-key: secret", "--s3-retries", "3",
+            "--syq-path", "/opt/syq", "--rsh", "ssh -v",
+        ]);
+        let (dst, srcs) = args.locations.split_last().unwrap();
+        let remote = coordinator_arguments(
+            &args,
+            (srcs, dst, dst),
+            (false, false),
+            CoordinatorCommand {
+                relay_results: false,
+                destination_results: false,
+                remote_shell: None,
+                peer_login_user: None,
+                peer_connection_host: None,
+                destination_path: None,
+                mapping: false,
+                sources_on_input: None,
+                storage: args.s3.as_ref(),
+            },
+        )
+        .unwrap();
+        let text = remote.join(" ");
+        for expected in ["--delegated-operands-b64", "-n", "--prune", "--s3-retries=3", "--to s3://bucket"] {
+            assert!(text.contains(expected), "{expected}: {text}");
+        }
+        for absent in ["secret", "work", "objects.example", "auto", "--rsh", "--syq-path", "--tcp-ports", "server"] {
+            assert!(!text.contains(absent), "{absent}: {text}");
+        }
+        // The server parses it as an upload from its own files.
+        std::env::set_var(started::SIGNING_ENV, crate::identity::build());
+        let parsed = Args::parse_args(&remote.iter().map(OsString::from).collect::<Vec<_>>());
+        std::env::remove_var(started::SIGNING_ENV);
+        let parsed = parsed.unwrap();
+        assert!(parsed.delegated && parsed.dry_run && parsed.delete);
+        assert_eq!(parsed.locations.len(), 2);
+        assert_eq!(parsed.locations[0].host, None);
+        assert_eq!(parsed.locations[0].path, b"dataset");
+        assert_eq!(parsed.locations[1].host.as_deref(), Some("s3://bucket"));
+
+        // A download runs at the destination, with the bucket as its source.
+        let args = command(&[
+            "cp", "--from", "s3://bucket", "--srcs-in", "dataset", "--to", "server", "--into", "/data",
+        ]);
+        let (dst, srcs) = args.locations.split_last().unwrap();
+        let remote = coordinator_arguments(
+            &args,
+            (srcs, dst, &srcs[0]),
+            (true, false),
+            CoordinatorCommand {
+                relay_results: true,
+                destination_results: false,
+                remote_shell: None,
+                peer_login_user: None,
+                peer_connection_host: None,
+                destination_path: None,
+                mapping: false,
+                sources_on_input: None,
+                storage: args.s3.as_ref(),
+            },
+        )
+        .unwrap()
+        .join(" ");
+        assert!(remote.contains("--from s3://bucket") && remote.contains("--relay-results"), "{remote}");
+        assert!(!remote.contains("--to"), "{remote}");
+    }
 }

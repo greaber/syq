@@ -581,6 +581,33 @@ onto itself to update metadata. It does not authorize tag changes on older
 versions or copying a different destination object as the source;
 bucket-to-bucket copies need a separately approved source.
 
+A [copy between a server and a bucket](object-storage.md#copy-between-a-server-and-a-bucket)
+that you start from your own machine gives the server signed URLs in the same
+way, with your machine signing in place of a receiving laptop. Three things
+differ:
+
+- **No prompt.** Typing the command is the approval. Your machine works out
+  what the command allows before it contacts the server: the bucket it names;
+  for an upload, the destination path and everything under it; for a download,
+  each source path and everything under it; and only the operations the
+  command implies. A download gets read access only. An upload can also write,
+  can delete only with `--prune` or `--prune-before`, and with `--dry-run` can
+  only read. The server says which requests it needs, and your machine refuses
+  to sign any outside those limits, which ends the copy.
+- **Shorter life.** The URLs last 24 hours, or until your credentials expire
+  if that is sooner, instead of up to seven days.
+- **Headers.** Values given with `--s3-header` and `--s3-write-header`, such as
+  a customer-provided encryption key, are sent to the server because it makes
+  the requests.
+
+A compromised server, or anyone who gets the URLs from it, can use them until
+they expire for anything inside those limits: read every object under the
+paths the command names, and after an upload command also replace those
+objects with other contents or, with pruning, delete them. Ending the command
+stops the copy but does not revoke URLs already signed; nothing can, short of
+revoking the credentials that signed them. Your secret access key never
+leaves your machine.
+
 ## SSH account access
 
 Approving SSH account access, as requested by

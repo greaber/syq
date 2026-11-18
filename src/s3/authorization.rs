@@ -417,7 +417,7 @@ impl Unsigned {
                 .map(String::as_str),
         )
     }
-    pub(super) fn new(method: &str, key: &str) -> Self {
+    pub(crate) fn new(method: &str, key: &str) -> Self {
         Self {
             bucket: None,
             method: method.into(),
@@ -426,15 +426,15 @@ impl Unsigned {
             headers: BTreeMap::new(),
         }
     }
-    pub(super) fn bucket(mut self, bucket: &str, default: &str) -> Self {
+    pub(crate) fn bucket(mut self, bucket: &str, default: &str) -> Self {
         self.bucket = (bucket != default).then(|| bucket.to_owned());
         self
     }
-    pub(super) fn query(mut self, key: &str, value: &str) -> Self {
+    pub(crate) fn query(mut self, key: &str, value: &str) -> Self {
         self.query.insert(key.into(), value.into());
         self
     }
-    pub(super) fn header(mut self, key: &str, value: &str) -> Self {
+    pub(crate) fn header(mut self, key: &str, value: &str) -> Self {
         self.headers.insert(key.into(), value.into());
         self
     }
@@ -719,7 +719,7 @@ impl Authorization {
         use std::sync::atomic::Ordering::Relaxed;
         self.unanswered.load(Relaxed) && !self.answered.load(Relaxed)
     }
-    pub(super) fn authorize(&self, requests: Vec<Unsigned>) -> Result<()> {
+    pub(crate) fn authorize(&self, requests: Vec<Unsigned>) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         let missing: Vec<_> = requests
             .into_iter()
@@ -746,7 +746,7 @@ impl Authorization {
         state.requests.extend(missing.into_iter().zip(signed));
         Ok(())
     }
-    pub(super) fn signed(&self, request: Unsigned) -> Result<String> {
+    pub(crate) fn signed(&self, request: Unsigned) -> Result<String> {
         if now()? >= self.configuration.expires_at {
             return Err(self.expired());
         }
@@ -774,7 +774,7 @@ impl Authorization {
         crate::output::diagnostic!("syq: storage authorization ready; the authorizing machine may disconnect. Authorization expires at {deadline}; provider policies or credential revocation may shorten it.");
         Ok(())
     }
-    pub(super) fn finish_preparation(&self) -> Result<()> {
+    pub(crate) fn finish_preparation(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         if let Some(mut stream) = state.connection.take() {
             crate::destination::storage::finish(&mut stream)?;

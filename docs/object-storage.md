@@ -80,8 +80,7 @@ objects.
   service's consistency allows, but not a whole prefix.
   `--if-exists=update-if-older` compares stored file times, falling back to S3
   Last-Modified, which is the upload time rather than the file's age.
-  `--in-place` is unsupported, and so are copies between S3 and an SSH host;
-  run syq on the machine that has the files.
+  `--in-place` is unsupported.
 - **Recovery:** A rerun can resume interrupted uploads and downloads. A resumed
   download needs room for a second copy of its `.syq-s3-*.partial` file; to
   start over instead, remove the partial or run
@@ -127,6 +126,49 @@ Syq never downloads objects to compare them, so `--hash`, `--hash-or-copy`
 and expected hashes are unsupported here. It compares objects by their
 metadata, and `--if-exists=error-if-different` rejects copies whose contents
 can't be shown to match that way.
+
+## Copy between a server and a bucket
+
+Name an SSH server as the other end to copy between its files and a bucket
+without logging in to it:
+
+```sh
+syq cp --from server --srcs-in dataset --to s3://bucket --into dataset
+syq cp --from s3://bucket --srcs-in dataset --to server --into dataset
+```
+
+The copy runs on the server, and file data travels directly between the
+server and the storage service, never through the machine where you typed the
+command. That machine supplies the credentials: `--s3-profile`,
+`--s3-endpoint`, `--s3-region` and the AWS environment variables are read
+there, and it signs each storage request the server needs, so the server needs
+no credentials and never receives yours. Typing the command is the approval;
+there is no prompt. See [Storage authorization](security.md#storage-authorization)
+for what this trusts the server with.
+
+The server needs:
+
+- network access to the storage service, and for HTTPS the usual
+  [CA certificates](security.md#https-certificates);
+- a clock that is roughly right;
+- the same syq build as your machine, which syq installs for you as for any
+  copy to a server.
+
+`--dry-run`, `--results`, `-v`, progress and exit codes work as they do for a
+copy run on the server itself. Keep the command running: if it ends or loses
+its connection, the copy on the server stops. Run it again to continue; the
+server keeps the records of interrupted uploads and downloads, and your
+machine signs again.
+
+Requests are signed before data starts moving and stay valid for 24 hours, or
+until your credentials expire if that is sooner. A copy that runs longer fails
+its remaining files; run it again to continue.
+
+These copies do not support `--detach`, `--auth-from`, `--mapping`,
+`--stream-mapping-fd` or the SSH route options (`--via`, `--coordinate-at`,
+`--peer-auth` and the TCP options). `syq rm`, copies between two buckets and
+copies that also name a second server or a receiving machine (`@NAME`) cannot
+run through a server this way.
 
 ## Authorize from your laptop
 

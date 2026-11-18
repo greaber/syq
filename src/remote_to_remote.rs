@@ -3219,18 +3219,18 @@ fn wait_for_requester_loss(
 /// This machine's end of a storage signing session with a copy it started
 /// on a server: the server's requests arrive through the relay of its
 /// output, and replies go to its input.
-struct SigningSession {
+struct SigningSession<W> {
     requests: std::os::unix::net::UnixStream,
-    replies: std::process::ChildStdin,
+    replies: W,
 }
 
-impl Read for SigningSession {
+impl<W> Read for SigningSession<W> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         self.requests.read(buffer)
     }
 }
 
-impl Write for SigningSession {
+impl<W: Write> Write for SigningSession<W> {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         self.replies.write(buffer)
     }

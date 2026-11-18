@@ -727,6 +727,7 @@ fn session(stop_after: Option<usize>) -> (Authorization, std::thread::JoinHandle
             let seen = messages.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             stop_after.is_some_and(|limit| seen >= limit)
         })
+        .map(drop)
     });
     (
         Authorization::new("fixture".into(), configuration, client),
