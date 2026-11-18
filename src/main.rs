@@ -108,6 +108,27 @@ fn tune_allocator() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn tune_allocator() {}
 
+/// glibc gives each new thread its own arena, up to eight per CPU, and keeps
+/// freed memory in the arena that freed it. An S3 command runs up to 32
+/// tokio workers and a blocking pool, and the HTTP client's per-connection
+/// buffers left in their arenas raise its peak memory to several times its
+/// live heap. A few shared arenas keep it near the live heap at no measured
+/// cost in time or CPU there. File copies would pay for a cap in user CPU,
+/// so only S3 commands get it. glibc fixes the limit when a thread first
+/// needs a ninth arena, so call this before starting the S3 runtime.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn limit_allocator_arenas_for_s3() {
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, S3_ARENAS);
+    }
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const S3_ARENAS: libc::c_int = 4;
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn limit_allocator_arenas_for_s3() {}
+
 /// Many workers each keep a few files open; the default soft limit (1024 on
 /// Linux, 256 on macOS) is too small for -j32, so use whatever the hard limit
 /// allows. Best effort: the source descriptor budget later reports what the
@@ -405,6 +426,7 @@ fn run() {
         }
     }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("_ls") {
+        limit_allocator_arenas_for_s3();
         match s3::listing::run(&argv[2..]) {
             Ok(code) => crate::output::exit(code),
             Err(error) => {
@@ -497,6 +519,9 @@ fn run() {
     // enrollment out of date and the next copy updates the receiver.
     let reports_other_build = args.delegated
         && std::env::var_os(remote_to_remote::REPORT_OTHER_BUILD).is_some_and(|value| value == "1");
+    if args.s3.is_some() {
+        limit_allocator_arenas_for_s3();
+    }
     let result = if args.stream_mapping_fd.is_some() {
         stream_mapping::run(args)
     } else if args.descriptor_copy.is_some() {
