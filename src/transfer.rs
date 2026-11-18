@@ -658,29 +658,20 @@ pub fn endpoint(loc: &Location, args: &Args) -> Result<Endpoint> {
                 }
             };
             Endpoint::Remote(RemoteSpec {
-                local_process: false,
-                user: loc.user.clone(),
-                host: h.clone(),
-                port: loc.port,
-                rsh,
                 syq_path: args.syq_path.clone(),
                 bootstrap_helper: restricted_grant.is_none()
                     && args.syq_path.is_none()
                     && !args.no_bootstrap,
                 restricted_grant,
-                helper_install: Default::default(),
                 ssh_multiplexer,
                 quiet: args.quiet,
-                pacing: Default::default(),
-                tcp: Default::default(),
-                diagnostics: Default::default(),
-                primed_control: Default::default(),
                 receiver_host: args
                     .receiver_host
                     .as_ref()
                     .filter(|(dialed, _)| dialed == h)
                     .map(|(_, receiver)| std::sync::Arc::new(receiver.clone())),
                 read_ahead: args.tuning_options.unwrap_or_default().pipeline_depth(),
+                ..RemoteSpec::new(loc.user.clone(), h.clone(), loc.port, rsh)
             })
         }
     })
@@ -724,7 +715,7 @@ fn open_control_connection(ep: &Endpoint, args: &Args) -> Result<Box<dyn Conn>> 
     match ep {
         Endpoint::Local { .. } => ep.connect_control(args.compress),
         Endpoint::Remote(spec) => spec
-            .connect_with(args.compress, false)
+            .connect(args.compress)
             .map(|c| Box::new(c) as Box<dyn Conn>),
     }
 }

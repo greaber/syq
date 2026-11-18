@@ -1031,16 +1031,19 @@ pub(crate) fn cleanup_domain(domain: &Domain) -> Result<()> {
 fn helper_spec(record: &Record) -> Result<crate::conn::RemoteSpec> {
     record.provider.validate()?;
     crate::persistence::validate_openssh_socket_path(&record.control())?;
-    let mut spec = crate::conn::RemoteSpec::local_receiver(false);
-    spec.local_process = false;
-    spec.user = record.endpoint()?.user.clone();
-    spec.host = record.endpoint()?.host.clone();
-    spec.port = record.endpoint()?.port;
-    spec.rsh = std::iter::once("ssh".to_owned())
+    let endpoint = record.endpoint()?;
+    let rsh = std::iter::once("ssh".to_owned())
         .chain(strict_options(&record.control()))
         .collect();
-    spec.bootstrap_helper = true;
-    Ok(spec)
+    Ok(crate::conn::RemoteSpec {
+        bootstrap_helper: true,
+        ..crate::conn::RemoteSpec::new(
+            endpoint.user.clone(),
+            endpoint.host.clone(),
+            endpoint.port,
+            rsh,
+        )
+    })
 }
 
 pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
