@@ -503,6 +503,18 @@ impl Engine {
                 self.args
                     .s3_metadata
                     .apply(&source_head, &mut desired_head)?;
+                // The command's storage class replaces the copied one in every
+                // request, so expect it, or each run would rewrite the object.
+                if self.args.s3_metadata.storage_class {
+                    let added = self
+                        .options
+                        .headers_for("PUT", [])
+                        .filter(|header| header.0 == "x-amz-storage-class")
+                        .last();
+                    if let Some(super::super::Header(_, class)) = added {
+                        desired_head.storage_class = Some(class.as_str().into());
+                    }
+                }
                 if self.args.s3_metadata.tags {
                     let (source_tags, destination_tags) = tokio::try_join!(
                         self.selected_tags(source_bucket, &source.key, &source_head),

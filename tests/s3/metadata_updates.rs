@@ -346,6 +346,42 @@ fn added_headers_replace_the_objects_own_attributes_in_metadata_updates() {
 }
 
 #[test]
+fn copied_storage_class_header_settles_after_one_update() {
+    // A storage-class header replaces a copied source class, so an object
+    // already in the header's class is unchanged rather than rewritten again.
+    for fault in ["metadata-update-small", "metadata-update-large"] {
+        for flag in ["--s3-header", "--s3-write-header"] {
+            let temp = test_support::tempdir().unwrap();
+            let server = Server::start(fault);
+            let output = server
+                .command_with_part_size(temp.path(), 0, false)
+                .args(["--s3-endpoint", &server.address])
+                .args([
+                    "--from",
+                    "s3://source",
+                    "original",
+                    "--to",
+                    "s3://destination",
+                    "--as",
+                    "copied",
+                    "--copy-metadata=storage-class",
+                    "--if-exists=error-if-different",
+                    "--performance-tuning=s3-part-size=5G",
+                    flag,
+                    "x-amz-storage-class: REDUCED_REDUNDANCY",
+                    "--s3-write-header",
+                    &format!("{}: yes", super::WRITE_PROBE),
+                ])
+                .capture_output()
+                .unwrap();
+            assert!(output.status.success(), "{fault}: {}", output_text(&output));
+            assert!(!server.gate.1.load(Ordering::Relaxed), "{fault} {flag}");
+            assert_eq!(server.probes.load(Ordering::Relaxed), 0, "{fault} {flag}");
+        }
+    }
+}
+
+#[test]
 fn incomplete_metadata_blocks_only_requested_metadata_updates() {
     for fault in [
         "metadata-update-small-missing",
