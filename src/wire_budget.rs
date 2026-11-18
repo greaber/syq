@@ -11,11 +11,12 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 pub(crate) const MEMORY_LIMIT: usize = 512 << 20;
-/// A message's first reservation: what any message and its small
-/// collections hold, and at least a decoded `Request` or `Response` (a few
-/// hundred bytes, in a queue slot allocated with its channel). Each queued
-/// reply holds one, so it costs the allowance what it holds rather than a
-/// whole granule.
+/// A message's first reservation: at least a decoded `Request` or
+/// `Response` (a few hundred bytes, in a queue slot allocated with its
+/// channel). A queued acknowledgment, matched range or data block, whose
+/// data is not counted, costs the allowance this rather than a whole
+/// granule. A message counted for more, such as one with a digest or a
+/// file's metadata, reserves granules, as before.
 const MESSAGE_RESERVATION: usize = 1 << 10;
 /// Reservations beyond a message's first grow in granules, so that a large
 /// collection updates the shared count once per granule, not per element.
@@ -134,21 +135,18 @@ pub(crate) struct Hold {
     expansion: Option<Expansion>,
 }
 
-/// The process's decoded-collection allowance.
-fn memory_budget() -> &'static Arc<Budget> {
-    static BUDGET: OnceLock<Arc<Budget>> = OnceLock::new();
-    BUDGET.get_or_init(|| {
-        Arc::new(Budget {
-            used: AtomicUsize::new(0),
-            limit: MEMORY_LIMIT,
-        })
-    })
-}
-
 impl Hold {
     pub(crate) fn new() -> Self {
+        static BUDGET: OnceLock<Arc<Budget>> = OnceLock::new();
         Self {
-            budget: memory_budget().clone(),
+            budget: BUDGET
+                .get_or_init(|| {
+                    Arc::new(Budget {
+                        used: AtomicUsize::new(0),
+                        limit: MEMORY_LIMIT,
+                    })
+                })
+                .clone(),
             used: 0,
             reserved: 0,
             exhausted: false,
@@ -654,16 +652,15 @@ mod tests {
         assert_eq!(shared.used.load(Relaxed), MESSAGE_RESERVATION);
     }
 
-    // Holds the process's own allowance: run in a process of its own, as
-    // nextest does.
     #[test]
     fn every_reply_queue_of_many_workers_fits_the_allowance() {
-        // Each of 64 workers' two connections queues up to 256 replies,
-        // such as a stream's pieces read from its source and their
+        // Each of 64 workers' two connections queues up to 256 replies, such
+        // as a stream's pieces read from its source and their
         // acknowledgments, or a comparison's matched ranges: 32,768 queued
-        // replies, each holding a few hundred bytes. Each reserves what it holds, not a 64 KiB granule, which
-        // would have used up the allowance at 8,192.
-        use crate::proto::Response;
+        // replies, each holding a few hundred bytes. Each reserves what it
+        // holds, not a 64 KiB granule, which would have used up the
+        // allowance at 8,192.
+        use crate::proto::{Response, SmallPatched};
         let replies = [
             Response::Ok,
             Response::Block {
@@ -677,15 +674,35 @@ mod tests {
             },
         ]
         .map(|reply| postcard::to_stdvec(&reply).unwrap());
+        let shared = Arc::new(Budget {
+            used: AtomicUsize::new(0),
+            limit: MEMORY_LIMIT,
+        });
         let queued = 64 * 2 * crate::transfer_tuning::COMPARE_REQUESTS;
         let held: Vec<_> = (0..queued)
-            .map(|n| decode::<Response>(&replies[n % replies.len()]).unwrap())
-            .collect();
-        let used = memory_budget().used.load(Relaxed);
-        assert_eq!(used, queued * MESSAGE_RESERVATION);
-        assert!(used <= MEMORY_LIMIT / 8);
+            .map(|n| decode_with_hold::<Response>(&replies[n % replies.len()], hold(&shared)))
+            .collect::<io::Result<_>>()
+            .unwrap();
+        assert_eq!(shared.used.load(Relaxed), queued * MESSAGE_RESERVATION);
         drop(held);
-        assert_eq!(memory_budget().used.load(Relaxed), 0);
+        assert_eq!(shared.used.load(Relaxed), 0);
+        // A reply counted for more, as a patch's result, a file's metadata
+        // or two digests, still reserves a granule.
+        let counted = [
+            Response::PatchedBatch(vec![Ok(SmallPatched {
+                kept: false,
+                identity: None,
+                replaced: None,
+            })]),
+            Response::Stats(vec![None]),
+            Response::Hashes(vec![Default::default(); 2]),
+        ];
+        for reply in counted {
+            let bytes = postcard::to_stdvec(&reply).unwrap();
+            let held = decode_with_hold::<Response>(&bytes, hold(&shared)).unwrap();
+            assert_eq!(shared.used.load(Relaxed), RESERVATION_GRANULE, "{reply:?}");
+            drop(held);
+        }
     }
 
     #[test]
