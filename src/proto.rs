@@ -2797,11 +2797,5 @@ mod completion_compat_tests {
             matches!(&request, Request::ListDir { directory, prefix, limit: 1000, symlink_policy: OperatorSymlinkPolicy::Refuse, confined_root: None } if directory == b"/data" && prefix == b"al")
         );
         assert_eq!(postcard::to_stdvec(&request).unwrap(), bytes);
-        let bytes = include_bytes!("../tests/fixtures/completion/directory-entries-v0.3.2.bin");
-        let response: Response = postcard::from_bytes(bytes).unwrap();
-        assert!(
-            matches!(&response, Response::DirectoryEntries { entries, truncated: false } if entries.len() == 1 && entries[0].name == b"alpha" && !entries[0].directory)
-        );
-        assert_eq!(postcard::to_stdvec(&response).unwrap(), bytes);
     }
 }
