@@ -149,6 +149,13 @@ pub(super) struct TransferSlot {
 }
 
 impl TransferSlot {
+    /// Whether objects beyond the transfer limit are in progress. Their
+    /// number then bounds the requests that check them, where otherwise an
+    /// object's requests are admitted as they always were.
+    pub fn beyond_limit(&self) -> bool {
+        self.gate.state.lock().unwrap().limit != usize::MAX
+    }
+
     /// Wait for a transfer slot. Call this before reading or hashing file
     /// contents and before any request that transfers an object or changes
     /// one; an object that turns out to need none of that never calls it.

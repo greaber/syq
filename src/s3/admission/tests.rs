@@ -936,6 +936,11 @@ fn a_waiter_that_gives_up_passes_its_transfer_slot_on() {
     // Claiming again neither waits nor takes a second slot.
     assert!(Box::pin(holder.claim()).as_mut().poll(&mut cx).is_ready());
     assert_eq!(gate.active(), 1);
+    // A limit is in force only while objects beyond it are in progress.
+    assert!(holder.beyond_limit());
+    gate.set_limit(usize::MAX);
+    assert!(!holder.beyond_limit());
+    gate.set_limit(1);
     let (mut cancelled, mut next, mut last) = (slot(), slot(), slot());
     {
         let mut cancelled = Box::pin(cancelled.claim());
