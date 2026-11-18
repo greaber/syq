@@ -76,10 +76,7 @@ const MAX_RELAYED_LINE_BYTES: usize = 1024 * 1024;
 
 /// Results arriving on a remote coordinator's standard output: its own
 /// records and, through a restricted receiver, the destination's frames.
-/// Each is written as it arrives, except that an attempt which may be run
-/// again holds back the coordinator's first few records until the
-/// destination's results start (`hold_until_destination_starts`). Through a
-/// restricted
+/// Each is written as it arrives. Through a restricted
 /// receiver, the destination's records of what it changed, refused, or
 /// failed are the only ones of their kind: the coordinator leaves out its
 /// records of the failures the destination lists, and its claims of success
@@ -99,24 +96,6 @@ struct Relay {
     errors: u64,
     /// The first problem with what arrived; later lines are drained unread.
     failure: Option<anyhow::Error>,
-    /// The coordinator's records from before a restricted destination's
-    /// results start, held back so that a copy its receiver refuses for
-    /// running another build, which is run again, leaves nothing in the
-    /// results; `None` when not holding, or once they are written.
-    held: Option<Vec<serde_json::Value>>,
-    /// The length of the lines `held` came from.
-    held_bytes: usize,
-}
-
-/// The most records, and the most bytes of relayed lines, a [`Relay`]
-/// holds back before writing them anyway. A refused attempt sends a few.
-const MAX_HELD_RECORDS: usize = 64;
-const MAX_HELD_BYTES: usize = 1024 * 1024;
-
-impl Drop for Relay {
-    fn drop(&mut self) {
-        self.release_held();
-    }
 }
 
 impl Relay {
@@ -127,8 +106,6 @@ impl Relay {
         (dry_run, prune): (bool, bool),
     ) -> Self {
         Self {
-            held: None,
-            held_bytes: 0,
             coordinator_prefix: crate::destination_results::relay::coordinator_prefix(token)
                 .into_bytes(),
             destination_prefix: crate::destination_results::relay::destination_prefix(token)
@@ -162,50 +139,6 @@ impl Relay {
         if let Err(error) = result {
             self.failure = Some(error);
         }
-    }
-
-    /// Hold back the coordinator's records until a restricted destination's
-    /// results start, for an attempt that is run again if the destination's
-    /// receiver refuses it for running another build.
-    fn hold_until_destination_starts(&mut self) {
-        if self.destination.is_some() {
-            self.held = Some(Vec::new());
-        }
-    }
-
-    /// Write `record`, relayed as a line of `length` bytes, to the results,
-    /// or hold it back with the others before the destination's results
-    /// start.
-    fn emit(&mut self, record: serde_json::Value, length: usize) {
-        match &mut self.held {
-            Some(held)
-                if held.len() < MAX_HELD_RECORDS && self.held_bytes + length <= MAX_HELD_BYTES =>
-            {
-                held.push(record);
-                self.held_bytes += length;
-            }
-            _ => {
-                self.release_held();
-                if let Some(writer) = &self.results {
-                    writer.emit_value(record);
-                }
-            }
-        }
-    }
-
-    /// Write the records held back so far, and stop holding any.
-    fn release_held(&mut self) {
-        if let (Some(held), Some(writer)) = (self.held.take(), &self.results) {
-            if !held.is_empty() {
-                writer.emit_values(held);
-            }
-        }
-    }
-
-    /// Drop the records held back so far, for an attempt that is run again:
-    /// whether nothing of it reached the results.
-    fn discard_held(&mut self) -> bool {
-        self.held.take().is_some()
     }
 
     fn coordinator_record(&mut self, line: &[u8]) -> Result<()> {
@@ -257,15 +190,13 @@ impl Relay {
                 if counted_error(&record) {
                     self.errors += 1;
                 }
-                self.emit(record, line.len());
+                writer.emit_value(record);
             }
         }
         Ok(())
     }
 
     fn destination_frame(&mut self, line: &[u8]) -> Result<()> {
-        // The destination's results have started: the copy is under way.
-        self.release_held();
         let reader = self.destination.as_mut().context(
             "the coordinating server relayed destination results that were not expected",
         )?;
@@ -289,7 +220,6 @@ impl Relay {
     }
 
     fn error(&mut self, message: &str, class: &'static str) {
-        self.release_held();
         if let Some(writer) = &self.results {
             writer.emit_value(serde_json::json!({
                 "type": "error",
@@ -439,7 +369,6 @@ struct Settlement<'a> {
 /// restricted receiver, the destination reported. Returns the process exit
 /// code the final result advertises, so the two can never disagree.
 fn settle(mut relay: Relay, settlement: Settlement<'_>) -> Result<i32> {
-    relay.release_held();
     let Settlement {
         src_host,
         dst_host,
@@ -2005,31 +1934,7 @@ pub fn coordinate_at_dst(
 /// receiver refuses it for running another build.
 pub(crate) const REPORT_OTHER_BUILD: &str = "SYQ_INTERNAL_NATIVE_REPORT_OTHER_BUILD";
 
-/// The destination's receiver refused a copy started here for running
-/// another build than this one, which coordinated the copy and signed it:
-/// this machine's record of the enrollment is out of date, so refreshing it
-/// installs this build there. `retry` is the copy as it was signed.
-#[derive(Debug)]
-struct ReceiverRunsOtherBuild {
-    receiver: String,
-    retry: crate::restricted::Retry,
-}
-
-impl std::fmt::Display for ReceiverRunsOtherBuild {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "the restricted receiver on {} runs another syq build than this one",
-            self.receiver
-        )
-    }
-}
-
-impl std::error::Error for ReceiverRunsOtherBuild {}
-
-/// Run a copy between two servers, and when the destination's receiver
-/// refuses it for running another build, update the receiver to this build
-/// and run it once more, under the same request ID.
+/// Run a copy between two servers.
 fn run_remote(
     args: &Args,
     srcs: &[Location],
@@ -2038,42 +1943,6 @@ fn run_remote(
     results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
 ) -> Result<i32> {
     let started = std::time::Instant::now();
-    let attempt = |retry_of| {
-        run_remote_once(
-            args,
-            (srcs, dst, coordinator_at_dst),
-            results.clone(),
-            started,
-            retry_of,
-        )
-    };
-    match attempt(None) {
-        Err(error) => match error.downcast::<ReceiverRunsOtherBuild>() {
-            Ok(refused) => {
-                if !args.quiet {
-                    crate::output::diagnostic!(
-                        "syq: {refused}; updating it to this build and trying once more"
-                    );
-                }
-                attempt(Some(refused.retry))
-            }
-            Err(error) => Err(error),
-        },
-        outcome => outcome,
-    }
-}
-
-/// One attempt at a copy between two servers that started at `started`.
-/// `retry_of` is the copy as an earlier attempt signed it, which the
-/// destination's receiver refused for running another build.
-fn run_remote_once(
-    args: &Args,
-    (srcs, dst, coordinator_at_dst): (&[Location], &Location, bool),
-    results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
-    started: std::time::Instant,
-    retry_of: Option<crate::restricted::Retry>,
-) -> Result<i32> {
-    let refresh = retry_of.is_some();
     crate::fsops::ensure_source_count(srcs.len())?;
     // A copy a receiving machine approved runs on the source's receiver,
     // which gives its coordinator the sources as separate arguments.
@@ -2110,8 +1979,8 @@ fn run_remote_once(
     let mut constrained_rsh = None;
     let mut restricted_destination_path = None;
     let mut restricted_grant = None;
-    // The restricted destination's copy as it was signed.
-    let mut signed_copy = None;
+    // The enrollment the restricted destination's copy was signed for.
+    let mut signed_enrollment = None;
     // The restricted destination's results: who signs them and which copy.
     let mut destination_results = None;
     let default_ssh_agent_policy = if args.rsh.is_some() {
@@ -2174,24 +2043,15 @@ fn run_remote_once(
                     )?),
                     agent: peer_policy.agent_socket(),
                     allow_enrollment: !args.dry_run,
-                    retry_of,
                     batch: false,
                     results_key: None,
                     role: crate::directive::Role::Destination,
                 })
             })
             .transpose()
-            .map_err(|error| {
-                // A refused copy that is not run again says why, and to run
-                // it again; the other modes are no answer to that.
-                if refresh {
-                    error
-                } else {
-                    error.context(
-                        "prepare restricted destination enrollment; use --peer-auth broker to explicitly request authentication-only confinement",
-                    )
-                }
-            })?;
+            .context(
+                "prepare restricted destination enrollment; use --peer-auth broker to explicitly request authentication-only confinement",
+            )?;
         if let Some(prepared) = prepared {
             // The coordinator gets the entry key on its input and uses it
             // for every SSH connection to the receiver, so the copy needs
@@ -2205,7 +2065,7 @@ fn run_remote_once(
             constrained_rsh = Some(receiver_rsh(Some(peer_policy.port())));
             restricted_destination_path = Some(prepared.destination);
             restricted_grant = Some(prepared.directive);
-            signed_copy = Some(prepared.retry);
+            signed_enrollment = Some(prepared.enrollment_id);
             // A detached copy has no one to relay the destination's results
             // to: its log on the coordinator is its record.
             destination_results = (!args.detach)
@@ -2377,21 +2237,25 @@ fn run_remote_once(
         internal_environment.push((REPORT_OTHER_BUILD, "1".to_owned()));
     }
     // What the coordinator's status says when the receiver refused it for
-    // running another build: run it again after a refresh, unless this
-    // attempt followed one or is a dry run, which never refreshes.
+    // running another build: mark this machine's record of the enrollment
+    // out of date, so that the next copy updates the receiver first.
     let other_build = |status: Option<i32>| -> Option<anyhow::Error> {
         if !reports_other_build || status != Some(crate::restricted::OTHER_BUILD_EXIT) {
             return None;
         }
         let receiver = endpoint_display(peer);
-        Some(match (refresh, signed_copy) {
-            (false, Some(_)) if args.dry_run => anyhow::anyhow!(
+        let marked = signed_enrollment
+            .context("the copy was signed for no enrollment")
+            .and_then(crate::restricted::mark_for_refresh);
+        Some(match marked {
+            Err(error) => anyhow::anyhow!(
+                "the restricted receiver on {receiver} runs another syq build, and syq could not mark its record of it for updating ({error:#}); run `syq receiver enroll {receiver}`, then run the copy again"
+            ),
+            Ok(()) if args.dry_run => anyhow::anyhow!(
                 "the restricted receiver on {receiver} runs another syq build; a dry run does not update it, but the next copy does"
             ),
-            (false, Some(retry)) => ReceiverRunsOtherBuild { receiver, retry }
-            .into(),
-            _ => anyhow::anyhow!(
-                "the restricted receiver on {receiver} still runs another syq build after syq updated it; see its message above"
+            Ok(()) => anyhow::anyhow!(
+                "the restricted receiver on {receiver} runs another syq build; run the copy again, which updates it first"
             ),
         })
     };
@@ -2595,16 +2459,12 @@ fn run_remote_once(
         crate::output::diagnostic!("syq: remote-to-remote: running on {coordinator_host}");
     }
     let relay = results_token.as_deref().map(|token| {
-        let mut relay = Relay::new(
+        Relay::new(
             token,
             results.clone(),
             destination_results.take(),
             (args.dry_run, args.delete),
-        );
-        if reports_other_build && !refresh && !args.dry_run {
-            relay.hold_until_destination_starts();
-        }
-        relay
+        )
     });
     let run = |relay: Option<Relay>| {
         let mut cmd = make_command();
@@ -2688,14 +2548,6 @@ fn run_remote_once(
     // channels have closed.
     drop(broker_guard);
     if let Some(error) = other_build(status.code()) {
-        // An attempt that is run again must have left nothing in the
-        // results; its records were held back, since the destination's
-        // results never started.
-        if error.is::<ReceiverRunsOtherBuild>()
-            && relay.as_mut().is_some_and(|relay| !relay.discard_held())
-        {
-            bail!("{error}");
-        }
         return Err(error);
     }
     let outcome: Result<i32> = match status.code() {
