@@ -279,7 +279,7 @@ impl Session {
     }
     pub fn pace(&self, bytes: u64) {
         if let Some(limit) = &self.resources.bandwidth {
-            limit.wait_prepaid(bytes);
+            limit.wait(bytes);
         }
     }
 }

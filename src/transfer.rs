@@ -2596,9 +2596,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         crate::destination::prepare(&mut args)?;
     }
     let block = args.block_size;
-    args.tuning_options
-        .unwrap_or_default()
-        .validate(args.bwlimit_bytes)?;
+    args.tuning_options.unwrap_or_default().validate()?;
     let max_size = args.max_size.as_deref().map(parse_size).transpose()?;
     let min_size = args.min_size.as_deref().map(parse_size).transpose()?;
     let bwlimit = (args.bwlimit_bytes > 0)
@@ -2903,7 +2901,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
 
     if opts.benchmark.is_some() {
         crate::output::diagnostic!(
-            "syq: tuning before transport selection: request-size={} bytes (ordinary ceiling, after logical pacing), adaptive-ordinary-requests={}, streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, transfer-strategy={} (block reuse {}), batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
+            "syq: tuning before transport selection: request-size={} bytes (ordinary ceiling, after logical pacing), adaptive-ordinary-requests={}, streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, transfer-strategy={} (block reuse {}), batch-files={}, batch-bytes={}, split-min-size={}",
             opts.tuning.request_size(block, bwlimit.as_deref()),
             opts.adaptive_ranges(),
             opts.tuning.streaming_request_size(block, bwlimit.as_deref()),
@@ -2913,7 +2911,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             if opts.transfer_strategy.reuse_destination_blocks(opts.same_host) { "on" } else { "off" },
             opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES),
             opts.tuning.batch_bytes(), opts.tuning.split_min_size(block),
-            if bwlimit.is_some() { opts.tuning.bw_pacing.unwrap_or_default().to_string() } else { "disabled".into() }
         );
     }
     let mapping_contents = args.mapping_contents.clone();
@@ -3584,11 +3581,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let transport_budget = (args.bwlimit_bytes > 0 && (opts.src_remote || opts.dst_remote))
         .then(|| Arc::new(crate::bwlimit::transport::Budget::new(args.bwlimit_bytes)));
     if let Some(budget) = &transport_budget {
-        if opts.tuning.bw_pacing.is_some() {
-            crate::output::diagnostic!(
-                "syq: bw-pacing has no effect on this copy; the bandwidth cap paces compressed bytes at the sender"
-            );
-        }
         for (ep, ctl, source) in [
             (&src_ep, &mut src_ctl, true),
             (&dst_ep, &mut dst_ctl, false),
