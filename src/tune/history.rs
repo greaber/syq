@@ -17,8 +17,9 @@ pub(crate) use command::{command_for_help, run};
 const SCHEMA: i64 = 2;
 const DEFAULT_BUDGET: u64 = 10 << 20;
 const MAX_PENDING: usize = 4096;
-/// A copy writes nothing to the history before it is this old, so that a
-/// short copy writes once, when it ends. One killed sooner leaves no record.
+/// A copy writes nothing to the history for this long after opening it, so
+/// that a short copy writes once, when it ends. One killed sooner leaves no
+/// record.
 /// Many copies starting and finishing together then contend for the writer
 /// lock once each, for a single short transaction, instead of several times.
 const FIRST_WRITE: Duration = Duration::from_secs(1);
@@ -276,13 +277,18 @@ impl Recorder {
         let db = open_waiting(path, lock_wait)?;
         let salt = identity_key(&db)?;
         db.busy_timeout(Duration::ZERO)?;
+        // The first save is counted from here, not from `start`. A copy's
+        // clock can start well before its history opens, as when choosing
+        // its authorization first connects to a server, and that copy is
+        // still starting.
+        let opened = Instant::now();
         let recorder = Self(Arc::new(Mutex::new(Writer {
             db,
             id: None,
             day: day(),
             start,
-            next_write: start + FIRST_WRITE,
-            retry: start,
+            next_write: opened + FIRST_WRITE,
+            retry: opened,
             sequence: 0,
             pending: Vec::new(),
             pending_context: None,

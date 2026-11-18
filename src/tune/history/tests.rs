@@ -559,7 +559,7 @@ fn a_failed_final_save_does_not_publish_partial_context_or_samples() {
 fn a_copy_writes_nothing_until_it_ends_and_then_writes_once() {
     let temp = crate::test_support::tempdir().unwrap();
     let path = temp.path().join("history.sqlite");
-    recorder(&path).complete(true, json!({}));
+    measured_run(&path, &key("a"), &[(8, 100.0), (16, 200.0)]);
     let other = open(&path).unwrap();
     // Another copy holds the writer lock while this one starts and records:
     // none of that waits for it, or takes it.
@@ -567,7 +567,9 @@ fn a_copy_writes_nothing_until_it_ends_and_then_writes_once() {
     let writer = recorder(&path);
     writer.context(&key("a"));
     writer.event("context", json!({"stage":"source_registered"}));
-    assert!(writer.starting_count(&key("a"), true).is_none());
+    // Its connection waits for no lock, so a starting count that it reads
+    // was read without waiting for the writer.
+    assert_eq!(writer.starting_count(&key("a"), false).unwrap().workers, 16);
     for bytes in 0..100 {
         writer.event("sample", json!({"bytes":bytes}));
     }
@@ -588,16 +590,69 @@ fn a_copy_writes_nothing_until_it_ends_and_then_writes_once() {
 }
 
 #[test]
+fn a_copy_whose_history_opens_late_writes_nothing_as_it_starts() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    // The copy's clock started well before its history opened, as when
+    // choosing its authorization first connected to a server.
+    let start = Instant::now()
+        .checked_sub(Duration::from_secs(30))
+        .expect("the machine has been up for half a minute");
+    let writer = Recorder::at(&path, start, json!({}), DEFAULT_BUDGET).unwrap();
+    writer.context(&key("a"));
+    writer.event("context", json!({"stage":"source_registered"}));
+    {
+        let mut state = writer.0.lock().unwrap();
+        assert!(state.next_write > Instant::now());
+        assert!(state.id.is_none() && state.pending.len() == 2);
+        // Keep this test's own pace out of the rest.
+        state.next_write = Instant::now() + Duration::from_secs(3600);
+    }
+    writer.complete(true, json!({}));
+    let db = open(&path).unwrap();
+    let events = command::read_events(&db, 1).unwrap();
+    assert_eq!(events.len(), 3);
+    assert!(events[0]["elapsed_us"].as_u64().unwrap() >= 30_000_000);
+}
+
+#[test]
+fn a_save_that_found_the_history_locked_leaves_it_alone_for_a_while() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let writer = recorder(&path);
+    let db = open(&path).unwrap();
+    {
+        // As after a save that found the lock taken, with a save now due.
+        let mut state = writer.0.lock().unwrap();
+        state.retry = Instant::now() + Duration::from_secs(3600);
+        state.next_write = Instant::now();
+    }
+    for worker in 0..WRITE_EVENTS + 1 {
+        writer.event("worker", json!({"worker":worker}));
+    }
+    // The lock is free, yet nothing tried it: neither the save that is due
+    // nor the one that many unsaved events ask for.
+    assert_eq!(run_count(&db), 0);
+    writer.0.lock().unwrap().retry = Instant::now();
+    writer.event("worker", json!({}));
+    assert_eq!(
+        command::read_events(&db, 1).unwrap().len(),
+        WRITE_EVENTS + 3
+    );
+}
+
+#[test]
 fn a_long_copy_saves_its_timeline_while_it_runs() {
     let temp = crate::test_support::tempdir().unwrap();
     let path = temp.path().join("history.sqlite");
     let start = Instant::now();
     let writer = Recorder::at(&path, start, json!({}), DEFAULT_BUDGET).unwrap();
-    // The first save is due when the copy is a second old. Keep this test's
-    // own pace out of it from here on.
+    // The first save is due a second after the history opened. Keep this
+    // test's own pace out of it from here on.
     {
         let mut state = writer.0.lock().unwrap();
-        assert_eq!(state.next_write, start + FIRST_WRITE);
+        assert!(state.next_write >= start + FIRST_WRITE);
+        assert!(state.next_write <= Instant::now() + FIRST_WRITE);
         state.next_write = start + Duration::from_secs(3600);
     }
     let db = open(&path).unwrap();

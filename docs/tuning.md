@@ -118,8 +118,9 @@ until it ends, and stays that way, with what it had saved, if it is
 interrupted. A copy interrupted in its first second leaves no record.
 Recording does not hold a copy up for long: when many copies end at the same
 moment, a copy waits for the others no longer than it ran itself, and never
-more than a tenth of a second, and then skips its record. That mostly happens
-to very short copies.
+more than a tenth of a second. Then it gives up: a copy that had saved nothing
+yet leaves no record, which mostly happens to very short copies, and a longer
+one stays `incomplete`.
 
 The history holds opaque endpoint, filesystem, and network-address
 identifiers, the UTC date, copy settings, progress numbers, and tuning
