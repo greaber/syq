@@ -25,6 +25,8 @@ const FIRST_BATCH_MAX_DELAY: Duration = Duration::from_millis(50);
 /// one's destination up as it is shown, and a control connection keeps this
 /// many requests in flight (`conn::reply_queue`).
 pub(crate) const AHEAD: usize = crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH;
+/// What a scan shows each batch it has complete while earlier ones wait.
+pub(crate) type Upcoming<'a> = &'a mut dyn FnMut(&[Entry]);
 /// Chunks a scan's producer queues for its consumer: about one batch, or
 /// two when the consumer holds batches ahead, which it fills only from
 /// chunks that have already arrived.
@@ -429,7 +431,7 @@ fn hold_chunk(
     batch: &mut Vec<Entry>,
     ignored_batch: &mut Vec<PathBytes>,
     held: &mut VecDeque<Held>,
-    upcoming: Option<&mut dyn FnMut(&[Entry])>,
+    upcoming: Option<Upcoming<'_>>,
 ) -> bool {
     for event in chunk {
         match event {
@@ -478,7 +480,7 @@ fn receive_scan(
     batch: &mut Vec<Entry>,
     ignored_batch: &mut Vec<PathBytes>,
     sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
-    mut upcoming: Option<&mut dyn FnMut(&[Entry])>,
+    mut upcoming: Option<Upcoming<'_>>,
     ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
     warn: &mut dyn FnMut(ScanWarning),
 ) -> Result<()> {
@@ -546,7 +548,7 @@ fn receive_scan(
         };
         // The first batch is never shown early: its sink runs before any
         // other batch is read.
-        let upcoming: Option<&mut dyn FnMut(&[Entry])> = match &mut upcoming {
+        let upcoming: Option<Upcoming<'_>> = match &mut upcoming {
             Some(upcoming) if !first_batch => Some(&mut **upcoming),
             _ => None,
         };
@@ -604,7 +606,7 @@ pub(crate) fn scan_descriptor_ahead(
     ignore: &[String],
     report_ignored: bool,
     sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
-    upcoming: Option<&mut dyn FnMut(&[Entry])>,
+    upcoming: Option<Upcoming<'_>>,
     ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
     warn: &mut dyn FnMut(ScanWarning),
 ) -> Result<u64> {

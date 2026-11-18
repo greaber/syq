@@ -42,7 +42,7 @@ impl LocalConn {
         ignore: &[String],
         report_ignored: bool,
         sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
-        upcoming: Option<&mut dyn FnMut(&[Entry])>,
+        upcoming: Option<crate::scan::Upcoming<'_>>,
         ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         warn: &mut dyn FnMut(crate::proto::ScanWarning),
     ) -> Result<u64> {
