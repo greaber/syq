@@ -77,18 +77,6 @@ impl From<forward::ForwardRequest> for Asked {
     }
 }
 
-/// Whether this machine serves a copy on `route` itself, under a token,
-/// rather than signing directives for other servers' accounts.
-fn served_here(route: Route) -> bool {
-    matches!(route, Route::ToNamed | Route::FromNamed)
-}
-
-/// Whether the end this machine approves on `route` only reads, and so
-/// deletes nothing.
-fn only_reads(route: Route) -> bool {
-    matches!(route, Route::FromNamed | Route::Download)
-}
-
 /// Where a request to approve a copy arrives, which decides what its command
 /// may select and how this machine reaches the accounts.
 pub(crate) enum Origin<'a> {
@@ -293,7 +281,7 @@ impl Approver<'_> {
         );
         let caps = crate::directive::Caps {
             // A source deletes nothing.
-            max_delete: if only_reads(route) {
+            max_delete: if matches!(route, Route::FromNamed | Route::Download) {
                 0
             } else {
                 self.caps.max_delete
@@ -356,9 +344,11 @@ impl Approver<'_> {
                 }
             }
         };
-        // At most eight requests wait here: copies served here, by their
-        // sessions, and copies signed for other servers, by their count.
-        let _slot = match receiver.filter(|_| served_here(route)) {
+        // At most eight requests wait here: copies this machine serves
+        // itself under a token, by their sessions, and copies it signs for
+        // other servers, by their count.
+        let served_here = matches!(route, Route::ToNamed | Route::FromNamed);
+        let _slot = match receiver.filter(|_| served_here) {
             Some(receiver) => {
                 let mut sessions = receiver.sessions.lock().unwrap();
                 sessions.retain(|_, s| s.opened || s.issued.elapsed() < START_TIMEOUT);
@@ -521,14 +511,14 @@ impl Approver<'_> {
         anyhow::ensure!(!cancelled(), disconnected);
         // This lock only serializes decisions, not enrollment.
         drop(request_lock);
-        let policies = [&destination, &source].map(|account| {
-            account
-                .as_ref()
-                .map(|account| account.policy(&cancelled))
-                .transpose()
-        });
-        let [destination_policy, source_policy] = policies;
-        let (destination_policy, source_policy) = (destination_policy?, source_policy?);
+        let destination_policy = destination
+            .as_ref()
+            .map(|destination| destination.policy(&cancelled))
+            .transpose()?;
+        let source_policy = source
+            .as_ref()
+            .map(|source| source.policy(&cancelled))
+            .transpose()?;
         // The destination's known hosts go to the server that dials it: the
         // source, in its signed directive, or the server that asked.
         let destination_known_hosts = destination_policy
