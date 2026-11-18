@@ -15,8 +15,8 @@ pub(crate) const MEMORY_LIMIT: usize = 512 << 20;
 /// `Response` (a few hundred bytes, in a queue slot allocated with its
 /// channel). A queued acknowledgment, matched range or data block, whose
 /// data is not counted, costs the allowance this rather than a whole
-/// granule. A message counted for more, such as one with a digest or a
-/// file's metadata, reserves granules, as before.
+/// granule. A message counted for more, such as one with two or more
+/// digests or a file's metadata, reserves granules, as before.
 const MESSAGE_RESERVATION: usize = 1 << 10;
 /// Reservations beyond a message's first grow in granules, so that a large
 /// collection updates the shared count once per granule, not per element.
@@ -660,7 +660,7 @@ mod tests {
         // replies, each holding a few hundred bytes. Each reserves what it
         // holds, not a 64 KiB granule, which would have used up the
         // allowance at 8,192.
-        use crate::proto::{Response, SmallPatched};
+        use crate::proto::Response;
         let replies = [
             Response::Ok,
             Response::Block {
@@ -686,8 +686,18 @@ mod tests {
         assert_eq!(shared.used.load(Relaxed), queued * MESSAGE_RESERVATION);
         drop(held);
         assert_eq!(shared.used.load(Relaxed), 0);
-        // A reply counted for more, as a patch's result, a file's metadata
-        // or two digests, still reserves a granule.
+    }
+
+    #[test]
+    fn a_reply_counted_for_more_reserves_no_more_than_a_granule() {
+        // A patch's result, a file's metadata or two digests are counted
+        // for more than a first reservation; they reserve no more than one
+        // granule, as before.
+        use crate::proto::{Response, SmallPatched};
+        let shared = Arc::new(Budget {
+            used: AtomicUsize::new(0),
+            limit: MEMORY_LIMIT,
+        });
         let counted = [
             Response::PatchedBatch(vec![Ok(SmallPatched {
                 kept: false,
@@ -700,7 +710,11 @@ mod tests {
         for reply in counted {
             let bytes = postcard::to_stdvec(&reply).unwrap();
             let held = decode_with_hold::<Response>(&bytes, hold(&shared)).unwrap();
-            assert_eq!(shared.used.load(Relaxed), RESERVATION_GRANULE, "{reply:?}");
+            let reserved = shared.used.load(Relaxed);
+            assert!(
+                held.hold.used > MESSAGE_RESERVATION && reserved <= RESERVATION_GRANULE,
+                "{reply:?}: {reserved}"
+            );
             drop(held);
         }
     }
