@@ -199,7 +199,9 @@ cat > "$SYQ_TEST_UPLOAD"
         } else {
             // Nothing is sent when the build cannot be had.
             assert!(
-                fs::read(root.join("uploaded")).unwrap_or_default().is_empty(),
+                fs::read(root.join("uploaded"))
+                    .unwrap_or_default()
+                    .is_empty(),
                 "{case}"
             );
         }
