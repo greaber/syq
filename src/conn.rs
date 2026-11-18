@@ -3425,7 +3425,7 @@ impl RemoteSpec {
     /// pacing.
     fn open<R, W>(
         &self,
-        transport: Transport<R, W>,
+        mut transport: Transport<R, W>,
         compress: bool,
         role: ConnectionRole,
         finish: impl FnOnce(Result<RemoteConn>) -> Result<RemoteConn>,
@@ -3434,21 +3434,6 @@ impl RemoteSpec {
         R: Read + Send + 'static,
         W: Write + Send + std::os::fd::AsFd + 'static,
     {
-        let Transport {
-            reader,
-            writer,
-            records,
-            label,
-            pacing,
-            mut child,
-            approved_login,
-            worker_setup,
-            tcp_socket,
-            named_socket,
-            multiplexed_ssh,
-            admission,
-            token,
-        } = transport;
         // Keep network compression, but not on the local receiver's hop:
         // recompressing forwarded blocks there adds CPU work to downloads.
         let compress = compress && !self.local_process;
@@ -3457,22 +3442,24 @@ impl RemoteSpec {
             std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
         let replies = reply_queue(self.read_ahead, &role);
         let started = (|| {
-            let output = paced_output(writer, pacing.as_ref(), &handshake)?;
+            let output = paced_output(transport.writer, transport.pacing.as_ref(), &handshake)?;
             let input = crate::bwlimit::activity::ActivityIo {
-                inner: reader,
-                bytes: pacing
+                inner: transport.reader,
+                bytes: transport
+                    .pacing
                     .as_ref()
                     .filter(|p| p.remote_sender)
                     .and_then(|p| p.activity.clone()),
                 handshake_pending: handshake.clone(),
             };
-            let (output, input): (Box<dyn Write + Send>, Box<dyn Read + Send>) = match records {
-                Some((sending, receiving)) => (
-                    Box::new(RecordWriter::new(output, sending)),
-                    Box::new(RecordReader::new(input, receiving)),
-                ),
-                None => (output, Box::new(input)),
-            };
+            let (output, input): (Box<dyn Write + Send>, Box<dyn Read + Send>) =
+                match transport.records {
+                    Some((sending, receiving)) => (
+                        Box::new(RecordWriter::new(output, sending)),
+                        Box::new(RecordReader::new(input, receiving)),
+                    ),
+                    None => (output, Box::new(input)),
+                };
             let reader =
                 spawn_observed_reader(input, replies, reply_bytes(&role), observation.clone())?;
             anyhow::Ok((output, reader))
@@ -3481,8 +3468,8 @@ impl RemoteSpec {
             Ok(started) => started,
             Err(error) => {
                 // Stop the watchers before reaping the child.
-                drop((approved_login, worker_setup));
-                if let Some(child) = &mut child {
+                drop((transport.approved_login, transport.worker_setup));
+                if let Some(child) = &mut transport.child {
                     let _ = child.kill();
                     let _ = child.wait();
                 }
@@ -3491,27 +3478,27 @@ impl RemoteSpec {
         };
         let conn = RemoteConn {
             batch_receipts,
-            transport_stop: pacing.as_ref().map(|p| p.scheduler.clone()),
+            transport_stop: transport.pacing.as_ref().map(|p| p.scheduler.clone()),
             observation,
-            child,
-            approved_login,
-            worker_setup,
-            w: FrameWriter::with_admission(output, compress, admission),
+            child: transport.child,
+            approved_login: transport.approved_login,
+            worker_setup: transport.worker_setup,
+            w: FrameWriter::with_admission(output, compress, transport.admission),
             rx: Some(rx),
             replies,
             deferred: Default::default(),
             reader: Some(reader),
-            label,
+            label: transport.label,
             dead: false,
             rpc_observation: None,
             write_stream: None,
             peer: None,
-            tcp_socket,
-            named_socket,
-            multiplexed_ssh,
+            tcp_socket: transport.tcp_socket,
+            named_socket: transport.named_socket,
+            multiplexed_ssh: transport.multiplexed_ssh,
             detached: false,
         };
-        let conn = finish(hello(conn, compress, token, role))?;
+        let conn = finish(hello(conn, compress, transport.token, role))?;
         // Authenticate within the fixed handshake deadline even at tiny caps.
         handshake.store(false, std::sync::atomic::Ordering::Release);
         self.record_peer(&conn);
