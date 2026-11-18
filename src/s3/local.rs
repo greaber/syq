@@ -621,17 +621,6 @@ impl CreationPermissions {
             .unwrap_or_default()
     }
 
-    /// For a new file at `path` beneath `root`.
-    pub(super) fn for_file(&mut self, root: &Root, path: &RelativePath) -> Result<u32> {
-        let parent = Self::file_parent(path);
-        if let Some(permitted) = self.0.get(&parent) {
-            return Ok(*permitted);
-        }
-        let permitted = root.creation_permissions(path)?;
-        self.remember(parent, permitted);
-        Ok(permitted)
-    }
-
     /// For a new file at `path` beneath `root`, through a cache that
     /// concurrent downloads share. Reading a parent's default ACL opens the
     /// parent, a round trip or two on a network filesystem, so that happens
@@ -695,8 +684,13 @@ pub(super) fn keep_unchanged_file(
     Ok(true)
 }
 
+/// Give the directory at `path` its marker's `metadata` through a handle
+/// of it, never its name, under the rules the ordinary engine applies to a
+/// directory (`fsops::set_handle_metadata`): unchanged values are left
+/// alone, and without privilege a different owner is left as it is and a
+/// group the user cannot give it is too, unless the copy names them.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn apply_metadata(
+pub(super) fn apply_directory_metadata(
     root: &Root,
     path: &RelativePath,
     metadata: &Metadata,
@@ -706,63 +700,41 @@ pub(super) fn apply_metadata(
     copied: bool,
     creation: &mut CreationPermissions,
 ) -> Result<()> {
-    debug_assert!(
-        metadata.kind != super::client::ObjectKind::File || copied,
-        "an unchanged file is kept by `keep_unchanged_file`"
-    );
-    if metadata.kind == super::client::ObjectKind::File {
-        return apply_file_metadata(
-            &root.open_regular_read(path)?,
-            metadata,
-            args,
-            existing_mode,
-            explicit,
-            || creation.for_file(root, path),
-        );
-    }
-    debug_assert!(
-        metadata.kind == super::client::ObjectKind::Dir,
-        "a symlink gets its metadata as it is created (`symlink_metadata`)"
-    );
-    // Every change goes through a handle of the directory, never its name.
+    use crate::proto::flags;
     let file = root.open_directory(path)?;
-    if args.owner || args.group || explicit.uid.is_some() || explicit.gid.is_some() {
-        crate::fsops::chown_handle(
-            &file,
-            (args.owner || explicit.uid.is_some()).then_some(metadata.uid),
-            (args.group || explicit.gid.is_some()).then_some(metadata.gid),
-        )?;
+    let current = file.metadata()?;
+    let mut selected = (args.meta_flags() & (flags::OWNER | flags::GROUP)) | explicit.apply_flags();
+    if copied || args.perms {
+        selected |= flags::MODE;
     }
-    if copied || args.perms || explicit.mode.is_some() {
-        // Without -p, a directory this download created gets its marker's
-        // permission bits and, as a native copy gives every new directory,
-        // owner access, so that a later download can update it. Creating it
-        // limits them by the default ACL it inherited, or else by the umask,
-        // and it keeps the setgid bit it inherited.
-        let mode = if args.perms || explicit.mode.is_some() {
-            metadata.mode
-        } else if let Some(existing) = existing_mode {
-            existing
-        } else {
-            let permitted = creation.permitted(path, &file)?;
-            ((metadata.mode | 0o700) & permitted & 0o777) | (file.metadata()?.mode() & 0o2000)
-        };
-        crate::fsops::set_mode_handle(&file, mode)?;
+    if (copied && args.times) || args.copy_mtime_metadata {
+        selected |= flags::TIMES;
     }
-    if (copied && args.times) || args.copy_mtime_metadata || explicit.mtime.is_some() {
-        let times = [
-            libc::timespec {
-                tv_sec: 0,
-                tv_nsec: libc::UTIME_OMIT,
-            },
-            libc::timespec {
-                tv_sec: metadata.mtime as _,
-                tv_nsec: metadata.nsec as _,
-            },
-        ];
-        crate::fsops::set_handle_times(&file, &times)?;
-    }
-    Ok(())
+    // Without -p, a directory this download created gets its marker's
+    // permission bits and, as a native copy gives every new directory,
+    // owner access, so that a later download can update it. Creating it
+    // limits them by the default ACL it inherited, or else by the umask,
+    // and it keeps the setgid bit it inherited.
+    let mode = if selected & flags::MODE == 0 || args.perms || explicit.mode.is_some() {
+        metadata.mode
+    } else if let Some(existing) = existing_mode {
+        existing
+    } else {
+        crate::fsops::created_directory_mode_permitted(
+            creation.permitted(path, &file)?,
+            metadata.mode | 0o700,
+            current.mode(),
+        )
+    };
+    let meta = crate::proto::Meta {
+        inode_metadata: None,
+        mode,
+        uid: metadata.uid,
+        gid: metadata.gid,
+        mtime: metadata.mtime,
+        mtime_nsec: metadata.nsec,
+    };
+    crate::fsops::set_handle_metadata(&file, &meta, selected, &current, None)
 }
 
 /// The metadata a downloaded symlink gets, as it is created

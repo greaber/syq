@@ -655,7 +655,7 @@ impl Engine {
                     );
                 }
                 if let Some((meta, mode, explicit)) = &metadata {
-                    local::apply_metadata(
+                    local::apply_directory_metadata(
                         &destination.root,
                         &relative,
                         meta,

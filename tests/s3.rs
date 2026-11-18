@@ -442,7 +442,10 @@ fn serve(
         }
         return;
     }
-    if fault == "copy-root-marker" || fault == "copy-root-marker-owned" {
+    if fault == "copy-root-marker"
+        || fault == "copy-root-marker-owned"
+        || fault == "copy-root-marker-foreign"
+    {
         let path = first.split_whitespace().nth(1).unwrap();
         match (method, path.split('?').next().unwrap()) {
             ("HEAD", "/source/data" | "/destination/child") =>
@@ -455,10 +458,15 @@ fn serve(
                     ("ETag".into(), "\"marker\"".into()),
                     ("Last-Modified".into(), "Wed, 01 Jan 2020 00:00:00 GMT".into()),
                 ];
-                if fault == "copy-root-marker-owned" {
-                    // The marker records the test's own account, which a
-                    // download may give the directory without privilege.
-                    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+                if fault != "copy-root-marker" {
+                    // The owned marker records the test's own account, which
+                    // a download may give the directory without privilege;
+                    // the foreign one an account and group it may not.
+                    let (uid, gid) = if fault == "copy-root-marker-owned" {
+                        unsafe { (libc::geteuid(), libc::getegid()) }
+                    } else {
+                        foreign_owner()
+                    };
                     for (name, value) in [
                         ("format", "1".to_owned()),
                         ("kind", "dir".to_owned()),
@@ -6214,6 +6222,57 @@ fn server_copy_directory_to_bucket_root_skips_root_marker() {
 fn download_directory_to_root_sets_its_owner_through_a_handle() {
     use std::os::unix::fs::MetadataExt;
     let server = Server::start("copy-root-marker-owned");
+    let temp = crate::test_support::tempdir().unwrap();
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--copy-metadata=ownership,mtime",
+            "--from",
+            "s3://source",
+            "--src-dir",
+            "data",
+            "--as",
+            ".",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_eq!(std::fs::read(temp.path().join("child")).unwrap(), b"data");
+    let metadata = std::fs::metadata(temp.path()).unwrap();
+    assert_eq!(
+        (metadata.uid(), metadata.gid(), metadata.mtime()),
+        (
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+            1577836800
+        )
+    );
+}
+
+/// A user and a group the unprivileged test account may not give a file:
+/// another uid, and a gid that is none of its groups.
+fn foreign_owner() -> (u32, u32) {
+    let uid = unsafe { libc::geteuid() };
+    let mut groups = vec![0; 1024];
+    let count = unsafe { libc::getgroups(groups.len() as _, groups.as_mut_ptr()) };
+    assert!(count >= 0, "{}", std::io::Error::last_os_error());
+    groups.truncate(count as usize);
+    groups.push(unsafe { libc::getegid() });
+    let gid = (1..u32::MAX - 1).find(|gid| !groups.contains(gid)).unwrap();
+    (uid.wrapping_add(1), gid)
+}
+
+/// As an unprivileged user, a download that keeps ownership leaves a
+/// directory's owner as it is when its marker names another account, and
+/// its group when the user cannot give it the marker's group, as it does
+/// for a file and as a local copy does; the rest of its metadata still
+/// applies.
+#[test]
+fn download_directory_skips_an_owner_the_user_cannot_set() {
+    use std::os::unix::fs::MetadataExt;
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let server = Server::start("copy-root-marker-foreign");
     let temp = crate::test_support::tempdir().unwrap();
     let output = server.cp(
         temp.path(),
