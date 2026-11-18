@@ -101,9 +101,11 @@ pub(crate) struct SourceAuthority {
 /// with `SourceAuthority::path_key`, over the root ID's 8 bytes and then the
 /// relative path. The fixed-width root makes the encoding unambiguous, so two
 /// paths share a digest only by a collision. A collision would count two paths
-/// as one; without the key, a coordinator cannot compute digests or search for
-/// a collision offline, and among the limit's 100 million paths at most, the
-/// chance of any accidental collision is below 2^-74.
+/// as one. Without the key, a coordinator cannot compute digests or search for
+/// a collision offline; choosing paths helps it no more than chance. If it
+/// names N distinct paths in one copy, counted or refused at the limit, the
+/// chance that any two share a digest is below N^2 / 2^129: about 2^-69 for a
+/// billion paths, and 2^-49 for a trillion, the largest limit a grant accepts.
 type PathDigest = u128;
 
 /// One open channel to a source (`SourceAuthority::open_channel`).
