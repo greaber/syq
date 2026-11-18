@@ -1325,23 +1325,15 @@ impl FsOps {
         path: &[u8],
         allow_missing: bool,
         symlink_policy: OperatorSymlinkPolicy,
+        require_search: bool,
     ) -> Result<Option<DirectoryAnchor>> {
         let (selection, anchor) = select_operator_directory(path, allow_missing, symlink_policy)?;
-        self.operator_selection = Some(selection);
-        Ok(anchor)
-    }
-
-    fn check_searchable_operator_directory(
-        &mut self,
-        path: &[u8],
-        allow_missing: bool,
-        symlink_policy: OperatorSymlinkPolicy,
-    ) -> Result<Option<DirectoryAnchor>> {
-        let (selection, anchor) = select_operator_directory(path, allow_missing, symlink_policy)?;
-        // Looking up "." through the retained handle asks the kernel about
-        // search permission, including ACLs and the receiving user's identity.
-        open_operator_directory_at(&selection.directory, b".")
-            .context("search selected destination directory")?;
+        if require_search {
+            // Looking up "." through the retained handle asks the kernel about
+            // search permission, including ACLs and the receiving user's identity.
+            open_operator_directory_at(&selection.directory, b".")
+                .context("search selected destination directory")?;
+        }
         self.operator_selection = Some(selection);
         Ok(anchor)
     }
@@ -2935,14 +2927,10 @@ impl FsOps {
             | Request::Hello { .. }
             | Request::TcpListen { .. }
             | Request::ListDir { .. }
-            | Request::ListDirDetails { .. }
-            | Request::ListDirNoFollowFinal { .. }
             | Request::NativeMap(_)
             | Request::NativeRemove { .. }
             | Request::CheckOperatorDirectory { .. }
             | Request::CheckOperatorDirectoryAncestry { .. }
-            | Request::CheckOperatorDirectoryAncestryWithAccess { .. }
-            | Request::CheckSearchableOperatorDirectory { .. }
             | Request::PrepareDestinationPath { .. }
             | Request::RestoreDestinationPath
             | Request::RegisterSourceRoots { .. }
@@ -2979,57 +2967,16 @@ impl FsOps {
         follow_final_symlinks: bool,
     ) -> Result<Response> {
         const MAX_COMPLETION_ENTRIES: usize = 1_000;
-        if directory.contains(&0)
-            || confined_root.is_some_and(|root| root.contains(&0))
-            || prefix.contains(&0)
-            || prefix.contains(&b'/')
-        {
-            bail!("invalid completion directory or prefix");
-        }
-        check_completion_directory(directory, confined_root, symlink_policy)?;
-        let limit = usize::from(requested_limit).min(MAX_COMPLETION_ENTRIES);
-        if limit == 0 {
-            return Ok(if detailed {
-                Response::DetailedDirectoryEntries {
-                    entries: Vec::new(),
-                    details: Vec::new(),
-                    truncated: false,
-                }
-            } else {
-                Response::DirectoryEntries {
-                    entries: Vec::new(),
-                    truncated: false,
-                }
-            });
-        }
-        let mut entries = Vec::new();
-        let mut truncated = false;
-        for item in std::fs::read_dir(resolve(directory))? {
-            let item = item?;
-            let name = item.file_name().into_vec();
-            if name == b"." || name == b".." || !name.starts_with(prefix) {
-                continue;
-            }
-            if !prefix.starts_with(b".") && name.starts_with(b".") {
-                continue;
-            }
-            if entries.len() == limit {
-                truncated = true;
-                break;
-            }
-            let file_type = item.file_type()?;
-            let directory = file_type.is_dir()
-                || (file_type.is_symlink()
-                    && follow_final_symlinks
-                    && check_completion_directory(
-                        item.path().as_os_str().as_bytes(),
-                        confined_root,
-                        symlink_policy,
-                    )
-                    .is_ok());
-            entries.push(CompletionEntry { name, directory });
-        }
-        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        let (entries, truncated) = list_completion_directory(
+            directory,
+            confined_root,
+            prefix,
+            usize::from(requested_limit).min(MAX_COMPLETION_ENTRIES),
+            symlink_policy,
+            follow_final_symlinks,
+            false,
+            false,
+        )?;
         if detailed {
             let details = crate::completion_details::describe(&resolve(directory), &entries);
             Ok(Response::DetailedDirectoryEntries {
@@ -4316,12 +4263,14 @@ mod completion_details_tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("alpha"), b"hello").unwrap();
         std::fs::write(root.join("alpine"), b"other").unwrap();
-        let request = |directory: &Path, limit| Request::ListDirDetails {
+        let request = |directory: &Path, limit| Request::ListDir {
             directory: directory.as_os_str().as_bytes().to_vec(),
             confined_root: Some(root.as_os_str().as_bytes().to_vec()),
             prefix: b"al".to_vec(),
             limit,
             symlink_policy: OperatorSymlinkPolicy::Refuse,
+            detailed: true,
+            follow_final_symlinks: true,
         };
         let response = FsOps::new().handle(&request(&root, 1));
         let Response::DetailedDirectoryEntries {

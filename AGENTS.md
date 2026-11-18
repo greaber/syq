@@ -753,7 +753,8 @@ runner from a clean, pushed task branch:
 
 ```bash
 scripts/run-focused-check.py --runner macos --cargo-cache -- \
-  cargo nextest run --locked --bin syq -- --exact 'module::tests::name'
+  cargo nextest run --locked --bin syq --run-ignored all --no-tests fail \
+  -- --exact 'module::tests::name'
 scripts/run-focused-check.py --runner linux --script target/check.sh
 ```
 
@@ -777,18 +778,10 @@ No builds or test suites run implicitly, and these checks do not certify a
 full suite for release. Add reusable focused checks when repeated use
 justifies them rather than adding a permanent option for every repair.
 
-For an exact macOS Rust test, the existing focused job also verifies that the
-named test exists and includes ignored tests:
-
-```bash
-gh workflow run macos.yml --ref <task-branch> \
-  -f test_target=syq -f test_name='module::tests::name'
-```
-
-`test_target` also accepts the integration target names. This runs only the
-exact test, including it if marked ignored, and rejects a name absent on that
-platform. It does not produce full-suite release certification. Leaving
-`test_name` empty selects the full workflow.
+For an exact Rust test on another platform, pass `--run-ignored all` and
+`--no-tests fail` as in the first example: the test runs even where it is
+marked ignored, and the check fails when the name does not exist on that
+platform. Replace `--bin syq` with `--test <target>` for an integration test.
 
 Two suites cover behavior that the Rust targets cannot reach. Both run in
 Docker and can run locally:

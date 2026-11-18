@@ -119,6 +119,7 @@ and custom KMS encryption contexts.
 
 New uploads and bucket copies use the provider's storage and encryption
 defaults unless overridden with `--s3-write-header` or, for bucket copies,
+`--copy-metadata=storage-class`. A storage-class header takes precedence over
 `--copy-metadata=storage-class`. Copying a storage class can affect storage
 costs and require restoring an archived object first.
 

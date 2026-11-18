@@ -220,6 +220,71 @@ fn signed_tcp_congestion_requires_the_exact_approved_algorithm() {
     assert!(authority.authorize(&mut paced, true).is_err());
 }
 
+/// Each request these merged variants replaced stays refused on a
+/// restricted destination with its old message, whatever its flags.
+#[test]
+fn completion_and_operator_directory_requests_stay_refused_for_every_flag() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let authority = tcp_test_authority(temporary.path());
+    let path = temporary.path().as_os_str().as_bytes().to_vec();
+    // Former ListDir, ListDirDetails and ListDirNoFollowFinal (both details).
+    for (detailed, follow_final_symlinks) in
+        [(false, true), (true, true), (false, false), (true, false)]
+    {
+        let error = authority
+            .authorize(
+                &mut Request::ListDir {
+                    directory: path.clone(),
+                    confined_root: None,
+                    prefix: Vec::new(),
+                    limit: 1000,
+                    symlink_policy: crate::proto::OperatorSymlinkPolicy::Refuse,
+                    detailed,
+                    follow_final_symlinks,
+                },
+                true,
+            )
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error, "directory completion is not valid on a restricted destination",
+            "detailed {detailed}, follow {follow_final_symlinks}"
+        );
+    }
+    let anchor_refusal = "destination-anchor management is not valid on a root-confined receiver";
+    // Former CheckOperatorDirectory and CheckSearchableOperatorDirectory.
+    for require_search in [false, true] {
+        let error = authority
+            .authorize(
+                &mut Request::CheckOperatorDirectory {
+                    path: path.clone(),
+                    allow_missing: true,
+                    symlink_policy: crate::proto::OperatorSymlinkPolicy::FollowAll,
+                    require_search,
+                },
+                true,
+            )
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, anchor_refusal, "require_search {require_search}");
+    }
+    // Former CheckOperatorDirectoryAncestry and ...WithAccess.
+    for access in [None, Some(false), Some(true)] {
+        let error = authority
+            .authorize(
+                &mut Request::CheckOperatorDirectoryAncestry {
+                    checks: Vec::new(),
+                    shared_suffixes: vec![path.clone()],
+                    access,
+                },
+                true,
+            )
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, anchor_refusal, "access {access:?}");
+    }
+}
+
 #[test]
 fn released_enrollment_state_is_never_read_or_touched() {
     // Unmodified output from checksum-verified v0.7.1 in the disposable SSH lab.
