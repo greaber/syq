@@ -2284,6 +2284,59 @@ for mode_receiver in ordinary restricted; do
     test "$(ssh destination "stat -c %a $mode_root/new")" = 755
 done
 
+printf 'case: a keep grant fails only the changes inside directories it may not widen\n'
+# Two read-only directories at the destination, one holding a file; the
+# source has that file, a new one in each, and more beside them.
+# --if-exists=keep lets a restricted receiver change no existing directory,
+# so --widen-dirs widens neither, under rsync or all: the new files in them
+# fail by name, everything else is copied, and the copy says why once. An
+# ordinary receiver that may not widen leaves the same tree and status.
+keep_tree=$(cat <<'PY_KEEP_TREE'
+import os, sys
+root = sys.argv[1]
+for name in ['sub/old', 'sub/new', 'second/new', 'fresh/file', 'beside']:
+    os.makedirs(os.path.dirname(f'{root}/{name}'), exist_ok=True)
+    with open(f'{root}/{name}', 'w') as f:
+        f.write(name)
+PY_KEEP_TREE
+)
+printf '%s\n' "$keep_tree" | python3 - /tmp/syq-real-ssh-keep-tree
+printf '%s\n' "$keep_tree" | ssh source python3 - /tmp/syq-real-ssh/keep-tree
+for keep_receiver in ordinary rsync all; do
+    keep_destination=/tmp/syq-real-ssh/keep-$keep_receiver
+    keep_errors=/tmp/syq-real-ssh-keep-$keep_receiver.err
+    # The fixture path is set by this loop.
+    # shellcheck disable=SC2029
+    ssh destination "mkdir -p $keep_destination/sub $keep_destination/second && printf existing > $keep_destination/sub/old && chmod 555 $keep_destination/sub $keep_destination/second"
+    keep_status=0
+    if [ "$keep_receiver" = ordinary ]; then
+        syq cp --no-progress --if-exists=keep --widen-dirs=none \
+            --srcs-in /tmp/syq-real-ssh-keep-tree --to destination --into "$keep_destination" \
+            2>"$keep_errors" || keep_status=$?
+    else
+        syq cp --no-progress --if-exists=keep --widen-dirs="$keep_receiver" \
+            --from source --srcs-in /tmp/syq-real-ssh/keep-tree \
+            --to destination --into "$keep_destination" \
+            2>"$keep_errors" || keep_status=$?
+    fi
+    cat "$keep_errors" >&2
+    test "$keep_status" = 23
+    grep -F 'syq: sub/new: ' "$keep_errors" >/dev/null
+    grep -F 'syq: second/new: ' "$keep_errors" >/dev/null
+    if [ "$keep_receiver" != ordinary ]; then
+        test "$(grep -c -F -e '--if-exists=keep lets the restricted receiver change no existing directory' "$keep_errors")" = 1
+        grep -F 'it is not widened either' "$keep_errors" >/dev/null
+        if grep -F -e refused -e contradicts "$keep_errors" >&2; then
+            echo 'the restricted receiver refused a request of the keep copy' >&2
+            exit 1
+        fi
+    fi
+    remote_manifest destination "$keep_destination" "/tmp/syq-real-ssh-keep-$keep_receiver.manifest"
+done
+cmp /tmp/syq-real-ssh-keep-ordinary.manifest /tmp/syq-real-ssh-keep-rsync.manifest
+cmp /tmp/syq-real-ssh-keep-ordinary.manifest /tmp/syq-real-ssh-keep-all.manifest
+ssh destination 'cd /tmp/syq-real-ssh/keep-rsync && test "$(cat sub/old)" = existing && test ! -e sub/new && test ! -e second/new && test "$(cat beside)" = beside && test "$(cat fresh/file)" = fresh/file && test "$(stat -c %a sub second | tr "\n" " ")" = "555 555 "'
+
 printf 'case: ordinary and restricted receivers update the same files in place\n'
 # Under --in-place=update both receivers write a file of their own with one
 # name where it is, and replace one with another name and one more widely

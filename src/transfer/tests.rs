@@ -538,6 +538,7 @@ fn pipeline_worker(
         access_limited: Default::default(),
         outer_directory: Default::default(),
         access_noted: Default::default(),
+        keep_widening_explained: Default::default(),
         devices: false,
         checksum: false,
         hash_or_copy: false,
@@ -6264,6 +6265,116 @@ fn restricted_destination(
         },
         replies: Default::default(),
     })
+}
+
+/// A copy whose grant keeps existing objects (`--if-exists=keep`) asks a
+/// restricted receiver to widen no directory inside the copy: the receiver
+/// refuses such a request whole, and the copy with it. Under `all` it still
+/// asks for the directory the copy goes into. In place of naming a wider
+/// mode, it says why none helps.
+#[test]
+fn a_keep_grant_copy_asks_a_restricted_receiver_to_widen_no_directory_inside_it() {
+    use crate::cli::WidenDirs;
+    use crate::delegation::DirectoryWidening;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let bytes = |path: &std::path::Path| path.as_os_str().as_bytes().to_vec();
+    let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().mode() & 0o7777;
+    for approved in [DirectoryWidening::Rsync, DirectoryWidening::All] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        let sub = root.join("target/sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let authority = Arc::new(crate::restricted::tests::keep_test_authority_widening(
+            root, approved,
+        ));
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let mut receiver = restricted_destination(authority, executed.clone(), || {});
+        let asked = Arc::new(Mutex::new(0));
+        let mut destination = AnsweringConn {
+            answer: {
+                let asked = asked.clone();
+                move |request: Request| {
+                    *asked.lock().unwrap() += 1;
+                    receiver.call(request).unwrap()
+                }
+            },
+            replies: Default::default(),
+        };
+        let sched = Arc::new(Sched::new(512, 8192));
+        let unused = Arc::new(Mutex::new(PipelineState::default()));
+        let mut worker = pipeline_worker(&sched, &unused, &unused, true);
+        let opts = Arc::get_mut(&mut worker.opts).unwrap();
+        opts.restricted_receiver = true;
+        opts.widen_dirs = match approved {
+            DirectoryWidening::All => WidenDirs::All,
+            _ => WidenDirs::Rsync,
+        };
+        // The directory an exact target is in.
+        opts.outer_directory.set(bytes(root)).unwrap();
+        let progress = Progress::new(false, false, None);
+        let identity = |path: &std::path::Path| {
+            let metadata = std::fs::metadata(path).unwrap();
+            TargetCondition::Matches {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            }
+        };
+        let mut restorations = Default::default();
+        let mut widen = |opts: &Opts, directories: Vec<&std::path::Path>| {
+            super::planner::widen_directory_batch(
+                &mut destination,
+                opts,
+                &progress,
+                &mut restorations,
+                directories
+                    .into_iter()
+                    .map(|path| (bytes(path), identity(path)))
+                    .collect(),
+                0o300,
+            )
+        };
+
+        // Asked as under any other policy, the receiver refuses.
+        assert_eq!(opts.hint_for(WidenDirs::Rsync), None);
+        let error = widen(opts, vec![&sub]).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("contradicts the signed existing-object policy"),
+            "{error:#}"
+        );
+        assert_eq!(*asked.lock().unwrap(), 1);
+
+        // Knowing its grant keeps what exists, the copy does not ask.
+        opts.preserve_existing_directory_metadata = true;
+        assert!(opts.keep_bars_widening() && !opts.widens_inside_copy());
+        assert_eq!(widen(opts, vec![&sub]).unwrap(), 0);
+        assert_eq!(*asked.lock().unwrap(), 1);
+        assert_eq!(mode(&sub), 0o555);
+        let hint = opts.hint_for(WidenDirs::Rsync).unwrap();
+        assert!(hint.contains("--if-exists=keep"), "{hint}");
+        assert_eq!(
+            opts.hint_for(WidenDirs::All),
+            (approved == DirectoryWidening::Rsync).then_some("--widen-dirs=all may help")
+        );
+        assert_eq!(opts.entering_hint(), Some(hint));
+
+        // Only the directory the copy goes into is asked for, under `all`.
+        if approved == DirectoryWidening::All {
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o500)).unwrap();
+            assert_eq!(widen(opts, vec![root, &sub]).unwrap(), 1);
+            assert_eq!(*asked.lock().unwrap(), 2);
+            let executed = executed.lock().unwrap();
+            let [Request::WidenDirectories { directories, .. }] = &executed[..] else {
+                panic!("{executed:?}");
+            };
+            assert_eq!(directories.len(), 1);
+            assert_eq!(directories[0].0, bytes(root));
+            assert_eq!((mode(root), mode(&sub)), (0o700, 0o555));
+        }
+    }
 }
 
 /// Run `workers` on threads of their own until the copy ends, and check

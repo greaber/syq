@@ -240,6 +240,8 @@ pub struct Opts {
     /// Directories already named as needing temporary access; failures
     /// beneath them do not repeat the hint.
     pub access_noted: Mutex<std::collections::HashSet<PathBytes>>,
+    /// A directory was named with `KEEP_BARS_WIDENING`, which is said once.
+    pub keep_widening_explained: AtomicBool,
     pub devices: bool,
     pub checksum: bool,
     /// Don't trust matching size and time, but compare only the files block
@@ -2365,6 +2367,10 @@ pub(crate) fn mode_hint(
     })
 }
 
+/// Why `--widen-dirs` widens no directory inside the copy
+/// (`Opts::keep_bars_widening`), in place of the hint naming a wider mode.
+const KEEP_BARS_WIDENING: &str = "--if-exists=keep lets the restricted receiver change no existing directory, so --widen-dirs does not widen it";
+
 /// Add the hint to a failed lookup or creation of the destination path, which
 /// the receiver found blocked by an owned directory lacking owner permission.
 /// Only `all` widens the directories on the way to the destination.
@@ -2437,16 +2443,46 @@ impl Opts {
         self.widen_dirs != WidenDirs::None && !self.dry_run
     }
 
-    /// Only a copy that widens nothing names, ahead of time, the directories
-    /// it would need to widen.
+    /// A restricted receiver whose grant keeps what exists
+    /// (`--if-exists=keep`) changes no directory the copy did not create,
+    /// not even its permissions while the copy runs, and refuses whole a
+    /// request to widen one. So the copy asks it to widen none inside the
+    /// copy, whatever the mode: changes in a directory lacking owner
+    /// permission fail one by one, as they do without `--widen-dirs`. The
+    /// directory the copy goes into is not the grant's to keep, and `all`
+    /// still widens it.
+    pub(super) fn keep_bars_widening(&self) -> bool {
+        self.restricted_receiver && self.preserve_existing_directory_metadata
+    }
+
+    /// Whether existing directories inside the copy are widened.
+    pub(super) fn widens_inside_copy(&self) -> bool {
+        self.may_widen_directory_permissions() && !self.keep_bars_widening()
+    }
+
+    /// Only a copy that widens nothing inside it names, ahead of time, the
+    /// directories it would need to widen.
     fn may_suggest_directory_access(&self) -> bool {
-        self.widen_dirs == WidenDirs::None
+        self.widen_dirs == WidenDirs::None || self.keep_bars_widening()
     }
 
     /// The hint naming `needed`, as this command spells it, when this copy's
-    /// mode is narrower.
+    /// mode is narrower; or, for a directory inside a copy whose grant bars
+    /// widening it, why no mode helps.
     pub(super) fn hint_for(&self, needed: WidenDirs) -> Option<&'static str> {
+        if needed == WidenDirs::Rsync && self.keep_bars_widening() {
+            return Some(KEEP_BARS_WIDENING);
+        }
         mode_hint(self.widen_dirs, needed, self.rsync_creation)
+    }
+
+    /// The hint for a destination-only directory pruning could not list,
+    /// which only `all` enters, and no mode where the grant bars widening.
+    pub(super) fn entering_hint(&self) -> Option<&'static str> {
+        if self.keep_bars_widening() {
+            return Some(KEEP_BARS_WIDENING);
+        }
+        self.hint_for(WidenDirs::All)
     }
 
     /// The hint for a failure inside the copy, which `rsync` widens.
@@ -2495,15 +2531,22 @@ impl Opts {
         };
         self.access_noted.lock().unwrap().insert(parent.clone());
         let missing = !mode & 0o300;
+        // Why a grant bars widening is said once; later directories are
+        // only named.
+        let hint = match self.hint_for(widens).unwrap_or_default() {
+            KEEP_BARS_WIDENING if self.keep_widening_explained.swap(true, Relaxed) => {
+                "it is not widened either"
+            }
+            hint => hint,
+        };
         progress.warning(&format!(
-            "{}: you own this directory, but it lacks owner {} permission; {}",
+            "{}: you own this directory, but it lacks owner {} permission; {hint}",
             display(&parent),
             match (missing & 0o200 != 0, missing & 0o100 != 0) {
                 (true, true) => "write and search",
                 (true, false) => "write",
                 _ => "search",
             },
-            self.hint_for(widens).unwrap_or_default()
         ));
     }
 
@@ -2838,6 +2881,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         access_limited: Default::default(),
         outer_directory: Default::default(),
         access_noted: Default::default(),
+        keep_widening_explained: Default::default(),
         devices: args.devices,
         checksum: args.checksum,
         hash_or_copy: args.hash_or_copy && !args.checksum,

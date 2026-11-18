@@ -1855,7 +1855,7 @@ impl Planner<'_> {
                 self.stat_directories_with_dry_run_overlay(&dirs, dst_root)?
             };
             let fill = self.fill_access();
-            if opts.may_widen_directory_permissions()
+            if opts.widens_inside_copy()
                 && stats
                     .iter()
                     .flatten()
@@ -4421,17 +4421,16 @@ impl Planner<'_> {
             }
             // Only `all` enters a destination-only directory pruning cannot
             // read, so one the receiving account owns names that mode.
-            let unlisted: std::collections::HashMap<&[u8], &Entry> = if warnings.is_empty()
-                || self.opts.hint_for(crate::cli::WidenDirs::All).is_none()
-            {
-                Default::default()
-            } else {
-                walk.entries
-                    .iter()
-                    .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o500 != 0o500)
-                    .map(|entry| (entry.path.as_slice(), entry))
-                    .collect()
-            };
+            let unlisted: std::collections::HashMap<&[u8], &Entry> =
+                if warnings.is_empty() || self.opts.entering_hint().is_none() {
+                    Default::default()
+                } else {
+                    walk.entries
+                        .iter()
+                        .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o500 != 0o500)
+                        .map(|entry| (entry.path.as_slice(), entry))
+                        .collect()
+                };
             for (base, warning) in warnings {
                 self.delete_walk_failed = true;
                 let directory = warning.path.as_ref().map(|path| join(&base, path));
@@ -4442,11 +4441,7 @@ impl Planner<'_> {
                     Some(entry) => receiver_owns(&mut *self.dst, &mut self.receiver_uid, entry)?,
                     None => false,
                 };
-                let hint = match self
-                    .opts
-                    .hint_for(crate::cli::WidenDirs::All)
-                    .filter(|_| owned)
-                {
+                let hint = match self.opts.entering_hint().filter(|_| owned) {
                     Some(hint) => format!("; {hint}"),
                     None => String::new(),
                 };
@@ -5480,7 +5475,8 @@ impl Planner<'_> {
                     Some("permission_denied"),
                 );
                 uninspected.push(path);
-            } else if hint {
+            } else if hint && self.opts.hint_for(needed).is_some() {
+                // A mode that already widens `needed` leaves nothing to name.
                 self.opts
                     .access_limited
                     .lock()
@@ -5516,7 +5512,7 @@ impl Planner<'_> {
     }
 
     fn prepare_existing_directories(&mut self, mut paths: Vec<PathBytes>) -> Result<()> {
-        if !self.opts.may_widen_directory_permissions() {
+        if !self.opts.widens_inside_copy() {
             return Ok(());
         }
         let fill = self.fill_access();
@@ -5758,7 +5754,7 @@ fn receiver_uid(dst: &mut dyn Conn, cache: &mut Option<u32>) -> Result<u32> {
 /// Temporarily add owner access to `directories` and remember the original
 /// modes of those actually changed; returns how many changed. The receiver
 /// widens only owned directories, never as root.
-fn widen_directory_batch(
+pub(super) fn widen_directory_batch(
     dst: &mut dyn Conn,
     opts: &Opts,
     progress: &Progress,
@@ -5767,7 +5763,14 @@ fn widen_directory_batch(
     access: u32,
 ) -> Result<usize> {
     let mut widened = 0;
-    let mut directories = directories.into_iter().peekable();
+    // A grant that bars widening the copy's directories leaves only the
+    // directory the copy goes into to ask for: the receiver would refuse the
+    // whole request for another, and the copy with it.
+    let barred = opts.keep_bars_widening();
+    let mut directories = directories
+        .into_iter()
+        .filter(|(path, _)| !barred || opts.outer_directory.get() == Some(path))
+        .peekable();
     while directories.peek().is_some() {
         let batch: Vec<_> = directories.by_ref().take(1000).collect();
         let names: Vec<_> = batch.iter().map(|(path, _)| path.clone()).collect();
