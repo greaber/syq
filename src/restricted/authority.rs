@@ -706,6 +706,45 @@ pub(crate) struct RestrictedAuthority {
     pub(super) lookups: Option<std::sync::Arc<crate::fsops::lookups::PlanningLookups>>,
 }
 
+/// How the executor's `response` reports operation `index` failed, if it
+/// did: the failure the results list, and the executor's typed error where
+/// settlement judges by it. A widened directory's error is listed but not
+/// judged.
+fn operation_failure(
+    response: &proto::Response,
+    index: usize,
+) -> Option<(Failure<'_>, Option<&proto::WireError>)> {
+    let typed = |error| (Failure::of(error), Some(error));
+    let missing = || {
+        (
+            Failure::io("receiver returned no outcome for this file"),
+            None,
+        )
+    };
+    match response {
+        proto::Response::Err(error) => Some((Failure::io(error.as_str()), None)),
+        proto::Response::EndpointError(error) => Some(typed(error)),
+        proto::Response::WidenedDirectories(results) => results
+            .get(index)?
+            .as_ref()
+            .err()
+            .map(|error| (Failure::of(error), None)),
+        proto::Response::Applied(results) => results.get(index)?.as_ref().map(typed),
+        proto::Response::PatchedBatch(results) => match results.get(index) {
+            Some(Ok(_)) => None,
+            Some(Err(error)) => Some(typed(&error.error)),
+            None => Some(missing()),
+        },
+        // Small files published with their identities, for links.
+        proto::Response::PublishedBatch(results) => match results.get(index) {
+            Some(Ok(_)) => None,
+            Some(Err(error)) => Some(typed(error)),
+            None => Some(missing()),
+        },
+        _ => None,
+    }
+}
+
 impl RestrictedAuthority {
     /// The directory every connection of the copy works beneath.
     #[cfg(test)]
@@ -1634,63 +1673,20 @@ impl RestrictedAuthority {
         if creations.is_empty() && outcomes.is_empty() && !tracked {
             return;
         }
-        let outcome_error = |index: usize| -> Option<Failure<'_>> {
-            let missing = || Failure::io("receiver returned no outcome for this file");
-            match response {
-                proto::Response::Err(error) => Some(Failure::io(error.as_str())),
-                proto::Response::EndpointError(error) => Some(Failure::of(error)),
-                proto::Response::WidenedDirectories(results) => results
-                    .get(index)
-                    .and_then(|result| result.as_ref().err().map(Failure::of)),
-                proto::Response::Applied(results) => results
-                    .get(index)
-                    .and_then(|error| error.as_ref().map(Failure::of)),
-                proto::Response::PatchedBatch(results) => match results.get(index) {
-                    Some(Ok(_)) => None,
-                    Some(Err(error)) => Some(Failure::of(&error.error)),
-                    None => Some(missing()),
-                },
-                // Small files published with their identities, for links.
-                proto::Response::PublishedBatch(results) => match results.get(index) {
-                    Some(Ok(_)) => None,
-                    Some(Err(error)) => Some(Failure::of(error)),
-                    None => Some(missing()),
-                },
-                _ => None,
-            }
-        };
+        let outcome_error =
+            |index: usize| operation_failure(response, index).map(|(error, _)| error);
         // The executor's typed error for an operation, where it gave one.
-        let outcome_wire = |index: usize| -> Option<&proto::WireError> {
-            match response {
-                proto::Response::EndpointError(error) => Some(error),
-                proto::Response::Applied(results) => results.get(index).and_then(Option::as_ref),
-                proto::Response::PatchedBatch(results) => match results.get(index) {
-                    Some(Err(error)) => Some(&error.error),
-                    _ => None,
-                },
-                proto::Response::PublishedBatch(results) => match results.get(index) {
-                    Some(Err(error)) => Some(error),
-                    _ => None,
-                },
-                _ => None,
-            }
-        };
+        let outcome_wire =
+            |index: usize| operation_failure(response, index).and_then(|(_, wire)| wire);
         let failed = |index: usize| outcome_error(index).is_some();
         // A change the receiver declined to make in place, because only a
         // replacement may change that file's metadata (`fsops::vouch`), is
         // not a failure: the copy replaces the file, and the results report
-        // that replacement.
+        // that replacement. A small-file publication that reports
+        // identities is not judged so.
         let declined = |index: usize| {
-            let error = match response {
-                proto::Response::EndpointError(error) => Some(error),
-                proto::Response::Applied(results) => results.get(index).and_then(Option::as_ref),
-                proto::Response::PatchedBatch(results) => match results.get(index) {
-                    Some(Err(error)) => Some(&error.error),
-                    _ => None,
-                },
-                _ => None,
-            };
-            error.is_some_and(crate::fsops::vouch::is_replace_required_wire)
+            !matches!(response, proto::Response::PublishedBatch(_))
+                && outcome_wire(index).is_some_and(crate::fsops::vouch::is_replace_required_wire)
         };
         let mut state = self.state.lock().unwrap();
         if tracked {
