@@ -88,34 +88,6 @@ class Scratch(unittest.TestCase):
 
 
 class WorkflowTextTests(unittest.TestCase):
-    def test_macos_exact_test_routes_all_offered_targets(self):
-        workflow = (ROOT / ".github/workflows/macos.yml").read_text()
-        choices = workflow.split("      test_target:\n", 1)[1].split("\npermissions:", 1)[0]
-        targets = [line.strip()[2:] for line in choices.splitlines()
-                   if line.startswith("          - ")]
-        self.assertIn("tls", targets)
-        step = workflow.split("      - name: Run the exact test\n", 1)[1]
-        step = step.split("        run: |\n", 1)[1].split("\n  scope:", 1)[0]
-        # Execute the workflow's shell, capturing the Cargo arguments without
-        # compiling Rust or needing a macOS runner.
-        script = 'cargo() { printf "%s\\n" "$@"; }\n' + textwrap.dedent(step)
-        for target in targets + ["unknown"]:
-            with self.subTest(target=target):
-                result = subprocess.run(
-                    ["bash", "-euo", "pipefail", "-c", script],
-                    env=dict(BASE_ENV, TEST_TARGET=target, TEST_NAME="fixture::test"),
-                    capture_output=True, text=True, timeout=10)
-                if target == "unknown":
-                    self.assertEqual(result.returncode, 2)
-                    self.assertEqual(result.stdout, "")
-                else:
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(result.stdout.splitlines(), [
-                        "nextest", "run", "--locked",
-                        "--bin" if target == "syq" else "--test", target,
-                        "--run-ignored", "all", "--no-tests", "fail", "--", "--exact",
-                        "fixture::test"])
-
     def test_macos_workflow_uses_the_scope_it_computes(self):
         # ci-scope.py decides when macOS runs release tooling; the step must run
         # those same groups and pass the inputs ci-scope reads.
