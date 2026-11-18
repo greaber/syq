@@ -3103,6 +3103,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let workers: Arc<Mutex<Vec<std::thread::JoinHandle<Result<()>>>>> =
         Arc::new(Mutex::new(Vec::new()));
     let connect_after_file_plan = Arc::new(AtomicBool::new(false));
+    // The first worker does not wait for that (`connect_after_file_plan`).
+    let first_connects_ahead = Arc::new(AtomicBool::new(false));
     let transport_stats: Arc<Mutex<Vec<TcpPairStats>>> = Arc::new(Mutex::new(Vec::new()));
     let spawn_worker: Arc<dyn Fn(usize) + Send + Sync> = {
         let (
@@ -3118,6 +3120,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             bwlimit,
             transport_stats,
             connect_after_file_plan,
+            first_connects_ahead,
         ) = (
             src_ep.clone(),
             dst_ep.clone(),
@@ -3131,6 +3134,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             bwlimit.clone(),
             transport_stats.clone(),
             connect_after_file_plan.clone(),
+            first_connects_ahead.clone(),
         );
         let compress = args.compress;
         let collect_tcp_stats = progress.observations.enabled.load(Relaxed);
@@ -3147,6 +3151,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 bwlimit,
                 transport_stats,
                 connect_after_file_plan,
+                first_connects_ahead,
             ) = (
                 src_ep.clone(),
                 dst_ep.clone(),
@@ -3159,6 +3164,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 bwlimit.clone(),
                 transport_stats.clone(),
                 connect_after_file_plan.clone(),
+                first_connects_ahead.clone(),
             );
             if !gate.connection_needed(id) {
                 gate.mark_absent(id);
@@ -3176,7 +3182,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             #[cfg(not(debug_assertions))]
             let refused = false;
             let work = move || -> Result<()> {
-                if connect_after_file_plan.load(Relaxed) && !sched.wait_for_anticipated_file_work()
+                if connect_after_file_plan.load(Relaxed)
+                    && !(id == 0 && first_connects_ahead.load(Relaxed))
+                    && !sched.wait_for_anticipated_file_work()
                 {
                     gate.mark_absent(id);
                     return Ok(());
@@ -4759,10 +4767,19 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         // regular file is work for a fresh destination, so the worker
         // connects once planning sees one, while the control connection
         // creates directories. An existing destination may already hold the
-        // file, so there the worker connects only once planning queues a file
-        // to send, and starts early only when it needs no new login. A copy
-        // with nothing to send then opens no data connection.
+        // file, so there the worker starts early only when it needs no new
+        // login. Where connecting takes a socket alone, it connects at once,
+        // while the planner's first lookup is out, so a file to send finds
+        // the connection ready; a copy with nothing to send then closes it
+        // unused. Otherwise it connects only once planning queues a file to
+        // send, and a copy with nothing to send opens no data connection.
         connect_after_file_plan.store(true, Relaxed);
+        first_connects_ahead.store(
+            !fresh_destination
+                && src_ep.first_worker_opens_only_a_socket()
+                && dst_ep.first_worker_opens_only_a_socket(),
+            Relaxed,
+        );
         gate.set_active(1);
         for id in gate.begin_warming(1) {
             spawn_worker(id);

@@ -1905,6 +1905,8 @@ struct SetupState {
     next: u64,
     /// Unreaped login processes and whether each leads its own process group.
     logins: std::collections::HashMap<u64, (libc::pid_t, bool)>,
+    /// Data sockets whose handshake has not been answered.
+    sockets: std::collections::HashMap<u64, std::sync::Arc<TcpStream>>,
 }
 
 /// SIGTERM, not SIGKILL: ssh restores the terminal if it was asking for a
@@ -1932,6 +1934,9 @@ impl WorkerSetups {
         let state = self.state.lock().unwrap();
         for &(pid, group) in state.logins.values() {
             end_login(pid, group);
+        }
+        for socket in state.sockets.values() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
         }
         drop(state);
         self.wake.notify_all();
@@ -1976,7 +1981,25 @@ impl WorkerSetups {
     }
 }
 
-/// A login process `WorkerSetups::cancel` may still end. Drop this BEFORE
+impl WorkerSetups {
+    /// Let `cancel` end the handshake on this data socket by closing it, or
+    /// close it now if the copy has already ended.
+    fn watch_socket(self: &std::sync::Arc<Self>, socket: std::sync::Arc<TcpStream>) -> SetupWatch {
+        let mut state = self.state.lock().unwrap();
+        if self.cancelled() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+        let id = state.next;
+        state.next += 1;
+        state.sockets.insert(id, socket);
+        SetupWatch {
+            setups: self.clone(),
+            id,
+        }
+    }
+}
+
+/// A login process or data socket `WorkerSetups::cancel` may still end. Drop this BEFORE
 /// reaping the process, so its PID cannot be reused while registered.
 pub(crate) struct SetupWatch {
     setups: std::sync::Arc<WorkerSetups>,
@@ -1987,7 +2010,7 @@ impl SetupWatch {
     /// The connection is ready: from now on the copy keeps it, unless the
     /// copy ended first.
     fn finish(self) -> Result<()> {
-        self.setups.state.lock().unwrap().logins.remove(&self.id);
+        self.forget();
         if self.setups.cancelled() {
             return Err(SetupCancelled.into());
         }
@@ -1995,9 +2018,17 @@ impl SetupWatch {
     }
 }
 
+impl SetupWatch {
+    fn forget(&self) {
+        let mut state = self.setups.state.lock().unwrap();
+        state.logins.remove(&self.id);
+        state.sockets.remove(&self.id);
+    }
+}
+
 impl Drop for SetupWatch {
     fn drop(&mut self) {
-        self.setups.state.lock().unwrap().logins.remove(&self.id);
+        self.forget();
     }
 }
 
@@ -3461,6 +3492,7 @@ impl RemoteSpec {
         info: &TcpInfo,
         compress: bool,
         role: ConnectionRole,
+        setups: Option<&std::sync::Arc<WorkerSetups>>,
     ) -> Result<RemoteConn> {
         #[cfg(debug_assertions)]
         if !self.local_process && std::env::var_os("SYQ_TEST_TCP_FAIL_AFTER_ONE_WORKER").is_some() {
@@ -3500,9 +3532,13 @@ impl RemoteSpec {
             ),
             None => (None, None),
         };
+        let socket = std::sync::Arc::new(stream.try_clone()?);
+        // A copy that ends while the handshake is out closes the socket
+        // rather than wait a round trip for a connection it will not use.
+        let handshake = setups.map(|setups| setups.watch_socket(socket.clone()));
         let transport = Transport {
             records: Some(ciphers),
-            tcp_socket: Some(std::sync::Arc::new(stream.try_clone()?)),
+            tcp_socket: Some(socket),
             token: info.token.clone(),
             ..Transport::new(
                 stream.try_clone()?,
@@ -3511,7 +3547,13 @@ impl RemoteSpec {
                 info.pacing.clone(),
             )
         };
-        self.open(transport, compress, role, |conn| conn)
+        self.open(transport, compress, role, |conn| {
+            let conn = conn?;
+            if let Some(handshake) = handshake {
+                handshake.finish()?;
+            }
+            Ok(conn)
+        })
     }
 }
 
@@ -4208,6 +4250,26 @@ impl Endpoint {
         }
     }
 
+    /// Whether a first data worker connects by opening a socket alone: in
+    /// this process, or over the TCP data route. No login is made and no
+    /// process is started for it on either machine.
+    pub(crate) fn first_worker_opens_only_a_socket(&self) -> bool {
+        match self {
+            Endpoint::Local { .. } => true,
+            // A receiving machine that dials back is asked to over its
+            // control channel, which is more than a socket.
+            Endpoint::Remote(spec) => {
+                spec.local_process
+                    || spec
+                        .tcp
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|info| !info.failed && info.reverse.is_none())
+            }
+        }
+    }
+
     pub fn has_data_server(&self) -> bool {
         matches!(self, Endpoint::Remote(_))
     }
@@ -4316,7 +4378,7 @@ impl Endpoint {
             Endpoint::Remote(spec) => {
                 let info = spec.tcp.lock().unwrap().clone();
                 if let Some(info) = info.filter(|i| !i.failed) {
-                    match spec.connect_tcp(&info, compress, role.clone()) {
+                    match spec.connect_tcp(&info, compress, role.clone(), setups) {
                         Ok(c) => return Ok(Box::new(c)),
                         Err(e)
                             if is_tcp_congestion_error(&e)

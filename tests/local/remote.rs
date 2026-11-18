@@ -914,11 +914,14 @@ fn existing_destination_tree(t: &Tmp, changed: bool) {
 }
 
 /// For an existing destination, the worker that connects during planning
-/// waits until planning queues a file to send, so an unchanged copy opens no
+/// connects at once over the TCP data route, where that takes a socket
+/// alone, so a file to send finds the connection ready; an unchanged copy
+/// then closes it unused. Where a connection is a login, the worker waits
+/// until planning queues a file to send, so an unchanged copy opens no
 /// worker connection. No copy leaves private temporary directories behind.
 #[cfg(debug_assertions)]
 #[test]
-fn an_early_worker_connects_only_for_a_file_to_send() {
+fn an_early_worker_connects_ahead_only_where_that_takes_a_socket() {
     for (tcp, changed) in [(true, false), (true, true), (false, false), (false, true)] {
         let case = format!("tcp={tcp} changed={changed}");
         let t = Tmp::new();
@@ -939,8 +942,13 @@ fn an_early_worker_connects_only_for_a_file_to_send() {
             .lines()
             .filter(|line| line.starts_with("connected "))
             .count();
-        assert_eq!(started.exists(), changed, "{case}: {out:?}");
-        assert_eq!(connected > 0, changed, "{case}: {out:?}");
+        assert_eq!(started.exists(), changed || tcp, "{case}: {out:?}");
+        // An unchanged copy may end before the connection it started over
+        // TCP is answered, and closes it either way.
+        if changed || !tcp {
+            assert_eq!(connected > 0, changed, "{case}: {out:?}");
+        }
+        assert_eq!(stderr_of(&out), "", "{case}");
         // A leaked directory stays; a helper's own cleanup may trail its exit.
         let leftovers = || private_temporary_leftovers(&temporary);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
