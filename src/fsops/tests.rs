@@ -6143,37 +6143,38 @@ fn metadata_chunks_keep_input_order_and_do_not_reuse_a_different_parent() {
     );
 }
 
+/// The pool threads that ran a batch of `items`; the calling thread takes
+/// shares of it as well.
 fn checked_metadata_batch_threads(items: &[usize]) -> Vec<std::thread::ThreadId> {
+    let caller = std::thread::current().id();
     let observations = parallel_map(items, |&index| {
         let thread = std::thread::current();
-        (
-            index,
-            thread.id(),
-            thread.name().map(str::to_owned),
-            rayon::current_num_threads(),
-        )
+        (index, thread.id(), thread.name().map(str::to_owned))
     });
     // Assert on the calling test thread so diagnostics reach this test's
     // capture buffer, regardless of which test initialized the static pool.
     assert_eq!(observations.len(), items.len());
     // Catch accidentally selecting a single-thread or host-sized pool.
-    // Its size is static within the batch, so inspect it only once.
     assert_eq!(
-        observations[0].3, PAR_THREADS,
+        metadata_pool().unwrap().threads(),
+        PAR_THREADS,
         "metadata pool must retain its configured parallelism"
     );
     observations
         .into_iter()
         .zip(items)
-        .map(|((index, thread, name, _), expected)| {
+        .filter_map(|((index, thread, name), expected)| {
             assert_eq!(index, *expected);
+            if thread == caller {
+                return None;
+            }
             // Catch bypassing the dedicated metadata pool.
             assert!(
                 name.as_deref()
                     .is_some_and(|name| name.starts_with("syq-metadata-")),
                 "unexpected metadata thread name: {name:?}"
             );
-            thread
+            Some(thread)
         })
         .collect()
 }
@@ -6262,15 +6263,34 @@ fn short_destination_batches_run_in_parallel_only_on_a_network_filesystem() {
 fn parallel_metadata_batches_share_a_bounded_pool() {
     let mut threads = std::collections::HashSet::new();
     let items: Vec<_> = (0..PAR_MIN).collect();
-    // Rust ThreadIds are never reused, even after threads exit. Each nonempty
-    // call contributes at least one ID, so PAR_THREADS + 1 calls must exceed
-    // this bound with per-call pools. Passing proves reuse across calls
-    // without assumptions about scheduling or native thread-ID recycling.
+    // Rust ThreadIds are never reused, even after threads exit, so threads
+    // started for each batch would exceed this bound: every operation of a
+    // batch waits until `PAR_MIN` of them run at once, on the calling thread
+    // and `PAR_MIN - 1` of the pool's.
     for _ in 0..=PAR_THREADS {
+        let started = (Mutex::new(0), std::sync::Condvar::new());
+        let batch = parallel_map(&items, |_| {
+            let (mutex, changed) = &started;
+            let mut arrived = mutex.lock().unwrap();
+            *arrived += 1;
+            changed.notify_all();
+            let (_arrived, waited) = changed
+                .wait_timeout_while(arrived, std::time::Duration::from_secs(30), |arrived| {
+                    *arrived < PAR_MIN
+                })
+                .unwrap();
+            assert!(
+                !waited.timed_out(),
+                "the batch must run on its threads at once"
+            );
+            std::thread::current().id()
+        });
+        threads.extend(batch);
         threads.extend(checked_metadata_batch_threads(&items));
     }
+    threads.remove(&std::thread::current().id());
     assert!(
-        threads.len() <= PAR_THREADS,
+        (PAR_MIN - 1..=PAR_THREADS).contains(&threads.len()),
         "metadata batches must reuse a bounded shared pool"
     );
 }

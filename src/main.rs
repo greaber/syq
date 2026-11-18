@@ -11,6 +11,7 @@ mod agent_broker;
 mod agent_socket;
 mod approval_command;
 mod auth_from;
+mod batch_pool;
 mod bwlimit;
 mod checks;
 mod cli;

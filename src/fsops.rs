@@ -3626,8 +3626,7 @@ fn list_nfs_directories_before_stats(
     let settled: Vec<bool> = if candidates.len() < 2 {
         candidates.iter().map(list).collect()
     } else if let Some(pool) = metadata_pool() {
-        use rayon::prelude::*;
-        pool.install(|| candidates.par_iter().map(list).collect())
+        pool.map(&candidates, list)
     } else {
         candidates.iter().map(list).collect()
     };
@@ -3784,9 +3783,12 @@ const PAR_MIN: usize = 32;
 /// the record starts over.
 const NETWORK_ENTRIES_MAX: usize = 4096;
 
-fn metadata_pool() -> Option<&'static rayon::ThreadPool> {
-    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
-    POOL.get_or_init(|| crate::resources::optional_pool("syq-metadata", PAR_THREADS))
+/// The threads that share out batches of metadata operations with the
+/// thread that asks. A batch is split into at most `PAR_THREADS` shares, so
+/// it keeps that many threads busy, the asking one among them.
+fn metadata_pool() -> Option<&'static crate::batch_pool::BatchPool> {
+    static POOL: OnceLock<Option<crate::batch_pool::BatchPool>> = OnceLock::new();
+    POOL.get_or_init(|| crate::resources::optional_batch_pool("syq-metadata", PAR_THREADS))
         .as_ref()
 }
 
@@ -3867,8 +3869,8 @@ fn creation_waves(ops: &[Op], selected: &[usize]) -> Vec<Vec<usize>> {
 
 /// Run the selected operations, which add or remove directory entries. The
 /// kernel adds one directory's entries one at a time, so threads beyond the
-/// second only contend for it: directories spread over the pool, and each is
-/// worked on by at most two of its threads. Removals keep the pool's plain
+/// second only contend for it: directories spread over the threads, and each
+/// is worked on by at most two of them. Removals keep the plain
 /// distribution; the work of freeing a removed file's blocks happens after
 /// the directory is unlocked and does spread over threads.
 fn parallel_by_directory<R: Send>(
@@ -3918,16 +3920,10 @@ fn parallel_by_directory<R: Send>(
             vec![positions, second]
         }))
         .collect();
-    use rayon::prelude::*;
-    let done: Vec<Vec<(usize, R)>> = pool.install(|| {
-        shares
-            .par_iter()
-            .map(|share| {
-                share
-                    .iter()
-                    .map(|&position| (position, f(&ops[selected[position]])))
-                    .collect()
-            })
+    let done: Vec<Vec<(usize, R)>> = pool.map(&shares, |share| {
+        share
+            .iter()
+            .map(|&position| (position, f(&ops[selected[position]])))
             .collect()
     });
     let mut results: Vec<Option<R>> = selected.iter().map(|_| None).collect();
@@ -3948,7 +3944,7 @@ thread_local! {
 
 // State belongs to one bounded input chunk and is discarded before returning.
 // Metadata lookups can reuse a held parent for adjacent siblings, while later
-// requests resolve the namespace afresh. No state is shared between workers.
+// requests resolve the namespace afresh. No state is shared between threads.
 fn parallel_map_init_from<T: Sync, R: Send, S>(
     minimum: usize,
     items: &[T],
@@ -3966,17 +3962,14 @@ fn parallel_map_init_from<T: Sync, R: Send, S>(
     #[cfg(test)]
     POOLED_BATCHES.with(|batches| batches.set(batches.get() + 1));
     let chunk = items.len().div_ceil(PAR_THREADS).max(1);
-    use rayon::prelude::*;
-    pool.install(|| {
-        items
-            .par_chunks(chunk)
-            .flat_map_iter(|chunk| {
-                let mut state = init();
-                let f = &f;
-                chunk.iter().map(move |item| f(&mut state, item))
-            })
-            .collect()
-    })
+    let chunks: Vec<&[T]> = items.chunks(chunk).collect();
+    let done: Vec<Vec<R>> = pool.map(&chunks, |chunk| {
+        let mut state = init();
+        chunk.iter().map(|item| f(&mut state, item)).collect()
+    });
+    let mut results = Vec::with_capacity(items.len());
+    results.extend(done.into_iter().flatten());
+    results
 }
 
 /// Hash exactly `len` bytes in fixed blocks. A short reader contributes the

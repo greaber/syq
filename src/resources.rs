@@ -91,15 +91,31 @@ pub(crate) fn exhausted(error: &anyhow::Error) -> bool {
 /// Pools are an optimization. A failed build must leave the caller able to
 /// perform the same operations sequentially without starting Rayon's global pool.
 pub(crate) fn optional_pool(name: &'static str, threads: usize) -> Option<rayon::ThreadPool> {
+    optional(name, || {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(move |index| format!("{name}-{index}"))
+            .build()
+    })
+}
+
+/// `optional_pool` for a pool whose threads sleep as soon as a batch is done.
+pub(crate) fn optional_batch_pool(
+    name: &'static str,
+    threads: usize,
+) -> Option<crate::batch_pool::BatchPool> {
+    optional(name, || crate::batch_pool::BatchPool::new(name, threads))
+}
+
+fn optional<P, E: std::fmt::Display>(
+    name: &str,
+    build: impl FnOnce() -> Result<P, E>,
+) -> Option<P> {
     #[cfg(debug_assertions)]
     if std::env::var_os("SYQ_TEST_NO_OPTIONAL_POOLS").is_some() {
         return None;
     }
-    match rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .thread_name(move |index| format!("{name}-{index}"))
-        .build()
-    {
+    match build() {
         Ok(pool) => Some(pool),
         Err(error) => {
             if crate::output::debug() {
