@@ -1406,13 +1406,11 @@ fn ssh_exit_255_wins_over_a_missing_wire_preamble() {
         multiplexed_ssh: false,
         detached: false,
     };
-    let error = conn.io_err(
-        std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            format!("{WIRE_PREAMBLE_PROTOCOL_ERROR}: read header from remote syq"),
-        )
-        .into(),
-    );
+    let missing = FrameReader::new(std::io::empty())
+        .read_msg::<Response>()
+        .unwrap_err();
+    assert!(is_preamble_error(&missing));
+    let error = conn.io_err(missing.into());
     let diagnostic = format!("{error:#}");
     assert!(diagnostic.contains("exit status: 255"), "{diagnostic}");
     assert!(!diagnostic.contains(WIRE_PREAMBLE_PROTOCOL_ERROR));

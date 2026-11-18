@@ -3442,7 +3442,13 @@ impl RemoteSpec {
             std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
         let replies = reply_queue(self.read_ahead, &role);
         let started = (|| {
-            let output = paced_output(transport.writer, transport.pacing.as_ref(), &handshake)?;
+            // A child's output is its stdin pipe, not a socket.
+            let output = paced_output(
+                transport.writer,
+                transport.child.is_none(),
+                transport.pacing.as_ref(),
+                &handshake,
+            )?;
             let input = crate::bwlimit::activity::ActivityIo {
                 inner: transport.reader,
                 bytes: transport
@@ -3509,9 +3515,11 @@ impl RemoteSpec {
 /// `socket` as a connection's output, paced by `pacing` when this machine
 /// sends on it. Bytes before `handshake` clears count for tuning activity
 /// but wait for no budget, so a connection authenticates in time even at a
-/// tiny cap.
+/// tiny cap. A paced socket also stops waiting once its peer has closed it;
+/// a child's pipe (`socket: false`) is not watched.
 fn paced_output<S>(
-    socket: S,
+    output: S,
+    socket: bool,
     pacing: Option<&TransportPacing>,
     handshake: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<Box<dyn Write + Send>>
@@ -3519,24 +3527,26 @@ where
     S: Write + Send + std::os::fd::AsFd + 'static,
 {
     let Some(pacing) = pacing.filter(|p| !p.remote_sender) else {
-        return Ok(Box::new(socket));
+        return Ok(Box::new(output));
     };
     let scheduler = pacing.scheduler.clone();
     let closed = socket
-        .as_fd()
-        .try_clone_to_owned()
+        .then(|| output.as_fd().try_clone_to_owned())
+        .transpose()
         .context("watch a paced connection")?;
     Ok(Box::new(crate::bwlimit::transport::PacedWriter {
         unpaced: Some(handshake.clone()),
         inner: crate::bwlimit::activity::ActivityIo {
-            inner: socket,
+            inner: output,
             bytes: pacing.activity.clone(),
             handshake_pending: handshake.clone(),
         },
         budget: pacing.budget.clone(),
         stopped: move || {
             scheduler.upgrade().is_none_or(|s| s.is_aborted())
-                || crate::bwlimit::transport::socket_closed(&closed)
+                || closed
+                    .as_ref()
+                    .is_some_and(crate::bwlimit::transport::socket_closed)
         },
     }))
 }
