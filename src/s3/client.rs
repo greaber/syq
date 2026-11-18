@@ -1468,30 +1468,6 @@ fn merge_metadata_encryption(
     Ok(())
 }
 
-pub(super) async fn copy_metadata(
-    client: &Client,
-    bucket: &str,
-    update: super::authorization::Unsigned,
-) -> Result<()> {
-    client
-        .copy_object()
-        .bucket(bucket)
-        .key(&update.key)
-        .copy_source(update.headers["x-amz-copy-source"].clone())
-        .customize()
-        .map_request(move |mut request| {
-            for (name, value) in &update.headers {
-                request
-                    .headers_mut()
-                    .try_insert(name.clone(), value.clone())?;
-            }
-            Ok::<_, aws_smithy_runtime_api::http::HttpError>(request)
-        })
-        .send()
-        .await?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     #[test]

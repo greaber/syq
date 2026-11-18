@@ -1,8 +1,12 @@
 //! Same-service copies never read object bodies through the invoking machine.
+use super::super::{
+    authorization::Unsigned,
+    metadata_copy::{encode_tags, Condition, Desired, Prepared},
+};
 use super::*;
 use aws_sdk_s3::{
     operation::head_object::HeadObjectOutput,
-    types::{ChecksumType, MetadataDirective, StorageClass, Tag, Tagging, TaggingDirective},
+    types::{ChecksumType, Tag, Tagging},
 };
 
 // Compare only fields whose meaning survives a copy. LastModified, encryption,
@@ -158,28 +162,16 @@ pub(super) fn check_overlap(sources: &[(String, bool)], targets: &[(String, bool
 enum CopyPreparation {
     Skipped,
     Preview(u64),
-    Ready(Box<PreparedCopy>),
-    Metadata(Box<super::super::metadata_copy::Prepared>),
+    /// A copy of the source's contents.
+    Ready(Box<Prepared>),
+    /// A copy of the destination onto itself with the source's metadata.
+    Metadata(Box<Prepared>),
     Tags {
         key: String,
         version: Option<String>,
         tags: Vec<Tag>,
         size: u64,
     },
-}
-struct PreparedCopy {
-    source: Object,
-    source_head: HeadObjectOutput,
-    desired_head: HeadObjectOutput,
-    key: String,
-    copy_source: String,
-    must_be_new: bool,
-    explicit: bool,
-    multipart: Option<PreparedCopyMultipart>,
-}
-struct PreparedCopyMultipart {
-    id: String,
-    part_size: u64,
 }
 
 impl Engine {
@@ -287,12 +279,8 @@ impl Engine {
             .await;
             if let Err(error) = finish {
                 for (_, work) in &prepared {
-                    match work {
-                        CopyPreparation::Ready(work) => self.abort_prepared_copy(work).await,
-                        CopyPreparation::Metadata(work) => {
-                            work.abort(&self.client, &self.options.bucket).await
-                        }
-                        _ => {}
+                    if let CopyPreparation::Ready(work) | CopyPreparation::Metadata(work) = work {
+                        self.abort_prepared_copy(work).await;
                     }
                 }
                 return Err(error);
@@ -546,8 +534,7 @@ impl Engine {
                 } else {
                     old_head.version_id().map(str::to_owned)
                 };
-                let mut request =
-                    super::super::authorization::Unsigned::new("PUT", &key).query("tagging", "");
+                let mut request = Unsigned::new("PUT", &key).query("tagging", "");
                 if let Some(version) = &version {
                     request = request.query("versionId", version);
                 }
@@ -560,12 +547,12 @@ impl Engine {
                 });
             }
             let _slot = self.tuning.requests.acquire().await;
-            let update = super::super::metadata_copy::Prepared::prepare_selected(
+            let update = Prepared::prepare_selected(
                 &self.client,
                 &self.options,
                 &key,
                 old_head,
-                super::super::metadata_copy::Desired {
+                Desired {
                     head: desired_head,
                     tags: selected_tags,
                 },
@@ -588,11 +575,18 @@ impl Engine {
             anyhow::ensure!(source_head.missing_meta().unwrap_or(0) == 0,
                 "cannot copy user metadata: the service omitted source metadata (x-amz-missing-meta)");
         }
-        let copy_source = encoded_source(source_bucket, &source);
         let must_be_new = self.args.ignore_existing
             || self.args.target_existence == Existence::New
             || (self.args.protects_existing_contents() && existing.is_none());
-        let multipart = if source.size > self.copy_request_limit(source.size) {
+        let (request, headers) = self.copy_request(
+            &key,
+            &source,
+            &desired_head,
+            explicit.flags() != 0 || matching_contents,
+            must_be_new,
+        );
+        let mut copy = Prepared::new(request, source.size, must_be_new.then_some(Condition::New));
+        if source.size > self.copy_request_limit(source.size) {
             let selected_tags = if self.args.s3_metadata.tags {
                 Some(
                     self.selected_tags(source_bucket, &source.key, &source_head)
@@ -601,33 +595,97 @@ impl Engine {
             } else {
                 None
             };
-            Some(
-                self.prepare_multipart_copy(
-                    &source,
-                    desired_head.clone(),
-                    &key,
-                    selected_tags.as_deref(),
-                )
-                .await?,
+            let _slot = self.tuning.requests.acquire().await;
+            self.check_cancelled()?;
+            copy.start_multipart(
+                &self.client,
+                &self.options.bucket,
+                self.part_size(source.size),
+                headers,
+                self.source_tagging(&source, &desired_head, selected_tags.as_deref()),
             )
-        } else {
-            None
-        };
-        let prepared = PreparedCopy {
-            source,
-            source_head,
-            desired_head,
-            key,
-            copy_source,
-            must_be_new,
-            explicit: explicit.flags() != 0 || matching_contents,
-            multipart,
-        };
-        if let Err(error) = self.authorize_copy(&prepared).await {
-            self.abort_prepared_copy(&prepared).await;
+            .await?;
+        }
+        if let Err(error) = self.authorize_requests(copy.requests()).await {
+            self.abort_prepared_copy(&copy).await;
             return Err(error);
         }
-        Ok(CopyPreparation::Ready(Box::new(prepared)))
+        Ok(CopyPreparation::Ready(Box::new(copy)))
+    }
+
+    /// The single CopyObject request, and the headers CreateMultipartUpload
+    /// takes when the copy needs parts. Native COPY keeps the source's
+    /// metadata, so the single request names it only when replacing it.
+    fn copy_request(
+        &self,
+        key: &str,
+        source: &Object,
+        desired: &HeadObjectOutput,
+        replace: bool,
+        must_be_new: bool,
+    ) -> (Unsigned, BTreeMap<String, String>) {
+        let mut object = BTreeMap::new();
+        for (name, value) in desired.metadata().into_iter().flat_map(|m| m.iter()) {
+            object.insert(format!("x-amz-meta-{name}"), value.clone());
+        }
+        for (name, value) in [
+            ("content-type", desired.content_type()),
+            ("content-encoding", desired.content_encoding()),
+            ("content-language", desired.content_language()),
+            ("content-disposition", desired.content_disposition()),
+            ("cache-control", desired.cache_control()),
+            // Expires is an opaque HTTP hint. Providers can retain values
+            // such as "0" which the SDK's typed date setter cannot represent.
+            ("expires", desired.expires_string()),
+            (
+                "x-amz-website-redirect-location",
+                desired.website_redirect_location(),
+            ),
+            (
+                "x-amz-storage-class",
+                self.args
+                    .s3_metadata
+                    .storage_class
+                    .then(|| super::super::metadata_fields::storage_class(desired)),
+            ),
+        ] {
+            if let Some(value) = value {
+                object.insert(name.to_owned(), value.to_owned());
+            }
+        }
+        let mut request = Unsigned::new("PUT", key)
+            .header(
+                "x-amz-copy-source",
+                &encoded_source(self.options.route.source_bucket().unwrap(), source),
+            )
+            .header("x-amz-copy-source-if-match", &source.etag)
+            .header(
+                "x-amz-metadata-directive",
+                if replace { "REPLACE" } else { "COPY" },
+            )
+            .header("x-amz-tagging-directive", "COPY");
+        for (name, value) in &object {
+            if replace
+                || matches!(
+                    name.as_str(),
+                    "x-amz-website-redirect-location" | "x-amz-storage-class"
+                )
+            {
+                request = request.header(name, value);
+            }
+        }
+        if must_be_new {
+            request = request.header("if-none-match", "*");
+        }
+        // Headers the command adds replace the copy's own, as the client adds
+        // them to the request, so the description is what is sent.
+        for super::super::Header(name, value) in self.options.headers_for("PUT", []) {
+            request = request.header(name, value);
+        }
+        for super::super::Header(name, value) in self.options.headers_for("POST", ["uploads"]) {
+            object.insert(name.clone(), value.clone());
+        }
+        (request, object)
     }
 
     async fn copy_object(&self, job: &mut Download) -> Result<Option<u64>> {
@@ -683,155 +741,29 @@ impl Engine {
             return Err(error);
         }
         let _interval = self.progress.copying_interval();
-        let PreparedCopy {
-            source,
-            source_head,
-            desired_head,
-            key,
-            copy_source,
-            must_be_new,
-            explicit,
-            multipart,
-        } = *work;
-        if let Some(multipart) = multipart {
-            self.execute_multipart_copy(&source, &key, &copy_source, must_be_new, multipart)
-                .await?;
-        } else {
-            let _slot = self.tuning.requests.acquire().await;
-            let request = self
-                .client
-                .copy_object()
-                .bucket(&self.options.bucket)
-                .key(&key)
-                .copy_source(&copy_source)
-                .copy_source_if_match(&source.etag)
-                .set_website_redirect_location(
-                    source_head.website_redirect_location().map(str::to_owned),
-                )
-                .metadata_directive(MetadataDirective::Copy)
-                .tagging_directive(TaggingDirective::Copy)
-                .set_storage_class(self.args.s3_metadata.storage_class.then(|| {
-                    desired_head
-                        .storage_class()
-                        .cloned()
-                        .unwrap_or(StorageClass::Standard)
-                }))
-                .set_if_none_match(must_be_new.then(|| "*".to_owned()));
-            let request = if explicit {
-                request
-                    .metadata_directive(MetadataDirective::Replace)
-                    .set_metadata(desired_head.metadata().cloned())
-                    .set_content_type(desired_head.content_type().map(str::to_owned))
-                    .set_content_encoding(desired_head.content_encoding().map(str::to_owned))
-                    .set_content_language(desired_head.content_language().map(str::to_owned))
-                    .set_content_disposition(desired_head.content_disposition().map(str::to_owned))
-                    .set_cache_control(desired_head.cache_control().map(str::to_owned))
-            } else {
-                request
-            };
-            let expires = desired_head.expires_string().map(str::to_owned);
-            request
-                .customize()
-                .map_request(move |mut request| {
-                    if explicit {
-                        if let Some(expires) = &expires {
-                            request
-                                .headers_mut()
-                                .try_insert("expires", expires.clone())?;
-                        }
-                    }
-                    Ok::<_, aws_smithy_runtime_api::http::HttpError>(request)
-                })
-                .send()
-                .await
-                .map_err(|e| e.into_service_error())
-                .context("S3 server-side copy failed")?;
-            self.tuning.requests.completed(source.size);
-            self.progress.add_bytes(source.size);
-        }
-        Ok(Some(source.size))
+        work.execute_counted(
+            &self.client,
+            &self.options.bucket,
+            self.part_workers(),
+            || async {
+                let slot = self.tuning.requests.acquire().await;
+                self.check_cancelled()?;
+                Ok(slot)
+            },
+            |bytes| {
+                self.tuning.requests.completed(bytes);
+                self.progress.add_bytes(bytes);
+            },
+        )
+        .await?;
+        Ok(Some(work.size))
     }
 
-    async fn abort_prepared_copy(&self, work: &PreparedCopy) {
-        if let Some(multipart) = &work.multipart {
+    async fn abort_prepared_copy(&self, work: &Prepared) {
+        if work.is_multipart() {
             let _slot = self.tuning.requests.acquire().await;
-            if let Err(error) = self
-                .client
-                .abort_multipart_upload()
-                .bucket(&self.options.bucket)
-                .key(&work.key)
-                .upload_id(&multipart.id)
-                .send()
-                .await
-            {
-                self.progress.eprintln(&format!(
-                    "S3 multipart cleanup failed for {:?}: {}",
-                    work.key,
-                    error.into_service_error()
-                ));
-            }
+            work.abort(&self.client, &self.options.bucket).await;
         }
-    }
-
-    async fn authorize_copy(&self, work: &PreparedCopy) -> Result<()> {
-        use crate::s3::authorization::Unsigned;
-        if self.authorization.is_none() {
-            return Ok(());
-        }
-        let mut requests = Vec::new();
-        let copy = |request: Unsigned| {
-            request
-                .header("x-amz-copy-source", &work.copy_source)
-                .header("x-amz-copy-source-if-match", &work.source.etag)
-        };
-        if let Some(multipart) = &work.multipart {
-            requests.push(Unsigned::new("DELETE", &work.key).query("uploadId", &multipart.id));
-            for index in 0..work.source.size.div_ceil(multipart.part_size) {
-                let start = index * multipart.part_size;
-                let end = (start + multipart.part_size).min(work.source.size) - 1;
-                requests.push(
-                    copy(
-                        Unsigned::new("PUT", &work.key)
-                            .query("uploadId", &multipart.id)
-                            .query("partNumber", &(index + 1).to_string()),
-                    )
-                    .header("x-amz-copy-source-range", &format!("bytes={start}-{end}")),
-                );
-            }
-            let mut complete = Unsigned::new("POST", &work.key).query("uploadId", &multipart.id);
-            if work.must_be_new {
-                complete = complete.header("if-none-match", "*");
-            }
-            requests.push(complete);
-        } else {
-            let mut request = copy(Unsigned::new("PUT", &work.key))
-                .header(
-                    "x-amz-metadata-directive",
-                    if work.explicit { "REPLACE" } else { "COPY" },
-                )
-                .header("x-amz-tagging-directive", "COPY");
-            if let Some(redirect) = work.source_head.website_redirect_location() {
-                request = request.header("x-amz-website-redirect-location", redirect);
-            }
-            if work.explicit {
-                if let Some(metadata) = work.desired_head.metadata() {
-                    for (name, value) in metadata {
-                        request = request.header(&format!("x-amz-meta-{name}"), value);
-                    }
-                }
-            }
-            if self.args.s3_metadata.storage_class {
-                request = request.header(
-                    "x-amz-storage-class",
-                    super::super::metadata_fields::storage_class(&work.desired_head),
-                );
-            }
-            if work.must_be_new {
-                request = request.header("if-none-match", "*");
-            }
-            requests.push(request);
-        }
-        self.authorize_requests(requests).await
     }
 
     async fn selected_tags(
@@ -859,215 +791,62 @@ impl Engine {
         Ok(tags)
     }
 
-    async fn prepare_multipart_copy(
+    /// The source's tags for a multipart copy's destination, encoded.
+    async fn source_tagging(
         &self,
         source: &Object,
-        metadata: HeadObjectOutput,
-        key: &str,
-        selected_tags: Option<&[Tag]>,
-    ) -> Result<PreparedCopyMultipart> {
-        let bucket = self.options.route.source_bucket().unwrap();
-        let part_size = self.part_size(source.size);
-        anyhow::ensure!(
-            part_size <= 5 * 1024 * 1024 * 1024,
-            "object exceeds the S3 multipart size limit"
-        );
-        let setup_slot = self.tuning.requests.acquire().await;
-        self.check_cancelled()?;
-        let tagging = if let Some(tags) = selected_tags {
-            super::super::metadata_copy::encode_tags(tags)
-        } else if metadata.tag_count() == Some(0) {
-            String::new()
-        } else if self.copy_tagging_unsupported.load(Relaxed) {
+        head: &HeadObjectOutput,
+        selected: Option<&[Tag]>,
+    ) -> Result<String> {
+        if let Some(tags) = selected {
+            return Ok(encode_tags(tags));
+        }
+        if head.tag_count() == Some(0) {
+            return Ok(String::new());
+        }
+        if self.copy_tagging_unsupported.load(Relaxed) {
             anyhow::ensure!(
-                metadata.tag_count().is_none_or(|count| count <= 0),
+                head.tag_count().is_none_or(|count| count <= 0),
                 "source has tags but S3 GetObjectTagging is unsupported; refusing to drop known tags"
             );
-            String::new()
-        } else {
-            // A missing count is unknown. Only explicit lack of tagging support
-            // permits copying without tags; permission failures remain fatal.
-            let tags = self
-                .client
-                .get_object_tagging()
-                .bucket(bucket)
-                .key(&source.key)
-                .set_version_id(source.version.clone())
-                .send()
-                .await;
-            let tags = match tags {
-                Ok(tags) => Some(tags),
-                Err(e)
-                    if e.raw_response().is_some_and(|r| r.status().as_u16() == 501)
-                        && metadata.tag_count().is_none_or(|count| count <= 0) =>
-                {
-                    if !self.copy_tagging_unsupported.swap(true, Relaxed) {
-                        self.progress.eprintln(
-                            "Warning: S3 GetObjectTagging is unsupported (HTTP 501); continuing without tags for objects with an unknown tag count. Tags may be omitted.",
-                        );
-                    }
-                    None
-                }
-                Err(e) => {
-                    let permission = if source.version.is_some() {
-                        "s3:GetObjectVersionTagging"
-                    } else {
-                        "s3:GetObjectTagging"
-                    };
-                    let operation = format!(
-                        "S3 GetObjectTagging for multipart copy (reading source tags requires {permission} on AWS)"
-                    );
-                    let detail = client::failure(&operation, &e);
-                    return Err(anyhow::Error::new(e.into_service_error()).context(detail));
-                }
-            };
-            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-            if let Some(tags) = tags {
-                for tag in tags.tag_set() {
-                    serializer.append_pair(tag.key(), tag.value());
-                }
-            }
-            serializer.finish().replace('+', "%20")
-        };
-        let created = self
+            return Ok(String::new());
+        }
+        // A missing count is unknown. Only explicit lack of tagging support
+        // permits copying without tags; permission failures remain fatal.
+        match self
             .client
-            .create_multipart_upload()
-            .bucket(&self.options.bucket)
-            .key(key)
-            .set_metadata(metadata.metadata().cloned())
-            .set_storage_class(self.args.s3_metadata.storage_class.then(|| {
-                metadata
-                    .storage_class()
-                    .cloned()
-                    .unwrap_or(StorageClass::Standard)
-            }))
-            .set_content_type(metadata.content_type().map(str::to_owned))
-            .set_content_encoding(metadata.content_encoding().map(str::to_owned))
-            .set_content_language(metadata.content_language().map(str::to_owned))
-            .set_content_disposition(metadata.content_disposition().map(str::to_owned))
-            .set_cache_control(metadata.cache_control().map(str::to_owned))
-            .set_website_redirect_location(metadata.website_redirect_location().map(str::to_owned))
-            .set_tagging((!tagging.is_empty()).then_some(tagging))
-            .customize()
-            .map_request(move |mut request| {
-                // Expires is an opaque HTTP hint. Providers can retain values
-                // such as "0" which the SDK's typed date setter cannot represent.
-                if let Some(expires) = metadata.expires_string() {
-                    request
-                        .headers_mut()
-                        .try_insert("expires", expires.to_owned())?;
-                }
-                Ok::<_, aws_smithy_runtime_api::http::HttpError>(request)
-            })
+            .get_object_tagging()
+            .bucket(self.options.route.source_bucket().unwrap())
+            .key(&source.key)
+            .set_version_id(source.version.clone())
             .send()
             .await
-            .map_err(|e| e.into_service_error())?;
-        let id = created
-            .upload_id()
-            .context("S3 omitted multipart upload ID")?
-            .to_owned();
-        drop(setup_slot);
-        Ok(PreparedCopyMultipart { id, part_size })
-    }
-
-    async fn execute_multipart_copy(
-        &self,
-        source: &Object,
-        key: &str,
-        copy_source: &str,
-        new: bool,
-        prepared: PreparedCopyMultipart,
-    ) -> Result<()> {
-        let PreparedCopyMultipart { id, part_size } = prepared;
-        let id = id.as_str();
-        let failed = std::sync::atomic::AtomicBool::new(false);
-        let result: Result<()> = async {
-            let mut parts = stream::iter(0..source.size.div_ceil(part_size))
-                .take_while(|_| std::future::ready(!failed.load(Relaxed)))
-                .map(|index| {
-                    let failed = &failed;
-                    async move {
-                        anyhow::ensure!(!failed.load(Relaxed), "another server-copy part failed");
-                        let _slot = self.tuning.requests.acquire().await;
-                        self.check_cancelled()?;
-                        anyhow::ensure!(!failed.load(Relaxed), "another server-copy part failed");
-                        let start = index * part_size;
-                        let end = (start + part_size).min(source.size) - 1;
-                        let output = self
-                            .client
-                            .upload_part_copy()
-                            .bucket(&self.options.bucket)
-                            .key(key)
-                            .upload_id(id)
-                            .part_number((index + 1) as i32)
-                            .copy_source(copy_source)
-                            .copy_source_if_match(&source.etag)
-                            .copy_source_range(format!("bytes={start}-{end}"))
-                            .send()
-                            .await
-                            .map_err(|e| e.into_service_error())?;
-                        let part = output
-                            .copy_part_result()
-                            .context("S3 omitted copy part result")?;
-                        let part = CompletedPart::builder()
-                            .part_number((index + 1) as i32)
-                            .e_tag(part.e_tag().context("S3 omitted copied part ETag")?)
-                            .build();
-                        self.tuning.requests.completed(end - start + 1);
-                        self.progress.add_bytes(end - start + 1);
-                        Ok(part)
-                    }
-                })
-                .buffer_unordered(self.part_workers())
-                .inspect(|result: &Result<CompletedPart>| {
-                    if result.is_err() {
-                        failed.store(true, Relaxed);
-                    }
-                })
-                // Drain started requests before aborting: dropping their futures
-                // could leave provider-side parts racing cleanup.
-                .collect::<Vec<Result<_>>>()
-                .await
-                .into_iter()
-                .collect::<Result<Vec<_>>>()?;
-            parts.sort_by_key(|part| part.part_number());
-            let _slot = self.tuning.requests.acquire().await;
-            self.check_cancelled()?;
-            self.client
-                .complete_multipart_upload()
-                .bucket(&self.options.bucket)
-                .key(key)
-                .upload_id(id)
-                .multipart_upload(
-                    CompletedMultipartUpload::builder()
-                        .set_parts(Some(parts))
-                        .build(),
-                )
-                .set_if_none_match(new.then(|| "*".to_owned()))
-                .send()
-                .await
-                .map_err(|e| e.into_service_error())?;
-            Ok(())
-        }
-        .await;
-        if result.is_err() {
-            let _slot = self.tuning.requests.acquire().await;
-            if let Err(error) = self
-                .client
-                .abort_multipart_upload()
-                .bucket(&self.options.bucket)
-                .key(key)
-                .upload_id(id)
-                .send()
-                .await
+        {
+            Ok(tags) => Ok(encode_tags(tags.tag_set())),
+            Err(e)
+                if e.raw_response().is_some_and(|r| r.status().as_u16() == 501)
+                    && head.tag_count().is_none_or(|count| count <= 0) =>
             {
-                self.progress.eprintln(&format!(
-                    "S3 multipart cleanup failed for {key:?}, upload {id:?}: {}",
-                    error.into_service_error()
-                ));
+                if !self.copy_tagging_unsupported.swap(true, Relaxed) {
+                    self.progress.eprintln(
+                        "Warning: S3 GetObjectTagging is unsupported (HTTP 501); continuing without tags for objects with an unknown tag count. Tags may be omitted.",
+                    );
+                }
+                Ok(String::new())
+            }
+            Err(e) => {
+                let permission = if source.version.is_some() {
+                    "s3:GetObjectVersionTagging"
+                } else {
+                    "s3:GetObjectTagging"
+                };
+                let operation = format!(
+                    "S3 GetObjectTagging for multipart copy (reading source tags requires {permission} on AWS)"
+                );
+                let detail = client::failure(&operation, &e);
+                Err(anyhow::Error::new(e.into_service_error()).context(detail))
             }
         }
-        result
     }
 }
 
