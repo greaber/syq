@@ -751,6 +751,44 @@ mod tests {
     }
 
     #[test]
+    fn a_destination_stage_has_a_partial_name_and_goes_with_its_session() {
+        // `clean-partials` and the interrupt sweep know a stage by its
+        // partial name.
+        let temporary = crate::test_support::tempdir().unwrap();
+        let target = temporary.path().join("target");
+        let descriptors = DescriptorSessionSlot::default();
+        let mut ops = crate::fsops::FsOps::new();
+        let mut slot = Session::default();
+        let open = Operation::Open {
+            entry: 1,
+            dry_run: false,
+            only_new: false,
+            only_existing: false,
+            path: target.as_os_str().as_bytes().to_vec(),
+            write: true,
+            follow: false,
+            root: None,
+            placement: StreamPlacement::default(),
+            metadata: Default::default(),
+            source_meta: None,
+            settings: Settings::default(),
+        };
+        Session::handle(&mut slot, &open, &descriptors, &mut ops).unwrap();
+        let names = || {
+            std::fs::read_dir(temporary.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>()
+        };
+        let staged = names();
+        assert_eq!(staged.len(), 1, "{staged:?}");
+        assert!(crate::fsops::is_partial_name(&staged[0]), "{staged:?}");
+        assert!(staged[0].as_bytes().starts_with(b".target.syq-tmp."));
+        drop(slot);
+        assert!(names().is_empty());
+    }
+
+    #[test]
     fn a_metadata_override_is_the_first_mode_the_finished_file_gets() {
         // A mapping entry's metadata replaces the mode the destination would
         // otherwise get. The finished file must take it at once: a default
