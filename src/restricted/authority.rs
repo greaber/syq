@@ -4215,15 +4215,11 @@ impl RestrictedAuthority {
             Request::PrepareSmallFiles(request) => self.authorize_small_copy(request, outcomes)?,
             // Held to its preparation in `authorize_stream`.
             Request::CopySmallFiles(_) => {}
-            Request::ListDir { .. }
-            | Request::ListDirDetails { .. }
-            | Request::ListDirNoFollowFinal { .. } => {
+            Request::ListDir { .. } => {
                 bail!("directory completion is not valid on a restricted destination")
             }
             Request::CheckOperatorDirectory { .. }
             | Request::CheckOperatorDirectoryAncestry { .. }
-            | Request::CheckOperatorDirectoryAncestryWithAccess { .. }
-            | Request::CheckSearchableOperatorDirectory { .. }
             | Request::RegisterSourceRoots { .. }
             | Request::CreateOperatorDirectory { .. }
             | Request::AnchorDestination { .. } => {
