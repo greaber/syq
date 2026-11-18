@@ -6531,14 +6531,18 @@ fn parallel_listing_failure_stops_copy_and_removal_before_mutation() {
 
 #[test]
 fn parallel_listing_preserves_exact_prefix_permissions_and_explicit_concurrency() {
-    for command in ["cp", "rm"] {
+    // An ignored first directory makes a filtered copy probe with a
+    // delimiter (denied by one policy) and then list its other child
+    // (denied by the other).
+    for (command, ignore) in [("cp", false), ("cp", true), ("rm", false)] {
         for fault in [
             "parallel-prefix-policy",
             "parallel-delimiter-policy",
             "parallel-serial",
         ] {
-            // S3 removal has no discovery-concurrency override.
-            if command == "rm" && fault == "parallel-serial" {
+            // S3 removal has no discovery-concurrency override. One request
+            // slot still lets a filtered copy probe past ignored directories.
+            if (command == "rm" || ignore) && fault == "parallel-serial" {
                 continue;
             }
             let temp = crate::test_support::tempdir().unwrap();
@@ -6576,6 +6580,9 @@ fn parallel_listing_preserves_exact_prefix_permissions_and_explicit_concurrency(
                     "--into",
                     "out",
                 ]);
+                if ignore {
+                    process.args(["--ignore", "a/"]);
+                }
             } else {
                 process.args(["--on", "s3://bucket", "--srcs-in", "tree"]);
             }
@@ -6602,10 +6609,14 @@ fn parallel_listing_preserves_exact_prefix_permissions_and_explicit_concurrency(
                 .filter(|record| record["type"] == kind)
                 .map(|record| record[key]["value"].as_str().unwrap())
                 .collect();
-            let expected: std::collections::BTreeSet<_> = (0..4000)
+            let expected: std::collections::BTreeSet<_> = (if ignore { 2000 } else { 0 }..4000)
                 .map(|i| format!("tree/{}/{i:04}", if i < 2000 { "a" } else { "b" }))
                 .collect();
-            assert_eq!(actual.len(), 4000);
+            assert_eq!(actual.len(), expected.len());
+            if ignore {
+                let terminal = records.last().unwrap();
+                assert_eq!(terminal["files_excluded"], 1, "{fault}: {terminal}");
+            }
             assert_eq!(
                 actual
                     .into_iter()

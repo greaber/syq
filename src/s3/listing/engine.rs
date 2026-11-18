@@ -318,7 +318,6 @@ async fn lookahead(
     query: &str,
     depth: usize,
     flat: &Page,
-    probed: &mut bool,
 ) -> Result<Option<Batch>> {
     let budget = prune.probes.load(Ordering::Relaxed);
     let mut reachable = false;
@@ -341,7 +340,6 @@ async fn lookahead(
     let mut probe = query.to_owned();
     let mut parents = Vec::new();
     while prune.take_probe() {
-        *probed = true;
         let page = read(store, &probe, true, None).await?;
         let (pruned, included): (Vec<_>, Vec<_>) = page
             .prefixes
@@ -386,16 +384,17 @@ async fn recursive(
     start_after: Option<&str>,
 ) -> Result<Batch> {
     let mut flat = read_after(store, &query, false, None, start_after).await?;
-    let mut probed = false;
-    if let Some(prune) = prune.filter(|_| start_after.is_none()) {
-        if let Some(batch) = lookahead(store, prune, &query, depth, &flat, &mut probed).await? {
-            return Ok(batch);
+    if let Some(prune) = prune {
+        if start_after.is_none() {
+            if let Some(batch) = lookahead(store, prune, &query, depth, &flat).await? {
+                return Ok(batch);
+            }
         }
+        // The dense split below would request every small sibling of two
+        // dense directories separately; filtered listings stay flat instead.
+        return Ok(scan_batch(query, false, flat, start_after));
     }
-    // A wide or truncated directory probe already showed that splitting this
-    // prefix would not help.
-    if probed
-        || flat.next.is_none()
+    if flat.next.is_none()
         || !split
         || !store.ordered()
         || depth >= MAX_RECURSIVE_PROBES
@@ -452,22 +451,19 @@ async fn recursive(
             .iter()
             .any(|prefix| entry.key.starts_with(prefix))
     }));
-    let (pruned, children): (Vec<_>, Vec<_>) = branches
-        .prefixes
-        .into_iter()
-        .filter(|prefix| prefix >= &last || last.starts_with(prefix))
-        .partition(|prefix| prune.is_some_and(|prune| (prune.subtree)(prefix, true).is_some()));
     Ok(Batch {
         entries,
-        jobs: children
+        jobs: branches
+            .prefixes
             .into_iter()
+            .filter(|prefix| prefix >= &last || last.starts_with(prefix))
             .map(|prefix| Job::Recursive {
                 start_after: last.starts_with(&prefix).then(|| last.clone()),
                 prefix,
                 depth: depth + 1,
             })
             .collect(),
-        pruned,
+        pruned: Vec::new(),
     })
 }
 
@@ -518,9 +514,10 @@ pub(super) async fn enumerate(
 /// This only changes request scheduling; callers still validate and interpret
 /// object metadata, source types and destination mappings.
 ///
-/// With `prune`, directories it names may be skipped: their common prefixes
-/// are returned instead of being listed. Objects in pruned directories may
-/// still be emitted, so callers must classify every entry themselves.
+/// With `prune`, the listing stays flat apart from the lookahead, and
+/// directories it names may be skipped: their common prefixes are returned
+/// instead of being listed. Objects in pruned directories may still be
+/// emitted, so callers must classify every entry themselves.
 pub(in crate::s3) async fn enumerate_prefix(
     store: &impl Store,
     prefix: &str,

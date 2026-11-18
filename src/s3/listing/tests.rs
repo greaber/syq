@@ -569,7 +569,7 @@ async fn ignored_start_after_filters_every_continuation_page() {
 }
 
 #[tokio::test]
-async fn pruned_directories_are_reported_instead_of_listed() {
+async fn filtered_listings_stay_flat_and_prune_ignored_first_pages() {
     async fn pruned(store: &Memory, prune: &engine::Prune<'_>) -> (Vec<String>, Vec<String>) {
         let mut keys = Vec::new();
         let pruned = engine::enumerate_prefix(store, "tree/", 8, Some(prune), |entry| {
@@ -582,24 +582,21 @@ async fn pruned_directories_are_reported_instead_of_listed() {
     }
     let ignored =
         |key: &str, _directory: bool| key.starts_with("tree/d3/").then_some("tree/d3".len());
-    // Dense children split in parallel; the pruned one is never listed.
-    let store =
-        Memory::new((0..8).flat_map(|d| (0..1200).map(move |i| format!("tree/d{d}/file{i:04}"))));
+    // Filtered listings do not split dense directories: with many small
+    // siblings that would cost a request per sibling.
+    let store = Memory::new(
+        (0..2)
+            .flat_map(|d| (0..1500).map(move |i| format!("tree/d{d}/file{i:04}")))
+            .chain((2..64).map(|d| format!("tree/e{d:02}/file"))),
+    );
     let prune = engine::Prune {
         subtree: &ignored,
         probes: 4.into(),
     };
     let (keys, pruned_prefixes) = pruned(&store, &prune).await;
-    assert_eq!(pruned_prefixes, ["tree/d3/"]);
-    assert!(!store
-        .calls
-        .borrow()
-        .iter()
-        .any(|(prefix, _)| prefix == "tree/d3/"));
-    let listed: BTreeSet<_> = keys.into_iter().collect();
-    for key in &store.keys {
-        assert_eq!(listed.contains(key), !key.starts_with("tree/d3/"), "{key}");
-    }
+    assert!(pruned_prefixes.is_empty());
+    assert_eq!(keys.len(), store.keys.len());
+    assert_eq!(*store.calls.borrow(), vec![("tree/".to_owned(), false); 4]);
     // A first page entirely in a pruned directory switches to a directory
     // listing at once, following a single included child.
     let store = Memory::new(

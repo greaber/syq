@@ -142,7 +142,7 @@ impl Store for S3<'_> {
         // request returns keys as stored, and those can contain '%' and '+'.
         let encoded = response.encoding_type() == Some(&aws_sdk_s3::types::EncodingType::Url);
         let decode = |value: &str| -> Result<String> {
-            if !encoded {
+            if !encoded || !value.contains(['%', '+']) {
                 return Ok(value.to_owned());
             }
             Ok(
