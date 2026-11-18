@@ -1670,6 +1670,7 @@ impl Queue {
             if request.upload { "read and upload" } else { "read" },
             if request.create_only { ", create-only writes" } else if request.upload { ", may overwrite" } else { "" },
             match (request.delete, request.max_delete) {
+                (true, Some(0)) => ", no object deletion (--max-delete 0)".to_owned(),
                 (true, Some(limit)) => format!(", may delete at most {limit} objects"),
                 (true, None) => ", may delete".to_owned(),
                 (false, _) => ", no object deletion".to_owned(),

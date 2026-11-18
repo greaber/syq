@@ -409,7 +409,7 @@ impl Engine {
             }
             self.check_upload_placement(plan.first().map(|s| s.kind() != ObjectKind::Dir))
                 .await?;
-            self.discover_destination(plan.iter().map(|s| s.key.as_str()).collect())
+            self.discover_destination(plan.iter().map(|s| s.key.as_str()).collect(), &prune.scopes)
                 .await?;
             let workers = self.object_workers(plan.iter().map(|s| s.meta.len))?;
             self.progress.files_total.store(plan.len() as u64, Relaxed);
@@ -916,10 +916,28 @@ impl Engine {
         )
         .into_bytes()
     }
-    async fn discover_destination(&self, keys: HashSet<&str>) -> Result<()> {
+    /// List the destination to learn which of the upload's `keys` exist,
+    /// and with pruning everything under `pruned`, the directories pruning
+    /// will look through.
+    async fn discover_destination(&self, keys: HashSet<&str>, pruned: &[Vec<u8>]) -> Result<()> {
         if keys.len() > 1 && !self.args.existing && !self.args.ignore_existing {
             let mut found = DestinationListing::default();
+            // A named file has nothing beneath its key for pruning to look
+            // through, so an upload another machine signs for does not
+            // list there. Every pruned directory stays covered.
+            let named = self.authorization.is_some() && self.options.route == Route::Upload;
             for prefix in self.destination_prefixes()? {
+                if self.args.delete
+                    && named
+                    && !pruned.iter().any(|scope| {
+                        scope.is_empty()
+                            || [scope.as_slice(), b"/"]
+                                .concat()
+                                .starts_with(prefix.as_bytes())
+                    })
+                {
+                    continue;
+                }
                 let listing = if self.args.delete {
                     // Pruning needs every destination key, including keys absent
                     // from the upload plan. Only this complete cache is reusable

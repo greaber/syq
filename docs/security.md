@@ -587,7 +587,9 @@ signs nothing else:
   destination path instead when the command does not fix the names: with
   `--srcs-in`, whose names come from the directory's contents, with
   `--mapping`, with `--into-existing` or `--into-new`, which look at the
-  destination directory itself, and with more than 1024 named sources.
+  destination directory itself, and with more than 1024 named sources. A copy
+  between two buckets covers each source in the source bucket and the whole
+  destination path.
 - **The operations.** A download can only read. An upload can also write. It
   can delete only with `--prune` or `--prune-before`, and then no more objects
   than `--max-delete` allows: the signing machine counts the deletions it
@@ -622,9 +624,9 @@ way, within the same limits. Who signs depends on the command:
 - **With `--auth-from @NAME`, the receiving machine NAME signs, after you
   approve its prompt.** It checks the command and shows the same request as
   for any storage authorization, and its URLs last up to seven days. The
-  machine where you typed the command holds no storage credentials and never
-  receives any: it passes the server's signing requests to NAME and the signed
-  URLs back, and nothing else. The option chooses who signs for storage only;
+  machine where you typed the command holds no storage credentials: it passes
+  the server's signing requests to NAME and the signed URLs back, so it sees
+  those URLs as the server does, and passes nothing else. The option chooses who signs for storage only;
   the login to the server uses the typing machine's own SSH access.
 
 Either way, file data travels only between the server and the storage

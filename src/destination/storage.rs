@@ -89,8 +89,8 @@ pub(crate) fn serve_started_copy(
     serve_signing(stream, signer, || false)
 }
 
-/// How long a receiving machine may leave signing requests unanswered
-/// before the copy treats it as gone.
+/// How long a receiving machine may send nothing while it owes answers to
+/// signing requests before the copy treats it as gone.
 const RELAY_REPLY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Passes a signing session between the server this machine started a copy
@@ -140,12 +140,14 @@ pub(crate) fn relay_started_copy(
         let mut reader = authority;
         let outcome = (|| -> Result<Option<String>> {
             loop {
-                if !reply_ready(authority, &owed, &ended)? {
-                    bail!("the server ended its storage signing session");
-                }
-                let reply = match read_message(&mut reader) {
-                    Ok(reply) => reply,
-                    Err(_) => {
+                let reply = match reply_ready(authority, &owed, &ended)? {
+                    Waited::ServerEnded => bail!("the server ended its storage signing session"),
+                    Waited::Silent => None,
+                    Waited::Ready => read_message(&mut reader).ok(),
+                };
+                let reply = match reply {
+                    Some(reply) => reply,
+                    None => {
                         let lost = format!("@{name} disconnected before it finished signing this copy's storage requests; reconnect it and run the copy again");
                         write_message(replies, &SigningReply::Error(lost.clone()))?;
                         return Ok(Some(lost));
@@ -181,11 +183,22 @@ pub(crate) fn relay_started_copy(
     outcome
 }
 
-/// Wait until `authority` has sent something, or closed. Returns `false`
-/// once the server's requests have `ended`. While `authority` owes answers
-/// it must keep sending; with none owed it may stay silent, since the server
-/// can take any time to scan and hash before it asks.
-fn reply_ready(authority: &UnixStream, owed: &AtomicU64, ended: &AtomicBool) -> Result<bool> {
+/// What [`reply_ready`] waited for.
+enum Waited {
+    /// The receiving machine sent something, or closed its connection.
+    Ready,
+    /// The server's requests ended.
+    ServerEnded,
+    /// The receiving machine owed answers and sent nothing for
+    /// [`RELAY_REPLY_TIMEOUT`].
+    Silent,
+}
+
+/// Wait until `authority` has sent something or closed, or the server's
+/// requests have `ended`. While `authority` owes answers it must keep
+/// sending; with none owed it may stay silent, since the server can take
+/// any time to scan and hash before it asks.
+fn reply_ready(authority: &UnixStream, owed: &AtomicU64, ended: &AtomicBool) -> Result<Waited> {
     let mut silent = Instant::now();
     loop {
         let mut poll = libc::pollfd {
@@ -195,7 +208,7 @@ fn reply_ready(authority: &UnixStream, owed: &AtomicU64, ended: &AtomicBool) -> 
         };
         match unsafe { libc::poll(&mut poll, 1, 200) } {
             0 => {}
-            ready if ready > 0 => return Ok(true),
+            ready if ready > 0 => return Ok(Waited::Ready),
             _ => {
                 let error = std::io::Error::last_os_error();
                 if error.kind() != std::io::ErrorKind::Interrupted {
@@ -204,13 +217,12 @@ fn reply_ready(authority: &UnixStream, owed: &AtomicU64, ended: &AtomicBool) -> 
             }
         }
         if ended.load(Ordering::Acquire) {
-            return Ok(false);
+            return Ok(Waited::ServerEnded);
         }
         if owed.load(Ordering::Acquire) == 0 {
             silent = Instant::now();
         } else if silent.elapsed() > RELAY_REPLY_TIMEOUT {
-            // Reading reports it as gone.
-            return Ok(true);
+            return Ok(Waited::Silent);
         }
     }
 }

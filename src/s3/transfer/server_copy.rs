@@ -239,7 +239,7 @@ impl Engine {
         )
         .await?;
         let keys: Vec<_> = plan.iter().map(copy_destination_key).collect();
-        self.discover_destination(keys.iter().map(String::as_str).collect())
+        self.discover_destination(keys.iter().map(String::as_str).collect(), &prune.scopes)
             .await?;
         let workers = self.object_workers(plan.iter().map(|p| p.size))?;
         self.progress.files_total.store(plan.len() as u64, Relaxed);
