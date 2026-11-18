@@ -219,6 +219,9 @@ jobs:
         run: scripts/run-tooling-tests.py --quick
       - name: Test every repository tooling script
         if: needs.scope.outputs.all_tooling == 'true'
+        env:
+          # test-cargo-package.py runs first and builds a syq to reuse.
+          SYQ_RELEASE_TOOLS_SYQ: ${{ github.workspace }}/target/package-identity/debug/syq
         run: scripts/run-tooling-tests.py
       - name: Test the selected repository tooling groups
         if: >-
