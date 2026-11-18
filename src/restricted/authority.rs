@@ -1996,8 +1996,8 @@ impl RestrictedAuthority {
                 "signed placement puts names inside {label}, so it must be created as a directory"
             );
         }
-        if self.created_by_this_grant(path)
-            || (policy == ExistingDestinationPolicy::Replace && !root_must_be_new)
+        if (policy == ExistingDestinationPolicy::Replace && !root_must_be_new)
+            || self.created_by_this_grant(path)
         {
             return Ok(());
         }
@@ -2051,7 +2051,8 @@ impl RestrictedAuthority {
             self.root_existence == RootExistence::New && path == self.destination;
         let recorded = match &self.lookups {
             Some(lookups)
-                if !(in_place || root_must_be_new || self.created_by_this_grant(path)) =>
+                if self.creation_policy(false) != ExistingDestinationPolicy::Replace
+                    && !(in_place || root_must_be_new || self.created_by_this_grant(path)) =>
             {
                 crate::fsops::destination_relative_to(&self.root_path, path)
                     .ok()
@@ -2269,21 +2270,23 @@ impl RestrictedAuthority {
         // A creation earlier in this same request (a symlink followed by its
         // metadata, say) counts: the request's metadata runs only once its
         // no-replace creations have all succeeded.
-        let created_before = self.created_by_this_grant(path);
-        let created_here = pending
-            .iter()
-            .any(|creation| creation.path == path && !creation.link);
+        let created = || {
+            pending
+                .iter()
+                .any(|creation| creation.path == path && !creation.link)
+                || self.created_by_this_grant(path)
+        };
         match self.creation_policy(directory) {
             // A name this grant created leads only to an object it created,
             // whatever runs on other connections meanwhile: the one step
             // that could give it an existing file is a hard link, which
             // this policy allows only to the grant's own files
             // (`OwnedObjects`).
-            ExistingDestinationPolicy::Skip if created_before || created_here => Ok(()),
+            ExistingDestinationPolicy::Skip if created() => Ok(()),
             ExistingDestinationPolicy::Skip => Err(kept(format!(
                 "signed grant retains existing objects: {label} may not be modified"
             ))),
-            ExistingDestinationPolicy::MustExist if created_before || created_here => Ok(()),
+            ExistingDestinationPolicy::MustExist if created() => Ok(()),
             // Updates are pinned to the observed object, like publications:
             // nothing hostA supplies names an inode on its own authority.
             ExistingDestinationPolicy::MustExist => self.pin_update(path, &label, condition),
@@ -2425,19 +2428,19 @@ impl RestrictedAuthority {
     /// Refuse staging work whose eventual publication the existing-object
     /// policy would reject, so the transfer fails before moving bytes.
     pub(super) fn constrain_prepare(&self, path: &[u8]) -> Result<()> {
-        if self.created_by_this_grant(path) {
-            return Ok(());
-        }
-        let label = String::from_utf8_lossy(path);
         // Under `Skip` the publication refuses a name that exists, so
         // nothing is looked at here; under `MustExist`, a name this
-        // receiver's lookups found needs no look either.
+        // receiver's lookups found, or this grant created, needs no look
+        // either.
         match self.creation_policy(false) {
             ExistingDestinationPolicy::MustExist
-                if !self.looked_up_present(path) && self.rooted_metadata(path)?.is_none() =>
+                if !self.created_by_this_grant(path)
+                    && !self.looked_up_present(path)
+                    && self.rooted_metadata(path)?.is_none() =>
             {
                 Err(kept(format!(
-                    "signed grant creates nothing: {label} does not exist"
+                    "signed grant creates nothing: {} does not exist",
+                    String::from_utf8_lossy(path)
                 )))
             }
             _ => Ok(()),
