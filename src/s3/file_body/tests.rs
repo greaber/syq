@@ -185,18 +185,28 @@ async fn a_source_changed_in_place_fails_the_last_chunk() {
 /// Dropping a body, as cancellation does, while a read is in flight still
 /// returns that read's buffer when the read finishes.
 #[tokio::test]
-async fn a_body_dropped_mid_read_returns_its_buffers() {
+async fn a_body_dropped_mid_read_returns_its_buffer() {
     let temp = crate::test_support::tempdir().unwrap();
     let opened = opened(temp.path(), &patterned(3 * CHUNK));
     let pool = pool(8);
-    let mut chunks = Chunks::new(opened, 0, 3 * CHUNK as u64, pool);
-    let held = frame(&mut chunks).await.unwrap().unwrap();
-    // Start the next read, then drop the body before it completes.
+    let mut chunks = Chunks::new(opened.clone(), 0, 3 * CHUNK as u64, pool);
+    // The first chunk's buffer is the only one, so the next read takes it.
+    drop(frame(&mut chunks).await.unwrap().unwrap());
+    assert_eq!(pool.idle().len(), 1);
+    // Start that read, then drop the body before it completes.
     let started = std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut chunks).poll_frame(cx)));
     if let Poll::Ready(frame) = started.await {
         drop(frame);
     }
     drop(chunks);
-    drop(held);
-    eventually_idle(pool, 2).await;
+    // The abandoned read holds the last other reference until it finishes.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while Arc::strong_count(&opened) > 1 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the abandoned read finishes");
+    // A buffer kept by the abandoned read would leave the pool empty.
+    eventually_idle(pool, 1).await;
 }
