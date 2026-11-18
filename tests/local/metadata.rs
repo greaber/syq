@@ -2300,6 +2300,61 @@ fn a_failure_in_a_later_final_metadata_request_names_its_directory() {
     }
 }
 
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn every_failure_is_reported_when_the_errors_of_long_paths_would_overfill_a_reply() {
+    use std::os::unix::ffi::OsStrExt;
+    // 1,000 directories below thirteen named with 255 bytes that are not
+    // UTF-8. Each one's error names its path, which the receiver shows at
+    // three bytes for each of those: about 10 KiB. Their destination is
+    // moved away once the copy has filled it, so every one fails. A reply
+    // carries a request's errors and holds 8 MiB, less than 1,000 of these:
+    // the requests end before their errors could overfill it, and each
+    // directory's failure is reported.
+    let t = Tmp::new();
+    let long = std::ffi::OsStr::from_bytes(&[0xff; 255]);
+    let parent = (0..13).fold(PathBuf::new(), |path, _| path.join(long));
+    for index in 0..1000 {
+        fs::create_dir_all(t.path("src").join(&parent).join(format!("d{index:04}"))).unwrap();
+    }
+    let ready = t.path("metadata-ready");
+    let continuation = t.path("metadata-continue");
+    let mut child = copy_recording_final_metadata(&t, "-a", false)
+        .env("SYQ_TEST_DIRECTORY_METADATA_READY_FILE", &ready)
+        .env("SYQ_TEST_DIRECTORY_METADATA_CONTINUE_FILE", &continuation)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "final directory metadata");
+    fs::rename(t.path("dst").join(long), t.path("moved")).unwrap();
+    release_confinement_barrier(&continuation);
+
+    let output = child.wait_with_output().unwrap();
+    let stderr = stderr_of(&output);
+    let missing = stderr
+        .lines()
+        .filter(|line| line.contains("No such file or directory"))
+        .count();
+    assert_eq!(
+        (output.status.code(), missing),
+        // The 1,000 directories and the thirteen above them.
+        (Some(23), 1013),
+        "{}",
+        stderr.lines().rev().take(3).collect::<Vec<_>>().join("\n")
+    );
+    let requests = final_metadata_requests(&t);
+    // With the destination itself, which is still there.
+    assert_eq!(
+        requests.iter().map(|request| request.0).sum::<usize>(),
+        1014
+    );
+    assert!(
+        requests.len() >= 6 && requests.iter().all(|request| request.0 <= 200),
+        "{requests:?}"
+    );
+}
+
 #[cfg(debug_assertions)]
 #[test]
 fn a_directory_loses_search_access_only_once_the_requests_before_it_are_answered() {
