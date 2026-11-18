@@ -213,8 +213,17 @@ impl Worker {
         }
         let round_trip = setup.src? + setup.dst?;
         self.setup_latency = None;
-        self.batch_budget.set_latency(round_trip);
+        self.apply_setup_latency(round_trip);
         Some(round_trip)
+    }
+
+    /// Start the latency allowance from `round_trip`: for small-file
+    /// batches, and for a range allowance kept from before it was known.
+    fn apply_setup_latency(&mut self, round_trip: std::time::Duration) {
+        self.batch_budget.set_latency(round_trip);
+        if let Some(budget) = &mut self.range_budget {
+            budget.set_latency(round_trip);
+        }
     }
 
     pub(super) fn transport_dead(&self) -> bool {
@@ -392,6 +401,9 @@ impl Worker {
             }
             return self.leave_shared_login(format_args!("{error:#}"));
         }
+        // The shared sessions hold the setup round trips read on them until
+        // the worker takes them: take them before those sessions close.
+        self.settle_setup_latency();
         self.on_shared_login = false;
         for (source, new) in [(true, src), (false, dst)] {
             if let Some(new) = new {
@@ -402,11 +414,8 @@ impl Worker {
         // A session that closed before its setup reply was read gives no
         // round trip. The allowance then starts from the other side's alone
         // and is checked again like any that proves too small.
-        if self.settle_setup_latency().is_none() {
-            if let Some(setup) = self.setup_latency.take() {
-                self.batch_budget
-                    .set_latency(setup.src.unwrap_or_default() + setup.dst.unwrap_or_default());
-            }
+        if let Some(setup) = self.setup_latency.take() {
+            self.apply_setup_latency(setup.src.unwrap_or_default() + setup.dst.unwrap_or_default());
         }
         // The shared sessions are closed. A worker that leaves gives its
         // share back once the worker loop has closed them (`Worker` drop).

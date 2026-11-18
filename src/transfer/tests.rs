@@ -1805,6 +1805,8 @@ fn a_worker_does_not_wait_for_its_hashing_configuration() {
         assert_eq!(state.received, 0, "the reply was waited for");
     }
     let default = worker.batch_budget.latency_target();
+    // A range allowance kept from before the round trips were known.
+    worker.range_budget = Some(WorkBudget::ranges(512, default, None));
 
     // The allowance comes from both round trips, once both replies have
     // been read ahead of a later one.
@@ -1824,11 +1826,53 @@ fn a_worker_does_not_wait_for_its_hashing_configuration() {
             assert_eq!(worker.batch_budget.latency_target(), default);
         }
     }
+    let allowance =
+        Duration::from_millis(80) * crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH as u32;
+    assert_eq!(worker.batch_budget.latency_target(), allowance);
     assert_eq!(
-        worker.batch_budget.latency_target(),
-        Duration::from_millis(80) * crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH as u32
+        worker.range_budget.as_ref().unwrap().latency_target(),
+        allowance
     );
     assert_eq!(worker.settle_setup_latency(), None, "settled once");
+}
+
+#[test]
+fn moving_to_its_own_login_keeps_a_setup_round_trip_already_read() {
+    use std::time::Duration;
+    let timed = |round_trip| {
+        Arc::new(Mutex::new(PipelineState {
+            timed: Some(Duration::from_millis(round_trip)),
+            replies: [Response::Ok].into(),
+            ..Default::default()
+        }))
+    };
+    let (source, shared) = (timed(0), timed(100));
+    let sched = Arc::new(Sched::new(512, 8192));
+    sched.scan_done();
+    let mut worker = pipeline_worker(&sched, &source, &shared, false);
+    worker.run(None).unwrap();
+    // The shared session's reply is read by the requests of the file the
+    // worker copies there, which do not take the round trip.
+    for state in [&source, &shared] {
+        state.lock().unwrap().replies.push_back(Response::Ok);
+    }
+    assert!(matches!(worker.src.recv().unwrap(), Response::Ok));
+    assert!(matches!(worker.dst.recv().unwrap(), Response::Ok));
+
+    worker.on_shared_login = true;
+    let own = Arc::new(Mutex::new(PipelineState::default()));
+    worker.own_login = OwnLogin::Unopened(Box::new(move || {
+        Ok((None, Some(Box::new(PipelineConn(own)) as Box<dyn Conn>)))
+    }));
+    worker.open_own_login();
+    wait_for_own_login(&worker);
+    worker.take_own_login_if_ready().unwrap();
+    assert!(!worker.on_shared_login);
+    assert_eq!(
+        worker.batch_budget.latency_target(),
+        Duration::from_millis(100) * crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH as u32,
+        "the round trip went with the shared session"
+    );
 }
 
 #[test]

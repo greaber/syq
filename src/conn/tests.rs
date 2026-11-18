@@ -3750,7 +3750,7 @@ fn connection_with_peer() -> (
     let (rx, reader, batch_receipts) = spawn_observed_reader(
         Box::new(client.try_clone().unwrap()),
         4,
-        None,
+        Some(1 << 20),
         Default::default(),
     )
     .unwrap();
@@ -3787,6 +3787,7 @@ fn a_timed_request_is_not_waited_for_and_reports_its_round_trip_once_read() {
     let configure = || Request::ConfigureHashing(crate::hashing::HashPolicy::default());
     let (mut conn, mut replies, mut requests) = connection_with_peer();
     // Nothing answers yet: sending must not wait, and no time is known.
+    let before_send = std::time::Instant::now();
     assert_eq!(conn.send_timing_ok(configure(), "configure").unwrap(), None);
     assert!(matches!(
         requests.read_msg::<Request>().unwrap(),
@@ -3796,19 +3797,34 @@ fn a_timed_request_is_not_waited_for_and_reports_its_round_trip_once_read() {
     let wait = std::time::Duration::from_millis(40);
     std::thread::sleep(wait);
     replies.write_msg(&Response::Ok).unwrap();
+    // A reply with file data behind it shows, without reading either, when
+    // the reader has taken both.
+    let data = vec![42; 16];
+    replies
+        .write_msg(&Response::Block {
+            off: 0,
+            hash: crate::fsops::content_digest(&data),
+            data,
+        })
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while conn.rx.as_ref().unwrap().queued_bytes() == 0 {
+        assert!(std::time::Instant::now() < deadline, "the reply never came");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let arrived_within = before_send.elapsed();
     // The time ends when the reply arrives, however much later it is read.
-    let arrived = std::time::Instant::now();
-    let read_later = std::time::Duration::from_millis(300);
-    std::thread::sleep(read_later);
+    std::thread::sleep(std::time::Duration::from_millis(100));
     let round_trip = conn
         .take_timed_round_trip()
         .expect("the arrived reply is read without a later one");
     assert!(round_trip >= wait, "{round_trip:?}");
     assert!(
-        round_trip < wait + read_later.saturating_sub(arrived.elapsed() / 2),
+        round_trip <= arrived_within,
         "{round_trip:?} includes the time until the reply was read"
     );
     assert_eq!(conn.take_timed_round_trip(), None, "reported once");
+    assert!(matches!(conn.recv().unwrap(), Response::Block { .. }));
 
     // A later reply is read behind it as usual.
     assert_eq!(conn.send_timing_ok(configure(), "configure").unwrap(), None);
@@ -3819,6 +3835,29 @@ fn a_timed_request_is_not_waited_for_and_reports_its_round_trip_once_read() {
         Response::Stats(_)
     ));
     assert!(conn.take_timed_round_trip().is_some());
+}
+
+#[test]
+fn taking_a_round_trip_reads_no_reply_behind_the_timed_one() {
+    let configure = || Request::ConfigureHashing(crate::hashing::HashPolicy::default());
+    let (mut conn, mut replies, _requests) = connection_with_peer();
+    conn.send_timing_ok(configure(), "configure").unwrap();
+    let later = conn.send_pending(Request::Shutdown).unwrap();
+    replies.write_msg(&Response::Ok).unwrap();
+    replies.write_msg(&Response::Stats(vec![])).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while conn.take_timed_round_trip().is_none() {
+        assert!(std::time::Instant::now() < deadline, "the reply never came");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    // Its caller takes the later reply, with any error it carries.
+    assert!(!conn.reply_arrived(&later));
+    assert_eq!(conn.take_timed_round_trip(), None);
+    assert!(!conn.reply_arrived(&later));
+    assert!(matches!(
+        conn.take_reply(later).unwrap(),
+        Response::Stats(_)
+    ));
 }
 
 #[test]

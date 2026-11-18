@@ -1259,16 +1259,7 @@ impl RemoteConn {
                 break;
             };
             match deferred {
-                Deferred::Ok { what, timed } => {
-                    if let Some(sent) = timed {
-                        self.deferred.round_trip =
-                            Some(first.started_at.saturating_duration_since(sent));
-                    }
-                    if let Err(error) = ok(first.into_inner(), what) {
-                        self.deferred.pending.clear();
-                        self.deferred.failed = Some(format!("{error:#}"));
-                    }
-                }
+                Deferred::Ok { what, timed } => self.check_deferred_ok(what, timed, first),
                 Deferred::Reply { id, expected } => {
                     let arrival = first.started_at;
                     let reply = assemble_reply(expected, first.into_inner(), || {
@@ -1285,6 +1276,33 @@ impl RemoteConn {
             Some(failure) => Err(DeferredRequestError(failure.clone()).into()),
             None => Ok(all),
         }
+    }
+
+    /// Check the reply to a request whose reply must be `Ok`, and time its
+    /// round trip if that was asked for.
+    fn check_deferred_ok(
+        &mut self,
+        what: &'static str,
+        timed: Option<std::time::Instant>,
+        reply: ReceivedResponse,
+    ) {
+        if let Some(sent) = timed {
+            self.deferred.round_trip = Some(reply.started_at.saturating_duration_since(sent));
+        }
+        if let Err(error) = ok(reply.into_inner(), what) {
+            self.deferred.pending.clear();
+            self.deferred.failed = Some(format!("{error:#}"));
+        }
+    }
+
+    /// Whether the next replies owed are all ones that must be `Ok`, up to
+    /// one whose round trip is timed.
+    fn timed_reply_is_next(&self) -> bool {
+        self.deferred
+            .pending
+            .iter()
+            .take_while(|deferred| matches!(deferred, Deferred::Ok { .. }))
+            .any(|deferred| matches!(deferred, Deferred::Ok { timed: Some(_), .. }))
     }
 
     /// The next reply, if it has arrived, without waiting for it.
@@ -1490,17 +1508,28 @@ impl Conn for RemoteConn {
         Ok(None)
     }
     fn take_timed_round_trip(&mut self) -> Option<std::time::Duration> {
-        // Read the reply if it has arrived, without waiting for it. A
-        // failure it shows is kept for the next reply that is read.
-        if self.deferred.round_trip.is_none()
+        // Read the timed reply if it has arrived, without waiting for it,
+        // and nothing behind it. A failure is kept for the next reply that
+        // is read.
+        while self.deferred.round_trip.is_none()
+            && self.deferred.failed.is_none()
             && self.rx.is_some()
-            && self
-                .deferred
-                .pending
-                .iter()
-                .any(|deferred| matches!(deferred, Deferred::Ok { timed: Some(_), .. }))
+            && self.timed_reply_is_next()
         {
-            let _ = self.receive_arrived_deferred();
+            match self.try_receive_next_response() {
+                Ok(Some(reply)) => {
+                    let Some(Deferred::Ok { what, timed }) = self.deferred.pending.pop_front()
+                    else {
+                        unreachable!("a reply that must be Ok is next");
+                    };
+                    self.check_deferred_ok(what, timed, reply);
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    self.deferred.pending.clear();
+                    self.deferred.failed = Some(format!("{error:#}"));
+                }
+            }
         }
         self.deferred.round_trip.take()
     }
