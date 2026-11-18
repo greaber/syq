@@ -310,19 +310,6 @@ impl Options {
                 "S3 endpoints must be s3://BUCKET; select keys with source and placement options"
             );
         }
-        if tuning.comparison_block_size.is_some()
-            || tuning.workers.is_some()
-            || tuning.request_size.is_some()
-            || tuning.pipeline_depth.is_some()
-            || tuning.copy_path.is_some()
-            || tuning.batch_files.is_some()
-            || tuning.batch_bytes.is_some()
-            || tuning.split_min_size.is_some()
-        {
-            bail!(
-                "filesystem performance tuning is not supported for S3 {operation}; use the s3-* keys"
-            );
-        }
         let concurrency = tuning.s3_part_workers.unwrap_or(64);
         let part_size = tuning.s3_part_size.unwrap_or(16 << 20);
         if let Some(endpoint) = &flags.s3_endpoint {

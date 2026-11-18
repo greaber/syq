@@ -1,5 +1,6 @@
 //! Public advanced controls. Limits constrain tuning; integrity is independent.
 use crate::hashing::HashAlgorithm;
+use crate::transfer_tuning::{count, pairs, set_once as once};
 use anyhow::{bail, Result};
 use std::str::FromStr;
 
@@ -100,14 +101,6 @@ impl ResourceLimits {
     }
 }
 
-fn count(value: &str, key: &str, max: usize) -> Result<usize> {
-    let n = value
-        .parse::<usize>()
-        .ok()
-        .filter(|n| (1..=max).contains(n));
-    n.ok_or_else(|| anyhow::anyhow!("{key} must be between 1 and {max}"))
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct IntegrityChecking {
     pub compare: Option<Option<HashAlgorithm>>,
@@ -143,23 +136,6 @@ impl FromStr for IntegrityChecking {
         Ok(result)
     }
 }
-fn pairs(s: &str) -> Result<Vec<(&str, &str)>> {
-    s.split(',')
-        .map(|p| {
-            p.split_once('=')
-                .filter(|(k, v)| !k.is_empty() && !v.is_empty())
-                .ok_or_else(|| anyhow::anyhow!("expected KEY=VALUE, got {p:?}"))
-        })
-        .collect()
-}
-fn once<T>(slot: &mut Option<T>, value: T, key: &str) -> Result<()> {
-    if slot.is_some() {
-        bail!("duplicate option {key:?}");
-    }
-    *slot = Some(value);
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

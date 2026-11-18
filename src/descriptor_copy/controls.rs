@@ -11,16 +11,10 @@ pub(crate) fn validate_controls(args: &mut Args) -> Result<()> {
     let tuning = args.tuning_options.unwrap_or_default();
     tuning.validate()?;
     let s3 = args.s3.is_some();
-    for control in args.performance_tuning.iter().flat_map(|s| s.split(',')) {
-        let key = control.split('=').next().unwrap_or("").trim();
-        let supported = if s3 {
-            key.starts_with("s3-")
-        } else {
-            matches!(key, "workers" | "request-size" | "pipeline-depth")
-        };
-        if !supported {
-            bail!("performance control {key:?} is not supported with this descriptor copy: streams transfer one object without file comparison or small-file batching; S3 uses its part controls");
-        }
+    // `Args::apply_advanced` checked the keys of S3 and filesystem copies;
+    // a filesystem stream uses fewer.
+    if !s3 {
+        tuning.check_route(crate::transfer_tuning::TuningRoute::Stream)?;
     }
     if let Some(checks) = args.integrity_checking {
         if checks.compare.is_some() {

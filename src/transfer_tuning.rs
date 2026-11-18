@@ -16,10 +16,6 @@ const MAX_REQUEST_BYTES: u64 = 64 << 20;
 pub(crate) const DEFAULT_BATCH_BYTES: u64 = 16 << 20;
 pub(crate) const DEFAULT_SPLIT_BYTES: u64 = 32 << 20;
 
-pub(crate) const HELP: &str = "Fix settings syq normally chooses itself, as comma-separated KEY=VALUE pairs, for troubleshooting and benchmarks. Keys: workers, s3-requests, s3-objects, s3-parts-per-object, s3-part-size, comparison-block-size, request-size, pipeline-depth, copy-path, batch-files, batch-bytes, split-min-size. See the performance tuning reference.";
-/// rsync copies never use S3, so they accept only the filesystem keys.
-pub(crate) const RSYNC_HELP: &str = "Fix settings syq normally chooses itself, as comma-separated KEY=VALUE pairs, for troubleshooting and benchmarks. Keys: workers, comparison-block-size, request-size, pipeline-depth, copy-path, batch-files, batch-bytes, split-min-size. See the performance tuning reference.";
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum CopyPath {
     #[default]
@@ -158,9 +154,21 @@ impl TransferTuning {
     }
 }
 
-fn set_once<T>(slot: &mut Option<T>, value: T, key: &str) -> Result<()> {
+/// Split comma-separated `KEY=VALUE` pairs, as `--performance-tuning`,
+/// `--resource-limits` and `--integrity-checking` take them.
+pub(crate) fn pairs(s: &str) -> Result<Vec<(&str, &str)>> {
+    s.split(',')
+        .map(|pair| {
+            pair.split_once('=')
+                .filter(|(key, value)| !key.is_empty() && !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("expected KEY=VALUE, got {pair:?}; see --help-all"))
+        })
+        .collect()
+}
+
+pub(crate) fn set_once<T>(slot: &mut Option<T>, value: T, key: &str) -> Result<()> {
     if slot.replace(value).is_some() {
-        bail!("duplicate tuning option {key}");
+        bail!("duplicate option {key:?}");
     }
     Ok(())
 }
@@ -186,7 +194,7 @@ fn size(value: &str, key: Option<&str>, min: u64, max: u64) -> Result<u64> {
     Ok(bytes)
 }
 
-fn count(value: &str, key: &str, max: usize) -> Result<usize> {
+pub(crate) fn count(value: &str, key: &str, max: usize) -> Result<usize> {
     let n: usize = value
         .parse()
         .with_context(|| format!("{key} must be an integer"))?;
@@ -196,76 +204,149 @@ fn count(value: &str, key: &str, max: usize) -> Result<usize> {
     Ok(n)
 }
 
+/// The kind of operation a command's tuning applies to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TuningRoute {
+    /// A filesystem copy, local, over SSH or over TCP, by `cp` or `rsync`.
+    Copy,
+    /// A filesystem copy of one byte stream: a descriptor copy or a
+    /// callback mapping's entries.
+    Stream,
+    /// An S3 copy, of files or of a stream.
+    S3Copy,
+    /// A filesystem removal.
+    Removal,
+    /// An S3 removal.
+    S3Removal,
+}
+
+impl TuningRoute {
+    const fn bit(self) -> u8 {
+        match self {
+            Self::Copy => COPY,
+            Self::Stream => STREAM,
+            Self::S3Copy => S3_COPY,
+            Self::Removal => REMOVAL,
+            Self::S3Removal => S3_REMOVAL,
+        }
+    }
+
+    fn refusal(self, key: &str) -> String {
+        let s3_key = key.starts_with("s3-");
+        match self {
+            Self::Copy | Self::Stream | Self::Removal if s3_key => {
+                "S3 performance tuning requires an S3 endpoint".into()
+            }
+            Self::S3Copy | Self::S3Removal if !s3_key => format!(
+                "filesystem performance tuning is not supported for S3 {}; use the s3-* keys",
+                if self == Self::S3Removal { "removal" } else { "copies" }
+            ),
+            Self::Stream => format!("performance control {key:?} is not supported with this descriptor copy: streams transfer one object without file comparison or small-file batching; S3 uses its part controls"),
+            _ => "removal supports only performance-tuning workers for filesystems or s3-requests for S3".into(),
+        }
+    }
+}
+
+const COPY: u8 = 1;
+const STREAM: u8 = 2;
+const S3_COPY: u8 = 4;
+const REMOVAL: u8 = 8;
+const S3_REMOVAL: u8 = 16;
+
+/// One `--performance-tuning` key: its name, the routes that use it, how
+/// to set it from a value, and how to show it when set.
+struct Key {
+    name: &'static str,
+    routes: u8,
+    set: fn(&mut TransferTuning, &str, &str) -> Result<()>,
+    show: fn(&TransferTuning) -> Option<String>,
+}
+
+/// A key that stores the value `parse(value, key)` returns in `field`.
+macro_rules! key {
+    ($name:literal, $routes:expr, $field:ident, $parse:expr) => {
+        Key {
+            name: $name,
+            routes: $routes,
+            set: |t, key, value| set_once(&mut t.$field, $parse(value, key)?, key),
+            show: |t| t.$field.map(|v| v.to_string()),
+        }
+    };
+}
+
+fn copy_path(value: &str, _key: &str) -> Result<CopyPath> {
+    Ok(match value {
+        "auto" => CopyPath::Auto,
+        "ranges" => CopyPath::Ranges,
+        "streaming" => CopyPath::Streaming,
+        "auto-streaming" => CopyPath::AutoStreaming,
+        _ => bail!("copy-path must be auto, ranges, streaming or auto-streaming"),
+    })
+}
+
+/// Every key, in the order help lists them and forwarding writes them.
+#[rustfmt::skip]
+const KEYS: &[Key] = &[
+    key!("workers", COPY | STREAM | REMOVAL, workers, |v, k| count(v, k, 65536)),
+    key!("s3-requests", S3_COPY | S3_REMOVAL, s3_requests, |v, k| count(v, k, 65536)),
+    key!("s3-objects", S3_COPY, s3_object_workers, |v, k| count(v, k, 65536)),
+    key!("s3-parts-per-object", S3_COPY, s3_part_workers, |v, k| count(v, k, 1024)),
+    key!("s3-part-size", S3_COPY, s3_part_size, |v, k| size(v, Some(k), 5 << 20, 5 << 30)),
+    key!("comparison-block-size", COPY, comparison_block_size, |v, k| parse_comparison_block_size(v, Some(k))),
+    key!("request-size", COPY | STREAM, request_size, |v, k| size(v, Some(k), 512, MAX_REQUEST_BYTES)),
+    key!("pipeline-depth", COPY | STREAM, pipeline_depth, |v, k| count(v, k, MAX_PIPELINE_DEPTH)),
+    key!("copy-path", COPY, copy_path, copy_path),
+    key!("batch-files", COPY, batch_files, |v, k| count(v, k, 4096)),
+    key!("batch-bytes", COPY, batch_bytes, |v, k| size(v, Some(k), 512, 64 << 20)),
+    key!("split-min-size", COPY, split_min_size, |v, k| size(v, Some(k), 1, 1 << 30)),
+];
+
+/// `--performance-tuning` help listing the keys a copy can use: every
+/// key for `cp`, and the filesystem keys for `rsync`, which never uses S3.
+pub(crate) fn help(rsync: bool) -> String {
+    let routes = if rsync { COPY } else { COPY | S3_COPY };
+    let keys: Vec<_> = KEYS
+        .iter()
+        .filter(|key| key.routes & routes != 0)
+        .map(|key| key.name)
+        .collect();
+    format!(
+        "Fix settings syq normally chooses itself, as comma-separated KEY=VALUE pairs, for troubleshooting and benchmarks. Keys: {}. See the performance tuning reference.",
+        keys.join(", ")
+    )
+}
+
+impl TransferTuning {
+    /// Refuse a key that `route` does not use.
+    pub(crate) fn check_route(&self, route: TuningRoute) -> Result<()> {
+        match KEYS
+            .iter()
+            .find(|key| key.routes & route.bit() == 0 && (key.show)(self).is_some())
+        {
+            Some(key) => bail!("{}", route.refusal(key.name)),
+            None => Ok(()),
+        }
+    }
+}
+
 impl FromStr for TransferTuning {
     type Err = anyhow::Error;
     fn from_str(value: &str) -> Result<Self> {
         let mut tuning = Self::default();
-        for pair in value.split(',') {
-            let Some((key, value)) = pair.split_once('=') else {
-                bail!("expected a tuning KEY=VALUE pair, got {pair:?}; see --help-all");
+        for (name, value) in pairs(value)? {
+            let Some(key) = KEYS.iter().find(|key| key.name == name) else {
+                match name {
+                    // An S3 option since it left this group.
+                    "s3-retries" => bail!(
+                        "s3-retries is no longer a --performance-tuning key; use --s3-retries N"
+                    ),
+                    "bw-pacing" => bail!(
+                        "bw-pacing is no longer a --performance-tuning key; a bandwidth cap always sends requests of up to 125 ms of its rate"
+                    ),
+                    _ => bail!("unknown tuning option {name:?}; see --help-all"),
+                }
             };
-            match key {
-                "workers" => set_once(&mut tuning.workers, count(value, key, 65536)?, key)?,
-                "s3-requests" => set_once(&mut tuning.s3_requests, count(value, key, 65536)?, key)?,
-                "s3-objects" => set_once(
-                    &mut tuning.s3_object_workers,
-                    count(value, key, 65536)?,
-                    key,
-                )?,
-                "s3-parts-per-object" => {
-                    set_once(&mut tuning.s3_part_workers, count(value, key, 1024)?, key)?
-                }
-                "s3-part-size" => set_once(
-                    &mut tuning.s3_part_size,
-                    size(value, Some(key), 5 << 20, 5 << 30)?,
-                    key,
-                )?,
-                "comparison-block-size" => set_once(
-                    &mut tuning.comparison_block_size,
-                    parse_comparison_block_size(value, Some(key))?,
-                    key,
-                )?,
-                "request-size" => set_once(
-                    &mut tuning.request_size,
-                    size(value, Some(key), 512, MAX_REQUEST_BYTES)?,
-                    key,
-                )?,
-                "pipeline-depth" => set_once(
-                    &mut tuning.pipeline_depth,
-                    count(value, key, MAX_PIPELINE_DEPTH)?,
-                    key,
-                )?,
-                "copy-path" => set_once(
-                    &mut tuning.copy_path,
-                    match value {
-                        "auto" => CopyPath::Auto,
-                        "ranges" => CopyPath::Ranges,
-                        "streaming" => CopyPath::Streaming,
-                        "auto-streaming" => CopyPath::AutoStreaming,
-                        _ => bail!("copy-path must be auto, ranges, streaming or auto-streaming"),
-                    },
-                    key,
-                )?,
-                "batch-files" => set_once(&mut tuning.batch_files, count(value, key, 4096)?, key)?,
-                "batch-bytes" => set_once(
-                    &mut tuning.batch_bytes,
-                    size(value, Some(key), 512, 64 << 20)?,
-                    key,
-                )?,
-                "split-min-size" => set_once(
-                    &mut tuning.split_min_size,
-                    size(value, Some(key), 1, 1 << 30)?,
-                    key,
-                )?,
-                "bw-pacing" => bail!(
-                    "bw-pacing is no longer a --performance-tuning key; a bandwidth cap always sends requests of up to 125 ms of its rate"
-                ),
-                // An S3 option since it left this group.
-                "s3-retries" => {
-                    bail!("s3-retries is no longer a --performance-tuning key; use --s3-retries N")
-                }
-                _ => bail!("unknown tuning option {key:?}; see --help-all"),
-            }
+            (key.set)(&mut tuning, name, value)?;
         }
         Ok(tuning)
     }
@@ -273,26 +354,10 @@ impl FromStr for TransferTuning {
 
 impl std::fmt::Display for TransferTuning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut pairs = Vec::new();
-        macro_rules! pair {
-            ($key:literal, $value:expr) => {
-                if let Some(value) = $value {
-                    pairs.push(format!("{}={value}", $key));
-                }
-            };
-        }
-        pair!("workers", self.workers);
-        pair!("s3-requests", self.s3_requests);
-        pair!("s3-objects", self.s3_object_workers);
-        pair!("s3-parts-per-object", self.s3_part_workers);
-        pair!("s3-part-size", self.s3_part_size);
-        pair!("comparison-block-size", self.comparison_block_size);
-        pair!("request-size", self.request_size);
-        pair!("pipeline-depth", self.pipeline_depth);
-        pair!("copy-path", self.copy_path);
-        pair!("batch-files", self.batch_files);
-        pair!("batch-bytes", self.batch_bytes);
-        pair!("split-min-size", self.split_min_size);
+        let pairs: Vec<_> = KEYS
+            .iter()
+            .filter_map(|key| (key.show)(self).map(|value| format!("{}={value}", key.name)))
+            .collect();
         f.write_str(&pairs.join(","))
     }
 }
@@ -364,6 +429,55 @@ mod tests {
                 "{error:#}"
             );
         }
+    }
+
+    /// Each route accepts the keys it accepted before the key table; help
+    /// lists the keys a copy accepts.
+    #[test]
+    fn routes_accept_the_keys_they_use_and_help_lists_them() {
+        let values = [
+            ("workers", "2"),
+            ("s3-requests", "2"),
+            ("s3-objects", "2"),
+            ("s3-parts-per-object", "2"),
+            ("s3-part-size", "8M"),
+            ("comparison-block-size", "1M"),
+            ("request-size", "1M"),
+            ("pipeline-depth", "2"),
+            ("copy-path", "ranges"),
+            ("batch-files", "2"),
+            ("batch-bytes", "1M"),
+            ("split-min-size", "1M"),
+        ];
+        assert_eq!(values.len(), KEYS.len());
+        for (key, value) in values {
+            let tuning: TransferTuning = format!("{key}={value}").parse().unwrap();
+            let s3 = key.starts_with("s3-");
+            for (route, accepted) in [
+                (TuningRoute::Copy, !s3),
+                (
+                    TuningRoute::Stream,
+                    matches!(key, "workers" | "request-size" | "pipeline-depth"),
+                ),
+                (TuningRoute::S3Copy, s3),
+                (TuningRoute::Removal, key == "workers"),
+                (TuningRoute::S3Removal, key == "s3-requests"),
+            ] {
+                assert_eq!(
+                    tuning.check_route(route).is_ok(),
+                    accepted,
+                    "{key} on {route:?}"
+                );
+            }
+        }
+        assert_eq!(
+            help(false),
+            "Fix settings syq normally chooses itself, as comma-separated KEY=VALUE pairs, for troubleshooting and benchmarks. Keys: workers, s3-requests, s3-objects, s3-parts-per-object, s3-part-size, comparison-block-size, request-size, pipeline-depth, copy-path, batch-files, batch-bytes, split-min-size. See the performance tuning reference."
+        );
+        assert_eq!(
+            help(true),
+            "Fix settings syq normally chooses itself, as comma-separated KEY=VALUE pairs, for troubleshooting and benchmarks. Keys: workers, comparison-block-size, request-size, pipeline-depth, copy-path, batch-files, batch-bytes, split-min-size. See the performance tuning reference."
+        );
     }
 
     #[test]
