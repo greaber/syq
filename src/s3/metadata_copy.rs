@@ -287,24 +287,27 @@ impl Prepared {
         F: Fn() -> A,
         A: Future<Output = Result<P>>,
     {
-        self.execute_counted(client, bucket, workers, acquire, |_| {})
+        self.execute_counted(client, bucket, workers, acquire, || async {}, |_| {})
             .await
     }
 
     /// Run the copy, holding a permit from `acquire` for each request and
     /// reporting each copied range's length to `copied`. A failed multipart
-    /// copy drains its started parts, then aborts.
-    pub(super) async fn execute_counted<F, A, P>(
+    /// copy drains its started parts, then aborts while holding what
+    /// `cleanup` yields, even after cancellation.
+    pub(super) async fn execute_counted<F, A, P, C, Q>(
         &self,
         client: &Client,
         bucket: &str,
         workers: usize,
         acquire: F,
+        cleanup: impl FnOnce() -> C,
         copied: impl Fn(u64),
     ) -> Result<()>
     where
         F: Fn() -> A,
         A: Future<Output = Result<P>>,
+        C: Future<Output = Q>,
     {
         let Some(Multipart { id, part_size }) = &self.multipart else {
             let _permit = acquire().await?;
@@ -390,8 +393,7 @@ impl Prepared {
         }
         .await;
         if result.is_err() {
-            // Cleanup proceeds without a permit after cancellation.
-            let _permit = acquire().await.ok();
+            let _permit = cleanup().await;
             self.abort(client, bucket).await;
         }
         result

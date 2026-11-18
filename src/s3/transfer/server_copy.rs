@@ -562,7 +562,7 @@ impl Engine {
             .await?;
             drop(_slot);
             if let Err(error) = self.authorize_requests(update.requests()).await {
-                update.abort(&self.client, &self.options.bucket).await;
+                self.abort_prepared_copy(&update).await;
                 return Err(error);
             }
             return Ok(CopyPreparation::Metadata(Box::new(update)));
@@ -606,9 +606,11 @@ impl Engine {
             )
             .await?;
         }
-        if let Err(error) = self.authorize_requests(copy.requests()).await {
-            self.abort_prepared_copy(&copy).await;
-            return Err(error);
+        if self.authorization.is_some() {
+            if let Err(error) = self.authorize_requests(copy.requests()).await {
+                self.abort_prepared_copy(&copy).await;
+                return Err(error);
+            }
         }
         Ok(CopyPreparation::Ready(Box::new(copy)))
     }
@@ -750,6 +752,7 @@ impl Engine {
                 self.check_cancelled()?;
                 Ok(slot)
             },
+            || self.tuning.requests.acquire(),
             |bytes| {
                 self.tuning.requests.completed(bytes);
                 self.progress.add_bytes(bytes);
