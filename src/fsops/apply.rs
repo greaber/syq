@@ -26,26 +26,11 @@ pub(super) type MadeDirectory<'a> = Option<&'a (dyn Fn(&File) + Sync)>;
 
 pub(super) fn apply_one(
     op: &Op,
-    destination_root: Option<Arc<Root>>,
-    destination_prefix: Option<&[u8]>,
-    create_missing_parents: bool,
+    scope: DestinationScope<'_>,
     (owned, made): (Option<&owned::OwnedObjects>, MadeDirectory<'_>),
 ) -> Result<()> {
-    let Some(root) = destination_root else {
-        bail!("{UNROOTED_MUTATION}");
-    };
-    let path = op_path(op);
-    let relative = RelativePath::new(path)?;
-    let label = PathBuf::from(OsStr::from_bytes(
-        &destination_prefix.map_or_else(|| path.to_vec(), |prefix| join(prefix, path)),
-    ));
-    hold_before_destination_mutation_for_test(&label)?;
-    let target = RootedTarget {
-        root,
-        relative,
-        label,
-        create_missing_parents,
-    };
+    let target = scope.target(op_path(op))?;
+    hold_before_destination_mutation_for_test(&target.label)?;
     #[cfg(debug_assertions)]
     fail_apply_capacity_for_test(&target.label)?;
     #[cfg(debug_assertions)]
@@ -94,20 +79,17 @@ pub(super) fn apply_one(
 /// names. No Selected operation permits traversal or recursive discovery.
 pub(super) fn selected_removals(
     ops: &[Op],
-    destination_root: Option<Arc<Root>>,
-    destination_prefix: Option<&[u8]>,
+    scope: DestinationScope<'_>,
 ) -> Vec<Result<crate::deletion::Selected>> {
-    let root = destination_root.context(UNROOTED_MUTATION);
+    let root = scope.root.context(UNROOTED_MUTATION);
     ops.iter()
         .map(|op| {
             let root = root
                 .as_ref()
-                .map_err(|error| anyhow::Error::new(wire_error(error)))?
-                .clone();
+                .map_err(|error| anyhow::Error::new(wire_error(error)))?;
+            let root = Arc::clone(root);
             let path = op_path(op);
-            let label = PathBuf::from(OsStr::from_bytes(
-                &destination_prefix.map_or_else(|| path.to_vec(), |prefix| join(prefix, path)),
-            ));
+            let label = scope.label(path);
             #[cfg(debug_assertions)]
             fail_apply_capacity_for_test(&label)?;
             Ok(crate::deletion::Selected {
@@ -133,6 +115,40 @@ pub(super) struct RootedTarget {
     pub(super) relative: RelativePath,
     pub(super) label: PathBuf,
     pub(super) create_missing_parents: bool,
+}
+
+/// The authority a request's destination paths resolve under: the
+/// session's root, the prefix requests name it by, and whether a directory
+/// creation may create missing parents on the way.
+#[derive(Clone, Copy)]
+pub(super) struct DestinationScope<'a> {
+    pub(super) root: Option<&'a Arc<Root>>,
+    pub(super) prefix: Option<&'a [u8]>,
+    pub(super) create_missing_parents: bool,
+}
+
+impl DestinationScope<'_> {
+    /// The target an operation on `path` resolves to; refused without a root.
+    pub(super) fn target(&self, path: &[u8]) -> Result<RootedTarget> {
+        let Some(root) = self.root else {
+            bail!("{UNROOTED_MUTATION}");
+        };
+        Ok(RootedTarget {
+            root: root.clone(),
+            relative: RelativePath::new(path)?,
+            label: self.label(path),
+            create_missing_parents: self.create_missing_parents,
+        })
+    }
+
+    /// `path` as requests name it, for messages.
+    pub(super) fn label(&self, path: &[u8]) -> PathBuf {
+        PathBuf::from(OsStr::from_bytes(
+            &self
+                .prefix
+                .map_or_else(|| path.to_vec(), |prefix| join(prefix, path)),
+        ))
+    }
 }
 
 impl RootedTarget {
@@ -806,26 +822,6 @@ pub(super) fn set_meta_rooted(
     )
 }
 
-/// The target an operation on `path` resolves to, as `apply_one` resolves it.
-pub(super) fn operation_target(
-    path: &[u8],
-    destination_root: Option<Arc<Root>>,
-    destination_prefix: Option<&[u8]>,
-    create_missing_parents: bool,
-) -> Result<RootedTarget> {
-    let Some(root) = destination_root else {
-        bail!("{UNROOTED_MUTATION}");
-    };
-    Ok(RootedTarget {
-        root,
-        relative: RelativePath::new(path)?,
-        label: PathBuf::from(OsStr::from_bytes(
-            &destination_prefix.map_or_else(|| path.to_vec(), |prefix| join(prefix, path)),
-        )),
-        create_missing_parents,
-    })
-}
-
 /// The group and mode of the directories new ones are created in, observed
 /// once per request.
 pub(super) type CreationParents = std::sync::Mutex<HashMap<Vec<u8>, Option<(u32, u32)>>>;
@@ -839,14 +835,13 @@ pub(super) fn starting_group_may_differ(
     path: &[u8],
     group: u32,
     parents: &CreationParents,
-    destination_root: Option<Arc<Root>>,
-    destination_prefix: Option<&[u8]>,
+    scope: DestinationScope<'_>,
 ) -> bool {
     let parent_path = path[..path.iter().rposition(|byte| *byte == b'/').unwrap_or(0)].to_vec();
     let cached = parents.lock().unwrap().get(&parent_path).copied();
     let parent = cached.unwrap_or_else(|| {
         let observed = (|| -> Result<(u32, u32)> {
-            let target = operation_target(path, destination_root, destination_prefix, false)?;
+            let target = scope.target(path)?;
             let (parents, _) = target.relative.leaf()?;
             let parent = target
                 .root
@@ -915,9 +910,7 @@ pub(super) type CreatedDirectory = (u64, u64, u32);
 /// rather than finding one already there.
 pub(super) fn create_identified_directory(
     op: &Op,
-    destination_root: Option<Arc<Root>>,
-    destination_prefix: Option<&[u8]>,
-    create_missing_parents: bool,
+    scope: DestinationScope<'_>,
     private: bool,
     made: MadeDirectory<'_>,
 ) -> Result<Option<CreatedDirectory>> {
@@ -929,12 +922,7 @@ pub(super) fn create_identified_directory(
     else {
         bail!("identified creation requires a Mkdir");
     };
-    let target = operation_target(
-        path,
-        destination_root,
-        destination_prefix,
-        create_missing_parents,
-    )?;
+    let target = scope.target(path)?;
     hold_before_destination_mutation_for_test(&target.label)?;
     #[cfg(debug_assertions)]
     fail_apply_capacity_for_test(&target.label)?;
@@ -952,10 +940,9 @@ pub(super) fn open_created_directory(
     path: &[u8],
     proposed: u32,
     created: (u64, u64),
-    destination_root: Option<Arc<Root>>,
-    destination_prefix: Option<&[u8]>,
+    scope: DestinationScope<'_>,
 ) -> Result<()> {
-    let target = operation_target(path, destination_root, destination_prefix, false)?;
+    let target = scope.target(path)?;
     let directory = target.root.open_metadata(&target.relative)?;
     let current = directory.metadata()?;
     if (current.dev(), current.ino()) != created || !current.is_dir() {
