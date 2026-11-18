@@ -6274,6 +6274,7 @@ fn download_directory_skips_an_owner_the_user_cannot_set() {
     }
     let server = Server::start("copy-root-marker-foreign");
     let temp = crate::test_support::tempdir().unwrap();
+    let before = std::fs::metadata(temp.path()).unwrap();
     let output = server.cp(
         temp.path(),
         &[
@@ -6291,12 +6292,52 @@ fn download_directory_skips_an_owner_the_user_cannot_set() {
     let metadata = std::fs::metadata(temp.path()).unwrap();
     assert_eq!(
         (metadata.uid(), metadata.gid(), metadata.mtime()),
-        (
-            unsafe { libc::geteuid() },
-            unsafe { libc::getegid() },
-            1577836800
-        )
+        (before.uid(), before.gid(), 1577836800)
     );
+}
+
+/// An owner or group a mapping names for a downloaded directory must be
+/// applied: when the user may not give it, the copy fails, as it does for
+/// a file.
+#[test]
+fn s3_mapping_metadata_rejects_unapplied_ownership_on_a_directory() {
+    use std::os::unix::fs::MetadataExt;
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("ownership denial requires a non-root test process");
+        return;
+    }
+    let (uid, gid) = foreign_owner();
+    for (field, value) in [("mtime", 123), ("uid", uid), ("gid", gid)] {
+        let server = Server::start("copy-root-marker-owned");
+        let temp = crate::test_support::tempdir().unwrap();
+        let entry = serde_json::json!({"src":{"encoding":"utf-8","value":"data"},
+            "dst":{"encoding":"utf-8","value":"output"}, "kind":"dir",
+            "metadata":{field:value}});
+        std::fs::write(temp.path().join("mapping"), entry.to_string()).unwrap();
+        let out = server.cp(
+            temp.path(),
+            &[
+                "--mapping",
+                "mapping",
+                "--from",
+                "s3://source",
+                "--into",
+                ".",
+            ],
+        );
+        if field == "mtime" {
+            // The mapping reaches the directory.
+            assert!(out.status.success(), "{}", output_text(&out));
+            let metadata = std::fs::metadata(temp.path().join("output")).unwrap();
+            assert_eq!(metadata.mtime(), 123);
+        } else {
+            assert!(
+                !out.status.success(),
+                "unapplied {field} reported success: {}",
+                output_text(&out)
+            );
+        }
+    }
 }
 
 #[test]

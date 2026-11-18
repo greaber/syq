@@ -660,7 +660,6 @@ impl Engine {
                         &relative,
                         meta,
                         &self.args,
-                        *mode,
                         *explicit,
                         mode.is_none(),
                         &mut creation,

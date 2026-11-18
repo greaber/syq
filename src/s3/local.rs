@@ -689,20 +689,17 @@ pub(super) fn keep_unchanged_file(
 /// directory (`fsops::set_handle_metadata`): unchanged values are left
 /// alone, and without privilege a different owner is left as it is and a
 /// group the user cannot give it is too, unless the copy names them.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn apply_directory_metadata(
     root: &Root,
     path: &RelativePath,
     metadata: &Metadata,
     args: &Args,
-    existing_mode: Option<u32>,
     explicit: crate::mapping::Metadata,
     copied: bool,
     creation: &mut CreationPermissions,
 ) -> Result<()> {
     use crate::proto::flags;
     let file = root.open_directory(path)?;
-    let current = file.metadata()?;
     let mut selected = (args.meta_flags() & (flags::OWNER | flags::GROUP)) | explicit.apply_flags();
     if copied || args.perms {
         selected |= flags::MODE;
@@ -710,6 +707,10 @@ pub(super) fn apply_directory_metadata(
     if (copied && args.times) || args.copy_mtime_metadata {
         selected |= flags::TIMES;
     }
+    if selected == 0 {
+        return Ok(());
+    }
+    let current = file.metadata()?;
     // Without -p, a directory this download created gets its marker's
     // permission bits and, as a native copy gives every new directory,
     // owner access, so that a later download can update it. Creating it
@@ -717,8 +718,6 @@ pub(super) fn apply_directory_metadata(
     // and it keeps the setgid bit it inherited.
     let mode = if selected & flags::MODE == 0 || args.perms || explicit.mode.is_some() {
         metadata.mode
-    } else if let Some(existing) = existing_mode {
-        existing
     } else {
         crate::fsops::created_directory_mode_permitted(
             creation.permitted(path, &file)?,
