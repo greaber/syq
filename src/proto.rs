@@ -22,8 +22,12 @@ pub const MAX_FRAME: usize = 65 * 1024 * 1024;
 /// response, so it is rejected before the server allocates anything.
 pub const MAX_READ_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_HANDSHAKE_FRAME: usize = 1024 * 1024;
-const MAX_METADATA_FRAME: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_METADATA_FRAME: usize = 8 * 1024 * 1024;
 pub(crate) const METADATA_BATCH_BYTES: usize = 6 * 1024 * 1024;
+/// What the failures of one request's metadata operations may add to its
+/// reply, by `failed_set_meta_hint`: half a metadata frame, so that the
+/// reply still fits should an error come to say more than that allows for.
+pub(crate) const METADATA_REPLY_BYTES: usize = MAX_METADATA_FRAME / 2;
 /// Supported comparison granularity floor, enforced by receivers as well as the CLI.
 /// Smaller blocks increase the number of hashes per file; this is a protocol
 /// policy, not a minimum input size imposed by the hash algorithm.
@@ -745,6 +749,27 @@ impl Op {
             | Self::Rmdir { path } => path.len() + 96,
         }
     }
+}
+
+/// The most a failed `Op::SetMeta` of `path` adds to its request's `Applied`
+/// reply: the receiver's error, as text, and its other fields.
+///
+/// The text names the path as the receiver displays it, in which each byte
+/// that is not UTF-8 shows as a three-byte replacement character. No error
+/// of this operation names it more than twice (opening its metadata handle
+/// names it for the request and again beneath the destination root); three
+/// are allowed for. The rest of the text is fixed wording and the system's
+/// description of the error, well under 320 bytes with the error's other
+/// fields. An error of preserved ACLs or extended attributes also names one
+/// attribute, of at most 255 bytes, as a list of numbers
+/// (`InodeMetadata::failure_hint`).
+pub(crate) fn failed_set_meta_hint(path: &[u8], meta: &Meta) -> usize {
+    3 * String::from_utf8_lossy(path).len()
+        + 320
+        + meta
+            .inode_metadata
+            .as_ref()
+            .map_or(0, |inode| inode.failure_hint())
 }
 
 /// Receiver-observed mode and identity before temporary directory access.

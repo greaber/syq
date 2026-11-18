@@ -232,6 +232,13 @@ impl InodeMetadata {
         #[cfg(not(target_os = "linux"))]
         let _ = mode;
     }
+    /// The most that applying this can add to the text of an error: the
+    /// wording, and one attribute's name of at most 255 bytes (longer names
+    /// are refused before any is used) shown as a list of numbers, five
+    /// characters for each byte.
+    pub(crate) fn failure_hint(&self) -> usize {
+        256 + 5 * 256
+    }
     pub(crate) fn size_hint(&self) -> usize {
         64 + self
             .macos_acl

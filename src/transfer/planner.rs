@@ -5963,19 +5963,36 @@ impl<'a> Iterator for DirectoryMetadataRequests<'a> {
     }
 }
 
-/// Keep ordinary metadata in full batches, even across directory depths. Only
-/// a mode that removes search access needs to wait for deeper operations: it
+/// Directories whose final metadata goes in one request: as many as one
+/// request creates at its largest on a network filesystem
+/// (`directory_stream`).
+const DIRECTORIES_PER_REQUEST: usize = 4096;
+
+/// How many of `entries`, deepest first, go in the next request.
+///
+/// Ordinary metadata fills a request, even across directory depths. Only a
+/// mode that removes search access needs to wait for deeper operations: it
 /// goes in a later request, which the receiver runs once the earlier ones
 /// are done.
+///
+/// A request also ends before the failures of all its operations could
+/// overfill its reply (`proto::METADATA_REPLY_BYTES`). Each failure's error
+/// names its directory, so a request of very long paths holds fewer.
 fn directory_metadata_batch_len(entries: &[DirectoryMetadata]) -> usize {
-    let maximum = entries.len().min(1000);
+    let maximum = entries.len().min(DIRECTORIES_PER_REQUEST);
     let deepest = entries[0].3;
+    let mut reply = 0;
     entries[..maximum]
         .iter()
-        .position(|(_, meta, flags, depth, _)| {
-            *depth < deepest
-                && flags & (flags::MODE | flags::RECEIVER_MODE) != 0
-                && meta.mode & 0o100 == 0
+        .enumerate()
+        .position(|(index, (path, meta, flags, depth, _))| {
+            reply += crate::proto::failed_set_meta_hint(path, meta);
+            // The first always goes: it is as deep as itself, and a request
+            // carries at least one operation.
+            (index > 0 && reply > crate::proto::METADATA_REPLY_BYTES)
+                || (*depth < deepest
+                    && flags & (flags::MODE | flags::RECEIVER_MODE) != 0
+                    && meta.mode & 0o100 == 0)
         })
         .unwrap_or(maximum)
 }
