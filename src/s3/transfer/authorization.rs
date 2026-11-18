@@ -62,17 +62,30 @@ impl Engine {
     /// hashing and before any data moves.
     pub(super) async fn authorize_uploads<'a>(
         &self,
-        prepared: impl Iterator<Item = &'a UploadPreparation>,
+        prepared: impl Iterator<Item = &'a UploadPreparation> + Clone,
     ) -> Result<()> {
-        self.authorize_all(
-            prepared
-                .filter_map(|work| match work {
-                    UploadPreparation::Ready(work) => Some(work),
-                    UploadPreparation::Skipped | UploadPreparation::Preview(_) => None,
-                })
-                .flat_map(|work| Self::upload_requests(work)),
-        )
-        .await
+        let ready = prepared.filter_map(|work| match work {
+            UploadPreparation::Ready(work) => Some(&**work),
+            UploadPreparation::Skipped | UploadPreparation::Preview(_) => None,
+        });
+        // First the requests that abandon uploads no recovery record keeps,
+        // so a failure while signing the rest can still clean those up.
+        self.authorize_all(ready.clone().flat_map(Self::abandon_requests))
+            .await?;
+        self.authorize_all(ready.flat_map(Self::upload_requests))
+            .await
+    }
+    /// The requests that abort a prepared upload which nothing would resume.
+    fn abandon_requests(prepared: &PreparedUpload) -> Vec<Unsigned> {
+        let unrecorded = prepared.metadata_update.is_some()
+            || prepared.multipart.as_ref().is_some_and(|m| !m.recorded);
+        let mut requests = if unrecorded {
+            Self::upload_requests(prepared)
+        } else {
+            Vec::new()
+        };
+        requests.retain(|r| r.method == "DELETE" && r.query.contains_key("uploadId"));
+        requests
     }
     fn upload_requests(prepared: &PreparedUpload) -> Vec<Unsigned> {
         if let Some(update) = &prepared.metadata_update {
