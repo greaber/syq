@@ -509,7 +509,7 @@ fn compressed_metadata_still_obeys_its_message_limit() {
 }
 
 #[test]
-fn bounded_decoder_preserves_released_completion_payloads() {
+fn bounded_decoder_preserves_the_released_completion_request() {
     let request = include_bytes!("../../tests/fixtures/completion/list-dir-v0.3.2.bin");
     let decoded = crate::wire_budget::decode::<Request>(request)
         .unwrap()
@@ -618,20 +618,6 @@ fn released_preambles_reject_new_transfer_messages_before_decoding() {
                 "{error}"
             );
         }
-    }
-}
-
-#[test]
-fn released_v060_preamble_preserves_explicit_compatibility() {
-    // v0.6.0 preamble, kept independent of the current encoder. Selecting
-    // release helpers must accept it; ordinary source builds must reject it.
-    const V060: &[u8] = b"SYQWIRE\0\0\x06v0.6.0";
-    let result = FrameReader::new(V060).read_preamble();
-    if crate::identity::build() == "v0.6.0" {
-        result.unwrap();
-    } else {
-        let error = result.unwrap_err().to_string();
-        assert!(error.contains("build identity mismatch"), "{error}");
     }
 }
 

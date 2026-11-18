@@ -2786,7 +2786,7 @@ mod tests;
 mod completion_compat_tests {
     use super::*;
     #[test]
-    fn released_v032_completion_messages_keep_their_wire_encoding() {
+    fn released_v032_completion_request_keeps_its_wire_encoding() {
         // Generated with unchanged src/proto.rs from tag v0.3.2. Do not regenerate
         // these when editing the current writer or reader.
         let bytes = include_bytes!("../tests/fixtures/completion/list-dir-v0.3.2.bin");
