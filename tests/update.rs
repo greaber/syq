@@ -476,6 +476,112 @@ fn self_update_refuses_a_signed_downgrade() {
     fixture.assert_original_unchanged();
 }
 
+/// The package metadata a wheel installer leaves beside `<prefix>/bin`,
+/// whose record lists the executable.
+fn add_python_package(prefix: &Path, packages: &str) {
+    let metadata = prefix.join(packages).join("syq-0.10.1.dist-info");
+    fs::create_dir_all(&metadata).unwrap();
+    fs::write(
+        metadata.join("RECORD"),
+        "../../../bin/syq,sha256=abc,10\nsyq/__init__.py,sha256=def,20\n",
+    )
+    .unwrap();
+}
+
+/// A virtual environment holding the syq package, as pip, pipx, `uv tool`,
+/// and `uvx` make, and the path of its executable.
+fn python_environment(fixture: &UpdateFixture, name: &str) -> PathBuf {
+    let prefix = fixture.temp.path(name);
+    let executable = prefix.join("bin/syq");
+    fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    fs::write(prefix.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+    add_python_package(&prefix, "lib/python3.13/site-packages");
+    executable_support::copy_executable(&fixture.installed, &executable, 0o755);
+    executable
+}
+
+fn assert_python_refusal(fixture: &UpdateFixture, executable: &Path, what: &str) {
+    let output = fixture.command_at(executable, "--self-update");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{what}: {stderr}");
+    assert!(
+        stderr.contains("this syq was installed as a Python package")
+            && stderr.contains(
+                "`pip install --upgrade syq`, `uv tool upgrade syq`, or `pipx upgrade syq`"
+            ),
+        "{what}: {stderr}"
+    );
+    assert!(
+        !stderr.contains("install.json")
+            && !stderr.contains("No such file")
+            && !stderr.contains("standalone installer"),
+        "{what}: {stderr}"
+    );
+    assert_eq!(fs::read(executable).unwrap(), fixture.original, "{what}");
+}
+
+#[test]
+fn self_update_refuses_a_python_package_despite_a_stale_receipt() {
+    let version = next_release_version();
+    let fixture = UpdateFixture::new(&version, &format!("v{version}"));
+    // `pip install --user` wrote ~/.local/bin/syq over a standalone install,
+    // whose receipt still names that path.
+    fixture.register();
+    add_python_package(&fixture.temp.0, "lib/python3.13/site-packages");
+    assert_python_refusal(&fixture, &fixture.installed, "user install");
+    fixture.assert_original_unchanged();
+    // The same receipted copy updates beside a version of the package that
+    // shipped no executable, and so does not list one.
+    fs::write(
+        fixture
+            .temp
+            .path("lib/python3.13/site-packages/syq-0.10.1.dist-info/RECORD"),
+        "syq/__init__.py,sha256=def,20\n",
+    )
+    .unwrap();
+    assert_success(&fixture.command("--self-update"));
+}
+
+#[test]
+fn self_update_refuses_python_environments_and_links_into_them() {
+    let version = next_release_version();
+    let fixture = UpdateFixture::new(&version, &format!("v{version}"));
+    let environment = python_environment(&fixture, "venv");
+    assert_python_refusal(&fixture, &environment, "virtual environment");
+
+    // pipx and `uv tool` link ~/.local/bin/syq into their environment. A
+    // receipt from an earlier standalone install names the link, by either
+    // of the places releases have kept receipts.
+    let link = fixture.home.join(".local/bin/syq");
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&environment, &link).unwrap();
+    assert_python_refusal(&fixture, &link, "tool link");
+    let receipt = serde_json::to_vec(&serde_json::json!({
+        "schema": 1,
+        "provider": "standalone",
+        "version": env!("CARGO_PKG_VERSION"),
+        "target": release_target(),
+        "binary": link,
+    }))
+    .unwrap();
+    write_legacy_receipt(&fixture.config.join("syq/install.json"), &receipt);
+    assert_python_refusal(&fixture, &link, "tool link with a legacy receipt");
+    fs::write(environment.with_file_name(".syq-install.json"), &receipt).unwrap();
+    assert_python_refusal(&fixture, &link, "tool link with an adjacent receipt");
+
+    // Interpreters that keep packages under lib64 or dist-packages.
+    for (name, packages) in [
+        ("fedora", "lib64/python3.13/site-packages"),
+        ("debian", "lib/python3/dist-packages"),
+    ] {
+        let executable = fixture.temp.path(&format!("{name}/bin/syq"));
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        executable_support::copy_executable(&fixture.installed, &executable, 0o755);
+        add_python_package(&fixture.temp.path(name), packages);
+        assert_python_refusal(&fixture, &executable, name);
+    }
+}
+
 #[test]
 fn receipt_is_bound_to_the_exact_installed_executable() {
     let release_version = next_release_version();
@@ -618,14 +724,44 @@ fn self_update_accepts_the_released_v052_receipt() {
         serde_json::from_str(include_str!("fixtures/standalone-install-v0.5.2.json")).unwrap();
     receipt["binary"] = fixture.installed.to_str().unwrap().into();
     let legacy = fixture.config.join("syq/install.json");
-    write_legacy_receipt(&legacy, &serde_json::to_vec(&receipt).unwrap());
+    let saved = serde_json::to_vec(&receipt).unwrap();
+    write_legacy_receipt(&legacy, &saved);
     assert_success(&fixture.command("--self-update"));
-    let updated: serde_json::Value = serde_json::from_slice(&fs::read(&legacy).unwrap()).unwrap();
-    assert_eq!(updated["version"], version);
-    assert!(!fixture
-        .installed
-        .with_file_name(".syq-install.json")
-        .exists());
+    // The update's receipt is beside the executable now; the old one stays.
+    assert_eq!(fixture.receipt()["version"], version);
+    assert_eq!(fixture.receipt()["binary"], receipt["binary"]);
+    assert_eq!(fs::read(&legacy).unwrap(), saved);
+}
+
+/// With nothing newer to install, self-update still moves the receipt from
+/// before 0.6.0 beside the executable, and from then on reads only that one.
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn self_update_moves_the_released_v052_receipt_beside_the_executable() {
+    let fixture = UpdateFixture::new(
+        env!("CARGO_PKG_VERSION"),
+        &format!("v{}", env!("CARGO_PKG_VERSION")),
+    );
+    let mut receipt: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/standalone-install-v0.5.2.json")).unwrap();
+    receipt["binary"] = fixture.installed.to_str().unwrap().into();
+    let legacy = fixture.config.join("syq/install.json");
+    let saved = serde_json::to_vec(&receipt).unwrap();
+    write_legacy_receipt(&legacy, &saved);
+    let current = fixture.command("--self-update");
+    assert_success(&current);
+    assert!(
+        String::from_utf8_lossy(&current.stdout).contains("is already the newest release"),
+        "{}",
+        String::from_utf8_lossy(&current.stdout)
+    );
+    assert_eq!(fixture.receipt(), receipt);
+    assert_eq!(fs::read(&legacy).unwrap(), saved);
+    assert_eq!(fs::read(&fixture.installed).unwrap(), fixture.original);
+    // The old receipt no longer matters.
+    fs::write(&legacy, b"invalid JSON").unwrap();
+    assert_success(&fixture.command("--self-update"));
+    assert_eq!(fixture.receipt(), receipt);
 }
 
 #[test]
@@ -668,11 +804,16 @@ fn self_update_reads_a_legacy_receipt_only_as_a_private_file() {
     fs::write(&legacy, &padded).unwrap();
     fs::set_permissions(&legacy, fs::Permissions::from_mode(0o600)).unwrap();
     refused("oversized receipt");
+    // Nothing was moved beside the executable from those.
+    assert!(!fixture
+        .installed
+        .with_file_name(".syq-install.json")
+        .exists());
     // The private file syq wrote.
     fs::write(&legacy, &saved).unwrap();
     assert_success(&fixture.command("--self-update"));
-    let updated: serde_json::Value = serde_json::from_slice(&fs::read(&legacy).unwrap()).unwrap();
-    assert_eq!(updated["version"], version);
+    assert_eq!(fixture.receipt()["version"], version);
+    assert_eq!(fs::read(&legacy).unwrap(), saved);
 }
 
 #[test]

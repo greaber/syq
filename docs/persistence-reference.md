@@ -277,6 +277,11 @@ as `syq persist connect` does. `syq persist receive on`, `receive off NAME`,
 and `receive remove NAME` switch it even when busy, which cuts off copies and
 approvals in progress.
 
+Receiving that syq 0.7 or earlier started can't say whether a copy is in
+progress, so syq never switches it by itself; it says so instead. Run
+`syq persist connect HOST` or `syq persist receive on` to replace it, which
+cuts off any copy in progress through it.
+
 An account connection you approved closes at the switch when nothing runs
 through it, along with any idle port forwards it holds. The next syq command
 that uses it opens it again, which asks for approval again unless you

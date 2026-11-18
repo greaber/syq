@@ -2,9 +2,15 @@
 import hashlib
 import importlib.util
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+
+# The release scripts run on the interpreter pinned by scripts/setup.sh and
+# use tomllib, which the oldest Python the package supports does not have.
+if sys.version_info < (3, 11):
+    raise unittest.SkipTest("release tooling needs Python 3.11 or newer")
 
 SCRIPT = Path(__file__).resolve().parents[3] / "scripts/verify-python-release-preparation.py"
 spec = importlib.util.spec_from_file_location("preparation", SCRIPT)

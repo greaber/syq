@@ -294,25 +294,11 @@ fn registration_reads_only_its_secret_line_from_standard_input() {
 fn a_registration_that_takes_over_waits_for_its_service_and_the_name() {
     let dir = crate::test_support::tempdir().unwrap();
     let path = dir.path().join("laptop.lock");
-    let open = || {
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .unwrap()
-    };
-    let free = || {
-        let probe = open();
-        unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
-    };
+    let open = || LockFile::open(&path, true).unwrap();
+    let free = || !open().held().unwrap();
     let hold = || {
         let held = open();
-        assert_eq!(
-            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
+        assert!(held.try_exclusive().unwrap());
         held
     };
     let timed_out = |error: anyhow::Error| {

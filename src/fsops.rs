@@ -100,7 +100,9 @@ pub(crate) use operator::*;
 pub(crate) use partial::*;
 pub(crate) use paths::*;
 use sidecars::Sidecar;
-pub(crate) use sidecars::{sweep as sweep_sidecars, track as track_sidecars, Swept};
+pub(crate) use sidecars::{
+    forget as forget_sidecar, sweep as sweep_sidecars, track as track_sidecars, Swept,
+};
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use small_batch::with_coarse_change_times;
 
@@ -2059,30 +2061,16 @@ impl FsOps {
         self.resolve_publication(&rooted, &mut meta, &mut flags, &mut None, replaced)?;
         let meta = &meta;
         self.uncache_rooted(&rooted.root, &rooted.relative);
-        let creation = sidecars::begin()?;
-        let staged = staged_file_mode(meta, flags);
-        let (partial, label, opened) = with_rooted_partial(&rooted, copy_id, |partial, label| {
-            self.open_private_partial_rooted(
-                stages::of(self.stage_scope, &rooted, copy_id, false),
-                partial,
-                label,
-                true,
-                staged,
-                Some(staged),
-            )
-        })?;
-        let (file, opened) = opened.context("sidecar creation was requested")?;
-        creation.register_with(&rooted.root, &partial, Sidecar::Stage, || {
-            match opened.identity() {
-                Some(identity) => Ok(identity),
-                None => file
-                    .metadata()
-                    .map(|metadata| (metadata.dev(), metadata.ino())),
-            }
-        })?;
-        if opened.basis_size().is_some() {
-            file.set_len(0)?;
-        }
+        let Stage {
+            relative: partial,
+            label,
+            file,
+            ..
+        } = self.open_stage(
+            &rooted,
+            copy_id,
+            StagePolicy::new(Sidecar::Stage).mode(staged_file_mode(meta, flags)),
+        )?;
         observed_write(&self.operation, &file, data, 0, false)
             .with_context(|| format!("write {}", label.display()))?;
         check_destination_writes(&file, &label)?;

@@ -19,8 +19,8 @@
 //! The switch and the service it starts are always the same build, as is
 //! the helper on the server: the switch installs and runs its own.
 use super::{
-    lock_for_start, preferences, protect_followed_program, serve, suffixed, switch, try_lock,
-    ProfileWorker, ServiceSpec, RECORD,
+    preferences, protect_followed_program, serve, suffixed, switch, try_lock, ProfileWorker,
+    ServiceSpec, RECORD,
 };
 use crate::destination::{Handover, Prepared};
 use crate::persistence::Domain;
@@ -320,7 +320,7 @@ pub(super) fn run(domain: &Domain, control: &Path, started_from: Option<PathBuf>
     // The service it replaces has stopped. Another that started meanwhile,
     // as for a command, keeps the connection, with its record; the server
     // never gave this one the name.
-    let Some(_lock) = lock_for_start(|| try_lock(control, true))? else {
+    let Some(_lock) = try_lock(control)? else {
         return Ok(());
     };
     // The control's record says how it receives from now on.
