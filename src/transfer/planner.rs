@@ -706,7 +706,7 @@ impl Planner<'_> {
                     Scanned::Upcoming(entries) => {
                         // Only after the first batch, which settles `sub`.
                         anyhow::ensure!(!first, "a scan showed its first batch early");
-                        pl.show_upcoming(entries, &sub, dst_root);
+                        pl.show_upcoming(entries, src_root, &sub, dst_root);
                         return Ok(());
                     }
                 };
@@ -1321,27 +1321,10 @@ impl Planner<'_> {
         dst_root: &[u8],
         early: &mut Option<super::early_lookups::EarlyLookup>,
     ) -> Result<()> {
-        let batch = if self.opts.expressions.selection.is_some() && !self.mapping_mode {
+        let batch = if self.filters_scanned_entries() {
             let mut selected = Vec::with_capacity(batch.len());
             for entry in batch {
-                // Directories bypass --where: they are created and receive
-                // metadata as in an unfiltered copy.
-                if entry.kind == Kind::Dir {
-                    selected.push(entry);
-                    continue;
-                }
-                let relative = self
-                    .src_overrides
-                    .get(&entry.path)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&entry.path);
-                let path = crate::expression::source_path(src_root, relative);
-                let included = self
-                    .opts
-                    .expressions
-                    .selects(&crate::expression::File::from_entry(&entry), path)
-                    .with_context(|| format!("source {}", display(path)))?;
-                if !included {
+                if !self.selects_scanned_entry(&entry, src_root)? {
                     // Selection never makes a source counterpart extraneous.
                     if self.opts.delete {
                         let dst = join(dst_root, &join(sub, &entry.path));
@@ -1462,6 +1445,33 @@ impl Planner<'_> {
             self.dst_seen = std::collections::HashMap::new();
             self.delete_roots = Vec::new();
         }
+    }
+
+    /// Whether `plan_batch` drops the scanned entries `--where` leaves out.
+    /// A mapping's entries are filtered as they are read instead.
+    pub(super) fn filters_scanned_entries(&self) -> bool {
+        self.opts.expressions.selection.is_some() && !self.mapping_mode
+    }
+
+    /// Whether `--where` selects a scanned entry. It sees only the entry,
+    /// its source path and the time the command started, so it gives the
+    /// same answer whenever it is asked.
+    pub(super) fn selects_scanned_entry(&self, entry: &Entry, src_root: &[u8]) -> Result<bool> {
+        // Directories bypass --where: they are created and receive metadata
+        // as in an unfiltered copy.
+        if entry.kind == Kind::Dir {
+            return Ok(true);
+        }
+        let relative = self
+            .src_overrides
+            .get(&entry.path)
+            .map(Vec::as_slice)
+            .unwrap_or(&entry.path);
+        let path = crate::expression::source_path(src_root, relative);
+        self.opts
+            .expressions
+            .selects(&crate::expression::File::from_entry(entry), path)
+            .with_context(|| format!("source {}", display(path)))
     }
 
     /// The mapping loop: decide and claim everything about each entry.
