@@ -4831,7 +4831,7 @@ fn open_held_or_new(
     widest: Option<u32>,
 ) -> Result<(File, OpenedPartial)> {
     let root = held.root;
-    if let Some((file, len)) = ops.reuse_held_stage(held, relative, label, widest)? {
+    if let HeldStage::Reused(file, len) = ops.reuse_held_stage(held, relative, label, widest)? {
         return Ok((file, OpenedPartial::Reused(len)));
     }
     let policy = StagePolicy::new(Sidecar::Partial).mode(mode);
@@ -5046,6 +5046,36 @@ fn only_a_device_that_ignores_a_chmod_skips_the_width_check() {
     assert!(!ops.wider_than(0o644, dev, Some(0o600)));
     assert!(ops.wider_than(0o644, dev.wrapping_add(1), Some(0o600)));
     assert!(!ops.wider_than(0o600, dev.wrapping_add(1), Some(0o600)));
+}
+
+#[test]
+fn a_held_stage_that_is_not_resumed_is_replaced_owner_only() {
+    // Whoever opened a held sidecar while it was wider can read what is
+    // written to it, so one wider than this attempt's mode is replaced, and
+    // by an exclusive owner-only creation, whatever the policy allows a
+    // stage that nothing was held for.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let mut ops = destination_ops(temporary.path());
+    let target = ops.destination_mutation_target(b"file").unwrap();
+    let copy_id = [46; 16];
+    let (relative, _) = rooted_partial_target(&target, &copy_id).unwrap();
+    let path = temporary.path().join(relative.to_path_buf());
+    fs::write(&path, b"an earlier attempt").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    let held = File::options().read(true).write(true).open(&path).unwrap();
+    let held_for = stages::of(0, &target, &copy_id, false);
+    stages::hold(held_for, &relative, &held, None, true, u64::MAX).unwrap();
+    let policy = StagePolicy::new(Sidecar::Partial)
+        .mode(0o644)
+        .keeps_owner_access()
+        .new_contents_only()
+        .resume(Some(0o600));
+    let stage = ops.open_stage(&target, &copy_id, policy).unwrap();
+    assert!(matches!(stage.opened, OpenedPartial::Created(_)));
+    let created = stage.file.metadata().unwrap();
+    assert_ne!(created.ino(), held.metadata().unwrap().ino());
+    assert_eq!(created.mode() & 0o777, 0o600);
+    assert_eq!(created.len(), 0);
 }
 
 #[test]

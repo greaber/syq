@@ -2096,7 +2096,6 @@ impl FsOps {
         self.resolve_publication(&rooted, &mut meta, &mut flags, &mut None, replaced)?;
         let meta = &meta;
         self.uncache_rooted(&rooted.root, &rooted.relative);
-        // It holds only the new contents and nothing reads it back.
         let Stage {
             relative: partial,
             label,
@@ -2105,10 +2104,7 @@ impl FsOps {
         } = self.open_stage(
             &rooted,
             copy_id,
-            StagePolicy::new(Sidecar::Stage)
-                .mode(staged_file_mode(meta, flags))
-                .write_only()
-                .new_contents_only(),
+            StagePolicy::new(Sidecar::Stage).mode(staged_file_mode(meta, flags)),
         )?;
         observed_write(&self.operation, &file, data, 0, false)
             .with_context(|| format!("write {}", label.display()))?;

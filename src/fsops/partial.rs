@@ -450,23 +450,23 @@ impl FsOps {
     /// never written: whoever could rename a file into its place could have
     /// chosen it, and a chmod does not stop someone who opened it while its
     /// mode was wider. A held one whose group or other bits exceed `widest`,
-    /// the mode this attempt would create it in, is removed instead, and
-    /// `None` returned. `None` for `widest` leaves that check to the Prepare
-    /// that came first in the attempt.
+    /// the mode this attempt would create it in, is removed instead, and one
+    /// someone renamed away is let go. `None` for `widest` leaves that check
+    /// to the Prepare that came first in the attempt.
     pub(super) fn reuse_held_stage(
         &mut self,
         held: stages::For<'_>,
         relative: &RelativePath,
         label: &Path,
         widest: Option<u32>,
-    ) -> Result<Option<(File, u64)>> {
+    ) -> Result<HeldStage> {
         let root = held.root;
         self.uncache_rooted(root, relative);
         let Some(file) = stages::get(held)?
             .filter(|got| &got.relative == relative)
             .map(|got| got.file)
         else {
-            return Ok(None);
+            return Ok(HeldStage::NotHeld);
         };
         let opened = file.metadata()?;
         // A held sidecar someone has renamed away is let go: what its name
@@ -481,15 +481,17 @@ impl FsOps {
             drop(file);
             discard_safe_rooted_partial_if_same(root, relative, opened.dev(), opened.ino(), label)?;
         } else {
-            return Ok(Some((file, opened.len())));
+            return Ok(HeldStage::Reused(file, opened.len()));
         }
-        Ok(None)
+        Ok(HeldStage::LetGo)
     }
 
     /// The stage (sidecar) of `target` for `copy_id`, beside it under its
     /// partial name, obtained as `policy` says: the one this receiver holds
     /// there when the policy resumes, or else a new one, removing whatever
-    /// the name holds. A stage this creates is registered, so that an
+    /// the name holds. A held stage it does not resume is replaced
+    /// exclusively and owner-only (`StagePolicy::new`), whatever else the
+    /// policy allows. A stage this creates is registered, so that an
     /// interrupted receiver removes it (`sidecars`).
     pub(super) fn open_stage(
         &mut self,
@@ -514,18 +516,21 @@ impl FsOps {
         let (relative, label, (file, opened, inspected)) =
             with_rooted_partial(target, copy_id, |relative, label| {
                 let inspected = inspect(relative);
+                let mut create = policy;
                 if let Some(widest) = policy.resume {
                     let held = stages::of(self.stage_scope, target, copy_id, false);
-                    if let Some((file, len)) =
-                        self.reuse_held_stage(held, relative, label, widest)?
-                    {
-                        return Ok((file, OpenedPartial::Reused(len), inspected));
+                    match self.reuse_held_stage(held, relative, label, widest)? {
+                        HeldStage::Reused(file, len) => {
+                            return Ok((file, OpenedPartial::Reused(len), inspected));
+                        }
+                        HeldStage::LetGo => create = StagePolicy::new(policy.kind),
+                        HeldStage::NotHeld => {}
                     }
                 } else {
                     self.uncache_rooted(&target.root, relative);
                 }
                 let (file, created) =
-                    self.create_stage_file(&target.root, relative, label, policy)?;
+                    self.create_stage_file(&target.root, relative, label, create)?;
                 Ok((file, OpenedPartial::Created(created), inspected))
             })?;
         if let Some(identity) = opened.identity() {
@@ -931,7 +936,10 @@ impl FsOps {
                     Some(staged),
                 )
             })?;
-            held.map(|(file, len)| (relative, file, Some(len), None))
+            match held {
+                HeldStage::Reused(file, len) => Some((relative, file, Some(len), None)),
+                HeldStage::LetGo | HeldStage::NotHeld => None,
+            }
         };
         let Some((relative, file, basis_size, created)) = opened else {
             return Ok(Preparation {
@@ -5309,6 +5317,16 @@ impl StagePolicy {
             ..self
         }
     }
+}
+
+/// What `FsOps::reuse_held_stage` found.
+pub(super) enum HeldStage {
+    /// The held stage, to resume, and its length.
+    Reused(File, u64),
+    /// A held stage it would not resume, let go and, if still at its name,
+    /// removed.
+    LetGo,
+    NotHeld,
 }
 
 /// What `FsOps::open_inplace_output` settled on.
