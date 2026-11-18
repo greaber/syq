@@ -2043,16 +2043,15 @@ fn run_remote(
     // while the SSH session starts.
     let signer = storage
         .map(|_| {
-            let request = crate::s3::authorization::started::request(args)?;
-            let signer = std::sync::Arc::new(std::sync::OnceLock::new());
+            let signer = std::sync::Arc::new(StorageSigner {
+                request: crate::s3::authorization::started::request(args)?,
+                signer: std::sync::OnceLock::new(),
+            });
             let prepared = signer.clone();
             std::thread::Builder::new()
                 .name("storage-signer".into())
                 .spawn(move || {
-                    prepared.get_or_init(|| {
-                        crate::s3::authorization::started::signer(request)
-                            .map_err(|error| format!("{error:#}"))
-                    });
+                    prepared.get();
                 })
                 .context("start the storage signer")?;
             anyhow::Ok(signer)
@@ -2652,8 +2651,7 @@ fn run_remote(
                 let Some((signer, requests, headers, write_headers)) = signing else {
                     return Ok::<_, std::io::Error>(Some(stdin));
                 };
-                let signer = signer.get_or_init(|| Err("the storage signer did not start".into()));
-                let Ok(signer) = signer else {
+                let Ok(signer) = signer.get() else {
                     // Closing the coordinator's input stops it; this machine
                     // reports why once it has.
                     return Ok(None);
@@ -2701,7 +2699,7 @@ fn run_remote(
                     .and_then(|written| written.map_err(anyhow::Error::from))
             })
             .transpose();
-        if let Some(Err(error)) = signer.as_ref().and_then(|signer| signer.get()) {
+        if let Some(Err(error)) = signer.as_ref().map(|signer| signer.get()) {
             bail!("{error}");
         }
         if status.success() {
@@ -3215,6 +3213,25 @@ fn wait_for_requester_loss(
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => return marked,
         }
+    }
+}
+
+/// This machine's signer for a copy it started on a server, prepared once:
+/// loading credentials and finding the bucket's region can take a moment,
+/// so that starts while the SSH session does.
+struct StorageSigner {
+    request: crate::s3::authorization::Request,
+    signer: std::sync::OnceLock<Result<crate::s3::authorization::Signer, String>>,
+}
+
+impl StorageSigner {
+    /// The signer, or why this machine cannot sign. Whoever asks first
+    /// prepares it; anyone asking meanwhile waits for that.
+    fn get(&self) -> &Result<crate::s3::authorization::Signer, String> {
+        self.signer.get_or_init(|| {
+            crate::s3::authorization::started::signer(self.request.clone())
+                .map_err(|error| format!("{error:#}"))
+        })
     }
 }
 

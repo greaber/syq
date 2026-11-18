@@ -27,7 +27,9 @@ pub(super) fn serve(
             .append(true)
             .open(directory.join("request-log"))
             .unwrap();
-        writeln!(log, "{method} {path}").unwrap();
+        // One write, so that concurrent requests keep their own lines.
+        log.write_all(format!("{method} {path}\n").as_bytes())
+            .unwrap();
     }
     // The server holds no credentials: it can only send what was signed.
     assert!(
