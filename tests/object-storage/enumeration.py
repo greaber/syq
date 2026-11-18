@@ -57,16 +57,18 @@ def check():
 def check_parts():
     """A prefix wide enough that its listing is handed to several listings.
 
-    Objects sit beside the directories, share their names, and need URL
+    Objects sit beside the directories, start with their names, and need URL
     encoding, and the last directory is ignored.
     """
     prefix = c.PREFIX + '/wide'
     objects = {f'{prefix}/shard {shard:03}/f{i:03}': b'x'
                for shard in range(120) for i in range(100)}
     objects.update({f'{prefix}/zz ignored/f{i:04}': b'x' for i in range(1500)})
+    # MinIO cannot hold an object and a directory of the same name; the
+    # in-memory fixture of the unit tests covers that.
     objects.update({key: b'beside' for key in (
-        prefix + '/shard 050', prefix + '/shard 050.txt', prefix + '/shard 1',
-        prefix + '/shard 119+', prefix + '/zz', prefix + '/文')})
+        prefix + '/shard 050.txt', prefix + '/shard 1', prefix + '/shard 119+',
+        prefix + '/zz', prefix + '/文')})
     objects.update({prefix + '/shard 010/': b'', prefix + '/zz ignored/': b''})
     remote = 's3://' + c.BUCKET
     with ThreadPoolExecutor(max_workers=32) as pool:

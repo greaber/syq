@@ -94,6 +94,7 @@ pub(in crate::s3) trait Store {
         prefix: &str,
         delimiter: bool,
         token: Option<&str>,
+        start_after: Option<&str>,
     ) -> impl Future<Output = Result<Page>>;
 }
 
@@ -107,9 +108,15 @@ impl<S: Store> Store for LimitedStore<'_, S> {
     fn ordered(&self) -> bool {
         self.inner.ordered()
     }
-    async fn page(&self, prefix: &str, delimiter: bool, token: Option<&str>) -> Result<Page> {
+    async fn page(
+        &self,
+        prefix: &str,
+        delimiter: bool,
+        token: Option<&str>,
+        start_after: Option<&str>,
+    ) -> Result<Page> {
         let _permit = self.slots.acquire().await?;
-        self.inner.page(prefix, delimiter, token).await
+        self.inner.page(prefix, delimiter, token, start_after).await
     }
 }
 
@@ -121,7 +128,9 @@ impl<S: Store> Store for LimitedStore<'_, S> {
 pub(in crate::s3) struct Unordered;
 impl std::fmt::Display for Unordered {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("S3 listing returned keys out of order")
+        f.write_str(
+            "S3 listing returned keys out of order; a listing with a concurrency of 1 does not rely on the order",
+        )
     }
 }
 impl std::error::Error for Unordered {}
@@ -204,7 +213,9 @@ pub(in crate::s3) async fn read(
     delimiter: bool,
     token: Option<&str>,
 ) -> Result<Page> {
-    let page = store.page(prefix, delimiter, token).await?;
+    // The engine starts every listing at its prefix. Other listings of the
+    // same store start after a key.
+    let page = store.page(prefix, delimiter, token, None).await?;
     ensure!(
         page.entries.len() + page.prefixes.len() <= PAGE,
         "S3 listing exceeded the requested page size"

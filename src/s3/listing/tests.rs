@@ -44,7 +44,13 @@ impl Memory {
     }
 }
 impl Store for Memory {
-    async fn page(&self, prefix: &str, delimiter: bool, token: Option<&str>) -> Result<Page> {
+    async fn page(
+        &self,
+        prefix: &str,
+        delimiter: bool,
+        token: Option<&str>,
+        _: Option<&str>,
+    ) -> Result<Page> {
         self.calls.borrow_mut().push((prefix.into(), delimiter));
         self.active.set(self.active.get() + 1);
         self.peak.set(self.peak.get().max(self.active.get()));
@@ -257,7 +263,13 @@ async fn flat_wide_and_deep_fallbacks_preserve_pagination() {
 async fn partial_listing_and_output_failures_propagate() {
     struct Fault;
     impl Store for Fault {
-        async fn page(&self, _: &str, _: bool, token: Option<&str>) -> Result<Page> {
+        async fn page(
+            &self,
+            _: &str,
+            _: bool,
+            token: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<Page> {
             anyhow::ensure!(token.is_none(), "injected page failure");
             Ok(Page {
                 entries: vec![Entry {
@@ -293,7 +305,7 @@ async fn partial_listing_and_output_failures_propagate() {
 async fn malformed_pages_fail() {
     struct Bad(bool);
     impl Store for Bad {
-        async fn page(&self, _: &str, _: bool, _: Option<&str>) -> Result<Page> {
+        async fn page(&self, _: &str, _: bool, _: Option<&str>, _: Option<&str>) -> Result<Page> {
             Ok(if self.0 {
                 Page {
                     next: Some(String::new()),
@@ -371,7 +383,13 @@ async fn unordered_stores_do_not_apply_exact_key_shortcut() {
         fn ordered(&self) -> bool {
             false
         }
-        async fn page(&self, _: &str, _: bool, token: Option<&str>) -> Result<Page> {
+        async fn page(
+            &self,
+            _: &str,
+            _: bool,
+            token: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<Page> {
             Ok(Page {
                 entries: vec![Entry {
                     key: if token.is_none() {
@@ -665,8 +683,14 @@ async fn parts_take_the_shortest_prefix_the_listing_has_not_passed() {
 async fn a_children_listing_that_misses_a_directory_ahead_loses_nothing() {
     struct Incomplete(Memory);
     impl Store for Incomplete {
-        async fn page(&self, prefix: &str, delimiter: bool, token: Option<&str>) -> Result<Page> {
-            let mut page = self.0.page(prefix, delimiter, token).await?;
+        async fn page(
+            &self,
+            prefix: &str,
+            delimiter: bool,
+            token: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<Page> {
+            let mut page = self.0.page(prefix, delimiter, token, None).await?;
             if delimiter {
                 page.prefixes.retain(|prefix| prefix != "t/d0001/");
             }
@@ -700,8 +724,14 @@ async fn keys_out_of_order_stop_a_listing_in_parts() {
         pages: Cell<usize>,
     }
     impl Store for Reversed {
-        async fn page(&self, prefix: &str, delimiter: bool, token: Option<&str>) -> Result<Page> {
-            let mut page = self.inner.page(prefix, delimiter, token).await?;
+        async fn page(
+            &self,
+            prefix: &str,
+            delimiter: bool,
+            token: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<Page> {
+            let mut page = self.inner.page(prefix, delimiter, token, None).await?;
             if prefix == "t/" && !delimiter {
                 self.pages.set(self.pages.get() + 1);
                 if self.pages.get() >= self.from {
@@ -750,8 +780,14 @@ async fn stores_without_key_order_are_listed_whole() {
         fn ordered(&self) -> bool {
             false
         }
-        async fn page(&self, prefix: &str, delimiter: bool, token: Option<&str>) -> Result<Page> {
-            self.0.page(prefix, delimiter, token).await
+        async fn page(
+            &self,
+            prefix: &str,
+            delimiter: bool,
+            token: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<Page> {
+            self.0.page(prefix, delimiter, token, None).await
         }
     }
     let store = Unordered(Memory::new(tree(100, 300)));

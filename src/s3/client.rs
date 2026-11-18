@@ -1039,9 +1039,15 @@ pub(super) async fn list_with_times(
         fn ordered(&self) -> bool {
             self.inner.ordered()
         }
-        async fn page(&self, prefix: &str, delimiter: bool, token: Option<&str>) -> Result<Page> {
+        async fn page(
+            &self,
+            prefix: &str,
+            delimiter: bool,
+            token: Option<&str>,
+            start_after: Option<&str>,
+        ) -> Result<Page> {
             self.inner
-                .page(prefix, delimiter, token)
+                .page(prefix, delimiter, token, start_after)
                 .await
                 .inspect_err(|error| {
                     if (delimiter || prefix != self.root) && denied(error) {
