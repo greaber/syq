@@ -53,7 +53,7 @@ impl Engine {
         let listed = self.upload_keys.get();
         self.authorize_all(
             plan.iter()
-                .filter(|source| listed.is_none_or(|keys| keys.contains_key(&source.key)))
+                .filter(|source| listed.is_none_or(|listed| !listed.absent(&source.key)))
                 .map(|source| Unsigned::new("HEAD", &source.key)),
         )
         .await

@@ -246,13 +246,8 @@ impl Options {
             }
             return Ok(None);
         }
-        if server {
-            if explicit("auth_from") {
-                bail!("--auth-from is not supported for copies between an SSH server and S3: this machine signs the server's storage requests with its own credentials");
-            }
-            if explicit("detach") {
-                bail!("--detach is not supported for copies between an SSH server and S3: this machine signs the server's storage requests and must stay connected");
-            }
+        if server && explicit("detach") {
+            bail!("--detach is not supported for copies between an SSH server and S3: the machine that starts the copy passes on or signs the server's storage requests and must stay connected");
         }
         // A copy that the machine at the other end of the SSH session started
         // and signs for arrives as a delegated command.

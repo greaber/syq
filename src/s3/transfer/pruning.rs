@@ -261,8 +261,13 @@ impl Engine {
                 if !prefix.is_empty() {
                     prefix.push('/');
                 }
-                let listed = match self.upload_keys.get() {
-                    Some(keys) => keys
+                let listed = match self
+                    .upload_keys
+                    .get()
+                    .filter(|listed| listed.covers(&prefix))
+                {
+                    Some(listed) => listed
+                        .keys
                         .iter()
                         .filter(|(key, _)| key.starts_with(&prefix))
                         .map(|(key, size)| (key.clone(), *size))
@@ -343,7 +348,7 @@ impl Engine {
         // Cache complete listings before disconnect. The pruning pass reuses the
         // snapshot and still skips deletions if any copy failed.
         if self.upload_keys.get().is_none() {
-            let mut keys = HashMap::new();
+            let mut listed = DestinationListing::default();
             for scope in &plan.scopes {
                 let key = std::str::from_utf8(scope)?;
                 let prefix = if key.is_empty() {
@@ -351,7 +356,7 @@ impl Engine {
                 } else {
                     format!("{key}/")
                 };
-                keys.extend(
+                listed.keys.extend(
                     client::list(
                         &self.client,
                         &self.options.bucket,
@@ -361,8 +366,9 @@ impl Engine {
                     .await?
                     .into_objects(),
                 );
+                listed.prefixes.push(prefix);
             }
-            let _ = self.upload_keys.set(keys);
+            let _ = self.upload_keys.set(listed);
         }
         if self.args.dry_run {
             return Ok(());
@@ -375,7 +381,16 @@ impl Engine {
             .map(|candidate| {
                 crate::s3::authorization::Unsigned::new("DELETE", candidate.key.as_ref().unwrap())
             })
-            .collect();
+            .collect::<Vec<_>>();
+        // More deletions than --max-delete allows are refused together
+        // later, so none of them needs a signature.
+        if self
+            .args
+            .max_delete
+            .is_some_and(|max| requests.len() as u64 > max)
+        {
+            return Ok(());
+        }
         self.authorize_requests(requests).await
     }
 

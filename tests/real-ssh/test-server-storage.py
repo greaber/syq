@@ -1,8 +1,12 @@
-"""Copies between a server and a bucket that the runner starts and signs for.
+"""Copies between a server and a bucket, started from another machine.
 
 The runner holds the storage credentials and types the command. The source
 server holds none: it runs the copy with URLs the runner signs over the SSH
 session, and exchanges file data with the storage fixture directly.
+
+In the last cases the command is typed on the source about files on the
+destination, and the runner, as the source's receiving machine, approves the
+request and signs: the source only passes the signing messages on.
 """
 import hashlib
 import importlib.util
@@ -180,6 +184,87 @@ with tempfile.TemporaryDirectory(prefix='syq-server-storage-') as directory:
             interrupted[-1] = str(root / 'resumed.ndjson')
             syq([argument for argument in interrupted if not argument.startswith('--resource-limits')])
             assert hashlib.sha256(checks.request('GET', prefix + '/interrupted')[1]).hexdigest() == expected
+
+            print('case: named sources are signed for at their own names only', flush=True)
+            named = ['--from', 'source', REMOTE + '/dataset', '--to', 's3://' + BUCKET, '--into', prefix + '/named']
+            checks.request('PUT', prefix + '/named/kept', b'kept')
+            syq([*named, '--prune'])
+            assert checks.request('GET', prefix + '/named/dataset/sub/small')[1] == b'small\n'
+            assert checks.request('GET', prefix + '/named/kept')[1] == b'kept', 'pruning left the named source'
+
+            print('case: more deletions than --max-delete are refused together, unsigned', flush=True)
+            for name in ('extra-1', 'extra-2'):
+                checks.request('PUT', f'{prefix}/named/dataset/{name}', b'extra')
+            result = syq([*named, '--prune', '--max-delete=1'], ok=False)
+            assert 'planned deletions exceed --max-delete' in result.stdout + result.stderr, result
+            assert 'refused to sign' not in result.stderr, result
+            for name in ('extra-1', 'extra-2'):
+                assert checks.request('GET', f'{prefix}/named/dataset/{name}')[1] == b'extra'
+            syq([*named, '--prune', '--max-delete=2'])
+            absent(prefix + '/named/dataset/extra-1')
+            absent(prefix + '/named/dataset/extra-2')
+
+            print('case: a receiving machine signs for a copy typed on one server about files on another', flush=True)
+            # The source types the command and holds nothing: the files are
+            # on the destination, and the storage credentials on the runner,
+            # which is the source's receiving machine @laptop.
+            there = '/tmp/syq-real-ssh/server-storage'
+            script = ("from pathlib import Path; p=Path(%r); (p/'tree/sub').mkdir(parents=True); "
+                      "(p/'tree/a').write_text('first\\n'); (p/'tree/sub/b').write_text('second\\n')" % there)
+            lab.remote('destination', shlex.join(['python3', '-c', script]))
+            for host in ('source', 'destination'):
+                lab.remote(host, 'test ! -e ~/.aws/credentials && test -z "${AWS_ACCESS_KEY_ID:-}"')
+            # The source logs in to the destination with the runner's
+            # forwarded agent, and trusts the host key the runner trusts.
+            trusted = lab.run('ssh-keygen', '-F', 'destination', '-f', str(Path.home() / '.ssh/known_hosts'))
+            lab.remote('source', 'umask 077; cat >> ~/.ssh/known_hosts', stdin=trusted)
+            lab.run('syq', 'persist', 'receive', 'on', '--name', 'laptop', '--notify', 'off',
+                    '--auto-approve-root', str(Path.home()))
+            try:
+                lab.run('syq', 'persist', 'connect', 'source')
+                lab.run('syq', 'persist', 'receive', 'wait', 'source', '--timeout', '30')
+
+                def typed_on_source(into, approve):
+                    command = ['syq', 'cp', '--from', 'destination', there + '/tree', '--to', 's3://' + BUCKET,
+                               '--into', into, '--auth-from', '@laptop', '--s3-profile', 'server-storage-test',
+                               '--s3-endpoint', ENDPOINT, '--s3-region', 'us-east-1', '--no-progress',
+                               '--s3-retries=0']
+                    process = subprocess.Popen(['ssh', '-A', 'source', 'exec ' + shlex.join(command)],
+                                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                               stderr=subprocess.PIPE, text=True, start_new_session=True)
+                    try:
+                        pending = json.loads(lab.run('syq', 'persist', 'receive', 'pending', '--json', '--wait',
+                                                     '--timeout', '30'))
+                        assert len(pending) == 1 and pending[0]['kind'] == 'storage', pending
+                        shown = json.dumps(pending[0])
+                        # The prompt shows the command, the one path its named
+                        # source produces, and today's lifetime.
+                        assert pending[0]['command'][2:5] == ['--from', 'destination', there + '/tree'], shown
+                        assert f'"{into}/tree" and descendants' in pending[0]['description'], shown
+                        assert '604800 seconds' in pending[0]['description'], shown
+                        lab.run('syq', 'persist', 'receive', 'approve' if approve else 'deny', pending[0]['id'])
+                        out, err = process.communicate(timeout=90)
+                    finally:
+                        if process.poll() is None:
+                            os.killpg(process.pid, signal.SIGKILL)
+                            process.wait(timeout=5)
+                    assert (process.returncode == 0) == approve, (process.returncode, out, err)
+                    assert 'X-Amz-Signature' not in out + err, 'a signed URL reached the output'
+                    return err
+
+                err = typed_on_source(prefix + '/relayed', True)
+                assert '@laptop signs its storage requests' in err, err
+                assert 'storage authorization ready; @laptop may disconnect' in err, err
+                assert checks.request('GET', prefix + '/relayed/tree/a')[1] == b'first\n'
+                assert checks.request('GET', prefix + '/relayed/tree/sub/b')[1] == b'second\n'
+                lab.remote('source', 'test ! -e ' + shlex.quote(there))
+
+                print('case: a receiving machine that denies the request leaves the bucket alone', flush=True)
+                typed_on_source(prefix + '/denied', False)
+                assert not checks.listing(prefix + '/denied')
+            finally:
+                lab.run('syq', 'persist', 'receive', 'off')
+                subprocess.run(['ssh', 'destination', 'rm -rf ' + there], timeout=30)
         finally:
             try:
                 subprocess.run(['ssh', 'source', 'rm -rf ' + REMOTE], timeout=30)

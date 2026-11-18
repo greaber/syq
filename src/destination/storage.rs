@@ -89,6 +89,132 @@ pub(crate) fn serve_started_copy(
     serve_signing(stream, signer, || false)
 }
 
+/// How long a receiving machine may leave signing requests unanswered
+/// before the copy treats it as gone.
+const RELAY_REPLY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Passes a signing session between the server this machine started a copy
+/// on and the receiving machine `name`, which approved the copy with
+/// [`connect`] and signs for it: the server's requests arrive on `requests`,
+/// answers go to it on `replies`, and `authority` is the connection to
+/// `name`. Each message is decoded and written again, so only signing
+/// messages pass; file data has no path through this machine.
+///
+/// Returns what this machine told the server when the session ended without
+/// finishing: `name`'s refusal, or that `name` went away. An error means the
+/// server's side ended first. A session that passed nothing on leaves
+/// `authority` ready for another attempt to start the server's copy.
+pub(crate) fn relay_started_copy(
+    requests: &UnixStream,
+    replies: &mut impl Write,
+    authority: &UnixStream,
+    name: &str,
+    opening: &Opening,
+) -> Result<Option<String>> {
+    write_message(replies, opening)?;
+    // Answers `name` owes, whether anything reached it, and whether the
+    // server's requests ended.
+    let owed = AtomicU64::new(0);
+    let passed = AtomicBool::new(false);
+    let ended = AtomicBool::new(false);
+    let outcome = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let (mut requests, mut authority) = (requests, authority);
+            let _ = (|| -> Result<()> {
+                loop {
+                    let request: SigningRequest = read_message(&mut requests)?;
+                    let (answers, last) = match &request {
+                        SigningRequest::Sign(requests) => (requests.len() as u64, false),
+                        SigningRequest::Finish => (1, true),
+                    };
+                    owed.fetch_add(answers, Ordering::AcqRel);
+                    passed.store(true, Ordering::Release);
+                    write_message(&mut authority, &request)?;
+                    if last {
+                        return Ok(());
+                    }
+                }
+            })()
+            .inspect_err(|_| ended.store(true, Ordering::Release));
+        });
+        let mut reader = authority;
+        let outcome = (|| -> Result<Option<String>> {
+            loop {
+                if !reply_ready(authority, &owed, &ended)? {
+                    bail!("the server ended its storage signing session");
+                }
+                let reply = match read_message(&mut reader) {
+                    Ok(reply) => reply,
+                    Err(_) => {
+                        let lost = format!("@{name} disconnected before it finished signing this copy's storage requests; reconnect it and run the copy again");
+                        write_message(replies, &SigningReply::Error(lost.clone()))?;
+                        return Ok(Some(lost));
+                    }
+                };
+                let answers = match &reply {
+                    SigningReply::Signed(urls) => urls.len() as u64,
+                    SigningReply::Finished | SigningReply::Error(_) => 1,
+                    SigningReply::Configuration(_) => bail!("invalid storage signing response"),
+                };
+                anyhow::ensure!(
+                    owed.fetch_sub(answers, Ordering::AcqRel) >= answers,
+                    "@{name} answered storage requests the server did not send"
+                );
+                write_message(replies, &reply)?;
+                match reply {
+                    SigningReply::Finished => return Ok(None),
+                    SigningReply::Error(refusal) => return Ok(Some(refusal)),
+                    _ => {}
+                }
+            }
+        })();
+        if !matches!(outcome, Ok(None)) {
+            // Release the thread reading the server's requests, and end a
+            // session with `name` that can no longer finish.
+            let _ = requests.shutdown(std::net::Shutdown::Both);
+            if passed.load(Ordering::Acquire) {
+                let _ = authority.shutdown(std::net::Shutdown::Both);
+            }
+        }
+        outcome
+    });
+    outcome
+}
+
+/// Wait until `authority` has sent something, or closed. Returns `false`
+/// once the server's requests have `ended`. While `authority` owes answers
+/// it must keep sending; with none owed it may stay silent, since the server
+/// can take any time to scan and hash before it asks.
+fn reply_ready(authority: &UnixStream, owed: &AtomicU64, ended: &AtomicBool) -> Result<bool> {
+    let mut silent = Instant::now();
+    loop {
+        let mut poll = libc::pollfd {
+            fd: authority.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        match unsafe { libc::poll(&mut poll, 1, 200) } {
+            0 => {}
+            ready if ready > 0 => return Ok(true),
+            _ => {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error).context("wait for the receiving machine");
+                }
+            }
+        }
+        if ended.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        if owed.load(Ordering::Acquire) == 0 {
+            silent = Instant::now();
+        } else if silent.elapsed() > RELAY_REPLY_TIMEOUT {
+            // Reading reports it as gone.
+            return Ok(true);
+        }
+    }
+}
+
 /// Reads what [`serve_started_copy`] sends first.
 pub(crate) fn open_started_copy(stream: &mut impl Read) -> Result<Opening> {
     read_message(stream)
@@ -470,6 +596,188 @@ mod pipeline_tests {
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
+    }
+
+    /// A copy started on a server whose signing session this machine passes
+    /// to a receiving machine: the server's end, this machine's relay, and
+    /// the receiving machine's signer.
+    struct Relayed {
+        server: UnixStream,
+        relay: std::thread::JoinHandle<Result<Option<String>>>,
+        /// This machine's connection to the receiving machine, as the relay
+        /// leaves it.
+        authority: UnixStream,
+    }
+    fn relayed(receiving: impl FnOnce(UnixStream) + Send + 'static) -> Relayed {
+        let (server, here) = sockets();
+        let (authority, receiver) = sockets();
+        std::thread::spawn(move || receiving(receiver));
+        let connection = authority.try_clone().unwrap();
+        let relay = std::thread::spawn(move || {
+            let mut replies = here.try_clone().unwrap();
+            relay_started_copy(
+                &here,
+                &mut replies,
+                &connection,
+                "laptop",
+                &Opening {
+                    configuration: Signer::fixture(approval()).configuration,
+                    headers: vec![("x-amz-storage-class".into(), "STANDARD_IA".into())],
+                    write_headers: vec![],
+                },
+            )
+        });
+        Relayed {
+            server,
+            relay,
+            authority,
+        }
+    }
+    fn signs(mut receiver: UnixStream) {
+        let _ = serve_signing(&mut receiver, &Signer::fixture(approval()), || false);
+    }
+
+    #[test]
+    fn a_receiving_machine_signs_through_the_machine_that_started_the_copy() {
+        let Relayed {
+            mut server, relay, ..
+        } = relayed(signs);
+        let opening = open_started_copy(&mut server).unwrap();
+        assert_eq!(opening.headers.len(), 1);
+        // Pipelined batches each way, as the server's copy sends them.
+        let requests = requests();
+        let urls = sign(&mut server, &requests, "the machine that started this copy").unwrap();
+        assert_eq!(urls.len(), requests.len());
+        assert!(
+            urls[7].starts_with("https://storage.example/fixture/allowed/7?")
+                && urls[7].contains("X-Amz-Signature="),
+            "{}",
+            urls[7]
+        );
+        finish(&mut server).unwrap();
+        assert_eq!(relay.join().unwrap().unwrap(), None);
+    }
+
+    #[test]
+    fn a_receiving_machines_refusal_reaches_the_server_and_ends_the_session() {
+        let Relayed {
+            mut server,
+            relay,
+            authority,
+        } = relayed(signs);
+        open_started_copy(&mut server).unwrap();
+        let outside: Unsigned = serde_json::from_value(serde_json::json!({
+            "method": "GET", "key": "elsewhere/secret", "query": {}, "headers": {},
+        }))
+        .unwrap();
+        let error = sign(
+            &mut server,
+            &[outside],
+            "the machine that started this copy",
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            error,
+            "the machine that started this copy: storage request is outside the approved paths"
+        );
+        assert_eq!(
+            relay.join().unwrap().unwrap().as_deref(),
+            Some("storage request is outside the approved paths")
+        );
+        // Nothing more is passed either way.
+        let mut authority = authority;
+        assert!(read_message::<SigningReply>(&mut authority).is_err());
+        assert!(read_message::<SigningReply>(&mut server).is_err());
+    }
+
+    #[test]
+    fn losing_the_receiving_machine_during_signing_is_named_to_the_server() {
+        let Relayed {
+            mut server, relay, ..
+        } = relayed(|mut receiver| {
+            // It takes the first requests and goes away without answering.
+            let _: SigningRequest = read_message(&mut receiver).unwrap();
+        });
+        open_started_copy(&mut server).unwrap();
+        let error = sign(
+            &mut server,
+            &requests(),
+            "the machine that started this copy",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("@laptop disconnected before it finished signing"),
+            "{error}"
+        );
+        let ended = relay.join().unwrap().unwrap().unwrap();
+        assert!(ended.contains("@laptop disconnected"), "{ended}");
+    }
+
+    #[test]
+    fn losing_the_server_during_signing_ends_the_receiving_machines_session() {
+        let (ended, receiving_ended) = std::sync::mpsc::channel();
+        let Relayed {
+            mut server, relay, ..
+        } = relayed(move |mut receiver| {
+            // It holds its answer until the session ends under it.
+            let _: SigningRequest = read_message(&mut receiver).unwrap();
+            let _ = ended.send(read_message::<SigningRequest>(&mut receiver).is_err());
+        });
+        open_started_copy(&mut server).unwrap();
+        write_message(&mut server, &SigningRequest::Sign(requests()[..3].to_vec())).unwrap();
+        // The copy's SSH session drops: the server's requests end.
+        server.shutdown(std::net::Shutdown::Both).unwrap();
+        assert!(relay.join().unwrap().is_err());
+        assert!(receiving_ended
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap());
+    }
+
+    #[test]
+    fn an_attempt_that_asked_for_nothing_leaves_the_approval_usable() {
+        let Relayed {
+            mut server,
+            relay,
+            authority,
+        } = relayed(signs);
+        open_started_copy(&mut server).unwrap();
+        // The first attempt to start the server's copy ends before it asks.
+        drop(server);
+        assert!(relay.join().unwrap().is_err());
+        // Bytes that are no signing message are not passed on either.
+        let (mut server, here) = sockets();
+        let mut replies = here.try_clone().unwrap();
+        let again = std::thread::spawn(move || {
+            relay_started_copy(
+                &here,
+                &mut replies,
+                &authority,
+                "laptop",
+                &Opening {
+                    configuration: Signer::fixture(approval()).configuration,
+                    headers: vec![],
+                    write_headers: vec![],
+                },
+            )
+        });
+        open_started_copy(&mut server).unwrap();
+        let requests = requests();
+        assert_eq!(
+            sign(
+                &mut server,
+                &requests[..200],
+                "the machine that started this copy"
+            )
+            .unwrap()
+            .len(),
+            200
+        );
+        // File data, or anything else that is not a signing message, ends
+        // the session instead of reaching the receiving machine.
+        write_message(&mut server, &"file data").unwrap();
+        assert!(again.join().unwrap().is_err());
     }
 
     #[test]

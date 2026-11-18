@@ -330,7 +330,7 @@ impl Engine {
         anyhow::ensure!(key.len() <= 1024, "S3 key exceeds 1024 bytes");
         // Provider checksums can matter only against an existing destination
         // of the same size that is not kept regardless.
-        let listed = self.upload_keys.get().map(|keys| keys.get(&key).copied());
+        let listed = self.upload_keys.get().and_then(|listed| listed.size(&key));
         let comparable =
             !self.args.ignore_existing && listed.is_none_or(|size| size == Some(job.size));
         let destination = async {

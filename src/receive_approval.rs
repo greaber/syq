@@ -968,16 +968,23 @@ fn storage_request(
         }
         locations.join("\n    ")
     }
-    // The command names the operation and its local operands; a dry run
-    // clears the request's write flags, so they cannot say the direction.
+    // The command names the operation and its operands outside storage:
+    // files on the requesting machine, or on the SSH server it runs the
+    // copy on. A dry run clears the request's write flags, so they cannot
+    // say the direction.
     let parsed = crate::approval_command::parse(command).ok();
     let local = parsed
         .as_ref()
         .map(|args| {
             args.locations
                 .iter()
-                .filter(|location| location.host.is_none())
-                .map(|location| crate::approval_command::quote_arg(&location.path))
+                .filter(|location| location.host.is_none() || location.is_ssh_server())
+                .map(|location| match &location.host {
+                    Some(host) => crate::approval_command::quote_arg(
+                        &[host.as_bytes(), b":", &location.path].concat(),
+                    ),
+                    None => crate::approval_command::quote_arg(&location.path),
+                })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -1662,7 +1669,12 @@ impl Queue {
             request.bucket, request.endpoint.as_deref().unwrap_or("configured AWS/S3 endpoint"), request.profile.as_deref().unwrap_or("default"),
             if request.upload { "read and upload" } else { "read" },
             if request.create_only { ", create-only writes" } else if request.upload { ", may overwrite" } else { "" },
-            if request.delete { ", may delete" } else { ", no object deletion" }, request.lifetime);
+            match (request.delete, request.max_delete) {
+                (true, Some(limit)) => format!(", may delete at most {limit} objects"),
+                (true, None) => ", may delete".to_owned(),
+                (false, _) => ", no object deletion".to_owned(),
+            },
+            request.lifetime);
         let StorageRequest {
             verb,
             preposition,
@@ -3056,6 +3068,7 @@ mod tests {
             create_only: false,
             lifetime: 60,
             headers: Default::default(),
+            max_delete: None,
         };
         let queue = Arc::new(Queue::default());
         let asking = Arc::clone(&queue);
@@ -3106,6 +3119,7 @@ mod tests {
             create_only: false,
             lifetime: crate::s3::authorization::DEFAULT_LIFETIME,
             headers: Default::default(),
+            max_delete: None,
         };
         let command = |parts: &[&str]| -> Vec<Vec<u8>> {
             parts.iter().map(|part| part.as_bytes().to_vec()).collect()
@@ -3136,6 +3150,25 @@ mod tests {
             "--s3-endpoint=https://storage.example",
         ]);
         assert!(storage_request(&named, &request).notes.is_empty());
+        // Files on a server the requesting machine runs the copy on are
+        // shown with that server's name.
+        let server = command(&[
+            "cp",
+            "--from",
+            "server",
+            "results",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "runs",
+            "--auth-from",
+            "@laptop",
+        ]);
+        let StorageRequest { verb, sources, .. } = storage_request(&server, &request);
+        assert_eq!(
+            (verb, &sources[..]),
+            ("wants to upload", &["\"server:results\"".to_owned()][..])
+        );
         let pruning = command(&[
             "cp",
             "results",

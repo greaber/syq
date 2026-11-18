@@ -2046,17 +2046,20 @@ fn run_remote(
     // A copy between the coordinator and a bucket: it reaches no other
     // server, and this machine signs its storage requests.
     let storage = args.s3.as_ref();
-    // What the command lets the server ask this machine to sign, settled
-    // before anything is started there, and the signer for it, prepared
-    // while the SSH session starts.
+    // What the command lets the server ask for signatures of, settled
+    // before anything is started there, and who signs it, prepared while
+    // the SSH session starts: this machine, or the receiving machine the
+    // command names with --auth-from, once it has approved the request.
     let signer = storage
         .map(|_| {
             let request = crate::s3::authorization::started::request(args)?;
+            let name =
+                crate::s3::authorization::started::receiving_machine(args).map(str::to_owned);
             let signer = std::sync::Arc::new(StorageSigner::default());
             let prepared = signer.clone();
             std::thread::Builder::new()
                 .name("storage-signer".into())
-                .spawn(move || prepared.prepare(request))
+                .spawn(move || prepared.prepare(request, name))
                 .context("start the storage signer")?;
             anyhow::Ok(signer)
         })
@@ -2567,8 +2570,12 @@ fn run_remote(
     if !args.quiet {
         if storage.is_some() {
             crate::output::diagnostic!(
-                "syq: running on {coordinator_host}, which exchanges file data with {} directly; this machine signs its storage requests",
-                peer.host.as_deref().unwrap_or("storage")
+                "syq: running on {coordinator_host}, which exchanges file data with {} directly; {} signs its storage requests",
+                peer.host.as_deref().unwrap_or("storage"),
+                match crate::s3::authorization::started::receiving_machine(args) {
+                    Some(name) => format!("@{name}"),
+                    None => "this machine".into(),
+                }
             );
         } else {
             crate::output::diagnostic!("syq: remote-to-remote: running on {coordinator_host}");
@@ -2666,28 +2673,64 @@ fn run_remote(
                     // reports why once it has.
                     return Ok(None);
                 };
-                if !quiet {
-                    if let Some(notice) = crate::s3::authorization::started::early_expiry_notice(
-                        &signer.configuration,
-                    ) {
-                        crate::output::diagnostic!("syq: {notice}");
-                    }
-                }
                 let mut session = SigningSession {
                     requests,
                     replies: stdin,
                 };
-                match crate::destination::storage::serve_started_copy(
-                    &mut session,
-                    signer,
-                    headers,
-                    write_headers,
-                ) {
-                    // This machine's own word that it refused, whatever the
+                let served = match signer {
+                    StorageAuthority::Here(signer) => {
+                        if !quiet {
+                            if let Some(notice) =
+                                crate::s3::authorization::started::early_expiry_notice(
+                                    &signer.configuration,
+                                )
+                            {
+                                crate::output::diagnostic!("syq: {notice}");
+                            }
+                        }
+                        crate::destination::storage::serve_started_copy(
+                            &mut session,
+                            signer,
+                            headers,
+                            write_headers,
+                        )
+                        .map(|refusal| {
+                            refusal.map(|refusal| format!("refused to sign a storage request from the server: {refusal}"))
+                        })
+                    }
+                    // The receiving machine checks and signs; this machine
+                    // only passes the signing messages on.
+                    StorageAuthority::Named {
+                        name,
+                        connection,
+                        configuration,
+                    } => {
+                        let ended = crate::destination::storage::relay_started_copy(
+                            &session.requests,
+                            &mut session.replies,
+                            connection,
+                            name,
+                            &crate::destination::storage::Opening {
+                                configuration: configuration.clone(),
+                                headers,
+                                write_headers,
+                            },
+                        );
+                        if matches!(ended, Ok(None)) && !quiet {
+                            crate::output::diagnostic!(
+                                "syq: storage authorization ready; @{name} may disconnect. Authorization expires at {}; provider policies or credential revocation may shorten it.",
+                                crate::s3::authorization::started::time(configuration.expires_at)
+                            );
+                        }
+                        ended.map(|ended| {
+                            ended.map(|ended| format!("storage signing by @{name} ended: {ended}"))
+                        })
+                    }
+                };
+                match served {
+                    // This machine's own word on a refusal, whatever the
                     // server goes on to print.
-                    Ok(Some(refusal)) => crate::output::diagnostic!(
-                        "syq: refused to sign a storage request from the server: {refusal}"
-                    ),
+                    Ok(Some(ended)) => crate::output::diagnostic!("syq: {ended}"),
                     Ok(None) => {}
                     // The session ended without an answer the server could
                     // act on. Closing its input stops a copy still waiting
@@ -3238,21 +3281,49 @@ fn wait_for_requester_loss(
     }
 }
 
-/// This machine's signer for a copy it started on a server, prepared once:
-/// loading credentials and finding the bucket's region can take a moment,
-/// so that starts while the SSH session does.
+/// Who signs the storage requests of a copy this machine started on a
+/// server.
+enum StorageAuthority {
+    /// This machine, with its own credentials. The command typed here is
+    /// the approval.
+    Here(Box<crate::s3::authorization::Signer>),
+    /// The receiving machine `name`, which approved the request over
+    /// `connection` and holds the credentials. This machine passes the
+    /// server's signing messages to it.
+    Named {
+        name: String,
+        connection: std::os::unix::net::UnixStream,
+        configuration: crate::s3::authorization::Configuration,
+    },
+}
+
+/// The signer for a copy this machine started on a server, prepared once:
+/// loading credentials and finding the bucket's region, or waiting for a
+/// receiving machine's approval, takes a while, so that starts while the
+/// SSH session does.
 #[derive(Default)]
 struct StorageSigner {
-    signer: std::sync::OnceLock<Result<crate::s3::authorization::Signer, String>>,
+    signer: std::sync::OnceLock<Result<StorageAuthority, String>>,
     prepared: (std::sync::Mutex<()>, std::sync::Condvar),
 }
 
 impl StorageSigner {
     /// Prepare the signer for `request`, or record why this machine cannot
     /// sign, and wake whoever waits for it.
-    fn prepare(&self, request: crate::s3::authorization::Request) {
+    fn prepare(&self, request: crate::s3::authorization::Request, name: Option<String>) {
         let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::s3::authorization::started::signer(request).map_err(|error| format!("{error:#}"))
+            match name {
+                None => crate::s3::authorization::started::signer(request)
+                    .map(|signer| StorageAuthority::Here(Box::new(signer))),
+                Some(name) => crate::destination::storage::connect(&name, request).map(
+                    |(connection, configuration)| StorageAuthority::Named {
+                        name,
+                        connection,
+                        configuration,
+                    },
+                ),
+            }
+            .map_err(|error| format!("{error:#}"))
         }))
         .unwrap_or_else(|_| Err("preparing to sign storage requests failed".into()));
         let _ = self.signer.set(prepared);
@@ -3261,7 +3332,7 @@ impl StorageSigner {
     }
 
     /// The signer, or why this machine cannot sign, if that is known yet.
-    fn ready(&self) -> Option<&Result<crate::s3::authorization::Signer, String>> {
+    fn ready(&self) -> Option<&Result<StorageAuthority, String>> {
         self.signer.get()
     }
 
@@ -3269,7 +3340,7 @@ impl StorageSigner {
     fn wait(
         &self,
         ended: &std::sync::atomic::AtomicBool,
-    ) -> Option<&Result<crate::s3::authorization::Signer, String>> {
+    ) -> Option<&Result<StorageAuthority, String>> {
         let mut waiting = self.prepared.0.lock().unwrap();
         loop {
             if let Some(signer) = self.ready() {

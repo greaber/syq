@@ -87,6 +87,9 @@ pub(crate) struct Request {
     /// signed headers must be ones syq sends itself.
     #[serde(default)]
     pub headers: std::collections::BTreeSet<(String, String)>,
+    /// The command's --max-delete: the most object deletions signed.
+    #[serde(default)]
+    pub max_delete: Option<u64>,
 }
 impl Request {
     pub(crate) fn validate(&self) -> Result<()> {
@@ -471,6 +474,8 @@ pub(crate) struct Signer {
     request: Request,
     pub configuration: Configuration,
     credentials: aws_sdk_s3::config::Credentials,
+    /// Object deletions signed so far, counted against --max-delete.
+    deletions: std::sync::atomic::AtomicU64,
 }
 impl Signer {
     pub(crate) async fn new(request: Request) -> Result<Self> {
@@ -532,6 +537,7 @@ impl Signer {
             },
             request,
             credentials,
+            deletions: Default::default(),
         })
     }
 
@@ -553,7 +559,29 @@ impl Signer {
                 None,
                 "test",
             ),
+            deletions: Default::default(),
         }
+    }
+
+    /// Refuses an object deletion beyond the command's --max-delete. The
+    /// copy asks for all of its deletions together, and for none when it
+    /// plans more than the limit, so only a server that ignores the limit
+    /// reaches this. Each signature counts, whatever key it names.
+    fn count_deletion(&self, request: &Unsigned) -> Result<()> {
+        let Some(limit) = self.request.max_delete else {
+            return Ok(());
+        };
+        if request.method != "DELETE" || request.query.contains_key("uploadId") {
+            return Ok(());
+        }
+        let signed = self
+            .deletions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        anyhow::ensure!(
+            signed < limit,
+            "storage authorization permits no more than {limit} object deletions (--max-delete)"
+        );
+        Ok(())
     }
 
     pub(crate) fn sign(&self, request: &Unsigned) -> Result<String> {
@@ -562,6 +590,7 @@ impl Signer {
             SigningSettings, UriPathNormalizationMode,
         };
         self.request.permits(request)?;
+        self.count_deletion(request)?;
         let remaining = self
             .configuration
             .expires_at
@@ -700,7 +729,7 @@ impl Authorization {
             anyhow::anyhow!(
                 "the signed storage URLs for this copy expired at {}; they last {} hours, or until the credentials that signed them expire if that is sooner. Run the copy again to continue it",
                 started::time(self.configuration.expires_at),
-                started::LIFETIME / 3600
+                self.configuration.requested_lifetime / 3600
             )
         } else {
             anyhow::anyhow!("storage authorization expired; rerun the copy for fresh approval")
@@ -846,16 +875,13 @@ pub(crate) fn request_for(args: &crate::cli::Args, options: &super::Options) -> 
             })
             .collect::<Result<Vec<_>>>()?
     } else if upload {
-        vec![Scope {
-            key: super::local::key_path(
-                &args
-                    .locations
-                    .last()
-                    .context("storage destination missing")?
-                    .path,
-            )?,
-            descendants: true,
-        }]
+        upload_roots(args, options)?
+            .into_iter()
+            .map(|key| Scope {
+                key,
+                descendants: true,
+            })
+            .collect()
     } else {
         source_scopes()?
     };
@@ -891,8 +917,54 @@ pub(crate) fn request_for(args: &crate::cli::Args, options: &super::Options) -> 
         create_only: args.ignore_existing || args.target_existence == crate::cli::Existence::New,
         lifetime: DEFAULT_LIFETIME,
         headers: command_headers(options),
+        max_delete: args
+            .max_delete
+            .filter(|_| upload && args.delete && !args.dry_run),
     };
     Ok(request)
+}
+
+/// The most upload roots a request names one by one.
+const NAMED_ROOTS: usize = 1024;
+
+/// The keys under which an upload reads, writes and lists: each is a key and
+/// everything below it. Where the command names its sources, each lands at
+/// its own name inside the destination directory, and those names are the
+/// roots: nothing else in the directory is the copy's business. The whole
+/// destination is the root when the command does not say which names the
+/// copy produces (`--srcs-in`, a mapping, a copy between buckets), when it
+/// tests the destination directory itself (the `-existing` and `-new`
+/// placements), and when it names more sources than a request lists.
+///
+/// The machine that signs derives the signed paths from this, and the copy
+/// lists the destination under the same roots, so the two cannot disagree.
+pub(crate) fn upload_roots(
+    args: &crate::cli::Args,
+    options: &super::Options,
+) -> Result<Vec<String>> {
+    let (target, sources) = args
+        .locations
+        .split_last()
+        .context("storage destination missing")?;
+    let target = super::local::key_path(&target.path)?;
+    let named = options.route == super::Route::Upload
+        && args.native_mapping.is_none()
+        && args.target_existence == crate::cli::Existence::Any;
+    if !named {
+        return Ok(vec![target]);
+    }
+    let mut roots = std::collections::BTreeSet::new();
+    for source in sources {
+        let root = super::local::upload_destination(args, &target, source)?;
+        if root == target || roots.len() == NAMED_ROOTS {
+            return Ok(vec![target]);
+        }
+        roots.insert(root);
+    }
+    if roots.is_empty() {
+        return Ok(vec![target]);
+    }
+    Ok(roots.into_iter().collect())
 }
 
 pub(super) fn acl_headers(options: &super::Options) -> BTreeMap<String, String> {

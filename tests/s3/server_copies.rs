@@ -231,6 +231,42 @@ fn a_server_uploads_with_urls_this_machine_signed() {
     );
 }
 
+/// Named sources are signed for at their own names in the destination
+/// directory and nowhere else in it, so the copy must look only there:
+/// a request for the directory itself would end it.
+#[test]
+fn named_sources_upload_within_the_paths_their_names_produce() {
+    let lab = Lab::start("ok");
+    std::fs::write(lab.path("server-home/note.txt"), b"note\n").unwrap();
+    for options in [&[][..], &["--prune", "--max-delete=0"]] {
+        let output = lab.run(
+            &[
+                &["--from", "server", "dataset", "note.txt"],
+                &["--to", "s3://bucket", "--into", "backup"],
+                options,
+            ]
+            .concat(),
+        );
+        assert!(
+            output.status.success(),
+            "{options:?}: {}",
+            output_text(&output)
+        );
+        assert_eq!(
+            std::fs::read(lab.path("stored-by-fixture/note.txt")).unwrap(),
+            b"note\n"
+        );
+        let requests = lab.requests();
+        for request in [
+            "PUT /bucket/backup/dataset/a",
+            "PUT /bucket/backup/dataset/sub/b",
+            "PUT /bucket/backup/note.txt",
+        ] {
+            assert!(requests.contains(request), "{options:?}: {requests}");
+        }
+    }
+}
+
 #[test]
 fn a_server_downloads_with_urls_this_machine_signed() {
     let lab = Lab::start("ok");
@@ -444,8 +480,7 @@ fn options_these_copies_cannot_honor_are_refused() {
     let lab = Lab::start("ok");
     for (options, message) in [
         (&["--detach"][..], "--detach is not supported for copies between an SSH server and S3"),
-        (&["--auth-from", "@laptop"], "--auth-from is not supported for copies between an SSH server and S3"),
-        (&["--auth-from", "ssh"], "--auth-from is not supported for copies between an SSH server and S3"),
+        (&["--auth-from", "ssh"], "S3 authorization requires --auth-from @NAME"),
         (&["--mapping", "manifest"], "--mapping and --stream-mapping-fd are not supported for copies between an SSH server and S3"),
         (&["--coordinate-at", "dst"], "--coordinate-at is not supported for S3 copies"),
         (&["--peer-auth", "broker"], "--peer-auth is not supported for S3 copies"),

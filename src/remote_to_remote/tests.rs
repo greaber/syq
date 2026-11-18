@@ -2111,6 +2111,12 @@ mod storage_signing {
     }
 
     fn session(words: &[&str]) -> Session {
+        session_signed_by(words, false)
+    }
+
+    /// As `session`. With `receiving_machine`, this machine holds no signer:
+    /// a receiving machine does, and this machine passes the session on.
+    fn session_signed_by(words: &[&str], receiving_machine: bool) -> Session {
         let request = started::request(&command(words)).unwrap();
         let bucket = request.bucket.clone();
         let signer = Signer::fixture(request);
@@ -2149,11 +2155,30 @@ mod storage_signing {
         let served = std::thread::spawn(move || {
             replies.write_all(&[REQUESTER_MARKER])?;
             let mut session = SigningSession { requests, replies };
-            crate::destination::storage::serve_started_copy(
-                &mut session,
-                &signer,
-                vec![("x-amz-storage-class".into(), "STANDARD_IA".into())],
-                vec![],
+            let headers = vec![("x-amz-storage-class".into(), "STANDARD_IA".into())];
+            if !receiving_machine {
+                return crate::destination::storage::serve_started_copy(
+                    &mut session,
+                    &signer,
+                    headers,
+                    vec![],
+                );
+            }
+            let opening = crate::destination::storage::Opening {
+                configuration: signer.configuration.clone(),
+                headers,
+                write_headers: vec![],
+            };
+            let (connection, mut receiver) = UnixStream::pair().unwrap();
+            std::thread::spawn(move || {
+                crate::destination::storage::serve_signing(&mut receiver, &signer, || false)
+            });
+            crate::destination::storage::relay_started_copy(
+                &session.requests,
+                &mut session.replies,
+                &connection,
+                "laptop",
+                &opening,
             )
         });
         let (authorization, headers, write_headers) = started::open(bucket, local).unwrap();
@@ -2215,6 +2240,44 @@ mod storage_signing {
             .authorization
             .authorize(vec![Unsigned::new("PUT", "dataset/later")])
             .is_err());
+    }
+
+    #[test]
+    fn a_receiving_machine_signs_over_the_session_this_machine_passes_on() {
+        let mut session = session_signed_by(
+            &[
+                UPLOAD,
+                &["--auth-from", "@laptop", "--prune", "--max-delete=1"],
+            ]
+            .concat(),
+            true,
+        );
+        let requests: Vec<_> = (0..3000)
+            .map(|index| Unsigned::new("PUT", &format!("dataset/file-{index}")))
+            .collect();
+        session.authorization.authorize(requests.clone()).unwrap();
+        let url = session.authorization.signed(requests[7].clone()).unwrap();
+        assert!(
+            url.starts_with("https://storage.example/bucket/dataset/file-7?")
+                && url.contains("X-Amz-Signature="),
+            "{url}"
+        );
+        // The receiving machine counts deletions against the command's limit.
+        session
+            .authorization
+            .authorize(vec![Unsigned::new("DELETE", "dataset/old")])
+            .unwrap();
+        let error = session
+            .authorization
+            .authorize(vec![Unsigned::new("DELETE", "dataset/older")])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no more than 1 object deletions"), "{error}");
+        let ended = session.served.join().unwrap().unwrap().unwrap();
+        assert!(ended.contains("no more than 1 object deletions"), "{ended}");
+        // Losing this machine still stops the server's copy.
+        lose(&mut session.requester);
+        assert!(session.lost.join().unwrap());
     }
 
     #[test]

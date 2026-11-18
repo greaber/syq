@@ -103,7 +103,7 @@ pub(super) struct Engine {
     client: Client,
     progress: Arc<Progress>,
     pace: Mutex<tokio::time::Instant>,
-    upload_keys: OnceLock<HashMap<String, u64>>,
+    upload_keys: OnceLock<DestinationListing>,
     copy_checksum_unsupported: std::sync::atomic::AtomicBool,
     copy_tagging_unsupported: std::sync::atomic::AtomicBool,
     tuning: super::tuning::Tuning,
@@ -229,7 +229,53 @@ struct DownloadState {
     hash_algorithm: HashAlgorithm,
 }
 
+/// What listing an upload's destination found, and under which prefixes it
+/// looked. A key outside those prefixes was not looked for.
+#[derive(Default)]
+pub(super) struct DestinationListing {
+    prefixes: Vec<String>,
+    keys: HashMap<String, u64>,
+}
+impl DestinationListing {
+    fn covers(&self, key: &str) -> bool {
+        self.prefixes.iter().any(|prefix| key.starts_with(prefix))
+    }
+    /// The size of `key` when the listing found it, `Some(None)` when the
+    /// listing shows that it does not exist, and `None` when the listing
+    /// does not say.
+    fn size(&self, key: &str) -> Option<Option<u64>> {
+        match self.keys.get(key) {
+            Some(size) => Some(Some(*size)),
+            None => self.covers(key).then_some(None),
+        }
+    }
+    fn absent(&self, key: &str) -> bool {
+        self.size(key) == Some(None)
+    }
+}
+
 impl Engine {
+    /// The prefixes under which an upload's destination keys lie. A copy
+    /// another machine signs for lists only what that machine's signatures
+    /// cover (`authorization::upload_roots`); a named file there has no
+    /// prefix of its own and is checked with a request for its key.
+    fn destination_prefixes(&self) -> Result<Vec<String>> {
+        let roots = if self.authorization.is_some() {
+            super::authorization::upload_roots(&self.args, &self.options)?
+        } else {
+            vec![local::key_path(&self.args.locations.last().unwrap().path)?]
+        };
+        Ok(roots
+            .into_iter()
+            .map(|root| {
+                if root.is_empty() {
+                    root
+                } else {
+                    format!("{root}/")
+                }
+            })
+            .collect())
+    }
     fn expression_destination_path<'a>(&self, path: &'a str) -> &'a [u8] {
         let path = path.trim_end_matches('/');
         let root = self
@@ -872,44 +918,55 @@ impl Engine {
     }
     async fn discover_destination(&self, keys: HashSet<&str>) -> Result<()> {
         if keys.len() > 1 && !self.args.existing && !self.args.ignore_existing {
-            let target = local::key_path(&self.args.locations.last().unwrap().path)?;
-            let prefix = if target.is_empty() {
-                String::new()
-            } else {
-                format!("{target}/")
-            };
-            let listing = if self.args.delete {
-                // Pruning needs every destination key, including keys absent
-                // from the upload plan. Only this complete cache is reusable
-                // by the deletion planner.
-                client::list(
-                    &self.client,
-                    &self.options.bucket,
-                    &prefix,
-                    self.options.concurrency,
-                )
-                .await
-                .map(|listing| Some(listing.into_objects().into_iter().collect()))
-            } else {
-                client::upload_listing(&self.client, &self.options.bucket, &prefix, &keys).await
-            };
-            match listing {
-                Ok(Some(keys)) => {
-                    let _ = self.upload_keys.set(keys);
+            let mut found = DestinationListing::default();
+            for prefix in self.destination_prefixes()? {
+                let listing = if self.args.delete {
+                    // Pruning needs every destination key, including keys absent
+                    // from the upload plan. Only this complete cache is reusable
+                    // by the deletion planner.
+                    client::list(
+                        &self.client,
+                        &self.options.bucket,
+                        &prefix,
+                        self.options.concurrency,
+                    )
+                    .await
+                    .map(|listing| Some(listing.into_objects().into_iter().collect()))
+                } else {
+                    let beneath: HashSet<&str> = keys
+                        .iter()
+                        .copied()
+                        .filter(|key| key.starts_with(&prefix))
+                        .collect();
+                    if beneath.is_empty() {
+                        continue;
+                    }
+                    client::upload_listing(&self.client, &self.options.bucket, &prefix, &beneath)
+                        .await
+                };
+                match listing {
+                    Ok(Some(keys)) => {
+                        found.keys.extend::<HashMap<String, u64>>(keys);
+                        found.prefixes.push(prefix);
+                    }
+                    Ok(None) => {}
+                    Err(error)
+                        if error
+                            .downcast_ref::<client::RequestFailure>()
+                            .is_some_and(|failure| failure.region_mismatch()) =>
+                    {
+                        return Err(error);
+                    }
+                    Err(error) if self.args.delete => {
+                        self.progress
+                            .error(&format!("list S3 destination: {error:#}"));
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
                 }
-                Ok(None) => {}
-                Err(error)
-                    if error
-                        .downcast_ref::<client::RequestFailure>()
-                        .is_some_and(|failure| failure.region_mismatch()) =>
-                {
-                    return Err(error);
-                }
-                Err(error) if self.args.delete => {
-                    self.progress
-                        .error(&format!("list S3 destination: {error:#}"));
-                }
-                Err(error) => return Err(error),
+            }
+            if !found.prefixes.is_empty() {
+                let _ = self.upload_keys.set(found);
             }
         }
 
@@ -1059,7 +1116,7 @@ impl Engine {
         let existing = if self
             .upload_keys
             .get()
-            .is_some_and(|keys| !keys.contains_key(&source.key))
+            .is_some_and(|listed| listed.absent(&source.key))
         {
             None
         } else {

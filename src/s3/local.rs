@@ -185,6 +185,30 @@ pub(super) fn join(a: &str, b: &str) -> String {
     }
 }
 
+/// The key an upload gives the named source `location` under the destination
+/// `target`: the destination itself for `--as` and for a source whose
+/// contents are copied, and otherwise the source's own name inside it.
+pub(super) fn upload_destination(
+    args: &Args,
+    target: &str,
+    location: &crate::cli::Location,
+) -> Result<String> {
+    if args.placement == Placement::As || location.copies_contents() {
+        return Ok(target.to_owned());
+    }
+    let name = crate::cli::native_basename(&location.path).with_context(|| {
+        format!(
+            "source has no basename: {:?}",
+            OsStr::from_bytes(&location.path)
+        )
+    })?;
+    Ok(join(
+        target,
+        &key_path(name)
+            .with_context(|| format!("source {:?}", OsStr::from_bytes(&location.path)))?,
+    ))
+}
+
 pub(super) struct UploadPlan {
     pub sources: Vec<Source>,
     pub prune: super::prune::Plan,
@@ -247,22 +271,7 @@ pub(super) fn upload_plan(args: &Args) -> Result<UploadPlan> {
         }
     } else {
         for location in &args.locations[..count] {
-            let destination = if args.placement == Placement::As || location.copies_contents() {
-                target.clone()
-            } else {
-                join(
-                    &target,
-                    &key_path(
-                        crate::cli::native_basename(&location.path).with_context(|| {
-                            format!(
-                                "source has no basename: {:?}",
-                                OsStr::from_bytes(&location.path)
-                            )
-                        })?,
-                    )
-                    .with_context(|| format!("source {:?}", OsStr::from_bytes(&location.path)))?,
-                )
-            };
+            let destination = upload_destination(args, &target, location)?;
             selectors.push((
                 location.path.clone(),
                 destination,

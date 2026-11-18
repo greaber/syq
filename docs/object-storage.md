@@ -143,8 +143,28 @@ command. That machine supplies the credentials: `--s3-profile`,
 `--s3-endpoint`, `--s3-region` and the AWS environment variables are read
 there, and it signs each storage request the server needs, so the server needs
 no credentials and never receives yours. Typing the command is the approval;
-there is no prompt. See [Storage authorization](security.md#storage-authorization)
+there is no prompt. It signs only for the bucket, paths and operations the
+command implies: for a source you name, such as `project` with
+`--into backups`, that is `backups/project` and what lies under it. See
+[Storage authorization](security.md#storage-authorization) for the limits and
 for what this trusts the server with.
+
+When the storage credentials are on a third machine, add `--auth-from @NAME`
+to have that [receiving machine](receive.md#set-up-receiving) approve the copy
+and sign instead:
+
+```sh
+syq cp --from server project --to s3://bucket --into backups \
+  --auth-from @laptop --s3-profile storage
+```
+
+You approve the request on NAME, as for
+[any storage authorization](#authorize-from-your-laptop), and
+`--s3-profile` selects a profile there. The machine where you typed the
+command only passes signing requests and signed URLs between the server and
+NAME; it needs no storage credentials, and it still logs in to the server
+with its own SSH access. Once syq reports **storage authorization ready**,
+NAME may disconnect.
 
 The server needs:
 
@@ -162,10 +182,11 @@ machine signs again.
 
 Requests are signed before data starts moving and stay valid for 24 hours, or
 until your credentials expire if that is sooner, as temporary credentials
-often do within an hour; syq then says when. A copy that runs longer fails
-its remaining files; run it again to continue.
+often do within an hour; syq then says when. With `--auth-from @NAME` they
+stay valid for up to seven days. A copy that runs longer fails its remaining
+files; run it again to continue.
 
-These copies do not support `--detach`, `--auth-from`, `--mapping`,
+These copies do not support `--detach`, `--mapping`,
 `--stream-mapping-fd` or the options for copies between two servers
 (`--coordinate-at`, `--peer-auth` and the TCP options). `syq rm`, copies between two buckets and
 copies that also name a second server or a receiving machine (`@NAME`) cannot
@@ -183,7 +204,9 @@ syq cp results --to s3://my-bucket --into runs \
 ```
 
 Approve on your laptop, then wait for **storage authorization ready** before
-disconnecting. Data travels directly between the server and storage.
+disconnecting. The prompt lists the paths the command covers: for a source
+you name, its own name inside the destination, and otherwise the whole
+destination path. Data travels directly between the server and storage.
 Authorization lasts up to seven days, subject to credentials and provider
 policies; restarting requires fresh approval. Both machines need the same syq
 build. See [Storage authorization](security.md#storage-authorization) for the

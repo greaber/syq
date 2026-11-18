@@ -40,8 +40,21 @@ pub(crate) fn request(args: &crate::cli::Args) -> Result<Request> {
         .or_else(|| std::env::var("AWS_ENDPOINT_URL_S3").ok())
         .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok());
     let mut request = request_for(args, &options)?;
-    request.lifetime = LIFETIME;
+    if receiving_machine(args).is_none() {
+        request.lifetime = LIFETIME;
+    }
     Ok(request)
+}
+
+/// The receiving machine the command names with `--auth-from @NAME` to
+/// approve the copy and sign for it, instead of this machine. It derives
+/// the same request from the command, with the lifetime it gives any
+/// storage request it approves.
+pub(crate) fn receiving_machine(args: &crate::cli::Args) -> Option<&str> {
+    match &args.auth_from {
+        crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name)) => Some(name),
+        _ => None,
+    }
 }
 
 /// A signer for [`request`], using this machine's storage credentials.
@@ -61,9 +74,9 @@ pub(crate) fn time(seconds: u64) -> String {
 }
 
 /// What the starting machine says once when its credentials expire, and its
-/// signed URLs with them, well before [`LIFETIME`] is up.
+/// signed URLs with them, well before their requested lifetime is up.
 pub(crate) fn early_expiry_notice(configuration: &Configuration) -> Option<String> {
-    let full = now().ok()?.checked_add(LIFETIME)?;
+    let full = now().ok()?.checked_add(configuration.requested_lifetime)?;
     (configuration.expires_at + 300 < full).then(|| {
         format!(
             "this machine's storage credentials expire at {}, and the URLs it signs for the server with them; a copy still running then fails its remaining files and can be run again to continue",
@@ -288,6 +301,172 @@ mod tests {
         }
     }
 
+    fn keys(request: &Request) -> Vec<&str> {
+        request
+            .scopes
+            .iter()
+            .map(|scope| scope.key.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn named_sources_sign_only_the_paths_their_names_produce() {
+        let request = request(&command(&[
+            "cp",
+            "--from",
+            "server",
+            "/srv/project",
+            "/srv/notes.txt",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "backups",
+        ]))
+        .unwrap();
+        assert_eq!(keys(&request), ["backups/notes.txt", "backups/project"]);
+        for allowed in [
+            // The named file, and the named directory with its marker,
+            // contents and listing.
+            Unsigned::new("HEAD", "backups/notes.txt"),
+            Unsigned::new("PUT", "backups/notes.txt"),
+            // This machine cannot see whether a name is a file or a
+            // directory on the server, so each covers what lies below it.
+            Unsigned::new("GET", "backups/notes.txt/child"),
+            Unsigned::new("HEAD", "backups/project"),
+            Unsigned::new("PUT", "backups/project/"),
+            Unsigned::new("PUT", "backups/project/sub/a"),
+            Unsigned::new("POST", "backups/project/big").query("uploads", ""),
+            Unsigned::new("DELETE", "backups/project/big").query("uploadId", "1"),
+            list("backups/project/"),
+            list("backups/project/sub/"),
+        ] {
+            assert!(permits(&request, allowed.clone()), "{allowed:?}");
+        }
+        for refused in [
+            // Siblings in the same --into directory.
+            Unsigned::new("GET", "backups/other"),
+            Unsigned::new("PUT", "backups/other/a"),
+            Unsigned::new("PUT", "backups/project-private/a"),
+            Unsigned::new("PUT", "backups/notes.txt.bak"),
+            // The directory itself, and listing it.
+            Unsigned::new("HEAD", "backups"),
+            Unsigned::new("PUT", "backups/"),
+            list("backups/"),
+            list("backups/notes.txt"),
+            list(""),
+        ] {
+            assert!(!permits(&request, refused.clone()), "{refused:?}");
+        }
+        // No placement option puts a named source at the top of the bucket,
+        // which is all it then covers.
+        let top = super::request(&command(&[
+            "cp",
+            "--from",
+            "server",
+            "project",
+            "--to",
+            "s3://bucket",
+        ]))
+        .unwrap();
+        assert_eq!(keys(&top), ["project"]);
+        assert!(permits(&top, Unsigned::new("PUT", "project/a")));
+        assert!(!permits(&top, Unsigned::new("PUT", "other")));
+        assert!(!permits(&top, list("")));
+        // --as names the one key.
+        let renamed = super::request(&command(&[
+            "cp",
+            "--from",
+            "server",
+            "project",
+            "--to",
+            "s3://bucket",
+            "--as",
+            "backups/copy",
+        ]))
+        .unwrap();
+        assert_eq!(keys(&renamed), ["backups/copy"]);
+    }
+
+    #[test]
+    fn the_whole_destination_is_signed_where_the_command_does_not_fix_the_names() {
+        // The server's directory decides the names --srcs-in produces.
+        assert_eq!(
+            keys(&request(&command(UPLOAD)).unwrap()),
+            ["backups/dataset"]
+        );
+        // A placement that tests the directory itself looks at all of it.
+        let existing = request(&command(&[
+            "cp",
+            "--from",
+            "server",
+            "project",
+            "--to",
+            "s3://bucket",
+            "--into-existing",
+            "backups",
+        ]))
+        .unwrap();
+        assert_eq!(keys(&existing), ["backups"]);
+        assert!(permits(&existing, Unsigned::new("HEAD", "backups")));
+        assert!(permits(&existing, list("backups/")));
+        // More sources than a request lists one by one.
+        let names: Vec<String> = (0..1025).map(|index| format!("file-{index}")).collect();
+        let mut words = vec!["cp", "--from", "server"];
+        words.extend(names.iter().map(String::as_str));
+        words.extend(["--to", "s3://bucket", "--into", "backups"]);
+        assert_eq!(keys(&request(&command(&words)).unwrap()), ["backups"]);
+    }
+
+    #[test]
+    fn deletions_beyond_max_delete_are_not_signed() {
+        let limited = request(&command(&with(UPLOAD, &["--prune", "--max-delete=2"]))).unwrap();
+        assert_eq!(limited.max_delete, Some(2));
+        let signer = Signer::fixture(limited);
+        let delete = |key: &str| signer.sign(&Unsigned::new("DELETE", key));
+        // Abandoning a multipart upload deletes no object.
+        for _ in 0..5 {
+            signer
+                .sign(&Unsigned::new("DELETE", "backups/dataset/big").query("uploadId", "1"))
+                .unwrap();
+        }
+        delete("backups/dataset/a").unwrap();
+        delete("backups/dataset/b").unwrap();
+        let error = delete("backups/dataset/c").unwrap_err().to_string();
+        assert!(error.contains("no more than 2 object deletions"), "{error}");
+        // Other requests are still signed.
+        signer
+            .sign(&Unsigned::new("PUT", "backups/dataset/c"))
+            .unwrap();
+        let none = Signer::fixture(
+            request(&command(&with(UPLOAD, &["--prune", "--max-delete=0"]))).unwrap(),
+        );
+        assert!(none
+            .sign(&Unsigned::new("DELETE", "backups/dataset/a"))
+            .is_err());
+        // Without the option there is nothing to count.
+        let unlimited = request(&command(&with(UPLOAD, &["--prune"]))).unwrap();
+        assert_eq!(unlimited.max_delete, None);
+    }
+
+    #[test]
+    fn a_receiving_machine_named_by_the_command_signs_with_its_own_lifetime() {
+        let named = command(&with(UPLOAD, &["--auth-from", "@laptop"]));
+        assert_eq!(receiving_machine(&named), Some("laptop"));
+        let request = request(&named).unwrap();
+        // What the receiving machine derives from the same command.
+        assert_eq!(request.lifetime, DEFAULT_LIFETIME);
+        crate::approval_command::check_storage(
+            &named_words(&with(UPLOAD, &["--auth-from", "@laptop"])),
+            &request,
+            "laptop",
+        )
+        .unwrap();
+        assert_eq!(receiving_machine(&command(UPLOAD)), None);
+    }
+    fn named_words(words: &[&str]) -> Vec<Vec<u8>> {
+        words.iter().map(|word| word.as_bytes().to_vec()).collect()
+    }
+
     #[test]
     fn a_dry_run_signs_no_change() {
         let request = request(&command(&with(UPLOAD, &["--dry-run", "--prune"]))).unwrap();
@@ -432,6 +611,7 @@ mod tests {
     #[test]
     fn credentials_that_expire_early_are_announced_and_named_at_expiry() {
         let mut signer = Signer::fixture(request(&command(UPLOAD)).unwrap());
+        signer.configuration.requested_lifetime = LIFETIME;
         signer.configuration.expires_at = now().unwrap() + LIFETIME;
         assert_eq!(early_expiry_notice(&signer.configuration), None);
         signer.configuration.expires_at = now().unwrap() + 3600;
