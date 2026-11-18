@@ -1331,7 +1331,13 @@ fn many_named_sources_with_several_workers_claim_every_source() {
         .iter()
         .map(|name| t.path("src").join(name).to_string_lossy().into_owned())
         .collect();
-    for reject in [true, false] {
+    // The rejection hook exists only in debug builds.
+    let cases: &[bool] = if cfg!(debug_assertions) {
+        &[true, false]
+    } else {
+        &[false]
+    };
+    for &reject in cases {
         let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
         command
             .args(["cp", "--no-progress", "--performance-tuning=workers=4"])

@@ -34,12 +34,9 @@ use std::time::Duration;
 
 const HANDOFF_MAGIC: &[u8; 8] = b"SYQFD001";
 const SECRET_LEN: usize = TICKET_SECRET_LEN;
-/// One claim: the registered root's identifier and the descriptor kind.
-const CLAIM_LEN: usize = size_of::<u64>() + 1;
-/// A connection's first request authenticates it and carries its first claim
-/// (or asks to hand over a connection). Further claims follow as bare
-/// [`CLAIM_LEN`] records.
-const HANDOFF_REQUEST_LEN: usize = HANDOFF_MAGIC.len() + SECRET_LEN + CLAIM_LEN;
+/// Every request carries the session secret, a registered root's identifier
+/// and a descriptor kind (or, first on a connection, asks to hand it over).
+const HANDOFF_REQUEST_LEN: usize = HANDOFF_MAGIC.len() + SECRET_LEN + size_of::<u64>() + 1;
 const RESPONSE_OK: u8 = 0;
 const RESPONSE_REJECTED: u8 = 1;
 const RESPONSE_INTERNAL: u8 = 2;
@@ -320,11 +317,17 @@ impl DescriptorTicket {
         }
     }
 
-    fn claim(&self) -> [u8; CLAIM_LEN] {
-        let mut claim = [0u8; CLAIM_LEN];
-        claim[..size_of::<u64>()].copy_from_slice(&self.root_id.0.to_be_bytes());
-        claim[size_of::<u64>()] = self.kind.wire_byte();
-        claim
+    /// The broker request that claims this ticket's descriptor.
+    fn claim_request(&self) -> [u8; HANDOFF_REQUEST_LEN] {
+        let mut request = [0u8; HANDOFF_REQUEST_LEN];
+        request[..HANDOFF_MAGIC.len()].copy_from_slice(HANDOFF_MAGIC);
+        let secret_start = HANDOFF_MAGIC.len();
+        let root_start = secret_start + SECRET_LEN;
+        let root_end = root_start + size_of::<u64>();
+        request[secret_start..root_start].copy_from_slice(self.broker.secret());
+        request[root_start..root_end].copy_from_slice(&self.root_id.0.to_be_bytes());
+        request[root_end] = self.kind.wire_byte();
+        request
     }
 
     #[cfg(test)]
@@ -753,6 +756,16 @@ impl DescriptorSessionSlot {
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
+
+    /// Connections this session's broker has accepted so far.
+    #[cfg(test)]
+    pub(crate) fn broker_connections(&self) -> u64 {
+        self.session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map_or(0, |session| session._broker.opened_connections())
+    }
 }
 
 /// Claim a registered root from an independent process. The returned
@@ -763,10 +776,10 @@ pub(crate) fn acquire_descriptor(ticket: &DescriptorTicket) -> Result<File> {
 }
 
 /// Claim several registered descriptors of one endpoint session over a
-/// single broker connection, in order. The first request authenticates the
-/// connection with the session secret; the broker checks every claim against
-/// its registry exactly as it checks a claim on a connection of its own, and
-/// closes the connection after the first one it refuses.
+/// single broker connection, in order. Each claim is a complete request with
+/// the session secret; the broker checks every one exactly as it checks a
+/// claim on a connection of its own, and closes the connection after the
+/// first one it refuses.
 pub(crate) fn acquire_descriptors(tickets: &[&DescriptorTicket]) -> Result<Vec<File>> {
     let Some(first) = tickets.first() else {
         return Ok(Vec::new());
@@ -781,18 +794,8 @@ pub(crate) fn acquire_descriptors(tickets: &[&DescriptorTicket]) -> Result<Vec<F
     stream.set_read_timeout(Some(BROKER_IO_TIMEOUT))?;
     stream.set_write_timeout(Some(BROKER_IO_TIMEOUT))?;
     let mut descriptors = Vec::with_capacity(tickets.len());
-    for (index, ticket) in tickets.iter().enumerate() {
-        if index == 0 {
-            let mut request = [0u8; HANDOFF_REQUEST_LEN];
-            request[..HANDOFF_MAGIC.len()].copy_from_slice(HANDOFF_MAGIC);
-            let secret_start = HANDOFF_MAGIC.len();
-            request[secret_start..secret_start + SECRET_LEN]
-                .copy_from_slice(ticket.broker.secret());
-            request[secret_start + SECRET_LEN..].copy_from_slice(&ticket.claim());
-            stream.write_all(&request)?;
-        } else {
-            stream.write_all(&ticket.claim())?;
-        }
+    for ticket in tickets {
+        stream.write_all(&ticket.claim_request())?;
         // One claim at a time: a reply is read before the next claim is
         // sent, so replies never queue up and run together on the socket.
         let (status, descriptor) = receive_descriptor(&stream)?;
@@ -1010,49 +1013,45 @@ fn serve_request(
 ) -> Result<()> {
     let mut request = [0u8; HANDOFF_REQUEST_LEN];
     stream.read_exact(&mut request)?;
-    let secret_start = HANDOFF_MAGIC.len();
-    let authenticated = request[..secret_start] == *HANDOFF_MAGIC
-        && bool::from(subtle::ConstantTimeEq::ct_eq(
-            &request[secret_start..secret_start + SECRET_LEN],
-            secret.as_slice(),
-        ));
-    if !authenticated {
-        stream.write_all(&[RESPONSE_REJECTED])?;
-        return Ok(());
-    }
-    if request[HANDOFF_REQUEST_LEN - 1] == CONNECTION_REQUEST {
+    if authenticated(&request, secret) && request[HANDOFF_REQUEST_LEN - 1] == CONNECTION_REQUEST {
         return accept_connection(stream, connections);
     }
-    let mut claim: [u8; CLAIM_LEN] = request[secret_start + SECRET_LEN..]
-        .try_into()
-        .expect("request claim has a fixed length");
-    // Later claims on this connection carry no secret of their own: the
-    // first request authenticated the connection for this session, and
-    // every claim is still checked against the registry.
-    while serve_claim(&mut stream, &claim, registry)? {
-        match read_claim(&mut stream)? {
-            Some(next) => claim = next,
-            None => break,
+    // A connection may carry any number of claims, each authenticated on
+    // its own. Only a connection's first request can hand it over.
+    while serve_claim(&mut stream, &request, secret, registry)? {
+        if !read_request(&mut stream, &mut request)? {
+            break;
         }
     }
     Ok(())
 }
 
-/// The next claim on a connection, or `None` when the client closed it
-/// between claims.
-fn read_claim(stream: &mut TrackedStream) -> io::Result<Option<[u8; CLAIM_LEN]>> {
-    let mut claim = [0u8; CLAIM_LEN];
+fn authenticated(request: &[u8; HANDOFF_REQUEST_LEN], secret: &[u8; SECRET_LEN]) -> bool {
+    let secret_start = HANDOFF_MAGIC.len();
+    request[..secret_start] == *HANDOFF_MAGIC
+        && bool::from(subtle::ConstantTimeEq::ct_eq(
+            &request[secret_start..secret_start + SECRET_LEN],
+            secret.as_slice(),
+        ))
+}
+
+/// Read the next request on a connection. False when the client closed it
+/// between requests.
+fn read_request(
+    stream: &mut TrackedStream,
+    request: &mut [u8; HANDOFF_REQUEST_LEN],
+) -> io::Result<bool> {
     let first = loop {
-        match stream.read(&mut claim) {
+        match stream.read(request) {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             result => break result?,
         }
     };
     if first == 0 {
-        return Ok(None);
+        return Ok(false);
     }
-    stream.read_exact(&mut claim[first..])?;
-    Ok(Some(claim))
+    stream.read_exact(&mut request[first..])?;
+    Ok(true)
 }
 
 /// Take a connection another process hands over: its descriptors, then the
@@ -1106,19 +1105,26 @@ fn accept_connection(stream: TrackedStream, connections: &HandlerCell) -> Result
     })
 }
 
-/// Answer one claim. Returns whether it was granted; the connection ends
-/// after a refused claim.
+/// Answer one claim request. Returns whether it was granted; the connection
+/// ends after a refused claim.
 fn serve_claim(
     stream: &mut TrackedStream,
-    claim: &[u8; CLAIM_LEN],
+    request: &[u8; HANDOFF_REQUEST_LEN],
+    secret: &[u8; SECRET_LEN],
     registry: &RegisteredRootRegistry,
 ) -> Result<bool> {
+    if !authenticated(request, secret) {
+        stream.write_all(&[RESPONSE_REJECTED])?;
+        return Ok(false);
+    }
+    let root_start = HANDOFF_MAGIC.len() + SECRET_LEN;
+    let root_end = root_start + size_of::<u64>();
     let root_id = RegisteredRootId(u64::from_be_bytes(
-        claim[..size_of::<u64>()]
+        request[root_start..root_end]
             .try_into()
-            .expect("claim root identifier has a fixed length"),
+            .expect("request root identifier has a fixed length"),
     ));
-    let Some(kind) = RegisteredDescriptorKind::from_wire_byte(claim[size_of::<u64>()]) else {
+    let Some(kind) = RegisteredDescriptorKind::from_wire_byte(request[root_end]) else {
         stream.write_all(&[RESPONSE_REJECTED])?;
         return Ok(false);
     };
@@ -1661,7 +1667,9 @@ mod tests {
         identities.push(identities[1]);
 
         let fresh = DescriptorSessionSlot::default();
+        let opened = slot.broker_connections();
         let descriptors = fresh.acquire_many(&tickets).unwrap();
+        assert_eq!(slot.broker_connections() - opened, 1);
         assert_eq!(descriptors.len(), identities.len());
         for (descriptor, identity) in descriptors.iter().zip(&identities) {
             let metadata = descriptor.metadata().unwrap();
@@ -1709,25 +1717,23 @@ mod tests {
 
     #[test]
     fn broker_ends_a_connection_after_a_refused_claim() {
-        // Claims after the first carry no secret. One the registry refuses,
-        // or one asking to hand over a connection, gets a refusal and the
-        // connection ends: the worker cannot go on asking.
+        // Every claim on a connection is authenticated on its own. A later
+        // claim with a forged secret, for a root the registry does not hold,
+        // or asking to hand over the connection is refused, and the
+        // connection ends: the client cannot go on asking.
         let temp = crate::test_support::tempdir().unwrap();
         let slot = DescriptorSessionSlot::default();
         let granted = slot.register(File::open(temp.path()).unwrap()).unwrap();
+        let mut forged = granted.clone();
+        forged.broker.secret_mut()[0] ^= 1;
         let mut unknown = granted.clone();
         unknown.root_id = RegisteredRootId(granted.root_id.0 + 100);
-        let mut handoff = granted.claim();
-        handoff[size_of::<u64>()] = CONNECTION_REQUEST;
-        for refused in [unknown.claim(), handoff] {
+        let mut handoff = granted.claim_request();
+        handoff[HANDOFF_REQUEST_LEN - 1] = CONNECTION_REQUEST;
+        for refused in [forged.claim_request(), unknown.claim_request(), handoff] {
             let mut stream = granted.broker.connect(BrokerBase::Account).unwrap();
             stream.set_read_timeout(Some(BROKER_IO_TIMEOUT)).unwrap();
-            let mut request = [0u8; HANDOFF_REQUEST_LEN];
-            request[..HANDOFF_MAGIC.len()].copy_from_slice(HANDOFF_MAGIC);
-            request[HANDOFF_MAGIC.len()..HANDOFF_MAGIC.len() + SECRET_LEN]
-                .copy_from_slice(granted.broker.secret());
-            request[HANDOFF_MAGIC.len() + SECRET_LEN..].copy_from_slice(&granted.claim());
-            stream.write_all(&request).unwrap();
+            stream.write_all(&granted.claim_request()).unwrap();
             let (status, descriptor) = receive_descriptor(&stream).unwrap();
             assert_eq!(status, RESPONSE_OK);
             assert!(descriptor.unwrap().metadata().unwrap().is_dir());
@@ -1841,6 +1847,9 @@ mod tests {
         independent_process_receives_exact_registered_descriptor();
         broker_rejects_bad_secrets_and_unknown_roots();
         stream_tickets_preserve_direction_across_the_broker();
+        one_connection_claims_every_descriptor_in_order();
+        a_claim_that_was_not_granted_fails_the_whole_batch();
+        broker_ends_a_connection_after_a_refused_claim();
 
         // A stalled inline client must not make broker teardown wait for the
         // I/O timeout. Also prove the hook reached the listener fallback.
