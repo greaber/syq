@@ -650,7 +650,10 @@ impl Engine {
         let mut creation = local::CreationPermissions::default();
         for (path, metadata) in entries {
             let relative = RelativePath::new(&path)?;
-            let label = String::from_utf8_lossy(&path).into_owned();
+            let label = match String::from_utf8_lossy(&path) {
+                name if name.is_empty() => ".".into(),
+                name => name.into_owned(),
+            };
             let saved = widened.remove(&path);
             // Require the inode we widened before applying any final metadata.
             let result = (|| {
@@ -670,14 +673,18 @@ impl Engine {
                         *explicit,
                         mode.is_none(),
                         &mut creation,
-                    )?;
+                    )
+                    .with_context(|| format!("set metadata of directory {label}"))?;
                 } else if saved.is_none() {
-                    let directory = destination.root.open_directory(&relative)?;
-                    let current = directory.metadata()?.mode();
-                    crate::fsops::set_mode_handle(
-                        &directory,
-                        crate::fsops::created_directory_mode(&directory, 0o777, current)?,
-                    )?;
+                    (|| {
+                        let directory = destination.root.open_directory(&relative)?;
+                        let current = directory.metadata()?.mode();
+                        crate::fsops::set_mode_handle(
+                            &directory,
+                            crate::fsops::created_directory_mode(&directory, 0o777, current)?,
+                        )
+                    })()
+                    .with_context(|| format!("set mode of directory {label}"))?;
                 }
                 Ok::<_, anyhow::Error>(())
             })();
