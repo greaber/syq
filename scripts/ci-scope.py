@@ -389,7 +389,7 @@ def classify(paths, preparation_only):
             path_tooling_checks.append("setup")
         elif path == "scripts/setup.lock":
             path_tooling_checks += ALL_TOOLING.split()
-        elif path == "scripts/verify-release-ci.py":
+        elif matches(path, "scripts/verify-release-ci.py", "scripts/release_checks.py"):
             path_tooling_checks += ["release", "orchestration"]
         elif matches(path, "tests/tooling/test-release-tools.py", "scripts/package-release.py",
                      "scripts/verify-crates-io-package.py", "scripts/verify-release-*",
