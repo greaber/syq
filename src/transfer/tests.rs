@@ -6071,6 +6071,10 @@ struct HoldingDestination<F> {
     sent: F,
     /// Refuse every streamed begin, as a receiver's grant can.
     refuse_begin: bool,
+    /// Reply slots its requests beyond sixteen reserve, as a remote
+    /// connection's do (`Conn::reserve_reply`); without them, any request
+    /// may be sent.
+    reserved: Option<crate::wire_budget::ReservedReplies>,
 }
 
 impl<F: FnMut(usize) + Send> Conn for HoldingDestination<F> {
@@ -6106,6 +6110,11 @@ impl<F: FnMut(usize) + Send> Conn for HoldingDestination<F> {
     }
     fn reply_queue(&self) -> Option<usize> {
         Some(self.queue)
+    }
+    fn reserve_reply(&self) -> bool {
+        self.reserved
+            .as_ref()
+            .is_none_or(crate::wire_budget::ReservedReplies::reserve)
     }
     fn scan(
         &mut self,
@@ -6250,7 +6259,10 @@ struct Holding {
     remote_source: bool,
     /// Read from a remote source whose replies hold room in the
     /// decoded-message allowance (`BudgetedSource`); this thread reads it.
+    /// The destination's further requests then reserve reply slots too.
     budgeted_source: bool,
+    /// The destination's requests beyond sixteen reserve reply slots.
+    destination_slots: bool,
     /// Stream to a command-restricted receiver.
     restricted: bool,
     /// The receiver refuses every streamed begin.
@@ -6315,6 +6327,7 @@ fn stream_into_holding_destination(
             sent(&aborting, pieces)
         },
         refuse_begin: how.refuse_begin,
+        reserved: (how.budgeted_source || how.destination_slots).then(Default::default),
     });
     worker.fast_batch_files = files.len();
     let opts = Arc::get_mut(&mut worker.opts).unwrap();
@@ -6444,6 +6457,8 @@ fn an_aborted_copy_takes_every_reply_of_a_wide_patch_stream() {
     }
 }
 
+// Holds the process's own allowance or slots: run in a process of its own,
+// as nextest does.
 #[test]
 fn a_wide_patch_stream_cannot_use_up_the_decoded_message_allowance() {
     // A stream of 320 single-block pieces from a remote source has up to
@@ -6451,7 +6466,8 @@ fn a_wide_patch_stream_cannot_use_up_the_decoded_message_allowance() {
     // 100 granules of the process's decoded-message allowance, as those of
     // many workers can: the stream's further replies take reserved slots
     // instead, and the copy completes. With every slot taken by other
-    // connections, it keeps to the sixteen a stream may always have.
+    // connections, it keeps to the sixteen requests a stream may always
+    // have on each connection.
     let granule = crate::wire_budget::RESERVATION_GRANULE;
     let reply = postcard::to_stdvec(&0u32).unwrap();
     let _others: Vec<_> = (0..crate::wire_budget::MEMORY_LIMIT / granule - 100)
@@ -6479,6 +6495,41 @@ fn a_wide_patch_stream_cannot_use_up_the_decoded_message_allowance() {
             assert_eq!(held.reads, crate::transfer_tuning::COMPARE_WINDOW, "{case}");
         } else {
             assert!(held.reads > 64, "{case}: {} reads", held.reads);
+        }
+    }
+}
+
+// Holds the process's own allowance or slots: run in a process of its own,
+// as nextest does.
+#[test]
+fn a_wide_patch_stream_keeps_to_sixteen_acknowledgments_without_reply_slots() {
+    // From an in-process source, as in a push, a stream's pieces await
+    // acknowledgment as far as the destination's reply queue allows, each
+    // beyond sixteen with a reply slot. With every slot taken by other
+    // connections, as many await as before the window widened.
+    let window = crate::transfer_tuning::COMPARE_WINDOW;
+    for slots_taken in [false, true] {
+        let case = format!("slots_taken={slots_taken}");
+        let taken = crate::wire_budget::ReservedReplies::default();
+        while slots_taken && taken.reserve() {}
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
+        let how = Holding {
+            destination_slots: true,
+            ..Holding::default()
+        };
+        let (_, worker, held) = stream_into_holding_destination(root, &files, how, |_, _| {});
+        assert_eq!(
+            read(root, "source/file"),
+            read(root, "target/file"),
+            "{case}"
+        );
+        assert_eq!(worker.progress.files_done.load(Relaxed), 1, "{case}");
+        if slots_taken {
+            assert!(held.pieces <= window, "{case}: {} pieces", held.pieces);
+        } else {
+            assert_eq!(held.pieces, 256, "{case}");
         }
     }
 }

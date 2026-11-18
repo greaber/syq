@@ -123,8 +123,8 @@ pub(crate) struct Hold {
     exhausted: bool,
     expansion: Option<Expansion>,
     /// The connection whose reserved reply slot the message was decoded
-    /// into. The slot stands for the message's first granule, which is not
-    /// charged to the allowance (`ReservedReplies`).
+    /// into. The slot covers the message's first `REPLY_SLOT_BYTES`, which
+    /// are not charged to the allowance (`ReservedReplies`).
     slot: Option<ReservedReplies>,
 }
 
@@ -140,9 +140,15 @@ fn memory_budget() -> &'static Arc<Budget> {
 }
 
 /// Most replies that all connections' queues together may hold in slots
-/// reserved for them (`ReservedReplies`): a full reply queue of 256 for each
-/// of sixteen workers.
-pub(crate) const RESERVED_REPLY_SLOTS: usize = 16 * 256;
+/// reserved for them (`ReservedReplies`): a full reply queue of 256 on both
+/// connections of each of sixteen workers.
+pub(crate) const RESERVED_REPLY_SLOTS: usize = 2 * 16 * 256;
+
+/// The accounting a reply slot covers: a reply's own size and its small
+/// collections, which is all a streamed patch's replies decode. A message
+/// that decodes more is charged for the rest, so all slots together allow at
+/// most `RESERVED_REPLY_SLOTS` times this beyond the allowance.
+pub(crate) const REPLY_SLOT_BYTES: usize = 4 << 10;
 
 /// Reserved slots, in every connection's reservations and queued replies.
 static RESERVED_SLOTS: AtomicUsize = AtomicUsize::new(0);
@@ -156,10 +162,10 @@ thread_local! {
 /// Slots, from a count of their own, for the replies to requests that a
 /// connection sends beyond those it always may. The thread reading that
 /// connection decodes each next message into a reserved slot, while one is
-/// left, and the slot stands for the message's first granule of the
-/// allowance: its own size and the first 64 KiB of collections it decodes.
-/// So those replies take no room from the allowance unless they decode more,
-/// however many connections stream, and a sender that cannot
+/// left, and the slot covers the message's first `REPLY_SLOT_BYTES` of
+/// accounting: its own size and small collections. So those replies take no
+/// room from the allowance unless they decode more, however many
+/// connections stream, and a sender that cannot
 /// reserve a slot sends no further request until a reply is taken. The data
 /// those replies carry is bounded where they are queued.
 #[derive(Clone, Debug, Default)]
@@ -222,12 +228,8 @@ impl Hold {
         Self {
             budget: memory_budget().clone(),
             used: 0,
-            // A slot's granule is not charged to the allowance.
-            reserved: if slot.is_some() {
-                RESERVATION_GRANULE
-            } else {
-                0
-            },
+            // What a slot covers is not charged to the allowance.
+            reserved: if slot.is_some() { REPLY_SLOT_BYTES } else { 0 },
             exhausted: false,
             expansion: None,
             slot,
@@ -239,7 +241,7 @@ impl Hold {
     pub(crate) fn return_slot(&mut self) {
         if let Some(slot) = self.slot.take() {
             slot.0.slots.fetch_add(1, Relaxed);
-            self.reserved -= RESERVATION_GRANULE;
+            self.reserved -= REPLY_SLOT_BYTES;
         }
     }
 
@@ -302,7 +304,7 @@ impl Drop for Hold {
     fn drop(&mut self) {
         let free = if self.slot.is_some() {
             RESERVED_SLOTS.fetch_sub(1, Relaxed);
-            RESERVATION_GRANULE
+            REPLY_SLOT_BYTES
         } else {
             0
         };
@@ -805,6 +807,8 @@ mod tests {
         assert_eq!(shared.used.load(Relaxed), 0);
     }
 
+    // Reads the process's own allowance and slots: run in a process of its
+    // own, as nextest does.
     #[test]
     fn a_reply_decodes_into_a_slot_reserved_for_it_and_takes_no_room() {
         use crate::proto::Response;
@@ -868,6 +872,26 @@ mod tests {
         assert_eq!(reserved_slots(), slots);
     }
 
+    // Reads the process's own allowance and slots: run in a process of its
+    // own, as nextest does.
+    #[test]
+    fn a_reply_that_decodes_more_than_its_slot_covers_is_charged_the_rest() {
+        let used = || memory_budget().used.load(Relaxed);
+        let start = used();
+        let reserved = ReservedReplies::default();
+        assert!(reserved.reserve());
+        reserved.read_on_this_thread();
+        let bytes = postcard::to_stdvec(&vec![7u64; 256]).unwrap();
+        let decoded = decode::<Vec<u64>>(&bytes).unwrap();
+        assert_eq!(reserved.slots(), 0);
+        assert_eq!(used(), start + RESERVATION_GRANULE - REPLY_SLOT_BYTES);
+        drop(decoded);
+        READING.with(|reading| *reading.borrow_mut() = None);
+        assert_eq!(used(), start);
+    }
+
+    // Reads the process's own allowance and slots: run in a process of its
+    // own, as nextest does.
     #[test]
     fn reply_slots_are_limited_and_leave_the_allowance_alone() {
         let used = || memory_budget().used.load(Relaxed);

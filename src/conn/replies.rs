@@ -121,9 +121,14 @@ impl Replies {
         }
     }
 
-    /// Reserve the room one more reply takes while it is queued here.
+    /// Reserve a slot for one more reply to be queued here.
     pub(super) fn reserve_reply(&self) -> bool {
         self.reserved.reserve()
+    }
+
+    #[cfg(test)]
+    pub(super) fn reserved_slots(&self) -> usize {
+        self.reserved.slots()
     }
 
     pub(crate) fn recv(&self) -> Result<Reply, RecvError> {
