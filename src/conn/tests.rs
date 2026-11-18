@@ -820,6 +820,8 @@ fn local_source_worker_rejects_destination_mutation_requests() {
             prefix: b"mar".to_vec(),
             limit: 10,
             symlink_policy: crate::proto::OperatorSymlinkPolicy::Refuse,
+            detailed: false,
+            follow_final_symlinks: true,
         })
         .unwrap();
     assert!(

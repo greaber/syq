@@ -1441,34 +1441,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
             w.write_msg(&Response::Err(crate::fsops::OPEN_PATCH_STREAM.into()))?;
             continue;
         }
-        if !is_control
-            && matches!(
-                &req,
-                Request::TcpListen { .. }
-                    | Request::CreateSendBudget { .. }
-                    | Request::DescriptorCopy(_)
-                    | Request::ListDir { .. }
-                    | Request::ListDirDetails { .. }
-                    | Request::ListDirNoFollowFinal { .. }
-                    | Request::NativeMap(_)
-                    | Request::NativeRemove { .. }
-                    | Request::CheckOperatorDirectory { .. }
-                    | Request::CheckOperatorDirectoryAncestry { .. }
-                    | Request::CheckOperatorDirectoryAncestryWithAccess { .. }
-                    | Request::CheckSearchableOperatorDirectory { .. }
-                    | Request::PrepareDestinationPath { .. }
-                    | Request::RestoreDestinationPath
-                    | Request::RegisterSourceRoots { .. }
-                    | Request::CreateOperatorDirectory { .. }
-                    | Request::AnchorDestination { .. }
-                    | Request::PrepareSmallFiles(_)
-                    | Request::CopySmallFiles(_)
-                    | Request::PruneLookup { .. }
-                    | Request::DestinationResults { .. }
-                    | Request::FinishDestinationResults
-                    | Request::MappingChunk { .. }
-            )
-        {
+        if !is_control && req.control_only() {
             w.write_msg(&Response::Err(
                 "request is allowed only on the control connection".into(),
             ))?;

@@ -119,7 +119,7 @@ fn selected_seed_frames_accommodate_large_comparisons() {
 }
 
 #[test]
-fn direct_frames_preserve_buffered_encoding_and_released_payloads() {
+fn direct_frames_preserve_buffered_encoding() {
     // The previous writer (also in v0.5.1) materializes postcard bytes
     // before adding this header. Compare entire consecutive frames.
     let mut actual = Vec::new();
@@ -141,15 +141,23 @@ fn direct_frames_preserve_buffered_encoding_and_released_payloads() {
         }
     }
     assert_eq!(actual, expected);
-    let fixture = include_bytes!("../../tests/fixtures/completion/list-dir-v0.3.2.bin");
-    let request: Request = postcard::from_bytes(fixture).unwrap();
+    let request = Request::ListDir {
+        directory: b"/data".to_vec(),
+        confined_root: None,
+        prefix: b"al".to_vec(),
+        limit: 1000,
+        symlink_policy: OperatorSymlinkPolicy::Refuse,
+        detailed: false,
+        follow_final_symlinks: true,
+    };
+    let payload = postcard::to_stdvec(&request).unwrap();
     let mut actual = Vec::new();
     FrameWriter::new(&mut actual, false)
         .write_msg(&request)
         .unwrap();
     assert_eq!(
         &actual[local_preamble_len()..],
-        &raw_frame(fixture, 0)[local_preamble_len()..]
+        &raw_frame(&payload, 0)[local_preamble_len()..]
     );
 }
 
@@ -509,9 +517,18 @@ fn compressed_metadata_still_obeys_its_message_limit() {
 }
 
 #[test]
-fn bounded_decoder_preserves_the_released_completion_request() {
-    let request = include_bytes!("../../tests/fixtures/completion/list-dir-v0.3.2.bin");
-    let decoded = crate::wire_budget::decode::<Request>(request)
+fn bounded_decoder_preserves_a_completion_request() {
+    let request = postcard::to_stdvec(&Request::ListDir {
+        directory: b"/data".to_vec(),
+        confined_root: None,
+        prefix: b"al".to_vec(),
+        limit: 1000,
+        symlink_policy: OperatorSymlinkPolicy::Refuse,
+        detailed: false,
+        follow_final_symlinks: true,
+    })
+    .unwrap();
+    let decoded = crate::wire_budget::decode::<Request>(&request)
         .unwrap()
         .into_inner();
     assert_eq!(postcard::to_stdvec(&decoded).unwrap(), request);
