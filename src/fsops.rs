@@ -3108,6 +3108,7 @@ impl FsOps {
         paths: &[PathBytes],
         sources: Option<&[RegisteredPath]>,
         follow: bool,
+        read_here: bool,
     ) -> Result<Vec<Option<Entry>>> {
         if let Some(sources) = sources {
             if self.destination_root.is_some() {
@@ -3136,7 +3137,14 @@ impl FsOps {
             // `follow` describes the legacy pathname request. A registered
             // selection has already applied the operator-root policy, and no
             // descendant component gains symlink-traversal authority here.
-            let results = parallel_map_init(
+            // Sources this thread has just read, one at a time, are statted
+            // on it too. Every worker rechecks its batches at once, so the
+            // pool's threads would mostly look for work, at several times the
+            // cost of the stats: a file just read usually still has its
+            // attributes cached, on a network filesystem as well.
+            let minimum = if read_here { usize::MAX } else { PAR_MIN };
+            let results = parallel_map_init_from(
+                minimum,
                 &targets,
                 || None,
                 |parent, (_, _, source, target)| {
@@ -3932,17 +3940,15 @@ fn parallel_by_directory<R: Send>(
         .collect()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Batches the current thread has handed to the metadata pool.
+    static POOLED_BATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 // State belongs to one bounded input chunk and is discarded before returning.
 // Metadata lookups can reuse a held parent for adjacent siblings, while later
 // requests resolve the namespace afresh. No state is shared between workers.
-fn parallel_map_init<T: Sync, R: Send, S>(
-    items: &[T],
-    init: impl Fn() -> S + Sync,
-    f: impl Fn(&mut S, &T) -> R + Sync,
-) -> Vec<R> {
-    parallel_map_init_from(PAR_MIN, items, init, f)
-}
-
 fn parallel_map_init_from<T: Sync, R: Send, S>(
     minimum: usize,
     items: &[T],
@@ -3957,6 +3963,8 @@ fn parallel_map_init_from<T: Sync, R: Send, S>(
         let mut state = init();
         return items.iter().map(|item| f(&mut state, item)).collect();
     };
+    #[cfg(test)]
+    POOLED_BATCHES.with(|batches| batches.set(batches.get() + 1));
     let chunk = items.len().div_ceil(PAR_THREADS).max(1);
     use rayon::prelude::*;
     pool.install(|| {

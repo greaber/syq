@@ -6329,6 +6329,67 @@ fn source_stat_batches_preserve_order_across_sizes() {
 }
 
 #[test]
+fn read_sources_are_rechecked_on_the_reading_thread() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let count = 2 * PAR_MIN;
+    for index in 0..count {
+        fs::write(temporary.path().join(format!("f{index}")), b"data").unwrap();
+    }
+    // The batches the calling thread hands to the pool while `request` runs.
+    let pooled = |request: &dyn Fn(Vec<RegisteredPath>) -> Request| {
+        let (mut worker, selections, _control) = registered_source_worker(&[temporary.path()]);
+        let sources = (0..count)
+            .map(|index| selections[0].join(format!("f{index}").as_bytes()).unwrap())
+            .collect();
+        let before = POOLED_BATCHES.get();
+        let entries: Vec<_> = match worker.handle(&request(sources)) {
+            Response::SmallBlocks(blocks) => blocks
+                .into_iter()
+                .map(|block| {
+                    let block = block.unwrap();
+                    assert_eq!(block.data, b"data");
+                    block.source
+                })
+                .collect(),
+            Response::Stats(entries) => entries,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(entries.len(), count);
+        assert!(entries
+            .iter()
+            .all(|entry| entry.as_ref().is_some_and(|entry| entry.size == 4)));
+        POOLED_BATCHES.get() - before
+    };
+    // The worker read every file itself before statting it again, which
+    // costs less than waking the pool.
+    assert_eq!(
+        pooled(&|sources| {
+            Request::ReadSmallBatch(
+                sources
+                    .into_iter()
+                    .map(|source| SmallRead {
+                        path: b"/display/path/is/not/authority".to_vec(),
+                        source: Some(source),
+                        attempt: 0,
+                        len: 4,
+                    })
+                    .collect(),
+            )
+        }),
+        0
+    );
+    // Sources nothing has read yet, such as a list's, share the pool.
+    assert_eq!(
+        pooled(&|sources| Request::StatMany {
+            paths: vec![b"/display/path/is/not/authority".to_vec(); sources.len()],
+            sources: Some(sources),
+            follow: false,
+        }),
+        1
+    );
+}
+
+#[test]
 fn source_stat_batches_isolate_roots_and_refresh_parents_between_requests() {
     let temporary = crate::test_support::tempdir().unwrap();
     let roots: Vec<_> = ["first", "second"]

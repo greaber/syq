@@ -290,6 +290,18 @@ impl FsOps {
         sources: Option<&[RegisteredPath]>,
         follow: bool,
     ) -> Result<Vec<Option<Entry>>> {
+        self.stat_sources_request(paths, sources, follow, false)
+    }
+
+    /// `stat_many_request`, where `read_here` says that this thread has just
+    /// read every registered source named: those are statted on it as well.
+    pub(super) fn stat_sources_request(
+        &mut self,
+        paths: &[PathBytes],
+        sources: Option<&[RegisteredPath]>,
+        follow: bool,
+        read_here: bool,
+    ) -> Result<Vec<Option<Entry>>> {
         #[cfg(debug_assertions)]
         if sources.is_none() {
             crate::fsops::record_test_event(
@@ -297,7 +309,7 @@ impl FsOps {
                 format_args!("stat {}", paths.len()),
             )?;
         }
-        let mut entries = self.stat_many_unadorned_request(paths, sources, follow)?;
+        let mut entries = self.stat_many_unadorned_request(paths, sources, follow, read_here)?;
         if self.inode_preservation.any() {
             for (index, entry) in entries.iter_mut().enumerate() {
                 if let Some(entry) = entry {
