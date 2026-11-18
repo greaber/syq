@@ -361,6 +361,63 @@ fn pruning_leaves_room_so_the_next_copies_only_check_the_size() {
 }
 
 #[test]
+fn returning_free_pages_keeps_its_progress_when_the_deadline_cuts_it_short() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let db = unfinished_history(&path, 200);
+    db.execute("DELETE FROM runs WHERE status='incomplete'", [])
+        .unwrap();
+    let before = file_bytes(&db);
+    assert!(before - used_bytes(&db) > 64 * 4096, "many free pages");
+    // What `prune_within` does when its deadline passes after one step:
+    // the statement is dropped before it has returned every page.
+    {
+        let mut vacuum = db.prepare("PRAGMA incremental_vacuum(64)").unwrap();
+        let mut rows = vacuum.raw_query();
+        assert!(rows.next().unwrap().is_some());
+    }
+    // Another connection sees the smaller file, so the step was committed
+    // and the copies which follow continue from it.
+    let after = file_bytes(&open(&path).unwrap());
+    assert!(after < before, "{after} {before}");
+    assert!(after > used_bytes(&db), "only part was returned");
+}
+
+#[test]
+fn a_run_deleted_while_its_copy_records_stops_recording() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let writer = recorder(&path);
+    let id = writer.0.lock().unwrap().id;
+    let other = open(&path).unwrap();
+    // As another copy's pruning or `tuning-cache clear` does.
+    other.execute("DELETE FROM runs WHERE id=?1", [id]).unwrap();
+    writer.event("sample", json!({"bytes":1}));
+    writer.flush();
+    {
+        let state = writer.0.lock().unwrap();
+        assert!(state.finished && state.pending.is_empty());
+    }
+    // Later events and the outcome are dropped without touching the history,
+    // which another copy may have locked.
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let before = pages_read(&writer.0.lock().unwrap().db);
+    writer.context(&key("a"));
+    writer.event("sample", json!({"bytes":2}));
+    writer.flush();
+    writer.complete(true, json!({}));
+    {
+        let state = writer.0.lock().unwrap();
+        assert!(state.pending.is_empty() && state.pending_context.is_none());
+        assert_eq!(pages_read(&state.db), before);
+    }
+    other.execute_batch("COMMIT").unwrap();
+    drop(writer);
+    assert!(command::read_run(&other, id).is_err());
+    assert!(command::read_events(&other, id).unwrap().is_empty());
+}
+
+#[test]
 fn lock_contention_keeps_samples_and_context_for_later_flush() {
     let temp = crate::test_support::tempdir().unwrap();
     let path = temp.path().join("history.sqlite");

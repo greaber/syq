@@ -365,6 +365,9 @@ impl Recorder {
 
     pub(crate) fn context(&self, key: &ContextKey) {
         let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if state.finished {
+            return;
+        }
         state.pending_context = Some(key.clone());
         if let Err(error) = state.flush() {
             diagnostic(&error);
@@ -398,13 +401,36 @@ impl Writer {
             return Ok(());
         }
         let transaction = self.db.unchecked_transaction()?;
-        self.write_pending(&transaction)?;
+        if !self.write_pending(&transaction)? {
+            drop(transaction);
+            self.abandon();
+            return Ok(());
+        }
         transaction.commit()?;
         self.mark_flushed();
         Ok(())
     }
 
-    fn write_pending(&self, transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    /// Stop recording a run that is no longer in the history: another copy
+    /// pruned it to keep the history within its budget, or the user cleared
+    /// the history. Its remaining events could only fail, each taking the
+    /// writer lock that other copies wait for.
+    fn abandon(&mut self) {
+        self.pending.clear();
+        self.pending_context = None;
+        self.finished = true;
+    }
+
+    /// Write the pending context and events. Returns false, having written
+    /// nothing that can be kept, when the run is no longer in the history.
+    fn write_pending(&self, transaction: &rusqlite::Transaction<'_>) -> Result<bool> {
+        if transaction.execute(
+            "UPDATE runs SET lost=?1,updated_day=?3 WHERE id=?2",
+            params![self.lost, self.id, day()],
+        )? == 0
+        {
+            return Ok(false);
+        }
         // Context revisions (for example, discovering a mixed-filesystem tree)
         // must survive contention just like samples. Finish flushes this before
         // recording the outcome under the context.
@@ -437,11 +463,7 @@ impl Writer {
                 ])?;
             }
         }
-        transaction.execute(
-            "UPDATE runs SET lost=?1,updated_day=?3 WHERE id=?2",
-            params![self.lost, self.id, day()],
-        )?;
-        Ok(())
+        Ok(true)
     }
 
     fn mark_flushed(&mut self) {
@@ -469,7 +491,11 @@ impl Writer {
         );
         self.db.busy_timeout(Duration::ZERO)?;
         let transaction = transaction?;
-        self.write_pending(&transaction)?;
+        if !self.write_pending(&transaction)? {
+            drop(transaction);
+            self.abandon();
+            return Ok(());
+        }
         transaction.execute(
             "UPDATE runs SET status=?1,eligible=?2,summary=?3,lost=?4 WHERE id=?5",
             params![
