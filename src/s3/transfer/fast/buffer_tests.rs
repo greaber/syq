@@ -348,7 +348,7 @@ pub(super) fn planning_engine(extra: &[&str]) -> Engine {
         tuning,
         client: Client::from_conf(config),
         progress: Progress::new(false, false, None),
-        pace: Mutex::new(tokio::time::Instant::now()),
+        bandwidth: None,
         upload_keys: OnceLock::new(),
         authorization: None,
         copy_checksum_unsupported: Default::default(),

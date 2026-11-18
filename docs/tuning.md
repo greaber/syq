@@ -28,7 +28,6 @@ syq cp large-file --to server --as /scratch/benchmark-copy -v \
 | `batch-files` | Up to 2048 | 1 through 4096 files per worker batch |
 | `batch-bytes` | 16 MiB | 512 bytes through 64 MiB per worker batch |
 | `split-min-size` | 32 MiB | 1 byte through 1 GiB: the smallest part of a file an idle worker can take over from another |
-| `bw-pacing` | `125ms` | An integer interval from `1ms` through `10s`, or `average`; see below |
 
 <a id="streaming-and-request-windows"></a>
 
@@ -40,10 +39,9 @@ shortcuts and streams all other ranges.
 
 <a id="average-rate-and-burst-patterns"></a>
 
-`bw-pacing` needs a nonzero `--resource-limits bandwidth=RATE` and applies to
-local and descriptor copies; SSH and TCP copies ignore it, and S3 copies
-reject it. An interval sends smaller requests that far apart, while `average`
-waits for each request's byte budget, so data can arrive in bursts.
+Under a `--resource-limits bandwidth=RATE` cap, local copies and filesystem
+descriptor copies split file data into requests of at most 125 ms of the rate
+(and at least 512 bytes), even when `request-size` is larger.
 
 Sizes accept `K`, `M`, and `G`, using powers of 1024. Setting a request, block,
 pipeline, split, or batch value also stops syq from adjusting it during the

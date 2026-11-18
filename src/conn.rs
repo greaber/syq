@@ -205,6 +205,13 @@ pub trait Conn: Send {
     fn reply_queue(&self) -> Option<usize> {
         None
     }
+    /// How many requests this connection has sent, when `send_pending` can
+    /// leave a reply for later. A caller that sent a request early compares
+    /// counts to learn whether anything was sent after it. None when each
+    /// request is answered as it is sent.
+    fn requests_sent(&self) -> Option<u64> {
+        None
+    }
     /// Current kernel RTT estimate for a TCP data connection. This is a
     /// local socket query and never sends a protocol request.
     fn tcp_rtt_us(&self) -> Option<u64> {
@@ -230,6 +237,35 @@ pub trait Conn: Send {
         ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         warn: &mut dyn FnMut(crate::proto::ScanWarning),
     ) -> Result<u64>;
+    /// `scan`, which also shows `upcoming` each batch after the first as
+    /// soon as the scan has it, while `sink` may still have earlier batches
+    /// to take: at most `scan::AHEAD` wait at once. `sink` then gets those
+    /// batches in the same order. A connection that cannot hold batches
+    /// back never calls `upcoming`.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_ahead(
+        &mut self,
+        root: &[u8],
+        source: Option<&RegisteredPath>,
+        follow_root: bool,
+        ignore: &[String],
+        report_ignored: bool,
+        sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        _upcoming: &mut dyn FnMut(&[Entry]),
+        ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
+        warn: &mut dyn FnMut(crate::proto::ScanWarning),
+    ) -> Result<u64> {
+        self.scan(
+            root,
+            source,
+            follow_root,
+            ignore,
+            report_ignored,
+            sink,
+            ignored,
+            warn,
+        )
+    }
     /// Stream descendants of disjoint selections relative to one registered base.
     /// Return false without invoking callbacks when this endpoint needs the
     /// ordinary per-selection scan path. Selected roots are already planned.
@@ -429,6 +465,8 @@ struct DeferredReplies {
     arrived: std::collections::HashMap<u64, (Response, std::time::Instant)>,
     next: u64,
     failed: Option<String>,
+    /// Every request sent, deferred or not (`Conn::requests_sent`).
+    sent: u64,
 }
 
 pub(crate) fn tcp_congestion_fallback_note(requested: Option<&str>) -> String {
@@ -723,7 +761,6 @@ pub fn change_ok(resp: Response, what: &str) -> Result<Response> {
             io_kind: None,
             raw_os_error: None,
             condition_not_met: false,
-            unchanged: false,
         })),
         Response::EndpointError(error) => Err(ChangeFailed::replying(what, error)),
         r => Ok(r),
@@ -1389,6 +1426,7 @@ impl Conn for RemoteConn {
             "only writes and their fence are valid during streaming writes"
         );
         self.batch_receipts.request(&req)?;
+        self.deferred.sent += 1;
         // The peer may have to send replies before it reads this request.
         let _sending = self.rx.as_ref().and_then(Replies::sending);
         if let Request::WriteRange { .. } = &req {
@@ -1489,6 +1527,9 @@ impl Conn for RemoteConn {
     }
     fn reply_queue(&self) -> Option<usize> {
         Some(self.replies)
+    }
+    fn requests_sent(&self) -> Option<u64> {
+        Some(self.deferred.sent)
     }
     fn detach(&mut self) {
         self.detached = true;

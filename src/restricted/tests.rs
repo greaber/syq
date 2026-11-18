@@ -1645,8 +1645,10 @@ fn an_enrolled_receiver_admits_tcp_only_when_its_verified_command_does() {
             };
             let admitted = match session_for(rules, &verified, &state, (&home, &home), &[]).unwrap()
             {
-                Session::Copy(authority) => authority.authorize(&mut listener, true).map(drop),
-                Session::Source(authority) => authority
+                Session::Serve(Checker::Destination(authority)) => {
+                    authority.authorize(&mut listener, true).map(drop)
+                }
+                Session::Serve(Checker::Source { authority, .. }) => authority
                     .acquire(&proto::ConnectionRole::Control, compressed)
                     .unwrap()
                     .authorize(&listener),
@@ -5708,10 +5710,10 @@ fn at_the_entry_limit_a_file_held_without_a_count_is_not_published() {
     };
     assert!(matches!(ops.handle(&write), proto::Response::Ok));
     let publish = || finalize_request(&held, proto::TargetCondition::Any);
-    let refused = execute_authorized(&authority, &mut ops, publish());
+    let refused = authority.authorize(&mut publish(), false).unwrap_err();
     assert!(
-        format!("{refused:?}").contains("signed grant entry limit exceeded"),
-        "{refused:?}"
+        format!("{refused:#}").contains("signed grant entry limit exceeded"),
+        "{refused:#}"
     );
     assert!(!held.exists());
     assert_eq!(entries_counted(&authority), 1);
@@ -5806,10 +5808,11 @@ fn entries_counted(authority: &RestrictedAuthority) -> u64 {
     authority.changes.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// A Finalize sent again for a file already published counts nothing: the
-/// copy still has room for its next file.
+/// A Finalize sent again for a file already published, as after its reply
+/// was lost, is answered as the first was, and counts again: the entry
+/// limit counts authorized requests.
 #[test]
-fn a_finalize_sent_again_gives_back_its_count() {
+fn a_finalize_sent_again_counts_again() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
     let target = root.join("target");
@@ -5827,68 +5830,218 @@ fn a_finalize_sent_again_gives_back_its_count() {
         finalize_request(&first, proto::TargetCondition::Any),
     );
     assert_eq!(format!("{again:?}"), format!("{published:?}"));
-    assert_eq!(entries_counted(&authority), 1);
-    publish_written(&authority, &mut ops, &second, b"more");
     assert_eq!(entries_counted(&authority), 2);
-    assert_eq!(fs::read(&second).unwrap(), b"more");
+    let refused = authority
+        .authorize(&mut prepare_request(&second), false)
+        .unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("signed grant entry limit exceeded"),
+        "{refused:#}"
+    );
+    assert!(!second.exists());
+    assert_eq!(fs::read(&first).unwrap(), b"data");
 }
 
 /// At the entry limit, a Finalize sent again for a file already published
-/// is answered as the first was. Any other Finalize the limit has no room
-/// for publishes nothing, and the results list it as refused.
+/// is refused before it runs, as any request the limit has no room for,
+/// and the results list it as refused; the file stays as published.
 #[test]
-fn a_finalize_sent_again_at_the_entry_limit_is_answered_as_published() {
+fn a_finalize_sent_again_at_the_entry_limit_is_refused() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
-    let (file, unpublished) = (target.join("fresh"), target.join("unpublished"));
+    let file = target.join("fresh");
     let (secret, policy) = results_policy();
     let mut authority = existence_authority_with_results(&root, &policy, 60_000);
     authority.copy.limits.max_entries = 1;
     let mut reader = start_results(&authority, secret);
     let mut first = authority.test_ops();
-    let published = publish_written(&authority, &mut first, &file, b"data");
-    let mut second = authority.test_ops();
-    let again = execute_authorized(
-        &authority,
-        &mut second,
-        finalize_request(&file, proto::TargetCondition::Any),
-    );
-    assert_eq!(format!("{again:?}"), format!("{published:?}"));
-    // A Finalize the limit leaves no room for, of a file never published,
-    // publishes nothing and is refused.
-    let refused = execute_authorized(
-        &authority,
-        &mut second,
-        finalize_request(&unpublished, proto::TargetCondition::Any),
-    );
+    publish_written(&authority, &mut first, &file, b"data");
+    let refused = authority
+        .authorize(
+            &mut finalize_request(&file, proto::TargetCondition::Any),
+            false,
+        )
+        .unwrap_err();
     assert!(
-        format!("{refused:?}").contains("signed grant entry limit exceeded"),
-        "{refused:?}"
+        format!("{refused:#}").contains("signed grant entry limit exceeded"),
+        "{refused:#}"
     );
-    assert!(!unpublished.exists());
     assert_eq!(entries_counted(&authority), 1);
     assert_eq!(fs::read(&file).unwrap(), b"data");
     let results = finish_results(&authority, &mut reader);
     assert_eq!((results.totals.failed, results.totals.refused), (0, 1));
-    let mut changes = results.changes();
-    changes.sort();
-    assert_eq!(
-        changes,
-        [
+}
+
+/// Whether a Finalize changed nothing is what the receiver says when it runs
+/// it, not whether the file had a reservation when it was authorized: a
+/// newer preparation of the same file on another connection can come
+/// between the two. A Finalize that publishes the newer file is listed as
+/// published, and one answered from the record of an earlier publication
+/// leaves the newer file's reservation alone.
+#[test]
+fn a_finalize_racing_a_newer_preparation_settles_by_what_it_did() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let file = target.join("fresh");
+    let key = (path_bytes(&file), [1; 16]);
+    let (secret, policy) = results_policy();
+    let authority = existence_authority_with_results(&root, &policy, 60_000);
+    let mut reader = start_results(&authority, secret);
+    let write = |data: &[u8]| Request::WriteRange {
+        path: path_bytes(&file),
+        inplace: false,
+        copy_id: [1; 16],
+        attempt: 0,
+        off: 0,
+        hash: crate::fsops::content_digest(data),
+        data: data.to_vec().into(),
+    };
+    let publish = || finalize_request(&file, proto::TargetCondition::Any);
+    let (mut first, mut second) = (authority.test_ops(), authority.test_ops());
+    execute_authorized(&authority, &mut first, prepare_request(&file));
+    execute_authorized(&authority, &mut first, write(b"data"));
+    // The first Finalize runs; a newer preparation of the file is
+    // authorized before the Finalize settles and runs after it.
+    let mut request = publish();
+    let mut finalized = authority.authorize(&mut request, false).unwrap();
+    let response = finalized.execute(&mut first, |ops| ops.handle(&request));
+    let mut request = prepare_request(&file);
+    let mut prepared = authority.authorize(&mut request, false).unwrap();
+    authority.settle(finalized, &response);
+    let response = prepared.execute(&mut second, |ops| ops.handle(&request));
+    assert!(
+        matches!(response, proto::Response::Prepared(_)),
+        "{response:?}"
+    );
+    authority.settle(prepared, &response);
+    let written = execute_authorized(&authority, &mut second, write(b"next"));
+    assert!(matches!(written, proto::Response::Ok), "{written:?}");
+    // With no reservation left, this Finalize publishes the newer file.
+    let published = execute_authorized(&authority, &mut second, publish());
+    assert!(
+        !matches!(
+            published,
+            proto::Response::EndpointError(_) | proto::Response::Err(_)
+        ),
+        "{published:?}"
+    );
+    assert_eq!(fs::read(&file).unwrap(), b"next");
+    assert!(authority.state.lock().unwrap().file_lifecycles.is_empty());
+    // A Finalize sent again runs while a still newer preparation holds a
+    // reservation: it is answered from the record and leaves it alone.
+    let mut request = prepare_request(&file);
+    let mut prepared = authority.authorize(&mut request, false).unwrap();
+    let again = execute_authorized(&authority, &mut first, publish());
+    assert_eq!(format!("{again:?}"), format!("{published:?}"));
+    assert!(authority.state.lock().unwrap().reserved.contains_key(&key));
+    let response = prepared.execute(&mut second, |ops| ops.handle(&request));
+    authority.settle(prepared, &response);
+    execute_authorized(&authority, &mut second, write(b"last"));
+    execute_authorized(&authority, &mut second, publish());
+    assert_eq!(fs::read(&file).unwrap(), b"last");
+    assert!(authority.state.lock().unwrap().file_lifecycles.is_empty());
+    let results = finish_results(&authority, &mut reader);
+    assert_eq!(results.totals.failed, 0, "{:?}", results.records);
+    let changes = results.changes();
+    assert!(!changes.is_empty(), "{:?}", results.records);
+    for change in changes {
+        assert_eq!(
+            change,
             (
                 "transfer_file".to_owned(),
                 b"fresh".to_vec(),
                 "succeeded".to_owned()
-            ),
-            (
-                "transfer_file".to_owned(),
-                b"unpublished".to_vec(),
-                "failed".to_owned()
-            ),
-        ]
-    );
+            )
+        );
+    }
+}
+
+/// An ordinary copy of N files whose worker connection drops in the middle
+/// completes under an entry limit of N plus what was in flight on that
+/// connection: here one Finalize whose reply was lost, which the sender
+/// sends again, and one file a new connection prepares and writes again,
+/// which shares the count the file already took. At a limit of N the copy
+/// is refused at its last file, and never makes more changes than allowed.
+#[test]
+fn a_copy_with_a_dropped_connection_fits_its_files_plus_what_was_in_flight() {
+    const FILES: usize = 6;
+    for (limit, completes) in [(FILES as u64 + 1, true), (FILES as u64, false)] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path().join("root");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let files: Vec<_> = (0..FILES)
+            .map(|index| target.join(format!("file-{index}")))
+            .collect();
+        let mut authority = existence_authority_with_results(&root, &results_policy().1, 60_000);
+        authority.copy.limits.max_entries = limit;
+        let send = |ops: &mut crate::fsops::FsOps, mut request: Request| {
+            let settlement = authority
+                .authorize(&mut request, false)
+                .map_err(|error| format!("{error:#}"))?;
+            let response = ops.handle(&request);
+            authority.settle(settlement, &response);
+            assert!(
+                !matches!(
+                    response,
+                    proto::Response::EndpointError(_) | proto::Response::Err(_)
+                ),
+                "{response:?}"
+            );
+            Ok::<_, String>(response)
+        };
+        let write = |file: &Path| Request::WriteRange {
+            path: path_bytes(file),
+            inplace: false,
+            copy_id: [1; 16],
+            attempt: 0,
+            off: 0,
+            hash: crate::fsops::content_digest(b"data"),
+            data: b"data".to_vec().into(),
+        };
+        let copy = |ops: &mut crate::fsops::FsOps, file: &Path| {
+            send(ops, prepare_request(file))?;
+            send(ops, write(file))?;
+            send(ops, finalize_request(file, proto::TargetCondition::Any))
+        };
+        let outcome = (|| {
+            let mut first = authority.test_ops();
+            // The third file's Finalize runs, and its reply is lost with
+            // the connection, which drops while the fourth is written.
+            for file in &files[..3] {
+                copy(&mut first, file)?;
+            }
+            send(&mut first, prepare_request(&files[3]))?;
+            send(&mut first, write(&files[3]))?;
+            drop(first);
+            let mut second = authority.test_ops();
+            send(
+                &mut second,
+                finalize_request(&files[2], proto::TargetCondition::Any),
+            )?;
+            for file in &files[3..] {
+                copy(&mut second, file)?;
+            }
+            Ok::<_, String>(())
+        })();
+        let counted = entries_counted(&authority);
+        if completes {
+            outcome.unwrap();
+            assert_eq!(counted, limit);
+            for file in &files {
+                assert_eq!(fs::read(file).unwrap(), b"data");
+            }
+        } else {
+            let error = outcome.unwrap_err();
+            assert!(error.contains("entry limit exceeded"), "{error}");
+            assert_eq!(counted, limit);
+            assert!(!files[FILES - 1].exists());
+        }
+    }
 }
 
 /// A publication the source says found earlier partials removes only the
@@ -6976,7 +7129,6 @@ fn a_small_file_batch_with_links_reports_each_failed_write() {
                 io_kind: Some(proto::WireIoKind::NoSpace),
                 raw_os_error: Some(28),
                 condition_not_met: false,
-                unchanged: false,
             }),
         ]),
     );
@@ -7091,7 +7243,6 @@ fn results_report_a_declined_metadata_change_as_the_replacement() {
         )),
         raw_os_error: None,
         condition_not_met: false,
-        unchanged: false,
     };
 
     // A metadata repair the receiver declines, then the replacement.
@@ -13229,9 +13380,10 @@ fn files_the_keep_policy_keeps_are_neither_refused_nor_failed() {
     let results = finish_results(&authority, &mut reader);
     assert_eq!((results.totals.refused, results.totals.failed), (0, 0));
     assert!(results.changes().is_empty(), "{:?}", results.records);
+    // Each authorized change counts against the entry limit, kept or not.
     assert_eq!(
         authority.changes.load(std::sync::atomic::Ordering::Relaxed),
-        0
+        2
     );
 }
 
@@ -13248,20 +13400,21 @@ fn small_copies_publish_through_a_restricted_receiver() {
     fs::write(target.join("old"), b"stale contents").unwrap();
     let key = generate_results_key(EnrollmentId::random()).unwrap();
     let (secret, policy) = results_policy();
-    let authority = std::sync::Arc::new(
-        test_authority_with_results(
-            &root,
-            DeletionPolicy::Forbid,
-            1024,
-            FilterPolicy::default(),
-            PublicationPolicy::AtomicStaged,
-            ExistingDestinationPolicy::Replace,
-            DestinationPlacement::DirectoryContents,
-            RootExistence::Any,
-            Some((key, policy)),
-        )
-        .unwrap(),
-    );
+    let mut authority = test_authority_with_results(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        FilterPolicy::default(),
+        PublicationPolicy::AtomicStaged,
+        ExistingDestinationPolicy::Replace,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+        Some((key, policy)),
+    )
+    .unwrap();
+    // Each of the copy's three preparations counts its three files.
+    authority.copy.limits.max_entries = 9;
+    let authority = std::sync::Arc::new(authority);
     let mut reader = start_results(&authority, secret);
     let mut ops = authority.test_ops();
     let mut gate = PatchStreamGate::new(authority.clone());
@@ -13352,9 +13505,10 @@ fn small_copies_publish_through_a_restricted_receiver() {
     )
     .unwrap();
     assert_eq!(in_flight(), 0);
+    // Both preparations count their three files, though neither ran.
     assert_eq!(
         authority.changes.load(std::sync::atomic::Ordering::Relaxed),
-        0
+        6
     );
 
     // A telemetry sample in between does not.
@@ -13383,7 +13537,7 @@ fn small_copies_publish_through_a_restricted_receiver() {
     }
     assert_eq!(
         authority.changes.load(std::sync::atomic::Ordering::Relaxed),
-        3
+        9
     );
     let results = finish_results(&authority, &mut reader);
     assert_eq!(results.totals.files_transferred, 3);
@@ -13897,20 +14051,15 @@ fn files_count_against_the_entry_limit_from_their_first_change() {
     }
 }
 
-/// Only changes the receiver reports it did not make are given back: one
-/// whose condition it found unmet, and one it skipped. One that failed
-/// after it may have changed something stays counted.
+/// A change counts once its request is authorized and is never given
+/// back, even one the receiver reports it did not make.
 #[test]
-fn only_changes_that_made_nothing_are_given_back() {
+fn changes_that_made_nothing_stay_counted() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
     let target = root.join("target");
     fs::create_dir_all(target.join("taken")).unwrap();
     let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
-    let unchanged = |message: &str| proto::WireError {
-        unchanged: true,
-        ..proto::WireError::from(message)
-    };
     let mut request = Request::Apply {
         ops: ["taken", "partly", "fine"]
             .iter()
@@ -13929,7 +14078,10 @@ fn only_changes_that_made_nothing_are_given_back() {
     authority.settle(
         settlement,
         &proto::Response::Applied(vec![
-            Some(unchanged("the name was taken")),
+            Some(proto::WireError {
+                condition_not_met: true,
+                ..proto::WireError::from("the name was taken")
+            }),
             Some(proto::WireError::from(
                 "set metadata: failed after creating it",
             )),
@@ -13938,7 +14090,7 @@ fn only_changes_that_made_nothing_are_given_back() {
     );
     assert_eq!(
         authority.changes.load(std::sync::atomic::Ordering::Relaxed),
-        2
+        3
     );
 }
 
@@ -14004,15 +14156,10 @@ fn changes_check_existence_only_where_numbers_mislead() {
     }
 }
 
-/// A small copy whose staging failed keeps the count of the files it may
-/// have staged: their sidecars stay for the fallback engine to resume, so
-/// they count against the entry limit as any file a change created. Here an
-/// invalid time fails each file's metadata after its sidecar is created,
-/// and a grant of one entry admits one such copy, not three; only Linux
-/// refuses that time, so only there. A small copy that fails before staging
-/// anything gives its count back.
+/// A small copy counts its files against the entry limit when it is
+/// prepared, and keeps the count when its staging fails.
 #[test]
-fn a_failed_small_copy_keeps_the_entries_its_staging_made() {
+fn a_small_copy_counts_its_files_when_prepared() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
     let target = root.join("target");
@@ -14053,11 +14200,7 @@ fn a_failed_small_copy_keeps_the_entries_its_staging_made() {
             path: path_bytes(file),
             expression_source: None,
             size: 1,
-            meta: proto::Meta {
-                // Not a valid time: setting it fails once the file exists.
-                mtime_nsec: 1_000_000_000,
-                ..plain_meta()
-            },
+            meta: plain_meta(),
         }],
     };
     let payload = || {
@@ -14068,22 +14211,26 @@ fn a_failed_small_copy_keeps_the_entries_its_staging_made() {
         }])
     };
 
-    // Different contents under `error-if-different`: nothing is staged, and
-    // the count comes back.
     fs::write(target.join("other"), b"y").unwrap();
-    let response = execute_on_connection(
-        &mut gate,
-        &mut ops,
-        Request::PrepareSmallFiles(offer(
-            &target.join("other"),
-            crate::cli::IfExists::ErrorIfDifferent,
-        )),
-    )
-    .unwrap();
-    assert!(
-        matches!(response, proto::Response::SmallFilesPrepared(_)),
-        "{response:?}"
-    );
+    let prepare = |gate: &mut PatchStreamGate, ops: &mut crate::fsops::FsOps| {
+        let response = execute_on_connection(
+            gate,
+            ops,
+            Request::PrepareSmallFiles(offer(
+                &target.join("other"),
+                crate::cli::IfExists::ErrorIfDifferent,
+            )),
+        )
+        .unwrap();
+        assert!(
+            matches!(response, proto::Response::SmallFilesPrepared(_)),
+            "{response:?}"
+        );
+    };
+    // Different contents under `error-if-different`: nothing is staged,
+    // and the file still counts.
+    prepare(&mut gate, &mut ops);
+    assert_eq!(changes(), 1);
     let response = execute_on_connection(&mut gate, &mut ops, payload()).unwrap();
     assert!(
         matches!(
@@ -14095,42 +14242,103 @@ fn a_failed_small_copy_keeps_the_entries_its_staging_made() {
         ),
         "{response:?}"
     );
-    assert_eq!(changes(), 0);
+    assert_eq!(changes(), 1);
+    let refused = execute_on_connection(
+        &mut gate,
+        &mut ops,
+        Request::PrepareSmallFiles(offer(
+            &target.join("other"),
+            crate::cli::IfExists::ErrorIfDifferent,
+        )),
+    )
+    .unwrap_err();
+    assert!(refused.contains("entry limit"), "{refused}");
+    assert_eq!(changes(), 1);
+    assert_eq!(fs::read(target.join("other")).unwrap(), b"y");
+}
 
-    // macOS accepts a nanosecond count of a whole second.
-    let tries = if cfg!(target_os = "linux") { 3 } else { 0 };
-    for index in 0..tries {
-        let file = target.join(format!("{index}-fail"));
-        let prepared = execute_on_connection(
-            &mut gate,
-            &mut ops,
-            Request::PrepareSmallFiles(offer(&file, crate::cli::IfExists::Update)),
-        );
-        if index > 0 {
-            let error = prepared.unwrap_err();
-            assert!(error.contains("entry limit"), "{error}");
-            continue;
-        }
-        assert!(
-            matches!(prepared, Ok(proto::Response::SmallFilesPrepared(_))),
-            "{prepared:?}"
-        );
-        let response = execute_on_connection(&mut gate, &mut ops, payload()).unwrap();
+/// A small copy whose files all pass the receiver's quick check finishes in
+/// its preparation's turn, with no payloads, and may change their metadata
+/// there: it counts against the entry limit, and is refused past it.
+#[test]
+fn a_small_copy_without_payloads_counts_its_metadata_changes() {
+    use std::os::unix::fs::PermissionsExt;
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let kept = target.join("kept");
+    fs::write(&kept, b"x").unwrap();
+    fs::set_permissions(&kept, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&kept)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH)
+        .unwrap();
+    let mut authority = test_authority_with_results(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        FilterPolicy::default(),
+        PublicationPolicy::AtomicStaged,
+        ExistingDestinationPolicy::Replace,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+        None,
+    )
+    .unwrap();
+    authority.copy.limits.max_entries = 2;
+    authority.copy.options.preserve_times = true;
+    authority.copy.options.preserve_permissions = true;
+    let authority = std::sync::Arc::new(authority);
+    let mut ops = authority.test_ops();
+    let mut gate = PatchStreamGate::new(authority.clone());
+    let changes = || authority.changes.load(std::sync::atomic::Ordering::Relaxed);
+    let mode = || fs::metadata(&kept).unwrap().permissions().mode() & 0o7777;
+    let offer = |mode: u32| {
+        Request::PrepareSmallFiles(proto::SmallCopyRequest {
+            reuse_block_size: None,
+            if_exists: crate::cli::IfExists::Update,
+            matching_flags: 0,
+            hash_policy: authority.hash_policy(),
+            copy_if: None,
+            directory: path_bytes(&target),
+            symlink_policy: proto::OperatorSymlinkPolicy::Refuse,
+            request_prefix: path_bytes(&target),
+            identity: proto::SmallCopyIdentity {
+                copy_id: [8; 16],
+                dst_leaf: None,
+            },
+            flags: proto::flags::TIMES | proto::flags::MODE,
+            files: vec![proto::SmallCopyFile {
+                path: path_bytes(&kept),
+                expression_source: None,
+                size: 1,
+                meta: proto::Meta {
+                    mode,
+                    ..plain_meta()
+                },
+            }],
+        })
+    };
+    for (count, wanted) in [(1, 0o644), (2, 0o600)] {
+        let response = execute_on_connection(&mut gate, &mut ops, offer(wanted)).unwrap();
         assert!(
             matches!(
-                response,
+                &response,
                 proto::Response::SmallFilesCopied(proto::SmallCopyResponse {
-                    outcome: proto::SmallCopyOutcome::StagingFailed(_),
+                    outcome: proto::SmallCopyOutcome::Published(results),
                     ..
-                })
+                }) if results[0].repaired
             ),
             "{response:?}"
         );
-        assert!(crate::fsops::partial_path(&file, &[8; 16])
-            .unwrap()
-            .exists());
-        assert_eq!(changes(), 1);
+        assert_eq!((changes(), mode()), (count, wanted));
     }
+    let refused = execute_on_connection(&mut gate, &mut ops, offer(0o644)).unwrap_err();
+    assert!(refused.contains("entry limit"), "{refused}");
+    assert_eq!((changes(), mode()), (2, 0o600));
 }
 
 /// A preparation that may neither create nor update its file only looks,
@@ -14194,8 +14402,8 @@ fn an_in_place_preparation_that_only_looks_changes_nothing() {
 }
 
 /// Two requests that may create the same file share its count against the
-/// entry limit: one that finds its condition unmet gives nothing back
-/// while the other may still create the file.
+/// entry limit: one that finds its condition unmet keeps the count, and
+/// the other still creates the file under it.
 #[test]
 fn a_refused_preparation_keeps_the_count_another_still_shares() {
     let temporary = crate::test_support::tempdir().unwrap();
@@ -14621,6 +14829,198 @@ fn keeping_files_renames_unchecked_beneath_directories_found_empty_or_made() {
         }
     }
     assert_eq!(fs::read(target.join("old/kept")).unwrap(), b"old");
+}
+
+/// Look a batch up for the planner on `ops`, a connection of `authority`,
+/// as one `Request::PlanBatch` does.
+fn look_up_batch(
+    authority: &RestrictedAuthority,
+    ops: &mut crate::fsops::FsOps,
+    directories: &[PathBuf],
+    others: &[PathBuf],
+) -> (Vec<Option<proto::Entry>>, Option<Vec<Option<proto::Entry>>>) {
+    let paths = |paths: &[PathBuf]| paths.iter().map(|path| path_bytes(path)).collect();
+    let mut request = Request::PlanBatch {
+        directories: paths(directories),
+        others: paths(others),
+        strict_metadata: false,
+    };
+    authority.authorize(&mut request, false).unwrap();
+    match ops.handle(&request) {
+        proto::Response::BatchPlan {
+            directories,
+            others,
+        } => (directories, others),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A planner that keeps several batch lookups in flight asks about a batch
+/// before it has applied the batches ahead of it: here, before it created
+/// the directory the batch's files go into. It then drops that reply and
+/// asks again in the batch's turn.
+///
+/// Keeping existing files on a filesystem without a no-replace rename, the
+/// receiver publishes by what it recorded of its own lookups. The early
+/// lookup of a name in a directory that is not there yet records nothing
+/// for it; the directory's creation and the lookup in turn record what an
+/// ordinary copy's would, and the file is renamed into place unchecked.
+#[test]
+fn an_early_batch_lookup_records_nothing_beneath_a_directory_not_yet_made() {
+    use crate::fsops::lookups::Looked;
+    use proto::TargetCondition::{Absent, Any};
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("there"), b"old").unwrap();
+    let mut authority = existence_authority(
+        &root,
+        ExistingDestinationPolicy::Skip,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+    )
+    .unwrap();
+    authority.copy.limits.max_entries = 64;
+    assume_lacking(&authority, true, false);
+    let mut ops = authority.test_ops();
+    let recorded = |name: &str| {
+        authority
+            .lookups
+            .as_ref()
+            .unwrap()
+            .get(format!("target/{name}").as_bytes())
+    };
+    let made = target.join("made");
+    let files = [made.join("first"), made.join("second")];
+
+    // The early lookup, sent before the batch ahead creates the directory.
+    let (_, found) = look_up_batch(&authority, &mut ops, &[], &files);
+    assert!(matches!(found.as_deref(), Some([None, None])));
+    assert_eq!(recorded("made/first"), None);
+    assert_eq!(recorded("made/second"), None);
+    assert_eq!(recorded("made"), None);
+
+    // The batch ahead, in its turn, finds the directory missing and
+    // creates it.
+    let (found, _) = look_up_batch(&authority, &mut ops, std::slice::from_ref(&made), &[]);
+    assert!(matches!(found[..], [None]));
+    assert_eq!(recorded("made"), Some(Looked::Absent));
+    carry_out(&authority, &mut ops, &mut apply(mkdir(&made))).unwrap();
+    assert_eq!(recorded("made"), Some(Looked::Empty));
+
+    // The lookup repeated in the batch's turn finds the names absent in a
+    // directory that is there, and records that.
+    let (_, found) = look_up_batch(&authority, &mut ops, &[], &files);
+    assert!(matches!(found.as_deref(), Some([None, None])));
+    assert_eq!(recorded("made/first"), Some(Looked::Absent));
+    let mut request = small_put_with(&files[0], Absent);
+    carry_out(&authority, &mut ops, &mut request).unwrap();
+    assert_eq!(small_put_condition(&request), Any);
+    assert_eq!(recorded("made/first"), Some(Looked::Claimed));
+    assert_eq!(fs::read(&files[0]).unwrap(), b"new");
+    // An early lookup that a later one repeats unchanged records the same
+    // thing twice: a file found stays kept.
+    for _ in 0..2 {
+        let (_, found) = look_up_batch(&authority, &mut ops, &[], &[target.join("there")]);
+        assert!(matches!(found.as_deref(), Some([Some(_)])));
+        assert!(matches!(recorded("there"), Some(Looked::Present { .. })));
+    }
+    let error = carry_out(
+        &authority,
+        &mut ops,
+        &mut small_put_with(&target.join("there"), Any),
+    )
+    .unwrap_err();
+    assert!(KeptExisting::is(&error), "{error:#}");
+    assert_eq!(fs::read(target.join("there")).unwrap(), b"old");
+}
+
+/// The same, where the batch ahead widens a directory that hides the
+/// batch's files. A copy that keeps existing files widens no directory
+/// that exists, so this arises replacing only existing files, on a
+/// filesystem without an exchange, where the receiver records the files
+/// its lookups find.
+///
+/// The early lookup cannot see into the directory and records nothing, so
+/// a publication on its strength alone is looked at by the receiver. The
+/// lookup in turn records the files that are there, and those alone.
+#[test]
+fn an_early_batch_lookup_records_nothing_in_a_directory_not_yet_widened() {
+    use crate::fsops::lookups::Looked;
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    let locked = target.join("locked");
+    fs::create_dir_all(&locked).unwrap();
+    fs::write(locked.join("found"), b"old").unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut authority = existence_authority(
+        &root,
+        ExistingDestinationPolicy::MustExist,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+    )
+    .unwrap();
+    authority.copy.limits.max_entries = 64;
+    authority.extra_options.widen_dirs = DirectoryWidening::Rsync;
+    assume_lacking(&authority, false, true);
+    let mut ops = authority.test_ops();
+    let lookups = authority.lookups.clone().unwrap();
+    let files = [locked.join("found"), locked.join("missing")];
+
+    // The early lookup, before the directory is widened.
+    let (_, found) = look_up_batch(&authority, &mut ops, &[], &files);
+    assert!(matches!(found.as_deref(), Some([None, None])));
+    assert_eq!(lookups.len(), 0);
+
+    // The batch ahead widens the directory.
+    let metadata = fs::metadata(&locked).unwrap();
+    let mut widen = Request::WidenDirectories {
+        access: 0o300,
+        remember: true,
+        directories: vec![(
+            path_bytes(&locked),
+            proto::TargetCondition::Matches {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            },
+        )],
+    };
+    let settlement = authority.authorize(&mut widen, false).unwrap();
+    let response = ops.handle(&widen);
+    assert!(
+        matches!(&response, proto::Response::WidenedDirectories(outcomes)
+            if outcomes.len() == 1 && outcomes[0].is_ok()),
+        "{response:?}"
+    );
+    authority.settle(settlement, &response);
+
+    // On the early reply alone nothing was recorded: the receiver looks
+    // for itself, and creates nothing.
+    let Err(error) = authority.authorize(&mut small_put(&locked.join("missing")), false) else {
+        panic!("a file was created under a grant that creates nothing")
+    };
+    assert!(KeptExisting::is(&error), "{error:#}");
+
+    // The lookup repeated in the batch's turn records the file it finds.
+    let (_, found) = look_up_batch(&authority, &mut ops, &[], &files);
+    assert!(matches!(found.as_deref(), Some([Some(_), None])));
+    assert_eq!(lookups.len(), 1);
+    assert!(matches!(
+        lookups.get(b"target/locked/found"),
+        Some(Looked::Present { .. })
+    ));
+    carry_out(&authority, &mut ops, &mut small_put(&locked.join("found"))).unwrap();
+    assert_eq!(fs::read(locked.join("found")).unwrap(), b"new");
+    let Err(error) = authority.authorize(&mut small_put(&locked.join("missing")), false) else {
+        panic!("a file was created under a grant that creates nothing")
+    };
+    assert!(KeptExisting::is(&error), "{error:#}");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 /// A destination reached through links, which the receiver then holds as

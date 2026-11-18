@@ -33,6 +33,7 @@ mod comparing;
 mod diagnostics;
 mod directory_stream;
 mod dry_run;
+mod early_lookups;
 mod hardlinks;
 mod planner;
 mod publication;
@@ -1696,9 +1697,9 @@ fn attempt_small_copy(
     progress.clear();
     let errors = progress.errors.load(Relaxed);
     let (status, exit_code) = if errors > 0 {
-        ("partial", 23)
+        (crate::results::Status::Partial, 23)
     } else {
-        ("success", 0)
+        (crate::results::Status::Success, 0)
     };
     drop(planning);
     drop(copying);
@@ -1713,25 +1714,8 @@ fn attempt_small_copy(
     drop(_native_work);
     drop(finalization);
     progress.finish(exit_code == 0);
-    let terminal = crate::results::ResultRecord {
-        status,
-        exit_code,
-        dry_run: false,
-        files_transferred: progress.files_done.load(Relaxed),
-        files_unchanged: progress.files_unchanged.load(Relaxed),
-        files_excluded: progress.excluded(),
-        directories_created: 0,
-        symlinks_created: 0,
-        specials_created: 0,
-        errors,
-        bytes_transferred: progress.bytes_done.load(Relaxed),
-        bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
-        timings: progress.timings(),
-        deletions_planned: None,
-        deletions_completed: None,
-        deletions_blocked: None,
-        replaced_not_in_place: None,
-    };
+    // The shortcut neither plans directories nor prunes.
+    let terminal = progress.result_record(status, exit_code, false, false, false);
     let elapsed = progress.display_elapsed().as_secs_f64();
     if !args.quiet && !args.suppress_summary {
         print_transfer_summary(
@@ -1938,8 +1922,8 @@ pub(crate) fn print_transfer_summary(
     );
     if let Some(summary) = terminal
         .replaced_not_in_place
-        .as_deref()
-        .and_then(|counts| in_place_refusal_summary(counts, false))
+        .as_ref()
+        .and_then(|counts| in_place_refusal_summary(&counts.counts(), false))
     {
         crate::output::human_stdout!("syq: {summary}");
     }
@@ -2268,47 +2252,46 @@ pub fn run(mut args: Args) -> Result<i32> {
         // including failures in deferred metadata and deletion finalization.
         progress.stop();
         progress.finish(false);
-        // The error text reaches stderr via main; the stream gets it as a
-        // counted error record, then its terminal record, so a consumer
-        // never mistakes a handled fatal for a crash (only a real crash
-        // leaves the terminal record missing) and can say why it failed.
-        if let Some(results) = progress.results_writer() {
-            if let (Err(error), true) = (&outcome, records_failure) {
-                let os_kind = os_kind_of(error);
-                progress.errors.fetch_add(1, Relaxed);
-                results.emit_error_classified(
-                    &format!("syq: {error:#}"),
-                    os_kind.map(|_| "io"),
-                    os_kind,
-                );
-            }
-            results.emit_result(&crate::results::ResultRecord {
-                status: "failed",
-                exit_code: 1,
-                dry_run,
-                files_transferred: progress.files_done.load(Relaxed),
-                files_unchanged: progress.files_unchanged.load(Relaxed),
-                files_excluded: progress.excluded(),
-                // Mutations that settled (and streamed their records)
-                // before the run died must not vanish from the aggregates.
-                directories_created: progress.directories_created.load(Relaxed),
-                symlinks_created: progress.symlinks_created.load(Relaxed),
-                specials_created: progress.specials_created.load(Relaxed),
-                errors: progress.errors.load(Relaxed),
-                bytes_transferred: progress.bytes_done.load(Relaxed),
-                bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
-                timings: progress.timings(),
-                // What the deletion pass did before the run died; zeros
-                // mean it never got that far, and status "failed" already
-                // marks every aggregate here as pre-failure state.
-                deletions_planned: prune.then(|| progress.deletions_planned.load(Relaxed)),
-                deletions_completed: prune.then(|| progress.deletions_completed.load(Relaxed)),
-                deletions_blocked: prune.then(|| progress.deletions_blocked.load(Relaxed)),
-                replaced_not_in_place: in_place_update.then(|| progress.in_place_refusals.counts()),
-            });
-        }
+        record_failure(
+            &progress,
+            outcome.as_ref().err().filter(|_| records_failure),
+            (dry_run, prune, in_place_update),
+        );
     }
     outcome
+}
+
+/// Settle a copy's results stream after a fatal `error`, which the stream
+/// records unless the caller that lent this copy its stream records it.
+/// The error text reaches stderr via main; the stream gets it as a counted
+/// error record, then its terminal record, so a consumer never mistakes a
+/// handled fatal for a crash (only a real crash leaves the terminal record
+/// missing) and can say why it failed.
+fn record_failure(
+    progress: &Progress,
+    error: Option<&anyhow::Error>,
+    (dry_run, prune, in_place_update): (bool, bool, bool),
+) {
+    let Some(results) = progress.results_writer() else {
+        return;
+    };
+    if let Some(error) = error {
+        let os_kind = os_kind_of(error);
+        progress.errors.fetch_add(1, Relaxed);
+        results.emit_error_classified(&format!("syq: {error:#}"), os_kind.map(|_| "io"), os_kind);
+    }
+    // Mutations that settled (and streamed their records) before the run
+    // died must not vanish from the aggregates. Deletion counts are what the
+    // deletion pass did before the run died; zeros mean it never got that
+    // far, and status "failed" already marks every aggregate here as
+    // pre-failure state.
+    results.emit_result(&progress.result_record(
+        crate::results::Status::Failed,
+        1,
+        dry_run,
+        prune,
+        in_place_update,
+    ));
 }
 
 pub(crate) fn uses_remote_coordinator(args: &Args, sources: &[Location], dst: &Location) -> bool {
@@ -2596,9 +2579,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         crate::destination::prepare(&mut args)?;
     }
     let block = args.block_size;
-    args.tuning_options
-        .unwrap_or_default()
-        .validate(args.bwlimit_bytes)?;
+    args.tuning_options.unwrap_or_default().validate()?;
     let max_size = args.max_size.as_deref().map(parse_size).transpose()?;
     let min_size = args.min_size.as_deref().map(parse_size).transpose()?;
     let bwlimit = (args.bwlimit_bytes > 0)
@@ -2903,7 +2884,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
 
     if opts.benchmark.is_some() {
         crate::output::diagnostic!(
-            "syq: tuning before transport selection: request-size={} bytes (ordinary ceiling, after logical pacing), adaptive-ordinary-requests={}, streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, transfer-strategy={} (block reuse {}), batch-files={}, batch-bytes={}, split-min-size={}, bw-pacing={}",
+            "syq: tuning before transport selection: request-size={} bytes (ordinary ceiling, after logical pacing), adaptive-ordinary-requests={}, streaming-block-size={} bytes, pipeline-depth={}, hash-block-size={} bytes, copy-path={}, transfer-strategy={} (block reuse {}), batch-files={}, batch-bytes={}, split-min-size={}",
             opts.tuning.request_size(block, bwlimit.as_deref()),
             opts.adaptive_ranges(),
             opts.tuning.streaming_request_size(block, bwlimit.as_deref()),
@@ -2913,7 +2894,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             if opts.transfer_strategy.reuse_destination_blocks(opts.same_host) { "on" } else { "off" },
             opts.tuning.batch_files.unwrap_or(FAST_BATCH_FILES),
             opts.tuning.batch_bytes(), opts.tuning.split_min_size(block),
-            if bwlimit.is_some() { opts.tuning.bw_pacing.unwrap_or_default().to_string() } else { "disabled".into() }
         );
     }
     let mapping_contents = args.mapping_contents.clone();
@@ -3584,11 +3564,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let transport_budget = (args.bwlimit_bytes > 0 && (opts.src_remote || opts.dst_remote))
         .then(|| Arc::new(crate::bwlimit::transport::Budget::new(args.bwlimit_bytes)));
     if let Some(budget) = &transport_budget {
-        if opts.tuning.bw_pacing.is_some() {
-            crate::output::diagnostic!(
-                "syq: bw-pacing has no effect on this copy; the bandwidth cap paces compressed bytes at the sender"
-            );
-        }
         for (ep, ctl, source) in [
             (&src_ep, &mut src_ctl, true),
             (&dst_ep, &mut dst_ctl, false),
@@ -5013,6 +4988,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         },
         active_source: None,
         hardlinks: Default::default(),
+        early_lookups: Default::default(),
     };
 
     let mut scan_err = None;
@@ -5418,11 +5394,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // live runs; drop it here so the terminal record and the human dry-run
     // summary count the same set (spec: summary renders from the record).
     dry_run_changes.directories.remove(&dst_root);
-    let created_counts = (
-        progress.directories_created.load(Relaxed),
-        progress.symlinks_created.load(Relaxed),
-        progress.specials_created.load(Relaxed),
-    );
     drop(st);
     // Every change is settled: end the destination's results, which also
     // ends its grant.
@@ -5456,66 +5427,32 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // aborts trump entry errors, which trump a blocked deletion pass (its
     // fact survives in deletions_blocked).
     let (status, exit_code) = if aborted {
-        ("aborted", 1)
+        (crate::results::Status::Aborted, 1)
     } else if errors > 0 {
-        ("partial", 23)
+        (crate::results::Status::Partial, 23)
     } else if max_delete_hit {
-        ("refused", 25)
+        (crate::results::Status::Refused, 25)
     } else {
-        ("success", 0)
+        (crate::results::Status::Success, 0)
     };
     drop(finalization);
     progress.finish(exit_code == 0);
-    let (deletions_planned, deletions_completed, deletions_blocked) = if opts.delete {
-        let planned = match delete_plan {
-            DeletePlan::Planned(n) => n,
-            _ => 0,
-        };
-        (
-            Some(planned),
-            Some(deleted),
-            Some(if max_delete_hit { planned } else { 0 }),
-        )
-    } else {
-        (None, None, None)
-    };
     // Hard v1 rule: the human summary below renders from this same struct,
     // so the numbers a person reads and a machine parses cannot disagree.
-    let terminal = crate::results::ResultRecord {
+    let mut terminal = progress.result_record(
         status,
         exit_code,
-        dry_run: opts.dry_run,
-        files_transferred: progress.files_done.load(Relaxed),
-        files_unchanged: progress.files_unchanged.load(Relaxed),
-        files_excluded: progress.excluded(),
-        // Live counters only move when mutations run; a dry run reports the
-        // planned work it traced instead.
-        directories_created: if opts.dry_run {
-            dry_run_changes.directories.len() as u64
-        } else {
-            created_counts.0
-        },
-        symlinks_created: if opts.dry_run {
-            dry_run_changes.symlinks
-        } else {
-            created_counts.1
-        },
-        specials_created: if opts.dry_run {
-            dry_run_changes.specials
-        } else {
-            created_counts.2
-        },
-        errors,
-        bytes_transferred: progress.bytes_done.load(Relaxed),
-        bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
-        timings: progress.timings(),
-        deletions_planned,
-        deletions_completed,
-        deletions_blocked,
-        replaced_not_in_place: opts
-            .inplace_update
-            .then(|| progress.in_place_refusals.counts()),
-    };
+        opts.dry_run,
+        opts.delete,
+        opts.inplace_update,
+    );
+    // Live counters only move when mutations run; a dry run reports the
+    // planned work it traced instead.
+    if opts.dry_run {
+        terminal.directories_created = dry_run_changes.directories.len() as u64;
+        terminal.symlinks_created = dry_run_changes.symlinks;
+        terminal.specials_created = dry_run_changes.specials;
+    }
 
     if let (Some(history), Some(initial)) = (
         progress.tuning_history.get(),
@@ -6300,43 +6237,93 @@ fn stat_and_canonicalize(
     Ok((entry, canonical))
 }
 
+/// What a source scan gives the planner (`scan_into_planner`).
+enum Scanned<'a> {
+    /// The next batch to plan. `shown` when it was `Upcoming` before.
+    Batch { entries: Vec<Entry>, shown: bool },
+    /// A batch the scan has complete while earlier ones are still to be
+    /// planned (`Conn::scan_ahead`). It comes as a `Batch` in its turn.
+    Upcoming(&'a [Entry]),
+}
+
 /// Run a source scan whose batches feed the planner, and remember whether it
 /// reported any problem — `scan_warned` is what gates --delete, so every
-/// source walk must go through here.
+/// source walk must go through here. With `ahead`, `f` is also shown the
+/// batches to come, when the planner looks destinations up early
+/// (`Planner::looks_up_early`).
 fn scan_into_planner(
     pl: &mut Planner<'_>,
     src: &mut dyn Conn,
     root: &[u8],
     source: Option<&RegisteredPath>,
-    follow_root: bool,
+    (follow_root, ahead): (bool, bool),
     ignore: &[String],
-    mut f: impl FnMut(&mut Planner<'_>, Vec<Entry>) -> Result<()>,
+    f: impl FnMut(&mut Planner<'_>, Scanned<'_>) -> Result<()>,
 ) -> Result<()> {
     let progress = pl.progress;
     let quiet = pl.opts.quiet;
     let warned = std::cell::Cell::new(false);
-    let res = src.scan(
-        root,
-        source,
-        follow_root,
-        ignore,
-        false,
-        &mut |batch| f(pl, batch),
-        &mut |_| Ok(()),
-        &mut |w| {
-            let w = w.to_string();
-            // "skipping …" is a notice (nothing the copy owes is missing);
-            // anything else from the scanner means an entry was lost.
-            if w.starts_with("skipping ") {
-                if !quiet {
-                    progress.eprintln(&format!("syq: {w}"));
-                }
-            } else {
-                warned.set(true);
-                progress.error(&format!("syq: {w}"));
+    let mut warn = |w: crate::proto::ScanWarning| {
+        let w = w.to_string();
+        // "skipping …" is a notice (nothing the copy owes is missing);
+        // anything else from the scanner means an entry was lost.
+        if w.starts_with("skipping ") {
+            if !quiet {
+                progress.eprintln(&format!("syq: {w}"));
             }
-        },
-    );
+        } else {
+            warned.set(true);
+            progress.error(&format!("syq: {w}"));
+        }
+    };
+    let ahead = ahead && pl.looks_up_early();
+    // The planner, `f`, and how many batches were shown and not yet planned.
+    let state = std::cell::RefCell::new((pl, f, 0usize));
+    let mut sink = |entries: Vec<Entry>| {
+        let (pl, f, shown) = &mut *state.borrow_mut();
+        let was_shown = *shown > 0;
+        *shown -= usize::from(was_shown);
+        f(
+            pl,
+            Scanned::Batch {
+                entries,
+                shown: was_shown,
+            },
+        )
+    };
+    let res = if ahead {
+        src.scan_ahead(
+            root,
+            source,
+            follow_root,
+            ignore,
+            false,
+            &mut sink,
+            &mut |entries| {
+                let (pl, f, shown) = &mut *state.borrow_mut();
+                // Only a hint: the batch's own turn reports what goes wrong.
+                if f(pl, Scanned::Upcoming(entries)).is_ok() {
+                    *shown += 1;
+                }
+            },
+            &mut |_| Ok(()),
+            &mut warn,
+        )
+    } else {
+        src.scan(
+            root,
+            source,
+            follow_root,
+            ignore,
+            false,
+            &mut sink,
+            &mut |_| Ok(()),
+            &mut warn,
+        )
+    };
+    let (pl, ..) = state.into_inner();
+    // Batches shown but never planned leave their lookups unanswered.
+    pl.drop_early_lookups();
     if warned.get() {
         pl.scan_warned = true;
     }

@@ -1080,6 +1080,96 @@ done
 ssh source 'syq cp --if-exists=keep --copy-metadata permissions --srcs-in /tmp/syq-real-ssh/network-deep --to @laptop --into local-deep-keep'
 local_manifest "$receive_root/local-deep-keep" | diff -u /tmp/syq-network-deep-source.manifest -
 
+printf 'case: a restricted receiver answers lookups sent ahead of their scan batches\n'
+# A copy plans its source in batches and asks the destination about several
+# of them ahead of their turn. When an earlier batch changes the destination
+# it drops those replies and asks again. The laptop's receiver, keeping
+# existing files on a filesystem without a no-replace rename (a debug-build
+# hook), publishes by what it recorded of those lookups: every new file's
+# name must have been found absent, so that it is renamed into place.
+ssh source python3 - <<'AHEAD_TREE'
+import os
+root = "/tmp/syq-real-ssh/ahead-tree/a"
+os.makedirs(root)
+for index in range(12000):
+    with open(f"{root}/f{index:05}", "w") as out:
+        out.write("data")
+AHEAD_TREE
+syq persist off
+SYQ_TEST_NO_RENAME_NOREPLACE=1 SYQ_TEST_PUBLICATION_CLAIMS=/tmp/syq-ahead-claims \
+    syq persist connect source
+syq persist receive wait source --timeout 30
+ssh source 'syq persist destinations wait laptop --timeout 30'
+ahead_copy() {
+    ssh source 'rm -f /tmp/syq-ahead-early'
+    rm -f /tmp/syq-ahead-claims
+    # The scan holds every batch it may, so each lookup that can go early does.
+    ssh source 'SYQ_TEST_SCAN_AHEAD_WAIT=1 SYQ_TEST_EARLY_LOOKUPS=/tmp/syq-ahead-early syq cp --if-exists=keep --no-progress --srcs-in /tmp/syq-real-ssh/ahead-tree --to @laptop --into ahead'
+    # What became of each early lookup, and what the receiver's record gave
+    # each publication.
+    # A copy into an empty destination asks about no batch.
+    ssh source 'test ! -e /tmp/syq-ahead-early || cut -d" " -f1 /tmp/syq-ahead-early | sort | uniq -c' >/tmp/syq-ahead-fates
+    { test ! -e /tmp/syq-ahead-claims || sort /tmp/syq-ahead-claims | uniq -c; } >/tmp/syq-ahead-claimed
+}
+ahead_count() {
+    awk -v name="$2" '$2 == name { count = $1 } END { print count + 0 }' "$1"
+}
+ahead_copy
+test "$(find "$receive_root/ahead/a" -type f | wc -l)" -eq 12000
+# The destination now holds the tree. A new directory sorts after the
+# existing files, two batches into the scan, so the batch that holds it
+# creates it while the lookups for the batches after it are in flight; those
+# batches hold new files of the existing directory, and the new directory's
+# own files follow.
+ssh source python3 - <<'AHEAD_MORE'
+import os
+root = "/tmp/syq-real-ssh/ahead-tree/a"
+os.mkdir(f"{root}/fz.d")
+for index in range(4000):
+    with open(f"{root}/fz.d/h{index:05}", "w") as out:
+        out.write("data")
+    with open(f"{root}/g{index:05}", "w") as out:
+        out.write("data")
+AHEAD_MORE
+printf 'kept\n' >"$receive_root/ahead/a/f00007"
+ahead_copy
+ahead_sent=$(ahead_count /tmp/syq-ahead-fates sent)
+ahead_used=$(ahead_count /tmp/syq-ahead-fates used)
+ahead_dropped=$(($(ahead_count /tmp/syq-ahead-fates repeated) + $(ahead_count /tmp/syq-ahead-fates withdrawn)))
+ahead_discarded=$(ahead_count /tmp/syq-ahead-fates discarded)
+if [ "$ahead_used" -lt 1 ] || [ "$ahead_dropped" -lt 1 ] ||
+    [ "$ahead_sent" -ne $((ahead_used + ahead_dropped + ahead_discarded)) ]; then
+    echo 'the copy did not both use and drop lookups sent ahead:' >&2
+    cat /tmp/syq-ahead-fates >&2
+    exit 1
+fi
+# Every new file was published at a name the receiver had recorded absent,
+# its own or beneath the directory it created: none at a name it did not
+# know, which it would have had to link into place.
+if [ "$(ahead_count /tmp/syq-ahead-claimed Absent)" -ne 8000 ] ||
+    [ "$(wc -l </tmp/syq-ahead-claimed)" -ne 1 ]; then
+    echo 'the receiver did not find every new name absent:' >&2
+    cat /tmp/syq-ahead-claimed >&2
+    exit 1
+fi
+test "$(cat "$receive_root/ahead/a/f00007")" = kept
+printf 'data' >"$receive_root/ahead/a/f00007"
+remote_manifest source /tmp/syq-real-ssh/ahead-tree /tmp/syq-ahead-source.manifest
+local_manifest "$receive_root/ahead" | diff -u /tmp/syq-ahead-source.manifest -
+# Unchanged, every lookup sent ahead is used and nothing is published.
+ahead_copy
+ahead_sent=$(ahead_count /tmp/syq-ahead-fates sent)
+if [ "$ahead_sent" -lt 2 ] || [ "$ahead_sent" -ne "$(ahead_count /tmp/syq-ahead-fates used)" ] ||
+    [ -s /tmp/syq-ahead-claimed ]; then
+    echo 'an unchanged copy did not use every lookup it sent ahead:' >&2
+    cat /tmp/syq-ahead-fates /tmp/syq-ahead-claimed >&2
+    exit 1
+fi
+syq persist off
+syq persist connect source
+syq persist receive wait source --timeout 30
+ssh source 'syq persist destinations wait laptop --timeout 30'
+
 printf 'case: named return rejects traversal and receiver symlink escape\n'
 ln -s /tmp/syq-real-ssh-receive-other "$receive_root/escape"
 if ssh source 'syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as escape/escaped'; then
@@ -1746,8 +1836,21 @@ rebuild_copy() {
         --from source --srcs-in /tmp/syq-real-ssh/rebuild-source \
         --to destination --into /tmp/syq-real-ssh/rebuild-destination 2>&1
 }
+# Its results stream counts every error record it holds: the receiver's
+# refusal, relayed as it arrived, and the failure here.
+rebuild_refused_results() {
+    python3 - "$1" <<'PYTHON'
+import json, sys
+records = [json.loads(line) for line in open(sys.argv[1])]
+counted = [r for r in records if r["type"] == "error" and "diagnostic_for" not in r]
+assert records[-1]["type"] == "result" and records[-1]["status"] == "failed", records
+# At least the relayed refusal and this machine's own failure.
+assert len(counted) >= 2 and records[-1]["errors"] == len(counted), records
+PYTHON
+}
 # The refused copy says to run it again, and changes nothing there.
-if rebuild_output=$(rebuild_copy); then
+rm -f /tmp/syq-real-ssh-rebuild-refused.ndjson
+if rebuild_output=$(rebuild_copy --results /tmp/syq-real-ssh-rebuild-refused.ndjson); then
     printf '%s\n' "$rebuild_output" >&2
     echo 'a copy against a receiver of another build unexpectedly succeeded' >&2
     exit 1
@@ -1757,6 +1860,7 @@ case "$rebuild_output" in
     *) printf '%s\n' "$rebuild_output" >&2; exit 1 ;;
 esac
 ssh destination 'test ! -e /tmp/syq-real-ssh/rebuild-destination'
+rebuild_refused_results /tmp/syq-real-ssh-rebuild-refused.ndjson
 # The next copy updates the receiver and runs.
 rm -f /tmp/syq-real-ssh-rebuild.ndjson
 rebuild_output=$(rebuild_copy --results /tmp/syq-real-ssh-rebuild.ndjson) || {
@@ -1777,7 +1881,8 @@ PYTHON
 # A dry run says so and updates nothing, and the next copy updates it.
 stale_receiver
 ssh destination 'rm -rf /tmp/syq-real-ssh/rebuild-destination'
-if rebuild_output=$(rebuild_copy --dry-run); then
+rm -f /tmp/syq-real-ssh-rebuild-refused.ndjson
+if rebuild_output=$(rebuild_copy --dry-run --results /tmp/syq-real-ssh-rebuild-refused.ndjson); then
     printf '%s\n' "$rebuild_output" >&2
     echo 'a dry run against a receiver of another build unexpectedly succeeded' >&2
     exit 1
@@ -1786,6 +1891,7 @@ case "$rebuild_output" in
     *'a dry run does not update it, but the next copy does'*) ;;
     *) printf '%s\n' "$rebuild_output" >&2; exit 1 ;;
 esac
+rebuild_refused_results /tmp/syq-real-ssh-rebuild-refused.ndjson
 rebuild_output=$(rebuild_copy) || {
     printf '%s\n' "$rebuild_output" >&2
     exit 1
@@ -2391,7 +2497,7 @@ assert_same_tree \
 
 printf 'case: tuning overrides for range uploads, downloads, direct copies, and relay\n'
 dd if=/dev/urandom of=/tmp/syq-real-ssh-tuning.bin bs=1M count=9 status=none
-exercise_tuning tuning 1 copy-path=ranges,request-size=2M,pipeline-depth=64,split-min-size=8M,bw-pacing=average 120s
+exercise_tuning tuning 1 copy-path=ranges,request-size=2M,pipeline-depth=64,split-min-size=8M 120s
 
 printf 'case: restricted authorization accepts 128 workers\n'
 syq cp --from source /tmp/syq-real-ssh/tuning-tcp --to destination \
@@ -2416,7 +2522,7 @@ for transport in tcp ssh; do
 done
 
 printf 'case: experimental streaming over TCP/SSH and each coordinator\n'
-exercise_tuning streaming 2 copy-path=streaming,request-size=128K,split-min-size=1M,bw-pacing=average 25s
+exercise_tuning streaming 2 copy-path=streaming,request-size=128K,split-min-size=1M 25s
 
 printf 'case: batch overrides through a command-restricted receiver\n'
 ssh source 'mkdir /tmp/syq-real-ssh/tuning-batches; for n in 1 2 3 4 5 6 7; do dd if=/dev/urandom of=/tmp/syq-real-ssh/tuning-batches/$n bs=1024 count=600 status=none; done'

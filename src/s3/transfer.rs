@@ -102,7 +102,7 @@ pub(super) struct Engine {
     options: Options,
     client: Client,
     progress: Arc<Progress>,
-    pace: Mutex<tokio::time::Instant>,
+    bandwidth: Option<crate::bwlimit::BandwidthLimit>,
     upload_keys: OnceLock<HashMap<String, u64>>,
     copy_checksum_unsupported: std::sync::atomic::AtomicBool,
     copy_tagging_unsupported: std::sync::atomic::AtomicBool,
@@ -277,11 +277,12 @@ impl Engine {
             cancel_wake: tokio::sync::Notify::new(),
             uploads,
             authorization,
+            bandwidth: (args.bwlimit_bytes != 0)
+                .then(|| crate::bwlimit::BandwidthLimit::new(args.bwlimit_bytes)),
             args,
             options,
             client,
             progress,
-            pace: Mutex::new(tokio::time::Instant::now()),
             upload_keys: OnceLock::new(),
             copy_checksum_unsupported: Default::default(),
             content_md5: content_md5.into(),
@@ -822,14 +823,10 @@ impl Engine {
     }
     async fn pace(&self, n: u64) -> Result<()> {
         self.check_cancelled()?;
-        if self.args.bwlimit_bytes == 0 {
+        let Some(limit) = &self.bandwidth else {
             return Ok(());
-        }
-        let mut next = self.pace.lock().await;
-        let now = tokio::time::Instant::now();
-        let start = (*next).max(now);
-        *next = start + Duration::from_secs_f64(n as f64 / self.args.bwlimit_bytes as f64);
-        drop(next);
+        };
+        let start = limit.reserve(std::time::Instant::now(), n);
         let cancelled = self.cancel_wake.notified();
         tokio::pin!(cancelled);
         // Register before checking the flag so a concurrent signal cannot be lost.
@@ -837,7 +834,7 @@ impl Engine {
         self.check_cancelled()?;
         tokio::select! {
             _ = &mut cancelled => {},
-            _ = tokio::time::sleep_until(start) => {},
+            _ = tokio::time::sleep_until(start.into()) => {},
         }
         self.check_cancelled()
     }

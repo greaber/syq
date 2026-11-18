@@ -1140,6 +1140,9 @@ mod data_safety;
 #[cfg(debug_assertions)]
 #[path = "local/directory_privacy.rs"]
 mod directory_privacy;
+#[cfg(debug_assertions)]
+#[path = "local/early_lookups.rs"]
+mod early_lookups;
 #[path = "local/existing_policy.rs"]
 mod existing_policy;
 #[path = "local/fifo.rs"]

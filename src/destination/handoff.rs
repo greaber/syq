@@ -57,7 +57,6 @@ pub(crate) struct Selection {
     pub(super) name: String,
     pub(super) registration: Registration,
     pub(super) kind: Kind,
-    pub(super) target: Option<String>,
 }
 
 impl std::fmt::Debug for Selection {
@@ -66,23 +65,16 @@ impl std::fmt::Debug for Selection {
         f.debug_struct("Selection")
             .field("name", &self.name)
             .field("kind", &self.kind)
-            .field("target", &self.target)
             .finish_non_exhaustive()
     }
 }
 
 impl Selection {
-    pub(super) fn new(
-        name: String,
-        registration: Registration,
-        kind: Kind,
-        target: Option<String>,
-    ) -> Self {
+    pub(super) fn new(name: String, registration: Registration, kind: Kind) -> Self {
         Self {
             name,
             registration,
             kind,
-            target,
         }
     }
 

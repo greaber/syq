@@ -2378,9 +2378,9 @@ impl FsOps {
             "SYQ_TEST_SOURCE_RECHECK_CONTINUE_FILE",
             "small-file source recheck before sending",
         )?;
-        // Keep the existing parallel metadata lookup and return its results
-        // alongside the data, avoiding a separate round trip. Never substitute
-        // a diagnostic path for a registered source's capability.
+        // Return the metadata alongside the data, avoiding a separate round
+        // trip. Never substitute a diagnostic path for a registered source's
+        // capability.
         for registered in [true, false] {
             let indices: Vec<_> = reads
                 .iter()
@@ -2399,7 +2399,7 @@ impl FsOps {
                     .map(|&i| reads[i].source().cloned().unwrap())
                     .collect()
             });
-            let entries = self.stat_many_request(&paths, sources.as_deref(), false)?;
+            let entries = self.stat_sources_request(&paths, sources.as_deref(), false, true)?;
             for (i, entry) in indices.into_iter().zip(entries) {
                 blocks[i].as_mut().unwrap().set_source(entry);
             }
@@ -2457,7 +2457,7 @@ impl FsOps {
         }
         observed_write(&self.operation, &file, data, 0, self.sparse)
             .with_context(|| format!("write {}", rooted.label.display()))?;
-        check_destination_writes(&file, &rooted.label)?;
+        check_written_file(&rooted.root, Some(created.dev()), &file, &rooted.label)?;
         set_meta_written_file(&file, meta, *flags, &created)
             .with_context(|| format!("set metadata {}", rooted.label.display()))?;
         // As when an in-place file is finalized (`finalize_held`): the file
@@ -3065,8 +3065,7 @@ impl FsOps {
     /// held while its name still leads to it and the copy goes on, so that
     /// it can be finalized again. A Finalize sent again after its connection dropped waits for
     /// the first one, and then finds the file held again, or published, and
-    /// then answers as the first one did. One that may publish nothing new
-    /// (`set_finalize_repeat_only`) only answers so.
+    /// then answers as the first one did.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn finalize_rooted(
         &mut self,
@@ -3080,13 +3079,7 @@ impl FsOps {
         expected: Option<&crate::hashing::ExpectedHashes>,
     ) -> Result<Option<(u64, u64)>> {
         let held_for = stages::of(self.stage_scope, target, copy_id, inplace);
-        let found = match self.finalize_repeat_only {
-            Some(refusal) => Some(stages::Found::Published(
-                stages::repeated(held_for).ok_or_else(|| anyhow!(refusal))?,
-            )),
-            None => stages::finalize(held_for),
-        };
-        let (held, finalizing) = match found {
+        let (held, finalizing) = match stages::finalize(held_for) {
             Some(stages::Found::Held(held, finalizing)) => (*held, finalizing),
             Some(stages::Found::Published(identity)) => {
                 self.finalize_repeated = true;
@@ -3188,7 +3181,7 @@ impl FsOps {
                 _ => file.metadata()?,
             };
             require_open_target_known(&current, &target.label, condition)?;
-            check_destination_writes(&file, &target.label)?;
+            check_written_file(&target.root, Some(current.dev()), &file, &target.label)?;
             if let Some(expected) = expected {
                 Self::verify_expected_held(&target.root, &target.relative, &file, expected)?;
             }
@@ -3252,7 +3245,11 @@ impl FsOps {
         let (meta, flags) = resolved
             .as_ref()
             .map_or((meta, flags), |(meta, flags)| (meta, *flags));
-        check_destination_writes(&file, &src)?;
+        // A sidecar with no metadata read, as one resumed from an earlier
+        // attempt or written by a whole-file local copy, is checked
+        // whatever it is on.
+        let dev = created.as_ref().map(MetadataExt::dev);
+        check_written_file(&target.root, dev, &file, &src)?;
         if let Some(expected) = expected {
             Self::verify_expected_held(&target.root, &src_relative, &file, expected)?;
         }
@@ -4528,7 +4525,7 @@ fn remove_unwritten_partial(root: &Root, relative: &RelativePath) -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        if !super::fs_caps::leases_show_writers(&file) {
+        if !root.leases_show_writers_on(metadata.dev(), &file) {
             return false;
         }
         // Nothing releases this lease when it is broken: a writer's open
@@ -4812,25 +4809,38 @@ pub(super) fn timespec(sec: i64, nsec: u32) -> libc::timespec {
     }
 }
 
+/// `check_destination_writes` for a file written beneath `root`, wherever a
+/// close may report a write error. On a local Linux filesystem whose close
+/// reports none, the check would cost each file two system calls that take
+/// the lock on the process's descriptor table, which the threads of a
+/// receiver writing small files contend for. `dev` is the device `file` is
+/// on when the caller already knows it, so that the decision needs no
+/// system call; without it the check is made.
+pub(super) fn check_written_file(
+    root: &Root,
+    dev: Option<u64>,
+    file: &File,
+    label: &Path,
+) -> Result<()> {
+    if dev.is_some_and(|dev| !root.close_reports_writes_on(dev)) {
+        return Ok(());
+    }
+    check_destination_writes(file, label)
+}
+
 /// Collect pending write errors before metadata changes and publication, while
-/// keeping the original inode pinned. Linux NFS flushes on a duplicate close.
-/// macOS closes duplicates without calling the filesystem, so flush NFS/SMB
-/// explicitly there. This is not a general crash-durability guarantee and does
-/// not collect every error reported on other workers' cached handles.
+/// keeping the original inode pinned. Linux NFS, SMB and FUSE flush on a
+/// duplicate close. macOS closes duplicates without calling the filesystem,
+/// so flush NFS/SMB explicitly there. This is not a general crash-durability
+/// guarantee and does not collect every error reported on other workers'
+/// cached handles.
 pub(crate) fn check_destination_writes(file: &File, label: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let check = || -> io::Result<()> {
-            let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
-            // SAFETY: fstatfs initializes stats, including a NUL-terminated type
-            // name, on success. Inspect this inode, not a root that might have
-            // a different filesystem mounted underneath it.
-            crate::sys::retry_zero(|| unsafe {
-                libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr())
-            })?;
-            let stats = unsafe { stats.assume_init() };
-            let kind = unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) };
-            if matches!(kind.to_bytes(), b"nfs" | b"smbfs") {
+            // Inspect this inode, not a root that might have a different
+            // filesystem mounted underneath it.
+            if matches!(super::file_system_of(file)?.kind(), b"nfs" | b"smbfs") {
                 // Use ordinary fsync: Rust's sync_all/sync_data request the
                 // stronger, expensive F_FULLFSYNC on macOS. Local filesystems
                 // need neither this flush nor an ineffective duplicate close.
@@ -4852,9 +4862,18 @@ pub(crate) fn check_destination_writes(file: &File, label: &Path) -> Result<()> 
     }
 }
 
+#[cfg(all(test, not(target_os = "macos")))]
+thread_local! {
+    /// How many duplicate descriptors this thread closed to check writes.
+    pub(super) static WRITER_CLOSES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 #[cfg(not(target_os = "macos"))]
 fn close_writer(file: File, label: &Path) -> Result<()> {
     use std::os::fd::IntoRawFd;
+    #[cfg(test)]
+    WRITER_CLOSES.set(WRITER_CLOSES.get() + 1);
     let check = || -> io::Result<()> {
         let fd = file.into_raw_fd();
         // SAFETY: into_raw_fd transfers ownership. Close exactly once: retrying
@@ -5335,6 +5354,14 @@ pub(super) enum OpenedPartial {
 }
 
 impl OpenedPartial {
+    /// The device the stage is on, when its metadata was read.
+    pub(super) fn dev(&self) -> Option<u64> {
+        match self {
+            OpenedPartial::Created(created) => Some(created.dev()),
+            OpenedPartial::Reused(_) => None,
+        }
+    }
+
     /// The length of the reopened partial, whose bytes may be resumed.
     pub(super) fn basis_size(&self) -> Option<u64> {
         match self {

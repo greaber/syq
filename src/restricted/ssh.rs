@@ -3,7 +3,6 @@
 //! A worker's SSH session process hands its input and output to the
 //! receiver over that socket, and the receiver serves them on a thread.
 
-use super::RestrictedAuthority;
 use crate::private_broker::{
     BrokerBase, BrokerDirectory, BrokerTicket, PrivateBroker, PrivateBrokerConfig,
 };
@@ -14,8 +13,6 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 
@@ -39,7 +36,7 @@ pub(super) fn enter_state_directory(state: &Path) -> Result<()> {
 pub(crate) struct SshWorkers {
     broker: PrivateBroker,
     /// Workers admitted and not yet told how their connection ended.
-    live: Arc<AtomicU32>,
+    live: crate::server::HandedWorkers,
 }
 
 impl SshWorkers {
@@ -51,51 +48,19 @@ impl SshWorkers {
     /// Otherwise close at once.
     pub(crate) fn end(self, normal: bool, limit: Duration) {
         if normal {
-            crate::server::wait_for_handed(&self.live, limit);
+            self.live.wait(limit);
         }
         drop(self.broker);
     }
 }
 
-/// Counts a worker as served until it has been told how it ended.
-struct Served<'a>(&'a AtomicU32);
-
-impl<'a> Served<'a> {
-    fn new(live: &'a AtomicU32) -> Self {
-        live.fetch_add(1, Ordering::Relaxed);
-        Self(live)
-    }
-}
-
-impl Drop for Served<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Release);
-    }
-}
-
-/// Serve a copy's SSH workers with `authority`, the copy's destination
-/// rules. The standalone receiver keeps its protected enrollment directory
-/// as cwd.
-pub(crate) fn start(authority: Arc<RestrictedAuthority>) -> Result<(SshWorkers, String)> {
+/// Serve a copy's SSH workers under `checker`: its destination's rules,
+/// or the reads its source allows, in the descriptor session its control
+/// registers the sources in. The standalone receiver keeps its protected
+/// enrollment directory as cwd.
+pub(crate) fn start(checker: super::Checker) -> Result<(SshWorkers, String)> {
     start_with(move |input, output, stream, handshake| {
-        crate::server::serve_handed_restricted(input, output, stream, authority.clone(), handshake)
-    })
-}
-
-/// Serve a copy's SSH workers with `authority`, the reads its source
-/// allows, in the descriptor session its control registers the sources in.
-pub(crate) fn start_source(
-    authority: Arc<crate::restricted::source::SourceAuthority>,
-    session: crate::descriptor_broker::DescriptorSessionSlot,
-) -> Result<(SshWorkers, String)> {
-    start_with(move |input, output, stream, handshake| {
-        crate::server::serve_handed_source(
-            input,
-            output,
-            stream,
-            (authority.clone(), session.clone()),
-            handshake,
-        )
+        crate::server::serve_handed_restricted(input, output, stream, checker.clone(), handshake)
     })
 }
 
@@ -115,7 +80,7 @@ fn start_with(
 ) -> Result<(SshWorkers, String)> {
     let mut secret = [0u8; 32];
     getrandom::fill(&mut secret).context("generate SSH worker admission")?;
-    let live = Arc::new(AtomicU32::new(0));
+    let live = crate::server::HandedWorkers::default();
     let served = live.clone();
     let broker = PrivateBroker::start_managed(
         PrivateBrokerConfig {
@@ -150,7 +115,7 @@ fn start_with(
                 if !bool::from(offered.ct_eq(&secret)) {
                     bail!("invalid SSH worker admission");
                 }
-                let _served = Served::new(&served);
+                let _served = served.count();
                 let (input, output) =
                     crate::descriptor_broker::receive_standard_streams(&stream.try_clone()?)?;
                 let handshake = deadline
@@ -190,8 +155,10 @@ pub(super) fn join(ticket: &str) -> Result<UnixStream> {
 mod tests {
     use super::*;
     use crate::proto::{ConnectionRole, FrameReader, FrameWriter, Request, Response};
+    use crate::restricted::RestrictedAuthority;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
 
     /// A worker as its SSH session process would start it: the session's
     /// input and output are handed to the receiver, and closed, as sshd
@@ -323,7 +290,8 @@ mod tests {
             let mut authority = super::super::tests::tcp_test_authority(root);
             authority.copy.options.compressed_transport = false;
             let authority = Arc::new(authority);
-            let (workers, ticket) = start(authority.clone()).unwrap();
+            let (workers, ticket) =
+                start(crate::restricted::Checker::Destination(authority.clone())).unwrap();
             let (input, output, handed) = hand_over(&ticket).unwrap();
             let (reader, writer) = hello(input, output, role()).unwrap();
             Self {
@@ -448,7 +416,8 @@ mod tests {
         let mut authority = super::super::tests::tcp_test_authority(root.path());
         authority.copy.options.compressed_transport = false;
         let authority = Arc::new(authority);
-        let (workers, ticket) = start(authority.clone()).unwrap();
+        let (workers, ticket) =
+            start(crate::restricted::Checker::Destination(authority.clone())).unwrap();
         assert!(earlier_receivers_accept(&ticket), "{ticket}");
         assert!(workers.broker.socket_path().as_os_str().as_bytes().len() < 32);
         assert!(!workers.broker.socket_path().is_absolute());
@@ -604,7 +573,7 @@ mod tests {
         let root = crate::test_support::tempdir().unwrap();
         std::fs::create_dir(root.path().join("target")).unwrap();
         let authority = Arc::new(super::super::tests::tcp_test_authority(root.path()));
-        let (workers, ticket) = start(authority).unwrap();
+        let (workers, ticket) = start(crate::restricted::Checker::Destination(authority)).unwrap();
         let other = crate::test_support::tempdir().unwrap();
         std::fs::set_permissions(other.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let refused = || {

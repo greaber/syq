@@ -130,6 +130,8 @@ pub(super) struct Planner<'a> {
     /// planner batches. Buffered jobs retain their own derived path.
     pub(super) active_source: Option<RegisteredPath>,
     pub(super) hardlinks: super::hardlinks::Hardlinks,
+    /// Lookups sent for batches the scan showed before their turn.
+    pub(super) early_lookups: super::early_lookups::EarlyLookups,
 }
 
 /// What a source entry asserts about its destination path. Two dirs merge;
@@ -693,12 +695,21 @@ impl Planner<'_> {
             src,
             src_root,
             Some(&source),
-            follow_root,
+            (follow_root, true),
             &ignore,
-            |pl, batch| {
+            |pl, scanned| {
                 if skip_all {
                     return Ok(());
                 }
+                let (batch, shown) = match scanned {
+                    Scanned::Batch { entries, shown } => (entries, shown),
+                    Scanned::Upcoming(entries) => {
+                        // Only after the first batch, which settles `sub`.
+                        anyhow::ensure!(!first, "a scan showed its first batch early");
+                        pl.show_upcoming(entries, &sub, dst_root);
+                        return Ok(());
+                    }
+                };
                 if first {
                     first = false;
                     if let Some(root) = batch.first() {
@@ -765,7 +776,7 @@ impl Planner<'_> {
                     }
                 }
                 pl.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
-                pl.handle_batch(batch, src_root, &sub, dst_root)
+                pl.handle_scanned_batch(batch, src_root, &sub, dst_root, shown)
             },
         )?;
         mapping.ok_or_else(|| anyhow::anyhow!("source scan returned no root entry"))
@@ -1243,9 +1254,12 @@ impl Planner<'_> {
             src,
             &join(src_root, rel),
             Some(&source),
-            false,
+            (false, false),
             &[],
-            |pl, batch| {
+            |pl, scanned| {
+                let Scanned::Batch { entries: batch, .. } = scanned else {
+                    return Ok(());
+                };
                 let batch: Vec<Entry> = batch
                     .into_iter()
                     .filter(|e| !e.path.is_empty())
@@ -1274,6 +1288,38 @@ impl Planner<'_> {
         src_root: &[u8],
         sub: &[u8],
         dst_root: &[u8],
+    ) -> Result<()> {
+        self.handle_scanned_batch(batch, src_root, sub, dst_root, false)
+    }
+
+    /// `handle_batch` for a batch from a scan, `shown` when the scan showed
+    /// it earlier (`show_upcoming`).
+    pub(super) fn handle_scanned_batch(
+        &mut self,
+        batch: Vec<Entry>,
+        src_root: &[u8],
+        sub: &[u8],
+        dst_root: &[u8],
+        shown: bool,
+    ) -> Result<()> {
+        let mut early = shown.then(|| self.next_early_lookup()).flatten();
+        let before = self.other_requests();
+        let planned = self.plan_batch(batch, src_root, sub, dst_root, &mut early);
+        if let Some(unused) = early {
+            self.discard_early_lookup(unused);
+        }
+        planned?;
+        self.batch_planned(before);
+        Ok(())
+    }
+
+    fn plan_batch(
+        &mut self,
+        batch: Vec<Entry>,
+        src_root: &[u8],
+        sub: &[u8],
+        dst_root: &[u8],
+        early: &mut Option<super::early_lookups::EarlyLookup>,
     ) -> Result<()> {
         let batch = if self.opts.expressions.selection.is_some() && !self.mapping_mode {
             let mut selected = Vec::with_capacity(batch.len());
@@ -1370,7 +1416,7 @@ impl Planner<'_> {
                     .map(|planned| planned.dst.clone()),
             );
         }
-        self.inspect_destination_batch(&mut mapped)?;
+        self.inspect_destination_batch(&mut mapped, early.take())?;
         match &mut self.buffer {
             Some(buf) => buf.push(mapped),
             None => self.apply_mapped(mapped)?,
@@ -1419,6 +1465,31 @@ impl Planner<'_> {
     }
 
     /// The mapping loop: decide and claim everything about each entry.
+    /// What a scanned entry claims at its destination; None for a directory
+    /// this copy does not take.
+    pub(super) fn claim_for(&self, e: &Entry) -> Option<Claim> {
+        let opts = self.opts;
+        Some(match e.kind {
+            Kind::Dir if !opts.recursive && !self.keep_dirs => return None,
+            Kind::Dir => Claim::Dir,
+            Kind::File => Claim::File {
+                dev: e.dev,
+                ino: e.ino,
+            },
+            Kind::Symlink if opts.links => Claim::Leaf,
+            Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev
+                if opts.devices
+                    && special_creation_supported(
+                        self.destination_supports_confined_socket_nodes,
+                        e.kind,
+                    ) =>
+            {
+                Claim::Leaf
+            }
+            _ => Claim::Weak,
+        })
+    }
+
     pub(super) fn map_batch(
         &mut self,
         batch: Vec<Entry>,
@@ -1431,9 +1502,9 @@ impl Planner<'_> {
         let mut others: Vec<Planned> = Vec::new();
         let mut directory_expression_sources = std::collections::HashMap::new();
         for e in batch {
-            if e.kind == Kind::Dir && !opts.recursive && !self.keep_dirs {
+            let Some(claim) = self.claim_for(&e) else {
                 continue;
-            }
+            };
             let dst_rel = join(sub, &e.path);
             if opts.expected_for(&dst_rel).is_some()
                 && e.kind != Kind::File
@@ -1463,24 +1534,6 @@ impl Planner<'_> {
             // path, and it is what makes --delete safe — whatever happens
             // below (skip, filter, unsupported type), a path the source has is
             // never an extra.
-            let claim = match e.kind {
-                Kind::Dir => Claim::Dir,
-                Kind::File => Claim::File {
-                    dev: e.dev,
-                    ino: e.ino,
-                },
-                Kind::Symlink if opts.links => Claim::Leaf,
-                Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev
-                    if opts.devices
-                        && special_creation_supported(
-                            self.destination_supports_confined_socket_nodes,
-                            e.kind,
-                        ) =>
-                {
-                    Claim::Leaf
-                }
-                _ => Claim::Weak,
-            };
             // A later real claim can replace a weak claim from an entry that
             // is not copied. In that case it is the first capacity-relevant
             // object at this path even though the namespace was already seen.
@@ -1861,9 +1914,7 @@ impl Planner<'_> {
 
         let leaves = self.leaf_entries(others, other_stats, root_entry.as_ref(), dst_root)?;
         let mut leaf_ops = LeafOps::default();
-        for (p, dst_entry) in leaves {
-            self.plan_leaf(p, dst_entry, dst_root, &mut leaf_ops)?;
-        }
+        self.plan_leaves(leaves, dst_root, &mut leaf_ops)?;
         self.flush_meta_fixes(leaf_ops.meta_fixes)?;
         self.flush_leaf_ops(leaf_ops.ops, &leaf_ops.names)
     }
@@ -1901,6 +1952,25 @@ impl Planner<'_> {
             )?
         };
         Ok(others.into_iter().zip(stats).collect())
+    }
+
+    /// Plan leaves whose directories exist, queuing their files as one
+    /// burst, so that the workers waiting for work are woken once for all
+    /// of them (`Sched::file_burst`). Planning a leaf waits on nothing but
+    /// a few questions about ownership, which announce the queued files
+    /// first (`announce_before_asking`); anything else that waits here must
+    /// do the same.
+    fn plan_leaves(
+        &mut self,
+        leaves: impl IntoIterator<Item = (Planned, Option<Entry>)>,
+        dst_root: &[u8],
+        leaf_ops: &mut LeafOps,
+    ) -> Result<()> {
+        let _burst = self.sched.file_burst();
+        for (leaf, entry) in leaves {
+            self.plan_leaf(leaf, entry, dst_root, leaf_ops)?;
+        }
+        Ok(())
     }
 
     /// Decide what one mapped leaf needs, given what its destination holds.
@@ -2900,9 +2970,7 @@ impl Planner<'_> {
             }
         }
         if !ready.is_empty() {
-            for (leaf, entry) in ready {
-                self.plan_leaf(leaf, entry, dst_root, leaf_ops)?;
-            }
+            self.plan_leaves(ready, dst_root, leaf_ops)?;
             (self.start_streaming)((!mkdirs.is_empty()).then_some(pending));
         }
         let sizes: Vec<usize> = mkdirs
@@ -2942,6 +3010,11 @@ impl Planner<'_> {
             // Nothing to create: a private root's metadata goes by itself.
             self.apply(std::mem::take(&mut stream.last_metadata))?;
         }
+        if !stream.queue.is_empty() {
+            // The creations make them stale, and their replies would take
+            // the room the creations' replies need (`REQUESTS_IN_FLIGHT`).
+            self.withdraw_early_lookups();
+        }
         let outcome =
             self.run_directory_stream(&mut stream, &mut waiting, &mut pending, dst_root, leaf_ops);
         // However the stream ended, record what the requests already sent did.
@@ -2968,9 +3041,7 @@ impl Planner<'_> {
             self.open_private_root(proposed)?;
         }
         if !last.is_empty() {
-            for (leaf, entry) in last {
-                self.plan_leaf(leaf, entry, dst_root, leaf_ops)?;
-            }
+            self.plan_leaves(last, dst_root, leaf_ops)?;
             (self.start_streaming)(None);
         }
         Ok(true)
@@ -3032,12 +3103,9 @@ impl Planner<'_> {
                     stream.own_metadata[i].clear();
                 }
                 let targets = mkdir_targets(&ops);
-                let error = WireError {
-                    unchanged: true,
-                    ..WireError::from(
-                        "operation skipped because the no-replace creation it depends on failed",
-                    )
-                };
+                let error = WireError::from(
+                    "operation skipped because the no-replace creation it depends on failed",
+                );
                 self.record_new_directories(
                     &targets,
                     vec![Some(error); targets.len()],
@@ -3161,16 +3229,17 @@ impl Planner<'_> {
         if chosen.is_empty() || self.sched.is_aborted() {
             return Ok(());
         }
-        let mut released = false;
-        for i in chosen {
-            for (leaf, entry) in std::mem::take(&mut waiting[i]) {
-                if leaf.e.kind == Kind::File {
-                    pending.remove(leaf.e.size);
-                }
-                self.plan_leaf(leaf, entry, dst_root, leaf_ops)?;
-                released = true;
+        let leaves: Vec<_> = chosen
+            .into_iter()
+            .flat_map(|i| std::mem::take(&mut waiting[i]))
+            .collect();
+        let released = !leaves.is_empty();
+        for (leaf, _) in &leaves {
+            if leaf.e.kind == Kind::File {
+                pending.remove(leaf.e.size);
             }
         }
+        self.plan_leaves(leaves, dst_root, leaf_ops)?;
         if released {
             pending.trickling = !self.directory_pacing.link_bound();
             (self.start_streaming)(Some(*pending));
@@ -3532,6 +3601,8 @@ impl Planner<'_> {
             .unzip();
         let errors = self.apply(ops)?;
         let capacity_error = first_capacity_error(&errors);
+        // The files to replace are queued together, after the reply.
+        let _burst = self.sched.file_burst();
         for ((dst, kind, replacement), error) in entries.into_iter().zip(errors) {
             match (error, replacement) {
                 (None, _) => {}
@@ -3699,40 +3770,65 @@ impl Planner<'_> {
             .collect()
     }
 
-    fn inspect_destination_batch(&mut self, mapped: &mut Mapped) -> Result<()> {
+    /// Whether this copy looks each batch's destinations up in one request
+    /// as the batch arrives (`inspect_destination_batch`).
+    pub(super) fn batch_lookups_configured(&self) -> bool {
+        !self.opts.inode_preservation.any()
+            && self.opts.dst_remote
+            && self.buffer.is_none()
+            && !self.opts.dry_run
+            && !self.destination_children_known_missing
+    }
+
+    /// `batch_lookups_configured`, once the directory the copy goes into is
+    /// accessible.
+    pub(super) fn looks_up_batches(&self) -> bool {
+        self.batch_lookups_configured() && self.container_access.is_none()
+    }
+
+    /// Look the batch's destinations up in one request, or take the reply
+    /// to `early`, the same request sent before the batch's turn.
+    fn inspect_destination_batch(
+        &mut self,
+        mapped: &mut Mapped,
+        early: Option<super::early_lookups::EarlyLookup>,
+    ) -> Result<()> {
         // Keep the remote receiver's combined metadata lookup, but wait for
         // container access first: an inaccessible child must not be cached as
         // absent before apply_mapped makes its container searchable.
-        if self.opts.inode_preservation.any()
-            || !self.opts.dst_remote
-            || self.buffer.is_some()
-            || self.opts.dry_run
-            || self.container_access.is_some()
-            || self.destination_children_known_missing
-        {
+        if !self.looks_up_batches() {
+            if let Some(early) = early {
+                self.discard_early_lookup(early);
+            }
             return Ok(());
         }
-        let directories: Vec<_> = mapped
-            .dirs
-            .iter()
-            .map(|(path, _, _)| path.clone())
-            .collect();
-        let others: Vec<_> = mapped
-            .others
-            .iter()
-            .map(|planned| planned.dst.clone())
-            .collect();
-        if directories.is_empty() && others.is_empty() {
-            return Ok(());
-        }
-        match ok(
-            self.dst.call(Request::PlanBatch {
-                directories: directories.clone(),
-                others: others.clone(),
-                strict_metadata: self.opts.expressions.update.is_some(),
-            })?,
-            "plan destination batch",
-        )? {
+        let (directories, others, response) =
+            match early.and_then(|early| self.early_reply(early, mapped)) {
+                Some(answered) => answered,
+                None => {
+                    let directories: Vec<_> = mapped
+                        .dirs
+                        .iter()
+                        .map(|(path, _, _)| path.clone())
+                        .collect();
+                    let others: Vec<_> = mapped
+                        .others
+                        .iter()
+                        .map(|planned| planned.dst.clone())
+                        .collect();
+                    if directories.is_empty() && others.is_empty() {
+                        return Ok(());
+                    }
+                    self.count_batch_lookup();
+                    let response = self.dst.call(Request::PlanBatch {
+                        directories: directories.clone(),
+                        others: others.clone(),
+                        strict_metadata: self.opts.expressions.update.is_some(),
+                    })?;
+                    (directories, others, response)
+                }
+            };
+        match ok(response, "plan destination batch")? {
             Response::BatchPlan {
                 directories: dir_stats,
                 others: other_stats,
@@ -5049,7 +5145,18 @@ impl Planner<'_> {
 
     /// The receiving account's user ID, asked once.
     fn receiver_uid(&mut self) -> Result<u32> {
+        self.announce_before_asking(self.receiver_uid.is_none());
         receiver_uid(&mut *self.dst, &mut self.receiver_uid)
+    }
+
+    /// Deciding about a leaf is about to wait for the destination's answer,
+    /// when `asking`. That can happen while the leaf's files are queued as a
+    /// burst (`plan_leaves`): the files queued so far get their workers
+    /// first, rather than wait for the reply too.
+    fn announce_before_asking(&self, asking: bool) {
+        if asking {
+            self.sched.announce_queued_files();
+        }
     }
 
     /// Whether the existing file `destination` must be replaced rather than
@@ -5273,6 +5380,7 @@ impl Planner<'_> {
     /// letting the receiver create anything anyone could see.
     fn new_file_owner(&mut self, dst: &[u8]) -> Option<crate::proto::NewFileOwner> {
         if self.new_file_owner.is_none() {
+            self.announce_before_asking(true);
             let directory = dst
                 .iter()
                 .rposition(|&c| c == b'/')
@@ -5309,6 +5417,7 @@ impl Planner<'_> {
         let directory = match self.parent_groups.get(&parent) {
             Some(directory) => *directory,
             None => {
+                self.announce_before_asking(true);
                 let directory = self
                     .stat_many(vec![parent.clone()])
                     .ok()

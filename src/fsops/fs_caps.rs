@@ -22,13 +22,96 @@
 //! type, mount options, and on macOS the capabilities a volume advertises.
 //! It is read when a publication first needs it and cached per mount or
 //! volume. Nothing is probed.
+//!
+//! Whether a close can report a write error (`TypeFacts::quiet_close`) is
+//! kept out of the profile: a wrong answer there hides a failed write, so
+//! each destination root reads it from its own filesystem.
 
 use std::fs::File;
+use std::io;
+use std::os::fd::AsRawFd;
 #[cfg(target_os = "macos")]
 use std::os::fd::RawFd;
 
 #[cfg(target_os = "linux")]
 use super::FileSystemKey;
+
+/// What one `fstatfs` says about the filesystem a descriptor is on.
+#[derive(Clone, Copy)]
+pub(crate) struct FileSystem(libc::statfs);
+
+/// The filesystem `file` is on: one `fstatfs`, retried while it is
+/// interrupted, and nothing allocated. A failure is the caller's to treat
+/// conservatively. On NFS each call is a request to the server, so a
+/// per-file path should use what has already been read where it can.
+pub(crate) fn file_system_of(file: &impl AsRawFd) -> io::Result<FileSystem> {
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: fstatfs writes only into the local structure, which is plain
+    // data, zeroed and then filled by the call.
+    crate::sys::retry_zero(|| unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) })?;
+    Ok(FileSystem(unsafe { stats.assume_init() }))
+}
+
+/// The filesystem `path` is on, from one `statfs`, retried while it is
+/// interrupted.
+fn file_system_at(path: &std::ffi::CStr) -> io::Result<FileSystem> {
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: statfs reads the NUL-terminated path and writes only into the
+    // local structure.
+    crate::sys::retry_zero(|| unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) })?;
+    Ok(FileSystem(unsafe { stats.assume_init() }))
+}
+
+impl FileSystem {
+    /// The filesystem's type number.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn magic(&self) -> u32 {
+        self.0.f_type as u32
+    }
+
+    /// What syq relies on this type of filesystem for.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn facts(&self) -> &'static TypeFacts {
+        type_facts(self.magic())
+    }
+
+    /// The filesystem's type name.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn kind(&self) -> &[u8] {
+        // SAFETY: fstatfs NUL-terminates the type name within its array.
+        unsafe { std::ffi::CStr::from_ptr(self.0.f_fstypename.as_ptr()) }.to_bytes()
+    }
+
+    /// Where the filesystem is mounted.
+    #[cfg(target_os = "macos")]
+    fn mount_point(&self) -> &std::ffi::CStr {
+        // SAFETY: fstatfs NUL-terminates the mount point within its array.
+        unsafe { std::ffi::CStr::from_ptr(self.0.f_mntonname.as_ptr()) }
+    }
+
+    /// The mount's flags (`MNT_*`).
+    #[cfg(target_os = "macos")]
+    fn flags(&self) -> u32 {
+        self.0.f_flags
+    }
+
+    /// The filesystem ID the kernel reports, all zero where it has none.
+    pub(crate) fn fsid(&self) -> &[u8] {
+        // SAFETY: fsid_t is plain data; its fields are not public in libc.
+        unsafe {
+            std::slice::from_raw_parts(
+                (&self.0.f_fsid as *const libc::fsid_t).cast::<u8>(),
+                std::mem::size_of::<libc::fsid_t>(),
+            )
+        }
+    }
+
+    /// The filesystem's block size, at least one.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn block_size(&self) -> u64 {
+        (self.0.f_bsize as u64).max(1)
+    }
+}
 
 /// exFAT's filesystem type, which libc does not name.
 #[cfg(target_os = "linux")]
@@ -49,56 +132,402 @@ const SMB2_SUPER_MAGIC: u32 = 0xfe53_4d42;
 const CIFS_SUPER_MAGIC: u32 = 0xff53_4d42;
 #[cfg(target_os = "linux")]
 const GFS2_SUPER_MAGIC: u32 = 0x0116_1970;
-
-/// Linux filesystems whose rename handler rejects every flag it does not
-/// implement with `EINVAL` (kernel 7.2 source; OpenZFS 2.4 for ZFS, whose
-/// releases before 2.2 reject all flags), so a flag can be tried and a
-/// refusal falls back. The kernel itself rejects unknown flags
-/// (`do_renameat2` in fs/namei.c) and passes the rest to the handler.
+/// 9p's filesystem type, which libc does not name.
 #[cfg(target_os = "linux")]
-const RENAME_FLAGS_REFUSED_WHEN_UNSUPPORTED: [u32; 29] = [
-    0xef53,      // ext2, ext3, ext4: ext4_rename2
-    0x5846_5342, // XFS: xfs_vn_rename
-    0x9123_683e, // btrfs: btrfs_rename2
-    0x0102_1994, // tmpfs: shmem_rename2
-    0x794c_7630, // overlayfs: ovl_rename_start
-    ZFS_SUPER_MAGIC,
-    F2FS_SUPER_MAGIC,
-    NTFS3_SUPER_MAGIC,
-    EXFAT_SUPER_MAGIC,
-    0x4d44,      // FAT: vfat_rename2, msdos_rename
-    0x4244,      // HFS
-    0x482b,      // HFS+
-    0x3153_464a, // JFS
-    0x3434,      // NILFS
-    0x1501_3346, // UDF
-    0x0001_1954, // UFS
-    0x7461_636f, // OCFS2: refuses every flag
-    GFS2_SUPER_MAGIC,
-    CEPH_SUPER_MAGIC, // refuses every flag
-    0x6969,           // NFS: refuses every flag
-    CIFS_SUPER_MAGIC,
-    SMB2_SUPER_MAGIC,
-    0x0102_1997, // 9p: refuses every flag
-    0x6b41_4653, // AFS: flags only to YFS servers, else ENOTSUPP
-    0x5346_414f, // AFS
-    0x2405_1905, // UBIFS
-    0x72b6,      // JFFS2
-    0x7375_7245, // Coda: refuses every flag
-    0x786f_4256, // vboxsf: refuses every flag
+const V9FS_MAGIC: u32 = 0x0102_1997;
+#[cfg(target_os = "linux")]
+const EXT_SUPER_MAGIC: u32 = libc::EXT4_SUPER_MAGIC as u32;
+#[cfg(target_os = "linux")]
+const XFS_SUPER_MAGIC: u32 = libc::XFS_SUPER_MAGIC as u32;
+#[cfg(target_os = "linux")]
+pub(crate) const BTRFS_SUPER_MAGIC: u32 = libc::BTRFS_SUPER_MAGIC as u32;
+#[cfg(target_os = "linux")]
+const TMPFS_MAGIC: u32 = libc::TMPFS_MAGIC as u32;
+#[cfg(target_os = "linux")]
+const OVERLAYFS_SUPER_MAGIC: u32 = libc::OVERLAYFS_SUPER_MAGIC as u32;
+#[cfg(target_os = "linux")]
+pub(crate) const NFS_SUPER_MAGIC: u32 = libc::NFS_SUPER_MAGIC as u32;
+#[cfg(target_os = "linux")]
+pub(crate) const FUSE_SUPER_MAGIC: u32 = libc::FUSE_SUPER_MAGIC as u32;
+#[cfg(target_os = "linux")]
+pub(crate) const PROC_SUPER_MAGIC: u32 = libc::PROC_SUPER_MAGIC as u32;
+#[cfg(target_os = "linux")]
+const FAT_SUPER_MAGIC: u32 = libc::MSDOS_SUPER_MAGIC as u32;
+
+/// Who the files on a filesystem show as their owners.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Owners {
+    /// Each file keeps its own owner and mode.
+    Kept,
+    /// Every file shows an owner and mode set when the filesystem was
+    /// mounted (`fixed_owners_and_modes`).
+    Fixed,
+    /// Either, as the mount table says: FUSE and 9p serve filesystems of
+    /// both kinds.
+    ByMount,
+}
+
+/// Whether a filesystem's rename handler may be given flags.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Renames {
+    /// Not audited: no flag is tried (`Profile::audited` is false).
+    NotAudited,
+    /// The handler rejects every flag it does not implement with `EINVAL`
+    /// (kernel 7.2 source; OpenZFS 2.4 for ZFS, whose releases before 2.2
+    /// reject all flags), so a flag can be tried and a refusal falls back.
+    /// The kernel itself rejects unknown flags (`do_renameat2` in
+    /// fs/namei.c) and passes the rest to the handler. `atomic_no_replace`
+    /// is false where the no-replace flag does not keep another client or
+    /// node from the name.
+    RefuseUnsupported { atomic_no_replace: bool },
+    /// The handler implements no flag at all, so every flag is refused:
+    /// none is tried.
+    ImplementNone,
+}
+
+/// What a filesystem's link counts, inode numbers and symlink times show
+/// (`Profile::link_counts_trusted`, `Profile::symlink_times`).
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Links {
+    /// Counts and numbers can be relied on, and a symlink's own times set.
+    Trusted,
+    /// As `Trusted`, except that counts are not relied on where the mount
+    /// has this option, or its options cannot be read.
+    TrustedWithout(&'static [u8]),
+    /// There are no hard links, so every count of one is true; symlink
+    /// times are not known to be the link's own.
+    OneNameEach,
+    /// Nothing is relied on.
+    Untrusted,
+}
+
+/// What syq relies on one Linux filesystem type for, by its type number.
+/// Every choice syq makes by type is here, so that a type added for one
+/// fact is weighed for the others; `type_facts_keep_their_answers` pins
+/// each.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TypeFacts {
+    pub(crate) magic: u32,
+    /// The kind a receiver reports (`FilesystemHint::kind`).
+    pub(crate) kind: &'static str,
+    /// Each operation can wait for a network round trip: NFS, SMB, Ceph,
+    /// or a FUSE mount such as SSHFS. Local disk and memory filesystems are
+    /// not.
+    pub(crate) network: bool,
+    /// A read lease shows every write to a file (`leases_show_writers`).
+    pub(crate) leases_show_writers: bool,
+    /// A file this process creates shows as owned by the account it runs
+    /// as (`reports_owners_faithfully`).
+    pub(crate) reports_owners_faithfully: bool,
+    pub(crate) owners: Owners,
+    pub(crate) renames: Renames,
+    pub(crate) links: Links,
+    /// Concurrent range writes to one file are taken one at a time
+    /// (`Profile::serialized_writes`).
+    pub(crate) serialized_writes: bool,
+    /// Whole-file copies here may use userspace ranges. Unknown and
+    /// network-backed filesystems keep adaptive ranges; tmpfs provides a
+    /// real cross-filesystem control.
+    pub(crate) local_userspace_copy: bool,
+    /// A source here is within the independently measured ext-family/XFS
+    /// to NFS scope.
+    pub(crate) measured_local_source: bool,
+    /// Direct I/O was exercised here, for kernels that do not report its
+    /// alignment.
+    pub(crate) direct_io_tested: bool,
+    /// Replacing files is bounded per filesystem (`Root::replacement_turn`).
+    pub(crate) bounds_replacement: bool,
+    /// Closing a descriptor reports no write error here, so a written file
+    /// need not be checked by closing a duplicate of its descriptor
+    /// (`Root::close_reports_writes_on`). `close` returns only what the
+    /// filesystem's `flush` file operation returns (`filp_flush` in
+    /// fs/open.c). NFS, SMB, FUSE and OrangeFS write out there and report
+    /// what failed, and overlayfs and eCryptfs pass on what the filesystem
+    /// below them reports. This is set only for local types whose file
+    /// operations have no `flush`, read in Linux 4.19, 5.4, 6.12 and 7.2
+    /// where each exists and in OpenZFS 2.4 (`zpl_file_operations`), and
+    /// for f2fs, whose `f2fs_file_flush` only rolls back an exiting
+    /// process's atomic write and returns 0. Set it for each type by name,
+    /// never through a shared base: overlayfs shares one with them.
+    pub(crate) quiet_close: bool,
+}
+
+/// A filesystem type syq knows nothing about.
+#[cfg(target_os = "linux")]
+pub(crate) const UNKNOWN_TYPE: TypeFacts = TypeFacts {
+    magic: 0,
+    kind: "other",
+    network: false,
+    leases_show_writers: false,
+    reports_owners_faithfully: false,
+    owners: Owners::Kept,
+    renames: Renames::NotAudited,
+    links: Links::Untrusted,
+    serialized_writes: true,
+    local_userspace_copy: false,
+    measured_local_source: false,
+    direct_io_tested: false,
+    bounds_replacement: true,
+    quiet_close: false,
+};
+
+/// A filesystem whose rename handler refuses the flags it lacks, with
+/// nothing else known.
+#[cfg(target_os = "linux")]
+const REFUSES_RENAME_FLAGS: TypeFacts = TypeFacts {
+    renames: Renames::RefuseUnsupported {
+        atomic_no_replace: true,
+    },
+    ..UNKNOWN_TYPE
+};
+
+/// A tested local filesystem: every write breaks a lease, this process's
+/// files show as its own, rename flags are tried, and counts and symlink
+/// times are kept.
+#[cfg(target_os = "linux")]
+const LOCAL_TYPE: TypeFacts = TypeFacts {
+    leases_show_writers: true,
+    reports_owners_faithfully: true,
+    links: Links::Trusted,
+    ..REFUSES_RENAME_FLAGS
+};
+
+/// A network filesystem whose rename handler implements no flag.
+#[cfg(target_os = "linux")]
+const NETWORK_WITHOUT_RENAME_FLAGS: TypeFacts = TypeFacts {
+    network: true,
+    renames: Renames::ImplementNone,
+    ..UNKNOWN_TYPE
+};
+
+/// SMB: fixed owners, and a no-replace target checked in the client before
+/// the server is asked to replace (smb2inode.c).
+#[cfg(target_os = "linux")]
+const SMB_TYPE: TypeFacts = TypeFacts {
+    network: true,
+    owners: Owners::Fixed,
+    renames: Renames::RefuseUnsupported {
+        atomic_no_replace: false,
+    },
+    ..UNKNOWN_TYPE
+};
+
+/// `base` for filesystem type `magic`.
+#[cfg(target_os = "linux")]
+const fn of_type(magic: u32, base: TypeFacts) -> TypeFacts {
+    TypeFacts { magic, ..base }
+}
+
+/// Every Linux filesystem type syq treats specially.
+///
+/// Link counts and symlink times are relied on where there is evidence:
+/// - tested: ext4, XFS, btrfs, tmpfs, overlayfs, ZFS;
+/// - source: f2fs and ntfs3 count links (f2fs_i_links_write, ntfs_link)
+///   and keep stable inode numbers, and the kernel sets a symlink's own
+///   times on local filesystems (fs/utimes.c follows no link);
+/// - NFS: the server keeps counts and file IDs, and SETATTR acts on the
+///   object a file handle names, the link itself. An open revalidates a
+///   file's attributes; with `nocto` it does not, and a count can be as
+///   stale as the attribute cache allows;
+/// - CephFS: the MDS keeps counts (ceph_fill_inode) and sets attributes
+///   on the inode named; `ino32` folds inode numbers so they can collide;
+/// - FAT and exFAT have no hard links, so every count is one, and a file
+///   keeps the number iunique gave it while its inode is in use
+///   (fs/fat/inode.c:609, fs/exfat/inode.c:432).
+///
+/// SMB counts are not relied on: a listing marks counts unknown
+/// (readdir.c:207), which gives a new inode a count of one (inode.c:165),
+/// and so does the CREATE response of an open (smb2pdu.c:3383); the real
+/// count arrives only when the attribute cache next expires. The client
+/// can also stop using the server's file IDs mid-mount
+/// (cifs_autodisable_serverino), and whether a server follows a symlink
+/// when setting its times is not known.
+///
+/// Leases are trusted on ext4, XFS, Btrfs, tmpfs and OpenZFS 2.4 (whose
+/// `zpl_file.c` uses `generic_setlease`): tests show that an open for
+/// writing or a truncate breaks a lease, and that a file open for writing,
+/// or mapped writable and shared, is refused one. Network filesystems, FUSE
+/// and overlayfs are not trusted: another client, a FUSE server or a write
+/// to an overlay's layers changes a file without opening it here, and FUSE
+/// grants leases that such writes leave intact.
+#[cfg(target_os = "linux")]
+const KNOWN_TYPES: [TypeFacts; 31] = [
+    // ext2, ext3, ext4: ext4_rename2
+    TypeFacts {
+        magic: EXT_SUPER_MAGIC,
+        kind: "ext",
+        local_userspace_copy: true,
+        measured_local_source: true,
+        direct_io_tested: true,
+        quiet_close: true,
+        ..LOCAL_TYPE
+    },
+    // xfs_vn_rename. XFS frees inodes per allocation group and replaces
+    // files faster with every worker, so replacing is not bounded there.
+    TypeFacts {
+        magic: XFS_SUPER_MAGIC,
+        kind: "xfs",
+        local_userspace_copy: true,
+        measured_local_source: true,
+        direct_io_tested: true,
+        bounds_replacement: false,
+        quiet_close: true,
+        ..LOCAL_TYPE
+    },
+    // btrfs_rename2
+    TypeFacts {
+        magic: BTRFS_SUPER_MAGIC,
+        kind: "btrfs",
+        quiet_close: true,
+        ..LOCAL_TYPE
+    },
+    // shmem_rename2
+    TypeFacts {
+        magic: TMPFS_MAGIC,
+        kind: "tmpfs",
+        local_userspace_copy: true,
+        quiet_close: true,
+        ..LOCAL_TYPE
+    },
+    // ovl_rename_start
+    TypeFacts {
+        magic: OVERLAYFS_SUPER_MAGIC,
+        kind: "overlay",
+        leases_show_writers: false,
+        ..LOCAL_TYPE
+    },
+    // ZFS locks only the ranges written, so its writes run concurrently.
+    TypeFacts {
+        magic: ZFS_SUPER_MAGIC,
+        kind: "zfs",
+        serialized_writes: false,
+        quiet_close: true,
+        ..LOCAL_TYPE
+    },
+    TypeFacts {
+        magic: F2FS_SUPER_MAGIC,
+        kind: "f2fs",
+        leases_show_writers: false,
+        quiet_close: true,
+        ..LOCAL_TYPE
+    },
+    TypeFacts {
+        magic: NTFS3_SUPER_MAGIC,
+        kind: "ntfs3",
+        owners: Owners::Fixed,
+        links: Links::Trusted,
+        quiet_close: true,
+        ..REFUSES_RENAME_FLAGS
+    },
+    TypeFacts {
+        magic: EXFAT_SUPER_MAGIC,
+        kind: "exfat",
+        owners: Owners::Fixed,
+        links: Links::OneNameEach,
+        quiet_close: true,
+        ..REFUSES_RENAME_FLAGS
+    },
+    // vfat_rename2, msdos_rename. FAT keeps modification times in
+    // two-second steps; exFAT keeps 10 ms, which the ordinary comparison
+    // of significant digits already covers.
+    TypeFacts {
+        magic: FAT_SUPER_MAGIC,
+        kind: FAT_KIND,
+        owners: Owners::Fixed,
+        links: Links::OneNameEach,
+        quiet_close: true,
+        ..REFUSES_RENAME_FLAGS
+    },
+    of_type(0x4244, REFUSES_RENAME_FLAGS),      // HFS
+    of_type(0x482b, REFUSES_RENAME_FLAGS),      // HFS+
+    of_type(0x3153_464a, REFUSES_RENAME_FLAGS), // JFS
+    of_type(0x3434, REFUSES_RENAME_FLAGS),      // NILFS
+    of_type(0x1501_3346, REFUSES_RENAME_FLAGS), // UDF
+    of_type(0x0001_1954, REFUSES_RENAME_FLAGS), // UFS
+    TypeFacts {
+        magic: 0x7461_636f, // OCFS2: refuses every flag
+        renames: Renames::ImplementNone,
+        ..UNKNOWN_TYPE
+    },
+    // GFS2 drops the no-replace flag after the local check, so it does not
+    // keep another node from the name.
+    TypeFacts {
+        magic: GFS2_SUPER_MAGIC,
+        renames: Renames::RefuseUnsupported {
+            atomic_no_replace: false,
+        },
+        ..UNKNOWN_TYPE
+    },
+    // CephFS refuses every rename flag.
+    TypeFacts {
+        magic: CEPH_SUPER_MAGIC,
+        kind: "ceph",
+        links: Links::TrustedWithout(b"ino32"),
+        ..NETWORK_WITHOUT_RENAME_FLAGS
+    },
+    // NFS refuses every rename flag.
+    TypeFacts {
+        magic: NFS_SUPER_MAGIC,
+        kind: "nfs",
+        links: Links::TrustedWithout(b"nocto"),
+        ..NETWORK_WITHOUT_RENAME_FLAGS
+    },
+    of_type(CIFS_SUPER_MAGIC, SMB_TYPE),
+    of_type(SMB2_SUPER_MAGIC, SMB_TYPE),
+    // The old SMB client's type, whose rename handler was not audited.
+    TypeFacts {
+        magic: libc::SMB_SUPER_MAGIC as u32,
+        network: true,
+        owners: Owners::Fixed,
+        ..UNKNOWN_TYPE
+    },
+    // 9p refuses every rename flag. WSL 2 mounts Windows drives (drvfs) as
+    // 9p, with fixed owners.
+    TypeFacts {
+        magic: V9FS_MAGIC,
+        owners: Owners::ByMount,
+        renames: Renames::ImplementNone,
+        ..UNKNOWN_TYPE
+    },
+    // AFS gives flags only to YFS servers, else ENOTSUPP.
+    of_type(0x6b41_4653, REFUSES_RENAME_FLAGS),
+    of_type(0x5346_414f, REFUSES_RENAME_FLAGS), // AFS
+    of_type(0x2405_1905, REFUSES_RENAME_FLAGS), // UBIFS
+    of_type(0x72b6, REFUSES_RENAME_FLAGS),      // JFFS2
+    TypeFacts {
+        magic: 0x7375_7245, // Coda: refuses every flag
+        renames: Renames::ImplementNone,
+        ..UNKNOWN_TYPE
+    },
+    TypeFacts {
+        magic: 0x786f_4256, // vboxsf: refuses every flag
+        owners: Owners::Fixed,
+        renames: Renames::ImplementNone,
+        ..UNKNOWN_TYPE
+    },
+    // FUSE (also virtiofs) passes rename flags to a userspace server, which
+    // could ignore them. Block devices it serves (`fuseblk`: ntfs-3g,
+    // exfat-fuse) have fixed owners.
+    TypeFacts {
+        magic: FUSE_SUPER_MAGIC,
+        network: true,
+        owners: Owners::ByMount,
+        ..UNKNOWN_TYPE
+    },
 ];
 
-/// Of those, the filesystems whose rename handler implements no flag at
-/// all, so every flag is refused: none is tried there.
+/// The facts of filesystem type `magic`, or those of an unknown type.
 #[cfg(target_os = "linux")]
-const RENAME_FLAGS_NEVER_IMPLEMENTED: [u32; 6] = [
-    0x7461_636f, // OCFS2
-    CEPH_SUPER_MAGIC,
-    0x6969,      // NFS
-    0x0102_1997, // 9p
-    0x7375_7245, // Coda
-    0x786f_4256, // vboxsf
-];
+pub(crate) fn type_facts(magic: u32) -> &'static TypeFacts {
+    KNOWN_TYPES
+        .iter()
+        .find(|facts| facts.magic == magic)
+        .unwrap_or(&UNKNOWN_TYPE)
+}
 
 /// What syq may rely on a filesystem for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -347,35 +776,20 @@ pub(crate) fn reports_owners_faithfully(file: &File) -> bool {
     if UNFAITHFUL_OWNERS.get() {
         return false;
     }
+    let Ok(file_system) = file_system_of(file) else {
+        return false;
+    };
     #[cfg(target_os = "linux")]
     {
-        use std::os::fd::AsRawFd;
-        let mut stats = std::mem::MaybeUninit::<libc::statfs>::zeroed();
-        // SAFETY: fstatfs writes only into the local structure.
-        if unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
-            return false;
-        }
-        let stats = unsafe { stats.assume_init() };
-        matches!(
-            stats.f_type as u32,
-            0xef53 // ext2, ext3, ext4
-                | 0x5846_5342 // XFS
-                | 0x9123_683e // btrfs
-                | 0x0102_1994 // tmpfs
-                | 0x794c_7630 // overlayfs
-                | ZFS_SUPER_MAGIC
-                | F2FS_SUPER_MAGIC
-        )
+        file_system.facts().reports_owners_faithfully
     }
     #[cfg(target_os = "macos")]
     {
-        use std::os::fd::AsRawFd;
-        volume_of(file.as_raw_fd())
-            .is_some_and(|volume| matches!(volume.kind.as_slice(), b"apfs" | b"hfs"))
+        matches!(file_system.kind(), b"apfs" | b"hfs")
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = file;
+        let _ = file_system;
         false
     }
 }
@@ -402,89 +816,47 @@ pub(crate) fn fixed_owners_and_modes(path: &std::path::Path) -> bool {
     let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
         return false;
     };
-    let mut stats = std::mem::MaybeUninit::<libc::statfs>::zeroed();
-    // SAFETY: statfs writes only into the local structure.
-    if unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+    let Ok(file_system) = file_system_at(&path) else {
         return false;
-    }
-    let stats = unsafe { stats.assume_init() };
+    };
     #[cfg(target_os = "linux")]
     {
-        let kind = stats.f_type as u32;
-        linux_fixed_owners_and_modes(kind)
-            || ((kind == libc::FUSE_SUPER_MAGIC as u32 || kind == V9FS_MAGIC)
-                && mount_fields_at(&path).is_some_and(|(kind, options)| {
-                    linux_mount_fixes_owners_and_modes(&kind, &options)
-                }))
+        match file_system.facts().owners {
+            Owners::Kept => false,
+            Owners::Fixed => true,
+            Owners::ByMount => mount_fields_at(&path)
+                .is_some_and(|(kind, options)| linux_mount_fixes_owners_and_modes(&kind, &options)),
+        }
     }
     #[cfg(target_os = "macos")]
     {
-        // SAFETY: statfs NUL-terminates the type name.
-        let kind = unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) };
-        macos_fixed_owners_and_modes(kind.to_bytes(), stats.f_flags)
+        macos_fixed_owners_and_modes(file_system.kind(), file_system.flags())
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = stats;
+        let _ = file_system;
         false
     }
 }
 
 /// Whether a read lease on `file` shows every write to it (`leases`): the
 /// filesystem grants leases, and its files change only through opens in
-/// this kernel, which break them. Tested on ext4, XFS, Btrfs, tmpfs and
-/// OpenZFS 2.4 (whose `zpl_file.c` uses `generic_setlease`): an open for
-/// writing or a truncate breaks a lease, and a file open for writing, or
-/// mapped writable and shared, is refused one. Network filesystems, FUSE and
-/// overlayfs are not trusted: another client, a FUSE server or a write to an
-/// overlay's layers changes a file without opening it here, and FUSE grants
-/// leases that such writes leave intact. Debug builds given
-/// `SYQ_TEST_LEASES=unsupported` trust no filesystem.
+/// this kernel, which break them (`TypeFacts::leases_show_writers`).
 #[cfg(target_os = "linux")]
 pub(crate) fn leases_show_writers(file: &File) -> bool {
-    use std::os::fd::AsRawFd;
+    file_system_of(file).is_ok_and(|file_system| leases_trusted(file_system.facts()))
+}
+
+/// Whether leases are trusted on a filesystem with these facts. Debug
+/// builds given `SYQ_TEST_LEASES=unsupported` trust no filesystem.
+#[cfg(target_os = "linux")]
+pub(crate) fn leases_trusted(facts: &TypeFacts) -> bool {
     #[cfg(debug_assertions)]
     if std::env::var_os("SYQ_TEST_LEASES").is_some_and(|value| value == "unsupported") {
         return false;
     }
-    let mut stats = std::mem::MaybeUninit::<libc::statfs>::zeroed();
-    // SAFETY: fstatfs writes only into the local structure.
-    if unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
-        return false;
-    }
-    let stats = unsafe { stats.assume_init() };
-    linux_leases_show_writers(stats.f_type as u32)
+    facts.leases_show_writers
 }
-
-#[cfg(target_os = "linux")]
-fn linux_leases_show_writers(file_system_type: u32) -> bool {
-    matches!(
-        file_system_type,
-        0xef53 // ext2, ext3, ext4
-            | 0x5846_5342 // XFS
-            | 0x9123_683e // btrfs
-            | 0x0102_1994 // tmpfs
-            | ZFS_SUPER_MAGIC
-    )
-}
-
-#[cfg(target_os = "linux")]
-fn linux_fixed_owners_and_modes(file_system_type: u32) -> bool {
-    matches!(
-        file_system_type,
-        0x4d44 // FAT
-            | EXFAT_SUPER_MAGIC
-            | NTFS3_SUPER_MAGIC
-            | CIFS_SUPER_MAGIC
-            | SMB2_SUPER_MAGIC
-            | 0x517b // SMB
-            | 0x786f_4256 // vboxsf
-    )
-}
-
-/// 9p's filesystem type, which libc does not name.
-#[cfg(target_os = "linux")]
-const V9FS_MAGIC: u32 = 0x0102_1997;
 
 /// Of the FUSE and 9p mounts, the ones with fixed owners and modes: block
 /// devices served by FUSE (`fuseblk`: ntfs-3g, exfat-fuse) and WSL's drvfs,
@@ -546,76 +918,33 @@ pub(crate) fn profile(file: &File) -> Profile {
 /// reads and, for NFS and CephFS, the mount's options.
 #[cfg(target_os = "linux")]
 pub(super) fn linux_profile(file_system_type: u32, file: &File, key: FileSystemKey) -> Profile {
-    let t = file_system_type;
-    let audited = RENAME_FLAGS_REFUSED_WHEN_UNSUPPORTED.contains(&t);
-    let tries_flags = audited && !RENAME_FLAGS_NEVER_IMPLEMENTED.contains(&t);
-    // SMB checks a no-replace target in the client and then asks the server
-    // to replace (smb2inode.c), and GFS2 drops the flag after the local
-    // check, so neither keeps another client or node from the name.
-    let no_replace_is_atomic =
-        tries_flags && !matches!(t, CIFS_SUPER_MAGIC | SMB2_SUPER_MAGIC | GFS2_SUPER_MAGIC);
-    let fat = t == libc::MSDOS_SUPER_MAGIC as u32;
-    // Link counts and symlink times, where there is evidence:
-    // - tested: ext4, XFS, btrfs, tmpfs, overlayfs, ZFS;
-    // - source: f2fs and ntfs3 count links (f2fs_i_links_write, ntfs_link)
-    //   and keep stable inode numbers, and the kernel sets a symlink's own
-    //   times on local filesystems (fs/utimes.c follows no link);
-    // - NFS: the server keeps counts and file IDs, and SETATTR acts on the
-    //   object a file handle names, the link itself. An open revalidates a
-    //   file's attributes; with `nocto` it does not, and a count can be as
-    //   stale as the attribute cache allows;
-    // - CephFS: the MDS keeps counts (ceph_fill_inode) and sets attributes
-    //   on the inode named; `ino32` folds inode numbers so they can collide;
-    // - FAT and exFAT have no hard links, so every count is one, and a file
-    //   keeps the number iunique gave it while its inode is in use
-    //   (fs/fat/inode.c:609, fs/exfat/inode.c:432).
-    // SMB counts are not trusted: a listing marks counts unknown
-    // (readdir.c:207), which gives a new inode a count of one (inode.c:165),
-    // and so does the CREATE response of an open (smb2pdu.c:3383); the real
-    // count arrives only when the attribute cache next expires. The client
-    // can also stop using the server's file IDs mid-mount
-    // (cifs_autodisable_serverino), and whether a server follows a symlink
-    // when setting its times is not known.
-    let (link_counts_trusted, symlink_times) = match t {
-        0xef53 | 0x5846_5342 | 0x9123_683e | 0x0102_1994 | 0x794c_7630 | ZFS_SUPER_MAGIC
-        | F2FS_SUPER_MAGIC | NTFS3_SUPER_MAGIC => (true, true),
-        0x6969 => (!mount_has_option(file, key, b"nocto"), true),
-        CEPH_SUPER_MAGIC => (!mount_has_option(file, key, b"ino32"), true),
-        _ if fat || t == EXFAT_SUPER_MAGIC => (true, false),
-        _ => (false, false),
-    };
-    Profile {
-        exchange: tries_flags,
-        atomic_no_replace_rename: no_replace_is_atomic,
-        hard_links: !(fat || t == EXFAT_SUPER_MAGIC),
-        link_counts_trusted,
-        symlink_times,
-        two_second_mtimes: fat,
-        audited,
-        serialized_writes: t != ZFS_SUPER_MAGIC,
-    }
+    profile_of_type(type_facts(file_system_type), |option| {
+        mount_has_option(file, key, option)
+    })
 }
 
-/// The name syq reports for a filesystem type it treats specially but has
-/// no tuning label for. FAT keeps modification times in two-second steps;
-/// exFAT keeps 10 ms, which the ordinary comparison of significant digits
-/// already covers.
+/// The profile of a filesystem type, given whether its mount has an option.
 #[cfg(target_os = "linux")]
-pub(super) fn linux_kind(file_system_type: u32) -> Option<&'static str> {
-    if file_system_type == libc::MSDOS_SUPER_MAGIC as u32 {
-        Some(FAT_KIND)
-    } else if file_system_type == EXFAT_SUPER_MAGIC {
-        Some("exfat")
-    } else if file_system_type == ZFS_SUPER_MAGIC {
-        Some("zfs")
-    } else if file_system_type == F2FS_SUPER_MAGIC {
-        Some("f2fs")
-    } else if file_system_type == NTFS3_SUPER_MAGIC {
-        Some("ntfs3")
-    } else if file_system_type == CEPH_SUPER_MAGIC {
-        Some("ceph")
-    } else {
-        None
+fn profile_of_type(facts: &TypeFacts, mount_has_option: impl FnOnce(&[u8]) -> bool) -> Profile {
+    let (exchange, atomic_no_replace_rename) = match facts.renames {
+        Renames::RefuseUnsupported { atomic_no_replace } => (true, atomic_no_replace),
+        Renames::NotAudited | Renames::ImplementNone => (false, false),
+    };
+    let (link_counts_trusted, symlink_times) = match facts.links {
+        Links::Trusted => (true, true),
+        Links::TrustedWithout(option) => (!mount_has_option(option), true),
+        Links::OneNameEach => (true, false),
+        Links::Untrusted => (false, false),
+    };
+    Profile {
+        exchange,
+        atomic_no_replace_rename,
+        hard_links: facts.links != Links::OneNameEach,
+        link_counts_trusted,
+        symlink_times,
+        two_second_mtimes: facts.kind == FAT_KIND,
+        audited: facts.renames != Renames::NotAudited,
+        serialized_writes: facts.serialized_writes,
     }
 }
 
@@ -721,29 +1050,18 @@ struct Volume {
 
 #[cfg(target_os = "macos")]
 fn volume_of(fd: RawFd) -> Option<Volume> {
-    let mut stats = std::mem::MaybeUninit::<libc::statfs>::zeroed();
-    // SAFETY: fstatfs writes only into the local structure.
-    if unsafe { libc::fstatfs(fd, stats.as_mut_ptr()) } != 0 {
-        return None;
-    }
-    let stats = unsafe { stats.assume_init() };
-    // SAFETY: fstatfs NUL-terminates both names.
-    let mount = unsafe { std::ffi::CStr::from_ptr(stats.f_mntonname.as_ptr()) };
-    let kind = unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) };
-    // SAFETY: fsid_t is plain data; its fields are not public in libc.
-    let fsid = unsafe {
-        std::slice::from_raw_parts(
-            (&stats.f_fsid as *const libc::fsid_t).cast::<u8>(),
-            std::mem::size_of::<libc::fsid_t>(),
-        )
-    };
-    let mut identity = fsid.to_vec();
+    // SAFETY: the caller's descriptor stays open for this call.
+    let file = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    let file_system = file_system_of(&file).ok()?;
+    let mount = file_system.mount_point();
+    let kind = file_system.kind();
+    let mut identity = file_system.fsid().to_vec();
     identity.extend_from_slice(mount.to_bytes_with_nul());
-    identity.extend_from_slice(kind.to_bytes());
+    identity.extend_from_slice(kind);
     Some(Volume {
         identity,
         mount: mount.to_owned(),
-        kind: kind.to_bytes().to_vec(),
+        kind: kind.to_vec(),
     })
 }
 
@@ -880,57 +1198,159 @@ fn read_volume_capabilities(mount: &std::ffi::CStr) -> Option<VolumeCapabilities
 mod tests {
     use super::*;
 
+    /// Every filesystem type syq treats specially, and a few it does not,
+    /// with what each implies, as the separate lists that `KNOWN_TYPES`
+    /// replaced gave it. Columns: type, reported kind; network, leases show
+    /// writers, owners reported faithfully, owners fixed, owners decided
+    /// by the mount; userspace copy ranges, measured local source, direct
+    /// I/O tested, replacement bounded, a close that reports no write
+    /// error; then the profile on a mount without
+    /// `nocto` or `ino32`: exchange, atomic no-replace rename, hard links,
+    /// link counts trusted, symlink times, two-second times, audited,
+    /// serialized writes.
     #[cfg(target_os = "linux")]
-    #[test]
-    fn fat_exfat_ntfs_and_smb_have_fixed_owners_on_linux() {
-        for kind in [
-            0x4d44,
-            EXFAT_SUPER_MAGIC,
-            NTFS3_SUPER_MAGIC,
-            CIFS_SUPER_MAGIC,
-            SMB2_SUPER_MAGIC,
-        ] {
-            assert!(linux_fixed_owners_and_modes(kind), "{kind:#x}");
-        }
-        for kind in [
-            0xef53,
-            0x5846_5342,
-            0x9123_683e,
-            0x0102_1994,
-            ZFS_SUPER_MAGIC,
-            libc::NFS_SUPER_MAGIC as u32,
-            libc::FUSE_SUPER_MAGIC as u32,
-        ] {
-            assert!(!linux_fixed_owners_and_modes(kind), "{kind:#x}");
-        }
-    }
+    type PinnedRow = (
+        u32,
+        &'static str,
+        u8,
+        u8,
+        u8,
+        u8,
+        u8,
+        u8,
+        u8,
+        u8,
+        u8,
+        u8,
+        [u8; 8],
+    );
+
+    #[cfg(target_os = "linux")]
+    #[rustfmt::skip]
+    const PINNED: [PinnedRow; 35] = [
+    (0x0000ef53, "ext", 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, [1, 1, 1, 1, 1, 0, 1, 1]),
+    (0x58465342, "xfs", 0, 1, 1, 0, 0, 1, 1, 1, 0, 1, [1, 1, 1, 1, 1, 0, 1, 1]),
+    (0x9123683e, "btrfs", 0, 1, 1, 0, 0, 0, 0, 0, 1, 1, [1, 1, 1, 1, 1, 0, 1, 1]),
+    (0x01021994, "tmpfs", 0, 1, 1, 0, 0, 1, 0, 0, 1, 1, [1, 1, 1, 1, 1, 0, 1, 1]),
+    (0x794c7630, "overlay", 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, [1, 1, 1, 1, 1, 0, 1, 1]),
+    (0x2fc12fc1, "zfs", 0, 1, 1, 0, 0, 0, 0, 0, 1, 1, [1, 1, 1, 1, 1, 0, 1, 0]),
+    (0xf2f52010, "f2fs", 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, [1, 1, 1, 1, 1, 0, 1, 1]),
+    (0x7366746e, "ntfs3", 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, [1, 1, 1, 1, 1, 0, 1, 1]),
+    (0x2011bab0, "exfat", 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, [1, 1, 0, 1, 0, 0, 1, 1]),
+    (0x00004d44, "fat", 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, [1, 1, 0, 1, 0, 1, 1, 1]),
+    (0x00004244, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [1, 1, 1, 0, 0, 0, 1, 1]),
+    (0x0000482b, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [1, 1, 1, 0, 0, 0, 1, 1]),
+    (0x3153464a, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [1, 1, 1, 0, 0, 0, 1, 1]),
+    (0x00003434, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [1, 1, 1, 0, 0, 0, 1, 1]),
+    (0x15013346, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [1, 1, 1, 0, 0, 0, 1, 1]),
+    (0x00011954, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [1, 1, 1, 0, 0, 0, 1, 1]),
+    (0x7461636f, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [0, 0, 1, 0, 0, 0, 1, 1]),
+    (0x01161970, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [1, 0, 1, 0, 0, 0, 1, 1]),
+    (0x00c36400, "ceph", 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, [0, 0, 1, 1, 1, 0, 1, 1]),
+    (0x00006969, "nfs", 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, [0, 0, 1, 1, 1, 0, 1, 1]),
+    (0xff534d42, "other", 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, [1, 0, 1, 0, 0, 0, 1, 1]),
+    (0xfe534d42, "other", 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, [1, 0, 1, 0, 0, 0, 1, 1]),
+    (0x01021997, "other", 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, [0, 0, 1, 0, 0, 0, 1, 1]),
+    (0x6b414653, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [1, 1, 1, 0, 0, 0, 1, 1]),
+    (0x5346414f, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [1, 1, 1, 0, 0, 0, 1, 1]),
+    (0x24051905, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [1, 1, 1, 0, 0, 0, 1, 1]),
+    (0x000072b6, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [1, 1, 1, 0, 0, 0, 1, 1]),
+    (0x73757245, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [0, 0, 1, 0, 0, 0, 1, 1]),
+    (0x786f4256, "other", 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, [0, 0, 1, 0, 0, 0, 1, 1]),
+    (0x65735546, "other", 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, [0, 0, 1, 0, 0, 0, 0, 1]),
+    (0x0000517b, "other", 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, [0, 0, 1, 0, 0, 0, 0, 1]),
+    (0x00009fa0, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [0, 0, 1, 0, 0, 0, 0, 1]),
+    (0x5346544e, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [0, 0, 1, 0, 0, 0, 0, 1]),
+    (0xca451a4e, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [0, 0, 1, 0, 0, 0, 0, 1]),
+    (0x12345678, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [0, 0, 1, 0, 0, 0, 0, 1]),
+    ];
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn leases_are_trusted_only_on_local_filesystems_that_break_them() {
-        for kind in [
-            0xef53,
-            0x5846_5342,
-            0x9123_683e,
-            0x0102_1994,
-            ZFS_SUPER_MAGIC,
-        ] {
-            assert!(linux_leases_show_writers(kind), "{kind:#x}");
+    fn type_facts_keep_their_answers() {
+        for (
+            magic,
+            kind,
+            network,
+            leases,
+            faithful,
+            fixed,
+            by_mount,
+            userspace,
+            measured,
+            direct,
+            bounds,
+            quiet,
+            profile,
+        ) in PINNED
+        {
+            let facts = type_facts(magic);
+            let bit = |value: bool| u8::from(value);
+            let read = profile_of_type(facts, |_| false);
+            assert_eq!(
+                (
+                    facts.kind,
+                    bit(facts.network),
+                    bit(facts.leases_show_writers),
+                    bit(facts.reports_owners_faithfully),
+                    bit(facts.owners == Owners::Fixed),
+                    bit(facts.owners == Owners::ByMount),
+                    bit(facts.local_userspace_copy),
+                    bit(facts.measured_local_source),
+                    bit(facts.direct_io_tested),
+                    bit(facts.bounds_replacement),
+                    bit(facts.quiet_close),
+                    [
+                        bit(read.exchange),
+                        bit(read.atomic_no_replace_rename),
+                        bit(read.hard_links),
+                        bit(read.link_counts_trusted),
+                        bit(read.symlink_times),
+                        bit(read.two_second_mtimes),
+                        bit(read.audited),
+                        bit(read.serialized_writes),
+                    ],
+                ),
+                (
+                    kind, network, leases, faithful, fixed, by_mount, userspace, measured, direct,
+                    bounds, quiet, profile
+                ),
+                "{magic:#x}"
+            );
         }
-        for kind in [
-            libc::NFS_SUPER_MAGIC as u32,
-            libc::FUSE_SUPER_MAGIC as u32,
-            0x794c_7630, // overlayfs
-            CIFS_SUPER_MAGIC,
-            SMB2_SUPER_MAGIC,
-            CEPH_SUPER_MAGIC,
-            GFS2_SUPER_MAGIC,
-            V9FS_MAGIC,
-            F2FS_SUPER_MAGIC,
-            0x4d44,
-        ] {
-            assert!(!linux_leases_show_writers(kind), "{kind:#x}");
+        // Each known type is listed once and pinned above.
+        for facts in KNOWN_TYPES {
+            assert_eq!(
+                KNOWN_TYPES
+                    .iter()
+                    .filter(|other| other.magic == facts.magic)
+                    .count(),
+                1,
+                "{:#x}",
+                facts.magic
+            );
+            assert!(
+                PINNED.iter().any(|row| row.0 == facts.magic),
+                "{:#x}",
+                facts.magic
+            );
         }
+        // A mount option that makes counts unreliable is honoured.
+        assert!(
+            !profile_of_type(type_facts(NFS_SUPER_MAGIC), |option| option == b"nocto")
+                .link_counts_trusted
+        );
+        assert!(
+            !profile_of_type(type_facts(CEPH_SUPER_MAGIC), |option| option == b"ino32")
+                .link_counts_trusted
+        );
+        // Leases are trusted only on local filesystems that break them.
+        let trusted: Vec<_> = KNOWN_TYPES
+            .iter()
+            .filter(|facts| leases_trusted(facts))
+            .map(|facts| facts.kind)
+            .collect();
+        assert_eq!(trusted, ["ext", "xfs", "btrfs", "tmpfs", "zfs"]);
     }
 
     #[cfg(target_os = "linux")]
@@ -1027,6 +1447,48 @@ mod tests {
             assert_eq!(Profile::from_bits(bits).to_bits(), bits);
         }
         assert_eq!(Profile::from_bits(Profile::LOCAL.to_bits()), Profile::LOCAL);
+    }
+
+    /// A close is trusted to report nothing on exactly the local types
+    /// audited for it. Every filesystem that flushes at close, or sits on
+    /// one that may, and every type not listed keeps the check of its
+    /// writes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_close_is_quiet_only_on_the_audited_local_types() {
+        let mut quiet: Vec<u32> = KNOWN_TYPES
+            .iter()
+            .filter(|facts| facts.quiet_close)
+            .map(|facts| facts.magic)
+            .collect();
+        quiet.sort_unstable();
+        let mut audited = [
+            EXT_SUPER_MAGIC,
+            XFS_SUPER_MAGIC,
+            BTRFS_SUPER_MAGIC,
+            TMPFS_MAGIC,
+            ZFS_SUPER_MAGIC,
+            F2FS_SUPER_MAGIC,
+            NTFS3_SUPER_MAGIC,
+            EXFAT_SUPER_MAGIC,
+            FAT_SUPER_MAGIC,
+        ];
+        audited.sort_unstable();
+        assert_eq!(quiet, audited);
+        for checked in [
+            NFS_SUPER_MAGIC,
+            FUSE_SUPER_MAGIC,
+            CIFS_SUPER_MAGIC,
+            SMB2_SUPER_MAGIC,
+            OVERLAYFS_SUPER_MAGIC,
+            CEPH_SUPER_MAGIC,
+            V9FS_MAGIC,
+            libc::ECRYPTFS_SUPER_MAGIC as u32,
+            0x2011_3221, // OrangeFS
+            0x1234_5678,
+        ] {
+            assert!(!type_facts(checked).quiet_close, "{checked:#x}");
+        }
     }
 
     /// A macOS volume's rename flags are tried only on volume types where
@@ -1158,16 +1620,12 @@ mod tests {
                 "{unknown:x}"
             );
         }
-        assert_eq!(linux_kind(libc::MSDOS_SUPER_MAGIC as u32), Some(FAT_KIND));
-        assert_eq!(linux_kind(EXFAT_SUPER_MAGIC), Some("exfat"));
-        assert_eq!(linux_kind(ZFS_SUPER_MAGIC), Some("zfs"));
         for kind in ["ext", "xfs", "tmpfs", "btrfs", "overlay", "zfs", "nfs"] {
             assert!(kind_sets_symlink_times(kind), "{kind}");
             assert!(linux_kind_profile_sets_symlink_times(kind), "{kind}");
         }
         assert!(!kind_sets_symlink_times("other"));
         assert!(!kind_sets_symlink_times(FAT_KIND));
-        assert_eq!(linux_kind(libc::EXT4_SUPER_MAGIC as u32), None);
     }
 }
 

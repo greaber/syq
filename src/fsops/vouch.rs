@@ -118,7 +118,6 @@ pub(crate) fn replace_required(
         io_kind: Some(WireIoKind::ReplaceRequired(reason)),
         raw_os_error: None,
         condition_not_met: false,
-        unchanged: true,
     })
 }
 

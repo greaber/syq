@@ -35,8 +35,14 @@ mod apply;
 mod basis_copy;
 #[cfg(test)]
 pub(crate) use fs_caps::distrust_owners_for_test;
+pub(crate) use fs_caps::file_system_of;
 pub(crate) use fs_caps::fixed_owners_and_modes;
 pub(crate) use fs_caps::reports_owners_faithfully;
+#[cfg(target_os = "linux")]
+pub(crate) use fs_caps::{
+    leases_show_writers, leases_trusted, TypeFacts, FUSE_SUPER_MAGIC, PROC_SUPER_MAGIC,
+    UNKNOWN_TYPE,
+};
 pub(crate) use partial::SeedAccess;
 
 /// Copy the first `len` bytes of `input` into `output`, which this receiver
@@ -85,6 +91,7 @@ mod paths;
 mod receiver_mode;
 mod sidecars;
 mod small_batch;
+mod source_selection;
 mod stages;
 pub(crate) mod vouch;
 
@@ -107,6 +114,7 @@ pub(crate) use sidecars::{
 };
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use small_batch::with_coarse_change_times;
+pub(crate) use source_selection::{PinnedSource, SourceSelector};
 
 /// Whether this receiver trusts read leases on the filesystem of `file`
 /// (`leases`), for tests outside these modules.
@@ -436,42 +444,15 @@ fn reject_copy_source_claim_for_test() -> Result<()> {
 /// No pathname re-resolution, subprocess or additional remote round trip.
 /// f_fsid is an OS/filesystem hint, not a globally unique storage identifier.
 fn filesystem_hint(file: &File) -> Option<FilesystemHint> {
-    let mut stats = std::mem::MaybeUninit::<libc::statfs>::zeroed();
-    // SAFETY: the syscall initializes stats; zero initialization also covers padding.
-    if unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
-        return None;
-    }
-    let stats = unsafe { stats.assume_init() };
-    let fsid = unsafe {
-        std::slice::from_raw_parts(
-            (&stats.f_fsid as *const libc::fsid_t).cast::<u8>(),
-            std::mem::size_of_val(&stats.f_fsid),
-        )
-    };
+    let file_system = file_system_of(file).ok()?;
+    let fsid = file_system.fsid();
     if fsid.iter().all(|b| *b == 0) {
         return None;
     }
     #[cfg(target_os = "linux")]
-    let kind = match stats.f_type as u64 {
-        0xef53 => "ext",
-        0x58465342 => "xfs",
-        0x01021994 => "tmpfs",
-        0x6969 => "nfs",
-        0x9123683e => "btrfs",
-        0x794c7630 => "overlay",
-        other => fs_caps::linux_kind(other as u32).unwrap_or("other"),
-    }
-    .to_string();
+    let kind = file_system.facts().kind.to_string();
     #[cfg(target_os = "macos")]
-    let kind = String::from_utf8_lossy(
-        &stats
-            .f_fstypename
-            .iter()
-            .take_while(|b| **b != 0)
-            .map(|b| *b as u8)
-            .collect::<Vec<_>>(),
-    )
-    .into_owned();
+    let kind = String::from_utf8_lossy(file_system.kind()).into_owned();
     let mut hasher = blake3::Hasher::new();
     hasher.update(kind.as_bytes());
     hasher.update(fsid);
@@ -482,61 +463,33 @@ fn filesystem_hint(file: &File) -> Option<FilesystemHint> {
     })
 }
 
-/// Filesystems where each operation can cost a network round trip. Local
-/// disk and memory filesystems (ext4, XFS, Btrfs, ZFS, tmpfs) are not.
-#[cfg(target_os = "linux")]
-fn network_file_system_type(file_system_type: u32) -> bool {
-    [
-        libc::NFS_SUPER_MAGIC as u32,
-        libc::FUSE_SUPER_MAGIC as u32,
-        libc::SMB_SUPER_MAGIC as u32,
-        0xfe53_4d42, // SMB2
-        0xff53_4d42, // CIFS
-        0x00c3_6400, // Ceph
-    ]
-    .contains(&file_system_type)
-}
-
 #[cfg(target_os = "linux")]
 fn inspect_file_system(file: &File, key: FileSystemKey) -> FileSystemTraits {
-    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    unsafe {
-        if libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) != 0 {
-            return FileSystemTraits::default();
-        }
-        let stats = stats.assume_init();
-        let file_system_type = stats.f_type as u32;
-        let mut mount_stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-        // Unknown mount flags are treated as synchronous so a metadata-query
-        // failure cannot opt an unmeasured topology into the shortcut.
-        let synchronous = if libc::fstatvfs(file.as_raw_fd(), mount_stats.as_mut_ptr()) == 0 {
-            mount_stats.assume_init().f_flag & libc::ST_SYNCHRONOUS != 0
-        } else {
-            true
-        };
-        FileSystemTraits {
-            is_nfs: file_system_type == libc::NFS_SUPER_MAGIC as u32,
-            btrfs_compression: (file_system_type == libc::BTRFS_SUPER_MAGIC as u32)
-                .then(|| btrfs::Compression::for_mount(file, key)),
-            network: network_file_system_type(file_system_type),
-            synchronous,
-            // Keep unknown and network-backed filesystems on adaptive ranges.
-            // tmpfs also provides a real cross-filesystem control for this path.
-            local_userspace_copy: matches!(
-                file_system_type,
-                t if t == libc::EXT4_SUPER_MAGIC as u32
-                    || t == libc::XFS_SUPER_MAGIC as u32
-                    || t == libc::TMPFS_MAGIC as u32
-            ),
-            // Preserve the independently measured ext-family/XFS -> NFS scope.
-            measured_local_source: matches!(
-                file_system_type,
-                t if t == libc::EXT4_SUPER_MAGIC as u32
-                    || t == libc::XFS_SUPER_MAGIC as u32
-            ),
-            file_system_type,
-            profile: None,
-        }
+    let Ok(file_system) = file_system_of(file) else {
+        return FileSystemTraits::default();
+    };
+    let file_system_type = file_system.magic();
+    let facts = file_system.facts();
+    let mut mount_stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // Unknown mount flags are treated as synchronous so a metadata-query
+    // failure cannot opt an unmeasured topology into the shortcut.
+    // SAFETY: fstatvfs writes only into the local structure.
+    let synchronous = match crate::sys::retry_zero(|| unsafe {
+        libc::fstatvfs(file.as_raw_fd(), mount_stats.as_mut_ptr())
+    }) {
+        Ok(()) => unsafe { mount_stats.assume_init() }.f_flag & libc::ST_SYNCHRONOUS != 0,
+        Err(_) => true,
+    };
+    FileSystemTraits {
+        is_nfs: file_system_type == fs_caps::NFS_SUPER_MAGIC,
+        btrfs_compression: (file_system_type == fs_caps::BTRFS_SUPER_MAGIC)
+            .then(|| btrfs::Compression::for_mount(file, key)),
+        network: facts.network,
+        synchronous,
+        local_userspace_copy: facts.local_userspace_copy,
+        measured_local_source: facts.measured_local_source,
+        file_system_type,
+        profile: None,
     }
 }
 
@@ -721,14 +674,12 @@ fn errstr(e: &anyhow::Error) -> String {
 
 pub(crate) fn wire_error(error: &anyhow::Error) -> WireError {
     let condition_not_met = is_condition_not_met(error);
-    let unchanged = is_unchanged(error);
     if error.chain().any(|cause| cause.is::<CorruptedInTransit>()) {
         return WireError {
             message: errstr(error),
             io_kind: Some(WireIoKind::CorruptedInTransit),
             raw_os_error: None,
             condition_not_met,
-            unchanged,
         };
     }
     if let Some(wire) = crate::conn::wire_error_of(error) {
@@ -737,7 +688,6 @@ pub(crate) fn wire_error(error: &anyhow::Error) -> WireError {
             io_kind: wire.io_kind,
             raw_os_error: wire.raw_os_error,
             condition_not_met,
-            unchanged,
         };
     }
     let io_error = error
@@ -748,7 +698,6 @@ pub(crate) fn wire_error(error: &anyhow::Error) -> WireError {
         io_kind: io_error.map(wire_io_kind),
         raw_os_error: io_error.and_then(io::Error::raw_os_error),
         condition_not_met,
-        unchanged,
     }
 }
 
@@ -962,10 +911,6 @@ pub struct FsOps {
     /// This connection's number, which the files it publishes are
     /// remembered by (`stages`).
     stage_connection: u64,
-    /// The request being executed is a Finalize that may only be answered
-    /// as one that already published its file, and is refused otherwise,
-    /// with this reason (`set_finalize_repeat_only`).
-    finalize_repeat_only: Option<&'static str>,
     /// A Finalize was answered as one that already published its file,
     /// since `take_finalize_repeated`.
     finalize_repeated: bool,
@@ -1241,14 +1186,6 @@ impl FsOps {
         self.stage_scope
     }
 
-    /// Let the next requests publish nothing new: a Finalize among them is
-    /// answered only as one that already published its file (`stages`),
-    /// and fails with `refusal` otherwise. A restricted receiver sets this
-    /// for a Finalize its signed limits leave no room for.
-    pub(crate) fn set_finalize_repeat_only(&mut self, refusal: Option<&'static str>) {
-        self.finalize_repeat_only = refusal;
-    }
-
     /// Whether a Finalize was answered as one that already published its
     /// file since this was last asked: it changed nothing.
     pub(crate) fn take_finalize_repeated(&mut self) -> bool {
@@ -1309,7 +1246,6 @@ impl FsOps {
             held_basis: None,
             stage_scope: 0,
             stage_connection: stages::new_connection(),
-            finalize_repeat_only: None,
             finalize_repeated: false,
             comparison_window: None,
             partial_candidates: HashMap::new(),
@@ -1874,10 +1810,7 @@ impl FsOps {
                 Err(error) => {
                     return Ok(Response::SmallFilesCopied(SmallCopyResponse {
                         anchor,
-                        outcome: SmallCopyOutcome::StagingFailed(WireError {
-                            unchanged: true,
-                            ..wire_error(&error)
-                        }),
+                        outcome: SmallCopyOutcome::StagingFailed(wire_error(&error)),
                     }))
                 }
             }
@@ -1891,12 +1824,9 @@ impl FsOps {
         {
             return Ok(Response::SmallFilesCopied(SmallCopyResponse {
                 anchor,
-                outcome: SmallCopyOutcome::StagingFailed(WireError {
-                    unchanged: true,
-                    ..wire_error(&anyhow::anyhow!(
-                        "destination contents differ (--if-exists=error-if-different)"
-                    ))
-                }),
+                outcome: SmallCopyOutcome::StagingFailed(wire_error(&anyhow::anyhow!(
+                    "destination contents differ (--if-exists=error-if-different)"
+                ))),
             }));
         }
 
@@ -2098,7 +2028,7 @@ impl FsOps {
             relative: partial,
             label,
             file,
-            ..
+            opened,
         } = self.open_stage(
             &rooted,
             copy_id,
@@ -2106,7 +2036,7 @@ impl FsOps {
         )?;
         observed_write(&self.operation, &file, data, 0, false)
             .with_context(|| format!("write {}", label.display()))?;
-        check_destination_writes(&file, &label)?;
+        check_written_file(&rooted.root, opened.dev(), &file, &label)?;
         set_meta_file(&file, meta, flags)
             .with_context(|| format!("set metadata {}", label.display()))?;
         // `publish_partial_rooted` re-checks the staged name against the open
@@ -2184,140 +2114,26 @@ impl FsOps {
                 Ok(resolve(&selection.path))
             })
             .collect::<Result<Vec<_>>>()?;
-        let needs_base = base.confined || paths.iter().any(|path| !path.is_absolute());
-        let relative_resolver = if needs_base {
-            let base_path = resolve(base.path.as_deref().unwrap_or(b"."));
-            let mut base_hops = Vec::new();
-            let directory = |pinned: Result<PinnedPath>| -> Result<_> {
-                match pinned
-                    .with_context(|| format!("resolve source base {}", base_path.display()))?
-                {
-                    PinnedPath::Directory(directory) => Ok(directory.into_parts().0),
-                    PinnedPath::Leaf(_) | PinnedPath::OpenFile(_) => {
-                        bail!("source base {} is not a directory", base_path.display())
-                    }
-                    PinnedPath::Missing(_) => {
-                        unreachable!("source base resolution requires an existing directory")
-                    }
-                }
-            };
-            let base_directory = match &self.source_outer_root {
-                None => directory(OperatorResolver::resolve_process(
-                    base_path.as_os_str().as_bytes(),
-                    symlink_policy,
-                    OperatorFinalComponent::Directory,
-                    false,
-                    &mut base_hops,
-                ))?,
-                Some(outer) => {
-                    let outer = Path::new(OsStr::from_bytes(outer));
-                    let inside = base_path.strip_prefix(outer).with_context(|| {
-                        format!("source base {} is outside its root", base_path.display())
-                    })?;
-                    let outer_directory = directory(OperatorResolver::resolve_process(
-                        outer.as_os_str().as_bytes(),
-                        OperatorSymlinkPolicy::Refuse,
-                        OperatorFinalComponent::Directory,
-                        false,
-                        &mut Vec::new(),
-                    ))?;
-                    if inside.as_os_str().is_empty() {
-                        outer_directory
-                    } else {
-                        directory(
-                            OperatorResolver::beneath(&outer_directory, true, symlink_policy)?
-                                .resolve(
-                                    inside.as_os_str().as_bytes(),
-                                    OperatorFinalComponent::Directory,
-                                    false,
-                                    &mut base_hops,
-                                ),
-                        )?
-                    }
-                }
-            };
-            Some(OperatorResolver::beneath(
-                &base_directory,
-                base.confined,
-                symlink_policy,
-            )?)
-        } else {
-            None
-        };
+        let needs_base = paths.iter().any(|path| !path.is_absolute());
+        let selector = SourceSelector::new(
+            "source base",
+            base,
+            self.source_outer_root.as_deref(),
+            symlink_policy,
+            needs_base,
+        )?;
         let mut resolved = Vec::with_capacity(selections.len());
         for (selection, path) in selections.iter().zip(paths) {
-            let mut hops = Vec::new();
-            let pinned = if path.is_absolute() {
-                if base.confined {
-                    bail!(
-                        "source selector {} beneath --root must be relative",
-                        path.display()
-                    );
-                }
-                OperatorResolver::resolve_process(
-                    path.as_os_str().as_bytes(),
-                    symlink_policy,
-                    OperatorFinalComponent::Entry {
-                        follow_symlink: selection.follow_root,
-                    },
-                    false,
-                    &mut hops,
-                )
-            } else {
-                relative_resolver
-                    .as_ref()
-                    .expect("relative source selection requires a pinned base")
-                    .resolve(
-                        path.as_os_str().as_bytes(),
-                        OperatorFinalComponent::Entry {
-                            follow_symlink: selection.follow_root,
-                        },
-                        false,
-                        &mut hops,
-                    )
-            };
-            let pinned =
-                pinned.with_context(|| format!("resolve source selection {}", path.display()))?;
-            match pinned {
-                PinnedPath::Directory(directory) => {
-                    let (directory, _) = directory.into_parts();
-                    resolved.push((directory, Vec::new(), None, None));
-                }
-                PinnedPath::Leaf(leaf) => {
-                    let (parent, name, metadata, object) = leaf.into_parts();
-                    if object.is_none() && !metadata.is_fifo() {
-                        bail!("this platform cannot retain the selected source leaf safely");
-                    }
-                    let symlink_target = if metadata.is_symlink() {
-                        Some(
-                            read_open_symlink(object.as_ref().expect("symlink object was checked"))?
-                                .context("this platform cannot snapshot a selected source symlink through its pinned object (macOS 13 or newer is required on Darwin)")?,
-                        )
-                    } else {
-                        None
-                    };
-                    resolved.push((
-                        parent,
-                        name.as_bytes().to_vec(),
-                        Some(SourceLeafIdentity {
-                            dev: metadata.dev,
-                            ino: metadata.ino,
-                            file_type: metadata.file_type(),
-                            symlink_atime: (metadata.is_symlink()
-                                && self.inode_preservation.atimes)
-                                .then_some(metadata.atime),
-                            symlink_target,
-                        }),
-                        object,
-                    ));
-                }
-                PinnedPath::Missing(_) => {
-                    unreachable!("source resolution did not allow a missing suffix")
-                }
-                PinnedPath::OpenFile(_) => {
-                    unreachable!("source resolution never opens a procfs control input")
-                }
-            }
+            let pinned = selector.resolve(&path, selection.follow_root, || {
+                format!("resolve source selection {}", path.display())
+            })?;
+            let source = PinnedSource::new(pinned, self.inode_preservation.atimes)?;
+            resolved.push((
+                source.directory,
+                source.relative,
+                source.expected_leaf,
+                source.object,
+            ));
         }
 
         let registrations: Vec<_> = resolved
@@ -3292,6 +3108,7 @@ impl FsOps {
         paths: &[PathBytes],
         sources: Option<&[RegisteredPath]>,
         follow: bool,
+        read_here: bool,
     ) -> Result<Vec<Option<Entry>>> {
         if let Some(sources) = sources {
             if self.destination_root.is_some() {
@@ -3320,7 +3137,14 @@ impl FsOps {
             // `follow` describes the legacy pathname request. A registered
             // selection has already applied the operator-root policy, and no
             // descendant component gains symlink-traversal authority here.
-            let results = parallel_map_init(
+            // Sources this thread has just read, one at a time, are statted
+            // on it too. Every worker rechecks its batches at once, so the
+            // pool's threads would mostly look for work, at several times the
+            // cost of the stats: a file just read usually still has its
+            // attributes cached, on a network filesystem as well.
+            let minimum = if read_here { usize::MAX } else { PAR_MIN };
+            let results = parallel_map_init_from(
+                minimum,
                 &targets,
                 || None,
                 |parent, (_, _, source, target)| {
@@ -3624,12 +3448,9 @@ impl FsOps {
             let (skipped, run): (Vec<usize>, Vec<usize>) =
                 indices.iter().partition(|&&i| under_failed(i));
             for i in skipped {
-                out[i] = Some(WireError {
-                    unchanged: true,
-                    ..WireError::from(
-                        "operation skipped because the no-replace creation it depends on failed",
-                    )
-                });
+                out[i] = Some(WireError::from(
+                    "operation skipped because the no-replace creation it depends on failed",
+                ));
             }
             run
         };
@@ -4119,17 +3940,15 @@ fn parallel_by_directory<R: Send>(
         .collect()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Batches the current thread has handed to the metadata pool.
+    static POOLED_BATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 // State belongs to one bounded input chunk and is discarded before returning.
 // Metadata lookups can reuse a held parent for adjacent siblings, while later
 // requests resolve the namespace afresh. No state is shared between workers.
-fn parallel_map_init<T: Sync, R: Send, S>(
-    items: &[T],
-    init: impl Fn() -> S + Sync,
-    f: impl Fn(&mut S, &T) -> R + Sync,
-) -> Vec<R> {
-    parallel_map_init_from(PAR_MIN, items, init, f)
-}
-
 fn parallel_map_init_from<T: Sync, R: Send, S>(
     minimum: usize,
     items: &[T],
@@ -4144,6 +3963,8 @@ fn parallel_map_init_from<T: Sync, R: Send, S>(
         let mut state = init();
         return items.iter().map(|item| f(&mut state, item)).collect();
     };
+    #[cfg(test)]
+    POOLED_BATCHES.with(|batches| batches.set(batches.get() + 1));
     let chunk = items.len().div_ceil(PAR_THREADS).max(1);
     use rayon::prelude::*;
     pool.install(|| {
