@@ -482,7 +482,9 @@ where
         while error.is_none() && tasks.len() < preparation_limit {
             let Some(job) = jobs.next() else { break };
             let prepared = generation;
-            let future = work(job);
+            // A job's future can be tens of kilobytes. Box it once here
+            // rather than move it into the task and again into its allocation.
+            let future = Box::pin(work(job));
             tasks.spawn(async move { (prepared, future.await) });
         }
         if tasks.is_empty() {
