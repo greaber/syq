@@ -382,3 +382,89 @@ async fn direct_download_can_resume_after_a_long_pause_within_one_read() {
         Digest::hash_bytes(HashAlgorithm::Blake3, &bytes).value
     );
 }
+
+/// A GET that fails in a way no resend can fix, such as an expired storage
+/// authorization, ends at once; a reset connection is still retried.
+#[tokio::test(start_paused = true)]
+async fn permanent_get_failures_are_not_retried() {
+    use aws_smithy_runtime_api::client::result::ConnectorError;
+    #[derive(Debug, Clone)]
+    struct Failing {
+        permanent: bool,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl HttpConnector for Failing {
+        fn call(&self, _: HttpRequest) -> HttpConnectorFuture {
+            let first = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                == 0;
+            HttpConnectorFuture::ready(if self.permanent {
+                Err(crate::s3::retry::Permanent::connector(anyhow::anyhow!(
+                    "storage authorization expired"
+                )))
+            } else if first {
+                Err(ConnectorError::io(Box::new(std::io::Error::from(
+                    std::io::ErrorKind::ConnectionReset,
+                ))))
+            } else {
+                let mut response =
+                    HttpResponse::new(206.try_into().unwrap(), SdkBody::from(data()));
+                let headers = response.headers_mut();
+                headers.insert("etag", "fixture");
+                headers.insert("content-length", SIZE.to_string());
+                headers.insert("content-range", "bytes 0-65535/65536");
+                Ok(response)
+            })
+        }
+    }
+    let object = Object {
+        key: "object".into(),
+        size: SIZE as u64,
+        etag: "fixture".into(),
+        version: None,
+        metadata: None,
+        mtime: 0,
+    };
+    for permanent in [true, false] {
+        let dir = crate::test_support::tempdir().unwrap();
+        let file = Arc::new(std::fs::File::create_new(dir.path().join("object")).unwrap());
+        file.set_len(SIZE as u64).unwrap();
+        let output = writer::Writer::with_readback(file, SIZE as u64, false).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let connector = Failing {
+            permanent,
+            calls: calls.clone(),
+        };
+        let mut engine = super::buffer_tests::planning_engine(&["--s3-retries", "3"]);
+        engine.client = Client::from_conf(
+            aws_sdk_s3::config::Builder::new()
+                .behavior_version_latest()
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    "test", "test", None, None, "fixture",
+                ))
+                .http_client(http_client_fn(move |_, _| {
+                    SharedHttpConnector::new(connector.clone())
+                }))
+                .build(),
+        );
+        let started = Instant::now();
+        let result = engine
+            .download_fast_range(&object, &output, 0, SIZE as u64, None, None, None)
+            .await;
+        let calls = calls.load(std::sync::atomic::Ordering::Relaxed);
+        if permanent {
+            let message = format!("{:#}", result.unwrap_err());
+            assert!(
+                message.contains("storage authorization expired"),
+                "{message}"
+            );
+            assert_eq!((calls, started.elapsed()), (1, Duration::ZERO), "{message}");
+        } else {
+            result.unwrap();
+            assert_eq!(calls, 2);
+            assert!(started.elapsed() >= Duration::from_millis(100));
+        }
+    }
+}

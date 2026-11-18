@@ -36,6 +36,118 @@ fn file_upload_accepts_precomputed_digest_but_rejects_placeholder_hash() {
     }
 }
 
+/// A source that grows, shrinks or disappears while the synchronous file
+/// body sends it fails the upload at once, without retries.
+#[tokio::test]
+async fn a_changed_source_fails_without_retries() {
+    for change in ["grows", "shrinks", "removed"] {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("source");
+        let size = 4 * 1024 * 1024;
+        std::fs::write(&path, vec![b'x'; size as usize]).unwrap();
+        let args = crate::cli::Args::parse_args(
+            &[
+                "cp",
+                path.to_str().unwrap(),
+                "--to",
+                "s3://bucket",
+                "--as",
+                "object",
+            ]
+            .map(std::ffi::OsString::from),
+        )
+        .unwrap();
+        let source = crate::s3::local::upload_plan(&args)
+            .unwrap()
+            .sources
+            .pop()
+            .unwrap();
+        let file = FileBody::new(source, 0, size);
+        if change == "removed" {
+            std::fs::remove_file(&path).unwrap();
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let changed = path.clone();
+        // Answer each request after changing the source during the first.
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    headers.push(socket.read_u8().await.unwrap());
+                }
+                let source = std::fs::OpenOptions::new().append(true).open(&changed);
+                if change == "shrinks" {
+                    source.as_ref().unwrap().set_len(0).unwrap();
+                }
+                let mut body = (&mut socket).take(size);
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    tokio::io::copy(&mut body, &mut tokio::io::sink()),
+                )
+                .await;
+                if change == "grows" {
+                    std::io::Write::write_all(&mut source.as_ref().unwrap(), b"more").unwrap();
+                }
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nETag: \"e\"\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+        let fallback = aws_smithy_http_client::Builder::new()
+            .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
+                aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
+            ))
+            .build_https();
+        let sdk = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::config::Builder::new()
+                .behavior_version_latest()
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    "test", "test", None, None, "fixture",
+                ))
+                .endpoint_url(endpoint)
+                .force_path_style(true)
+                .http_client(client(fallback, Arc::new(Cancellation::default())))
+                .request_checksum_calculation(
+                    aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+                )
+                .build(),
+        );
+        let (attempts, _, error) = crate::s3::upload_send::tests::failed_upload(|| {
+            let request = sdk
+                .put_object()
+                .bucket("bucket")
+                .key("object")
+                .content_length(size as i64)
+                .body(body(size))
+                .customize()
+                .config_override(crate::s3::client::without_sdk_retries())
+                .disable_payload_signing()
+                .interceptor(file.clone());
+            let file = file.clone();
+            async move {
+                let result = request.send().await;
+                file.drain().await;
+                result
+            }
+        })
+        .await;
+        server.abort();
+        let expected = if change == "removed" {
+            "No such file"
+        } else {
+            "source changed during S3 copy"
+        };
+        assert_eq!(attempts, 1, "{change}: {error:#}");
+        assert!(
+            format!("{error:#}").contains(expected),
+            "{change}: {error:#}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn cancellation_retires_buffered_and_file_uploads_and_rejects_new_requests() {
     for synchronous in [false, true] {

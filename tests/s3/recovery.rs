@@ -4,6 +4,8 @@ use std::os::unix::fs::PermissionsExt;
 
 static REJECTED_PARTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static CORRUPTED_ONCE: AtomicBool = AtomicBool::new(false);
+/// The source file that `recovery-upload-source-*` changes while it is sent.
+static CHANGING_SOURCE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
 
 pub(super) fn serve_upload(
     socket: &mut TcpStream,
@@ -16,6 +18,31 @@ pub(super) fn serve_upload(
     let length = headers
         .get("content-length")
         .map_or(0, |s| s.parse::<usize>().unwrap());
+    if method == "PUT" && fault.starts_with("recovery-upload-source-") {
+        let path = CHANGING_SOURCE.lock().unwrap().clone().unwrap();
+        let file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        if fault == "recovery-upload-source-shrinks" {
+            // Shrink the file while the part is still being sent; the body
+            // then ends early, and the connection closes without a reply.
+            file.set_len(0).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let _ = std::io::copy(&mut socket.take(length as u64), &mut std::io::sink());
+        } else {
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).unwrap();
+            (&file).write_all(b"more").unwrap();
+            reply(
+                socket,
+                200,
+                &[("ETag".into(), "\"part\"".into())],
+                b"",
+                false,
+            );
+        }
+        return;
+    }
     let mut body = vec![0; length];
     socket.read_exact(&mut body).unwrap();
     match method {
@@ -242,6 +269,40 @@ fn failed_upload_without_recovery_record_aborts_multipart_work() {
     assert!(!output.status.success(), "{}", output_text(&output));
     assert!(!server.gate.0.load(Ordering::Relaxed));
     assert!(server.gate.1.load(Ordering::Relaxed));
+}
+
+/// A source file that changes while a part is sent fails the copy at once,
+/// without backing off as if the request might yet succeed.
+#[test]
+fn a_source_that_changes_during_a_part_fails_without_retries() {
+    for fault in [
+        "recovery-upload-source-grows",
+        "recovery-upload-source-shrinks",
+    ] {
+        let temp = crate::test_support::tempdir().unwrap();
+        let server = Server::start(fault);
+        let file = temp.path().join("source");
+        std::fs::write(&file, vec![b'x'; SIZE]).unwrap();
+        *CHANGING_SOURCE.lock().unwrap() = Some(file.clone());
+        // Eight retries would back off for at least 22 seconds.
+        let started = std::time::Instant::now();
+        let output = server
+            .command_with_retries(temp.path(), 8)
+            .args(["--s3-endpoint", &server.address])
+            .arg(&file)
+            .args(["--to", "s3://bucket", "--as", "object"])
+            .capture_output()
+            .unwrap();
+        let elapsed = started.elapsed();
+        let text = output_text(&output);
+        assert!(!output.status.success(), "{fault}: {text}");
+        assert!(
+            text.contains("source changed during S3 copy"),
+            "{fault}: {text}"
+        );
+        assert!(elapsed < Duration::from_secs(10), "{fault}: {elapsed:?}");
+        assert!(!server.gate.0.load(Ordering::Relaxed), "{fault}");
+    }
 }
 
 #[test]

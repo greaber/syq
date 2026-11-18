@@ -26,26 +26,11 @@ pub(super) type MadeDirectory<'a> = Option<&'a (dyn Fn(&File) + Sync)>;
 
 pub(super) fn apply_one(
     op: &Op,
-    destination_root: Option<Arc<Root>>,
-    destination_prefix: Option<&[u8]>,
-    create_missing_parents: bool,
+    scope: DestinationScope<'_>,
     (owned, made): (Option<&owned::OwnedObjects>, MadeDirectory<'_>),
 ) -> Result<()> {
-    let Some(root) = destination_root else {
-        bail!("{UNROOTED_MUTATION}");
-    };
-    let path = op_path(op);
-    let relative = RelativePath::new(path)?;
-    let label = PathBuf::from(OsStr::from_bytes(
-        &destination_prefix.map_or_else(|| path.to_vec(), |prefix| join(prefix, path)),
-    ));
-    hold_before_destination_mutation_for_test(&label)?;
-    let target = RootedTarget {
-        root,
-        relative,
-        label,
-        create_missing_parents,
-    };
+    let target = scope.target(op_path(op))?;
+    hold_before_destination_mutation_for_test(&target.label)?;
     #[cfg(debug_assertions)]
     fail_apply_capacity_for_test(&target.label)?;
     #[cfg(debug_assertions)]
@@ -94,20 +79,17 @@ pub(super) fn apply_one(
 /// names. No Selected operation permits traversal or recursive discovery.
 pub(super) fn selected_removals(
     ops: &[Op],
-    destination_root: Option<Arc<Root>>,
-    destination_prefix: Option<&[u8]>,
+    scope: DestinationScope<'_>,
 ) -> Vec<Result<crate::deletion::Selected>> {
-    let root = destination_root.context(UNROOTED_MUTATION);
+    let root = scope.root.context(UNROOTED_MUTATION);
     ops.iter()
         .map(|op| {
             let root = root
                 .as_ref()
-                .map_err(|error| anyhow::Error::new(wire_error(error)))?
-                .clone();
+                .map_err(|error| anyhow::Error::new(wire_error(error)))?;
+            let root = Arc::clone(root);
             let path = op_path(op);
-            let label = PathBuf::from(OsStr::from_bytes(
-                &destination_prefix.map_or_else(|| path.to_vec(), |prefix| join(prefix, path)),
-            ));
+            let label = scope.label(path);
             #[cfg(debug_assertions)]
             fail_apply_capacity_for_test(&label)?;
             Ok(crate::deletion::Selected {
@@ -133,6 +115,40 @@ pub(super) struct RootedTarget {
     pub(super) relative: RelativePath,
     pub(super) label: PathBuf,
     pub(super) create_missing_parents: bool,
+}
+
+/// The authority a request's destination paths resolve under: the
+/// session's root, the prefix requests name it by, and whether a directory
+/// creation may create missing parents on the way.
+#[derive(Clone, Copy)]
+pub(super) struct DestinationScope<'a> {
+    pub(super) root: Option<&'a Arc<Root>>,
+    pub(super) prefix: Option<&'a [u8]>,
+    pub(super) create_missing_parents: bool,
+}
+
+impl DestinationScope<'_> {
+    /// The target an operation on `path` resolves to; refused without a root.
+    pub(super) fn target(&self, path: &[u8]) -> Result<RootedTarget> {
+        let Some(root) = self.root else {
+            bail!("{UNROOTED_MUTATION}");
+        };
+        Ok(RootedTarget {
+            root: root.clone(),
+            relative: RelativePath::new(path)?,
+            label: self.label(path),
+            create_missing_parents: self.create_missing_parents,
+        })
+    }
+
+    /// `path` as requests name it, for messages.
+    pub(super) fn label(&self, path: &[u8]) -> PathBuf {
+        PathBuf::from(OsStr::from_bytes(
+            &self
+                .prefix
+                .map_or_else(|| path.to_vec(), |prefix| join(prefix, path)),
+        ))
+    }
 }
 
 impl RootedTarget {
@@ -207,6 +223,24 @@ pub(super) fn with_rooted_partial<T>(
     }
 }
 
+impl TargetCondition {
+    /// Whether an object found with this identity and change time meets
+    /// the condition. `Absent` is met only by finding nothing.
+    pub(crate) fn check(self, dev: u64, ino: u64, ctime: (i64, u32)) -> bool {
+        match self {
+            TargetCondition::Any => true,
+            TargetCondition::Absent => false,
+            TargetCondition::Matches { dev: d, ino: i } => (dev, ino) == (d, i),
+            TargetCondition::MatchesFingerprint {
+                dev: d,
+                ino: i,
+                ctime: c,
+                ctime_nsec: n,
+            } => (dev, ino, ctime) == (d, i, (c, n)),
+        }
+    }
+}
+
 /// Observe the object at a destination path and hold it to the planner's
 /// condition. `Absent` requires nothing there (the following `*at` creation
 /// then fails atomically if something appears); the matching conditions
@@ -217,39 +251,25 @@ pub(super) fn observe_rooted_condition(
 ) -> Result<Option<crate::rooted::RootMetadata>> {
     let observed = target.root.metadata_optional(&target.relative)?;
     let label = &target.label;
-    match (condition, observed) {
-        (TargetCondition::Any, observed) => Ok(observed),
-        (TargetCondition::Absent, None) => Ok(None),
-        (TargetCondition::Absent, Some(_)) => Err(condition_not_met(format!(
+    match observed {
+        Some(metadata)
+            if condition.check(
+                metadata.dev,
+                metadata.ino,
+                (metadata.ctime, metadata.ctime_nsec),
+            ) =>
+        {
+            Ok(Some(metadata))
+        }
+        None if matches!(condition, TargetCondition::Any | TargetCondition::Absent) => Ok(None),
+        _ if condition == TargetCondition::Absent => Err(condition_not_met(format!(
             "destination {} appeared before no-replace creation",
             label.display()
         ))),
-        (TargetCondition::Matches { dev, ino }, Some(metadata))
-            if metadata.dev == dev && metadata.ino == ino =>
-        {
-            Ok(Some(metadata))
-        }
-        (
-            TargetCondition::MatchesFingerprint {
-                dev,
-                ino,
-                ctime,
-                ctime_nsec,
-            },
-            Some(metadata),
-        ) if metadata.dev == dev
-            && metadata.ino == ino
-            && metadata.ctime == ctime
-            && metadata.ctime_nsec == ctime_nsec =>
-        {
-            Ok(Some(metadata))
-        }
-        (TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. }, _) => {
-            Err(condition_not_met(format!(
-                "destination {} changed before it could be replaced",
-                label.display()
-            )))
-        }
+        _ => Err(condition_not_met(format!(
+            "destination {} changed before it could be replaced",
+            label.display()
+        ))),
     }
 }
 
@@ -366,15 +386,21 @@ fn apply_one_rooted(
             require_open_target_known(&opened, &target.label, *condition)?;
             // Only a file the receiver can vouch for is changed in place;
             // the copy replaces any other (`vouch`).
-            vouch::require(target, &file, &opened, meta, *flags)?;
-            set_meta_handle_known_portable(&file, meta, *flags, &opened)?;
-            require_rooted_named_identity_known(
-                &target.root,
-                &target.relative,
-                &target.label,
+            let keeping = keep::Keeping {
+                handle: keep::Handle::Path,
+                recheck_any: true,
+                setting: None,
+            };
+            keep::keep_existing(
+                target.into(),
+                &file,
                 &opened,
+                (meta, *flags),
                 *condition,
-            )
+                keeping,
+            )?
+            .required()
+            .map(drop)
         }
         Op::Rmdir { .. } | Op::Unlink { .. } => crate::deletion::DirectoryBatch::default().remove(
             root,
@@ -660,7 +686,7 @@ pub(crate) fn set_handle_metadata(
             (Err(error), _) => return Err(error.into()),
         }
     }
-    set_meta_handle_known_portable(handle, meta, flags & !flags::TIMES, current)
+    set_meta_handle_known(handle, meta, flags & !flags::TIMES, current)
 }
 
 /// Set the times of the symlink `current` describes, which this receiver
@@ -806,26 +832,6 @@ pub(super) fn set_meta_rooted(
     )
 }
 
-/// The target an operation on `path` resolves to, as `apply_one` resolves it.
-pub(super) fn operation_target(
-    path: &[u8],
-    destination_root: Option<Arc<Root>>,
-    destination_prefix: Option<&[u8]>,
-    create_missing_parents: bool,
-) -> Result<RootedTarget> {
-    let Some(root) = destination_root else {
-        bail!("{UNROOTED_MUTATION}");
-    };
-    Ok(RootedTarget {
-        root,
-        relative: RelativePath::new(path)?,
-        label: PathBuf::from(OsStr::from_bytes(
-            &destination_prefix.map_or_else(|| path.to_vec(), |prefix| join(prefix, path)),
-        )),
-        create_missing_parents,
-    })
-}
-
 /// The group and mode of the directories new ones are created in, observed
 /// once per request.
 pub(super) type CreationParents = std::sync::Mutex<HashMap<Vec<u8>, Option<(u32, u32)>>>;
@@ -839,14 +845,13 @@ pub(super) fn starting_group_may_differ(
     path: &[u8],
     group: u32,
     parents: &CreationParents,
-    destination_root: Option<Arc<Root>>,
-    destination_prefix: Option<&[u8]>,
+    scope: DestinationScope<'_>,
 ) -> bool {
     let parent_path = path[..path.iter().rposition(|byte| *byte == b'/').unwrap_or(0)].to_vec();
     let cached = parents.lock().unwrap().get(&parent_path).copied();
     let parent = cached.unwrap_or_else(|| {
         let observed = (|| -> Result<(u32, u32)> {
-            let target = operation_target(path, destination_root, destination_prefix, false)?;
+            let target = scope.target(path)?;
             let (parents, _) = target.relative.leaf()?;
             let parent = target
                 .root
@@ -915,9 +920,7 @@ pub(super) type CreatedDirectory = (u64, u64, u32);
 /// rather than finding one already there.
 pub(super) fn create_identified_directory(
     op: &Op,
-    destination_root: Option<Arc<Root>>,
-    destination_prefix: Option<&[u8]>,
-    create_missing_parents: bool,
+    scope: DestinationScope<'_>,
     private: bool,
     made: MadeDirectory<'_>,
 ) -> Result<Option<CreatedDirectory>> {
@@ -929,12 +932,7 @@ pub(super) fn create_identified_directory(
     else {
         bail!("identified creation requires a Mkdir");
     };
-    let target = operation_target(
-        path,
-        destination_root,
-        destination_prefix,
-        create_missing_parents,
-    )?;
+    let target = scope.target(path)?;
     hold_before_destination_mutation_for_test(&target.label)?;
     #[cfg(debug_assertions)]
     fail_apply_capacity_for_test(&target.label)?;
@@ -952,10 +950,9 @@ pub(super) fn open_created_directory(
     path: &[u8],
     proposed: u32,
     created: (u64, u64),
-    destination_root: Option<Arc<Root>>,
-    destination_prefix: Option<&[u8]>,
+    scope: DestinationScope<'_>,
 ) -> Result<()> {
-    let target = operation_target(path, destination_root, destination_prefix, false)?;
+    let target = scope.target(path)?;
     let directory = target.root.open_metadata(&target.relative)?;
     let current = directory.metadata()?;
     if (current.dev(), current.ino()) != created || !current.is_dir() {
@@ -1272,36 +1269,24 @@ pub(super) fn require_rooted_condition(
     condition: TargetCondition,
     label: &Path,
 ) -> Result<()> {
-    match condition {
-        TargetCondition::Any => Ok(()),
-        TargetCondition::Absent => Err(condition_not_met(format!(
+    if condition.check(
+        metadata.dev,
+        metadata.ino,
+        (metadata.ctime, metadata.ctime_nsec),
+    ) {
+        return Ok(());
+    }
+    Err(condition_not_met(if condition == TargetCondition::Absent {
+        format!(
             "destination {} appeared before metadata update",
             label.display()
-        ))),
-        TargetCondition::Matches { dev, ino } if (metadata.dev, metadata.ino) == (dev, ino) => {
-            Ok(())
-        }
-        TargetCondition::MatchesFingerprint {
-            dev,
-            ino,
-            ctime,
-            ctime_nsec,
-        } if (
-            metadata.dev,
-            metadata.ino,
-            metadata.ctime,
-            metadata.ctime_nsec,
-        ) == (dev, ino, ctime, ctime_nsec) =>
-        {
-            Ok(())
-        }
-        TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. } => {
-            Err(condition_not_met(format!(
-                "destination {} changed before metadata update",
-                label.display()
-            )))
-        }
-    }
+        )
+    } else {
+        format!(
+            "destination {} changed before metadata update",
+            label.display()
+        )
+    }))
 }
 
 pub(super) fn require_rooted_metadata(
@@ -1440,111 +1425,34 @@ pub(super) fn require_open_target_known(
     path: &Path,
     condition: TargetCondition,
 ) -> Result<()> {
-    match condition {
-        TargetCondition::Any => Ok(()),
-        TargetCondition::Absent => Err(condition_not_met(format!(
-            "destination {} appeared after the new-path precondition was checked",
-            path.display()
-        ))),
-        TargetCondition::Matches { dev, ino } => {
-            if metadata.dev() != dev || metadata.ino() != ino {
-                return Err(condition_not_met(format!(
-                    "destination {} changed after the existing-path precondition was checked",
-                    path.display()
-                )));
-            }
-            Ok(())
-        }
-        TargetCondition::MatchesFingerprint {
-            dev,
-            ino,
-            ctime,
-            ctime_nsec,
-        } => {
-            if metadata.dev() != dev
-                || metadata.ino() != ino
-                || metadata.ctime() != ctime
-                || metadata.ctime_nsec() as u32 != ctime_nsec
-            {
-                return Err(condition_not_met(format!(
-                    "destination {} changed after the existing-path precondition was checked",
-                    path.display()
-                )));
-            }
-            Ok(())
-        }
+    if condition.check(
+        metadata.dev(),
+        metadata.ino(),
+        (metadata.ctime(), metadata.ctime_nsec() as u32),
+    ) {
+        return Ok(());
     }
+    let precondition = if condition == TargetCondition::Absent {
+        "appeared after the new-path"
+    } else {
+        "changed after the existing-path"
+    };
+    Err(condition_not_met(format!(
+        "destination {} {precondition} precondition was checked",
+        path.display()
+    )))
 }
 
-#[cfg(target_os = "linux")]
+/// Apply `meta` under `flags` to the object `file`, a metadata handle
+/// (`Root::open_metadata`), refers to, whose metadata `current` was read
+/// through it.
 pub(super) fn set_meta_handle_known(
     file: &File,
     meta: &Meta,
     flags: u8,
     current: &fs::Metadata,
 ) -> Result<()> {
-    let fd = file.as_raw_fd();
-    let empty = c"";
-    // Owner first: chown clears setuid/setgid, so mode must follow it.
-    let owner_changed =
-        apply_owner_if_changed(flags, meta, current.uid(), current.gid(), |uid, gid| {
-            let r = unsafe {
-                libc::fchownat(
-                    fd,
-                    empty.as_ptr(),
-                    uid.unwrap_or(u32::MAX),
-                    gid.unwrap_or(u32::MAX),
-                    libc::AT_EMPTY_PATH,
-                )
-            };
-            if r == 0 {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
-            }
-        })?;
-    if owner_changed {
-        super::access_changed(file);
-    }
-    // A Linux ACL before the mode (see `apply_acls`).
-    let narrowed = crate::inode_metadata::apply_acls(
-        file,
-        meta.inode_metadata.as_deref(),
-        meta.mode,
-        flags & flags::MODE != 0,
-    )?;
-    if flags & flags::MODE != 0 {
-        let current = narrowed.unwrap_or(current.mode() & 0o7777);
-        let wanted = meta.mode & 0o7777;
-        if current != wanted || (owner_changed && wanted & 0o6000 != 0) {
-            set_mode_handle(file, wanted)?;
-            super::access_changed(file);
-        }
-    }
-    if flags & flags::TIMES != 0 {
-        bail!("metadata-only O_PATH repair does not support timestamp changes");
-    }
-    crate::inode_metadata::apply_after_acls(file, meta.inode_metadata.as_deref(), meta.mode)
-}
-
-#[cfg(target_os = "linux")]
-pub(super) fn set_meta_handle_known_portable(
-    file: &File,
-    meta: &Meta,
-    flags: u8,
-    current: &fs::Metadata,
-) -> Result<()> {
-    set_meta_handle_known(file, meta, flags, current)
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(super) fn set_meta_handle_known_portable(
-    file: &File,
-    meta: &Meta,
-    flags: u8,
-    current: &fs::Metadata,
-) -> Result<()> {
-    set_meta_file_known(file, meta, flags, current)
+    set_meta_file_inner(file, keep::Handle::Path, meta, flags, current, false, true)
 }
 
 #[cfg(target_os = "linux")]
