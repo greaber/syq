@@ -65,7 +65,7 @@ pub(crate) use operator::*;
 static NEXT_SWAP_NAME: AtomicU64 = AtomicU64::new(0);
 
 /// Set in `Root::root_profile` once the profile has been read.
-const PROFILE_KNOWN: u16 = 1 << 15;
+const PROFILE_KNOWN: u16 = 1 << 8;
 
 pub(crate) const OPERATOR_SYMLINK_FOLLOW_ADVICE: &str = "pass --follow-src for source paths, --follow-dst for destination paths, or --follow for all the paths you give";
 
@@ -227,6 +227,9 @@ pub(crate) struct Root {
     #[cfg(target_os = "linux")]
     bounds_replacement: OnceLock<bool>,
     network: OnceLock<bool>,
+    /// Whether a close on the root's filesystem reports no write error
+    /// (`fsops::close_is_quiet`), read when a written file first asks.
+    quiet_close: OnceLock<bool>,
     /// The profile of the root's own device as `Profile` bits, with
     /// `PROFILE_KNOWN` set once read, so that publication there looks it up
     /// without a system call or a lock.
@@ -302,6 +305,7 @@ impl Root {
             #[cfg(target_os = "linux")]
             bounds_replacement: OnceLock::new(),
             network: OnceLock::new(),
+            quiet_close: OnceLock::new(),
             root_profile: AtomicU16::new(0),
             other_profiles: Mutex::new(HashMap::new()),
             #[cfg(test)]
@@ -358,6 +362,28 @@ impl Root {
         let _ = self.network.set(true);
     }
 
+    /// Whether closing a descriptor of a file on device `dev` beneath this
+    /// root may report a write error (see `fsops::close_is_quiet`). Only
+    /// the root's own device can be known to report none: the root's open
+    /// directory keeps that filesystem mounted and its device number its
+    /// own, so what was read once holds for as long as the root does. A
+    /// filesystem mounted beneath the root can be replaced by another that
+    /// is given the same number, so a file there always may. After the
+    /// first, a lookup is one atomic load.
+    pub(crate) fn close_reports_writes_on(&self, dev: u64) -> bool {
+        dev != self.identity.dev
+            || !*self
+                .quiet_close
+                .get_or_init(|| crate::fsops::close_is_quiet(&self.directory))
+    }
+
+    /// Stand in for a filesystem whose close does or does not report write
+    /// errors, before anything asks.
+    #[cfg(test)]
+    pub(crate) fn assume_quiet_close_for_test(&self, quiet: bool) {
+        self.quiet_close.set(quiet).unwrap();
+    }
+
     /// What syq relies on the filesystem `directory`, on device `dev`, is
     /// on for (see `fsops::Profile`): the verified capabilities of a known
     /// filesystem type, or the conservative profile for any other. Cached
@@ -373,10 +399,10 @@ impl Root {
         if dev == self.identity.dev {
             let bits = self.root_profile.load(Ordering::Relaxed);
             if bits & PROFILE_KNOWN != 0 {
-                return crate::fsops::Profile::from_bits(bits);
+                return crate::fsops::Profile::from_bits(bits as u8);
             }
             let read = crate::fsops::profile(&self.directory);
-            let known = PROFILE_KNOWN | read.to_bits();
+            let known = PROFILE_KNOWN | u16::from(read.to_bits());
             return match self.root_profile.compare_exchange(
                 bits,
                 known,
@@ -384,7 +410,7 @@ impl Root {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => read,
-                Err(current) => crate::fsops::Profile::from_bits(current),
+                Err(current) => crate::fsops::Profile::from_bits(current as u8),
             };
         }
         if let Some(profile) = self.known_profile(dev) {
@@ -506,9 +532,11 @@ impl Root {
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
                     (bits & PROFILE_KNOWN != 0).then(|| {
                         PROFILE_KNOWN
-                            | crate::fsops::Profile::from_bits(bits)
-                                .without(refusal)
-                                .to_bits()
+                            | u16::from(
+                                crate::fsops::Profile::from_bits(bits as u8)
+                                    .without(refusal)
+                                    .to_bits(),
+                            )
                     })
                 });
         } else if let Some(profile) = self.other_profiles.lock().unwrap().get_mut(&dev) {

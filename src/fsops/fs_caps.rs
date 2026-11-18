@@ -17,14 +17,15 @@
 //!   not tried there, nor on types not audited.
 //! - Link counts, inode numbers and symlink times cannot be checked by
 //!   their errors, so they are trusted only on filesystems with evidence.
-//! - A written file is checked for write errors that only a close reports,
-//!   except on the Linux filesystems below whose source shows that a close
-//!   reports none.
 //!
 //! The profile comes from facts syq already reads cheaply: the filesystem
 //! type, mount options, and on macOS the capabilities a volume advertises.
 //! It is read when a publication first needs it and cached per mount or
 //! volume. Nothing is probed.
+//!
+//! Whether a close can report a write error (`close_is_quiet`) is kept out
+//! of the profile: a wrong answer there hides a failed write, so each
+//! destination root reads it from its own filesystem.
 
 use std::fs::File;
 #[cfg(target_os = "macos")]
@@ -153,16 +154,6 @@ pub(crate) struct Profile {
     /// serializing them saves CPU at the same speed. ZFS locks only the
     /// ranges written, so there they run concurrently, which is faster.
     pub(crate) serialized_writes: bool,
-    /// Linux: closing a descriptor reports no write error here, so a
-    /// written file is not checked by closing a duplicate of its descriptor
-    /// (`check_destination_writes`). `close` returns only what the
-    /// filesystem's `flush` file operation returns (`filp_flush` in
-    /// fs/open.c). NFS, SMB, FUSE and OrangeFS write out there and report
-    /// what failed, and overlayfs and eCryptfs pass on what the filesystem
-    /// below them reports; the filesystems trusted here have no such
-    /// operation, or one that always succeeds (f2fs). macOS decides its own
-    /// check from the file's filesystem and leaves this unset.
-    pub(crate) quiet_close: bool,
 }
 
 impl Default for Profile {
@@ -182,7 +173,6 @@ impl Profile {
         two_second_mtimes: false,
         audited: false,
         serialized_writes: true,
-        quiet_close: false,
     };
 
     /// Every capability, as on the tested local filesystems.
@@ -196,7 +186,6 @@ impl Profile {
         two_second_mtimes: false,
         audited: true,
         serialized_writes: true,
-        quiet_close: true,
     };
 
     /// Tests stand in for filesystems that lack these capabilities.
@@ -223,11 +212,6 @@ impl Profile {
             if set("SYQ_TEST_SYMLINK_TIMES_FOLLOW") {
                 profile.symlink_times = false;
             }
-            // A test that fails the check of a file's writes stands in for
-            // a filesystem whose close reports them, so the check is made.
-            if set("SYQ_TEST_FAIL_WRITER_CLOSE") {
-                profile.quiet_close = false;
-            }
             profile
         }
         #[cfg(not(debug_assertions))]
@@ -245,20 +229,18 @@ pub(crate) enum Refusal {
 
 impl Profile {
     /// The profile as bits, for an atomic cache.
-    pub(crate) const fn to_bits(self) -> u16 {
-        self.exchange as u16
-            | (self.atomic_no_replace_rename as u16) << 1
-            | (self.hard_links as u16) << 2
-            | (self.link_counts_trusted as u16) << 3
-            | (self.symlink_times as u16) << 4
-            | (self.two_second_mtimes as u16) << 5
-            | (self.audited as u16) << 6
-            | (self.serialized_writes as u16) << 7
-            | (self.quiet_close as u16) << 8
+    pub(crate) const fn to_bits(self) -> u8 {
+        self.exchange as u8
+            | (self.atomic_no_replace_rename as u8) << 1
+            | (self.hard_links as u8) << 2
+            | (self.link_counts_trusted as u8) << 3
+            | (self.symlink_times as u8) << 4
+            | (self.two_second_mtimes as u8) << 5
+            | (self.audited as u8) << 6
+            | (self.serialized_writes as u8) << 7
     }
 
-    /// The profile `to_bits` gave these bits for; higher bits are ignored.
-    pub(crate) const fn from_bits(bits: u16) -> Self {
+    pub(crate) const fn from_bits(bits: u8) -> Self {
         Self {
             exchange: bits & 1 != 0,
             atomic_no_replace_rename: bits & 1 << 1 != 0,
@@ -268,7 +250,6 @@ impl Profile {
             two_second_mtimes: bits & 1 << 5 != 0,
             audited: bits & 1 << 6 != 0,
             serialized_writes: bits & 1 << 7 != 0,
-            quiet_close: bits & 1 << 8 != 0,
         }
     }
 
@@ -616,16 +597,59 @@ pub(super) fn linux_profile(file_system_type: u32, file: &File, key: FileSystemK
         two_second_mtimes: fat,
         audited,
         serialized_writes: t != ZFS_SUPER_MAGIC,
-        quiet_close: linux_close_is_quiet(t),
     }
 }
 
-/// Linux: whether closing a file on a filesystem of this type reports no
-/// write error (`Profile::quiet_close`). These are the local filesystems
-/// whose file operations have no `flush`, read in Linux 4.19, 5.4, 6.12 and
-/// 7.2 where each exists and in OpenZFS 2.4 (`zpl_file_operations`), and
-/// f2fs, whose `f2fs_file_flush` only rolls back an exiting process's
-/// atomic write and returns 0. Any type not listed keeps the check.
+/// Whether closing a descriptor of a file on the filesystem `directory` is
+/// on reports no write error, so that a written file there need not be
+/// checked by closing a duplicate of its descriptor (`check_written_file`).
+///
+/// On Linux, `close` returns only what the filesystem's `flush` file
+/// operation returns (`filp_flush` in fs/open.c). NFS, SMB, FUSE and
+/// OrangeFS write out there and report what failed, and overlayfs and
+/// eCryptfs pass on what the filesystem below them reports. Only the local
+/// types listed in `linux_close_is_quiet` are trusted to report nothing;
+/// every other type is checked, as is every filesystem on other systems
+/// (macOS decides its own check from the file's filesystem).
+///
+/// This asks the filesystem itself, and a root asks once
+/// (`Root::close_reports_writes_on`). The cached profiles are keyed by
+/// mount, and a later mount can be given the number of one that is gone.
+pub(crate) fn close_is_quiet(directory: &File) -> bool {
+    // A test that fails the check of a file's writes, or stands in for an
+    // unknown filesystem, has the check made.
+    #[cfg(debug_assertions)]
+    if [
+        "SYQ_TEST_FAIL_WRITER_CLOSE",
+        "SYQ_TEST_CONSERVATIVE_FILESYSTEM",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some())
+    {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: fstatfs writes only into the local struct, which it
+        // initializes on success.
+        unsafe {
+            libc::fstatfs(directory.as_raw_fd(), stats.as_mut_ptr()) == 0
+                && linux_close_is_quiet(stats.assume_init().f_type as u32)
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = directory;
+        false
+    }
+}
+
+/// The local filesystem types whose file operations have no `flush`, read
+/// in Linux 4.19, 5.4, 6.12 and 7.2 where each exists and in OpenZFS 2.4
+/// (`zpl_file_operations`), and f2fs, whose `f2fs_file_flush` only rolls
+/// back an exiting process's atomic write and returns 0.
 #[cfg(target_os = "linux")]
 fn linux_close_is_quiet(file_system_type: u32) -> bool {
     let t = file_system_type;
@@ -848,7 +872,6 @@ pub(crate) fn macos_profile(fd: RawFd) -> Profile {
                 two_second_mtimes: false,
                 audited: true,
                 serialized_writes: true,
-                quiet_close: false,
             },
             &volume.kind,
         ),
@@ -1068,14 +1091,10 @@ mod tests {
 
     #[test]
     fn profiles_survive_their_bits() {
-        for bits in 0..1 << 9 {
+        for bits in 0..=u8::MAX {
             assert_eq!(Profile::from_bits(bits).to_bits(), bits);
         }
         assert_eq!(Profile::from_bits(Profile::LOCAL.to_bits()), Profile::LOCAL);
-        assert_eq!(
-            Profile::from_bits(Profile::CONSERVATIVE.to_bits()),
-            Profile::CONSERVATIVE
-        );
     }
 
     /// A close is trusted to report nothing only on the local filesystems
@@ -1084,9 +1103,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_close_is_quiet_only_on_listed_local_filesystems() {
-        let directory = crate::test_support::tempdir().unwrap();
-        let file = File::open(directory.path()).unwrap();
-        let quiet = |kind| linux_profile(kind, &file, FileSystemKey::Device(0)).quiet_close;
         for local in [
             libc::EXT4_SUPER_MAGIC as u32,
             libc::XFS_SUPER_MAGIC as u32,
@@ -1098,7 +1114,7 @@ mod tests {
             EXFAT_SUPER_MAGIC,
             NTFS3_SUPER_MAGIC,
         ] {
-            assert!(quiet(local), "{local:#x}");
+            assert!(linux_close_is_quiet(local), "{local:#x}");
         }
         for checked in [
             libc::NFS_SUPER_MAGIC as u32,
@@ -1115,7 +1131,7 @@ mod tests {
             0x2011_3221, // OrangeFS
             0x1234_5678,
         ] {
-            assert!(!quiet(checked), "{checked:#x}");
+            assert!(!linux_close_is_quiet(checked), "{checked:#x}");
         }
     }
 
@@ -1150,7 +1166,6 @@ mod tests {
         assert!(!profile.link_counts_trusted);
         assert!(!profile.symlink_times);
         assert!(!profile.two_second_mtimes);
-        assert!(!profile.quiet_close);
     }
 
     #[cfg(target_os = "linux")]

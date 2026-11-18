@@ -481,7 +481,7 @@ impl FsOps {
         } else {
             stage.file.set_len(stream.patch.len)?;
         }
-        check_destination_writes(
+        check_written_file(
             &stage.target.root,
             Some(stage.created.dev()),
             &stage.file,

@@ -1275,7 +1275,7 @@ impl FsOps {
         } else {
             file.set_len(patch.len)?;
         }
-        check_destination_writes(&target.root, Some(dev), file, &target.label)?;
+        check_written_file(&target.root, Some(dev), file, &target.label)?;
         let current = file.metadata()?;
         finish_updated_metadata(target, file, &current, &patch.meta, patch.flags)?;
         if patch.condition != TargetCondition::Any
@@ -2075,7 +2075,7 @@ impl FsOps {
             }
             .with_context(|| format!("write {}", stage.label.display()))?;
         }
-        check_destination_writes(
+        check_written_file(
             &stage.target.root,
             Some(stage.created.dev()),
             &stage.file,

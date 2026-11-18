@@ -95,7 +95,8 @@ pub(crate) use fs_caps::macos_profile;
 #[cfg(test)]
 pub(crate) use fs_caps::override_profiles_for_test;
 pub(crate) use fs_caps::{
-    kind_has_two_second_mtimes, kind_sets_symlink_times, profile, record_refusal, Profile, Refusal,
+    close_is_quiet, kind_has_two_second_mtimes, kind_sets_symlink_times, profile, record_refusal,
+    Profile, Refusal,
 };
 pub(crate) use limits::*;
 pub(crate) use operator::*;
@@ -2106,7 +2107,7 @@ impl FsOps {
         )?;
         observed_write(&self.operation, &file, data, 0, false)
             .with_context(|| format!("write {}", label.display()))?;
-        check_destination_writes(&rooted.root, opened.dev(), &file, &label)?;
+        check_written_file(&rooted.root, opened.dev(), &file, &label)?;
         set_meta_file(&file, meta, flags)
             .with_context(|| format!("set metadata {}", label.display()))?;
         // `publish_partial_rooted` re-checks the staged name against the open

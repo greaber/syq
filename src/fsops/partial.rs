@@ -2457,7 +2457,7 @@ impl FsOps {
         }
         observed_write(&self.operation, &file, data, 0, self.sparse)
             .with_context(|| format!("write {}", rooted.label.display()))?;
-        check_destination_writes(&rooted.root, Some(created.dev()), &file, &rooted.label)?;
+        check_written_file(&rooted.root, Some(created.dev()), &file, &rooted.label)?;
         set_meta_written_file(&file, meta, *flags, &created)
             .with_context(|| format!("set metadata {}", rooted.label.display()))?;
         // As when an in-place file is finalized (`finalize_held`): the file
@@ -3188,7 +3188,7 @@ impl FsOps {
                 _ => file.metadata()?,
             };
             require_open_target_known(&current, &target.label, condition)?;
-            check_destination_writes(&target.root, Some(current.dev()), &file, &target.label)?;
+            check_written_file(&target.root, Some(current.dev()), &file, &target.label)?;
             if let Some(expected) = expected {
                 Self::verify_expected_held(&target.root, &target.relative, &file, expected)?;
             }
@@ -3252,10 +3252,11 @@ impl FsOps {
         let (meta, flags) = resolved
             .as_ref()
             .map_or((meta, flags), |(meta, flags)| (meta, *flags));
-        // A sidecar resumed from an earlier attempt has no metadata read,
-        // and is checked whatever it is on.
+        // A sidecar with no metadata read, as one resumed from an earlier
+        // attempt or written by a whole-file local copy, is checked
+        // whatever it is on.
         let dev = created.as_ref().map(MetadataExt::dev);
-        check_destination_writes(&target.root, dev, &file, &src)?;
+        check_written_file(&target.root, dev, &file, &src)?;
         if let Some(expected) = expected {
             Self::verify_expected_held(&target.root, &src_relative, &file, expected)?;
         }
@@ -4815,46 +4816,32 @@ pub(super) fn timespec(sec: i64, nsec: u32) -> libc::timespec {
     }
 }
 
-/// Collect pending write errors before metadata changes and publication, while
-/// keeping the original inode pinned, where the filesystem `file` is on can
-/// have some. `dev` is the device `file` is on when the caller already
-/// knows it, so that the filesystem is looked up without a system call;
-/// without it the check is made.
-pub(crate) fn check_destination_writes(
+/// `check_destination_writes` for a file written beneath `root`, wherever a
+/// close may report a write error. On a local Linux filesystem whose close
+/// reports none, the check would cost each file two system calls that take
+/// the lock on the process's descriptor table, which the threads of a
+/// receiver writing small files contend for. `dev` is the device `file` is
+/// on when the caller already knows it, so that the decision needs no
+/// system call; without it the check is made.
+pub(super) fn check_written_file(
     root: &Root,
     dev: Option<u64>,
     file: &File,
     label: &Path,
 ) -> Result<()> {
-    if dev.is_some_and(|dev| !close_reports_writes(root, dev, file)) {
+    if dev.is_some_and(|dev| !root.close_reports_writes_on(dev)) {
         return Ok(());
     }
-    collect_destination_writes(file, label)
+    check_destination_writes(file, label)
 }
 
-/// Whether `collect_destination_writes` may find a write error on `file`,
-/// on device `dev` beneath `root`. On Linux that is wherever a close can
-/// report one (`Profile::quiet_close`): every filesystem but the local ones
-/// known to report none. There the check costs each file two system calls
-/// that take the lock on the process's descriptor table, which the threads
-/// of a receiver writing small files contend for. macOS reads the file's
-/// filesystem in the check itself.
-pub(crate) fn close_reports_writes(root: &Root, dev: u64, file: &File) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = (root, dev, file);
-        true
-    }
-    #[cfg(not(target_os = "macos"))]
-    !root.profile_on(dev, file).quiet_close
-}
-
-/// Collect the write errors `file` has pending. Linux NFS, SMB and FUSE
-/// flush when a duplicate descriptor is closed. macOS closes duplicates
-/// without calling the filesystem, so flush NFS/SMB explicitly there. This
-/// is not a general crash-durability guarantee and does not collect every
-/// error reported on other workers' cached handles.
-pub(crate) fn collect_destination_writes(file: &File, label: &Path) -> Result<()> {
+/// Collect pending write errors before metadata changes and publication, while
+/// keeping the original inode pinned. Linux NFS, SMB and FUSE flush on a
+/// duplicate close. macOS closes duplicates without calling the filesystem,
+/// so flush NFS/SMB explicitly there. This is not a general crash-durability
+/// guarantee and does not collect every error reported on other workers'
+/// cached handles.
+pub(crate) fn check_destination_writes(file: &File, label: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let check = || -> io::Result<()> {

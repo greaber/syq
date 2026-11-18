@@ -8155,9 +8155,9 @@ fn late_close_is_reported_before_identity_conditioned_publication() {
 }
 
 /// A written file is checked by closing a duplicate of its descriptor
-/// wherever a close can report a write error, and not on a filesystem whose
-/// close reports none. A file whose device the caller does not know is
-/// checked whatever it is on.
+/// wherever a close can report a write error, and not on a root's own
+/// filesystem when its close reports none. A file on another device, or one
+/// whose device the caller does not know, is checked whatever it is on.
 #[cfg(target_os = "linux")]
 #[test]
 fn written_files_are_checked_at_close_only_where_a_close_reports() {
@@ -8171,19 +8171,16 @@ fn written_files_are_checked_at_close_only_where_a_close_reports() {
         inode_metadata: None,
     };
     let data = b"updated contents";
-    for (quiet_close, expected) in [(true, 0), (false, 1)] {
+    for (quiet, expected) in [(true, 0), (false, 1)] {
         for (small, inplace) in [(true, false), (true, true), (false, false), (false, true)] {
-            let context = format!("quiet_close={quiet_close}, small={small}, inplace={inplace}");
+            let context = format!("quiet={quiet}, small={small}, inplace={inplace}");
             let directory = crate::test_support::tempdir().unwrap();
             let mut ops = destination_ops(directory.path());
             ops.set_hash_policy(crate::hashing::HashPolicy::default());
             ops.destination_root
                 .as_ref()
                 .unwrap()
-                .assume_profile_for_test(Profile {
-                    quiet_close,
-                    ..Profile::LOCAL
-                });
+                .assume_quiet_close_for_test(quiet);
             let copy_id = [84; 16];
             closes();
             if small {
@@ -8240,13 +8237,16 @@ fn written_files_are_checked_at_close_only_where_a_close_reports() {
     }
     let directory = crate::test_support::tempdir().unwrap();
     let root = Root::open(directory.path()).unwrap();
-    root.assume_profile_for_test(Profile::LOCAL);
+    root.assume_quiet_close_for_test(true);
     let file = File::create(directory.path().join("file")).unwrap();
     let dev = file.metadata().unwrap().dev();
     let label = Path::new("file");
-    check_destination_writes(&root, Some(dev), &file, label).unwrap();
+    super::partial::check_written_file(&root, Some(dev), &file, label).unwrap();
     assert_eq!(closes(), 0);
-    check_destination_writes(&root, None, &file, label).unwrap();
+    // Another filesystem beneath the root is not known to be the one read.
+    super::partial::check_written_file(&root, Some(dev + 1), &file, label).unwrap();
+    assert_eq!(closes(), 1);
+    super::partial::check_written_file(&root, None, &file, label).unwrap();
     assert_eq!(closes(), 1);
 }
 
