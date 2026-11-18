@@ -37,10 +37,12 @@ pub(super) struct EarlyLookups {
     shown: std::collections::VecDeque<EarlyLookup>,
     /// Batch lookups the planner has sent, early or in turn.
     sent: u64,
-    /// The batch planned last sent the destination nothing but its lookup.
-    /// One that sent more is likely followed by others that do, each of
-    /// which would waste the lookups sent ahead of it.
-    quiet: bool,
+    /// How many batches in a row, up to `scan::AHEAD`, sent the destination
+    /// nothing but their lookups: as many lookups are kept in flight. A
+    /// batch that sends more wastes those in flight and is likely followed
+    /// by others that do, so the count starts again from none, and a copy
+    /// whose batches keep sending more wastes few.
+    quiet_run: usize,
 }
 
 impl Planner<'_> {
@@ -98,14 +100,16 @@ impl Planner<'_> {
         self.early_lookups.shown.pop_front()
     }
 
-    /// Send the lookups of shown batches that have none in flight.
+    /// Send the lookups of the next shown batches that have none in flight,
+    /// as many batches as `quiet_run` allows.
     fn send_early_lookups(&mut self) {
-        if !self.early_lookups.quiet || !self.looks_up_batches() || self.collision {
+        if !self.looks_up_batches() || self.collision {
             return;
         }
+        let ahead = self.early_lookups.quiet_run;
         let strict_metadata = self.opts.expressions.update.is_some();
         let after = self.other_requests();
-        for early in self.early_lookups.shown.iter_mut().take(crate::scan::AHEAD) {
+        for early in self.early_lookups.shown.iter_mut().take(ahead) {
             if early.reply.is_some() || (early.directories.is_empty() && early.others.is_empty()) {
                 continue;
             }
@@ -201,14 +205,17 @@ impl Planner<'_> {
     }
 
     /// A batch has been planned, having sent `before` other requests when
-    /// it started. Lookups in flight are stale if it sent any; otherwise
-    /// the shown batches without one are looked up.
+    /// it started. Lookups in flight are stale if it sent any, and none is
+    /// sent ahead of the next batch; otherwise one more batch than before
+    /// is looked up ahead.
     pub(super) fn batch_planned(&mut self, before: u64) {
-        let quiet = self.other_requests() == before;
-        if !quiet {
+        if self.other_requests() == before {
+            self.early_lookups.quiet_run =
+                (self.early_lookups.quiet_run + 1).min(crate::scan::AHEAD);
+        } else {
             self.withdraw_early_lookups();
+            self.early_lookups.quiet_run = 0;
         }
-        self.early_lookups.quiet = quiet;
         self.send_early_lookups();
     }
 }

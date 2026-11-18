@@ -11,10 +11,21 @@ use super::*;
 /// Files in each of the fixtures' large directories: more than a scan batch.
 const FILES: usize = 6000;
 
-fn fill(directory: &Path, prefix: &str) {
+/// Put `files` files named `prefix` and a number in `directory`.
+fn fill(directory: &Path, prefix: &str, files: usize) {
     fs::create_dir_all(directory).unwrap();
-    for index in 0..FILES {
-        fs::write(directory.join(format!("{prefix}{index:04}")), b"data").unwrap();
+    for index in 0..files {
+        fs::write(directory.join(format!("{prefix}{index:05}")), b"data").unwrap();
+    }
+}
+
+/// A source whose directory `a/<last>` comes at least two batches after the
+/// first, behind files that sort before it, with its own files filling the
+/// batches after: by then lookups are being sent more than one batch ahead.
+fn fill_with_late_directory(t: &Tmp, last: Option<&str>) {
+    fill(&t.path("src/a"), "f", 2 * FILES);
+    if let Some(last) = last {
+        fill(&t.path(&format!("src/a/{last}")), "g", FILES);
     }
 }
 
@@ -70,8 +81,8 @@ fn stdout(output: &Output) -> String {
 fn unchanged_rerun_uses_every_lookup_it_sent_early() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-    fill(&t.path("src/a"), "f");
-    fill(&t.path("src/b"), "g");
+    fill(&t.path("src/a"), "f", FILES);
+    fill(&t.path("src/b"), "g", FILES);
     assert_output_ok(&copy(&t, &rsh, &[]));
 
     let output = copy(&t, &rsh, &[]);
@@ -92,7 +103,7 @@ fn unchanged_rerun_uses_every_lookup_it_sent_early() {
     let out = stdout(&output);
     assert!(out.contains("transferred 0 files"), "{out}");
     assert!(!t.path("dst/b/extra").exists());
-    assert!(t.path("dst/b/g5999").exists());
+    assert!(t.path("dst/b/g05999").exists());
     let [sent, used, repeated, withdrawn, discarded] = fates(&t);
     assert!(sent >= 2, "{sent} lookups were sent early");
     assert_eq!((used, repeated, withdrawn, discarded), (sent, 0, 0, 0));
@@ -109,10 +120,7 @@ fn lookups_sent_before_a_directory_was_widened_are_repeated() {
     }
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-    // `locked` sorts after the files beside it, so its own entry comes at
-    // least a batch into the scan and its files fill the batches after.
-    fill(&t.path("src/a"), "f");
-    fill(&t.path("src/a/locked"), "g");
+    fill_with_late_directory(&t, Some("locked"));
     assert_output_ok(&copy(&t, &rsh, &[]));
     let locked = t.path("dst/a/locked");
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o600)).unwrap();
@@ -123,7 +131,7 @@ fn lookups_sent_before_a_directory_was_widened_are_repeated() {
     assert_output_ok(&output);
     let out = stdout(&output);
     assert!(out.contains("transferred 0 files"), "{out}");
-    assert!(out.contains("unchanged (12,000 files)"), "{out}");
+    assert!(out.contains("unchanged (18,000 files)"), "{out}");
     assert_eq!(restored, 0o600);
     let [sent, used, repeated, withdrawn, discarded] = fates(&t);
     assert!(
@@ -131,8 +139,9 @@ fn lookups_sent_before_a_directory_was_widened_are_repeated() {
         "no lookup was in flight when the directory was widened: \
          sent {sent}, used {used}, discarded {discarded}"
     );
-    // Each one dropped was asked again.
-    assert!(batch_lookups(&t) > sent - withdrawn - repeated);
+    // The first batch asks in its turn, and so does the first batch after
+    // the widening, whose early lookup was dropped.
+    assert!(batch_lookups(&t) >= sent + 2);
 }
 
 /// A new source directory is created by the batch that holds it, after the
@@ -142,15 +151,15 @@ fn lookups_sent_before_a_directory_was_widened_are_repeated() {
 fn lookups_sent_before_a_directory_was_created_are_repeated() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-    fill(&t.path("src/a"), "f");
+    fill_with_late_directory(&t, None);
     assert_output_ok(&copy(&t, &rsh, &[]));
-    fill(&t.path("src/a/new"), "g");
+    fill(&t.path("src/a/new"), "g", FILES);
 
     let output = copy(&t, &rsh, &[]);
     assert_output_ok(&output);
     let out = stdout(&output);
     assert!(out.contains("transferred 6,000 files"), "{out}");
-    assert!(out.contains("unchanged (6,000 files)"), "{out}");
+    assert!(out.contains("unchanged (12,000 files)"), "{out}");
     assert!(out.contains("1 dirs created"), "{out}");
     let [sent, used, repeated, withdrawn, discarded] = fates(&t);
     assert!(
@@ -160,7 +169,7 @@ fn lookups_sent_before_a_directory_was_created_are_repeated() {
     );
     for index in [0, FILES - 1] {
         assert_eq!(
-            read(&t.path(&format!("dst/a/new/g{index:04}"))),
+            read(&t.path(&format!("dst/a/new/g{index:05}"))),
             b"data",
             "file {index}"
         );
@@ -171,7 +180,7 @@ fn lookups_sent_before_a_directory_was_created_are_repeated() {
     assert_output_ok(&output);
     let out = stdout(&output);
     assert!(out.contains("transferred 0 files"), "{out}");
-    assert!(out.contains("unchanged (12,000 files)"), "{out}");
+    assert!(out.contains("unchanged (18,000 files)"), "{out}");
 }
 
 /// Planning that fails with lookups in flight takes their replies before it
@@ -185,8 +194,7 @@ fn a_failed_batch_leaves_no_early_reply_unread() {
     }
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
-    fill(&t.path("src/a"), "f");
-    fill(&t.path("src/a/locked"), "g");
+    fill_with_late_directory(&t, Some("locked"));
     assert_output_ok(&copy(&t, &rsh, &[]));
     let locked = t.path("dst/a/locked");
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o600)).unwrap();
