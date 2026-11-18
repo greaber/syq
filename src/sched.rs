@@ -649,6 +649,9 @@ struct Inner {
     /// the files a worker's small-file batch holds at least
     /// (`trickling_files`).
     trickle_batch: Option<usize>,
+    /// Bursts of planned files being queued (`file_burst`): their files wake
+    /// no worker until the burst ends.
+    bursts: usize,
     abort: bool,
 }
 
@@ -699,6 +702,27 @@ pub struct Sched {
     worker_setups: Arc<crate::conn::WorkerSetups>,
 }
 
+/// Planned files being queued back to back (`Sched::file_burst`).
+pub struct FileBurst<'a> {
+    sched: &'a Sched,
+}
+
+impl Drop for FileBurst<'_> {
+    fn drop(&mut self) {
+        // Planning that failed part way still wakes workers for what it
+        // queued.
+        let mut inner = self
+            .sched
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.bursts -= 1;
+        if inner.bursts == 0 {
+            self.sched.wake_for_queued_files(inner);
+        }
+    }
+}
+
 impl Sched {
     pub fn new(block: u64, min_split: u64) -> Self {
         Sched {
@@ -721,6 +745,7 @@ impl Sched {
                 scan_done: false,
                 work_released: false,
                 trickle_batch: None,
+                bursts: 0,
                 abort: false,
             }),
             cv: Condvar::new(),
@@ -773,17 +798,53 @@ impl Sched {
         let mut inner = self.inner.lock().unwrap();
         inner.files.register(idx, &job.dst);
         inner.files.push((size, Reverse(FileOrder::new(idx))));
-        let first_work = !std::mem::replace(&mut inner.file_work_anticipated, true);
-        // New batches can run once the source-wide preflights have passed.
-        let runnable = inner.scan_done || inner.work_released;
-        drop(inner);
-        if first_work {
+        if !std::mem::replace(&mut inner.file_work_anticipated, true) {
+            drop(inner);
             // Also wake a worker waiting to learn whether there is file work.
             self.cv.notify_all();
-        } else if runnable {
-            self.cv.notify_one();
+        } else if inner.bursts == 0 {
+            self.wake_for_queued_files(inner);
         }
         idx
+    }
+
+    /// Queue the files planned until the returned burst is dropped without
+    /// waking a worker for each. The workers waiting for work are woken
+    /// once, when the burst ends, and divide what it queued between them.
+    /// Woken file by file while planning is slower than they are, each
+    /// would take the few files queued at that moment as a batch of its own.
+    /// Workers that are not waiting take the files as they are queued.
+    ///
+    /// A burst must not span anything planning waits on, such as a request
+    /// to either end: until it ends, its files have only the workers that
+    /// were already busy.
+    pub fn file_burst(&self) -> FileBurst<'_> {
+        self.inner.lock().unwrap().bursts += 1;
+        FileBurst { sched: self }
+    }
+
+    /// Wake a waiting worker for each queued file, and all of them when
+    /// there are no more workers than files: each takes at least one file,
+    /// and `begin_fast_batch` divides the queue between those that come. A
+    /// worker waits while runnable files are queued only if they were queued
+    /// since it last looked, so the queue holds every file that still needs
+    /// a wakeup.
+    fn wake_for_queued_files(&self, inner: std::sync::MutexGuard<'_, Inner>) {
+        // New batches can run once the source-wide preflights have passed.
+        // Until then the files wait for that release, which wakes everyone.
+        if !(inner.scan_done || inner.work_released) {
+            return;
+        }
+        let waiting = inner.waiting_workers;
+        let files = inner.files.len();
+        drop(inner);
+        if files < waiting {
+            for _ in 0..files {
+                self.cv.notify_one();
+            }
+        } else if waiting > 0 {
+            self.cv.notify_all();
+        }
     }
 
     /// File jobs and queues are index-addressed while workers are active. Once

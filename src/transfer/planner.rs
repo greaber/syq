@@ -1861,9 +1861,7 @@ impl Planner<'_> {
 
         let leaves = self.leaf_entries(others, other_stats, root_entry.as_ref(), dst_root)?;
         let mut leaf_ops = LeafOps::default();
-        for (p, dst_entry) in leaves {
-            self.plan_leaf(p, dst_entry, dst_root, &mut leaf_ops)?;
-        }
+        self.plan_leaves(leaves, dst_root, &mut leaf_ops)?;
         self.flush_meta_fixes(leaf_ops.meta_fixes)?;
         self.flush_leaf_ops(leaf_ops.ops, &leaf_ops.names)
     }
@@ -1901,6 +1899,22 @@ impl Planner<'_> {
             )?
         };
         Ok(others.into_iter().zip(stats).collect())
+    }
+
+    /// Plan leaves whose directories exist, queuing their files as one
+    /// burst: planning them waits on nothing, so the workers waiting for
+    /// work are woken once for all of them (`Sched::file_burst`).
+    fn plan_leaves(
+        &mut self,
+        leaves: impl IntoIterator<Item = (Planned, Option<Entry>)>,
+        dst_root: &[u8],
+        leaf_ops: &mut LeafOps,
+    ) -> Result<()> {
+        let _burst = self.sched.file_burst();
+        for (leaf, entry) in leaves {
+            self.plan_leaf(leaf, entry, dst_root, leaf_ops)?;
+        }
+        Ok(())
     }
 
     /// Decide what one mapped leaf needs, given what its destination holds.
@@ -2900,9 +2914,7 @@ impl Planner<'_> {
             }
         }
         if !ready.is_empty() {
-            for (leaf, entry) in ready {
-                self.plan_leaf(leaf, entry, dst_root, leaf_ops)?;
-            }
+            self.plan_leaves(ready, dst_root, leaf_ops)?;
             (self.start_streaming)((!mkdirs.is_empty()).then_some(pending));
         }
         let sizes: Vec<usize> = mkdirs
@@ -2968,9 +2980,7 @@ impl Planner<'_> {
             self.open_private_root(proposed)?;
         }
         if !last.is_empty() {
-            for (leaf, entry) in last {
-                self.plan_leaf(leaf, entry, dst_root, leaf_ops)?;
-            }
+            self.plan_leaves(last, dst_root, leaf_ops)?;
             (self.start_streaming)(None);
         }
         Ok(true)
@@ -3161,16 +3171,17 @@ impl Planner<'_> {
         if chosen.is_empty() || self.sched.is_aborted() {
             return Ok(());
         }
-        let mut released = false;
-        for i in chosen {
-            for (leaf, entry) in std::mem::take(&mut waiting[i]) {
-                if leaf.e.kind == Kind::File {
-                    pending.remove(leaf.e.size);
-                }
-                self.plan_leaf(leaf, entry, dst_root, leaf_ops)?;
-                released = true;
+        let leaves: Vec<_> = chosen
+            .into_iter()
+            .flat_map(|i| std::mem::take(&mut waiting[i]))
+            .collect();
+        let released = !leaves.is_empty();
+        for (leaf, _) in &leaves {
+            if leaf.e.kind == Kind::File {
+                pending.remove(leaf.e.size);
             }
         }
+        self.plan_leaves(leaves, dst_root, leaf_ops)?;
         if released {
             pending.trickling = !self.directory_pacing.link_bound();
             (self.start_streaming)(Some(*pending));
@@ -3532,6 +3543,7 @@ impl Planner<'_> {
             .unzip();
         let errors = self.apply(ops)?;
         let capacity_error = first_capacity_error(&errors);
+        let _burst = self.sched.file_burst();
         for ((dst, kind, replacement), error) in entries.into_iter().zip(errors) {
             match (error, replacement) {
                 (None, _) => {}
