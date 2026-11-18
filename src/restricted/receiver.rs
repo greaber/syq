@@ -1116,32 +1116,12 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
                 entry_public_key: entry_key.public_key().to_openssh()?,
             };
             let target = endpoint(&target_login, &host, port)?;
-            let encoded = serde_json::to_vec(&request)?;
-            let configured = run_management_over_route(
-                &target,
-                EnrollmentRoute::Configured,
-                id,
-                ManagementAction::Revoke,
-                &encoded,
-            );
-            match (configured, via.as_ref()) {
-                (Ok(_), _) => {}
-                (Err(configured_error), Some(via))
-                    if is_enrollment_transport_failure(&configured_error) =>
-                {
-                    run_management_over_route(
-                        &target,
-                        EnrollmentRoute::ProxyJump { jump: via },
-                        id,
-                        ManagementAction::Revoke,
-                        &encoded,
-                    )
-                    .with_context(|| {
-                        format!("revoking along your SSH configuration's route also failed: {configured_error:#}")
-                    })?;
-                }
-                (Err(error), _) => return Err(error),
-            }
+            over_routes(
+                "revoking",
+                via.as_ref(),
+                || None,
+                |route| revoke_over_route(&target, route, id, &request),
+            )?;
             remove_local_enrollment(&directory)?;
             crate::output::command_println!("revoked {id} from {}", target.label());
             Ok(0)
