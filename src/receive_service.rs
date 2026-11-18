@@ -3394,6 +3394,11 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
             }
             if let Some(name) = name.as_ref() {
                 connections.retain_mut(|s| {
+                    // Which profiles one this build cannot read serves is
+                    // unknown; it is shown for each.
+                    if s.older.is_some() {
+                        return true;
+                    }
                     if s.profiles.is_empty() {
                         return &s.name == name;
                     }

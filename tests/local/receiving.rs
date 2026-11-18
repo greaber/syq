@@ -6186,9 +6186,25 @@ fn a_service_from_before_syq_followed_updates_is_replaced_only_by_hand() {
         &["receive", "on"],
     ];
     let id = "0123456789abcdef0123456789abcdef";
+    // A second profile, which an older service's status does not name.
+    assert_output_ok(&installed.persist(
+        &installed.syq,
+        &[
+            "receive",
+            "on",
+            "--name",
+            "second",
+            "--notify",
+            "off",
+            "--root",
+            &t.s("root"),
+            "--all-connections",
+        ],
+    ));
     let settings: serde_json::Value =
         serde_json::from_slice(&read(&installed.scope.join("receive.json"))).unwrap();
     let profile = settings["profiles"][0]["name"].as_str().unwrap().to_owned();
+    assert_ne!(profile, "second");
     for (pass, command) in replace.into_iter().enumerate() {
         let old = other_service(
             &installed,
@@ -6255,6 +6271,7 @@ fn a_service_from_before_syq_followed_updates_is_replaced_only_by_hand() {
                 &["status", "--json"][..],
                 &["receive", "status", "--json"],
                 &["receive", "status", "--json", "--name", &profile],
+                &["receive", "status", "--json", "--name", "second"],
             ] {
                 let shown = installed.persist(syq, args);
                 assert_output_ok(&shown);
