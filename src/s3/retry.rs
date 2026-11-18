@@ -105,10 +105,11 @@ impl std::error::Error for Permanent {
 }
 
 /// Whether a request that failed without a response would fail the same way
-/// if sent again: the SDK could not build it, credentials could not be loaded,
-/// or a connector or body marked its error [`Permanent`]. This matches the
-/// SDK's own retry policy for the requests it retries, except that a
-/// credential provider that timed out is retried.
+/// if sent again: the SDK could not build it, no credentials are configured
+/// or their configuration is invalid, or a connector or body marked its error
+/// [`Permanent`]. A credential provider that timed out or failed, such as on
+/// a 503 from STS or a credential process that exited with an error, may
+/// still succeed later.
 pub(super) fn permanent<E, R>(error: &SdkError<E, R>) -> bool {
     use aws_credential_types::provider::error::CredentialsError;
     let connector = match error {
@@ -119,9 +120,13 @@ pub(super) fn permanent<E, R>(error: &SdkError<E, R>) -> bool {
     connector.is_some_and(|connector| {
         marked_permanent(connector)
             || causes(connector).any(|cause| {
-                cause
-                    .downcast_ref::<CredentialsError>()
-                    .is_some_and(|e| !matches!(e, CredentialsError::ProviderTimedOut(_)))
+                cause.downcast_ref::<CredentialsError>().is_some_and(|e| {
+                    matches!(
+                        e,
+                        CredentialsError::CredentialsNotLoaded(_)
+                            | CredentialsError::InvalidConfiguration(_)
+                    )
+                })
             })
     })
 }

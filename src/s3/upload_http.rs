@@ -203,7 +203,13 @@ impl Connector {
                             return Err(permanent(file.source.changed()));
                         }
                     }
-                    file.source.check(&check).map_err(permanent)?;
+                    file.source.check(&check).map_err(|e| {
+                        if e.is::<super::local::SourceChanged>() {
+                            permanent(e)
+                        } else {
+                            e
+                        }
+                    })?;
                     let response = response?;
                     let (parts, mut body) = response.into_parts();
                     let mut bytes = Vec::new();

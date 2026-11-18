@@ -507,6 +507,41 @@ mod tests {
             );
             assert!(format!("{error:#}").contains(message), "{error:#}");
         }
+        // The authorizing machine refuses the request; the refusal is final.
+        let (socket, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let authorizer = std::thread::spawn(move || {
+            crate::destination::read_message::<serde_json::Value>(&mut peer).unwrap();
+            crate::destination::write_message(
+                &mut peer,
+                &serde_json::json!({ "Error": "outside approved paths" }),
+            )
+            .unwrap();
+        });
+        let authorization = Arc::new(Authorization::new(
+            "b".into(),
+            Configuration {
+                endpoint: "https://storage.example".into(),
+                region: "auto".into(),
+                expires_at: later,
+                requested_lifetime: 60,
+            },
+            socket,
+        ));
+        let client = client_with(
+            http_client(unreachable, authorization),
+            static_credentials(),
+        );
+        let (attempts, waited, error) = failed_put(&client).await;
+        authorizer.join().unwrap();
+        assert_eq!(
+            (attempts, waited),
+            (1, std::time::Duration::ZERO),
+            "{error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("authorizing machine: outside approved paths"),
+            "{error:#}"
+        );
     }
 
     /// Redacting a connector error keeps its mark as permanent.
