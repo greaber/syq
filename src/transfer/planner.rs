@@ -5637,6 +5637,10 @@ impl Planner<'_> {
                 "final directory metadata",
             )?;
         }
+        // Planning that ended in an error can leave lookups sent early
+        // unanswered. Their replies are taken first: with these requests
+        // they would be more than the connection lets wait.
+        self.withdraw_early_lookups();
         // The receiver runs requests in the order sent, so several can await
         // their replies without a later one's changes overtaking an earlier
         // one's (`directory_metadata_batch_len`).
