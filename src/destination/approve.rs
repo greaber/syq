@@ -211,12 +211,14 @@ impl Approver<'_> {
         let request_lock = self.request_lock.try_lock().map_err(|_| {
             anyhow::anyhow!("another transfer is awaiting approval; retry after it is decided")
         })?;
+        // Parsed once, for the authorizer and the route's own checks.
+        let args = crate::approval_command::parse(&command)?;
         let receiver = match self.origin {
             Origin::Receiving(receiver) => {
                 // A copy from this machine names it as its source; its own
                 // checks refuse another authorizer, with their own advice.
                 if route != Route::FromNamed {
-                    crate::approval_command::check_authorizer(&command, &receiver.name)?;
+                    crate::approval_command::check_authorizer(&args, &receiver.name)?;
                 }
                 Some(receiver)
             }
@@ -225,7 +227,7 @@ impl Approver<'_> {
                     route == Route::Between,
                     "an SSH authorization provider approves only copies between two other servers; this copy uses the provider's account access"
                 );
-                crate::approval_command::check_provider_authorizer(&command)?;
+                crate::approval_command::check_provider_authorizer(&args)?;
                 None
             }
         };
@@ -236,11 +238,11 @@ impl Approver<'_> {
                 .map(|receiver| receiver.name.as_str())
                 .context("only a receiving connection asks to copy to or from this machine")
         };
-        let args = match route {
-            Route::ToNamed => crate::approval_command::receiving_command(&command, name()?)?,
-            Route::FromNamed => send::sending_command(&command, name()?)?,
-            _ => crate::approval_command::parse(&command)?,
-        };
+        match route {
+            Route::ToNamed => crate::approval_command::check_receiving_command(&args, name()?)?,
+            Route::FromNamed => send::check_sending(&args, name()?)?,
+            _ => {}
+        }
         let (source, destination, results_key) = match ask {
             Ask::Write | Ask::Send => (None, None, None),
             Ask::Pull { target } => {

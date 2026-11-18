@@ -21,7 +21,7 @@ fn command(args: &[&str]) -> Vec<Vec<u8>> {
 #[test]
 fn receiving_authorizer_checks_the_command_without_local_preferences() {
     let omitted = command(&["cp", "results", "--to", "backup"]);
-    check_authorizer(&omitted, "laptop").unwrap();
+    check_authorizer(&parse(&omitted).unwrap(), "laptop").unwrap();
     for (mode, accepted) in [
         ("auto", true),
         ("@laptop", true),
@@ -30,7 +30,7 @@ fn receiving_authorizer_checks_the_command_without_local_preferences() {
     ] {
         let selected = command(&["cp", "results", "--to", "backup", "--auth-from", mode]);
         assert_eq!(
-            check_authorizer(&selected, "laptop").is_ok(),
+            check_authorizer(&parse(&selected).unwrap(), "laptop").is_ok(),
             accepted,
             "{mode}"
         );

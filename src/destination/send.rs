@@ -103,13 +103,20 @@ pub(crate) fn request(args: &crate::cli::Args) -> Result<pull::PullRequest> {
 /// The copy `command` asks this machine, the receiving machine `name`, to
 /// send: a `syq cp --from @name` to the requesting server. This machine
 /// derives what the copy may read from the command alone.
-pub(super) fn sending_command(command: &[Vec<u8>], name: &str) -> Result<crate::cli::Args> {
+#[cfg(test)]
+fn sending_command(command: &[Vec<u8>], name: &str) -> Result<crate::cli::Args> {
     let args = crate::approval_command::parse(command)?;
+    check_sending(&args, name)?;
+    Ok(args)
+}
+
+/// As `sending_command`, for a command already parsed.
+pub(super) fn check_sending(args: &crate::cli::Args, name: &str) -> Result<()> {
     anyhow::ensure!(
-        eligible(&args)? == name,
+        eligible(args)? == name,
         "the requesting command copies from a different machine"
     );
-    Ok(args)
+    Ok(())
 }
 
 pub(super) fn select(args: &crate::cli::Args) -> Result<Option<handoff::Selection>> {
