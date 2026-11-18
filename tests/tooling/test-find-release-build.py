@@ -129,7 +129,7 @@ class Tests(unittest.TestCase):
         self.assertNotIn("    needs:", crate)
         self.assertIn('scripts/prepare-release-crate.py "v$version"', crate)
         self.assertIn('name: source-crate', crate)
-        self.assertIn('scripts/verify-prepared-crate.py "$GITHUB_REF_NAME"', release)
+        self.assertIn('scripts/prepare-release-crate.py --verify "$GITHUB_REF_NAME"', release)
 
 
 

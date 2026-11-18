@@ -551,6 +551,20 @@ class BranchStatusTests(unittest.TestCase):
                                "isCrossRepository": False}]
         self.assertIn("unfinished runs):\n  none\n", self.status())
 
+    def test_this_branchs_merged_failure_is_reported_beyond_the_shared_window(self):
+        # Still on a merged task branch, its failure from before the merge has left
+        # the shared list but is still found by the direct query for this branch.
+        self.dispatch("ci.yml", 34, "2026-02-01T00:00:00Z", {"s3": "failure"})
+        (self.runs / "ci.yml.workflow_dispatch.branch-task.json").write_text(
+            json.dumps(self.dispatched["ci.yml"]))
+        (self.runs / "ci.yml.workflow_dispatch.json").write_text("[]")
+        self.merged = self.branch_merged = [
+            {"number": 4, "url": "https://example.invalid/pull/4", "headRefName": "task",
+             "mergedAt": "2026-02-02T00:00:00Z", "isCrossRepository": False}]
+        output = self.status()
+        self.assertIn("unfinished runs):\n  none\n", output)
+        self.assertIn("NOTE: #4 merged with ci.yml s3 failure", output)
+
     def test_failure_left_by_a_merge_is_reported_until_a_full_run_on_master(self):
         self.dispatch("ci.yml", 41, "2026-02-01T00:00:00Z", {"s3": "failure"}, branch="merged-task")
         # Runs after the merge belong to later work that reuses the branch name.

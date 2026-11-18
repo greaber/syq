@@ -41,10 +41,11 @@ import shutil
 import subprocess
 import sys
 
-from dispatched_checks import (BRANCH_WORKFLOWS, apply_resolutions, branch_runs, check_results,
+from dispatched_checks import (BRANCH_WORKFLOWS, acknowledgement_reason, apply_resolutions,
+                               branch_runs, check_results, fetch_branch_runs,
                                dispatched_runs, failed_checks, fetch_commit_statuses, fetch_jobs,
-                               fetch_resolutions, in_parallel, merged_from_branch,
-                               merged_pull_requests, result_lines,
+                               fetch_resolutions, in_parallel, merged_pull_requests,
+                               post_acknowledgement, read_acknowledgement, result_lines,
                                run_jobs, running, undecided, unresolved)
 from tooling import ToolError, json_output, output, report_errors
 
@@ -131,13 +132,11 @@ def annotate_master_runs(runs):
     for run in runs:
         if not failed_master_run(run):
             continue
-        resolution = statuses.get(run["headSha"], {}).get(master_resolution_context(run), {})
-        if (resolution.get("state") == "success" and (resolution.get("description") or "").strip()
-                and resolution.get("target_url")):
-            run["resolution"] = {
-                "reason": resolution["description"], "fix": resolution["target_url"],
-                "actor": (resolution.get("creator") or {}).get("login"),
-                "created_at": resolution.get("created_at"), "url": resolution.get("url")}
+        resolution = read_acknowledgement(statuses, run["headSha"],
+                                          master_resolution_context(run), "fix",
+                                          link_required=True)
+        if resolution:
+            run["resolution"] = resolution
 
 
 def address_master_run(run_id, reason, fix):
@@ -147,9 +146,7 @@ def address_master_run(run_id, reason, fix):
     run = next((run for run in runs if run and run.get("databaseId") == run_id), None)
     if not failed_master_run(run):
         raise ToolError(f"run {run_id} is not a current failed post-merge or nightly master run", 2)
-    output("gh", "api", "--method", "POST", f"repos/{REPOSITORY}/statuses/{run['headSha']}",
-           "-f", "state=success", "-f", f"context={master_resolution_context(run)}",
-           "-f", f"description={reason}", "-f", f"target_url={fix}", status=2)
+    post_acknowledgement(REPOSITORY, run["headSha"], master_resolution_context(run), reason, fix)
     print(f"Addressed master run {run_id}, attempt {run['attempt']}, at {run['headSha'][:7]}: "
           f"{reason} {fix}")
     print("The original result is unchanged; this is not passing test or release evidence.")
@@ -229,21 +226,20 @@ def report(json_report, check):
     # directly rather than from the recent merges shared with other branches.
     lookups = [lambda: open_pull_request(branch) if branch != "HEAD" else None,
                lambda: merged_pull_requests(REPOSITORY),
-               lambda: merged_from_branch(REPOSITORY, branch) if branch != "HEAD" else []]
+               lambda: fetch_branch_runs(REPOSITORY, branch) if branch != "HEAD" else ([], [])]
     lookups += [lambda workflow=workflow, event=event: master_run(workflow, event)
                 for workflow in WORKFLOWS for event in ("push", "schedule")]
     lookups += [lambda workflow=workflow: dispatched_runs(REPOSITORY, workflow)
                 for workflow in BRANCH_WORKFLOWS]
-    # The recent runs on every branch can crowd out this branch's older ones.
-    lookups += [lambda workflow=workflow: dispatched_runs(REPOSITORY, workflow, branch)
-                if branch != "HEAD" else [] for workflow in BRANCH_WORKFLOWS]
     results = in_parallel(lookups)
-    pr, merged, own_merged = results[:3]
+    # The recent runs on every branch can crowd out this branch's older ones,
+    # which are looked up directly.
+    pr, merged, (own_merged, own_branch_runs) = results[:3]
     latest_runs = results[3:3 + 2 * len(WORKFLOWS)]
     annotate_master_runs(latest_runs)
     latest = iter(latest_runs)
     runs = {run.get("databaseId"): run for workflow_runs in results[3 + 2 * len(WORKFLOWS):]
-            for run in workflow_runs}
+            + [own_branch_runs] for run in workflow_runs}
     runs = list(runs.values())
     master_runs = []
     for workflow in WORKFLOWS:
@@ -438,11 +434,8 @@ def main():
     if args.address_master_run is not None:
         if args.address_master_run <= 0 or args.json or args.check:
             parser.error("--address-master-run requires a positive run ID and no report options")
-        args.reason = (args.reason or "").strip()
-        if not 1 <= len(args.reason) <= 140 or any(c in args.reason for c in "\r\n"):
-            parser.error("--reason must be one line of 1–140 characters")
-        if not args.fix or not args.fix.startswith("https://") or any(c.isspace() for c in args.fix):
-            parser.error("--fix requires an HTTPS URL")
+        args.reason = acknowledgement_reason(parser, args.reason, args.fix, "--fix",
+                                             link_required=True)
     elif args.reason is not None or args.fix is not None:
         parser.error("--reason and --fix require --address-master-run")
     for tool in ("git", "gh"):

@@ -223,6 +223,7 @@ class DispatchedChecksStatusTests(unittest.TestCase):
                         ["--resolve-job", "8400", "--reason", " "],
                         ["--resolve-job", "8400", "--reason", "x" * 141],
                         ["--resolve-job", "8400", "--reason", "two\nlines"],
+                        ["--resolve-job", "8400", "--reason", "x", "--replacement", "http://x"],
                         ["--reason", "not an action"],
                         ["--resolve-job", "-1", "--reason", "invalid id"]):
             with self.subTest(options=options):

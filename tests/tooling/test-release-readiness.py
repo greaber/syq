@@ -156,7 +156,7 @@ else:
                "FIXTURE_TARGET": str(target)}
         prepared = self.root / "prepared"
         subprocess.run([str(SCRIPTS / "prepare-release-crate.py"), "v9.9.9", str(prepared)], env=env, check=True)
-        command = [str(SCRIPTS / "verify-prepared-crate.py"), "v9.9.9", str(prepared)]
+        command = [str(SCRIPTS / "prepare-release-crate.py"), "--verify", "v9.9.9", str(prepared)]
         subprocess.run(command, env=env, check=True)
         result = subprocess.run(command, env={**env, "FIXTURE_BYTES": "different"}, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)

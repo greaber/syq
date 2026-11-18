@@ -5,6 +5,7 @@ Every GitHub, registry, and remote-Git response comes from fakes; nothing here
 creates a tag, a publication, or a CI run.
 """
 from support import ROOT, SCRIPTS
+import release_checks
 
 import base64
 import importlib.util
@@ -132,7 +133,7 @@ class WorkflowTextTests(unittest.TestCase):
 
     def test_release_workflow_requires_checks_and_notes(self):
         release = (ROOT / ".github/workflows/release.yml").read_text()
-        self.assertIn("rust,sdks,macos,linux-arm64,conformance", release)
+        self.assertIn(",".join(release_checks.REQUIRED_CHECKS), release)
         self.assertIn(".github/release-notes/$GITHUB_REF_NAME.md", release)
 
 
@@ -722,7 +723,7 @@ class PreflightTests(Scratch):
         option_scripts = self.work / "tag-option-scripts"
         option_scripts.mkdir()
         shutil.copy(SCRIPTS / "release-preflight.py", option_scripts)
-        for name in ["release-readiness.py", "verify-release-ci.py", "release_test_inputs.py",
+        for name in ["release_checks.py", "verify-release-ci.py", "release_test_inputs.py",
                      "tooling.py"]:
             (option_scripts / name).symlink_to(SCRIPTS / name)
         for options in ["", 'namespaces="git"', 'namespaces="git, file",valid-before="20990101"']:
@@ -747,6 +748,26 @@ class PreflightTests(Scratch):
                 ({"SYQ_TEST_EXISTING_CRATE_VERSION": "9.9.9"}, "already published on crates.io")]:
             with self.subTest(message=message):
                 self.assertFails(self.preflight(**env), message)
+        # Readiness reports the same missing named check that preflight rejects.
+        status, report = self.readiness(
+            SYQ_TEST_CHECKS_JSON=check_runs("rust", "sdks", "macos", "linux-arm64"))
+        self.assertEqual(status, 1, report)
+        self.assertEqual([item["message"] for item in report["missing"]],
+                         [f"required check conformance is missing on certified commit {self.head}"])
+
+    def test_api_follow_ups_are_read_from_the_checked_repository(self):
+        # The candidate's own inventory decides, not that of the scripts' checkout.
+        (self.repo / "sdk/python/native-api.json").write_text(
+            '{"schema":1,"commands":{"copy":{"sdk":"supported","follow_up":["example"]}}}\n')
+        self.git(self.repo, "commit", "-qam", "pending follow-up")
+        candidate = self.git(self.repo, "rev-parse", "HEAD")
+        self.git(self.repo, "update-ref", "refs/remotes/origin/master", candidate)
+        env = {"SYQ_TEST_PREFLIGHT_HEAD": candidate}
+        self.assertFails(self.preflight(**env), "syq copy: Python SDK follow-up required")
+        status, report = self.readiness(**env)
+        self.assertEqual(status, 1, report)
+        self.assertTrue(any("Python native API synchronization failed" in item["message"]
+                            for item in report["missing"]))
 
     def test_branch_names_do_not_define_the_candidate(self):
         # Branch names and the coordination branch tip do not define the candidate.
@@ -788,6 +809,9 @@ class PreflightTests(Scratch):
         self.assertFails(self.preflight(SYQ_TEST_PREFLIGHT_HEAD=later), "origin/master is stale")
         (self.repo / "untracked").write_text("uncommitted")
         self.assertFails(self.preflight(), "working tree is not clean")
+        # A configuration that hides untracked files does not hide them here.
+        self.git(self.repo, "config", "status.showUntrackedFiles", "no")
+        self.assertFails(self.preflight(), "working tree is not clean")
         (self.repo / "untracked").unlink()
         self.receipt.unlink()
         self.assertFails(self.preflight(), "real-SSH evidence is missing")
@@ -806,8 +830,8 @@ class PreflightTests(Scratch):
         scripts = self.work / "lint-scripts"
         scripts.mkdir()
         shutil.copy(SCRIPTS / "release-readiness.py", scripts)
-        for name in ["verify-release-ci.py", "release_test_inputs.py", "tooling.py",
-                     "check-python-api-sync.py"]:
+        for name in ["release_checks.py", "verify-release-ci.py", "release_test_inputs.py",
+                     "tooling.py", "check-python-api-sync.py"]:
             (scripts / name).symlink_to(SCRIPTS / name)
         marker = self.work / "lint-ran"
         write_executable(scripts / "check-macos-lint.py", textwrap.dedent(f"""\
