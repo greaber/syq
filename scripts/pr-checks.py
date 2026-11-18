@@ -22,9 +22,8 @@ import json
 import shutil
 import sys
 
-from dispatched_checks import (BRANCH_WORKFLOWS, apply_resolutions, branch_runs, check_results,
-                               dispatched_runs, fetch_jobs, fetch_resolutions, in_parallel,
-                               merged_from_branch, result_lines, running, unresolved)
+from dispatched_checks import (apply_resolutions, branch_dispatched_runs, check_results,
+                               fetch_jobs, fetch_resolutions, result_lines, running, unresolved)
 from tooling import ToolError, json_output, report_errors
 
 REPOSITORY = "greaber/syq"
@@ -38,11 +37,7 @@ def report(number, json_report):
     branch = pr.get("headRefName") or ""
     results, active = [], []
     if not pr.get("isCrossRepository"):
-        found = in_parallel([lambda: merged_from_branch(REPOSITORY, branch)] + [
-            lambda workflow=workflow: dispatched_runs(REPOSITORY, workflow, branch)
-            for workflow in BRANCH_WORKFLOWS])
-        runs = branch_runs([run for workflow_runs in found[1:] for run in workflow_runs],
-                           branch, found[0], pr.get("mergedAt") or None)
+        runs = branch_dispatched_runs(REPOSITORY, branch, pr.get("mergedAt") or None)
         results = check_results(runs, fetch_jobs(REPOSITORY, runs))
         results = apply_resolutions(pr["number"], results, fetch_resolutions(REPOSITORY, results))
         active = running(runs)
