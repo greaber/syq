@@ -13192,20 +13192,21 @@ fn small_copies_publish_through_a_restricted_receiver() {
     fs::write(target.join("old"), b"stale contents").unwrap();
     let key = generate_results_key(EnrollmentId::random()).unwrap();
     let (secret, policy) = results_policy();
-    let authority = std::sync::Arc::new(
-        test_authority_with_results(
-            &root,
-            DeletionPolicy::Forbid,
-            1024,
-            FilterPolicy::default(),
-            PublicationPolicy::AtomicStaged,
-            ExistingDestinationPolicy::Replace,
-            DestinationPlacement::DirectoryContents,
-            RootExistence::Any,
-            Some((key, policy)),
-        )
-        .unwrap(),
-    );
+    let mut authority = test_authority_with_results(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        FilterPolicy::default(),
+        PublicationPolicy::AtomicStaged,
+        ExistingDestinationPolicy::Replace,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+        Some((key, policy)),
+    )
+    .unwrap();
+    // Each of the copy's three preparations counts its three files.
+    authority.copy.limits.max_entries = 9;
+    let authority = std::sync::Arc::new(authority);
     let mut reader = start_results(&authority, secret);
     let mut ops = authority.test_ops();
     let mut gate = PatchStreamGate::new(authority.clone());
@@ -13296,9 +13297,10 @@ fn small_copies_publish_through_a_restricted_receiver() {
     )
     .unwrap();
     assert_eq!(in_flight(), 0);
+    // Both preparations count their three files, though neither ran.
     assert_eq!(
         authority.changes.load(std::sync::atomic::Ordering::Relaxed),
-        0
+        6
     );
 
     // A telemetry sample in between does not.
@@ -13327,7 +13329,7 @@ fn small_copies_publish_through_a_restricted_receiver() {
     }
     assert_eq!(
         authority.changes.load(std::sync::atomic::Ordering::Relaxed),
-        3
+        9
     );
     let results = finish_results(&authority, &mut reader);
     assert_eq!(results.totals.files_transferred, 3);
@@ -13946,12 +13948,11 @@ fn changes_check_existence_only_where_numbers_mislead() {
     }
 }
 
-/// A small copy counts its files against the entry limit when their
-/// payloads come, and keeps the count when its staging fails. One that
-/// ends without its payloads, as when the sender turns to the ordinary
-/// engine instead, counts nothing.
+/// A small copy counts its files against the entry limit when it is
+/// prepared, and keeps the count when it ends without its payloads or its
+/// staging fails.
 #[test]
-fn a_small_copy_counts_its_files_with_their_payloads() {
+fn a_small_copy_counts_its_files_when_prepared() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
     let target = root.join("target");
@@ -14019,31 +14020,105 @@ fn a_small_copy_counts_its_files_with_their_payloads() {
             "{response:?}"
         );
     };
-    // Prepared, then left without its payloads: nothing counts.
+    // Prepared, then left without its payloads: the file still counts.
     prepare(&mut gate, &mut ops);
-    assert_eq!(changes(), 0);
-    prepare(&mut gate, &mut ops);
-    assert_eq!(changes(), 0);
-    // Different contents under `error-if-different`: nothing is staged,
-    // and the file still counts.
-    let response = execute_on_connection(&mut gate, &mut ops, payload()).unwrap();
-    assert!(
-        matches!(
-            response,
-            proto::Response::SmallFilesCopied(proto::SmallCopyResponse {
-                outcome: proto::SmallCopyOutcome::StagingFailed(_),
-                ..
-            })
-        ),
-        "{response:?}"
-    );
     assert_eq!(changes(), 1);
-    // The limit leaves no room for another copy's payloads.
-    prepare(&mut gate, &mut ops);
-    let error = execute_on_connection(&mut gate, &mut ops, payload()).unwrap_err();
-    assert!(error.contains("entry limit"), "{error}");
+    let refused = execute_on_connection(
+        &mut gate,
+        &mut ops,
+        Request::PrepareSmallFiles(offer(
+            &target.join("other"),
+            crate::cli::IfExists::ErrorIfDifferent,
+        )),
+    )
+    .unwrap_err();
+    assert!(refused.contains("entry limit"), "{refused}");
     assert_eq!(changes(), 1);
     assert_eq!(fs::read(target.join("other")).unwrap(), b"y");
+}
+
+/// A small copy whose files all pass the receiver's quick check finishes in
+/// its preparation's turn, with no payloads, and may change their metadata
+/// there: it counts against the entry limit, and is refused past it.
+#[test]
+fn a_small_copy_without_payloads_counts_its_metadata_changes() {
+    use std::os::unix::fs::PermissionsExt;
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let kept = target.join("kept");
+    fs::write(&kept, b"x").unwrap();
+    fs::set_permissions(&kept, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&kept)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH)
+        .unwrap();
+    let mut authority = test_authority_with_results(
+        &root,
+        DeletionPolicy::Forbid,
+        1024,
+        FilterPolicy::default(),
+        PublicationPolicy::AtomicStaged,
+        ExistingDestinationPolicy::Replace,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+        None,
+    )
+    .unwrap();
+    authority.copy.limits.max_entries = 2;
+    authority.copy.options.preserve_times = true;
+    authority.copy.options.preserve_permissions = true;
+    let authority = std::sync::Arc::new(authority);
+    let mut ops = authority.test_ops();
+    let mut gate = PatchStreamGate::new(authority.clone());
+    let changes = || authority.changes.load(std::sync::atomic::Ordering::Relaxed);
+    let mode = || fs::metadata(&kept).unwrap().permissions().mode() & 0o7777;
+    let offer = |mode: u32| {
+        Request::PrepareSmallFiles(proto::SmallCopyRequest {
+            reuse_block_size: None,
+            if_exists: crate::cli::IfExists::Update,
+            matching_flags: 0,
+            hash_policy: authority.hash_policy(),
+            copy_if: None,
+            directory: path_bytes(&target),
+            symlink_policy: proto::OperatorSymlinkPolicy::Refuse,
+            request_prefix: path_bytes(&target),
+            identity: proto::SmallCopyIdentity {
+                copy_id: [8; 16],
+                dst_leaf: None,
+            },
+            flags: proto::flags::TIMES | proto::flags::MODE,
+            files: vec![proto::SmallCopyFile {
+                path: path_bytes(&kept),
+                expression_source: None,
+                size: 1,
+                meta: proto::Meta {
+                    mode,
+                    ..plain_meta()
+                },
+            }],
+        })
+    };
+    for (count, wanted) in [(1, 0o644), (2, 0o600)] {
+        let response = execute_on_connection(&mut gate, &mut ops, offer(wanted)).unwrap();
+        assert!(
+            matches!(
+                &response,
+                proto::Response::SmallFilesCopied(proto::SmallCopyResponse {
+                    outcome: proto::SmallCopyOutcome::Published(results),
+                    ..
+                }) if results[0].repaired
+            ),
+            "{response:?}"
+        );
+        assert_eq!((changes(), mode()), (count, wanted));
+    }
+    let refused = execute_on_connection(&mut gate, &mut ops, offer(0o644)).unwrap_err();
+    assert!(refused.contains("entry limit"), "{refused}");
+    assert_eq!((changes(), mode()), (2, 0o600));
 }
 
 /// A preparation that may neither create nor update its file only looks,

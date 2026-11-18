@@ -106,10 +106,10 @@ certificate's critical options, such as `source-address`.
 A restricted copy may make up to 100 million entries and write up to 8 TiB of
 file data by default; change these for one copy with
 `--receiver-max-entries N` and `--receiver-max-bytes SIZE`. Entries are the
-changes hostB makes: files written, directories, links and special files
-created, metadata changes, and deletions. Each change counts when hostB
-accepts the request for it, so one sent again after a dropped connection
-counts again. The copy must start within 24 hours of authorization and
+changes the copy asks hostB to make: files written, directories, links and
+special files created, metadata changes, and deletions. Each counts when hostB
+accepts the request for it, even if hostB then finds nothing to change, and
+one sent again after a dropped connection counts again. The copy must start within 24 hours of authorization and
 finish within seven days of it.
 
 A copy between two servers can name up to 1,024 sources, like any copy, but

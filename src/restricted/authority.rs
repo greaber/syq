@@ -1840,9 +1840,12 @@ impl RestrictedAuthority {
                         && matches!(response, proto::Response::EndpointError(error)
                             if crate::fsops::vouch::is_replace_required_wire(error));
                     // A Finalize of a file with no reservation that
-                    // succeeded was answered as one that already published
-                    // its file: it changed nothing, and leaves alone any
-                    // newer file the copy writes under its name.
+                    // succeeded is taken to be one sent again after the
+                    // Finalize that published the file lost its reply: it
+                    // leaves alone any newer file the copy writes under its
+                    // name. A Finalize that raced a newer preparation of
+                    // the same file could instead have published that file,
+                    // which the results then list as unfinished.
                     if stage == FileStage::Finalize
                         && charged.unreserved_finalize
                         && outcome_error(index).is_none()
@@ -2636,7 +2639,7 @@ impl RestrictedAuthority {
     /// limit. A count is never given back, even for a change the receiver
     /// then finds it need not or cannot make, and a request sent again
     /// counts again. Nothing is counted when any limit would be exceeded.
-    pub(super) fn charge_request(&self, request: &Request, step: &StreamStep) -> Result<Charged> {
+    pub(super) fn charge_request(&self, request: &Request) -> Result<Charged> {
         // A file the copy writes counts once, before its first change: the
         // request that creates or opens it for writing (a stage, a
         // sidecar, an in-place file, even an empty one) or, for one prepared
@@ -2681,14 +2684,11 @@ impl RestrictedAuthority {
             | Request::StageBasis { .. }
             | Request::SeedBasis { .. }
             | Request::Finalize { .. } => (u64::from(file.is_some() || own_file_change), 0),
-            // A small copy counts its files when their payloads come, as
-            // only then does it change anything: one its receiver turned
-            // back to the ordinary engine counts nothing.
+            // A small copy counts its files when prepared: one that needs
+            // no payloads finishes in its preparation's turn.
+            Request::PrepareSmallFiles(request) => (request.files.len() as u64, 0),
             Request::CopySmallFiles(payloads) => (
-                match step {
-                    StreamStep::CopySmallCopy { files, .. } => *files,
-                    _ => 0,
-                },
+                0,
                 payloads
                     .iter()
                     .map(|payload| payload.data.len() as u64)
@@ -2794,10 +2794,7 @@ impl RestrictedAuthority {
                         || std::mem::replace(&mut sent[index], true)
                         || prepared.sizes[index] != payload.data.len() as u64
                 });
-                *step = StreamStep::CopySmallCopy {
-                    files: prepared.sizes.len() as u64,
-                    prepared: Box::new(prepared.settlement),
-                };
+                *step = StreamStep::CopySmallCopy(Box::new(prepared.settlement));
                 if mismatched {
                     bail!("small copy payloads differ from what its preparation asked for");
                 }
@@ -3360,7 +3357,7 @@ impl RestrictedAuthority {
         let authorized = self.authorize_inner(request, over_ssh, &mut pending, &mut outcomes);
         let authorized = authorized
             .and_then(|()| self.authorize_stream(request, stream, small_copy, &mut step))
-            .and_then(|()| self.charge_request(request, &step));
+            .and_then(|()| self.charge_request(request));
         match authorized {
             Ok(charged) => Ok(Settlement {
                 creations: pending,
@@ -3373,7 +3370,7 @@ impl RestrictedAuthority {
                 // Nothing of a refused request executes, including the
                 // entries authorized before the refusing one, or the small
                 // copy whose payloads it carries.
-                if let StreamStep::CopySmallCopy { prepared, .. } = step {
+                if let StreamStep::CopySmallCopy(prepared) = step {
                     self.settle_unexecuted(*prepared, &format!("{error:#}"));
                 }
                 self.release_patch_holds(outcomes.into_iter());
@@ -4117,12 +4114,9 @@ pub(super) enum StreamStep {
     PrepareSmallCopy {
         sizes: Vec<u64>,
     },
-    /// Send the payloads of the prepared small copy of `files` files; its
-    /// preparation settles with their reply.
-    CopySmallCopy {
-        files: u64,
-        prepared: Box<Settlement>,
-    },
+    /// Send the prepared small copy's payloads; its preparation settles
+    /// with their reply.
+    CopySmallCopy(Box<Settlement>),
 }
 
 /// A small copy prepared on one connection, waiting for its payloads: the
@@ -4211,7 +4205,7 @@ impl PatchStreamGate {
                 }
                 _ => self.authority.settle(settlement, response),
             },
-            StreamStep::CopySmallCopy { prepared, .. } => {
+            StreamStep::CopySmallCopy(prepared) => {
                 self.authority.settle(settlement, response);
                 self.authority.settle(*prepared, response);
             }
