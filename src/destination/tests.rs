@@ -830,6 +830,35 @@ fn named_parser_rejects_oversize_truncated_and_wrong_generation() {
     ));
 }
 
+/// A copy to this machine that names another machine as its authorizer is
+/// refused before anyone is asked, as the other approvers refuse one.
+#[test]
+fn a_copy_here_naming_another_authorizer_is_refused_before_asking() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("receiving");
+    fs::create_dir(&root).unwrap();
+    let (_broker, receiver, registration, prompts) = broker(&root, Approval::Ask);
+    let (command, inputs) = requested(Path::new("source"), &["--auth-from", "@other"]);
+    let error = exchange(
+        &registration,
+        Message::Request {
+            cwd: String::new(),
+            command,
+            inputs,
+        },
+        Duration::from_secs(5),
+        Some(Duration::from_secs(5)),
+    )
+    .err()
+    .expect("refused");
+    assert!(
+        format!("{error:#}").contains("the requesting command authorizes from a different machine"),
+        "{error:#}"
+    );
+    assert!(prompts.try_recv().is_err());
+    assert!(receiver.sessions.lock().unwrap().is_empty());
+}
+
 #[test]
 fn named_denial_does_not_issue_authority_or_touch_destination() {
     let temp = crate::test_support::tempdir().unwrap();
