@@ -1981,9 +1981,8 @@ impl Planner<'_> {
         }
         match p.e.kind {
             Kind::File => self.plan_file(p, dst_entry, target_condition, leaf_ops),
-            Kind::Symlink => self.plan_symlink(p, dst_entry, leaf_ops),
-            Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => {
-                self.plan_special(p, dst_entry, leaf_ops)
+            Kind::Symlink | Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => {
+                self.plan_link_or_special(p, dst_entry, leaf_ops)
             }
             Kind::Dir | Kind::Other => unreachable!("handled in the mapping loop"),
         }
@@ -2379,9 +2378,14 @@ impl Planner<'_> {
         });
     }
 
-    /// Queue the creation or replacement of a mapped symlink unless the
-    /// destination already matches.
-    fn plan_symlink(&mut self, leaf: Planned, dst_entry: Option<Entry>, leaf_ops: &mut LeafOps) {
+    /// Queue the creation or replacement of a mapped symlink or special file
+    /// unless the destination already matches.
+    fn plan_link_or_special(
+        &mut self,
+        leaf: Planned,
+        dst_entry: Option<Entry>,
+        leaf_ops: &mut LeafOps,
+    ) {
         let opts = self.opts;
         let Planned {
             dst: dst_path,
@@ -2390,6 +2394,12 @@ impl Planner<'_> {
             e,
             ..
         } = leaf;
+        let symlink = e.kind == Kind::Symlink;
+        let (action, kind) = if symlink {
+            ("create_symlink", "symlink")
+        } else {
+            ("create_special", "special")
+        };
         if self.skip_existing(&dst_entry) {
             self.progress.files_excluded.fetch_add(1, Relaxed);
             return;
@@ -2405,11 +2415,16 @@ impl Planner<'_> {
             self.progress.files_excluded.fetch_add(1, Relaxed);
             return;
         }
+        // A special file has no target, so this is empty for one.
         let target = e.link.clone().unwrap_or_default();
-        let same = dst_entry
-            .as_ref()
-            .is_some_and(|d| d.kind == Kind::Symlink && d.link.as_deref() == Some(&target[..]));
-
+        let same = dst_entry.as_ref().is_some_and(|d| {
+            d.kind == e.kind
+                && if symlink {
+                    d.link.as_deref() == Some(&target[..])
+                } else {
+                    d.rdev == e.rdev
+                }
+        });
         if dst_entry.is_some()
             && (opts.if_exists == Some(crate::cli::IfExists::Error)
                 || (!same && opts.if_exists == Some(crate::cli::IfExists::ErrorIfDifferent)))
@@ -2435,125 +2450,28 @@ impl Planner<'_> {
             );
             return;
         }
+        // How messages show the entry after its path: a symlink's target.
+        let arrow = || {
+            if symlink {
+                format!(" -> {}", display(&target))
+            } else {
+                String::new()
+            }
+        };
         self.note_directory_change(&dst_path, true);
         if opts.dry_run {
-            self.dry_run_changes.symlinks += 1;
-            if dst_entry.as_ref().is_some_and(|d| d.kind != Kind::Symlink) {
-                self.dry_run_changes.type_replacements += 1;
+            if symlink {
+                self.dry_run_changes.symlinks += 1;
+            } else {
+                self.dry_run_changes.specials += 1;
             }
-            self.emit_trace(
-                "create_symlink",
-                &dst_rel,
-                "symlink",
-                None,
-                match &dst_entry {
-                    None => "destination_missing",
-                    Some(d) if d.kind != Kind::Symlink => "type_differs",
-                    Some(_) => "content_differs",
-                },
-            );
-            if opts.verbose > 0 {
-                let shown = display(&dst_path);
-                let action = match &dst_entry {
-                    None => format!(
-                        "create symlink {shown} -> {} (destination missing)",
-                        display(&target)
-                    ),
-                    Some(d) if d.kind != Kind::Symlink => format!(
-                        "replace with symlink {shown} -> {} (destination is {})",
-                        display(&target),
-                        kind_label(d.kind)
-                    ),
-                    Some(_) => format!(
-                        "update symlink {shown} -> {} (target differs)",
-                        display(&target)
-                    ),
-                };
-                self.progress.println(&action);
-            }
-            return;
-        }
-        leaf_ops.names.push(QueuedLeafOp {
-            dst_rel: dst_rel.clone(),
-            action: "create_symlink",
-            kind: "symlink",
-            name: format!("{rel} -> {}", display(&target)),
-            quiet: false,
-        });
-        // The symlink gets its metadata before it is published.
-        leaf_ops.ops.push(Op::Symlink {
-            path: dst_path.clone(),
-            target,
-            condition: self.leaf_condition_for(&dst_path, dst_entry.as_ref()),
-            meta: opts.metadata_for(&dst_rel, &e),
-            flags: opts.flags_for(&dst_rel) & !flags::MODE,
-        });
-    }
-
-    /// Queue the creation or replacement of a mapped special file unless the
-    /// destination already matches.
-    fn plan_special(&mut self, leaf: Planned, dst_entry: Option<Entry>, leaf_ops: &mut LeafOps) {
-        let opts = self.opts;
-        let Planned {
-            dst: dst_path,
-            dst_rel,
-            rel,
-            e,
-            ..
-        } = leaf;
-        if self.skip_existing(&dst_entry) {
-            self.progress.files_excluded.fetch_add(1, Relaxed);
-            return;
-        }
-        if self.refuse_directory_target(&dst_path, &dst_rel, e.kind, dst_entry.as_ref()) {
-            return;
-        }
-        if opts.if_exists == Some(crate::cli::IfExists::UpdateIfOlder)
-            && dst_entry
-                .as_ref()
-                .is_some_and(|d| (d.mtime, d.mtime_nsec) > (e.mtime, e.mtime_nsec))
-        {
-            self.progress.files_excluded.fetch_add(1, Relaxed);
-            return;
-        }
-        let same = dst_entry
-            .as_ref()
-            .is_some_and(|d| d.kind == e.kind && d.rdev == e.rdev);
-        if dst_entry.is_some()
-            && (opts.if_exists == Some(crate::cli::IfExists::Error)
-                || (!same && opts.if_exists == Some(crate::cli::IfExists::ErrorIfDifferent)))
-        {
-            self.existing_conflict(
-                &dst_path,
-                &dst_rel,
-                if same {
-                    "destination already exists"
-                } else {
-                    "destination contents differ"
-                },
-            );
-            return;
-        }
-        if same {
-            self.plan_explicit_leaf_metadata(
-                &dst_path,
-                &dst_rel,
-                &e,
-                dst_entry.as_ref().unwrap(),
-                leaf_ops,
-            );
-            return;
-        }
-        self.note_directory_change(&dst_path, true);
-        if opts.dry_run {
-            self.dry_run_changes.specials += 1;
             if dst_entry.as_ref().is_some_and(|d| d.kind != e.kind) {
                 self.dry_run_changes.type_replacements += 1;
             }
             self.emit_trace(
-                "create_special",
+                action,
                 &dst_rel,
-                "special",
+                kind,
                 None,
                 match &dst_entry {
                     None => "destination_missing",
@@ -2563,19 +2481,21 @@ impl Planner<'_> {
             );
             if opts.verbose > 0 {
                 let shown = display(&dst_path);
+                let label = kind_label(e.kind);
+                let arrow = arrow();
                 let action = match &dst_entry {
-                    None => format!(
-                        "create {} {shown} (destination missing)",
-                        kind_label(e.kind)
-                    ),
+                    None => format!("create {label} {shown}{arrow} (destination missing)"),
                     Some(d) if d.kind != e.kind => format!(
-                        "replace with {} {shown} (destination is {})",
-                        kind_label(e.kind),
+                        "replace with {label} {shown}{arrow} (destination is {})",
                         kind_label(d.kind)
                     ),
                     Some(_) => format!(
-                        "update {} {shown} (device identity differs)",
-                        kind_label(e.kind)
+                        "update {label} {shown}{arrow} ({})",
+                        if symlink {
+                            "target differs"
+                        } else {
+                            "device identity differs"
+                        }
                     ),
                 };
                 self.progress.println(&action);
@@ -2584,27 +2504,39 @@ impl Planner<'_> {
         }
         leaf_ops.names.push(QueuedLeafOp {
             dst_rel: dst_rel.clone(),
-            action: "create_special",
-            kind: "special",
-            name: rel,
+            action,
+            kind,
+            name: if symlink { rel + &arrow() } else { rel },
             quiet: false,
         });
+        let condition = self.leaf_condition_for(&dst_path, dst_entry.as_ref());
         let meta = opts.metadata_for(&dst_rel, &e);
         let flags = opts.flags_for(&dst_rel);
-        // Without a mode to apply, the node takes the source's permission
-        // bits as creating it limits them, and none of its special bits. It
-        // gets its metadata before it is published.
-        leaf_ops.ops.push(Op::Mknod {
-            path: dst_path.clone(),
-            mode: if flags & flags::MODE == 0 {
-                e.mode & !0o7000
-            } else {
-                e.mode
-            },
-            rdev: e.rdev,
-            condition: self.leaf_condition_for(&dst_path, dst_entry.as_ref()),
-            meta,
-            flags,
+        // The entry gets its metadata before it is published.
+        leaf_ops.ops.push(if symlink {
+            Op::Symlink {
+                path: dst_path.clone(),
+                target,
+                condition,
+                meta,
+                flags: flags & !flags::MODE,
+            }
+        } else {
+            // Without a mode to apply, the node takes the source's
+            // permission bits as creating it limits them, and none of its
+            // special bits.
+            Op::Mknod {
+                path: dst_path.clone(),
+                mode: if flags & flags::MODE == 0 {
+                    e.mode & !0o7000
+                } else {
+                    e.mode
+                },
+                rdev: e.rdev,
+                condition,
+                meta,
+                flags,
+            }
         });
     }
 
