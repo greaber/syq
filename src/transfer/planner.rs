@@ -5105,18 +5105,14 @@ impl Planner<'_> {
         Ok(results)
     }
 
-    pub(super) fn apply(&mut self, mut ops: Vec<Op>) -> Result<Vec<Option<WireError>>> {
-        if ops.len() > 1
-            && ops.iter().map(Op::size_hint).sum::<usize>() > crate::proto::METADATA_BATCH_BYTES
-        {
-            let tail = ops.split_off(ops.len() / 2);
-            let mut results = self.apply(ops)?;
-            results.extend(self.apply(tail)?);
-            return Ok(results);
+    pub(super) fn apply(&mut self, ops: Vec<Op>) -> Result<Vec<Option<WireError>>> {
+        let mut results = Vec::with_capacity(ops.len());
+        for ops in request_sized(ops) {
+            let count = ops.len();
+            let response = self.dst.call(Request::Apply { ops })?;
+            results.extend(self.applied(response, count)?);
         }
-        let count = ops.len();
-        let response = self.dst.call(Request::Apply { ops })?;
-        self.applied(response, count)
+        Ok(results)
     }
 
     /// The outcome of each of an `Apply` request's `count` operations.
@@ -5641,23 +5637,52 @@ impl Planner<'_> {
                 "final directory metadata",
             )?;
         }
-        let mut pending = d.as_slice();
-        while !pending.is_empty() {
-            let (chunk, rest) = pending.split_at(directory_metadata_batch_len(pending));
-            pending = rest;
-            let ops: Vec<Op> = chunk
-                .iter()
-                .map(|(p, m, f, _, condition)| Op::SetMeta {
-                    path: p.clone(),
-                    meta: m.clone(),
-                    flags: *f,
-                    condition: *condition,
-                    directory: true,
-                })
-                .collect();
-            let errors = self.apply(ops)?;
+        // The receiver runs requests in the order sent, so several can await
+        // their replies without a later one's changes overtaking an earlier
+        // one's (`directory_metadata_batch_len`).
+        let unanswered = self.dst.reply_queue().map_or(1, |replies| {
+            replies.min(super::directory_stream::REQUESTS_IN_FLIGHT)
+        });
+        let mut requests = DirectoryMetadataRequests::new(&d);
+        let mut in_flight = std::collections::VecDeque::new();
+        // What ends the pass early. Nothing more is sent, and the requests
+        // already sent are still answered: they have changed the directories
+        // they name.
+        let mut failure = None;
+        loop {
+            while failure.is_none() && in_flight.len() < unanswered {
+                let Some((directories, ops)) = requests.next() else {
+                    break;
+                };
+                // Tests count each request's directories and the requests
+                // still unanswered when it is sent.
+                #[cfg(debug_assertions)]
+                let _ = crate::fsops::record_test_event(
+                    "SYQ_TEST_DIRECTORY_METADATA_REQUESTS",
+                    format_args!("{} {}", ops.len(), in_flight.len()),
+                );
+                match self.dst.send_pending(Request::Apply { ops }) {
+                    Ok(reply) => in_flight.push_back((reply, directories)),
+                    Err(error) => failure = Some(error),
+                }
+            }
+            let Some((reply, directories)) = in_flight.pop_front() else {
+                break;
+            };
+            let response = match self.dst.take_reply(reply) {
+                Ok(response) => response,
+                // The connection is lost, and the other replies with it.
+                Err(error) => return Err(failure.unwrap_or(error)),
+            };
+            let errors = match self.applied(response, directories.len()) {
+                Ok(errors) => errors,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    continue;
+                }
+            };
             let capacity_error = first_capacity_error(&errors);
-            for ((path, ..), error) in chunk.iter().zip(errors) {
+            for ((path, ..), error) in directories.iter().zip(errors) {
                 if let Some(error) = error {
                     if quiet {
                         continue;
@@ -5671,10 +5696,12 @@ impl Planner<'_> {
                 }
             }
             if let Some(error) = capacity_error {
-                return Err(endpoint_error(error)).context("apply destination changes");
+                failure.get_or_insert_with(|| {
+                    endpoint_error(error).context("apply destination changes")
+                });
             }
         }
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 }
 
@@ -5857,11 +5884,75 @@ fn merge_directory_metadata(
     }
 }
 
+/// A directory's final metadata: its path, the metadata and which of it to
+/// set (`flags`), its depth, and the directory it must still be.
+type DirectoryMetadata = (PathBytes, Meta, u8, usize, TargetCondition);
+
+/// Split `ops` in halves until each part's request fits the metadata frame
+/// budget, keeping their order.
+fn request_sized(mut ops: Vec<Op>) -> Vec<Vec<Op>> {
+    if ops.len() > 1
+        && ops.iter().map(Op::size_hint).sum::<usize>() > crate::proto::METADATA_BATCH_BYTES
+    {
+        let tail = ops.split_off(ops.len() / 2);
+        let mut parts = request_sized(ops);
+        parts.extend(request_sized(tail));
+        return parts;
+    }
+    vec![ops]
+}
+
+/// The final directory metadata still to send, deepest first, as the
+/// requests it goes in: each with the directories it changes.
+struct DirectoryMetadataRequests<'a> {
+    pending: &'a [DirectoryMetadata],
+    /// The rest of a batch too large for one request.
+    split: std::collections::VecDeque<(&'a [DirectoryMetadata], Vec<Op>)>,
+}
+
+impl<'a> DirectoryMetadataRequests<'a> {
+    fn new(pending: &'a [DirectoryMetadata]) -> Self {
+        Self {
+            pending,
+            split: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+impl<'a> Iterator for DirectoryMetadataRequests<'a> {
+    type Item = (&'a [DirectoryMetadata], Vec<Op>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.split.is_empty() && !self.pending.is_empty() {
+            let (mut batch, rest) = self
+                .pending
+                .split_at(directory_metadata_batch_len(self.pending));
+            self.pending = rest;
+            let ops = batch
+                .iter()
+                .map(|(path, meta, flags, _, condition)| Op::SetMeta {
+                    path: path.clone(),
+                    meta: meta.clone(),
+                    flags: *flags,
+                    condition: *condition,
+                    directory: true,
+                })
+                .collect();
+            for ops in request_sized(ops) {
+                let (directories, later) = batch.split_at(ops.len());
+                batch = later;
+                self.split.push_back((directories, ops));
+            }
+        }
+        self.split.pop_front()
+    }
+}
+
 /// Keep ordinary metadata in full batches, even across directory depths. Only
-/// a mode that removes search access needs to wait for deeper operations.
-fn directory_metadata_batch_len(
-    entries: &[(PathBytes, Meta, u8, usize, TargetCondition)],
-) -> usize {
+/// a mode that removes search access needs to wait for deeper operations: it
+/// goes in a later request, which the receiver runs once the earlier ones
+/// are done.
+fn directory_metadata_batch_len(entries: &[DirectoryMetadata]) -> usize {
     let maximum = entries.len().min(1000);
     let deepest = entries[0].3;
     entries[..maximum]
