@@ -20,25 +20,6 @@ on:
         description: Also run the independent APFS timing benchmark
         type: boolean
         default: false
-      test_name:
-        description: Exact Rust test name (empty runs the full suite)
-        required: false
-        type: string
-      test_target:
-        description: Cargo target for the exact test
-        required: false
-        default: syq
-        type: choice
-        options:
-          - syq
-          - local
-          - help
-          - output
-          - update
-          - tls
-          - return_handoff
-          - macos_exfat
-          - s3
 
 permissions:
   contents: read
@@ -54,59 +35,7 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
-  focused-test:
-    # scripts/branch-status.py identifies a check by its job name.
-    name: focused-test (${{ inputs.test_target || 'syq' }}, ${{ inputs.test_name }})
-    if: github.event_name == 'workflow_dispatch' && inputs.test_name != ''
-    runs-on: macos-26
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      # The suite's master runs save this entry.
-      - name: Restore Cargo dependencies and build output
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-macos-suite-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
-      - name: Cache pinned development tools
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/syq-tools
-          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-jq-python-nextest-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
-      - name: Install pinned development tools
-        env:
-          SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
-        run: scripts/setup.sh github jq python cargo-nextest
-      - name: Run the exact test
-        shell: bash
-        env:
-          TEST_NAME: ${{ inputs.test_name }}
-          TEST_TARGET: ${{ inputs.test_target || 'syq' }}
-        run: |
-          # Inputs remain data; accept only ordinary Rust test identifiers.
-          [[ "$TEST_NAME" =~ ^[a-zA-Z_][a-zA-Z0-9_:]*$ ]] || {
-            echo 'Provide a fully qualified Rust test name.' >&2
-            exit 2
-          }
-          case "$TEST_TARGET" in
-            syq) target=(--bin syq) ;;
-            local|help|output|update|tls|return_handoff|macos_exfat|s3)
-              target=(--test "$TEST_TARGET") ;;
-            *) echo "Unknown test target: $TEST_TARGET" >&2; exit 2 ;;
-          esac
-          # Nextest rejects a missing exact test and times out a hung one.
-          cargo nextest run --locked "${target[@]}" --run-ignored all --no-tests fail -- --exact "$TEST_NAME"
-
   scope:
-    if: github.event_name != 'workflow_dispatch' || inputs.test_name == ''
     runs-on: ubuntu-26.04
     outputs:
       needed: ${{ steps.changes.outputs.macos_needed }}

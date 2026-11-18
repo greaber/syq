@@ -219,6 +219,9 @@ jobs:
         run: scripts/run-tooling-tests.py --quick
       - name: Test every repository tooling script
         if: needs.scope.outputs.all_tooling == 'true'
+        env:
+          # test-cargo-package.py runs first and builds a syq to reuse.
+          SYQ_RELEASE_TOOLS_SYQ: ${{ github.workspace }}/target/package-identity/debug/syq
         run: scripts/run-tooling-tests.py
       - name: Test the selected repository tooling groups
         if: >-
@@ -338,7 +341,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/syq-tools
-          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-python-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-uv-python-jq-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
       - name: Install pinned development tools
         if: needs.scope.outputs.python_sdk == 'true'
         env:
@@ -669,12 +672,24 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Key the cache by the dependency stage (the Dockerfile up to its second
+      # FROM) and the files it copies, so edits to later stages keep it.
+      - name: Key the lab's dependency build
+        id: dependency-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest=$({
+            awk '/^FROM /{stage++} stage <= 1' tests/real-ssh/Dockerfile
+            cat Cargo.toml Cargo.lock build.rs
+          } | sha256sum)
+          echo "key=real-ssh-dependencies-$RUNNER_OS-$RUNNER_ARCH-${digest%% *}" >> "$GITHUB_OUTPUT"
       - name: Restore the lab's dependency build
         id: dependencies
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/real-ssh-dependencies
-          key: real-ssh-dependencies-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/real-ssh/Dockerfile', 'Cargo.toml', 'Cargo.lock', 'build.rs') }}
+          key: ${{ steps.dependency-key.outputs.key }}
       - name: Build the lab image
         env:
           CACHE: ${{ runner.temp }}/real-ssh-dependencies
@@ -706,8 +721,9 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-  # The core suite also runs the storage checks. scripts/ci-scope.py defines
-  # the matrix, including the cases the one-session profile skips.
+  # The core suite also runs the storage and metadata checks.
+  # scripts/ci-scope.py defines the matrix, including the cases the one-session
+  # profile skips.
   real-ssh:
     concurrency:
       group: ${{ github.workflow }}-real-ssh-${{ matrix.suite }}-${{ matrix.profile }}-${{ needs.scope.outputs.suite_selection == 'true' && github.ref || github.run_id }}
