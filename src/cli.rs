@@ -1281,6 +1281,144 @@ pub(crate) fn command_for_completion(name: &str) -> Option<clap::Command> {
     }
 }
 
+/// A source selector of `cp`, `map`, and `rm`. The parser checks, shell
+/// completion, and help read this table instead of listing the options.
+/// A new selector also needs `NativeSourceArgs::selectors`, the
+/// `--src-fd` conflict list, `rm`'s wording in `help::filesystem`, and, if
+/// it names non-directories, the pipe and descriptor source lists in
+/// `selected_stream_source` and `parse_descriptor_copy`;
+/// `selector_and_placement_tables_match_the_parser` checks all but the last.
+pub(crate) struct SourceSelector {
+    /// The clap argument id.
+    pub(crate) id: &'static str,
+    /// The option spelling; `None` for the positional sources.
+    pub(crate) option: Option<&'static str>,
+    /// Whether one occurrence takes several values.
+    pub(crate) variadic: bool,
+    /// What the selector selects; `None` for a named object, whose meaning
+    /// depends on the command (`NamedNoFollow` for copies, `File` for removal).
+    selection: Option<SourceSelection>,
+}
+
+impl SourceSelector {
+    /// Whether the value must name a directory.
+    pub(crate) fn directories_only(&self) -> bool {
+        matches!(
+            self.selection,
+            Some(SourceSelection::Contents | SourceSelection::Directory)
+        )
+    }
+
+    /// Whether a byte stream can be read through this selector.
+    fn names_non_directory(&self) -> bool {
+        matches!(self.selection, None | Some(SourceSelection::File))
+    }
+}
+
+/// In the order `NativeSourceArgs::selectors` returns their values; the
+/// argument-order check reports the first listed selector that is misplaced.
+pub(crate) const SOURCE_SELECTORS: [SourceSelector; 8] = {
+    use SourceSelection::{Contents, Directory, File};
+    const fn selector(
+        id: &'static str,
+        option: Option<&'static str>,
+        variadic: bool,
+        selection: Option<SourceSelection>,
+    ) -> SourceSelector {
+        SourceSelector {
+            id,
+            option,
+            variadic,
+            selection,
+        }
+    }
+    [
+        selector("src", Some("--src"), false, None),
+        selector("srcs_in", Some("--srcs-in"), false, Some(Contents)),
+        selector("src_non_dir", Some("--src-non-dir"), false, Some(File)),
+        selector("src_dir", Some("--src-dir"), false, Some(Directory)),
+        selector("src_non_dirs", Some("--src-non-dirs"), true, Some(File)),
+        selector("src_dirs", Some("--src-dirs"), true, Some(Directory)),
+        selector("srcs", Some("--srcs"), true, None),
+        selector("sources", None, false, None),
+    ]
+};
+
+pub(crate) fn source_selector(id: &str) -> Option<&'static SourceSelector> {
+    SOURCE_SELECTORS.iter().find(|selector| selector.id == id)
+}
+
+/// Whether `option` spells a source selector option.
+pub(crate) fn source_selector_option(option: &[u8]) -> bool {
+    SOURCE_SELECTORS.iter().any(|selector| {
+        selector
+            .option
+            .is_some_and(|name| name.as_bytes() == option)
+    })
+}
+
+/// A copy placement option, in the order `NativeCopyFields::placements`
+/// returns their values. A new one also needs the `placement` group and the
+/// `--as-fd` conflict list.
+pub(crate) struct PlacementOption {
+    /// The clap argument id.
+    pub(crate) id: &'static str,
+    pub(crate) option: &'static str,
+    placement: Placement,
+    existence: Existence,
+}
+
+impl PlacementOption {
+    /// Whether the value must name a directory.
+    pub(crate) fn directories_only(&self) -> bool {
+        self.placement == Placement::Into
+    }
+}
+
+pub(crate) const PLACEMENT_OPTIONS: [PlacementOption; 6] = {
+    use Existence::{Any, Existing, New};
+    use Placement::{As, Into};
+    const fn placement(
+        id: &'static str,
+        option: &'static str,
+        placement: Placement,
+        existence: Existence,
+    ) -> PlacementOption {
+        PlacementOption {
+            id,
+            option,
+            placement,
+            existence,
+        }
+    }
+    [
+        placement("into", "--into", Into, Any),
+        placement("into_new", "--into-new", Into, New),
+        placement("into_existing", "--into-existing", Into, Existing),
+        placement("as", "--as", As, Any),
+        placement("as_new", "--as-new", As, New),
+        placement("as_existing", "--as-existing", As, Existing),
+    ]
+};
+
+pub(crate) fn placement_option(id: &str) -> Option<&'static PlacementOption> {
+    PLACEMENT_OPTIONS
+        .iter()
+        .find(|placement| placement.id == id)
+}
+
+/// Whether `option` spells a placement option.
+pub(crate) fn placement_option_name(option: &[u8]) -> bool {
+    PLACEMENT_OPTIONS
+        .iter()
+        .any(|placement| placement.option.as_bytes() == option)
+}
+
+/// Clap argument ids that start a copy destination.
+pub(crate) fn destination_id(id: &str) -> bool {
+    matches!(id, "as_fd" | "to") || placement_option(id).is_some()
+}
+
 #[derive(clap::Args, Debug)]
 struct NativeSourceArgs {
     /// Resolve relative source paths from DIR
@@ -1321,6 +1459,35 @@ struct NativeSourceArgs {
     sources: Vec<OsString>,
 }
 
+impl NativeSourceArgs {
+    /// The selector values, in `SOURCE_SELECTORS` order.
+    fn selectors(&self) -> [&Vec<OsString>; SOURCE_SELECTORS.len()] {
+        [
+            &self.src,
+            &self.srcs_in,
+            &self.src_non_dir,
+            &self.src_dir,
+            &self.src_non_dirs,
+            &self.src_dirs,
+            &self.srcs,
+            &self.sources,
+        ]
+    }
+
+    fn selectors_mut(&mut self) -> [&mut Vec<OsString>; SOURCE_SELECTORS.len()] {
+        [
+            &mut self.src,
+            &mut self.srcs_in,
+            &mut self.src_non_dir,
+            &mut self.src_dir,
+            &mut self.src_non_dirs,
+            &mut self.src_dirs,
+            &mut self.srcs,
+            &mut self.sources,
+        ]
+    }
+}
+
 #[derive(clap::Args, Debug)]
 struct NativeSelectionArgs {
     /// Source endpoint ([USER@]HOST[:PORT], receiving name (@NAME), or s3://BUCKET); omitted means local
@@ -1330,47 +1497,15 @@ struct NativeSelectionArgs {
     source: NativeSourceArgs,
 }
 
+/// The removal selection shares the copy selectors under `--on`; `syq rm`
+/// replaces their help text in `help::filesystem`.
 #[derive(clap::Args, Debug)]
 struct NativeRmSelectionArgs {
     /// Removal endpoint ([USER@]HOST[:PORT] or s3://BUCKET); omitted means local
     #[arg(long = "on", value_name = "ENDPOINT")]
     from: Option<String>,
-    /// Resolve relative paths from DIR on the removal endpoint
-    #[arg(short = 'C', long, value_name = "DIR", conflicts_with = "root")]
-    cwd: Option<OsString>,
-    /// Confine resolution and removal beneath DIR
-    #[arg(long, value_name = "DIR")]
-    root: Option<OsString>,
-    /// Like --follow-src; also follow symlinks in the --results path
-    #[arg(long)]
-    follow: bool,
-    /// Follow symlinks in --cwd, --root, and the parent directories of selected paths; a selected symlink itself is always removed as a link
-    #[arg(long)]
-    follow_src: bool,
-    /// Select a non-directory object (repeatable)
-    #[arg(long, value_name = "PATH")]
-    src: Vec<OsString>,
-    /// Recursively select a directory's contents, keeping the directory (repeatable)
-    #[arg(long, value_name = "DIR")]
-    srcs_in: Vec<OsString>,
-    /// Select a non-directory object (repeatable)
-    #[arg(long, value_name = "PATH")]
-    src_non_dir: Vec<OsString>,
-    /// Select a directory tree (repeatable)
-    #[arg(long, value_name = "DIR")]
-    src_dir: Vec<OsString>,
-    /// Select several non-directory objects
-    #[arg(long, value_name = "PATH", num_args = 1..)]
-    src_non_dirs: Vec<OsString>,
-    /// Select several directory trees
-    #[arg(long, value_name = "DIR", num_args = 1..)]
-    src_dirs: Vec<OsString>,
-    /// Select several non-directory objects
-    #[arg(long, value_name = "PATH", num_args = 1..)]
-    srcs: Vec<OsString>,
-    /// Selected objects (shorthand for --src)
-    #[arg(value_name = "PATH")]
-    sources: Vec<OsString>,
+    #[command(flatten)]
+    source: NativeSourceArgs,
 }
 
 #[derive(clap::Args, Debug)]
@@ -1688,6 +1823,31 @@ struct NativeCopyFields {
     operational: NativeCopyOperationalArgs,
 }
 
+impl NativeCopyFields {
+    /// The placement values, in `PLACEMENT_OPTIONS` order.
+    fn placements(&self) -> [&Option<OsString>; PLACEMENT_OPTIONS.len()] {
+        [
+            &self.into,
+            &self.into_new,
+            &self.into_existing,
+            &self.r#as,
+            &self.as_new,
+            &self.as_existing,
+        ]
+    }
+
+    fn placements_mut(&mut self) -> [&mut Option<OsString>; PLACEMENT_OPTIONS.len()] {
+        [
+            &mut self.into,
+            &mut self.into_new,
+            &mut self.into_existing,
+            &mut self.r#as,
+            &mut self.as_new,
+            &mut self.as_existing,
+        ]
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "syq cp",
@@ -1724,46 +1884,39 @@ struct NativeCopyCommand {
 }
 
 fn validate_native_copy_argument_order(matches: &clap::ArgMatches) -> Result<()> {
-    const DESTINATION_ARGUMENTS: &[(&str, &str)] = &[
-        ("as_fd", "--as-fd"),
-        ("to", "--to"),
-        ("into", "--into"),
-        ("into_new", "--into-new"),
-        ("into_existing", "--into-existing"),
-        ("as", "--as"),
-        ("as_new", "--as-new"),
-        ("as_existing", "--as-existing"),
-    ];
-    const SOURCE_ARGUMENTS: &[(&str, &str)] = &[
+    let destination_arguments = [("as_fd", "--as-fd"), ("to", "--to")].into_iter().chain(
+        PLACEMENT_OPTIONS
+            .iter()
+            .map(|placement| (placement.id, placement.option)),
+    );
+    let source_arguments = [
         ("src_fd", "--src-fd"),
         ("from", "--from"),
         ("cwd", "--cwd"),
         ("root", "--root"),
-        ("src", "--src"),
-        ("srcs_in", "--srcs-in"),
-        ("src_non_dir", "--src-non-dir"),
-        ("src_dir", "--src-dir"),
-        ("src_non_dirs", "--src-non-dirs"),
-        ("src_dirs", "--src-dirs"),
-        ("srcs", "--srcs"),
-        ("sources", "a positional source"),
-        ("mapping", "--mapping"),
-    ];
+    ]
+    .into_iter()
+    .chain(SOURCE_SELECTORS.iter().map(|selector| {
+        (
+            selector.id,
+            selector.option.unwrap_or("a positional source"),
+        )
+    }))
+    .chain([("mapping", "--mapping")]);
 
-    let first_destination = DESTINATION_ARGUMENTS
-        .iter()
+    let first_destination = destination_arguments
         .filter_map(|(id, option)| {
             matches
                 .indices_of(id)
                 .and_then(|mut indices| indices.next())
-                .map(|index| (index, *option))
+                .map(|index| (index, option))
         })
         .min_by_key(|(index, _)| *index);
     let Some((destination_index, destination_option)) = first_destination else {
         return Ok(());
     };
 
-    for (id, source_option) in SOURCE_ARGUMENTS {
+    for (id, source_option) in source_arguments {
         let follows_destination = matches
             .indices_of(id)
             .is_some_and(|mut indices| indices.any(|index| index > destination_index));
@@ -1945,26 +2098,23 @@ fn reject_detached_dash_native_values(argv: &[OsString]) -> Result<()> {
         b"-C",
         b"--cwd",
         b"--root",
-        b"--src",
-        b"--srcs-in",
-        b"--src-non-dir",
-        b"--src-dir",
-        b"--srcs",
-        b"--src-non-dirs",
-        b"--src-dirs",
-        b"--into",
-        b"--into-new",
-        b"--into-existing",
-        b"--as",
-        b"--as-new",
-        b"--as-existing",
         b"--results",
         b"--ignore",
         b"--ignore-from",
         b"--pscope",
         b"--syq-path",
     ];
-    const VARIADIC_VALUE_OPTIONS: &[&[u8]] = &[b"--srcs", b"--src-non-dirs", b"--src-dirs"];
+    let attached_value_option = |option: &[u8]| {
+        ATTACHED_VALUE_OPTIONS.contains(&option)
+            || source_selector_option(option)
+            || placement_option_name(option)
+    };
+    let variadic_value_options = || {
+        SOURCE_SELECTORS
+            .iter()
+            .filter(|selector| selector.variadic)
+            .filter_map(|selector| selector.option.map(str::as_bytes))
+    };
 
     let arguments = argv
         .split(|argument| argument.as_bytes() == b"--")
@@ -1973,7 +2123,7 @@ fn reject_detached_dash_native_values(argv: &[OsString]) -> Result<()> {
 
     for pair in arguments.windows(2) {
         let option = pair[0].as_bytes();
-        if ATTACHED_VALUE_OPTIONS.contains(&option) && pair[1].as_bytes() == b"-" {
+        if attached_value_option(option) && pair[1].as_bytes() == b"-" {
             reject_detached_dash(option)?;
         }
     }
@@ -1986,7 +2136,7 @@ fn reject_detached_dash_native_values(argv: &[OsString]) -> Result<()> {
                 reject_detached_dash(option)?;
             }
         } else if argument.starts_with(b"-") {
-            variadic_option = VARIADIC_VALUE_OPTIONS.iter().copied().find(|option| {
+            variadic_option = variadic_value_options().find(|option| {
                 argument == *option
                     || (argument.starts_with(option) && argument.get(option.len()) == Some(&b'='))
             });
@@ -2021,33 +2171,18 @@ fn decode_delegated_operands(copy: &mut NativeCopyFields) -> Result<()> {
         Ok(())
     }
     let source = &mut copy.selection.source;
-    for list in [
-        &mut source.src,
-        &mut source.srcs_in,
-        &mut source.src_non_dir,
-        &mut source.src_dir,
-        &mut source.src_non_dirs,
-        &mut source.src_dirs,
-        &mut source.srcs,
-        &mut source.sources,
-    ] {
+    for list in source.selectors_mut() {
         for value in list.iter_mut() {
             decode_one(value)?;
         }
     }
-    for value in [
-        source.cwd.as_mut(),
-        source.root.as_mut(),
-        copy.into.as_mut(),
-        copy.into_new.as_mut(),
-        copy.into_existing.as_mut(),
-        copy.r#as.as_mut(),
-        copy.as_new.as_mut(),
-        copy.as_existing.as_mut(),
-    ]
-    .into_iter()
-    .flatten()
+    for value in [source.cwd.as_mut(), source.root.as_mut()]
+        .into_iter()
+        .flatten()
     {
+        decode_one(value)?;
+    }
+    for value in copy.placements_mut().into_iter().flatten() {
         decode_one(value)?;
     }
     Ok(())
@@ -2174,22 +2309,11 @@ fn parse_descriptor_copy(
                 | "results_fd"
                 | "stream_commit_fd"
                 | "as_fd"
-                | "sources"
-                | "src"
-                | "srcs"
-                | "src_non_dir"
-                | "src_non_dirs"
                 | "cwd"
                 | "root"
                 | "follow"
-                | "into"
-                | "into_new"
-                | "into_existing"
                 | "from"
                 | "to"
-                | "as"
-                | "as_new"
-                | "as_existing"
                 | "s3_endpoint"
                 | "s3_region"
                 | "s3_profile"
@@ -2216,7 +2340,9 @@ fn parse_descriptor_copy(
                 | "no_progress"
                 | "follow_src"
                 | "follow_dst"
-        ) {
+        ) && !source_selector(id.as_str()).is_some_and(SourceSelector::names_non_directory)
+            && placement_option(id.as_str()).is_none()
+        {
             // Name the option as typed: some IDs differ from their spelling.
             let option = argument
                 .get_long()
@@ -2305,17 +2431,13 @@ fn parse_descriptor_copy(
     }
     let mut placement = crate::descriptor_copy::StreamPlacement::default();
     let (endpoint, path) = if as_fd.is_none() {
-        let choices = [
-            (&copy.r#as, false, Existence::Any),
-            (&copy.as_new, false, Existence::New),
-            (&copy.as_existing, false, Existence::Existing),
-            (&copy.into, true, Existence::Any),
-            (&copy.into_new, true, Existence::New),
-            (&copy.into_existing, true, Existence::Existing),
-        ];
-        let (destination, into, existence) = choices
-            .into_iter()
-            .find_map(|(path, into, existence)| path.clone().map(|path| (path, into, existence)))
+        let (destination, into, existence) = PLACEMENT_OPTIONS
+            .iter()
+            .zip(copy.placements())
+            .find_map(|(option, path)| {
+                path.clone()
+                    .map(|path| (path, option.placement == Placement::Into, option.existence))
+            })
             .or_else(|| {
                 copy.to
                     .as_ref()
@@ -2541,15 +2663,12 @@ fn parse_native_copy_with(argv: &[OsString], sources: SourceProbe) -> Result<Arg
     let results_fd = copy.results_output.results_fd.take();
     validate_native_results_fd(results_fd)?;
     let mut locations = if mapping.is_some() {
-        let source = &copy.selection.source;
-        let has_selectors = !(source.src.is_empty()
-            && source.srcs_in.is_empty()
-            && source.srcs.is_empty()
-            && source.src_non_dir.is_empty()
-            && source.src_dir.is_empty()
-            && source.src_non_dirs.is_empty()
-            && source.src_dirs.is_empty()
-            && source.sources.is_empty());
+        let has_selectors = copy
+            .selection
+            .source
+            .selectors()
+            .iter()
+            .any(|values| !values.is_empty());
         if has_selectors {
             bail!("--mapping replaces source selectors; do not combine them");
         }
@@ -2564,18 +2683,14 @@ fn parse_native_copy_with(argv: &[OsString], sources: SourceProbe) -> Result<Arg
         lower_native_selection(&copy.selection, &matches)?
     };
 
-    let placements = [
-        (copy.into, Placement::Into, Existence::Any),
-        (copy.into_new, Placement::Into, Existence::New),
-        (copy.into_existing, Placement::Into, Existence::Existing),
-        (copy.r#as, Placement::As, Existence::Any),
-        (copy.as_new, Placement::As, Existence::New),
-        (copy.as_existing, Placement::As, Existence::Existing),
-    ];
-    let (target, placement, existence) = match placements
-        .into_iter()
-        .find_map(|(path, placement, existence)| path.map(|path| (path, placement, existence)))
-    {
+    let chosen = PLACEMENT_OPTIONS
+        .iter()
+        .zip(copy.placements_mut())
+        .find_map(|(option, path)| {
+            path.take()
+                .map(|path| (path, option.placement, option.existence))
+        });
+    let (target, placement, existence) = match chosen {
         Some((path, placement, existence)) => (Some(path), placement, existence),
         None if prune || prune_before => bail!(
             "{} requires an explicit placement, such as --into DIR",
@@ -2845,46 +2960,8 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
         crate::help::filesystem(NativeRmCommand::command()).try_get_matches_from(full_argv)?;
     let parsed = NativeRmCommand::from_arg_matches(&matches)?;
     validate_native_results_fd(parsed.results_output.results_fd)?;
-    let mut ordered: Vec<(usize, SourceSelection, OsString)> = Vec::new();
-    for (id, selection, paths) in [
-        ("sources", SourceSelection::File, &parsed.selection.sources),
-        ("src", SourceSelection::File, &parsed.selection.src),
-        ("srcs", SourceSelection::File, &parsed.selection.srcs),
-        (
-            "srcs_in",
-            SourceSelection::Contents,
-            &parsed.selection.srcs_in,
-        ),
-        (
-            "src_non_dir",
-            SourceSelection::File,
-            &parsed.selection.src_non_dir,
-        ),
-        (
-            "src_dir",
-            SourceSelection::Directory,
-            &parsed.selection.src_dir,
-        ),
-        (
-            "src_non_dirs",
-            SourceSelection::File,
-            &parsed.selection.src_non_dirs,
-        ),
-        (
-            "src_dirs",
-            SourceSelection::Directory,
-            &parsed.selection.src_dirs,
-        ),
-    ] {
-        if let Some(indices) = matches.indices_of(id) {
-            ordered.extend(
-                indices
-                    .zip(paths.iter().cloned())
-                    .map(|(index, path)| (index, selection, path)),
-            );
-        }
-    }
-    ordered.sort_by_key(|(index, _, _)| *index);
+    let ordered =
+        ordered_native_selectors(&parsed.selection.source, &matches, SourceSelection::File);
     if ordered.is_empty() {
         bail!("syq rm needs at least one source selector");
     }
@@ -2894,13 +2971,13 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
         .as_deref()
         .filter(|s| s.starts_with("s3://"));
     let s3 = crate::s3::Options::parse(parsed.s3, s3_endpoint, None, &matches)?;
-    if s3.is_some() && parsed.selection.follow_src {
+    if s3.is_some() && parsed.selection.source.follow_src {
         bail!("--follow-src is not supported for S3 removal; object keys have no parent symlinks");
     }
     parsed.s3_remove.validate(
         s3.is_some(),
         ordered.len(),
-        &ordered.iter().map(|(_, kind, _)| *kind).collect::<Vec<_>>(),
+        &ordered.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(),
     )?;
     let endpoint = if s3.is_some() {
         None
@@ -2913,27 +2990,15 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
     if endpoint.is_none() && (parsed.helper.syq_path.is_some() || parsed.helper.no_bootstrap) {
         bail!("--syq-path and --no-bootstrap apply only to a remote removal endpoint");
     }
-    let locations = ordered
-        .into_iter()
-        .map(|(_, selection, path)| {
-            let path = if s3.is_some() {
-                path.into_vec()
-            } else {
-                trim_native_trailing_slashes(path.into_vec())
-            };
-            validate_native_source_selector(&path, parsed.selection.root.is_some())?;
-            let mut location = Location::native(endpoint.clone(), path.clone(), selection);
-            if s3.is_some() {
-                // An S3 marker key ends in a slash; retain its identity for
-                // explicit version deletion and non-directory validation.
-                location.path = path;
-            }
-            Ok(location)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let locations = lower_native_selectors(
+        ordered,
+        endpoint,
+        parsed.selection.source.root.is_some(),
+        s3.is_some(),
+    )?;
     let mut args = native_removal_args(
-        parsed.selection.cwd,
-        parsed.selection.root,
+        parsed.selection.source.cwd,
+        parsed.selection.source.root,
         parsed.operational,
         parsed.helper,
         parsed.results_output,
@@ -2949,8 +3014,8 @@ fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
     args.s3_remove = parsed.s3_remove;
     args.auth_from_explicit = parsed.auth_from.is_some();
     args.auth_from = parsed.auth_from.unwrap_or_default();
-    args.native_follow = parsed.selection.follow;
-    args.native_follow_src = parsed.selection.follow_src;
+    args.native_follow = parsed.selection.source.follow;
+    args.native_follow_src = parsed.selection.source.follow_src;
     args.pscope = parsed.pscope;
     Ok(args)
 }
@@ -3002,18 +3067,24 @@ fn lower_native_sources(
     matches: &clap::ArgMatches,
     endpoint: Option<NativeEndpoint>,
 ) -> Result<Vec<Location>> {
+    let ordered = ordered_native_selectors(parsed, matches, SourceSelection::NamedNoFollow);
+    if ordered.is_empty() {
+        bail!("native operations need at least one source selector");
+    }
+    lower_native_selectors(ordered, endpoint, parsed.root.is_some(), false)
+}
+
+/// The selected paths in command-line order, with what each selects; a
+/// named object selects `named`.
+fn ordered_native_selectors(
+    parsed: &NativeSourceArgs,
+    matches: &clap::ArgMatches,
+    named: SourceSelection,
+) -> Vec<(SourceSelection, OsString)> {
     let mut ordered: Vec<(usize, SourceSelection, OsString)> = Vec::new();
-    for (id, selection, paths) in [
-        ("sources", SourceSelection::NamedNoFollow, &parsed.sources),
-        ("src", SourceSelection::NamedNoFollow, &parsed.src),
-        ("srcs", SourceSelection::NamedNoFollow, &parsed.srcs),
-        ("srcs_in", SourceSelection::Contents, &parsed.srcs_in),
-        ("src_non_dir", SourceSelection::File, &parsed.src_non_dir),
-        ("src_dir", SourceSelection::Directory, &parsed.src_dir),
-        ("src_non_dirs", SourceSelection::File, &parsed.src_non_dirs),
-        ("src_dirs", SourceSelection::Directory, &parsed.src_dirs),
-    ] {
-        if let Some(indices) = matches.indices_of(id) {
+    for (selector, paths) in SOURCE_SELECTORS.iter().zip(parsed.selectors()) {
+        if let Some(indices) = matches.indices_of(selector.id) {
+            let selection = selector.selection.unwrap_or(named);
             ordered.extend(
                 indices
                     .zip(paths.iter().cloned())
@@ -3022,16 +3093,37 @@ fn lower_native_sources(
         }
     }
     ordered.sort_by_key(|(index, _, _)| *index);
-    if ordered.is_empty() {
-        bail!("native operations need at least one source selector");
-    }
-
     ordered
         .into_iter()
-        .map(|(_, selection, path)| {
-            let path = trim_native_trailing_slashes(path.into_vec());
-            validate_native_source_selector(&path, parsed.root.is_some())?;
-            Ok(Location::native(endpoint.clone(), path, selection))
+        .map(|(_, selection, path)| (selection, path))
+        .collect()
+}
+
+/// Validate selected paths and make them locations. `s3_keys` keeps a
+/// trailing slash: an S3 marker key ends in one, and its identity matters
+/// for explicit version deletion and non-directory validation.
+fn lower_native_selectors(
+    ordered: Vec<(SourceSelection, OsString)>,
+    endpoint: Option<NativeEndpoint>,
+    confined: bool,
+    s3_keys: bool,
+) -> Result<Vec<Location>> {
+    ordered
+        .into_iter()
+        .map(|(selection, path)| {
+            let path = if s3_keys {
+                path.into_vec()
+            } else {
+                trim_native_trailing_slashes(path.into_vec())
+            };
+            validate_native_source_selector(&path, confined)?;
+            Ok(if s3_keys {
+                let mut location = Location::native(endpoint.clone(), path.clone(), selection);
+                location.path = path;
+                location
+            } else {
+                Location::native(endpoint.clone(), path, selection)
+            })
         })
         .collect()
 }
@@ -3350,7 +3442,7 @@ fn trim_native_trailing_slashes(mut path: Vec<u8>) -> Vec<u8> {
     path
 }
 
-fn validate_native_source_selector(path: &[u8], confined: bool) -> Result<()> {
+pub(crate) fn validate_native_source_selector(path: &[u8], confined: bool) -> Result<()> {
     if path.is_empty() {
         bail!("source selectors may not be empty");
     }
