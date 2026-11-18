@@ -182,6 +182,11 @@ fn used_bytes(db: &Connection) -> i64 {
     (pragma("page_count") - pragma("freelist_count")) * pragma("page_size")
 }
 
+fn file_bytes(db: &Connection) -> i64 {
+    let pragma = |name| -> i64 { db.pragma_query_value(None, name, |r| r.get(0)).unwrap() };
+    pragma("page_count") * pragma("page_size")
+}
+
 fn run_ids(db: &Connection) -> Vec<i64> {
     db.prepare("SELECT id FROM runs ORDER BY id")
         .unwrap()
@@ -343,10 +348,7 @@ fn pruning_leaves_room_so_the_next_copies_only_check_the_size() {
     let pruned = run_ids(&db).len();
     assert!(pruned < full);
     // The free pages stay for later runs, except those over the budget.
-    let file: i64 = db
-        .pragma_query_value(None, "page_count", |r| r.get::<_, i64>(0))
-        .unwrap()
-        * 4096;
+    let file = file_bytes(&db);
     assert!(file <= budget && file > used, "{file} {used}");
     first.complete(true, json!({}));
     for _ in 0..4 {
@@ -355,11 +357,7 @@ fn pruning_leaves_room_so_the_next_copies_only_check_the_size() {
             .complete(true, json!({}));
     }
     assert_eq!(run_ids(&db).len(), pruned + 4, "nothing more deleted");
-    let rewritten: i64 = db
-        .pragma_query_value(None, "page_count", |r| r.get::<_, i64>(0))
-        .unwrap()
-        * 4096;
-    assert_eq!(rewritten, file, "new runs reuse the free pages");
+    assert_eq!(file_bytes(&db), file, "new runs reuse the free pages");
 }
 
 #[test]
