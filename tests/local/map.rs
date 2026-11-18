@@ -281,7 +281,8 @@ fn native_map_wide_directory_keeps_depth_first_order() {
 }
 
 /// An unreadable directory fails the map after the entries before it, with
-/// the error that names the failure.
+/// the error that names the failure. The directory stays searchable so every
+/// platform fails at the same step: macOS needs search permission to open it.
 #[test]
 fn native_map_fails_on_an_unreadable_directory() {
     use std::os::unix::fs::PermissionsExt;
@@ -292,7 +293,7 @@ fn native_map_fails_on_an_unreadable_directory() {
     let t = Tmp::new();
     write(&t.path("src/a"), b"");
     write(&t.path("src/locked/x"), b"");
-    fs::set_permissions(t.path("src/locked"), fs::Permissions::from_mode(0o000)).unwrap();
+    fs::set_permissions(t.path("src/locked"), fs::Permissions::from_mode(0o100)).unwrap();
     let out = syq_map_in(&t.path(""), &["--srcs-in", "src"]);
     fs::set_permissions(t.path("src/locked"), fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
