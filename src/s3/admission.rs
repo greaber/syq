@@ -374,7 +374,18 @@ impl Controller {
                 // Pay for more concurrency only when it improves throughput.
                 // Prefer fewer objects only when measured speed holds: a
                 // tolerated loss per step can accumulate into a large loss.
-                let floor = if probe.upward { 1.02 } else { 1.0 };
+                let floor = if !probe.upward {
+                    1.0
+                } else if self.checking {
+                    // Each object checked at once is a request in flight
+                    // that the service must admit. Keep an increase only
+                    // for a quarter of the gain it would give if the added
+                    // requests were as productive as the others.
+                    let added = self.limit as f64 / probe.from as f64 - 1.0;
+                    (1.0 + 0.25 * added).max(1.02)
+                } else {
+                    1.02
+                };
                 let direction = usize::from(probe.upward);
                 if fresh_score < probe.baseline * floor && score >= probe.baseline * floor {
                     // Old completions could explain the apparent gain. Neither

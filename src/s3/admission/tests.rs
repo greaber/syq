@@ -776,6 +776,35 @@ fn checking_searches_only_above_the_transfer_limit() {
 }
 
 #[test]
+fn a_checking_increase_must_earn_a_quarter_of_its_share() {
+    // Checking 64 objects at once instead of 32 is kept for 28% more
+    // unchanged objects found, not for 22%; transfers keep a 2% gain.
+    for (rate_at_64, checking, kept) in
+        [(41.0, true, true), (39.0, true, false), (39.0, false, true)]
+    {
+        let mut controller = if checking {
+            Controller::checking(32, 256)
+        } else {
+            Controller::new(32, 256, true)
+        };
+        for _ in 0..200 {
+            let active = controller.limit;
+            let rate = 32.0 + (rate_at_64 - 32.0) * (active.min(64) as f64 - 32.0) / 32.0;
+            controller.observe(rate, active, 10000, 16, 0.0);
+        }
+        let settled = controller
+            .probe
+            .as_ref()
+            .map_or(controller.limit, |probe| probe.from);
+        assert_eq!(
+            settled >= 60,
+            kept,
+            "rate {rate_at_64}, checking {checking}: settled {settled}"
+        );
+    }
+}
+
+#[test]
 fn checking_follows_the_transfer_limit_until_it_has_grown() {
     let mut controller = Controller::checking(32, 256);
     controller.follow(64);
