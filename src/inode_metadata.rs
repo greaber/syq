@@ -440,14 +440,16 @@ mod platform {
         );
         Ok(metadata)
     }
+    /// Whether `raw` has a version 2 POSIX ACL header followed by whole
+    /// 8-byte entries.
+    fn valid_posix_acl(raw: &[u8]) -> bool {
+        raw.len() >= 4 && (raw.len() - 4).is_multiple_of(8) && raw[..4] == 2u32.to_le_bytes()
+    }
     pub(super) fn default_permissions(directory: &File) -> Result<Option<u32>> {
         let Some(acl) = get(directory, DEFAULT)? else {
             return Ok(None);
         };
-        anyhow::ensure!(
-            acl.len() >= 4 && (acl.len() - 4).is_multiple_of(8) && acl[..4] == 2u32.to_le_bytes(),
-            "invalid Linux default ACL encoding"
-        );
+        anyhow::ensure!(valid_posix_acl(&acl), "invalid Linux default ACL encoding");
         let mut owner = None;
         let mut group = None;
         let mut mask = None;
@@ -477,18 +479,12 @@ mod platform {
         let Some(acl) = get(file, ACCESS)? else {
             return Ok(None);
         };
-        anyhow::ensure!(
-            acl.len() >= 4 && (acl.len() - 4).is_multiple_of(8) && acl[..4] == 2u32.to_le_bytes(),
-            "invalid Linux POSIX ACL encoding"
-        );
+        anyhow::ensure!(valid_posix_acl(&acl), "invalid Linux POSIX ACL encoding");
         Ok(posix_acl_is_extended(&acl).then_some(acl))
     }
 
     pub(super) fn access_for_mode(raw: &[u8], mode: u32) -> Result<Vec<u8>> {
-        anyhow::ensure!(
-            raw.len() >= 4 && (raw.len() - 4).is_multiple_of(8) && raw[..4] == 2u32.to_le_bytes(),
-            "invalid Linux POSIX ACL encoding"
-        );
+        anyhow::ensure!(valid_posix_acl(raw), "invalid Linux POSIX ACL encoding");
         let mask = raw[4..]
             .chunks_exact(8)
             .any(|e| u16::from_le_bytes([e[0], e[1]]) == 0x10);
@@ -569,23 +565,51 @@ mod platform {
             }
         }
         if let Some(attributes) = &metadata.xattrs {
-            for name in names(file)? {
-                if selected(&name, attributes.privileged)
-                    && attributes
-                        .values
-                        .binary_search_by(|(n, _)| n.cmp(&name))
-                        .is_err()
-                {
-                    return Ok(true);
-                }
-            }
-            for (name, value) in &attributes.values {
-                if get(file, name)?.as_deref() != Some(value) {
-                    return Ok(true);
-                }
+            if !xattr_changes(file, attributes, |_| true, true)?.is_empty() {
+                return Ok(true);
             }
         }
         Ok(false)
+    }
+
+    /// An attribute `apply_xattrs` sets to a value (`Some`) or removes
+    /// (`None`).
+    type Change<'a> = (Vec<u8>, Option<&'a [u8]>);
+
+    /// The attributes among those `considered` that `apply_xattrs` would
+    /// change on `file`: first the selected ones it has but `attributes`
+    /// lacks, in name order, then those whose value differs, in the order
+    /// of `attributes`. With `first`, stop at the first change found.
+    fn xattr_changes<'a>(
+        file: &File,
+        attributes: &'a ExtendedAttributes,
+        considered: impl Fn(&[u8]) -> bool,
+        first: bool,
+    ) -> Result<Vec<Change<'a>>> {
+        let mut changes = Vec::new();
+        for name in names(file)? {
+            if selected(&name, attributes.privileged)
+                && considered(&name)
+                && attributes
+                    .values
+                    .binary_search_by(|(n, _)| n.cmp(&name))
+                    .is_err()
+            {
+                changes.push((name, None));
+                if first {
+                    return Ok(changes);
+                }
+            }
+        }
+        for (name, value) in &attributes.values {
+            if considered(name) && get(file, name)?.as_deref() != Some(value) {
+                changes.push((name.clone(), Some(value.as_slice())));
+                if first {
+                    return Ok(changes);
+                }
+            }
+        }
+        Ok(changes)
     }
 
     /// Whether `metadata` would give `file` a file capability it does not
@@ -597,22 +621,8 @@ mod platform {
         let Some(attributes) = metadata.xattrs.as_ref().filter(|a| a.privileged) else {
             return Ok(false);
         };
-        for name in names(file)? {
-            if super::privileged_attribute(&name)
-                && attributes
-                    .values
-                    .binary_search_by(|(n, _)| n.cmp(&name))
-                    .is_err()
-            {
-                return Ok(true);
-            }
-        }
-        for (name, value) in &attributes.values {
-            if super::privileged_attribute(name) && get(file, name)?.as_deref() != Some(value) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        // Every privileged attribute is `selected` when `privileged` is set.
+        Ok(!xattr_changes(file, attributes, super::privileged_attribute, true)?.is_empty())
     }
 
     pub(super) fn apply_xattrs(file: &File, metadata: &InodeMetadata) -> Result<()> {
@@ -632,22 +642,7 @@ mod platform {
                 );
                 previous = Some(name);
             }
-            let mut changes: Vec<(Vec<u8>, Option<&[u8]>)> = Vec::new();
-            for name in names(file)? {
-                if selected(&name, attributes.privileged)
-                    && attributes
-                        .values
-                        .binary_search_by(|(n, _)| n.cmp(&name))
-                        .is_err()
-                {
-                    changes.push((name, None));
-                }
-            }
-            for (name, value) in &attributes.values {
-                if get(file, name)?.as_deref() != Some(value) {
-                    changes.push((name.clone(), Some(value)));
-                }
-            }
+            let changes = xattr_changes(file, attributes, |_| true, false)?;
             if !changes.is_empty() {
                 // Linux user.* writes require write permission, even for the
                 // owner. Temporarily add only the owner's write bit and always
@@ -663,7 +658,7 @@ mod platform {
                 }
                 let result = changes
                     .into_iter()
-                    .try_for_each(|(name, value)| set(file, &name, value));
+                    .try_for_each(|(name, value)| write(file, &name, value));
                 if temporary_write {
                     crate::fsops::set_mode_handle(file, current.mode() & 0o7777)
                         .context("restore permissions after extended attributes")?;
@@ -674,6 +669,48 @@ mod platform {
             // security.capability follows the final mode and ACL restoration.
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn xattr_changes_lists_removals_then_differences_among_those_considered() {
+            let dir = crate::test_support::tempdir().unwrap();
+            let file = File::create(dir.path().join("file")).unwrap();
+            for (name, value) in [
+                (&b"user.c"[..], &b"1"[..]),
+                (b"user.a", b"1"),
+                (b"user.b", b"1"),
+            ] {
+                write(&file, name, Some(value)).unwrap();
+            }
+            let attributes = ExtendedAttributes {
+                privileged: false,
+                values: vec![
+                    (b"user.b".to_vec(), b"1".to_vec()),
+                    (b"user.d".to_vec(), b"2".to_vec()),
+                    (b"user.e".to_vec(), b"".to_vec()),
+                ],
+            };
+            let all = xattr_changes(&file, &attributes, |_| true, false).unwrap();
+            assert_eq!(
+                all,
+                [
+                    (b"user.a".to_vec(), None),
+                    (b"user.c".to_vec(), None),
+                    (b"user.d".to_vec(), Some(&b"2"[..])),
+                    (b"user.e".to_vec(), Some(&b""[..])),
+                ]
+            );
+            let first = xattr_changes(&file, &attributes, |_| true, true).unwrap();
+            assert_eq!(first, [(b"user.a".to_vec(), None)]);
+            let considered = xattr_changes(&file, &attributes, |n| n == b"user.e", false).unwrap();
+            assert_eq!(considered, [(b"user.e".to_vec(), Some(&b""[..]))]);
+            let none = xattr_changes(&file, &attributes, |n| n == b"user.b", false).unwrap();
+            assert!(none.is_empty());
+        }
     }
 }
 
@@ -785,11 +822,10 @@ pub(crate) fn apply_after_acls_before_publication(
     apply_inner(file, metadata, mode, true)
 }
 
-/// Whether applying `metadata` with the final `mode` would change `file`:
-/// its ACLs, extended attributes, access time or birth time. Where a part
-/// cannot be compared it counts as a change.
-/// Whether applying `metadata` through `file` would change anything but its
-/// access time, which syq restores in place on any file (`fsops::vouch`).
+/// Whether applying `metadata` with the final `mode` through `file` would
+/// change anything but its access time, which syq restores in place on any
+/// file (`fsops::vouch`): its ACLs, extended attributes or birth time. Where
+/// a part cannot be compared it counts as a change.
 pub(crate) fn would_change_besides_atime(
     file: &File,
     metadata: Option<&InodeMetadata>,
