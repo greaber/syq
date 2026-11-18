@@ -126,6 +126,12 @@ fn limit_allocator_arenas_for_s3() {
     {
         return;
     }
+    // glibc's default limit is 8 arenas per online CPU (its get_nprocs,
+    // which this sysconf returns); on fewer than 4 CPUs, 32 would raise it.
+    let online = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.max(1);
+    if 8 * online <= libc::c_long::from(S3_ARENAS) {
+        return;
+    }
     unsafe {
         libc::mallopt(libc::M_ARENA_MAX, S3_ARENAS);
     }
