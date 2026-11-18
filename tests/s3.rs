@@ -6342,6 +6342,12 @@ fn s3_mapping_metadata_rejects_unapplied_ownership_on_a_directory() {
                 "unapplied {field} reported success: {}",
                 output_text(&out)
             );
+            assert!(
+                output_text(&out)
+                    .contains("set metadata of directory output: Operation not permitted"),
+                "{}",
+                output_text(&out)
+            );
         }
     }
 }

@@ -2,6 +2,7 @@
 //! long-lived credentials with the authorizer; file data goes directly to storage.
 mod admission;
 pub(crate) mod authorization;
+mod cancel;
 mod checksum;
 mod client;
 mod delete;

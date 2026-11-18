@@ -110,7 +110,7 @@ pub(super) struct Engine {
     tuning: super::tuning::Tuning,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     cancel_wake: tokio::sync::Notify,
-    uploads: Arc<super::upload_http::Cancellation>,
+    uploads: Arc<super::cancel::Cancellation>,
     authorization: Option<Arc<super::authorization::Authorization>>,
     /// The destination rejected an upload without a checksum; send Content-MD5.
     content_md5: std::sync::atomic::AtomicBool,
@@ -256,7 +256,7 @@ impl Engine {
             .or_else(|| std::env::var("AWS_ENDPOINT_URL_S3").ok())
             .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok());
         let control = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
-        let uploads = Arc::new(super::upload_http::Cancellation::default());
+        let uploads = Arc::new(super::cancel::Cancellation::default());
         let authorization = super::authorization::connect(&args, &options).await?;
         let outage = Arc::new(super::outage::Outage::default());
         let (client, note) = client::connect_authorized(
@@ -650,7 +650,10 @@ impl Engine {
         let mut creation = local::CreationPermissions::default();
         for (path, metadata) in entries {
             let relative = RelativePath::new(&path)?;
-            let label = String::from_utf8_lossy(&path).into_owned();
+            let label = match String::from_utf8_lossy(&path) {
+                name if name.is_empty() => ".".into(),
+                name => name.into_owned(),
+            };
             let saved = widened.remove(&path);
             // Require the inode we widened before applying any final metadata.
             let result = (|| {
@@ -670,14 +673,18 @@ impl Engine {
                         *explicit,
                         mode.is_none(),
                         &mut creation,
-                    )?;
+                    )
+                    .with_context(|| format!("set metadata of directory {label}"))?;
                 } else if saved.is_none() {
-                    let directory = destination.root.open_directory(&relative)?;
-                    let current = directory.metadata()?.mode();
-                    crate::fsops::set_mode_handle(
-                        &directory,
-                        crate::fsops::created_directory_mode(&directory, 0o777, current)?,
-                    )?;
+                    (|| {
+                        let directory = destination.root.open_directory(&relative)?;
+                        let current = directory.metadata()?.mode();
+                        crate::fsops::set_mode_handle(
+                            &directory,
+                            crate::fsops::created_directory_mode(&directory, 0o777, current)?,
+                        )
+                    })()
+                    .with_context(|| format!("set mode of directory {label}"))?;
                 }
                 Ok::<_, anyhow::Error>(())
             })();
