@@ -998,6 +998,21 @@ fn a_connection_ahead_that_fails_or_stalls_costs_the_copy_nothing() {
         }
     }
 
+    // Used: only the first TCP connection succeeds, which is the one opened
+    // ahead, and the copy may not fall back to SSH data.
+    let t = Tmp::new();
+    existing_destination_tree(&t, true);
+    let temporary = t.runtime();
+    fs::create_dir(&temporary).unwrap();
+    let out = existing_destination_copy(&t, true, &temporary)
+        .arg("--performance-tuning=workers=1")
+        .env("SYQ_TEST_TCP_FAIL_AFTER_ONE_WORKER", "1")
+        .env("SYQ_TEST_REQUIRE_TCP", "1")
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst/b")), b"changed");
+
     // Stalls: the copy ends while the connection is still held back.
     let t = Tmp::new();
     existing_destination_tree(&t, false);

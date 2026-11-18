@@ -2077,13 +2077,29 @@ impl WorkerConnector {
 /// is a TCP data connection.
 type SidesAhead = (Option<crate::conn::TcpAhead>, Option<crate::conn::TcpAhead>);
 
+/// Connections opened ahead of a file to send, with how long opening them
+/// took and when it ended.
+struct OpenedAhead {
+    connections: worker::OwnConnections,
+    took: std::time::Duration,
+    opened: std::time::Instant,
+}
+
+/// How long a connection opened ahead waits for a file to send before the
+/// worker opens another instead. Nothing keeps an idle data connection
+/// alive, and a firewall or address translator on the way may have dropped
+/// one that waited through a long plan, without either end learning of it.
+/// The round trip it saves matters only when planning is short.
+const AHEAD_CONNECTION_USABLE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Open `sides`, so the first file to send finds them ready. A side that
 /// is not a TCP data connection, or whose connection fails, is `None`: the
 /// worker opens it in the usual way once there is a file.
-fn connect_ahead(sides: SidesAhead) -> worker::OwnConnections {
+fn connect_ahead(sides: SidesAhead) -> OpenedAhead {
+    let started = std::time::Instant::now();
     // Tests hold these connections back, or fail them.
     #[cfg(debug_assertions)]
-    if crate::fsops::test_race_barrier(
+    let sides = if crate::fsops::test_race_barrier(
         "SYQ_TEST_CONNECT_AHEAD_READY_FILE",
         "SYQ_TEST_CONNECT_AHEAD_CONTINUE_FILE",
         "connection ahead",
@@ -2091,12 +2107,19 @@ fn connect_ahead(sides: SidesAhead) -> worker::OwnConnections {
     .is_err()
         || std::env::var_os("SYQ_TEST_CONNECT_AHEAD_FAILS").is_some()
     {
-        return (None, None);
-    }
-    (
+        (None, None)
+    } else {
+        sides
+    };
+    let connections = (
         sides.0.and_then(crate::conn::TcpAhead::connect),
         sides.1.and_then(crate::conn::TcpAhead::connect),
-    )
+    );
+    OpenedAhead {
+        connections,
+        took: started.elapsed(),
+        opened: std::time::Instant::now(),
+    }
 }
 
 fn handle_tcp_setup_error(
@@ -3298,11 +3321,25 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     gate.mark_absent(id);
                     return Ok(());
                 }
+                // Planner wait is not connection setup. Start once here so
+                // subsequent connection attempts still include retry backoff.
+                let mut setup = Some(progress.clock.setup.begin());
                 // A file to send: take what the thread opened, waiting for it
                 // as the connection made here would be waited for.
-                let mut ahead = ahead
-                    .and_then(|ahead| ahead.recv().ok())
-                    .unwrap_or((None, None));
+                let mut ahead_took = None;
+                let mut ahead = match ahead.and_then(|ahead| ahead.recv().ok()) {
+                    Some(opened) if opened.opened.elapsed() <= AHEAD_CONNECTION_USABLE => {
+                        ahead_took = Some(opened.took);
+                        opened.connections
+                    }
+                    Some(stale) => {
+                        // Closed apart from this worker, which is joined:
+                        // closing sends a request a bandwidth limit paces.
+                        let _ = std::thread::Builder::new().spawn(move || drop(stale));
+                        (None, None)
+                    }
+                    None => (None, None),
+                };
                 let connector = connector()?;
                 #[cfg(debug_assertions)]
                 if id == 0 {
@@ -3312,9 +3349,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         "first worker connection",
                     )?;
                 }
-                // Planner wait is not connection setup. Start once here so
-                // subsequent connection attempts still include retry backoff.
-                let mut setup = Some(progress.clock.setup.begin());
                 gate.mark_warming(id);
                 let mut failures = 0u32;
                 loop {
@@ -3324,7 +3358,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         gate.mark_absent(id);
                         return Ok(());
                     }
-                    let t0 = std::time::Instant::now();
+                    // An attempt that takes connections opened ahead took as
+                    // long as opening them did.
+                    let now = std::time::Instant::now();
+                    let t0 = ahead_took
+                        .take()
+                        .and_then(|took| now.checked_sub(took))
+                        .unwrap_or(now);
                     // Automatic copies start two channels on the authenticated
                     // SSH transport so file ranges can run in parallel before
                     // the remaining independent connections finish logging in.
