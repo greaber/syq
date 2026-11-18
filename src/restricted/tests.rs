@@ -5752,6 +5752,92 @@ fn a_finalize_sent_again_at_the_entry_limit_is_refused() {
     assert_eq!((results.totals.failed, results.totals.refused), (0, 1));
 }
 
+/// Whether a Finalize changed nothing is what the receiver says when it runs
+/// it, not whether the file had a reservation when it was authorized: a
+/// newer preparation of the same file on another connection can come
+/// between the two. A Finalize that publishes the newer file is listed as
+/// published, and one answered from the record of an earlier publication
+/// leaves the newer file's reservation alone.
+#[test]
+fn a_finalize_racing_a_newer_preparation_settles_by_what_it_did() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    let file = target.join("fresh");
+    let key = (path_bytes(&file), [1; 16]);
+    let (secret, policy) = results_policy();
+    let authority = existence_authority_with_results(&root, &policy, 60_000);
+    let mut reader = start_results(&authority, secret);
+    let write = |data: &[u8]| Request::WriteRange {
+        path: path_bytes(&file),
+        inplace: false,
+        copy_id: [1; 16],
+        attempt: 0,
+        off: 0,
+        hash: crate::fsops::content_digest(data),
+        data: data.to_vec().into(),
+    };
+    let publish = || finalize_request(&file, proto::TargetCondition::Any);
+    let (mut first, mut second) = (authority.test_ops(), authority.test_ops());
+    execute_authorized(&authority, &mut first, prepare_request(&file));
+    execute_authorized(&authority, &mut first, write(b"data"));
+    // The first Finalize runs; a newer preparation of the file is
+    // authorized before the Finalize settles and runs after it.
+    let mut request = publish();
+    let mut finalized = authority.authorize(&mut request, false).unwrap();
+    let response = finalized.execute(&mut first, |ops| ops.handle(&request));
+    let mut request = prepare_request(&file);
+    let mut prepared = authority.authorize(&mut request, false).unwrap();
+    authority.settle(finalized, &response);
+    let response = prepared.execute(&mut second, |ops| ops.handle(&request));
+    assert!(
+        matches!(response, proto::Response::Prepared(_)),
+        "{response:?}"
+    );
+    authority.settle(prepared, &response);
+    let written = execute_authorized(&authority, &mut second, write(b"next"));
+    assert!(matches!(written, proto::Response::Ok), "{written:?}");
+    // With no reservation left, this Finalize publishes the newer file.
+    let published = execute_authorized(&authority, &mut second, publish());
+    assert!(
+        !matches!(
+            published,
+            proto::Response::EndpointError(_) | proto::Response::Err(_)
+        ),
+        "{published:?}"
+    );
+    assert_eq!(fs::read(&file).unwrap(), b"next");
+    assert!(authority.state.lock().unwrap().file_lifecycles.is_empty());
+    // A Finalize sent again runs while a still newer preparation holds a
+    // reservation: it is answered from the record and leaves it alone.
+    let mut request = prepare_request(&file);
+    let mut prepared = authority.authorize(&mut request, false).unwrap();
+    let again = execute_authorized(&authority, &mut first, publish());
+    assert_eq!(format!("{again:?}"), format!("{published:?}"));
+    assert!(authority.state.lock().unwrap().reserved.contains_key(&key));
+    let response = prepared.execute(&mut second, |ops| ops.handle(&request));
+    authority.settle(prepared, &response);
+    execute_authorized(&authority, &mut second, write(b"last"));
+    execute_authorized(&authority, &mut second, publish());
+    assert_eq!(fs::read(&file).unwrap(), b"last");
+    assert!(authority.state.lock().unwrap().file_lifecycles.is_empty());
+    let results = finish_results(&authority, &mut reader);
+    assert_eq!(results.totals.failed, 0, "{:?}", results.records);
+    let changes = results.changes();
+    assert!(!changes.is_empty(), "{:?}", results.records);
+    for change in changes {
+        assert_eq!(
+            change,
+            (
+                "transfer_file".to_owned(),
+                b"fresh".to_vec(),
+                "succeeded".to_owned()
+            )
+        );
+    }
+}
+
 /// An ordinary copy of N files whose worker connection drops in the middle
 /// completes under an entry limit of N plus what was in flight on that
 /// connection: here one Finalize whose reply was lost, which the sender

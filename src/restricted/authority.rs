@@ -1637,7 +1637,7 @@ impl RestrictedAuthority {
         let Settlement {
             creations,
             outcomes,
-            charged,
+            repeated,
             tracked,
             stream: _,
         } = settlement;
@@ -1842,7 +1842,7 @@ impl RestrictedAuthority {
                     // A Finalize answered as one that already published its
                     // file changed nothing, and leaves alone any newer file
                     // the copy writes under its name.
-                    if stage == FileStage::Finalize && charged.repeated {
+                    if stage == FileStage::Finalize && repeated {
                         continue;
                     }
                     // A published file is no longer in flight; what it
@@ -2632,7 +2632,7 @@ impl RestrictedAuthority {
     /// limit. A count is never given back, even for a change the receiver
     /// then finds it need not or cannot make, and a request sent again
     /// counts again. Nothing is counted when any limit would be exceeded.
-    pub(super) fn charge_request(&self, request: &Request) -> Result<Charged> {
+    pub(super) fn charge_request(&self, request: &Request) -> Result<()> {
         // A file the copy writes counts once, before its first change: the
         // request that creates or opens it for writing (a stage, a
         // sidecar, an in-place file, even an empty one) or, for one prepared
@@ -2730,7 +2730,7 @@ impl RestrictedAuthority {
                 .expect("the reservation was found under the same lock")
                 .counted = true;
         }
-        Ok(Charged::default())
+        Ok(())
     }
 
     /// Settle a request whose execution never started, as a small copy
@@ -3350,10 +3350,10 @@ impl RestrictedAuthority {
             .and_then(|()| self.authorize_stream(request, stream, small_copy, &mut step))
             .and_then(|()| self.charge_request(request));
         match authorized {
-            Ok(charged) => Ok(Settlement {
+            Ok(()) => Ok(Settlement {
                 creations: pending,
                 outcomes,
-                charged,
+                repeated: false,
                 tracked,
                 stream: step,
             }),
@@ -4071,21 +4071,13 @@ impl RestrictedAuthority {
 pub(crate) struct Settlement {
     pub(super) creations: Vec<PendingCreation>,
     pub(super) outcomes: Vec<PendingOutcome>,
-    /// What the request counted against the signed limits.
-    pub(super) charged: Charged,
+    /// The receiver answered the request, a Finalize, as one that already
+    /// published its file (`Settlement::execute`).
+    pub(super) repeated: bool,
     /// The request counts as in flight until settled.
     pub(super) tracked: bool,
     /// Where the request leaves its connection's streamed patch.
     pub(super) stream: StreamStep,
-}
-
-/// What charging a request against the signed limits found
-/// (`charge_request`).
-#[derive(Debug, Default)]
-pub(super) struct Charged {
-    /// The receiver answered the Finalize as one that already published
-    /// its file (`Settlement::execute`).
-    repeated: bool,
 }
 
 impl Settlement {
@@ -4099,7 +4091,7 @@ impl Settlement {
     ) -> T {
         ops.take_finalize_repeated();
         let result = execute(ops);
-        self.charged.repeated = ops.take_finalize_repeated();
+        self.repeated = ops.take_finalize_repeated();
         result
     }
 }
