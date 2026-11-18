@@ -1396,7 +1396,7 @@ impl Engine {
                             } else if synchronous {
                                 crate::s3::upload_http::body(size)
                             } else {
-                                file_body(&source, 0, size).await?
+                                file_body(source, 0, size).await?
                             };
                             self.pace(size).await?;
                             let request = self
