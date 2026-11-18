@@ -7,9 +7,15 @@ import io
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 import zipfile
+
+# The release scripts run on the interpreter pinned by scripts/setup.sh and
+# use tomllib, which the oldest Python the package supports does not have.
+if sys.version_info < (3, 11):
+    raise unittest.SkipTest("release tooling needs Python 3.11 or newer")
 
 SCRIPT = Path(__file__).resolve().parents[3] / "scripts/package-python-wheel.py"
 spec = importlib.util.spec_from_file_location("release_wheel", SCRIPT)
@@ -94,7 +100,9 @@ class ReleaseWheelTests(unittest.TestCase):
         with zipfile.ZipFile(self.build()) as archive:
             actual = {line for line in archive.read("syq-0.7.0.dist-info/WHEEL").decode().splitlines()
                       if line.startswith("Tag: ")}
-        self.assertEqual(actual, expected)
+        # Later tags may be added; every tag that wheel had must remain.
+        self.assertLessEqual(expected, actual)
+        self.assertIn("Tag: py3-none-musllinux_1_1_x86_64", actual)
 
     def test_corrupt_native_binary_is_rejected(self):
         self.binary.write_bytes(b"wrong bytes")
