@@ -721,8 +721,9 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-  # The core suite also runs the storage checks. scripts/ci-scope.py defines
-  # the matrix, including the cases the one-session profile skips.
+  # The core suite also runs the storage and metadata checks.
+  # scripts/ci-scope.py defines the matrix, including the cases the one-session
+  # profile skips.
   real-ssh:
     concurrency:
       group: ${{ github.workflow }}-real-ssh-${{ matrix.suite }}-${{ matrix.profile }}-${{ needs.scope.outputs.suite_selection == 'true' && github.ref || github.run_id }}

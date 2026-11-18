@@ -136,7 +136,10 @@ class WorkflowTextTests(unittest.TestCase):
     def test_release_workflow_requires_checks_and_notes(self):
         release = (ROOT / ".github/workflows/release.yml").read_text()
         self.assertIn(",".join(release_checks.REQUIRED_CHECKS), release)
-        self.assertIn(".github/release-notes/$GITHUB_REF_NAME.md", release)
+        # verify-tag is the workflow's only check that the notes exist.
+        verify_tag = release.split("\n  verify-tag:\n", 1)[1]
+        verify_tag = verify_tag.split("\n  candidate-build:\n", 1)[0]
+        self.assertIn('test -s ".github/release-notes/$GITHUB_REF_NAME.md"', verify_tag)
 
 
 class PathScopeTests(Scratch):
