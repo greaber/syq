@@ -1746,8 +1746,21 @@ rebuild_copy() {
         --from source --srcs-in /tmp/syq-real-ssh/rebuild-source \
         --to destination --into /tmp/syq-real-ssh/rebuild-destination 2>&1
 }
+# Its results stream counts every error record it holds: the receiver's
+# refusal, relayed as it arrived, and the failure here.
+rebuild_refused_results() {
+    python3 - "$1" <<'PYTHON'
+import json, sys
+records = [json.loads(line) for line in open(sys.argv[1])]
+counted = [r for r in records if r["type"] == "error" and "diagnostic_for" not in r]
+assert records[-1]["type"] == "result" and records[-1]["status"] == "failed", records
+# At least the relayed refusal and this machine's own failure.
+assert len(counted) >= 2 and records[-1]["errors"] == len(counted), records
+PYTHON
+}
 # The refused copy says to run it again, and changes nothing there.
-if rebuild_output=$(rebuild_copy); then
+rm -f /tmp/syq-real-ssh-rebuild-refused.ndjson
+if rebuild_output=$(rebuild_copy --results /tmp/syq-real-ssh-rebuild-refused.ndjson); then
     printf '%s\n' "$rebuild_output" >&2
     echo 'a copy against a receiver of another build unexpectedly succeeded' >&2
     exit 1
@@ -1757,6 +1770,7 @@ case "$rebuild_output" in
     *) printf '%s\n' "$rebuild_output" >&2; exit 1 ;;
 esac
 ssh destination 'test ! -e /tmp/syq-real-ssh/rebuild-destination'
+rebuild_refused_results /tmp/syq-real-ssh-rebuild-refused.ndjson
 # The next copy updates the receiver and runs.
 rm -f /tmp/syq-real-ssh-rebuild.ndjson
 rebuild_output=$(rebuild_copy --results /tmp/syq-real-ssh-rebuild.ndjson) || {
@@ -1777,7 +1791,8 @@ PYTHON
 # A dry run says so and updates nothing, and the next copy updates it.
 stale_receiver
 ssh destination 'rm -rf /tmp/syq-real-ssh/rebuild-destination'
-if rebuild_output=$(rebuild_copy --dry-run); then
+rm -f /tmp/syq-real-ssh-rebuild-refused.ndjson
+if rebuild_output=$(rebuild_copy --dry-run --results /tmp/syq-real-ssh-rebuild-refused.ndjson); then
     printf '%s\n' "$rebuild_output" >&2
     echo 'a dry run against a receiver of another build unexpectedly succeeded' >&2
     exit 1
@@ -1786,6 +1801,7 @@ case "$rebuild_output" in
     *'a dry run does not update it, but the next copy does'*) ;;
     *) printf '%s\n' "$rebuild_output" >&2; exit 1 ;;
 esac
+rebuild_refused_results /tmp/syq-real-ssh-rebuild-refused.ndjson
 rebuild_output=$(rebuild_copy) || {
     printf '%s\n' "$rebuild_output" >&2
     exit 1
@@ -2391,7 +2407,7 @@ assert_same_tree \
 
 printf 'case: tuning overrides for range uploads, downloads, direct copies, and relay\n'
 dd if=/dev/urandom of=/tmp/syq-real-ssh-tuning.bin bs=1M count=9 status=none
-exercise_tuning tuning 1 copy-path=ranges,request-size=2M,pipeline-depth=64,split-min-size=8M,bw-pacing=average 120s
+exercise_tuning tuning 1 copy-path=ranges,request-size=2M,pipeline-depth=64,split-min-size=8M 120s
 
 printf 'case: restricted authorization accepts 128 workers\n'
 syq cp --from source /tmp/syq-real-ssh/tuning-tcp --to destination \
@@ -2416,7 +2432,7 @@ for transport in tcp ssh; do
 done
 
 printf 'case: experimental streaming over TCP/SSH and each coordinator\n'
-exercise_tuning streaming 2 copy-path=streaming,request-size=128K,split-min-size=1M,bw-pacing=average 25s
+exercise_tuning streaming 2 copy-path=streaming,request-size=128K,split-min-size=1M 25s
 
 printf 'case: batch overrides through a command-restricted receiver\n'
 ssh source 'mkdir /tmp/syq-real-ssh/tuning-batches; for n in 1 2 3 4 5 6 7; do dd if=/dev/urandom of=/tmp/syq-real-ssh/tuning-batches/$n bs=1024 count=600 status=none; done'

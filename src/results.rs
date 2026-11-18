@@ -23,6 +23,7 @@
 use crate::cli::{Args, Interface};
 use crate::proto::OperatorSymlinkPolicy;
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::io::Write;
 use std::os::fd::FromRawFd;
@@ -71,6 +72,9 @@ pub struct ResultsWriter {
     /// nothing may follow it, even from a straggling ticker render racing
     /// an error unwind. Sealing also makes a second terminal impossible.
     sealed: AtomicBool,
+    /// Counted error records written for a caller (`emit_value`), as a
+    /// remote coordinator's are relayed: the final record counts them.
+    relayed_errors: AtomicU64,
 }
 
 impl std::fmt::Debug for ResultsWriter {
@@ -82,27 +86,42 @@ impl std::fmt::Debug for ResultsWriter {
 /// One settled operation. `dst`/`src` are container/base-relative raw path
 /// bytes; together with `kind` a failed record round-trips as a mapping
 /// entry for retry.
+#[derive(Serialize)]
 pub struct OperationRecord<'a> {
     pub action: &'static str,
+    #[serde(serialize_with = "tagged_path")]
     pub dst: &'a [u8],
+    #[serde(
+        serialize_with = "tagged_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub src: Option<&'a [u8]>,
     pub kind: &'static str,
     pub disposition: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub attempts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub retryable: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub class: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub os_kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<&'a str>,
 }
 
+#[derive(Serialize)]
 pub struct RunRecord<'a> {
     pub run_id: &'a str,
     pub started_at: i64,
     pub mode: &'static str,
     /// Copy-only fields. Omitting them gives rm a distinct shape instead of
     /// assigning copy semantics to false values.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub prune: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mapping: Option<bool>,
     pub dry_run: bool,
     pub endpoints: Vec<EndpointRecord>,
@@ -114,7 +133,34 @@ pub struct EndpointRecord {
     pub user: Option<String>,
 }
 
+impl Serialize for EndpointRecord {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Endpoint<'a> {
+            role: &'a str,
+            kind: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            host: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            user: Option<&'a str>,
+        }
+        Endpoint {
+            role: self.role,
+            kind: match self.host.as_deref() {
+                Some(host) if host.starts_with("s3://") => "s3",
+                Some(_) => "ssh",
+                None => "local",
+            },
+            host: self.host.as_deref(),
+            user: self.user.as_deref(),
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Serialize)]
 pub struct ProgressRecord<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) activity: Option<&'a crate::transfer_observations::Interval>,
     pub bytes_done: u64,
     pub bytes_total: u64,
@@ -127,62 +173,297 @@ pub struct ProgressRecord<'a> {
     pub scan_done: bool,
     pub timings: crate::progress::Timings,
     pub rate_bytes_per_second: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub eta_ms: Option<u64>,
 }
 
+#[derive(Serialize)]
 pub struct TraceRecord<'a> {
     pub action: &'static str,
+    #[serde(serialize_with = "tagged_path")]
     pub dst: &'a [u8],
+    #[serde(
+        serialize_with = "tagged_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub src: Option<&'a [u8]>,
     pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
     pub reason: &'static str,
 }
 
+#[derive(Serialize)]
 pub struct SelectionResultRecord<'a> {
     pub selector: u64,
+    #[serde(serialize_with = "tagged_path")]
     pub path: &'a [u8],
     pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<&'static str>,
 }
 
+#[derive(Serialize)]
 pub struct RemovalRecord<'a> {
     pub selector: u64,
+    #[serde(serialize_with = "tagged_path")]
     pub path: &'a [u8],
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<&'static str>,
     pub disposition: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub attempts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub retryable: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub class: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub os_kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<&'a str>,
 }
 
+/// A terminal record's `status`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    Success,
+    Partial,
+    Refused,
+    Aborted,
+    Failed,
+}
+
+/// A final record's `status` as written: one this build knows, or another
+/// that a relayed record from another build gave.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RecordStatus {
+    Known(Status),
+    Other(String),
+}
+
+impl From<Status> for RecordStatus {
+    fn from(status: Status) -> Self {
+        Self::Known(status)
+    }
+}
+
+/// A copy's terminal record. A coordinator on another machine, possibly of
+/// another release, sends one that this machine relays, so it also reads
+/// back from a record that lacks fields (read as zero or false) or holds
+/// them in another type; see [`ResultRecord::from_record`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResultRecord {
-    pub status: &'static str,
+    pub status: RecordStatus,
+    #[serde(default)]
     pub exit_code: i32,
+    #[serde(default)]
     pub dry_run: bool,
+    #[serde(default)]
     pub files_transferred: u64,
+    #[serde(default)]
     pub files_unchanged: u64,
+    #[serde(default)]
     pub files_excluded: u64,
+    #[serde(default)]
     pub directories_created: u64,
+    #[serde(default)]
     pub symlinks_created: u64,
+    #[serde(default)]
     pub specials_created: u64,
+    #[serde(default)]
     pub errors: u64,
+    #[serde(default)]
     pub bytes_transferred: u64,
+    #[serde(default)]
     pub bytes_unchanged: u64,
+    #[serde(default)]
     pub timings: crate::progress::Timings,
+    /// Stream copies only: whether the source's size was known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_total_known: Option<bool>,
     /// `--prune` runs only; None keeps the fields out of the record.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub deletions_planned: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub deletions_completed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub deletions_blocked: Option<u64>,
     /// `--in-place=update` runs only: existing files replaced rather than
     /// updated in place, by reason.
-    pub replaced_not_in_place: Option<Vec<(crate::proto::ReplaceReason, u64)>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaced_not_in_place: Option<ReplacedNotInPlace>,
+    /// Fields of a relayed record that this build does not know, or holds
+    /// in another type, kept as they came. They are written after the
+    /// typed fields, so one held here replaces its typed default.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+    /// The typed fields a relayed record lacked or held in another type:
+    /// written as it sent them (left out, or from `extra`) unless this
+    /// machine sets them with [`ResultRecord::settle`].
+    #[serde(skip)]
+    pub(crate) as_sent: Vec<&'static str>,
 }
 
+/// Whether a relayed value reads as its typed field and writes back the same.
+type FieldCheck = fn(&serde_json::Value) -> bool;
+
+/// Each typed field of a final record with whether a relayed value has its
+/// type. `status` is not among them: a record without one is not a result.
+const RELAYED_FIELDS: [(&str, FieldCheck); 17] = [
+    ("exit_code", |value| {
+        value
+            .as_i64()
+            .is_some_and(|code| i32::try_from(code).is_ok())
+    }),
+    ("dry_run", serde_json::Value::is_boolean),
+    ("files_transferred", serde_json::Value::is_u64),
+    ("files_unchanged", serde_json::Value::is_u64),
+    ("files_excluded", serde_json::Value::is_u64),
+    ("directories_created", serde_json::Value::is_u64),
+    ("symlinks_created", serde_json::Value::is_u64),
+    ("specials_created", serde_json::Value::is_u64),
+    ("errors", serde_json::Value::is_u64),
+    ("bytes_transferred", serde_json::Value::is_u64),
+    ("bytes_unchanged", serde_json::Value::is_u64),
+    // Typed only when it reads back as it came: a known measurement given
+    // as null, or in another type, keeps the whole object as sent.
+    ("timings", |value| {
+        serde_json::from_value::<crate::progress::Timings>(value.clone())
+            .ok()
+            .and_then(|timings| serde_json::to_value(timings).ok())
+            .is_some_and(|written| written == *value)
+    }),
+    ("bytes_total_known", serde_json::Value::is_boolean),
+    ("deletions_planned", serde_json::Value::is_u64),
+    ("deletions_completed", serde_json::Value::is_u64),
+    ("deletions_blocked", serde_json::Value::is_u64),
+    ("replaced_not_in_place", serde_json::Value::is_object),
+];
+
+impl ResultRecord {
+    /// A record with every count zero.
+    pub(crate) fn new(status: Status, exit_code: i32, dry_run: bool) -> Self {
+        ResultRecord {
+            status: status.into(),
+            exit_code,
+            dry_run,
+            files_transferred: 0,
+            files_unchanged: 0,
+            files_excluded: 0,
+            directories_created: 0,
+            symlinks_created: 0,
+            specials_created: 0,
+            errors: 0,
+            bytes_transferred: 0,
+            bytes_unchanged: 0,
+            timings: Default::default(),
+            bytes_total_known: None,
+            deletions_planned: None,
+            deletions_completed: None,
+            deletions_blocked: None,
+            replaced_not_in_place: None,
+            extra: Default::default(),
+            as_sent: Vec::new(),
+        }
+    }
+
+    /// Read a terminal record as written, without its envelope. Only a
+    /// record without a `status` string is refused: a count or flag it
+    /// lacks reads as zero or false, and one in another type as if it were
+    /// absent, and both are written back as they were sent.
+    pub(crate) fn from_record(mut record: serde_json::Value) -> Result<Self> {
+        let object = record
+            .as_object_mut()
+            .context("a final result is not an object")?;
+        anyhow::ensure!(
+            object
+                .remove("type")
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+                == Some("result"),
+            "a final result has another type"
+        );
+        anyhow::ensure!(
+            object
+                .get("status")
+                .is_some_and(serde_json::Value::is_string),
+            "a final result has no status"
+        );
+        let mut as_sent = Vec::new();
+        let mut kept = serde_json::Map::new();
+        for (key, typed) in RELAYED_FIELDS {
+            match object.get(key) {
+                None => as_sent.push(key),
+                Some(value) if typed(value) => {}
+                Some(_) => {
+                    kept.insert(key.to_owned(), object.remove(key).expect("present"));
+                    as_sent.push(key);
+                }
+            }
+        }
+        let mut result: Self = serde_json::from_value(record).context("read a final result")?;
+        result.extra.extend(kept);
+        result.as_sent = as_sent;
+        Ok(result)
+    }
+
+    /// The fields this machine set, written from now on as typed.
+    pub(crate) fn settle(&mut self, keys: &[&str]) {
+        debug_assert!(keys
+            .iter()
+            .all(|key| *key == "status" || RELAYED_FIELDS.iter().any(|(name, _)| name == key)));
+        self.as_sent.retain(|key| !keys.contains(key));
+        for key in keys {
+            self.extra.remove(*key);
+        }
+    }
+
+    fn to_record(&self) -> serde_json::Value {
+        let mut record = typed("result", self);
+        let object = record.as_object_mut().expect("record is an object");
+        for key in &self.as_sent {
+            if !self.extra.contains_key(*key) {
+                object.remove(*key);
+            }
+        }
+        record
+    }
+}
+
+/// `replaced_not_in_place`: counts by reason key, each present only when
+/// nonzero. A relayed record keeps keys this build does not know.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ReplacedNotInPlace(serde_json::Map<String, serde_json::Value>);
+
+impl ReplacedNotInPlace {
+    pub(crate) fn from_counts(counts: &[(crate::proto::ReplaceReason, u64)]) -> Self {
+        Self(
+            counts
+                .iter()
+                .filter(|(_, count)| *count > 0)
+                .map(|(reason, count)| (reason.key().to_owned(), (*count).into()))
+                .collect(),
+        )
+    }
+
+    /// Every reason this build knows, with its count.
+    pub(crate) fn counts(&self) -> Vec<(crate::proto::ReplaceReason, u64)> {
+        crate::proto::ReplaceReason::ALL
+            .iter()
+            .map(|reason| {
+                let count = self.0.get(reason.key()).and_then(serde_json::Value::as_u64);
+                (*reason, count.unwrap_or(0))
+            })
+            .collect()
+    }
+}
+
+#[derive(Serialize)]
 pub struct RmResultRecord {
-    pub status: &'static str,
+    pub status: Status,
     pub exit_code: i32,
     pub dry_run: bool,
     pub selectors_total: u64,
@@ -193,7 +474,58 @@ pub struct RmResultRecord {
     pub entries_already_absent: u64,
     pub entries_failed: u64,
     pub errors: u64,
+    #[serde(rename = "timings", serialize_with = "total_ms")]
     pub elapsed_ms: u64,
+}
+
+fn total_ms<S: serde::Serializer>(elapsed_ms: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+    serde_json::json!({ "total_ms": elapsed_ms }).serialize(serializer)
+}
+
+/// A path as `tagged` writes it, serialized without building a value first.
+struct Tagged<'a>(&'a [u8]);
+
+impl Serialize for Tagged<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use base64::Engine as _;
+        use serde::ser::SerializeStruct as _;
+        let mut tagged = serializer.serialize_struct("Tagged", 2)?;
+        match std::str::from_utf8(self.0) {
+            Ok(value) => {
+                tagged.serialize_field("encoding", "utf-8")?;
+                tagged.serialize_field("value", value)?;
+            }
+            Err(_) => {
+                tagged.serialize_field("encoding", "base64")?;
+                tagged.serialize_field(
+                    "value",
+                    &base64::engine::general_purpose::STANDARD.encode(self.0),
+                )?;
+            }
+        }
+        tagged.end()
+    }
+}
+
+fn tagged_path<S: serde::Serializer>(path: &&[u8], serializer: S) -> Result<S::Ok, S::Error> {
+    Tagged(path).serialize(serializer)
+}
+
+fn tagged_optional<S: serde::Serializer>(
+    path: &Option<&[u8]>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    path.map(Tagged).serialize(serializer)
+}
+
+/// A record of `kind` with `body`'s fields.
+fn typed(kind: &str, body: &impl Serialize) -> serde_json::Value {
+    let mut record = serde_json::to_value(body).expect("a results record serializes");
+    record
+        .as_object_mut()
+        .expect("record is an object")
+        .insert("type".into(), kind.into());
+    record
 }
 
 #[derive(Clone, Copy)]
@@ -371,6 +703,7 @@ impl ResultsWriter {
             seq: AtomicU64::new(0),
             dead: AtomicBool::new(false),
             sealed: AtomicBool::new(false),
+            relayed_errors: AtomicU64::new(0),
         }
     }
 
@@ -380,112 +713,30 @@ impl ResultsWriter {
         writer.parent = Some(parent);
         Arc::new(writer)
     }
-    pub(crate) fn take_phase_result(&self) -> Option<serde_json::Value> {
-        self.phase_result.lock().unwrap().take()
+    /// The terminal record of the phase this writer collected.
+    pub(crate) fn take_phase_result(&self) -> Option<ResultRecord> {
+        let record = self.phase_result.lock().unwrap().take()?;
+        Some(ResultRecord::from_record(record).expect("a phase settles with a copy's result"))
     }
 
     pub fn emit_run(&self, run: &RunRecord) {
-        let endpoints: Vec<serde_json::Value> = run
-            .endpoints
-            .iter()
-            .map(|endpoint| {
-                let mut value = serde_json::json!({
-                    "role": endpoint.role,
-                    "kind": match endpoint.host.as_deref() {
-                        Some(host) if host.starts_with("s3://") => "s3",
-                        Some(_) => "ssh",
-                        None => "local",
-                    },
-                });
-                let object = value.as_object_mut().expect("endpoint is an object");
-                if let Some(host) = &endpoint.host {
-                    object.insert("host".into(), host.as_str().into());
-                }
-                if let Some(user) = &endpoint.user {
-                    object.insert("user".into(), user.as_str().into());
-                }
-                value
-            })
-            .collect();
-        let mut record = serde_json::json!({
-            "type": "run",
-            "run_id": run.run_id,
-            "started_at": run.started_at,
-            "syq_version": crate::identity::version(),
-            "mode": run.mode,
-            "dry_run": run.dry_run,
-            "endpoints": endpoints,
-        });
-        let object = record.as_object_mut().expect("record is an object");
-
-        if let Some(prune) = run.prune {
-            object.insert("prune".into(), prune.into());
-        }
-        if let Some(mapping) = run.mapping {
-            object.insert("mapping".into(), mapping.into());
-        }
+        let mut record = typed("run", run);
+        record["syq_version"] = crate::identity::version().into();
         self.write(record);
     }
 
     pub fn emit_progress(&self, progress: &ProgressRecord<'_>) {
-        let mut record = serde_json::json!({
-            "type": "progress",
-            "bytes_done": progress.bytes_done,
-            "bytes_total": progress.bytes_total,
-            "bytes_unchanged": progress.bytes_unchanged,
-            "files_done": progress.files_done,
-            "files_total": progress.files_total,
-            "files_unchanged": progress.files_unchanged,
-            "files_excluded": progress.files_excluded,
-            "scanned": progress.scanned,
-            "scan_done": progress.scan_done,
-            "timings": progress.timings,
-            "rate_bytes_per_second": progress.rate_bytes_per_second,
-        });
-        if let Some(eta_ms) = progress.eta_ms {
-            record["eta_ms"] = eta_ms.into();
-        }
-        if let Some(activity) = progress.activity {
-            record["activity"] =
-                serde_json::to_value(activity).expect("finite observation fractions");
-        }
-        self.write(record);
+        self.write(typed("progress", progress));
     }
 
     /// Dry run only: one intended mutation, sharing `operation_result`'s
     /// identity fields, with the reason the mutation is needed.
     pub fn emit_trace(&self, trace: &TraceRecord) {
-        let mut record = serde_json::json!({
-            "type": "trace",
-            "action": trace.action,
-            "dst": tagged(trace.dst),
-            "kind": trace.kind,
-            "reason": trace.reason,
-        });
-        let object = record.as_object_mut().expect("record is an object");
-        if let Some(src) = trace.src {
-            object.insert("src".into(), tagged(src));
-        }
-        if let Some(bytes) = trace.bytes {
-            object.insert("bytes".into(), bytes.into());
-        }
-        self.write(record);
+        self.write(typed("trace", trace));
     }
 
     pub fn emit_selection_result(&self, selection: &SelectionResultRecord) {
-        let mut record = serde_json::json!({
-            "type": "selection_result",
-            "selector": selection.selector,
-            "path": tagged(selection.path),
-            "status": selection.status,
-        });
-        if let Some(kind) = selection.kind {
-            record
-                .as_object_mut()
-                .expect("record is an object")
-                .insert("kind".into(), kind.into());
-        }
-        self.write(record);
+        self.write(typed("selection_result", selection));
     }
 
     pub fn emit_removal_trace(&self, removal: &RemovalRecord) {
@@ -523,34 +774,10 @@ impl ResultsWriter {
         removal: &RemovalRecord,
         version: Option<(&str, bool)>,
     ) {
-        let mut record = serde_json::json!({
-            "type": "removal_result",
-            "selector": removal.selector,
-            "path": tagged(removal.path),
-            "disposition": removal.disposition,
-        });
-        let object = record.as_object_mut().expect("record is an object");
-        if let Some(kind) = removal.kind {
-            object.insert("kind".into(), kind.into());
-        }
-        if let Some(attempts) = removal.attempts {
-            object.insert("attempts".into(), attempts.into());
-        }
-        if let Some(retryable) = removal.retryable {
-            object.insert("retryable".into(), retryable.into());
-        }
-        if let Some(class) = removal.class {
-            object.insert("class".into(), class.into());
-        }
-        if let Some(os_kind) = removal.os_kind {
-            object.insert("os_kind".into(), os_kind.into());
-        }
-        if let Some(message) = removal.message {
-            object.insert("message".into(), message.into());
-        }
+        let mut record = typed("removal_result", removal);
         if let Some((id, marker)) = version {
-            object.insert("s3_version_id".into(), id.into());
-            object.insert("s3_delete_marker".into(), marker.into());
+            record["s3_version_id"] = id.into();
+            record["s3_delete_marker"] = marker.into();
         }
         self.write(record);
     }
@@ -675,13 +902,7 @@ impl ResultsWriter {
                 }
             }
         }
-        let mut record = serde_json::json!({
-            "type": "operation_result",
-            "action": op.action,
-            "dst": tagged(op.dst),
-            "kind": op.kind,
-            "disposition": op.disposition,
-        });
+        let mut record = typed("operation_result", op);
         let object = record.as_object_mut().expect("record is an object");
         if let Some(expected) = expected {
             object.insert("expected_hash".into(), serde_json::json!(expected));
@@ -693,100 +914,18 @@ impl ResultsWriter {
         {
             object.insert("metadata".into(), serde_json::json!(metadata));
         }
-
-        if let Some(src) = op.src {
-            object.insert("src".into(), tagged(src));
-        }
-        if let Some(bytes) = op.bytes {
-            object.insert("bytes".into(), bytes.into());
-        }
-        if let Some(attempts) = op.attempts {
-            object.insert("attempts".into(), attempts.into());
-        }
-        if let Some(retryable) = op.retryable {
-            object.insert("retryable".into(), retryable.into());
-        }
-        if let Some(class) = op.class {
-            object.insert("class".into(), class.into());
-        }
-        if let Some(os_kind) = op.os_kind {
-            object.insert("os_kind".into(), os_kind.into());
-        }
-        if let Some(message) = op.message {
-            object.insert("message".into(), message.into());
-        }
         self.write(record);
     }
 
     /// The terminal record; flushes the stream. Nothing may be written after.
     pub fn emit_result(&self, result: &ResultRecord) {
-        self.emit_result_size_known(result, None);
-    }
-
-    pub(crate) fn emit_result_size_known(&self, result: &ResultRecord, known: Option<bool>) {
-        let mut record = serde_json::json!({
-            "type": "result",
-            "status": result.status,
-            "exit_code": result.exit_code,
-            "dry_run": result.dry_run,
-            "files_transferred": result.files_transferred,
-            "files_unchanged": result.files_unchanged,
-            "files_excluded": result.files_excluded,
-            "directories_created": result.directories_created,
-            "symlinks_created": result.symlinks_created,
-            "specials_created": result.specials_created,
-            "errors": result.errors,
-            "bytes_transferred": result.bytes_transferred,
-            "bytes_unchanged": result.bytes_unchanged,
-            "timings": result.timings,
-        });
-        let object = record.as_object_mut().expect("record is an object");
-        if let Some(known) = known {
-            object.insert("bytes_total_known".into(), known.into());
-        }
-        if let Some(planned) = result.deletions_planned {
-            object.insert("deletions_planned".into(), planned.into());
-        }
-        if let Some(completed) = result.deletions_completed {
-            object.insert("deletions_completed".into(), completed.into());
-        }
-        if let Some(blocked) = result.deletions_blocked {
-            object.insert("deletions_blocked".into(), blocked.into());
-        }
-        if let Some(replaced) = &result.replaced_not_in_place {
-            object.insert(
-                "replaced_not_in_place".into(),
-                replaced
-                    .iter()
-                    .filter(|(_, count)| *count > 0)
-                    .map(|(reason, count)| (reason.key().to_owned(), (*count).into()))
-                    .collect::<serde_json::Map<_, _>>()
-                    .into(),
-            );
-        }
-        self.write_and_seal(record, true);
+        self.write_and_seal(result.to_record(), true);
     }
 
     pub fn emit_rm_result(&self, result: &RmResultRecord) {
-        self.write_and_seal(
-            serde_json::json!({
-                "type": "result",
-                "mode": "rm",
-                "status": result.status,
-                "exit_code": result.exit_code,
-                "dry_run": result.dry_run,
-                "selectors_total": result.selectors_total,
-                "selectors_resolved": result.selectors_resolved,
-                "selectors_missing": result.selectors_missing,
-                "entries_planned": result.entries_planned,
-                "entries_removed": result.entries_removed,
-                "entries_already_absent": result.entries_already_absent,
-                "entries_failed": result.entries_failed,
-                "errors": result.errors,
-                "timings": {"total_ms": result.elapsed_ms},
-            }),
-            true,
-        );
+        let mut record = typed("result", result);
+        record["mode"] = "rm".into();
+        self.write_and_seal(record, true);
     }
 
     pub(crate) fn schema_version(&self) -> u64 {
@@ -805,18 +944,34 @@ impl ResultsWriter {
     /// restricted destination); the envelope and sequencing are applied like
     /// any other record.
     pub(crate) fn emit_value(&self, record: serde_json::Value) {
+        self.count_relayed(std::slice::from_ref(&record));
         self.write_and_seal(record, false);
+    }
+
+    fn count_relayed(&self, records: &[serde_json::Value]) {
+        let counted = records
+            .iter()
+            .filter(|record| counted_error(record))
+            .count();
+        self.relayed_errors.fetch_add(counted as u64, Relaxed);
+    }
+
+    /// The counted error records written for callers, which a final record
+    /// built from this machine's own counts adds.
+    pub(crate) fn relayed_errors(&self) -> u64 {
+        self.relayed_errors.load(Relaxed)
     }
 
     /// Emit caller-built records in order with one write, as `emit_value`
     /// would one by one.
     pub(crate) fn emit_values(&self, records: Vec<serde_json::Value>) {
+        self.count_relayed(&records);
         if records.is_empty() || self.dead.load(Relaxed) {
             return;
         }
         if self.parent.is_some() {
             for record in records {
-                self.emit_value(record);
+                self.write(record);
             }
             return;
         }
@@ -847,12 +1002,6 @@ impl ResultsWriter {
         }
     }
 
-    /// Emit a caller-built terminal record and seal the stream, flushing
-    /// inside the same critical section like `emit_result`.
-    pub(crate) fn emit_terminal_value(&self, record: serde_json::Value) {
-        self.write_and_seal(record, true);
-    }
-
     fn write_and_seal(&self, mut record: serde_json::Value, seal: bool) {
         if self.dead.load(Relaxed) {
             return;
@@ -873,7 +1022,7 @@ impl ResultsWriter {
             if seal {
                 *self.phase_result.lock().unwrap() = Some(record);
             } else if record["type"] != "run" {
-                parent.emit_value(record);
+                parent.write(record);
             }
             return;
         }
@@ -917,6 +1066,13 @@ pub(crate) const ALTER_FAILURES_ENV: &str = "SYQ_TEST_ALTER_RELAYED_FAILURES";
 #[cfg(debug_assertions)]
 fn altered_failures() -> Option<String> {
     std::env::var(ALTER_FAILURES_ENV).ok()
+}
+
+/// An error record a final result counts: not one that only explains a
+/// failure another record counts.
+pub(crate) fn counted_error(record: &serde_json::Value) -> bool {
+    record.get("type").and_then(serde_json::Value::as_str) == Some("error")
+        && record.get(DIAGNOSTIC_FOR).is_none()
 }
 
 pub(crate) fn tagged(path: &[u8]) -> serde_json::Value {
@@ -964,28 +1120,40 @@ mod tests {
         }
     }
 
+    /// Every field a final record writes is either `type`, `status`, or one
+    /// the relay reads leniently, so a relayed record of another release
+    /// never fails over a field this list forgot.
+    #[test]
+    fn every_final_record_field_is_read_leniently_when_relayed() {
+        let record = ResultRecord {
+            bytes_total_known: Some(true),
+            deletions_planned: Some(1),
+            deletions_completed: Some(1),
+            deletions_blocked: Some(1),
+            replaced_not_in_place: Some(ReplacedNotInPlace::default()),
+            ..ResultRecord::new(Status::Success, 0, false)
+        };
+        let written = record.to_record();
+        let mut keys: Vec<&str> = written
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        let mut expected: Vec<&str> = RELAYED_FIELDS.iter().map(|(name, _)| *name).collect();
+        expected.extend(["type", "status"]);
+        expected.sort_unstable();
+        assert_eq!(keys, expected);
+    }
+
     #[test]
     fn nothing_follows_the_terminal_record() {
         let sink = Sink::default();
         let writer = ResultsWriter::new(Box::new(sink.clone()));
         writer.emit_result(&ResultRecord {
-            status: "failed",
-            exit_code: 1,
-            dry_run: false,
-            files_transferred: 0,
-            files_unchanged: 0,
-            files_excluded: 0,
-            directories_created: 0,
-            symlinks_created: 0,
-            specials_created: 0,
             errors: 1,
-            bytes_transferred: 0,
-            bytes_unchanged: 0,
-            timings: Default::default(),
-            deletions_planned: None,
-            deletions_completed: None,
-            deletions_blocked: None,
-            replaced_not_in_place: None,
+            ..ResultRecord::new(Status::Failed, 1, false)
         });
         let after = sink.0.lock().unwrap().len();
         // A straggling ticker render (or a second terminal) must be inert.
@@ -1004,25 +1172,7 @@ mod tests {
             rate_bytes_per_second: 0,
             eta_ms: None,
         });
-        writer.emit_result(&ResultRecord {
-            status: "success",
-            exit_code: 0,
-            dry_run: false,
-            files_transferred: 0,
-            files_unchanged: 0,
-            files_excluded: 0,
-            directories_created: 0,
-            symlinks_created: 0,
-            specials_created: 0,
-            errors: 0,
-            bytes_transferred: 0,
-            bytes_unchanged: 0,
-            timings: Default::default(),
-            deletions_planned: None,
-            deletions_completed: None,
-            deletions_blocked: None,
-            replaced_not_in_place: None,
-        });
+        writer.emit_result(&ResultRecord::new(Status::Success, 0, false));
         assert_eq!(sink.0.lock().unwrap().len(), after);
     }
 }

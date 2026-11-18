@@ -92,7 +92,8 @@ struct Opened {
 /// come from `source.open()`. Each copy the SDK makes of the body starts
 /// again at `offset`. A body fails rather than finish once the source no
 /// longer matches what was selected: a short read, or a changed size or
-/// timestamp when the last chunk has been read.
+/// timestamp when the last chunk has been read. That failure is marked
+/// [`super::retry::Permanent`], so the upload is not retried.
 pub(super) fn body(source: Source, file: File, offset: u64, length: u64) -> SdkBody {
     let opened = Arc::new(Opened { file, source });
     SdkBody::retryable(move || {
@@ -134,13 +135,24 @@ impl Chunks {
                 },
             };
             let read = opened.file.read_exact_at(&mut buffer.buffer[..n], offset);
-            // A short read means the file shrank; name that, not the EOF.
-            if read.is_err() || last {
-                opened
-                    .source
-                    .check(&opened.file)
-                    .map_err(std::io::Error::other)?;
-            }
+            // A short read shows that the file shrank, even before its
+            // metadata does; name that, not the EOF. A confirmed change is
+            // final, but an error reading the metadata may pass.
+            let short = matches!(&read, Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof);
+            let changed = if short {
+                Err(opened.source.changed())
+            } else if read.is_err() || last {
+                opened.source.check(&opened.file)
+            } else {
+                Ok(())
+            };
+            changed.map_err(|e| {
+                if e.is::<super::local::SourceChanged>() {
+                    std::io::Error::other(super::retry::Permanent::new(e))
+                } else {
+                    std::io::Error::other(e)
+                }
+            })?;
             read?;
             buffer.len = n;
             Ok(buffer)

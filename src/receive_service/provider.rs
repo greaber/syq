@@ -55,8 +55,8 @@ pub(crate) enum SessionRequest {
     LocalAccount(ssh_auth::LocalRequest),
     /// A copy between two other servers that the login asks this provider
     /// to approve, as a receiving machine approves one
-    /// (`destination::forward::approve`).
-    Forward(Box<crate::destination::forward::ForwardRequest>),
+    /// (`destination::approve`).
+    Copy(Box<crate::destination::approve::Asked>),
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -857,7 +857,7 @@ impl Service {
                                 context, request, tracked, 0, &cancelled,
                             )
                         }
-                        SessionRequest::Forward(request) => {
+                        SessionRequest::Copy(asked) => {
                             // Ending the session shuts this request down.
                             let _tracked = tracked;
                             // A completed copy request has no more bytes:
@@ -887,7 +887,7 @@ impl Service {
                                 forward_count: &session.forward_count,
                                 cancelled: &cancelled,
                             }
-                            .approve((*request).into(), &mut stream)
+                            .approve(*asked, &mut stream)
                         }
                     }
                 })();
@@ -2105,10 +2105,8 @@ mod tests {
                 &mut client,
                 &Access::Request {
                     session: ticket.session,
-                    operation: Box::new(SessionRequest::Forward(Box::new(
-                        crate::destination::forward::ForwardRequest {
-                            source: Some("reader@source-host".into()),
-                            target: "backup".into(),
+                    operation: Box::new(SessionRequest::Copy(Box::new(
+                        crate::destination::approve::Asked {
                             command,
                             cwd: "~".into(),
                             inputs: crate::directive::Inputs::default(),
@@ -2214,10 +2212,8 @@ mod tests {
             &mut client,
             &Access::Request {
                 session: ticket.session,
-                operation: Box::new(SessionRequest::Forward(Box::new(
-                    crate::destination::forward::ForwardRequest {
-                        source: Some("reader@source-host".into()),
-                        target: "backup".into(),
+                operation: Box::new(SessionRequest::Copy(Box::new(
+                    crate::destination::approve::Asked {
                         command,
                         cwd: "~".into(),
                         inputs: crate::directive::Inputs::default(),

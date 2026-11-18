@@ -440,70 +440,6 @@ pub(super) fn is_enrollment_transport_failure(error: &anyhow::Error) -> bool {
     })
 }
 
-pub(super) fn run_ssh(
-    target: &SshEndpoint,
-    route: EnrollmentRoute<'_>,
-    remote_command: &str,
-    input: &[u8],
-) -> Result<Vec<u8>> {
-    // Only `syq receiver revoke` manages an enrollment, in the foreground.
-    let args = enrollment::enrollment_ssh_args_raw(target, route, remote_command, None);
-    let mut command = Command::new("ssh");
-    command
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn_guarded()
-        .map_err(|error| enrollment_ssh_error(target, true, error))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| enrollment_ssh_error(target, true, "stdin unavailable"))?;
-    let write_error = stdin.write_all(input).err();
-    drop(stdin);
-    let output = child
-        .wait_with_output()
-        .map_err(|error| enrollment_ssh_error(target, true, error))?;
-    if !output.status.success() {
-        let diagnostic = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        return Err(enrollment_ssh_error(
-            target,
-            output.status.code() == Some(255),
-            format_args!(
-                "{}: {}",
-                output.status,
-                if diagnostic.is_empty() {
-                    "no diagnostic"
-                } else {
-                    &diagnostic
-                }
-            ),
-        ));
-    }
-    if let Some(error) = write_error {
-        return Err(enrollment_ssh_error(target, true, error));
-    }
-    Ok(output.stdout)
-}
-
-/// What a management session runs on the server after the user's login.
-/// Installing runs in its own session (`install_over_route`), which also
-/// reads the login trace.
-#[derive(Clone, Copy)]
-pub(super) enum ManagementAction {
-    Revoke,
-}
-
-impl ManagementAction {
-    pub(super) fn argument(self) -> &'static str {
-        match self {
-            Self::Revoke => "--restricted-revoke",
-        }
-    }
-}
-
 /// Shell commands that make the store's directory `$d` and stage the
 /// uploaded syq at `$p` in it, removed again when the shell exits.
 /// Directories above the store follow the umask; the store's own are the
@@ -515,51 +451,348 @@ fn stage_commands(stage: &str) -> String {
     )
 }
 
-pub(super) fn management_remote_command(
-    stage: &str,
-    action: ManagementAction,
-    request: &[u8],
-) -> Result<String> {
-    let request = std::str::from_utf8(request).context("management request is not UTF-8")?;
-    Ok(format!(
-        "set -eu; {}; printf '%s' {} | \"$p\" {}",
-        stage_commands(stage),
-        shell_words::quote(request),
-        action.argument()
-    ))
+/// What runs on the server once a session has the build: the installer, or
+/// the revoker.
+#[derive(Clone, Copy)]
+pub(super) enum ManagementAction {
+    Install,
+    Revoke,
 }
 
-pub(super) fn run_management_over_route(
+impl ManagementAction {
+    pub(super) fn argument(self) -> &'static str {
+        match self {
+            Self::Install => "--restricted-install",
+            Self::Revoke => "--restricted-revoke",
+        }
+    }
+}
+
+/// What a session's greeting reports; see [`install_remote_command`].
+struct Greeting {
+    os: String,
+    arch: String,
+    home: String,
+    uid: String,
+    name: String,
+    config_home: String,
+    runtime_dir: String,
+    tmpdir: String,
+    /// The platforms the server's store has this build for.
+    stored: String,
+    authorized: Vec<u8>,
+}
+
+/// A session over the user's own login, past its greeting. Dropping it
+/// ends the login, and the remote shell with it, as `ProcessGroup` does.
+struct ManagementSession {
+    group: crate::process_group::ProcessGroup,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+    input: std::process::ChildStdin,
+    trace_path: PathBuf,
+    _temporary: tempfile::TempDir,
+    greeting: Greeting,
+}
+
+/// How a session ended once the request was sent.
+struct Finished {
+    /// Sending the request and the build.
+    write: Result<()>,
+    /// Why the build to upload could not be fetched, when it could not.
+    unsent: Option<String>,
+    response: Vec<u8>,
+    status: std::process::ExitStatus,
+    /// What SSH itself said, when the session failed.
+    reason: Option<String>,
+}
+
+/// Log in to the server with the user's own SSH and start the session that
+/// ends in `action`, reading its greeting. An error before the greeting
+/// counts as a transport failure when SSH says so.
+fn open_session(
+    target: &SshEndpoint,
+    route: EnrollmentRoute<'_>,
+    (unattended, in_this_group): (Option<enrollment::Unattended>, bool),
+    id: EnrollmentId,
+    action: ManagementAction,
+) -> Result<ManagementSession> {
+    let temporary = crate::private_broker::private_temp_dir("syq-enroll-")?;
+    let trace_path = temporary.path().join("ssh.log");
+    let stage = stage_name(id)?;
+    let remote = in_sh(&install_remote_command(&stage, action));
+    let mut command = Command::new("ssh");
+    // The trace goes to the file alone. With -v, OpenSSH would also start a
+    // configured jump with -v, which writes its own trace to stderr.
+    command
+        .args([
+            "-o",
+            "LogLevel=DEBUG3",
+            "-o",
+            "FingerprintHash=sha256",
+            "-E",
+        ])
+        .arg(&trace_path);
+    command
+        .args(enrollment::enrollment_ssh_args_raw(
+            target, route, &remote, unattended,
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    // In this process's group, the login gets this process's signals and
+    // terminal and never needs the terminal handed over. A batch login
+    // stays here so that the receiving service ends it with its setup
+    // child's whole group, at its deadline or when the requester goes;
+    // revoking stays here so that Ctrl-C ends the login with syq, and the
+    // login may write to the terminal throughout. An interactive install
+    // takes its own group, since syq asks for a PIN once SSH has
+    // authenticated.
+    let mut group = if in_this_group {
+        crate::process_group::ProcessGroup::spawn_in_this_group(&mut command)
+    } else {
+        crate::process_group::ProcessGroup::spawn(&mut command)
+    }
+    .map_err(|error| enrollment_ssh_error(target, true, error))?;
+    let foreground = group
+        .foreground()
+        .context("give enrollment SSH access to the terminal")?;
+    let mut stdout = std::io::BufReader::new(
+        group
+            .child
+            .stdout
+            .take()
+            .context("enrollment SSH output missing")?,
+    );
+    let input = group
+        .child
+        .stdin
+        .take()
+        .context("enrollment SSH input missing")?;
+    let mut greeted = false;
+    let greeting = (|| -> Result<_> {
+        // Any output, including an oversized or malformed first line, means
+        // the remote command started. Only an empty stream warrants waiting
+        // for SSH's transport-failure status before trying another route.
+        greeted = !std::io::BufRead::fill_buf(&mut stdout)?.is_empty();
+        let os = read_enrollment_line(&mut stdout)?;
+        let arch = read_enrollment_line(&mut stdout)?;
+        let home = read_enrollment_line(&mut stdout)?;
+        let uid = read_enrollment_line(&mut stdout)?;
+        let name = read_enrollment_line(&mut stdout)?;
+        let config_home = read_enrollment_line(&mut stdout)?;
+        let runtime_dir = read_enrollment_line(&mut stdout)?;
+        let tmpdir = read_enrollment_line(&mut stdout)?;
+        let stored = read_enrollment_line(&mut stdout)?;
+        let length: usize = read_enrollment_line(&mut stdout)?
+            .parse()
+            .context("authorized_keys byte count")?;
+        if length > MAX_AUTHORIZED_KEYS {
+            bail!("authorized_keys is too large to inspect");
+        }
+        let mut authorized = vec![0u8; length];
+        stdout.read_exact(&mut authorized)?;
+        Ok(Greeting {
+            os,
+            arch,
+            home,
+            uid,
+            name,
+            config_home,
+            runtime_dir,
+            tmpdir,
+            stored,
+            authorized,
+        })
+    })();
+    drop(foreground);
+    match greeting {
+        Ok(greeting) => Ok(ManagementSession {
+            group,
+            stdout,
+            input,
+            trace_path,
+            _temporary: temporary,
+            greeting,
+        }),
+        Err(error) => {
+            drop(input);
+            // Before a greeting, EOF means SSH failed to connect/authenticate.
+            // Malformed or excessive output after a greeting must be stopped
+            // rather than waiting while the SSH pipe could still be full.
+            let status = if greeted {
+                group.close()?
+            } else {
+                group.wait()?
+            };
+            let ssh_failed = !greeted || status.code() == Some(255);
+            let reason = fs::read_to_string(&trace_path)
+                .ok()
+                .and_then(|trace| ssh_reason(&trace, ssh_failed));
+            Err(enrollment_ssh_error(
+                target,
+                status.code() == Some(255),
+                match reason {
+                    Some(reason) => format!("{error:#} ({reason})"),
+                    None => format!("{error:#}"),
+                },
+            ))
+        }
+    }
+}
+
+impl ManagementSession {
+    /// The build this machine would install on the server's platform and,
+    /// when the server's store has a build for that platform, the offer to
+    /// start that one instead: the platform and the SHA-256 of this build.
+    /// The session starts the stored build only when it is exactly this one.
+    fn offered_build(&self) -> Result<(Option<(&'static str, String)>, ManagementBuild)> {
+        let platform =
+            crate::remote_helper::Target::for_bootstrap(&self.greeting.os, &self.greeting.arch)
+                .context("unsupported receiver platform")?;
+        let build = ManagementBuild::select(platform)?;
+        let offer = self
+            .greeting
+            .stored
+            .split_whitespace()
+            .any(|key| key == platform.key)
+            .then(|| build.sha256().map(|digest| (platform.key, digest)))
+            .transpose()?;
+        Ok((offer, build))
+    }
+
+    /// Send `request`, then the build as the session asks for it, and read
+    /// the response until the session ends.
+    fn finish(
+        mut self,
+        request: &impl serde::Serialize,
+        (offer, build): (Option<(&str, String)>, ManagementBuild),
+    ) -> Result<Finished> {
+        let input = &mut self.input;
+        let stdout = &mut self.stdout;
+        // A build that cannot be fetched is never sent, and the session
+        // runs nothing without one.
+        let mut unsent = None;
+        let write = (|| -> Result<()> {
+            let mut build = Some(build);
+            let mut fetch = |build: ManagementBuild| {
+                build
+                    .bytes()
+                    .inspect_err(|error| unsent = Some(format!("{error:#}")))
+            };
+            serde_json::to_writer(&mut *input, request)?;
+            match &offer {
+                Some((target, digest)) => writeln!(input, "\n{target}\n{digest}")?,
+                None => {
+                    input.write_all(b"\n\n\n")?;
+                    // Nothing to compare: the session needs this build.
+                    let bytes = fetch(build.take().expect("the build is sent once"))?;
+                    input.write_all(&bytes)?;
+                }
+            }
+            input.flush()?;
+            // The session says whether it started the stored build or needs
+            // this one, which is fetched only then.
+            match read_enrollment_line(stdout)?.as_str() {
+                "stored" => {}
+                "upload" => {
+                    if let Some(build) = build.take() {
+                        input.write_all(&fetch(build)?)?;
+                    }
+                }
+                _ => bail!("the enrollment session gave an unexpected answer"),
+            }
+            Ok(())
+        })();
+        drop(self.input);
+        let mut response = Vec::new();
+        self.stdout
+            .take((MAX_STATE_FILE + 1) as u64)
+            .read_to_end(&mut response)?;
+        if response.len() > MAX_STATE_FILE {
+            bail!("enrollment response too large");
+        }
+        let status = self.group.wait()?;
+        let reason = (!status.success())
+            .then(|| fs::read_to_string(&self.trace_path).ok())
+            .flatten()
+            .and_then(|trace| ssh_reason(&trace, status.code() == Some(255)));
+        Ok(Finished {
+            write,
+            unsent,
+            response,
+            status,
+            reason,
+        })
+    }
+}
+
+/// Run `attempt` along the route the user's SSH configuration gives and,
+/// when that cannot connect, through `jump`. `doing` names the work for the
+/// error, as "enrolling"; `retry_state`, when it has something to say, what
+/// a failure leaves.
+pub(super) fn over_routes<T>(
+    doing: &str,
+    jump: Option<&SshEndpoint>,
+    retry_state: impl Fn() -> Option<String>,
+    mut attempt: impl FnMut(EnrollmentRoute<'_>) -> Result<T>,
+) -> Result<T> {
+    match (attempt(EnrollmentRoute::Configured), jump) {
+        (Ok(value), _) => Ok(value),
+        (Err(configured_error), Some(jump))
+            if is_enrollment_transport_failure(&configured_error) =>
+        {
+            attempt(EnrollmentRoute::ProxyJump { jump }).map_err(|error| {
+                let also = format!(
+                    "{doing} along your SSH configuration's route also failed: {configured_error:#}"
+                );
+                match retry_state() {
+                    Some(state) => error.context(format!("{state}; {also}")),
+                    None => error.context(also),
+                }
+            })
+        }
+        (Err(error), _) => Err(match retry_state() {
+            Some(state) => error.context(state),
+            None => error,
+        }),
+    }
+}
+
+/// Revoke enrollment `id` on the server in one session over the user's own
+/// login, which starts the stored build when it is exactly this machine's
+/// and has this machine upload it otherwise.
+pub(super) fn revoke_over_route(
     target: &SshEndpoint,
     route: EnrollmentRoute<'_>,
     id: EnrollmentId,
-    action: ManagementAction,
-    input: &[u8],
-) -> Result<Vec<u8>> {
-    let platform = run_ssh(
-        target,
-        route.clone(),
-        &in_sh("set -eu; uname -s; uname -m"),
-        &[],
-    )?;
-    let platform = std::str::from_utf8(&platform).context("receiver platform is not UTF-8")?;
-    let mut lines = platform.lines();
-    let os = lines
-        .next()
-        .context("receiver platform probe returned no operating system")?;
-    let arch = lines
-        .next()
-        .context("receiver platform probe returned no architecture")?;
-    let platform = crate::remote_helper::Target::for_bootstrap(os, arch)
-        .with_context(|| format!("restricted enrollment does not support {os} {arch}"))?;
-    let bytes = management_executable(platform)?;
-    let stage = stage_name(id)?;
-    let command = in_sh(&management_remote_command(&stage, action, input)?);
-    // Upload and invocation share one SSH session. The remote shell installs
-    // its cleanup trap before reading the binary and retains it until the
-    // management helper exits, so there is no inter-session orphan window or
-    // cleanup request that depends on a route which has already failed.
-    run_ssh(target, route, &command, &bytes)
+    request: &RevokeRequest,
+) -> Result<()> {
+    let session = open_session(target, route, (None, true), id, ManagementAction::Revoke)?;
+    let offered = session.offered_build()?;
+    let finished = session.finish(request, offered)?;
+    // Without the build, the session ran nothing that revokes.
+    if finished.write.is_err() {
+        if let Some(unsent) = finished.unsent {
+            bail!(unsent);
+        }
+    }
+    if !finished.status.success() {
+        // Revoking again is harmless, so whenever SSH itself failed (255),
+        // even after the greeting, the revocation may go through `--via`.
+        return Err(enrollment_ssh_error(
+            target,
+            finished.status.code() == Some(255),
+            format_args!(
+                "{}{}",
+                finished.status,
+                finished
+                    .reason
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default()
+            ),
+        ));
+    }
+    finished.write
 }
 
 fn stage_name(id: EnrollmentId) -> Result<String> {
@@ -570,10 +803,6 @@ fn stage_name(id: EnrollmentId) -> Result<String> {
         id,
         u64::from_le_bytes(nonce)
     ))
-}
-
-pub(super) fn management_executable(target: crate::remote_helper::Target) -> Result<Vec<u8>> {
-    ManagementBuild::select(target)?.bytes()
 }
 
 /// The syq this machine installs on a server of a given platform: this
@@ -968,38 +1197,9 @@ fn run_session(
     };
     // The user's own login first, along the route the SSH configuration
     // gives; then through `jump` when that cannot connect.
-    let configured = install_over_route(
-        target,
-        EnrollmentRoute::Configured,
-        account,
-        (&plan, batch),
-        check,
-    );
-    let session = match (configured, jump) {
-        (Ok(session), _) => session,
-        (Err(configured_error), Some(jump)) if is_enrollment_transport_failure(&configured_error) => {
-            install_over_route(
-                target,
-                EnrollmentRoute::ProxyJump { jump },
-                account,
-                (&plan, batch),
-                check,
-            )
-            .map_err(|error| {
-                let also = format!("enrolling along your SSH configuration's route also failed: {configured_error:#}");
-                match retry_state() {
-                    Some(state) => error.context(format!("{state}; {also}")),
-                    None => error.context(also),
-                }
-            })?
-        }
-        (Err(error), _) => {
-            return Err(match retry_state() {
-                Some(state) => error.context(state),
-                None => error,
-            })
-        }
-    };
+    let session = over_routes("enrolling", jump, retry_state, |route| {
+        install_over_route(target, route, account, (&plan, batch), check)
+    })?;
     Ok((session, plan.directory))
 }
 
@@ -1030,130 +1230,41 @@ fn install_over_route(
             jump_accepts_new: false,
         }),
     };
-    let temporary = crate::private_broker::private_temp_dir("syq-enroll-")?;
-    let trace_path = temporary.path().join("ssh.log");
-    let stage = stage_name(plan.id)?;
-    let remote = in_sh(&install_remote_command(&stage));
-    let mut command = Command::new("ssh");
-    // The trace goes to the file alone. With -v, OpenSSH would also start a
-    // configured jump with -v, which writes its own trace to stderr.
-    command
-        .args([
-            "-o",
-            "LogLevel=DEBUG3",
-            "-o",
-            "FingerprintHash=sha256",
-            "-E",
-        ])
-        .arg(&trace_path);
-    command
-        .args(enrollment::enrollment_ssh_args_raw(
-            target,
-            route.clone(),
-            &remote,
-            unattended,
-        ))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    // Without a terminal, the login stays in this process's group: the
-    // receiving service ends its setup child with that whole group, at its
-    // deadline or when the requester goes, and the login with it.
-    let mut group = if batch {
-        crate::process_group::ProcessGroup::spawn_in_this_group(&mut command)
-    } else {
-        crate::process_group::ProcessGroup::spawn(&mut command)
-    }
-    .map_err(|error| enrollment_ssh_error(target, true, error))?;
-    let foreground = group
-        .foreground()
-        .context("give enrollment SSH access to the terminal")?;
-    let mut stdout = std::io::BufReader::new(
-        group
-            .child
-            .stdout
-            .take()
-            .context("enrollment SSH output missing")?,
+    let session = open_session(
+        target,
+        route,
+        (unattended, batch),
+        plan.id,
+        ManagementAction::Install,
+    )?;
+    let greeting = &session.greeting;
+    let (home, uid, name) = (&greeting.home, &greeting.uid, &greeting.name);
+    let receiving = server_receiving_state(
+        Path::new(home),
+        uid,
+        &greeting.os,
+        (
+            &greeting.config_home,
+            &greeting.runtime_dir,
+            &greeting.tmpdir,
+        ),
     );
-    let mut input = group
-        .child
-        .stdin
-        .take()
-        .context("enrollment SSH input missing")?;
-    let mut greeted = false;
-    let platform = (|| -> Result<_> {
-        // Any output, including an oversized or malformed first line, means
-        // the remote command started. Only an empty stream warrants waiting
-        // for SSH's transport-failure status before trying another route.
-        greeted = !std::io::BufRead::fill_buf(&mut stdout)?.is_empty();
-        let os = read_enrollment_line(&mut stdout)?;
-        let arch = read_enrollment_line(&mut stdout)?;
-        let home = read_enrollment_line(&mut stdout)?;
-        let uid = read_enrollment_line(&mut stdout)?;
-        let name = read_enrollment_line(&mut stdout)?;
-        let config_home = read_enrollment_line(&mut stdout)?;
-        let runtime_dir = read_enrollment_line(&mut stdout)?;
-        let tmpdir = read_enrollment_line(&mut stdout)?;
-        let stored = read_enrollment_line(&mut stdout)?;
-        let receiving = server_receiving_state(
-            Path::new(&home),
-            &uid,
-            &os,
-            (&config_home, &runtime_dir, &tmpdir),
-        );
-        let length: usize = read_enrollment_line(&mut stdout)?
-            .parse()
-            .context("authorized_keys byte count")?;
-        if length > MAX_AUTHORIZED_KEYS {
-            bail!("authorized_keys is too large to inspect");
-        }
-        let mut authorized = vec![0u8; length];
-        stdout.read_exact(&mut authorized)?;
-        Ok((os, arch, home, receiving, stored, authorized, (uid, name)))
-    })();
-    drop(foreground);
-    let (os, arch, home, receiving, stored, authorized, (uid, name)) = match platform {
-        Ok(platform) => platform,
-        Err(error) => {
-            drop(input);
-            // Before a greeting, EOF means SSH failed to connect/authenticate.
-            // Malformed or excessive output after a greeting must be stopped
-            // rather than waiting while the SSH pipe could still be full.
-            let status = if greeted {
-                group.close()?
-            } else {
-                group.wait()?
-            };
-            let ssh_failed = !greeted || status.code() == Some(255);
-            let reason = fs::read_to_string(&trace_path)
-                .ok()
-                .and_then(|trace| ssh_reason(&trace, ssh_failed));
-            return Err(enrollment_ssh_error(
-                target,
-                status.code() == Some(255),
-                match reason {
-                    Some(reason) => format!("{error:#} ({reason})"),
-                    None => format!("{error:#}"),
-                },
-            ));
-        }
-    };
     // Everything before the request is checked with nothing installed: an
-    // error closes the session's input, and the remote shell stops.
+    // error ends the session, and the remote shell with it.
     // Whether this attempt stored the pending record, which it removes when
     // the server is found to have installed nothing.
     let mut stored_pending = false;
     let prepared = (|| -> Result<_> {
         // A copy the receiver would refuse leaves no enrollment.
         if let Some(check) = check {
-            check(Path::new(&home), &receiving, &uid)?;
+            check(Path::new(home), &receiving, uid)?;
         }
         // The server knows the account by the name it gives the user ID,
         // which its receiver and every directive name. Another name for the
         // same user ID, such as `toor` for root, cannot enroll.
         if name != login {
             let given = endpoint(login, host, port)?.label();
-            let mut message = match endpoint(&name, host, port) {
+            let mut message = match endpoint(name, host, port) {
                 _ if name.is_empty() => format!("{given} logs in with user ID {uid}, which has no account name on that server; restricted copying needs one"),
                 Ok(named) => format!("{given} logs in as user ID {uid}, which that server calls {name}; restricted copying works only under that name, so use {} instead", named.label()),
                 Err(_) => format!("{given} logs in as user ID {uid}, which that server calls {name}; restricted copying works only under that name"),
@@ -1177,26 +1288,16 @@ fn install_over_route(
             }
             bail!(message);
         }
-        let trace =
-            fs::read_to_string(&trace_path).context("read enrollment SSH authentication trace")?;
+        let trace = fs::read_to_string(&session.trace_path)
+            .context("read enrollment SSH authentication trace")?;
         keys::require_openssh_server(&trace)?;
         let login_key = keys::discover(
             &trace,
-            &authorized,
+            &greeting.authorized,
             agent.as_deref(),
             plan.id.to_string().as_bytes(),
         )?;
-        let platform = crate::remote_helper::Target::for_bootstrap(&os, &arch)
-            .context("unsupported receiver platform")?;
-        // A stored build for this platform is offered to the session with
-        // the SHA-256 of the build this machine would install: the session
-        // starts the stored one only when it is exactly that build.
-        let build = ManagementBuild::select(platform)?;
-        let offer = stored
-            .split_whitespace()
-            .any(|key| key == platform.key)
-            .then(|| build.sha256().map(|digest| (platform.key, digest)))
-            .transpose()?;
+        let offered = session.offered_build()?;
         let entry_key = match &plan.entry_key {
             Some(key) => key.clone(),
             None => {
@@ -1230,59 +1331,16 @@ fn install_over_route(
             refresh: plan.refresh,
             replaces: plan.replaces.clone(),
         };
-        Ok((login_key, (offer, build), request))
+        Ok((login_key, offered, request))
     })();
-    let (login_key, (offer, build), request) = match prepared {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            drop(input);
-            let _ = group.close();
-            return Err(error);
-        }
-    };
-    // A build that cannot be fetched is never sent, and the session
-    // installs nothing without one.
-    let mut unsent = None;
-    let write = (|| -> Result<()> {
-        let mut build = Some(build);
-        let mut fetch = |build: ManagementBuild| {
-            build
-                .bytes()
-                .inspect_err(|error| unsent = Some(format!("{error:#}")))
-        };
-        serde_json::to_writer(&mut input, &request)?;
-        match &offer {
-            Some((target, digest)) => writeln!(input, "\n{target}\n{digest}")?,
-            None => {
-                input.write_all(b"\n\n\n")?;
-                // Nothing to compare: the session needs this build.
-                let bytes = fetch(build.take().expect("the build is sent once"))?;
-                input.write_all(&bytes)?;
-            }
-        }
-        input.flush()?;
-        // The session says whether it started the stored build or needs
-        // this one, which is fetched only then.
-        match read_enrollment_line(&mut stdout)?.as_str() {
-            "stored" => {}
-            "upload" => {
-                if let Some(build) = build.take() {
-                    input.write_all(&fetch(build)?)?;
-                }
-            }
-            _ => bail!("the enrollment session gave an unexpected answer"),
-        }
-        Ok(())
-    })();
-    drop(input);
-    let mut response = Vec::new();
-    stdout
-        .take((MAX_STATE_FILE + 1) as u64)
-        .read_to_end(&mut response)?;
-    if response.len() > MAX_STATE_FILE {
-        bail!("enrollment response too large");
-    }
-    let status = group.wait()?;
+    let (login_key, offered, request) = prepared?;
+    let Finished {
+        write,
+        unsent,
+        response,
+        status,
+        reason,
+    } = session.finish(&request, offered)?;
     // Nothing on the server names an entry key it refused, or one that no
     // build arrived to install, so a pending record this attempt stored
     // goes. Its retry is a new enrollment.
@@ -1306,9 +1364,7 @@ fn install_over_route(
         bail!("{error}; retry, or run `syq receiver revoke {}`", plan.id);
     }
     if !status.success() {
-        let reason = fs::read_to_string(&trace_path)
-            .ok()
-            .and_then(|trace| ssh_reason(&trace, status.code() == Some(255)))
+        let reason = reason
             .map(|reason| format!(": {reason}"))
             .unwrap_or_default();
         bail!(
@@ -1359,11 +1415,12 @@ fn install_over_route(
 
 /// The enrollment session's commands, for `sh`. The greeting reports the
 /// platform, the account's user ID and name, where it keeps syq's state, the platforms the store
-/// has this build for, and `authorized_keys`. The session then reads the
+/// has this build for, and `authorized_keys` (empty when revoking). The session then reads the
 /// request and, when the enrolling machine offers a stored build, its
 /// platform and the SHA-256 of the build that machine would install. It
 /// answers `stored` when it starts that stored build, or `upload` when it
-/// reads the syq that follows and starts that instead.
+/// reads the syq that follows and starts that instead, either one to do
+/// what `action` says: install, or revoke.
 ///
 /// A stored build is listed only when it passes the binary store's rules:
 /// its directories and file belong to the account and nobody else can write
@@ -1376,7 +1433,7 @@ fn install_over_route(
 /// POSIX does not require `-O`, `find -perm`, and the SHA-256 tools the
 /// helper bootstrap uses. The script is one line, so any login shell can
 /// pass it to `sh -c`.
-pub(super) fn install_remote_command(stage: &str) -> String {
+pub(super) fn install_remote_command(stage: &str, action: ManagementAction) -> String {
     [
         "set -eu".to_owned(),
         "uname -s".to_owned(),
@@ -1392,11 +1449,18 @@ pub(super) fn install_remote_command(stage: &str) -> String {
         "digest() { if command -v sha256sum >/dev/null 2>&1; then o=$(sha256sum < \"$1\") || return 1; elif command -v shasum >/dev/null 2>&1; then o=$(shasum -a 256 < \"$1\") || return 1; elif command -v openssl >/dev/null 2>&1; then o=$(openssl dgst -sha256 < \"$1\") || return 1; o=${o##* }; else return 1; fi; printf '%s' \"${o%%[[:space:]]*}\"; }".to_owned(),
         "for f in \"$s\"/*/syq; do t=${f%/syq}; t=${t##*/}; if stored \"$t\"; then printf '%s ' \"$t\"; fi; done".to_owned(),
         "printf '\\n'".to_owned(),
-        "if test -f \"$HOME/.ssh/authorized_keys\"; then wc -c <\"$HOME/.ssh/authorized_keys\"; cat \"$HOME/.ssh/authorized_keys\"; else printf '0\\n'; fi".to_owned(),
+        match action {
+            ManagementAction::Install => "if test -f \"$HOME/.ssh/authorized_keys\"; then wc -c <\"$HOME/.ssh/authorized_keys\"; cat \"$HOME/.ssh/authorized_keys\"; else printf '0\\n'; fi",
+            // Revoking finds no login key, and the revoker reads the file
+            // itself, under its lock.
+            ManagementAction::Revoke => "printf '0\\n'",
+        }
+        .to_owned(),
         "IFS= read -r request; IFS= read -r target; IFS= read -r expected".to_owned(),
         format!(
-            "if [ -n \"$target\" ] && stored \"$target\" && h=$(digest \"$s/$target/syq\") && [ \"$h\" = \"$expected\" ]; then echo stored; printf '%s' \"$request\" | \"$s/$target/syq\" --restricted-install; else echo upload; {stage}; printf '%s' \"$request\" | \"$p\" --restricted-install; fi",
+            "if [ -n \"$target\" ] && stored \"$target\" && h=$(digest \"$s/$target/syq\") && [ \"$h\" = \"$expected\" ]; then echo stored; printf '%s' \"$request\" | \"$s/$target/syq\" {action}; else echo upload; {stage}; printf '%s' \"$request\" | \"$p\" {action}; fi",
             stage = stage_commands(stage),
+            action = action.argument(),
         ),
     ]
     .join("; ")

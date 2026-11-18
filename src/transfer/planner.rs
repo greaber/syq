@@ -3045,12 +3045,9 @@ impl Planner<'_> {
                     stream.own_metadata[i].clear();
                 }
                 let targets = mkdir_targets(&ops);
-                let error = WireError {
-                    unchanged: true,
-                    ..WireError::from(
-                        "operation skipped because the no-replace creation it depends on failed",
-                    )
-                };
+                let error = WireError::from(
+                    "operation skipped because the no-replace creation it depends on failed",
+                );
                 self.record_new_directories(
                     &targets,
                     vec![Some(error); targets.len()],
