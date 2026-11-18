@@ -1169,6 +1169,39 @@ syq persist off
 syq persist connect source
 syq persist receive wait source --timeout 30
 ssh source 'syq persist destinations wait laptop --timeout 30'
+printf 'case: a restricted receiver gets the final metadata of 1,300 directories in requests sent together\n'
+# The directories' final metadata takes two requests, and the server sends
+# the second before the first is answered: this debug build records each
+# request's directories and the requests still unanswered when it went. The
+# laptop's restricted receiver authorizes and runs them in turn, and every
+# directory gets its source's time.
+ssh source sh -s <<'MANY_DIRECTORIES'
+set -eu
+root=/tmp/syq-real-ssh/many-directories
+requests=/tmp/syq-many-directories.requests
+rm -rf "$root" "$requests"
+mkdir -p "$root"
+directory=0
+while [ "$directory" -lt 1300 ]; do
+    mkdir "$root/d$directory"
+    directory=$((directory + 1))
+done
+find "$root" -mindepth 1 -type d -exec touch -d @981173106 {} +
+SYQ_TEST_DIRECTORY_METADATA_REQUESTS=$requests \
+    syq cp --no-progress --srcs-in "$root" --to @laptop --into many-directories
+if [ "$(wc -l <"$requests")" -ne 2 ] || [ "$(head -n 1 "$requests")" != '1000 0' ] ||
+    [ "$(tail -n 1 "$requests" | cut -d ' ' -f 2)" != 1 ]; then
+    echo 'the final directory metadata did not go in two requests sent together:' >&2
+    cat "$requests" >&2
+    exit 1
+fi
+MANY_DIRECTORIES
+test "$(find "$receive_root/many-directories" -mindepth 1 -type d | wc -l)" -eq 1300
+many_times=$(find "$receive_root/many-directories" -mindepth 1 -type d -printf '%Ts\n' | sort -u)
+if [ "$many_times" != 981173106 ]; then
+    printf 'copied directories lack their source time; the times found:\n%s\n' "$many_times" >&2
+    exit 1
+fi
 
 printf 'case: named return rejects traversal and receiver symlink escape\n'
 ln -s /tmp/syq-real-ssh-receive-other "$receive_root/escape"

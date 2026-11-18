@@ -5649,6 +5649,10 @@ impl Planner<'_> {
         // already sent are still answered: they have changed the directories
         // they name.
         let mut failure = None;
+        // A reply was no `Apply` result, so the replies after it may not be
+        // their requests'. They are taken, to leave the connection as it
+        // was, and not read.
+        let mut unmatched = false;
         loop {
             while failure.is_none() && in_flight.len() < unanswered {
                 let Some((directories, ops)) = requests.next() else {
@@ -5675,10 +5679,14 @@ impl Planner<'_> {
                 // step, so the replies after it are not waited for.
                 Err(error) => return Err(failure.unwrap_or(error)),
             };
+            if unmatched {
+                continue;
+            }
             let errors = match self.applied(response, directories.len()) {
                 Ok(errors) => errors,
                 Err(error) => {
                     failure.get_or_insert(error);
+                    unmatched = true;
                     continue;
                 }
             };

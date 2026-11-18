@@ -17,6 +17,7 @@ remote commands run through the return connection
 storage authorization through the return connection
 explicit automatic approval supports unattended copies
 a restricted receiver answers lookups sent ahead of their scan batches
+a restricted receiver gets the final metadata of 1,300 directories in requests sent together
 named return rejects traversal and receiver symlink escape
 a copied receiver identity cannot displace a responsive laptop
 interrupted named copy fails, laptop reconnects, and retry resumes
