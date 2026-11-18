@@ -269,8 +269,19 @@ fn cleanup_master_present(scope: &Path) -> Result<()> {
             let control = scope.join(name);
             // An orphaned pool remains owned after its socket disappears, but
             // only a registered endpoint can own these sidecar names.
-            let record = private_file(&control.with_extension("json"), 128 * 1024, false)?;
-            let _: crate::persistence::EndpointRecord = serde_json::from_reader(record)
+            let record = control.with_extension("json");
+            let record = crate::state_file::open_private(&record)
+                .with_context(|| format!("open SSH account state {}", record.display()))?;
+            let record = crate::state_file::read_open(
+                record,
+                &format_args!(
+                    "SSH account state {}",
+                    control.with_extension("json").display()
+                ),
+                crate::persistence::MAX_ENDPOINT_RECORD,
+                crate::state_file::FileRule::NoGroupOther,
+            )?;
+            let _: crate::persistence::EndpointRecord = serde_json::from_slice(&record)
                 .with_context(|| format!("parse approved SSH endpoint {}", control.display()))?;
             validate_pool_files(&control)?;
             controls.insert(control);
@@ -291,8 +302,11 @@ fn cleanup_master_present(scope: &Path) -> Result<()> {
                 path.display()
             );
         } else {
+            // A temporary file that a killed endpoint-record writer left
+            // is removed with the scope.
             let recognized = name == crate::receive_service::CLOSING
                 || name == ".syq-persistence"
+                || crate::state_file::is_own_temp_name(std::ffi::OsStr::new(name))
                 || [".json", ".generation", ".peer.json"]
                     .iter()
                     .any(|suffix| name.strip_suffix(suffix).is_some_and(master_name));
@@ -383,6 +397,13 @@ pub(crate) fn cleanup_domain(domain: &Domain) -> Result<()> {
             private_file(&path, 0, false)?;
         } else if path.file_name().is_some_and(|name| name == GENERATION) {
             read_generation(&path)?;
+        } else if path
+            .file_name()
+            .is_some_and(crate::state_file::is_own_temp_name)
+        {
+            // Left by a writer killed before it published; every keeper
+            // has stopped, so nothing will publish it.
+            private_file(&path, 128 * 1024, false)?;
         } else {
             bail!("unexpected file in SSH account index {}", path.display());
         }
@@ -400,6 +421,7 @@ mod tests {
     use super::*;
 
     use std::io::BufRead;
+    use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
 
@@ -804,5 +826,41 @@ mod tests {
         keeper.join().unwrap();
         assert!(!scope.join("approved-starting").exists());
         assert_eq!(keepers_running(&domain).unwrap(), 0);
+    }
+
+    fn leave_temporaries(directory: &Path) {
+        // The name an earlier build's writer used, and the current one.
+        for name in [".tmpAb12Z9", ".syq-tmp-123-00ff00ff00ff00ff"] {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(directory.join(name))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn scope_cleanup_removes_temporaries_a_killed_writer_left() {
+        let temporary = temporary();
+        let scope = temporary.path().join("a");
+        registered_control(&scope);
+        leave_temporaries(&scope);
+        cleanup_master(&scope).unwrap();
+        assert!(!scope.exists());
+    }
+
+    #[test]
+    fn index_cleanup_removes_temporaries_a_killed_writer_left() {
+        let temporary = crate::test_support::short_tempdir().unwrap();
+        let scope = temporary.path().join("scope");
+        crate::persistence::initialize_scope(&scope).unwrap();
+        let domain = Domain::select(Some(&scope)).unwrap();
+        let index = directory(&domain).unwrap();
+        ensure_generation(&domain).unwrap();
+        leave_temporaries(&index);
+        fs::write(scope.join(crate::receive_service::CLOSING), b"").unwrap();
+        cleanup_domain(&domain).unwrap();
+        assert!(!index.exists());
     }
 }

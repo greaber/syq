@@ -6,7 +6,6 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -200,7 +199,7 @@ fn read_inner(path: &Path) -> Result<Config> {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(path)
     };
-    let mut file = match open(path) {
+    let file = match open(path) {
         Ok(file) => file,
         // Keep the ordinary read to one open. A final symlink resolves once;
         // a dangling target is an error, never a missing/default preference.
@@ -215,21 +214,12 @@ fn read_inner(path: &Path) -> Result<Config> {
         }
         Err(error) => return Err(error).context("open authorization preferences"),
     };
-    let metadata = file.metadata()?;
-    anyhow::ensure!(
-        metadata.is_file()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o022 == 0,
-        "authorization preferences must be a regular file owned by this user and not writable by others"
-    );
-    let mut contents = Vec::new();
-    Read::by_ref(&mut file)
-        .take(MAX_CONFIG_BYTES + 1)
-        .read_to_end(&mut contents)?;
-    anyhow::ensure!(
-        contents.len() as u64 <= MAX_CONFIG_BYTES,
-        "authorization preferences are too large"
-    );
+    let contents = crate::state_file::read_open(
+        file,
+        &"authorization preferences",
+        MAX_CONFIG_BYTES as usize,
+        crate::state_file::FileRule::NoGroupOtherWrite,
+    )?;
     let config: Config =
         serde_json::from_slice(&contents).context("parse authorization preferences")?;
     config.validate()?;
@@ -430,14 +420,18 @@ fn update_inner(
             config.hosts.remove(host);
         }
     }
-    let mut temporary = tempfile::NamedTempFile::new_in(&parent)?;
-    serde_json::to_writer_pretty(&mut temporary, &config)?;
-    temporary.write_all(b"\n")?;
-    temporary.as_file().sync_all()?;
-    temporary
-        .persist(&path)
-        .map_err(|error| error.error)
-        .context("write authorization preferences")?;
+    let mut bytes = serde_json::to_vec_pretty(&config)?;
+    bytes.push(b'\n');
+    crate::state_file::write_atomic_at(
+        &directory,
+        path.file_name()
+            .context("authorization configuration filename missing")?,
+        &bytes,
+        0o600,
+        crate::state_file::Publish::Replace,
+        crate::state_file::Durability::FileSynced,
+    )
+    .context("write authorization preferences")?;
     Ok(config)
 }
 
@@ -504,6 +498,7 @@ pub(crate) fn run(domain: &Domain, command: PreferenceCommand) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     #[test]
     fn provider_values_preserve_return_state_and_distinguish_native_hosts() {
         let returning = Provider::parse("@laptop").unwrap();

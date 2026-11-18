@@ -14,7 +14,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -612,18 +612,12 @@ fn registry() -> Result<PathBuf> {
 fn private_directory(name: &str) -> Result<PathBuf> {
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME is unset")?);
     let path = home.join(name);
-    match fs::DirBuilder::new().mode(0o700).create(&path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e.into()),
-    }
-    let metadata = fs::symlink_metadata(&path)?;
-    if !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o777 != 0o700
-    {
-        bail!("destination registry must be an owned directory with mode 0700");
-    }
+    crate::state_file::open_private_dir(
+        &path,
+        "destination registry",
+        true,
+        crate::state_file::DirRule::Exact0700,
+    )?;
     Ok(path)
 }
 /// Completion only lists local names; it never creates state or asks a laptop
@@ -633,13 +627,15 @@ pub(crate) fn registered_names() -> Vec<String> {
         return Vec::new();
     };
     let directory = PathBuf::from(home).join(".syq-destinations-v3");
-    let Ok(metadata) = fs::symlink_metadata(&directory) else {
-        return Vec::new();
-    };
-    if !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o777 != 0o700
-    {
+    if !matches!(
+        crate::state_file::open_private_dir(
+            &directory,
+            "destination registry",
+            false,
+            crate::state_file::DirRule::Exact0700,
+        ),
+        Ok(Some(_))
+    ) {
         return Vec::new();
     }
     let Ok(entries) = fs::read_dir(directory) else {
@@ -680,18 +676,16 @@ fn read_existing_registration_at(directory: &Path, name: &str) -> Result<Option<
             directory.display()
         ))
     };
-    let metadata = match fs::symlink_metadata(directory) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(unreadable(error.into())),
-    };
-    if !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o777 != 0o700
+    if crate::state_file::open_private_dir(
+        directory,
+        "destination registry",
+        false,
+        crate::state_file::DirRule::Exact0700,
+    )
+    .map_err(unreadable)?
+    .is_none()
     {
-        return Err(unreadable(anyhow::anyhow!(
-            "destination registry must be an owned directory with mode 0700"
-        )));
+        return Ok(None);
     }
     let path = directory.join(format!("{name}.json"));
     let encoded =
@@ -2552,9 +2546,13 @@ fn register_inner(
     };
     identity::claim(&directory, name, &public_key)?;
     let path = directory.join(format!("{name}.json"));
-    let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
-    temporary.write_all(&serde_json::to_vec(&registration)?)?;
-    temporary.persist(&path)?;
+    crate::state_file::write_atomic(
+        &path,
+        &serde_json::to_vec(&registration)?,
+        0o600,
+        crate::state_file::Publish::Replace,
+        crate::state_file::Durability::RenameOnly,
+    )?;
     let meta = fs::symlink_metadata(&path)?;
     guard.record = Some((path, (meta.dev(), meta.ino())));
     // Drop the advertisement before releasing its name lock, including on a
