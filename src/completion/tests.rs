@@ -569,11 +569,14 @@ fn remote_completion_keeps_names_when_pipelined_metadata_is_slow() {
         let mut reader = crate::proto::FrameReader::new(server.try_clone().unwrap());
         assert!(matches!(
             reader.read_msg::<Request>().unwrap(),
-            Request::ListDir { .. }
+            Request::ListDir {
+                detailed: false,
+                ..
+            }
         ));
         assert!(matches!(
             reader.read_msg::<Request>().unwrap(),
-            Request::ListDirDetails { .. }
+            Request::ListDir { detailed: true, .. }
         ));
         let mut writer = crate::proto::FrameWriter::with_preamble_written(server, false);
         writer

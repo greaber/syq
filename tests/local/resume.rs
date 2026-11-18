@@ -617,7 +617,7 @@ fn streaming_and_default_copies_share_resume_partials() {
             "-a",
             "--block-size=1M",
             "--resource-limits=bandwidth=1G",
-            &format!("--performance-tuning=copy-path={after},request-size=128K,bw-pacing=average"),
+            &format!("--performance-tuning=copy-path={after},request-size=128K"),
             &src,
             &dst,
         ]);
@@ -656,7 +656,7 @@ fn tuning_options_preserve_partial_identity_and_reused_hash_blocks() {
         "--whole-file",
         "--block-size=1M",
         "--resource-limits=bandwidth=1G",
-        "--performance-tuning=request-size=128K,pipeline-depth=8,copy-path=ranges,split-min-size=2M,bw-pacing=average",
+        "--performance-tuning=request-size=128K,pipeline-depth=8,copy-path=ranges,split-min-size=2M",
         &src,
         &dst,
     ]);

@@ -310,7 +310,7 @@ check a payload hash or a pipe's length. `--results` reports one
 Descriptor copies refuse options for file trees, such as `--hash`, `--prune`,
 `--where`, and `--detach`, and cannot use a receiving name (`@NAME`). An
 interrupted one starts over. Filesystem descriptor copies accept only the
-`workers`, `request-size`, `pipeline-depth`, and `bw-pacing`
+`workers`, `request-size`, and `pipeline-depth`
 [tuning keys](../tuning.md); for S3, see
 [Descriptor copies](../object-storage.md#descriptor-copies).
 

@@ -308,8 +308,9 @@ fn dense_children(query: &str, page: &Page) -> usize {
     counts.values().filter(|count| **count >= 256).count()
 }
 
-/// When every object on a truncated first page lies in a pruned directory,
-/// list directories instead, so that the pruned ones need not be enumerated.
+/// When every object on a truncated first page, apart from directory markers,
+/// lies in a pruned directory, list directories instead, so that the pruned
+/// ones need not be enumerated.
 /// Follow a single unpruned child at most as deep as the probe budget allows.
 /// Returns `None` when probing was not tried or did not pay off.
 async fn lookahead(
@@ -326,12 +327,17 @@ async fn lookahead(
         || flat.entries.is_empty()
         || !flat.entries.iter().all(|entry| {
             let directory = entry.size == 0 && entry.key.ends_with('/');
-            (prune.subtree)(&entry.key, directory).is_some_and(|boundary| {
-                reachable |= entry.key[..boundary]
-                    .strip_prefix(query)
-                    .is_some_and(|relative| relative.matches('/').count() < budget);
-                true
-            })
+            match (prune.subtree)(&entry.key, directory) {
+                Some(boundary) => {
+                    reachable |= entry.key[..boundary]
+                        .strip_prefix(query)
+                        .is_some_and(|relative| relative.matches('/').count() < budget);
+                    true
+                }
+                // A kept directory's marker sorts before the pruned objects
+                // under it; the directory listing returns it again.
+                None => directory,
+            }
         })
         || !reachable
     {

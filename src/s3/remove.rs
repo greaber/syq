@@ -432,7 +432,7 @@ pub(super) fn run(args: Args) -> Result<i32> {
         progress.set_results(writer);
     }
     let mut summary = RmResultRecord {
-        status: "success",
+        status: crate::results::Status::Success,
         exit_code: 0,
         dry_run: args.dry_run,
         selectors_total: args.locations.len() as u64,
@@ -457,7 +457,7 @@ pub(super) fn run(args: Args) -> Result<i32> {
         let work = async {
             let mut options = args.s3.clone().unwrap();
             let control = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
-            let uploads = std::sync::Arc::new(super::upload_http::Cancellation::default());
+            let uploads = std::sync::Arc::new(super::cancel::Cancellation::default());
             let authorization = super::authorization::connect(&args, &options).await?;
             let (client, note) = client::connect_authorized(&mut options, control.clone(), uploads, authorization.clone(), Some(outage.clone())).await?;
             if let Some(note) = note.filter(|_| args.verbose > 0 && !args.quiet) {
@@ -576,10 +576,10 @@ pub(super) fn run(args: Args) -> Result<i32> {
         progress.error(&format!("syq: {error:#}"));
         summary.errors += 1;
         summary.exit_code = 1;
-        summary.status = "failed";
+        summary.status = crate::results::Status::Failed;
     } else if summary.entries_failed != 0 {
         summary.exit_code = 23;
-        summary.status = "partial";
+        summary.status = crate::results::Status::Partial;
     }
     summary.elapsed_ms = progress.start.elapsed().as_millis() as u64;
     progress.scan_done.store(true, Relaxed);

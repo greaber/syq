@@ -27,7 +27,6 @@ use aws_sdk_s3::{
     types::{CompletedMultipartUpload, CompletedPart},
     Client,
 };
-use aws_smithy_types::byte_stream::Length;
 use discovery::{Discovery, Listed};
 use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -105,7 +104,7 @@ pub(super) struct Engine {
     options: Options,
     client: Client,
     progress: Arc<Progress>,
-    pace: Mutex<tokio::time::Instant>,
+    bandwidth: Option<crate::bwlimit::BandwidthLimit>,
     /// Every destination key, when pruning listed them all before the copy.
     upload_keys: OnceLock<HashMap<String, u64>>,
     /// Otherwise, the planned keys the destination listing has reached.
@@ -115,7 +114,7 @@ pub(super) struct Engine {
     tuning: super::tuning::Tuning,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     cancel_wake: tokio::sync::Notify,
-    uploads: Arc<super::upload_http::Cancellation>,
+    uploads: Arc<super::cancel::Cancellation>,
     authorization: Option<Arc<super::authorization::Authorization>>,
     /// The destination rejected an upload without a checksum; send Content-MD5.
     content_md5: std::sync::atomic::AtomicBool,
@@ -261,7 +260,7 @@ impl Engine {
             .or_else(|| std::env::var("AWS_ENDPOINT_URL_S3").ok())
             .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok());
         let control = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
-        let uploads = Arc::new(super::upload_http::Cancellation::default());
+        let uploads = Arc::new(super::cancel::Cancellation::default());
         let authorization = super::authorization::connect(&args, &options).await?;
         let outage = Arc::new(super::outage::Outage::default());
         let (client, note) = client::connect_authorized(
@@ -283,11 +282,12 @@ impl Engine {
             cancel_wake: tokio::sync::Notify::new(),
             uploads,
             authorization,
+            bandwidth: (args.bwlimit_bytes != 0)
+                .then(|| crate::bwlimit::BandwidthLimit::new(args.bwlimit_bytes)),
             args,
             options,
             client,
             progress,
-            pace: Mutex::new(tokio::time::Instant::now()),
             upload_keys: OnceLock::new(),
             discovery: OnceLock::new(),
             copy_checksum_unsupported: Default::default(),
@@ -664,7 +664,10 @@ impl Engine {
         let mut creation = local::CreationPermissions::default();
         for (path, metadata) in entries {
             let relative = RelativePath::new(&path)?;
-            let label = String::from_utf8_lossy(&path).into_owned();
+            let label = match String::from_utf8_lossy(&path) {
+                name if name.is_empty() => ".".into(),
+                name => name.into_owned(),
+            };
             let saved = widened.remove(&path);
             // Require the inode we widened before applying any final metadata.
             let result = (|| {
@@ -684,14 +687,18 @@ impl Engine {
                         *explicit,
                         mode.is_none(),
                         &mut creation,
-                    )?;
+                    )
+                    .with_context(|| format!("set metadata of directory {label}"))?;
                 } else if saved.is_none() {
-                    let directory = destination.root.open_directory(&relative)?;
-                    let current = directory.metadata()?.mode();
-                    crate::fsops::set_mode_handle(
-                        &directory,
-                        crate::fsops::created_directory_mode(&directory, 0o777, current)?,
-                    )?;
+                    (|| {
+                        let directory = destination.root.open_directory(&relative)?;
+                        let current = directory.metadata()?.mode();
+                        crate::fsops::set_mode_handle(
+                            &directory,
+                            crate::fsops::created_directory_mode(&directory, 0o777, current)?,
+                        )
+                    })()
+                    .with_context(|| format!("set mode of directory {label}"))?;
                 }
                 Ok::<_, anyhow::Error>(())
             })();
@@ -822,14 +829,10 @@ impl Engine {
     }
     async fn pace(&self, n: u64) -> Result<()> {
         self.check_cancelled()?;
-        if self.args.bwlimit_bytes == 0 {
+        let Some(limit) = &self.bandwidth else {
             return Ok(());
-        }
-        let mut next = self.pace.lock().await;
-        let now = tokio::time::Instant::now();
-        let start = (*next).max(now);
-        *next = start + Duration::from_secs_f64(n as f64 / self.args.bwlimit_bytes as f64);
-        drop(next);
+        };
+        let start = limit.reserve(std::time::Instant::now(), n);
         let cancelled = self.cancel_wake.notified();
         tokio::pin!(cancelled);
         // Register before checking the flag so a concurrent signal cannot be lost.
@@ -837,7 +840,7 @@ impl Engine {
         self.check_cancelled()?;
         tokio::select! {
             _ = &mut cancelled => {},
-            _ = tokio::time::sleep_until(start) => {},
+            _ = tokio::time::sleep_until(start.into()) => {},
         }
         self.check_cancelled()
     }
@@ -3430,7 +3433,8 @@ impl std::error::Error for Permanent {}
 /// The upload loops replace SDK retries, so they must recognize the same
 /// throttling and transient conditions: dispatch failures without a response,
 /// retryable statuses, and the error codes S3 can send with other statuses,
-/// such as `RequestTimeout` with HTTP 400.
+/// such as `RequestTimeout` with HTTP 400. A failure without a response is
+/// retried unless resending cannot help (see [`super::retry::permanent`]).
 pub(super) fn retryable<E: aws_sdk_s3::error::ProvideErrorMetadata>(
     error: &aws_sdk_s3::error::SdkError<
         E,
@@ -3438,27 +3442,24 @@ pub(super) fn retryable<E: aws_sdk_s3::error::ProvideErrorMetadata>(
     >,
 ) -> bool {
     use aws_runtime::retries::classifiers::{THROTTLING_ERRORS, TRANSIENT_ERRORS};
-    error
-        .raw_response()
-        .map(|r| r.status().as_u16())
-        .is_none_or(super::outage::transient_status)
-        || error
-            .as_service_error()
-            .and_then(|e| e.code())
-            .is_some_and(|code| {
-                THROTTLING_ERRORS.contains(&code) || TRANSIENT_ERRORS.contains(&code)
-            })
+    error.raw_response().map_or_else(
+        || !super::retry::permanent(error),
+        |r| super::outage::transient_status(r.status().as_u16()),
+    ) || error
+        .as_service_error()
+        .and_then(|e| e.code())
+        .is_some_and(|code| THROTTLING_ERRORS.contains(&code) || TRANSIENT_ERRORS.contains(&code))
 }
 async fn file_body(source: &Source, offset: u64, length: u64) -> Result<ByteStream> {
     let source = source.clone();
-    let file = tokio::task::spawn_blocking(move || source.open()).await??;
-    Ok(ByteStream::read_from()
-        .file(tokio::fs::File::from_std(file))
-        .offset(offset)
-        .length(Length::Exact(length))
-        .buffer_size(length.clamp(1, 1024 * 1024) as usize)
-        .build()
-        .await?)
+    let (source, file) = tokio::task::spawn_blocking(move || {
+        let file = source.open()?;
+        anyhow::Ok((source, file))
+    })
+    .await??;
+    Ok(ByteStream::new(super::file_body::body(
+        source, file, offset, length,
+    )))
 }
 fn upload_identity(
     algorithm: Algorithm,

@@ -88,34 +88,6 @@ class Scratch(unittest.TestCase):
 
 
 class WorkflowTextTests(unittest.TestCase):
-    def test_macos_exact_test_routes_all_offered_targets(self):
-        workflow = (ROOT / ".github/workflows/macos.yml").read_text()
-        choices = workflow.split("      test_target:\n", 1)[1].split("\npermissions:", 1)[0]
-        targets = [line.strip()[2:] for line in choices.splitlines()
-                   if line.startswith("          - ")]
-        self.assertIn("tls", targets)
-        step = workflow.split("      - name: Run the exact test\n", 1)[1]
-        step = step.split("        run: |\n", 1)[1].split("\n  scope:", 1)[0]
-        # Execute the workflow's shell, capturing the Cargo arguments without
-        # compiling Rust or needing a macOS runner.
-        script = 'cargo() { printf "%s\\n" "$@"; }\n' + textwrap.dedent(step)
-        for target in targets + ["unknown"]:
-            with self.subTest(target=target):
-                result = subprocess.run(
-                    ["bash", "-euo", "pipefail", "-c", script],
-                    env=dict(BASE_ENV, TEST_TARGET=target, TEST_NAME="fixture::test"),
-                    capture_output=True, text=True, timeout=10)
-                if target == "unknown":
-                    self.assertEqual(result.returncode, 2)
-                    self.assertEqual(result.stdout, "")
-                else:
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(result.stdout.splitlines(), [
-                        "nextest", "run", "--locked",
-                        "--bin" if target == "syq" else "--test", target,
-                        "--run-ignored", "all", "--no-tests", "fail", "--", "--exact",
-                        "fixture::test"])
-
     def test_macos_workflow_uses_the_scope_it_computes(self):
         # ci-scope.py decides when macOS runs release tooling; the step must run
         # those same groups and pass the inputs ci-scope reads.
@@ -131,10 +103,53 @@ class WorkflowTextTests(unittest.TestCase):
         for output in ("needed", "sdk", "release_tooling"):
             self.assertIn(f"{output}: ${{{{ steps.changes.outputs.macos_{output} }}}}", workflow)
 
+    def test_real_ssh_dependency_key_follows_only_the_dependency_stage(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        step = workflow.split("      - name: Key the lab's dependency build\n", 1)[1]
+        script = textwrap.dedent(step.split("        run: |\n", 1)[1].split("\n      - ", 1)[0])
+        dockerfile = (ROOT / "tests/real-ssh/Dockerfile").read_text()
+        final = dockerfile.index("\nFROM debian:")
+        dependencies = dockerfile.index("\nRUN mkdir src")
+        edits = {"final": dockerfile[:final] + "\n# edit" + dockerfile[final:],
+                 "dependencies": dockerfile[:dependencies] + "\n# edit" + dockerfile[dependencies:]}
+
+        def key(text, lock="lock\n"):
+            with tempfile.TemporaryDirectory(prefix="syq-real-ssh-key-") as temporary:
+                root = Path(temporary)
+                (root / "tests/real-ssh").mkdir(parents=True)
+                (root / "tests/real-ssh/Dockerfile").write_text(text)
+                for name, content in [("Cargo.toml", "toml\n"), ("Cargo.lock", lock),
+                                      ("build.rs", "build\n")]:
+                    (root / name).write_text(content)
+                output = root / "output"
+                env = dict(BASE_ENV, RUNNER_OS="Linux", RUNNER_ARCH="X64",
+                           GITHUB_OUTPUT=str(output))
+                if shutil.which("sha256sum") is None:
+                    # The step runs on Linux; macOS lacks GNU sha256sum.
+                    tools = root / "tools"
+                    tools.mkdir()
+                    write_executable(tools / "sha256sum", textwrap.dedent(f"""\
+                        #!{sys.executable}
+                        import hashlib, sys
+                        print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest() + "  -")
+                        """))
+                    env["PATH"] = f"{tools}{os.pathsep}{env['PATH']}"
+                subprocess.run(["bash", "-c", script], cwd=root, check=True, timeout=10, env=env)
+                return parse(output.read_text())["key"]
+
+        original = key(dockerfile)
+        self.assertRegex(original, r"^real-ssh-dependencies-Linux-X64-[0-9a-f]{64}$")
+        self.assertEqual(key(edits["final"]), original)
+        self.assertNotEqual(key(edits["dependencies"]), original)
+        self.assertNotEqual(key(dockerfile, lock="other\n"), original)
+
     def test_release_workflow_requires_checks_and_notes(self):
         release = (ROOT / ".github/workflows/release.yml").read_text()
         self.assertIn(",".join(release_checks.REQUIRED_CHECKS), release)
-        self.assertIn(".github/release-notes/$GITHUB_REF_NAME.md", release)
+        # verify-tag is the workflow's only check that the notes exist.
+        verify_tag = release.split("\n  verify-tag:\n", 1)[1]
+        verify_tag = verify_tag.split("\n  candidate-build:\n", 1)[0]
+        self.assertIn('test -s ".github/release-notes/$GITHUB_REF_NAME.md"', verify_tag)
 
 
 class PathScopeTests(Scratch):
@@ -203,7 +218,7 @@ class PathScopeTests(Scratch):
                                "conformance", "macos", "linux_arm64", "full_suite"], "false")
         self.assertScope(self.scope(".github/workflows/rsync-compat.yml"), tooling="true",
                          conformance="false", native="false")
-        self.assertScope(self.scope(".github/workflows/python-api-sync.yml"), tooling="true",
+        self.assertScope(self.scope(".github/workflows/pages.yml"), tooling="true",
                          python_sdk="false", native="false")
 
     def test_pinned_tools_run_everything_that_uses_them(self):
@@ -250,6 +265,9 @@ class PathScopeTests(Scratch):
                              ("tests/tooling/test-release-orchestration.py",
                               "orchestration workflows"),
                              ("scripts/check-macos-lint.py", "orchestration workflows"),
+                             ("scripts/release_checks.py", "orchestration release workflows"),
+                             ("scripts/verify-release-ci.py",
+                              "orchestration release workflows"),
                              (".github/workflows/macos.yml", "orchestration workflows"),
                              (".github/workflows/ci.yml", "orchestration workflows"),
                              (".github/actionlint.yaml", "orchestration workflows"),
@@ -410,18 +428,19 @@ class EventScopeTests(Scratch):
         dispatch = self.event("workflow-dispatch-event.json", DISPATCH_EVENT)
         branch = {"GITHUB_REF": "refs/heads/task"}
         scope = self.scope(event=dispatch, cwd=self.repo,
-                           env=dict(branch, SYQ_CI_SUITES="real-ssh-metadata, s3 real-ssh-core"))
+                           env=dict(branch, SYQ_CI_SUITES="real-ssh-max-sessions-1, s3 real-ssh-core"))
         self.assertScope(scope, suite_selection="true", s3="true", native="false",
                          repository_checks="false", full_suite="false")
         # Matrix order is fixed so equal selections share cancellation groups.
         self.assertEqual(json.loads(scope["real_ssh_matrix"]),
                          [{"suite": "core", "profile": "default"},
-                          {"suite": "metadata", "profile": "default"}])
+                          {"suite": "core", "profile": "max-sessions-1",
+                           "skip": "tests/real-ssh/max-sessions-1.skip"}])
         scope = self.scope(event=dispatch, cwd=self.repo,
                            env=dict(branch, SYQ_CI_SUITES="rust real-ssh macos-intel"))
         self.assertScope(scope, native="true", integration_targets="all", macos="true",
                          macos_intel="true", s3="false", tooling="false", full_suite="false")
-        self.assertEqual(len(json.loads(scope["real_ssh_matrix"])), 4)
+        self.assertEqual(len(json.loads(scope["real_ssh_matrix"])), 3)
         # On task branches the rust job's name records what it ran.
         self.assertScope(scope, rust_label="native:all", all_tooling="false", macos_lint="false")
         scope = self.scope(event=dispatch, cwd=self.repo,

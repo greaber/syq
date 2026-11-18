@@ -219,18 +219,22 @@ impl OperatorResolver {
         allow_missing: bool,
         hops: &mut Vec<OperatorSymlinkHop>,
     ) -> Result<PinnedPath> {
+        Self::process(path, symlink_policy)?.resolve(path, final_component, allow_missing, hops)
+    }
+
+    /// A resolver at the process root for an absolute `path`, or at the cwd.
+    fn process(path: &[u8], symlink_policy: OperatorSymlinkPolicy) -> Result<Self> {
         let base = open_operator_start(path.starts_with(b"/"))?;
         let base_identity = operator_directory_identity(&base)?;
         let base_is_process_root = operator_base_is_process_root(base_identity)?;
-        Self {
+        Ok(Self {
             base,
             base_identity,
             base_is_process_root,
             confined: false,
             relative_input: false,
             symlink_policy,
-        }
-        .resolve(path, final_component, allow_missing, hops)
+        })
     }
 
     /// Like `resolve_process`, but when looking up a component is denied,
@@ -244,18 +248,13 @@ impl OperatorResolver {
         hops: &mut Vec<OperatorSymlinkHop>,
         search: &mut dyn FnMut(&File) -> Result<bool>,
     ) -> Result<PinnedPath> {
-        let base = open_operator_start(path.starts_with(b"/"))?;
-        let base_identity = operator_directory_identity(&base)?;
-        let base_is_process_root = operator_base_is_process_root(base_identity)?;
-        Self {
-            base,
-            base_identity,
-            base_is_process_root,
-            confined: false,
-            relative_input: false,
-            symlink_policy,
-        }
-        .resolve_searching(path, final_component, allow_missing, hops, search)
+        Self::process(path, symlink_policy)?.resolve_searching(
+            path,
+            final_component,
+            allow_missing,
+            hops,
+            search,
+        )
     }
 
     /// Begin at an already-open directory. The supplied path must be relative;
@@ -1063,16 +1062,20 @@ pub(super) fn read_link_bytes(
     }
 }
 
+fn same_identity(expected: RootMetadata, actual: RootMetadata) -> bool {
+    (actual.dev, actual.ino, actual.file_type())
+        == (expected.dev, expected.ino, expected.file_type())
+}
+
 pub(super) fn require_operator_identity(
     expected: RootMetadata,
     actual: RootMetadata,
     label: &str,
 ) -> Result<()> {
-    if (actual.dev, actual.ino, actual.file_type())
-        != (expected.dev, expected.ino, expected.file_type())
-    {
-        bail!("{label} changed identity during resolution");
-    }
+    anyhow::ensure!(
+        same_identity(expected, actual),
+        "{label} changed identity during resolution"
+    );
     Ok(())
 }
 
@@ -1081,11 +1084,7 @@ pub(super) fn require_metadata_identity(
     actual: RootMetadata,
     label: &str,
 ) -> Result<()> {
-    if (actual.dev, actual.ino, actual.file_type())
-        != (expected.dev, expected.ino, expected.file_type())
-    {
-        bail!("{label} changed identity");
-    }
+    anyhow::ensure!(same_identity(expected, actual), "{label} changed identity");
     Ok(())
 }
 
@@ -1104,17 +1103,9 @@ pub(super) fn require_operator_link_fallback_allowed(policy: OperatorSymlinkPoli
 
 #[cfg(target_os = "linux")]
 pub(super) fn operator_descriptor_is_procfs(file: &File) -> Result<bool> {
-    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    loop {
-        if unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) } == 0 {
-            let stats = unsafe { stats.assume_init() };
-            return Ok(stats.f_type as u32 == libc::PROC_SUPER_MAGIC as u32);
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error).context("identify operator descriptor filesystem");
-        }
-    }
+    let file_system =
+        crate::fsops::file_system_of(file).context("identify operator descriptor filesystem")?;
+    Ok(file_system.magic() == crate::fsops::PROC_SUPER_MAGIC)
 }
 
 /// Upgrade a retained Linux `O_PATH` object to a readable descriptor without

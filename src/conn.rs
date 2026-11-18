@@ -544,7 +544,6 @@ pub(crate) fn ssh_login_needs_user(error: &anyhow::Error) -> bool {
 }
 
 fn is_non_retryable_connect_error(error: &anyhow::Error) -> bool {
-    let message = format!("{error:#}");
     is_worker_initialization_error(error)
         || error.is::<crate::restricted::CopyRefused>()
         || crate::restricted::is_other_build(error)
@@ -552,19 +551,76 @@ fn is_non_retryable_connect_error(error: &anyhow::Error) -> bool {
         || error
             .chain()
             .any(|cause| cause.is::<crate::destination::ssh::workers::AuthorizationError>())
-        || message.contains("build identity mismatch")
-        || message.contains(WIRE_PREAMBLE_PROTOCOL_ERROR)
-        || message.contains("unexpected handshake response")
-        || message.contains("exit status: 127")
-        || message.contains(&format!(
-            "exit status: {}",
-            remote_helper::HELPER_MISSING_EXIT
-        ))
-        || message.contains(&format!(
-            "exit status: {}",
-            remote_helper::HELPER_NOT_EXECUTABLE_EXIT
-        ))
+        || ConnectFailure::of(error).is_some_and(|failure| !failure.retryable())
 }
+
+/// Why starting the remote syq failed, where its text alone told callers
+/// whether to install the helper or try again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectFailure {
+    /// The remote syq, or the launcher in its place, exited with this code.
+    Exited(Option<i32>),
+    /// The preamble exchange failed: the peer runs another build or is no syq.
+    Preamble,
+    /// The Hello was answered with something else.
+    UnexpectedHandshake,
+}
+
+impl ConnectFailure {
+    /// The failure in `error`'s chain, if any.
+    fn of(error: &anyhow::Error) -> Option<Self> {
+        error.chain().find_map(|cause| {
+            if let Some(failure) = cause.downcast_ref::<ConnectFailureError>() {
+                return Some(failure.failure);
+            }
+            cause
+                .downcast_ref::<std::io::Error>()
+                .filter(|error| is_preamble_error(error))
+                .map(|_| ConnectFailure::Preamble)
+        })
+    }
+
+    /// Whether installing the matching helper may cure it.
+    fn needs_install(self) -> bool {
+        match self {
+            ConnectFailure::Exited(code) => remote_helper::needs_install(code),
+            ConnectFailure::Preamble => true,
+            ConnectFailure::UnexpectedHandshake => false,
+        }
+    }
+
+    /// Whether connecting again may succeed: not for a missing program or
+    /// another build.
+    fn retryable(self) -> bool {
+        !self.needs_install()
+            && !matches!(
+                self,
+                ConnectFailure::Exited(Some(127)) | ConnectFailure::UnexpectedHandshake
+            )
+    }
+
+    fn error(self, message: String) -> anyhow::Error {
+        ConnectFailureError {
+            failure: self,
+            message,
+        }
+        .into()
+    }
+}
+
+#[derive(Debug)]
+struct ConnectFailureError {
+    failure: ConnectFailure,
+    message: String,
+}
+
+impl std::fmt::Display for ConnectFailureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ConnectFailureError {}
 
 /// OpenSSH accepted the control connection but rejected a multiplexed worker
 /// session. Independent SSH connections may still be permitted (for example,
@@ -667,7 +723,6 @@ pub fn change_ok(resp: Response, what: &str) -> Result<Response> {
             io_kind: None,
             raw_os_error: None,
             condition_not_met: false,
-            unchanged: false,
         })),
         Response::EndpointError(error) => Err(ChangeFailed::replying(what, error)),
         r => Ok(r),
@@ -1028,6 +1083,7 @@ impl RemoteConn {
         self.approved_login.take();
         self.worker_setup.take();
         let detail = format!("{e:#}");
+        let preamble = ConnectFailure::of(&e) == Some(ConnectFailure::Preamble);
         // If the child has exited (or does so shortly), that's usually the
         // more useful error. A multiplexed SSH refusal in particular must win
         // over the missing-preamble EOF so the caller can retry independently.
@@ -1052,7 +1108,8 @@ impl RemoteConn {
                             }
                             .into();
                         }
-                        return anyhow!("{}: remote syq exited ({status})", self.label);
+                        return ConnectFailure::Exited(status.code())
+                            .error(format!("{}: remote syq exited ({status})", self.label));
                     }
                     // An enrolled receiver whose slots for starting
                     // sessions are all taken refuses before its preamble;
@@ -1083,20 +1140,17 @@ impl RemoteConn {
                     // For other early exits, a preamble failure is the
                     // actionable version-skew diagnosis; the exit status is
                     // commonly just the old helper rejecting unknown bytes.
-                    if detail.contains(WIRE_PREAMBLE_PROTOCOL_ERROR)
-                        || detail.contains("build identity mismatch")
-                    {
-                        return anyhow!("{}: {detail}", self.label);
+                    if preamble {
+                        return ConnectFailure::Preamble.error(format!("{}: {detail}", self.label));
                     }
-                    return anyhow!("{}: remote syq exited ({status})", self.label);
+                    return ConnectFailure::Exited(status.code())
+                        .error(format!("{}: remote syq exited ({status})", self.label));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
-        if detail.contains(WIRE_PREAMBLE_PROTOCOL_ERROR)
-            || detail.contains("build identity mismatch")
-        {
-            return anyhow!("{}: {detail}", self.label);
+        if preamble {
+            return ConnectFailure::Preamble.error(format!("{}: {detail}", self.label));
         }
         let msg = if e
             .downcast_ref::<std::io::Error>()
@@ -2076,25 +2130,39 @@ pub(crate) enum PrimedControl {
 }
 
 impl RemoteSpec {
-    pub fn local_receiver(quiet: bool) -> Self {
+    /// A connection to `host` over `rsh`, with nothing else set.
+    pub(crate) fn new(
+        user: Option<String>,
+        host: String,
+        port: Option<u16>,
+        rsh: Vec<String>,
+    ) -> Self {
         Self {
-            local_process: true,
-            user: None,
-            host: "127.0.0.1".into(),
-            port: None,
-            rsh: vec!["local".into()],
+            local_process: false,
+            user,
+            host,
+            port,
+            rsh,
             syq_path: None,
             bootstrap_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: None,
-            quiet,
+            quiet: false,
             pacing: Default::default(),
             tcp: Default::default(),
             diagnostics: Default::default(),
             primed_control: Default::default(),
             receiver_host: None,
             read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
+        }
+    }
+
+    pub fn local_receiver(quiet: bool) -> Self {
+        Self {
+            local_process: true,
+            quiet,
+            ..Self::new(None, "127.0.0.1".into(), None, vec!["local".into()])
         }
     }
 
@@ -2436,20 +2504,11 @@ impl RemoteSpec {
         self.program_command(args)
     }
 
-    /// `limited`: take a connect slot (data connections). The control
-    /// connection passes false: everything waits on it, so it must never
-    /// queue behind workers. In managed mode the matching helper is installed
-    /// on first use if the remote lacks it.
-    pub fn connect_with(&self, compress: bool, limited: bool) -> Result<RemoteConn> {
-        let role = if limited {
-            ConnectionRole::SourceWorker {
-                roots: Vec::new(),
-                send_budget: None,
-            }
-        } else {
-            ConnectionRole::Control
-        };
-        self.connect_with_role(compress, limited, role, false, false, None)
+    /// The control connection. It takes no connect slot: everything waits
+    /// on it, so it must never queue behind workers. In managed mode the
+    /// matching helper is installed on first use if the remote lacks it.
+    pub fn connect(&self, compress: bool) -> Result<RemoteConn> {
+        self.connect_with_role(compress, false, ConnectionRole::Control, false, false, None)
     }
 
     /// Ordinary SSH settings, with diagnostics inspected only to decide whether
@@ -2458,31 +2517,14 @@ impl RemoteSpec {
         self.connect_with_role(compress, false, ConnectionRole::Control, false, true, None)
     }
 
-    /// One non-retrying control connection for speculative shell completion.
-    /// The caller supplies BatchMode and SSH timeouts in `rsh`; this avoids the
-    /// transfer engine's exponential retries while retaining the exact same
-    /// managed-helper bootstrap and persistent control socket behavior.
+    /// An uncompressed control connection for speculative shell completion.
+    /// The caller supplies BatchMode and SSH timeouts in `rsh`. Unlike
+    /// `connect`, it takes a pooled session without compression too.
     pub(crate) fn connect_completion(&self) -> Result<RemoteConn> {
         if let Some(conn) = self.take_pooled_control(false) {
             return Ok(conn);
         }
-        let role = ConnectionRole::Control;
-        let first = self.connect_once(false, SshConnection::Control, role.clone(), false, None);
-        let Err(first_error) = first else {
-            return first;
-        };
-        if !self.bootstrap_helper || !helper_needs_install(&first_error) {
-            return Err(first_error);
-        }
-        self.install_helper()?;
-        self.connect_once(false, SshConnection::Control, role, false, None)
-            .with_context(|| {
-                format!(
-                    "could not start the {} helper installed on {}",
-                    remote_helper::helper_identity(),
-                    self.label()
-                )
-            })
+        self.connect_with_role(false, false, ConnectionRole::Control, false, false, None)
     }
 
     fn connect_with_role(
@@ -2509,37 +2551,45 @@ impl RemoteSpec {
                 }
             }
         }
-        let first = self.connect_retried(
-            compress,
-            limited,
-            role.clone(),
-            first_worker,
-            classify_ssh_failure,
-            setups,
-        );
-        let Err(first_error) = first else {
-            return first;
-        };
-        if !self.bootstrap_helper || !helper_needs_install(&first_error) {
-            return Err(first_error);
-        }
-
-        self.install_helper()?;
-        self.connect_retried(
-            compress,
-            limited,
-            role,
-            first_worker,
-            classify_ssh_failure,
-            setups,
+        self.with_helper(
+            |installed| {
+                let conn = self.connect_retried(
+                    compress,
+                    limited,
+                    role.clone(),
+                    first_worker,
+                    classify_ssh_failure,
+                    setups,
+                );
+                if !installed {
+                    return conn;
+                }
+                conn.with_context(|| {
+                    format!(
+                        "could not start the {} helper installed on {}",
+                        remote_helper::helper_identity(),
+                        self.label()
+                    )
+                })
+            },
+            |conn| conn.as_ref().is_err_and(helper_needs_install),
         )
-        .with_context(|| {
-            format!(
-                "could not start the {} helper installed on {}",
-                remote_helper::helper_identity(),
-                self.label()
-            )
-        })
+    }
+
+    /// `run`, and in managed mode, if `missing` finds that it failed for
+    /// want of the matching helper, `run` again once the helper is
+    /// installed. `run` is told whether it is that second run.
+    pub(crate) fn with_helper<T>(
+        &self,
+        mut run: impl FnMut(bool) -> Result<T>,
+        missing: impl FnOnce(&Result<T>) -> bool,
+    ) -> Result<T> {
+        let first = run(false);
+        if !self.bootstrap_helper || !missing(&first) {
+            return first;
+        }
+        self.install_helper()?;
+        run(true)
     }
 
     fn connect_retried(
@@ -2639,52 +2689,11 @@ impl RemoteSpec {
         let pacing = (!matches!(role, ConnectionRole::Control))
             .then(|| self.pacing.lock().unwrap().clone())
             .flatten();
-        let handshake = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let observation =
-            std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
-        let replies = reply_queue(self.read_ahead, &role);
-        let (rx, reader, batch_receipts) = spawn_observed_reader(
-            Box::new(crate::bwlimit::activity::ActivityIo {
-                inner: stream.try_clone()?,
-                bytes: pacing
-                    .as_ref()
-                    .filter(|p| p.remote_sender)
-                    .and_then(|p| p.activity.clone()),
-                handshake_pending: handshake.clone(),
-            }),
-            replies,
-            reply_bytes(&role),
-            observation.clone(),
-        )?;
-        let conn = RemoteConn {
-            batch_receipts,
-            transport_stop: pacing.as_ref().map(|p| p.scheduler.clone()),
-            observation,
-            child: None,
-            approved_login: None,
-            worker_setup: None,
-            w: FrameWriter::new(
-                paced_output(stream.try_clone()?, pacing.as_ref(), &handshake)?,
-                compress,
-            ),
-            rx: Some(rx),
-            replies,
-            deferred: Default::default(),
-            reader: Some(reader),
-            label: self.label(),
-            dead: false,
-            rpc_observation: None,
-            write_stream: None,
-            peer: None,
-            tcp_socket: None,
-            named_socket: Some(stream),
-            multiplexed_ssh: false,
-            detached: false,
+        let transport = Transport {
+            named_socket: Some(stream.try_clone()?),
+            ..Transport::new(stream.try_clone()?, stream, self.label(), pacing)
         };
-        let conn = hello(conn, compress, Vec::new(), role)?;
-        handshake.store(false, std::sync::atomic::Ordering::Release);
-        self.record_peer(&conn);
-        Ok(conn)
+        self.open(transport, compress, role, |conn| conn)
     }
 
     fn connect_once(
@@ -2698,9 +2707,6 @@ impl RemoteSpec {
         if setups.is_some_and(|setups| setups.cancelled()) {
             return Err(SetupCancelled.into());
         }
-        // The receiver child is on this machine, not across the network.
-        // Recompressing forwarded blocks here adds CPU work to downloads.
-        let compress = compress && !self.local_process;
         let return_stream = if crate::destination::is_named(&self.restricted_grant) {
             let control = matches!(role, ConnectionRole::Control);
             let started = std::time::Instant::now();
@@ -2861,127 +2867,73 @@ impl RemoteSpec {
                     .context("start SSH stderr reader");
             }
         };
-        let stdin = child.stdin.take().unwrap();
+        let mut role = role;
         let pacing = (!matches!(role, ConnectionRole::Control))
             .then(|| self.pacing.lock().unwrap().clone())
             .flatten();
-        let handshake = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let writer: Box<dyn Write + Send> =
-            if let Some(pacing) = pacing.as_ref().filter(|p| !p.remote_sender) {
-                let scheduler = pacing.scheduler.clone();
-                Box::new(crate::bwlimit::transport::PacedWriter {
-                    inner: crate::bwlimit::activity::ActivityIo {
-                        inner: stdin,
-                        bytes: pacing.activity.clone(),
-                        handshake_pending: handshake.clone(),
-                    },
-                    budget: pacing.budget.clone(),
-                    unpaced: Some(handshake.clone()),
-                    stopped: move || scheduler.upgrade().is_none_or(|s| s.is_aborted()),
-                })
-            } else {
-                Box::new(stdin)
-            };
-        let stdout = child.stdout.take().unwrap();
-        let observation =
-            std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
-        let stdout = crate::bwlimit::activity::ActivityIo {
-            inner: stdout,
-            bytes: pacing
-                .as_ref()
-                .filter(|p| p.remote_sender)
-                .and_then(|p| p.activity.clone()),
-            handshake_pending: handshake.clone(),
-        };
-        let replies = reply_queue(self.read_ahead, &role);
-        let (rx, reader, batch_receipts) = match spawn_observed_reader(
-            Box::new(stdout),
-            replies,
-            reply_bytes(&role),
-            observation.clone(),
-        ) {
-            Ok(reader) => reader,
-            Err(error) => {
-                drop(writer);
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error);
-            }
-        };
-        let worker_setup = setups.map(|setups| setups.watch(child.id(), independent_approved));
-        let conn = RemoteConn {
-            batch_receipts,
-            transport_stop: pacing.as_ref().map(|p| p.scheduler.clone()),
-            observation,
-            child: Some(child),
-            approved_login,
-            worker_setup,
-            w: FrameWriter::with_admission(writer, compress, admission),
-            rx: Some(rx),
-            replies,
-            deferred: Default::default(),
-            reader: Some(reader),
-            label: self.label(),
-            dead: false,
-            rpc_observation: None,
-            write_stream: None,
-            peer: None,
-            tcp_socket: None,
-            named_socket: None,
-            multiplexed_ssh: ssh_connection == SshConnection::Worker,
-            detached: false,
-        };
-        let mut role = role;
         if let ConnectionRole::SourceWorker { send_budget, .. } = &mut role {
             *send_budget = pacing.as_ref().and_then(|p| p.source_budget.clone());
         }
-        let mut conn = hello(conn, compress, Vec::new(), role).map_err(|mut error| {
-            // Drain diagnostics before reporting any error, including helper
-            // errors. A ProxyCommand descendant may keep stderr open after ssh
-            // exits, so bound the wait and leave unclassified failures alone.
-            let diagnosis = ssh_failure.and_then(|diagnosis| {
-                diagnosis
-                    .recv_timeout(std::time::Duration::from_millis(100))
-                    .ok()
-                    .flatten()
-            });
-            if let (Some((_, name)), Some(diagnosis)) = (approving, &diagnosis) {
-                // ssh names the approving machine's entries with a label no
-                // file here has, and suggests fixing this machine's files.
-                if diagnosis.failure == Some(ssh_auth::Failure::HostKey) && diagnosis.names_marker
-                {
-                    crate::output::diagnostic!(
-                        "syq: the approving machine's known_hosts lists a different key for {}; if that key is out of date, remove it there with `ssh-keygen -R {}`",
-                        self.host,
-                        shell_words::quote(name)
-                    );
+        let worker_setup = setups.map(|setups| setups.watch(child.id(), independent_approved));
+        let output = child.stdout.take().unwrap();
+        let input = child.stdin.take().unwrap();
+        let transport = Transport {
+            child: Some(child),
+            approved_login,
+            worker_setup,
+            multiplexed_ssh: ssh_connection == SshConnection::Worker,
+            admission,
+            ..Transport::new(output, input, self.label(), pacing)
+        };
+        let conn = self.open(transport, compress, role, |conn| {
+            let mut conn = conn.map_err(|mut error| {
+                // Drain diagnostics before reporting any error, including helper
+                // errors. A ProxyCommand descendant may keep stderr open after ssh
+                // exits, so bound the wait and leave unclassified failures alone.
+                let diagnosis = ssh_failure.and_then(|diagnosis| {
+                    diagnosis
+                        .recv_timeout(std::time::Duration::from_millis(100))
+                        .ok()
+                        .flatten()
+                });
+                if let (Some((_, name)), Some(diagnosis)) = (approving, &diagnosis) {
+                    // ssh names the approving machine's entries with a label no
+                    // file here has, and suggests fixing this machine's files.
+                    if diagnosis.failure == Some(ssh_auth::Failure::HostKey)
+                        && diagnosis.names_marker
+                    {
+                        crate::output::diagnostic!(
+                            "syq: the approving machine's known_hosts lists a different key for {}; if that key is out of date, remove it there with `ssh-keygen -R {}`",
+                            self.host,
+                            shell_words::quote(name)
+                        );
+                    }
                 }
+                if let Some(ssh_error) = error
+                    .downcast_mut::<SshConnectError>()
+                    .filter(|_| classify)
+                {
+                    ssh_error.failure = diagnosis.and_then(|diagnosis| diagnosis.failure);
+                }
+                if independent_approved && is_ssh_authorization_fallback_error(&error) {
+                    // Authentication/policy refusal cannot improve on retry. In
+                    // particular, do not request the same hardware signature six
+                    // times after a permanent host or key failure.
+                    return crate::destination::ssh::workers::AuthorizationError(error).into();
+                }
+                error
+            })?;
+            if let Some(setup) = conn.worker_setup.take() {
+                setup.finish()?;
             }
-            if let Some(ssh_error) = error
-                .downcast_mut::<SshConnectError>()
-                .filter(|_| classify)
-            {
-                ssh_error.failure = diagnosis.and_then(|diagnosis| diagnosis.failure);
+            if let Some(login) = &conn.approved_login {
+                // SSH and the exact helper are authenticated. The original
+                // approved master now owns the worker's lifetime; release the
+                // per-handshake signing channel before admitting more workers.
+                login.authenticated()?;
             }
-            if independent_approved && is_ssh_authorization_fallback_error(&error) {
-                // Authentication/policy refusal cannot improve on retry. In
-                // particular, do not request the same hardware signature six
-                // times after a permanent host or key failure.
-                return crate::destination::ssh::workers::AuthorizationError(error).into();
-            }
-            error
+            Ok(conn)
         })?;
-        if let Some(setup) = conn.worker_setup.take() {
-            setup.finish()?;
-        }
-        if let Some(login) = &conn.approved_login {
-            // SSH and the exact helper are authenticated. The original
-            // approved master now owns the worker's lifetime; release the
-            // per-handshake signing channel before admitting more workers.
-            login.authenticated()?;
-        }
-        handshake.store(false, std::sync::atomic::Ordering::Release);
-        self.record_peer(&conn);
         if ssh_connection == SshConnection::Control
             && !self.local_process
             && self.restricted_grant.is_none()
@@ -3047,11 +2999,13 @@ impl RemoteSpec {
             diagnostics.tcp_probe = None;
             diagnostics.tcp_setup_error = None;
         }
-        let result = self.request_tcp_listener_inner(ctl, plain, ports, congestion_control, pacing);
-        if let Err(error) = &result {
-            self.diagnostics.lock().unwrap().tcp_setup_error = Some(format!("{error:#}"));
-        }
-        result
+        self.tcp_setup_result(self.request_tcp_listener_inner(
+            ctl,
+            plain,
+            ports,
+            congestion_control,
+            pacing,
+        ))
     }
 
     /// Read the reply to `request_tcp_listener` and begin probing the
@@ -3061,16 +3015,16 @@ impl RemoteSpec {
         ctl: &mut dyn Conn,
         requested: RequestedTcpListener,
     ) -> Result<PendingTcpSetup> {
-        let result = self.begin_requested_tcp_setup_inner(ctl, requested);
-        if let Err(error) = &result {
-            self.diagnostics.lock().unwrap().tcp_setup_error = Some(format!("{error:#}"));
-        }
-        result
+        self.tcp_setup_result(self.begin_requested_tcp_setup_inner(ctl, requested))
     }
 
     /// Join background route probes and record the selected TCP data paths.
     pub(crate) fn finish_tcp_setup(&self, pending: PendingTcpSetup) -> Result<()> {
-        let result = self.finish_tcp_setup_inner(pending);
+        self.tcp_setup_result(self.finish_tcp_setup_inner(pending))
+    }
+
+    /// `result`, its error recorded for the diagnostics.
+    fn tcp_setup_result<T>(&self, result: Result<T>) -> Result<T> {
         if let Err(error) = &result {
             self.diagnostics.lock().unwrap().tcp_setup_error = Some(format!("{error:#}"));
         }
@@ -3379,8 +3333,6 @@ impl RemoteSpec {
         if let Some(reverse) = &info.reverse {
             return self.connect_reverse_tcp(reverse, info.pacing.as_ref(), compress, role);
         }
-        // Keep network compression, but not on the local receiver's data hop.
-        let compress = compress && !self.local_process;
         let stream = info.connect_socket().map_err(|error| {
             if is_tcp_congestion_error(&error) {
                 error.context(format!(
@@ -3401,82 +3353,159 @@ impl RemoteSpec {
         stream.set_nodelay(true)?;
         let conn_id = next_tcp_connection_id(&TCP_CONN_ID)?;
         (&stream).write_all(&conn_id.to_be_bytes())?;
-        let (wc, rc) = match &info.key {
+        let ciphers = match &info.key {
             Some(k) => (
                 Some(Cipher::new(k, conn_id, 1)),
                 Some(Cipher::new(k, conn_id, 2)),
             ),
             None => (None, None),
         };
-        let pacing_handshake = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let output: Box<dyn Write + Send> =
-            if let Some(pacing) = info.pacing.as_ref().filter(|p| !p.remote_sender) {
-                let scheduler = pacing.scheduler.clone();
-                let socket = stream.try_clone()?;
-                Box::new(crate::bwlimit::transport::PacedWriter {
-                    unpaced: Some(pacing_handshake.clone()),
-                    inner: crate::bwlimit::activity::ActivityIo {
-                        inner: stream.try_clone()?,
-                        bytes: pacing.activity.clone(),
-                        handshake_pending: pacing_handshake.clone(),
-                    },
-                    budget: pacing.budget.clone(),
-                    stopped: move || {
-                        scheduler.upgrade().is_none_or(|s| s.is_aborted())
-                            || crate::bwlimit::transport::socket_closed(&socket)
-                    },
-                })
-            } else {
-                Box::new(stream.try_clone()?)
-            };
-        let writer = RecordWriter::new(output, wc);
-        let tcp_socket = stream.try_clone()?;
-        let reader = RecordReader::new(
-            crate::bwlimit::activity::ActivityIo {
-                inner: stream,
-                bytes: info
+        let transport = Transport {
+            records: Some(ciphers),
+            tcp_socket: Some(std::sync::Arc::new(stream.try_clone()?)),
+            token: info.token.clone(),
+            ..Transport::new(
+                stream.try_clone()?,
+                stream,
+                format!("{} (tcp {addr_s})", self.label()),
+                info.pacing.clone(),
+            )
+        };
+        self.open(transport, compress, role, |conn| conn)
+    }
+}
+
+/// What a connection runs over, before its handshake (`RemoteSpec::open`):
+/// its two byte streams and what the connection owns with them.
+struct Transport<R, W> {
+    reader: R,
+    writer: W,
+    /// TCP's record layer, with each direction's cipher when it is
+    /// encrypted: (sending, receiving).
+    records: Option<(Option<Cipher>, Option<Cipher>)>,
+    label: String,
+    /// How this machine paces the connection, if it does.
+    pacing: Option<TransportPacing>,
+    child: Option<Child>,
+    approved_login: Option<crate::destination::ssh::workers::Guard>,
+    worker_setup: Option<SetupWatch>,
+    tcp_socket: Option<std::sync::Arc<TcpStream>>,
+    named_socket: Option<std::os::unix::net::UnixStream>,
+    multiplexed_ssh: bool,
+    /// What an enrolled receiver reads before the preamble.
+    admission: Vec<u8>,
+    /// The data listener's token, which the Hello carries.
+    token: Vec<u8>,
+}
+
+impl<R, W> Transport<R, W> {
+    fn new(reader: R, writer: W, label: String, pacing: Option<TransportPacing>) -> Self {
+        Self {
+            reader,
+            writer,
+            records: None,
+            label,
+            pacing,
+            child: None,
+            approved_login: None,
+            worker_setup: None,
+            tcp_socket: None,
+            named_socket: None,
+            multiplexed_ssh: false,
+            admission: Vec::new(),
+            token: Vec::new(),
+        }
+    }
+}
+
+impl RemoteSpec {
+    /// A connection over `transport`, once its Hello is answered. `finish`
+    /// sees the handshake's result while the handshake is still exempt from
+    /// pacing.
+    fn open<R, W>(
+        &self,
+        mut transport: Transport<R, W>,
+        compress: bool,
+        role: ConnectionRole,
+        finish: impl FnOnce(Result<RemoteConn>) -> Result<RemoteConn>,
+    ) -> Result<RemoteConn>
+    where
+        R: Read + Send + 'static,
+        W: Write + Send + std::os::fd::AsFd + 'static,
+    {
+        // Keep network compression, but not on the local receiver's hop:
+        // recompressing forwarded blocks there adds CPU work to downloads.
+        let compress = compress && !self.local_process;
+        let handshake = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let observation =
+            std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
+        let replies = reply_queue(self.read_ahead, &role);
+        let started = (|| {
+            // A child's output is its stdin pipe, not a socket.
+            let output = paced_output(
+                transport.writer,
+                transport.child.is_none(),
+                transport.pacing.as_ref(),
+                &handshake,
+            )?;
+            let input = crate::bwlimit::activity::ActivityIo {
+                inner: transport.reader,
+                bytes: transport
                     .pacing
                     .as_ref()
                     .filter(|p| p.remote_sender)
                     .and_then(|p| p.activity.clone()),
-                handshake_pending: pacing_handshake.clone(),
-            },
-            rc,
-        );
-        let observation =
-            std::sync::Arc::new(crate::transfer_observations::RemoteSample::default());
-        let replies = reply_queue(self.read_ahead, &role);
-        let (rx, reader, batch_receipts) = spawn_observed_reader(
-            Box::new(reader),
-            replies,
-            reply_bytes(&role),
-            observation.clone(),
-        )?;
+                handshake_pending: handshake.clone(),
+            };
+            let (output, input): (Box<dyn Write + Send>, Box<dyn Read + Send>) =
+                match transport.records {
+                    Some((sending, receiving)) => (
+                        Box::new(RecordWriter::new(output, sending)),
+                        Box::new(RecordReader::new(input, receiving)),
+                    ),
+                    None => (output, Box::new(input)),
+                };
+            let reader =
+                spawn_observed_reader(input, replies, reply_bytes(&role), observation.clone())?;
+            anyhow::Ok((output, reader))
+        })();
+        let (output, (rx, reader, batch_receipts)) = match started {
+            Ok(started) => started,
+            Err(error) => {
+                // Stop the watchers before reaping the child.
+                drop((transport.approved_login, transport.worker_setup));
+                if let Some(child) = &mut transport.child {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                return Err(error);
+            }
+        };
         let conn = RemoteConn {
             batch_receipts,
-            transport_stop: info.pacing.as_ref().map(|p| p.scheduler.clone()),
+            transport_stop: transport.pacing.as_ref().map(|p| p.scheduler.clone()),
             observation,
-            child: None,
-            approved_login: None,
-            worker_setup: None,
-            w: FrameWriter::new(Box::new(writer), compress),
+            child: transport.child,
+            approved_login: transport.approved_login,
+            worker_setup: transport.worker_setup,
+            w: FrameWriter::with_admission(output, compress, transport.admission),
             rx: Some(rx),
             replies,
             deferred: Default::default(),
             reader: Some(reader),
-            label: format!("{} (tcp {addr_s})", self.label()),
+            label: transport.label,
             dead: false,
             rpc_observation: None,
             write_stream: None,
             peer: None,
-            tcp_socket: Some(std::sync::Arc::new(tcp_socket)),
-            named_socket: None,
-            multiplexed_ssh: false,
+            tcp_socket: transport.tcp_socket,
+            named_socket: transport.named_socket,
+            multiplexed_ssh: transport.multiplexed_ssh,
             detached: false,
         };
-        let conn = hello(conn, compress, info.token.clone(), role.clone())?;
+        let conn = finish(hello(conn, compress, transport.token, role))?;
         // Authenticate within the fixed handshake deadline even at tiny caps.
-        pacing_handshake.store(false, std::sync::atomic::Ordering::Release);
+        handshake.store(false, std::sync::atomic::Ordering::Release);
         self.record_peer(&conn);
         Ok(conn)
     }
@@ -3485,9 +3514,11 @@ impl RemoteSpec {
 /// `socket` as a connection's output, paced by `pacing` when this machine
 /// sends on it. Bytes before `handshake` clears count for tuning activity
 /// but wait for no budget, so a connection authenticates in time even at a
-/// tiny cap.
+/// tiny cap. A paced socket also stops waiting once its peer has closed it;
+/// a child's pipe (`socket: false`) is not watched.
 fn paced_output<S>(
-    socket: S,
+    output: S,
+    socket: bool,
     pacing: Option<&TransportPacing>,
     handshake: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<Box<dyn Write + Send>>
@@ -3495,38 +3526,32 @@ where
     S: Write + Send + std::os::fd::AsFd + 'static,
 {
     let Some(pacing) = pacing.filter(|p| !p.remote_sender) else {
-        return Ok(Box::new(socket));
+        return Ok(Box::new(output));
     };
     let scheduler = pacing.scheduler.clone();
     let closed = socket
-        .as_fd()
-        .try_clone_to_owned()
+        .then(|| output.as_fd().try_clone_to_owned())
+        .transpose()
         .context("watch a paced connection")?;
     Ok(Box::new(crate::bwlimit::transport::PacedWriter {
         unpaced: Some(handshake.clone()),
         inner: crate::bwlimit::activity::ActivityIo {
-            inner: socket,
+            inner: output,
             bytes: pacing.activity.clone(),
             handshake_pending: handshake.clone(),
         },
         budget: pacing.budget.clone(),
         stopped: move || {
             scheduler.upgrade().is_none_or(|s| s.is_aborted())
-                || crate::bwlimit::transport::socket_closed(&closed)
+                || closed
+                    .as_ref()
+                    .is_some_and(crate::bwlimit::transport::socket_closed)
         },
     }))
 }
 
 fn helper_needs_install(e: &anyhow::Error) -> bool {
-    let message = format!("{e:#}");
-    message.contains(&format!(
-        "exit status: {}",
-        remote_helper::HELPER_MISSING_EXIT
-    )) || message.contains(&format!(
-        "exit status: {}",
-        remote_helper::HELPER_NOT_EXECUTABLE_EXIT
-    )) || message.contains("build identity mismatch")
-        || message.contains(WIRE_PREAMBLE_PROTOCOL_ERROR)
+    ConnectFailure::of(e).is_some_and(ConnectFailure::needs_install)
 }
 
 pub(crate) fn select_tcp_candidates(mut candidates: Vec<TcpCandidate>) -> Vec<TcpCandidate> {
@@ -3968,21 +3993,25 @@ fn receive_hello(mut conn: RemoteConn, worker: bool) -> Result<RemoteConn> {
                 ssh_worker_ticket,
             });
         }
-        Ok(Response::Err(error)) if worker => {
-            return Err(WorkerInitializationError(format!("{}: {error}", conn.label)).into());
+        Ok(Response::Err(error)) => {
+            let message = format!("{}: {error}", conn.label);
+            return Err(if worker {
+                WorkerInitializationError(message).into()
+            } else {
+                anyhow!(message)
+            });
         }
-        Ok(Response::Err(error)) => bail!("{}: {error}", conn.label),
-        Ok(other) if worker => {
-            return Err(WorkerInitializationError(format!(
-            "{}: unexpected handshake response {other:?}; remote syq may be a different version",
-            conn.label
-        ))
-            .into())
+        Ok(other) => {
+            let message = format!(
+                "{}: unexpected handshake response {other:?}; remote syq may be a different version",
+                conn.label
+            );
+            return Err(if worker {
+                WorkerInitializationError(message).into()
+            } else {
+                ConnectFailure::UnexpectedHandshake.error(message)
+            });
         }
-        Ok(other) => bail!(
-            "{}: unexpected handshake response {other:?}; remote syq may be a different version",
-            conn.label
-        ),
         Err(e)
             if e.is::<crate::restricted::CopyRefused>()
                 || crate::restricted::is_other_build(&e) =>

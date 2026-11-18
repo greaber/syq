@@ -32,13 +32,14 @@ SCRIPTS = Path(os.path.abspath(__file__)).parent
 ALL_TOOLING = "package installer benchmark release orchestration focused branch workflows setup"
 # Tooling groups that macos.yml's release tooling step runs.
 MACOS_TOOLING = {"release", "orchestration", "installer"}
+# The core suite also runs the storage and metadata checks, so CI does not
+# select those local-only suites separately.
 REAL_SSH = {
     "real-ssh-core": {"suite": "core", "profile": "default"},
     # Omit unaffected cases and workflows that require concurrent sessions
     # on one connection; both remain covered by the default profile.
     "real-ssh-max-sessions-1": {"suite": "core", "profile": "max-sessions-1",
                                 "skip": "tests/real-ssh/max-sessions-1.skip"},
-    "real-ssh-metadata": {"suite": "metadata", "profile": "default"},
     "real-ssh-benchmark": {"suite": "benchmark", "profile": "default"},
 }
 # Suites that ci.yml's `suites` input can select, as the scope outputs each sets.
@@ -388,7 +389,7 @@ def classify(paths, preparation_only):
             path_tooling_checks.append("setup")
         elif path == "scripts/setup.lock":
             path_tooling_checks += ALL_TOOLING.split()
-        elif path == "scripts/verify-release-ci.py":
+        elif matches(path, "scripts/verify-release-ci.py", "scripts/release_checks.py"):
             path_tooling_checks += ["release", "orchestration"]
         elif matches(path, "tests/tooling/test-release-tools.py", "scripts/package-release.py",
                      "scripts/verify-crates-io-package.py", "scripts/verify-release-*",

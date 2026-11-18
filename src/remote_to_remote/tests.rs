@@ -249,7 +249,7 @@ fn settlement_preserves_terminal_outcomes() {
     ];
     for (destination, refusals, coordinator, status, exit_code, rejects) in cases {
         let outcome = settlement_outcome(destination, refusals, coordinator);
-        assert_eq!(outcome.results_status, status);
+        assert_eq!(serde_json::json!(outcome.results_status), status);
         assert_eq!(outcome.exit_code, exit_code);
         assert_eq!(outcome.rejects, rejects);
     }
@@ -329,6 +329,138 @@ fn coordinator_terminal() -> serde_json::Value {
         "bytes_unchanged": 40,
         "timings": {"total_ms": 5, "transfer_ms": 3},
     })
+}
+
+/// A coordinator of another build may add fields to its final result; the
+/// relay writes them as they came.
+#[test]
+fn a_relayed_final_result_keeps_fields_this_build_does_not_know() {
+    let (file, writer) = results_file();
+    let relay = Relay::new(TOKEN, Some(writer), None, (false, true));
+    let mut terminal = coordinator_terminal();
+    terminal["future_count"] = 7.into();
+    terminal["future_detail"] = serde_json::json!({"nested": [1, "two"]});
+    terminal["timings"]["future_ms"] = 9.into();
+    terminal["deletions_planned"] = 3.into();
+    terminal["deletions_completed"] = 2.into();
+    terminal["deletions_blocked"] = 0.into();
+    terminal["replaced_not_in_place"] = serde_json::json!({"owner": 2, "future_reason": 1});
+    let mut relay = relay;
+    let input = coordinator_line(terminal.clone(), 0);
+    relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
+    assert_eq!(settle(relay, settlement(0)).unwrap(), 0);
+    let mut written = read_records(file).pop().unwrap();
+    assert_eq!(written["seq"], 0);
+    for key in ["schema", "schema_version", "seq"] {
+        written.as_object_mut().unwrap().remove(key);
+    }
+    assert_eq!(written, terminal);
+}
+
+/// A final result without a status is not a result: the relayed results
+/// are unusable, and the stream settles as failed and says why.
+#[test]
+fn an_unreadable_relayed_final_result_fails_the_stream() {
+    let mut missing = coordinator_terminal();
+    missing.as_object_mut().unwrap().remove("status");
+    let mut number = coordinator_terminal();
+    number["status"] = 0.into();
+    let mut null = coordinator_terminal();
+    null["status"] = serde_json::Value::Null;
+    for terminal in [missing, number, null] {
+        let (file, writer) = results_file();
+        let mut relay = Relay::new(TOKEN, Some(writer), None, (false, false));
+        let input = coordinator_line(terminal.clone(), 0);
+        relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
+        let error = settle(relay, settlement(0)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unusable"),
+            "{terminal}: {error:#}"
+        );
+        let records = read_records(file);
+        let kinds: Vec<_> = records.iter().map(|r| r["type"].clone()).collect();
+        assert_eq!(kinds, ["error", "result"], "{terminal}");
+        assert_eq!(records[0]["class"], "integrity");
+        assert_eq!(records[1]["status"], "failed");
+        assert_eq!(records[1]["errors"], 1);
+    }
+}
+
+/// A coordinator of another release may lack a count this build writes, or
+/// give a field in another type or a status this build does not know. Its
+/// final result is relayed as it came, and the missing count reads as zero.
+#[test]
+fn a_relayed_final_result_lacking_a_count_reads_it_as_zero() {
+    let mut terminal = coordinator_terminal();
+    let object = terminal.as_object_mut().unwrap();
+    object.remove("files_unchanged");
+    object.insert("status".into(), "future_status".into());
+    object.insert("dry_run".into(), "maybe".into());
+    object.insert("future_count".into(), 3.into());
+    let (file, writer) = results_file();
+    let mut relay = Relay::new(TOKEN, Some(writer), None, (false, false));
+    let input = coordinator_line(terminal.clone(), 0);
+    relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
+    let relayed = relay.coordinator_terminal.clone().unwrap();
+    assert_eq!(relayed.files_unchanged, 0);
+    assert_eq!(relayed.files_transferred, 99);
+    assert_eq!(
+        relayed.status,
+        crate::results::RecordStatus::Other("future_status".into())
+    );
+    assert_eq!(settle(relay, settlement(0)).unwrap(), 0);
+    let mut written = read_records(file).pop().unwrap();
+    for key in ["schema", "schema_version", "seq"] {
+        written.as_object_mut().unwrap().remove(key);
+    }
+    assert_eq!(written, terminal);
+
+    // Through a restricted receiver, the fields settlement sets are this
+    // machine's; the rest stay as the coordinator sent them.
+    let mut pruning = terminal.clone();
+    pruning["deletions_completed"] = serde_json::Value::Null;
+    pruning["timings"] = serde_json::json!({"total_ms": 5, "transfer_ms": null});
+    let (file, writer) = results_file();
+    let mut relay = Relay::new(TOKEN, Some(writer.clone()), None, (false, true));
+    let input = coordinator_line(pruning.clone(), 0);
+    relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
+    let totals = crate::destination_results::Totals {
+        files_transferred: 7,
+        deletions_completed: 2,
+        ..Default::default()
+    };
+    let composed = compose_terminal(
+        &relay,
+        &totals,
+        settlement_outcome(DestinationStatus::Clean, 0, 23),
+        0,
+    );
+    writer.emit_result(&composed);
+    let written = read_records(file).pop().unwrap();
+    assert_eq!(written["status"], "partial");
+    assert_eq!(written["exit_code"], 23);
+    assert_eq!(written["files_transferred"], 7);
+    assert_eq!(written["deletions_completed"], 2);
+    assert_eq!(written["dry_run"], "maybe");
+    assert_eq!(written["future_count"], 3);
+    assert_eq!(written["timings"], pruning["timings"]);
+    assert!(written.get("files_unchanged").is_none(), "{written}");
+}
+
+/// The summary reads the copying time from timings relayed as sent, as it
+/// did from any relayed record, even when one measurement is unreadable.
+#[test]
+fn the_summary_reads_timings_this_build_could_not_read_whole() {
+    let mut terminal = coordinator_terminal();
+    terminal["timings"] =
+        serde_json::json!({"total_ms": 1000, "transfer_ms": 500, "setup_ms": "unknown"});
+    let record = crate::results::ResultRecord::from_record(terminal.clone()).unwrap();
+    assert_eq!(summary_elapsed_ms(&record), 500);
+    terminal["timings"] = serde_json::json!({"total_ms": 1000, "transfer_ms": "soon"});
+    let record = crate::results::ResultRecord::from_record(terminal.clone()).unwrap();
+    assert_eq!(summary_elapsed_ms(&record), 1000);
+    let record = crate::results::ResultRecord::from_record(coordinator_terminal()).unwrap();
+    assert_eq!(summary_elapsed_ms(&record), 3);
 }
 
 #[test]

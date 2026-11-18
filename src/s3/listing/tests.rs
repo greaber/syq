@@ -77,8 +77,9 @@ impl Store for Memory {
                 page.prefixes.push(key);
             } else {
                 page.entries.push(Entry {
+                    // Directory markers are empty.
+                    size: u64::from(!key.ends_with('/')),
                     key,
-                    size: 1,
                     last_modified: None,
                     etag: None,
                 });
@@ -620,4 +621,65 @@ async fn filtered_listings_stay_flat_and_prune_ignored_first_pages() {
             ("tree/d4/".to_owned(), false)
         ]
     );
+}
+
+#[tokio::test]
+async fn directory_markers_do_not_stop_pruning_an_ignored_first_page() {
+    let ignored = |key: &str, _directory: bool| {
+        ["tree/d3/", "tree/a/d3/"]
+            .into_iter()
+            .find(|dir| key.starts_with(dir))
+            .map(|dir| dir.len() - 1)
+    };
+    // The listed prefix's own marker, and a kept directory's marker, sort
+    // before the ignored objects that fill the rest of the first page.
+    for (marker, ignored_dir, kept, calls) in [
+        (
+            "tree/",
+            "tree/d3/",
+            ["tree/d4/a", "tree/top"],
+            &[("tree/", false), ("tree/", true), ("tree/d4/", false)][..],
+        ),
+        (
+            "tree/a/",
+            "tree/a/d3/",
+            ["tree/a/top", "tree/a/z/b"],
+            &[
+                ("tree/", false),
+                ("tree/", true),
+                ("tree/a/", true),
+                ("tree/a/z/", false),
+            ][..],
+        ),
+    ] {
+        let store = Memory::new(
+            (0..5000)
+                .map(|i| format!("{ignored_dir}file{i:04}"))
+                .chain([marker.to_owned()])
+                .chain(kept.map(str::to_owned)),
+        );
+        let prune = engine::Prune {
+            subtree: &ignored,
+            probes: 4.into(),
+        };
+        let mut keys = Vec::new();
+        let pruned = engine::enumerate_prefix(&store, "tree/", 8, Some(&prune), |entry| {
+            keys.push(entry.key);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        keys.sort();
+        let mut expected = vec![marker.to_owned()];
+        expected.extend(kept.map(str::to_owned));
+        assert_eq!(keys, expected);
+        assert_eq!(pruned, [ignored_dir]);
+        assert_eq!(
+            *store.calls.borrow(),
+            calls
+                .iter()
+                .map(|(prefix, delimiter)| (prefix.to_string(), *delimiter))
+                .collect::<Vec<_>>()
+        );
+    }
 }

@@ -27,7 +27,7 @@ pub(crate) struct Session {
     client: Client,
     options: Options,
     authorization: Option<Arc<super::authorization::Authorization>>,
-    cancellation: Arc<super::upload_http::Cancellation>,
+    cancellation: Arc<super::cancel::Cancellation>,
     parts: Arc<tokio::sync::Semaphore>,
     requests: Arc<tokio::sync::Semaphore>,
     objects: Arc<tokio::sync::Semaphore>,
@@ -41,7 +41,7 @@ impl Session {
         controls: &crate::descriptor_copy::controls::Controls,
         authorization: Option<Arc<super::authorization::Authorization>>,
     ) -> Result<Self> {
-        let cancellation = Arc::new(super::upload_http::Cancellation::default());
+        let cancellation = Arc::new(super::cancel::Cancellation::default());
         let (client, _) = client::connect_authorized(
             &mut options,
             Arc::default(),
@@ -150,12 +150,8 @@ impl Session {
     async fn pace(&self, length: u64) {
         if let Some(limit) = &self.bandwidth {
             if length != 0 {
-                tokio::time::sleep_until(
-                    limit
-                        .reserve_prepaid_at(std::time::Instant::now(), length)
-                        .into(),
-                )
-                .await;
+                tokio::time::sleep_until(limit.reserve(std::time::Instant::now(), length).into())
+                    .await;
             }
         }
     }

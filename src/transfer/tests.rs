@@ -1696,7 +1696,6 @@ fn a_policy_skip_read_before_a_connection_fails_stays_a_skip() {
             io_kind: None,
             raw_os_error: None,
             condition_not_met: true,
-            unchanged: true,
         }),
         Response::Ok,
     ]);
@@ -2217,7 +2216,6 @@ fn later_batch_read_error_keeps_publications_and_requeues_unwritten_files() {
             io_kind: Some(crate::proto::WireIoKind::PermissionDenied),
             raw_os_error: None,
             condition_not_met: false,
-            unchanged: false,
         }));
 
     let mut worker = pipeline_worker(&sched, &src, &dst, false);
@@ -3000,7 +2998,6 @@ fn endpoint_semantic_error_kind_wins_over_numeric_errno() {
         // policy.
         raw_os_error: Some(libc::ENOSPC),
         condition_not_met: false,
-        unchanged: false,
     };
     assert_eq!(wire_os_kind(&error), Some("quota_exceeded"));
     assert!(capacity_os_kind(wire_os_kind(&error)));
@@ -3015,7 +3012,6 @@ fn data_corrupted_in_transit_has_no_os_kind() {
         io_kind: Some(WireIoKind::CorruptedInTransit),
         raw_os_error: None,
         condition_not_met: false,
-        unchanged: false,
     };
     assert_eq!(wire_os_kind(&error), None);
 }
@@ -3027,7 +3023,6 @@ fn mkdir_apply_error_preserves_endpoint_os_kind() {
         io_kind: Some(WireIoKind::NoSpace),
         raw_os_error: Some(libc::ENOSPC),
         condition_not_met: false,
-        unchanged: false,
     };
     let error = mkdir_apply_result(vec![None, Some(error)]).unwrap_err();
     assert_eq!(os_kind_of(&error), Some("no_space"));
@@ -3543,11 +3538,11 @@ fn bandwidth_limited_remote_sources_compare_before_pacing_only_differing_reads()
             let opts = Arc::get_mut(&mut worker.opts).unwrap();
             opts.src_remote = true;
             opts.dst_remote = relay;
-            opts.tuning.bw_pacing = Some(crate::transfer_tuning::BwPacing::Average);
             if basis == "candidate-reuse-off" {
                 opts.transfer_strategy = crate::cli::TransferStrategy::WholeFile;
             }
-            worker.bwlimit = Some(Arc::new(BandwidthLimit::new(5120)));
+            // 512 bytes cost 500 ms, beyond the 125 ms of idle credit.
+            worker.bwlimit = Some(Arc::new(BandwidthLimit::new(1024)));
             worker.progress.bytes_total.store(1536, Relaxed);
             worker.progress.files_total.store(1, Relaxed);
             worker.handle_file(0).unwrap();
@@ -6381,11 +6376,12 @@ fn copy_through_restricted_receiver_with(
         sched.push_file(job);
     }
     sched.scan_done();
+    // A file whose patch fails counts again when it is copied whole.
     let authority = Arc::new(
         crate::restricted::tests::time_preserving_test_authority_for(
             root,
             64 << 20,
-            files.len().max(8) as u64,
+            (2 * files.len()).max(8) as u64,
             permissions,
         ),
     );
@@ -7106,7 +7102,6 @@ fn directory_access_advice_needs_evidence_and_an_available_option() {
         io_kind: Some(WireIoKind::OwnedDirectoryPermissions),
         raw_os_error: Some(libc::EACCES),
         condition_not_met: false,
-        unchanged: false,
     };
     assert_eq!(wire_os_kind(&error), Some("permission_denied"));
     let error = endpoint_error(error).context("prepare file");
@@ -7278,7 +7273,6 @@ fn a_restricted_receivers_listed_failures_are_left_to_it() {
                     io_kind: Some(WireIoKind::PermissionDenied),
                     raw_os_error: Some(13),
                     condition_not_met: false,
-                    unchanged: false,
                 })
             }));
         }
@@ -7321,9 +7315,9 @@ fn a_restricted_receivers_listed_failures_are_left_to_it() {
 }
 
 /// No receiver paces file data, restricted receivers included: the sender
-/// paces, so a bandwidth limit never bounds a copy's requests by one burst.
+/// paces, so only the sender's own request budget sizes requests.
 #[test]
-fn a_bandwidth_limit_leaves_requests_to_a_restricted_receiver_their_size() {
+fn a_bandwidth_limit_sizes_requests_to_a_restricted_receiver_by_the_sender_budget() {
     let sched = Arc::new(Sched::new(512, 8192));
     let unused = Arc::new(Mutex::new(PipelineState::default()));
     let mut worker = pipeline_worker(&sched, &unused, &unused, false);
@@ -7331,11 +7325,9 @@ fn a_bandwidth_limit_leaves_requests_to_a_restricted_receiver_their_size() {
     let opts = Arc::get_mut(&mut worker.opts).unwrap();
     opts.block = 4 << 20;
     opts.restricted_receiver = true;
-    // Average pacing sizes requests for the bandwidth limit no further.
-    opts.tuning.bw_pacing = Some(crate::transfer_tuning::BwPacing::Average);
     assert_eq!(
         fast_file_size_limit(opts, Some(&limit)),
-        fast_file_size_limit(opts, None)
+        limit.request_bytes()
     );
 }
 
@@ -7367,6 +7359,48 @@ fn kept_small_files_are_listed_by_whoever_saw_them_fail() {
     }
 }
 
+/// A remote coordinator's error records reach this machine's stream as they
+/// arrive. When the copy then fails here before the relay settles the
+/// stream, as when a coordinator refuses to run for another build, the
+/// final record counts them with this machine's own.
+#[test]
+fn a_fatal_failure_counts_the_errors_relayed_before_it() {
+    use std::io::{Read, Seek};
+    let file = tempfile::tempfile().unwrap();
+    let writer = Arc::new(crate::results::ResultsWriter::new(Box::new(
+        file.try_clone().unwrap(),
+    )));
+    let progress = Progress::new(false, false, None);
+    progress.set_results(writer.clone());
+    // Relayed: a counted error, and one that only explains another record.
+    writer.emit_value(serde_json::json!({"type": "error", "message": "coordinator"}));
+    writer.emit_value(serde_json::json!({"type": "error", "message": "why",
+        crate::results::DIAGNOSTIC_FOR: {"encoding": "utf-8", "value": "a"}}));
+    record_failure(
+        &progress,
+        Some(&anyhow::anyhow!("run the copy again")),
+        (false, false, false),
+    );
+    let mut text = String::new();
+    let mut file = file;
+    file.rewind().unwrap();
+    file.read_to_string(&mut text).unwrap();
+    let records: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let counted = records
+        .iter()
+        .filter(|record| {
+            record["type"] == "error" && record.get(crate::results::DIAGNOSTIC_FOR).is_none()
+        })
+        .count();
+    let terminal = records.last().unwrap();
+    assert_eq!(terminal["type"], "result");
+    assert_eq!(counted, 2);
+    assert_eq!(terminal["errors"], 2, "{text}");
+}
+
 fn summary_record(
     files_transferred: u64,
     bytes_transferred: u64,
@@ -7374,23 +7408,11 @@ fn summary_record(
     bytes_unchanged: u64,
 ) -> crate::results::ResultRecord {
     crate::results::ResultRecord {
-        status: "success",
-        exit_code: 0,
-        dry_run: false,
         files_transferred,
         files_unchanged,
-        files_excluded: 0,
-        directories_created: 0,
-        symlinks_created: 0,
-        specials_created: 0,
-        errors: 0,
         bytes_transferred,
         bytes_unchanged,
-        timings: Default::default(),
-        deletions_planned: None,
-        deletions_completed: None,
-        deletions_blocked: None,
-        replaced_not_in_place: None,
+        ..crate::results::ResultRecord::new(crate::results::Status::Success, 0, false)
     }
 }
 
