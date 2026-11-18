@@ -226,8 +226,10 @@ never applies to them; they always ask.
 ## Copy limits and restrictions
 
 Each copy to a receiving name may write up to 100 GiB and one million entries
-by default. Entries are the changes it makes, such as files written,
-directories created, metadata changes, and deletions. Change the limits with
+by default. Entries are the changes the copy asks for, such as files
+written, directories created, metadata changes, and deletions. Each counts
+when the request for it is accepted, even if nothing then needs changing, and
+one sent again after a dropped connection counts again. Change the limits with
 `syq persist receive on --max-bytes 20G --max-entries 100000`; the sender can
 only lower them. They apply per copy, so repeated copies can still fill the
 disk. The byte and entry limits also bound what one copy from your laptop

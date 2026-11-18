@@ -754,9 +754,7 @@ impl FsOps {
                     let (blocks, expected) = (&mut data[off as usize..], &patch.reuse[index..end]);
                     if !self.holds_blocks(old, off, blocks, patch.block, expected)? {
                         // Built in memory: nothing was written.
-                        return Err(unchanged(
-                            "the destination changed after it was compared".into(),
-                        ));
+                        return Err(anyhow!("the destination changed after it was compared"));
                     }
                     index = end;
                 }
