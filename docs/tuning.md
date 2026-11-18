@@ -112,6 +112,15 @@ records can change between versions and are not part of the
 remembered counts. When a server coordinates a copy, the history is on that
 server; S3 copies record none.
 
+A copy saves its timeline when it ends. One that runs for more than a second
+also saves it every few seconds along the way: it is listed as `incomplete`
+until it ends, and stays that way, with what it had saved, if it is
+interrupted. A copy interrupted in its first second leaves no record.
+Recording does not hold a copy up for long: when many copies end at the same
+moment, a copy waits for the others no longer than it ran itself, and never
+more than a tenth of a second, and then skips its record. That mostly happens
+to very short copies.
+
 The history holds opaque endpoint, filesystem, and network-address
 identifiers, the UTC date, copy settings, progress numbers, and tuning
 decisions, but no filenames, command lines, file contents, or Wi-Fi names, and
