@@ -1,20 +1,20 @@
 """A requester on a third machine copies between two other servers with one
 approval from the laptop: the source's enrolled receiver runs the copy and
 reaches the destination's enrolled receiver itself. All paths are disposable."""
-import contextlib
+import functools
 import json
 import os
 from pathlib import Path
 import shlex
-import signal
-import subprocess
 import tempfile
-import time
+
+import syq_real_ssh_lab as lab
+from syq_real_ssh_lab import digest, probe, remote, run
 
 
 # Each probe runs as the account whose processes it inspects. Its inputs
 # travel over stdin.
-PROBES = {
+lab.PROBES.update({
     "coordinator": r'''
 from pathlib import Path
 import base64
@@ -39,36 +39,6 @@ for pid, (args, parent, started, state) in processes.items():
     found.append({"pid": pid, "started": started, "receiver": receiver[1:2],
                   "parent": parent, "parent_started": processes.get(parent, ([], 0, "", ""))[2]})
 print(json.dumps(found))
-''',
-    "exited": r'''
-from pathlib import Path
-active = []
-for pid, started in v["processes"]:
-    try:
-        stat = Path("/proc", str(pid), "stat").read_text().rsplit(") ", 1)[1].split()
-        if stat[19] == started and stat[0] != "Z":
-            active.append(pid)
-    except FileNotFoundError:
-        pass
-print(json.dumps(not active))
-''',
-    "tcp": r'''
-import socket, struct
-address = socket.gethostbyname("destination")
-connected = False
-for row in open("/proc/net/tcp").read().splitlines()[1:]:
-    fields = row.split()
-    host, port = fields[2].split(":")
-    peer = socket.inet_ntoa(struct.pack("<I", int(host, 16)))
-    connected |= fields[3] == "01" and peer == address and int(port, 16) == v["port"]
-print(json.dumps(connected))
-''',
-    "partial": r'''
-import hashlib
-from pathlib import Path
-root = Path(v["root"])
-matches = list(root.glob("." + v["name"] + ".syq-tmp.*"))
-print(json.dumps(any(hashlib.sha256(p.open("rb").read(1 << 20)).hexdigest() == v["digest"] for p in matches)))
 ''',
     "signal_requester": r'''
 from pathlib import Path
@@ -109,79 +79,18 @@ for p in Path("/proc").iterdir():
 assert killed, "the destination has no restricted receiver"
 print(json.dumps(killed))
 ''',
-}
+})
 
 
-def run(*args, stdin=None, success=True):
-    result = subprocess.run(args, input=stdin, capture_output=True, text=True, timeout=60)
-    assert (result.returncode == 0) == success, (args, result)
-    return result.stdout
+wait_for = functools.partial(lab.wait_for, timeout=25)
 
 
-def remote(host, command, **kwargs):
-    return run("ssh", host, command, **kwargs)
-
-
-def probe(host, selector, **values):
-    script = "import json, sys\nv = json.load(sys.stdin)\n" + PROBES[selector]
-    return json.loads(remote(host, "python3 -c " + shlex.quote(script), stdin=json.dumps(values)))
-
-
-def wait_for(description, predicate, timeout=25):
-    deadline, progress = time.monotonic() + timeout, time.monotonic() + 3
-    state = None
-    while time.monotonic() < deadline:
-        state = predicate()
-        if state:
-            return state
-        if time.monotonic() >= progress:
-            print("Waiting for", description, "last state:", state, flush=True)
-            progress += 3
-        time.sleep(.1)
-    raise AssertionError(("Timed out", description, "last state", state))
-
-
-def stop(process):
-    if process.poll() is None:
-        os.killpg(process.pid, signal.SIGTERM)
-        try:
-            process.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=3)
-
-
-@contextlib.contextmanager
 def running(command):
-    with tempfile.TemporaryFile() as output:
-        process = subprocess.Popen(["ssh", "requester", command], stdin=subprocess.DEVNULL,
-                                   stdout=output, stderr=output, start_new_session=True)
-        try:
-            yield process, output
-        except BaseException:
-            print(os.pread(output.fileno(), 1024 * 1024, 0).decode(errors="replace"), flush=True)
-            raise
-        finally:
-            stop(process)
+    return lab.running("requester", command)
 
 
 def finish(process, output, success=True):
-    deadline, offset = time.monotonic() + 90, 0
-    while True:
-        try:
-            status = process.wait(timeout=5)
-            break
-        except subprocess.TimeoutExpired:
-            data = os.pread(output.fileno(), 1024 * 1024, offset)
-            offset += len(data)
-            print(data.decode(errors="replace"), end="", flush=True)
-            print("Waiting for the copy between servers", flush=True)
-            assert time.monotonic() < deadline, "copy between servers exceeded its deadline"
-    text = os.pread(output.fileno(), 1024 * 1024, 0).decode(errors="replace")
-    print(text, end="", flush=True)
-    assert status != 124, "copy between servers reached its safety timeout"
-    assert (status == 0) == success, (status, text)
-    return text
+    return lab.finish(process, output, "copy between servers", success)
 
 
 def pending():
@@ -200,16 +109,7 @@ def decide(allow=True):
 
 
 def enrollments():
-    rows = {}
-    for line in run("syq", "receiver", "list").splitlines():
-        fields = line.split("\t")
-        if len(fields) >= 3 and fields[1] == "active":
-            rows[fields[2]] = fields[0]
-    return rows
-
-
-def digest(host, path):
-    return remote(host, "sha256sum " + shlex.quote(path)).split()[0]
+    return {account: identifier for identifier, account in lab.enrollments()}
 
 
 def authorized_keys(host):
@@ -293,7 +193,8 @@ def main():
             assert pending() == []
 
         def partial(name, expected_prefix=prefix):
-            return probe("destination", "partial", root=c, name=name, digest=expected_prefix)
+            return probe("destination", "partial", root=c, name=name, digest=expected_prefix,
+                         size=1 << 20)
 
         def stopped(name, description, stop):
             """Start a slow copy and stop it with `stop` once data arrives: the

@@ -1,54 +1,29 @@
 """An ordinary SSH login reaches a local provider without agent forwarding."""
 import contextlib
+import functools
 import json
 import os
 from pathlib import Path
 import shlex
-import signal
 import socket
 import subprocess
 import sys
 import tempfile
 import time
 
+import syq_real_ssh_lab as lab
+from syq_real_ssh_lab import stop
+
 
 NATIVE_PATH = "PATH=/usr/bin:/bin:/usr/local/bin"
 TARGET = "provider-destination"
 
 
-def run(*args, data=None, success=True, env=None):
-    result = subprocess.run(args, input=data, capture_output=True, text=True,
-                            timeout=40, env=env)
-    assert (result.returncode == 0) == success, (args, result)
-    return result.stdout
+run = functools.partial(lab.run, timeout=40)
 
 
 def remote(host, *args, **kwargs):
     return run("ssh", host, shlex.join(args), **kwargs)
-
-
-def wait_for(description, predicate, timeout=15):
-    deadline, progress = time.monotonic() + timeout, time.monotonic() + 3
-    observed = None
-    while time.monotonic() < deadline:
-        observed = predicate()
-        if observed:
-            return observed
-        if time.monotonic() >= progress:
-            print("Waiting for", description, "last state:", observed, flush=True)
-            progress += 3
-        time.sleep(.05)
-    raise AssertionError((description, "timed out; last state", observed))
-
-
-def terminate(process):
-    if process.poll() is None:
-        os.killpg(process.pid, signal.SIGTERM)
-        try:
-            process.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=3)
 
 
 def cleanup_actions(actions):
@@ -125,7 +100,7 @@ def provider_sshd(root, public_key, provider_environment, unix_forwarding="local
             except OSError:
                 return False
         try:
-            wait_for("fixture provider SSH listener", ready)
+            lab.wait_for("fixture provider SSH listener", ready, 15)
             yield port, key.with_suffix(".pub").read_text()
         except BaseException:
             log.seek(0)
@@ -134,7 +109,7 @@ def provider_sshd(root, public_key, provider_environment, unix_forwarding="local
         finally:
             cleanup_actions([
                 ("provider persistence", lambda: run("syq", "persist", "off", env=provider_environment)),
-                ("fixture provider sshd", lambda: terminate(process)),
+                ("fixture provider sshd", lambda: stop(process)),
             ])
 
 
@@ -197,7 +172,7 @@ def main():
                 print(output.read().decode(errors="replace"), flush=True)
                 raise
             finally:
-                cleanup_actions([("requester client", lambda: terminate(process))])
+                cleanup_actions([("requester client", lambda: stop(process))])
 
     try:
         source("mkdir", "-m", "700", source_root + "/r", source_root + "/c")
@@ -206,7 +181,7 @@ def main():
         destination_key = run("ssh-keygen", "-y", "-f", str(Path.home() / ".ssh/id_ed25519"))
         destination_identity = source_root + "/destination.pub"
         source("python3", "-c", "from pathlib import Path; import sys; "
-               "Path(sys.argv[1]).write_text(sys.stdin.read())", destination_identity, data=destination_key)
+               "Path(sys.argv[1]).write_text(sys.stdin.read())", destination_identity, stdin=destination_key)
         remote("source", "sh", "-c", 'test -z "${SSH_AUTH_SOCK:-}" && test ! -e ~/.ssh/id_ed25519')
         # This credential cannot authenticate to the destination, even when its
         # hostname and host key are supplied directly.
@@ -229,7 +204,7 @@ def main():
                     address = route.getsockname()[0]
                 source("python3", "-c", "from pathlib import Path; import sys; "
                        "Path(sys.argv[1]).write_text(sys.stdin.read())", source_root + "/known_hosts",
-                       data="[{}]:{} {}".format(address, port, host_key))
+                       stdin="[{}]:{} {}".format(address, port, host_key))
                 prefix = ("Host provider\n  HostName {}\n  Port {}\n  User syq\n"
                           "  IdentityFile {}\n  IdentityAgent none\n  IdentitiesOnly yes\n"
                           "  StreamLocalBindMask 0000\n"
@@ -244,7 +219,7 @@ def main():
                        "shutil.copy2(p,backup) if p.exists() else None; "
                        "old=p.read_bytes() if p.exists() else b''; "
                        "p.write_bytes(sys.stdin.buffer.read()+old); p.chmod(0o600)",
-                       source_root + "/config.saved", data=prefix)
+                       source_root + "/config.saved", stdin=prefix)
                 source_config_changed = True
                 # Only provider trust applies; its alias route and login must
                 # not override the requester's selected destination account.
@@ -273,7 +248,7 @@ def main():
                 assert "SAVED_OK" in execute("ssh", TARGET, "--", "printf SAVED_OK")
                 payload = "provider-copy-data\n" * 131072
                 source("python3", "-c", "from pathlib import Path; import sys; "
-                       "Path(sys.argv[1]).write_text(sys.stdin.read())", source_root + "/payload", data=payload)
+                       "Path(sys.argv[1]).write_text(sys.stdin.read())", source_root + "/payload", stdin=payload)
                 # The file exceeds the small-file control path. Both
                 # directions need independent authenticated data sessions,
                 # including in the MaxSessions=1 profile, with no new prompt.
@@ -311,7 +286,7 @@ def main():
                                 + "  UserKnownHostsFile /home/syq/.ssh/known_hosts\n  GlobalKnownHostsFile /dev/null\n")
                 config.write_bytes(trust_config.encode() + config.read_bytes())
                 source("python3", "-c", "from pathlib import Path; import sys; p=Path.home()/'.ssh/config'; "
-                       "p.write_text(sys.stdin.read()+p.read_text())", data=jump_config)
+                       "p.write_text(sys.stdin.read()+p.read_text())", stdin=jump_config)
                 jump_scope = source("syq", "persist", "on", "--ephemeral").strip()
                 scopes.append(jump_scope)
                 route_command = "printf 'ROUTE=%s\\n' \"$SSH_CONNECTION\""
@@ -338,12 +313,12 @@ def main():
                              "-i", source_root + "/provider_key", "-p", str(port), "-l", "syq"])
                          + ' -W "$1:$2" ' + shlex.quote(address) + "\n")
                 source("python3", "-c", "from pathlib import Path; import sys; p=Path(sys.argv[1]); "
-                       "p.write_text(sys.stdin.read()); p.chmod(0o700)", proxy_script, data=proxy)
+                       "p.write_text(sys.stdin.read()); p.chmod(0o700)", proxy_script, stdin=proxy)
                 proxy_config = ("Host " + via_command + "\n  HostName destination\n  User syq\n  Port 22\n"
                                 + "  IdentityFile " + destination_identity + "\n  IdentitiesOnly yes\n"
                                 + "  ProxyCommand " + proxy_script + " %h %p\n")
                 source("python3", "-c", "from pathlib import Path; import sys; p=Path.home()/'.ssh/config'; "
-                       "p.write_text(sys.stdin.read()+p.read_text())", data=proxy_config)
+                       "p.write_text(sys.stdin.read()+p.read_text())", stdin=proxy_config)
                 proxy_scope = source("syq", "persist", "on", "--ephemeral").strip()
                 scopes.append(proxy_scope)
                 route = execute("ssh", "--pscope", proxy_scope, "--auth-from", "provider", via_command,
@@ -365,14 +340,14 @@ def main():
                     denied_hosts = source_root + "/denied-known-hosts"
                     source("python3", "-c", "from pathlib import Path; import sys; "
                            "Path(sys.argv[1]).write_text(sys.stdin.read())", denied_hosts,
-                           data="[{}]:{} {}".format(address, denied_port, denied_key))
+                           stdin="[{}]:{} {}".format(address, denied_port, denied_key))
                     denied_config = ("Host denied-provider\n  HostName {}\n  Port {}\n  User syq\n"
                                      "  IdentityFile {}\n  IdentityAgent none\n  IdentitiesOnly yes\n"
                                      "  BatchMode yes\n  StrictHostKeyChecking yes\n  UserKnownHostsFile {}\n"
                                      "  GlobalKnownHostsFile /dev/null\n  UpdateHostKeys no\n").format(
                                          address, denied_port, source_root + "/provider_key", denied_hosts)
                     source("python3", "-c", "from pathlib import Path; import sys; p=Path.home()/'.ssh/config'; "
-                           "p.write_text(sys.stdin.read()+p.read_text())", data=denied_config)
+                           "p.write_text(sys.stdin.read()+p.read_text())", stdin=denied_config)
                     denied_scope = source("syq", "persist", "on", "--ephemeral").strip()
                     scopes.append(denied_scope)
                     text = execute("persist", "connect", TARGET, "--pscope", denied_scope,

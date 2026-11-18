@@ -13,8 +13,9 @@ With the argument `detached`, it checks the opposite: a `--detach` copy runs
 on after the command that started it returns, keeps the destination's entry
 key on the source only until it finishes, and leaves its log there.
 """
+import functools
 import hashlib
-import json
+import operator
 import os
 import shlex
 import signal
@@ -23,12 +24,14 @@ import sys
 import tempfile
 import time
 
+import syq_real_ssh_lab as lab
+
 SOURCE = "/tmp/syq-real-ssh/requester-loss-source"
 FILES = {"short": 921600, "long": 6291456}
 STOP_SECONDS = 5
 
-# Each probe runs on the host it inspects and reads its input from stdin.
-PROBES = {
+# Each probe runs on the host it inspects.
+lab.PROBES.update({
     # The copy's coordinator, found by its encoded destination operand, and
     # every process below it.
     "coordinator": r'''
@@ -99,30 +102,14 @@ root = Path(v["root"])
 print(json.dumps({name: hashlib.sha256(root.joinpath(name).read_bytes()).hexdigest()
                   for name in v["names"]}))
 ''',
-}
+})
 
 
-def probe(host, name, **values):
-    script = "import json, sys\nfrom pathlib import Path\nv = json.load(sys.stdin)\n" + PROBES[name]
-    result = subprocess.run(["ssh", host, "python3 -c " + shlex.quote(script)],
-                            input=json.dumps(values), capture_output=True, text=True,
-                            timeout=30, check=True)
-    return json.loads(result.stdout)
+probe = functools.partial(lab.probe, timeout=30)
 
 
-def wait_for(description, predicate, timeout):
-    deadline = time.monotonic() + timeout
-    progress = time.monotonic() + 2
-    state = None
-    while time.monotonic() < deadline:
-        done, state = predicate()
-        if done:
-            return state
-        if time.monotonic() >= progress:
-            print(f"waiting for {description}; last state: {state}", flush=True)
-            progress += 2
-        time.sleep(0.1)
-    raise AssertionError(f"timed out after {timeout}s waiting for {description}; last state: {state}")
+# Each probe returns (done, last observed state).
+wait_for = functools.partial(lab.wait_for, done=operator.itemgetter(0))
 
 
 def copy(destination, *options):
