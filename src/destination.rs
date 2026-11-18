@@ -1480,7 +1480,10 @@ impl Receiver {
         {
             bail!("named destination build mismatch; restart with matching syq builds");
         }
-        if envelope.secret != self.secret {
+        if !bool::from(subtle::ConstantTimeEq::ct_eq(
+            envelope.secret.as_bytes(),
+            self.secret.as_bytes(),
+        )) {
             bail!("named destination authentication failed");
         }
         match envelope.message {
@@ -1765,17 +1768,6 @@ pub(crate) fn requester_closed(socket: &UnixStream) -> bool {
         )
 }
 
-struct OwnedSsh(Child);
-impl Drop for OwnedSsh {
-    fn drop(&mut self) {
-        // The child is always started in a new process group. Kill the entire
-        // group, including ProxyCommand helpers, and reap its leader.
-        unsafe {
-            libc::kill(-(self.0.id() as i32), libc::SIGKILL);
-        }
-        let _ = self.0.wait();
-    }
-}
 const RETURN_SSH_OPTIONS: &[&str] = &[
     "-a",
     "-x",
@@ -2225,30 +2217,28 @@ pub(crate) fn serve_background(
                 .arg(format!("{} {}", spec.program, shell_words::join(&args)))
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .process_group(0);
-            let mut child = OwnedSsh(
-                command
-                    .spawn_guarded()
-                    .context("start receiving SSH connection")?,
-            );
+                .stderr(Stdio::piped());
+            // Its own process group, which polling and dropping it kill with
+            // any ProxyCommand helpers before reaping ssh.
+            let mut child = crate::process_group::ProcessGroup::spawn(&mut command)
+                .context("start receiving SSH connection")?;
             // A pipe takes this short line at once. If ssh has already
             // exited, the wait below reports why.
-            if let Some(input) = child.0.stdin.as_mut() {
+            if let Some(input) = child.child.stdin.as_mut() {
                 let _ = input.write_all(format!("{}\n", receiver.secret).as_bytes());
             }
             {
                 let mut state = state.lock().unwrap();
                 state.phase = "connecting".into();
                 state.error = None;
-                state.ssh_pid = Some(child.0.id());
+                state.ssh_pid = Some(child.child.id());
                 state.attempted = Some(Instant::now());
                 state.retry = None;
             }
             // One `Waiting` before `Ready` from a registration that takes
             // over, so the channel never fills.
             let (ready, readiness) = mpsc::sync_channel(2);
-            let mut stdout = child.0.stdout.take().unwrap();
+            let mut stdout = child.child.stdout.take().unwrap();
             let reader = std::thread::spawn(move || {
                 let first = read_message::<Reply>(&mut stdout);
                 let waiting = take_over && matches!(first, Ok(Reply::Waiting));
@@ -2256,7 +2246,7 @@ pub(crate) fn serve_background(
                     let _ = ready.send(read_message::<Reply>(&mut stdout));
                 }
             });
-            let mut stderr = child.0.stderr.take().unwrap();
+            let mut stderr = child.child.stderr.take().unwrap();
             let errors = Arc::new(Mutex::new(Vec::new()));
             let captured = errors.clone();
             let error_reader = std::thread::spawn(move || {
@@ -2276,7 +2266,7 @@ pub(crate) fn serve_background(
             let mut logged_in = false;
             // Whether the server was told to take the name.
             let mut told = false;
-            while !stop.load(Ordering::Acquire) && child.0.try_wait()?.is_none() {
+            while !stop.load(Ordering::Acquire) && child.poll()?.is_none() {
                 while let Ok(message) = readiness.try_recv() {
                     let ready = match message {
                         Ok(Reply::Ready) => true,
@@ -2296,7 +2286,7 @@ pub(crate) fn serve_background(
                 // when the replaced service's registration lets go of it.
                 if take_over && logged_in && !told && !preparing() {
                     told = true;
-                    if let Some(input) = child.0.stdin.as_mut() {
+                    if let Some(input) = child.child.stdin.as_mut() {
                         let _ = input.write_all(b"\n");
                     }
                 }
@@ -2310,7 +2300,7 @@ pub(crate) fn serve_background(
                 }
                 let _ = woken.recv_timeout(Duration::from_millis(50));
             }
-            let exit = child.0.try_wait()?;
+            let exit = child.poll()?;
             drop(child);
             drop(readiness);
             let _ = reader.join();
