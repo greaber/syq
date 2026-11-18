@@ -77,20 +77,12 @@ pub(super) fn serve(
             return;
         }
         "file-body-checksum" => {
-            use sha2::Digest as _;
             if let Some(md5) = headers.get("content-md5") {
                 assert_eq!(*md5, content_md5(&body));
-            } else if let Some(sha256) = headers.get("x-amz-checksum-sha256") {
-                use base64::Engine as _;
-                let digest = sha2::Sha256::digest(&body);
-                assert_eq!(
-                    *sha256,
-                    base64::engine::general_purpose::STANDARD.encode(digest)
-                );
             } else {
                 assert!(
                     !gate.0.swap(true, Ordering::AcqRel),
-                    "uploaded again without a checksum"
+                    "uploaded again without Content-MD5"
                 );
                 reply_checksum_required(socket);
                 return;
