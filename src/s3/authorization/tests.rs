@@ -706,3 +706,36 @@ fn validation_rejects_bad_buckets_and_scope_counts_on_both_sides() {
     });
     request.validate().unwrap();
 }
+
+/// A refusal ends the signing session; later requests it has not prepared
+/// report that refusal, not a disconnection.
+#[test]
+fn later_requests_report_an_earlier_refusal() {
+    let (socket, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let authorizer = std::thread::spawn(move || {
+        crate::destination::read_message::<serde_json::Value>(&mut peer).unwrap();
+        crate::destination::write_message(
+            &mut peer,
+            &serde_json::json!({ "Error": "outside approved paths" }),
+        )
+        .unwrap();
+    });
+    let authorization = Authorization::new(
+        "fixture".into(),
+        Configuration {
+            endpoint: "https://storage.example".into(),
+            region: "auto".into(),
+            expires_at: now().unwrap() + 60,
+            requested_lifetime: 60,
+        },
+        socket,
+    );
+    for key in ["outside/a", "allowed/b"] {
+        let error = format!(
+            "{:#}",
+            authorization.signed(Unsigned::new("GET", key)).unwrap_err()
+        );
+        assert_eq!(error, "authorizing machine: outside approved paths");
+    }
+    authorizer.join().unwrap();
+}
