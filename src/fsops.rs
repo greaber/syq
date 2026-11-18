@@ -3064,6 +3064,15 @@ impl FsOps {
         Ok(Some((root.clone(), relative)))
     }
 
+    /// Close the oldest cached descriptor if the cache is full, before
+    /// another is opened for it.
+    fn make_cache_room(&mut self) {
+        if self.fds.len() >= FD_CACHE_MAX {
+            let victim = self.fd_order.remove(0);
+            self.fds.remove(&victim);
+        }
+    }
+
     fn cached(&mut self, p: &Path, attempt: u32) -> Result<&CachedFile> {
         let key = FdKey {
             location: FileLocation::Path(p.to_path_buf()),
@@ -3071,10 +3080,7 @@ impl FsOps {
             private: false,
         };
         if !self.fds.contains_key(&key) {
-            if self.fds.len() >= FD_CACHE_MAX {
-                let victim = self.fd_order.remove(0);
-                self.fds.remove(&victim);
-            }
+            self.make_cache_room();
             let f = open_existing_regular(p, false)?;
             crate::inode_metadata::prepare_read(&f, self.inode_preservation.open_noatime);
             self.fds.insert(key.clone(), CachedFile::new(f));
@@ -3091,10 +3097,7 @@ impl FsOps {
         entry: CachedFile,
     ) {
         self.uncache_location(&location);
-        if self.fds.len() >= FD_CACHE_MAX {
-            let victim = self.fd_order.remove(0);
-            self.fds.remove(&victim);
-        }
+        self.make_cache_room();
         let key = FdKey {
             location,
             attempt,
@@ -3173,10 +3176,7 @@ impl FsOps {
         if !self.fds.contains_key(&key(relative)) {
             let got = stages::get(held)?.ok_or_else(|| stages::not_held(label))?;
             if !self.fds.contains_key(&key(&got.relative)) {
-                if self.fds.len() >= FD_CACHE_MAX {
-                    let victim = self.fd_order.remove(0);
-                    self.fds.remove(&victim);
-                }
+                self.make_cache_room();
                 self.fds.insert(
                     key(&got.relative),
                     CachedFile::held(got.file, got.in_use, got.declared),
@@ -3204,10 +3204,7 @@ impl FsOps {
             private: false,
         };
         if !self.fds.contains_key(&key) {
-            if self.fds.len() >= FD_CACHE_MAX {
-                let victim = self.fd_order.remove(0);
-                self.fds.remove(&victim);
-            }
+            self.make_cache_room();
             self.fds.insert(
                 key.clone(),
                 CachedFile::new(open_registered_source(
