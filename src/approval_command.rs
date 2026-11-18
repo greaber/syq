@@ -94,7 +94,8 @@ pub(crate) fn receiving_command(command: &[Vec<u8>], receiver: &str) -> Result<c
     );
     let destination = args.locations.last().context("copy destination missing")?;
     anyhow::ensure!(
-        destination.host.as_deref() == Some(&format!("@{receiver}")),
+        crate::route::classify(&args) == crate::route::Route::ToNamed
+            && destination.host.as_deref() == Some(&format!("@{receiver}")),
         "the requesting command copies to a different destination"
     );
     Ok(args)

@@ -1148,7 +1148,7 @@ fn reject_receiving_names(command: &str, args: &Args) -> Result<()> {
             bail!(notices::unsupported(&format!("syq {command}"), name));
         }
     }
-    if crate::destination::send::source_name(args).is_some() {
+    if crate::route::classify(args) == crate::route::Route::FromNamed {
         crate::destination::send::check_endpoints(args)?;
     }
     Ok(())
