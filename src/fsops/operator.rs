@@ -192,6 +192,76 @@ pub(crate) fn check_completion_directory(
     Ok(())
 }
 
+/// List the names in `directory` that start with `prefix`, sorted, for shell
+/// completion; hidden names only when the prefix starts with a dot. Returns
+/// at most `limit` entries and whether the listing stopped at a further
+/// matching name. `directories_only` returns only directories. An entry whose
+/// type cannot be read fails the listing, or with `skip_unreadable` is left
+/// out.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn list_completion_directory(
+    directory: &[u8],
+    confined_root: Option<&[u8]>,
+    prefix: &[u8],
+    limit: usize,
+    symlink_policy: OperatorSymlinkPolicy,
+    follow_final_symlinks: bool,
+    directories_only: bool,
+    skip_unreadable: bool,
+) -> Result<(Vec<CompletionEntry>, bool)> {
+    if directory.contains(&0)
+        || confined_root.is_some_and(|root| root.contains(&0))
+        || prefix.contains(&0)
+        || prefix.contains(&b'/')
+    {
+        bail!("invalid completion directory or prefix");
+    }
+    check_completion_directory(directory, confined_root, symlink_policy)?;
+    let mut entries = Vec::new();
+    let mut truncated = false;
+    if limit == 0 {
+        return Ok((entries, truncated));
+    }
+    for item in std::fs::read_dir(resolve(directory))? {
+        let item = match item {
+            Ok(item) => item,
+            Err(_) if skip_unreadable => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let name = item.file_name().into_vec();
+        if name == b"." || name == b".." || !name.starts_with(prefix) {
+            continue;
+        }
+        if !prefix.starts_with(b".") && name.starts_with(b".") {
+            continue;
+        }
+        if entries.len() == limit {
+            truncated = true;
+            break;
+        }
+        let file_type = match item.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) if skip_unreadable => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let directory = file_type.is_dir()
+            || (file_type.is_symlink()
+                && follow_final_symlinks
+                && check_completion_directory(
+                    item.path().as_os_str().as_bytes(),
+                    confined_root,
+                    symlink_policy,
+                )
+                .is_ok());
+        if directories_only && !directory {
+            continue;
+        }
+        entries.push(CompletionEntry { name, directory });
+    }
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok((entries, truncated))
+}
+
 /// A receiver-side selection retained from the ownership walk until it is
 /// either created or made the connection's working directory. Keeping the fd,
 /// rather than just its identity, closes the post-check pathname race.

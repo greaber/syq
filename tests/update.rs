@@ -724,14 +724,44 @@ fn self_update_accepts_the_released_v052_receipt() {
         serde_json::from_str(include_str!("fixtures/standalone-install-v0.5.2.json")).unwrap();
     receipt["binary"] = fixture.installed.to_str().unwrap().into();
     let legacy = fixture.config.join("syq/install.json");
-    write_legacy_receipt(&legacy, &serde_json::to_vec(&receipt).unwrap());
+    let saved = serde_json::to_vec(&receipt).unwrap();
+    write_legacy_receipt(&legacy, &saved);
     assert_success(&fixture.command("--self-update"));
-    let updated: serde_json::Value = serde_json::from_slice(&fs::read(&legacy).unwrap()).unwrap();
-    assert_eq!(updated["version"], version);
-    assert!(!fixture
-        .installed
-        .with_file_name(".syq-install.json")
-        .exists());
+    // The update's receipt is beside the executable now; the old one stays.
+    assert_eq!(fixture.receipt()["version"], version);
+    assert_eq!(fixture.receipt()["binary"], receipt["binary"]);
+    assert_eq!(fs::read(&legacy).unwrap(), saved);
+}
+
+/// With nothing newer to install, self-update still moves the receipt from
+/// before 0.6.0 beside the executable, and from then on reads only that one.
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn self_update_moves_the_released_v052_receipt_beside_the_executable() {
+    let fixture = UpdateFixture::new(
+        env!("CARGO_PKG_VERSION"),
+        &format!("v{}", env!("CARGO_PKG_VERSION")),
+    );
+    let mut receipt: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/standalone-install-v0.5.2.json")).unwrap();
+    receipt["binary"] = fixture.installed.to_str().unwrap().into();
+    let legacy = fixture.config.join("syq/install.json");
+    let saved = serde_json::to_vec(&receipt).unwrap();
+    write_legacy_receipt(&legacy, &saved);
+    let current = fixture.command("--self-update");
+    assert_success(&current);
+    assert!(
+        String::from_utf8_lossy(&current.stdout).contains("is already the newest release"),
+        "{}",
+        String::from_utf8_lossy(&current.stdout)
+    );
+    assert_eq!(fixture.receipt(), receipt);
+    assert_eq!(fs::read(&legacy).unwrap(), saved);
+    assert_eq!(fs::read(&fixture.installed).unwrap(), fixture.original);
+    // The old receipt no longer matters.
+    fs::write(&legacy, b"invalid JSON").unwrap();
+    assert_success(&fixture.command("--self-update"));
+    assert_eq!(fixture.receipt(), receipt);
 }
 
 #[test]
@@ -774,11 +804,16 @@ fn self_update_reads_a_legacy_receipt_only_as_a_private_file() {
     fs::write(&legacy, &padded).unwrap();
     fs::set_permissions(&legacy, fs::Permissions::from_mode(0o600)).unwrap();
     refused("oversized receipt");
+    // Nothing was moved beside the executable from those.
+    assert!(!fixture
+        .installed
+        .with_file_name(".syq-install.json")
+        .exists());
     // The private file syq wrote.
     fs::write(&legacy, &saved).unwrap();
     assert_success(&fixture.command("--self-update"));
-    let updated: serde_json::Value = serde_json::from_slice(&fs::read(&legacy).unwrap()).unwrap();
-    assert_eq!(updated["version"], version);
+    assert_eq!(fixture.receipt()["version"], version);
+    assert_eq!(fs::read(&legacy).unwrap(), saved);
 }
 
 #[test]

@@ -221,16 +221,22 @@ with tempfile.TemporaryDirectory(prefix='syq-storage-authorization-') as directo
                 for descriptor in [False, True]:
                     key = prefix+('/metadata-stream' if descriptor else '/metadata-file')+('-multipart' if len(payload)>5*1024*1024 else '')
                     checks.request('PUT', key, payload, headers={
-                        'x-amz-meta-example': 'kept', 'content-type': 'text/plain'})
+                        'x-amz-meta-example': 'kept', 'content-type': 'text/plain',
+                        'x-amz-meta-replaced': 'stored'})
                     source_args = ['--src-fd', '0'] if descriptor else [metadata_source]
+                    # The command's header replaces the stored value in the
+                    # approved request, so the sent request must carry it too:
+                    # after preparation, an unapproved request fails.
                     copy([*source_args, '--to', 's3://syq-storage-test', '--as', key,
                           '--copy-metadata=mtime', '--if-exists=error-if-different',
-                          '--s3-write-header', 'x-amz-meta-write-probe: yes'], disconnect=False,
+                          '--s3-write-header', 'x-amz-meta-write-probe: yes',
+                          '--s3-write-header', 'x-amz-meta-replaced: command'], disconnect=False,
                          redirection=(' < '+metadata_source) if descriptor else '')
                     headers, body = checks.request('GET', key)
                     headers = {k.lower(): v for k, v in headers.items()}
                     assert body == payload
                     assert headers['x-amz-meta-write-probe'] == 'yes', headers
+                    assert headers['x-amz-meta-replaced'] == 'command', headers
                     assert headers['x-amz-meta-example'] == 'kept', headers
                     assert headers['content-type'] == 'text/plain', headers
                     assert headers['x-amz-meta-syq-mtime'] == '123', headers

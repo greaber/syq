@@ -1141,16 +1141,10 @@ pub(super) fn metadata_update_request(
         )
         .header("x-amz-metadata-directive", "REPLACE")
         .header("x-amz-tagging-directive", "COPY");
-    for (name, value) in desired.metadata().into_iter().flat_map(|m| m.iter()) {
-        request = request.header(&format!("x-amz-meta-{name}"), value);
-    }
+    request
+        .headers
+        .extend(super::metadata_copy::object_headers(desired));
     for (name, value) in [
-        ("content-type", desired.content_type()),
-        ("content-encoding", desired.content_encoding()),
-        ("content-language", desired.content_language()),
-        ("content-disposition", desired.content_disposition()),
-        ("cache-control", desired.cache_control()),
-        ("expires", desired.expires_string()),
         (
             "x-amz-storage-class",
             desired.storage_class().map(|v| v.as_str()),
@@ -1168,16 +1162,17 @@ pub(super) fn metadata_update_request(
             head.bucket_key_enabled()
                 .map(|v| if v { "true" } else { "false" }),
         ),
-        (
-            "x-amz-website-redirect-location",
-            desired.website_redirect_location(),
-        ),
     ] {
         if let Some(value) = value {
             request = request.header(name, value);
         }
     }
     merge_metadata_encryption(&mut request, overrides)?;
+    // Headers the command adds replace the object's own, as the client adds
+    // them to the request, so the description is what is sent.
+    for Header(name, value) in overrides {
+        request.headers.insert(name.clone(), value.clone());
+    }
     Ok(request)
 }
 
@@ -1231,11 +1226,6 @@ fn merge_metadata_encryption(
                     request.headers.remove(name);
                 }
             }
-        }
-    }
-    for Header(name, value) in overrides {
-        if name.starts_with("x-amz-server-side-encryption") {
-            request.headers.insert(name.clone(), value.clone());
         }
     }
     Ok(())

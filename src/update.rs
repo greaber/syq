@@ -129,6 +129,17 @@ pub fn self_update() -> Result<()> {
     let (receipt_path, mut receipt) = managed_receipt().context(
         "self-update is only available for installs made by the standalone installer; Homebrew installs should use `brew upgrade syq`, and source builds should be rebuilt or replaced with a standalone install",
     )?;
+    // An install from before 0.6.0 gets its receipt beside the executable
+    // now, read from the old one, which stays (`managed_receipt`). Until
+    // that works, the old one keeps serving.
+    if matches!(fs::symlink_metadata(&receipt_path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        if let Err(error) = write_receipt(&receipt_path, &receipt) {
+            crate::output::diagnostic!(
+                "syq: could not copy the install receipt beside syq: {error:#}"
+            );
+        }
+    }
     let release = fetch_latest(FetchMode::Interactive)?;
     match release.version.cmp(&current_version()?) {
         std::cmp::Ordering::Less => bail!(
@@ -1492,6 +1503,11 @@ fn fetch_into(url: &str, sink: &mut dyn DownloadSink, mode: FetchMode, limit: u6
     Err(crate::tls::download_error(last_error.unwrap())).with_context(|| format!("download {url}"))
 }
 
+/// The receipt for this executable, and the path beside it where updates
+/// write it. That is where it is read from too, except for an install whose
+/// only receipt is the one releases before 0.6.0 kept in the configuration
+/// directory, which every later release went on updating there; a
+/// self-update writes that one beside the executable (`self_update`).
 fn managed_receipt() -> Result<(PathBuf, InstallReceipt)> {
     // Replacing an installed release with a custom build must not let a stale
     // receipt turn that custom executable back into an upstream release.
@@ -1499,8 +1515,8 @@ fn managed_receipt() -> Result<(PathBuf, InstallReceipt)> {
         bail!("source builds must be rebuilt or replaced with a standalone install");
     }
     let current = canonical_current_exe()?;
-    let path = receipt_read_path(receipt_path_for(&current)?)?;
-    let receipt = read_receipt(&path)?;
+    let adjacent = receipt_path_for(&current)?;
+    let receipt = read_receipt(&receipt_read_path(adjacent.clone())?)?;
     if canonical_or_original(&receipt.binary) != current {
         bail!(
             "standalone install receipt belongs to {}, not {}",
@@ -1508,7 +1524,7 @@ fn managed_receipt() -> Result<(PathBuf, InstallReceipt)> {
             current.display()
         );
     }
-    Ok((path, receipt))
+    Ok((adjacent, receipt))
 }
 
 fn read_receipt(path: &Path) -> Result<InstallReceipt> {
@@ -1528,7 +1544,7 @@ fn is_legacy_receipt(path: &Path) -> bool {
     legacy_receipt_path().is_ok_and(|legacy| legacy == path)
 }
 
-/// Read the receipt that released versions kept in the configuration
+/// Read the receipt that releases before 0.6.0 kept in the configuration
 /// directory, away from the executable it names. It must be a regular file
 /// of this user's that group and others cannot write, as syq wrote it, and
 /// is read without following a link: whoever could put it there could
@@ -1611,8 +1627,9 @@ fn receipt_path_for(binary: &Path) -> Result<PathBuf> {
 }
 
 fn receipt_read_path(adjacent: PathBuf) -> Result<PathBuf> {
-    // Released versions stored their receipt in XDG_CONFIG_HOME. Read it only
-    // when no adjacent receipt exists, keeping malformed new state visible.
+    // Releases before 0.6.0 stored their receipt in XDG_CONFIG_HOME, and
+    // later ones updated it there. Read it only when no adjacent receipt
+    // exists, keeping malformed new state visible.
     match fs::symlink_metadata(&adjacent) {
         Ok(_) => Ok(adjacent),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => legacy_receipt_path(),

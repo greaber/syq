@@ -1,10 +1,7 @@
 //! Which route a copy takes, as its endpoints show, and the options each
 //! route that another machine approves refuses. The machine that asks
-//! classifies a command here. So do the approvers of routes 3, 4 and 6 and
-//! of copies from a receiving machine, and the source's directive checks.
-//! The route 2 approver (`approval_command::receiving_command`) and the
-//! destination's directive checks (`directive::destination_command`) still
-//! test the destination themselves.
+//! classifies a command here, as do the approvers (`destination::approve`)
+//! and the directive checks of sources and destinations.
 use crate::cli::{Args, CoordinateAt, Location, PeerAuth};
 use anyhow::{bail, Result};
 
@@ -99,23 +96,32 @@ impl Opt {
 const AUTO: &[CoordinateAt] = &[CoordinateAt::Auto];
 const AUTO_OR_SOURCE: &[CoordinateAt] = &[CoordinateAt::Auto, CoordinateAt::Src];
 
-/// The options a route refuses, and the one message that refuses them.
+/// Options a route refuses, and the message that refuses them.
 struct Refusal {
     options: &'static [Opt],
     message: &'static str,
 }
 
-/// What each approved route refuses. `Own` refuses nothing here.
-fn refusal(route: Route) -> Option<Refusal> {
+/// What each approved route refuses, in the order it checks. `Own` refuses
+/// nothing here.
+fn refusals(route: Route) -> &'static [Refusal] {
     use Opt::*;
-    let (options, message): (&'static [Opt], _) = match route {
-        Route::Own => return None,
-        Route::ToNamed => (
-            &[SyqPath, Rsh, Detach, RestrictedGrant, NoTcpEncryption, PeerAuth],
-            "named destinations own their connection; --syq-path, --rsh, --detach, --peer-auth, and --no-tcp-encryption cannot be combined with them",
-        ),
-        Route::FromNamed => (
-            &[
+    match route {
+        Route::Own => &[],
+        Route::ToNamed => &[
+            Refusal {
+                options: &[SyqPath, Rsh, Detach, RestrictedGrant, NoTcpEncryption, PeerAuth],
+                message: "named destinations own their connection; --syq-path, --rsh, --detach, --peer-auth, and --no-tcp-encryption cannot be combined with them",
+            },
+            // Refused before the receiving machine asks its user, with the
+            // message the copy would get when it started.
+            Refusal {
+                options: &[CoordinateAt(AUTO)],
+                message: "--coordinate-at currently applies only to copies between two remote endpoints",
+            },
+        ],
+        Route::FromNamed => &[Refusal {
+            options: &[
                 Rsh,
                 SyqPath,
                 Detach,
@@ -124,10 +130,10 @@ fn refusal(route: Route) -> Option<Refusal> {
                 PeerAuth,
                 CoordinateAt(AUTO),
             ],
-            "copies from receiving machines own their connection; --rsh, --syq-path, --detach, --peer-auth, --coordinate-at, and --no-tcp-encryption cannot be combined with them",
-        ),
-        Route::Upload => (
-            &[
+            message: "copies from receiving machines own their connection; --rsh, --syq-path, --detach, --peer-auth, --coordinate-at, and --no-tcp-encryption cannot be combined with them",
+        }],
+        Route::Upload => &[Refusal {
+            options: &[
                 Rsh,
                 SyqPath,
                 NoBootstrap,
@@ -136,10 +142,10 @@ fn refusal(route: Route) -> Option<Refusal> {
                 PeerAuth,
                 CoordinateAt(AUTO),
             ],
-            "return authorization owns its SSH connection; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --detach, --peer-auth, or --coordinate-at",
-        ),
-        Route::Download => (
-            &[
+            message: "return authorization owns its SSH connection; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --detach, --peer-auth, or --coordinate-at",
+        }],
+        Route::Download => &[Refusal {
+            options: &[
                 Rsh,
                 SyqPath,
                 NoBootstrap,
@@ -148,10 +154,10 @@ fn refusal(route: Route) -> Option<Refusal> {
                 PeerAuth,
                 CoordinateAt(AUTO),
             ],
-            "a copy from another server that a receiving machine approves reads it through that server's restricted receiver; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --detach, --peer-auth, or --coordinate-at",
-        ),
-        Route::Between => (
-            &[
+            message: "a copy from another server that a receiving machine approves reads it through that server's restricted receiver; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --detach, --peer-auth, or --coordinate-at",
+        }],
+        Route::Between => &[Refusal {
+            options: &[
                 Rsh,
                 SyqPath,
                 NoBootstrap,
@@ -161,15 +167,14 @@ fn refusal(route: Route) -> Option<Refusal> {
                 PeerAuth,
                 CoordinateAt(AUTO_OR_SOURCE),
             ],
-            "a copy between two servers approved by another machine runs on the source with the destination's restricted receiver; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --detach, --peer-auth or --coordinate-at local or dst",
-        ),
-    };
-    Some(Refusal { options, message })
+            message: "a copy between two servers approved by another machine runs on the source with the destination's restricted receiver; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --detach, --peer-auth or --coordinate-at local or dst",
+        }],
+    }
 }
 
 /// Refuse the options `route` cannot carry, with its message.
 pub(crate) fn refuse_options(route: Route, args: &Args) -> Result<()> {
-    if let Some(refusal) = refusal(route) {
+    for refusal in refusals(route) {
         if refusal.options.iter().any(|option| option.given(args)) {
             bail!(refusal.message);
         }
