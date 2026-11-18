@@ -626,34 +626,12 @@ impl Engine {
         replace: bool,
         must_be_new: bool,
     ) -> (Unsigned, BTreeMap<String, String>) {
-        let mut object = BTreeMap::new();
-        for (name, value) in desired.metadata().into_iter().flat_map(|m| m.iter()) {
-            object.insert(format!("x-amz-meta-{name}"), value.clone());
-        }
-        for (name, value) in [
-            ("content-type", desired.content_type()),
-            ("content-encoding", desired.content_encoding()),
-            ("content-language", desired.content_language()),
-            ("content-disposition", desired.content_disposition()),
-            ("cache-control", desired.cache_control()),
-            // Expires is an opaque HTTP hint. Providers can retain values
-            // such as "0" which the SDK's typed date setter cannot represent.
-            ("expires", desired.expires_string()),
-            (
-                "x-amz-website-redirect-location",
-                desired.website_redirect_location(),
-            ),
-            (
-                "x-amz-storage-class",
-                self.args
-                    .s3_metadata
-                    .storage_class
-                    .then(|| super::super::metadata_fields::storage_class(desired)),
-            ),
-        ] {
-            if let Some(value) = value {
-                object.insert(name.to_owned(), value.to_owned());
-            }
+        let mut object = super::super::metadata_copy::object_headers(desired);
+        if self.args.s3_metadata.storage_class {
+            object.insert(
+                "x-amz-storage-class".into(),
+                super::super::metadata_fields::storage_class(desired).into(),
+            );
         }
         let mut request = Unsigned::new("PUT", key)
             .header(

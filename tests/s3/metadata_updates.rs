@@ -178,16 +178,32 @@ fn check_metadata(headers: &std::collections::HashMap<String, String>, fault: &s
             }
         );
     }
+    // A "-class" fault adds the storage class the object already has a value
+    // for, and an "-attributes" fault also cache control and user metadata.
+    let attributes = fault.ends_with("attributes");
     for (name, value) in [
-        ("x-amz-storage-class", "REDUCED_REDUNDANCY"),
+        (
+            "x-amz-storage-class",
+            if attributes || fault.ends_with("class") {
+                "STANDARD_IA"
+            } else {
+                "REDUCED_REDUNDANCY"
+            },
+        ),
         ("content-type", "application/example"),
         ("content-encoding", "identity"),
         ("content-language", "en"),
         ("content-disposition", "inline"),
-        ("cache-control", "max-age=60"),
+        (
+            "cache-control",
+            if attributes { "no-store" } else { "max-age=60" },
+        ),
         ("expires", "0"),
         ("x-amz-website-redirect-location", "/destination"),
-        ("x-amz-meta-other", "destination"),
+        (
+            "x-amz-meta-other",
+            if attributes { "added" } else { "destination" },
+        ),
         ("x-amz-meta-syq-mode", "384"),
         ("x-amz-meta-syq-mtime", "10"),
     ] {
@@ -302,6 +318,29 @@ fn metadata_encryption_overrides_work_for_single_and_multipart_copies() {
             for flag in ["--s3-header", "--s3-write-header"] {
                 run_metadata_update(fault, upload, flag, &headers, true);
             }
+        }
+    }
+}
+
+#[test]
+fn added_headers_replace_the_objects_own_attributes_in_metadata_updates() {
+    // The command's headers win over the stored attributes the self-copy
+    // repeats, as they do for copies between keys, so what is sent is what
+    // --auth-from approves. S3-to-S3 copies refuse content and user metadata
+    // headers, so only an upload's metadata update can take them.
+    let headers = [
+        "x-amz-storage-class: STANDARD_IA",
+        "cache-control: no-store",
+        "x-amz-meta-other: added",
+    ];
+    for (fault, upload, headers) in [
+        ("metadata-update-small-class", false, &headers[..1]),
+        ("metadata-update-large-class", false, &headers[..1]),
+        ("metadata-update-small-attributes", true, &headers[..]),
+        ("metadata-update-large-attributes", true, &headers[..]),
+    ] {
+        for flag in ["--s3-header", "--s3-write-header"] {
+            run_metadata_update(fault, upload, flag, headers, true);
         }
     }
 }
