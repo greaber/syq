@@ -5646,6 +5646,43 @@ fn destination_worker_claims_copy_sources_from_the_foreign_session() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn copy_worker_claims_every_named_source_over_one_broker_connection() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&destination).unwrap();
+    let files: Vec<_> = (0..20)
+        .map(|index| {
+            let file = source.join(format!("f{index}"));
+            fs::write(&file, b"source").unwrap();
+            file
+        })
+        .collect();
+    let source_session = DescriptorSessionSlot::default();
+    let mut source_control = FsOps::with_descriptor_session(source_session.clone());
+    let response = source_control.handle(&crate::test_support::register_source_roots(&files, 1));
+    let Response::SourceRootsRegistered(roots) = response else {
+        panic!("unexpected source registration response: {response:?}")
+    };
+    assert!(roots.iter().all(|root| root.leaf_ticket.is_some()));
+
+    let destination_session = DescriptorSessionSlot::default();
+    destination_session
+        .register(File::open(&destination).unwrap())
+        .unwrap();
+    let mut worker = FsOps::with_descriptor_session(destination_session);
+    worker.destination_root = Some(Arc::new(Root::open(&destination).unwrap()));
+    worker.destination_prefix = Some(b".".to_vec());
+    // Each source's directory and exact file: 40 claims, one connection.
+    let opened = source_session.broker_connections();
+    worker.initialize_copy_sources(&roots).unwrap();
+    assert_eq!(source_session.broker_connections() - opened, 1);
+    assert_eq!(worker.source_roots.len(), files.len());
+}
+
 #[test]
 fn source_initialization_rejects_mismatched_bad_and_excess_roots_atomically() {
     let temporary = crate::test_support::tempdir().unwrap();

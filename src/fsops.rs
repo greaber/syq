@@ -2,7 +2,8 @@
 //! by `syq --server` for remote endpoints, so both sides behave identically.
 
 use crate::descriptor_broker::{
-    acquire_descriptor, DescriptorSessionSlot, DescriptorTicket, RegisteredRootId, MAX_SOURCE_ROOTS,
+    acquire_descriptor, acquire_descriptors, DescriptorSessionSlot, DescriptorTicket,
+    RegisteredRootId, MAX_SOURCE_ROOTS,
 };
 use crate::proto::*;
 use crate::rooted::{
@@ -16,9 +17,7 @@ use crate::sys::{
 use crate::write_gate::CachedFile;
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
-#[cfg(target_os = "linux")]
-use std::collections::HashSet;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 #[cfg(target_os = "linux")]
@@ -2406,32 +2405,48 @@ impl FsOps {
         if sources.len() > MAX_SOURCE_ROOTS {
             bail!(too_many_sources(sources.len()));
         }
-        let mut roots = HashMap::with_capacity(sources.len());
         let endpoint_ticket = &sources[0].ticket;
+        let mut ids = HashSet::with_capacity(sources.len());
+        let mut tickets = Vec::with_capacity(sources.len() * 2);
         for source in sources {
             source.validate()?;
             if !source.ticket.same_session(endpoint_ticket) {
                 bail!("source roots belong to different endpoint sessions");
             }
             let id = source.selection.root();
-            if roots.contains_key(&id) {
+            if !ids.insert(id) {
                 bail!(
                     "source worker received duplicate registered root {}",
                     id.get()
                 );
             }
-            let acquire = |ticket: &DescriptorTicket| {
-                if claim_foreign_session {
-                    acquire_descriptor(ticket)
-                } else {
-                    self.descriptor_session.acquire(ticket)
-                }
+            tickets.push(&source.ticket);
+            if let (Some(ticket), Some(_)) = (&source.leaf_ticket, &source.expected_leaf) {
+                tickets.push(ticket);
+            }
+        }
+        // Claim every descriptor at once: over one broker connection when
+        // they belong to another process's session, rather than a
+        // connection (and a broker thread) for each.
+        let mut descriptors = if claim_foreign_session {
+            acquire_descriptors(&tickets)?
+        } else {
+            self.descriptor_session.acquire_many(&tickets)?
+        }
+        .into_iter();
+        let mut roots = HashMap::with_capacity(sources.len());
+        for source in sources {
+            let id = source.selection.root();
+            let mut acquire = || {
+                descriptors
+                    .next()
+                    .context("descriptor broker returned too few source descriptors")
             };
-            let directory = acquire(&source.ticket)?;
+            let directory = acquire()?;
             let root = Arc::new(Root::from_directory(directory)?);
             let leaf_object = match (&source.leaf_ticket, &source.expected_leaf) {
-                (Some(ticket), Some(expected)) => {
-                    let object = acquire(ticket)?;
+                (Some(_), Some(expected)) => {
+                    let object = acquire()?;
                     let metadata = root_metadata_from_std(
                         &object
                             .metadata()
