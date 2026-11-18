@@ -119,6 +119,12 @@ pub fn self_update() -> Result<()> {
     let (receipt_path, mut receipt) = managed_receipt().context(
         "self-update is only available for installs made by the standalone installer; Homebrew installs should use `brew upgrade syq`, and source builds should be rebuilt or replaced with a standalone install",
     )?;
+    // An install from before 0.6.0 gets its receipt beside the executable
+    // now, read from the old one, which stays (`managed_receipt`).
+    if matches!(fs::symlink_metadata(&receipt_path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        write_receipt(&receipt_path, &receipt).context("move the install receipt beside syq")?;
+    }
     let release = fetch_latest(FetchMode::Interactive)?;
     match release.version.cmp(&current_version()?) {
         std::cmp::Ordering::Less => bail!(
@@ -206,14 +212,21 @@ pub(crate) fn register_standalone_install_at(binary: PathBuf) -> Result<()> {
 /// for a different executable (or malformed metadata) is not such a record.
 pub(crate) fn was_standalone_install(binary: &Path) -> Result<bool> {
     let (parent, name) = install_path_parts(binary)?;
-    let path = receipt_path(parent, name);
+    let path = receipt_read_path(receipt_path(parent, name))?;
     match fs::metadata(&path) {
         Ok(metadata) if !metadata.is_file() => return Ok(false),
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error).context("inspect previous standalone install receipt"),
     }
-    let bytes = fs::read(&path).context("read previous standalone install receipt")?;
+    let bytes = if is_legacy_receipt(&path) {
+        match read_legacy_receipt(&path) {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(false),
+        }
+    } else {
+        fs::read(&path).context("read previous standalone install receipt")?
+    };
     let Ok(receipt) = parse_receipt(&bytes) else {
         return Ok(false);
     };
@@ -256,40 +269,32 @@ pub fn after_success(quiet: bool) {
         return;
     }
     crate::output::diagnostic!(
-        "syq: update {} is available; {}",
+        "syq: update {} is available; run `{}`",
         release.version,
-        install.advice()
+        install.upgrade_command()
     );
 }
 
-/// Installations that receive update reminders, each with its own way to
-/// upgrade. Source builds have neither a receipt nor a Homebrew path.
+/// Installations that receive update reminders, each with its own upgrade
+/// command. Source builds have neither a receipt nor a Homebrew path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RemindedInstall {
     Standalone,
-    /// A standalone install with only the receipt from before 0.6.0
-    /// (`LegacyReceiptOnly`).
-    Reinstall,
     Homebrew,
 }
 
 impl RemindedInstall {
-    fn advice(self) -> &'static str {
+    fn upgrade_command(self) -> &'static str {
         match self {
-            RemindedInstall::Standalone => "run `syq --self-update`",
-            RemindedInstall::Reinstall => {
-                "reinstall syq with the standalone installer, so that `syq --self-update` works again"
-            }
-            RemindedInstall::Homebrew => "run `brew upgrade syq`",
+            RemindedInstall::Standalone => "syq --self-update",
+            RemindedInstall::Homebrew => "brew upgrade syq",
         }
     }
 }
 
 fn reminded_install() -> Option<RemindedInstall> {
-    match managed_receipt() {
-        Ok(_) => return Some(RemindedInstall::Standalone),
-        Err(error) if error.is::<LegacyReceiptOnly>() => return Some(RemindedInstall::Reinstall),
-        Err(_) => {}
+    if managed_receipt().is_ok() {
+        return Some(RemindedInstall::Standalone);
     }
     let executable = canonical_current_exe().ok()?;
     is_homebrew_keg_path(&executable).then_some(RemindedInstall::Homebrew)
@@ -1439,6 +1444,11 @@ fn fetch_into(url: &str, sink: &mut dyn DownloadSink, mode: FetchMode, limit: u6
     Err(crate::tls::download_error(last_error.unwrap())).with_context(|| format!("download {url}"))
 }
 
+/// The receipt for this executable, and the path beside it where updates
+/// write it. That is where it is read from too, except for an install whose
+/// only receipt is the one releases before 0.6.0 kept in the configuration
+/// directory, which every later release went on updating there; a
+/// self-update writes that one beside the executable (`self_update`).
 fn managed_receipt() -> Result<(PathBuf, InstallReceipt)> {
     // Replacing an installed release with a custom build must not let a stale
     // receipt turn that custom executable back into an upstream release.
@@ -1446,15 +1456,8 @@ fn managed_receipt() -> Result<(PathBuf, InstallReceipt)> {
         bail!("source builds must be rebuilt or replaced with a standalone install");
     }
     let current = canonical_current_exe()?;
-    let path = receipt_path_for(&current)?;
-    if let Err(error) = fs::symlink_metadata(&path) {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            if let Some(legacy) = legacy_receipt_for(&current) {
-                return Err(LegacyReceiptOnly { current, legacy }.into());
-            }
-        }
-    }
-    let receipt = read_receipt(&path)?;
+    let adjacent = receipt_path_for(&current)?;
+    let receipt = read_receipt(&receipt_read_path(adjacent.clone())?)?;
     if canonical_or_original(&receipt.binary) != current {
         bail!(
             "standalone install receipt belongs to {}, not {}",
@@ -1462,53 +1465,58 @@ fn managed_receipt() -> Result<(PathBuf, InstallReceipt)> {
             current.display()
         );
     }
-    Ok((path, receipt))
-}
-
-/// A standalone install whose only receipt is where releases before 0.6.0
-/// kept it, in the configuration directory, away from the executable it
-/// names. Every later release updated that one in place. Reinstalling
-/// writes one beside the executable.
-#[derive(Debug)]
-struct LegacyReceiptOnly {
-    current: PathBuf,
-    legacy: PathBuf,
-}
-impl std::fmt::Display for LegacyReceiptOnly {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} has no install receipt beside it, only one in {}, where syq before 0.6.0 kept it; reinstall syq with the standalone installer",
-            self.current.display(),
-            self.legacy.display()
-        )
-    }
-}
-impl std::error::Error for LegacyReceiptOnly {}
-
-/// The receipt from before 0.6.0, when it names `current`. It decides only
-/// what to tell the user, never what to update.
-fn legacy_receipt_for(current: &Path) -> Option<PathBuf> {
-    let legacy = config_dir().ok()?.join("install.json");
-    let mut bytes = Vec::new();
-    // Never block on a FIFO there.
-    std::os::unix::fs::OpenOptionsExt::custom_flags(
-        OpenOptions::new().read(true),
-        libc::O_NONBLOCK | libc::O_NOCTTY,
-    )
-    .open(&legacy)
-    .ok()?
-    .take(64 * 1024)
-    .read_to_end(&mut bytes)
-    .ok()?;
-    let receipt = parse_receipt(&bytes).ok()?;
-    (canonical_or_original(&receipt.binary) == current).then_some(legacy)
+    Ok((adjacent, receipt))
 }
 
 fn read_receipt(path: &Path) -> Result<InstallReceipt> {
-    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let bytes = if is_legacy_receipt(path) {
+        read_legacy_receipt(path)?
+    } else {
+        fs::read(path).with_context(|| format!("read {}", path.display()))?
+    };
     parse_receipt(&bytes)
         .with_context(|| format!("read standalone install receipt {}", path.display()))
+}
+
+/// The most a receipt may hold; one is a few hundred bytes.
+const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
+
+fn is_legacy_receipt(path: &Path) -> bool {
+    legacy_receipt_path().is_ok_and(|legacy| legacy == path)
+}
+
+/// Read the receipt that releases before 0.6.0 kept in the configuration
+/// directory, away from the executable it names. It must be a regular file
+/// of this user's that group and others cannot write, as syq wrote it, and
+/// is read without following a link: whoever could put it there could
+/// otherwise choose which executable an update replaces.
+fn read_legacy_receipt(path: &Path) -> Result<Vec<u8>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect {}", path.display()))?;
+    if !metadata.is_file()
+        || metadata.uid() != crate::rooted::own_uid()
+        || metadata.mode() & 0o022 != 0
+    {
+        bail!(
+            "{} must be a regular file that you own and nobody else can write",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_RECEIPT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", path.display()))?;
+    if bytes.len() as u64 > MAX_RECEIPT_BYTES {
+        bail!("{} is too large to be an install receipt", path.display());
+    }
+    Ok(bytes)
 }
 
 fn parse_receipt(bytes: &[u8]) -> Result<InstallReceipt> {
@@ -1559,13 +1567,28 @@ fn receipt_path_for(binary: &Path) -> Result<PathBuf> {
     Ok(receipt_path(parent, name))
 }
 
+fn receipt_read_path(adjacent: PathBuf) -> Result<PathBuf> {
+    // Releases before 0.6.0 stored their receipt in XDG_CONFIG_HOME, and
+    // later ones updated it there. Read it only when no adjacent receipt
+    // exists, keeping malformed new state visible.
+    match fs::symlink_metadata(&adjacent) {
+        Ok(_) => Ok(adjacent),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => legacy_receipt_path(),
+        Err(error) => Err(error).context("inspect standalone install receipt"),
+    }
+}
+
+fn legacy_receipt_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join("install.json"))
+}
+
 fn check_stamp_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("last-update-check"))
 }
 
 fn config_dir() -> Result<PathBuf> {
     let base = crate::user_dirs::config_dir().ok_or_else(|| {
-        anyhow!("cannot locate the syq configuration directory: no home directory or absolute XDG_CONFIG_HOME")
+        anyhow!("cannot locate the standalone install receipt: no home directory or absolute XDG_CONFIG_HOME")
     })?;
     Ok(base.join("syq"))
 }
@@ -1858,14 +1881,13 @@ mod tests {
         ] {
             assert!(!is_homebrew_keg_path(Path::new(path)), "{path}");
         }
-        assert_eq!(RemindedInstall::Homebrew.advice(), "run `brew upgrade syq`");
         assert_eq!(
-            RemindedInstall::Standalone.advice(),
-            "run `syq --self-update`"
+            RemindedInstall::Homebrew.upgrade_command(),
+            "brew upgrade syq"
         );
         assert_eq!(
-            RemindedInstall::Reinstall.advice(),
-            "reinstall syq with the standalone installer, so that `syq --self-update` works again"
+            RemindedInstall::Standalone.upgrade_command(),
+            "syq --self-update"
         );
     }
 
