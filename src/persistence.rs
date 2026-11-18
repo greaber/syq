@@ -376,44 +376,6 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     Ok(0)
 }
 
-/// Establish authority through ordinary SSH, without selecting or copying files.
-/// Repeated connects leave a healthy receiving process and its approvals alone.
-/// Parse only the displayed command; the approving laptop must not consult
-/// its own authorization preferences when checking a server's request.
-pub(crate) fn parse_account_connect(
-    argv: &[OsString],
-    authorizer: &str,
-) -> Result<crate::destination::ssh::SessionRequest> {
-    if argv.first().is_none_or(|arg| arg != "persist") {
-        bail!("persistent SSH approval needs a syq persist connect command");
-    }
-    let matches = command_for_help().try_get_matches_from(argv)?;
-    let command = PersistCommand::from_arg_matches(&matches)?;
-    let PersistAction::Connect {
-        host,
-        auth_from,
-        syq_path,
-        no_bootstrap,
-        ..
-    } = command.action
-    else {
-        bail!("persistent SSH approval needs a syq persist connect command");
-    };
-    if syq_path.is_some() || no_bootstrap {
-        bail!("laptop-authorized SSH persistence does not take helper overrides");
-    }
-    let selected = auth_from.context("persistent SSH approval requires --auth-from @NAME")?;
-    if selected != format!("@{authorizer}") {
-        bail!("persistent SSH authorizer does not match the shown command");
-    }
-    crate::destination::ssh::parse(&[
-        "ssh".into(),
-        "--auth-from".into(),
-        selected.into(),
-        host.into(),
-    ])
-}
-
 /// `persist connect` runs on the receiving machine and names an SSH server.
 fn reject_receiving_name(host: &str) -> Result<()> {
     if let Some(name) = host.strip_prefix('@') {
@@ -2055,47 +2017,6 @@ mod tests {
         assert_eq!(socket.file_name().unwrap(), KEY);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), FIXTURE);
         close_scope(&scope).unwrap();
-    }
-
-    #[test]
-    fn persistent_account_approval_requires_the_explicit_matching_connect_command() {
-        let parse = |args: &[&str]| {
-            parse_account_connect(
-                &args.iter().map(OsString::from).collect::<Vec<_>>(),
-                "laptop",
-            )
-        };
-        let request = parse(&[
-            "persist",
-            "connect",
-            "alice@hostB:2222",
-            "--auth-from",
-            "@laptop",
-        ])
-        .unwrap();
-        assert_eq!(request.destination.user.as_deref(), Some("alice"));
-        assert_eq!(request.destination.port, Some(2222));
-        // Scope paths are requester-local metadata, not a dependency on the
-        // approving machine's filesystem.
-        let scoped = parse(&[
-            "persist",
-            "--pscope",
-            "/requester-only/scope",
-            "connect",
-            "alice@hostB:2222",
-            "--auth-from",
-            "@laptop",
-        ])
-        .unwrap();
-        assert_eq!(scoped.destination, request.destination);
-        for args in [
-            vec!["persist", "connect", "hostB"],
-            vec!["persist", "connect", "hostB", "--auth-from", "@other"],
-            vec!["persist", "off"],
-            vec!["ssh", "--auth-from", "@laptop", "hostB"],
-        ] {
-            assert!(parse(&args).is_err(), "{args:?}");
-        }
     }
 
     #[test]
