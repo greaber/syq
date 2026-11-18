@@ -8154,6 +8154,102 @@ fn late_close_is_reported_before_identity_conditioned_publication() {
     }
 }
 
+/// A written file is checked by closing a duplicate of its descriptor
+/// wherever a close can report a write error, and not on a root's own
+/// filesystem when its close reports none. A file on another device, or one
+/// whose device the caller does not know, is checked whatever it is on.
+#[cfg(target_os = "linux")]
+#[test]
+fn written_files_are_checked_at_close_only_where_a_close_reports() {
+    let closes = || super::partial::WRITER_CLOSES.replace(0);
+    let meta = Meta {
+        mode: 0o600,
+        uid: 0,
+        gid: 0,
+        mtime: 1_500_000_000,
+        mtime_nsec: 0,
+        inode_metadata: None,
+    };
+    let data = b"updated contents";
+    for (quiet, expected) in [(true, 0), (false, 1)] {
+        for (small, inplace) in [(true, false), (true, true), (false, false), (false, true)] {
+            let context = format!("quiet={quiet}, small={small}, inplace={inplace}");
+            let directory = crate::test_support::tempdir().unwrap();
+            let mut ops = destination_ops(directory.path());
+            ops.set_hash_policy(crate::hashing::HashPolicy::default());
+            ops.destination_root
+                .as_ref()
+                .unwrap()
+                .assume_quiet_close_for_test(quiet);
+            let copy_id = [84; 16];
+            closes();
+            if small {
+                ops.put_small(&SmallPut {
+                    path: b"target".to_vec(),
+                    copy_id,
+                    data: data.to_vec(),
+                    hash: content_digest(data),
+                    meta: meta.clone(),
+                    flags: flags::TIMES,
+                    inplace,
+                    condition: TargetCondition::Absent,
+                    replaces: false,
+                    scanned: crate::proto::ScannedDestination::Unknown,
+                })
+                .unwrap();
+            } else {
+                let partial = || PartialTarget {
+                    path: b"target",
+                    id: &copy_id,
+                };
+                ops.prepare(
+                    partial(),
+                    PrepareOptions {
+                        size: data.len() as u64,
+                        inplace,
+                        mode: 0o600,
+                        attempt: 0,
+                        create_if_missing: true,
+                        group: None,
+                        update: None,
+                    },
+                )
+                .unwrap();
+                ops.write_range(partial(), inplace, 0, 0, content_digest(data), data)
+                    .unwrap();
+                ops.finalize(
+                    b"target",
+                    inplace,
+                    &copy_id,
+                    &meta,
+                    flags::TIMES,
+                    TargetCondition::Absent,
+                )
+                .unwrap();
+            }
+            assert_eq!(closes(), expected, "{context}");
+            assert_eq!(
+                fs::read(directory.path().join("target")).unwrap(),
+                data,
+                "{context}"
+            );
+        }
+    }
+    let directory = crate::test_support::tempdir().unwrap();
+    let root = Root::open(directory.path()).unwrap();
+    root.assume_quiet_close_for_test(true);
+    let file = File::create(directory.path().join("file")).unwrap();
+    let dev = file.metadata().unwrap().dev();
+    let label = Path::new("file");
+    super::partial::check_written_file(&root, Some(dev), &file, label).unwrap();
+    assert_eq!(closes(), 0);
+    // Another filesystem beneath the root is not known to be the one read.
+    super::partial::check_written_file(&root, Some(dev + 1), &file, label).unwrap();
+    assert_eq!(closes(), 1);
+    super::partial::check_written_file(&root, None, &file, label).unwrap();
+    assert_eq!(closes(), 1);
+}
+
 #[cfg(all(target_os = "linux", debug_assertions))]
 #[test]
 fn native_copy_reports_original_writer_close_error() {

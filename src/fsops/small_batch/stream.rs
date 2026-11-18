@@ -481,7 +481,12 @@ impl FsOps {
         } else {
             stage.file.set_len(stream.patch.len)?;
         }
-        check_destination_writes(&stage.file, &stage.label)?;
+        check_written_file(
+            &stage.target.root,
+            Some(stage.created.dev()),
+            &stage.file,
+            &stage.label,
+        )?;
         // The file a seeded patch reuses is open, so its mode is known.
         let scanned = match &stream.old {
             Some(old) => ScannedDestination::File(old.metadata()?.mode() & 0o7777),

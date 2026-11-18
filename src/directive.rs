@@ -607,7 +607,7 @@ fn rules_at(
 pub(crate) fn source_rules(
     directive: &Directive,
     home: &Path,
-) -> Result<crate::destination::pull::PullRequest> {
+) -> Result<crate::restricted::source::SourcePolicy> {
     ensure!(
         directive.binding.role == Role::Source,
         "the directive is not for a copy's source"
@@ -630,7 +630,7 @@ pub(crate) fn source_rules(
             Some(base) => crate::fsops::join(home, base),
         });
     }
-    request.validate()?;
+    crate::destination::pull::validate(&request)?;
     Ok(request)
 }
 

@@ -90,7 +90,6 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
         name.into(),
         load_registration(name)?,
         handoff::Kind::Command,
-        None,
     );
     handoff::maybe_exec(&selection, false)?;
     let registration = selection.registration;

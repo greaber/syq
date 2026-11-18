@@ -22,9 +22,17 @@ const FINISH_LOCK_WAIT: Duration = Duration::from_millis(100);
 /// goes without history.
 const OPEN_LOCK_WAIT: Duration = Duration::from_millis(100);
 /// About how long one copy spends deleting old runs from a history over its
-/// budget, and how many runs one statement deletes.
-const PRUNE_TIME: Duration = Duration::from_millis(20);
-const PRUNE_BATCH: i128 = 256;
+/// budget and returning its free space.
+const PRUNE_TIME: Duration = Duration::from_millis(5);
+/// The fraction of its budget a history over it is pruned below.
+const PRUNE_SLACK: i64 = 32;
+/// The most runs one step deletes, and how many of the oldest runs it reads
+/// to choose them. Both bound a step whatever the history holds.
+const PRUNE_BATCH: usize = 256;
+const PRUNE_WINDOW: i64 = 512;
+/// An incomplete run this close behind the finishing one may belong to a copy
+/// still in progress, and is never deleted.
+const ACTIVE_RUNS: i64 = 256;
 
 #[derive(Clone)]
 pub(crate) struct Recorder(Arc<Mutex<Writer>>);
@@ -357,6 +365,9 @@ impl Recorder {
 
     pub(crate) fn context(&self, key: &ContextKey) {
         let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if state.finished {
+            return;
+        }
         state.pending_context = Some(key.clone());
         if let Err(error) = state.flush() {
             diagnostic(&error);
@@ -390,13 +401,36 @@ impl Writer {
             return Ok(());
         }
         let transaction = self.db.unchecked_transaction()?;
-        self.write_pending(&transaction)?;
+        if !self.write_pending(&transaction)? {
+            drop(transaction);
+            self.abandon();
+            return Ok(());
+        }
         transaction.commit()?;
         self.mark_flushed();
         Ok(())
     }
 
-    fn write_pending(&self, transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    /// Stop recording a run that is no longer in the history: another copy
+    /// pruned it to keep the history within its budget, or the user cleared
+    /// the history. Its remaining events could only fail, each taking the
+    /// writer lock that other copies wait for.
+    fn abandon(&mut self) {
+        self.pending.clear();
+        self.pending_context = None;
+        self.finished = true;
+    }
+
+    /// Write the pending context and events. Returns false, having written
+    /// nothing that can be kept, when the run is no longer in the history.
+    fn write_pending(&self, transaction: &rusqlite::Transaction<'_>) -> Result<bool> {
+        if transaction.execute(
+            "UPDATE runs SET lost=?1,updated_day=?3 WHERE id=?2",
+            params![self.lost, self.id, day()],
+        )? == 0
+        {
+            return Ok(false);
+        }
         // Context revisions (for example, discovering a mixed-filesystem tree)
         // must survive contention just like samples. Finish flushes this before
         // recording the outcome under the context.
@@ -429,11 +463,7 @@ impl Writer {
                 ])?;
             }
         }
-        transaction.execute(
-            "UPDATE runs SET lost=?1,updated_day=?3 WHERE id=?2",
-            params![self.lost, self.id, day()],
-        )?;
-        Ok(())
+        Ok(true)
     }
 
     fn mark_flushed(&mut self) {
@@ -461,7 +491,11 @@ impl Writer {
         );
         self.db.busy_timeout(Duration::ZERO)?;
         let transaction = transaction?;
-        self.write_pending(&transaction)?;
+        if !self.write_pending(&transaction)? {
+            drop(transaction);
+            self.abandon();
+            return Ok(());
+        }
         transaction.execute(
             "UPDATE runs SET status=?1,eligible=?2,summary=?3,lost=?4 WHERE id=?5",
             params![
@@ -505,25 +539,33 @@ fn prune_within(db: &Connection, budget: u64, current: i64, time: Duration) -> R
     };
     let (mut size, mut free) = used()?;
     if size > budget {
-        // Delete the oldest runs, keeping the current run and recent
-        // incomplete ones, in batches sized from the estimated excess. A
-        // history far over its budget, as after the budget shrank, then
-        // shrinks over a few copies rather than slowing many.
-        // The estimate is redone after each batch, so batches stay sized
-        // when the oldest runs are smaller than average.
-        let mut runs: i64 = db.query_row("SELECT count(*) FROM runs", [], |r| r.get(0))?;
+        // Delete a little more than the excess, so that the copies which
+        // follow find the history within its budget and only read its size.
+        // A history far over its budget, as after the budget shrank, shrinks
+        // over several copies, each spending about `time`.
+        let target = budget - budget / PRUNE_SLACK;
+        // Nothing here counts or scans the runs: each step sizes the next
+        // from the space it freed, growing at most fourfold in case the
+        // oldest runs are smaller than the ones behind them.
+        let mut batch = 1;
         loop {
-            let excess = i128::from(runs) * i128::from(size - budget) / i128::from(size);
-            let batch = excess.clamp(1, PRUNE_BATCH) as i64;
-            let deleted = db.execute(
-                "DELETE FROM runs WHERE id IN (SELECT id FROM runs WHERE id!=?1 AND (status!='incomplete' OR updated_day<?2) ORDER BY id LIMIT ?3)",
-                params![current, day().saturating_sub(2), batch],
-            )?;
-            runs -= deleted as i64;
-            (size, free) = used()?;
-            if deleted == 0 || size <= budget || Instant::now() >= deadline {
+            let runs = prunable(db, current, batch)?;
+            if runs.is_empty() {
                 break;
             }
+            let before = size;
+            let deleted = delete_runs(db, &runs, deadline)? as i128;
+            (size, free) = used()?;
+            if size <= target || Instant::now() >= deadline {
+                break;
+            }
+            let freed = i128::from(before - size);
+            let needed = if freed > 0 {
+                (deleted * i128::from(size - target) + freed - 1) / freed
+            } else {
+                deleted * 2
+            };
+            batch = needed.clamp(1, (batch * 4).min(PRUNE_BATCH) as i128) as usize;
         }
     }
     if size <= budget && free > budget {
@@ -531,13 +573,70 @@ fn prune_within(db: &Connection, budget: u64, current: i64, time: Duration) -> R
         // the free space, which a gradual reclaim would have to move
         // around. This happens once after a large shrink.
         db.execute_batch("VACUUM;")?;
-    } else if size <= budget {
-        // Each step of this pragma frees one page; run it to completion.
-        let mut vacuum = db.prepare("PRAGMA incremental_vacuum(256)")?;
+    } else if size <= budget && size + free > budget {
+        // Later runs reuse free pages, so return only the ones that keep the
+        // file over the budget. Each step of this pragma moves one page and
+        // commits when the statement is dropped, so the same deadline bounds
+        // it and the copies which follow finish the rest.
+        let pages = (size + free - budget + page_size - 1) / page_size;
+        let mut vacuum = db.prepare(&format!("PRAGMA incremental_vacuum({pages})"))?;
         let mut rows = vacuum.raw_query();
-        while rows.next()?.is_some() {}
+        while Instant::now() < deadline && rows.next()?.is_some() {}
     }
     Ok(())
+}
+
+/// Up to `batch` of the oldest runs to delete, never `current`.
+///
+/// A run that finished, or one left incomplete more than two days ago, can
+/// go. Among the `PRUNE_WINDOW` oldest runs these go first, so an incomplete
+/// run that a long copy may still be recording outlives them. Copies whose
+/// final save found the history locked, and copies that were killed, leave
+/// incomplete runs that never finish. Once such runs are all that the window
+/// holds, the oldest of them go too, except the `ACTIVE_RUNS` started last.
+/// Without that a history filled by them would stay over its budget, and
+/// would cost every copy this search.
+fn prunable(db: &Connection, current: i64, batch: usize) -> Result<Vec<i64>> {
+    let mut oldest = db.prepare_cached(
+        "SELECT id, status='incomplete' AND updated_day>=?2 FROM runs
+         WHERE id!=?1 ORDER BY id LIMIT ?3",
+    )?;
+    let mut rows = oldest.query(params![current, day().saturating_sub(2), PRUNE_WINDOW])?;
+    let settled = current.saturating_sub(ACTIVE_RUNS);
+    let (mut runs, mut recent) = (Vec::new(), Vec::new());
+    while let Some(row) = rows.next()? {
+        let (id, may_be_active): (i64, bool) = (row.get(0)?, row.get(1)?);
+        if !may_be_active {
+            runs.push(id);
+            if runs.len() == batch {
+                break;
+            }
+        } else if id < settled && recent.len() < batch {
+            recent.push(id);
+        }
+    }
+    Ok(if runs.is_empty() { recent } else { runs })
+}
+
+/// Delete `runs` with their events in one transaction, stopping early at
+/// `deadline`. Returns how many were deleted.
+fn delete_runs(db: &Connection, runs: &[i64], deadline: Instant) -> Result<usize> {
+    // Another run holding the writer lock fails this at once, and a later
+    // copy prunes instead.
+    let transaction =
+        rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)?;
+    let mut deleted = 0;
+    {
+        let mut delete = transaction.prepare_cached("DELETE FROM runs WHERE id=?1")?;
+        for run in runs {
+            deleted += delete.execute([run])?;
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+    }
+    transaction.commit()?;
+    Ok(deleted)
 }
 
 fn diagnostic(error: &anyhow::Error) {

@@ -233,6 +233,8 @@ impl Planner<'_> {
             .set(hashes)
             .expect("hardlink assertions set once");
         // Publish the complete assertion map before any worker can see a job.
+        // The jobs are then queued together.
+        let _burst = self.sched.file_burst();
         for index in 0..self.hardlinks.groups.len() {
             let (leaf, destination) = *self.hardlinks.groups[index].preview.take().unwrap();
             let representative = self.enqueue(

@@ -95,7 +95,7 @@ pub(crate) fn eligible(args: &crate::cli::Args) -> Result<String> {
 /// receiving profile resolve it. The server derives it to refuse early what
 /// the receiving machine would refuse in the command alone, and to name the
 /// approved sources in its own arguments (`apply`).
-pub(crate) fn request(args: &crate::cli::Args) -> Result<pull::PullRequest> {
+pub(crate) fn request(args: &crate::cli::Args) -> Result<crate::restricted::source::SourcePolicy> {
     eligible(args)?;
     pull::source_request(args, None)
 }
@@ -132,38 +132,13 @@ pub(super) fn select(args: &crate::cli::Args) -> Result<Option<handoff::Selectio
         name,
         registration,
         handoff::Kind::Send,
-        None,
     )))
 }
 
-pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection) -> Result<()> {
-    let handoff::Selection {
-        name, registration, ..
-    } = selection;
-    let command = crate::approval_command::copy_command(args)?;
-    // Refuse here, before asking, what the receiving machine would refuse
-    // in the command alone: it derives the reads the same way.
-    let request = request(args)?;
-    notices::waiting(&format!("@{name}"), "sending these files");
-    let (_, reply) = exchange(
-        &registration,
-        Message::Send {
-            command,
-            cwd: crate::approval_command::current_directory(),
-        },
-        REQUEST_TIMEOUT + Duration::from_secs(10),
-        None,
-    )?;
-    let Reply::SendApproved(approved) = reply else {
-        bail!("unexpected response from @{name}");
-    };
-    apply(args, &request, *approved, registration)
-}
-
 /// Read the copy's sources as the receiving machine approved them.
-fn apply(
+pub(super) fn apply(
     args: &mut crate::cli::Args,
-    request: &pull::PullRequest,
+    request: &crate::restricted::source::SourcePolicy,
     approved: SendApproved,
     registration: Registration,
 ) -> Result<()> {
@@ -256,7 +231,7 @@ fn join(directory: &Path, path: &[u8]) -> Vec<u8> {
 pub(super) fn resolve(
     cwd: &Path,
     root: Option<&Path>,
-    request: &mut pull::PullRequest,
+    request: &mut crate::restricted::source::SourcePolicy,
 ) -> Result<()> {
     let Some(root) = root else {
         request.base.path = Some(match request.base.path.take().map(expand_home) {
@@ -307,7 +282,9 @@ pub(super) fn resolve(
 /// `..` resolved by name is where reading goes. When it follows them, `..`
 /// can lead from where a link led, so the paths keep their spelling and the
 /// prompt says that links are followed.
-pub(super) fn exact_paths(request: &pull::PullRequest) -> Vec<(Vec<u8>, &'static str)> {
+pub(super) fn exact_paths(
+    request: &crate::restricted::source::SourcePolicy,
+) -> Vec<(Vec<u8>, &'static str)> {
     let by_name = request.symlink_policy == crate::proto::OperatorSymlinkPolicy::Refuse;
     let base = request.base.path.as_deref().unwrap_or(b"/");
     request
@@ -369,10 +346,12 @@ mod tests {
         let task = std::thread::spawn(move || {
             exchange(
                 &registration,
-                Message::Send {
+                Message::Copy(Box::new(approve::Asked {
                     command,
                     cwd: "~/job".into(),
-                },
+                    inputs: Default::default(),
+                    results_key: None,
+                })),
                 Duration::from_secs(10),
                 Some(Duration::from_secs(10)),
             )
@@ -1099,14 +1078,6 @@ mod tests {
                 words(&["cp", "--from", "@other", "notes", "--into", "/out"]),
                 "copies from a different machine",
             ),
-            (
-                words(&["cp", "notes", "--to", "@laptop", "--into", "in"]),
-                "not a receiving machine",
-            ),
-            (
-                words(&["cp", "--from", "backup", "notes", "--into", "/out"]),
-                "not a receiving machine",
-            ),
             (words(&["cp", "--bogus"]), "cannot parse"),
             // Options this route refuses, and limits no source allows.
             (
@@ -1146,10 +1117,12 @@ mod tests {
         ] {
             let result = exchange(
                 &registration,
-                Message::Send {
+                Message::Copy(Box::new(approve::Asked {
                     command: refused.clone(),
                     cwd: "~".into(),
-                },
+                    inputs: Default::default(),
+                    results_key: None,
+                })),
                 Duration::from_secs(2),
                 Some(Duration::from_secs(2)),
             );
@@ -1234,8 +1207,7 @@ mod tests {
         }
     }
 
-    /// What a send may read comes from its command alone. A request a
-    /// server puts beside the command names nothing more; a copy that
+    /// What a send may read comes from its command alone: a copy that
     /// registers anything other than what the approved command reads is
     /// refused; and no other file is readable, even beside the approved one.
     #[test]
@@ -1250,31 +1222,19 @@ mod tests {
         let (_broker, receiver, registration, _) = broker(&root, Approval::Always);
         let command = command(&["--no-compress", "--src-non-dir", "notes", "--into", "/out"]);
 
-        // Ask with a request beside the command that names the whole
-        // filesystem, followed, and another file. This machine ignores
-        // fields a message does not have; if it refused them instead, this
-        // part of the test would only need the extra field removed.
-        let mut request = request(&crate::approval_command::parse(&command).unwrap()).unwrap();
-        request.base = SourceRootBase {
-            path: Some(b"/".to_vec()),
-            confined: false,
-        };
-        request.selections[0].path = b"secret".to_vec();
-        request.symlink_policy = OperatorSymlinkPolicy::FollowAll;
+        // Ask with the command alone: the message has no room for reads
+        // of the server's own choosing.
         let task = {
             let registration = registration.clone();
             let message = serde_json::json!({
                 "version": VERSION,
                 "identity": crate::identity::build(),
                 "secret": registration.secret,
-                "message": {"Send": {
+                "message": {"Copy": {
                     "command": command,
                     "cwd": "~",
-                    "request": {
-                        "base": request.base,
-                        "selections": request.selections,
-                        "symlink_policy": request.symlink_policy,
-                    },
+                    "inputs": crate::directive::Inputs::default(),
+                    "results_key": null,
                 }},
             });
             std::thread::spawn(move || -> Result<SendApproved> {
