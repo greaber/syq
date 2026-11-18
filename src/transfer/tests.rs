@@ -6313,7 +6313,10 @@ fn a_streamed_patchs_unacknowledged_pieces_stay_within_their_byte_bound() {
     // the reply queue would take all twenty pieces.
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path();
-    let rewritten = [0..40 << 20].to_vec();
+    let rewritten = vec![std::ops::Range {
+        start: 0,
+        end: 40 << 20,
+    }];
     let files = [
         ("first", 40 << 20, rewritten.clone()),
         ("second", 40 << 20, rewritten),
