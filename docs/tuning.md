@@ -55,7 +55,7 @@ Use these keys for `syq cp` with S3 endpoints:
 
 | Key | Default | Accepted values / meaning |
 |---|---|---|
-| `s3-requests` | Automatic | 1–65536 simultaneous data requests across objects; excludes metadata requests and idle sockets |
+| `s3-requests` | Automatic | 1–65536 simultaneous data requests across objects; excludes idle sockets and metadata requests, apart from the extra checks of unchanged objects described below |
 | `s3-objects` | Automatic | 1–65536 objects in progress, including preparation and finalization |
 | `s3-parts-per-object` | Automatic | 1–1024 simultaneous parts or ranges per object |
 | `s3-part-size` | 16 MiB for uploads, 8 MiB for downloads, 256 MiB for copies between buckets; adjusted for some providers and fast links | 5 MiB–5 GiB per upload part or download range. Larger parts take fewer requests; smaller ones let one object use more requests at once and resend less after a failure |

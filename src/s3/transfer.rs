@@ -1956,11 +1956,11 @@ impl Engine {
                 let mut copy_source = None;
                 let mut exact = None;
                 if !selector.0.is_empty() && !prefix {
-                    let _slot = self.tuning.requests.acquire().await;
                     if self.options.route.is_server_copy() {
                         copy_source = self.copy_head(source_bucket, &selector.0, false).await?;
                         exact = copy_source.as_ref().map(|(object, _)| object.clone());
                     } else {
+                        let _slot = self.tuning.requests.acquire().await;
                         exact = client::head(&self.client, source_bucket, &selector.0).await?;
                     }
                     if exact.is_none() && self.args.native_mapping.is_some() {
@@ -1969,6 +1969,7 @@ impl Engine {
                             copy_source = self.copy_head(source_bucket, &marker, false).await?;
                             exact = copy_source.as_ref().map(|(object, _)| object.clone());
                         } else {
+                            let _slot = self.tuning.requests.acquire().await;
                             exact = client::head(&self.client, source_bucket, &marker).await?;
                         }
                     }

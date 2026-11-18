@@ -150,9 +150,10 @@ pub(super) struct TransferSlot {
 
 impl TransferSlot {
     /// Wait for a transfer slot. Call this before reading or hashing file
-    /// contents and before any request that moves data or changes the
-    /// destination; an object that turns out to need none of that never
-    /// calls it. Claiming again is free.
+    /// contents and before any request that transfers an object or changes
+    /// one; an object that turns out to need none of that never calls it.
+    /// Creating a directory or applying metadata to an unchanged local file
+    /// needs no slot. Claiming again is free.
     pub async fn claim(&mut self) {
         if self.held {
             return;
@@ -267,21 +268,41 @@ impl Controller {
     }
 
     /// The transfer limit moved. Checking that had not grown beyond it, or
-    /// that it overtook, starts again from it.
+    /// that it overtook, continues from it. What rejected increases taught
+    /// stays: the transfer limit often moves just after one, and that is no
+    /// reason to try again at once.
     fn follow(&mut self, transfers: usize) {
-        if self.minimum != transfers.min(self.maximum) {
-            if self.limit <= self.minimum || self.limit <= transfers {
-                *self = Self::checking(transfers, self.maximum);
-            } else {
-                self.minimum = transfers;
-            }
+        let minimum = transfers.clamp(1, self.maximum);
+        if self.minimum == minimum {
+            return;
         }
+        let grown = self.limit > self.minimum;
+        let rejected = self.upper <= self.minimum + 1;
+        self.minimum = minimum;
+        if grown && self.limit > minimum {
+            return;
+        }
+        self.limit = minimum;
+        self.upper = if rejected {
+            minimum + 1
+        } else {
+            self.upper.max(minimum + 1)
+        };
+        self.lower = minimum - 1;
+        self.upward = true;
+        self.probe = None;
+        self.probe_completed = 0;
+        self.growth_baseline = None;
+        // Rates measured at another transfer limit say nothing about this one.
+        self.reference = None;
+        self.changed_scores = 0;
+        self.sampler.reset();
     }
 
     /// The service asked for fewer requests. Halve the room above the
-    /// transfer limit, at once and for the rest of the copy, so that
-    /// checking settles below the rate the service refuses instead of
-    /// returning to it.
+    /// transfer limit, at once and for the rest of this batch of objects,
+    /// so that checking settles below the rate the service refuses instead
+    /// of returning to it.
     fn throttled(&mut self) -> usize {
         let before = self.limit;
         if before <= self.minimum {

@@ -122,8 +122,9 @@ impl Engine {
         self.tuning.report(initial);
         // Finding an object unchanged takes one metadata request, or two
         // between buckets, so the ceiling counts those requests. A fixed
-        // object count leaves nothing to adjust, and a request count the
-        // user set bounds these requests too.
+        // object count leaves nothing to adjust, a request count the user
+        // set bounds these requests too, and small uploads keep the room
+        // their descriptors leave.
         let checking = fixed_workers.is_none().then(|| {
             let requests = self
                 .args
@@ -142,8 +143,13 @@ impl Engine {
             } else {
                 1
             };
+            let maximum = (requests / per_object).max(1).min(object_limit);
             Checking {
-                maximum: (requests / per_object).max(1).min(object_limit),
+                maximum: if small_upload {
+                    maximum.min(capacity)
+                } else {
+                    maximum
+                },
                 outage: self.outage.clone(),
             }
         });

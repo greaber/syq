@@ -205,6 +205,34 @@ impl Engine {
         key: &str,
         checksums: bool,
     ) -> Result<Option<(Object, HeadObjectOutput)>> {
+        let _slot = self.tuning.requests.acquire().await;
+        self.head_unadmitted(bucket, key, checksums).await
+    }
+
+    /// `copy_head` for an object of the copy itself. As for uploads and
+    /// downloads, the objects in progress bound these requests, so that
+    /// unchanged objects can be checked beyond the transfer limit. A request
+    /// count the user set keeps bounding them, as it always has here.
+    async fn object_head(
+        &self,
+        bucket: &str,
+        key: &str,
+        checksums: bool,
+    ) -> Result<Option<(Object, HeadObjectOutput)>> {
+        let _slot = if self.tuning.requests_set() {
+            Some(self.tuning.requests.acquire().await)
+        } else {
+            None
+        };
+        self.head_unadmitted(bucket, key, checksums).await
+    }
+
+    async fn head_unadmitted(
+        &self,
+        bucket: &str,
+        key: &str,
+        checksums: bool,
+    ) -> Result<Option<(Object, HeadObjectOutput)>> {
         let Some(output) = client::head_output(
             &self.client,
             bucket,
@@ -340,14 +368,15 @@ impl Engine {
             if listed == Some(None) {
                 Ok(None)
             } else {
-                self.copy_head(&self.options.bucket, &key, comparable).await
+                self.object_head(&self.options.bucket, &key, comparable)
+                    .await
             }
         };
         let planned = job.copy_source.is_some();
         let source = async {
             match job.copy_source.take() {
                 Some(source) => Ok(Some(*source)),
-                None => self.copy_head(source_bucket, &job.key, comparable).await,
+                None => self.object_head(source_bucket, &job.key, comparable).await,
             }
         };
         let (source, existing) = tokio::try_join!(source, destination)?;
@@ -440,7 +469,7 @@ impl Engine {
                 && checksums_could_decide(&source, old)
                 && full_object_checksums(old_head).iter().any(Option::is_some)
             {
-                match self.copy_head(source_bucket, &job.key, true).await {
+                match self.object_head(source_bucket, &job.key, true).await {
                     Ok(Some((now, head))) if now.etag == source.etag && now.size == source.size => {
                         Some(head)
                     }

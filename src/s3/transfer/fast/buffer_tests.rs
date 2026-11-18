@@ -80,6 +80,20 @@ fn objects_checked_beyond_the_transfer_limit_stay_within_set_limits() {
     ] {
         assert_eq!(checking(&[flag], route), expected, "{flag}");
     }
+    // Between buckets a request count the user set also admits each
+    // object's own metadata requests, as before.
+    for (flags, set) in [
+        (&[][..], false),
+        (&["--performance-tuning=s3-requests=16"][..], true),
+        (&["--resource-limits=s3-requests=16"][..], true),
+        (&["--resource-limits=s3-objects=16"][..], false),
+    ] {
+        assert_eq!(
+            planning_engine(flags).tuning.requests_set(),
+            set,
+            "{flags:?}"
+        );
+    }
 }
 
 #[test]

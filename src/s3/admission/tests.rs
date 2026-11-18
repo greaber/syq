@@ -829,6 +829,26 @@ fn checking_follows_the_transfer_limit_until_it_has_grown() {
 }
 
 #[test]
+fn a_moving_transfer_limit_does_not_bring_a_rejected_increase_back() {
+    for transfers in [40, 24] {
+        let mut controller = Controller::checking(32, 256);
+        exercise(&mut controller, 256);
+        assert_eq!(controller.reject(), 32);
+        controller.follow(transfers);
+        assert_eq!(
+            (controller.limit, controller.minimum),
+            (transfers, transfers)
+        );
+        let mut waited = 0;
+        while controller.observe(transfers as f64, transfers, 10000, 16, 0.0) == transfers {
+            waited += 1;
+            assert!(waited < 200, "checking never retried");
+        }
+        assert!(waited >= 16, "retried after {waited} samples");
+    }
+}
+
+#[test]
 fn rejected_checking_returns_to_the_transfer_limit_and_retries_later() {
     let mut controller = Controller::checking(32, 256);
     exercise(&mut controller, 256);
