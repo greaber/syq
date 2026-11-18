@@ -16,6 +16,10 @@ include = [
     "/schemas/**",
     "/tests/**",
     "!/tests/tooling/**",
+    # An include list replaces .gitignore, so name what Python leaves behind
+    # when the tests run their helper scripts.
+    "!__pycache__/",
+    "!*.pyc",
     "/Cargo.toml",
     "/Cargo.lock",
     "/README.md",
