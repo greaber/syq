@@ -72,7 +72,8 @@ pub(crate) fn run(args: Args) -> Result<i32> {
         0 => results::Status::Success,
         23 => results::Status::Partial,
         _ => results::Status::Failed,
-    };
+    }
+    .into();
     totals.0.exit_code = code;
     totals.0.timings.total_ms = started.elapsed().as_millis() as u64;
     writer.emit_result(&totals.0);

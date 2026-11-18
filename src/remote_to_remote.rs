@@ -496,9 +496,10 @@ fn compose_terminal(
         .coordinator_terminal
         .clone()
         .unwrap_or_else(|| empty_terminal(relay, elapsed_ms));
-    terminal.status = outcome.results_status;
+    terminal.status = outcome.results_status.into();
     terminal.exit_code = outcome.exit_code;
     terminal.errors = relay.errors();
+    terminal.settle(&["status", "exit_code", "errors"]);
     // A dry run changes nothing: its plan is the coordinator's.
     if !relay.dry_run {
         terminal.files_transferred = totals.files_transferred;
@@ -506,8 +507,19 @@ fn compose_terminal(
         terminal.directories_created = totals.directories_created;
         terminal.symlinks_created = totals.symlinks_created;
         terminal.specials_created = totals.specials_created;
-        if terminal.deletions_completed.is_some() {
+        terminal.settle(&[
+            "files_transferred",
+            "bytes_transferred",
+            "directories_created",
+            "symlinks_created",
+            "specials_created",
+        ]);
+        // Only a pruning copy's record has it, in whatever type.
+        if terminal.deletions_completed.is_some()
+            || terminal.extra.contains_key("deletions_completed")
+        {
             terminal.deletions_completed = Some(totals.deletions_completed);
+            terminal.settle(&["deletions_completed"]);
         }
     }
     terminal

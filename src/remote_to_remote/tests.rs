@@ -357,17 +357,17 @@ fn a_relayed_final_result_keeps_fields_this_build_does_not_know() {
     assert_eq!(written, terminal);
 }
 
-/// A final result that does not read as a copy's result makes the relayed
-/// results unusable: the stream settles as failed and says why.
+/// A final result without a status is not a result: the relayed results
+/// are unusable, and the stream settles as failed and says why.
 #[test]
 fn an_unreadable_relayed_final_result_fails_the_stream() {
     let mut missing = coordinator_terminal();
-    missing.as_object_mut().unwrap().remove("files_unchanged");
-    let mut bogus = coordinator_terminal();
-    bogus["status"] = "bogus".into();
-    let mut timings = coordinator_terminal();
-    timings["timings"]["total_ms"] = "soon".into();
-    for terminal in [missing, bogus, timings] {
+    missing.as_object_mut().unwrap().remove("status");
+    let mut number = coordinator_terminal();
+    number["status"] = 0.into();
+    let mut null = coordinator_terminal();
+    null["status"] = serde_json::Value::Null;
+    for terminal in [missing, number, null] {
         let (file, writer) = results_file();
         let mut relay = Relay::new(TOKEN, Some(writer), None, (false, false));
         let input = coordinator_line(terminal.clone(), 0);
@@ -384,6 +384,52 @@ fn an_unreadable_relayed_final_result_fails_the_stream() {
         assert_eq!(records[1]["status"], "failed");
         assert_eq!(records[1]["errors"], 1);
     }
+}
+
+/// A coordinator of another release may lack a count this build writes, or
+/// give a field in another type or a status this build does not know. Its
+/// final result is relayed as it came, and the missing count reads as zero.
+#[test]
+fn a_relayed_final_result_lacking_a_count_reads_it_as_zero() {
+    let mut terminal = coordinator_terminal();
+    let object = terminal.as_object_mut().unwrap();
+    object.remove("files_unchanged");
+    object.insert("status".into(), "future_status".into());
+    object.insert("dry_run".into(), "maybe".into());
+    object.insert("future_count".into(), 3.into());
+    let (file, writer) = results_file();
+    let mut relay = Relay::new(TOKEN, Some(writer), None, (false, false));
+    let input = coordinator_line(terminal.clone(), 0);
+    relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
+    let relayed = relay.coordinator_terminal.clone().unwrap();
+    assert_eq!(relayed.files_unchanged, 0);
+    assert_eq!(relayed.files_transferred, 99);
+    assert_eq!(
+        relayed.status,
+        crate::results::RecordStatus::Other("future_status".into())
+    );
+    assert_eq!(settle(relay, settlement(0)).unwrap(), 0);
+    let mut written = read_records(file).pop().unwrap();
+    for key in ["schema", "schema_version", "seq"] {
+        written.as_object_mut().unwrap().remove(key);
+    }
+    assert_eq!(written, terminal);
+
+    // Through a restricted receiver, the fields this machine sets are its
+    // own; the rest stay as the coordinator sent them.
+    let mut composed = crate::results::ResultRecord::from_record(terminal.clone()).unwrap();
+    composed.status = crate::results::Status::Partial.into();
+    composed.exit_code = 23;
+    composed.dry_run = false;
+    composed.settle(&["status", "exit_code"]);
+    let (file, writer) = results_file();
+    writer.emit_result(&composed);
+    let written = read_records(file).pop().unwrap();
+    assert_eq!(written["status"], "partial");
+    assert_eq!(written["exit_code"], 23);
+    assert_eq!(written["dry_run"], "maybe");
+    assert_eq!(written["future_count"], 3);
+    assert!(written.get("files_unchanged").is_none(), "{written}");
 }
 
 #[test]

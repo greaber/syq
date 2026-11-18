@@ -234,22 +234,51 @@ pub enum Status {
     Failed,
 }
 
-/// A copy's terminal record. A coordinator on another machine sends one
-/// that this machine relays, so it reads back as well.
+/// A final record's `status` as written: one this build knows, or another
+/// that a relayed record from another build gave.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RecordStatus {
+    Known(Status),
+    Other(String),
+}
+
+impl From<Status> for RecordStatus {
+    fn from(status: Status) -> Self {
+        Self::Known(status)
+    }
+}
+
+/// A copy's terminal record. A coordinator on another machine, possibly of
+/// another release, sends one that this machine relays, so it also reads
+/// back from a record that lacks fields (read as zero or false) or holds
+/// them in another type; see [`ResultRecord::from_record`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResultRecord {
-    pub status: Status,
+    pub status: RecordStatus,
+    #[serde(default)]
     pub exit_code: i32,
+    #[serde(default)]
     pub dry_run: bool,
+    #[serde(default)]
     pub files_transferred: u64,
+    #[serde(default)]
     pub files_unchanged: u64,
+    #[serde(default)]
     pub files_excluded: u64,
+    #[serde(default)]
     pub directories_created: u64,
+    #[serde(default)]
     pub symlinks_created: u64,
+    #[serde(default)]
     pub specials_created: u64,
+    #[serde(default)]
     pub errors: u64,
+    #[serde(default)]
     pub bytes_transferred: u64,
+    #[serde(default)]
     pub bytes_unchanged: u64,
+    #[serde(default)]
     pub timings: crate::progress::Timings,
     /// Stream copies only: whether the source's size was known.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -265,17 +294,51 @@ pub struct ResultRecord {
     /// updated in place, by reason.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replaced_not_in_place: Option<ReplacedNotInPlace>,
-    /// Fields of a relayed record that this build does not know, kept as
-    /// they came.
+    /// Fields of a relayed record that this build does not know, or holds
+    /// in another type, kept as they came. They are written after the
+    /// typed fields, so one held here replaces its typed default.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+    /// The typed fields a relayed record lacked or held in another type:
+    /// written as it sent them (left out, or from `extra`) unless this
+    /// machine sets them with [`ResultRecord::settle`].
+    #[serde(skip)]
+    pub(crate) as_sent: Vec<&'static str>,
 }
+
+/// Each typed field of a final record with whether a relayed value has its
+/// type. `status` is not among them: a record without one is not a result.
+const RELAYED_FIELDS: [(&str, fn(&serde_json::Value) -> bool); 17] = [
+    ("exit_code", |value| {
+        value
+            .as_i64()
+            .is_some_and(|code| i32::try_from(code).is_ok())
+    }),
+    ("dry_run", serde_json::Value::is_boolean),
+    ("files_transferred", serde_json::Value::is_u64),
+    ("files_unchanged", serde_json::Value::is_u64),
+    ("files_excluded", serde_json::Value::is_u64),
+    ("directories_created", serde_json::Value::is_u64),
+    ("symlinks_created", serde_json::Value::is_u64),
+    ("specials_created", serde_json::Value::is_u64),
+    ("errors", serde_json::Value::is_u64),
+    ("bytes_transferred", serde_json::Value::is_u64),
+    ("bytes_unchanged", serde_json::Value::is_u64),
+    ("timings", |value| {
+        serde_json::from_value::<crate::progress::Timings>(value.clone()).is_ok()
+    }),
+    ("bytes_total_known", serde_json::Value::is_boolean),
+    ("deletions_planned", serde_json::Value::is_u64),
+    ("deletions_completed", serde_json::Value::is_u64),
+    ("deletions_blocked", serde_json::Value::is_u64),
+    ("replaced_not_in_place", serde_json::Value::is_object),
+];
 
 impl ResultRecord {
     /// A record with every count zero.
     pub(crate) fn new(status: Status, exit_code: i32, dry_run: bool) -> Self {
         ResultRecord {
-            status,
+            status: status.into(),
             exit_code,
             dry_run,
             files_transferred: 0,
@@ -294,10 +357,14 @@ impl ResultRecord {
             deletions_blocked: None,
             replaced_not_in_place: None,
             extra: Default::default(),
+            as_sent: Vec::new(),
         }
     }
 
-    /// Read a terminal record as written, without its envelope.
+    /// Read a terminal record as written, without its envelope. Only a
+    /// record without a `status` string is refused: a count or flag it
+    /// lacks reads as zero or false, and one in another type as if it were
+    /// absent, and both are written back as they were sent.
     pub(crate) fn from_record(mut record: serde_json::Value) -> Result<Self> {
         let object = record
             .as_object_mut()
@@ -310,7 +377,47 @@ impl ResultRecord {
                 == Some("result"),
             "a final result has another type"
         );
-        serde_json::from_value(record).context("read a final result")
+        anyhow::ensure!(
+            object
+                .get("status")
+                .is_some_and(serde_json::Value::is_string),
+            "a final result has no status"
+        );
+        let mut as_sent = Vec::new();
+        let mut kept = serde_json::Map::new();
+        for (key, typed) in RELAYED_FIELDS {
+            match object.get(key) {
+                None => as_sent.push(key),
+                Some(value) if typed(value) => {}
+                Some(_) => {
+                    kept.insert(key.to_owned(), object.remove(key).expect("present"));
+                    as_sent.push(key);
+                }
+            }
+        }
+        let mut result: Self = serde_json::from_value(record).context("read a final result")?;
+        result.extra.extend(kept);
+        result.as_sent = as_sent;
+        Ok(result)
+    }
+
+    /// The fields this machine set, written from now on as typed.
+    pub(crate) fn settle(&mut self, keys: &[&str]) {
+        self.as_sent.retain(|key| !keys.contains(key));
+        for key in keys {
+            self.extra.remove(*key);
+        }
+    }
+
+    fn to_record(&self) -> serde_json::Value {
+        let mut record = typed("result", self);
+        let object = record.as_object_mut().expect("record is an object");
+        for key in &self.as_sent {
+            if !self.extra.contains_key(*key) {
+                object.remove(*key);
+            }
+        }
+        record
     }
 }
 
@@ -801,7 +908,7 @@ impl ResultsWriter {
 
     /// The terminal record; flushes the stream. Nothing may be written after.
     pub fn emit_result(&self, result: &ResultRecord) {
-        self.write_and_seal(typed("result", result), true);
+        self.write_and_seal(result.to_record(), true);
     }
 
     pub fn emit_rm_result(&self, result: &RmResultRecord) {

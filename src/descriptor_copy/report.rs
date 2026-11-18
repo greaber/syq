@@ -178,30 +178,19 @@ impl Report {
         if self.entry.is_some() {
             return;
         }
+        let status = if success {
+            results::Status::Success
+        } else {
+            results::Status::Failed
+        };
         writer.emit_result(&results::ResultRecord {
-            status: if success {
-                results::Status::Success
-            } else {
-                results::Status::Failed
-            },
-            exit_code: if success { 0 } else { 1 },
-            dry_run: self.dry_run,
             files_transferred: u64::from(success && !skipped),
-            files_unchanged: 0,
             files_excluded: u64::from(skipped),
-            directories_created: 0,
-            symlinks_created: 0,
-            specials_created: 0,
             errors: u64::from(!success),
             bytes_transferred: if skipped { 0 } else { bytes },
-            bytes_unchanged: 0,
             timings: progress.timings(),
             bytes_total_known: Some(known),
-            deletions_planned: None,
-            deletions_completed: None,
-            deletions_blocked: None,
-            replaced_not_in_place: None,
-            extra: Default::default(),
+            ..results::ResultRecord::new(status, if success { 0 } else { 1 }, self.dry_run)
         });
     }
 }
