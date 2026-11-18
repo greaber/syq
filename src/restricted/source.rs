@@ -23,6 +23,7 @@ use crate::proto::{
     SourceRootBase, SourceRootSelection, Which,
 };
 use anyhow::{bail, ensure, Context, Result};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -79,7 +80,8 @@ struct State {
     control_admitted: bool,
     live_connections: u16,
     roots: HashMap<RegisteredRootId, RegisteredSourceRoot>,
-    paths: HashSet<(RegisteredRootId, Vec<u8>)>,
+    /// One `PathDigest` for each distinct path any request has named.
+    paths: HashSet<PathDigest>,
     requested_bytes: u64,
     tcp_listener_started: bool,
     send_budget: Option<DescriptorTicket>,
@@ -90,8 +92,19 @@ struct State {
 
 pub(crate) struct SourceAuthority {
     policy: SourcePolicy,
+    /// Keys `PathDigest`; random for each authority and never sent anywhere.
+    path_key: [u8; 32],
     state: Mutex<State>,
 }
+
+/// A path's identity in the entry count: the first 128 bits of BLAKE3 keyed
+/// with `SourceAuthority::path_key`, over the root ID's 8 bytes and then the
+/// relative path. The fixed-width root makes the encoding unambiguous, so two
+/// paths share a digest only by a collision. A collision would count two paths
+/// as one; without the key, a coordinator cannot compute digests or search for
+/// a collision offline, and among the limit's 100 million paths at most, the
+/// chance of any accidental collision is below 2^-74.
+type PathDigest = u128;
 
 /// One open channel to a source (`SourceAuthority::open_channel`).
 pub(crate) struct ChannelPermit(Arc<SourceAuthority>);
@@ -106,6 +119,9 @@ impl Drop for ChannelPermit {
 pub(crate) struct SourceConnection {
     authority: Arc<SourceAuthority>,
     control: bool,
+    /// The last single path this connection had counted. Each chunk of a file
+    /// read in pieces names the same path, and the count already includes it.
+    last_path: Cell<Option<PathDigest>>,
 }
 
 impl SourceAuthority {
@@ -142,8 +158,11 @@ impl SourceAuthority {
                 "source approval contains an invalid selection"
             );
         }
+        let mut path_key = [0; 32];
+        getrandom::fill(&mut path_key).context("generate the source path key")?;
         Ok(Arc::new(Self {
             policy,
+            path_key,
             state: Mutex::new(State {
                 open: true,
                 control_admitted: false,
@@ -318,6 +337,7 @@ impl SourceAuthority {
         Ok(SourceConnection {
             authority: Arc::clone(self),
             control,
+            last_path: Cell::new(None),
         })
     }
 
@@ -333,11 +353,23 @@ impl SourceAuthority {
         Ok(())
     }
 
-    fn record_paths(&self, state: &mut State, paths: &[RegisteredPath]) -> Result<()> {
+    fn path_digest(&self, source: &RegisteredPath) -> PathDigest {
+        let mut hasher = blake3::Hasher::new_keyed(&self.path_key);
+        hasher.update(&source.root().get().to_le_bytes());
+        hasher.update(source.relative());
+        let mut digest = [0; 16];
+        hasher.finalize_xof().fill(&mut digest);
+        PathDigest::from_le_bytes(digest)
+    }
+
+    fn record_paths<'a>(
+        &self,
+        state: &mut State,
+        paths: impl IntoIterator<Item = (&'a RegisteredPath, PathDigest)>,
+    ) -> Result<()> {
         let mut additions = HashSet::new();
-        for source in paths {
+        for (source, key) in paths {
             self.check_path(state, source)?;
-            let key = (source.root(), source.relative().to_vec());
             if !state.paths.contains(&key) {
                 additions.insert(key);
             }
@@ -462,7 +494,7 @@ impl SourceConnection {
     /// bytes, including retries and requests that subsequently fail, just as
     /// the destination's transfer limit counts submitted writes. Hashing has
     /// its own per-file bound and does not consume the payload allowance.
-    pub(crate) fn authorize(&self, request: &Request) -> Result<()> {
+    pub(crate) fn authorize<'r>(&self, request: &'r Request) -> Result<()> {
         if matches!(
             request,
             Request::Shutdown | Request::StopReadStream | Request::ShrinkReadStream { .. }
@@ -472,6 +504,8 @@ impl SourceConnection {
         let mut state = self.authority.state.lock().unwrap();
         self.authority.check_open(&state)?;
         let policy = &self.authority.policy;
+        // A request names either one path or a batch of them.
+        let mut path = None;
         let mut paths = Vec::new();
         let mut bytes = 0u64;
         ensure!(
@@ -499,9 +533,9 @@ impl SourceConnection {
                 ),
             "a dry run was approved to list and compare these files, not to read them"
         );
-        let source = |source: &Option<RegisteredPath>| -> Result<RegisteredPath> {
+        let source = |source: &'r Option<RegisteredPath>| -> Result<&'r RegisteredPath> {
             source
-                .clone()
+                .as_ref()
                 .context("approved source request omitted its registered reference")
         };
         let range = |off: u64, len: u64| -> Result<()> {
@@ -566,7 +600,7 @@ impl SourceConnection {
             Request::Scan {
                 source: reference, ..
             } => {
-                paths.push(source(reference)?);
+                path = Some(source(reference)?);
             }
             Request::StatMany {
                 paths: labels,
@@ -574,8 +608,10 @@ impl SourceConnection {
                 ..
             } => {
                 paths = sources
-                    .clone()
-                    .context("source stat omitted registered references")?;
+                    .as_ref()
+                    .context("source stat omitted registered references")?
+                    .iter()
+                    .collect();
                 ensure!(
                     paths.len() == labels.len(),
                     "source stat reference count differs"
@@ -599,7 +635,7 @@ impl SourceConnection {
                     bytes <= crate::proto::MAX_READ_BYTES,
                     "source read exceeds frame limit"
                 );
-                paths.push(source(reference)?);
+                path = Some(source(reference)?);
             }
             Request::ReadSmallBatch(reads) => {
                 for read in reads {
@@ -632,7 +668,7 @@ impl SourceConnection {
             Request::ReadStream(stream) => {
                 stream.validate()?;
                 range(stream.off, stream.end - stream.off)?;
-                paths.push(source(&stream.source)?);
+                path = Some(source(&stream.source)?);
                 // Each generated ReadRange must be admitted separately. This
                 // permits cancellation and charges only the requested chunks.
             }
@@ -654,12 +690,12 @@ impl SourceConnection {
                     "source hash block policy differs from approval"
                 );
                 range(*off, *len)?;
-                paths.push(source(reference)?);
+                path = Some(source(reference)?);
             }
             Request::FileHash {
                 source: reference, ..
             } => {
-                paths.push(source(reference)?);
+                path = Some(source(reference)?);
             }
             Request::TransportStats => {}
             _ => bail!("request is not valid on an approved source"),
@@ -672,7 +708,25 @@ impl SourceConnection {
             requested_bytes <= policy.limits.max_total_bytes,
             "source total-byte limit exceeded"
         );
-        self.authority.record_paths(&mut state, &paths)?;
+        match path {
+            Some(path) => {
+                let digest = self.authority.path_digest(path);
+                if self.last_path.get() == Some(digest) {
+                    // Counted before and never uncounted; the root and
+                    // selection checks still apply.
+                    self.authority.check_path(&state, path)?;
+                } else {
+                    self.authority.record_paths(&mut state, [(path, digest)])?;
+                    self.last_path.set(Some(digest));
+                }
+            }
+            None => self.authority.record_paths(
+                &mut state,
+                paths
+                    .into_iter()
+                    .map(|path| (path, self.authority.path_digest(path))),
+            )?,
+        }
         state.requested_bytes = requested_bytes;
         Ok(())
     }
@@ -691,7 +745,12 @@ impl SourceConnection {
             .into_iter()
             .map(|entry| root.join(entry))
             .collect::<Result<Vec<_>>>()?;
-        self.authority.record_paths(&mut state, &paths)
+        self.authority.record_paths(
+            &mut state,
+            paths
+                .iter()
+                .map(|path| (path, self.authority.path_digest(path))),
+        )
     }
 
     /// Whole-file hashing has no length in its wire request. Bound it while
