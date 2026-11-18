@@ -437,10 +437,10 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
     if let Some(writer) = progress.results_writer() {
         writer.emit_result(&crate::results::ResultRecord {
             status: match code {
-                0 => "success",
-                23 => "partial",
-                25 => "refused",
-                _ => "failed",
+                0 => crate::results::Status::Success,
+                23 => crate::results::Status::Partial,
+                25 => crate::results::Status::Refused,
+                _ => crate::results::Status::Failed,
             },
             exit_code: code,
             dry_run: args.dry_run,
@@ -463,7 +463,9 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
             deletions_blocked: args
                 .delete
                 .then(|| progress.deletions_blocked.load(Relaxed)),
+            bytes_total_known: None,
             replaced_not_in_place: None,
+            extra: Default::default(),
         });
         if writer.is_dead() {
             bail!("S3 result stream could not be completed");

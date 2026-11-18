@@ -1705,9 +1705,9 @@ fn attempt_small_copy(
     progress.clear();
     let errors = progress.errors.load(Relaxed);
     let (status, exit_code) = if errors > 0 {
-        ("partial", 23)
+        (crate::results::Status::Partial, 23)
     } else {
-        ("success", 0)
+        (crate::results::Status::Success, 0)
     };
     drop(planning);
     drop(copying);
@@ -1736,10 +1736,12 @@ fn attempt_small_copy(
         bytes_transferred: progress.bytes_done.load(Relaxed),
         bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
         timings: progress.timings(),
+        bytes_total_known: None,
         deletions_planned: None,
         deletions_completed: None,
         deletions_blocked: None,
         replaced_not_in_place: None,
+        extra: Default::default(),
     };
     let elapsed = progress.display_elapsed().as_secs_f64();
     if !args.quiet && !args.suppress_summary {
@@ -1947,8 +1949,8 @@ pub(crate) fn print_transfer_summary(
     );
     if let Some(summary) = terminal
         .replaced_not_in_place
-        .as_deref()
-        .and_then(|counts| in_place_refusal_summary(counts, false))
+        .as_ref()
+        .and_then(|counts| in_place_refusal_summary(&counts.counts(), false))
     {
         crate::output::human_stdout!("syq: {summary}");
     }
@@ -2292,7 +2294,7 @@ pub fn run(mut args: Args) -> Result<i32> {
                 );
             }
             results.emit_result(&crate::results::ResultRecord {
-                status: "failed",
+                status: crate::results::Status::Failed,
                 exit_code: 1,
                 dry_run,
                 files_transferred: progress.files_done.load(Relaxed),
@@ -2313,7 +2315,13 @@ pub fn run(mut args: Args) -> Result<i32> {
                 deletions_planned: prune.then(|| progress.deletions_planned.load(Relaxed)),
                 deletions_completed: prune.then(|| progress.deletions_completed.load(Relaxed)),
                 deletions_blocked: prune.then(|| progress.deletions_blocked.load(Relaxed)),
-                replaced_not_in_place: in_place_update.then(|| progress.in_place_refusals.counts()),
+                bytes_total_known: None,
+                replaced_not_in_place: in_place_update.then(|| {
+                    crate::results::ReplacedNotInPlace::from_counts(
+                        &progress.in_place_refusals.counts(),
+                    )
+                }),
+                extra: Default::default(),
             });
         }
     }
@@ -5465,13 +5473,13 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // aborts trump entry errors, which trump a blocked deletion pass (its
     // fact survives in deletions_blocked).
     let (status, exit_code) = if aborted {
-        ("aborted", 1)
+        (crate::results::Status::Aborted, 1)
     } else if errors > 0 {
-        ("partial", 23)
+        (crate::results::Status::Partial, 23)
     } else if max_delete_hit {
-        ("refused", 25)
+        (crate::results::Status::Refused, 25)
     } else {
-        ("success", 0)
+        (crate::results::Status::Success, 0)
     };
     drop(finalization);
     progress.finish(exit_code == 0);
@@ -5518,12 +5526,14 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         bytes_transferred: progress.bytes_done.load(Relaxed),
         bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
         timings: progress.timings(),
+        bytes_total_known: None,
         deletions_planned,
         deletions_completed,
         deletions_blocked,
-        replaced_not_in_place: opts
-            .inplace_update
-            .then(|| progress.in_place_refusals.counts()),
+        replaced_not_in_place: opts.inplace_update.then(|| {
+            crate::results::ReplacedNotInPlace::from_counts(&progress.in_place_refusals.counts())
+        }),
+        extra: Default::default(),
     };
 
     if let (Some(history), Some(initial)) = (

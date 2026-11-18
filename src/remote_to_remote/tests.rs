@@ -249,7 +249,7 @@ fn settlement_preserves_terminal_outcomes() {
     ];
     for (destination, refusals, coordinator, status, exit_code, rejects) in cases {
         let outcome = settlement_outcome(destination, refusals, coordinator);
-        assert_eq!(outcome.results_status, status);
+        assert_eq!(serde_json::json!(outcome.results_status), status);
         assert_eq!(outcome.exit_code, exit_code);
         assert_eq!(outcome.rejects, rejects);
     }
@@ -329,6 +329,32 @@ fn coordinator_terminal() -> serde_json::Value {
         "bytes_unchanged": 40,
         "timings": {"total_ms": 5, "transfer_ms": 3},
     })
+}
+
+/// A coordinator of another build may add fields to its final result; the
+/// relay writes them as they came.
+#[test]
+fn a_relayed_final_result_keeps_fields_this_build_does_not_know() {
+    let (file, writer) = results_file();
+    let relay = Relay::new(TOKEN, Some(writer), None, (false, true));
+    let mut terminal = coordinator_terminal();
+    terminal["future_count"] = 7.into();
+    terminal["future_detail"] = serde_json::json!({"nested": [1, "two"]});
+    terminal["timings"]["future_ms"] = 9.into();
+    terminal["deletions_planned"] = 3.into();
+    terminal["deletions_completed"] = 2.into();
+    terminal["deletions_blocked"] = 0.into();
+    terminal["replaced_not_in_place"] = serde_json::json!({"owner": 2, "future_reason": 1});
+    let mut relay = relay;
+    let input = coordinator_line(terminal.clone(), 0);
+    relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
+    assert_eq!(settle(relay, settlement(0)).unwrap(), 0);
+    let mut written = read_records(file).pop().unwrap();
+    assert_eq!(written["seq"], 0);
+    for key in ["schema", "schema_version", "seq"] {
+        written.as_object_mut().unwrap().remove(key);
+    }
+    assert_eq!(written, terminal);
 }
 
 #[test]

@@ -12,7 +12,7 @@ use crate::{
 use anyhow::{bail, ensure, Context, Result};
 use futures_util::{stream, StreamExt};
 use manifest::{Endpoint, Entry};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::{
     io::Read,
     sync::{
@@ -21,33 +21,27 @@ use std::{
     },
 };
 
-struct Totals(Value);
+/// The run's totals: its pathname phase's, then each callback entry's.
+struct Totals(results::ResultRecord);
 impl Totals {
     fn new(dry_run: bool) -> Self {
-        Self(
-            json!({"type":"result", "status":"success", "exit_code":0, "dry_run":dry_run,
-            "files_transferred":0,"files_unchanged":0,"files_excluded":0,"directories_created":0,
-            "symlinks_created":0,"specials_created":0,"errors":0,"bytes_transferred":0,
-            "bytes_unchanged":0,"timings":{"total_ms":0}}),
-        )
+        Self(results::ResultRecord::new(
+            results::Status::Success,
+            0,
+            dry_run,
+        ))
     }
-    fn add(&mut self, name: &str, value: u64) {
-        self.0[name] = (self.0[name].as_u64().unwrap_or(0) + value).into();
-    }
-    fn phase(&mut self, value: &Value) {
-        for name in [
-            "files_transferred",
-            "files_unchanged",
-            "files_excluded",
-            "directories_created",
-            "symlinks_created",
-            "specials_created",
-            "errors",
-            "bytes_transferred",
-            "bytes_unchanged",
-        ] {
-            self.add(name, value[name].as_u64().unwrap_or(0));
-        }
+    fn phase(&mut self, record: &results::ResultRecord) {
+        let totals = &mut self.0;
+        totals.files_transferred += record.files_transferred;
+        totals.files_unchanged += record.files_unchanged;
+        totals.files_excluded += record.files_excluded;
+        totals.directories_created += record.directories_created;
+        totals.symlinks_created += record.symlinks_created;
+        totals.specials_created += record.specials_created;
+        totals.errors += record.errors;
+        totals.bytes_transferred += record.bytes_transferred;
+        totals.bytes_unchanged += record.bytes_unchanged;
     }
 }
 
@@ -67,24 +61,21 @@ pub(crate) fn run(args: Args) -> Result<i32> {
     let code = if let Err(error) = &outcome {
         writer.emit_error_classified(&format!("{error:#}"), None, None);
         crate::output::diagnostic!("syq: {error:#}");
-        totals.add("errors", 1);
+        totals.0.errors += 1;
         1
-    } else if totals.0["errors"].as_u64().unwrap_or(0) != 0 {
+    } else if totals.0.errors != 0 {
         23
     } else {
         0
     };
-    totals.0["status"] = (if code == 0 {
-        "success"
-    } else if code == 23 {
-        "partial"
-    } else {
-        "failed"
-    })
-    .into();
-    totals.0["exit_code"] = code.into();
-    totals.0["timings"]["total_ms"] = (started.elapsed().as_millis() as u64).into();
-    writer.emit_terminal_value(totals.0);
+    totals.0.status = match code {
+        0 => results::Status::Success,
+        23 => results::Status::Partial,
+        _ => results::Status::Failed,
+    };
+    totals.0.exit_code = code;
+    totals.0.timings.total_ms = started.elapsed().as_millis() as u64;
+    writer.emit_result(&totals.0);
     Ok(if writer.is_dead() { 1 } else { code })
 }
 
@@ -166,13 +157,13 @@ fn run_inner(args: &Args, writer: Arc<ResultsWriter>, totals: &mut Totals) -> Re
             progress.set_results(writer.clone());
             progress
                 .bytes_done
-                .store(totals.0["bytes_transferred"].as_u64().unwrap(), Relaxed);
+                .store(totals.0.bytes_transferred, Relaxed);
             progress
                 .files_total
                 .store(manifest.callbacks.len() as u64, Relaxed);
-            let ordinary_done = totals.0["files_transferred"].as_u64().unwrap();
-            let ordinary_unchanged = totals.0["files_unchanged"].as_u64().unwrap();
-            let ordinary_excluded = totals.0["files_excluded"].as_u64().unwrap();
+            let ordinary_done = totals.0.files_transferred;
+            let ordinary_unchanged = totals.0.files_unchanged;
+            let ordinary_excluded = totals.0.files_excluded;
             progress.files_total.fetch_add(
                 ordinary_done + ordinary_unchanged + ordinary_excluded,
                 Relaxed,
@@ -182,10 +173,10 @@ fn run_inner(args: &Args, writer: Arc<ResultsWriter>, totals: &mut Totals) -> Re
             progress.files_excluded.store(ordinary_excluded, Relaxed);
             progress
                 .bytes_total
-                .store(totals.0["bytes_transferred"].as_u64().unwrap(), Relaxed);
+                .store(totals.0.bytes_transferred, Relaxed);
             progress
                 .bytes_unchanged
-                .store(totals.0["bytes_unchanged"].as_u64().unwrap(), Relaxed);
+                .store(totals.0.bytes_unchanged, Relaxed);
             let ticker = progress.spawn_ticker();
             let result = runtime.block_on(async {
             let cancelled = Arc::new(AtomicBool::new(false));
@@ -232,10 +223,10 @@ fn run_inner(args: &Args, writer: Arc<ResultsWriter>, totals: &mut Totals) -> Re
                 };
                 let Some((controls, success)) = next else { break; };
                 let skipped = success && controls.report.skipped();
-                totals.add("files_transferred", u64::from(success && !skipped));
-                totals.add("files_excluded", u64::from(skipped));
-                totals.add("errors", u64::from(!success));
-                totals.add("bytes_transferred", controls.progress.bytes_done.load(Relaxed));
+                totals.0.files_transferred += u64::from(success && !skipped);
+                totals.0.files_excluded += u64::from(skipped);
+                totals.0.errors += u64::from(!success);
+                totals.0.bytes_transferred += controls.progress.bytes_done.load(Relaxed);
                 progress.files_done.fetch_add(u64::from(success && !skipped), Relaxed);
                 progress.files_excluded.fetch_add(u64::from(skipped), Relaxed);
                 progress.errors.fetch_add(u64::from(!success), Relaxed);
@@ -247,7 +238,7 @@ fn run_inner(args: &Args, writer: Arc<ResultsWriter>, totals: &mut Totals) -> Re
                 let _ = ticker.join();
             }
             if args.stats && !args.quiet {
-                crate::output::diagnostic!("mapping complete: {} bytes transferred, {} unchanged files, {} excluded files, {} errors", totals.0["bytes_transferred"], totals.0["files_unchanged"], totals.0["files_excluded"], totals.0["errors"]);
+                crate::output::diagnostic!("mapping complete: {} bytes transferred, {} unchanged files, {} excluded files, {} errors", totals.0.bytes_transferred, totals.0.files_unchanged, totals.0.files_excluded, totals.0.errors);
             }
             result
         })();

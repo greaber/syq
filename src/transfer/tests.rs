@@ -7374,23 +7374,11 @@ fn summary_record(
     bytes_unchanged: u64,
 ) -> crate::results::ResultRecord {
     crate::results::ResultRecord {
-        status: "success",
-        exit_code: 0,
-        dry_run: false,
         files_transferred,
         files_unchanged,
-        files_excluded: 0,
-        directories_created: 0,
-        symlinks_created: 0,
-        specials_created: 0,
-        errors: 0,
         bytes_transferred,
         bytes_unchanged,
-        timings: Default::default(),
-        deletions_planned: None,
-        deletions_completed: None,
-        deletions_blocked: None,
-        replaced_not_in_place: None,
+        ..crate::results::ResultRecord::new(crate::results::Status::Success, 0, false)
     }
 }
 
