@@ -104,7 +104,16 @@ print(json.dumps([any(p.open('rb').read(4 << 20) == b'x' * (4 << 20) for p in ro
                 assert 0 < terminal["bytes_transferred"] <= 28 << 20, terminal
             actual = remote("sha256sum " + shlex.quote(root + "/" + name)).split()[0]
             assert actual == hashlib.sha256(b'x' * (32 << 20)).hexdigest()
-        run("syq", "receiver", "revoke", bytes(after["id"]).hex())
+        # Without the build in the server's store, revoking uploads it for
+        # its one session and leaves nothing staged.
+        store = "\"$HOME/.local/lib/syq\""
+        remote(f"mv {store} \"$HOME/.local/lib/syq-aside\"")
+        try:
+            run("syq", "receiver", "revoke", bytes(after["id"]).hex())
+            remote("test ! -e " + shlex.quote(after["remote_home"] + "/.local/share/syq/enrollments/" + bytes(after["id"]).hex()))
+            assert remote(f"ls -A {store}") == "", "revocation left its upload staged"
+        finally:
+            remote(f"rm -rf {store} && mv \"$HOME/.local/lib/syq-aside\" {store}")
         print("Active receiver revocation and fresh-enrollment resume passed", flush=True)
     except BaseException:
         for process in processes:
