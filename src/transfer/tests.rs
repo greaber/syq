@@ -1193,11 +1193,15 @@ fn changed_source_exhausts_retries_without_publishing() {
             .unwrap()
             .replies
             .push_back(Response::Stats(vec![Some(changed)]));
-        let result = worker.finish_file(0);
+        worker
+            .publish(0, false)
+            .and_then(|()| worker.settle_publications(true))
+            .unwrap();
         if attempt + 1 == MAX_ATTEMPTS {
-            assert!(result.unwrap_err().to_string().contains("source changed"));
+            assert!(sched.is_failed(0));
+            assert_eq!(worker.progress.errors.load(Relaxed), 1);
         } else {
-            result.unwrap();
+            assert!(!sched.is_failed(0));
             assert!(
                 !worker.fast_eligible(0),
                 "a smaller retry must keep staged publication"
@@ -1240,15 +1244,17 @@ fn a_refused_finalize_whose_sidecar_is_gone_is_verified_by_contents() {
             Response::PartialSize(sidecar_left.then_some(512)),
             hash,
         ]);
-        let result = worker.finish_file(0);
+        worker
+            .publish(0, false)
+            .and_then(|()| worker.settle_publications(true))
+            .unwrap();
         let destination = dst.lock().unwrap();
         if sidecar_left {
-            let error = format!("{:#}", result.unwrap_err());
-            assert!(error.contains("not open in this receiver"), "{error}");
+            assert!(sched.is_failed(0));
+            assert_eq!(worker.progress.errors.load(Relaxed), 1);
             assert_eq!(destination.requests.len(), 2);
             assert_eq!(worker.progress.files_done.load(Relaxed), 0);
         } else {
-            result.unwrap();
             assert!(matches!(
                 destination.requests[..],
                 [
@@ -1472,6 +1478,41 @@ fn a_deferred_recheck_that_finds_a_change_queues_the_file_again() {
     assert!(queued.contains(&idx), "{queued:?}");
 }
 
+/// A connection that drops while `--if-exists=error-if-different` compares
+/// an existing file queues the file again for the reopened connection,
+/// rather than letting it leave the copy neither compared nor failed.
+#[test]
+fn a_connection_lost_comparing_a_protected_file_queues_it_again() {
+    let sched = Arc::new(Sched::new(512, 8192));
+    let mut job = pipeline_job(b"file", 512);
+    job.dst_entry = Some(job.entry.clone());
+    sched.push_file(job);
+    sched.scan_done();
+    let Item::File(idx) = sched.next() else {
+        panic!("expected a file")
+    };
+    let src = Arc::new(Mutex::new(PipelineState {
+        fail_receive: Some(1),
+        ..Default::default()
+    }));
+    let dst = Arc::new(Mutex::new(PipelineState {
+        fail_receive: Some(1),
+        ..Default::default()
+    }));
+    let mut worker = pipeline_worker(&sched, &src, &dst, false);
+    Arc::get_mut(&mut worker.opts).unwrap().if_exists =
+        Some(crate::cli::IfExists::ErrorIfDifferent);
+    let error = worker.handle_file(idx).unwrap_err();
+    assert!(worker.transport_dead());
+    // The worker leaves with the error, to reopen its connection.
+    assert!(worker.file_error(idx, error).is_err());
+    assert!(!sched.is_failed(idx));
+    assert!(
+        matches!(sched.try_next(), Some(Item::File(queued)) if queued == idx),
+        "the file must be queued again"
+    );
+}
+
 /// A worker whose connection fails with publications in flight queues them
 /// to be published again, as it does a Finalize whose reply was lost.
 #[test]
@@ -1669,7 +1710,8 @@ fn cancelled_range_drains_without_reporting_or_publishing_an_innocent_file() {
     let mut worker = pipeline_worker(&sched, &src, &dst, false);
     worker.transfer_range(&range, &mut 0).unwrap();
     assert!(!sched.range_done(&range));
-    worker.finish_file(0).unwrap();
+    worker.publish(0, false).unwrap();
+    assert!(worker.publications.is_empty());
     assert!(!sched.is_failed(0));
     assert!(src.lock().unwrap().replies.is_empty());
     let destination = dst.lock().unwrap();
@@ -3312,8 +3354,15 @@ fn local_copy_progress_is_live_but_failure_retracts_completion_credit() {
             .unwrap()
             .replies
             .push_back(Response::Stats(vec![Some(job.entry.clone())]));
-        let result = worker.try_copy_local(0, &job);
+        let result = worker.try_copy_local(&job);
         assert_eq!(result.is_ok(), failure == "none", "{failure}: {result:?}");
+        if result.is_ok() {
+            sched.ranges_ready(0, vec![]);
+            worker
+                .publish(0, false)
+                .and_then(|()| worker.settle_publications(true))
+                .unwrap();
+        }
         assert_eq!(dst.lock().unwrap().progress_at_receive[1], (1024, 0));
         assert_eq!(
             worker.progress.bytes_done.load(Relaxed),

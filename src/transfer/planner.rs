@@ -5124,7 +5124,7 @@ impl Planner<'_> {
     /// or it is to get new names as a hard-link representative and its
     /// owner is not one the receiver accepts. This predicts the receiver's
     /// decision from the scan; the receiver decides for itself, and a file
-    /// it refuses is replaced then (`Worker::replace_instead`).
+    /// it refuses is replaced then (`Worker::replacing`).
     pub(super) fn must_replace(
         &mut self,
         (dst, rel): (&[u8], &[u8]),

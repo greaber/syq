@@ -66,11 +66,11 @@ fn source_recheck_reply(response: Response) -> Result<Option<Entry>> {
 
 impl Worker {
     /// Publish the file at `idx`, whose contents are complete at the
-    /// destination, without waiting for the round trips: as
-    /// `finish_file` does, or, when `matched`, as `finish_matched_file`
-    /// does. A failure of this file is reported here; an error returned
-    /// means this worker's connection failed, and the file is queued to be
-    /// published again.
+    /// destination, without waiting for the round trips: check its source
+    /// again and, unless `matched` (its contents and metadata are already
+    /// in place), `Finalize` it. A failure of this file is reported here;
+    /// an error returned means this worker's connection failed, and the
+    /// file is queued to be published again.
     pub(super) fn publish(&mut self, idx: usize, matched: bool) -> Result<()> {
         let room = self.settle_publications(false).and_then(|()| {
             while self.publications.len() >= DEFERRED_PUBLICATIONS {
