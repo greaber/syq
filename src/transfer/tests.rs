@@ -6183,7 +6183,7 @@ impl Conn for WideSource {
 /// fit fails, and so does every later one, as the reader stops.
 struct BudgetedSource {
     inner: QueuingSource,
-    holds: std::collections::VecDeque<std::io::Result<crate::wire_budget::Budgeted<u32>>>,
+    holds: std::collections::VecDeque<std::io::Result<crate::wire_budget::Budgeted<Response>>>,
     reserved: crate::wire_budget::ReservedReplies,
     failed: bool,
 }
@@ -6191,9 +6191,9 @@ struct BudgetedSource {
 impl Conn for BudgetedSource {
     fn send(&mut self, request: Request) -> Result<()> {
         self.inner.send(request)?;
-        let reply = postcard::to_stdvec(&0u32).unwrap();
+        let reply = postcard::to_stdvec(self.inner.replies.back().expect("a reply")).unwrap();
         self.holds
-            .push_back(crate::wire_budget::decode::<u32>(&reply));
+            .push_back(crate::wire_budget::decode::<Response>(&reply));
         Ok(())
     }
     fn recv(&mut self) -> Result<Response> {

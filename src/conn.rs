@@ -915,14 +915,17 @@ fn spawn_observed_reader(
             }
             r.set_limit(MAX_FRAME);
             loop {
-                let msg = r
+                let mut msg = r
                     .read_budgeted_with_start::<Response>()
                     .map(ReceivedResponse::from_frame);
-                if let Ok(message) = &msg {
+                if let Ok(message) = &mut msg {
                     // A restricted receiver's results are for the syq that
                     // started this coordinator, not for any request here.
+                    // A frame not queued leaves a reserved reply slot to the
+                    // reply it was reserved for.
                     if let Response::DestinationResults(frame) = &message.value {
                         crate::destination_results::relay::forward(frame);
+                        message.hold.return_slot();
                         continue;
                     }
                     if let Response::TransportStats(stats) = &message.value {
@@ -932,6 +935,7 @@ fn spawn_observed_reader(
                             observation.update(value);
                         }
                         if !stats.solicited {
+                            message.hold.return_slot();
                             continue;
                         }
                     }
