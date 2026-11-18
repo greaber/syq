@@ -171,6 +171,7 @@ impl Creation<'_> {
 
     /// Like `register`, reading the sidecar's identity only when this
     /// process registers sidecars.
+    #[cfg(target_os = "macos")]
     pub(super) fn register_with(
         self,
         root: &Arc<Root>,
@@ -410,7 +411,7 @@ pub(super) fn begin() -> Result<Creation<'static>> {
 }
 
 /// The sidecar with this identity was published or removed.
-pub(super) fn forget(identity: (u64, u64)) {
+pub(crate) fn forget(identity: (u64, u64)) {
     SIDECARS.forget(identity)
 }
 

@@ -4819,6 +4819,26 @@ fn on_a_device_with_fixed_wide_modes_a_retry_reuses_its_sidecar() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The sidecar `held` names at `relative`: the one held there, unless wider
+/// than `widest`, or else a new one created exclusively in `mode`, as
+/// `FsOps::open_stage` settles on one, at a name of the test's choosing.
+fn open_held_or_new(
+    ops: &mut FsOps,
+    held: stages::For<'_>,
+    relative: &RelativePath,
+    label: &Path,
+    mode: u32,
+    widest: Option<u32>,
+) -> Result<(File, OpenedPartial)> {
+    let root = held.root;
+    if let Some((file, len)) = ops.reuse_held_stage(held, relative, label, widest)? {
+        return Ok((file, OpenedPartial::Reused(len)));
+    }
+    let policy = StagePolicy::new(Sidecar::Partial).mode(mode);
+    let (file, created) = ops.create_stage_file(root, relative, label, policy)?;
+    Ok((file, OpenedPartial::Created(created)))
+}
+
 #[test]
 fn a_refused_mode_probe_leaves_the_device_checked() {
     // Whether a file's mode may be changed can depend on that file's own
@@ -4838,7 +4858,8 @@ fn a_refused_mode_probe_leaves_the_device_checked() {
     FORCED_MODE.set(Some(0o644));
     REFUSE_MODE_PROBE.set(true);
     let probe = RelativePath::new(b"probe").unwrap();
-    let probed = ops.open_private_partial_rooted(
+    let probed = open_held_or_new(
+        &mut ops,
         stages::For {
             scope: 0,
             root: &root,
@@ -4848,13 +4869,12 @@ fn a_refused_mode_probe_leaves_the_device_checked() {
         },
         &probe,
         &temporary.path().join("probe"),
-        true,
         0o600,
         Some(0o600),
     );
     FORCED_MODE.set(None);
     REFUSE_MODE_PROBE.set(false);
-    probed.unwrap().unwrap();
+    probed.unwrap();
     // A retry on the same connection, with a narrower mode.
     let path = temporary.path().join("file");
     let id = [44; 16];
@@ -4928,23 +4948,21 @@ fn one_connections_probe_does_not_decide_for_another() {
     let copy_id = [62; 16];
     let open = |ops: &mut FsOps, name: &str| {
         let relative = RelativePath::new(name.as_bytes()).unwrap();
-        let (file, basis) = ops
-            .open_private_partial_rooted(
-                stages::For {
-                    scope: 0,
-                    root: &root,
-                    target: &relative,
-                    copy_id: &copy_id,
-                    inplace: false,
-                },
-                &relative,
-                &temporary.path().join(name),
-                true,
-                0o600,
-                Some(0o600),
-            )
-            .unwrap()
-            .unwrap();
+        let (file, basis) = open_held_or_new(
+            ops,
+            stages::For {
+                scope: 0,
+                root: &root,
+                target: &relative,
+                copy_id: &copy_id,
+                inplace: false,
+            },
+            &relative,
+            &temporary.path().join(name),
+            0o600,
+            Some(0o600),
+        )
+        .unwrap();
         (file.metadata().unwrap().ino(), basis.basis_size().is_some())
     };
     // A sidecar an earlier attempt in this receiver created, and holds.
@@ -7441,10 +7459,8 @@ fn acl_resume_replaces_previously_readable_staging_inodes() {
             copy_id: &[0; 16],
             inplace: false,
         };
-        let (mut file, basis) = ops
-            .open_private_partial_rooted(held, &relative, &path, true, 0o644, None)
-            .unwrap()
-            .unwrap();
+        let (mut file, basis) =
+            open_held_or_new(&mut ops, held, &relative, &path, 0o644, None).unwrap();
         assert!(basis.basis_size().is_none());
         assert_ne!(file.metadata().unwrap().ino(), old_inode);
         assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);

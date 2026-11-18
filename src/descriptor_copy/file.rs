@@ -22,6 +22,7 @@ impl Session {
         slot: &mut Self,
         operation: &Operation,
         descriptors: &crate::descriptor_broker::DescriptorSessionSlot,
+        ops: &mut crate::fsops::FsOps,
     ) -> Result<Response> {
         let entry = match operation {
             Operation::Open { entry, .. } => {
@@ -34,7 +35,7 @@ impl Session {
             Operation::Finish { entry, .. } | Operation::Abort { entry } => *entry,
         };
         let mut file = slot.entries.remove(&entry);
-        let result = FileSession::handle(&mut file, operation, descriptors);
+        let result = FileSession::handle(&mut file, operation, descriptors, ops);
         if let Some(file) = file {
             slot.entries.insert(entry, file);
         }
@@ -59,9 +60,11 @@ struct FileSession {
     registration: Option<Registration>,
 }
 struct Destination {
-    root: Root,
+    root: std::sync::Arc<Root>,
     target: RelativePath,
+    /// The stage, at its partial name, and its device and inode.
     temporary: RelativePath,
+    identity: (u64, u64),
     mode: u32,
     source_meta: Option<crate::proto::Meta>,
     metadata: super::metadata::Policy,
@@ -70,6 +73,7 @@ struct Destination {
 impl Drop for Destination {
     fn drop(&mut self) {
         let _ = self.root.unlink(&self.temporary);
+        crate::fsops::forget_sidecar(self.identity);
     }
 }
 pub(crate) fn resolve_source(path: &[u8], root: Option<&[u8]>, follow: bool) -> Result<PinnedPath> {
@@ -185,6 +189,7 @@ impl FileSession {
         write: bool,
         metadata: super::metadata::Policy,
         source_meta: Option<crate::proto::Meta>,
+        ops: &mut crate::fsops::FsOps,
     ) -> Result<Self> {
         let existed = !matches!(&selected, PinnedPath::Missing(_));
         let (file, destination) = if write {
@@ -221,38 +226,18 @@ impl FileSession {
                         & root.creation_permissions(&target)?
                 }
             };
-            // Keep the temporary in the target's own directory, including when
+            // The stage is in the target's own directory, including when
             // that directory is a mount point beneath the selected root.
-            let mut bytes = target
-                .to_path_buf()
-                .parent()
-                .unwrap()
-                .as_os_str()
-                .as_bytes()
-                .to_vec();
-            if !bytes.is_empty() {
-                bytes.push(b'/');
-            }
-            let mut random = [0u8; 16];
-            getrandom::fill(&mut random).context("generate stream temporary name")?;
-            bytes.extend_from_slice(
-                format!(
-                    ".syq-stream-{}",
-                    random
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect::<String>()
-                )
-                .as_bytes(),
-            );
-            let temporary = RelativePath::new(&bytes)?;
-            let file = root.create_file(&temporary, 0o600)?;
+            let root = std::sync::Arc::new(root);
+            let (temporary, file) = ops.open_descriptor_stage(&root, &target)?;
+            let created = file.metadata()?;
             (
                 file,
                 Some(Destination {
                     root,
                     target,
                     temporary,
+                    identity: (created.dev(), created.ino()),
                     mode: if metadata.preserve & crate::proto::flags::MODE != 0 {
                         source_meta
                             .as_ref()
@@ -299,6 +284,7 @@ impl FileSession {
         slot: &mut Option<Self>,
         operation: &Operation,
         descriptors: &crate::descriptor_broker::DescriptorSessionSlot,
+        ops: &mut crate::fsops::FsOps,
     ) -> Result<Response> {
         let result = (|| match operation {
             Operation::Open {
@@ -391,7 +377,7 @@ impl FileSession {
                 {
                     selected = resolve_destination(path, *follow, placement, true)?;
                 }
-                let mut stream = Self::open(selected, *write, *metadata, source_meta.clone())?;
+                let mut stream = Self::open(selected, *write, *metadata, source_meta.clone(), ops)?;
                 let size = (!*write).then_some(stream.original.len());
                 let ticket = descriptors.register_stream(stream.file.try_clone()?, *write)?;
                 stream.registration = Some(Registration {
@@ -670,6 +656,7 @@ mod tests {
         std::fs::write(&target, b"old").unwrap();
         let descriptors = DescriptorSessionSlot::default();
         let mut slot = Session::default();
+        let mut ops = crate::fsops::FsOps::new();
         let open = Operation::Open {
             entry: 1,
             dry_run: false,
@@ -688,7 +675,7 @@ mod tests {
             },
         };
         let Response::DescriptorOpened { ticket, .. } =
-            Session::handle(&mut slot, &open, &descriptors).unwrap()
+            Session::handle(&mut slot, &open, &descriptors, &mut ops).unwrap()
         else {
             panic!()
         };
@@ -742,20 +729,22 @@ mod tests {
             &mut slot,
             &Operation::Finish { entry: 1, size: 6 },
             &descriptors,
+            &mut ops,
         )
         .unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"onetwo");
         assert!(descriptors.acquire(&ticket).is_err());
         assert!(slot.entries.is_empty());
         // Bad lengths and abandoned sessions preserve the already-published file.
-        Session::handle(&mut slot, &open, &descriptors).unwrap();
+        Session::handle(&mut slot, &open, &descriptors, &mut ops).unwrap();
         assert!(Session::handle(
             &mut slot,
             &Operation::Finish { entry: 1, size: 1 },
-            &descriptors
+            &descriptors,
+            &mut ops,
         )
         .is_err());
-        Session::handle(&mut slot, &open, &descriptors).unwrap();
+        Session::handle(&mut slot, &open, &descriptors, &mut ops).unwrap();
         drop(slot);
         assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 1);
         assert_eq!(std::fs::read(&target).unwrap(), b"onetwo");
@@ -799,6 +788,7 @@ mod tests {
             };
             let descriptors = DescriptorSessionSlot::default();
             let mut slot = Session::default();
+            let mut ops = crate::fsops::FsOps::new();
             let Response::DescriptorOpened { ticket, .. } = Session::handle(
                 &mut slot,
                 &Operation::Open {
@@ -816,6 +806,7 @@ mod tests {
                     source_meta,
                 },
                 &descriptors,
+                &mut ops,
             )
             .unwrap() else {
                 panic!()
@@ -848,6 +839,7 @@ mod tests {
                 &mut slot,
                 &Operation::Finish { entry: 1, size: 7 },
                 &descriptors,
+                &mut ops,
             );
             crate::fsops::ACCESS_CHANGED.set(None);
             finished.unwrap();
@@ -877,6 +869,7 @@ mod tests {
         std::fs::write(&target, b"old").unwrap();
         let descriptors = DescriptorSessionSlot::default();
         let mut slot = Session::default();
+        let mut ops = crate::fsops::FsOps::new();
         let Response::DescriptorOpened { size, ticket, .. } = Session::handle(
             &mut slot,
             &Operation::Open {
@@ -894,6 +887,7 @@ mod tests {
                 source_meta: None,
             },
             &descriptors,
+            &mut ops,
         )
         .unwrap() else {
             panic!()
@@ -920,7 +914,8 @@ mod tests {
         assert!(Session::handle(
             &mut slot,
             &Operation::Finish { entry: 1, size: 3 },
-            &descriptors
+            &descriptors,
+            &mut ops,
         )
         .is_err());
     }
