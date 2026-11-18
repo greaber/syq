@@ -14,7 +14,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -905,27 +905,23 @@ pub(crate) fn prepare_endpoint(
     validate_openssh_socket_path(&socket)?;
     let record_path = scope.join(format!("{key}.json"));
     let expected = EndpointRecord::new(user, host, port, ssh);
-    let record_bytes = serde_json::to_vec(&expected)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(scope)
-        .with_context(|| format!("create endpoint record in {}", scope.display()))?;
-    temporary
-        .write_all(&record_bytes)
-        .and_then(|()| temporary.write_all(b"\n"))
-        .with_context(|| format!("write endpoint record {}", record_path.display()))?;
-    match temporary.persist_noclobber(&record_path) {
-        Ok(_) => {}
-        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let actual = read_endpoint_record(&record_path)?;
-            if actual != expected {
-                bail!(
-                    "persistence scope endpoint-key collision at {}",
-                    record_path.display()
-                );
-            }
-        }
-        Err(error) => {
-            return Err(error.error)
-                .with_context(|| format!("create endpoint record {}", record_path.display()));
+    let mut record_bytes = serde_json::to_vec(&expected)?;
+    record_bytes.push(b'\n');
+    let created = crate::state_file::write_atomic(
+        &record_path,
+        &record_bytes,
+        0o600,
+        crate::state_file::Publish::NoClobber,
+        crate::state_file::Durability::RenameOnly,
+    )
+    .with_context(|| format!("create endpoint record {}", record_path.display()))?;
+    if !created {
+        let actual = read_endpoint_record(&record_path)?;
+        if actual != expected {
+            bail!(
+                "persistence scope endpoint-key collision at {}",
+                record_path.display()
+            );
         }
     }
 
@@ -952,11 +948,7 @@ fn read_global_config() -> Result<Option<PersistenceConfig>> {
     let Some(path) = config_path() else {
         return Ok(None);
     };
-    let mut file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&path)
-    {
+    let file = match crate::state_file::open_private(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) if error.raw_os_error() == Some(libc::ENOTDIR) => return Ok(None),
@@ -964,25 +956,20 @@ fn read_global_config() -> Result<Option<PersistenceConfig>> {
             return Err(error).with_context(|| format!("open {}", path.display()));
         }
     };
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
-        bail!(
-            "persistence configuration {} must be a regular file owned by the current user",
-            path.display()
-        );
-    }
-    if metadata.mode() & 0o022 != 0 {
-        bail!(
-            "persistence configuration {} must not be group- or other-writable",
-            path.display()
-        );
-    }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    let bytes = crate::state_file::read_open(
+        file,
+        &format_args!("persistence configuration {}", path.display()),
+        MAX_CONFIG_BYTES,
+        crate::state_file::FileRule::NoGroupOtherWrite,
+    )?;
     let config: PersistenceConfig = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse persistence configuration {}", path.display()))?;
     Ok(Some(config))
 }
+
+/// The configuration holds one flag; the bound only stops a stray large
+/// file from being read whole.
+const MAX_CONFIG_BYTES: usize = 64 * 1024;
 
 pub(crate) fn global_enabled() -> Result<bool> {
     Ok(read_global_config()?.is_some_and(|config| config.enabled))
@@ -994,15 +981,16 @@ fn write_global_config(enabled: bool) -> Result<()> {
     let parent = path.parent().expect("configuration path has a parent");
     std::fs::create_dir_all(parent)
         .with_context(|| format!("create configuration directory {}", parent.display()))?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("create temporary configuration in {}", parent.display()))?;
-    serde_json::to_writer_pretty(&mut temporary, &PersistenceConfig { enabled })?;
-    temporary.write_all(b"\n")?;
-    temporary.as_file().sync_all()?;
-    temporary
-        .persist(&path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("replace persistence configuration {}", path.display()))?;
+    let mut bytes = serde_json::to_vec_pretty(&PersistenceConfig { enabled })?;
+    bytes.push(b'\n');
+    crate::state_file::write_atomic(
+        &path,
+        &bytes,
+        0o600,
+        crate::state_file::Publish::Replace,
+        crate::state_file::Durability::Synced,
+    )
+    .with_context(|| format!("replace persistence configuration {}", path.display()))?;
     Ok(())
 }
 
@@ -1139,49 +1127,20 @@ pub(crate) fn validate_scope(scope: &Path) -> Result<()> {
 /// Only internally selected directories are permission-tightened; an explicit
 /// `--pscope` that is too broad is refused without modifying it.
 fn secure_directory(path: &Path, create: bool, tighten: bool) -> Result<File> {
-    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .context("persistence directory path contains NUL")?;
-    if create && unsafe { libc::mkdir(c_path.as_ptr(), 0o700) } != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(error).with_context(|| format!("create {}", path.display()));
-        }
-    }
-    let descriptor = unsafe {
-        libc::open(
-            c_path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
+    let rule = if tighten {
+        crate::state_file::DirRule::Tighten
+    } else {
+        crate::state_file::DirRule::NoGroupOther
     };
-    if descriptor < 0 {
-        return Err(std::io::Error::last_os_error()).with_context(|| {
+    match crate::state_file::open_private_dir(path, "persistence directory", create, rule)? {
+        Some(directory) => Ok(directory),
+        None => Err(std::io::Error::from(std::io::ErrorKind::NotFound)).with_context(|| {
             format!(
                 "open persistence directory {} (symlinks are refused)",
                 path.display()
             )
-        });
+        }),
     }
-    let directory = unsafe { File::from_raw_fd(descriptor) };
-    let metadata = directory.metadata()?;
-    if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
-        bail!(
-            "persistence directory {} must be owned by the current user",
-            path.display()
-        );
-    }
-    if metadata.mode() & 0o077 != 0 {
-        if !tighten {
-            bail!(
-                "persistence directory {} must not be accessible by group or other users",
-                path.display()
-            );
-        }
-        if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("restrict {}", path.display()));
-        }
-    }
-    Ok(directory)
 }
 
 /// An `--rsh` ssh command's options select a separate connection, so a login
@@ -1223,22 +1182,22 @@ fn endpoint_key(
 }
 
 fn read_endpoint_record(path: &Path) -> Result<EndpointRecord> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
+    let file = crate::state_file::open_private(path)
         .with_context(|| format!("open endpoint record {}", path.display()))?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
-        bail!(
-            "endpoint record {} must be a regular file owned by the current user",
-            path.display()
-        );
-    }
-    let record: EndpointRecord = serde_json::from_reader(file)
+    let bytes = crate::state_file::read_open(
+        file,
+        &format_args!("endpoint record {}", path.display()),
+        MAX_ENDPOINT_RECORD,
+        crate::state_file::FileRule::Owned,
+    )?;
+    let record: EndpointRecord = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse endpoint record {}", path.display()))?;
     Ok(record)
 }
+
+/// Endpoint records are a few hundred bytes; cleanup reads them with the
+/// same bound.
+pub(crate) const MAX_ENDPOINT_RECORD: usize = 128 * 1024;
 
 fn record_key(name: &OsStr) -> Option<&str> {
     let name = name.to_str()?;
@@ -1792,9 +1751,16 @@ fn close_scope(scope: &Path) -> Result<()> {
     anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
     let record_keys: std::collections::HashSet<&str> =
         records.iter().map(|(key, _)| key.as_str()).collect();
+    let mut temporaries = Vec::new();
     for entry in std::fs::read_dir(scope)? {
         let entry = entry?;
         let name = entry.file_name();
+        // A writer killed before publishing leaves its temporary file; the
+        // scope is closing, so nothing will publish it.
+        if crate::state_file::is_own_temp_name(&name) && entry.file_type()?.is_file() {
+            temporaries.push(entry.path());
+            continue;
+        }
         if name == OsStr::new(SCOPE_MARKER)
             || name == OsStr::new(crate::receive_service::CLOSING)
             || record_key(&name).is_some()
@@ -1824,6 +1790,16 @@ fn close_scope(scope: &Path) -> Result<()> {
         );
     }
 
+    for path in temporaries {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("remove temporary file {}", path.display()))
+            }
+        }
+    }
     for (key, _) in records {
         let socket = scope.join(&key);
         if let Ok(metadata) = socket.symlink_metadata() {
@@ -2112,6 +2088,33 @@ mod tests {
         assert_eq!(scope_records(&scope).unwrap().len(), 2);
         close_scope(&scope).unwrap();
         assert!(!scope.exists());
+    }
+
+    #[test]
+    fn closing_scope_removes_temporary_files_a_killed_writer_left() {
+        let temporary = crate::test_support::short_tempdir().unwrap();
+        let scope = temporary.path().join("scope");
+        initialize_scope(&scope).unwrap();
+        prepare_endpoint(&scope, None, "example", None, None).unwrap();
+        // Earlier builds' writers name them `.tmpXXXXXX`.
+        for name in [".tmpAb12Z9", ".syq-tmp-123-00ff00ff00ff00ff"] {
+            std::fs::write(scope.join(name), b"{").unwrap();
+        }
+        close_scope(&scope).unwrap();
+        assert!(!scope.exists());
+    }
+
+    #[test]
+    fn closing_scope_still_refuses_unrecognized_entries() {
+        let temporary = crate::test_support::short_tempdir().unwrap();
+        let scope = temporary.path().join("scope");
+        initialize_scope(&scope).unwrap();
+        std::fs::write(scope.join(".tmp-not-ours"), b"").unwrap();
+        let error = close_scope(&scope).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unrecognized entry"),
+            "{error:#}"
+        );
     }
 
     #[test]

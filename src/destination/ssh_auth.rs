@@ -1310,6 +1310,7 @@ impl Receiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::DirBuilderExt;
 
     fn policy(seed: u8) -> ResolvedPolicy {
         let key = ssh_key::PrivateKey::new(

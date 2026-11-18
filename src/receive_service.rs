@@ -520,11 +520,15 @@ fn ensure_current_settings(domain: &Domain) -> Result<Preferences> {
     Ok(config)
 }
 fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    let mut file = tempfile::NamedTempFile::new_in(path.parent().context("missing state parent")?)?;
-    serde_json::to_writer(&mut file, value)?;
-    file.write_all(b"\n")?;
-    file.as_file().sync_all()?;
-    file.persist(path).map_err(|e| e.error)?;
+    let mut bytes = serde_json::to_vec(value)?;
+    bytes.push(b'\n');
+    crate::state_file::write_atomic(
+        path,
+        &bytes,
+        0o600,
+        crate::state_file::Publish::Replace,
+        crate::state_file::Durability::Synced,
+    )?;
     Ok(())
 }
 fn suffixed(control: &Path, suffix: &[u8]) -> PathBuf {

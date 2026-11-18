@@ -70,6 +70,7 @@ mod sched;
 mod server;
 mod session_pool;
 mod sparse;
+mod state_file;
 mod stream_mapping;
 mod streaming;
 #[cfg_attr(all(target_os = "macos", not(test)), deny(clippy::disallowed_methods))]
