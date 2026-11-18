@@ -6150,19 +6150,27 @@ mod directory_metadata_tests {
 
     #[test]
     fn final_metadata_too_large_for_one_request_goes_in_halves_with_its_directories() {
-        // Nine directories whose paths together exceed the frame budget, then
-        // one at a shallower depth that removes search access.
+        // Nine directories whose extended attributes together exceed the
+        // frame budget, then one at a shallower depth that removes search
+        // access.
         let long = crate::proto::METADATA_BATCH_BYTES / 4;
         let entry = |name: u8, len: usize, mode, depth| {
+            let attributes = crate::inode_metadata::ExtendedAttributes {
+                privileged: false,
+                values: vec![(b"user.large".to_vec(), vec![0; len])],
+            };
             (
-                vec![name; len],
+                vec![name],
                 Meta {
                     mode,
                     uid: 0,
                     gid: 0,
                     mtime: 0,
                     mtime_nsec: 0,
-                    inode_metadata: None,
+                    inode_metadata: Some(Box::new(crate::inode_metadata::InodeMetadata {
+                        xattrs: Some(attributes),
+                        ..Default::default()
+                    })),
                 },
                 flags::MODE,
                 depth,
@@ -6193,11 +6201,216 @@ mod directory_metadata_tests {
             })
             .collect();
         // Halved as `Planner::apply` halves any request, until at most three
-        // of these paths go together: 9 into 4 and 5, the 4 into 2 and 2, the
-        // 5 into 2 and 3. The narrowed directory waits for all of them.
+        // of these directories go together: 9 into 4 and 5, the 4 into 2 and
+        // 2, the 5 into 2 and 3. The narrowed directory waits for all of them.
         assert_eq!(
             names,
             [vec![0, 1], vec![2, 3], vec![4, 5], vec![6, 7, 8], vec![9]]
+        );
+    }
+
+    fn timed(path: Vec<u8>, depth: usize) -> DirectoryMetadata {
+        (
+            path,
+            Meta {
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                mtime: 1_500_000_000,
+                mtime_nsec: 0,
+                inode_metadata: None,
+            },
+            flags::TIMES,
+            depth,
+            TargetCondition::Any,
+        )
+    }
+
+    fn encoded_len<T: serde::Serialize>(message: &T) -> usize {
+        postcard::to_extend(message, Vec::new()).unwrap().len()
+    }
+
+    /// Whether a connection would send `message`: it is within its frame.
+    fn fits_its_frame<T: serde::Serialize + crate::proto::SizeHint>(message: &T) -> bool {
+        crate::proto::FrameWriter::new(Vec::new(), false)
+            .write_msg(message)
+            .is_ok()
+    }
+
+    #[test]
+    fn a_final_metadata_request_holds_4096_directories_of_ordinary_paths() {
+        let mut entries: Vec<DirectoryMetadata> = (0..10_000)
+            .map(|index| {
+                let path = format!("/destination/tree/g{:03}/d{index:06}", index / 1000);
+                timed(path.into_bytes(), 4)
+            })
+            .collect();
+        let lengths = |entries: &[DirectoryMetadata]| -> Vec<usize> {
+            DirectoryMetadataRequests::new(entries)
+                .map(|(directories, ops)| {
+                    assert_eq!(directories.len(), ops.len());
+                    ops.len()
+                })
+                .collect()
+        };
+        assert_eq!(lengths(&entries), [4096, 4096, 1808]);
+        // A shallower directory that loses search access still starts a
+        // request of its own, wherever in a request it would have fallen.
+        entries[5000] = timed(b"/destination/tree/closed".to_vec(), 3);
+        entries[5000].1.mode = 0o600;
+        entries[5000].2 = flags::MODE | flags::TIMES;
+        assert_eq!(lengths(&entries), [4096, 904, 4096, 904]);
+    }
+
+    /// The longest text an error of setting a directory's metadata takes: its
+    /// handle could not be opened, which names the directory as the request
+    /// does (`shown`) and again beneath the destination root (`beneath`),
+    /// with the system's longest description of an error.
+    fn longest_error(shown: &[u8], beneath: &[u8]) -> WireError {
+        WireError {
+            message: format!(
+                "open confined metadata handle {}: open confined metadata handle {}: \
+                 Attempting to link in too many shared libraries (os error 2147483647)",
+                String::from_utf8_lossy(shown),
+                String::from_utf8_lossy(beneath)
+            ),
+            io_kind: Some(crate::proto::WireIoKind::OwnedDirectoryPermissions),
+            raw_os_error: Some(i32::MAX),
+            condition_not_met: true,
+        }
+    }
+
+    #[test]
+    fn final_metadata_requests_and_their_replies_fit_their_frames_when_every_directory_fails() {
+        use crate::proto::{failed_set_meta_hint, METADATA_BATCH_BYTES, METADATA_REPLY_BYTES};
+        // The worst case for a reply: paths as long as a system call takes
+        // (4,095 bytes below the destination), none of them UTF-8, so that
+        // the receiver shows each byte as three, and every operation fails.
+        let tree = crate::test_support::tempdir().unwrap();
+        let root = tree.path().as_os_str().as_encoded_bytes().to_vec();
+        let mut receiver = crate::fsops::FsOps::rooted_for_test(tree.path());
+        let beneath = |index: usize| {
+            let mut path = vec![vec![0xff; 255]; 15].join(&b'/');
+            path.push(b'/');
+            path.extend_from_slice(&[0xff; 247]);
+            path.extend_from_slice(format!("{index:08}").as_bytes());
+            assert_eq!(path.len(), 4095);
+            path
+        };
+        let entries: Vec<DirectoryMetadata> = (0..400)
+            .map(|index| timed(join(&root, &beneath(index)), 17))
+            .collect();
+        let mut sent = 0;
+        let mut one_failure = None;
+        for (directories, ops) in DirectoryMetadataRequests::new(&entries) {
+            // Far fewer than 4,096 go together: about 110, and what is left.
+            assert!(ops.len() <= 120, "{}", ops.len());
+            assert!(sent > 0 || ops.len() >= 100, "{}", ops.len());
+            let request = Request::Apply { ops: ops.clone() };
+            assert!(encoded_len(&request) < METADATA_BATCH_BYTES);
+            assert!(fits_its_frame(&request));
+            // The receiver takes each path beneath its root, as its server
+            // maps a request's paths.
+            let relative: Vec<Op> = (sent..sent + ops.len())
+                .map(|index| Op::SetMeta {
+                    path: beneath(index),
+                    meta: entries[index].1.clone(),
+                    flags: flags::TIMES,
+                    condition: TargetCondition::Any,
+                    directory: true,
+                })
+                .collect();
+            let errors = receiver.apply(&relative);
+            assert_eq!(errors.len(), ops.len());
+            let mut longest = Vec::new();
+            for (index, ((path, meta, ..), error)) in directories.iter().zip(&errors).enumerate() {
+                let allowed = failed_set_meta_hint(path, meta);
+                let error = error.as_ref().expect("no such directory exists");
+                // What the receiver said, and the most it could have said.
+                assert!(encoded_len(&Some(error)) <= allowed, "{error:?}");
+                assert!(error.message.len() > 3 * 4095, "{error:?}");
+                let worst = longest_error(path, &beneath(sent + index));
+                assert!(encoded_len(&Some(&worst)) <= allowed);
+                longest.push(Some(worst));
+            }
+            one_failure = errors[0].clone();
+            for reply in [Response::Applied(errors), Response::Applied(longest)] {
+                assert!(encoded_len(&reply) <= METADATA_REPLY_BYTES);
+                assert!(fits_its_frame(&reply));
+            }
+            sent += ops.len();
+        }
+        assert_eq!(sent, entries.len());
+        // The number of directories alone would not have kept these replies
+        // within their frame: not 4,096 of these failures, nor 1,000.
+        for count in [4096, 1000] {
+            assert!(!fits_its_frame(&Response::Applied(vec![
+                one_failure.clone();
+                count
+            ])));
+        }
+    }
+
+    #[test]
+    fn a_failed_final_metadata_operation_says_no_more_than_its_request_allowed_for() {
+        use crate::proto::failed_set_meta_hint;
+        // Directories that exist, at paths near the longest a system call
+        // takes, fail in the other ways open to a test: a file has taken
+        // the directory's place, or it is not the directory the copy found.
+        let tree = crate::test_support::tempdir().unwrap();
+        let root = tree.path().as_os_str().as_encoded_bytes().to_vec();
+        let mut receiver = crate::fsops::FsOps::rooted_for_test(tree.path());
+        let parent = vec![vec![0xff; 255]; 13].join(&b'/');
+        let on_disk = |path: &[u8]| {
+            use std::os::unix::ffi::OsStrExt;
+            tree.path().join(std::ffi::OsStr::from_bytes(path))
+        };
+        std::fs::create_dir_all(on_disk(&parent)).unwrap();
+        let (file, other) = (join(&parent, b"file"), join(&parent, b"other"));
+        std::fs::write(on_disk(&file), b"").unwrap();
+        std::fs::create_dir(on_disk(&other)).unwrap();
+        let meta = timed(Vec::new(), 0).1;
+        let op = |path: &[u8], condition| Op::SetMeta {
+            path: path.to_vec(),
+            meta: meta.clone(),
+            flags: flags::TIMES,
+            condition,
+            directory: true,
+        };
+        let elsewhere = TargetCondition::Matches { dev: 1, ino: 1 };
+        let errors = receiver.apply(&[
+            op(&file, TargetCondition::Any),
+            op(&other, elsewhere),
+            op(&join(&parent, b"missing"), TargetCondition::Any),
+        ]);
+        let paths = [&file[..], &other[..], &join(&parent, b"missing")[..]].map(<[u8]>::to_vec);
+        let said: Vec<&str> = errors
+            .iter()
+            .zip(&paths)
+            .map(|(error, path)| {
+                let error = error.as_ref().expect("each operation fails");
+                let allowed = failed_set_meta_hint(&join(&root, path), &meta);
+                assert!(encoded_len(&Some(error)) <= allowed, "{error:?}");
+                error.message.as_str()
+            })
+            .collect();
+        assert!(said[0].contains("is no longer a directory"), "{said:?}");
+        assert!(
+            said[1].contains("changed before metadata update"),
+            "{said:?}"
+        );
+        assert!(said[2].contains("No such file or directory"), "{said:?}");
+        // An error of preserved attributes names one attribute, of at most
+        // 255 bytes, as a list of numbers.
+        let attribute = format!(
+            "reconcile attribute {:?}: restore permissions after extended attributes: \
+             Attempting to link in too many shared libraries (os error 2147483647)",
+            [255_u8; 255].as_slice()
+        );
+        assert!(
+            attribute.len() <= crate::inode_metadata::InodeMetadata::default().failure_hint(),
+            "{}",
+            attribute.len()
         );
     }
 
