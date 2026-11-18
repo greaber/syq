@@ -430,21 +430,25 @@ fn push_directory_children(
     names.sort();
     let start = pending.len();
     pending.reserve(names.len());
-    let inspected = crate::scan::inspect_descriptor_children(
-        root,
-        &directory,
-        output_relative,
-        &names,
-        true,
-        read_symlink_target,
-    );
-    for (name, (_, inspected)) in names.iter().zip(inspected) {
-        let (entry, metadata) = inspected?;
-        pending.push(PendingMapEntry {
-            root_relative: join_rel(root_relative, name),
-            entry,
-            metadata,
-        });
+    // Inspect a bounded chunk at a time, so a wide directory holds one
+    // chunk's results beside its pending entries rather than a second copy.
+    for names in names.chunks(crate::scan::FIRST_BATCH) {
+        let inspected = crate::scan::inspect_descriptor_children(
+            root,
+            &directory,
+            output_relative,
+            names,
+            true,
+            read_symlink_target,
+        );
+        for (name, (_, inspected)) in names.iter().zip(inspected) {
+            let (entry, metadata) = inspected?;
+            pending.push(PendingMapEntry {
+                root_relative: join_rel(root_relative, name),
+                entry,
+                metadata,
+            });
+        }
     }
     pending[start..].reverse();
     Ok(())

@@ -254,6 +254,61 @@ fn native_map_contents_emits_identity_parent_first() {
     assert_eq!(lines[3]["kind"], "file");
 }
 
+/// Listings large enough to be statted in parallel, and in several chunks,
+/// still print in byte-sorted depth-first order.
+#[test]
+fn native_map_wide_directory_keeps_depth_first_order() {
+    let t = Tmp::new();
+    let mut expected = Vec::new();
+    for i in 0..1100 {
+        let name = format!("f{i:04}");
+        write(&t.path(&format!("src/{name}")), b"");
+        expected.push(name);
+    }
+    for (dir, children) in [("d0500", ["b", "a"]), ("f0999z", ["y", "x"])] {
+        expected.push(dir.to_string());
+        for child in children {
+            write(&t.path(&format!("src/{dir}/{child}")), b"");
+            expected.push(format!("{dir}/{child}"));
+        }
+    }
+    // `/` sorts before every name character here, so byte order of the
+    // whole paths is the depth-first order.
+    expected.sort();
+    let lines = map_lines(&syq_map_in(&t.path(""), &["--srcs-in", "src"]));
+    let dsts: Vec<String> = lines.iter().map(|v| map_path(v, "dst")).collect();
+    assert_eq!(dsts, expected);
+}
+
+/// An unreadable directory fails the map after the entries before it, with
+/// the error that names the failure.
+#[test]
+fn native_map_fails_on_an_unreadable_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("an unreadable directory requires a non-root test process");
+        return;
+    }
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"");
+    write(&t.path("src/locked/x"), b"");
+    fs::set_permissions(t.path("src/locked"), fs::Permissions::from_mode(0o000)).unwrap();
+    let out = syq_map_in(&t.path(""), &["--srcs-in", "src"]);
+    fs::set_permissions(t.path("src/locked"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "syq: open readable confined directory: Permission denied (os error 13)\n"
+    );
+    let printed: Vec<serde_json::Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let dsts: Vec<String> = printed.iter().map(|v| map_path(v, "dst")).collect();
+    assert_eq!(dsts, ["a", "locked"]);
+}
+
 #[test]
 fn native_map_symlink_targets_remain_available_to_filters() {
     use std::os::unix::{ffi::OsStrExt, fs::symlink};

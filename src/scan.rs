@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub const BATCH: usize = 4096;
-const FIRST_BATCH: usize = 1000;
+pub(crate) const FIRST_BATCH: usize = 1000;
 const FIRST_BATCH_MAX_DELAY: Duration = Duration::from_millis(50);
 const DESCRIPTOR_STAT_THREADS: usize = 8;
 const DESCRIPTOR_STAT_PAR_MIN: usize = 32;
