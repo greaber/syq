@@ -727,7 +727,7 @@ pub(super) fn verify_coordination(
 /// What a verified directive for one end of a copy allows.
 pub(super) enum Rules {
     Destination(Box<(Grant, GrantConstraints)>),
-    Source(Box<crate::destination::pull::PullRequest>),
+    Source(Box<crate::restricted::source::SourcePolicy>),
 }
 
 impl Rules {
@@ -809,7 +809,8 @@ pub(super) fn session_for(
         // approving machine's prompt showed what it names.
         Rules::Source(reads) => {
             return Ok(Session::Source(super::source::SourceAuthority::new(
-                reads.policy(verified.execution_deadline),
+                *reads,
+                verified.execution_deadline,
             )?));
         }
     };

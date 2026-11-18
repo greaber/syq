@@ -48,7 +48,7 @@ def check(current, helper, *, legacy=False):
 
             def respond():
                 try:
-                    for expected in ("Ping", "Forward"):
+                    for expected in ("Ping", "Copy"):
                         conn, _ = listener.accept()
                         with conn:
                             conn.settimeout(5)

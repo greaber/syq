@@ -1216,10 +1216,10 @@ fn copies_from_a_receiving_machine_ask_it_and_explain_an_old_helper() {
         stderr_of(&denied)
     );
     // Only the command travels; the laptop derives what it may read.
-    let send = request["message"]["Send"].as_object().unwrap();
+    let send = request["message"]["Copy"].as_object().unwrap();
     assert_eq!(
         send.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["command", "cwd"]
+        ["command", "cwd", "inputs", "results_key"]
     );
     assert!(
         send["command"]
@@ -1905,7 +1905,7 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
                 );
                 vec![serde_json::json!({"Error": "account denied by fixture"})]
             } else {
-                assert!(envelope["message"].get("Forward").is_some(), "{envelope}");
+                assert!(envelope["message"].get("Copy").is_some(), "{envelope}");
                 vec![serde_json::json!({"Error": "copy denied by fixture"})]
             };
             messages.push(envelope);
@@ -2044,14 +2044,14 @@ fn automatic_authorization_tries_ssh_before_live_names_and_stops_after_a_refusal
     assert_eq!(messages[1]["secret"], "laptop");
     // The request carries the command, from which the laptop derives the
     // rules, and only what the command read from files beside it.
-    let forward = &messages[1]["message"]["Forward"];
+    let forward = &messages[1]["message"]["Copy"];
     assert_eq!(forward["command"][0], serde_json::json!(b"cp"));
     assert_eq!(forward["inputs"]["ignore"], serde_json::json!([]));
     assert!(forward.get("request").is_none(), "{forward}");
     for pair in messages[2..4].chunks_exact(2) {
         assert_eq!(pair[0]["secret"], "laptop");
         assert_eq!(pair[0]["message"], "Ping");
-        assert!(pair[1]["message"].get("Forward").is_some());
+        assert!(pair[1]["message"].get("Copy").is_some());
     }
     for (pair, name) in messages[4..8].chunks_exact(2).zip(["z-other", "ssh"]) {
         assert_eq!(pair[0]["secret"], name);
@@ -2343,7 +2343,7 @@ fn automatic_fallback_explains_failed_credentials_and_says_at_once_that_it_waits
     let (status, stderr, requests) = laptop.run(&mut upload());
     assert!(!status.success());
     assert_eq!(requests.len(), 1, "{stderr}");
-    assert!(requests[0]["message"].get("Forward").is_some());
+    assert!(requests[0]["message"].get("Copy").is_some());
     assert!(!stderr.contains(asking), "{stderr}");
     assert!(
         stderr.lines().any(|line| line
@@ -2499,11 +2499,11 @@ fn a_signal_ends_a_wait_for_the_laptops_approval() {
             &["cp", "source", "--to", "backup", "--auth-from", "@laptop"][..],
             "LocalSsh",
         ),
-        (&["cp", "source", "--to", "backup"][..], "Forward"),
-        (&["cp", "source", "--to", "@laptop"][..], "Request"),
+        (&["cp", "source", "--to", "backup"][..], "Copy"),
+        (&["cp", "source", "--to", "@laptop"][..], "Copy"),
         (
             &["cp", "--from", "@laptop", "source", "--into", "copy"][..],
-            "Send",
+            "Copy",
         ),
     ] {
         for signal in [libc::SIGTERM, libc::SIGINT] {

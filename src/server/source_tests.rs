@@ -86,7 +86,6 @@ fn source_policy(path: &Path) -> SourcePolicy {
             max_deletions: 0,
         },
         preview: false,
-        deadline: Instant::now() + Duration::from_secs(30),
         outer_root: None,
     }
 }
@@ -117,7 +116,8 @@ impl SourceServer {
         policy: SourcePolicy,
         writer: impl FnOnce(UnixStream) -> W + Send + 'static,
     ) -> Self {
-        let authority = SourceAuthority::new(policy).unwrap();
+        let authority =
+            SourceAuthority::new(policy, Instant::now() + Duration::from_secs(30)).unwrap();
         let session = DescriptorSessionSlot::default();
         let (client, server) = UnixStream::pair().unwrap();
         server
