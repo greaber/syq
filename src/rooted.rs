@@ -429,7 +429,7 @@ impl Root {
 
     /// Stand in for a filesystem whose close does or does not report write
     /// errors, before anything asks.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn assume_quiet_close_for_test(&self, quiet: bool) {
         self.quiet_close.set(quiet).unwrap();
     }
