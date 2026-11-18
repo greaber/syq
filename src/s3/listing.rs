@@ -105,6 +105,8 @@ pub(crate) fn run(args: &[OsString]) -> Result<i32> {
     Ok(0)
 }
 
+/// ListObjectsV2 pages for every S3 listing: `_ls`, `map`, and copy,
+/// download and removal planning.
 pub(super) struct S3<'a> {
     pub(super) client: aws_sdk_s3::Client,
     pub(super) bucket: &'a str,
@@ -134,8 +136,15 @@ impl Store for S3<'_> {
             .set_start_after(start_after.map(str::to_owned))
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("{}", super::client::failure("listing S3 objects", &e)))?;
+            .map_err(super::client::listing_failure)?;
+        // URL encoding lets keys hold characters XML cannot carry. Decode only
+        // when the response says it was applied: a provider that ignores the
+        // request returns keys as stored, and those can contain '%' and '+'.
+        let encoded = response.encoding_type() == Some(&aws_sdk_s3::types::EncodingType::Url);
         let decode = |value: &str| -> Result<String> {
+            if !encoded {
+                return Ok(value.to_owned());
+            }
             Ok(
                 percent_encoding::percent_decode_str(&value.replace('+', " "))
                     .decode_utf8()
@@ -151,8 +160,7 @@ impl Store for S3<'_> {
                     .context("S3 listing returned a negative size")?,
                 last_modified: object
                     .last_modified()
-                    .map(|date| date.fmt(aws_smithy_types::date_time::Format::DateTime))
-                    .transpose()?,
+                    .map(|time| (time.secs(), time.subsec_nanos())),
                 etag: object.e_tag().map(str::to_owned),
             });
         }

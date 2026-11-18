@@ -868,8 +868,6 @@ impl Engine {
                     &self.client,
                     &self.options.bucket,
                     &prefix,
-                    None,
-                    &mut HashSet::new(),
                     self.options.concurrency,
                 )
                 .await
@@ -2042,9 +2040,6 @@ impl Engine {
             } else {
                 String::new()
             };
-            // An exclusion under one root says nothing about the same object
-            // selected through another root with different anchoring.
-            let mut excluded_subtrees = HashSet::new();
             let contents = selection == SourceSelection::Contents;
             let directory = matches!(
                 selection,
@@ -2077,7 +2072,6 @@ impl Engine {
                         source_bucket,
                         &prefix,
                         matcher.as_ref(),
-                        &mut excluded_subtrees,
                         self.options.concurrency,
                         self.args.expressions.uses_source_s3_time(),
                     )
@@ -2129,7 +2123,6 @@ impl Engine {
                                 source_bucket,
                                 &prefix,
                                 matcher.as_ref(),
-                                &mut excluded_subtrees,
                                 self.options.concurrency,
                                 self.args.expressions.uses_source_s3_time(),
                             )

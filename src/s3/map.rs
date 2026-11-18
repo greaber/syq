@@ -5,7 +5,6 @@ use crate::cli::{Args, SourceSelection};
 use crate::native_map::{Emitter, Field, Options};
 use anyhow::{bail, Context, Result};
 use futures_util::{stream, StreamExt, TryStreamExt};
-use listing::engine::Entry;
 use std::{collections::HashSet, io::Write, sync::Arc};
 
 pub(crate) fn run(args: &Args, options: &Options, out: &mut impl Write) -> Result<()> {
@@ -171,7 +170,7 @@ pub(crate) fn run(args: &Args, options: &Options, out: &mut impl Write) -> Resul
                             let suffix = if marker { suffix.strip_suffix('/').unwrap_or(suffix) } else { suffix };
                             let src = if contents { suffix.to_owned() } else { local::join(source_path, suffix) };
                             let dst = local::join(std::str::from_utf8(destination)?, suffix);
-                            let object_time = if service_time { listed_time(&entry)? } else { None };
+                            let object_time = entry.last_modified.filter(|_| service_time);
                             let expression_path = crate::expression::source_path(source_path.as_bytes(), suffix.as_bytes());
                             let selected = args.expressions.selects_known(
                                 crate::expression::Facts::S3Listing { size: entry.size, directory_marker: marker, last_modified: object_time },
@@ -208,21 +207,6 @@ pub(crate) fn run(args: &Args, options: &Options, out: &mut impl Write) -> Resul
 enum Checked {
     Object(Box<aws_sdk_s3::operation::head_object::HeadObjectOutput>),
     Prefix(String, Option<listing::engine::Page>),
-}
-
-fn listed_time(entry: &Entry) -> Result<Option<(i64, u32)>> {
-    entry
-        .last_modified
-        .as_deref()
-        .map(|value| {
-            aws_smithy_types::DateTime::from_str(
-                value,
-                aws_smithy_types::date_time::Format::DateTime,
-            )
-            .map(|time| (time.secs(), time.subsec_nanos()))
-            .context("invalid S3 Last-Modified")
-        })
-        .transpose()
 }
 
 #[allow(clippy::too_many_arguments)]
