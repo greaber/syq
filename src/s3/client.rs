@@ -1039,15 +1039,9 @@ pub(super) async fn list_with_times(
         fn ordered(&self) -> bool {
             self.inner.ordered()
         }
-        async fn page(
-            &self,
-            prefix: &str,
-            delimiter: bool,
-            token: Option<&str>,
-            start_after: Option<&str>,
-        ) -> Result<Page> {
+        async fn page(&self, prefix: &str, delimiter: bool, token: Option<&str>) -> Result<Page> {
             self.inner
-                .page(prefix, delimiter, token, start_after)
+                .page(prefix, delimiter, token)
                 .await
                 .inspect_err(|error| {
                     if (delimiter || prefix != self.root) && denied(error) {
@@ -1125,6 +1119,11 @@ pub(super) async fn list_with_times(
             // denying discovery or child prefixes. No caller has consumed the
             // plan yet.
             Err(error) if !fallback && store.discovery_denied.load(Relaxed) && denied(&error) => {
+                fallback = true;
+            }
+            // The engine relies on key order only when it lists a prefix in
+            // parts. List it whole instead.
+            Err(error) if !fallback && error.is::<engine::Unordered>() => {
                 fallback = true;
             }
             Err(error) => return Err(error),

@@ -1451,10 +1451,19 @@ fn serve(
                 "one request slot must stay flat"
             );
         }
+        // Two pages in one directory, then two dense directories on the
+        // third page: an unfiltered listing gives the last directory a
+        // listing of its own, which a policy for the exact prefix denies.
+        let directory = |i: usize| match i {
+            0..2000 => "a",
+            2000..2400 => "b",
+            2400..3000 => "c",
+            _ => "d",
+        };
         let denied = (fault == "parallel-prefix-policy" && prefix != "tree/")
             || (fault == "parallel-delimiter-policy" && delimiter)
             || (fault == "parallel-listing-failure"
-                && (prefix == "tree/b/" || token == Some("last")));
+                && (prefix == "tree/d/" || token == Some("3000")));
         if denied {
             reply(
                 &mut socket,
@@ -1466,28 +1475,24 @@ fn serve(
             return;
         }
         let body = if delimiter {
-            "<IsTruncated>false</IsTruncated><CommonPrefixes><Prefix>tree/a/</Prefix></CommonPrefixes><CommonPrefixes><Prefix>tree/b/</Prefix></CommonPrefixes>".to_owned()
+            assert_eq!(prefix, "tree/");
+            let prefixes = ["a", "b", "c", "d"].map(|name| {
+                format!("<CommonPrefixes><Prefix>tree/{name}/</Prefix></CommonPrefixes>")
+            });
+            format!("<IsTruncated>false</IsTruncated>{}", prefixes.concat())
         } else {
-            let (range, next) = match (prefix, token) {
-                ("tree/" | "tree/a/", None) => (0..1000, Some("next")),
-                ("tree/", Some("next")) => (1000..2000, Some("last")),
-                ("tree/a/", Some("next")) => (1000..2000, None),
-                ("tree/b/", None)
-                    if query.get("start-after").map(|s| s.as_ref()) == Some("tree/b/2999") =>
-                {
-                    (3000..4000, None)
-                }
-                ("tree/", Some("last")) | ("tree/b/", None) => (2000..3000, Some("tail")),
-                ("tree/" | "tree/b/", Some("tail")) => (3000..4000, None),
-                other => panic!("unexpected listing {other:?}"),
-            };
-            let contents = range
-                .map(|i| {
-                    format!(
-                        "<Contents><Key>tree/{}/{i:04}</Key><Size>1</Size></Contents>",
-                        if i < 2000 { "a" } else { "b" }
-                    )
-                })
+            // A token counts the keys of the listing before the page.
+            let start: usize = token.map_or(0, |token| token.parse().unwrap());
+            let keys: Vec<_> = (0..4000)
+                .map(|i| format!("tree/{}/{i:04}", directory(i)))
+                .filter(|key| key.starts_with(prefix))
+                .collect();
+            let next = (keys.len() > start + 1000).then_some(start + 1000);
+            let contents = keys
+                .iter()
+                .skip(start)
+                .take(1000)
+                .map(|key| format!("<Contents><Key>{key}</Key><Size>1</Size></Contents>"))
                 .collect::<String>();
             format!(
                 "<IsTruncated>{}</IsTruncated>{}{contents}",
@@ -6711,9 +6716,10 @@ fn parallel_listing_failure_stops_copy_and_removal_before_mutation() {
 
 #[test]
 fn parallel_listing_preserves_exact_prefix_permissions_and_explicit_concurrency() {
-    // An ignored first directory makes a filtered copy probe with a
-    // delimiter (denied by one policy) and then list its other child
-    // (denied by the other).
+    // An unfiltered listing asks for the prefix's children (denied by one
+    // policy) and lists the last of them by itself (denied by the other).
+    // An ignored first directory makes a filtered copy ask for the children
+    // too.
     for (command, ignore) in [("cp", false), ("cp", true), ("rm", false)] {
         for fault in [
             "parallel-prefix-policy",
@@ -6790,7 +6796,15 @@ fn parallel_listing_preserves_exact_prefix_permissions_and_explicit_concurrency(
                 .map(|record| record[key]["value"].as_str().unwrap())
                 .collect();
             let expected: std::collections::BTreeSet<_> = (if ignore { 2000 } else { 0 }..4000)
-                .map(|i| format!("tree/{}/{i:04}", if i < 2000 { "a" } else { "b" }))
+                .map(|i| {
+                    let directory = match i {
+                        0..2000 => "a",
+                        2000..2400 => "b",
+                        2400..3000 => "c",
+                        _ => "d",
+                    };
+                    format!("tree/{directory}/{i:04}")
+                })
                 .collect();
             assert_eq!(actual.len(), expected.len());
             if ignore {

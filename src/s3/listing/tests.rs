@@ -1,14 +1,16 @@
 use super::*;
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
+    ops::Bound,
     time::Duration,
 };
 
 struct Memory {
     keys: BTreeSet<String>,
     calls: RefCell<Vec<(String, bool)>>,
-    resumes: RefCell<Vec<(String, String)>>,
+    /// Listings of keys that were read to their last page.
+    ended: RefCell<BTreeSet<String>>,
     active: Cell<usize>,
     peak: Cell<usize>,
 }
@@ -17,76 +19,126 @@ impl Memory {
         Self {
             keys: keys.into_iter().collect(),
             calls: RefCell::default(),
-            resumes: RefCell::default(),
+            ended: RefCell::default(),
             active: Cell::new(0),
             peak: Cell::new(0),
         }
     }
+    /// The requests a listing of everything under `prefix` makes one page
+    /// after another.
+    fn pages(&self, prefix: &str) -> usize {
+        let keys = self.keys.iter().filter(|key| key.starts_with(prefix));
+        keys.count().div_ceil(1000).max(1)
+    }
+    /// The prefixes whose keys were listed, and those among them whose
+    /// listing stopped before its last page.
+    fn listings(&self) -> (BTreeSet<String>, BTreeSet<String>) {
+        let calls = self.calls.borrow();
+        let listed: BTreeSet<_> = calls
+            .iter()
+            .filter(|(_, delimiter)| !delimiter)
+            .map(|(prefix, _)| prefix.clone())
+            .collect();
+        let cut = listed.difference(&self.ended.borrow()).cloned().collect();
+        (listed, cut)
+    }
 }
 impl Store for Memory {
-    async fn page(
-        &self,
-        prefix: &str,
-        delimiter: bool,
-        token: Option<&str>,
-        start_after: Option<&str>,
-    ) -> Result<Page> {
+    async fn page(&self, prefix: &str, delimiter: bool, token: Option<&str>) -> Result<Page> {
         self.calls.borrow_mut().push((prefix.into(), delimiter));
-        if let Some(after) = start_after {
-            assert!(!delimiter && token.is_none());
-            self.resumes
-                .borrow_mut()
-                .push((prefix.into(), after.into()));
-        }
         self.active.set(self.active.get() + 1);
         self.peak.set(self.peak.get().max(self.active.get()));
         tokio::time::sleep(Duration::from_millis(1)).await;
         self.active.set(self.active.get() - 1);
-        let token_start = token.map(|t| {
-            let marker = format!("{}:{prefix}:", u8::from(delimiter));
-            t.strip_prefix(&marker)
-                .expect("token must stay with its original query")
-                .parse::<usize>()
-                .unwrap()
-        });
-        let mut items = BTreeMap::new();
-        for key in &self.keys {
-            let Some(suffix) = key.strip_prefix(prefix) else {
-                continue;
-            };
-            if let Some(slash) = delimiter.then(|| suffix.find('/')).flatten() {
-                items.insert(format!("{prefix}{}", &suffix[..slash + 1]), true);
-            } else {
-                items.insert(key.clone(), false);
+        // A token names its query and where the next page starts: after a
+        // key, or at the first key past a directory.
+        let marker = format!("{}:{prefix}:", u8::from(delimiter));
+        let mut cursor = match token {
+            Some(token) => {
+                let position = token
+                    .strip_prefix(&marker)
+                    .expect("token must stay with its original query");
+                match position.split_at(1) {
+                    ("+", at) => Bound::Included(at.to_owned()),
+                    (_, after) => Bound::Excluded(after.to_owned()),
+                }
             }
-        }
-        let start = token_start.unwrap_or_else(|| {
-            items
-                .keys()
-                .take_while(|key| start_after.is_some_and(|after| key.as_str() <= after))
-                .count()
-        });
-        let next = (items.len() > start + 1000)
-            .then(|| format!("{}:{prefix}:{}", u8::from(delimiter), start + 1000));
-        let mut page = Page {
-            next,
-            ..Page::default()
+            None => Bound::Included(prefix.to_owned()),
         };
-        for (key, directory) in items.into_iter().skip(start).take(1000) {
-            if directory {
-                page.prefixes.push(key);
+        let mut page = Page::default();
+        loop {
+            let Some(key) = self.keys.range((cursor.clone(), Bound::Unbounded)).next() else {
+                break;
+            };
+            if !key.starts_with(prefix) {
+                break;
+            }
+            if page.entries.len() + page.prefixes.len() == 1000 {
+                page.next = Some(match &cursor {
+                    Bound::Included(at) => format!("{marker}+{at}"),
+                    Bound::Excluded(after) => format!("{marker}-{after}"),
+                    Bound::Unbounded => unreachable!(),
+                });
+                break;
+            }
+            let child = delimiter
+                .then(|| key[prefix.len()..].find('/'))
+                .flatten()
+                .map(|slash| &key[..prefix.len() + slash]);
+            if let Some(child) = child {
+                page.prefixes.push(format!("{child}/"));
+                // '0' follows '/': the first key past the directory.
+                cursor = Bound::Included(format!("{child}0"));
             } else {
                 page.entries.push(Entry {
                     // Directory markers are empty.
                     size: u64::from(!key.ends_with('/')),
-                    key,
+                    key: key.clone(),
                     last_modified: None,
                     etag: None,
                 });
+                cursor = Bound::Excluded(key.clone());
             }
+        }
+        if page.next.is_none() && !delimiter {
+            self.ended.borrow_mut().insert(prefix.to_owned());
         }
         Ok(page)
     }
+}
+
+/// List everything under `prefix`, checking the keys against the store.
+/// Returns the requests made and the round trips the listing took.
+async fn walked(
+    store: &Memory,
+    prefix: &str,
+    concurrency: usize,
+    prune: Option<&engine::Prune<'_>>,
+) -> (usize, u128) {
+    let before = store.calls.borrow().len();
+    store.peak.set(0);
+    let started = tokio::time::Instant::now();
+    let mut keys = Vec::new();
+    engine::enumerate_prefix(store, prefix, concurrency, prune, |entry| {
+        keys.push(entry.key);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let elapsed = started.elapsed().as_millis();
+    keys.sort();
+    let expected: Vec<_> = store
+        .keys
+        .iter()
+        .filter(|key| key.starts_with(prefix))
+        .cloned()
+        .collect();
+    assert!(
+        keys == expected,
+        "listing of {prefix:?} differs from the store"
+    );
+    assert!(store.peak.get() <= concurrency);
+    (store.calls.borrow().len() - before, elapsed)
 }
 
 async fn listed(store: &Memory, input: &str, concurrency: usize) -> Vec<String> {
@@ -205,13 +257,7 @@ async fn flat_wide_and_deep_fallbacks_preserve_pagination() {
 async fn partial_listing_and_output_failures_propagate() {
     struct Fault;
     impl Store for Fault {
-        async fn page(
-            &self,
-            _: &str,
-            _: bool,
-            token: Option<&str>,
-            _: Option<&str>,
-        ) -> Result<Page> {
+        async fn page(&self, _: &str, _: bool, token: Option<&str>) -> Result<Page> {
             anyhow::ensure!(token.is_none(), "injected page failure");
             Ok(Page {
                 entries: vec![Entry {
@@ -247,7 +293,7 @@ async fn partial_listing_and_output_failures_propagate() {
 async fn malformed_pages_fail() {
     struct Bad(bool);
     impl Store for Bad {
-        async fn page(&self, _: &str, _: bool, _: Option<&str>, _: Option<&str>) -> Result<Page> {
+        async fn page(&self, _: &str, _: bool, _: Option<&str>) -> Result<Page> {
             Ok(if self.0 {
                 Page {
                     next: Some(String::new()),
@@ -310,45 +356,6 @@ async fn literal_prefix_enumeration_preserves_metacharacters_and_overlap() {
 }
 
 #[tokio::test]
-async fn sparse_trees_stay_flat_and_exact_keys_stop_after_one_page() {
-    for per_directory in [4, 40] {
-        let store =
-            Memory::new((0..256).flat_map(|d| {
-                (0..per_directory).map(move |i| format!("tree/dir{d:03}/file{i:03}"))
-            }));
-        let keys = listed(&store, "tree/**", 32).await;
-        assert_eq!(keys.len(), 256 * per_directory);
-        assert_eq!(store.calls.borrow().len(), keys.len().div_ceil(1000));
-        assert!(store.calls.borrow().iter().all(|(_, delimiter)| !delimiter));
-    }
-    let store = Memory::new(
-        std::iter::once("exact".into()).chain((0..3000).map(|i| format!("exact{i:04}"))),
-    );
-    assert_eq!(listed(&store, "exact", 32).await, ["exact"]);
-    assert_eq!(store.calls.borrow().len(), 1);
-}
-
-#[tokio::test]
-async fn two_page_dense_tree_finishes_flat_and_dense_branches_overlap() {
-    let store = Memory::new((0..1001).map(|i| format!("tree/a/file{i:04}")));
-    assert_eq!(listed(&store, "tree/**", 32).await.len(), 1001);
-    assert_eq!(store.calls.borrow().len(), 3);
-    assert!(store
-        .calls
-        .borrow()
-        .iter()
-        .all(|(prefix, _)| prefix == "tree/"));
-    assert_eq!(store.peak.get(), 2, "probe overlaps useful continuation");
-    let store = Memory::new(
-        (0..8).flat_map(|d| (0..2000).map(move |i| format!("tree/dir{d:02}/file{i:04}"))),
-    );
-    assert_eq!(listed(&store, "tree/**", 32).await.len(), 16000);
-    assert_eq!(store.calls.borrow().len(), 17);
-    assert!(store.peak.get() > 1);
-    assert!(store.peak.get() <= 8);
-}
-
-#[tokio::test]
 async fn nested_probes_respect_the_actual_request_limit() {
     let store = Memory::new((0..4).flat_map(|a| {
         (0..2).flat_map(move |b| (0..2000).map(move |i| format!("tree/{a}/{b}/file{i:04}")))
@@ -358,35 +365,13 @@ async fn nested_probes_respect_the_actual_request_limit() {
 }
 
 #[tokio::test]
-async fn dense_head_with_sparse_siblings_does_not_fan_out() {
-    let store = Memory::new(
-        (0..2001)
-            .map(|i| format!("tree/a/file{i:04}"))
-            .chain((1..8).map(|i| format!("tree/dir{i}/file"))),
-    );
-    assert_eq!(listed(&store, "tree/**", 32).await.len(), 2008);
-    assert_eq!(store.calls.borrow().len(), 4);
-    assert!(store
-        .calls
-        .borrow()
-        .iter()
-        .all(|(prefix, _)| prefix == "tree/"));
-}
-
-#[tokio::test]
 async fn unordered_stores_do_not_apply_exact_key_shortcut() {
     struct Unordered;
     impl Store for Unordered {
         fn ordered(&self) -> bool {
             false
         }
-        async fn page(
-            &self,
-            _: &str,
-            _: bool,
-            token: Option<&str>,
-            _: Option<&str>,
-        ) -> Result<Page> {
+        async fn page(&self, _: &str, _: bool, token: Option<&str>) -> Result<Page> {
             Ok(Page {
                 entries: vec![Entry {
                     key: if token.is_none() {
@@ -417,210 +402,6 @@ async fn unordered_stores_do_not_apply_exact_key_shortcut() {
     .await
     .unwrap();
     assert_eq!(keys, ["exact"]);
-}
-
-#[tokio::test]
-async fn medium_density_keeps_latency_parallelism_and_reuses_complete_children() {
-    let store = Memory::new(
-        (0..64).flat_map(|d| (0..400).map(move |i| format!("tree/dir{d:03}/file{i:04}"))),
-    );
-    assert_eq!(listed(&store, "tree/**", 32).await.len(), 25600);
-    let calls = store.calls.borrow();
-    assert_eq!(calls.len(), 63);
-    // The first four children are fully covered by the two sampled pages.
-    for d in 0..4 {
-        assert!(!calls
-            .iter()
-            .any(|(prefix, _)| prefix == &format!("tree/dir{d:03}/")));
-    }
-    assert!(store.peak.get() > 1);
-    assert!(store.peak.get() <= 32);
-}
-
-#[tokio::test]
-async fn incomplete_directory_probe_cannot_discard_observed_objects() {
-    struct Incomplete(Memory);
-    impl Store for Incomplete {
-        async fn page(
-            &self,
-            prefix: &str,
-            delimiter: bool,
-            token: Option<&str>,
-            start_after: Option<&str>,
-        ) -> Result<Page> {
-            let mut page = self.0.page(prefix, delimiter, token, start_after).await?;
-            if delimiter {
-                page.prefixes.retain(|prefix| prefix != "tree/dir01/");
-            }
-            Ok(page)
-        }
-    }
-    let store =
-        Incomplete(Memory::new((0..8).flat_map(|d| {
-            (0..2000).map(move |i| format!("tree/dir{d:02}/file{i:04}"))
-        })));
-    let mut keys = Vec::new();
-    engine::enumerate_prefix(&store, "tree/", 32, None, |entry| {
-        keys.push(entry.key);
-        Ok(())
-    })
-    .await
-    .unwrap();
-    assert_eq!(keys.len(), 16000);
-    assert_eq!(keys.into_iter().collect::<BTreeSet<_>>(), store.0.keys);
-    assert!(store
-        .0
-        .calls
-        .borrow()
-        .iter()
-        .all(|(prefix, _)| prefix == "tree/"));
-}
-
-#[tokio::test]
-async fn resumed_child_can_split_again_without_losing_or_duplicating_keys() {
-    let store = Memory::new(
-        (0..1200)
-            .map(|i| format!("tree/a/{i:04}"))
-            .chain((0..8).flat_map(|d| (0..1200).map(move |i| format!("tree/b/{d}/sp +%é{i:04}"))))
-            .chain([
-                "tree/b/".into(),
-                "tree/b/0/".into(),
-                "tree/b/8-direct".into(),
-                "tree/z".into(),
-            ]),
-    );
-    let expected: Vec<_> = store.keys.iter().cloned().collect();
-    assert_eq!(listed(&store, "tree/**", 8).await, expected);
-    let resumes = store.resumes.borrow();
-    assert!(resumes.iter().any(|(prefix, _)| prefix == "tree/b/"));
-    assert!(resumes
-        .iter()
-        .any(|(prefix, _)| prefix.starts_with("tree/b/") && prefix != "tree/b/"));
-}
-
-#[tokio::test]
-async fn ignored_start_after_filters_every_continuation_page() {
-    struct IgnoresStartAfter {
-        inner: Memory,
-        resumes: Cell<usize>,
-    }
-    impl Store for IgnoresStartAfter {
-        async fn page(
-            &self,
-            prefix: &str,
-            delimiter: bool,
-            token: Option<&str>,
-            start_after: Option<&str>,
-        ) -> Result<Page> {
-            if start_after.is_some() {
-                assert!(token.is_none());
-                self.resumes.set(self.resumes.get() + 1);
-            }
-            self.inner.page(prefix, delimiter, token, None).await
-        }
-    }
-    // Exercise a completely filtered first page followed by a partially
-    // filtered page, as well as a cursor exactly on a page boundary.
-    for leading in [256, 600, 1000, 1200] {
-        for glob in [false, true] {
-            let store = IgnoresStartAfter {
-                inner: Memory::new(
-                    (0..leading)
-                        .map(|i| format!("tree/a/{i:04}"))
-                        .chain((0..6200).map(|i| format!("tree/b/sp +%é{i:04}"))),
-                ),
-                resumes: Cell::new(0),
-            };
-            let mut actual = Vec::new();
-            if glob {
-                engine::enumerate(
-                    &store,
-                    &Pattern::parse("s3://bucket/tree/**").unwrap(),
-                    8,
-                    |entry| {
-                        actual.push(entry.key);
-                        Ok(())
-                    },
-                )
-                .await
-                .unwrap();
-            } else {
-                engine::enumerate_prefix(&store, "tree/", 8, None, |entry| {
-                    actual.push(entry.key);
-                    Ok(())
-                })
-                .await
-                .unwrap();
-            }
-            actual.sort();
-            assert_eq!(actual, store.inner.keys.iter().cloned().collect::<Vec<_>>());
-            assert_eq!(store.resumes.get(), 1);
-            assert_eq!(
-                store
-                    .inner
-                    .calls
-                    .borrow()
-                    .iter()
-                    .filter(|(prefix, delimiter)| prefix == "tree/b/" && !delimiter)
-                    .count(),
-                7
-            );
-        }
-    }
-}
-
-#[tokio::test]
-async fn filtered_listings_stay_flat_and_prune_ignored_first_pages() {
-    async fn pruned(store: &Memory, prune: &engine::Prune<'_>) -> (Vec<String>, Vec<String>) {
-        let mut keys = Vec::new();
-        let pruned = engine::enumerate_prefix(store, "tree/", 8, Some(prune), |entry| {
-            keys.push(entry.key);
-            Ok(())
-        })
-        .await
-        .unwrap();
-        (keys, pruned)
-    }
-    let ignored =
-        |key: &str, _directory: bool| key.starts_with("tree/d3/").then_some("tree/d3".len());
-    // Filtered listings do not split dense directories: with many small
-    // siblings that would cost a request per sibling.
-    let store = Memory::new(
-        (0..2)
-            .flat_map(|d| (0..1500).map(move |i| format!("tree/d{d}/file{i:04}")))
-            .chain((2..64).map(|d| format!("tree/e{d:02}/file"))),
-    );
-    let prune = engine::Prune {
-        subtree: &ignored,
-        probes: 4.into(),
-    };
-    let (keys, pruned_prefixes) = pruned(&store, &prune).await;
-    assert!(pruned_prefixes.is_empty());
-    assert_eq!(keys.len(), store.keys.len());
-    assert_eq!(*store.calls.borrow(), vec![("tree/".to_owned(), false); 4]);
-    // A first page entirely in a pruned directory switches to a directory
-    // listing at once, following a single included child.
-    let store = Memory::new(
-        (0..5000)
-            .map(|i| format!("tree/d3/file{i:04}"))
-            .chain(["tree/d4/a".into(), "tree/top".into()]),
-    );
-    let prune = engine::Prune {
-        subtree: &ignored,
-        probes: 4.into(),
-    };
-    let (mut keys, pruned_prefixes) = pruned(&store, &prune).await;
-    keys.sort();
-    assert_eq!(keys, ["tree/d4/a", "tree/top"]);
-    assert_eq!(pruned_prefixes, ["tree/d3/"]);
-    assert_eq!(
-        *store.calls.borrow(),
-        [
-            ("tree/".to_owned(), false),
-            ("tree/".to_owned(), true),
-            ("tree/d4/".to_owned(), false)
-        ]
-    );
 }
 
 #[tokio::test]
@@ -682,4 +463,340 @@ async fn directory_markers_do_not_stop_pruning_an_ignored_first_page() {
                 .collect::<Vec<_>>()
         );
     }
+}
+
+fn tree(directories: usize, keys: usize) -> impl Iterator<Item = String> {
+    (0..directories).flat_map(move |d| (0..keys).map(move |i| format!("t/d{d:04}/f{i:05}")))
+}
+
+/// The most requests a listing of `pages` sequential pages may make.
+fn allowance(pages: usize) -> usize {
+    pages + 2 + pages / 4
+}
+
+#[tokio::test(start_paused = true)]
+async fn wide_and_deep_trees_list_in_parts_within_the_request_allowance() {
+    let deep = (0..243usize).flat_map(|leaf| {
+        let path: Vec<_> = (0..5)
+            .rev()
+            .map(|level| format!("n{}", (leaf / 3usize.pow(level)) % 3))
+            .collect();
+        let path = format!("t/a/b/c/d/{}", path.join("/"));
+        (0..600).map(move |i| format!("{path}/f{i:03}"))
+    });
+    let partitioned = (0..3).flat_map(|year| {
+        (0..12).flat_map(move |month| {
+            (0..30).flat_map(move |day| {
+                (0..200).map(move |i| format!("t/y={year}/m={month:02}/d={day:02}/part-{i:03}"))
+            })
+        })
+    });
+    // name, keys, the least factor by which round trips must fall
+    let shapes: Vec<(&str, Vec<String>, usize)> = vec![
+        ("few large directories", tree(8, 40_000).collect(), 5),
+        ("a thousand shards", tree(1000, 300).collect(), 8),
+        (
+            "twenty thousand directories",
+            tree(20_000, 100).collect(),
+            8,
+        ),
+        ("date partitions", partitioned.collect(), 4),
+        ("deep and narrow", deep.collect(), 2),
+    ];
+    for (name, keys, faster) in shapes {
+        let store = Memory::new(keys);
+        let pages = store.pages("t/");
+        let (requests, trips) = walked(&store, "t/", 32, None).await;
+        assert!(
+            requests <= allowance(pages),
+            "{name}: {requests} requests for {pages} pages"
+        );
+        assert!(
+            trips as usize * faster <= pages,
+            "{name}: {trips} round trips for {pages} pages"
+        );
+        // Every listing runs to its end, except those that handed part of
+        // their keys to a listing of a longer prefix.
+        let (listed, cut) = store.listings();
+        for prefix in &cut {
+            assert!(
+                listed
+                    .iter()
+                    .any(|part| part.len() > prefix.len() && part.starts_with(prefix)),
+                "{name}: the listing of {prefix:?} was cut short for nothing"
+            );
+        }
+        // Without concurrency the listing is the sequential one.
+        let (requests, _) = walked(&store, "t/", 1, None).await;
+        assert_eq!(requests, pages, "{name}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn small_sparse_and_flat_trees_cost_at_most_two_more_requests() {
+    // name, keys, the most requests beyond the sequential pages
+    let shapes: Vec<(&str, Vec<String>, usize)> = vec![
+        ("one page", tree(5, 10).collect(), 0),
+        ("two sparse pages", tree(256, 4).collect(), 0),
+        ("eleven sparse pages", tree(256, 40).collect(), 2),
+        ("two dense pages", tree(1, 1001).collect(), 1),
+        ("one flat directory", tree(1, 30_000).collect(), 2),
+        ("two keys a directory", tree(30_000, 2).collect(), 2),
+        (
+            "a dense directory before sparse ones",
+            tree(1, 2001)
+                .chain((0..200).map(|d| format!("t/z{d:03}/only")))
+                .collect(),
+            2,
+        ),
+        (
+            "seven dense directories before a thousand sparse ones",
+            tree(7, 300)
+                .chain((0..993).map(|d| format!("t/z{d:03}/only")))
+                .collect(),
+            2,
+        ),
+    ];
+    for (name, keys, extra) in shapes {
+        let store = Memory::new(keys);
+        let pages = store.pages("t/");
+        let (requests, _) = walked(&store, "t/", 32, None).await;
+        assert!(
+            requests <= pages + extra,
+            "{name}: {requests} requests for {pages} pages"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn dense_directories_under_a_narrow_prefix_are_listed_at_once() {
+    // Two dense directories within three pages and at most 64 children:
+    // unfiltered listings give every remaining child a listing of its own.
+    let store = Memory::new(tree(64, 400));
+    let (requests, trips) = walked(&store, "t/", 32, None).await;
+    assert!(requests <= 63, "{requests} requests");
+    assert!(trips <= 5, "{trips} round trips");
+    assert!(store.peak.get() > 16);
+    // The directories the first pages covered are not listed again.
+    let (listed, _) = store.listings();
+    for d in 0..4 {
+        assert!(!listed.contains(&format!("t/d{d:04}/")));
+    }
+    // A third page finds the second dense directory.
+    let store = Memory::new(tree(8, 2000));
+    let (requests, trips) = walked(&store, "t/", 32, None).await;
+    assert!(requests <= allowance(16) + 6, "{requests} requests");
+    assert!(trips <= 6, "{trips} round trips");
+    // Filtered listings keep to the allowance: sparse siblings of two dense
+    // directories would cost a request each.
+    let keys = || tree(2, 1500).chain((2..64).map(|d| format!("t/e{d:02}/file")));
+    let kept = |_: &str, _: bool| None;
+    let prune = engine::Prune {
+        subtree: &kept,
+        probes: 4.into(),
+    };
+    let store = Memory::new(keys());
+    let (requests, _) = walked(&store, "t/", 32, Some(&prune)).await;
+    assert!(requests <= 4 + 2, "{requests} requests");
+    let store = Memory::new(keys());
+    let (requests, _) = walked(&store, "t/", 32, None).await;
+    assert!(requests <= 4 + 2 + 62, "{requests} requests");
+}
+
+#[tokio::test(start_paused = true)]
+async fn objects_beside_directories_are_reported_once() {
+    // Objects of the listed directory sort among, and after, the children
+    // that parts take over, and some share a child's name or its start.
+    let keys = tree(40, 1500)
+        .chain(
+            [
+                "t/",
+                "t/d0003",
+                "t/d0003.txt",
+                "t/d0005/",
+                "t/d001",
+                "t/d002-notes",
+                "t/d0039/",
+                "t/d0039x",
+                "t/d1",
+                "t/zz",
+                "t/é/文",
+                "t/é文",
+                "t-other/file",
+            ]
+            .map(String::from),
+        )
+        .chain((0..1500).map(|i| format!("t/e é/sp +%{i:04}")))
+        .chain((0..1500).map(|i| format!("t/e é文/{i:04}")));
+    let store = Memory::new(keys);
+    for concurrency in [2, 32] {
+        // Forty children, the first of them dense: each gets its own listing.
+        let (requests, _) = walked(&store, "t/", concurrency, None).await;
+        assert!(requests <= allowance(store.pages("t/")) + 40);
+        assert!(store.listings().0.len() > 4, "the tree was listed in parts");
+    }
+    // A pattern's recursive part can start in the middle of a name.
+    let expected: Vec<_> = store
+        .keys
+        .iter()
+        .filter(|key| key.starts_with("t/d00"))
+        .cloned()
+        .collect();
+    assert_eq!(listed(&store, "t/d00**", 32).await, expected);
+}
+
+#[tokio::test]
+async fn parts_take_the_shortest_prefix_the_listing_has_not_passed() {
+    for (inside, name, expected) in [
+        ("t/s0006/", "t/s0999/", "t/s09"),
+        ("t/s0006/", "t/s0007/", "t/s0007"),
+        ("t/s0006/", "t/x/", "t/x"),
+        ("t/a", "t/a/", "t/a/"),
+        ("t/a/", "t/ab/", "t/ab"),
+        ("t/file", "t/zebra/", "t/z"),
+        ("t/é/", "t/ê/", "t/ê"),
+        ("t/é/", "t/é文/", "t/é文"),
+    ] {
+        assert_eq!(engine::block(inside, name), expected, "{inside} {name}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_children_listing_that_misses_a_directory_ahead_loses_nothing() {
+    struct Incomplete(Memory);
+    impl Store for Incomplete {
+        async fn page(&self, prefix: &str, delimiter: bool, token: Option<&str>) -> Result<Page> {
+            let mut page = self.0.page(prefix, delimiter, token).await?;
+            if delimiter {
+                page.prefixes.retain(|prefix| prefix != "t/d0001/");
+            }
+            Ok(page)
+        }
+    }
+    // The listing has yet to reach the directory when it hands the later
+    // ones over, and stops only where the first of those begins.
+    let store = Incomplete(Memory::new(tree(8, 2000)));
+    let mut keys = Vec::new();
+    engine::enumerate_prefix(&store, "t/", 32, None, |entry| {
+        keys.push(entry.key);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(keys.len(), 16000);
+    assert_eq!(keys.into_iter().collect::<BTreeSet<_>>(), store.0.keys);
+    assert!(
+        store.0.listings().0.len() > 1,
+        "the tree was listed in parts"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn keys_out_of_order_stop_a_listing_in_parts() {
+    /// Returns the keys of each page of `t/` in reverse from the given page on.
+    struct Reversed {
+        inner: Memory,
+        from: usize,
+        pages: Cell<usize>,
+    }
+    impl Store for Reversed {
+        async fn page(&self, prefix: &str, delimiter: bool, token: Option<&str>) -> Result<Page> {
+            let mut page = self.inner.page(prefix, delimiter, token).await?;
+            if prefix == "t/" && !delimiter {
+                self.pages.set(self.pages.get() + 1);
+                if self.pages.get() >= self.from {
+                    page.entries.reverse();
+                }
+            }
+            Ok(page)
+        }
+    }
+    let list = |from, concurrency| async move {
+        let store = Reversed {
+            inner: Memory::new(tree(100, 300)),
+            from,
+            pages: Cell::new(0),
+        };
+        let mut keys = BTreeSet::new();
+        let outcome = engine::enumerate_prefix(&store, "t/", concurrency, None, |entry| {
+            assert!(keys.insert(entry.key));
+            Ok(())
+        })
+        .await;
+        (
+            outcome,
+            keys == store.inner.keys,
+            store.inner.listings().0.len(),
+        )
+    };
+    // Out of order from the start: the listing is never divided.
+    let (outcome, complete, listings) = list(1, 32).await;
+    assert!(outcome.is_ok() && complete);
+    assert_eq!(listings, 1);
+    // Out of order once parts were handed over: where to stop is unknown.
+    let (outcome, _, listings) = list(4, 32).await;
+    assert!(outcome.unwrap_err().is::<engine::Unordered>());
+    assert!(listings > 1);
+    // One request at a time relies on no order.
+    let (outcome, complete, listings) = list(4, 1).await;
+    assert!(outcome.is_ok() && complete);
+    assert_eq!(listings, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stores_without_key_order_are_listed_whole() {
+    struct Unordered(Memory);
+    impl Store for Unordered {
+        fn ordered(&self) -> bool {
+            false
+        }
+        async fn page(&self, prefix: &str, delimiter: bool, token: Option<&str>) -> Result<Page> {
+            self.0.page(prefix, delimiter, token).await
+        }
+    }
+    let store = Unordered(Memory::new(tree(100, 300)));
+    let mut keys = 0;
+    engine::enumerate_prefix(&store, "t/", 32, None, |_| {
+        keys += 1;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(keys, 30_000);
+    assert_eq!(*store.0.calls.borrow(), vec![("t/".to_owned(), false); 30]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn filtered_listings_leave_out_pruned_directories_at_the_end() {
+    let ignored = |key: &str, _directory: bool| {
+        ["t/d0003/", "t/d0006/", "t/d0007/"]
+            .into_iter()
+            .find(|directory| key.starts_with(directory))
+            .map(|directory| directory.len() - 1)
+    };
+    let prune = engine::Prune {
+        subtree: &ignored,
+        probes: 4.into(),
+    };
+    let store = Memory::new(tree(8, 5000).chain(["t/d0007.txt".to_owned(), "t/zz".to_owned()]));
+    let mut keys = Vec::new();
+    let mut pruned = engine::enumerate_prefix(&store, "t/", 32, Some(&prune), |entry| {
+        keys.push(entry.key);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    pruned.sort();
+    // The last directories are never listed. The one in the middle is left
+    // out once everything after it has a listing of its own.
+    assert_eq!(pruned, ["t/d0003/", "t/d0006/", "t/d0007/"]);
+    keys.sort();
+    let expected: Vec<_> = store
+        .keys
+        .iter()
+        .filter(|key| ignored(key, false).is_none())
+        .cloned()
+        .collect();
+    assert!(keys == expected);
+    assert!(store.calls.borrow().len() <= allowance(25));
 }

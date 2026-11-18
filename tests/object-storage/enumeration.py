@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Verify existing commands across parallel S3 listing branches and pages."""
 from concurrent.futures import ThreadPoolExecutor
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -49,7 +50,42 @@ def check():
                        check=True, timeout=120)
         assert c.listing(prefix + '/') == [prefix + '/']
         assert c.request('GET', outside)[1] == b'outside'
-    print('Parallel S3 enumeration passed: download bytes, server copy, prune, removal, literal selectors', flush=True)
+    check_parts()
+    print('Parallel S3 enumeration passed: download bytes, server copy, prune, removal, literal selectors, listing in parts', flush=True)
+
+
+def check_parts():
+    """A prefix wide enough that its listing is handed to several listings.
+
+    Objects sit beside the directories, share their names, and need URL
+    encoding, and the last directory is ignored.
+    """
+    prefix = c.PREFIX + '/wide'
+    objects = {f'{prefix}/shard {shard:03}/f{i:03}': b'x'
+               for shard in range(120) for i in range(100)}
+    objects.update({f'{prefix}/zz ignored/f{i:04}': b'x' for i in range(1500)})
+    objects.update({key: b'beside' for key in (
+        prefix + '/shard 050', prefix + '/shard 050.txt', prefix + '/shard 1',
+        prefix + '/shard 119+', prefix + '/zz', prefix + '/文')})
+    objects.update({prefix + '/shard 010/': b'', prefix + '/zz ignored/': b''})
+    remote = 's3://' + c.BUCKET
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        list(pool.map(lambda item: c.request('PUT', item[0], item[1]), objects.items()))
+    assert set(c.listing(prefix + '/')) == set(objects), 'independent listing must see the fixture'
+    listed = subprocess.run([c.SYQ, '_ls', f'{remote}/{prefix}/**', '--s3-region', c.REGION],
+                            capture_output=True, text=True, timeout=120)
+    assert listed.returncode == 0, listed.stderr
+    keys = [json.loads(line)['key'] for line in listed.stdout.splitlines()]
+    assert len(keys) == len(objects) and set(keys) == set(objects)
+    with tempfile.TemporaryDirectory(prefix='syq-enumeration-') as temp:
+        destination = Path(temp).resolve() / 'download'
+        c.run(['--from', remote, '--srcs-in', prefix, '--into', destination,
+               '--ignore', 'zz ignored/'])
+        expected = {key[len(prefix) + 1:] for key in objects
+                    if not key.endswith('/') and '/zz ignored/' not in key}
+        actual = {str(path.relative_to(destination))
+                  for path in destination.rglob('*') if path.is_file()}
+        assert actual == expected
 
 
 if __name__ == '__main__':
