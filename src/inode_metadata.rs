@@ -343,7 +343,8 @@ mod platform {
         }
         write(file, name, value)
     }
-    /// Set or remove an attribute already read to differ from `value`.
+    /// Set or remove an attribute already read or listed to differ from
+    /// `value`.
     fn write(file: &File, name: &[u8], value: Option<&[u8]>) -> Result<()> {
         #[cfg(debug_assertions)]
         if std::env::var_os("SYQ_TEST_FAIL_XATTR")
@@ -711,6 +712,33 @@ mod platform {
             let none = xattr_changes(&file, &attributes, |n| n == b"user.b", false).unwrap();
             assert!(none.is_empty());
         }
+
+        /// Only `security.*` and `trusted.*` differences count, and only for
+        /// privileged metadata. Reading an absent one needs no privilege.
+        #[test]
+        fn only_privileged_differences_change_privileged_attributes() {
+            let dir = crate::test_support::tempdir().unwrap();
+            let file = File::create(dir.path().join("file")).unwrap();
+            write(&file, b"user.extra", Some(b"1")).unwrap();
+            write(&file, b"user.changed", Some(b"1")).unwrap();
+            let metadata = |privileged, values: &[(&[u8], &[u8])]| InodeMetadata {
+                xattrs: Some(ExtendedAttributes {
+                    privileged,
+                    values: values
+                        .iter()
+                        .map(|(n, v)| (n.to_vec(), v.to_vec()))
+                        .collect(),
+                }),
+                ..Default::default()
+            };
+            let user_only = metadata(true, &[(b"user.changed", b"2"), (b"user.missing", b"1")]);
+            assert!(would_change(&file, &user_only, 0o644).unwrap());
+            assert!(!changes_privileged_attributes(&file, &user_only).unwrap());
+            let security: &[(&[u8], &[u8])] =
+                &[(b"security.syq-test", b"1"), (b"user.changed", b"1")];
+            assert!(changes_privileged_attributes(&file, &metadata(true, security)).unwrap());
+            assert!(!changes_privileged_attributes(&file, &metadata(false, security)).unwrap());
+        }
     }
 }
 
@@ -823,9 +851,9 @@ pub(crate) fn apply_after_acls_before_publication(
 }
 
 /// Whether applying `metadata` with the final `mode` through `file` would
-/// change anything but its access time, which syq restores in place on any
-/// file (`fsops::vouch`): its ACLs, extended attributes or birth time. Where
-/// a part cannot be compared it counts as a change.
+/// change its ACLs, extended attributes or birth time: anything but its
+/// access time, which syq restores in place on any file (`fsops::vouch`).
+/// Where a part cannot be compared it counts as a change.
 pub(crate) fn would_change_besides_atime(
     file: &File,
     metadata: Option<&InodeMetadata>,
