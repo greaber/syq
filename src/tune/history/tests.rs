@@ -533,6 +533,12 @@ pub(in crate::tune) fn measured_run(
     key: &ContextKey,
     points: &[(usize, f64)],
 ) -> Recorder {
+    let writer = unfinished_run(path, key, points);
+    writer.complete(true, json!({}));
+    writer
+}
+
+fn unfinished_run(path: &Path, key: &ContextKey, points: &[(usize, f64)]) -> Recorder {
     let writer = recorder(path);
     writer.context(key);
     writer.event(
@@ -548,8 +554,37 @@ pub(in crate::tune) fn measured_run(
             );
         }
     }
-    writer.complete(true, json!({}));
     writer
+}
+
+#[test]
+fn exact_filesystem_starts_survive_other_destinations_and_unfinished_runs() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    // Each run's other count is nearly as fast, so an exact match may refine.
+    measured_run(&path, &key("a"), &[(8, 200.0), (16, 195.0)]);
+    measured_run(&path, &key("b"), &[(32, 200.0), (16, 195.0)]);
+    let failed = unfinished_run(&path, &key("a"), &[(64, 200.0), (32, 100.0)]);
+    failed.complete(false, json!({}));
+    drop(unfinished_run(
+        &path,
+        &key("a"),
+        &[(64, 200.0), (32, 100.0)],
+    ));
+    let next = recorder(&path);
+    let exact = next.starting_count(&key("a"), false).unwrap();
+    assert_eq!((exact.workers, exact.matched.as_str()), (8, "filesystems"));
+    assert!(exact.refine);
+    assert_eq!(next.starting_count(&key("b"), false).unwrap().workers, 32);
+    // Another filesystem pair falls back to the route only when allowed,
+    // and a route-level match never skips the startup doubling.
+    assert!(next.starting_count(&key("unknown"), false).is_none());
+    let route = next.starting_count(&key("unknown"), true).unwrap();
+    assert_eq!(route.matched, "route");
+    assert!(!route.refine);
+    let mut other_mode = key("a");
+    other_mode.mode = "bandwidth_limited".into();
+    assert!(next.starting_count(&other_mode, true).is_none());
 }
 
 #[test]

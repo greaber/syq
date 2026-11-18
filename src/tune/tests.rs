@@ -876,7 +876,7 @@ fn downward_gain_requirement_preserves_clear_upward_loss_rollback() {
 }
 
 #[test]
-fn settled_count_changes_only_with_justified_growth_or_reduction() {
+fn settled_count_follows_kept_increases_and_measured_reductions() {
     let mut policy = Policy::new(8, 1, 64);
     measure(&mut policy, 100.0); // Proposed 16 is not settled yet.
     assert_eq!(policy.settled(), 8);
