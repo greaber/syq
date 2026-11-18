@@ -31,8 +31,8 @@ use std::{
 };
 use tokio::sync::Notify;
 
-mod cancel;
-pub(super) use cancel::{Cancellation, Sleep};
+use super::cancel::Cancellation;
+mod tcp;
 
 #[derive(Debug, Default)]
 struct Active {
@@ -253,7 +253,7 @@ fn upload_agent(cancellation: Arc<Cancellation>) -> ureq::Agent {
     ureq::Agent::with_parts(
         config,
         ().chain(ConnectProxyConnector::default())
-            .chain(cancel::TcpConnector(cancellation))
+            .chain(tcp::TcpConnector(cancellation))
             .chain(RustlsConnector::default()),
         ureq::unversioned::resolver::DefaultResolver::default(),
     )

@@ -1,4 +1,5 @@
 use super::*;
+use crate::s3::cancel::{self, Sleep};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[test]

@@ -334,7 +334,7 @@ async fn bucket_region(client: &Client, bucket: &str) -> std::result::Result<Str
 pub(super) async fn connect(
     options: &mut Options,
     control: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    uploads: std::sync::Arc<super::upload_http::Cancellation>,
+    uploads: std::sync::Arc<super::cancel::Cancellation>,
 ) -> Result<(Client, Option<String>)> {
     connect_authorized(options, control, uploads, None, None).await
 }
@@ -342,7 +342,7 @@ pub(super) async fn connect(
 pub(super) async fn connect_authorized(
     options: &mut Options,
     control: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    uploads: std::sync::Arc<super::upload_http::Cancellation>,
+    uploads: std::sync::Arc<super::cancel::Cancellation>,
     authorization: Option<std::sync::Arc<super::authorization::Authorization>>,
     outage: Option<std::sync::Arc<super::outage::Outage>>,
 ) -> Result<(Client, Option<String>)> {
@@ -375,7 +375,7 @@ pub(super) async fn connect_authorized(
 pub(super) async fn connect_local(
     options: &mut Options,
     control: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    uploads: std::sync::Arc<super::upload_http::Cancellation>,
+    uploads: std::sync::Arc<super::cancel::Cancellation>,
 ) -> Result<(
     Client,
     Option<aws_credential_types::provider::SharedCredentialsProvider>,
@@ -401,7 +401,7 @@ async fn connect_with(
     options: &mut Options,
     shared: aws_types::SdkConfig,
     control: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    uploads: std::sync::Arc<super::upload_http::Cancellation>,
+    uploads: std::sync::Arc<super::cancel::Cancellation>,
     authorization: Option<std::sync::Arc<super::authorization::Authorization>>,
     outage: Option<std::sync::Arc<super::outage::Outage>>,
 ) -> Result<(Client, Option<String>)> {
@@ -410,8 +410,7 @@ async fn connect_with(
             aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
         ))
         .build_with_resolver(super::dns::CoalescingDns::default());
-    let sleep =
-        aws_sdk_s3::config::SharedAsyncSleep::new(super::upload_http::Sleep(uploads.clone()));
+    let sleep = aws_sdk_s3::config::SharedAsyncSleep::new(super::cancel::Sleep(uploads.clone()));
     let transport = super::upload_http::client(transport, uploads);
     let transport = match authorization {
         Some(authorization) => super::authorization::http_client(transport, authorization),

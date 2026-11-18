@@ -110,7 +110,7 @@ pub(super) struct Engine {
     tuning: super::tuning::Tuning,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     cancel_wake: tokio::sync::Notify,
-    uploads: Arc<super::upload_http::Cancellation>,
+    uploads: Arc<super::cancel::Cancellation>,
     authorization: Option<Arc<super::authorization::Authorization>>,
     /// The destination rejected an upload without a checksum; send Content-MD5.
     content_md5: std::sync::atomic::AtomicBool,
@@ -256,7 +256,7 @@ impl Engine {
             .or_else(|| std::env::var("AWS_ENDPOINT_URL_S3").ok())
             .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok());
         let control = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
-        let uploads = Arc::new(super::upload_http::Cancellation::default());
+        let uploads = Arc::new(super::cancel::Cancellation::default());
         let authorization = super::authorization::connect(&args, &options).await?;
         let outage = Arc::new(super::outage::Outage::default());
         let (client, note) = client::connect_authorized(
