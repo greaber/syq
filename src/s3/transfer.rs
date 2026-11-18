@@ -7,7 +7,7 @@ mod server_copy;
 mod upload_hashes;
 
 use super::{
-    admission::parallel,
+    admission::{parallel, TransferSlot},
     checksum::Algorithm,
     client::{self, Metadata, Object, ObjectKind},
     local::{self, Destination, Source},
@@ -377,7 +377,7 @@ impl Engine {
             self.progress.scan_done.store(true, Relaxed);
             if self.authorization.is_some() {
                 let prepared = Arc::new(Mutex::new(Vec::with_capacity(plan.len())));
-                parallel(plan, workers, |source| {
+                parallel(plan, workers, |source, mut slot| {
                     let engine = self.clone();
                     let prepared = prepared.clone();
                     async move {
@@ -385,7 +385,7 @@ impl Engine {
                         let label = source.label.clone();
                         let kind = source.kind();
                         let expected = source.expected_hash.clone();
-                        match engine.prepare_upload(source).await {
+                        match engine.prepare_upload(source, &mut slot).await {
                             Ok(work) => prepared
                                 .lock()
                                 .await
@@ -422,28 +422,32 @@ impl Engine {
                         UploadPreparation::Preview(n) => *n,
                         UploadPreparation::Skipped => 0,
                     }))?;
-                parallel(prepared, workers, |(key, label, kind, expected, work)| {
-                    let engine = self.clone();
-                    async move {
-                        // Keep admitting jobs after cancellation so each one can
-                        // abort its unrecorded upload, but report nothing new.
-                        if engine.check_cancelled().is_err() {
-                            if let UploadPreparation::Ready(work) = &work {
-                                engine.abort_unrecorded_preparation(work).await;
+                parallel(
+                    prepared,
+                    workers,
+                    |(key, label, kind, expected, work), mut slot| {
+                        let engine = self.clone();
+                        async move {
+                            // Keep admitting jobs after cancellation so each one can
+                            // abort its unrecorded upload, but report nothing new.
+                            if engine.check_cancelled().is_err() {
+                                if let UploadPreparation::Ready(work) = &work {
+                                    engine.abort_unrecorded_preparation(work).await;
+                                }
+                                return Ok(None);
                             }
-                            return Ok(None);
+                            let result = engine.execute_upload(work, &mut slot).await;
+                            engine.settle(&label, &key, kind, &result, expected.as_ref());
+                            Ok(result.ok().flatten())
                         }
-                        let result = engine.execute_upload(work).await;
-                        engine.settle(&label, &key, kind, &result, expected.as_ref());
-                        Ok(result.ok().flatten())
-                    }
-                })
+                    },
+                )
                 .await?;
             } else {
                 if self.args.prune_before {
                     self.prune(std::mem::take(&mut prune), None).await?;
                 }
-                parallel(plan, workers, |source| {
+                parallel(plan, workers, |source, mut slot| {
                     let engine = self.clone();
                     async move {
                         let key = source.key.clone();
@@ -451,7 +455,7 @@ impl Engine {
                         let kind = source.kind();
                         engine.check_cancelled()?;
                         let expected = source.expected_hash.as_ref().cloned();
-                        let result = engine.upload(source).await;
+                        let result = engine.upload(source, &mut slot).await;
                         engine.settle(&label, &key, kind, &result, expected.as_ref());
                         Ok(result.ok().flatten())
                     }
@@ -520,7 +524,7 @@ impl Engine {
                     .await?;
                 }
                 let mut service_times = service_times.into_iter();
-                parallel(plan, workers, |mut job| {
+                parallel(plan, workers, |mut job, mut slot| {
                     let service_time = service_times.next().flatten();
                     let engine = self.clone();
                     let dst = destination.clone();
@@ -532,7 +536,11 @@ impl Engine {
                     async move {
                         engine.check_cancelled()?;
                         let result = match prepared {
-                            Ok(()) => engine.download(&mut job, &dst, dirs, service_time).await,
+                            Ok(()) => {
+                                engine
+                                    .download(&mut job, &dst, dirs, service_time, &mut slot)
+                                    .await
+                            }
                             Err(error) => Err(error),
                         }
                         .map_err(|error| {
@@ -970,6 +978,7 @@ impl Engine {
         self: &Arc<Self>,
         source: Source,
         object: &Object,
+        slot: &mut TransferSlot,
     ) -> Result<UploadPreparation> {
         let size = object.size;
         if self.upload_requested_metadata_matches(&source, object) {
@@ -983,6 +992,7 @@ impl Engine {
         let desired = source.metadata(None);
         let flags =
             self.args.matching_meta_flags() | source.metadata.map_or(0, |m| m.apply_flags());
+        slot.claim().await;
         let _slot = self.tuning.requests.acquire().await;
         let head = client::head_output(&self.client, &self.options.bucket, &source.key, None)
             .await?
@@ -1052,7 +1062,11 @@ impl Engine {
         })))
     }
 
-    async fn prepare_upload(self: &Arc<Self>, source: Source) -> Result<UploadPreparation> {
+    async fn prepare_upload(
+        self: &Arc<Self>,
+        source: Source,
+        slot: &mut TransferSlot,
+    ) -> Result<UploadPreparation> {
         let expected_hash = source.expected_hash.as_ref().filter(|_| !self.args.dry_run);
         let existing = if self
             .upload_keys
@@ -1142,9 +1156,11 @@ impl Engine {
                 source.bytes()?;
             }
             return self
-                .prepare_accepted_upload(source, existing.as_ref().unwrap())
+                .prepare_accepted_upload(source, existing.as_ref().unwrap(), slot)
                 .await;
         }
+        // Everything from here reads the file or changes the destination.
+        slot.claim().await;
         let comparable = existing
             .as_ref()
             .filter(|o| o.kind() == source.kind() && o.size == size);
@@ -1300,7 +1316,7 @@ impl Engine {
         );
         if same_contents {
             return self
-                .prepare_accepted_upload(source, existing.as_ref().unwrap())
+                .prepare_accepted_upload(source, existing.as_ref().unwrap(), slot)
                 .await;
         }
         if self.args.dry_run {
@@ -1337,17 +1353,26 @@ impl Engine {
         Ok(UploadPreparation::Ready(Box::new(prepared)))
     }
 
-    async fn upload(self: &Arc<Self>, source: Source) -> Result<Option<u64>> {
-        self.execute_upload(self.prepare_upload(source).await?)
-            .await
+    async fn upload(
+        self: &Arc<Self>,
+        source: Source,
+        slot: &mut TransferSlot,
+    ) -> Result<Option<u64>> {
+        let prepared = self.prepare_upload(source, slot).await?;
+        self.execute_upload(prepared, slot).await
     }
 
-    async fn execute_upload(self: &Arc<Self>, prepared: UploadPreparation) -> Result<Option<u64>> {
+    async fn execute_upload(
+        self: &Arc<Self>,
+        prepared: UploadPreparation,
+        slot: &mut TransferSlot,
+    ) -> Result<Option<u64>> {
         let prepared = match prepared {
             UploadPreparation::Skipped => return Ok(None),
             UploadPreparation::Preview(size) => return Ok(Some(size)),
             UploadPreparation::Ready(prepared) => *prepared,
         };
+        slot.claim().await;
         if let Some(update) = &prepared.metadata_update {
             update
                 .execute(
@@ -1931,11 +1956,11 @@ impl Engine {
                 let mut copy_source = None;
                 let mut exact = None;
                 if !selector.0.is_empty() && !prefix {
+                    let _slot = self.tuning.requests.acquire().await;
                     if self.options.route.is_server_copy() {
                         copy_source = self.copy_head(source_bucket, &selector.0, false).await?;
                         exact = copy_source.as_ref().map(|(object, _)| object.clone());
                     } else {
-                        let _slot = self.tuning.requests.acquire().await;
                         exact = client::head(&self.client, source_bucket, &selector.0).await?;
                     }
                     if exact.is_none() && self.args.native_mapping.is_some() {
@@ -1944,7 +1969,6 @@ impl Engine {
                             copy_source = self.copy_head(source_bucket, &marker, false).await?;
                             exact = copy_source.as_ref().map(|(object, _)| object.clone());
                         } else {
-                            let _slot = self.tuning.requests.acquire().await;
                             exact = client::head(&self.client, source_bucket, &marker).await?;
                         }
                     }
@@ -2276,6 +2300,7 @@ impl Engine {
         destination: &Destination,
         directories: DirectoryMetadata,
         service_time: Option<(i64, u32)>,
+        slot: &mut TransferSlot,
     ) -> Result<Option<u64>> {
         let known_source = job.source_object.as_deref().map(Object::expression_file);
         let source_facts = known_source.as_ref().map_or(
@@ -2379,6 +2404,7 @@ impl Engine {
         };
         let mut initial_slot = None;
         let initial = if get_first {
+            slot.claim().await;
             initial_slot = Some(self.tuning.requests.acquire().await);
             Some(
                 self.client
@@ -2507,6 +2533,7 @@ impl Engine {
             if object.size > 1024 * 1024 {
                 bail!("S3 symlink target is too large");
             }
+            slot.claim().await;
             let bytes = self.get_small(&object, initial, initial_slot).await?;
             if let Some(hash) = metadata
                 .hash
@@ -2571,6 +2598,7 @@ impl Engine {
                     || self.args.protects_existing_contents()
                     || self.stored_comparison_hash(&object).is_some())
             {
+                slot.claim().await;
                 checked = self.verify_download(root, &path, &object).await?;
                 unchanged = checked.is_some();
             }
@@ -2581,6 +2609,7 @@ impl Engine {
             job.path
         );
         if unchanged && expected_hash.is_some() {
+            slot.claim().await;
             match self.verify_expected_local(root, &path, expected_hash).await {
                 Ok(Some(hashed)) => Hashed::add(&mut checked, hashed),
                 Ok(None) => {}
@@ -2612,6 +2641,7 @@ impl Engine {
                 return Ok(Some(object.size));
             }
             let mode = existing.map(|m| m.mode & 0o7777);
+            slot.claim().await;
             match self
                 .replace_from_local(
                     root,
@@ -2670,6 +2700,7 @@ impl Engine {
             self.progress.add_bytes(object.size);
             return Ok(Some(object.size));
         }
+        slot.claim().await;
         directories.create_missing_parents(root, &path)?;
         if object.size <= part_size {
             return self
