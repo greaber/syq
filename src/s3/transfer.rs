@@ -655,12 +655,11 @@ impl Engine {
                     );
                 }
                 if let Some((meta, mode, explicit)) = &metadata {
-                    local::apply_metadata(
+                    local::apply_directory_metadata(
                         &destination.root,
                         &relative,
                         meta,
                         &self.args,
-                        *mode,
                         *explicit,
                         mode.is_none(),
                         &mut creation,
