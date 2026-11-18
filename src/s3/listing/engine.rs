@@ -309,7 +309,8 @@ fn dense_children(query: &str, page: &Page) -> usize {
 }
 
 /// When every object on a truncated first page, apart from directory markers,
-/// lies in a pruned directory, list directories instead, so that the pruned ones need not be enumerated.
+/// lies in a pruned directory, list directories instead, so that the pruned
+/// ones need not be enumerated.
 /// Follow a single unpruned child at most as deep as the probe budget allows.
 /// Returns `None` when probing was not tried or did not pay off.
 async fn lookahead(
