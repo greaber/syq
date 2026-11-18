@@ -1,8 +1,9 @@
 //! Publishing a file without waiting for its round trips.
 //!
-//! A file written in ranges is published in two steps once its last write is
-//! acknowledged: the source is checked again (a stat after its last read),
-//! and only if it is unchanged does the destination publish it (`Finalize`).
+//! A file whose contents are complete at the destination is published in two
+//! steps: the source is checked again (a stat after its last read), and only
+//! if it is unchanged does the destination publish it (`Finalize`). A file
+//! the destination already matched needs only the first.
 //! Each step is a round trip. Rather than wait for them, a worker sends the
 //! step's request and starts its next file; its next requests travel behind
 //! it on the same connection, so their round trips overlap. The worker

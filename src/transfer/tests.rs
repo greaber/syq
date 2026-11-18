@@ -1169,6 +1169,24 @@ fn prune_alias_lookups_are_bounded_and_keep_only_candidate_identities() {
     assert!(malformed.lock().unwrap().replies.is_empty());
 }
 
+/// Attach a results stream to `worker`, returning the file it writes.
+fn capture_results(worker: &Worker) -> std::fs::File {
+    let file = tempfile::tempfile().unwrap();
+    worker
+        .progress
+        .set_results(Arc::new(crate::results::ResultsWriter::new(Box::new(
+            file.try_clone().unwrap(),
+        ))));
+    file
+}
+
+fn captured_results(mut file: std::fs::File) -> String {
+    let mut text = String::new();
+    std::io::Seek::rewind(&mut file).unwrap();
+    std::io::Read::read_to_string(&mut file, &mut text).unwrap();
+    text
+}
+
 #[test]
 fn changed_source_exhausts_retries_without_publishing() {
     let sched = Arc::new(Sched::new(512, 8192));
@@ -1181,6 +1199,7 @@ fn changed_source_exhausts_retries_without_publishing() {
     let src = Arc::new(Mutex::new(PipelineState::default()));
     let dst = Arc::new(Mutex::new(PipelineState::default()));
     let mut worker = pipeline_worker(&sched, &src, &dst, false);
+    let results = capture_results(&worker);
     for attempt in 0..MAX_ATTEMPTS {
         assert!(matches!(sched.next(), Item::File(0)));
         let job = worker.job(0);
@@ -1213,6 +1232,8 @@ fn changed_source_exhausts_retries_without_publishing() {
     }
     assert_eq!(src.lock().unwrap().requests.len(), MAX_ATTEMPTS as usize);
     assert_eq!(worker.progress.files_done.load(Relaxed), 0);
+    let results = captured_results(results);
+    assert!(results.contains("source changed"), "{results}");
 }
 
 /// A staged file whose Finalize the receiver refuses because it no longer
@@ -1227,6 +1248,7 @@ fn a_refused_finalize_whose_sidecar_is_gone_is_verified_by_contents() {
         let src = Arc::new(Mutex::new(PipelineState::default()));
         let dst = Arc::new(Mutex::new(PipelineState::default()));
         let mut worker = pipeline_worker(&sched, &src, &dst, false);
+        let results = capture_results(&worker);
         assert!(matches!(sched.next(), Item::File(0)));
         let job = worker.job(0);
         job.done.store(job.entry.size, Relaxed);
@@ -1252,6 +1274,8 @@ fn a_refused_finalize_whose_sidecar_is_gone_is_verified_by_contents() {
         if sidecar_left {
             assert!(sched.is_failed(0));
             assert_eq!(worker.progress.errors.load(Relaxed), 1);
+            let results = captured_results(results);
+            assert!(results.contains("not open in this receiver"), "{results}");
             assert_eq!(destination.requests.len(), 2);
             assert_eq!(worker.progress.files_done.load(Relaxed), 0);
         } else {

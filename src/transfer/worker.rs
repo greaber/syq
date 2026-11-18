@@ -1443,8 +1443,8 @@ impl Worker {
             /// The receiver copied every byte itself, already counted as
             /// copied; the file still needs `Finalize`.
             Copied,
-            /// A verified content match: metadata was applied through the
-            /// retained basis, and only the source check remains.
+            /// A verified content match whose metadata is already applied:
+            /// only the source check remains.
             Matched,
         }
 
@@ -1957,10 +1957,10 @@ impl Worker {
     /// Err = real failure.
     /// The caller owns scheduler probing bookkeeping for every terminal result.
     pub(super) fn try_copy_local(&mut self, job: &WorkerJob) -> Result<bool> {
-        // Write to a partial and let publication rename it, so an interrupted
-        // A receiver-side copy never leaves a final-named file the quick check
-        // could mistake for complete. Only --inplace writes the final path
-        // directly.
+        // Write to a partial and let publication rename it, so that an
+        // interrupted receiver-side copy never leaves a final-named file the
+        // quick check could mistake for complete. Only --inplace writes the
+        // final path directly.
         let inplace = job.inplace;
         // A file it creates in place waits owner-only for its group or ACL,
         // as a sidecar does.
