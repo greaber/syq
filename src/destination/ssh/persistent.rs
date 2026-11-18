@@ -3,6 +3,7 @@ use super::{foreground, local_config::LocalPlan, resolution, SessionRequest, Tty
 use crate::auth_from::Provider;
 use crate::cli::{AuthFrom, NativeEndpoint};
 use crate::destination::ssh_auth::{LinkReply, LinkRequest};
+use crate::lock_file::LockFile;
 use crate::persistence::Domain;
 use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
@@ -607,17 +608,10 @@ pub(crate) struct StatusSnapshot {
     pub rows: Vec<Status>,
     pub errors: Vec<String>,
 }
-/// Whether another process holds the lock on `path`. Looking takes a
-/// shared lock for a moment, which a keeper taking it then retries.
+/// Whether another process holds the lock on `path`, which a keeper taking
+/// it retries for (`take_keeper_lock`).
 fn held(path: &Path) -> bool {
-    let Ok(file) = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path)
-    else {
-        return false;
-    };
-    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) != 0 }
+    LockFile::is_held(path).unwrap_or(false)
 }
 
 pub(crate) fn status(domain: &Domain) -> Result<StatusSnapshot> {
@@ -1111,22 +1105,8 @@ fn keeper(startup: Startup) -> Result<()> {
     let path = selected_index_path(&domain, &request.provider, &request.destination, selected)?;
     // Released last, after the scope is removed and everything in it ended,
     // which `persist off` relies on (`keeper_lock_path`).
-    let mut keeper_lock: Option<File> = None;
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path.with_extension("lock"))?;
-    let metadata = lock.metadata()?;
-    if !metadata.is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o077 != 0
-    {
-        bail!("SSH authority lock must be an owner-only file");
-    }
+    let mut keeper_lock: Option<LockFile> = None;
+    let lock = LockFile::open(&path.with_extension("lock"), true)?;
     let signals = foreground::Signals::new()?;
     let started = Instant::now();
     let deadline = started + Duration::from_secs(330);
@@ -1143,12 +1123,8 @@ fn keeper(startup: Startup) -> Result<()> {
                 &Ok::<_, String>(cached.endpoint().host.clone()),
             );
         }
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        if lock.try_exclusive()? {
             break;
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::WouldBlock {
-            return Err(error.into());
         }
         if Instant::now() >= deadline {
             bail!("another SSH account request did not become ready within 330 seconds");
@@ -1457,29 +1433,19 @@ fn keeper_lock_path(record: &Path, control: &Path) -> Option<PathBuf> {
     Some(record.parent()?.join(format!("{name}.lock")))
 }
 
-fn take_keeper_lock(record: &Path, control: &Path) -> Result<File> {
+fn take_keeper_lock(record: &Path, control: &Path) -> Result<LockFile> {
     let path = keeper_lock_path(record, control).context("SSH account index has no directory")?;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&path)
+    let lock = LockFile::open(&path, true)
         .with_context(|| format!("create SSH account keeper lock {}", path.display()))?;
     // No other keeper has this name, but someone counting keepers can hold
-    // it for a moment (`held`).
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "SSH account keeper lock {} is held",
-            path.display()
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    Ok(file)
+    // it for a moment (`held`), and an older build's count until a child it
+    // forked meanwhile execs.
+    anyhow::ensure!(
+        lock.try_exclusive_within(Duration::from_secs(2))?,
+        "SSH account keeper lock {} is held",
+        path.display()
+    );
+    Ok(lock)
 }
 
 /// How many sessions use the master at `control`, apart from the session
