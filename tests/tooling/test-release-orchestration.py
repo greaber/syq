@@ -122,9 +122,19 @@ class WorkflowTextTests(unittest.TestCase):
                                       ("build.rs", "build\n")]:
                     (root / name).write_text(content)
                 output = root / "output"
-                subprocess.run(["bash", "-c", script], cwd=root, check=True, timeout=10,
-                               env=dict(BASE_ENV, RUNNER_OS="Linux", RUNNER_ARCH="X64",
-                                        GITHUB_OUTPUT=str(output)))
+                env = dict(BASE_ENV, RUNNER_OS="Linux", RUNNER_ARCH="X64",
+                           GITHUB_OUTPUT=str(output))
+                if shutil.which("sha256sum") is None:
+                    # The step runs on Linux; macOS lacks GNU sha256sum.
+                    tools = root / "tools"
+                    tools.mkdir()
+                    write_executable(tools / "sha256sum", textwrap.dedent(f"""\
+                        #!{sys.executable}
+                        import hashlib, sys
+                        print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest() + "  -")
+                        """))
+                    env["PATH"] = f"{tools}{os.pathsep}{env['PATH']}"
+                subprocess.run(["bash", "-c", script], cwd=root, check=True, timeout=10, env=env)
                 return parse(output.read_text())["key"]
 
         original = key(dockerfile)
