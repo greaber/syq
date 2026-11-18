@@ -1315,3 +1315,46 @@ fn macos_clone_normalizes_staging_permissions_under_restrictive_umasks() {
         assert_eq!(fs::read_dir(&t.0).unwrap().count(), 2, "umask {mask:o}");
     }
 }
+
+#[test]
+fn many_named_sources_with_several_workers_claim_every_source() {
+    // Each receiver worker claims every named source (its directory and the
+    // exact file) over one broker connection.
+    let t = Tmp::new();
+    fs::create_dir(t.path("src")).unwrap();
+    fs::create_dir(t.path("dst")).unwrap();
+    let names: Vec<String> = (0..300).map(|index| format!("f{index:03}")).collect();
+    for (index, name) in names.iter().enumerate() {
+        write(&t.path("src").join(name), &prng(4096, index as u64));
+    }
+    let sources: Vec<String> = names
+        .iter()
+        .map(|name| t.path("src").join(name).to_string_lossy().into_owned())
+        .collect();
+    // The rejection hook exists only in debug builds.
+    let cases: &[bool] = if cfg!(debug_assertions) {
+        &[true, false]
+    } else {
+        &[false]
+    };
+    for &reject in cases {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command
+            .args(["cp", "--no-progress", "--performance-tuning=workers=4"])
+            .args(&sources)
+            .args(["--into", &t.s("dst")]);
+        if reject {
+            // Positive control: these workers really claim copy sources.
+            command.env("SYQ_TEST_REJECT_COPY_SOURCES", "1");
+            let out = command.run().unwrap();
+            assert!(!out.status.success());
+            assert!(stderr_of(&out).contains("test rejected unnecessary copy-source capabilities"));
+            continue;
+        }
+        let out = command.run().unwrap();
+        assert_output_ok(&out);
+        for (index, name) in names.iter().enumerate() {
+            assert_eq!(read(&t.path("dst").join(name)), prng(4096, index as u64));
+        }
+    }
+}

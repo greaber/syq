@@ -1836,31 +1836,14 @@ fn remote_listing_request(
     policy: PathCompletionPolicy,
     detailed: bool,
 ) -> Request {
-    if !policy.follow_final_symlinks {
-        Request::ListDirNoFollowFinal {
-            directory,
-            confined_root,
-            prefix: prefix.clone(),
-            limit: MAX_DIRECTORY_CANDIDATES,
-            symlink_policy: policy.parents,
-            detailed,
-        }
-    } else if detailed {
-        Request::ListDirDetails {
-            directory,
-            confined_root,
-            prefix: prefix.clone(),
-            limit: MAX_DIRECTORY_CANDIDATES,
-            symlink_policy: policy.parents,
-        }
-    } else {
-        Request::ListDir {
-            directory,
-            confined_root,
-            prefix: prefix.clone(),
-            limit: MAX_DIRECTORY_CANDIDATES,
-            symlink_policy: policy.parents,
-        }
+    Request::ListDir {
+        directory,
+        confined_root,
+        prefix,
+        limit: MAX_DIRECTORY_CANDIDATES,
+        symlink_policy: policy.parents,
+        detailed,
+        follow_final_symlinks: policy.follow_final_symlinks,
     }
 }
 
@@ -1943,45 +1926,20 @@ fn local_path_candidates_at(
     let Some(directory) = apply_path_base(base, &directory) else {
         return Vec::new();
     };
-    if crate::fsops::check_completion_directory(
+    // Local completion lists the whole directory and leaves out entries it
+    // cannot read, where an endpoint caps its reply and fails instead.
+    let Ok((entries, _)) = crate::fsops::list_completion_directory(
         &directory.path,
         directory.confined_root.as_deref(),
+        &prefix,
+        usize::MAX,
         policy.parents,
-    )
-    .is_err()
-    {
-        return Vec::new();
-    }
-    let mut entries = Vec::new();
-    let Ok(items) = std::fs::read_dir(crate::fsops::resolve(&directory.path)) else {
+        policy.follow_final_symlinks,
+        directories_only,
+        true,
+    ) else {
         return Vec::new();
     };
-    for item in items.flatten() {
-        let name = item.file_name().into_vec();
-        if !name.starts_with(&prefix) || (!prefix.starts_with(b".") && name.starts_with(b".")) {
-            continue;
-        }
-        let Ok(file_type) = item.file_type() else {
-            continue;
-        };
-        let is_directory = file_type.is_dir()
-            || (file_type.is_symlink()
-                && policy.follow_final_symlinks
-                && crate::fsops::check_completion_directory(
-                    item.path().as_os_str().as_bytes(),
-                    directory.confined_root.as_deref(),
-                    policy.parents,
-                )
-                .is_ok());
-        if directories_only && !is_directory {
-            continue;
-        }
-        entries.push(CompletionEntry {
-            name,
-            directory: is_directory,
-        });
-    }
-    entries.sort_by(|left, right| left.name.cmp(&right.name));
     let details = if details_requested() {
         let path = crate::fsops::resolve(&directory.path);
         let detail_entries = entries.clone();

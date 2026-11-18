@@ -1229,6 +1229,7 @@ fn ancestry_requires_an_available_source_directory() {
         temp.path().as_os_str().as_bytes(),
         false,
         OperatorSymlinkPolicy::Refuse,
+        false,
     )
     .unwrap();
     let check = || {
@@ -1462,6 +1463,7 @@ fn shared_ancestry_matches_masters_pairwise_check() {
         root.join("dst").as_os_str().as_bytes(),
         false,
         OperatorSymlinkPolicy::Refuse,
+        false,
     )
     .unwrap();
     let pairwise = |source: &Path, is_directory: bool, suffix: &str| {
@@ -1630,6 +1632,7 @@ fn shared_ancestry_matches_comparing_each_pair() {
         root.join("dst").as_os_str().as_bytes(),
         false,
         OperatorSymlinkPolicy::Refuse,
+        false,
     )
     .unwrap();
     let combined = |shared: &[PathBytes]| {
@@ -5643,6 +5646,43 @@ fn destination_worker_claims_copy_sources_from_the_foreign_session() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn copy_worker_claims_every_named_source_over_one_broker_connection() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&destination).unwrap();
+    let files: Vec<_> = (0..20)
+        .map(|index| {
+            let file = source.join(format!("f{index}"));
+            fs::write(&file, b"source").unwrap();
+            file
+        })
+        .collect();
+    let source_session = DescriptorSessionSlot::default();
+    let mut source_control = FsOps::with_descriptor_session(source_session.clone());
+    let response = source_control.handle(&crate::test_support::register_source_roots(&files, 1));
+    let Response::SourceRootsRegistered(roots) = response else {
+        panic!("unexpected source registration response: {response:?}")
+    };
+    assert!(roots.iter().all(|root| root.leaf_ticket.is_some()));
+
+    let destination_session = DescriptorSessionSlot::default();
+    destination_session
+        .register(File::open(&destination).unwrap())
+        .unwrap();
+    let mut worker = FsOps::with_descriptor_session(destination_session);
+    worker.destination_root = Some(Arc::new(Root::open(&destination).unwrap()));
+    worker.destination_prefix = Some(b".".to_vec());
+    // Each source's directory and exact file: 40 claims, one connection.
+    let opened = source_session.broker_connections();
+    worker.initialize_copy_sources(&roots).unwrap();
+    assert_eq!(source_session.broker_connections() - opened, 1);
+    assert_eq!(worker.source_roots.len(), files.len());
+}
+
 #[test]
 fn source_initialization_rejects_mismatched_bad_and_excess_roots_atomically() {
     let temporary = crate::test_support::tempdir().unwrap();
@@ -8501,6 +8541,7 @@ fn ancestry_access_restores_after_request_error() {
         destination.as_os_str().as_bytes(),
         false,
         OperatorSymlinkPolicy::Refuse,
+        false,
     )
     .unwrap();
     fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
@@ -8540,6 +8581,7 @@ fn ancestry_access_widens_only_directories_inside_the_copy() {
             selected.as_os_str().as_bytes(),
             true,
             OperatorSymlinkPolicy::Refuse,
+            false,
         )?;
         ops.check_operator_directory_ancestry(
             &[DirectoryAncestryCheck {
@@ -8607,10 +8649,11 @@ fn searchable_destination_selection_checks_kernel_access_without_chmod() {
         fs::set_permissions(&destination, fs::Permissions::from_mode(mode)).unwrap();
         let before = fs::metadata(&destination).unwrap();
         let mut ops = FsOps::new();
-        let response = ops.handle(&Request::CheckSearchableOperatorDirectory {
+        let response = ops.handle(&Request::CheckOperatorDirectory {
             path: path_bytes(&destination),
             allow_missing: false,
             symlink_policy: OperatorSymlinkPolicy::Refuse,
+            require_search: true,
         });
         assert_eq!(
             matches!(response, Response::DirectorySelection(Some(_))),
@@ -8631,6 +8674,7 @@ fn searchable_destination_selection_checks_kernel_access_without_chmod() {
             path: path_bytes(&destination),
             allow_missing: false,
             symlink_policy: OperatorSymlinkPolicy::Refuse,
+            require_search: false,
         }),
         Response::DirectorySelection(Some(_))
     ));
@@ -8638,10 +8682,11 @@ fn searchable_destination_selection_checks_kernel_access_without_chmod() {
     let link = temporary.path().join("link");
     std::os::unix::fs::symlink(&destination, &link).unwrap();
     assert!(!matches!(
-        FsOps::new().handle(&Request::CheckSearchableOperatorDirectory {
+        FsOps::new().handle(&Request::CheckOperatorDirectory {
             path: path_bytes(&link),
             allow_missing: false,
             symlink_policy: OperatorSymlinkPolicy::Refuse,
+            require_search: true,
         }),
         Response::DirectorySelection(_)
     ));

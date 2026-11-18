@@ -530,6 +530,7 @@ impl Sessions {
                             } else {
                                 crate::proto::OperatorSymlinkPolicy::Refuse
                             },
+                            require_search: false,
                         })?,
                         "mapping destination container",
                     )?;
