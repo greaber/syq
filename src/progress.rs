@@ -193,7 +193,12 @@ impl Progress {
             directories_created: self.directories_created.load(Relaxed),
             symlinks_created: self.symlinks_created.load(Relaxed),
             specials_created: self.specials_created.load(Relaxed),
-            errors: self.errors.load(Relaxed),
+            // Error records relayed from a remote coordinator are counted
+            // in the stream, not here.
+            errors: self.errors.load(Relaxed)
+                + self
+                    .results_writer()
+                    .map_or(0, |writer| writer.relayed_errors()),
             bytes_transferred: self.bytes_done.load(Relaxed),
             bytes_unchanged: self.bytes_unchanged.load(Relaxed),
             timings: self.timings(),

@@ -72,6 +72,9 @@ pub struct ResultsWriter {
     /// nothing may follow it, even from a straggling ticker render racing
     /// an error unwind. Sealing also makes a second terminal impossible.
     sealed: AtomicBool,
+    /// Counted error records written for a caller (`emit_value`), as a
+    /// remote coordinator's are relayed: the final record counts them.
+    relayed_errors: AtomicU64,
 }
 
 impl std::fmt::Debug for ResultsWriter {
@@ -557,6 +560,7 @@ impl ResultsWriter {
             seq: AtomicU64::new(0),
             dead: AtomicBool::new(false),
             sealed: AtomicBool::new(false),
+            relayed_errors: AtomicU64::new(0),
         }
     }
 
@@ -797,18 +801,34 @@ impl ResultsWriter {
     /// restricted destination); the envelope and sequencing are applied like
     /// any other record.
     pub(crate) fn emit_value(&self, record: serde_json::Value) {
+        self.count_relayed(std::slice::from_ref(&record));
         self.write_and_seal(record, false);
+    }
+
+    fn count_relayed(&self, records: &[serde_json::Value]) {
+        let counted = records
+            .iter()
+            .filter(|record| counted_error(record))
+            .count();
+        self.relayed_errors.fetch_add(counted as u64, Relaxed);
+    }
+
+    /// The counted error records written for callers, which a final record
+    /// built from this machine's own counts adds.
+    pub(crate) fn relayed_errors(&self) -> u64 {
+        self.relayed_errors.load(Relaxed)
     }
 
     /// Emit caller-built records in order with one write, as `emit_value`
     /// would one by one.
     pub(crate) fn emit_values(&self, records: Vec<serde_json::Value>) {
+        self.count_relayed(&records);
         if records.is_empty() || self.dead.load(Relaxed) {
             return;
         }
         if self.parent.is_some() {
             for record in records {
-                self.emit_value(record);
+                self.write(record);
             }
             return;
         }
@@ -859,7 +879,7 @@ impl ResultsWriter {
             if seal {
                 *self.phase_result.lock().unwrap() = Some(record);
             } else if record["type"] != "run" {
-                parent.emit_value(record);
+                parent.write(record);
             }
             return;
         }
@@ -903,6 +923,13 @@ pub(crate) const ALTER_FAILURES_ENV: &str = "SYQ_TEST_ALTER_RELAYED_FAILURES";
 #[cfg(debug_assertions)]
 fn altered_failures() -> Option<String> {
     std::env::var(ALTER_FAILURES_ENV).ok()
+}
+
+/// An error record a final result counts: not one that only explains a
+/// failure another record counts.
+pub(crate) fn counted_error(record: &serde_json::Value) -> bool {
+    record.get("type").and_then(serde_json::Value::as_str) == Some("error")
+        && record.get(DIAGNOSTIC_FOR).is_none()
 }
 
 pub(crate) fn tagged(path: &[u8]) -> serde_json::Value {

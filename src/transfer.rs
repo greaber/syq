@@ -2260,35 +2260,46 @@ pub fn run(mut args: Args) -> Result<i32> {
         // including failures in deferred metadata and deletion finalization.
         progress.stop();
         progress.finish(false);
-        // The error text reaches stderr via main; the stream gets it as a
-        // counted error record, then its terminal record, so a consumer
-        // never mistakes a handled fatal for a crash (only a real crash
-        // leaves the terminal record missing) and can say why it failed.
-        if let Some(results) = progress.results_writer() {
-            if let (Err(error), true) = (&outcome, records_failure) {
-                let os_kind = os_kind_of(error);
-                progress.errors.fetch_add(1, Relaxed);
-                results.emit_error_classified(
-                    &format!("syq: {error:#}"),
-                    os_kind.map(|_| "io"),
-                    os_kind,
-                );
-            }
-            // Mutations that settled (and streamed their records) before
-            // the run died must not vanish from the aggregates. Deletion
-            // counts are what the deletion pass did before the run died;
-            // zeros mean it never got that far, and status "failed" already
-            // marks every aggregate here as pre-failure state.
-            results.emit_result(&progress.result_record(
-                crate::results::Status::Failed,
-                1,
-                dry_run,
-                prune,
-                in_place_update,
-            ));
-        }
+        record_failure(
+            &progress,
+            outcome.as_ref().err().filter(|_| records_failure),
+            (dry_run, prune, in_place_update),
+        );
     }
     outcome
+}
+
+/// Settle a copy's results stream after a fatal `error`, which the stream
+/// records unless the caller that lent this copy its stream records it.
+/// The error text reaches stderr via main; the stream gets it as a counted
+/// error record, then its terminal record, so a consumer never mistakes a
+/// handled fatal for a crash (only a real crash leaves the terminal record
+/// missing) and can say why it failed.
+fn record_failure(
+    progress: &Progress,
+    error: Option<&anyhow::Error>,
+    (dry_run, prune, in_place_update): (bool, bool, bool),
+) {
+    let Some(results) = progress.results_writer() else {
+        return;
+    };
+    if let Some(error) = error {
+        let os_kind = os_kind_of(error);
+        progress.errors.fetch_add(1, Relaxed);
+        results.emit_error_classified(&format!("syq: {error:#}"), os_kind.map(|_| "io"), os_kind);
+    }
+    // Mutations that settled (and streamed their records) before the run
+    // died must not vanish from the aggregates. Deletion counts are what the
+    // deletion pass did before the run died; zeros mean it never got that
+    // far, and status "failed" already marks every aggregate here as
+    // pre-failure state.
+    results.emit_result(&progress.result_record(
+        crate::results::Status::Failed,
+        1,
+        dry_run,
+        prune,
+        in_place_update,
+    ));
 }
 
 pub(crate) fn uses_remote_coordinator(args: &Args, sources: &[Location], dst: &Location) -> bool {

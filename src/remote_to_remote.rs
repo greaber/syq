@@ -64,13 +64,6 @@ fn settlement_outcome(
     }
 }
 
-/// An error record the final result counts: not one that only explains a
-/// failure another record counts.
-fn counted_error(record: &serde_json::Value) -> bool {
-    record.get("type").and_then(serde_json::Value::as_str) == Some("error")
-        && record.get(crate::results::DIAGNOSTIC_FOR).is_none()
-}
-
 /// The longest relayed results line: a coordinator record, or a base64
 /// destination frame.
 const MAX_RELAYED_LINE_BYTES: usize = 1024 * 1024;
@@ -93,8 +86,6 @@ struct Relay {
     /// The run's shape, for a final result this machine writes itself.
     dry_run: bool,
     prune: bool,
-    /// Counted error records written to the results so far.
-    errors: u64,
     /// The first problem with what arrived; later lines are drained unread.
     failure: Option<anyhow::Error>,
 }
@@ -116,7 +107,6 @@ impl Relay {
             coordinator_terminal: None,
             dry_run,
             prune,
-            errors: 0,
             failure: None,
         }
     }
@@ -189,9 +179,6 @@ impl Relay {
                     self.coordinator_terminal.is_none(),
                     "the coordinating server sent results after its final result"
                 );
-                if counted_error(&record) {
-                    self.errors += 1;
-                }
                 writer.emit_value(record);
             }
         }
@@ -210,10 +197,6 @@ impl Relay {
             records.push(record);
             Ok(())
         })?;
-        self.errors += records
-            .iter()
-            .filter(|record| counted_error(record))
-            .count() as u64;
         // A frame's records are written together.
         if let Some(writer) = &self.results {
             writer.emit_values(records);
@@ -228,8 +211,14 @@ impl Relay {
                 "class": class,
                 "message": message,
             }));
-            self.errors += 1;
         }
+    }
+
+    /// Counted error records written to the results so far.
+    fn errors(&self) -> u64 {
+        self.results
+            .as_ref()
+            .map_or(0, |writer| writer.relayed_errors())
     }
 }
 
@@ -509,7 +498,7 @@ fn compose_terminal(
         .unwrap_or_else(|| empty_terminal(relay, elapsed_ms));
     terminal.status = outcome.results_status;
     terminal.exit_code = outcome.exit_code;
-    terminal.errors = relay.errors;
+    terminal.errors = relay.errors();
     // A dry run changes nothing: its plan is the coordinator's.
     if !relay.dry_run {
         terminal.files_transferred = totals.files_transferred;
@@ -553,7 +542,7 @@ fn print_summary(terminal: &crate::results::ResultRecord) {
 fn empty_terminal(relay: &Relay, elapsed_ms: u64) -> crate::results::ResultRecord {
     let mut terminal =
         crate::results::ResultRecord::new(crate::results::Status::Failed, 1, relay.dry_run);
-    terminal.errors = relay.errors;
+    terminal.errors = relay.errors();
     terminal.timings.total_ms = elapsed_ms;
     if relay.prune {
         terminal.deletions_planned = Some(0);
