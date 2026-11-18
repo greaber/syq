@@ -37,8 +37,6 @@ enum Control {
     Decide(Decision),
     Stop,
     /// Stop only if nothing is in progress, to switch to another build.
-    /// Only a provider whose status reports what it has in progress
-    /// (`Snapshot::busy`) receives it.
     StopIfIdle,
 }
 #[derive(Serialize, Deserialize)]
@@ -75,15 +73,14 @@ pub(crate) struct ProfileSnapshot {
 }
 impl Snapshot {
     /// What it has in progress, as a receiving service reports it.
-    pub(crate) fn busy(&self) -> Option<super::Busy> {
-        let busy = self.busy?;
+    pub(crate) fn busy(&self) -> super::Busy {
         let accounts = self.accounts.unwrap_or(0);
-        Some(super::Busy {
-            requests: busy.saturating_sub(accounts),
+        super::Busy {
+            requests: self.busy.saturating_sub(accounts),
             pending: 0,
             accounts,
             accounts_in_use: self.accounts_in_use.unwrap_or(0),
-        })
+        }
     }
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -92,10 +89,8 @@ pub(crate) struct Snapshot {
     pub(crate) pid: u32,
     pub(crate) profiles: Vec<ProfileSnapshot>,
     pub(crate) decision_error: Option<String>,
-    /// Logins and requests in progress, absent from providers from before
-    /// syq followed updates.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) busy: Option<usize>,
+    /// Logins and requests in progress.
+    pub(crate) busy: usize,
     /// Of those, approved account connections open through it, which hold
     /// a request for as long as they live (`super::Busy::accounts`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -350,45 +345,38 @@ pub(super) fn switch_when_idle(domain: &Domain) -> Result<()> {
             );
             return Ok(());
         }
-        let pid = if state.busy.is_none() {
-            // One from before syq followed updates has only a stop.
-            query(domain, Control::Stop)?.pid
-        } else {
-            let answer = query(domain, Control::StopIfIdle)?;
-            if !answer.stopping {
-                let mut fix = "syq persist receive on".to_owned();
-                if let Some(scope) = domain.explicit_path() {
-                    fix.push_str(&format!(
-                        " --pscope {}",
-                        shell_words::quote(&scope.to_string_lossy())
-                    ));
-                }
-                let busy = answer.busy().unwrap_or_default();
-                match busy.accounts_note(None, &fix) {
-                    Some(accounts) if busy.requests == 0 => crate::output::command_human_stdout!(
-                        "The SSH authorization provider keeps running syq {}: {accounts}",
-                        state.build
-                    ),
-                    _ => crate::output::command_human_stdout!(
-                        "The SSH authorization provider keeps running syq {} until its requests finish",
-                        state.build
-                    ),
-                }
-                return Ok(());
+        let answer = query(domain, Control::StopIfIdle)?;
+        if !answer.stopping {
+            let mut fix = "syq persist receive on".to_owned();
+            if let Some(scope) = domain.explicit_path() {
+                fix.push_str(&format!(
+                    " --pscope {}",
+                    shell_words::quote(&scope.to_string_lossy())
+                ));
             }
-            answer.pid
-        };
-        await_exit(domain, pid)?;
+            let busy = answer.busy();
+            match busy.accounts_note(None, &fix) {
+                Some(accounts) if busy.requests == 0 => crate::output::command_human_stdout!(
+                    "The SSH authorization provider keeps running syq {}: {accounts}",
+                    state.build
+                ),
+                _ => crate::output::command_human_stdout!(
+                    "The SSH authorization provider keeps running syq {} until its requests finish",
+                    state.build
+                ),
+            }
+            return Ok(());
+        }
+        await_exit(domain, answer.pid)?;
     }
     Ok(())
 }
 
 /// Replace a provider from another build that cannot follow updates by
-/// itself, as `receive_service::switch_outdated_now` does for receiving:
-/// one a command run with `--use-version` started from a release in the
-/// binary store, replaced once idle, or one from before syq followed
-/// updates, which cannot say whether it is idle and is stopped at once,
-/// ending any request it is serving (`switch_when_idle`).
+/// itself, once idle, as `receive_service::switch_outdated_now` does for
+/// receiving: one whose path is gone, or a release in the binary store
+/// that a command run with `--use-version` started it from
+/// (`switch_when_idle`).
 pub(super) fn switch_outdated(domain: &Domain) -> Result<()> {
     let Some(state) = running(domain, ANSWER_TIMEOUT, || Control::Status)? else {
         return Ok(());
@@ -689,7 +677,7 @@ impl Service {
         Snapshot {
             build: crate::identity::build().into(),
             pid: std::process::id(),
-            busy: Some(busy),
+            busy,
             accounts: Some(
                 (self.account_relays.load(Ordering::Acquire) as usize).saturating_sub(links.idle),
             ),
@@ -1541,7 +1529,7 @@ mod tests {
                 (Some(accounts), Some(in_use)),
                 "{reply:?}"
             );
-            let busy = snapshot.busy().unwrap();
+            let busy = snapshot.busy();
             assert_eq!((busy.accounts, busy.accounts_in_use), (accounts, in_use));
             assert_eq!(service.stop_if_idle(), accounts == 0);
             drop(end.shutdown(std::net::Shutdown::Both));
@@ -2514,7 +2502,7 @@ mod tests {
                     pid,
                     profiles: Vec::new(),
                     decision_error: None,
-                    busy: Some(busy),
+                    busy,
                     accounts: None,
                     accounts_in_use: None,
                     started_from: None,
@@ -2609,13 +2597,12 @@ mod tests {
                     },
                 )
                 .unwrap();
-                // As a provider from before syq followed updates answers.
                 let reply = Snapshot {
                     build: OTHER.into(),
                     pid: 1,
                     profiles: Vec::new(),
                     decision_error: None,
-                    busy: None,
+                    busy: 0,
                     accounts: None,
                     accounts_in_use: None,
                     started_from: None,
@@ -2633,7 +2620,7 @@ mod tests {
                         lock = None;
                     }
                     Control::Decide(_) => panic!("unexpected decision"),
-                    Control::StopIfIdle => panic!("an older provider cannot read this"),
+                    Control::StopIfIdle => panic!("a settings change stops it at once"),
                 }
                 crate::destination::write_framed(
                     &mut stream,

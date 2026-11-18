@@ -1510,17 +1510,23 @@ fn print_scope_status(domain: &Domain, json: bool) -> Result<()> {
             _ if ssh_live => "ready",
             _ => "inactive",
         };
-        let receiving_note = receiving.as_ref().and_then(|receiving| {
-            crate::receive_service::build_note(
-                &receiving.build,
-                receiving.started_from.as_deref(),
-                receiving.switch.as_ref(),
-                receiving.busy.as_ref(),
-                Some(&record.label()),
-                &crate::receive_service::connect_command(&record.label(), domain.explicit_path()),
-                true,
-            )
-        });
+        let receiving_note = receiving
+            .as_ref()
+            .filter(|receiving| !receiving.older)
+            .and_then(|receiving| {
+                crate::receive_service::build_note(
+                    &receiving.build,
+                    receiving.started_from.as_deref(),
+                    receiving.switch.as_ref(),
+                    &receiving.busy,
+                    Some(&record.label()),
+                    &crate::receive_service::connect_command(
+                        &record.label(),
+                        domain.explicit_path(),
+                    ),
+                    true,
+                )
+            });
         connections.push(ConnectionStatus {
             receiving_build: receiving.as_ref().map(|s| s.build.clone()),
             receiving_switch: receiving.as_ref().and_then(|s| s.switch.clone()),
@@ -1635,7 +1641,7 @@ fn print_scope_status(domain: &Domain, json: bool) -> Result<()> {
             &provider.build,
             provider.started_from.as_deref(),
             provider.switch.as_ref(),
-            provider.busy().as_ref(),
+            &provider.busy(),
             None,
             &fix,
             false,
