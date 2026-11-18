@@ -754,9 +754,7 @@ impl FsOps {
                     let (blocks, expected) = (&mut data[off as usize..], &patch.reuse[index..end]);
                     if !self.holds_blocks(old, off, blocks, patch.block, expected)? {
                         // Built in memory: nothing was written.
-                        return Err(unchanged(
-                            "the destination changed after it was compared".into(),
-                        ));
+                        return Err(anyhow!("the destination changed after it was compared"));
                     }
                     index = end;
                 }
@@ -986,23 +984,24 @@ impl FsOps {
         }
         // A file the receiver cannot vouch for is replaced instead, by a
         // stage built from its blocks (`vouch`).
-        if let Some(reason) = vouch::declines(target, file, &current, meta, flags)? {
-            return Ok(Keep::Replace(Some(reason)));
-        }
-        #[cfg(debug_assertions)]
-        fail_set_meta_for_test(&target.label)?;
-        set_meta_file_known(file, meta, flags, &current)
-            .with_context(|| format!("set metadata {}", target.label.display()))?;
-        if condition != TargetCondition::Any {
-            require_rooted_named_identity(
-                &target.root,
-                &target.relative,
-                &target.label,
+        let keeping = keep::Keeping {
+            handle: keep::Handle::Open,
+            recheck_any: false,
+            setting: Some("set metadata"),
+        };
+        Ok(
+            match keep::keep_existing(
+                target.into(),
                 file,
+                &current,
+                (meta, flags),
                 condition,
-            )?;
-        }
-        Ok(Keep::Kept(published_identity(file, flags)?))
+                keeping,
+            )? {
+                keep::Keep::Kept(identity) => Keep::Kept(identity),
+                keep::Keep::Replace(error) => Keep::Replace(vouch::replace_reason(&error)),
+            },
+        )
     }
 
     /// Publish each patch as `put_small_batch` publishes a whole file, from

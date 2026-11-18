@@ -2200,7 +2200,7 @@ fn run_remote(
     // missing helper could otherwise look like a successful start.  Validate
     // and, in automatic mode, install it before detaching.
     if args.detach {
-        drop(spec.connect_with(false, false)?);
+        drop(spec.connect(false)?);
     }
     let dbg = if crate::output::debug() {
         "SYQ_DEBUG=1 "
@@ -2431,11 +2431,13 @@ fn run_remote(
             }
             anyhow::Ok(output)
         };
-        let mut out = run()?;
-        if helper_missing(out.status.code(), spec.bootstrap_helper) {
-            spec.install_helper()?;
-            out = run()?;
-        }
+        let out = spec.with_helper(
+            |_| run(),
+            |out| {
+                out.as_ref()
+                    .is_ok_and(|out| crate::remote_helper::needs_install(out.status.code()))
+            },
+        )?;
         // The launcher printed the coordinator's log, which says why.
         if let Some(error) = other_build(out.status.code()) {
             return Err(error);
@@ -2540,11 +2542,19 @@ fn run_remote(
         }
         Ok::<_, anyhow::Error>((status, relayed?))
     };
-    let (mut status, mut relay) = run(relay)?;
-    if helper_missing(status.code(), spec.bootstrap_helper) {
-        spec.install_helper()?;
-        (status, relay) = run(relay)?;
-    }
+    let mut relay = relay;
+    let status = spec.with_helper(
+        |_| {
+            let status;
+            (status, relay) = run(relay.take())?;
+            Ok(status)
+        },
+        |status| {
+            status
+                .as_ref()
+                .is_ok_and(|status| crate::remote_helper::needs_install(status.code()))
+        },
+    )?;
     // Keep the broker alive until the outer SSH connection and all forwarded
     // channels have closed.
     drop(broker_guard);
@@ -2912,10 +2922,6 @@ pub(crate) fn coordinate(coordinating: crate::restricted::Coordinating) -> Resul
     Ok(status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)))
-}
-
-fn helper_missing(code: Option<i32>, automatic: bool) -> bool {
-    automatic && crate::remote_helper::needs_install(code)
 }
 
 /// Set for an attached remote coordinator: its standard input carries this

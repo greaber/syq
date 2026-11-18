@@ -20,7 +20,6 @@ pub(super) struct AuthorityState {
     pub(super) reserved: HashMap<(Vec<u8>, proto::CopyId), ByteReservation>,
     pub(super) reserved_bytes: u64,
     pub(super) next_reservation_hold: u64,
-    pub(super) next_reservation_instance: u64,
     pub(super) live_connections: u16,
     pub(super) tcp_listener_started: bool,
     /// Files this grant's results stream is writing that have not been
@@ -48,24 +47,10 @@ pub(super) struct ByteReservation {
     /// Capacity provisionally held by observation-only preparations until
     /// their individual outcomes are settled.
     pub(super) observations: HashMap<ReservationHoldId, u64>,
-    /// The file counts against the entry limit (`charge_request`), and
-    /// how many requests still to settle share that count.
-    pub(super) entry: Option<EntryCharge>,
-    /// Which reservation of its key this is: one settled away and made
-    /// again for the same file and partial is another, which a request
-    /// that held a share of the first must not touch.
-    pub(super) instance: u64,
-}
-
-/// One file's count against the entry limit, which every request that may
-/// create or open it for writing shares: it is given back only once all of
-/// them have settled and none changed anything.
-#[derive(Debug, Default)]
-pub(super) struct EntryCharge {
-    /// Requests that rely on the count and have not settled.
-    holders: usize,
-    /// One of them reported a change.
-    made: bool,
+    /// The file has counted against the entry limit (`charge_request`):
+    /// every request that may create or open it for writing shares that
+    /// one count.
+    pub(super) counted: bool,
 }
 
 impl ByteReservation {
@@ -689,7 +674,8 @@ pub(crate) struct RestrictedAuthority {
     pub(super) control_open: AtomicBool,
     /// Changes authorized so far, against the signed entry limit: each
     /// creation, publication, link, metadata change and deletion counts
-    /// each time it is made. Lookups count nothing.
+    /// each time a request for it is authorized, and is never given back.
+    /// Lookups count nothing.
     pub(super) changes: std::sync::atomic::AtomicU64,
     /// File bytes received so far, against the signed byte limit.
     pub(super) transferred_bytes: std::sync::atomic::AtomicU64,
@@ -1038,7 +1024,6 @@ impl RestrictedAuthority {
                 reserved: HashMap::new(),
                 reserved_bytes: 0,
                 next_reservation_hold: 0,
-                next_reservation_instance: 0,
                 live_connections: 0,
                 tcp_listener_started: false,
                 file_lifecycles: HashMap::new(),
@@ -1333,18 +1318,7 @@ impl RestrictedAuthority {
         } else {
             None
         };
-        let AuthorityState {
-            reserved,
-            next_reservation_instance,
-            ..
-        } = &mut *state;
-        let reservation = reserved.entry(key).or_insert_with(|| {
-            *next_reservation_instance += 1;
-            ByteReservation {
-                instance: *next_reservation_instance,
-                ..Default::default()
-            }
-        });
+        let reservation = state.reserved.entry(key).or_default();
         if let Some(hold) = hold {
             reservation.observations.insert(hold, size);
         } else {
@@ -1663,17 +1637,10 @@ impl RestrictedAuthority {
         let Settlement {
             creations,
             outcomes,
-            charged,
+            repeated,
             tracked,
             stream: _,
         } = settlement;
-        // Run otherwise, a Finalize the limit leaves no room for could have
-        // published a file without a count.
-        debug_assert!(
-            charged.republication != Some(Republication::RepeatOnly) || charged.executed,
-            "a Finalize the entry limit leaves no room for ran without Settlement::execute"
-        );
-        self.refund_unmade(&charged, response);
         if creations.is_empty() && outcomes.is_empty() && !tracked {
             return;
         }
@@ -1874,30 +1841,8 @@ impl RestrictedAuthority {
                             if crate::fsops::vouch::is_replace_required_wire(error));
                     // A Finalize answered as one that already published its
                     // file changed nothing, and leaves alone any newer file
-                    // the copy writes under its name. One the entry limit
-                    // left no room for, and that was not answered so, is
-                    // refused as the limit refuses a request before it runs
-                    // (`authorize_streaming`).
-                    if stage == FileStage::Finalize && charged.repeated {
-                        continue;
-                    }
-                    if stage == FileStage::Finalize
-                        && charged.republication == Some(Republication::RepeatOnly)
-                    {
-                        if streaming {
-                            if let Some(stream) = self.results.lock().unwrap().as_mut() {
-                                let change = (
-                                    self.result_path(&path, false),
-                                    Change::PublishFile { size: 0 },
-                                );
-                                stream.refused(&format!("refused: {ENTRY_LIMIT}"), &[change]);
-                            }
-                            if let Some(lifecycle) =
-                                state.file_lifecycles.get_mut(&(path.clone(), copy_id))
-                            {
-                                lifecycle.listed = true;
-                            }
-                        }
+                    // the copy writes under its name.
+                    if stage == FileStage::Finalize && repeated {
                         continue;
                     }
                     // A published file is no longer in flight; what it
@@ -2682,11 +2627,12 @@ impl RestrictedAuthority {
     }
 
     /// Count an authorized request against the signed limits: each change
-    /// it makes against the entry limit, each deletion against the deletion
-    /// limit, and the file bytes it carries against the byte limit. Nothing
-    /// is counted when any limit would be exceeded.
-    pub(super) fn charge_request(&self, request: &Request) -> Result<Charged> {
-        let mut deleting = Vec::new();
+    /// it may make against the entry limit, each deletion against the
+    /// deletion limit, and the file bytes it carries against the byte
+    /// limit. A count is never given back, even for a change the receiver
+    /// then finds it need not or cannot make, and a request sent again
+    /// counts again. Nothing is counted when any limit would be exceeded.
+    pub(super) fn charge_request(&self, request: &Request) -> Result<()> {
         // A file the copy writes counts once, before its first change: the
         // request that creates or opens it for writing (a stage, a
         // sidecar, an in-place file, even an empty one) or, for one prepared
@@ -2705,31 +2651,19 @@ impl RestrictedAuthority {
             _ => None,
         };
         // The file's count is shared through its reservation; without one,
-        // the request counts the file as an ordinary change of its own.
-        // The state stays locked until the request holds its share, so two
-        // requests never both count the file.
+        // the request counts the file as a change of its own. The state
+        // stays locked until the count is taken, so two requests never
+        // both count the file.
         let mut state = self.state.lock().unwrap();
-        let (file, file_charge, own_file_change) = match file {
+        let (file, own_file_change) = match file {
             Some(key) => match state.reserved.get(&key) {
-                Some(reservation) => {
-                    let charge = reservation.entry.is_none();
-                    let instance = reservation.instance;
-                    (Some((key, instance)), charge, false)
-                }
-                None => (None, false, true),
+                Some(reservation) => ((!reservation.counted).then_some(key), false),
+                None => (None, true),
             },
-            None => (None, false, false),
+            None => (None, false),
         };
         let (changes, bytes) = match request {
-            Request::Apply { ops } => {
-                deleting = ops
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, op)| matches!(op, Op::Rmdir { .. } | Op::Unlink { .. }))
-                    .map(|(index, _)| index)
-                    .collect();
-                (ops.len() as u64, 0)
-            }
+            Request::Apply { ops } => (ops.len() as u64, 0),
             Request::PutSmallBatch(puts) => (
                 puts.len() as u64,
                 puts.iter().map(|put| put.data.len() as u64).sum(),
@@ -2742,7 +2676,9 @@ impl RestrictedAuthority {
             Request::Prepare { .. }
             | Request::StageBasis { .. }
             | Request::SeedBasis { .. }
-            | Request::Finalize { .. } => (u64::from(own_file_change), 0),
+            | Request::Finalize { .. } => (u64::from(file.is_some() || own_file_change), 0),
+            // A small copy counts its files when prepared: one that needs
+            // no payloads finishes in its preparation's turn.
             Request::PrepareSmallFiles(request) => (request.files.len() as u64, 0),
             Request::CopySmallFiles(payloads) => (
                 0,
@@ -2756,6 +2692,13 @@ impl RestrictedAuthority {
             }
             _ => (0, 0),
         };
+        let deletions = match request {
+            Request::Apply { ops } => ops
+                .iter()
+                .filter(|op| matches!(op, Op::Rmdir { .. } | Op::Unlink { .. }))
+                .count() as u64,
+            _ => 0,
+        };
         let charge = |counter: &std::sync::atomic::AtomicU64, amount: u64, limit: u64| {
             amount == 0
                 || counter
@@ -2767,192 +2710,33 @@ impl RestrictedAuthority {
         let refund = |counter: &std::sync::atomic::AtomicU64, amount: u64| {
             counter.fetch_sub(amount, Ordering::AcqRel);
         };
-        let deletions = deleting.len() as u64;
         let limits = &self.copy.limits;
-        let (mut changes, mut counted) = (changes, changes + u64::from(file_charge));
-        // A Finalize of a file with no reservation may be one sent again
-        // after the Finalize that published the file lost its reply. The
-        // receiver answers it as that one did, which changes nothing, and
-        // its count is given back. Where the entry limit leaves no room
-        // for it, it is not counted, and may only be answered so.
-        let finalize = own_file_change && matches!(request, Request::Finalize { .. });
-        let mut republication = finalize.then_some(Republication::Counted);
-        if !charge(&self.changes, counted, limits.max_entries) {
-            if !finalize {
-                bail!(ENTRY_LIMIT);
-            }
-            (changes, counted) = (0, 0);
-            republication = Some(Republication::RepeatOnly);
+        if !charge(&self.changes, changes, limits.max_entries) {
+            bail!("signed grant entry limit exceeded");
         }
         if !charge(&self.deletions, deletions, limits.max_deletions) {
-            refund(&self.changes, counted);
+            refund(&self.changes, changes);
             bail!("signed grant deletion limit exceeded");
         }
         if !charge(&self.transferred_bytes, bytes, limits.max_total_bytes) {
-            refund(&self.changes, counted);
+            refund(&self.changes, changes);
             refund(&self.deletions, deletions);
             bail!("signed grant total-byte limit exceeded");
         }
-        if let Some((key, _)) = &file {
-            let reservation = state
+        if let Some(key) = &file {
+            state
                 .reserved
                 .get_mut(key)
-                .expect("the reservation was found under the same lock");
-            reservation
-                .entry
-                .get_or_insert_with(Default::default)
-                .holders += 1;
+                .expect("the reservation was found under the same lock")
+                .counted = true;
         }
-        Ok(Charged {
-            changes,
-            deleting,
-            file,
-            republication,
-            repeated: false,
-            executed: false,
-        })
+        Ok(())
     }
 
     /// Settle a request whose execution never started, as a small copy
-    /// that ended without its payloads: nothing it was charged for
-    /// changed, and it fails with `reason`.
-    pub(super) fn settle_unexecuted(&self, mut settlement: Settlement, reason: &str) {
-        let charged = std::mem::take(&mut settlement.charged);
-        self.changes.fetch_sub(charged.changes, Ordering::AcqRel);
-        self.deletions
-            .fetch_sub(charged.deleting.len() as u64, Ordering::AcqRel);
-        self.release_file(charged.file.as_ref(), false);
+    /// that ended without its payloads: it fails with `reason`.
+    pub(super) fn settle_unexecuted(&self, settlement: Settlement, reason: &str) {
         self.settle(settlement, &proto::Response::Err(reason.into()));
-    }
-
-    /// Release a settled request's share of `file`'s count against the
-    /// entry limit, noting whether it `made` a change. The count is given
-    /// back when the last share goes and no request changed the file.
-    fn release_file(&self, file: Option<&FileShare>, made: bool) {
-        let Some((key, instance)) = file else {
-            return;
-        };
-        let mut state = self.state.lock().unwrap();
-        // A reservation settled away meanwhile was published or failed
-        // after a change: the count stays, and a newer reservation of the
-        // same key is another file's.
-        let Some(reservation) = state
-            .reserved
-            .get_mut(key)
-            .filter(|reservation| reservation.instance == *instance)
-        else {
-            return;
-        };
-        let Some(entry) = &mut reservation.entry else {
-            return;
-        };
-        entry.holders = entry.holders.saturating_sub(1);
-        entry.made |= made;
-        if entry.holders == 0 && !entry.made {
-            reservation.entry = None;
-            self.changes.fetch_sub(1, Ordering::AcqRel);
-        }
-    }
-
-    /// Give back the changes and deletions of an authorized request that
-    /// the executor reports it did not make, and nothing else: a change
-    /// whose condition the executor found unmet before changing anything
-    /// (`fsops::condition_not_met`), a patch that found its file changed
-    /// since it was compared, a small-copy file that needed no change, and
-    /// a small copy that wrote nothing. A change that failed after it may
-    /// have changed something stays counted, as do the files of a small
-    /// copy whose staging failed: their sidecars stay for the fallback
-    /// engine to resume.
-    fn refund_unmade(&self, charged: &Charged, response: &proto::Response) {
-        use crate::fsops::is_unchanged_wire as unmet;
-        let all = || (0..charged.changes as usize).collect::<Vec<usize>>();
-        let unmade: Vec<usize> = match response {
-            proto::Response::EndpointError(error) if unmet(error) => all(),
-            proto::Response::Applied(results) => results
-                .iter()
-                .enumerate()
-                .filter(|(_, error)| error.as_ref().is_some_and(unmet))
-                .map(|(index, _)| index)
-                .collect(),
-            proto::Response::PatchedBatch(results) => results
-                .iter()
-                .enumerate()
-                .filter(|(_, result)| {
-                    result
-                        .as_ref()
-                        .err()
-                        .is_some_and(|error| error.stale_condition || unmet(&error.error))
-                })
-                .map(|(index, _)| index)
-                .collect(),
-            proto::Response::PublishedBatch(results) => results
-                .iter()
-                .enumerate()
-                .filter(|(_, result)| result.as_ref().err().is_some_and(unmet))
-                .map(|(index, _)| index)
-                .collect(),
-            // A small copy changes the files it publishes and those whose
-            // metadata it changes; a preparation waiting for its payloads
-            // is settled with their reply, and one that published nothing
-            // changed nothing.
-            proto::Response::SmallFilesCopied(proto::SmallCopyResponse {
-                outcome: proto::SmallCopyOutcome::Published(results),
-                ..
-            }) => results
-                .iter()
-                .enumerate()
-                .filter(|(_, result)| match &result.error {
-                    Some(error) => unmet(error),
-                    None => match result.disposition {
-                        proto::SmallCopyDisposition::Copied => false,
-                        proto::SmallCopyDisposition::QuickChecked
-                        | proto::SmallCopyDisposition::ContentMatched => !result.repaired,
-                        proto::SmallCopyDisposition::Excluded => true,
-                    },
-                })
-                .map(|(index, _)| index)
-                .collect(),
-            proto::Response::SmallFilesCopied(proto::SmallCopyResponse {
-                outcome: proto::SmallCopyOutcome::StagingFailed(error),
-                ..
-            }) => {
-                if unmet(error) {
-                    all()
-                } else {
-                    Vec::new()
-                }
-            }
-            // A target it does not handle, a capacity shortfall, or one
-            // that needs block reuse: nothing was written.
-            proto::Response::SmallFilesCopied(_) => all(),
-            _ => Vec::new(),
-        };
-        let mut refunded = (unmade.len() as u64).min(charged.changes);
-        // A Finalize that the receiver answered as one that already
-        // published its file changed nothing.
-        if charged.repeated && charged.republication == Some(Republication::Counted) {
-            refunded = charged.changes;
-        }
-        if refunded > 0 {
-            self.changes.fetch_sub(refunded, Ordering::AcqRel);
-        }
-        // A file request changes nothing only when its condition was unmet
-        // before it started.
-        let file_unmade = matches!(response, proto::Response::EndpointError(error) if unmet(error));
-        self.release_file(charged.file.as_ref(), !file_unmade);
-        // Both lists are in operation order.
-        let mut unmade = unmade.iter().peekable();
-        let undeleted = charged
-            .deleting
-            .iter()
-            .filter(|&&index| {
-                while unmade.next_if(|&&unmade| unmade < index).is_some() {}
-                unmade.peek().is_some_and(|&&unmade| unmade == index)
-            })
-            .count() as u64;
-        if undeleted > 0 {
-            self.deletions.fetch_sub(undeleted, Ordering::AcqRel);
-        }
     }
 
     /// Release the sizes held by the patches of a refused request.
@@ -3566,10 +3350,10 @@ impl RestrictedAuthority {
             .and_then(|()| self.authorize_stream(request, stream, small_copy, &mut step))
             .and_then(|()| self.charge_request(request));
         match authorized {
-            Ok(charged) => Ok(Settlement {
+            Ok(()) => Ok(Settlement {
                 creations: pending,
                 outcomes,
-                charged,
+                repeated: false,
                 tracked,
                 stream: step,
             }),
@@ -4215,15 +3999,11 @@ impl RestrictedAuthority {
             Request::PrepareSmallFiles(request) => self.authorize_small_copy(request, outcomes)?,
             // Held to its preparation in `authorize_stream`.
             Request::CopySmallFiles(_) => {}
-            Request::ListDir { .. }
-            | Request::ListDirDetails { .. }
-            | Request::ListDirNoFollowFinal { .. } => {
+            Request::ListDir { .. } => {
                 bail!("directory completion is not valid on a restricted destination")
             }
             Request::CheckOperatorDirectory { .. }
             | Request::CheckOperatorDirectoryAncestry { .. }
-            | Request::CheckOperatorDirectoryAncestryWithAccess { .. }
-            | Request::CheckSearchableOperatorDirectory { .. }
             | Request::RegisterSourceRoots { .. }
             | Request::CreateOperatorDirectory { .. }
             | Request::AnchorDestination { .. } => {
@@ -4287,72 +4067,30 @@ impl RestrictedAuthority {
 pub(crate) struct Settlement {
     pub(super) creations: Vec<PendingCreation>,
     pub(super) outcomes: Vec<PendingOutcome>,
-    /// What the request counted against the signed limits.
-    pub(super) charged: Charged,
+    /// The receiver answered the request, a Finalize, as one that already
+    /// published its file (`Settlement::execute`).
+    pub(super) repeated: bool,
     /// The request counts as in flight until settled.
     pub(super) tracked: bool,
     /// Where the request leaves its connection's streamed patch.
     pub(super) stream: StreamStep,
 }
 
-/// The changes a request counted against the entry limit, and which of its
-/// operations, by index, counted as deletions (`charge_request`).
-#[derive(Debug, Default)]
-pub(super) struct Charged {
-    changes: u64,
-    deleting: Vec<usize>,
-    /// The file whose shared count against the entry limit this request
-    /// holds until it settles (`EntryCharge`).
-    file: Option<FileShare>,
-    /// How a Finalize of a file with no reservation counted.
-    republication: Option<Republication>,
-    /// The receiver answered the Finalize as one that already published
-    /// its file (`Settlement::execute`).
-    repeated: bool,
-    /// The request ran through `Settlement::execute`, which alone tells the
-    /// receiver what a Finalize may do.
-    executed: bool,
-}
-
-/// How a Finalize of a file with no reservation counts against the entry
-/// limit, as one that may be sent again after the Finalize that published
-/// the file lost its reply (`charge_request`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Republication {
-    /// As a change of its own, given back if the receiver answers it as
-    /// that Finalize did.
-    Counted,
-    /// Not at all, as the limit leaves no room: the receiver may only
-    /// answer it as that Finalize did, and it is refused otherwise.
-    RepeatOnly,
-}
-
-/// Why a request is refused when it would exceed the signed entry limit.
-const ENTRY_LIMIT: &str = "signed grant entry limit exceeded";
-
 impl Settlement {
-    /// Execute the authorized request with `execute` on `ops`: a Finalize
-    /// the entry limit leaves no room for may only be answered as one that
-    /// already published its file. Notes for `settle` whether it was.
+    /// Execute the authorized request with `execute` on `ops`, noting for
+    /// `settle` whether a Finalize was answered as one that already
+    /// published its file.
     pub(crate) fn execute<T>(
         &mut self,
         ops: &mut crate::fsops::FsOps,
         execute: impl FnOnce(&mut crate::fsops::FsOps) -> T,
     ) -> T {
-        let repeat_only = self.charged.republication == Some(Republication::RepeatOnly);
-        ops.set_finalize_repeat_only(repeat_only.then_some(ENTRY_LIMIT));
         ops.take_finalize_repeated();
         let result = execute(ops);
-        ops.set_finalize_repeat_only(None);
-        self.charged.repeated = ops.take_finalize_repeated();
-        self.charged.executed = true;
+        self.repeated = ops.take_finalize_repeated();
         result
     }
 }
-
-/// A file's reservation key and which reservation of it a request shares
-/// (`ByteReservation::instance`).
-type FileShare = ((Vec<u8>, proto::CopyId), u64);
 
 /// What a request does to its connection's streamed patch.
 #[derive(Debug, Default)]

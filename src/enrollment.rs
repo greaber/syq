@@ -471,29 +471,6 @@ fn safe_ssh_name(value: &str) -> bool {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EnrollmentRemoteCommand(String);
-
-impl EnrollmentRemoteCommand {
-    /// Construct shell source only from a validated absolute program and
-    /// individually quoted arguments. sshd always invokes remote commands via
-    /// the account's shell, even when the local process supplied one argv.
-    pub fn new(program: &Path, args: &[String]) -> Result<Self> {
-        let program = safe_receiver_path(program)?;
-        if args.iter().any(|arg| arg.bytes().any(|byte| byte == 0)) {
-            bail!("enrollment command argument contains NUL");
-        }
-        let mut words = Vec::with_capacity(args.len() + 1);
-        words.push(program);
-        words.extend(args.iter().cloned());
-        Ok(Self(shell_words::join(words)))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EnrollmentRoute<'a> {
     /// The way the user's SSH configuration routes `ssh` to the account,
     /// its jump hosts and proxy commands included: the user's own login,
@@ -536,14 +513,7 @@ pub(crate) fn asks_about_new_host_keys(config: &[u8]) -> bool {
 /// Arguments for the trusted local OpenSSH client that enrolls HostB.  A jump
 /// host receives only an opaque TCP stream; it never receives an agent socket
 /// or an authenticated HostB session.
-pub fn enrollment_ssh_args(
-    target: &SshEndpoint,
-    route: EnrollmentRoute<'_>,
-    remote_command: &EnrollmentRemoteCommand,
-) -> Vec<String> {
-    enrollment_ssh_args_raw(target, route, remote_command.as_str(), None)
-}
-
+///
 /// `unattended`: nobody is watching this login.
 pub(crate) fn enrollment_ssh_args_raw(
     target: &SshEndpoint,
@@ -819,25 +789,16 @@ mod tests {
     }
 
     #[test]
-    fn remote_command_quotes_every_argument_for_the_remote_shell() {
-        let command = EnrollmentRemoteCommand::new(
-            Path::new("/opt/syq/receiver"),
-            &["enroll".into(), "argument with spaces;$(bad)".into()],
-        )
-        .unwrap();
-        assert_eq!(
-            command.as_str(),
-            "/opt/syq/receiver enroll 'argument with spaces;$(bad)'"
-        );
-    }
-
-    #[test]
     fn proxyjump_route_keeps_authentication_local() {
         let target = SshEndpoint::parse("backup@hostB").unwrap();
         let jump = SshEndpoint::parse("user@hostA").unwrap();
-        let command = EnrollmentRemoteCommand::new(Path::new("/opt/syq/enroll"), &[]).unwrap();
         assert_eq!(
-            enrollment_ssh_args(&target, EnrollmentRoute::ProxyJump { jump: &jump }, &command),
+            enrollment_ssh_args_raw(
+                &target,
+                EnrollmentRoute::ProxyJump { jump: &jump },
+                "/opt/syq/enroll",
+                None
+            ),
             [
                 "-a",
                 "-x",
@@ -866,11 +827,11 @@ mod tests {
     fn native_endpoint_port_reaches_direct_and_proxy_routes() {
         let target = SshEndpoint::from_parts("backup", "2001:db8::1", Some(2222)).unwrap();
         let jump = SshEndpoint::from_parts("alice", "jump.example", Some(2200)).unwrap();
-        let command = EnrollmentRemoteCommand::new(Path::new("/opt/syq/enroll"), &[]).unwrap();
-        let args = enrollment_ssh_args(
+        let args = enrollment_ssh_args_raw(
             &target,
             EnrollmentRoute::ProxyJump { jump: &jump },
-            &command,
+            "/opt/syq/enroll",
+            None,
         );
         assert!(args.windows(2).any(|args| args == ["-p", "2222"]));
         assert!(args.iter().any(|arg| {
@@ -1008,8 +969,12 @@ mod tests {
     #[test]
     fn the_configured_route_keeps_the_ssh_configurations_jumps_and_proxies() {
         let target = SshEndpoint::parse("backup@hostB").unwrap();
-        let command = EnrollmentRemoteCommand::new(Path::new("/opt/syq/enroll"), &[]).unwrap();
-        let args = enrollment_ssh_args(&target, EnrollmentRoute::Configured, &command);
+        let args = enrollment_ssh_args_raw(
+            &target,
+            EnrollmentRoute::Configured,
+            "/opt/syq/enroll",
+            None,
+        );
         // Nothing overrides the configuration's route...
         assert!(!args
             .iter()

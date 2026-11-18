@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Independent HTTP fixture; no credentials, packages or remote services needed."""
 import base64
+import fake_s3
 import hashlib
 import fcntl
 import http.server
@@ -29,25 +30,12 @@ PART_UPLOADED = threading.Event()
 CHILDREN = []
 
 
-class Handler(http.server.BaseHTTPRequestHandler):
+class Handler(fake_s3.Handler):
     protocol_version = 'HTTP/1.1'
 
     def setup(self):
         super().setup()
         self.connection.settimeout(10)
-
-    def log_message(self, *_):
-        pass
-
-    def reply(self, code, data=b'', headers=None, length=None):
-        self.send_response(code)
-        self.send_header('Content-Length', str(len(data) if length is None else length))
-        self.send_header('Connection', 'close')
-        for k, v in (headers or {}).items(): self.send_header(k, v)
-        self.end_headers()
-        try: self.wfile.write(data)
-        except (BrokenPipeError, ConnectionResetError): pass
-        self.close_connection = True
 
     def do_HEAD(self):
         STATE['requests'] += 1
@@ -75,7 +63,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if CASE == 'existing-policy':
             if 'list-type=2' in self.path:
                 STATE['lists'] = STATE.get('lists', 0) + 1
-                self.reply(200, b'<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>')
+                self.reply(200, fake_s3.LIST_EMPTY)
             else:
                 STATE['reads'] = STATE.get('reads', 0) + 1
                 self.reply(200, STATE['existing'], {'ETag': '"original"', **STATE.get('metadata', {})})
@@ -103,9 +91,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if CASE == 'truncated' or (CASE == 'retry' and not attempt):
             self.reply(206, body[:100], headers, length=len(body))
         else: self.reply(206, body, headers)
-
-    def body(self):
-        return self.rfile.read(int(self.headers.get('Content-Length', '0')))
 
     def do_PUT(self):
         STATE['writes'] += 1

@@ -1,7 +1,10 @@
 //! Bounded retries for parallel S3 work. Keep admission slots while backing off.
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_smithy_runtime::client::retries::{RetryPartition, TokenBucket};
-use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+use aws_smithy_runtime_api::{
+    box_error::BoxError,
+    client::{orchestrator::HttpResponse, result::ConnectorError},
+};
 use std::time::Duration;
 
 /// The SDK's shared retry quota can reject retries after just one attempt in a
@@ -67,6 +70,82 @@ fn retry_after(value: &str) -> Option<Duration> {
     let date =
         time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc2822).ok()?;
     (date - time::OffsetDateTime::now_utc()).try_into().ok()
+}
+
+/// A failure that resending the request cannot fix, such as a source file
+/// that changed during the copy or a storage authorization that expired or
+/// was refused. A connector or request body wraps its error in this type, at
+/// any depth of the error's source chain (an `io::Error` may carry it too).
+/// It displays, debugs and reports causes exactly as the wrapped error does,
+/// so the message a user sees does not change.
+pub(crate) struct Permanent(BoxError);
+impl Permanent {
+    pub(crate) fn new(error: impl Into<BoxError>) -> Self {
+        Self(error.into())
+    }
+    /// A connector error that the S3 retry loops do not retry.
+    pub(crate) fn connector(error: impl Into<BoxError>) -> ConnectorError {
+        ConnectorError::other(Box::new(Self::new(error)), None)
+    }
+}
+impl std::fmt::Debug for Permanent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+impl std::fmt::Display for Permanent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+impl std::error::Error for Permanent {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
+/// Whether a request that failed without a response would fail the same way
+/// if sent again: the SDK could not build it, no credentials are configured
+/// or their configuration is invalid, or a connector or body marked its error
+/// [`Permanent`]. A credential provider that timed out or failed, such as on
+/// a 503 from STS or a credential process that exited with an error, may
+/// still succeed later.
+pub(super) fn permanent<E, R>(error: &SdkError<E, R>) -> bool {
+    use aws_credential_types::provider::error::CredentialsError;
+    let connector = match error {
+        SdkError::ConstructionFailure(_) => return true,
+        SdkError::DispatchFailure(failure) => failure.as_connector_error(),
+        _ => None,
+    };
+    connector.is_some_and(|connector| {
+        marked_permanent(connector)
+            || causes(connector).any(|cause| {
+                cause.downcast_ref::<CredentialsError>().is_some_and(|e| {
+                    matches!(
+                        e,
+                        CredentialsError::CredentialsNotLoaded(_)
+                            | CredentialsError::InvalidConfiguration(_)
+                    )
+                })
+            })
+    })
+}
+
+/// Whether `error` carries [`Permanent`] anywhere in its causes.
+pub(super) fn marked_permanent(error: &ConnectorError) -> bool {
+    causes(error).any(|cause| {
+        cause.is::<Permanent>()
+            || cause
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::get_ref)
+                .is_some_and(|inner| inner.is::<Permanent>())
+    })
+}
+
+fn causes(error: &ConnectorError) -> impl Iterator<Item = &(dyn std::error::Error + 'static)> {
+    std::iter::successors(Some(error as &(dyn std::error::Error + 'static)), |e| {
+        e.source()
+    })
 }
 
 pub(super) async fn after_error<E: ProvideErrorMetadata>(

@@ -457,7 +457,7 @@ pub(super) fn run(args: Args) -> Result<i32> {
         let work = async {
             let mut options = args.s3.clone().unwrap();
             let control = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
-            let uploads = std::sync::Arc::new(super::upload_http::Cancellation::default());
+            let uploads = std::sync::Arc::new(super::cancel::Cancellation::default());
             let authorization = super::authorization::connect(&args, &options).await?;
             let (client, note) = client::connect_authorized(&mut options, control.clone(), uploads, authorization.clone(), Some(outage.clone())).await?;
             if let Some(note) = note.filter(|_| args.verbose > 0 && !args.quiet) {

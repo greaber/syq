@@ -44,6 +44,35 @@ pub(super) fn encode_tags<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> String
     encoded.finish().replace('+', "%20")
 }
 
+/// The object attributes a copy that replaces metadata repeats: content
+/// headers, user metadata and the website redirect. Storage class and
+/// encryption depend on the kind of copy.
+pub(super) fn object_headers(desired: &HeadObjectOutput) -> BTreeMap<String, String> {
+    let mut headers = BTreeMap::new();
+    for (name, value) in desired.metadata().into_iter().flat_map(|m| m.iter()) {
+        headers.insert(format!("x-amz-meta-{name}"), value.clone());
+    }
+    for (name, value) in [
+        ("content-type", desired.content_type()),
+        ("content-encoding", desired.content_encoding()),
+        ("content-language", desired.content_language()),
+        ("content-disposition", desired.content_disposition()),
+        ("cache-control", desired.cache_control()),
+        // Expires is an opaque HTTP hint. Providers can retain values such as
+        // "0" which the SDK's typed date setter cannot represent.
+        ("expires", desired.expires_string()),
+        (
+            "x-amz-website-redirect-location",
+            desired.website_redirect_location(),
+        ),
+    ] {
+        if let Some(value) = value {
+            headers.insert(name.to_owned(), value.to_owned());
+        }
+    }
+    headers
+}
+
 /// Part numbers and inclusive byte ranges of a multipart copy.
 fn parts(size: u64, part_size: u64) -> impl Iterator<Item = (i32, u64, u64)> {
     (0..size.div_ceil(part_size)).map(move |index| {
