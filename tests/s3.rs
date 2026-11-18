@@ -31,6 +31,9 @@ mod existing_policy;
 #[path = "s3/recovery.rs"]
 mod recovery;
 
+#[path = "s3/file_body.rs"]
+mod file_body;
+
 #[path = "s3/directory_permissions.rs"]
 mod directory_permissions;
 
@@ -292,6 +295,17 @@ fn serve(
     }
     if fault.starts_with("existing-policy") {
         existing_policy::serve(
+            &mut socket,
+            fault,
+            method,
+            first.split_whitespace().nth(1).unwrap(),
+            &headers,
+            &gate,
+        );
+        return;
+    }
+    if fault.starts_with("file-body-") {
+        file_body::serve(
             &mut socket,
             fault,
             method,
