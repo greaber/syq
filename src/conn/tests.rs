@@ -1345,10 +1345,37 @@ fn unexpected_hello_response_reports_version_skew_without_retry() {
 
 #[test]
 fn malformed_wire_preamble_is_non_retryable_and_refreshes_a_managed_helper() {
-    let error =
-        anyhow!("{WIRE_PREAMBLE_PROTOCOL_ERROR}: remote syq sent an invalid build identity");
+    let error = anyhow::Error::from(
+        FrameReader::new(&[0u8; 16][..])
+            .read_msg::<Response>()
+            .unwrap_err(),
+    );
+    assert!(format!("{error:#}").starts_with(WIRE_PREAMBLE_PROTOCOL_ERROR));
     assert!(is_non_retryable_connect_error(&error));
     assert!(helper_needs_install(&error));
+    let error = error.context("could not start the remote syq on host");
+    assert!(is_non_retryable_connect_error(&error));
+    assert!(helper_needs_install(&error));
+}
+
+#[test]
+fn a_helper_exit_code_says_whether_to_install_or_retry() {
+    let exited = |code| ConnectFailure::Exited(Some(code)).error(format!("exit {code}"));
+    for code in [
+        remote_helper::HELPER_MISSING_EXIT,
+        remote_helper::HELPER_NOT_EXECUTABLE_EXIT,
+    ] {
+        assert!(helper_needs_install(&exited(code)));
+        assert!(is_non_retryable_connect_error(&exited(code)));
+    }
+    assert!(!helper_needs_install(&exited(127)));
+    assert!(is_non_retryable_connect_error(&exited(127)));
+    assert!(!helper_needs_install(&exited(1)));
+    assert!(!is_non_retryable_connect_error(&exited(1)));
+    // The same text without the typed failure decides nothing.
+    let text = anyhow!("host: remote syq exited (exit status: 127)");
+    assert!(!helper_needs_install(&text));
+    assert!(!is_non_retryable_connect_error(&text));
 }
 
 #[test]

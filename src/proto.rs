@@ -45,6 +45,33 @@ const MODE_SYMLINK: u32 = libc::S_IFLNK;
 #[cfg(not(target_os = "linux"))]
 const MODE_SYMLINK: u32 = libc::S_IFLNK as u32;
 
+/// A failed preamble exchange: the peer runs another build, or is no syq.
+/// Its text starts with `WIRE_PREAMBLE_PROTOCOL_ERROR`.
+#[derive(Debug)]
+pub(crate) struct PreambleError(String);
+
+impl std::fmt::Display for PreambleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PreambleError {}
+
+fn preamble_error(kind: io::ErrorKind, detail: impl std::fmt::Display) -> io::Error {
+    io::Error::new(
+        kind,
+        PreambleError(format!("{WIRE_PREAMBLE_PROTOCOL_ERROR}: {detail}")),
+    )
+}
+
+/// Whether `error` is a failed preamble exchange.
+pub(crate) fn is_preamble_error(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<PreambleError>())
+}
+
 /// Windows may use sub-block requests for bandwidth pacing, but cannot ask
 /// for an unbounded number of digests or allocate an unbounded read buffer.
 pub(crate) fn hash_window_fits(off: u64, len: u32, block: u64) -> bool {
@@ -2378,11 +2405,9 @@ impl<W: Write> FrameWriter<W> {
             .ok()
             .filter(|length| usize::from(*length) <= MAX_BUILD_IDENTITY_BYTES)
             .ok_or_else(|| {
-                io::Error::new(
+                preamble_error(
                     io::ErrorKind::InvalidData,
-                    format!(
-                        "{WIRE_PREAMBLE_PROTOCOL_ERROR}: local build identity exceeds the supported limit"
-                    ),
+                    "local build identity exceeds the supported limit",
                 )
             })?;
         self.w.write_all(&std::mem::take(&mut self.admission))?;
@@ -2553,19 +2578,19 @@ impl<R: Read> FrameReader<R> {
         }
         let mut fixed = [0u8; WIRE_PREAMBLE_FIXED_LEN];
         self.r.read_exact(&mut fixed).map_err(|error| {
-            io::Error::new(
+            preamble_error(
                 error.kind(),
-                format!(
-                    "{WIRE_PREAMBLE_PROTOCOL_ERROR}: read header from remote syq: {error}; remote may be incompatible with local build {}",
+                format_args!(
+                    "read header from remote syq: {error}; remote may be incompatible with local build {}",
                     crate::identity::build()
                 ),
             )
         })?;
         if &fixed[..WIRE_PREAMBLE_MAGIC.len()] != WIRE_PREAMBLE_MAGIC {
-            return Err(io::Error::new(
+            return Err(preamble_error(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "{WIRE_PREAMBLE_PROTOCOL_ERROR}: magic mismatch; remote syq may predate the build-identified preamble (local {})",
+                format_args!(
+                    "magic mismatch; remote syq may predate the build-identified preamble (local {})",
                     crate::identity::build()
                 ),
             ));
@@ -2576,33 +2601,29 @@ impl<R: Read> FrameReader<R> {
                 .expect("fixed preamble length"),
         ) as usize;
         if identity_len == 0 || identity_len > MAX_BUILD_IDENTITY_BYTES {
-            return Err(io::Error::new(
+            return Err(preamble_error(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "{WIRE_PREAMBLE_PROTOCOL_ERROR}: remote syq build identity length {identity_len} is invalid"
-                ),
+                format_args!("remote syq build identity length {identity_len} is invalid"),
             ));
         }
         let mut identity = vec![0u8; identity_len];
         self.r.read_exact(&mut identity).map_err(|error| {
-            io::Error::new(
+            preamble_error(
                 error.kind(),
-                format!("{WIRE_PREAMBLE_PROTOCOL_ERROR}: read remote syq build identity: {error}"),
+                format_args!("read remote syq build identity: {error}"),
             )
         })?;
         let identity = std::str::from_utf8(&identity).map_err(|error| {
-            io::Error::new(
+            preamble_error(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "{WIRE_PREAMBLE_PROTOCOL_ERROR}: remote syq build identity is not UTF-8: {error}"
-                ),
+                format_args!("remote syq build identity is not UTF-8: {error}"),
             )
         })?;
         if identity != crate::identity::build() {
-            return Err(io::Error::new(
+            return Err(preamble_error(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "{WIRE_PREAMBLE_PROTOCOL_ERROR}: build identity mismatch (remote {identity}, local {})",
+                format_args!(
+                    "build identity mismatch (remote {identity}, local {})",
                     crate::identity::build()
                 ),
             ));

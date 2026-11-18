@@ -544,7 +544,6 @@ pub(crate) fn ssh_login_needs_user(error: &anyhow::Error) -> bool {
 }
 
 fn is_non_retryable_connect_error(error: &anyhow::Error) -> bool {
-    let message = format!("{error:#}");
     is_worker_initialization_error(error)
         || error.is::<crate::restricted::CopyRefused>()
         || crate::restricted::is_other_build(error)
@@ -552,19 +551,76 @@ fn is_non_retryable_connect_error(error: &anyhow::Error) -> bool {
         || error
             .chain()
             .any(|cause| cause.is::<crate::destination::ssh::workers::AuthorizationError>())
-        || message.contains("build identity mismatch")
-        || message.contains(WIRE_PREAMBLE_PROTOCOL_ERROR)
-        || message.contains("unexpected handshake response")
-        || message.contains("exit status: 127")
-        || message.contains(&format!(
-            "exit status: {}",
-            remote_helper::HELPER_MISSING_EXIT
-        ))
-        || message.contains(&format!(
-            "exit status: {}",
-            remote_helper::HELPER_NOT_EXECUTABLE_EXIT
-        ))
+        || ConnectFailure::of(error).is_some_and(|failure| !failure.retryable())
 }
+
+/// Why starting the remote syq failed, where its text alone told callers
+/// whether to install the helper or try again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectFailure {
+    /// The remote syq, or the launcher in its place, exited with this code.
+    Exited(Option<i32>),
+    /// The preamble exchange failed: the peer runs another build or is no syq.
+    Preamble,
+    /// The Hello was answered with something else.
+    UnexpectedHandshake,
+}
+
+impl ConnectFailure {
+    /// The failure in `error`'s chain, if any.
+    fn of(error: &anyhow::Error) -> Option<Self> {
+        error.chain().find_map(|cause| {
+            if let Some(failure) = cause.downcast_ref::<ConnectFailureError>() {
+                return Some(failure.failure);
+            }
+            cause
+                .downcast_ref::<std::io::Error>()
+                .filter(|error| is_preamble_error(error))
+                .map(|_| ConnectFailure::Preamble)
+        })
+    }
+
+    /// Whether installing the matching helper may cure it.
+    fn needs_install(self) -> bool {
+        match self {
+            ConnectFailure::Exited(code) => remote_helper::needs_install(code),
+            ConnectFailure::Preamble => true,
+            ConnectFailure::UnexpectedHandshake => false,
+        }
+    }
+
+    /// Whether connecting again may succeed: not for a missing program or
+    /// another build.
+    fn retryable(self) -> bool {
+        !self.needs_install()
+            && !matches!(
+                self,
+                ConnectFailure::Exited(Some(127)) | ConnectFailure::UnexpectedHandshake
+            )
+    }
+
+    fn error(self, message: String) -> anyhow::Error {
+        ConnectFailureError {
+            failure: self,
+            message,
+        }
+        .into()
+    }
+}
+
+#[derive(Debug)]
+struct ConnectFailureError {
+    failure: ConnectFailure,
+    message: String,
+}
+
+impl std::fmt::Display for ConnectFailureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ConnectFailureError {}
 
 /// OpenSSH accepted the control connection but rejected a multiplexed worker
 /// session. Independent SSH connections may still be permitted (for example,
@@ -1028,6 +1084,7 @@ impl RemoteConn {
         self.approved_login.take();
         self.worker_setup.take();
         let detail = format!("{e:#}");
+        let preamble = ConnectFailure::of(&e) == Some(ConnectFailure::Preamble);
         // If the child has exited (or does so shortly), that's usually the
         // more useful error. A multiplexed SSH refusal in particular must win
         // over the missing-preamble EOF so the caller can retry independently.
@@ -1052,7 +1109,8 @@ impl RemoteConn {
                             }
                             .into();
                         }
-                        return anyhow!("{}: remote syq exited ({status})", self.label);
+                        return ConnectFailure::Exited(status.code())
+                            .error(format!("{}: remote syq exited ({status})", self.label));
                     }
                     // An enrolled receiver whose slots for starting
                     // sessions are all taken refuses before its preamble;
@@ -1083,20 +1141,17 @@ impl RemoteConn {
                     // For other early exits, a preamble failure is the
                     // actionable version-skew diagnosis; the exit status is
                     // commonly just the old helper rejecting unknown bytes.
-                    if detail.contains(WIRE_PREAMBLE_PROTOCOL_ERROR)
-                        || detail.contains("build identity mismatch")
-                    {
-                        return anyhow!("{}: {detail}", self.label);
+                    if preamble {
+                        return ConnectFailure::Preamble.error(format!("{}: {detail}", self.label));
                     }
-                    return anyhow!("{}: remote syq exited ({status})", self.label);
+                    return ConnectFailure::Exited(status.code())
+                        .error(format!("{}: remote syq exited ({status})", self.label));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
-        if detail.contains(WIRE_PREAMBLE_PROTOCOL_ERROR)
-            || detail.contains("build identity mismatch")
-        {
-            return anyhow!("{}: {detail}", self.label);
+        if preamble {
+            return ConnectFailure::Preamble.error(format!("{}: {detail}", self.label));
         }
         let msg = if e
             .downcast_ref::<std::io::Error>()
@@ -2497,37 +2552,45 @@ impl RemoteSpec {
                 }
             }
         }
-        let first = self.connect_retried(
-            compress,
-            limited,
-            role.clone(),
-            first_worker,
-            classify_ssh_failure,
-            setups,
-        );
-        let Err(first_error) = first else {
-            return first;
-        };
-        if !self.bootstrap_helper || !helper_needs_install(&first_error) {
-            return Err(first_error);
-        }
-
-        self.install_helper()?;
-        self.connect_retried(
-            compress,
-            limited,
-            role,
-            first_worker,
-            classify_ssh_failure,
-            setups,
+        self.with_helper(
+            |installed| {
+                let conn = self.connect_retried(
+                    compress,
+                    limited,
+                    role.clone(),
+                    first_worker,
+                    classify_ssh_failure,
+                    setups,
+                );
+                if !installed {
+                    return conn;
+                }
+                conn.with_context(|| {
+                    format!(
+                        "could not start the {} helper installed on {}",
+                        remote_helper::helper_identity(),
+                        self.label()
+                    )
+                })
+            },
+            |conn| conn.as_ref().is_err_and(helper_needs_install),
         )
-        .with_context(|| {
-            format!(
-                "could not start the {} helper installed on {}",
-                remote_helper::helper_identity(),
-                self.label()
-            )
-        })
+    }
+
+    /// `run`, and in managed mode, if `missing` finds that it failed for
+    /// want of the matching helper, `run` again once the helper is
+    /// installed. `run` is told whether it is that second run.
+    pub(crate) fn with_helper<T>(
+        &self,
+        mut run: impl FnMut(bool) -> Result<T>,
+        missing: impl FnOnce(&Result<T>) -> bool,
+    ) -> Result<T> {
+        let first = run(false);
+        if !self.bootstrap_helper || !missing(&first) {
+            return first;
+        }
+        self.install_helper()?;
+        run(true)
     }
 
     fn connect_retried(
@@ -3492,15 +3555,7 @@ where
 }
 
 fn helper_needs_install(e: &anyhow::Error) -> bool {
-    let message = format!("{e:#}");
-    message.contains(&format!(
-        "exit status: {}",
-        remote_helper::HELPER_MISSING_EXIT
-    )) || message.contains(&format!(
-        "exit status: {}",
-        remote_helper::HELPER_NOT_EXECUTABLE_EXIT
-    )) || message.contains("build identity mismatch")
-        || message.contains(WIRE_PREAMBLE_PROTOCOL_ERROR)
+    ConnectFailure::of(e).is_some_and(ConnectFailure::needs_install)
 }
 
 pub(crate) fn select_tcp_candidates(mut candidates: Vec<TcpCandidate>) -> Vec<TcpCandidate> {
@@ -3942,21 +3997,25 @@ fn receive_hello(mut conn: RemoteConn, worker: bool) -> Result<RemoteConn> {
                 ssh_worker_ticket,
             });
         }
-        Ok(Response::Err(error)) if worker => {
-            return Err(WorkerInitializationError(format!("{}: {error}", conn.label)).into());
+        Ok(Response::Err(error)) => {
+            let message = format!("{}: {error}", conn.label);
+            return Err(if worker {
+                WorkerInitializationError(message).into()
+            } else {
+                anyhow!(message)
+            });
         }
-        Ok(Response::Err(error)) => bail!("{}: {error}", conn.label),
-        Ok(other) if worker => {
-            return Err(WorkerInitializationError(format!(
-            "{}: unexpected handshake response {other:?}; remote syq may be a different version",
-            conn.label
-        ))
-            .into())
+        Ok(other) => {
+            let message = format!(
+                "{}: unexpected handshake response {other:?}; remote syq may be a different version",
+                conn.label
+            );
+            return Err(if worker {
+                WorkerInitializationError(message).into()
+            } else {
+                ConnectFailure::UnexpectedHandshake.error(message)
+            });
         }
-        Ok(other) => bail!(
-            "{}: unexpected handshake response {other:?}; remote syq may be a different version",
-            conn.label
-        ),
         Err(e)
             if e.is::<crate::restricted::CopyRefused>()
                 || crate::restricted::is_other_build(&e) =>
