@@ -129,6 +129,24 @@ impl Session {
         };
         execute(&plan, None, None, None, cancelled, Some(&payload), prepared).await
     }
+    fn upload_request<'a>(
+        &'a self,
+        key: &'a str,
+        part: Option<i32>,
+        algorithm: Algorithm,
+        checksum: Option<&'a str>,
+    ) -> super::upload_send::Upload<'a> {
+        super::upload_send::Upload {
+            key,
+            part,
+            algorithm,
+            checksum,
+            retries: self.options.retries,
+            content_md5: &self.content_md5,
+            // A stream is one object; a failing request already ends it.
+            outage: None,
+        }
+    }
     async fn pace(&self, length: u64) {
         if let Some(limit) = &self.bandwidth {
             if length != 0 {
@@ -635,63 +653,40 @@ async fn upload(
         let checksum = algorithm.digest(&first.bytes);
         let comparison = comparison_digest(plan, &first.bytes);
         let _request = plan.session.requests.acquire().await?;
-        let mut retry_with_md5 = false;
-        let mut corrupt_attempts = 0;
-        let published = loop {
-            let fallback = (algorithm == Algorithm::None
-                && (retry_with_md5 || plan.session.content_md5.load(Relaxed)))
-            .then(|| Algorithm::Md5.digest(&first.bytes).unwrap());
-            let result = client
-                .put_object()
-                .set_metadata(metadata.clone())
-                .bucket(&options.bucket)
-                .key(&plan.key)
-                .set_checksum_sha256(algorithm.header(Algorithm::Sha256, checksum.as_deref()))
-                .set_content_md5(
-                    algorithm
-                        .header(Algorithm::Md5, checksum.as_deref())
-                        .or_else(|| fallback.clone()),
-                )
-                .set_if_none_match(
-                    (plan.placement.existence == crate::cli::Existence::New
-                        || plan.controls.report.only_new
-                        || protects_existing(plan))
-                    .then(|| "*".into()),
-                )
-                .body(ByteStream::from(first.bytes.clone()))
-                .customize()
-                .disable_payload_signing()
-                .send()
-                .await;
-            match result {
-                Err(e)
-                    if algorithm == Algorithm::None
-                        && fallback.is_none()
-                        && super::checksum::requires_checksum(&e) =>
-                {
-                    retry_with_md5 = true;
-                }
-                Err(e)
-                    if corrupt_attempts < options.retries
-                        && super::checksum::corrupted(&e).is_some() =>
-                {
-                    crate::output::diagnostic!(
-                        "syq: warning: {}: the destination received corrupted data ({}); retrying",
-                        plan.key,
-                        super::checksum::corrupted(&e).unwrap_or_default()
-                    );
-                    super::backoff(corrupt_attempts).await;
-                    corrupt_attempts += 1;
-                }
-                result => {
-                    // Content-MD5 fixed the rejection, so send it from now on.
-                    if result.is_ok() && fallback.is_some() {
-                        plan.session.content_md5.store(true, Relaxed);
+        let published = plan
+            .session
+            .upload_request(&plan.key, None, algorithm, checksum.as_deref())
+            .send(
+                async { Ok(Algorithm::Md5.digest(&first.bytes).unwrap()) },
+                |content_md5| {
+                    let (metadata, checksum) = (&metadata, &checksum);
+                    let body = ByteStream::from(first.bytes.clone());
+                    async move {
+                        Ok(client
+                            .put_object()
+                            .set_metadata(metadata.clone())
+                            .bucket(&options.bucket)
+                            .key(&plan.key)
+                            .set_checksum_sha256(
+                                algorithm.header(Algorithm::Sha256, checksum.as_deref()),
+                            )
+                            .set_content_md5(content_md5)
+                            .set_if_none_match(
+                                (plan.placement.existence == crate::cli::Existence::New
+                                    || plan.controls.report.only_new
+                                    || protects_existing(plan))
+                                .then(|| "*".into()),
+                            )
+                            .body(body)
+                            .customize()
+                            .config_override(client::without_sdk_retries())
+                            .disable_payload_signing()
+                            .send()
+                            .await)
                     }
-                    break result;
-                }
-            }
-        };
+                },
+            )
+            .await?;
         drop(_request);
         if let Err(error) = published {
             if protects_existing(plan)
@@ -1009,59 +1004,37 @@ async fn upload_part(
     let checksum = algorithm.digest(&data.bytes);
     let comparison = comparison_digest(plan, &data.bytes);
     let _request = plan.session.requests.acquire().await?;
-    let mut retry_with_md5 = false;
-    let mut corrupt_attempts = 0;
-    let output = loop {
-        let fallback = (algorithm == Algorithm::None
-            && (retry_with_md5 || plan.session.content_md5.load(Relaxed)))
-        .then(|| Algorithm::Md5.digest(&data.bytes).unwrap());
-        let result = client
-            .upload_part()
-            .bucket(&plan.options.bucket)
-            .key(&plan.key)
-            .upload_id(id)
-            .part_number(number)
-            .set_checksum_sha256(algorithm.header(Algorithm::Sha256, checksum.as_deref()))
-            .set_content_md5(
-                algorithm
-                    .header(Algorithm::Md5, checksum.as_deref())
-                    .or_else(|| fallback.clone()),
-            )
-            .body(ByteStream::from(data.bytes.clone()))
-            .customize()
-            .disable_payload_signing()
-            .send()
-            .await;
-        match result {
-            Err(e)
-                if algorithm == Algorithm::None
-                    && fallback.is_none()
-                    && super::checksum::requires_checksum(&e) =>
-            {
-                retry_with_md5 = true;
-            }
-            Err(e)
-                if corrupt_attempts < plan.options.retries
-                    && super::checksum::corrupted(&e).is_some() =>
-            {
-                crate::output::diagnostic!(
-                    "syq: warning: {}: the destination received corrupted data in part {number} ({}); retrying",
-                    plan.key,
-                    super::checksum::corrupted(&e).unwrap_or_default()
-                );
-                super::backoff(corrupt_attempts).await;
-                corrupt_attempts += 1;
-            }
-            result => {
-                if result.is_ok() && fallback.is_some() {
-                    plan.session.content_md5.store(true, Relaxed);
+    let output = plan
+        .session
+        .upload_request(&plan.key, Some(number), algorithm, checksum.as_deref())
+        .send(
+            async { Ok(Algorithm::Md5.digest(&data.bytes).unwrap()) },
+            |content_md5| {
+                let checksum = &checksum;
+                let body = ByteStream::from(data.bytes.clone());
+                async move {
+                    Ok(client
+                        .upload_part()
+                        .bucket(&plan.options.bucket)
+                        .key(&plan.key)
+                        .upload_id(id)
+                        .part_number(number)
+                        .set_checksum_sha256(
+                            algorithm.header(Algorithm::Sha256, checksum.as_deref()),
+                        )
+                        .set_content_md5(content_md5)
+                        .body(body)
+                        .customize()
+                        .config_override(client::without_sdk_retries())
+                        .disable_payload_signing()
+                        .send()
+                        .await)
                 }
-                break result
-                    .map_err(|e| e.into_service_error())
-                    .context("upload stream part")?;
-            }
-        }
-    };
+            },
+        )
+        .await?
+        .map_err(|e| e.into_service_error())
+        .context("upload stream part")?;
     controls.add_bytes(length);
     Ok((
         CompletedPart::builder()
