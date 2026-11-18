@@ -1,6 +1,6 @@
 //! Keep each file upload's read and socket write on one blocking worker. The
 //! AWS SDK still owns signing, headers, credentials, retries and S3 responses.
-use super::local::Source;
+use super::{local::Source, retry::Permanent};
 use aws_smithy_runtime_api::{
     box_error::BoxError,
     client::{
@@ -31,8 +31,8 @@ use std::{
 };
 use tokio::sync::Notify;
 
-mod cancel;
-pub(super) use cancel::{Cancellation, Sleep};
+use super::cancel::Cancellation;
+mod tcp;
 
 #[derive(Debug, Default)]
 struct Active {
@@ -147,17 +147,36 @@ impl Connector {
             tokio::task::spawn_blocking(move || {
                 let _ticket = ticket;
                 let result = (|| -> anyhow::Result<HttpResponse> {
-                    anyhow::ensure!(request.method() == "PUT", "file body requires PUT");
-                    anyhow::ensure!(
-                        request
-                            .headers()
-                            .get("content-length")
-                            .and_then(|v| v.to_str().ok())
-                            == Some(file.length.to_string().as_str()),
-                        "file body length differs from signed request"
-                    );
-                    check_payload(&request)?;
-                    let mut source = file.source.open()?;
+                    // Resending the same request cannot fix a request that
+                    // does not match its body, or a source that changed.
+                    let permanent = |e: anyhow::Error| anyhow::Error::new(Permanent::new(e));
+                    (|| {
+                        anyhow::ensure!(request.method() == "PUT", "file body requires PUT");
+                        anyhow::ensure!(
+                            request
+                                .headers()
+                                .get("content-length")
+                                .and_then(|v| v.to_str().ok())
+                                == Some(file.length.to_string().as_str()),
+                            "file body length differs from signed request"
+                        );
+                        check_payload(&request)
+                    })()
+                    .map_err(permanent)?;
+                    let mut source = file.source.open().map_err(|e| {
+                        // The selected file stays pinned, so a path that no
+                        // longer leads to it never will again.
+                        let gone = e.chain().any(|cause| {
+                            cause
+                                .downcast_ref::<std::io::Error>()
+                                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                        });
+                        if gone || e.is::<super::local::SourceChanged>() {
+                            permanent(e)
+                        } else {
+                            e
+                        }
+                    })?;
                     source.seek(SeekFrom::Start(file.offset))?;
                     let check = source.try_clone()?;
                     let mut builder = ureq::http::Request::builder()
@@ -168,18 +187,30 @@ impl Connector {
                         .extensions()
                         .get::<super::diagnostics::UploadProgress>()
                         .cloned();
+                    let reader = Exact(source.take(file.length));
                     let body = if let Some(observed) = observed {
-                        ureq::SendBody::from_owned_reader(ObservedReader {
-                            reader: source.take(file.length),
-                            observed,
-                        })
+                        ureq::SendBody::from_owned_reader(ObservedReader { reader, observed })
                     } else {
-                        ureq::SendBody::from_owned_reader(source.take(file.length))
+                        ureq::SendBody::from_owned_reader(reader)
                     };
                     let response = agent
                         .get_or_init(|| upload_agent(cancellation))
-                        .run(builder.body(body)?)?;
-                    file.source.check(&check)?;
+                        .run(builder.body(body)?);
+                    // A body that ended early shows that the source shrank,
+                    // even before its metadata does.
+                    if let Err(ureq::Error::Io(e)) = &response {
+                        if e.get_ref().is_some_and(|e| e.is::<Shrank>()) {
+                            return Err(permanent(file.source.changed()));
+                        }
+                    }
+                    file.source.check(&check).map_err(|e| {
+                        if e.is::<super::local::SourceChanged>() {
+                            permanent(e)
+                        } else {
+                            e
+                        }
+                    })?;
+                    let response = response?;
                     let (parts, mut body) = response.into_parts();
                     let mut bytes = Vec::new();
                     body.as_reader()
@@ -191,7 +222,10 @@ impl Connector {
                         SdkBody::from(bytes),
                     ))?)
                 })();
-                result.map_err(|e| ConnectorError::other(e.into(), None))
+                result.map_err(|e| match e.downcast::<Permanent>() {
+                    Ok(e) => ConnectorError::other(Box::new(e), None),
+                    Err(e) => ConnectorError::other(e.into(), None),
+                })
             })
             .await
             .map_err(|e| ConnectorError::other(e.into(), None))?
@@ -253,7 +287,7 @@ fn upload_agent(cancellation: Arc<Cancellation>) -> ureq::Agent {
     ureq::Agent::with_parts(
         config,
         ().chain(ConnectProxyConnector::default())
-            .chain(cancel::TcpConnector(cancellation))
+            .chain(tcp::TcpConnector(cancellation))
             .chain(RustlsConnector::default()),
         ureq::unversioned::resolver::DefaultResolver::default(),
     )
@@ -281,6 +315,27 @@ impl http_body::Body for FileBodyMarker {
 pub(super) fn body(length: u64) -> aws_sdk_s3::primitives::ByteStream {
     aws_sdk_s3::primitives::ByteStream::new(SdkBody::from_body_1_x(FileBodyMarker(length)))
 }
+
+/// Fails a read that ends before the signed length, as when the source
+/// shrank. ureq would otherwise keep asking for the rest of the body forever.
+struct Exact<R>(std::io::Take<R>);
+impl<R: Read> Read for Exact<R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.0.read(output)?;
+        if n == 0 && !output.is_empty() && self.0.limit() > 0 {
+            return Err(std::io::Error::other(Shrank));
+        }
+        Ok(n)
+    }
+}
+#[derive(Debug)]
+struct Shrank;
+impl std::fmt::Display for Shrank {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("source ended before the signed length")
+    }
+}
+impl std::error::Error for Shrank {}
 
 struct ObservedReader<R> {
     reader: R,

@@ -17,7 +17,13 @@ pub(super) fn connector_error(error: ConnectorError) -> ConnectorError {
     // explicit retry kind on Other. Keep established-connection metadata too.
     // Debug includes the underlying causes, without keeping an unsafe source
     // that a caller could expose through Error::source or Debug.
-    let source = anyhow::anyhow!(redacted).into();
+    let source = anyhow::anyhow!(redacted);
+    let source: aws_smithy_runtime_api::box_error::BoxError =
+        if crate::s3::retry::marked_permanent(&error) {
+            Box::new(crate::s3::retry::Permanent::new(source))
+        } else {
+            source.into()
+        };
     let sanitized = if error.is_io() {
         ConnectorError::io(source)
     } else if error.is_timeout() {

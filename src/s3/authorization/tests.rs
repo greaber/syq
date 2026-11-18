@@ -660,3 +660,49 @@ fn signing_adds_only_syq_headers_and_those_the_command_shows() {
     request.headers.insert(("Bad Name".into(), "x".into()));
     assert!(request.validate().is_err());
 }
+
+#[test]
+fn validation_rejects_bad_buckets_and_scope_counts_on_both_sides() {
+    let error = |request: Request| request.validate().unwrap_err().to_string();
+    let source = || ReadAccess {
+        bucket: "source".into(),
+        scopes: approval().scopes,
+    };
+    approval().validate().unwrap();
+    let mut request = approval();
+    request.source = Some(source());
+    request.validate().unwrap();
+    for bucket in ["", "a/b"] {
+        let mut request = approval();
+        request.bucket = bucket.into();
+        assert_eq!(error(request), "invalid storage bucket");
+        let mut request = approval();
+        request.source = Some(ReadAccess {
+            bucket: bucket.into(),
+            ..source()
+        });
+        assert_eq!(error(request), "invalid storage source bucket");
+    }
+    for count in [0, 1025] {
+        let scopes = vec![approval().scopes[0].clone(); count];
+        let mut request = approval();
+        request.scopes = scopes.clone();
+        assert_eq!(
+            error(request),
+            "storage authorization requires 1 to 1024 source or destination scopes"
+        );
+        let mut request = approval();
+        request.source = Some(ReadAccess { scopes, ..source() });
+        assert_eq!(
+            error(request),
+            "storage authorization requires 1 to 1024 source scopes"
+        );
+    }
+    let mut request = approval();
+    request.scopes = vec![approval().scopes[0].clone(); 1024];
+    request.source = Some(ReadAccess {
+        scopes: request.scopes.clone(),
+        ..source()
+    });
+    request.validate().unwrap();
+}

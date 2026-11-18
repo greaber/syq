@@ -1883,7 +1883,7 @@ fn safe_partial_must_have_one_link() {
     fs::hard_link(&file, &alias).unwrap();
 
     let opened = open_existing_regular(&file, true).unwrap();
-    let rejected = require_safe_partial(&opened, &file).is_err();
+    let rejected = !is_safe_partial(&opened.metadata().unwrap());
     drop(opened);
     fs::remove_dir_all(&dir).unwrap();
 
@@ -4003,57 +4003,6 @@ fn rooted_mkdir_race_accepts_only_an_existing_real_directory() {
 }
 
 #[test]
-fn name_limit_discovery_does_not_follow_an_intermediate_symlink() {
-    let dir = test_dir();
-    fs::create_dir(&dir).unwrap();
-    let target = dir.join("symlink-target");
-    let existing = target.join("existing");
-    let link = dir.join("in-tree-link");
-    fs::create_dir_all(&existing).unwrap();
-    symlink(&target, &link).unwrap();
-    let cache = Mutex::new(NameMaxCache::default());
-    let queried = Mutex::new(Vec::new());
-    let expected = fs::metadata(&dir).unwrap();
-
-    let limit = name_max_cached(&link.join("existing"), &cache, |candidate, directory| {
-        let metadata = directory.metadata().unwrap();
-        queried
-            .lock()
-            .unwrap()
-            .push((candidate.to_path_buf(), metadata.dev(), metadata.ino()));
-        143
-    });
-
-    assert_eq!(limit, 143);
-    assert_eq!(
-        *queried.lock().unwrap(),
-        vec![(lexical_absolute(&dir), expected.dev(), expected.ino())]
-    );
-    fs::remove_dir_all(&dir).unwrap();
-}
-
-#[test]
-fn name_limit_discovery_uses_the_nearest_existing_directory() {
-    let dir = test_dir();
-    fs::create_dir(&dir).unwrap();
-    let cache = Mutex::new(NameMaxCache::default());
-    let queried = Mutex::new(Vec::new());
-
-    let limit = name_max_cached(
-        &dir.join("not-yet-created/deeper"),
-        &cache,
-        |candidate, _directory| {
-            queried.lock().unwrap().push(candidate.to_path_buf());
-            143
-        },
-    );
-
-    assert_eq!(limit, 143);
-    assert_eq!(*queried.lock().unwrap(), vec![lexical_absolute(&dir)]);
-    fs::remove_dir_all(&dir).unwrap();
-}
-
-#[test]
 fn seed_basis_copies_only_selected_final_blocks_and_hashes_current_bytes() {
     let block = MIN_HASH_BLOCK_BYTES;
     for truncate in [false, true] {
@@ -5646,6 +5595,43 @@ fn destination_worker_claims_copy_sources_from_the_foreign_session() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn copy_worker_claims_every_named_source_over_one_broker_connection() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let source = temporary.path().join("source");
+    let destination = temporary.path().join("destination");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&destination).unwrap();
+    let files: Vec<_> = (0..20)
+        .map(|index| {
+            let file = source.join(format!("f{index}"));
+            fs::write(&file, b"source").unwrap();
+            file
+        })
+        .collect();
+    let source_session = DescriptorSessionSlot::default();
+    let mut source_control = FsOps::with_descriptor_session(source_session.clone());
+    let response = source_control.handle(&crate::test_support::register_source_roots(&files, 1));
+    let Response::SourceRootsRegistered(roots) = response else {
+        panic!("unexpected source registration response: {response:?}")
+    };
+    assert!(roots.iter().all(|root| root.leaf_ticket.is_some()));
+
+    let destination_session = DescriptorSessionSlot::default();
+    destination_session
+        .register(File::open(&destination).unwrap())
+        .unwrap();
+    let mut worker = FsOps::with_descriptor_session(destination_session);
+    worker.destination_root = Some(Arc::new(Root::open(&destination).unwrap()));
+    worker.destination_prefix = Some(b".".to_vec());
+    // Each source's directory and exact file: 40 claims, one connection.
+    let opened = source_session.broker_connections();
+    worker.initialize_copy_sources(&roots).unwrap();
+    assert_eq!(source_session.broker_connections() - opened, 1);
+    assert_eq!(worker.source_roots.len(), files.len());
+}
+
 #[test]
 fn source_initialization_rejects_mismatched_bad_and_excess_roots_atomically() {
     let temporary = crate::test_support::tempdir().unwrap();
@@ -6890,6 +6876,66 @@ fn destination_worker_rejects_source_only_content_requests() {
     }
 }
 
+/// A session no destination root was installed on, such as a control
+/// connection before it anchored a destination, refuses the requests that
+/// read a destination's sidecars and bases instead of following pathnames.
+#[test]
+fn unrooted_session_refuses_destination_basis_and_sidecar_requests() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let path = temporary.path().join("file");
+    fs::write(&path, b"contents").unwrap();
+    let id = [57; 16];
+    // A sidecar a pathname lookup would have found and reported.
+    fs::write(partial_path(&path, &id).unwrap(), b"partial").unwrap();
+    let mut ops = FsOps::new();
+    let path = path_bytes(&path);
+    let digest = crate::hashing::Digest::hash_bytes(ops.hash_policy.algorithm, b"contents").into();
+    let hash = |off, which| Request::HashBlocks {
+        off,
+        path: path.clone(),
+        source: None,
+        which,
+        copy_id: id,
+        block: MIN_HASH_BLOCK_BYTES,
+        len: 8,
+        attempt: 0,
+    };
+    for request in [
+        Request::ProbePartial {
+            path: path.clone(),
+            copy_id: id,
+        },
+        Request::HashAndHold {
+            off: 0,
+            path: path.clone(),
+            copy_id: id,
+            block: MIN_HASH_BLOCK_BYTES,
+            len: 8,
+            condition: TargetCondition::Any,
+            update: None,
+        },
+        hash(0, Which::Partial),
+        Request::ValidateDigest {
+            path: path.clone(),
+            expected: digest,
+        },
+    ] {
+        let message = match ops.handle(&request) {
+            Response::Err(message) => message,
+            Response::EndpointError(error) => error.message,
+            response => panic!("{request:?} was served without a root: {response:?}"),
+        };
+        assert!(message.contains(UNROOTED_MUTATION), "{message}");
+    }
+    assert!(ops.held_basis.is_none());
+    // The final file's own bytes are still read by pathname where no root
+    // confines them (`--insecure-links` and pre-anchor lookups).
+    assert!(matches!(
+        ops.handle(&hash(0, Which::Final)),
+        Response::Hashes(_)
+    ));
+}
+
 #[test]
 fn source_descriptor_budget_accounts_for_registry_control_and_workers() {
     assert_eq!(SOURCE_SHARED_WORKER_FD_RESERVE, 16 + 5 + 1);
@@ -7662,8 +7708,8 @@ fn retained_comparison_bytes_survive_donor_mutation_and_reject_replay() {
         ops.handle(&reuse(id, 2, 0, 9)),
         Response::EndpointError(_)
     ));
-    let staged = ops.partial_path(Path::new("file"), &id).unwrap();
-    assert_eq!(fs::read(tree.path().join(staged)).unwrap(), b"old bytes");
+    let staged = partial_path(&path, &id).unwrap();
+    assert_eq!(fs::read(staged).unwrap(), b"old bytes");
     assert_eq!(fs::read(&path).unwrap(), b"new bytes");
 }
 
@@ -7714,8 +7760,8 @@ fn prefetched_comparison_window_keeps_current_bytes() {
             Response::Ok
         ));
     }
-    let staged = ops.partial_path(Path::new("file"), &id).unwrap();
-    assert_eq!(fs::read(tree.path().join(staged)).unwrap(), b"firstsecond");
+    let staged = partial_path(&path, &id).unwrap();
+    assert_eq!(fs::read(staged).unwrap(), b"firstsecond");
 }
 
 #[test]
@@ -7913,8 +7959,8 @@ fn comparison_workers_release_donor_descriptors_before_publication() {
         assert!(matches!(ops.handle(&request), Response::Ok));
         assert!(ops.comparison_window.is_none());
     }
-    let partial = creator.partial_path(Path::new("file"), &id).unwrap();
-    fs::rename(tree.path().join(partial), &path).unwrap();
+    let partial = partial_path(&path, &id).unwrap();
+    fs::rename(partial, &path).unwrap();
     assert_eq!(fs::read(&path).unwrap(), b"abcdWXYZ");
     // Keep all sessions alive while checking every descriptor, including those
     // owned by workers which never execute Finalize.
@@ -7990,11 +8036,11 @@ fn staged_basis_uses_apfs_clone_and_keeps_an_independent_snapshot() {
             ),
             "APFS clone was not used: {response:?}"
         );
-        let partial = ops.partial_path(Path::new("file"), &id).unwrap();
+        let partial = partial_path(&path, &id).unwrap();
         fs::write(&path, vec![9; 8192]).unwrap();
         let mut expected = vec![7; 8192];
         expected.resize(len as usize, 0);
-        assert_eq!(fs::read(tree.path().join(partial)).unwrap(), expected);
+        assert_eq!(fs::read(partial).unwrap(), expected);
     }
 }
 

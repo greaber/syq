@@ -102,10 +102,14 @@ def clean():
     assert not listing(uploads=True), 'owned multipart uploads remain'
 
 
+def header_args():
+    """The --s3-header options for the headers the provider requires."""
+    return [arg for name, value in HEADERS.items() for arg in ('--s3-header', name + ': ' + value)]
+
+
 def run(args, *, ok=True, env=None, capture=False):
-    command = [SYQ, 'cp', '--no-progress', '--performance-tuning=s3-part-size=5M,s3-parts-per-object=3','--s3-retries=1']
-    for name, value in HEADERS.items():
-        command += ['--s3-header', name + ': ' + value]
+    command = [SYQ, 'cp', '--no-progress', '--performance-tuning=s3-part-size=5M,s3-parts-per-object=3','--s3-retries=1',
+               *header_args()]
     completed = subprocess.run(command + list(map(str, args)), env=env, text=True, capture_output=capture, timeout=180)
     assert (completed.returncode == 0) == ok, (args, completed.returncode, completed.stderr if capture else '')
     return completed

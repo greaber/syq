@@ -1189,36 +1189,23 @@ impl<R: Read + AsRawFd> Read for HandshakeInput<R> {
 /// that configuration without contacting the server.
 pub(super) fn target_spec(target: &str) -> Result<crate::conn::RemoteSpec> {
     let endpoint = target_endpoint(target)?;
+    // A return connection needs its explicit remote forwarding. This
+    // outbound copy needs no forwarding and must not ask about host keys
+    // from the background service. RemoteSpec disables multiplexing.
+    let rsh = std::iter::once("ssh")
+        .chain(RETURN_SSH_OPTIONS.iter().copied())
+        .chain([
+            "-o",
+            "ClearAllForwardings=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+        ])
+        .map(str::to_owned)
+        .collect();
     Ok(crate::conn::RemoteSpec {
-        local_process: false,
-        user: endpoint.user,
-        host: endpoint.host,
-        port: endpoint.port,
-        // A return connection needs its explicit remote forwarding. This
-        // outbound copy needs no forwarding and must not ask about host keys
-        // from the background service. RemoteSpec disables multiplexing.
-        rsh: std::iter::once("ssh")
-            .chain(RETURN_SSH_OPTIONS.iter().copied())
-            .chain([
-                "-o",
-                "ClearAllForwardings=yes",
-                "-o",
-                "StrictHostKeyChecking=yes",
-            ])
-            .map(str::to_owned)
-            .collect(),
-        syq_path: None,
         bootstrap_helper: true,
-        restricted_grant: None,
-        helper_install: Default::default(),
-        ssh_multiplexer: None,
         quiet: true,
-        pacing: Default::default(),
-        tcp: Default::default(),
-        diagnostics: Default::default(),
-        primed_control: Default::default(),
-        receiver_host: None,
-        read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
+        ..crate::conn::RemoteSpec::new(endpoint.user, endpoint.host, endpoint.port, rsh)
     })
 }
 
