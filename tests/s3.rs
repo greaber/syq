@@ -1498,6 +1498,10 @@ fn serve(
         serve_latency_pages(&mut socket, first);
         return;
     }
+    if fault == "upload-pages" {
+        serve_upload_pages(&mut socket, first, &probes);
+        return;
+    }
     if fault.starts_with("wrong-region") {
         // A prefix is looked up with a HEAD and a listing at once. Hold one of
         // them back so each gets a turn at being the first failure.
@@ -5241,6 +5245,81 @@ fn serve_latency_pages(socket: &mut TcpStream, first: &str) {
         ),
     ];
     reply(socket, 200, &fields, b"data", false);
+}
+
+/// A destination of 3,000 keys, `data/f0000` to `data/f2999`, listed in key
+/// order a thousand at a time. `probes` counts the LIST requests.
+fn serve_upload_pages(socket: &mut TcpStream, first: &str, probes: &AtomicUsize) {
+    if first.starts_with("HEAD ") {
+        reply(socket, 404, &[], b"", true);
+        return;
+    }
+    let target = first.split_whitespace().nth(1).unwrap();
+    let url = url::Url::parse(&format!("http://fixture{target}")).unwrap();
+    let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+    assert!(first.starts_with("GET ") && query.contains_key("list-type"));
+    assert_eq!(query["prefix"], "data/");
+    probes.fetch_add(1, Ordering::Relaxed);
+    let after = match query.get("continuation-token") {
+        Some(token) => token.to_string(),
+        None => {
+            // Only the first request starts a listing, just below the
+            // first planned key.
+            assert_eq!(query["start-after"], "data/f000/");
+            query["start-after"].to_string()
+        }
+    };
+    let keys: Vec<_> = (0..3000)
+        .map(|n| format!("data/f{n:04}"))
+        .filter(|key| *key > after)
+        .collect();
+    let page = &keys[..keys.len().min(1000)];
+    let next = if keys.len() > page.len() {
+        format!(
+            "<IsTruncated>true</IsTruncated><NextContinuationToken>{}</NextContinuationToken>",
+            page.last().unwrap()
+        )
+    } else {
+        "<IsTruncated>false</IsTruncated>".into()
+    };
+    let objects: String = page
+        .iter()
+        .map(|key| format!("<Contents><Key>{key}</Key><Size>1</Size></Contents>"))
+        .collect();
+    let xml = format!("<ListBucketResult>{next}{objects}</ListBucketResult>");
+    reply(socket, 200, &[], xml.as_bytes(), false);
+}
+
+#[test]
+fn s3_upload_pages_through_a_large_destination_while_copying() {
+    let server = Server::start("upload-pages");
+    let temp = crate::test_support::tempdir().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    // Every tenth destination key, and five keys the destination lacks.
+    for n in (0..3000).step_by(10) {
+        std::fs::write(data.join(format!("f{n:04}")), b"x").unwrap();
+    }
+    for n in 0..5 {
+        std::fs::write(data.join(format!("zz{n}")), b"x").unwrap();
+    }
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--srcs-in",
+            "data",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "data",
+            "--dry-run",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    // The copy starts after two pages; the third arrives while it runs and
+    // shows the five new keys absent. Listed keys get a HEAD, new ones none.
+    assert_eq!(server.probes.load(Ordering::Relaxed), 3);
+    assert_eq!(server.requests.load(Ordering::Relaxed), 3 + 300);
 }
 
 #[test]

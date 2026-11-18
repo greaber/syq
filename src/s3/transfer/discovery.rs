@@ -120,10 +120,13 @@ impl Walk {
     /// Request the next page and record what it decides. Returns whether
     /// another page is worth requesting.
     async fn page(&mut self, store: &impl Store) -> Result<bool> {
-        let bound = predecessor(self.keys.get(self.decided));
+        let start;
         let (token, after) = match &self.token {
             Some(token) => (Some(token.as_str()), self.passed.as_str()),
-            None => (None, bound.as_str()),
+            None => {
+                start = predecessor(self.keys.get(self.decided));
+                (None, start.as_str())
+            }
         };
         let page = store
             .page(&self.prefix, false, token, token.is_none().then_some(after))
