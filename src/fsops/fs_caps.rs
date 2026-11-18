@@ -17,6 +17,9 @@
 //!   not tried there, nor on types not audited.
 //! - Link counts, inode numbers and symlink times cannot be checked by
 //!   their errors, so they are trusted only on filesystems with evidence.
+//! - A written file is checked for write errors that only a close reports,
+//!   except on the Linux filesystems below whose source shows that a close
+//!   reports none.
 //!
 //! The profile comes from facts syq already reads cheaply: the filesystem
 //! type, mount options, and on macOS the capabilities a volume advertises.
@@ -150,6 +153,16 @@ pub(crate) struct Profile {
     /// serializing them saves CPU at the same speed. ZFS locks only the
     /// ranges written, so there they run concurrently, which is faster.
     pub(crate) serialized_writes: bool,
+    /// Linux: closing a descriptor reports no write error here, so a
+    /// written file is not checked by closing a duplicate of its descriptor
+    /// (`check_destination_writes`). `close` returns only what the
+    /// filesystem's `flush` file operation returns (`filp_flush` in
+    /// fs/open.c). NFS, SMB, FUSE and OrangeFS write out there and report
+    /// what failed, and overlayfs and eCryptfs pass on what the filesystem
+    /// below them reports; the filesystems trusted here have no such
+    /// operation, or one that always succeeds (f2fs). macOS decides its own
+    /// check from the file's filesystem and leaves this unset.
+    pub(crate) quiet_close: bool,
 }
 
 impl Default for Profile {
@@ -169,6 +182,7 @@ impl Profile {
         two_second_mtimes: false,
         audited: false,
         serialized_writes: true,
+        quiet_close: false,
     };
 
     /// Every capability, as on the tested local filesystems.
@@ -182,6 +196,7 @@ impl Profile {
         two_second_mtimes: false,
         audited: true,
         serialized_writes: true,
+        quiet_close: true,
     };
 
     /// Tests stand in for filesystems that lack these capabilities.
@@ -208,6 +223,11 @@ impl Profile {
             if set("SYQ_TEST_SYMLINK_TIMES_FOLLOW") {
                 profile.symlink_times = false;
             }
+            // A test that fails the check of a file's writes stands in for
+            // a filesystem whose close reports them, so the check is made.
+            if set("SYQ_TEST_FAIL_WRITER_CLOSE") {
+                profile.quiet_close = false;
+            }
             profile
         }
         #[cfg(not(debug_assertions))]
@@ -225,18 +245,20 @@ pub(crate) enum Refusal {
 
 impl Profile {
     /// The profile as bits, for an atomic cache.
-    pub(crate) const fn to_bits(self) -> u8 {
-        self.exchange as u8
-            | (self.atomic_no_replace_rename as u8) << 1
-            | (self.hard_links as u8) << 2
-            | (self.link_counts_trusted as u8) << 3
-            | (self.symlink_times as u8) << 4
-            | (self.two_second_mtimes as u8) << 5
-            | (self.audited as u8) << 6
-            | (self.serialized_writes as u8) << 7
+    pub(crate) const fn to_bits(self) -> u16 {
+        self.exchange as u16
+            | (self.atomic_no_replace_rename as u16) << 1
+            | (self.hard_links as u16) << 2
+            | (self.link_counts_trusted as u16) << 3
+            | (self.symlink_times as u16) << 4
+            | (self.two_second_mtimes as u16) << 5
+            | (self.audited as u16) << 6
+            | (self.serialized_writes as u16) << 7
+            | (self.quiet_close as u16) << 8
     }
 
-    pub(crate) const fn from_bits(bits: u8) -> Self {
+    /// The profile `to_bits` gave these bits for; higher bits are ignored.
+    pub(crate) const fn from_bits(bits: u16) -> Self {
         Self {
             exchange: bits & 1 != 0,
             atomic_no_replace_rename: bits & 1 << 1 != 0,
@@ -246,6 +268,7 @@ impl Profile {
             two_second_mtimes: bits & 1 << 5 != 0,
             audited: bits & 1 << 6 != 0,
             serialized_writes: bits & 1 << 7 != 0,
+            quiet_close: bits & 1 << 8 != 0,
         }
     }
 
@@ -593,7 +616,28 @@ pub(super) fn linux_profile(file_system_type: u32, file: &File, key: FileSystemK
         two_second_mtimes: fat,
         audited,
         serialized_writes: t != ZFS_SUPER_MAGIC,
+        quiet_close: linux_close_is_quiet(t),
     }
+}
+
+/// Linux: whether closing a file on a filesystem of this type reports no
+/// write error (`Profile::quiet_close`). These are the local filesystems
+/// whose file operations have no `flush`, read in Linux 4.19, 5.4, 6.12 and
+/// 7.2 where each exists and in OpenZFS 2.4 (`zpl_file_operations`), and
+/// f2fs, whose `f2fs_file_flush` only rolls back an exiting process's
+/// atomic write and returns 0. Any type not listed keeps the check.
+#[cfg(target_os = "linux")]
+fn linux_close_is_quiet(file_system_type: u32) -> bool {
+    let t = file_system_type;
+    t == libc::EXT4_SUPER_MAGIC as u32 // ext2, ext3 and ext4
+        || t == libc::XFS_SUPER_MAGIC as u32
+        || t == libc::BTRFS_SUPER_MAGIC as u32
+        || t == libc::TMPFS_MAGIC as u32
+        || t == libc::MSDOS_SUPER_MAGIC as u32
+        || matches!(
+            t,
+            ZFS_SUPER_MAGIC | F2FS_SUPER_MAGIC | EXFAT_SUPER_MAGIC | NTFS3_SUPER_MAGIC
+        )
 }
 
 /// The name syq reports for a filesystem type it treats specially but has
@@ -804,6 +848,7 @@ pub(crate) fn macos_profile(fd: RawFd) -> Profile {
                 two_second_mtimes: false,
                 audited: true,
                 serialized_writes: true,
+                quiet_close: false,
             },
             &volume.kind,
         ),
@@ -1023,10 +1068,55 @@ mod tests {
 
     #[test]
     fn profiles_survive_their_bits() {
-        for bits in 0..=u8::MAX {
+        for bits in 0..1 << 9 {
             assert_eq!(Profile::from_bits(bits).to_bits(), bits);
         }
         assert_eq!(Profile::from_bits(Profile::LOCAL.to_bits()), Profile::LOCAL);
+        assert_eq!(
+            Profile::from_bits(Profile::CONSERVATIVE.to_bits()),
+            Profile::CONSERVATIVE
+        );
+    }
+
+    /// A close is trusted to report nothing only on the local filesystems
+    /// listed: every filesystem that flushes at close, or sits on one that
+    /// may, and every type not listed keeps the check of its writes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_close_is_quiet_only_on_listed_local_filesystems() {
+        let directory = crate::test_support::tempdir().unwrap();
+        let file = File::open(directory.path()).unwrap();
+        let quiet = |kind| linux_profile(kind, &file, FileSystemKey::Device(0)).quiet_close;
+        for local in [
+            libc::EXT4_SUPER_MAGIC as u32,
+            libc::XFS_SUPER_MAGIC as u32,
+            libc::BTRFS_SUPER_MAGIC as u32,
+            libc::TMPFS_MAGIC as u32,
+            libc::MSDOS_SUPER_MAGIC as u32,
+            ZFS_SUPER_MAGIC,
+            F2FS_SUPER_MAGIC,
+            EXFAT_SUPER_MAGIC,
+            NTFS3_SUPER_MAGIC,
+        ] {
+            assert!(quiet(local), "{local:#x}");
+        }
+        for checked in [
+            libc::NFS_SUPER_MAGIC as u32,
+            libc::FUSE_SUPER_MAGIC as u32,
+            libc::SMB_SUPER_MAGIC as u32,
+            CIFS_SUPER_MAGIC,
+            SMB2_SUPER_MAGIC,
+            libc::OVERLAYFS_SUPER_MAGIC as u32,
+            libc::ECRYPTFS_SUPER_MAGIC as u32,
+            CEPH_SUPER_MAGIC,
+            GFS2_SUPER_MAGIC,
+            V9FS_MAGIC,
+            0x6b41_4653, // AFS
+            0x2011_3221, // OrangeFS
+            0x1234_5678,
+        ] {
+            assert!(!quiet(checked), "{checked:#x}");
+        }
     }
 
     /// A macOS volume's rename flags are tried only on volume types where
@@ -1060,6 +1150,7 @@ mod tests {
         assert!(!profile.link_counts_trusted);
         assert!(!profile.symlink_times);
         assert!(!profile.two_second_mtimes);
+        assert!(!profile.quiet_close);
     }
 
     #[cfg(target_os = "linux")]

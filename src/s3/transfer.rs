@@ -2904,15 +2904,12 @@ impl Engine {
         let flushed = output.finish().await;
         copied?;
         flushed?;
-        let partial = record.lock().await.partial.clone();
+        let (partial, dev) = {
+            let record = record.lock().await;
+            (record.partial.clone(), record.dev)
+        };
         let partial_path = RelativePath::new(partial.as_bytes())?;
-        // A network filesystem may flush here; keep that off the async workers.
-        let writer = file.clone();
-        let label = path.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            crate::fsops::check_destination_writes(&writer, &label)
-        })
-        .await??;
+        check_download_writes(root, dev, &file, path.to_path_buf()).await?;
         for expected in self.download_digests(&metadata, expected_hash) {
             let f = root.open_regular_read(&partial_path)?;
             tokio::task::spawn_blocking(move || expected.verify_reader(&mut &f)).await??;
@@ -3044,10 +3041,11 @@ impl Engine {
             local::join(parent, &super::prune::partial_name(&random)).as_bytes(),
         )?;
         let file = Arc::new(root.create_file(&partial, 0o600)?);
+        let created = file.metadata()?;
         let _cleanup = PartialCleanup {
             root,
             path: partial.clone(),
-            identity: (file.metadata()?.dev(), file.metadata()?.ino()),
+            identity: (created.dev(), created.ino()),
         };
         let result = async {
             let digests = self.download_digests(metadata, expected_hash);
@@ -3088,12 +3086,7 @@ impl Engine {
                 tokio::task::spawn_blocking(move || expected.verify_reader(&mut &*f)).await??;
             }
             self.check_cancelled()?;
-            let writer = file.clone();
-            let label = path_buf.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::fsops::check_destination_writes(&writer, &label)
-            })
-            .await??;
+            check_download_writes(root, created.dev(), &file, path_buf.clone()).await?;
             local::apply_file_metadata(&file, metadata, &self.args, mode, explicit, || {
                 local::CreationPermissions::shared_for_file(&self.file_permissions, root, path)
             })?;
@@ -3312,12 +3305,7 @@ impl Engine {
             "{} no longer has the source's size",
             target
         );
-        let label = std::path::PathBuf::from(&target);
-        let writer = staged.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::fsops::check_destination_writes(&writer, &label)
-        })
-        .await??;
+        check_download_writes(root, created.dev(), &staged, (&target).into()).await?;
         local::apply_file_metadata(&staged, metadata, &self.args, mode, explicit, || {
             local::CreationPermissions::shared_for_file(&self.file_permissions, root, path)
         })?;
@@ -3601,6 +3589,24 @@ fn out_of_space(error: &anyhow::Error) -> bool {
             .and_then(std::io::Error::raw_os_error)
             .is_some_and(|code| code == libc::ENOSPC || code == libc::EDQUOT)
     })
+}
+
+/// Collect the write errors a download's file, on device `dev`, has
+/// pending (`fsops::check_destination_writes`), where its filesystem can
+/// have some. A network filesystem may flush for it, which is kept off the
+/// async workers.
+async fn check_download_writes(
+    root: &Root,
+    dev: u64,
+    file: &Arc<File>,
+    label: std::path::PathBuf,
+) -> Result<()> {
+    if !crate::fsops::close_reports_writes(root, dev, file) {
+        return Ok(());
+    }
+    let writer = file.clone();
+    tokio::task::spawn_blocking(move || crate::fsops::collect_destination_writes(&writer, &label))
+        .await?
 }
 
 /// Remove the partial `record` names if its name still leads to the file

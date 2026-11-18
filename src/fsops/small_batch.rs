@@ -1233,7 +1233,7 @@ impl FsOps {
             )));
         }
         self.uncache_rooted(&target.root, &target.relative);
-        self.write_patch_in_place(&target, &file, patch)
+        self.write_patch_in_place(&target, &file, opened.dev(), patch)
             .map(Updated::InPlace)
             .map_err(failed(false, true))
     }
@@ -1248,6 +1248,7 @@ impl FsOps {
         &self,
         target: &RootedTarget,
         file: &File,
+        dev: u64,
         patch: &SmallPatch,
     ) -> Result<Option<(u64, u64)>> {
         #[cfg(debug_assertions)]
@@ -1274,7 +1275,7 @@ impl FsOps {
         } else {
             file.set_len(patch.len)?;
         }
-        check_destination_writes(file, &target.label)?;
+        check_destination_writes(&target.root, Some(dev), file, &target.label)?;
         let current = file.metadata()?;
         finish_updated_metadata(target, file, &current, &patch.meta, patch.flags)?;
         if patch.condition != TargetCondition::Any
@@ -2074,7 +2075,12 @@ impl FsOps {
             }
             .with_context(|| format!("write {}", stage.label.display()))?;
         }
-        check_destination_writes(&stage.file, &stage.label)?;
+        check_destination_writes(
+            &stage.target.root,
+            Some(stage.created.dev()),
+            &stage.file,
+            &stage.label,
+        )?;
         set_meta_written_file_for_publication(&stage.file, &put.meta, put.flags, &stage.created)
             .with_context(|| format!("set metadata {}", stage.label.display()))?;
         // A new name published by a hard link has its permission check

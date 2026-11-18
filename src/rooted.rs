@@ -65,7 +65,7 @@ pub(crate) use operator::*;
 static NEXT_SWAP_NAME: AtomicU64 = AtomicU64::new(0);
 
 /// Set in `Root::root_profile` once the profile has been read.
-const PROFILE_KNOWN: u16 = 1 << 8;
+const PROFILE_KNOWN: u16 = 1 << 15;
 
 pub(crate) const OPERATOR_SYMLINK_FOLLOW_ADVICE: &str = "pass --follow-src for source paths, --follow-dst for destination paths, or --follow for all the paths you give";
 
@@ -373,10 +373,10 @@ impl Root {
         if dev == self.identity.dev {
             let bits = self.root_profile.load(Ordering::Relaxed);
             if bits & PROFILE_KNOWN != 0 {
-                return crate::fsops::Profile::from_bits(bits as u8);
+                return crate::fsops::Profile::from_bits(bits);
             }
             let read = crate::fsops::profile(&self.directory);
-            let known = PROFILE_KNOWN | u16::from(read.to_bits());
+            let known = PROFILE_KNOWN | read.to_bits();
             return match self.root_profile.compare_exchange(
                 bits,
                 known,
@@ -384,7 +384,7 @@ impl Root {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => read,
-                Err(current) => crate::fsops::Profile::from_bits(current as u8),
+                Err(current) => crate::fsops::Profile::from_bits(current),
             };
         }
         if let Some(profile) = self.known_profile(dev) {
@@ -506,11 +506,9 @@ impl Root {
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
                     (bits & PROFILE_KNOWN != 0).then(|| {
                         PROFILE_KNOWN
-                            | u16::from(
-                                crate::fsops::Profile::from_bits(bits as u8)
-                                    .without(refusal)
-                                    .to_bits(),
-                            )
+                            | crate::fsops::Profile::from_bits(bits)
+                                .without(refusal)
+                                .to_bits()
                     })
                 });
         } else if let Some(profile) = self.other_profiles.lock().unwrap().get_mut(&dev) {
