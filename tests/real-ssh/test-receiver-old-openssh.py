@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Enrollment and restricted copies with pre-8.9 clients, agent, and sshd."""
 import argparse
+import functools
 import json
+import operator
 import os
 from pathlib import Path
 import shlex
 import signal
 import subprocess
 import tempfile
-import time
 import uuid
+
+import syq_real_ssh_lab as lab
 
 OLD = '/opt/openssh-8.8'
 
@@ -26,19 +29,8 @@ def remote_python(host, program):
     return remote(host, 'python3 -c ' + shlex.quote(program), stdout=subprocess.PIPE).stdout
 
 
-def wait_for(label, probe):
-    deadline = time.monotonic() + 20
-    progress = 0
-    last = None
-    while time.monotonic() < deadline:
-        done, last = probe()
-        if done:
-            return
-        if time.monotonic() >= progress:
-            print(f'Waiting for {label}: {last}', flush=True)
-            progress = time.monotonic() + 2
-        time.sleep(.1)
-    raise AssertionError(f'{label} timed out; last state: {last}')
+# Each probe returns (done, last observed state).
+wait_for = functools.partial(lab.wait_for, timeout=20, done=operator.itemgetter(0))
 
 
 def main():

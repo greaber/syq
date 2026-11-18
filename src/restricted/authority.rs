@@ -4,12 +4,11 @@ use crate::destination_results::{Change, Failure};
 pub(super) struct AuthorityState {
     /// Objects this grant created and the executor confirmed. The
     /// existing-object policy is about what existed before the transfer, so
-    /// later operations on these are the transfer's own business.
+    /// later operations on these are the transfer's own business. A
+    /// creation authorized but not yet confirmed is not here: a second
+    /// creation of the same path races at the kernel instead of trusting an
+    /// outcome that has not happened yet.
     pub(super) created: HashSet<Vec<u8>>,
-    /// Creations authorized but not yet confirmed or rolled back. They never
-    /// grant the shortcut above: a second creation of the same path races at
-    /// the kernel instead of trusting an outcome that has not happened yet.
-    pub(super) provisional: HashSet<Vec<u8>>,
     /// Bytes each staged, in-place or patched file this copy is writing
     /// may occupy on disk, keyed by the destination path and the partial
     /// this grant declared for it: preallocation and basis seeding are
@@ -84,9 +83,21 @@ pub(super) struct ReceiverControlPath {
     pub(super) label: &'static str,
 }
 
+/// `path` relative to `prefix`, when it lies beneath it: `prefix`, a
+/// slash, and the rest. `prefix` itself is not beneath it, and nothing is
+/// beneath `/` by this rule.
+pub(super) fn beneath<'a>(path: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    path.strip_prefix(prefix)?.strip_prefix(b"/")
+}
+
+/// `path` is `prefix` or lies beneath it, as `beneath` says.
+pub(super) fn at_or_beneath(path: &[u8], prefix: &[u8]) -> bool {
+    path == prefix || beneath(path, prefix).is_some()
+}
+
+/// `at_or_beneath`, with every absolute path below `/`.
 pub(super) fn path_is_at_or_below(path: &[u8], prefix: &[u8]) -> bool {
-    path == prefix
-        || (path.starts_with(prefix) && (prefix == b"/" || path.get(prefix.len()) == Some(&b'/')))
+    at_or_beneath(path, prefix) || (prefix == b"/" && path.starts_with(prefix))
 }
 
 pub(super) fn reject_control_plane_path(
@@ -707,6 +718,45 @@ pub(crate) struct RestrictedAuthority {
     pub(super) lookups: Option<std::sync::Arc<crate::fsops::lookups::PlanningLookups>>,
 }
 
+/// How the executor's `response` reports operation `index` failed, if it
+/// did: the failure the results list, and the executor's typed error where
+/// settlement judges by it. A widened directory's error is listed but not
+/// judged.
+fn operation_failure(
+    response: &proto::Response,
+    index: usize,
+) -> Option<(Failure<'_>, Option<&proto::WireError>)> {
+    let typed = |error| (Failure::of(error), Some(error));
+    let missing = || {
+        (
+            Failure::io("receiver returned no outcome for this file"),
+            None,
+        )
+    };
+    match response {
+        proto::Response::Err(error) => Some((Failure::io(error.as_str()), None)),
+        proto::Response::EndpointError(error) => Some(typed(error)),
+        proto::Response::WidenedDirectories(results) => results
+            .get(index)?
+            .as_ref()
+            .err()
+            .map(|error| (Failure::of(error), None)),
+        proto::Response::Applied(results) => results.get(index)?.as_ref().map(typed),
+        proto::Response::PatchedBatch(results) => match results.get(index) {
+            Some(Ok(_)) => None,
+            Some(Err(error)) => Some(typed(&error.error)),
+            None => Some(missing()),
+        },
+        // Small files published with their identities, for links.
+        proto::Response::PublishedBatch(results) => match results.get(index) {
+            Some(Ok(_)) => None,
+            Some(Err(error)) => Some(typed(error)),
+            None => Some(missing()),
+        },
+        _ => None,
+    }
+}
+
 impl RestrictedAuthority {
     /// The directory every connection of the copy works beneath.
     #[cfg(test)]
@@ -985,7 +1035,6 @@ impl RestrictedAuthority {
             deletions: Default::default(),
             state: Mutex::new(AuthorityState {
                 created: HashSet::new(),
-                provisional: HashSet::new(),
                 reserved: HashMap::new(),
                 reserved_bytes: 0,
                 next_reservation_hold: 0,
@@ -1211,16 +1260,13 @@ impl RestrictedAuthority {
     }
 
     pub(super) fn scope_allows(scope: &MutationScope, path: &[u8]) -> bool {
-        path == scope.path
-            || (scope.descendants
-                && path.starts_with(&scope.path)
-                && path.get(scope.path.len()) == Some(&b'/'))
+        path == scope.path || (scope.descendants && beneath(path, &scope.path).is_some())
     }
 
     pub(super) fn filter_applies(&self, path: &[u8]) -> bool {
-        self.filter_roots.iter().any(|root| {
-            path == root || (path.starts_with(root) && path.get(root.len()) == Some(&b'/'))
-        })
+        self.filter_roots
+            .iter()
+            .any(|root| at_or_beneath(path, root))
     }
 
     /// A mapped source root itself is never ignored. A destination path that
@@ -1235,11 +1281,10 @@ impl RestrictedAuthority {
             if path == root {
                 return false;
             }
-            if !path.starts_with(root) || path.get(root.len()) != Some(&b'/') {
+            let Some(relative) = beneath(path, root) else {
                 continue;
-            }
+            };
             under_root = true;
-            let relative = &path[root.len() + 1..];
             let relative = Path::new(OsStr::from_bytes(relative));
             let pruned_by_ancestor = relative.ancestors().skip(1).any(|ancestor| {
                 !ancestor.as_os_str().is_empty() && matcher.matched(ancestor, true).is_ignore()
@@ -1352,9 +1397,7 @@ impl RestrictedAuthority {
         if path == self.destination {
             return Ok(b"");
         }
-        path.strip_prefix(self.destination.as_slice())
-            .and_then(|relative| relative.strip_prefix(b"/"))
-            .context("mapping path is outside the destination")
+        beneath(path, &self.destination).context("mapping path is outside the destination")
     }
 
     pub(super) fn check_mapping_path(&self, path: &[u8], directory: Option<bool>) -> Result<()> {
@@ -1492,9 +1535,7 @@ impl RestrictedAuthority {
         if path == self.destination {
             return (!directory).then(Vec::new);
         }
-        path.strip_prefix(self.destination.as_slice())
-            .and_then(|rest| rest.strip_prefix(b"/"))
-            .map(<[u8]>::to_vec)
+        beneath(path, &self.destination).map(<[u8]>::to_vec)
     }
 
     /// Add one settled change to the results, if they have started.
@@ -1636,63 +1677,20 @@ impl RestrictedAuthority {
         if creations.is_empty() && outcomes.is_empty() && !tracked {
             return;
         }
-        let outcome_error = |index: usize| -> Option<Failure<'_>> {
-            let missing = || Failure::io("receiver returned no outcome for this file");
-            match response {
-                proto::Response::Err(error) => Some(Failure::io(error.as_str())),
-                proto::Response::EndpointError(error) => Some(Failure::of(error)),
-                proto::Response::WidenedDirectories(results) => results
-                    .get(index)
-                    .and_then(|result| result.as_ref().err().map(Failure::of)),
-                proto::Response::Applied(results) => results
-                    .get(index)
-                    .and_then(|error| error.as_ref().map(Failure::of)),
-                proto::Response::PatchedBatch(results) => match results.get(index) {
-                    Some(Ok(_)) => None,
-                    Some(Err(error)) => Some(Failure::of(&error.error)),
-                    None => Some(missing()),
-                },
-                // Small files published with their identities, for links.
-                proto::Response::PublishedBatch(results) => match results.get(index) {
-                    Some(Ok(_)) => None,
-                    Some(Err(error)) => Some(Failure::of(error)),
-                    None => Some(missing()),
-                },
-                _ => None,
-            }
-        };
+        let outcome_error =
+            |index: usize| operation_failure(response, index).map(|(error, _)| error);
         // The executor's typed error for an operation, where it gave one.
-        let outcome_wire = |index: usize| -> Option<&proto::WireError> {
-            match response {
-                proto::Response::EndpointError(error) => Some(error),
-                proto::Response::Applied(results) => results.get(index).and_then(Option::as_ref),
-                proto::Response::PatchedBatch(results) => match results.get(index) {
-                    Some(Err(error)) => Some(&error.error),
-                    _ => None,
-                },
-                proto::Response::PublishedBatch(results) => match results.get(index) {
-                    Some(Err(error)) => Some(error),
-                    _ => None,
-                },
-                _ => None,
-            }
-        };
+        let outcome_wire =
+            |index: usize| operation_failure(response, index).and_then(|(_, wire)| wire);
         let failed = |index: usize| outcome_error(index).is_some();
         // A change the receiver declined to make in place, because only a
         // replacement may change that file's metadata (`fsops::vouch`), is
         // not a failure: the copy replaces the file, and the results report
-        // that replacement.
+        // that replacement. A small-file publication that reports
+        // identities is not judged so.
         let declined = |index: usize| {
-            let error = match response {
-                proto::Response::EndpointError(error) => Some(error),
-                proto::Response::Applied(results) => results.get(index).and_then(Option::as_ref),
-                proto::Response::PatchedBatch(results) => match results.get(index) {
-                    Some(Err(error)) => Some(&error.error),
-                    _ => None,
-                },
-                _ => None,
-            };
-            error.is_some_and(crate::fsops::vouch::is_replace_required_wire)
+            !matches!(response, proto::Response::PublishedBatch(_))
+                && outcome_wire(index).is_some_and(crate::fsops::vouch::is_replace_required_wire)
         };
         let mut state = self.state.lock().unwrap();
         if tracked {
@@ -1700,7 +1698,6 @@ impl RestrictedAuthority {
             self.settled.notify_all();
         }
         for creation in creations {
-            state.provisional.remove(&creation.path);
             if creation.persist && !failed(creation.index) {
                 state.created.insert(creation.path);
             }
@@ -1963,13 +1960,6 @@ impl RestrictedAuthority {
         }
     }
 
-    pub(super) fn forget_provisional(&self, pending: &[PendingCreation]) {
-        let mut state = self.state.lock().unwrap();
-        for creation in pending {
-            state.provisional.remove(&creation.path);
-        }
-    }
-
     /// Bind an operation that creates or replaces the object at `path` to the
     /// signed existing-object policy. `Skip` retains whatever existed before
     /// the transfer, so creation is forced to be no-replace; `MustExist`
@@ -2006,8 +1996,8 @@ impl RestrictedAuthority {
                 "signed placement puts names inside {label}, so it must be created as a directory"
             );
         }
-        if self.created_by_this_grant(path)
-            || (policy == ExistingDestinationPolicy::Replace && !root_must_be_new)
+        if (policy == ExistingDestinationPolicy::Replace && !root_must_be_new)
+            || self.created_by_this_grant(path)
         {
             return Ok(());
         }
@@ -2061,7 +2051,8 @@ impl RestrictedAuthority {
             self.root_existence == RootExistence::New && path == self.destination;
         let recorded = match &self.lookups {
             Some(lookups)
-                if !(in_place || root_must_be_new || self.created_by_this_grant(path)) =>
+                if self.creation_policy(false) != ExistingDestinationPolicy::Replace
+                    && !(in_place || root_must_be_new || self.created_by_this_grant(path)) =>
             {
                 crate::fsops::destination_relative_to(&self.root_path, path)
                     .ok()
@@ -2079,7 +2070,6 @@ impl RestrictedAuthority {
                                 "replacement of {label} contradicts the signed existing-object policy"
                             ),
                         }
-                        self.state.lock().unwrap().provisional.insert(path.to_vec());
                         pending.push(PendingCreation {
                             index,
                             path: path.to_vec(),
@@ -2215,36 +2205,7 @@ impl RestrictedAuthority {
                 // A caller-supplied identity is accepted only when it names
                 // the observed object, never on its own authority, and only
                 // where numbers can show that.
-                self.existence_only_where_numbers_mislead(&metadata, condition);
-                match *condition {
-                    Any => {
-                        *condition = Matches {
-                            dev: metadata.dev,
-                            ino: metadata.ino,
-                        }
-                    }
-                    Absent => bail!(
-                        "no-replace creation of {label} contradicts the signed existing-object policy"
-                    ),
-                    Matches { dev, ino } if (dev, ino) == (metadata.dev, metadata.ino) => {}
-                    MatchesFingerprint {
-                        dev,
-                        ino,
-                        ctime,
-                        ctime_nsec,
-                    } if (dev, ino, ctime, ctime_nsec)
-                        == (
-                            metadata.dev,
-                            metadata.ino,
-                            metadata.ctime,
-                            metadata.ctime_nsec,
-                        ) => {}
-                    Matches { .. } | MatchesFingerprint { .. } => {
-                        return Err(kept(format!(
-                            "requested identity for {label} does not match the object the receiver observed"
-                        )))
-                    }
-                }
+                self.pin_to_observed(&metadata, condition, &label, "creation")?;
                 if !directory {
                     // Metadata later in this same batch lands on the new
                     // inode, not the one it replaces, so it must not be
@@ -2282,7 +2243,6 @@ impl RestrictedAuthority {
                         "replacement of {label} contradicts the signed existing-object policy"
                     ),
                 }
-                self.state.lock().unwrap().provisional.insert(path.to_vec());
                 pending.push(PendingCreation {
                     index,
                     path: path.to_vec(),
@@ -2310,21 +2270,23 @@ impl RestrictedAuthority {
         // A creation earlier in this same request (a symlink followed by its
         // metadata, say) counts: the request's metadata runs only once its
         // no-replace creations have all succeeded.
-        let created_before = self.created_by_this_grant(path);
-        let created_here = pending
-            .iter()
-            .any(|creation| creation.path == path && !creation.link);
+        let created = || {
+            pending
+                .iter()
+                .any(|creation| creation.path == path && !creation.link)
+                || self.created_by_this_grant(path)
+        };
         match self.creation_policy(directory) {
             // A name this grant created leads only to an object it created,
             // whatever runs on other connections meanwhile: the one step
             // that could give it an existing file is a hard link, which
             // this policy allows only to the grant's own files
             // (`OwnedObjects`).
-            ExistingDestinationPolicy::Skip if created_before || created_here => Ok(()),
+            ExistingDestinationPolicy::Skip if created() => Ok(()),
             ExistingDestinationPolicy::Skip => Err(kept(format!(
                 "signed grant retains existing objects: {label} may not be modified"
             ))),
-            ExistingDestinationPolicy::MustExist if created_before || created_here => Ok(()),
+            ExistingDestinationPolicy::MustExist if created() => Ok(()),
             // Updates are pinned to the observed object, like publications:
             // nothing hostA supplies names an inode on its own authority.
             ExistingDestinationPolicy::MustExist => self.pin_update(path, &label, condition),
@@ -2335,8 +2297,12 @@ impl RestrictedAuthority {
     /// Where inode numbers cannot show which file a name leads to
     /// (`fsops::Profile::link_counts_trusted`), a sender's identity for the
     /// object observed as `observed` is set aside: the change is pinned to
-    /// what is there, as on any receiver there (`FsOps`'s
-    /// `existence_only_where_numbers_mislead`).
+    /// what is there. The object's own filesystem decides where its profile
+    /// is known, and the root's otherwise. `FsOps`'s
+    /// `existence_only_where_numbers_mislead`, which runs again at
+    /// execution, judges every object by the root's: judged by the root
+    /// here, a file on an untrusted mount below a trusted root would be
+    /// refused whenever the sender's numbers for it went stale.
     fn existence_only_where_numbers_mislead(
         &self,
         observed: &RootMetadata,
@@ -2363,7 +2329,6 @@ impl RestrictedAuthority {
         label: &str,
         condition: Option<&mut proto::TargetCondition>,
     ) -> Result<()> {
-        use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
         let Some(metadata) = self.rooted_metadata(path)? else {
             return Err(kept(format!(
                 "signed grant creates nothing: {label} does not exist"
@@ -2372,7 +2337,22 @@ impl RestrictedAuthority {
         let Some(condition) = condition else {
             return Ok(());
         };
-        self.existence_only_where_numbers_mislead(&metadata, condition);
+        self.pin_to_observed(&metadata, condition, label, "update")
+    }
+
+    /// Hold `condition` to `observed`, the object the receiver found at
+    /// `label`: `Any` becomes its device and inode, a sender's identity is
+    /// accepted only when it names that object (and only where numbers can
+    /// show that), and a no-replace `verb` contradicts the policy.
+    fn pin_to_observed(
+        &self,
+        metadata: &RootMetadata,
+        condition: &mut proto::TargetCondition,
+        label: &str,
+        verb: &str,
+    ) -> Result<()> {
+        use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
+        self.existence_only_where_numbers_mislead(metadata, condition);
         match *condition {
             Any => {
                 *condition = Matches {
@@ -2381,7 +2361,7 @@ impl RestrictedAuthority {
                 }
             }
             Absent => {
-                bail!("no-replace update of {label} contradicts the signed existing-object policy")
+                bail!("no-replace {verb} of {label} contradicts the signed existing-object policy")
             }
             Matches { dev, ino } if (dev, ino) == (metadata.dev, metadata.ino) => {}
             MatchesFingerprint {
@@ -2452,19 +2432,19 @@ impl RestrictedAuthority {
     /// Refuse staging work whose eventual publication the existing-object
     /// policy would reject, so the transfer fails before moving bytes.
     pub(super) fn constrain_prepare(&self, path: &[u8]) -> Result<()> {
-        if self.created_by_this_grant(path) {
-            return Ok(());
-        }
-        let label = String::from_utf8_lossy(path);
         // Under `Skip` the publication refuses a name that exists, so
         // nothing is looked at here; under `MustExist`, a name this
-        // receiver's lookups found needs no look either.
+        // receiver's lookups found, or this grant created, needs no look
+        // either.
         match self.creation_policy(false) {
             ExistingDestinationPolicy::MustExist
-                if !self.looked_up_present(path) && self.rooted_metadata(path)?.is_none() =>
+                if !self.created_by_this_grant(path)
+                    && !self.looked_up_present(path)
+                    && self.rooted_metadata(path)?.is_none() =>
             {
                 Err(kept(format!(
-                    "signed grant creates nothing: {label} does not exist"
+                    "signed grant creates nothing: {} does not exist",
+                    String::from_utf8_lossy(path)
                 )))
             }
             _ => Ok(()),
@@ -3600,7 +3580,6 @@ impl RestrictedAuthority {
                 if let StreamStep::CopySmallCopy(prepared) = step {
                     self.settle_unexecuted(*prepared, &format!("{error:#}"));
                 }
-                self.forget_provisional(&pending);
                 self.release_patch_holds(outcomes.into_iter());
                 // What it asked for, classified before taking the state lock:
                 // classifying may look at the destination.
@@ -3795,22 +3774,17 @@ impl RestrictedAuthority {
                     ino: metadata.ino,
                 });
             }
-            Request::PartialPaths { paths, .. } | Request::PruneLookup { paths } => {
+            Request::PruneLookup { paths } => {
                 for path in paths {
                     self.check_observation_path(path)?;
                 }
             }
             Request::PlanBatch {
-                partial_paths,
                 directories,
                 others,
                 ..
             } => {
-                for path in partial_paths
-                    .iter()
-                    .chain(directories.iter())
-                    .chain(others.iter())
-                {
+                for path in directories.iter().chain(others.iter()) {
                     self.check_observation_path(path)?;
                 }
             }

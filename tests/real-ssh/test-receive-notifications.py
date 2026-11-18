@@ -1,4 +1,5 @@
 """Run inside the disposable runner under dbus-run-session, with real notify-send."""
+import functools
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,8 @@ import dbus
 import dbus.mainloop.glib
 import dbus.service
 from gi.repository import GLib
+
+import syq_real_ssh_lab as lab
 
 INTERFACE = "org.freedesktop.Notifications"
 dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
@@ -66,10 +69,7 @@ class Notifications(dbus.service.Object):
 service = Notifications(bus, "/org/freedesktop/Notifications")
 
 
-def run(*args, success=True):
-    result = subprocess.run(args, capture_output=True, text=True, timeout=30)
-    assert (result.returncode == 0) == success, (args, result)
-    return result.stdout
+run = functools.partial(lab.run, timeout=30)
 
 
 def wait_notification_status(expected):

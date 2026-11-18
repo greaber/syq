@@ -284,8 +284,6 @@ async fn plan(
                     client,
                     bucket,
                     &prefix,
-                    None,
-                    &mut HashSet::new(),
                     args.s3.as_ref().unwrap().concurrency,
                 )
                 .await?

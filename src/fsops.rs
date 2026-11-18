@@ -1004,7 +1004,6 @@ pub struct FsOps {
     destination_path_access: TemporaryDirectorySearchAccess,
     descriptor_session: DescriptorSessionSlot,
     source_roots: HashMap<RegisteredRootId, SourceRootHandle>,
-    allow_unconfined_source_paths: bool,
     destination_root: Option<Arc<Root>>,
     destination_prefix: Option<PathBytes>,
     /// Whether an Apply operation creates the missing directories on its
@@ -1329,7 +1328,6 @@ impl FsOps {
             destination_path_access: Default::default(),
             descriptor_session,
             source_roots: HashMap::new(),
-            allow_unconfined_source_paths: false,
             destination_root: None,
             create_missing_parents: true,
             destination_prefix: None,
@@ -2160,7 +2158,6 @@ impl FsOps {
         base: &SourceRootBase,
         selections: &[SourceRootSelection],
         symlink_policy: OperatorSymlinkPolicy,
-        allow_unconfined_paths: bool,
         shared_workers: usize,
         independent_workers: usize,
     ) -> Result<Vec<RegisteredSourceRoot>> {
@@ -2357,7 +2354,6 @@ impl FsOps {
                         leaf_ticket,
                         selection,
                         expected_leaf,
-                        allow_unconfined_paths,
                         directory_mode,
                     })
                 },
@@ -2396,9 +2392,6 @@ impl FsOps {
         if self.destination_root.is_none() {
             bail!("local copy sources require a registered destination root");
         }
-        if sources.iter().any(|source| source.allow_unconfined_paths) {
-            bail!("local copy sources must be confined registered capabilities");
-        }
         self.initialize_source_capabilities(sources, true)
     }
 
@@ -2423,14 +2416,10 @@ impl FsOps {
         }
         let mut roots = HashMap::with_capacity(sources.len());
         let endpoint_ticket = &sources[0].ticket;
-        let allow_unconfined_paths = sources[0].allow_unconfined_paths;
         for source in sources {
             source.validate()?;
             if !source.ticket.same_session(endpoint_ticket) {
                 bail!("source roots belong to different endpoint sessions");
-            }
-            if source.allow_unconfined_paths != allow_unconfined_paths {
-                bail!("source worker received inconsistent unconfined-path permissions");
             }
             let id = source.selection.root();
             if roots.contains_key(&id) {
@@ -2498,7 +2487,6 @@ impl FsOps {
             );
         }
         self.source_roots = roots;
-        self.allow_unconfined_source_paths = allow_unconfined_paths;
         Ok(())
     }
 
@@ -2531,8 +2519,7 @@ impl FsOps {
     }
 
     /// Resolve a source scan to its retained root. Once source roots exist,
-    /// omission is never an implicit fallback: only a registration carrying
-    /// the explicit `--insecure-links` permission may use the legacy pathname.
+    /// a scan must carry a registered source reference.
     pub(crate) fn source_scan_root(
         &self,
         source: Option<&RegisteredPath>,
@@ -2552,9 +2539,6 @@ impl FsOps {
             }));
         }
         if self.source_roots.is_empty() {
-            return Ok(None);
-        }
-        if self.allow_unconfined_source_paths {
             return Ok(None);
         }
         bail!("source scan omitted its registered source reference")
@@ -2607,9 +2591,6 @@ impl FsOps {
             return Ok(Some((source.root(), target)));
         }
         if self.source_roots.is_empty() {
-            return Ok(None);
-        }
-        if self.allow_unconfined_source_paths {
             return Ok(None);
         }
         bail!("source content request omitted its registered source reference")
@@ -2893,20 +2874,17 @@ impl FsOps {
                 bail!("descriptor copies require a separate unrestricted control session")
             }
             Request::Scan { root, .. } | Request::NewFileOwner { path: root, .. } => map(root)?,
-            Request::StatMany { paths, .. }
-            | Request::PartialPaths { paths, .. }
-            | Request::PruneLookup { paths } => {
+            Request::StatMany { paths, .. } | Request::PruneLookup { paths } => {
                 for path in paths {
                     map(path)?;
                 }
             }
             Request::PlanBatch {
-                partial_paths,
                 directories,
                 others,
                 ..
             } => {
-                for path in partial_paths.iter_mut().chain(directories).chain(others) {
+                for path in directories.iter_mut().chain(others) {
                     map(path)?;
                 }
             }
@@ -3014,10 +2992,6 @@ impl FsOps {
         Ok(())
     }
 
-    pub fn scan_root(&self, root: &[u8]) -> Result<PathBytes> {
-        self.destination_relative(root)
-    }
-
     fn completion_entries(
         directory: &[u8],
         confined_root: Option<&[u8]>,
@@ -3104,33 +3078,6 @@ impl FsOps {
         let relative = self.destination_relative(requested)?;
         RelativePath::new(&relative)?;
         Ok(Some((root.clone(), relative)))
-    }
-
-    fn rebase_response(&self, response: Response) -> Response {
-        if self.destination_prefix.is_none() {
-            return response;
-        }
-        match response {
-            Response::PathResults(paths) => Response::PathResults(
-                paths
-                    .into_iter()
-                    .map(|path| path.map(|path| self.destination_full(&path)))
-                    .collect(),
-            ),
-            Response::BatchPlan {
-                partial_paths,
-                directories,
-                others,
-            } => Response::BatchPlan {
-                partial_paths: partial_paths
-                    .into_iter()
-                    .map(|path| path.map(|path| self.destination_full(&path)))
-                    .collect(),
-                directories,
-                others,
-            },
-            response => response,
-        }
     }
 
     fn cached(&mut self, p: &Path, attempt: u32) -> Result<&CachedFile> {
@@ -3453,42 +3400,10 @@ impl FsOps {
             }
             return ordered.into_iter().collect();
         }
-        if self.destination_root.is_none()
-            && !self.source_roots.is_empty()
-            && !self.allow_unconfined_source_paths
-        {
+        if self.destination_root.is_none() && !self.source_roots.is_empty() {
             bail!("source stat omitted its registered source references");
         }
         Ok(self.stat_many(paths, follow))
-    }
-
-    pub fn partial_paths(
-        &mut self,
-        paths: &[PathBytes],
-        copy_id: &CopyId,
-    ) -> Vec<std::result::Result<PathBytes, String>> {
-        parallel_map_init(paths, PartialNameLimits::default, |limits, path| {
-            let requested = Path::new(OsStr::from_bytes(path));
-            let resolved = if let Some(target) = self.rooted_destination_target(path)? {
-                let relative = target.relative.to_path_buf();
-                // Validate the leaf even on a cache hit: an empty relative path
-                // names the root, not a file for which we can make a sidecar.
-                let parent = relative
-                    .parent()
-                    .context("operation requires a descendant path")?;
-                let limit =
-                    limits.get_or_query(&target.root, parent, || target.partial_name_max())?;
-                partial_path_with_name_max(&target.label, copy_id, limit)?
-            } else {
-                self.partial_path(&resolve(path), copy_id)?
-            };
-            let name = resolved.file_name().expect("partial always has a name");
-            let parent = requested.parent().unwrap_or_else(|| Path::new(""));
-            Ok(path_bytes(&parent.join(name)))
-        })
-        .into_iter()
-        .map(|result: Result<PathBytes>| result.map_err(|error| format!("{error:#}")))
-        .collect()
     }
 
     fn annotate_permission_failure(&self, path: &[u8], access: u32, error: &mut WireError) {

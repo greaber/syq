@@ -1,6 +1,7 @@
 """Laptop-approved account access over direct native SSH, in disposable paths."""
 import errno
 import fcntl
+import functools
 import json
 import os
 from pathlib import Path
@@ -14,29 +15,17 @@ import tempfile
 import termios
 import time
 
+import syq_real_ssh_lab as lab
 
-def run(*args, stdin=None, success=True):
-    result = subprocess.run(args, input=stdin, capture_output=True, text=True, timeout=40)
-    assert (result.returncode == 0) == success, (args, result)
-    return result.stdout
+
+run = functools.partial(lab.run, timeout=40)
 
 
 def ready():
     run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
 
 
-def wait_for(description, predicate, timeout=10):
-    deadline, progress = time.monotonic() + timeout, time.monotonic() + 2
-    state = None
-    while time.monotonic() < deadline:
-        state = predicate()
-        if state:
-            return state
-        if time.monotonic() >= progress:
-            print("Waiting for", description, "last state:", state, flush=True)
-            progress += 2
-        time.sleep(.05)
-    raise AssertionError(("Timed out", description, "last state", state))
+wait_for = functools.partial(lab.wait_for, timeout=10)
 
 
 def pending(allow=True, reusable=True, remember=False, target="syq@destination", endpoint=None):

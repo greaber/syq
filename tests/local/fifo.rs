@@ -209,3 +209,104 @@ fn fifo_node_operations_do_not_connect_a_producer() {
         writer.assert_waiting();
     }
 }
+
+/// Symlinks and special files share one planning path. Pin what it reports
+/// for each way the destination can differ, previewed and applied.
+#[test]
+fn symlink_and_fifo_plans_report_each_destination_state() {
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("src")).unwrap();
+    fs::create_dir_all(t.path("dst/src")).unwrap();
+    for name in ["new-link", "typed-link", "moved-link"] {
+        std::os::unix::fs::symlink("target", t.path(&format!("src/{name}"))).unwrap();
+    }
+    mkfifo(&t.path("src/new-fifo"));
+    mkfifo(&t.path("src/typed-fifo"));
+    write(&t.path("dst/src/typed-link"), b"file");
+    write(&t.path("dst/src/typed-fifo"), b"file");
+    std::os::unix::fs::symlink("old-target", t.path("dst/src/moved-link")).unwrap();
+    let copy = |extra: &[&str]| {
+        let mut args = vec!["--copy-metadata=specials", "-v"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["src", "--into", "dst"]);
+        syq_cp_in(&t.path(""), &args, None)
+    };
+
+    let out = copy(&["-n", "--results", "preview.ndjson"]);
+    assert_output_ok(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in [
+        "create symlink dst/src/new-link -> target (destination missing)",
+        "replace with symlink dst/src/typed-link -> target (destination is regular file)",
+        "update symlink dst/src/moved-link -> target (target differs)",
+        "create FIFO dst/src/new-fifo (destination missing)",
+        "replace with FIFO dst/src/typed-fifo (destination is regular file)",
+        "  changes: 3 symlinks; 2 special files; 2 type replacements among them",
+    ] {
+        assert!(
+            stdout.lines().any(|l| l == line),
+            "missing {line:?} in {stdout}"
+        );
+    }
+    let traces: std::collections::BTreeSet<String> =
+        String::from_utf8(read(&t.path("preview.ndjson")))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|v| v["type"] == "trace")
+            .map(|v| {
+                format!(
+                    "{} {} {} {}",
+                    v["dst"]["value"], v["action"], v["kind"], v["reason"]
+                )
+            })
+            .collect();
+    let expected: std::collections::BTreeSet<String> = [
+        r#""src/moved-link" "create_symlink" "symlink" "content_differs""#,
+        r#""src/new-fifo" "create_special" "special" "destination_missing""#,
+        r#""src/new-link" "create_symlink" "symlink" "destination_missing""#,
+        r#""src/typed-fifo" "create_special" "special" "type_differs""#,
+        r#""src/typed-link" "create_symlink" "symlink" "type_differs""#,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    assert_eq!(traces, expected);
+
+    let out = copy(&[]);
+    assert_output_ok(&out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in [
+        "src/new-link -> target",
+        "src/typed-link -> target",
+        "src/moved-link -> target",
+        "src/new-fifo",
+        "src/typed-fifo",
+    ] {
+        assert!(
+            stdout.lines().any(|l| l == line),
+            "missing {line:?} in {stdout}"
+        );
+    }
+    for name in ["new-fifo", "typed-fifo"] {
+        let path = t.path(&format!("dst/src/{name}"));
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_fifo());
+    }
+    for name in ["new-link", "typed-link", "moved-link"] {
+        let path = t.path(&format!("dst/src/{name}"));
+        assert_eq!(fs::read_link(&path).unwrap(), Path::new("target"));
+    }
+
+    let out = copy(&["--if-exists=error"]);
+    assert!(!out.status.success());
+    let stderr = stderr_of(&out);
+    for line in [
+        "syq: destination already exists: dst/src/new-link (--if-exists=error)",
+        "syq: destination already exists: dst/src/new-fifo (--if-exists=error)",
+    ] {
+        assert!(
+            stderr.lines().any(|l| l == line),
+            "missing {line:?} in {stderr}"
+        );
+    }
+}

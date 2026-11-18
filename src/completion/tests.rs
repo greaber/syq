@@ -468,7 +468,6 @@ fn completion_transport() -> (RemoteConn, std::os::unix::net::UnixStream) {
     crate::proto::FrameWriter::new(server.try_clone().unwrap(), false)
         .write_msg(&Response::HelloOk {
             descriptors: None,
-            identity: crate::identity::build().into(),
             platform: crate::identity::platform(),
             supports_confined_socket_nodes: false,
             ssh_worker_ticket: None,

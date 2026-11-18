@@ -282,6 +282,13 @@ mod tests {
         let guard = [1, 5, b'/', b'r', b'o', b'o', b't', 0xc8, 3, 0x95, 6];
         let (old, captured_guard) = captured.split_at(captured.len() - guard.len());
         assert_eq!(captured_guard, guard);
+        // The capture's leading variant tag predates the removal of
+        // Request::PartialPaths, which preceded WriteRange. The preamble pins
+        // peers to one build, so only the tag moved; the fields are unchanged.
+        assert_eq!(old[0], 24);
+        let mut old = old.to_vec();
+        old[0] = 23;
+        let old = old.as_slice();
         let bytes = [0, 1, 127, 128, 255, 9];
         assert_eq!(postcard::to_stdvec(&request(bytes.to_vec())).unwrap(), old);
         let frame = old.to_vec();

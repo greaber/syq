@@ -33,27 +33,14 @@ pub(super) fn target_endpoint(target: &str) -> Result<crate::cli::NativeEndpoint
 }
 
 pub(super) fn eligible_target(args: &crate::cli::Args) -> Result<String> {
-    use crate::cli::{CoordinateAt, Interface, PeerAuth};
-    let (destination, sources) = args
-        .locations
-        .split_last()
-        .context("copy endpoints missing")?;
-    if args.interface != Interface::NativeCp
-        || sources.iter().any(|s| s.is_remote())
-        || !destination.is_remote()
+    use crate::route::Route;
+    let destination = args.locations.last().context("copy endpoints missing")?;
+    if args.interface != crate::cli::Interface::NativeCp
+        || crate::route::classify(args) != Route::Upload
     {
         bail!("--auth-from requires syq cp with local sources and an SSH --to destination");
     }
-    if args.rsh.is_some()
-        || args.syq_path.is_some()
-        || args.no_bootstrap
-        || args.detach
-        || args.restricted_grant.is_some()
-        || args.peer_auth != PeerAuth::Restricted
-        || args.coordinate_at != CoordinateAt::Auto
-    {
-        bail!("return authorization owns its SSH connection; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --detach, --peer-auth, or --coordinate-at");
-    }
+    crate::route::refuse_options(Route::Upload, args)?;
     crate::directive::validate_restricted_args(args)?;
     let target = crate::remote_to_remote::endpoint_arg(destination, None, None);
     target_endpoint(&target)?;
@@ -72,12 +59,8 @@ pub(super) fn eligible_peer(args: &crate::cli::Args) -> Result<(String, String)>
 }
 
 /// Whether `args` copies from one server to another.
-pub(crate) fn between_servers(args: &crate::cli::Args) -> bool {
-    args.locations
-        .split_last()
-        .is_some_and(|(destination, sources)| {
-            destination.is_remote() && sources.first().is_some_and(|source| source.is_remote())
-        })
+fn between_servers(args: &crate::cli::Args) -> bool {
+    crate::route::classify(args) == crate::route::Route::Between
 }
 
 pub(super) fn select(
@@ -1084,9 +1067,6 @@ impl Prepare {
                 .transpose()?,
             agent: account.agent.as_deref(),
             allow_enrollment: self.allow_enrollment,
-            // This server's own syq connects to the receiver: a refusal for
-            // its build is that server's, which no refresh here changes.
-            retry_of: None,
             // No terminal: never prompt. Where the SSH configuration
             // would ask about a host key nobody knows, accept it the first
             // time, as `accept-new` does.

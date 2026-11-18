@@ -9,12 +9,12 @@ use crate::cli::{Args, SourceSelection};
 use crate::progress::{commas, Progress};
 use crate::proto::{
     Kind, NativeRemoveDisposition, NativeRemoveErrorClass, NativeRemoveKind, NativeRemoveOutcome,
-    NativeRemoveSelection, WireError, WireIoKind,
+    NativeRemoveSelection, WireError,
 };
 use crate::results::{
     RemovalRecord, ResultsWriter, RmResultRecord, RunMode, SelectionResultRecord,
 };
-use crate::transfer::{connect_ctl, endpoint};
+use crate::transfer::{connect_ctl, endpoint, io_os_kind, wire_os_kind};
 use anyhow::{bail, Result};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
@@ -296,7 +296,7 @@ fn record_outcome(
                 NativeRemoveErrorClass::Io => "unknown",
                 NativeRemoveErrorClass::Conflict => "no",
             };
-            let os_kind = failure.error.io_kind.map(wire_os_kind);
+            let os_kind = wire_os_kind(&failure.error);
             if let Some(writer) = results {
                 writer.emit_removal_result(&RemovalRecord {
                     selector: outcome.selector,
@@ -359,36 +359,6 @@ fn kind_name(kind: Kind) -> &'static str {
     }
 }
 
-fn wire_os_kind(kind: WireIoKind) -> &'static str {
-    match kind {
-        WireIoKind::NotFound => "not_found",
-        WireIoKind::PermissionDenied | WireIoKind::OwnedDirectoryPermissions => "permission_denied",
-        WireIoKind::AlreadyExists => "already_exists",
-        WireIoKind::InvalidInput => "invalid_input",
-        WireIoKind::NoSpace => "no_space",
-        WireIoKind::QuotaExceeded => "quota_exceeded",
-        WireIoKind::ReadOnly => "read_only",
-        WireIoKind::Other | WireIoKind::ReplaceRequired(_) | WireIoKind::CorruptedInTransit => {
-            "other"
-        }
-    }
-}
-
-fn io_os_kind(error: &std::io::Error) -> &'static str {
-    match error.raw_os_error() {
-        Some(libc::ENOSPC) => "no_space",
-        Some(libc::EDQUOT) => "quota_exceeded",
-        Some(libc::EROFS) => "read_only",
-        _ => match error.kind() {
-            std::io::ErrorKind::NotFound => "not_found",
-            std::io::ErrorKind::PermissionDenied => "permission_denied",
-            std::io::ErrorKind::AlreadyExists => "already_exists",
-            std::io::ErrorKind::InvalidInput => "invalid_input",
-            _ => "other",
-        },
-    }
-}
-
 fn fatal_classification(
     error: &anyhow::Error,
     remote: bool,
@@ -403,7 +373,7 @@ fn fatal_classification(
             } else {
                 "conflict"
             },
-            wire.io_kind.map(wire_os_kind),
+            wire_os_kind(wire),
         );
     }
     if let Some(io) = error

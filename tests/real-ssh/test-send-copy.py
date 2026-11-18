@@ -14,11 +14,7 @@ import subprocess
 import tempfile
 import time
 
-
-def run(*args, success=True):
-    result = subprocess.run(args, capture_output=True, text=True, timeout=60)
-    assert (result.returncode == 0) == success, (args, result)
-    return result.stdout
+from syq_real_ssh_lab import run
 
 
 receive_root = Path("/tmp/syq-real-ssh-receive")

@@ -1,4 +1,5 @@
 """Approved commands over the laptop-initiated connection, in disposable paths."""
+import functools
 import json
 import os
 from pathlib import Path
@@ -7,6 +8,8 @@ import signal
 import subprocess
 import tempfile
 import time
+
+import syq_real_ssh_lab as lab
 
 
 def run(*args):
@@ -17,13 +20,7 @@ def ready():
     run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
 
 
-def wait_for(description, predicate, timeout=5):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(.05)
-    raise AssertionError(f"Timed out: {description}")
+wait_for = functools.partial(lab.wait_for, timeout=5)
 
 
 root = Path("/tmp/syq-real-ssh-receive/exec-fixture")

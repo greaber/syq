@@ -15,7 +15,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -121,32 +121,23 @@ fn record_path(domain: &Domain, provider: &Provider, build: &str) -> Result<Path
     Ok(index(domain).join(format!("{name}.json")))
 }
 fn owned_directory(path: &Path) -> Result<bool> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
-    anyhow::ensure!(
-        metadata.is_dir()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o077 == 0,
-        "SSH provider directory must be owned and private: {}",
-        path.display()
-    );
-    Ok(true)
+    Ok(crate::state_file::open_private_dir(
+        path,
+        "SSH provider directory",
+        false,
+        crate::state_file::DirRule::NoGroupOther,
+    )?
+    .is_some())
 }
 fn directory(domain: &Domain) -> Result<PathBuf> {
     domain.ensure_runtime()?;
     let path = index(domain);
-    match fs::DirBuilder::new().mode(0o700).create(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
-    }
-    anyhow::ensure!(
-        owned_directory(&path)?,
-        "SSH provider directory disappeared"
-    );
+    crate::state_file::open_private_dir(
+        &path,
+        "SSH provider directory",
+        true,
+        crate::state_file::DirRule::NoGroupOther,
+    )?;
     Ok(path)
 }
 fn lock_file(path: &Path, create: bool) -> Result<File> {
@@ -257,9 +248,13 @@ fn validate_ticket(ticket: &Ticket) -> Result<()> {
 }
 fn write_record(domain: &Domain, record: &Record) -> Result<()> {
     let path = record_path(domain, &record.provider, &record.build)?;
-    let mut file = tempfile::NamedTempFile::new_in(index(domain))?;
-    file.write_all(&serde_json::to_vec(record)?)?;
-    file.persist(path)?;
+    crate::state_file::write_atomic(
+        &path,
+        &serde_json::to_vec(record)?,
+        0o600,
+        crate::state_file::Publish::Replace,
+        crate::state_file::Durability::RenameOnly,
+    )?;
     Ok(())
 }
 fn active(domain: &Domain, record: &Record) -> bool {
@@ -420,8 +415,13 @@ fn stop_master(record: &Record) -> Result<()> {
         .args(["-O", "exit"])
         .args(endpoint_arguments(record.endpoint()?));
     let deadline = Instant::now() + Duration::from_secs(5);
-    let output =
-        crate::process::capture_output_bounded(&mut command, deadline, &|| false, 16 * 1024)?;
+    let output = crate::process::capture_output_bounded(
+        "SSH provider shutdown",
+        &mut command,
+        deadline,
+        &|| false,
+        16 * 1024,
+    )?;
     if !output.status.success() && !remove_abandoned_control(record)? {
         bail!(
             "SSH provider refused shutdown: {}",
@@ -557,15 +557,25 @@ fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
     anyhow::ensure!(!cancelled(), "SSH provider setup cancelled");
     let spec = helper_spec(&owner.record)?;
     let mut probe = spec.helper_command(&["--build-identity".into()]);
-    let result =
-        crate::process::capture_output_bounded(&mut probe, deadline, &cancelled, 16 * 1024)?;
+    let result = crate::process::capture_output_bounded(
+        "SSH provider helper check",
+        &mut probe,
+        deadline,
+        &cancelled,
+        16 * 1024,
+    )?;
     if crate::remote_helper::needs_install(result.status.code()) {
         let mut install = crate::process::self_command()?;
         install
             .arg(INSTALL)
             .arg(serde_json::to_string(&owner.record)?);
-        let result =
-            crate::process::capture_output_bounded(&mut install, deadline, &cancelled, 64 * 1024)?;
+        let result = crate::process::capture_output_bounded(
+            "SSH provider helper installation",
+            &mut install,
+            deadline,
+            &cancelled,
+            64 * 1024,
+        )?;
         anyhow::ensure!(
             result.status.success(),
             "could not install SSH provider helper: {}",
@@ -740,6 +750,7 @@ fn forward_service(record: &Record, remote: &Path) -> Result<()> {
         ))
         .args(endpoint_arguments(record.endpoint()?));
     let output = crate::process::capture_output_bounded(
+        "SSH provider socket forwarding",
         &mut command,
         Instant::now() + Duration::from_secs(10),
         &|| false,
@@ -1020,6 +1031,15 @@ pub(crate) fn cleanup_domain(domain: &Domain) -> Result<()> {
     if errors.is_empty() {
         for entry in fs::read_dir(index(domain))? {
             let path = entry?.path();
+            // A writer killed before publishing leaves its temporary file;
+            // every keeper has stopped, so nothing will publish it.
+            if path
+                .file_name()
+                .is_some_and(crate::state_file::is_own_temp_name)
+            {
+                fs::remove_file(path)?;
+                continue;
+            }
             anyhow::ensure!(
                 entry_key(&path, "lock") || entry_key(&path, "stop"),
                 "unrecognized SSH provider state: {}",
@@ -1092,6 +1112,7 @@ pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::net::UnixListener;
 
     fn provider() -> Provider {
@@ -1213,6 +1234,19 @@ mod tests {
         assert!(!index(&domain).exists());
         assert!(!record.directory.exists());
         assert!(!older.directory.exists());
+    }
+
+    #[test]
+    fn persist_off_removes_temporaries_a_killed_writer_left() {
+        let (_root, domain, record) = cleanup_fixture();
+        let current = record_path(&domain, &record.provider, &record.build).unwrap();
+        drop(lock_file(&current.with_extension("lock"), true).unwrap());
+        for name in [".tmpAb12Z9", ".syq-tmp-123-00ff00ff00ff00ff"] {
+            fs::write(index(&domain).join(name), b"{").unwrap();
+        }
+        stop_all(&domain).unwrap();
+        cleanup_domain(&domain).unwrap();
+        assert!(!index(&domain).exists());
     }
 
     #[cfg(target_os = "linux")]

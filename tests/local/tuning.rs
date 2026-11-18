@@ -1958,7 +1958,7 @@ fn tuning_history_records_short_copy_and_exports_interactive_timeline() {
         .as_u64()
         .unwrap();
     assert_eq!(terminal["timings"]["transfer_ms"], copying_ms);
-    assert!(records[0]["run"]["selected_workers"].is_null());
+    assert!(records[0]["run"].get("selected_workers").is_none());
     assert!(records
         .iter()
         .any(|r| r["event"]["data"]["disposition"] == "final_partial"));
@@ -2030,7 +2030,7 @@ fn tuning_history_records_failed_copy_without_recommending_it() {
     let text = String::from_utf8(output.stdout).unwrap();
     let record: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
     assert_eq!(record["run"]["status"], "failed");
-    assert!(record["run"]["selected_workers"].is_null());
+    assert!(record["run"].get("selected_workers").is_none());
 }
 
 #[test]

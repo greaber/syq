@@ -2,8 +2,10 @@ use super::*;
 use crate::directive::{Binding, Inputs, Role, NAMESPACE};
 use crate::process::CommandExt as _;
 use ssh_key::{LineEnding, PrivateKey};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -41,7 +43,11 @@ impl TestDir {
             let path = parent.join(format!(
                 "syq-{label}-{}-{}",
                 std::process::id(),
-                hex(&random_array::<4>().expect("test randomness"))
+                hex(&{
+                    let mut bytes = [0u8; 4];
+                    getrandom::fill(&mut bytes).expect("test randomness");
+                    bytes
+                })
             ));
             let result = fs::DirBuilder::new().mode(0o700).create(&path);
             match result {

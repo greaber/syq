@@ -77,7 +77,6 @@ use std::os::unix::ffi::OsStrExt;
 fn hello_ok() -> Response {
     Response::HelloOk {
         descriptors: None,
-        identity: crate::identity::build().into(),
         platform: crate::identity::platform(),
         supports_confined_socket_nodes: crate::identity::supports_confined_socket_nodes(),
         ssh_worker_ticket: None,
@@ -325,16 +324,15 @@ fn try_recv_takes_arrived_deferred_replies_and_waits_for_none() {
 }
 
 #[test]
-fn observation_frames_do_not_enter_the_data_queue_or_bypass_identity_pinning() {
+fn observation_frames_do_not_enter_the_data_queue_or_bypass_the_hello() {
     for accepted in [true, false] {
         let mut wire = Vec::new();
         let mut writer = FrameWriter::new(&mut wire, false);
-        let mut hello = hello_ok();
-        if !accepted {
-            if let Response::HelloOk { identity, .. } = &mut hello {
-                *identity = "v0.6.0".into();
-            }
-        }
+        let hello = if accepted {
+            hello_ok()
+        } else {
+            Response::Err("refused".into())
+        };
         writer.write_msg(&hello).unwrap();
         for solicited in [false, false, true] {
             writer
@@ -356,10 +354,8 @@ fn observation_frames_do_not_enter_the_data_queue_or_bypass_identity_pinning() {
             observation.clone(),
         )
         .unwrap();
-        assert!(matches!(
-            rx.recv().unwrap().unwrap().value,
-            Response::HelloOk { .. }
-        ));
+        let first = rx.recv().unwrap().unwrap().value;
+        assert_eq!(matches!(first, Response::HelloOk { .. }), accepted);
         if accepted {
             assert!(matches!(
                 rx.recv().unwrap().unwrap().value,
@@ -416,12 +412,11 @@ fn client_reader_requires_accepted_hello_before_large_data() {
     for accepted in [false, true] {
         let mut wire = Vec::new();
         let mut writer = FrameWriter::new(&mut wire, false);
-        let mut hello = hello_ok();
-        if let Response::HelloOk { identity, .. } = &mut hello {
-            if !accepted {
-                *identity = "wrong-build".into();
-            }
-        }
+        let hello = if accepted {
+            hello_ok()
+        } else {
+            Response::Err("refused".into())
+        };
         writer.write_msg(&hello).unwrap();
         writer
             .write_msg(&Response::Block {
@@ -432,10 +427,8 @@ fn client_reader_requires_accepted_hello_before_large_data() {
             .unwrap();
         drop(writer);
         let (rx, thread) = spawn_reader(Box::new(std::io::Cursor::new(wire)), 4);
-        assert!(matches!(
-            rx.recv().unwrap().unwrap().value,
-            Response::HelloOk { .. }
-        ));
+        let first = rx.recv().unwrap().unwrap().value;
+        assert_eq!(matches!(first, Response::HelloOk { .. }), accepted);
         if accepted {
             assert!(
                 matches!(rx.recv().unwrap().unwrap().value, Response::Block { data, .. } if data.len() == 2 << 20)
@@ -467,13 +460,6 @@ fn remote_vector_replies_must_match_request_counts() {
                     }],
                 },
                 Response::Applied(vec![None; count]),
-            ),
-            (
-                Request::PartialPaths {
-                    paths: vec![b"file".to_vec()],
-                    copy_id: [0; 16],
-                },
-                Response::PathResults(vec![Ok(b"partial".to_vec()); count]),
             ),
         ];
         for (request, response) in cases {
@@ -684,7 +670,6 @@ fn local_workers_clone_the_control_descriptor_session_in_process() {
                 follow_root: false,
             }],
             symlink_policy: OperatorSymlinkPolicy::Refuse,
-            allow_unconfined_paths: false,
             shared_workers: 1,
             independent_handoff_workers: 0,
         })
@@ -724,7 +709,6 @@ fn local_source_worker_rejects_destination_mutation_requests() {
                 follow_root: false,
             }],
             symlink_policy: OperatorSymlinkPolicy::Refuse,
-            allow_unconfined_paths: false,
             shared_workers: 1,
             independent_handoff_workers: 0,
         })
@@ -1251,7 +1235,6 @@ fn hello_carries_destination_initialization_before_readiness() {
         writer
             .write_msg(&Response::HelloOk {
                 descriptors: None,
-                identity: crate::identity::build().to_string(),
                 platform: crate::identity::platform(),
                 supports_confined_socket_nodes: crate::identity::supports_confined_socket_nodes(),
                 ssh_worker_ticket: None,
@@ -1411,7 +1394,6 @@ fn ssh_exit_255_wins_over_a_missing_wire_preamble() {
     assert!(is_ssh_connect_error(&error));
     conn.peer = Some(PeerInfo {
         descriptors: None,
-        identity: crate::identity::build().into(),
         platform: crate::identity::platform(),
         supports_confined_socket_nodes: false,
         ssh_worker_ticket: None,
@@ -3012,7 +2994,6 @@ fn only_sessions_within_a_run_use_the_handshake_platform() {
     assert_eq!(spec.session_command_for(&server, true), before);
     spec.diagnostics.lock().unwrap().peer = Some(PeerInfo {
         descriptors: None,
-        identity: crate::identity::build().into(),
         platform: "linux-aarch64".into(),
         supports_confined_socket_nodes: true,
         ssh_worker_ticket: None,
@@ -3697,4 +3678,34 @@ fn a_receiver_that_refused_the_copy_is_reported_once_without_retrying() {
     assert!(!message.contains("preamble"), "{message}");
     assert!(!helper_needs_install(&error), "{message}");
     assert_eq!(std::fs::read_to_string(&log).unwrap(), "attempt\n");
+}
+
+#[test]
+fn a_local_scan_without_a_registered_source_is_refused() {
+    let tree = crate::test_support::tempdir().unwrap();
+    std::fs::write(tree.path().join("file"), b"data").unwrap();
+    let mut conn = LocalConn::new(&ConnectionRole::Control, Default::default());
+    let mut entries = 0;
+    let error = conn
+        .scan(
+            tree.path().as_os_str().as_bytes(),
+            None,
+            false,
+            &[],
+            false,
+            &mut |batch| {
+                entries += batch.len();
+                Ok(())
+            },
+            &mut |_| Ok(()),
+            &mut |_| {},
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("neither a registered source nor a destination root"),
+        "{error:#}"
+    );
+    assert_eq!(entries, 0);
 }

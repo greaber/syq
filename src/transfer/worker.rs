@@ -586,20 +586,9 @@ impl Worker {
             Item::Finish { idx, matched } => {
                 let progress = self.progress.clone();
                 let _copying = progress.copying_interval();
-                let result = if matched {
-                    self.finish_matched_file(idx)
-                } else {
-                    self.finish_file(idx)
-                };
-                let result = match result {
-                    Err(e) => {
-                        if self.transport_dead() {
-                            self.sched.requeue_finish(idx, matched);
-                        }
-                        self.file_error(idx, e)
-                    }
-                    Ok(()) => Ok(()),
-                };
+                let result = self
+                    .publish(idx, matched)
+                    .and_then(|()| self.settle_publications(true));
                 // Include error handling and retry publication in the claim's
                 // lifetime; even an early error return must release it.
                 self.sched.finish_done();
@@ -1446,6 +1435,19 @@ impl Worker {
     }
 
     pub(super) fn handle_file(&mut self, idx: usize) -> Result<()> {
+        /// How the file is completed once planned.
+        enum Plan {
+            /// These ranges are sent, and then the staged or in-place file
+            /// still needs `Finalize`.
+            Send(Vec<(u64, u64)>),
+            /// The receiver copied every byte itself, already counted as
+            /// copied; the file still needs `Finalize`.
+            Copied,
+            /// A verified content match whose metadata is already applied:
+            /// only the source check remains.
+            Matched,
+        }
+
         let job = self.job(idx);
         if job.compare_ranges {
             // A source-change retry chooses its policy again from current facts.
@@ -1455,8 +1457,8 @@ impl Worker {
         let opts = self.opts.clone();
         let _ = &opts;
 
-        if self.opts.protects_existing_contents() && job.dst_entry.is_some() {
-            let checked = (|| {
+        let planned: Result<Plan> = (|| {
+            if self.opts.protects_existing_contents() && job.dst_entry.is_some() {
                 anyhow::ensure!(
                     self.opts.if_exists != Some(crate::cli::IfExists::Error),
                     "destination already exists: {} (--if-exists=error)",
@@ -1468,151 +1470,68 @@ impl Worker {
                     "{}",
                     self.opts.file_difference_message(&job.rel)
                 );
-                Ok(())
-            })();
-            // A content-identical file the receiver will not keep is
-            // replaced below, as a changed file is.
-            if checked.is_err() || !job.replace {
-                self.sched.ranges_ready(idx, vec![]);
-                checked?;
-                if let Err(error) = self.finish_matched_basis(idx, &job) {
-                    if self.replace_instead(idx, &error) {
-                        return Ok(());
-                    }
-                    return Err(error);
+                // A content-identical file the receiver will not keep is
+                // replaced below, as a changed file is.
+                if !job.replace {
+                    self.finish_matched_basis(idx, &job)?;
+                    return Ok(Plan::Matched);
                 }
-                job.done.store(size, Relaxed);
-                self.progress.bytes_unchanged.fetch_add(size, Relaxed);
-                self.progress.bytes_total.fetch_sub(size, Relaxed);
-                return self.finish_matched_file(idx);
             }
-        }
 
-        match self.try_expected_match(idx, &job) {
-            Ok(true) => {
-                job.done.store(size, Relaxed);
-                self.progress.bytes_unchanged.fetch_add(size, Relaxed);
-                self.progress.bytes_total.fetch_sub(size, Relaxed);
-                self.sched.ranges_ready(idx, vec![]);
-                if let Err(error) = self.finish_matched_file(idx) {
-                    if self.transport_dead() {
-                        self.sched.requeue_finish(idx, true);
-                    }
-                    return Err(error);
-                }
-                return Ok(());
+            if self.try_expected_match(idx, &job)? {
+                return Ok(Plan::Matched);
             }
-            Ok(false) => {}
-            Err(error) => {
-                if self.end_failed_probe(idx, &error) {
-                    return Ok(());
-                }
-                return Err(error);
-            }
-        }
 
-        // Only a new file is written in place (`--in-place=new`).
-        let inplace = job.inplace;
-        // A file a grouped comparison already found different, or could not
-        // patch, is copied whole without comparing it again.
-        let reuse_blocks = !job.compared && self.opts.reuses_blocks();
-        let checksum = self.opts.checksum && !job.compared;
-        let final_file = job
-            .dst_entry
-            .as_deref()
-            .filter(|entry| entry.kind == Kind::File);
-        // An explicit content check decides whether an existing file needs
-        // copying; it does not change how the copy is made. Without block
-        // reuse a differing file is replaced whole, so on the same host probe
-        // equality and stop at the first difference rather than hashing both
-        // files to the end; the windows cost no round trips there. A matching
-        // file finishes through its retained inode. Remote copies keep their
-        // single exchange below.
-        let mut known_different = false;
-        if checksum && self.opts.same_host && !reuse_blocks && size > 0 && !job.replace {
-            if let Some(existing) = final_file {
-                let matched = existing.size == size
-                    && match self.matches_final_windows(&job) {
-                        Ok(matched) => matched,
-                        Err(error) => {
-                            if self.end_failed_probe(idx, &error) {
-                                return Ok(());
-                            }
-                            return Err(error);
-                        }
-                    };
-                if matched {
-                    if let Err(error) = self.finish_matched_basis(idx, &job) {
-                        if self.end_failed_probe(idx, &error) {
-                            return Ok(());
-                        }
-                        return Err(error);
+            // Only a new file is written in place (`--in-place=new`).
+            let inplace = job.inplace;
+            // A file a grouped comparison already found different, or could not
+            // patch, is copied whole without comparing it again.
+            let reuse_blocks = !job.compared && self.opts.reuses_blocks();
+            let checksum = self.opts.checksum && !job.compared;
+            let final_file = job
+                .dst_entry
+                .as_deref()
+                .filter(|entry| entry.kind == Kind::File);
+            // An explicit content check decides whether an existing file needs
+            // copying; it does not change how the copy is made. Without block
+            // reuse a differing file is replaced whole, so on the same host probe
+            // equality and stop at the first difference rather than hashing both
+            // files to the end; the windows cost no round trips there. A matching
+            // file finishes through its retained inode. Remote copies keep their
+            // single exchange below.
+            let mut known_different = false;
+            if checksum && self.opts.same_host && !reuse_blocks && size > 0 && !job.replace {
+                if let Some(existing) = final_file {
+                    if existing.size == size && self.matches_final_windows(&job)? {
+                        self.finish_matched_basis(idx, &job)?;
+                        return Ok(Plan::Matched);
                     }
-                    job.done.store(size, Relaxed);
-                    self.progress.bytes_unchanged.fetch_add(size, Relaxed);
-                    self.progress.bytes_total.fetch_sub(size, Relaxed);
-                    self.sched.ranges_ready(idx, vec![]);
-                    if let Err(error) = self.finish_matched_file(idx) {
-                        if self.transport_dead() {
-                            self.sched.requeue_finish(idx, true);
-                        }
-                        return Err(error);
-                    }
-                    return Ok(());
-                }
-                known_different = true;
-            }
-        }
-        // Same-machine copy: let the receiver move the bytes directly (kernel
-        // offload, or an eligible sequential userspace writer) instead of
-        // framing, hashing and scheduling them through the transport.
-        // copy_file_range cannot be paced, so a limited same-machine transfer
-        // uses the regular userspace path (also useful for mounted NFS paths).
-        // Reuse needs comparison only when there is a final file to compare.
-        // Fresh files can still use the whole-file shortcut with reuse enabled.
-        let compare_existing = final_file.is_some() && reuse_blocks;
-        if !(compare_existing || job.attempt > 0 && reuse_blocks)
-            && self
-                .opts
-                .copy_policy(self.bwlimit.is_some())
-                .file_operation(job.entry.size)
-                == crate::copy_policy::FileOperation::ReceiverCopy
-        {
-            match self.try_copy_local(idx, &job) {
-                Ok(true) => {
-                    self.sched.ranges_ready(idx, vec![]);
-                    return Ok(());
-                }
-                Ok(false) => {
-                    // The one-worker automatic start was only a cheap direct
-                    // copy probe. Restore the normal local worker count before
-                    // exposing userspace ranges for an unsupported offload.
-                    self.sched.request_direct_fallback();
-                }
-                Err(e) => {
-                    // `--in-place=update` found a file it will not write in
-                    // place, before copying anything. Otherwise
-                    // try_copy_local queues publication recovery after it
-                    // has credited the completed kernel copy; earlier
-                    // connection failures still need the whole probe.
-                    let replaced = self.replacing(idx, &e);
-                    if replaced
-                        || (self.transport_dead() && job.done.load(Relaxed) < job.entry.size)
-                    {
-                        self.sched.requeue_probed(idx);
-                    } else {
-                        self.sched.ranges_ready(idx, vec![]);
-                    }
-                    if replaced {
-                        return Ok(());
-                    }
-                    return Err(e);
+                    known_different = true;
                 }
             }
-        }
-        // bool = a staged or in-place file still needs Finalize. A verified
-        // content match applies metadata through its retained basis fd instead.
-        let planned: Result<(Vec<(u64, u64)>, bool)> = (|| {
+            // Same-machine copy: let the receiver move the bytes directly (kernel
+            // offload, or an eligible sequential userspace writer) instead of
+            // framing, hashing and scheduling them through the transport.
+            // copy_file_range cannot be paced, so a limited same-machine transfer
+            // uses the regular userspace path (also useful for mounted NFS paths).
+            // Reuse needs comparison only when there is a final file to compare.
+            // Fresh files can still use the whole-file shortcut with reuse enabled.
+            let compare_existing = final_file.is_some() && reuse_blocks;
+            if !(compare_existing || job.attempt > 0 && reuse_blocks)
+                && self
+                    .opts
+                    .copy_policy(self.bwlimit.is_some())
+                    .file_operation(job.entry.size)
+                    == crate::copy_policy::FileOperation::ReceiverCopy
+            {
+                if self.try_copy_local(&job)? {
+                    return Ok(Plan::Copied);
+                }
+                // The one-worker automatic start was only a cheap direct
+                // copy probe. Restore the normal local worker count before
+                // exposing userspace ranges for an unsupported offload.
+                self.sched.request_direct_fallback();
+            }
             let final_entry = job.dst_entry.as_deref();
             if let Some(f) = &final_entry {
                 if f.kind == Kind::Dir {
@@ -1636,7 +1555,7 @@ impl Worker {
                     let diff = self.diff_final_and_hold(&job)?;
                     if diff.ranges.is_empty() && diff.held_len == Some(size) {
                         self.finish_matched_basis(idx, &job)?;
-                        return Ok((vec![], false));
+                        return Ok(Plan::Matched);
                     }
                     // `--in-place=update`: a differing file the receiver will
                     // not update in place is replaced, from the file it
@@ -1651,19 +1570,21 @@ impl Worker {
                         let job = self.job(idx);
                         if !reuse_blocks {
                             self.prepare_file(idx, &job, true)?;
-                            return Ok((full(), true));
+                            return Ok(Plan::Send(full()));
                         }
                         let prepared = self.prepare_file(idx, &job, false)?;
                         if prepared.partial_size.is_some() {
-                            return Ok((self.resume_ranges(idx, &job)?, true));
+                            return Ok(Plan::Send(self.resume_ranges(idx, &job)?));
                         }
                         if !self.whole_file_hashes(size) {
-                            return Ok((self.stage_large_file(idx, &job, true)?, true));
+                            return Ok(Plan::Send(self.stage_large_file(idx, &job, true)?));
                         }
-                        return Ok((
-                            self.reuse_blocks_from(&job, diff.source_hashes, &diff.ranges, true)?,
+                        return Ok(Plan::Send(self.reuse_blocks_from(
+                            &job,
+                            diff.source_hashes,
+                            &diff.ranges,
                             true,
-                        ));
+                        )?));
                     }
                     Some(diff)
                 } else {
@@ -1689,7 +1610,7 @@ impl Worker {
                 } else {
                     full()
                 };
-                return Ok((ranges, true));
+                return Ok(Plan::Send(ranges));
             }
             // Resume an owned output or a previous invocation's partial,
             // independently of the policy for reusing the final destination.
@@ -1702,9 +1623,9 @@ impl Worker {
                     if prepared.partial_size.is_none() {
                         self.prepare_file(idx, &job, true)?;
                     }
-                    return Ok((vec![], true));
+                    return Ok(Plan::Send(vec![]));
                 }
-                return Ok((self.resume_ranges(idx, &job)?, true));
+                return Ok(Plan::Send(self.resume_ranges(idx, &job)?));
             }
             // A file the receiver will not keep is replaced as a changed file
             // is, whatever its contents: with block reuse, a stage is seeded
@@ -1713,11 +1634,11 @@ impl Worker {
             // whole into the sidecar Prepare created.
             if job.replace && final_is_file && !inplace {
                 if !reuse_blocks || size == 0 {
-                    return Ok((full(), true));
+                    return Ok(Plan::Send(full()));
                 }
                 if !self.bandwidth_limited_remote_source() {
                     self.stage_comparison(idx, &job, true)?;
-                    return Ok((full(), true));
+                    return Ok(Plan::Send(full()));
                 }
             }
             // Probe equality without creating a sidecar. A difference restarts
@@ -1734,10 +1655,10 @@ impl Worker {
                     && self.matches_final_windows(&job)?
                 {
                     self.finish_matched_basis(idx, &job)?;
-                    return Ok((vec![], false));
+                    return Ok(Plan::Matched);
                 }
                 self.stage_comparison(idx, &job, true)?;
-                return Ok((full(), true));
+                return Ok(Plan::Send(full()));
             }
 
             if !reuse_blocks {
@@ -1750,47 +1671,54 @@ impl Worker {
                         let diff = self.diff_final_and_hold(&job)?;
                         if diff.ranges.is_empty() && diff.held_len == Some(size) {
                             self.finish_matched_basis(idx, &job)?;
-                            return Ok((vec![], false));
+                            return Ok(Plan::Matched);
                         }
                     }
                     let prepared = self.prepare_file(idx, &job, true)?;
                     if prepared.partial_size.is_some() || prepared.has_candidates {
-                        return Ok((self.resume_ranges(idx, &job)?, true));
+                        return Ok(Plan::Send(self.resume_ranges(idx, &job)?));
                     }
                 }
-                return Ok((full(), true));
+                return Ok(Plan::Send(full()));
             }
             if final_is_file {
                 let diff = self.diff_final_and_hold(&job)?;
                 if diff.ranges.is_empty() && diff.held_len == Some(size) && !job.replace {
                     self.finish_matched_basis(idx, &job)?;
-                    return Ok((vec![], false));
+                    return Ok(Plan::Matched);
                 }
                 if !self.whole_file_hashes(size) {
-                    return Ok((self.stage_large_file(idx, &job, true)?, true));
+                    return Ok(Plan::Send(self.stage_large_file(idx, &job, true)?));
                 }
-                return Ok((
-                    {
-                        // Seeding from the final file prepares this one.
-                        self.receiver_holds(idx);
-                        self.reuse_blocks(&job, diff.source_hashes, &diff.ranges)?
-                    },
-                    true,
-                ));
+                // Seeding from the final file prepares this one.
+                self.receiver_holds(idx);
+                return Ok(Plan::Send(self.reuse_blocks(
+                    &job,
+                    diff.source_hashes,
+                    &diff.ranges,
+                )?));
             }
             if prepared.has_candidates {
-                return Ok((self.resume_ranges(idx, &job)?, true));
+                return Ok(Plan::Send(self.resume_ranges(idx, &job)?));
             }
-            Ok((full(), true))
+            Ok(Plan::Send(full()))
         })();
 
-        let (ranges, needs_finalize) = match planned {
-            Ok(result) => result,
+        let plan = match planned {
+            Ok(plan) => plan,
             Err(e) => {
                 if self.end_failed_probe(idx, &e) {
                     return Ok(());
                 }
                 return Err(e);
+            }
+        };
+        let (ranges, matched) = match plan {
+            Plan::Send(ranges) => (ranges, false),
+            Plan::Matched => (Vec::new(), true),
+            Plan::Copied => {
+                self.sched.ranges_ready(idx, vec![]);
+                return self.publish(idx, false);
             }
         };
         let to_send: u64 = ranges.iter().map(|(o, e)| e - o).sum();
@@ -1817,20 +1745,9 @@ impl Worker {
                     self.publish(idx, false)?;
                 }
             }
-            None => self.publish(idx, !needs_finalize)?,
+            None => self.publish(idx, matched)?,
         }
         Ok(())
-    }
-
-    /// When the receiver refused to keep this file because it will not change
-    /// its metadata in place (`fsops::vouch`), copy it again as a file to
-    /// replace, and say so. The job's scheduling has been settled.
-    fn replace_instead(&self, idx: usize, error: &anyhow::Error) -> bool {
-        let replacing = self.replacing(idx, error);
-        if replacing {
-            self.sched.requeue(idx);
-        }
-        replacing
     }
 
     /// Whether `error` asks for the file at `idx` to be replaced rather than
@@ -2034,15 +1951,16 @@ impl Worker {
         Ok(())
     }
 
-    /// Attempt a receiver-side same-host copy. Ok(true) = done; Ok(false) =
+    /// Attempt a receiver-side same-host copy. Ok(true) = every byte is
+    /// written and counted, and the file waits to be published; Ok(false) =
     /// receiver cannot use its direct path, so the caller should stream;
     /// Err = real failure.
     /// The caller owns scheduler probing bookkeeping for every terminal result.
-    pub(super) fn try_copy_local(&mut self, idx: usize, job: &WorkerJob) -> Result<bool> {
-        // Write to a partial and let finish_file rename it, so an interrupted
-        // A receiver-side copy never leaves a final-named file the quick check
-        // could mistake for complete. Only --inplace writes the final path
-        // directly.
+    pub(super) fn try_copy_local(&mut self, job: &WorkerJob) -> Result<bool> {
+        // Write to a partial and let publication rename it, so that an
+        // interrupted receiver-side copy never leaves a final-named file the
+        // quick check could mistake for complete. Only --inplace writes the
+        // final path directly.
         let inplace = job.inplace;
         // A file it creates in place waits owner-only for its group or ACL,
         // as a sidecar does.
@@ -2087,12 +2005,6 @@ impl Worker {
                 self.benchmark.local_whole_files += 1;
                 self.progress.add_bytes(job.entry.size - credited);
                 job.done.store(job.entry.size, Relaxed);
-                if let Err(e) = self.finish_file(idx) {
-                    if self.transport_dead() {
-                        self.sched.requeue_finish(idx, false);
-                    }
-                    return Err(e);
-                }
                 Ok(true)
             }
             Response::CopyLocalUnsupported => Ok(false),
@@ -3136,21 +3048,6 @@ impl Worker {
             .any(|path| path.starts_with(&prefix) && !path[prefix.len()..].contains(&b'/'))
     }
 
-    /// Publish the file at `idx`, waiting for each round trip; `publish`
-    /// does the same without waiting.
-    pub(super) fn finish_file(&mut self, idx: usize) -> Result<()> {
-        let Some((job, earlier_partials)) = self.publication_checks(idx, false)? else {
-            return Ok(());
-        };
-        if !self.recheck_source(idx, &job, job.inplace)? {
-            return Ok(());
-        }
-        let response = self
-            .dst
-            .call(self.finalize_request(&job, earlier_partials))?;
-        self.finalized(idx, job, earlier_partials, response)
-    }
-
     pub(super) fn finalize_request(&self, job: &WorkerJob, earlier_partials: bool) -> Request {
         let mut meta = self.opts.metadata_for(&job.rel_bytes, &job.entry);
         meta.mode = self.create_mode(job);
@@ -3275,31 +3172,6 @@ impl Worker {
                 bail!("unexpected responses {source:?} {destination:?}")
             }
         }
-    }
-
-    pub(super) fn finish_matched_file(&mut self, idx: usize) -> Result<()> {
-        let Some((job, _)) = self.publication_checks(idx, true)? else {
-            return Ok(());
-        };
-        if !self.recheck_source(idx, &job, true)? {
-            return Ok(());
-        }
-        self.complete_file(job, true)
-    }
-
-    /// Recheck before publishing staged data. A retry leaves both the old
-    /// destination and the completed partial in place; normal resume planning
-    /// can reuse the partial's matching blocks. In-place writes and verified
-    /// matches already have their completed contents at the destination.
-    fn recheck_source(
-        &mut self,
-        idx: usize,
-        job: &WorkerJob,
-        destination_completed: bool,
-    ) -> Result<bool> {
-        // Did the source change under us?
-        let now = stat_one_registered(&mut *self.src, &job.src, &job.source, false)?;
-        self.source_unchanged(idx, job, destination_completed, now)
     }
 
     /// Whether the source of the file at `idx` is unchanged, now `now`, so
@@ -3445,7 +3317,7 @@ impl Worker {
             Response::Applied(results) if results.len() == 1 => {
                 if let Some(error) = &results[0] {
                     // A refusal to change the file in place stays readable
-                    // for `replace_instead`.
+                    // for `replacing`.
                     return Err(ChangeFailed::replying(
                         "update metadata after expected digest match",
                         error.clone(),

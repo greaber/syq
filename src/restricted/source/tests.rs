@@ -41,7 +41,6 @@ fn registration(policy: &SourcePolicy) -> Request {
         base: policy.base.clone(),
         selections: policy.selections.clone(),
         symlink_policy: policy.symlink_policy,
-        allow_unconfined_paths: false,
         shared_workers: 0,
         independent_handoff_workers: 0,
     }
@@ -112,13 +111,12 @@ fn registration_checks_approved_selectors_before_opening_paths() {
     let authority = SourceAuthority::new(policy).unwrap();
     let control = authority.acquire(&ConnectionRole::Control, false).unwrap();
     let mut ops = FsOps::new();
-    for changed in 0..5 {
+    for changed in 0..4 {
         let mut altered = request.clone();
         let Request::RegisterSourceRoots {
             base,
             selections,
             symlink_policy,
-            allow_unconfined_paths,
             ..
         } = &mut altered
         else {
@@ -128,7 +126,6 @@ fn registration_checks_approved_selectors_before_opening_paths() {
             0 => base.path = Some(b"/".to_vec()),
             1 => selections[0].path = b"/unapproved/path".to_vec(),
             2 => selections[0].follow_root = true,
-            3 => *allow_unconfined_paths = true,
             _ => *symlink_policy = OperatorSymlinkPolicy::FollowAll,
         }
         assert!(control.register(&mut ops, &altered).is_err());
@@ -761,7 +758,6 @@ fn a_linked_home_reads_relative_sources_without_following_links() {
             base: reads.base.clone(),
             selections: reads.selections.clone(),
             symlink_policy: reads.symlink_policy,
-            allow_unconfined_paths: false,
             shared_workers: 0,
             independent_handoff_workers: 0,
         };

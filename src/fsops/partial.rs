@@ -3634,7 +3634,6 @@ impl FsOps {
                 base,
                 selections,
                 symlink_policy,
-                allow_unconfined_paths,
                 shared_workers,
                 independent_handoff_workers,
             } => self
@@ -3642,7 +3641,6 @@ impl FsOps {
                     base,
                     selections,
                     *symlink_policy,
-                    *allow_unconfined_paths,
                     *shared_workers,
                     *independent_handoff_workers,
                 )
@@ -3676,12 +3674,7 @@ impl FsOps {
                 )?;
                 self.prune_lookup(paths).map(Response::Stats)
             })(),
-            Request::PartialPaths { paths, copy_id } => {
-                Ok(Response::PathResults(self.partial_paths(paths, copy_id)))
-            }
             Request::PlanBatch {
-                partial_paths,
-                copy_id,
                 directories,
                 others,
                 strict_metadata,
@@ -3695,7 +3688,6 @@ impl FsOps {
                         others.len()
                     ),
                 )?;
-                let partial_paths = self.partial_paths(partial_paths, copy_id);
                 let directories = if *strict_metadata {
                     self.prune_lookup(directories)?
                 } else {
@@ -3716,7 +3708,6 @@ impl FsOps {
                     None
                 };
                 Ok(Response::BatchPlan {
-                    partial_paths,
                     directories,
                     others,
                 })
@@ -4177,7 +4168,7 @@ impl FsOps {
             }
             _ => {}
         }
-        self.rebase_response(response)
+        response
     }
 }
 

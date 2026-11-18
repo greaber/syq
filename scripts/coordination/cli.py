@@ -6,10 +6,9 @@ import re
 import signal
 import subprocess
 import sys
-import time
 
 from . import resources, reviews
-from .store import Error, Store, name, notify, publish
+from .store import Error, Store, name, notify, poll, publish
 
 
 def positive(value):
@@ -215,9 +214,7 @@ def dispatch(store, args):
 def wait_topic(store, topic_name, agent, timeout):
     name(topic_name)
     name(agent)
-    deadline = time.monotonic() + timeout
-    progress = 0
-    while True:
+    def unread():
         with store.locked() as state:
             topic = state['topics'].get(topic_name)
             if topic is None:
@@ -226,14 +223,9 @@ def wait_topic(store, topic_name, agent, timeout):
                 raise Error('Subscribe before waiting for updates')
             cursor = topic['subscribers'][agent]
             events = topic['events'][cursor:]
-            if events:
-                return {'topic': topic_name, 'cursor': cursor, 'events': events}
-        if time.monotonic() >= deadline:
-            raise Error(f'Timed out waiting for {topic_name}; no unread updates. Subscription and cursor unchanged.')
-        if time.monotonic() >= progress:
-            print(f'Waiting for topic {topic_name}: no unread updates', file=sys.stderr, flush=True)
-            progress = time.monotonic() + 10
-        time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+            return {'topic': topic_name, 'cursor': cursor, 'events': events} if events else None
+    return poll(unread, timeout, lambda: f'Waiting for topic {topic_name}: no unread updates',
+                lambda: f'Timed out waiting for {topic_name}; no unread updates. Subscription and cursor unchanged.')
 
 
 def main(argv=None):

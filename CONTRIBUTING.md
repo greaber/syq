@@ -194,13 +194,15 @@ Repository tooling tests run with `scripts/run-tooling-tests.py` after
 `scripts/setup.sh` and `eval "$(scripts/setup.sh env)"`. The full runner executes
 every `test-*.py`, `test-*.sh`, and `test-*.cjs` file directly inside `tests/tooling/`,
 plus `tests/rsync-compat/harness_test.py`. Use `--quick` for the inexpensive group
-that needs no builds or external services. The runner keeps each test's output
-visible and reports all failures. Use `--list` (optionally with `--quick`) to see
-what it will run, or run an individual file for a focused check. The full suite
+that needs no builds or external services, or `--group NAME...` for the groups
+that CI selects by changed path. The runner keeps each test's output
+visible and reports all failures. Use `--list` (optionally with `--quick` or
+`--group`) to see what it will run, or run an individual file for a focused check. The full suite
 includes Cargo package builds, so run it from a clean checkout.
 
-Add ordinary tooling tests to that directory; full nightly and manual CI discover
-them without a workflow change. Python tests can import `ROOT` and `SCRIPTS` from
+Add ordinary tooling tests to that directory and to a group in `GROUPS` in
+`scripts/run-tooling-tests.py`; `tests/tooling/test-tooling-discovery.py` fails
+until every test has a group. No workflow change is needed. Python tests can import `ROOT` and `SCRIPTS` from
 `support` to locate the checkout and import production tooling. Docker, Nix, and
 platform-specific suites such as Homebrew retain their own setup and CI entry points. Benchmarks
 and release operations live outside the discovered test directory.

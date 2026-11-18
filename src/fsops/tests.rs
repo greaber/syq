@@ -805,10 +805,7 @@ fn make_fifo(path: &Path, mode: libc::mode_t) {
     assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), mode) }, 0);
 }
 
-fn registered_source_worker(
-    selections: &[&Path],
-    allow_unconfined_paths: bool,
-) -> (FsOps, Vec<RegisteredPath>, FsOps) {
+fn registered_source_worker(selections: &[&Path]) -> (FsOps, Vec<RegisteredPath>, FsOps) {
     let session = DescriptorSessionSlot::default();
     let mut control = FsOps::with_descriptor_session(session.clone());
     let response = control.handle(&Request::RegisterSourceRoots {
@@ -821,7 +818,6 @@ fn registered_source_worker(
             })
             .collect(),
         symlink_policy: OperatorSymlinkPolicy::Refuse,
-        allow_unconfined_paths,
         shared_workers: 0,
         independent_handoff_workers: 0,
     });
@@ -847,7 +843,7 @@ fn macos_receiver_refuses_inplace_copy_without_touching_files() {
     let existing = destination.join("existing");
     fs::write(&existing, b"old bytes").unwrap();
     let original_inode = existing.metadata().unwrap().ino();
-    let (mut worker, sources, _control) = registered_source_worker(&[&source], false);
+    let (mut worker, sources, _control) = registered_source_worker(&[&source]);
     worker.destination_root = Some(Arc::new(Root::open(&destination).unwrap()));
     for name in [b"existing".as_slice(), b"missing"] {
         let response = worker.handle(&Request::CopyLocal {
@@ -883,7 +879,7 @@ fn direct_copy_rejects_eof_before_the_planned_size() {
     fs::write(&source, b"short").unwrap();
     fs::create_dir(&destination).unwrap();
     fs::write(destination.join("file"), b"old complete file").unwrap();
-    let (mut worker, sources, _control) = registered_source_worker(&[&source], false);
+    let (mut worker, sources, _control) = registered_source_worker(&[&source]);
     worker.destination_root = Some(Arc::new(Root::open(&destination).unwrap()));
     let result = worker.copy_local(
         &sources[0],
@@ -914,7 +910,7 @@ fn oversized_reads_are_rejected_before_allocation() {
     let selected = temporary.path().join("selected");
     fs::create_dir(&selected).unwrap();
     fs::write(selected.join("marker"), b"original").unwrap();
-    let (mut worker, selections, _control) = registered_source_worker(&[&selected], false);
+    let (mut worker, selections, _control) = registered_source_worker(&[&selected]);
     let marker = selections[0].join(b"marker").unwrap();
     let path = selected.join("marker").as_os_str().as_bytes().to_vec();
 
@@ -1928,22 +1924,18 @@ fn plan_batch_only_stats_leaves_below_ready_directories() {
     fs::write(&leaf, b"data").unwrap();
     let mut ops = FsOps::new();
     let request = |directory: &Path| Request::PlanBatch {
-        partial_paths: vec![path_bytes(&leaf)],
-        copy_id: [7; 16],
         directories: vec![path_bytes(directory)],
         others: vec![path_bytes(&leaf)],
         strict_metadata: false,
     };
 
     let Response::BatchPlan {
-        partial_paths,
         directories,
         others,
     } = ops.handle(&request(&ready))
     else {
         panic!("expected a batch plan");
     };
-    assert!(partial_paths[0].is_ok());
     assert_eq!(directories[0].as_ref().unwrap().kind, Kind::Dir);
     assert_eq!(others.unwrap()[0].as_ref().unwrap().kind, Kind::File);
 
@@ -3161,12 +3153,6 @@ fn destination_observation_uses_the_adopted_root_not_its_old_name() {
     assert_eq!(size, 8);
     assert_eq!(hash, content_digest(b"original"));
 
-    let partial = operations.partial_paths(&[b"missing/deeper/marker".to_vec()], &[12; 16]);
-    assert!(partial[0]
-        .as_ref()
-        .unwrap()
-        .starts_with(b"missing/deeper/.marker.syq-tmp."));
-    assert!(operations.partial_paths(&[b"../outside".to_vec()], &[12; 16])[0].is_err());
     assert!(operations.file_hash(b"../outside", None).is_err());
     assert!(operations.stat_many(&[b"../outside".to_vec()], false)[0].is_none());
 
@@ -6168,122 +6154,6 @@ fn metadata_chunks_keep_input_order_and_do_not_reuse_a_different_parent() {
     );
 }
 
-#[test]
-fn partial_name_limits_keep_roots_parents_and_errors_separate() {
-    let temporary = crate::test_support::tempdir().unwrap();
-    let root = Arc::new(Root::open(temporary.path()).unwrap());
-    let reopened = Arc::new(Root::open(temporary.path()).unwrap());
-    assert_eq!(root.identity(), reopened.identity());
-    let mut limits = PartialNameLimits::default();
-    let parent = Path::new("parent");
-    assert_eq!(limits.get_or_query(&root, parent, || Ok(143)).unwrap(), 143);
-    assert_eq!(
-        limits
-            .get_or_query(&root, parent, || panic!("sibling repeated query"))
-            .unwrap(),
-        143
-    );
-    // Distinct authorities must not share a result, even with the same
-    // device/inode and relative spelling.
-    assert_eq!(
-        limits.get_or_query(&reopened, parent, || Ok(255)).unwrap(),
-        255
-    );
-    assert_eq!(
-        limits
-            .get_or_query(&root, Path::new("other"), || Ok(100))
-            .unwrap(),
-        100
-    );
-    assert!(limits
-        .get_or_query(&root, parent, || bail!("transient failure"))
-        .is_err());
-    assert_eq!(limits.get_or_query(&root, parent, || Ok(120)).unwrap(), 120);
-    // The next batch starts a fresh observation.
-    assert_eq!(
-        PartialNameLimits::default()
-            .get_or_query(&root, parent, || Ok(200))
-            .unwrap(),
-        200
-    );
-}
-
-#[test]
-fn partial_path_batches_preserve_names_errors_and_order() {
-    let temporary = crate::test_support::tempdir().unwrap();
-    fs::create_dir(temporary.path().join("parent")).unwrap();
-    fs::write(temporary.path().join("not-directory"), b"file").unwrap();
-    std::os::unix::fs::symlink("parent", temporary.path().join("link")).unwrap();
-    let mut operations = FsOps::new();
-    operations
-        .install_destination(File::open(temporary.path()).unwrap(), b"logical")
-        .unwrap();
-    let id = [17; 16];
-    let mut cases: Vec<PathBytes> = [
-        b"file".as_slice(),
-        b"",
-        b"other",
-        b"parent/a",
-        b"parent/b",
-        b"missing/deeper/a",
-        b"missing/deeper/b",
-        b"not-directory/child",
-        b"link/child",
-        b"../outside",
-        b"parent//bad",
-        b"parent/..",
-        b"/absolute",
-        b"parent/nul\0",
-        b"parent/raw-\xff",
-    ]
-    .into_iter()
-    .map(<[u8]>::to_vec)
-    .collect();
-    cases.push(format!("parent/{}", "x".repeat(255)).into_bytes());
-    for count in [3, 31, 32, 65, 128] {
-        let paths: Vec<_> = cases.iter().cycle().take(count).cloned().collect();
-        let expected: Vec<_> = paths
-            .iter()
-            .map(|path| {
-                (|| -> Result<PathBytes> {
-                    let target = operations.rooted_destination_target(path)?.unwrap();
-                    let (_, label) = rooted_partial_target(&target, &id)?;
-                    let parent = Path::new(OsStr::from_bytes(path))
-                        .parent()
-                        .unwrap_or_else(|| Path::new(""));
-                    Ok(path_bytes(&parent.join(label.file_name().unwrap())))
-                })()
-                .map_err(|error| format!("{error:#}"))
-            })
-            .collect();
-        assert_eq!(
-            operations.partial_paths(&paths, &id),
-            expected,
-            "batch size {count}"
-        );
-    }
-    // After a namespace change, use the same resolution/fallback rules as
-    // an individual query (a symlink can select the nearest real ancestor).
-    assert!(operations.partial_paths(&[b"parent/a".to_vec()], &id)[0].is_ok());
-    fs::rename(
-        temporary.path().join("parent"),
-        temporary.path().join("moved"),
-    )
-    .unwrap();
-    std::os::unix::fs::symlink("moved", temporary.path().join("parent")).unwrap();
-    let target = operations
-        .rooted_destination_target(b"parent/a")
-        .unwrap()
-        .unwrap();
-    let expected = rooted_partial_target(&target, &id)
-        .map(|(_, label)| path_bytes(&Path::new("parent").join(label.file_name().unwrap())))
-        .map_err(|error| format!("{error:#}"));
-    assert_eq!(
-        operations.partial_paths(&[b"parent/a".to_vec()], &id),
-        vec![expected]
-    );
-}
-
 fn checked_metadata_batch_threads(items: &[usize]) -> Vec<std::thread::ThreadId> {
     let observations = parallel_map(items, |&index| {
         let thread = std::thread::current();
@@ -6435,7 +6305,7 @@ fn parallel_metadata_batches_propagate_panics_and_remain_usable() {
 #[test]
 fn source_stat_batches_preserve_order_across_sizes() {
     let temporary = crate::test_support::tempdir().unwrap();
-    let (mut worker, selections, _control) = registered_source_worker(&[temporary.path()], false);
+    let (mut worker, selections, _control) = registered_source_worker(&[temporary.path()]);
     for parent in 0..4 {
         fs::create_dir(temporary.path().join(format!("p{parent}"))).unwrap();
     }
@@ -6481,8 +6351,7 @@ fn source_stat_batches_isolate_roots_and_refresh_parents_between_requests() {
         fs::write(root.join("parent/file"), vec![0; index + 1]).unwrap();
         symlink(format!("target-{index}"), root.join("parent/link")).unwrap();
     }
-    let (mut worker, selections, _control) =
-        registered_source_worker(&[&roots[0], &roots[1]], false);
+    let (mut worker, selections, _control) = registered_source_worker(&[&roots[0], &roots[1]]);
     // Adjacent siblings exercise reuse; identical relative parents under
     // distinct source roots must never share the held directory. Cover
     // both paths with misleading labels.
@@ -6561,7 +6430,7 @@ fn source_stat_grouping_reports_the_first_error_in_request_order() {
     let second = temporary.path().join("second");
     fs::write(&first, b"first").unwrap();
     fs::write(&second, b"second").unwrap();
-    let (mut worker, selections, _control) = registered_source_worker(&[&first, &second], false);
+    let (mut worker, selections, _control) = registered_source_worker(&[&first, &second]);
     fs::rename(&first, temporary.path().join("held-first")).unwrap();
     fs::write(&first, b"replacement").unwrap();
     fs::remove_file(&second).unwrap();
@@ -6583,7 +6452,7 @@ fn source_stat_batches_report_missing_sources_and_accept_restored_files() {
     let temporary = crate::test_support::tempdir().unwrap();
     let path = temporary.path().join("selected");
     fs::write(&path, b"original").unwrap();
-    let (mut worker, selections, _control) = registered_source_worker(&[&path], false);
+    let (mut worker, selections, _control) = registered_source_worker(&[&path]);
     let request = Request::StatMany {
         paths: vec![b"ignored".to_vec(); 64],
         sources: Some(vec![selections[0].clone(); 64]),
@@ -6665,7 +6534,7 @@ fn source_content_uses_registered_directory_after_name_replacement() {
     );
     fs::write(selected.join(&raw_name), b"raw-original").unwrap();
 
-    let (mut worker, selections, _control) = registered_source_worker(&[&selected], false);
+    let (mut worker, selections, _control) = registered_source_worker(&[&selected]);
     let marker = selections[0].join(b"marker").unwrap();
     let raw = selections[0].join(raw_name.as_bytes()).unwrap();
     fs::rename(&selected, temporary.path().join("moved")).unwrap();
@@ -6733,7 +6602,7 @@ fn registered_source_hash_rejects_short_prefixes_but_accepts_eof_tails() {
     let block = MIN_HASH_BLOCK_BYTES;
     let original = vec![b'x'; block as usize + 7];
     fs::write(&selected, &original).unwrap();
-    let (mut worker, selections, _control) = registered_source_worker(&[&selected], false);
+    let (mut worker, selections, _control) = registered_source_worker(&[&selected]);
     let request = |off, len| Request::HashBlocks {
         off,
         path: selected.as_os_str().as_bytes().to_vec(),
@@ -6785,7 +6654,7 @@ fn source_content_rejects_a_replaced_exact_leaf() {
     let temporary = crate::test_support::tempdir().unwrap();
     let selected = temporary.path().join("selected");
     fs::write(&selected, b"original").unwrap();
-    let (mut worker, selections, _control) = registered_source_worker(&[&selected], false);
+    let (mut worker, selections, _control) = registered_source_worker(&[&selected]);
     fs::rename(&selected, temporary.path().join("selected-original")).unwrap();
     fs::write(&selected, b"replaced").unwrap();
 
@@ -6836,7 +6705,7 @@ fn source_content_refuses_symlink_intermediates() {
     fs::create_dir(&outside).unwrap();
     fs::write(outside.join("secret"), b"secret").unwrap();
     symlink("../outside", selected.join("link")).unwrap();
-    let (mut worker, selections, _control) = registered_source_worker(&[&selected], false);
+    let (mut worker, selections, _control) = registered_source_worker(&[&selected]);
     let secret = selections[0].join(b"link/secret").unwrap();
     let label = selected.join("link/secret").as_os_str().as_bytes().to_vec();
 
@@ -6884,7 +6753,7 @@ fn source_read_cache_keys_root_and_attempt() {
     fs::create_dir(&second).unwrap();
     fs::write(first.join("same"), b"first").unwrap();
     fs::write(second.join("same"), b"other").unwrap();
-    let (mut worker, selections, _control) = registered_source_worker(&[&first, &second], false);
+    let (mut worker, selections, _control) = registered_source_worker(&[&first, &second]);
     let first_source = selections[0].join(b"same").unwrap();
     let second_source = selections[1].join(b"same").unwrap();
 
@@ -6928,7 +6797,7 @@ fn confined_source_content_requires_exact_registered_references() {
     let selected = temporary.path().join("selected");
     fs::write(&selected, b"selected").unwrap();
     fs::write(temporary.path().join("sibling"), b"sibling!").unwrap();
-    let (mut worker, selections, _control) = registered_source_worker(&[&selected], false);
+    let (mut worker, selections, _control) = registered_source_worker(&[&selected]);
     let forged = RegisteredPath::new(selections[0].root(), b"sibling".to_vec()).unwrap();
 
     for source in [None, Some(forged)] {
@@ -6988,45 +6857,6 @@ fn confined_source_content_requires_exact_registered_references() {
 }
 
 #[test]
-fn unconfined_source_content_uses_only_the_explicit_legacy_path() {
-    let temporary = crate::test_support::tempdir().unwrap();
-    let selected = temporary.path().join("selected");
-    let sibling = temporary.path().join("sibling");
-    fs::write(&selected, b"selected").unwrap();
-    fs::write(&sibling, b"legacy!!").unwrap();
-    let (mut worker, _, _control) = registered_source_worker(&[&selected], true);
-    let response = worker.handle(&Request::ReadRange {
-        path: sibling.as_os_str().as_bytes().to_vec(),
-        source: None,
-        attempt: 0,
-        off: 0,
-        len: 8,
-    });
-    assert!(matches!(response, Response::Block { data, .. } if data == b"legacy!!"));
-
-    let response = worker.handle(&Request::HashBlocks {
-        off: 0,
-        path: sibling.as_os_str().as_bytes().to_vec(),
-        source: None,
-        which: Which::Final,
-        copy_id: [0; 16],
-        block: MIN_HASH_BLOCK_BYTES,
-        len: 8,
-        attempt: 0,
-    });
-    assert!(
-        matches!(response, Response::Hashes(hashes) if hashes == vec![content_digest(b"legacy!!")])
-    );
-    let response = worker.handle(&Request::FileHash {
-        path: sibling.as_os_str().as_bytes().to_vec(),
-        source: None,
-    });
-    assert!(
-        matches!(response, Response::FileHash { size: 8, hash } if hash == content_digest(b"legacy!!"))
-    );
-}
-
-#[test]
 fn destination_worker_rejects_source_only_content_requests() {
     let temporary = crate::test_support::tempdir().unwrap();
     fs::write(temporary.path().join("marker"), b"marker").unwrap();
@@ -7055,39 +6885,6 @@ fn destination_worker_rejects_source_only_content_requests() {
             matches!(response, Response::SmallBlocks(blocks) if matches!(&blocks[..], [Err(error)] if error.contains("destination worker")))
         );
     }
-}
-
-#[test]
-fn source_legacy_stat_requires_explicit_unconfined_registration() {
-    let temporary = crate::test_support::tempdir().unwrap();
-    let selected = temporary.path().join("selected");
-    let sibling = temporary.path().join("sibling");
-    fs::write(&selected, b"selected").unwrap();
-    fs::write(&sibling, b"sibling").unwrap();
-    let session = DescriptorSessionSlot::default();
-    let mut control = FsOps::with_descriptor_session(session.clone());
-    let response = control.handle(&Request::RegisterSourceRoots {
-        base: SourceRootBase::default(),
-        selections: vec![SourceRootSelection {
-            path: selected.as_os_str().as_bytes().to_vec(),
-            follow_root: false,
-        }],
-        symlink_policy: OperatorSymlinkPolicy::Refuse,
-        allow_unconfined_paths: true,
-        shared_workers: 0,
-        independent_handoff_workers: 0,
-    });
-    let Response::SourceRootsRegistered(roots) = response else {
-        panic!("unexpected source registration response: {response:?}")
-    };
-    let mut worker = FsOps::with_descriptor_session(session);
-    worker.initialize_sources(&roots).unwrap();
-    let response = worker.handle(&Request::StatMany {
-        paths: vec![sibling.as_os_str().as_bytes().to_vec()],
-        sources: None,
-        follow: false,
-    });
-    assert!(matches!(response, Response::Stats(stats) if stats.len() == 1 && stats[0].is_some()));
 }
 
 #[test]
@@ -7588,8 +7385,6 @@ fn strict_plan_batch_distinguishes_missing_entries_from_read_errors() {
     let mut ops = FsOps::new();
     ops.destination_root = Some(Arc::new(Root::open(root).unwrap()));
     let request = Request::PlanBatch {
-        partial_paths: Vec::new(),
-        copy_id: [7; 16],
         directories: Vec::new(),
         others: vec![b"missing/child".to_vec(), b"sub/file".to_vec()],
         strict_metadata: true,
@@ -7775,7 +7570,7 @@ fn pipeline_requests_keep_endpoint_authority() {
     let tree = crate::test_support::tempdir().unwrap();
     let input = tree.path().join("source");
     fs::write(&input, b"inside").unwrap();
-    let (mut source, paths, _control) = registered_source_worker(&[&input], false);
+    let (mut source, paths, _control) = registered_source_worker(&[&input]);
     let compared = |reference| Request::ReadComparedRange {
         path: b"/untrusted/spelling".to_vec(),
         source: reference,
@@ -8341,7 +8136,7 @@ fn native_copy_reports_original_writer_close_error() {
     let target = destination.join("target");
     fs::write(&target, b"previous good copy").unwrap();
     let before = fs::metadata(&target).unwrap();
-    let (mut worker, sources, _control) = registered_source_worker(&[&source], false);
+    let (mut worker, sources, _control) = registered_source_worker(&[&source]);
     worker.destination_root = Some(Arc::new(Root::open(&destination).unwrap()));
     // CopyLocal must collect this error itself. Checking only in Finalize
     // misses an error discarded when the original writer is dropped.

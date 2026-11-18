@@ -157,7 +157,8 @@ pub(crate) fn filesystem(command: Command) -> Command {
     let rsync = command.get_name() == "syq rsync";
     let map = command.get_name() == "syq map";
     let clean = command.get_name() == "syq clean-partials";
-    let rm = command.get_name() == "syq rm" || clean;
+    let removal = command.get_name() == "syq rm";
+    let rm = removal || clean;
     let command = command.mut_args(|arg| {
         if arg.is_hide_set() {
             return arg;
@@ -215,11 +216,11 @@ pub(crate) fn filesystem(command: Command) -> Command {
             copy_heading(id).0
         } else {
             match id {
-                "sources" | "trees" | "on" | "paths" | "src" | "srcs_in" | "src_non_dir"
-                | "src_dir" | "src_non_dirs" | "src_dirs" | "srcs" | "from" | "cwd" | "root"
-                | "follow" | "follow_src" | "src_fd" => "Sources and selection",
-                "to" | "into" | "into_new" | "into_existing" | "as" | "as_new" | "as_existing"
-                | "follow_dst" | "as_fd" => "Destination placement",
+                "trees" | "on" | "paths" | "from" | "cwd" | "root" | "follow" | "follow_src"
+                | "src_fd" => "Sources and selection",
+                id if crate::cli::source_selector(id).is_some() => "Sources and selection",
+                "to" | "follow_dst" | "as_fd" => "Destination placement",
+                id if crate::cli::placement_option(id).is_some() => "Destination placement",
                 "results" | "results_fd" | "progress" | "no_progress" | "stats" => {
                     "Progress and results"
                 }
@@ -263,6 +264,11 @@ pub(crate) fn filesystem(command: Command) -> Command {
             });
         }
         // Shared parser fields need command-specific explanations.
+        if removal {
+            if let Some((_, help)) = REMOVAL_SELECTION_HELP.iter().find(|(name, _)| *name == id) {
+                arg = arg.help(*help).long_help(None::<&'static str>);
+            }
+        }
         if rm && id == "verbose" {
             arg = arg.help("List removed paths");
         } else if rm && id == "performance_tuning" {
@@ -289,14 +295,36 @@ pub(crate) fn filesystem(command: Command) -> Command {
     configure(command)
 }
 
+/// `syq rm` shares the copy selection options; this is what they mean there.
+pub(crate) const REMOVAL_SELECTION_HELP: &[(&str, &str)] = &[
+    ("cwd", "Resolve relative paths from DIR on the removal endpoint"),
+    ("root", "Confine resolution and removal beneath DIR"),
+    ("follow", "Like --follow-src; also follow symlinks in the --results path"),
+    (
+        "follow_src",
+        "Follow symlinks in --cwd, --root, and the parent directories of selected paths; a selected symlink itself is always removed as a link",
+    ),
+    ("src", "Select a non-directory object (repeatable)"),
+    (
+        "srcs_in",
+        "Recursively select a directory's contents, keeping the directory (repeatable)",
+    ),
+    ("src_non_dir", "Select a non-directory object (repeatable)"),
+    ("src_dir", "Select a directory tree (repeatable)"),
+    ("src_non_dirs", "Select several non-directory objects"),
+    ("src_dirs", "Select several directory trees"),
+    ("srcs", "Select several non-directory objects"),
+    ("sources", "Selected objects (shorthand for --src)"),
+];
+
 /// Group copy options by the decisions a user makes, independently of parser layout.
 fn copy_heading(id: &str) -> (&'static str, usize) {
     match id {
-        "sources" | "src" | "srcs_in" | "src_non_dir" | "src_dir" | "src_non_dirs" | "src_dirs"
-        | "srcs" | "src_fd" | "from" | "cwd" | "root" | "ignore" | "ignore_from" | "min_size"
-        | "max_size" | "where_expression" => ("Sources and filtering", 0),
-        "to" | "into" | "into_new" | "into_existing" | "as" | "as_new" | "as_existing"
-        | "as_fd" | "mapping" => ("Destination and mapping", 1),
+        "src_fd" | "from" | "cwd" | "root" | "ignore" | "ignore_from" | "min_size" | "max_size"
+        | "where_expression" => ("Sources and filtering", 0),
+        id if crate::cli::source_selector(id).is_some() => ("Sources and filtering", 0),
+        "to" | "as_fd" | "mapping" => ("Destination and mapping", 1),
+        id if crate::cli::placement_option(id).is_some() => ("Destination and mapping", 1),
         "if_exists" | "ignore_existing" | "existing" | "update" | "copy_if" | "in_place"
         | "prune" | "prune_before" | "max_delete" => ("Updates and deletion", 2),
         "copy_metadata" | "widen_dirs" | "sparse" | "open_noatime" | "follow" | "follow_src"

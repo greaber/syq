@@ -313,7 +313,7 @@ mod tests {
                 writer.event("observation", observation(n, rate, true)["data"].clone());
             }
         }
-        writer.finish(true, false, None, json!({}));
+        writer.complete(true, json!({}));
         writer
     }
 
@@ -389,7 +389,6 @@ mod tests {
             drop(writer);
             let db = Connection::open(&path).unwrap();
             let saved = command::read_run(&db, 2).unwrap();
-            assert_eq!(saved["selected_workers"], Value::Null);
             assert_eq!(saved["summary"]["measurement_totals"], Value::Null);
             let stored = db
                 .prepare(
@@ -694,7 +693,7 @@ mod tests {
                 writer.event("observation", observation(n, rate, true)["data"].clone());
             }
         }
-        writer.finish(true, false, None, json!({}));
+        writer.complete(true, json!({}));
         let db = Connection::open(path).unwrap();
         // Diagnostic JSON and summaries are not part of the inference query.
         db.execute("DROP TABLE events", []).unwrap();
@@ -718,8 +717,8 @@ mod tests {
         let writer = record(&path, &key, None, true, &[(8, 100.0), (16, 200.0)]);
         let db = Connection::open(&path).unwrap();
         let run = command::read_run(&db, 1).unwrap();
-        assert_eq!(run["recommendation_eligible"], false);
-        assert_eq!(run["selected_workers"], Value::Null);
+        assert_eq!(run["recommendation_eligible"], true);
+        assert!(run.get("selected_workers").is_none());
         assert_eq!(writer.starting_count(&key, false).unwrap().workers, 16);
         // Earlier writers used 0 (no evidence), 1 (recommendation), or 2
         // (measurement totals, with bounds added in 3). None is backfilled.
@@ -728,6 +727,7 @@ mod tests {
                 .unwrap();
             assert!(writer.starting_count(&key, false).is_none());
             let run = command::read_run(&db, 1).unwrap();
+            assert_eq!(run["recommendation_eligible"], false);
             assert_eq!(run["summary"], json!({}));
         }
     }
@@ -832,7 +832,7 @@ mod tests {
                     writer.event("observation", observation(n, rate, true)["data"].clone());
                 }
             }
-            writer.finish(true, false, None, json!({}));
+            writer.complete(true, json!({}));
         }
         let writer = super::super::tests::recorder(&path);
         writer.context(&key);
@@ -842,7 +842,7 @@ mod tests {
                 writer.event("observation", observation(n, rate, true)["data"].clone());
             }
         }
-        writer.finish(true, false, None, json!({}));
+        writer.complete(true, json!({}));
         assert_eq!(writer.starting_count(&key, false).unwrap().workers, 32);
     }
 
@@ -860,10 +860,19 @@ mod tests {
                 writer.event("observation", e["data"].clone());
             }
         }
-        writer.finish(true, false, None, json!({}));
+        writer.complete(true, json!({}));
         let misleading = super::super::tests::recorder(&path);
         misleading.context(&key);
-        misleading.finish(true, true, Some(64), json!({"discovery_complete":true}));
+        misleading.complete(true, json!({}));
+        // A row as earlier releases saved their recommendation.
+        let id = misleading.0.lock().unwrap().id;
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE runs SET eligible=1,workers=64,summary='{\"discovery_complete\":true}' WHERE id=?1",
+                [id],
+            )
+            .unwrap();
         assert_eq!(misleading.starting_count(&key, false).unwrap().workers, 16);
     }
 }

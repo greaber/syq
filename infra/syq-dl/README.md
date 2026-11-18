@@ -4,7 +4,8 @@ The download host at `https://dl.syq.christmas`. Every request records one
 row in a D1 database and serves the matching GitHub release asset from the
 Cloudflare edge cache, fetching it from GitHub on a miss. Tagged assets are
 immutable, so they cache for a year; the tag behind `/latest/` is re-resolved
-every five minutes. If GitHub cannot be fetched, the client is redirected to
+every five minutes, and `/latest/` responses tell clients to keep them for
+five minutes too. If GitHub cannot be fetched, the client is redirected to
 GitHub to try directly. GitHub stays the immutable source of the bytes, and
 every syq client verifies what it downloads against the signed release
 manifest, so this host can only delay or withhold a download, never
@@ -15,7 +16,8 @@ URL shapes mirror GitHub's release URLs:
     /latest/<asset>    resolves the current tag, records it, serves that tag's asset
     /<tag>/<asset>     records, serves from the edge cache (fetching GitHub on a miss)
 
-`migrations/0001_events.sql` holds the schema and two reporting views:
+`migrations/0001_events.sql` holds the schema; `0002_installs_by_kind.sql`
+and `0003_purpose_and_client.sql` define the current two reporting views:
 `daily_checks` (background reminder checks from installed clients, a
 daily-active proxy; explicit `--self-update` fetches are excluded by the
 `x-syq-purpose` header) and `daily_installs` (downloads by kind, tag, target, and country; kind `archive`
@@ -29,7 +31,7 @@ Use your preferred credential manager; this repository does not load a
 credential store. Run from the worktree containing the worker you intend to deploy:
 
     cd infra/syq-dl
-    npm install
+    npm ci
     npx wrangler deploy
     npx wrangler d1 migrations apply syq-dl --remote
 
