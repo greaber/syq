@@ -88,6 +88,7 @@ def emit(values, task_branch=False):
         elif isinstance(value, list):
             value = json.dumps(value)
         print(f"{key}={value}")
+    return scope
 
 
 def run_everything():
@@ -251,10 +252,12 @@ def main():
         "--equivalent-to", base]).returncode == 0
     selection = classify(changed_paths.split("\n"), preparation_only)
 
-    emit(selection, task_branch)
+    scope = emit(selection, task_branch)
     keys = ["native", "python_sdk", "tooling", "shellcheck", "mapping_docs",
             "conformance", "macos", "macos_lint", "linux_arm64", "full_suite"]
-    print("CI scope: " + " ".join(f"{key}={str(selection[key]).lower()}" for key in keys),
+    if macos:
+        keys += ["macos_needed", "macos_sdk", "macos_release_tooling"]
+    print("CI scope: " + " ".join(f"{key}={str(scope[key]).lower()}" for key in keys),
           file=sys.stderr)
     return 0
 

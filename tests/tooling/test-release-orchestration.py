@@ -7,6 +7,7 @@ creates a tag, a publication, or a CI run.
 from support import ROOT, SCRIPTS
 
 import base64
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -113,6 +114,21 @@ class WorkflowTextTests(unittest.TestCase):
                         "--bin" if target == "syq" else "--test", target,
                         "--run-ignored", "all", "--no-tests", "fail", "--", "--exact",
                         "fixture::test"])
+
+    def test_macos_workflow_uses_the_scope_it_computes(self):
+        # ci-scope.py decides when macOS runs release tooling; the step must run
+        # those same groups and pass the inputs ci-scope reads.
+        workflow = (ROOT / ".github/workflows/macos.yml").read_text()
+        spec = importlib.util.spec_from_file_location("ci_scope", SCRIPTS / "ci-scope.py")
+        ci_scope = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ci_scope)
+        step = workflow.split("      - name: Release tooling suites\n", 1)[1].split("\n      - ", 1)[0]
+        groups = step.split("scripts/run-tooling-tests.py --group ", 1)[1].split(" ||", 1)[0]
+        self.assertEqual(set(groups.split()), ci_scope.MACOS_TOOLING)
+        self.assertIn('scripts/ci-scope.py --macos "$GITHUB_EVENT_PATH"', workflow)
+        self.assertIn("SYQ_CI_COMPLETE: ${{ inputs.complete }}", workflow)
+        for output in ("needed", "sdk", "release_tooling"):
+            self.assertIn(f"{output}: ${{{{ steps.changes.outputs.macos_{output} }}}}", workflow)
 
     def test_release_workflow_requires_checks_and_notes(self):
         release = (ROOT / ".github/workflows/release.yml").read_text()
