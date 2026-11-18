@@ -11,7 +11,17 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 pub(crate) const MEMORY_LIMIT: usize = 512 << 20;
+/// A message's first reservation: what any message and its small
+/// collections hold, and at least a decoded `Request` or `Response` (a few
+/// hundred bytes, in a queue slot allocated with its channel). Each queued
+/// reply holds one, so it costs the allowance what it holds rather than a
+/// whole granule.
+const MESSAGE_RESERVATION: usize = 1 << 10;
+/// Reservations beyond a message's first grow in granules, so that a large
+/// collection updates the shared count once per granule, not per element.
 const RESERVATION_GRANULE: usize = 64 << 10;
+const _: () = assert!(std::mem::size_of::<crate::proto::Request>() <= MESSAGE_RESERVATION);
+const _: () = assert!(std::mem::size_of::<crate::proto::Response>() <= MESSAGE_RESERVATION);
 /// Decompressed bytes beyond the bytes that arrived, across the frames a
 /// server's connections hold. Without it, a peer could make each queued
 /// frame hold up to `MAX_FRAME` for a few bytes sent.
@@ -124,18 +134,21 @@ pub(crate) struct Hold {
     expansion: Option<Expansion>,
 }
 
+/// The process's decoded-collection allowance.
+fn memory_budget() -> &'static Arc<Budget> {
+    static BUDGET: OnceLock<Arc<Budget>> = OnceLock::new();
+    BUDGET.get_or_init(|| {
+        Arc::new(Budget {
+            used: AtomicUsize::new(0),
+            limit: MEMORY_LIMIT,
+        })
+    })
+}
+
 impl Hold {
     pub(crate) fn new() -> Self {
-        static BUDGET: OnceLock<Arc<Budget>> = OnceLock::new();
         Self {
-            budget: BUDGET
-                .get_or_init(|| {
-                    Arc::new(Budget {
-                        used: AtomicUsize::new(0),
-                        limit: MEMORY_LIMIT,
-                    })
-                })
-                .clone(),
+            budget: memory_budget().clone(),
             used: 0,
             reserved: 0,
             exhausted: false,
@@ -173,11 +186,14 @@ impl Hold {
         };
         let used = self.used.checked_add(bytes).ok_or_else(exhausted)?;
         if used > self.reserved {
-            let wanted = used
-                .checked_add(RESERVATION_GRANULE - 1)
-                .ok_or_else(exhausted)?
-                / RESERVATION_GRANULE
-                * RESERVATION_GRANULE;
+            let wanted = if used <= MESSAGE_RESERVATION {
+                MESSAGE_RESERVATION
+            } else {
+                used.checked_add(RESERVATION_GRANULE - 1)
+                    .ok_or_else(exhausted)?
+                    / RESERVATION_GRANULE
+                    * RESERVATION_GRANULE
+            };
             let extra = wanted - self.reserved;
             self.budget
                 .used
@@ -635,7 +651,41 @@ mod tests {
         assert!(
             matches!(decoded.value, crate::proto::Response::Block { data, .. } if data.len() == 8 << 20)
         );
-        assert_eq!(shared.used.load(Relaxed), RESERVATION_GRANULE);
+        assert_eq!(shared.used.load(Relaxed), MESSAGE_RESERVATION);
+    }
+
+    // Holds the process's own allowance: run in a process of its own, as
+    // nextest does.
+    #[test]
+    fn every_reply_queue_of_many_workers_fits_the_allowance() {
+        // Each of 64 workers' two connections queues up to 256 replies,
+        // such as a stream's pieces read from its source and their
+        // acknowledgments, or a comparison's matched ranges: 32,768 queued
+        // replies, each holding a few hundred bytes. Each reserves what it holds, not a 64 KiB granule, which
+        // would have used up the allowance at 8,192.
+        use crate::proto::Response;
+        let replies = [
+            Response::Ok,
+            Response::Block {
+                off: 0,
+                hash: Default::default(),
+                data: vec![7; 16],
+            },
+            Response::RangeMatched {
+                off: 0,
+                len: 1 << 16,
+            },
+        ]
+        .map(|reply| postcard::to_stdvec(&reply).unwrap());
+        let queued = 64 * 2 * crate::transfer_tuning::COMPARE_REQUESTS;
+        let held: Vec<_> = (0..queued)
+            .map(|n| decode::<Response>(&replies[n % replies.len()]).unwrap())
+            .collect();
+        let used = memory_budget().used.load(Relaxed);
+        assert_eq!(used, queued * MESSAGE_RESERVATION);
+        assert!(used <= MEMORY_LIMIT / 8);
+        drop(held);
+        assert_eq!(memory_budget().used.load(Relaxed), 0);
     }
 
     #[test]
