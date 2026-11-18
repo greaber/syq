@@ -195,6 +195,8 @@ impl Engine {
             // fails afterwards is not a sign that the service is down.
             let mut answered = initial.is_some();
             let mut retry_delay = None;
+            // Whether the GET failed in a way no resend can fix.
+            let mut unanswerable = false;
             let result = async {
                 let body = if let Some(body) = initial.take() {
                     body
@@ -215,6 +217,10 @@ impl Engine {
                         .map_err(|e| {
                             if retryable(&e) {
                                 retry_delay = Some(crate::s3::retry::error_delay(attempt, &e));
+                                anyhow::Error::new(e.into_service_error())
+                            } else if crate::s3::retry::permanent(&e) {
+                                // Fail with the message a retried failure ends with.
+                                unanswerable = true;
                                 anyhow::Error::new(e.into_service_error())
                             } else {
                                 Permanent(format!(
@@ -382,6 +388,7 @@ impl Engine {
                 }
                 Err(e)
                     if attempt < self.options.retries
+                        && !unanswerable
                         && e.downcast_ref::<Permanent>().is_none() =>
                 {
                     output.finish().await?;
@@ -403,8 +410,9 @@ impl Engine {
                 }
                 Err(e) => {
                     // A permanent GET error is still an answer from the service.
-                    self.outage
-                        .failed(!answered && e.downcast_ref::<Permanent>().is_none());
+                    self.outage.failed(
+                        !answered && !unanswerable && e.downcast_ref::<Permanent>().is_none(),
+                    );
                     return Err(e);
                 }
             }

@@ -3378,7 +3378,8 @@ impl std::error::Error for Permanent {}
 /// The upload loops replace SDK retries, so they must recognize the same
 /// throttling and transient conditions: dispatch failures without a response,
 /// retryable statuses, and the error codes S3 can send with other statuses,
-/// such as `RequestTimeout` with HTTP 400.
+/// such as `RequestTimeout` with HTTP 400. A failure without a response is
+/// retried unless resending cannot help (see [`super::retry::permanent`]).
 pub(super) fn retryable<E: aws_sdk_s3::error::ProvideErrorMetadata>(
     error: &aws_sdk_s3::error::SdkError<
         E,
@@ -3386,16 +3387,13 @@ pub(super) fn retryable<E: aws_sdk_s3::error::ProvideErrorMetadata>(
     >,
 ) -> bool {
     use aws_runtime::retries::classifiers::{THROTTLING_ERRORS, TRANSIENT_ERRORS};
-    error
-        .raw_response()
-        .map(|r| r.status().as_u16())
-        .is_none_or(super::outage::transient_status)
-        || error
-            .as_service_error()
-            .and_then(|e| e.code())
-            .is_some_and(|code| {
-                THROTTLING_ERRORS.contains(&code) || TRANSIENT_ERRORS.contains(&code)
-            })
+    error.raw_response().map_or_else(
+        || !super::retry::permanent(error),
+        |r| super::outage::transient_status(r.status().as_u16()),
+    ) || error
+        .as_service_error()
+        .and_then(|e| e.code())
+        .is_some_and(|code| THROTTLING_ERRORS.contains(&code) || TRANSIENT_ERRORS.contains(&code))
 }
 async fn file_body(source: &Source, offset: u64, length: u64) -> Result<ByteStream> {
     let source = source.clone();

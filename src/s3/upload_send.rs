@@ -103,7 +103,7 @@ impl Upload<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use aws_sdk_s3::{error::ErrorMetadata, operation::put_object::PutObjectError};
     use aws_smithy_runtime_api::http::StatusCode;
@@ -174,5 +174,203 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(headers, [None, Some("md5".to_owned())]);
         assert!(flag.load(Relaxed));
+    }
+
+    /// A real client whose requests go to `connector`, with `credentials`.
+    pub(in crate::s3) fn client(
+        connector: impl aws_smithy_runtime_api::client::http::HttpConnector + Clone + 'static,
+        credentials: impl aws_credential_types::provider::ProvideCredentials + 'static,
+    ) -> aws_sdk_s3::Client {
+        use aws_smithy_runtime_api::client::http::{http_client_fn, SharedHttpConnector};
+        client_with(
+            http_client_fn(move |_, _| SharedHttpConnector::new(connector.clone())),
+            credentials,
+        )
+    }
+
+    pub(in crate::s3) fn client_with(
+        http: impl aws_smithy_runtime_api::client::http::HttpClient + 'static,
+        credentials: impl aws_credential_types::provider::ProvideCredentials + 'static,
+    ) -> aws_sdk_s3::Client {
+        aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::config::Builder::new()
+                .behavior_version_latest()
+                .region(aws_sdk_s3::config::Region::new("auto"))
+                .endpoint_url("https://storage.example")
+                .force_path_style(true)
+                .credentials_provider(credentials)
+                .http_client(http)
+                .build(),
+        )
+    }
+
+    /// Upload through `client` with up to eight retries. Returns the
+    /// attempts, the time spent backing off, and the error.
+    pub(in crate::s3) async fn failed_put(
+        client: &aws_sdk_s3::Client,
+    ) -> (usize, std::time::Duration, anyhow::Error) {
+        failed_upload(|| async {
+            client
+                .put_object()
+                .bucket("b")
+                .key("k")
+                .body(bytes::Bytes::from_static(b"x").into())
+                .customize()
+                .config_override(super::super::client::without_sdk_retries())
+                .send()
+                .await
+        })
+        .await
+    }
+
+    /// Send `put` through [`Upload::send`] with up to eight retries.
+    pub(in crate::s3) async fn failed_upload<F, O>(
+        mut put: impl FnMut() -> F,
+    ) -> (usize, std::time::Duration, anyhow::Error)
+    where
+        F: Future<Output = Result<O, Error>>,
+    {
+        let (flag, outage) = (AtomicBool::new(false), Default::default());
+        let upload = Upload {
+            retries: 8,
+            ..upload(&flag, &outage)
+        };
+        let mut attempts = 0;
+        let started = tokio::time::Instant::now();
+        let result = upload
+            .send(async { unreachable!() }, |_| {
+                attempts += 1;
+                let put = put();
+                async { Ok(put.await) }
+            })
+            .await
+            .unwrap();
+        let Err(error) = result else {
+            panic!("the upload succeeded")
+        };
+        let error = anyhow::Error::new(error.into_service_error());
+        (attempts, started.elapsed(), error)
+    }
+
+    /// Fails every request: without a response, or with a 503.
+    #[derive(Clone, Debug)]
+    pub(in crate::s3) struct Failing(pub fn() -> Result<HttpResponse, ConnectorError>);
+    impl aws_smithy_runtime_api::client::http::HttpConnector for Failing {
+        fn call(
+            &self,
+            _: aws_smithy_runtime_api::client::orchestrator::HttpRequest,
+        ) -> aws_smithy_runtime_api::client::http::HttpConnectorFuture {
+            aws_smithy_runtime_api::client::http::HttpConnectorFuture::ready(self.0())
+        }
+    }
+    use aws_smithy_runtime_api::client::result::ConnectorError;
+
+    pub(in crate::s3) fn static_credentials() -> aws_sdk_s3::config::Credentials {
+        aws_sdk_s3::config::Credentials::new("a", "b", None, None, "test")
+    }
+
+    /// Failures that a resend cannot fix end the upload at once, with the
+    /// same error they end with after retries.
+    #[tokio::test(start_paused = true)]
+    async fn permanent_failures_are_not_retried() {
+        use crate::s3::retry::Permanent;
+        use aws_credential_types::provider::{error::CredentialsError, future, ProvideCredentials};
+        #[derive(Debug)]
+        struct Missing(fn() -> CredentialsError);
+        impl ProvideCredentials for Missing {
+            fn provide_credentials<'a>(&'a self) -> future::ProvideCredentials<'a>
+            where
+                Self: 'a,
+            {
+                future::ProvideCredentials::ready(Err(self.0()))
+            }
+        }
+        let unreachable = Failing(|| unreachable!("no request is sent"));
+        for (client, message) in [
+            (
+                client(
+                    unreachable.clone(),
+                    Missing(|| CredentialsError::not_loaded("no profile")),
+                ),
+                "no profile",
+            ),
+            (
+                client(
+                    unreachable.clone(),
+                    Missing(|| CredentialsError::provider_error("the SSO session has expired")),
+                ),
+                "the SSO session has expired",
+            ),
+            (
+                client(
+                    Failing(|| Err(Permanent::connector(anyhow::anyhow!("source changed")))),
+                    static_credentials(),
+                ),
+                "source changed",
+            ),
+            // A request body reports errors as io::Error, whose causes skip
+            // the error it carries.
+            (
+                client(
+                    Failing(|| {
+                        Err(ConnectorError::io(Box::new(std::io::Error::other(
+                            Permanent::new(anyhow::anyhow!("source shrank")),
+                        ))))
+                    }),
+                    static_credentials(),
+                ),
+                "source shrank",
+            ),
+        ] {
+            let (attempts, waited, error) = failed_put(&client).await;
+            assert_eq!(
+                (attempts, waited),
+                (1, std::time::Duration::ZERO),
+                "{error:#}"
+            );
+            assert!(format!("{error:#}").contains(message), "{error:#}");
+        }
+    }
+
+    /// Failures that may pass are retried with backoff, including a credential
+    /// provider that timed out.
+    #[tokio::test(start_paused = true)]
+    async fn transient_failures_are_retried() {
+        use aws_credential_types::provider::{error::CredentialsError, future, ProvideCredentials};
+        #[derive(Debug)]
+        struct Slow;
+        impl ProvideCredentials for Slow {
+            fn provide_credentials<'a>(&'a self) -> future::ProvideCredentials<'a>
+            where
+                Self: 'a,
+            {
+                future::ProvideCredentials::ready(Err(CredentialsError::provider_timed_out(
+                    std::time::Duration::from_secs(5),
+                )))
+            }
+        }
+        let unreachable = Failing(|| unreachable!("no request is sent"));
+        let reset = Failing(|| {
+            Err(ConnectorError::io(Box::new(std::io::Error::from(
+                std::io::ErrorKind::ConnectionReset,
+            ))))
+        });
+        let other = Failing(|| Err(ConnectorError::other("connection closed".into(), None)));
+        let unavailable = Failing(|| {
+            Ok(HttpResponse::new(
+                StatusCode::try_from(503).unwrap(),
+                SdkBody::empty(),
+            ))
+        });
+        for client in [
+            client(unreachable, Slow),
+            client(reset, static_credentials()),
+            client(other, static_credentials()),
+            client(unavailable, static_credentials()),
+        ] {
+            let (attempts, waited, error) = failed_put(&client).await;
+            assert_eq!(attempts, 9, "{error:#}");
+            assert!(waited >= std::time::Duration::from_secs(20), "{waited:?}");
+        }
     }
 }
