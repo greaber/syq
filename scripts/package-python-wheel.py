@@ -13,9 +13,11 @@ import time
 import tomllib
 import zipfile
 
+# The Linux executable is statically linked, so it also runs where the C
+# library is musl, such as Alpine.
 PLATFORMS = {
-    "linux-x86_64": "manylinux_2_5_x86_64.manylinux1_x86_64",
-    "linux-aarch64": "manylinux_2_17_aarch64.manylinux2014_aarch64",
+    "linux-x86_64": "manylinux_2_5_x86_64.manylinux1_x86_64.musllinux_1_1_x86_64",
+    "linux-aarch64": "manylinux_2_17_aarch64.manylinux2014_aarch64.musllinux_1_1_aarch64",
     "macos-x86_64": "macosx_10_12_x86_64",
     "macos-arm64": "macosx_11_0_arm64",
 }

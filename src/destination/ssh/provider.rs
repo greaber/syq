@@ -6,6 +6,7 @@ use crate::auth_from::Provider;
 use crate::cli::NativeEndpoint;
 use crate::destination::forward::DeadlineIo;
 use crate::destination::{read_message, write_message};
+use crate::lock_file::LockFile;
 use crate::persistence::Domain;
 use crate::process::CommandExt as _;
 use crate::receive_service::provider::{self as service, SessionRequest, Ticket};
@@ -140,45 +141,13 @@ fn directory(domain: &Domain) -> Result<PathBuf> {
     )?;
     Ok(path)
 }
-fn lock_file(path: &Path, create: bool) -> Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(create)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path)?;
-    let metadata = file.metadata()?;
+fn lock_file(path: &Path, create: bool) -> Result<LockFile> {
+    let lock = LockFile::open(path, create)?;
     anyhow::ensure!(
-        metadata.is_file()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o077 == 0
-            && metadata.len() == 0,
+        lock.file().metadata()?.len() == 0,
         "SSH provider lock must be an empty owned private file"
     );
-    Ok(file)
-}
-fn try_lock(file: &File) -> Result<bool> {
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        return Ok(true);
-    }
-    let error = std::io::Error::last_os_error();
-    if error.kind() == std::io::ErrorKind::WouldBlock {
-        return Ok(false);
-    }
-    Err(error.into())
-}
-fn lock_is_available(lock: File) -> Result<bool> {
-    if !try_lock(&lock)? {
-        return Ok(false);
-    }
-    // A concurrent fork can inherit this open-file description. Closing our
-    // descriptor alone would leave that child holding the temporary probe lock.
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(true)
+    Ok(lock)
 }
 /// The record of this build's keeper for `provider`.
 fn read_record(domain: &Domain, provider: &Provider) -> Result<Option<Record>> {
@@ -281,7 +250,7 @@ fn existing(domain: &Domain, provider: &Provider) -> Result<Option<Record>> {
         Err(error) if missing(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
-    if lock_is_available(lock)? {
+    if !lock.held()? {
         return Ok(None);
     }
     let metadata = match fs::symlink_metadata(record.forwarded()) {
@@ -487,7 +456,7 @@ fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
     let deadline = Instant::now() + SETUP;
     // Only this build's keeper holds it: wait for one starting to be ready,
     // or one ending to end.
-    while !try_lock(&lock)? {
+    while !lock.try_exclusive()? {
         if let Some(record) = existing(domain, provider)? {
             return Ok(record);
         }
@@ -590,9 +559,10 @@ fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
         );
     }
     anyhow::ensure!(!cancelled(), "SSH provider setup cancelled");
-    launch_keeper(domain, &owner.record, &lock, deadline, &cancelled)?;
+    launch_keeper(domain, &owner.record, lock.file(), deadline, &cancelled)?;
     owner.armed = false;
-    drop(lock);
+    // The keeper holds the lock now.
+    drop(lock.into_inherited());
     existing(domain, provider)?.context("SSH provider ended before it became ready")
 }
 
@@ -787,6 +757,9 @@ fn keeper(startup: Startup) -> Result<()> {
     let domain = Domain::select(startup.scope.as_deref())?;
     validate_record(&domain, &startup.record.provider, &startup.record)?;
     anyhow::ensure!(startup.lock_fd > 2, "invalid SSH provider startup lock");
+    // Not a LockFile: until `ensure` finishes the handoff, the parent holds
+    // the same open file description, so unlocking here when the keeper
+    // fails early would release the parent's lock too. Closing does not.
     let lock = unsafe { File::from_raw_fd(startup.lock_fd) };
     let expected = lock_file(
         &record_path(&domain, &startup.record.provider, &startup.record.build)?
@@ -794,7 +767,7 @@ fn keeper(startup: Startup) -> Result<()> {
         false,
     )?;
     let actual_metadata = lock.metadata()?;
-    let expected_metadata = expected.metadata()?;
+    let expected_metadata = expected.file().metadata()?;
     anyhow::ensure!(
         (actual_metadata.dev(), actual_metadata.ino())
             == (expected_metadata.dev(), expected_metadata.ino()),
@@ -981,7 +954,7 @@ pub(crate) fn stop_all(domain: &Domain) -> Result<()> {
     loop {
         let mut running = false;
         for lock in &locks {
-            match try_lock(lock) {
+            match lock.try_exclusive() {
                 Ok(acquired) => running |= !acquired,
                 Err(error) => errors.push(format!("{error:#}")),
             }
@@ -1010,7 +983,7 @@ pub(crate) fn cleanup_domain(domain: &Domain) -> Result<()> {
         }
         let result = (|| -> Result<()> {
             let lock = lock_file(&path.with_extension("lock"), false)?;
-            anyhow::ensure!(try_lock(&lock)?, "SSH provider keeper is still active");
+            anyhow::ensure!(lock.try_exclusive()?, "SSH provider keeper is still active");
             let bytes =
                 crate::delegation::read_private_regular(&path, "SSH provider record", 16 * 1024)?;
             let record: Record = serde_json::from_slice(&bytes)?;
@@ -1046,7 +1019,7 @@ pub(crate) fn cleanup_domain(domain: &Domain) -> Result<()> {
                 path.display()
             );
             let file = lock_file(&path, false)?;
-            anyhow::ensure!(try_lock(&file)?, "SSH provider keeper is still active");
+            anyhow::ensure!(file.try_exclusive()?, "SSH provider keeper is still active");
             fs::remove_file(path)?;
         }
         fs::remove_dir(index(domain))?;
@@ -1172,10 +1145,10 @@ mod tests {
         assert_ne!(path(&record), path(&other));
         // Its keeper runs, holding its lock.
         let other_lock = lock_file(&path(&other).with_extension("lock"), true).unwrap();
-        assert!(try_lock(&other_lock).unwrap());
+        assert!(other_lock.try_exclusive().unwrap());
         // This build's keeper starts without waiting for it.
         let lock = lock_file(&path(&record).with_extension("lock"), true).unwrap();
-        assert!(try_lock(&lock).unwrap());
+        assert!(lock.try_exclusive().unwrap());
         assert_eq!(
             read_record(&domain, &record.provider)
                 .unwrap()
@@ -1258,7 +1231,7 @@ mod tests {
         let (_root, domain, record) = cleanup_fixture();
         let path = record_path(&domain, &record.provider, &record.build).unwrap();
         let lock = lock_file(&path.with_extension("lock"), true).unwrap();
-        assert!(try_lock(&lock).unwrap());
+        assert!(lock.try_exclusive().unwrap());
         for path in [record.control(), record.forwarded()] {
             drop(UnixListener::bind(&path).unwrap());
             fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -1424,12 +1397,12 @@ mod tests {
         let probe = lock_file(&path, true).unwrap();
         // A cloned descriptor shares flock ownership just as an inherited one
         // does, without needing a concurrent fork to reproduce the race.
-        let inherited = probe.try_clone().unwrap();
-        assert!(lock_is_available(probe).unwrap());
+        let inherited = probe.file().try_clone().unwrap();
+        assert!(!probe.held().unwrap());
         let keeper = lock_file(&path, false).unwrap();
-        let acquired = try_lock(&keeper).unwrap();
-        let available_while_owned = lock_is_available(lock_file(&path, false).unwrap()).unwrap();
-        assert_eq!(unsafe { libc::flock(keeper.as_raw_fd(), libc::LOCK_UN) }, 0);
+        let acquired = keeper.try_exclusive().unwrap();
+        let available_while_owned = !lock_file(&path, false).unwrap().held().unwrap();
+        drop(keeper);
         drop(inherited);
         assert!(
             acquired,
@@ -1492,7 +1465,7 @@ mod tests {
         )
         .unwrap();
         assert!(local_binding(&domain, &provider).unwrap().is_none());
-        assert!(try_lock(&lock).unwrap());
+        assert!(lock.try_exclusive().unwrap());
         assert_eq!(
             local_binding(&domain, &provider).unwrap(),
             record.binding().unwrap()
@@ -1520,7 +1493,6 @@ mod tests {
             socket.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
-        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(lock);
         assert!(local_binding(&domain, &provider).unwrap().is_none());
     }
