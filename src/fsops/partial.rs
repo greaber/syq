@@ -3414,37 +3414,8 @@ impl FsOps {
                 prefix,
                 limit,
                 symlink_policy,
-            } => Self::completion_entries(
-                directory,
-                confined_root.as_deref(),
-                prefix,
-                *limit,
-                *symlink_policy,
-                false,
-                true,
-            ),
-            Request::ListDirDetails {
-                directory,
-                confined_root,
-                prefix,
-                limit,
-                symlink_policy,
-            } => Self::completion_entries(
-                directory,
-                confined_root.as_deref(),
-                prefix,
-                *limit,
-                *symlink_policy,
-                true,
-                true,
-            ),
-            Request::ListDirNoFollowFinal {
-                directory,
-                confined_root,
-                prefix,
-                limit,
-                symlink_policy,
                 detailed,
+                follow_final_symlinks,
             } => Self::completion_entries(
                 directory,
                 confined_root.as_deref(),
@@ -3452,7 +3423,7 @@ impl FsOps {
                 *limit,
                 *symlink_policy,
                 *detailed,
-                false,
+                *follow_final_symlinks,
             ),
             Request::StatMany {
                 paths,
@@ -3465,23 +3436,17 @@ impl FsOps {
                 path,
                 allow_missing,
                 symlink_policy,
+                require_search,
             } => self
-                .check_operator_directory(path, *allow_missing, *symlink_policy)
-                .with_context(|| format!("resolve operator directory {}", resolve(path).display()))
-                .map(Response::DirectorySelection),
-            Request::CheckSearchableOperatorDirectory {
-                path,
-                allow_missing,
-                symlink_policy,
-            } => self
-                .check_searchable_operator_directory(path, *allow_missing, *symlink_policy)
+                .check_operator_directory(path, *allow_missing, *symlink_policy, *require_search)
                 .with_context(|| format!("resolve operator directory {}", resolve(path).display()))
                 .map(Response::DirectorySelection),
             Request::CheckOperatorDirectoryAncestry {
                 checks,
                 shared_suffixes,
+                access,
             } => self
-                .check_operator_directory_ancestry(checks, shared_suffixes, None)
+                .check_operator_directory_ancestry(checks, shared_suffixes, *access)
                 .map(Response::DirectoryRelations),
             Request::ReceiverUser => Ok(Response::ReceiverUser(crate::rooted::own_uid())),
             Request::NewFileOwner { path, probe } => {
@@ -3532,17 +3497,6 @@ impl FsOps {
                 .destination_path_access
                 .restore()
                 .map(|()| Response::Ok),
-            Request::CheckOperatorDirectoryAncestryWithAccess {
-                checks,
-                shared_suffixes,
-                selection_in_copy,
-            } => self
-                .check_operator_directory_ancestry(
-                    checks,
-                    shared_suffixes,
-                    Some(*selection_in_copy),
-                )
-                .map(Response::DirectoryRelations),
             Request::RegisterSourceRoots {
                 base,
                 selections,
@@ -4054,11 +4008,9 @@ impl FsOps {
                     )
                 }
             }
-            (
-                Request::CheckOperatorDirectory { path, .. }
-                | Request::CheckSearchableOperatorDirectory { path, .. },
-                Response::EndpointError(error),
-            ) => self.annotate_operator_failure(Some(path), error),
+            (Request::CheckOperatorDirectory { path, .. }, Response::EndpointError(error)) => {
+                self.annotate_operator_failure(Some(path), error)
+            }
             (Request::CreateOperatorDirectory { .. }, Response::EndpointError(error)) => {
                 self.annotate_operator_failure(None, error)
             }
