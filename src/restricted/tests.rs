@@ -14961,3 +14961,28 @@ fn restricted_receivers_refuse_unchecked_keeps() {
         "{error:#}"
     );
 }
+
+/// A path lies beneath a prefix only across a slash; `/` is a prefix of
+/// every absolute path only for the protected-path rule.
+#[test]
+fn paths_lie_beneath_a_prefix_only_across_a_slash() {
+    assert_eq!(beneath(b"/a/b/c", b"/a/b"), Some(&b"c"[..]));
+    assert_eq!(beneath(b"/a/b", b"/a/b"), None);
+    assert_eq!(beneath(b"/a/bc", b"/a/b"), None);
+    assert_eq!(beneath(b"/a", b"/"), None);
+    assert!(at_or_beneath(b"/a/b", b"/a/b"));
+    assert!(at_or_beneath(b"/a/b/c", b"/a/b"));
+    assert!(!at_or_beneath(b"/a/bc", b"/a/b"));
+    assert!(!at_or_beneath(b"/a", b"/"));
+    assert!(path_is_at_or_below(b"/a", b"/"));
+    assert!(path_is_at_or_below(b"/", b"/"));
+    assert!(!path_is_at_or_below(b"/a/bc", b"/a/b"));
+    let scope = |descendants| MutationScope {
+        path: b"/a/b".to_vec(),
+        descendants,
+    };
+    assert!(RestrictedAuthority::scope_allows(&scope(false), b"/a/b"));
+    assert!(!RestrictedAuthority::scope_allows(&scope(false), b"/a/b/c"));
+    assert!(RestrictedAuthority::scope_allows(&scope(true), b"/a/b/c"));
+    assert!(!RestrictedAuthority::scope_allows(&scope(true), b"/a/bc"));
+}

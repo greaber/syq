@@ -83,9 +83,21 @@ pub(super) struct ReceiverControlPath {
     pub(super) label: &'static str,
 }
 
+/// `path` relative to `prefix`, when it lies beneath it: `prefix`, a
+/// slash, and the rest. `prefix` itself is not beneath it, and nothing is
+/// beneath `/` by this rule.
+pub(super) fn beneath<'a>(path: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    path.strip_prefix(prefix)?.strip_prefix(b"/")
+}
+
+/// `path` is `prefix` or lies beneath it, as `beneath` says.
+pub(super) fn at_or_beneath(path: &[u8], prefix: &[u8]) -> bool {
+    path == prefix || beneath(path, prefix).is_some()
+}
+
+/// `at_or_beneath`, with every absolute path below `/`.
 pub(super) fn path_is_at_or_below(path: &[u8], prefix: &[u8]) -> bool {
-    path == prefix
-        || (path.starts_with(prefix) && (prefix == b"/" || path.get(prefix.len()) == Some(&b'/')))
+    at_or_beneath(path, prefix) || (prefix == b"/" && path.starts_with(prefix))
 }
 
 pub(super) fn reject_control_plane_path(
@@ -1248,16 +1260,13 @@ impl RestrictedAuthority {
     }
 
     pub(super) fn scope_allows(scope: &MutationScope, path: &[u8]) -> bool {
-        path == scope.path
-            || (scope.descendants
-                && path.starts_with(&scope.path)
-                && path.get(scope.path.len()) == Some(&b'/'))
+        path == scope.path || (scope.descendants && beneath(path, &scope.path).is_some())
     }
 
     pub(super) fn filter_applies(&self, path: &[u8]) -> bool {
-        self.filter_roots.iter().any(|root| {
-            path == root || (path.starts_with(root) && path.get(root.len()) == Some(&b'/'))
-        })
+        self.filter_roots
+            .iter()
+            .any(|root| at_or_beneath(path, root))
     }
 
     /// A mapped source root itself is never ignored. A destination path that
@@ -1272,11 +1281,10 @@ impl RestrictedAuthority {
             if path == root {
                 return false;
             }
-            if !path.starts_with(root) || path.get(root.len()) != Some(&b'/') {
+            let Some(relative) = beneath(path, root) else {
                 continue;
-            }
+            };
             under_root = true;
-            let relative = &path[root.len() + 1..];
             let relative = Path::new(OsStr::from_bytes(relative));
             let pruned_by_ancestor = relative.ancestors().skip(1).any(|ancestor| {
                 !ancestor.as_os_str().is_empty() && matcher.matched(ancestor, true).is_ignore()
@@ -1389,9 +1397,7 @@ impl RestrictedAuthority {
         if path == self.destination {
             return Ok(b"");
         }
-        path.strip_prefix(self.destination.as_slice())
-            .and_then(|relative| relative.strip_prefix(b"/"))
-            .context("mapping path is outside the destination")
+        beneath(path, &self.destination).context("mapping path is outside the destination")
     }
 
     pub(super) fn check_mapping_path(&self, path: &[u8], directory: Option<bool>) -> Result<()> {
@@ -1529,9 +1535,7 @@ impl RestrictedAuthority {
         if path == self.destination {
             return (!directory).then(Vec::new);
         }
-        path.strip_prefix(self.destination.as_slice())
-            .and_then(|rest| rest.strip_prefix(b"/"))
-            .map(<[u8]>::to_vec)
+        beneath(path, &self.destination).map(<[u8]>::to_vec)
     }
 
     /// Add one settled change to the results, if they have started.
