@@ -2021,6 +2021,27 @@ impl WorkerConnector {
         )
     }
 
+    /// The sides that are TCP data connections, to open before the copy
+    /// knows it has a file to send (`connect_ahead`).
+    fn sides_ahead(&self) -> SidesAhead {
+        (
+            self.src_ep.tcp_ahead(
+                self.compress,
+                crate::proto::ConnectionRole::SourceWorker {
+                    roots: self.sources.clone(),
+                    send_budget: None,
+                },
+            ),
+            self.dst_ep.tcp_ahead(
+                self.compress,
+                crate::proto::ConnectionRole::DestinationWorker {
+                    destination: self.destination.clone(),
+                    copy_sources: self.copy_sources.clone(),
+                },
+            ),
+        )
+    }
+
     /// Log a worker on the copy's shared SSH login in on its own, for the
     /// sides that share it (`source`, `destination`), and configure the new
     /// connections fully, so the worker can move to them between requests.
@@ -2050,6 +2071,32 @@ impl WorkerConnector {
         };
         Ok((src, dst))
     }
+}
+
+/// A worker's source and destination connections to open ahead, where each
+/// is a TCP data connection.
+type SidesAhead = (Option<crate::conn::TcpAhead>, Option<crate::conn::TcpAhead>);
+
+/// Open `sides`, so the first file to send finds them ready. A side that
+/// is not a TCP data connection, or whose connection fails, is `None`: the
+/// worker opens it in the usual way once there is a file.
+fn connect_ahead(sides: SidesAhead) -> worker::OwnConnections {
+    // Tests hold these connections back, or fail them.
+    #[cfg(debug_assertions)]
+    if crate::fsops::test_race_barrier(
+        "SYQ_TEST_CONNECT_AHEAD_READY_FILE",
+        "SYQ_TEST_CONNECT_AHEAD_CONTINUE_FILE",
+        "connection ahead",
+    )
+    .is_err()
+        || std::env::var_os("SYQ_TEST_CONNECT_AHEAD_FAILS").is_some()
+    {
+        return (None, None);
+    }
+    (
+        sides.0.and_then(crate::conn::TcpAhead::connect),
+        sides.1.and_then(crate::conn::TcpAhead::connect),
+    )
 }
 
 fn handle_tcp_setup_error(
@@ -3103,7 +3150,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let workers: Arc<Mutex<Vec<std::thread::JoinHandle<Result<()>>>>> =
         Arc::new(Mutex::new(Vec::new()));
     let connect_after_file_plan = Arc::new(AtomicBool::new(false));
-    // The first worker does not wait for that (`connect_after_file_plan`).
+    // Meanwhile the first worker's TCP data connections open on a thread of
+    // their own (`connect_ahead`).
     let first_connects_ahead = Arc::new(AtomicBool::new(false));
     let transport_stats: Arc<Mutex<Vec<TcpPairStats>>> = Arc::new(Mutex::new(Vec::new()));
     let spawn_worker: Arc<dyn Fn(usize) + Send + Sync> = {
@@ -3182,42 +3230,76 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             #[cfg(not(debug_assertions))]
             let refused = false;
             let work = move || -> Result<()> {
-                if connect_after_file_plan.load(Relaxed)
-                    && !(id == 0 && first_connects_ahead.load(Relaxed))
-                    && !sched.wait_for_anticipated_file_work()
+                let connector = || -> Result<WorkerConnector> {
+                    let initial_destination = if destination_anchor_required {
+                        Some(
+                            destination_anchor
+                                .get()
+                                .context(
+                                    "destination root was not anchored before workers started",
+                                )?
+                                .destination
+                                .clone(),
+                        )
+                    } else {
+                        None
+                    };
+                    let initial_sources = source_roots
+                        .get()
+                        .context("source roots were not registered before workers started")?
+                        .clone();
+                    Ok(WorkerConnector {
+                        src_ep: src_ep.clone(),
+                        dst_ep: dst_ep.clone(),
+                        compress,
+                        copy_sources: if opts.copy_policy(bwlimit.is_some()).allows_receiver_copy()
+                        {
+                            initial_sources.clone()
+                        } else {
+                            Vec::new()
+                        },
+                        sources: initial_sources,
+                        destination: initial_destination,
+                        opts: opts.clone(),
+                        setups: sched.worker_setups().clone(),
+                    })
+                };
+                // The connections open on a thread of their own while this
+                // one waits to learn whether planning found a file to send.
+                // The thread is not joined: a copy with nothing to send ends
+                // without waiting for connections it will not use, and the
+                // thread closes them when it finds nobody waiting. So it is
+                // given only what dialing takes, nothing of the copy's that
+                // is cleaned up when the copy ends.
+                let ahead = if id == 0 && first_connects_ahead.load(Relaxed) {
+                    let sides = connector()?.sides_ahead();
+                    let (opened, ahead) = std::sync::mpsc::sync_channel(1);
+                    #[cfg(debug_assertions)]
+                    crate::fsops::record_test_event(
+                        "SYQ_TEST_WORKER_EVENTS",
+                        format_args!("ahead {id}"),
+                    )?;
+                    std::thread::Builder::new()
+                        .name("syq-connect-ahead".into())
+                        .spawn(move || {
+                            let _ = opened.send(connect_ahead(sides));
+                        })
+                        .ok()
+                        .map(|_| ahead)
+                } else {
+                    None
+                };
+                if connect_after_file_plan.load(Relaxed) && !sched.wait_for_anticipated_file_work()
                 {
                     gate.mark_absent(id);
                     return Ok(());
                 }
-                let initial_destination = if destination_anchor_required {
-                    Some(
-                        destination_anchor
-                            .get()
-                            .context("destination root was not anchored before workers started")?
-                            .destination
-                            .clone(),
-                    )
-                } else {
-                    None
-                };
-                let initial_sources = source_roots
-                    .get()
-                    .context("source roots were not registered before workers started")?
-                    .clone();
-                let connector = WorkerConnector {
-                    src_ep: src_ep.clone(),
-                    dst_ep: dst_ep.clone(),
-                    compress,
-                    copy_sources: if opts.copy_policy(bwlimit.is_some()).allows_receiver_copy() {
-                        initial_sources.clone()
-                    } else {
-                        Vec::new()
-                    },
-                    sources: initial_sources,
-                    destination: initial_destination,
-                    opts: opts.clone(),
-                    setups: sched.worker_setups().clone(),
-                };
+                // A file to send: take what the thread opened, waiting for it
+                // as the connection made here would be waited for.
+                let mut ahead = ahead
+                    .and_then(|ahead| ahead.recv().ok())
+                    .unwrap_or((None, None));
+                let connector = connector()?;
                 #[cfg(debug_assertions)]
                 if id == 0 {
                     crate::fsops::test_race_barrier(
@@ -3244,9 +3326,18 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     // the remaining independent connections finish logging in.
                     // TCP and custom remote shells keep their existing policy.
                     let reuse_control = reuse_startup_ssh(id, autotune);
-                    let conns = connector
-                        .source(reuse_control)
-                        .and_then(|src| Ok((src, connector.destination(reuse_control)?)));
+                    // A side opened ahead serves the first attempt only.
+                    let conns = ahead
+                        .0
+                        .take()
+                        .map_or_else(|| connector.source(reuse_control), Ok)
+                        .and_then(|src| {
+                            let dst = ahead
+                                .1
+                                .take()
+                                .map_or_else(|| connector.destination(reuse_control), Ok)?;
+                            Ok((src, dst))
+                        });
                     // Tests fail the first worker's connection once every file
                     // is finished or the copy has failed: "reject" as a
                     // receiver rejecting its handshake, anything else as an
@@ -4768,11 +4859,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         // connects once planning sees one, while the control connection
         // creates directories. An existing destination may already hold the
         // file, so there the worker starts early only when it needs no new
-        // login. Where connecting takes a socket alone, it connects at once,
-        // while the planner's first lookup is out, so a file to send finds
-        // the connection ready; a copy with nothing to send then closes it
-        // unused. Otherwise it connects only once planning queues a file to
-        // send, and a copy with nothing to send opens no data connection.
+        // login, and takes work only once planning queues a file to send.
+        // Where its connections are sockets alone, they open meanwhile, while
+        // the planner's first lookup is out, so a file to send finds them
+        // ready; a copy with nothing to send then closes them unused.
+        // Otherwise a copy with nothing to send opens no data connection.
         connect_after_file_plan.store(true, Relaxed);
         first_connects_ahead.store(
             !fresh_destination

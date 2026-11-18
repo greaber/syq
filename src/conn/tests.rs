@@ -1127,7 +1127,6 @@ fn connecting_socket_congestion_rejection_is_attributed_to_coordinator() {
                 roots: Vec::new(),
                 send_budget: None,
             },
-            None,
         )
         .expect_err("unregistered congestion control should fail locally");
     let message = format!("{error:#}");
@@ -1184,7 +1183,7 @@ fn only_the_local_receiver_disables_requested_tcp_compression() {
                 next: Default::default(),
             };
             let conn = spec
-                .connect_tcp(&info, requested, ConnectionRole::Control, None)
+                .connect_tcp(&info, requested, ConnectionRole::Control)
                 .unwrap();
             let expected = requested && !local_process;
             assert_eq!(conn.w.compress, expected);
@@ -3916,45 +3915,4 @@ fn small_batches_start_without_waiting_for_a_configuration_reply() {
     replies.write_msg(&Response::Stats(vec![])).unwrap();
     let _scope = conn.track_small_batches(progress).unwrap().unwrap();
     assert!(conn.reply_arrived(&pending));
-}
-
-#[test]
-fn ending_a_copy_closes_data_sockets_still_in_their_handshake() {
-    use std::io::Read;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let connect = || {
-        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let _peer = listener.accept().unwrap();
-        (std::sync::Arc::new(socket), _peer)
-    };
-    let closed = |socket: &TcpStream| {
-        socket
-            .set_read_timeout(Some(std::time::Duration::from_millis(50)))
-            .unwrap();
-        // A closed socket reads its end at once; an open one times out.
-        matches!((&*socket).read(&mut [0; 1]), Ok(0))
-    };
-    let ended = std::sync::Arc::new(AtomicBool::new(false));
-    let setups = std::sync::Arc::new(WorkerSetups::default());
-    let copy_ended = ended.clone();
-    setups.set_ended(move || copy_ended.load(Ordering::Relaxed));
-
-    // A connection whose handshake was answered is the copy's to keep.
-    let (kept, _kept_peer) = connect();
-    setups.watch_socket(kept.clone()).finish().unwrap();
-    let (waiting, _waiting_peer) = connect();
-    let handshake = setups.watch_socket(waiting.clone());
-    assert!(!closed(&waiting));
-
-    ended.store(true, Ordering::Relaxed);
-    setups.cancel();
-    assert!(closed(&waiting), "the handshake was left waiting");
-    assert!(!closed(&kept), "a finished connection was closed");
-    assert!(handshake.finish().is_err(), "the copy kept the connection");
-
-    // One that connects after the copy ended is closed at once.
-    let (late, _late_peer) = connect();
-    let _handshake = setups.watch_socket(late.clone());
-    assert!(closed(&late));
 }

@@ -1905,8 +1905,6 @@ struct SetupState {
     next: u64,
     /// Unreaped login processes and whether each leads its own process group.
     logins: std::collections::HashMap<u64, (libc::pid_t, bool)>,
-    /// Data sockets whose handshake has not been answered.
-    sockets: std::collections::HashMap<u64, std::sync::Arc<TcpStream>>,
 }
 
 /// SIGTERM, not SIGKILL: ssh restores the terminal if it was asking for a
@@ -1934,9 +1932,6 @@ impl WorkerSetups {
         let state = self.state.lock().unwrap();
         for &(pid, group) in state.logins.values() {
             end_login(pid, group);
-        }
-        for socket in state.sockets.values() {
-            let _ = socket.shutdown(std::net::Shutdown::Both);
         }
         drop(state);
         self.wake.notify_all();
@@ -1981,25 +1976,7 @@ impl WorkerSetups {
     }
 }
 
-impl WorkerSetups {
-    /// Let `cancel` end the handshake on this data socket by closing it, or
-    /// close it now if the copy has already ended.
-    fn watch_socket(self: &std::sync::Arc<Self>, socket: std::sync::Arc<TcpStream>) -> SetupWatch {
-        let mut state = self.state.lock().unwrap();
-        if self.cancelled() {
-            let _ = socket.shutdown(std::net::Shutdown::Both);
-        }
-        let id = state.next;
-        state.next += 1;
-        state.sockets.insert(id, socket);
-        SetupWatch {
-            setups: self.clone(),
-            id,
-        }
-    }
-}
-
-/// A login process or data socket `WorkerSetups::cancel` may still end. Drop this BEFORE
+/// A login process `WorkerSetups::cancel` may still end. Drop this BEFORE
 /// reaping the process, so its PID cannot be reused while registered.
 pub(crate) struct SetupWatch {
     setups: std::sync::Arc<WorkerSetups>,
@@ -2010,7 +1987,7 @@ impl SetupWatch {
     /// The connection is ready: from now on the copy keeps it, unless the
     /// copy ended first.
     fn finish(self) -> Result<()> {
-        self.forget();
+        self.setups.state.lock().unwrap().logins.remove(&self.id);
         if self.setups.cancelled() {
             return Err(SetupCancelled.into());
         }
@@ -2018,17 +1995,9 @@ impl SetupWatch {
     }
 }
 
-impl SetupWatch {
-    fn forget(&self) {
-        let mut state = self.setups.state.lock().unwrap();
-        state.logins.remove(&self.id);
-        state.sockets.remove(&self.id);
-    }
-}
-
 impl Drop for SetupWatch {
     fn drop(&mut self) {
-        self.forget();
+        self.setups.state.lock().unwrap().logins.remove(&self.id);
     }
 }
 
@@ -2358,6 +2327,39 @@ impl RemoteSpec {
 
     pub fn diagnostics(&self) -> RemoteDiagnostics {
         self.diagnostics.lock().unwrap().clone()
+    }
+
+    /// This endpoint's name and connection settings alone, sharing none of
+    /// its session: no SSH login, route, pacing or diagnostics.
+    fn dialing_only(&self) -> RemoteSpec {
+        RemoteSpec {
+            local_process: self.local_process,
+            user: self.user.clone(),
+            host: self.host.clone(),
+            port: self.port,
+            rsh: self.rsh.clone(),
+            syq_path: self.syq_path.clone(),
+            bootstrap_helper: self.bootstrap_helper,
+            restricted_grant: self.restricted_grant.clone(),
+            helper_install: Default::default(),
+            ssh_multiplexer: None,
+            quiet: self.quiet,
+            tcp: Default::default(),
+            pacing: Default::default(),
+            diagnostics: Default::default(),
+            primed_control: Default::default(),
+            read_ahead: self.read_ahead,
+            receiver_host: None,
+        }
+    }
+
+    /// The TCP data route, where this machine dials it and it has not failed.
+    fn dialed_tcp_route(&self) -> Option<TcpInfo> {
+        self.tcp
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|info| !info.failed && info.reverse.is_none())
     }
 
     pub fn data_transport(&self) -> DataTransport {
@@ -3492,7 +3494,6 @@ impl RemoteSpec {
         info: &TcpInfo,
         compress: bool,
         role: ConnectionRole,
-        setups: Option<&std::sync::Arc<WorkerSetups>>,
     ) -> Result<RemoteConn> {
         #[cfg(debug_assertions)]
         if !self.local_process && std::env::var_os("SYQ_TEST_TCP_FAIL_AFTER_ONE_WORKER").is_some() {
@@ -3532,13 +3533,9 @@ impl RemoteSpec {
             ),
             None => (None, None),
         };
-        let socket = std::sync::Arc::new(stream.try_clone()?);
-        // A copy that ends while the handshake is out closes the socket
-        // rather than wait a round trip for a connection it will not use.
-        let handshake = setups.map(|setups| setups.watch_socket(socket.clone()));
         let transport = Transport {
             records: Some(ciphers),
-            tcp_socket: Some(socket),
+            tcp_socket: Some(std::sync::Arc::new(stream.try_clone()?)),
             token: info.token.clone(),
             ..Transport::new(
                 stream.try_clone()?,
@@ -3547,13 +3544,7 @@ impl RemoteSpec {
                 info.pacing.clone(),
             )
         };
-        self.open(transport, compress, role, |conn| {
-            let conn = conn?;
-            if let Some(handshake) = handshake {
-                handshake.finish()?;
-            }
-            Ok(conn)
-        })
+        self.open(transport, compress, role, |conn| conn)
     }
 }
 
@@ -4208,6 +4199,29 @@ fn receive_hello(mut conn: RemoteConn, worker: bool) -> Result<RemoteConn> {
     Ok(conn)
 }
 
+/// A worker connection over the TCP data route, to be opened apart from the
+/// copy it is for. `connect` can run on a thread nobody waits for, so this
+/// holds nothing the copy cleans up when it ends: none of the session's
+/// state, only what dialing takes.
+pub(crate) struct TcpAhead {
+    spec: RemoteSpec,
+    info: TcpInfo,
+    compress: bool,
+    role: ConnectionRole,
+}
+
+impl TcpAhead {
+    /// Nothing but the TCP data route is tried, and a failure changes and
+    /// reports nothing: the caller connects in the usual way, with the
+    /// usual retries and reports, once it has a file to send.
+    pub(crate) fn connect(self) -> Option<Box<dyn Conn>> {
+        self.spec
+            .connect_tcp(&self.info, self.compress, self.role)
+            .ok()
+            .map(|conn| Box::new(conn) as Box<dyn Conn>)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum Endpoint {
     Local {
@@ -4251,23 +4265,33 @@ impl Endpoint {
     }
 
     /// Whether a first data worker connects by opening a socket alone: in
-    /// this process, or over the TCP data route. No login is made and no
-    /// process is started for it on either machine.
+    /// this process, to a local receiver, or over a TCP data route that this
+    /// machine dials. No login is made and no process is started for it on
+    /// either machine. A receiving machine that dials back is asked to over
+    /// its control channel, which is more than a socket.
     pub(crate) fn first_worker_opens_only_a_socket(&self) -> bool {
         match self {
             Endpoint::Local { .. } => true,
-            // A receiving machine that dials back is asked to over its
-            // control channel, which is more than a socket.
-            Endpoint::Remote(spec) => {
-                spec.local_process
-                    || spec
-                        .tcp
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .is_some_and(|info| !info.failed && info.reverse.is_none())
-            }
+            Endpoint::Remote(spec) => spec.local_process || spec.dialed_tcp_route().is_some(),
         }
+    }
+
+    /// What opening a worker connection over the TCP data route takes, for
+    /// a copy that may turn out to have nothing to send. None where the
+    /// connection is not a socket this machine dials over the network.
+    pub(crate) fn tcp_ahead(&self, compress: bool, role: ConnectionRole) -> Option<TcpAhead> {
+        let Endpoint::Remote(spec) = self else {
+            return None;
+        };
+        if spec.local_process {
+            return None;
+        }
+        Some(TcpAhead {
+            info: spec.dialed_tcp_route()?,
+            spec: spec.dialing_only(),
+            compress,
+            role,
+        })
     }
 
     pub fn has_data_server(&self) -> bool {
@@ -4378,7 +4402,7 @@ impl Endpoint {
             Endpoint::Remote(spec) => {
                 let info = spec.tcp.lock().unwrap().clone();
                 if let Some(info) = info.filter(|i| !i.failed) {
-                    match spec.connect_tcp(&info, compress, role.clone(), setups) {
+                    match spec.connect_tcp(&info, compress, role.clone()) {
                         Ok(c) => return Ok(Box::new(c)),
                         Err(e)
                             if is_tcp_congestion_error(&e)

@@ -913,15 +913,14 @@ fn existing_destination_tree(t: &Tmp, changed: bool) {
     }
 }
 
-/// For an existing destination, the worker that connects during planning
-/// connects at once over the TCP data route, where that takes a socket
-/// alone, so a file to send finds the connection ready; an unchanged copy
-/// then closes it unused. Where a connection is a login, the worker waits
-/// until planning queues a file to send, so an unchanged copy opens no
-/// worker connection. No copy leaves private temporary directories behind.
+/// For an existing destination, the worker that starts during planning takes
+/// work only once planning queues a file to send, so an unchanged copy starts
+/// no worker. Over the TCP data route its connection opens meanwhile, ahead
+/// of that; where a connection is a login, nothing is opened for an unchanged
+/// copy. No copy leaves private temporary directories behind.
 #[cfg(debug_assertions)]
 #[test]
-fn an_early_worker_connects_ahead_only_where_that_takes_a_socket() {
+fn an_early_worker_connects_only_for_a_file_to_send() {
     for (tcp, changed) in [(true, false), (true, true), (false, false), (false, true)] {
         let case = format!("tcp={tcp} changed={changed}");
         let t = Tmp::new();
@@ -942,12 +941,13 @@ fn an_early_worker_connects_ahead_only_where_that_takes_a_socket() {
             .lines()
             .filter(|line| line.starts_with("connected "))
             .count();
-        assert_eq!(started.exists(), changed || tcp, "{case}: {out:?}");
-        // An unchanged copy may end before the connection it started over
-        // TCP is answered, and closes it either way.
-        if changed || !tcp {
-            assert_eq!(connected > 0, changed, "{case}: {out:?}");
-        }
+        assert_eq!(started.exists(), changed, "{case}: {out:?}");
+        assert_eq!(connected > 0, changed, "{case}: {out:?}");
+        let ahead = fs::read_to_string(&events)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.starts_with("ahead "));
+        assert_eq!(ahead, tcp, "{case}: {out:?}");
         assert_eq!(stderr_of(&out), "", "{case}");
         // A leaked directory stays; a helper's own cleanup may trail its exit.
         let leftovers = || private_temporary_leftovers(&temporary);
@@ -959,6 +959,65 @@ fn an_early_worker_connects_ahead_only_where_that_takes_a_socket() {
         }
         assert!(left.is_empty(), "{case}: left {left:?}: {out:?}");
     }
+}
+
+/// A connection opened ahead is nobody's until a file needs it. One that
+/// fails, or is still being made when a copy with nothing to send ends,
+/// neither fails nor delays that copy, and a copy with a file to send
+/// connects in the usual way.
+#[cfg(debug_assertions)]
+#[test]
+fn a_connection_ahead_that_fails_or_stalls_costs_the_copy_nothing() {
+    for changed in [false, true] {
+        // Fails. For the unchanged copy the worker's own source setup
+        // would fail too, and fail the copy, if the worker got that far.
+        let t = Tmp::new();
+        existing_destination_tree(&t, changed);
+        let temporary = t.runtime();
+        fs::create_dir(&temporary).unwrap();
+        let events = t.path("worker-events");
+        let mut copy = existing_destination_copy(&t, true, &temporary);
+        copy.arg("--performance-tuning=workers=1")
+            .env("SYQ_TEST_CONNECT_AHEAD_FAILS", "1")
+            .env("SYQ_TEST_WORKER_EVENTS", &events);
+        if !changed {
+            copy.env("SYQ_TEST_LOCAL_SOURCE_EMFILE_ONCE", "1");
+        }
+        let out = copy.run().unwrap();
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst/b")), read(&t.path("src/b")));
+        let events = fs::read_to_string(&events).unwrap_or_default();
+        assert!(events.contains("ahead 0"), "changed={changed}: {events}");
+        assert_eq!(
+            events.contains("connected 0"),
+            changed,
+            "changed={changed}: {events}"
+        );
+        if !changed {
+            assert_eq!(stderr_of(&out), "", "an unused connection was reported");
+        }
+    }
+
+    // Stalls: the copy ends while the connection is still held back.
+    let t = Tmp::new();
+    existing_destination_tree(&t, false);
+    let temporary = t.runtime();
+    fs::create_dir(&temporary).unwrap();
+    let held = t.path("ahead-held");
+    let started = std::time::Instant::now();
+    let out = existing_destination_copy(&t, true, &temporary)
+        .env("SYQ_TEST_CONNECT_AHEAD_READY_FILE", &held)
+        .env("SYQ_TEST_CONNECT_AHEAD_CONTINUE_FILE", t.path("never"))
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(stderr_of(&out), "");
+    assert!(held.exists(), "no connection was started ahead");
+    // The held connection would be released only after a minute.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "the copy waited for a connection it did not use"
+    );
 }
 
 /// The early worker connects while planning goes on. Planning queues the
