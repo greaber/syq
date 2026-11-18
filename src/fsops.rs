@@ -9,9 +9,11 @@ use crate::rooted::{
     open_operator_directory_at, read_open_symlink, root_metadata_from_std, OperatorFinalComponent,
     OperatorResolver, PinnedPath, RelativePath, Root, RootIdentity, RootMetadata,
 };
+#[cfg(test)]
+use crate::sys::COMMON_NAME_MAX;
 use crate::sys::{
-    absent_or_nondirectory, COMMON_NAME_MAX, MODE_BLOCK, MODE_CHAR, MODE_DIRECTORY, MODE_FIFO,
-    MODE_REGULAR, MODE_SOCKET, MODE_SYMLINK, NAME_MAX_CACHE_CAP,
+    absent_or_nondirectory, MODE_BLOCK, MODE_CHAR, MODE_DIRECTORY, MODE_FIFO, MODE_REGULAR,
+    MODE_SOCKET, MODE_SYMLINK,
 };
 use crate::write_gate::CachedFile;
 use anyhow::{anyhow, bail, Context, Result};
@@ -2807,24 +2809,6 @@ impl FsOps {
             .as_deref()
             .expect("relative response requires an active destination root");
         join(prefix, relative)
-    }
-
-    fn partial_path(&self, final_path: &Path, copy_id: &CopyId) -> Result<PathBuf> {
-        if self.destination_prefix.is_none() {
-            return partial_path(final_path, copy_id);
-        }
-        let relative = path_bytes(final_path);
-        let strict_relative = RelativePath::new(&relative)?;
-        let logical = PathBuf::from(OsStr::from_bytes(&self.destination_full(&relative)));
-        let component_limit = self
-            .destination_root
-            .as_ref()
-            .context("destination prefix has no retained root")?
-            .partial_name_max(&strict_relative)?;
-        let logical_partial = partial_path_with_name_max(&logical, copy_id, component_limit)?;
-        Ok(PathBuf::from(OsStr::from_bytes(
-            &self.destination_relative(logical_partial.as_os_str().as_bytes())?,
-        )))
     }
 
     fn logical_destination_path(&self, relative: &Path) -> PathBuf {
