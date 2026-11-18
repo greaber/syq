@@ -2141,7 +2141,9 @@ mod storage_signing {
             let mut other_output = Vec::new();
             relay_output(relay_input, &mut other_output, &mut None, &mut relay).unwrap();
             assert!(relay.failure.is_none(), "{:?}", relay.failure);
-            assert!(!String::from_utf8(other_output).unwrap().contains("syq-storage-"));
+            assert!(!String::from_utf8(other_output)
+                .unwrap()
+                .contains("syq-storage-"));
         });
         let mut replies = requester.try_clone().unwrap();
         let served = std::thread::spawn(move || {
@@ -2156,7 +2158,10 @@ mod storage_signing {
         });
         let (authorization, headers, write_headers) = started::open(bucket, local).unwrap();
         assert_eq!(headers.len(), 1);
-        assert_eq!((headers[0].0.as_str(), headers[0].1.as_str()), ("x-amz-storage-class", "STANDARD_IA"));
+        assert_eq!(
+            (headers[0].0.as_str(), headers[0].1.as_str()),
+            ("x-amz-storage-class", "STANDARD_IA")
+        );
         assert!(write_headers.is_empty());
         assert!(authorization.started_elsewhere());
         Session {
@@ -2168,7 +2173,14 @@ mod storage_signing {
     }
 
     const UPLOAD: &[&str] = &[
-        "cp", "--from", "server", "--srcs-in", "dataset", "--to", "s3://bucket", "--into",
+        "cp",
+        "--from",
+        "server",
+        "--srcs-in",
+        "dataset",
+        "--to",
+        "s3://bucket",
+        "--into",
         "dataset",
     ];
 
@@ -2228,7 +2240,10 @@ mod storage_signing {
     fn losing_the_starting_machine_after_signing_still_stops_the_copy() {
         let mut session = session(UPLOAD);
         let request = Unsigned::new("PUT", "dataset/first");
-        session.authorization.authorize(vec![request.clone()]).unwrap();
+        session
+            .authorization
+            .authorize(vec![request.clone()])
+            .unwrap();
         session.authorization.finish_preparation().unwrap();
         assert_eq!(session.served.join().unwrap().unwrap(), None);
         // Data moves with the URLs already signed; nothing more is signed.
@@ -2237,7 +2252,12 @@ mod storage_signing {
             .authorization
             .signed(Unsigned::new("PUT", "dataset/late"))
             .unwrap_err();
-        assert!(error.to_string().contains("was not signed before the copy started moving data"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("was not signed before the copy started moving data"),
+            "{error}"
+        );
         lose(&mut session.requester);
         assert!(session.lost.join().unwrap(), "the server did not notice");
     }
@@ -2245,11 +2265,31 @@ mod storage_signing {
     #[test]
     fn the_server_command_is_an_ordinary_storage_copy_without_this_machines_storage_options() {
         let args = command(&[
-            "cp", "--from", "user@server:2222", "--srcs-in", "dataset", "--to", "s3://bucket",
-            "--into", "dataset", "--prune", "-n", "--s3-profile", "work", "--s3-endpoint",
-            "https://objects.example", "--s3-region", "auto", "--s3-header",
-            "x-amz-server-side-encryption-customer-key: secret", "--s3-retries", "3",
-            "--syq-path", "/opt/syq", "--rsh", "ssh -v",
+            "cp",
+            "--from",
+            "user@server:2222",
+            "--srcs-in",
+            "dataset",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "dataset",
+            "--prune",
+            "-n",
+            "--s3-profile",
+            "work",
+            "--s3-endpoint",
+            "https://objects.example",
+            "--s3-region",
+            "auto",
+            "--s3-header",
+            "x-amz-server-side-encryption-customer-key: secret",
+            "--s3-retries",
+            "3",
+            "--syq-path",
+            "/opt/syq",
+            "--rsh",
+            "ssh -v",
         ]);
         let (dst, srcs) = args.locations.split_last().unwrap();
         let remote = coordinator_arguments(
@@ -2270,15 +2310,38 @@ mod storage_signing {
         )
         .unwrap();
         let text = remote.join(" ");
-        for expected in ["--delegated-operands-b64", "-n", "--prune", "--s3-retries=3", "--to s3://bucket"] {
+        for expected in [
+            "--delegated-operands-b64",
+            "-n",
+            "--prune",
+            "--s3-retries=3",
+            "--to s3://bucket",
+        ] {
             assert!(text.contains(expected), "{expected}: {text}");
         }
-        for absent in ["secret", "work", "objects.example", "auto", "--rsh", "--syq-path", "--tcp-ports", "server"] {
+        for absent in [
+            "secret",
+            "work",
+            "objects.example",
+            "auto",
+            "--rsh",
+            "--syq-path",
+            "--tcp-ports",
+            "server",
+        ] {
             assert!(!text.contains(absent), "{absent}: {text}");
         }
         // A download runs at the destination, with the bucket as its source.
         let args = command(&[
-            "cp", "--from", "s3://bucket", "--srcs-in", "dataset", "--to", "server", "--into", "/data",
+            "cp",
+            "--from",
+            "s3://bucket",
+            "--srcs-in",
+            "dataset",
+            "--to",
+            "server",
+            "--into",
+            "/data",
         ]);
         let (dst, srcs) = args.locations.split_last().unwrap();
         let remote = coordinator_arguments(
@@ -2299,7 +2362,10 @@ mod storage_signing {
         )
         .unwrap()
         .join(" ");
-        assert!(remote.contains("--from s3://bucket") && remote.contains("--relay-results"), "{remote}");
+        assert!(
+            remote.contains("--from s3://bucket") && remote.contains("--relay-results"),
+            "{remote}"
+        );
         assert!(!remote.contains("--to"), "{remote}");
     }
 }

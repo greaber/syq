@@ -409,7 +409,11 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
     if args.rm {
         return remove::run(args);
     }
-    if args.locations.iter().any(crate::cli::Location::is_ssh_server) {
+    if args
+        .locations
+        .iter()
+        .any(crate::cli::Location::is_ssh_server)
+    {
         return run_on_server(args);
     }
     let writer = crate::results::start(

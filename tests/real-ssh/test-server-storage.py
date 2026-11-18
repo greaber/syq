@@ -29,10 +29,17 @@ def syq(arguments, *, ok=True, endpoint=None, timeout=120):
     """Run `syq cp` on the runner, which signs with the fixture's profile."""
     command = ['syq', 'cp', '--s3-profile', 'server-storage-test', '--s3-endpoint', endpoint or ENDPOINT,
                '--s3-region', 'us-east-1', '--no-progress', '--s3-retries=0', *arguments]
-    result = subprocess.run(command, text=True, capture_output=True, timeout=timeout)
+    result = subprocess.run(command, text=True, capture_output=True, timeout=timeout, env=profile_only())
     assert (result.returncode == 0) == ok, (command, result)
     assert 'X-Amz-Signature' not in result.stdout + result.stderr, 'a signed URL reached the output'
     return result
+
+
+def profile_only():
+    """The runner's environment for syq: its storage credentials are in the
+    profile alone, and nothing but the command names the endpoint."""
+    return {name: value for name, value in os.environ.items()
+            if name not in ('AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_ENDPOINT_URL_S3')}
 
 
 def absent(key):
@@ -45,7 +52,8 @@ def absent(key):
 
 
 def server_copies():
-    """The storage copies running on the source server."""
+    """The processes of storage copies on the source server: the copy and
+    the shell that started it."""
     return lab.remote('source', "pgrep -u syq -f -- 'cp --delegated-operands-b6[4]' || true").split()
 
 
@@ -79,10 +87,8 @@ with tempfile.TemporaryDirectory(prefix='syq-server-storage-') as directory:
             spec.loader.exec_module(checks)
             checks.request('PUT')
             prefix = checks.PREFIX
-            # From here on only the profile holds the credentials, and only
-            # on the runner: syq must use them through --s3-profile.
-            for name in ('AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_ENDPOINT_URL_S3'):
-                del os.environ[name]
+            # The environment's credentials are for this script's own checks.
+            # syq gets them from the profile, and only on the runner.
             credentials.parent.mkdir(mode=0o700, exist_ok=True)
             credentials.write_text('[server-storage-test]\naws_access_key_id = syq-test-user\n'
                                    'aws_secret_access_key = syq-test-password\n')
@@ -151,7 +157,7 @@ with tempfile.TemporaryDirectory(prefix='syq-server-storage-') as directory:
             process = subprocess.Popen(['syq', 'cp', '--s3-profile', 'server-storage-test', '--s3-endpoint', ENDPOINT,
                                         '--s3-region', 'us-east-1', '--no-progress', *interrupted],
                                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-                                       start_new_session=True)
+                                       start_new_session=True, env=profile_only())
             try:
                 def uploaded():
                     assert process.poll() is None, ('the copy ended early', process.stderr.read())
@@ -160,7 +166,7 @@ with tempfile.TemporaryDirectory(prefix='syq-server-storage-') as directory:
                     events = [json.loads(line) for line in progress.read_text().splitlines() if line]
                     return max((e['bytes_done'] for e in events if e['type'] == 'progress'), default=0)
                 lab.wait_for('uploaded bytes', uploaded, 45)
-                assert len(server_copies()) == 1, server_copies()
+                assert server_copies(), 'no copy is running on the server'
                 # The runner ends with no chance to tell the server anything.
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=10)
@@ -178,7 +184,6 @@ with tempfile.TemporaryDirectory(prefix='syq-server-storage-') as directory:
             try:
                 subprocess.run(['ssh', 'source', 'rm -rf ' + REMOTE], timeout=30)
                 if checks is not None:
-                    os.environ.update(AWS_ACCESS_KEY_ID='syq-test-user', AWS_SECRET_ACCESS_KEY='syq-test-password')
                     checks.clean()
                     checks.request('DELETE')
             finally:

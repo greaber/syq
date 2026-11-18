@@ -1985,7 +1985,9 @@ pub(crate) fn run_storage(
     anyhow::ensure!(
         args.s3.is_some()
             && args.interface == Interface::NativeCp
-            && srcs.iter().all(|source| source.is_ssh_server() != server_is_destination),
+            && srcs
+                .iter()
+                .all(|source| source.is_ssh_server() != server_is_destination),
         "a copy between an SSH server and S3 needs one server and one bucket"
     );
     run_remote(args, srcs, dst, server_is_destination, results)

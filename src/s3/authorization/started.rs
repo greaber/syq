@@ -118,7 +118,11 @@ pub(crate) fn attach(args: &mut crate::cli::Args) -> Result<()> {
 pub(crate) fn open(
     bucket: String,
     mut session: UnixStream,
-) -> Result<(Authorization, Vec<crate::s3::Header>, Vec<crate::s3::Header>)> {
+) -> Result<(
+    Authorization,
+    Vec<crate::s3::Header>,
+    Vec<crate::s3::Header>,
+)> {
     let opening = crate::destination::storage::open_started_copy(&mut session).context(
         "the machine that started this copy ended before it could sign storage requests",
     )?;
@@ -191,8 +195,7 @@ mod tests {
     use std::ffi::OsString;
 
     fn command(words: &[&str]) -> crate::cli::Args {
-        crate::cli::Args::parse_args(&words.iter().map(OsString::from).collect::<Vec<_>>())
-            .unwrap()
+        crate::cli::Args::parse_args(&words.iter().map(OsString::from).collect::<Vec<_>>()).unwrap()
     }
     fn permits(request: &Request, unsigned: Unsigned) -> bool {
         // The signer the starting machine uses, with fixture credentials.
@@ -204,7 +207,14 @@ mod tests {
             .query("prefix", prefix)
     }
     const UPLOAD: &[&str] = &[
-        "cp", "--from", "server", "--srcs-in", "/srv/dataset", "--to", "s3://bucket", "--into",
+        "cp",
+        "--from",
+        "server",
+        "--srcs-in",
+        "/srv/dataset",
+        "--to",
+        "s3://bucket",
+        "--into",
         "backups/dataset",
     ];
     fn with(base: &[&'static str], more: &[&'static str]) -> Vec<&'static str> {
@@ -243,13 +253,17 @@ mod tests {
             // Never the bucket itself, its versions, or its ACLs.
             Unsigned::new("PUT", ""),
             Unsigned::new("DELETE", ""),
-            Unsigned::new("GET", "").query("versions", "").query("prefix", "backups/dataset/"),
+            Unsigned::new("GET", "")
+                .query("versions", "")
+                .query("prefix", "backups/dataset/"),
             Unsigned::new("PUT", "backups/dataset/a").query("acl", ""),
             Unsigned::new("PUT", "backups/dataset/a").header("x-amz-acl", "public-read"),
             // Copying an object the command does not name into the destination.
-            Unsigned::new("PUT", "backups/dataset/a").header("x-amz-copy-source", "/bucket/secrets"),
+            Unsigned::new("PUT", "backups/dataset/a")
+                .header("x-amz-copy-source", "/bucket/secrets"),
             // A header the command did not add.
-            Unsigned::new("PUT", "backups/dataset/a").header("x-amz-object-lock-mode", "COMPLIANCE"),
+            Unsigned::new("PUT", "backups/dataset/a")
+                .header("x-amz-object-lock-mode", "COMPLIANCE"),
         ] {
             assert!(!permits(&request, refused.clone()), "{refused:?}");
         }
@@ -259,7 +273,10 @@ mod tests {
     fn a_dry_run_signs_no_change() {
         let request = request(&command(&with(UPLOAD, &["--dry-run", "--prune"]))).unwrap();
         assert!(!request.upload && !request.delete);
-        assert!(permits(&request, Unsigned::new("HEAD", "backups/dataset/a")));
+        assert!(permits(
+            &request,
+            Unsigned::new("HEAD", "backups/dataset/a")
+        ));
         assert!(permits(&request, list("backups/dataset/")));
         for refused in [
             Unsigned::new("PUT", "backups/dataset/a"),
@@ -275,7 +292,10 @@ mod tests {
     fn pruning_and_create_only_follow_the_command() {
         let pruning = request(&command(&with(UPLOAD, &["--prune"]))).unwrap();
         assert!(pruning.delete);
-        assert!(permits(&pruning, Unsigned::new("DELETE", "backups/dataset/a")));
+        assert!(permits(
+            &pruning,
+            Unsigned::new("DELETE", "backups/dataset/a")
+        ));
         assert!(!permits(&pruning, Unsigned::new("DELETE", "backups/other")));
         // Older versions stay: the command names none.
         assert!(!permits(
@@ -284,7 +304,10 @@ mod tests {
         ));
         let keeping = request(&command(&with(UPLOAD, &["--if-exists=keep"]))).unwrap();
         assert!(keeping.create_only);
-        assert!(!permits(&keeping, Unsigned::new("PUT", "backups/dataset/a")));
+        assert!(!permits(
+            &keeping,
+            Unsigned::new("PUT", "backups/dataset/a")
+        ));
         assert!(permits(
             &keeping,
             Unsigned::new("PUT", "backups/dataset/a").header("if-none-match", "*")
@@ -294,13 +317,26 @@ mod tests {
     #[test]
     fn a_download_signs_reads_of_its_sources_only() {
         let request = request(&command(&[
-            "cp", "--from", "s3://bucket", "--cwd", "backups", "dataset", "notes.txt", "--to",
-            "server", "--into", "/srv/restore",
+            "cp",
+            "--from",
+            "s3://bucket",
+            "--cwd",
+            "backups",
+            "dataset",
+            "notes.txt",
+            "--to",
+            "server",
+            "--into",
+            "/srv/restore",
         ]))
         .unwrap();
         assert!(!request.upload && !request.delete);
         assert_eq!(
-            request.scopes.iter().map(|scope| scope.key.as_str()).collect::<Vec<_>>(),
+            request
+                .scopes
+                .iter()
+                .map(|scope| scope.key.as_str())
+                .collect::<Vec<_>>(),
             ["backups/dataset", "backups/notes.txt"]
         );
         for allowed in [
@@ -323,8 +359,16 @@ mod tests {
         }
         // --prune removes files on the server, never objects.
         let pruning = super::request(&command(&[
-            "cp", "--from", "s3://bucket", "--srcs-in", "backups", "--to", "server", "--into",
-            "/srv/restore", "--prune",
+            "cp",
+            "--from",
+            "s3://bucket",
+            "--srcs-in",
+            "backups",
+            "--to",
+            "server",
+            "--into",
+            "/srv/restore",
+            "--prune",
         ]))
         .unwrap();
         assert!(!pruning.delete && !pruning.upload);
@@ -335,8 +379,12 @@ mod tests {
     fn only_a_copy_between_a_server_and_a_bucket_is_signed_for() {
         for words in [
             &["rm", "--on", "s3://bucket", "key"][..],
-            &["cp", "--from", "s3://a", "x", "--to", "s3://b", "--into", "y"],
-            &["cp", "--from", "server", "x", "--to", "other", "--into", "y"],
+            &[
+                "cp", "--from", "s3://a", "x", "--to", "s3://b", "--into", "y",
+            ],
+            &[
+                "cp", "--from", "server", "x", "--to", "other", "--into", "y",
+            ],
         ] {
             assert!(request(&command(words)).is_err(), "{words:?}");
         }
@@ -350,7 +398,10 @@ mod tests {
         args.results_token = Some("0123456789abcdef0123456789abcdef".into());
         args.storage_signing = Some(format!("{}-other", crate::identity::build()));
         let error = attach(&mut args).unwrap_err().to_string();
-        assert!(error.contains("needs the same syq build on both machines"), "{error}");
+        assert!(
+            error.contains("needs the same syq build on both machines"),
+            "{error}"
+        );
         // Standard input was not taken, and nothing was attached.
         assert!(args.storage_authorization.is_none());
         // A copy nobody else started is left alone.
@@ -368,6 +419,9 @@ mod tests {
             crate::destination::storage::serve_started_copy(&mut remote, &signer, vec![], vec![])
         });
         let error = open("bucket".into(), local).err().unwrap().to_string();
-        assert!(error.contains("check the date and time on both machines"), "{error}");
+        assert!(
+            error.contains("check the date and time on both machines"),
+            "{error}"
+        );
     }
 }

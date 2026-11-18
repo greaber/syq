@@ -170,7 +170,14 @@ exec /bin/sh -c "$1"
 }
 
 const UPLOAD: &[&str] = &[
-    "--from", "server", "--srcs-in", "dataset", "--to", "s3://bucket", "--into", "backup",
+    "--from",
+    "server",
+    "--srcs-in",
+    "dataset",
+    "--to",
+    "s3://bucket",
+    "--into",
+    "backup",
 ];
 
 #[test]
@@ -178,8 +185,14 @@ fn a_server_uploads_with_urls_this_machine_signed() {
     let lab = Lab::start("ok");
     let output = lab.run(&[UPLOAD, &["--results", "results.jsonl"]].concat());
     assert!(output.status.success(), "{}", output_text(&output));
-    assert_eq!(std::fs::read(lab.path("stored-by-fixture/a")).unwrap(), b"first\n");
-    assert_eq!(std::fs::read(lab.path("stored-by-fixture/b")).unwrap(), b"second\n");
+    assert_eq!(
+        std::fs::read(lab.path("stored-by-fixture/a")).unwrap(),
+        b"first\n"
+    );
+    assert_eq!(
+        std::fs::read(lab.path("stored-by-fixture/b")).unwrap(),
+        b"second\n"
+    );
     let requests = lab.requests();
     assert!(requests.contains("PUT /bucket/backup/a"), "{requests}");
     assert!(requests.contains("PUT /bucket/backup/sub/b"), "{requests}");
@@ -192,10 +205,17 @@ fn a_server_uploads_with_urls_this_machine_signed() {
     );
     let results = parsed_results(lab.temp.path());
     let endpoints = results[0]["endpoints"].as_array().unwrap();
-    assert!(endpoints.iter().any(|e| e["kind"] == "ssh" && e["host"] == "server"));
-    assert!(endpoints.iter().any(|e| e["kind"] == "s3" && e["host"] == "s3://bucket"));
+    assert!(endpoints
+        .iter()
+        .any(|e| e["kind"] == "ssh" && e["host"] == "server"));
+    assert!(endpoints
+        .iter()
+        .any(|e| e["kind"] == "s3" && e["host"] == "s3://bucket"));
     let last = results.last().unwrap();
-    assert_eq!((&last["status"], &last["files_transferred"]), (&"success".into(), &2.into()));
+    assert_eq!(
+        (&last["status"], &last["files_transferred"]),
+        (&"success".into(), &2.into())
+    );
     assert_eq!(
         results
             .iter()
@@ -209,7 +229,13 @@ fn a_server_uploads_with_urls_this_machine_signed() {
 fn a_server_downloads_with_urls_this_machine_signed() {
     let lab = Lab::start("ok");
     let output = lab.run(&[
-        "--from", "s3://bucket", "stored/object", "--to", "server", "--into", "restored",
+        "--from",
+        "s3://bucket",
+        "stored/object",
+        "--to",
+        "server",
+        "--into",
+        "restored",
     ]);
     assert!(output.status.success(), "{}", output_text(&output));
     assert_eq!(
@@ -300,8 +326,9 @@ fn a_server_that_cannot_reach_storage_says_what_to_check() {
     assert_eq!(output.status.code(), Some(1), "{}", output_text(&output));
     let text = output_text(&output);
     assert!(
-        text.contains(&format!("this server got no answer from the storage service at {address}"))
-            && text.contains("never through the machine that started the copy"),
+        text.contains(&format!(
+            "this server got no answer from the storage service at {address}"
+        )) && text.contains("never through the machine that started the copy"),
         "{text}"
     );
     assert_eq!(lab.requests(), "");
@@ -352,7 +379,11 @@ fn ending_the_command_stops_the_copy_on_the_server() {
         .trim()
         .parse()
         .unwrap();
-    assert_eq!(unsafe { libc::kill(server_copy, 0) }, 0, "the copy is not running");
+    assert_eq!(
+        unsafe { libc::kill(server_copy, 0) },
+        0,
+        "the copy is not running"
+    );
     // The command ends without a chance to tell the server anything.
     child.kill().unwrap();
     child.wait().unwrap();
@@ -382,17 +413,37 @@ fn options_these_copies_cannot_honor_are_refused() {
     }
     for (endpoints, message) in [
         (
-            &["--from", "@laptop", "x", "--to", "s3://bucket", "--into", "y"][..],
+            &[
+                "--from",
+                "@laptop",
+                "x",
+                "--to",
+                "s3://bucket",
+                "--into",
+                "y",
+            ][..],
             "S3 copies cannot use receiving machine @laptop",
         ),
         (
-            &["--from", "s3://bucket", "x", "--to", "@laptop", "--into", "y"],
+            &[
+                "--from",
+                "s3://bucket",
+                "x",
+                "--to",
+                "@laptop",
+                "--into",
+                "y",
+            ],
             "S3 copies cannot use receiving machine @laptop",
         ),
     ] {
         let output = lab.run(endpoints);
         assert_eq!(output.status.code(), Some(2), "{}", output_text(&output));
-        assert!(output_text(&output).contains(message), "{}", output_text(&output));
+        assert!(
+            output_text(&output).contains(message),
+            "{}",
+            output_text(&output)
+        );
     }
     assert_eq!(lab.requests(), "");
 }
