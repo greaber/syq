@@ -409,10 +409,12 @@ impl Engine {
                     attempt += 1;
                 }
                 Err(e) => {
-                    // A permanent GET error is still an answer from the service.
-                    self.outage.failed(
-                        !answered && !unanswerable && e.downcast_ref::<Permanent>().is_none(),
-                    );
+                    // A permanent GET error is still an answer from the service;
+                    // a GET that never reached it says nothing about it.
+                    if !unanswerable {
+                        self.outage
+                            .failed(!answered && e.downcast_ref::<Permanent>().is_none());
+                    }
                     return Err(e);
                 }
             }

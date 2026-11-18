@@ -92,7 +92,10 @@ impl Upload<'_> {
                     attempt += 1;
                 }
                 Err(e) => {
-                    if let Some(outage) = self.outage {
+                    // A failure that never reached the service says nothing
+                    // about whether it is down.
+                    let local = super::retry::permanent(&e);
+                    if let Some(outage) = self.outage.filter(|_| !local) {
                         outage.failed(super::transfer::retryable(&e));
                     }
                     return Ok(Err(e));
