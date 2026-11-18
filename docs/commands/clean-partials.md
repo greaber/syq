@@ -19,11 +19,12 @@ output, see [Removal records](../automation.md#removal-records).
 
 ## Which files are removed
 
-It removes regular files named `.FILENAME.syq-tmp.RANDOM`, left by copies, and
+It removes regular files named `.FILENAME.syq-tmp.RANDOM`, left by copies,
+including [descriptor copies](cp.md#completion-and-failures), and
 `.syq-s3-HASH.partial`, left by [S3 downloads](../object-storage.md), including
 any file of yours with such a name. It does not follow symlinks, and it leaves
-the `.syq-stream-*` files of killed
-[descriptor copies](cp.md#completion-and-failures) alone.
+alone the `.syq-stream-*` files that descriptor copies of older versions
+left.
 
 Neither this command nor pruning removes `.syq-swap-...` recovery entries.
 Each holds either a file that a copy moved aside while replacing it (after an

@@ -1543,7 +1543,7 @@ fn stream_controls_check_hashes_pace_and_keep_payload_clean() {
         .unwrap()
         .file_name()
         .to_string_lossy()
-        .starts_with(".syq-stream-")));
+        .contains(".syq-tmp.")));
     let out = Command::new(env!("CARGO_BIN_EXE_syq"))
         .current_dir(&t.0)
         .env("SYQ_CP_OPTIONS", "--stats --performance-tuning workers=2")

@@ -28,5 +28,5 @@ with tempfile.TemporaryDirectory() as temp:
                 os.close(read_fd)
             assert (result.returncode == 0) == (commit == b'C'), result.stderr
             assert target.read_bytes() == (payload if commit == b'C' else b'old')
-            assert not list(root.glob('.syq-stream-*'))
+            assert not list(root.glob('.*.syq-tmp.*'))
 print('managed stream publication checks passed')

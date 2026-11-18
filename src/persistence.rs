@@ -5,6 +5,7 @@
 //! `--pscope`, avoiding shared configuration state.
 
 use crate::cli::Args;
+use crate::lock_file::LockFile;
 use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -14,7 +15,6 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -656,43 +656,29 @@ fn report_ready(domain: &Domain, label: &str, ready: crate::receive_service::Rea
 /// Take the endpoint record's lock for one switch to a new build at a time,
 /// or None while another holds it. The record is never rewritten, so its
 /// lock stays on one file while the scope lasts.
-fn lock_endpoint_record(control: &Path) -> Result<Option<File>> {
-    let mut path = control.as_os_str().to_owned();
-    path.push(".json");
-    let record = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&path)
-        .with_context(|| format!("open endpoint record {}", Path::new(&path).display()))?;
-    if unsafe { libc::flock(record.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        return Ok(Some(record));
-    }
-    let error = std::io::Error::last_os_error();
-    if error.kind() == std::io::ErrorKind::WouldBlock {
-        return Ok(None);
-    }
-    Err(error.into())
+fn lock_endpoint_record(control: &Path) -> Result<Option<LockFile>> {
+    let record = open_endpoint_record(control)?;
+    Ok(record.try_exclusive()?.then_some(record))
 }
 
 /// Take the endpoint record's lock as `lock_endpoint_record` does, waiting
 /// for another switch that holds it.
-fn wait_endpoint_record(control: &Path) -> Result<File> {
+fn wait_endpoint_record(control: &Path) -> Result<LockFile> {
+    let record = open_endpoint_record(control)?;
+    record.exclusive()?;
+    Ok(record)
+}
+
+fn open_endpoint_record(control: &Path) -> Result<LockFile> {
     let mut path = control.as_os_str().to_owned();
     path.push(".json");
     let record = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        // O_NONBLOCK: a FIFO in the record's place must not block the open.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(&path)
         .with_context(|| format!("open endpoint record {}", Path::new(&path).display()))?;
-    loop {
-        if unsafe { libc::flock(record.as_raw_fd(), libc::LOCK_EX) } == 0 {
-            return Ok(record);
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error.into());
-        }
-    }
+    Ok(LockFile::adopt(record))
 }
 
 /// Keep commands from starting a switch for this connection for `wait`
@@ -721,10 +707,11 @@ pub(crate) fn claim_switch_attempt(control: &Path, interval: Duration) -> bool {
     };
     let now = std::time::SystemTime::now();
     let due = record
+        .file()
         .metadata()
         .and_then(|metadata| metadata.modified())
         .is_ok_and(|next| next <= now);
-    due && record.set_modified(now + interval).is_ok()
+    due && record.file().set_modified(now + interval).is_ok()
 }
 
 /// Whether a switch a command makes on the way may start for a connection
@@ -736,7 +723,7 @@ pub(crate) enum SwitchClaim {
     Unavailable(anyhow::Error),
     /// Held for this switch; `due` says whether commands may try again now
     /// (`claim_switch_attempt`).
-    Claimed { lock: File, due: bool },
+    Claimed { lock: LockFile, due: bool },
 }
 pub(crate) fn claim_switch_now(control: &Path) -> SwitchClaim {
     let record = match lock_endpoint_record(control) {
@@ -745,6 +732,7 @@ pub(crate) fn claim_switch_now(control: &Path) -> SwitchClaim {
         Err(error) => return SwitchClaim::Unavailable(error),
     };
     let due = record
+        .file()
         .metadata()
         .and_then(|metadata| metadata.modified())
         .is_ok_and(|next| next <= std::time::SystemTime::now());
@@ -1522,17 +1510,23 @@ fn print_scope_status(domain: &Domain, json: bool) -> Result<()> {
             _ if ssh_live => "ready",
             _ => "inactive",
         };
-        let receiving_note = receiving.as_ref().and_then(|receiving| {
-            crate::receive_service::build_note(
-                &receiving.build,
-                receiving.started_from.as_deref(),
-                receiving.switch.as_ref(),
-                receiving.busy.as_ref(),
-                Some(&record.label()),
-                &crate::receive_service::connect_command(&record.label(), domain.explicit_path()),
-                true,
-            )
-        });
+        let receiving_note = receiving
+            .as_ref()
+            .filter(|receiving| !receiving.older)
+            .and_then(|receiving| {
+                crate::receive_service::build_note(
+                    &receiving.build,
+                    receiving.started_from.as_deref(),
+                    receiving.switch.as_ref(),
+                    &receiving.busy,
+                    Some(&record.label()),
+                    &crate::receive_service::connect_command(
+                        &record.label(),
+                        domain.explicit_path(),
+                    ),
+                    true,
+                )
+            });
         connections.push(ConnectionStatus {
             receiving_build: receiving.as_ref().map(|s| s.build.clone()),
             receiving_switch: receiving.as_ref().and_then(|s| s.switch.clone()),
@@ -1647,7 +1641,7 @@ fn print_scope_status(domain: &Domain, json: bool) -> Result<()> {
             &provider.build,
             provider.started_from.as_deref(),
             provider.switch.as_ref(),
-            provider.busy().as_ref(),
+            &provider.busy(),
             None,
             &fix,
             false,
