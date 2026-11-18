@@ -11,23 +11,13 @@ const UPDATE_IN_PLACE: &str = "update it in place";
 
 impl FsOps {
     pub fn probe_partial(&mut self, path: &[u8], copy_id: &CopyId) -> Result<Response> {
-        if let Some(target) = self.rooted_destination_target(path)? {
-            let (_, _, metadata) = with_rooted_partial(&target, copy_id, |relative, _| {
-                target.root.metadata_optional(relative)
-            })?;
-            let partial_size = metadata
-                .filter(|metadata| is_owned_rooted_partial(*metadata))
-                .map(|metadata| metadata.len);
-            return Ok(Response::PartialSize(partial_size));
-        }
-        let p = resolve(path);
-        let pp = self.partial_path(&p, copy_id)?;
-        let partial_size = match fs::symlink_metadata(&pp) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Ok(metadata) if is_owned_partial(&metadata) => Some(metadata.len()),
-            Ok(_) => None,
-            Err(error) => return Err(error).with_context(|| format!("stat {}", pp.display())),
-        };
+        let target = self.destination_mutation_target(path)?;
+        let (_, _, metadata) = with_rooted_partial(&target, copy_id, |relative, _| {
+            target.root.metadata_optional(relative)
+        })?;
+        let partial_size = metadata
+            .filter(|metadata| is_owned_rooted_partial(*metadata))
+            .map(|metadata| metadata.len);
         Ok(Response::PartialSize(partial_size))
     }
 
@@ -1016,11 +1006,8 @@ impl FsOps {
             block > 0 && off.is_multiple_of(block) && off.checked_add(len).is_some(),
             "invalid hash interval"
         );
-        let rooted = self.rooted_destination_target(path)?;
-        let location = rooted
-            .as_ref()
-            .map(|target| target.location())
-            .unwrap_or_else(|| FileLocation::Path(resolve(path)));
+        let target = self.destination_mutation_target(path)?;
+        let location = target.location();
         let (mut file, location, label, mut update_check) = if off > 0 {
             let held = self
                 .held_basis
@@ -1031,18 +1018,13 @@ impl FsOps {
                 "retained comparison basis does not match requested file"
             );
             (held.file, held.location, held.label, held.update_check)
-        } else if let Some(target) = &rooted {
+        } else {
             (
                 target.root.open_regular_read(&target.relative)?,
                 target.location(),
                 target.label.clone(),
                 None,
             )
-        } else {
-            let p = resolve(path);
-            open_existing_regular(&p, false)
-                .with_context(|| format!("open {} as repair basis", p.display()))
-                .map(|file| (file, FileLocation::Path(p.clone()), p, None))?
         };
         require_open_target(&file, &label, condition)?;
         // `--in-place=update`: the sender learns with the hashes whether the
@@ -1050,15 +1032,15 @@ impl FsOps {
         // file through its metadata, and replaces a differing one it may not
         // update from this held file. A preparation to update it then reuses
         // the answer.
-        if let (Some(update), Some(target), 0) = (update, &rooted, off) {
+        if let (Some(update), 0) = (update, off) {
             let current = file.metadata()?;
             let refused = vouch::update_refusal(
-                target.into(),
+                (&target).into(),
                 &file,
                 &current,
                 &update.meta,
                 update.flags,
-                || self.inherited_acl(target),
+                || self.inherited_acl(&target),
             )?;
             update_check = Some(UpdateCheck::new(refused, &current));
         }
@@ -1870,10 +1852,6 @@ impl FsOps {
             d
         };
         let mut userspace_fallback = copy_pair_unsupported && use_userspace_fallback;
-        if copy_pair_unsupported && !use_userspace_fallback {
-            // Only an in-place copy reaches this point; it has no sidecar.
-            return Ok(CopyLocalOutcome::Unsupported);
-        }
         #[cfg(debug_assertions)]
         if std::env::var_os("SYQ_TEST_COPY_LOCAL_EXDEV").is_some() {
             unsupported_copy_pairs().lock().unwrap().insert(copy_pair);
@@ -2604,25 +2582,17 @@ impl FsOps {
                 self.hash_policy.algorithm,
             );
         }
+        // A sidecar is only ever read beneath a destination root.
+        if which == Which::Partial {
+            bail!("{UNROOTED_MUTATION}");
+        }
         let p = resolve(target.path);
-        let p = if which == Which::Partial {
-            self.partial_path(&p, copy_id)?
-        } else {
-            p
-        };
         let mut f = self
-            .cached_clone(
-                FileLocation::Path(p.clone()),
-                attempt,
-                which == Which::Partial,
-            )?
+            .cached_clone(FileLocation::Path(p.clone()), attempt, false)?
             .map(Ok)
             .unwrap_or_else(|| open_existing_regular(&p, false))?;
         crate::inode_metadata::prepare_read(&f, self.inode_preservation.open_noatime);
         f.seek(SeekFrom::Start(off))?;
-        if which == Which::Partial {
-            require_safe_partial(&f, &p)?;
-        }
         hash_reader_observed(
             &mut f,
             block,
@@ -3013,11 +2983,8 @@ impl FsOps {
         path: &[u8],
         expected: &crate::hashing::ExpectedHashes,
     ) -> Result<()> {
-        let file = if let Some(target) = self.rooted_destination_target(path)? {
-            target.root.open_regular_read(&target.relative)?
-        } else {
-            open_existing_regular(&resolve(path), false)?
-        };
+        let target = self.destination_mutation_target(path)?;
+        let file = target.root.open_regular_read(&target.relative)?;
         Self::verify_expected_file(&file, expected)
     }
 
@@ -4278,17 +4245,6 @@ pub(super) fn open_existing_regular_with_metadata(
         bail!("{} is not a regular file", target.display());
     }
     Ok((file, metadata))
-}
-
-pub(super) fn require_safe_partial(file: &File, target: &Path) -> Result<()> {
-    let metadata = file.metadata()?;
-    if !is_safe_partial(&metadata) {
-        bail!(
-            "partial {} is not a singly-linked regular file",
-            target.display()
-        );
-    }
-    Ok(())
 }
 
 /// Whether a file this process has created exclusively on `dev` showed
