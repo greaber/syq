@@ -1804,6 +1804,43 @@ mod message_receive_tests {
     use std::time::Instant;
 
     #[test]
+    fn claim_response_accepts_one_status_and_at_most_one_descriptor() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let file = File::create(temporary.path().join("payload")).unwrap();
+        let receive = |payload: &[u8], descriptors: &[RawFd]| {
+            let (receiver, sender) = UnixStream::pair().unwrap();
+            send_message(sender.as_raw_fd(), payload, descriptors).unwrap();
+            drop(sender);
+            receive_descriptor(&receiver)
+        };
+
+        let (status, descriptor) = receive(&[RESPONSE_OK], &[file.as_raw_fd()]).unwrap();
+        assert_eq!(status, RESPONSE_OK);
+        let flags = unsafe { libc::fcntl(descriptor.unwrap().as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        let (status, descriptor) = receive(&[RESPONSE_REJECTED], &[]).unwrap();
+        assert_eq!((status, descriptor.is_none()), (RESPONSE_REJECTED, true));
+
+        let error = receive(&[RESPONSE_OK, 0], &[]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "descriptor broker returned an oversized response"
+        );
+        let error = receive(&[RESPONSE_OK], &[file.as_raw_fd(), file.as_raw_fd()]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "descriptor broker returned malformed ancillary data"
+        );
+        let (receiver, sender) = UnixStream::pair().unwrap();
+        drop(sender);
+        let error = receive_descriptor(&receiver).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "descriptor broker closed without a response"
+        );
+    }
+
+    #[test]
     fn delayed_message_keeps_descriptors_protected_and_socket_flags_unchanged() {
         let (receiver, sender) = UnixStream::pair().unwrap();
         receiver
