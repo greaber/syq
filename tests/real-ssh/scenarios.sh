@@ -1752,7 +1752,8 @@ import json, sys
 records = [json.loads(line) for line in open(sys.argv[1])]
 counted = [r for r in records if r["type"] == "error" and "diagnostic_for" not in r]
 assert records[-1]["type"] == "result" and records[-1]["status"] == "failed", records
-assert counted and records[-1]["errors"] == len(counted), records
+# At least the relayed refusal and this machine's own failure.
+assert len(counted) >= 2 and records[-1]["errors"] == len(counted), records
 PYTHON
 }
 # The refused copy says to run it again, and changes nothing there.

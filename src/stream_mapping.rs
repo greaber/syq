@@ -321,7 +321,9 @@ async fn run_callback(
             result = &mut operation => result,
             // The sender outlives every entry, so this ends only on a
             // cancellation.
-            _ = cancelled.wait_for(|cancelled| *cancelled) => {
+            // Drop the borrow wait_for returns at once: it holds the
+            // channel's read lock.
+            _ = async { drop(cancelled.wait_for(|cancelled| *cancelled).await) } => {
                 local_cancel.store(true, Relaxed);
                 operation.await
             }

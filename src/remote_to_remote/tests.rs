@@ -357,6 +357,35 @@ fn a_relayed_final_result_keeps_fields_this_build_does_not_know() {
     assert_eq!(written, terminal);
 }
 
+/// A final result that does not read as a copy's result makes the relayed
+/// results unusable: the stream settles as failed and says why.
+#[test]
+fn an_unreadable_relayed_final_result_fails_the_stream() {
+    let mut missing = coordinator_terminal();
+    missing.as_object_mut().unwrap().remove("files_unchanged");
+    let mut bogus = coordinator_terminal();
+    bogus["status"] = "bogus".into();
+    let mut timings = coordinator_terminal();
+    timings["timings"]["total_ms"] = "soon".into();
+    for terminal in [missing, bogus, timings] {
+        let (file, writer) = results_file();
+        let mut relay = Relay::new(TOKEN, Some(writer), None, (false, false));
+        let input = coordinator_line(terminal.clone(), 0);
+        relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
+        let error = settle(relay, settlement(0)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unusable"),
+            "{terminal}: {error:#}"
+        );
+        let records = read_records(file);
+        let kinds: Vec<_> = records.iter().map(|r| r["type"].clone()).collect();
+        assert_eq!(kinds, ["error", "result"], "{terminal}");
+        assert_eq!(records[0]["class"], "integrity");
+        assert_eq!(records[1]["status"], "failed");
+        assert_eq!(records[1]["errors"], 1);
+    }
+}
+
 #[test]
 fn ordinary_coordinator_results_are_relayed_with_this_machines_sequence() {
     let (file, writer) = results_file();

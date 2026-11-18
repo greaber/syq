@@ -364,15 +364,40 @@ fn total_ms<S: serde::Serializer>(elapsed_ms: &u64, serializer: S) -> Result<S::
     serde_json::json!({ "total_ms": elapsed_ms }).serialize(serializer)
 }
 
+/// A path as `tagged` writes it, serialized without building a value first.
+struct Tagged<'a>(&'a [u8]);
+
+impl Serialize for Tagged<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use base64::Engine as _;
+        use serde::ser::SerializeStruct as _;
+        let mut tagged = serializer.serialize_struct("Tagged", 2)?;
+        match std::str::from_utf8(self.0) {
+            Ok(value) => {
+                tagged.serialize_field("encoding", "utf-8")?;
+                tagged.serialize_field("value", value)?;
+            }
+            Err(_) => {
+                tagged.serialize_field("encoding", "base64")?;
+                tagged.serialize_field(
+                    "value",
+                    &base64::engine::general_purpose::STANDARD.encode(self.0),
+                )?;
+            }
+        }
+        tagged.end()
+    }
+}
+
 fn tagged_path<S: serde::Serializer>(path: &&[u8], serializer: S) -> Result<S::Ok, S::Error> {
-    tagged(path).serialize(serializer)
+    Tagged(path).serialize(serializer)
 }
 
 fn tagged_optional<S: serde::Serializer>(
     path: &Option<&[u8]>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
-    path.map(tagged).serialize(serializer)
+    path.map(Tagged).serialize(serializer)
 }
 
 /// A record of `kind` with `body`'s fields.
