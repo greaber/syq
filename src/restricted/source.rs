@@ -23,7 +23,7 @@ use crate::proto::{
     SourceRootBase, SourceRootSelection, Which,
 };
 use anyhow::{bail, ensure, Context, Result};
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -121,7 +121,8 @@ pub(crate) struct SourceConnection {
     control: bool,
     /// The last single path this connection had counted. Each chunk of a file
     /// read in pieces names the same path, and the count already includes it.
-    last_path: Cell<Option<PathDigest>>,
+    /// The buffer is reused, so a new path allocates only when it is longer.
+    last_path: RefCell<Option<(RegisteredRootId, Vec<u8>)>>,
 }
 
 impl SourceAuthority {
@@ -337,7 +338,7 @@ impl SourceAuthority {
         Ok(SourceConnection {
             authority: Arc::clone(self),
             control,
-            last_path: Cell::new(None),
+            last_path: RefCell::new(None),
         })
     }
 
@@ -710,14 +711,20 @@ impl SourceConnection {
         );
         match path {
             Some(path) => {
-                let digest = self.authority.path_digest(path);
-                if self.last_path.get() == Some(digest) {
+                let mut last = self.last_path.borrow_mut();
+                if last.as_ref().is_some_and(|(root, relative)| {
+                    *root == path.root() && relative.as_slice() == path.relative()
+                }) {
                     // Counted before and never uncounted; the root and
                     // selection checks still apply.
                     self.authority.check_path(&state, path)?;
                 } else {
+                    let digest = self.authority.path_digest(path);
                     self.authority.record_paths(&mut state, [(path, digest)])?;
-                    self.last_path.set(Some(digest));
+                    let (root, relative) = last.get_or_insert_with(|| (path.root(), Vec::new()));
+                    *root = path.root();
+                    relative.clear();
+                    relative.extend_from_slice(path.relative());
                 }
             }
             None => self.authority.record_paths(
