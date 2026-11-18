@@ -512,7 +512,7 @@ struct Finished {
 fn open_session(
     target: &SshEndpoint,
     route: EnrollmentRoute<'_>,
-    (unattended, batch): (Option<enrollment::Unattended>, bool),
+    (unattended, in_this_group): (Option<enrollment::Unattended>, bool),
     id: EnrollmentId,
     action: ManagementAction,
 ) -> Result<ManagementSession> {
@@ -539,10 +539,15 @@ fn open_session(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    // Without a terminal, the login stays in this process's group: the
-    // receiving service ends its setup child with that whole group, at its
-    // deadline or when the requester goes, and the login with it.
-    let mut group = if batch {
+    // In this process's group, the login gets this process's signals and
+    // terminal and never needs the terminal handed over. A batch login
+    // stays here so that the receiving service ends it with its setup
+    // child's whole group, at its deadline or when the requester goes;
+    // revoking stays here so that Ctrl-C ends the login with syq, and the
+    // login may write to the terminal throughout. An interactive install
+    // takes its own group, since syq asks for a PIN once SSH has
+    // authenticated.
+    let mut group = if in_this_group {
         crate::process_group::ProcessGroup::spawn_in_this_group(&mut command)
     } else {
         crate::process_group::ProcessGroup::spawn(&mut command)
@@ -762,7 +767,7 @@ pub(super) fn revoke_over_route(
     id: EnrollmentId,
     request: &RevokeRequest,
 ) -> Result<()> {
-    let session = open_session(target, route, (None, false), id, ManagementAction::Revoke)?;
+    let session = open_session(target, route, (None, true), id, ManagementAction::Revoke)?;
     let offered = session.offered_build()?;
     let finished = session.finish(request, offered)?;
     // Without the build, the session ran nothing that revokes.
