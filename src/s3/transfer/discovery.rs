@@ -38,6 +38,11 @@ const KEYS_PER_PAGE: usize = 64;
 /// stretch does not end a listing that pays for itself overall.
 const SLACK_PAGES: usize = 2;
 
+/// Pages awaited before the copy starts. The copy sizes its request
+/// concurrency from the fastest listing response seen by then, and the first
+/// response also opened the connection.
+const PAGES_BEFORE_COPY: usize = 2;
+
 const UNKNOWN: u64 = u64::MAX;
 const ABSENT: u64 = u64::MAX - 1;
 
@@ -234,7 +239,7 @@ pub(super) struct Discovery {
 impl Discovery {
     /// List the destination for `keys`, which must be in key order. A
     /// destination that cannot be listed fails the copy here, before it
-    /// starts; pages after the second arrive while the copy runs.
+    /// starts; later pages arrive while the copy runs.
     pub(super) async fn start(
         client: aws_sdk_s3::Client,
         bucket: &str,
@@ -257,16 +262,16 @@ impl Discovery {
             client: client.clone(),
             bucket,
         };
-        let mut more = if store.ordered() {
-            walk.page(&store).await?
+        let mut more = store.ordered();
+        if more {
+            for _ in 0..PAGES_BEFORE_COPY {
+                more = walk.page(&store).await?;
+                if !more {
+                    break;
+                }
+            }
         } else {
             walk.whole(&store).await?;
-            false
-        };
-        // The copy sizes its concurrency from the fastest listing response,
-        // and the first one also opened the connection.
-        if more {
-            more = walk.page(&store).await?;
         }
         let (sender, reach) = watch::channel(Reach {
             decided: walk.decided,
