@@ -7996,11 +7996,11 @@ fn staged_basis_uses_apfs_clone_and_keeps_an_independent_snapshot() {
             ),
             "APFS clone was not used: {response:?}"
         );
-        let partial = ops.partial_path(Path::new("file"), &id).unwrap();
+        let partial = partial_path(&path, &id).unwrap();
         fs::write(&path, vec![9; 8192]).unwrap();
         let mut expected = vec![7; 8192];
         expected.resize(len as usize, 0);
-        assert_eq!(fs::read(tree.path().join(partial)).unwrap(), expected);
+        assert_eq!(fs::read(partial).unwrap(), expected);
     }
 }
 
