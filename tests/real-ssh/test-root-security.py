@@ -327,6 +327,90 @@ def in_place_update_by_the_change(root):
     print("Root updates in place only files that already have the owner they end with", flush=True)
 
 
+def directory_groups_are_read_together(root):
+    """Without -g, root writes into an existing file, or gives it new hard
+    links, only when it has the group a new file would get in its directory:
+    the directory's own group where that is set-group-ID, root's otherwise.
+    Elsewhere it replaces the file, which then has the new file's group. A
+    preview counts the same files. Planning asks the receiver about the
+    directories of a batch's files in one request, not one for each."""
+    payload = b"source contents\n" * 200
+    old = b"former contents\n" * 200
+    # Directory group and mode, and the group its new files get.
+    kinds = [("plain", 0, 0o755, 0), ("setgid", 1002, 0o2755, 1002), ("other", 1002, 0o755, 0)]
+    count = 12
+
+    def expected(kind, new_group, name):
+        """Whether the file is kept, and the group it ends with."""
+        # Where the directory's group is neither the file's nor certain to
+        # be passed on, a new file's group is not predicted: every file
+        # there is replaced.
+        kept = name == "match" and kind != "other"
+        return kept, new_group
+
+    for case, metadata, extra in (("update", "mtime", ["--in-place=update"]), ("links", "mtime,hardlinks", [])):
+        source = root / f"groups-{case}-source"
+        destination = root / f"groups-{case}-destination"
+        inodes = {}
+        # Directories without files, so that no other lookup names as many
+        # paths as the one that reads the files' directories.
+        for index in range(3):
+            (source / f"empty{index}").mkdir(parents=True)
+        for index in range(count):
+            kind, directory_group, mode, new_group = kinds[index % len(kinds)]
+            for tree in (source, destination):
+                (tree / f"d{index:02}").mkdir(parents=True)
+            os.chown(destination / f"d{index:02}", 0, directory_group)
+            (destination / f"d{index:02}").chmod(mode)
+            for name, group in (("match", new_group), ("differ", 1001)):
+                file = source / f"d{index:02}" / name
+                file.write_bytes(payload)
+                os.utime(file, (1_700_000_000, 1_700_000_000))
+                target = destination / f"d{index:02}" / name
+                if case == "links":
+                    os.link(file, file.with_name(name + ".second"))
+                    target.write_bytes(payload)
+                    os.utime(target, (1_700_000_000, 1_700_000_000))
+                    os.link(target, target.with_name(name + ".second"))
+                else:
+                    target.write_bytes(old)
+                    os.utime(target, (1_600_000_000, 1_600_000_000))
+                os.chown(target, 0, group)
+                inodes[target] = target.stat().st_ino
+        replaced = sum(not expected(kinds[index % len(kinds)][0], 0, name)[0]
+                       for index in range(count) for name in ("match", "differ"))
+        command = ["syq", "cp", f"--copy-metadata={metadata}", *extra, "--srcs-in", str(source),
+                   "--into", str(destination), "--no-progress"]
+        for step in ("preview", "copy"):
+            results = root / f"groups-{case}-{step}.jsonl"
+            lookups = root / f"groups-{case}-{step}.lookups"
+            run([*command, *(["--dry-run"] if step == "preview" else []), "--results", str(results)],
+                env={**os.environ, "SYQ_TEST_DESTINATION_LOOKUPS": str(lookups)})
+            records = [json.loads(line) for line in results.read_text().splitlines()]
+            if case == "update":
+                assert records[-1]["replaced_not_in_place"] == {"owner": replaced}, (step, records[-1])
+            elif step == "preview":
+                rewritten = [record for record in records
+                             if record.get("action") == "transfer_file" and record.get("bytes")]
+                assert len(rewritten) == replaced, (case, rewritten)
+            # One request reads the group of every directory with files.
+            # Each directory asked by itself would be a lookup of one path,
+            # which only a preview makes, once, for the destination.
+            asked = lookups.read_text().splitlines()
+            assert (asked.count(f"stat {count}"), asked.count("stat 1")) == (1, step == "preview"), (
+                case, step, asked)
+        for target, inode in inodes.items():
+            kind, _, _, new_group = kinds[int(target.parent.name[1:]) % len(kinds)]
+            kept, group = expected(kind, new_group, target.name)
+            status = target.stat()
+            assert (status.st_ino == inode, status.st_uid, status.st_gid) == (kept, 0, group), (
+                case, str(target), kept, group, status)
+            assert target.read_bytes() == payload, (case, str(target))
+            if case == "links":
+                assert target.with_name(target.name + ".second").stat().st_ino == status.st_ino, (case, str(target))
+    print("Root reads the groups of a batch's directories together and replaces files by them", flush=True)
+
+
 def main():
     assert os.geteuid() == 0, "run this check as root only inside the disposable lab"
     libc = ctypes.CDLL(None, use_errno=True)
@@ -340,6 +424,7 @@ def main():
         root_metadata_repairs(root)
         root_metadata_by_the_change(root)
         in_place_update_by_the_change(root)
+        directory_groups_are_read_together(root)
         for interface in ["native", "native-owner", "rsync"]:
             source = root / f"source-{interface}"
             destination = root / f"destination-{interface}"
