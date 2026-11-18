@@ -801,7 +801,10 @@ impl Walk {
                 let Some(name) = part.ahead.back() else {
                     // Nothing left to hand over here. Look inside the child
                     // the listing is in, if it holds the whole latest page.
-                    if !inside.ends_with('/') || !part.first.starts_with(&inside) {
+                    if !inside.ends_with('/')
+                        || inside.len() <= part.directory.len()
+                        || !part.first.starts_with(&inside)
+                    {
                         return None;
                     }
                     part.directory = inside;
