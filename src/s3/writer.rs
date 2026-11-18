@@ -301,19 +301,35 @@ fn direct_file(file: &File, size: u64) -> Result<Option<File>> {
             (a.dev(), a.ino()) == (b.dev(), b.ino()),
             "direct destination identity differs"
         );
-        if !reported {
-            let probe = Aligned::new(4096)?;
-            if let Err(e) = output.write_all_at(probe.bytes(), 0) {
-                if matches!(e.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP)) {
-                    return Ok(None);
-                }
-                return Err(e).context("probe direct S3 destination alignment");
-            }
+        if !reported && !probe_alignment(file, &output)? {
+            return Ok(None);
         }
         return Ok(Some(output));
     }
     let _ = (file, size);
     Ok(None)
+}
+
+// Probes whether an aligned direct write succeeds by writing the file's first
+// block back unchanged: a resumed download has already copied the parts an
+// earlier run downloaded into the file, and none of them is written again.
+#[cfg(target_os = "linux")]
+fn probe_alignment(file: &File, output: &File) -> Result<bool> {
+    let length = file.metadata()?.len();
+    let mut block = Aligned::new(4096)?;
+    let held = length.min(4096) as usize;
+    file.read_exact_at(&mut block.bytes_mut()[..held], 0)
+        .context("read direct S3 destination")?;
+    if let Err(e) = output.write_all_at(block.bytes(), 0) {
+        if matches!(e.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP)) {
+            return Ok(false);
+        }
+        return Err(e).context("probe direct S3 destination alignment");
+    }
+    if length < 4096 {
+        output.set_len(length)?;
+    }
+    Ok(true)
 }
 
 pub(super) struct Aligned {
@@ -347,6 +363,25 @@ impl Drop for Aligned {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_alignment_probe_leaves_the_file_as_it_was() {
+        let dir = crate::test_support::tempdir().unwrap();
+        for content in [
+            (0..8192u32)
+                .map(|i| (i % 251 + 1) as u8)
+                .collect::<Vec<_>>(),
+            b"abc".to_vec(),
+            Vec::new(),
+        ] {
+            let path = dir.path().join("partial");
+            std::fs::write(&path, &content).unwrap();
+            let file = File::open(&path).unwrap();
+            let output = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            assert!(probe_alignment(&file, &output).unwrap());
+            assert!(std::fs::read(&path).unwrap() == content);
+        }
+    }
     #[test]
     fn a_download_waiting_for_data_does_not_occupy_the_only_blocking_worker() {
         let dir = crate::test_support::tempdir().unwrap();
