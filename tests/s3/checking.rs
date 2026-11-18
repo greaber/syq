@@ -3,9 +3,11 @@
 use super::*;
 
 /// Objects whose destination file matches. Their average size starts
-/// transfers at 32 objects, and there are enough of them to outlast the
-/// first samples at that rate.
-pub(super) const UNCHANGED: usize = 6_000;
+/// transfers at 32 objects, and at 100 ms a request there are enough of
+/// them to outlast the first samples at that rate several times over,
+/// without the load that thousands of quick requests would put on the
+/// tests running beside this one.
+pub(super) const UNCHANGED: usize = 800;
 pub(super) const SIZE: u64 = 2 * 1024 * 1024;
 /// Objects with no destination file, listed after the unchanged ones.
 pub(super) const CHANGED: usize = 48;
@@ -138,7 +140,7 @@ pub(super) fn serve(socket: &mut TcpStream, method: &str, target: &str) {
             reply(socket, 200, &[], body.as_bytes(), false);
         }
         ("HEAD", Some(index)) if index < UNCHANGED => {
-            HEADS.hold(Duration::from_millis(20));
+            HEADS.hold(Duration::from_millis(100));
             reply(socket, 200, &object(SIZE), b"", true);
         }
         ("HEAD", _) => reply(socket, 404, &[], b"", true),
