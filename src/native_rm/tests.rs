@@ -267,14 +267,16 @@ fn failed_attached_emit_cancels_pending_mutation() {
     process_task(
         &pool,
         Task::Leaf {
-            selector: 0,
-            name: PinnedName {
-                parent: PinnedParent::File(directory),
-                name: component_cstring(b"victim").unwrap(),
-                identity,
+            leaf: PinnedLeaf {
+                selector: 0,
+                name: PinnedName {
+                    parent: PinnedParent::File(directory),
+                    name: component_cstring(b"victim").unwrap(),
+                    identity,
+                },
+                _object: None,
+                label: b"victim".to_vec(),
             },
-            _object: None,
-            label: b"victim".to_vec(),
             parent: None,
         },
     );
