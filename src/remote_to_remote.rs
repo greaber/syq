@@ -990,6 +990,7 @@ impl ReceiverConnection {
         }
         query.args(["--", host]).stdin(std::process::Stdio::null());
         let output = crate::process::capture_output_bounded(
+            "SSH configuration lookup",
             &mut query,
             std::time::Instant::now() + std::time::Duration::from_secs(30),
             &|| false,

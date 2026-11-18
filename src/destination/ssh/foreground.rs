@@ -455,6 +455,7 @@ mod tests {
             .args(["--exact", SUBPROCESS_TEST, "--nocapture"])
             .env(SUBPROCESS, "nohup");
         let output = crate::process::capture_output_bounded(
+            "test subprocess",
             &mut command,
             Instant::now() + Duration::from_secs(5),
             &|| false,
@@ -485,6 +486,7 @@ mod tests {
             });
         }
         let output = crate::process::capture_output_bounded(
+            "test subprocess",
             &mut command,
             Instant::now() + Duration::from_secs(5),
             &|| false,

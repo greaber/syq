@@ -79,6 +79,7 @@ fn receiving_pins_preserve_native_identity_and_certificate_alias_tokens() {
         command.args(["--", requested]);
         let capture = |command: &mut Command| {
             crate::process::capture_output_bounded(
+                "test SSH command",
                 command,
                 Instant::now() + Duration::from_secs(5),
                 &|| false,

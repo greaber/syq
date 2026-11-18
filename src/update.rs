@@ -1048,6 +1048,7 @@ fn installed_version(executable: &Path) -> Result<Option<Version>> {
         )
     };
     let output = crate::process::capture_output_bounded(
+        "version check",
         Command::new(executable)
             .arg("--version")
             .env("SYQ_NO_UPDATE_CHECK", "1")

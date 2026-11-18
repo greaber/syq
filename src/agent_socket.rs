@@ -201,6 +201,7 @@ fn owned(socket: &Path) -> bool {
 /// fails when the session never had it.
 fn tmux_session_socket() -> Option<PathBuf> {
     let output = crate::process::capture_output_bounded(
+        "tmux environment query",
         std::process::Command::new("tmux").args(["show-environment", VARIABLE]),
         Instant::now() + Duration::from_secs(2),
         &|| false,

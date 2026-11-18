@@ -746,7 +746,10 @@ fn accept_connections<F>(
                 reap_workers(&mut workers);
                 // Wake as soon as a client or the shutdown connection arrives;
                 // a sleep here delayed every descriptor claim and every close.
-                crate::sys::wait_readable(listener.as_raw_fd(), Duration::from_millis(5));
+                // Drop's wake-up connection ends the wait at shutdown, so the
+                // timeout only bounds shutdown if that connection fails, and
+                // keeps an idle broker from waking hundreds of times a second.
+                crate::sys::wait_readable(listener.as_raw_fd(), ACCEPT_IDLE_WAIT);
             }
             Err(_) => break,
         }
@@ -756,6 +759,9 @@ fn accept_connections<F>(
         let _ = worker.join();
     }
 }
+
+/// The longest an idle accept loop waits before checking for shutdown again.
+const ACCEPT_IDLE_WAIT: Duration = Duration::from_millis(500);
 
 fn reap_workers(workers: &mut Vec<JoinHandle<()>>) {
     let mut index = 0;
@@ -928,6 +934,7 @@ mod tests {
                 // A directory a failed run leaves stays in this fixture.
                 .env("TMPDIR", temporary.path());
             let output = crate::process::capture_output_bounded(
+                "test subprocess",
                 &mut command,
                 std::time::Instant::now() + Duration::from_secs(20),
                 &|| false,
