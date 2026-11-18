@@ -2076,25 +2076,39 @@ pub(crate) enum PrimedControl {
 }
 
 impl RemoteSpec {
-    pub fn local_receiver(quiet: bool) -> Self {
+    /// A connection to `host` over `rsh`, with nothing else set.
+    pub(crate) fn new(
+        user: Option<String>,
+        host: String,
+        port: Option<u16>,
+        rsh: Vec<String>,
+    ) -> Self {
         Self {
-            local_process: true,
-            user: None,
-            host: "127.0.0.1".into(),
-            port: None,
-            rsh: vec!["local".into()],
+            local_process: false,
+            user,
+            host,
+            port,
+            rsh,
             syq_path: None,
             bootstrap_helper: false,
             restricted_grant: None,
             helper_install: Default::default(),
             ssh_multiplexer: None,
-            quiet,
+            quiet: false,
             pacing: Default::default(),
             tcp: Default::default(),
             diagnostics: Default::default(),
             primed_control: Default::default(),
             receiver_host: None,
             read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
+        }
+    }
+
+    pub fn local_receiver(quiet: bool) -> Self {
+        Self {
+            local_process: true,
+            quiet,
+            ..Self::new(None, "127.0.0.1".into(), None, vec!["local".into()])
         }
     }
 
@@ -2436,20 +2450,11 @@ impl RemoteSpec {
         self.program_command(args)
     }
 
-    /// `limited`: take a connect slot (data connections). The control
-    /// connection passes false: everything waits on it, so it must never
-    /// queue behind workers. In managed mode the matching helper is installed
-    /// on first use if the remote lacks it.
-    pub fn connect_with(&self, compress: bool, limited: bool) -> Result<RemoteConn> {
-        let role = if limited {
-            ConnectionRole::SourceWorker {
-                roots: Vec::new(),
-                send_budget: None,
-            }
-        } else {
-            ConnectionRole::Control
-        };
-        self.connect_with_role(compress, limited, role, false, false, None)
+    /// The control connection. It takes no connect slot: everything waits
+    /// on it, so it must never queue behind workers. In managed mode the
+    /// matching helper is installed on first use if the remote lacks it.
+    pub fn connect(&self, compress: bool) -> Result<RemoteConn> {
+        self.connect_with_role(compress, false, ConnectionRole::Control, false, false, None)
     }
 
     /// Ordinary SSH settings, with diagnostics inspected only to decide whether
@@ -2458,31 +2463,14 @@ impl RemoteSpec {
         self.connect_with_role(compress, false, ConnectionRole::Control, false, true, None)
     }
 
-    /// One non-retrying control connection for speculative shell completion.
-    /// The caller supplies BatchMode and SSH timeouts in `rsh`; this avoids the
-    /// transfer engine's exponential retries while retaining the exact same
-    /// managed-helper bootstrap and persistent control socket behavior.
+    /// An uncompressed control connection for speculative shell completion.
+    /// The caller supplies BatchMode and SSH timeouts in `rsh`. Unlike
+    /// `connect`, it takes a pooled session without compression too.
     pub(crate) fn connect_completion(&self) -> Result<RemoteConn> {
         if let Some(conn) = self.take_pooled_control(false) {
             return Ok(conn);
         }
-        let role = ConnectionRole::Control;
-        let first = self.connect_once(false, SshConnection::Control, role.clone(), false, None);
-        let Err(first_error) = first else {
-            return first;
-        };
-        if !self.bootstrap_helper || !helper_needs_install(&first_error) {
-            return Err(first_error);
-        }
-        self.install_helper()?;
-        self.connect_once(false, SshConnection::Control, role, false, None)
-            .with_context(|| {
-                format!(
-                    "could not start the {} helper installed on {}",
-                    remote_helper::helper_identity(),
-                    self.label()
-                )
-            })
+        self.connect_with_role(false, false, ConnectionRole::Control, false, false, None)
     }
 
     fn connect_with_role(
@@ -2949,11 +2937,13 @@ impl RemoteSpec {
             diagnostics.tcp_probe = None;
             diagnostics.tcp_setup_error = None;
         }
-        let result = self.request_tcp_listener_inner(ctl, plain, ports, congestion_control, pacing);
-        if let Err(error) = &result {
-            self.diagnostics.lock().unwrap().tcp_setup_error = Some(format!("{error:#}"));
-        }
-        result
+        self.tcp_setup_result(self.request_tcp_listener_inner(
+            ctl,
+            plain,
+            ports,
+            congestion_control,
+            pacing,
+        ))
     }
 
     /// Read the reply to `request_tcp_listener` and begin probing the
@@ -2963,16 +2953,16 @@ impl RemoteSpec {
         ctl: &mut dyn Conn,
         requested: RequestedTcpListener,
     ) -> Result<PendingTcpSetup> {
-        let result = self.begin_requested_tcp_setup_inner(ctl, requested);
-        if let Err(error) = &result {
-            self.diagnostics.lock().unwrap().tcp_setup_error = Some(format!("{error:#}"));
-        }
-        result
+        self.tcp_setup_result(self.begin_requested_tcp_setup_inner(ctl, requested))
     }
 
     /// Join background route probes and record the selected TCP data paths.
     pub(crate) fn finish_tcp_setup(&self, pending: PendingTcpSetup) -> Result<()> {
-        let result = self.finish_tcp_setup_inner(pending);
+        self.tcp_setup_result(self.finish_tcp_setup_inner(pending))
+    }
+
+    /// `result`, its error recorded for the diagnostics.
+    fn tcp_setup_result<T>(&self, result: Result<T>) -> Result<T> {
         if let Err(error) = &result {
             self.diagnostics.lock().unwrap().tcp_setup_error = Some(format!("{error:#}"));
         }

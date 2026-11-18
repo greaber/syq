@@ -1782,23 +1782,11 @@ fn connect_completion_endpoint(
         rsh.extend(["-o".into(), option.into()]);
     }
     let spec = RemoteSpec {
-        local_process: false,
-        user: endpoint.user,
-        host: endpoint.host,
-        port: endpoint.port,
-        rsh,
         syq_path: syq_path.clone(),
         bootstrap_helper: syq_path.is_none() && !no_bootstrap,
-        restricted_grant: None,
-        helper_install: Default::default(),
         ssh_multiplexer,
         quiet: true,
-        pacing: Default::default(),
-        tcp: Default::default(),
-        diagnostics: Default::default(),
-        primed_control: Default::default(),
-        receiver_host: None,
-        read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
+        ..RemoteSpec::new(endpoint.user, endpoint.host, endpoint.port, rsh)
     };
     spec.connect_completion()
 }

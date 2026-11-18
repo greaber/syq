@@ -2200,7 +2200,7 @@ fn run_remote(
     // missing helper could otherwise look like a successful start.  Validate
     // and, in automatic mode, install it before detaching.
     if args.detach {
-        drop(spec.connect_with(false, false)?);
+        drop(spec.connect(false)?);
     }
     let dbg = if crate::output::debug() {
         "SYQ_DEBUG=1 "
