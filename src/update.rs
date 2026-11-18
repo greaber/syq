@@ -130,10 +130,15 @@ pub fn self_update() -> Result<()> {
         "self-update is only available for installs made by the standalone installer; Homebrew installs should use `brew upgrade syq`, and source builds should be rebuilt or replaced with a standalone install",
     )?;
     // An install from before 0.6.0 gets its receipt beside the executable
-    // now, read from the old one, which stays (`managed_receipt`).
+    // now, read from the old one, which stays (`managed_receipt`). Until
+    // that works, the old one keeps serving.
     if matches!(fs::symlink_metadata(&receipt_path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
     {
-        write_receipt(&receipt_path, &receipt).context("move the install receipt beside syq")?;
+        if let Err(error) = write_receipt(&receipt_path, &receipt) {
+            crate::output::diagnostic!(
+                "syq: could not copy the install receipt beside syq: {error:#}"
+            );
+        }
     }
     let release = fetch_latest(FetchMode::Interactive)?;
     match release.version.cmp(&current_version()?) {

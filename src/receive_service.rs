@@ -2997,16 +2997,16 @@ fn pending(domain: &Domain, json: bool, wait: bool, timeout: u64) -> Result<()> 
     }
     let deadline = Instant::now() + Duration::from_secs(timeout);
     let mut progress = Instant::now();
-    let mut said = false;
+    // What this command said about services it cannot read, which may hold
+    // requests too: each once, also one that starts while it waits.
+    let mut said = std::collections::BTreeSet::new();
     loop {
         let states = statuses(domain)?;
-        // A service this command cannot read may hold requests too.
         for older in states.iter().filter_map(|state| state.older.as_ref()) {
-            if !said {
+            if said.insert(older.clone()) {
                 crate::output::diagnostic!("syq: {older}");
             }
         }
-        said = true;
         let mut requests: Vec<_> = states
             .into_iter()
             .flat_map(|status| status.pending)
