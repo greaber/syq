@@ -73,9 +73,14 @@ impl LocalPlan {
             ]);
         }
         command.args(["--", &requested.host]);
-        let output =
-            crate::process::capture_output_bounded(&mut command, deadline, cancelled, LIMIT)
-                .context("resolve SSH configuration on the requesting machine")?;
+        let output = crate::process::capture_output_bounded(
+            "SSH configuration lookup",
+            &mut command,
+            deadline,
+            cancelled,
+            LIMIT,
+        )
+        .context("resolve SSH configuration on the requesting machine")?;
         anyhow::ensure!(
             output.status.success(),
             "could not resolve local SSH configuration: {}",

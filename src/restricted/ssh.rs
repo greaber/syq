@@ -416,6 +416,7 @@ mod tests {
                 // child before the cleanup has run.
                 .env("SYQ_TEST_TERMINATION_CAP_MS", "10000");
             let output = crate::process::capture_output_bounded(
+                "test subprocess",
                 &mut command,
                 Instant::now() + Duration::from_secs(20),
                 &|| false,

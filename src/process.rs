@@ -105,14 +105,20 @@ pub(crate) fn file_build(path: &std::path::Path) -> std::io::Result<String> {
         .arg("--build-identity")
         .env("SYQ_NO_UPDATE_CHECK", "1");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let output =
-        capture_output_bounded(&mut probe, deadline, &|| false, 4096).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::TimedOut {
-                std::io::Error::new(error.kind(), "it did not say its version within 10 s")
-            } else {
-                error
-            }
-        })?;
+    let output = capture_output_bounded(
+        "build identity check",
+        &mut probe,
+        deadline,
+        &|| false,
+        4096,
+    )
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            std::io::Error::new(error.kind(), "it did not say its version within 10 s")
+        } else {
+            error
+        }
+    })?;
     let identity = output
         .stdout
         .strip_suffix(b"\n")
@@ -306,14 +312,17 @@ pub(crate) fn restore_self_started_name() {
 
 /// Run an inspection command under one deadline, including descendants that
 /// retain its output pipes. Neither output nor cancellation needs a reader
-/// thread whose lifetime can outlast the command's process group.
+/// thread whose lifetime can outlast the command's process group. `what`
+/// names the command in errors, as in "`what` timed out".
 pub(crate) fn capture_output_bounded(
+    what: &str,
     command: &mut Command,
     deadline: std::time::Instant,
     cancelled: &dyn Fn() -> bool,
     max_output_bytes: usize,
 ) -> std::io::Result<Output> {
     capture_output_bounded_with(
+        what,
         command,
         deadline,
         cancelled,
@@ -325,6 +334,7 @@ pub(crate) fn capture_output_bounded(
 /// `capture_output_bounded`, waiting with `wait` before each new look for
 /// the exit of a command that has closed its output.
 fn capture_output_bounded_with(
+    what: &str,
     command: &mut Command,
     deadline: std::time::Instant,
     cancelled: &dyn Fn() -> bool,
@@ -335,17 +345,17 @@ fn capture_output_bounded_with(
     use std::os::fd::{AsRawFd, RawFd};
     use std::time::{Duration, Instant};
 
-    fn check(deadline: Instant, cancelled: &dyn Fn() -> bool) -> io::Result<()> {
+    fn check(what: &str, deadline: Instant, cancelled: &dyn Fn() -> bool) -> io::Result<()> {
         if cancelled() {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
-                "SSH policy inspection cancelled",
+                format!("{what} cancelled"),
             ));
         }
         if Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "SSH policy inspection timed out",
+                format!("{what} timed out"),
             ));
         }
         Ok(())
@@ -359,6 +369,7 @@ fn capture_output_bounded_with(
         Ok(())
     }
     fn drain(
+        what: &str,
         reader: &mut impl Read,
         output: &mut Vec<u8>,
         total: &mut usize,
@@ -371,7 +382,7 @@ fn capture_output_bounded_with(
                 if count > limit.saturating_sub(*total) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "SSH policy inspection output exceeds its byte limit",
+                        format!("{what} output exceeds its byte limit"),
                     ));
                 }
                 *total += count;
@@ -390,7 +401,7 @@ fn capture_output_bounded_with(
         }
     }
 
-    check(deadline, cancelled)?;
+    check(what, deadline, cancelled)?;
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -410,12 +421,12 @@ fn capture_output_bounded_with(
     // already, then up to the check interval for one that lingers.
     let mut exit_wait = Duration::from_micros(100);
     loop {
-        check(deadline, cancelled)?;
+        check(what, deadline, cancelled)?;
         if !out_done {
-            out_done = drain(&mut stdout, &mut out, &mut total, max_output_bytes)?;
+            out_done = drain(what, &mut stdout, &mut out, &mut total, max_output_bytes)?;
         }
         if !err_done {
-            err_done = drain(&mut stderr, &mut err, &mut total, max_output_bytes)?;
+            err_done = drain(what, &mut stderr, &mut err, &mut total, max_output_bytes)?;
         }
         // Keep the leader unreaped until its descendants have closed the
         // pipes, then let ProcessGroup stop remaining descendants before
@@ -613,6 +624,7 @@ mod bounded_tests {
         limit: usize,
     ) -> std::io::Result<Output> {
         capture_output_bounded(
+            "test command",
             Command::new("sh").args(["-c", script]),
             Instant::now() + timeout,
             cancelled,
@@ -643,6 +655,7 @@ mod bounded_tests {
         // command, whose start-up time varies widely between hosts.
         let mut waits = Vec::new();
         let output = capture_output_bounded_with(
+            "test command",
             Command::new("sh").args(["-c", "printf done; exec >&- 2>&-; sleep 0.2"]),
             Instant::now() + Duration::from_secs(10),
             &|| false,
@@ -696,6 +709,7 @@ mod bounded_tests {
             });
         }
         let error = capture_output_bounded(
+            "test command",
             &mut command,
             Instant::now() + Duration::from_millis(150),
             &|| false,
@@ -703,6 +717,7 @@ mod bounded_tests {
         )
         .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "test command timed out");
         drop(holder);
         let (closed, wait) = std::sync::mpsc::channel();
         std::thread::spawn(move || closed.send(alive.read_to_end(&mut Vec::new()).unwrap()));

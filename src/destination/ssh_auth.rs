@@ -1909,6 +1909,7 @@ mod tests {
             let mut keygen = std::process::Command::new("ssh-keygen");
             keygen.args(["-F", lookup, "-f"]).arg(&hosts);
             let found = crate::process::capture_output_bounded(
+                "test SSH command",
                 &mut keygen,
                 Instant::now() + Duration::from_secs(5),
                 &|| false,
@@ -1931,6 +1932,7 @@ mod tests {
             // The local proxy exits without a transport. No network or agent
             // is needed to observe OpenSSH's actual token/identity expansion.
             let output = crate::process::capture_output_bounded(
+                "test SSH command",
                 &mut command,
                 Instant::now() + Duration::from_secs(5),
                 &|| false,

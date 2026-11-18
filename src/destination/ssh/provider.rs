@@ -420,8 +420,13 @@ fn stop_master(record: &Record) -> Result<()> {
         .args(["-O", "exit"])
         .args(endpoint_arguments(record.endpoint()?));
     let deadline = Instant::now() + Duration::from_secs(5);
-    let output =
-        crate::process::capture_output_bounded(&mut command, deadline, &|| false, 16 * 1024)?;
+    let output = crate::process::capture_output_bounded(
+        "SSH provider shutdown",
+        &mut command,
+        deadline,
+        &|| false,
+        16 * 1024,
+    )?;
     if !output.status.success() && !remove_abandoned_control(record)? {
         bail!(
             "SSH provider refused shutdown: {}",
@@ -557,15 +562,25 @@ fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
     anyhow::ensure!(!cancelled(), "SSH provider setup cancelled");
     let spec = helper_spec(&owner.record)?;
     let mut probe = spec.helper_command(&["--build-identity".into()]);
-    let result =
-        crate::process::capture_output_bounded(&mut probe, deadline, &cancelled, 16 * 1024)?;
+    let result = crate::process::capture_output_bounded(
+        "SSH provider helper check",
+        &mut probe,
+        deadline,
+        &cancelled,
+        16 * 1024,
+    )?;
     if crate::remote_helper::needs_install(result.status.code()) {
         let mut install = crate::process::self_command()?;
         install
             .arg(INSTALL)
             .arg(serde_json::to_string(&owner.record)?);
-        let result =
-            crate::process::capture_output_bounded(&mut install, deadline, &cancelled, 64 * 1024)?;
+        let result = crate::process::capture_output_bounded(
+            "SSH provider helper installation",
+            &mut install,
+            deadline,
+            &cancelled,
+            64 * 1024,
+        )?;
         anyhow::ensure!(
             result.status.success(),
             "could not install SSH provider helper: {}",
@@ -740,6 +755,7 @@ fn forward_service(record: &Record, remote: &Path) -> Result<()> {
         ))
         .args(endpoint_arguments(record.endpoint()?));
     let output = crate::process::capture_output_bounded(
+        "SSH provider socket forwarding",
         &mut command,
         Instant::now() + Duration::from_secs(10),
         &|| false,
