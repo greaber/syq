@@ -661,12 +661,24 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Key the cache by the dependency stage (the Dockerfile up to its second
+      # FROM) and the files it copies, so edits to later stages keep it.
+      - name: Key the lab's dependency build
+        id: dependency-key
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest=$({
+            awk '/^FROM /{stage++} stage <= 1' tests/real-ssh/Dockerfile
+            cat Cargo.toml Cargo.lock build.rs
+          } | sha256sum)
+          echo "key=real-ssh-dependencies-$RUNNER_OS-$RUNNER_ARCH-${digest%% *}" >> "$GITHUB_OUTPUT"
       - name: Restore the lab's dependency build
         id: dependencies
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/real-ssh-dependencies
-          key: real-ssh-dependencies-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/real-ssh/Dockerfile', 'Cargo.toml', 'Cargo.lock', 'build.rs') }}
+          key: ${{ steps.dependency-key.outputs.key }}
       - name: Build the lab image
         env:
           CACHE: ${{ runner.temp }}/real-ssh-dependencies

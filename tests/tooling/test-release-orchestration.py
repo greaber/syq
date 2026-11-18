@@ -103,6 +103,36 @@ class WorkflowTextTests(unittest.TestCase):
         for output in ("needed", "sdk", "release_tooling"):
             self.assertIn(f"{output}: ${{{{ steps.changes.outputs.macos_{output} }}}}", workflow)
 
+    def test_real_ssh_dependency_key_follows_only_the_dependency_stage(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        step = workflow.split("      - name: Key the lab's dependency build\n", 1)[1]
+        script = textwrap.dedent(step.split("        run: |\n", 1)[1].split("\n      - ", 1)[0])
+        dockerfile = (ROOT / "tests/real-ssh/Dockerfile").read_text()
+        final = dockerfile.index("\nFROM debian:")
+        dependencies = dockerfile.index("\nRUN mkdir src")
+        edits = {"final": dockerfile[:final] + "\n# edit" + dockerfile[final:],
+                 "dependencies": dockerfile[:dependencies] + "\n# edit" + dockerfile[dependencies:]}
+
+        def key(text, lock="lock\n"):
+            with tempfile.TemporaryDirectory(prefix="syq-real-ssh-key-") as temporary:
+                root = Path(temporary)
+                (root / "tests/real-ssh").mkdir(parents=True)
+                (root / "tests/real-ssh/Dockerfile").write_text(text)
+                for name, content in [("Cargo.toml", "toml\n"), ("Cargo.lock", lock),
+                                      ("build.rs", "build\n")]:
+                    (root / name).write_text(content)
+                output = root / "output"
+                subprocess.run(["bash", "-c", script], cwd=root, check=True, timeout=10,
+                               env=dict(BASE_ENV, RUNNER_OS="Linux", RUNNER_ARCH="X64",
+                                        GITHUB_OUTPUT=str(output)))
+                return parse(output.read_text())["key"]
+
+        original = key(dockerfile)
+        self.assertRegex(original, r"^real-ssh-dependencies-Linux-X64-[0-9a-f]{64}$")
+        self.assertEqual(key(edits["final"]), original)
+        self.assertNotEqual(key(edits["dependencies"]), original)
+        self.assertNotEqual(key(dockerfile, lock="other\n"), original)
+
     def test_release_workflow_requires_checks_and_notes(self):
         release = (ROOT / ".github/workflows/release.yml").read_text()
         self.assertIn(",".join(release_checks.REQUIRED_CHECKS), release)
