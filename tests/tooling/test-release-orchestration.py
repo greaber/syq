@@ -203,7 +203,7 @@ class PathScopeTests(Scratch):
                                "conformance", "macos", "linux_arm64", "full_suite"], "false")
         self.assertScope(self.scope(".github/workflows/rsync-compat.yml"), tooling="true",
                          conformance="false", native="false")
-        self.assertScope(self.scope(".github/workflows/python-api-sync.yml"), tooling="true",
+        self.assertScope(self.scope(".github/workflows/pages.yml"), tooling="true",
                          python_sdk="false", native="false")
 
     def test_pinned_tools_run_everything_that_uses_them(self):
@@ -410,18 +410,19 @@ class EventScopeTests(Scratch):
         dispatch = self.event("workflow-dispatch-event.json", DISPATCH_EVENT)
         branch = {"GITHUB_REF": "refs/heads/task"}
         scope = self.scope(event=dispatch, cwd=self.repo,
-                           env=dict(branch, SYQ_CI_SUITES="real-ssh-metadata, s3 real-ssh-core"))
+                           env=dict(branch, SYQ_CI_SUITES="real-ssh-max-sessions-1, s3 real-ssh-core"))
         self.assertScope(scope, suite_selection="true", s3="true", native="false",
                          repository_checks="false", full_suite="false")
         # Matrix order is fixed so equal selections share cancellation groups.
         self.assertEqual(json.loads(scope["real_ssh_matrix"]),
                          [{"suite": "core", "profile": "default"},
-                          {"suite": "metadata", "profile": "default"}])
+                          {"suite": "core", "profile": "max-sessions-1",
+                           "skip": "tests/real-ssh/max-sessions-1.skip"}])
         scope = self.scope(event=dispatch, cwd=self.repo,
                            env=dict(branch, SYQ_CI_SUITES="rust real-ssh macos-intel"))
         self.assertScope(scope, native="true", integration_targets="all", macos="true",
                          macos_intel="true", s3="false", tooling="false", full_suite="false")
-        self.assertEqual(len(json.loads(scope["real_ssh_matrix"])), 4)
+        self.assertEqual(len(json.loads(scope["real_ssh_matrix"])), 3)
         # On task branches the rust job's name records what it ran.
         self.assertScope(scope, rust_label="native:all", all_tooling="false", macos_lint="false")
         scope = self.scope(event=dispatch, cwd=self.repo,
