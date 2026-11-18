@@ -21,7 +21,7 @@ fn command(args: &[&str]) -> Vec<Vec<u8>> {
 #[test]
 fn receiving_authorizer_checks_the_command_without_local_preferences() {
     let omitted = command(&["cp", "results", "--to", "backup"]);
-    check_authorizer(&omitted, "laptop").unwrap();
+    check_authorizer(&parse(&omitted).unwrap(), "laptop").unwrap();
     for (mode, accepted) in [
         ("auto", true),
         ("@laptop", true),
@@ -30,7 +30,7 @@ fn receiving_authorizer_checks_the_command_without_local_preferences() {
     ] {
         let selected = command(&["cp", "results", "--to", "backup", "--auth-from", mode]);
         assert_eq!(
-            check_authorizer(&selected, "laptop").is_ok(),
+            check_authorizer(&parse(&selected).unwrap(), "laptop").is_ok(),
             accepted,
             "{mode}"
         );
@@ -107,6 +107,76 @@ fn a_receiving_machine_approves_only_copies_to_its_own_name() {
         assert!(
             receiving_command(&command(argv), "laptop").is_err(),
             "{argv:?}"
+        );
+    }
+}
+
+/// A copy to a receiving machine is checked there as its server checks it:
+/// shapes and options only a forged request carries are refused, with the
+/// messages the server gives them.
+#[test]
+fn a_receiving_machine_refuses_what_its_server_would() {
+    for (argv, message) in [
+        (
+            &[
+                "cp", "--from", "server", "results", "--to", "@laptop", "--into", "runs",
+            ][..],
+            "named destinations require syq cp with local sources",
+        ),
+        (
+            &[
+                "cp", "--src", "results", "--to", "@laptop", "--into", "runs", "--rsh", "ssh",
+            ],
+            "named destinations own their connection",
+        ),
+        (
+            &[
+                "cp",
+                "--src",
+                "results",
+                "--to",
+                "@laptop",
+                "--into",
+                "runs",
+                "--coordinate-at",
+                "src",
+            ],
+            "--coordinate-at currently applies only to copies between two remote endpoints",
+        ),
+        (
+            &[
+                "cp",
+                "--src",
+                "results",
+                "--to",
+                "@laptop",
+                "--into",
+                "runs",
+                "--follow-dst",
+                "--widen-dirs",
+                "all",
+            ],
+            "--widen-dirs all cannot be combined with --follow-dst",
+        ),
+        // The receiving machine's own message, as its rules give it.
+        (
+            &[
+                "cp",
+                "--src",
+                "results",
+                "--to",
+                "@laptop",
+                "--into",
+                "runs",
+                "--no-tcp-encryption",
+            ],
+            "copies to a receiving machine always encrypt their data",
+        ),
+    ] {
+        let error = receiving_command(&command(argv), "laptop").unwrap_err();
+        assert!(
+            format!("{error:#}").contains(message),
+            "{argv:?}: {error:#}"
         );
     }
 }
