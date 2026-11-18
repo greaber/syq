@@ -68,6 +68,13 @@ def s5cmd_transfer_flags(args):
             + (['-p', str(part_size)] if part_size is not None else []))
 
 
+def write_repeated(path, block, size):
+    """Write exactly `size` bytes to `path` by repeating `block`."""
+    with path.open('wb') as output:
+        for offset in range(0, size, len(block)):
+            output.write(block[:size - offset])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--syq', required=True, type=Path, help='optimized syq executable')
@@ -268,9 +275,7 @@ def main():
         src.mkdir()
         block = os.urandom(min(size, 8 * 2**20))
         for i in range(count):
-            with (src / f'{i:05d}.bin').open('wb') as output:
-                for _ in range(size // len(block)):
-                    output.write(block)
+            write_repeated(src / f'{i:05d}.bin', block, size)
         originals = {p.name: digest(p) for p in src.iterdir()}
         mib = count * size / 2**20
         for rep in range(args.repeats):

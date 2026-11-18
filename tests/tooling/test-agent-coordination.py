@@ -182,7 +182,7 @@ class CoordinationTests(unittest.TestCase):
         def interrupt(_seconds):
             resources.release(store, first, 'first')
             raise KeyboardInterrupt
-        with patch('coordination.resources.time.sleep', side_effect=interrupt):
+        with patch('coordination.store.time.sleep', side_effect=interrupt):
             with self.assertRaises(KeyboardInterrupt):
                 resources.wait(store, ticket, 'second', 5)
         self.acquire('third', 'server')
@@ -446,8 +446,17 @@ class CoordinationTests(unittest.TestCase):
     def test_triage_mode_does_not_launch_another_round(self):
         self.review_setup()
         review = self.wait(self.review(mode='triage', reviewer='codex'))
-        self.advance()
+        # Recording a revision does not require local fixes to be committed and pushed.
+        with (self.cwd / 'file').open('a') as out: out.write('fix in progress\n')
         self.assertEqual(self.triage(review, 'revise')['status'], 'needs_revision')
+        self.assertEqual(len(self.launches()), 1)
+
+    def test_auto_revise_requires_the_pushed_head(self):
+        self.review_setup()
+        review = self.wait(self.review())
+        with (self.cwd / 'file').open('a') as out: out.write('fix in progress\n')
+        self.triage(review, 'revise', code=2)
+        self.assertEqual(self.cmd('review', 'status', review['id'])['status'], 'review_ready')
         self.assertEqual(len(self.launches()), 1)
 
     def test_stop_keeps_report_available_without_restarting(self):
