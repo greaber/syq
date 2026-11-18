@@ -22,7 +22,7 @@ pub const MAX_FRAME: usize = 65 * 1024 * 1024;
 /// response, so it is rejected before the server allocates anything.
 pub const MAX_READ_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_HANDSHAKE_FRAME: usize = 1024 * 1024;
-pub(crate) const MAX_METADATA_FRAME: usize = 8 * 1024 * 1024;
+const MAX_METADATA_FRAME: usize = 8 * 1024 * 1024;
 pub(crate) const METADATA_BATCH_BYTES: usize = 6 * 1024 * 1024;
 /// What the failures of one request's metadata operations may add to its
 /// reply, by `failed_set_meta_hint`: half a metadata frame, so that the
