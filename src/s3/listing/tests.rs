@@ -295,7 +295,7 @@ async fn literal_prefix_enumeration_preserves_metacharacters_and_overlap() {
         .collect();
     for concurrency in [1, 4] {
         let mut actual = Vec::new();
-        engine::enumerate_prefix(&store, prefix, concurrency, |entry| {
+        engine::enumerate_prefix(&store, prefix, concurrency, None, |entry| {
             actual.push(entry.key);
             Ok(())
         })
@@ -459,7 +459,7 @@ async fn incomplete_directory_probe_cannot_discard_observed_objects() {
             (0..2000).map(move |i| format!("tree/dir{d:02}/file{i:04}"))
         })));
     let mut keys = Vec::new();
-    engine::enumerate_prefix(&store, "tree/", 32, |entry| {
+    engine::enumerate_prefix(&store, "tree/", 32, None, |entry| {
         keys.push(entry.key);
         Ok(())
     })
@@ -544,7 +544,7 @@ async fn ignored_start_after_filters_every_continuation_page() {
                 .await
                 .unwrap();
             } else {
-                engine::enumerate_prefix(&store, "tree/", 8, |entry| {
+                engine::enumerate_prefix(&store, "tree/", 8, None, |entry| {
                     actual.push(entry.key);
                     Ok(())
                 })
@@ -566,4 +566,61 @@ async fn ignored_start_after_filters_every_continuation_page() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn pruned_directories_are_reported_instead_of_listed() {
+    async fn pruned(store: &Memory, prune: &engine::Prune<'_>) -> (Vec<String>, Vec<String>) {
+        let mut keys = Vec::new();
+        let pruned = engine::enumerate_prefix(store, "tree/", 8, Some(prune), |entry| {
+            keys.push(entry.key);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        (keys, pruned)
+    }
+    let ignored =
+        |key: &str, _directory: bool| key.starts_with("tree/d3/").then_some("tree/d3".len());
+    // Dense children split in parallel; the pruned one is never listed.
+    let store =
+        Memory::new((0..8).flat_map(|d| (0..1200).map(move |i| format!("tree/d{d}/file{i:04}"))));
+    let prune = engine::Prune {
+        subtree: &ignored,
+        probes: 4.into(),
+    };
+    let (keys, pruned_prefixes) = pruned(&store, &prune).await;
+    assert_eq!(pruned_prefixes, ["tree/d3/"]);
+    assert!(!store
+        .calls
+        .borrow()
+        .iter()
+        .any(|(prefix, _)| prefix == "tree/d3/"));
+    let listed: BTreeSet<_> = keys.into_iter().collect();
+    for key in &store.keys {
+        assert_eq!(listed.contains(key), !key.starts_with("tree/d3/"), "{key}");
+    }
+    // A first page entirely in a pruned directory switches to a directory
+    // listing at once, following a single included child.
+    let store = Memory::new(
+        (0..5000)
+            .map(|i| format!("tree/d3/file{i:04}"))
+            .chain(["tree/d4/a".into(), "tree/top".into()]),
+    );
+    let prune = engine::Prune {
+        subtree: &ignored,
+        probes: 4.into(),
+    };
+    let (mut keys, pruned_prefixes) = pruned(&store, &prune).await;
+    keys.sort();
+    assert_eq!(keys, ["tree/d4/a", "tree/top"]);
+    assert_eq!(pruned_prefixes, ["tree/d3/"]);
+    assert_eq!(
+        *store.calls.borrow(),
+        [
+            ("tree/".to_owned(), false),
+            ("tree/".to_owned(), true),
+            ("tree/d4/".to_owned(), false)
+        ]
+    );
 }
