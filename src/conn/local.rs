@@ -31,6 +31,46 @@ impl From<&ConnectionRole> for LocalConnectionRole {
 }
 
 impl LocalConn {
+    /// Scan a registered source: `Conn::scan`, or `Conn::scan_ahead` when
+    /// `upcoming` is given.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_source(
+        &mut self,
+        root: &[u8],
+        source: Option<&RegisteredPath>,
+        follow_root: bool,
+        ignore: &[String],
+        report_ignored: bool,
+        sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        upcoming: Option<&mut dyn FnMut(&[Entry])>,
+        ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
+        warn: &mut dyn FnMut(crate::proto::ScanWarning),
+    ) -> Result<u64> {
+        let mut capture = |mut batch: Vec<Entry>| {
+            self.ops
+                .capture_scan_metadata(root, source, follow_root, &mut batch)?;
+            sink(batch)
+        };
+        if let Some(source) = self.ops.source_scan_root(source)? {
+            return crate::scan::scan_descriptor_ahead(
+                source.root,
+                &source.relative,
+                source.expected_leaf,
+                false,
+                false,
+                ignore,
+                report_ignored,
+                &mut capture,
+                upcoming,
+                ignored,
+                warn,
+            );
+        }
+        // Every destination is served by a receiver process, so a local
+        // connection only scans registered sources.
+        bail!("scan names neither a registered source nor a destination root")
+    }
+
     pub(super) fn new(
         role: &ConnectionRole,
         descriptor_session: crate::descriptor_broker::DescriptorSessionSlot,
@@ -233,28 +273,42 @@ impl Conn for LocalConn {
         ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         warn: &mut dyn FnMut(crate::proto::ScanWarning),
     ) -> Result<u64> {
-        let mut capture = |mut batch: Vec<Entry>| {
-            self.ops
-                .capture_scan_metadata(root, source, follow_root, &mut batch)?;
-            sink(batch)
-        };
-        if let Some(source) = self.ops.source_scan_root(source)? {
-            return crate::scan::scan_descriptor(
-                source.root,
-                &source.relative,
-                source.expected_leaf,
-                false,
-                false,
-                ignore,
-                report_ignored,
-                &mut capture,
-                ignored,
-                warn,
-            );
-        }
-        // Every destination is served by a receiver process, so a local
-        // connection only scans registered sources.
-        bail!("scan names neither a registered source nor a destination root")
+        self.scan_source(
+            root,
+            source,
+            follow_root,
+            ignore,
+            report_ignored,
+            sink,
+            None,
+            ignored,
+            warn,
+        )
+    }
+
+    fn scan_ahead(
+        &mut self,
+        root: &[u8],
+        source: Option<&RegisteredPath>,
+        follow_root: bool,
+        ignore: &[String],
+        report_ignored: bool,
+        sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        upcoming: &mut dyn FnMut(&[Entry]),
+        ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
+        warn: &mut dyn FnMut(crate::proto::ScanWarning),
+    ) -> Result<u64> {
+        self.scan_source(
+            root,
+            source,
+            follow_root,
+            ignore,
+            report_ignored,
+            sink,
+            Some(upcoming),
+            ignored,
+            warn,
+        )
     }
 
     fn scan_selected(

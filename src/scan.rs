@@ -9,16 +9,32 @@ use crate::proto::{Entry, PathBytes, ScanWarning, SourceLeafIdentity};
 use crate::rooted::{RelativePath, Root, RootMetadata};
 use anyhow::{Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use std::collections::VecDeque;
 use std::fs::File;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub const BATCH: usize = 4096;
 const FIRST_BATCH: usize = 1000;
 const FIRST_BATCH_MAX_DELAY: Duration = Duration::from_millis(50);
+/// Complete batches a scan that shows them early (`Conn::scan_ahead`) holds
+/// at once, the one its sink takes next included. The planner looks each
+/// one's destination up as it is shown, and a control connection keeps this
+/// many requests in flight (`conn::reply_queue`).
+pub(crate) const AHEAD: usize = crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH;
+/// Chunks a scan's producer queues for its consumer: about one batch, or
+/// two when the consumer holds batches ahead, which it fills only from
+/// chunks that have already arrived.
+const fn queued_chunks(ahead: bool) -> usize {
+    if ahead {
+        2 * BATCH / FIRST_BATCH
+    } else {
+        BATCH / FIRST_BATCH
+    }
+}
 const DESCRIPTOR_STAT_THREADS: usize = 8;
 const DESCRIPTOR_STAT_PAR_MIN: usize = 32;
 const DESCRIPTOR_DIRECTORY_FDS: usize = 8;
@@ -399,6 +415,62 @@ fn produce_descriptor_scan(
     ignored_count
 }
 
+/// What a scan produced, in order, that its consumer has not been given yet.
+enum Held {
+    Batch(Vec<Entry>),
+    Ignored(Vec<PathBytes>),
+    Warning(ScanWarning),
+}
+
+/// Add a chunk's events to `held` in order, with the batch it completes, if
+/// any, last: shown to `upcoming` first. Returns whether it completed one.
+fn hold_chunk(
+    chunk: ScanChunk,
+    batch: &mut Vec<Entry>,
+    ignored_batch: &mut Vec<PathBytes>,
+    held: &mut VecDeque<Held>,
+    upcoming: Option<&mut dyn FnMut(&[Entry])>,
+) -> bool {
+    for event in chunk {
+        match event {
+            ScanEvent::Entry(entry) => batch.push(entry),
+            ScanEvent::Ignored(path) => {
+                ignored_batch.push(path);
+                if ignored_batch.len() >= BATCH {
+                    held.push_back(Held::Ignored(std::mem::take(ignored_batch)));
+                }
+            }
+            ScanEvent::Warning(message) => held.push_back(Held::Warning(message)),
+        }
+    }
+    if batch.len() < BATCH {
+        return false;
+    }
+    if let Some(upcoming) = upcoming {
+        upcoming(batch);
+    }
+    held.push_back(Held::Batch(std::mem::replace(
+        batch,
+        Vec::with_capacity(BATCH),
+    )));
+    true
+}
+
+/// The next chunk if it has arrived, without waiting for it.
+fn arrived_chunk(rx: &Receiver<ScanChunk>) -> Result<ScanChunk, TryRecvError> {
+    // Tests hold every batch the limit allows, however fast the scan is.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SYQ_TEST_SCAN_AHEAD_WAIT").is_some() {
+        return rx.recv().map_err(|_| TryRecvError::Disconnected);
+    }
+    rx.try_recv()
+}
+
+/// Give the scan's events to `sink`, `ignored` and `warn` in order. With
+/// `upcoming`, batches after the first are also shown to it as soon as they
+/// are complete: up to `AHEAD` are held, filled only from chunks that have
+/// already arrived, so no batch waits for a later one to be scanned. The
+/// last, partial batch is shown too; the caller gives it to `sink`.
 #[allow(clippy::too_many_arguments)]
 fn receive_scan(
     rx: &Receiver<ScanChunk>,
@@ -406,23 +478,65 @@ fn receive_scan(
     batch: &mut Vec<Entry>,
     ignored_batch: &mut Vec<PathBytes>,
     sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+    mut upcoming: Option<&mut dyn FnMut(&[Entry])>,
     ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
     warn: &mut dyn FnMut(ScanWarning),
 ) -> Result<()> {
     let mut first_batch = true;
+    let mut held = VecDeque::new();
+    let mut held_batches = 0;
+    let mut finished = false;
     loop {
-        if batch.len() >= BATCH {
-            sink(std::mem::replace(batch, Vec::with_capacity(BATCH)))?;
-            first_batch = false;
-            continue;
+        if let Some(upcoming) = &mut upcoming {
+            while !first_batch && !finished && held_batches < AHEAD {
+                match arrived_chunk(rx) {
+                    Ok(chunk) => {
+                        held_batches += usize::from(hold_chunk(
+                            chunk,
+                            batch,
+                            ignored_batch,
+                            &mut held,
+                            Some(&mut **upcoming),
+                        ));
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        finished = true;
+                        if !batch.is_empty() {
+                            upcoming(batch);
+                        }
+                    }
+                }
+            }
+        }
+        match held.pop_front() {
+            Some(Held::Batch(entries)) => {
+                held_batches -= 1;
+                sink(entries)?;
+                first_batch = false;
+                continue;
+            }
+            Some(Held::Ignored(paths)) => {
+                ignored(paths)?;
+                continue;
+            }
+            Some(Held::Warning(message)) => {
+                warn(message);
+                continue;
+            }
+            None if finished => break,
+            None => {}
         }
         let chunk = if first_batch && batch.len() >= FIRST_BATCH {
             let remaining = FIRST_BATCH_MAX_DELAY.saturating_sub(scan_started.elapsed());
             match rx.recv_timeout(remaining) {
                 Ok(chunk) => Some(chunk),
                 Err(RecvTimeoutError::Timeout) => {
-                    sink(std::mem::replace(batch, Vec::with_capacity(BATCH)))?;
-                    first_batch = false;
+                    held.push_back(Held::Batch(std::mem::replace(
+                        batch,
+                        Vec::with_capacity(BATCH),
+                    )));
+                    held_batches += 1;
                     continue;
                 }
                 Err(RecvTimeoutError::Disconnected) => None,
@@ -430,21 +544,19 @@ fn receive_scan(
         } else {
             rx.recv().ok()
         };
+        // The first batch is never shown early: its sink runs before any
+        // other batch is read.
+        let upcoming: Option<&mut dyn FnMut(&[Entry])> = match &mut upcoming {
+            Some(upcoming) if !first_batch => Some(&mut **upcoming),
+            _ => None,
+        };
         let Some(chunk) = chunk else {
+            if let Some(upcoming) = upcoming.filter(|_| !batch.is_empty()) {
+                upcoming(batch);
+            }
             break;
         };
-        for event in chunk {
-            match event {
-                ScanEvent::Entry(entry) => batch.push(entry),
-                ScanEvent::Ignored(path) => {
-                    ignored_batch.push(path);
-                    if ignored_batch.len() >= BATCH {
-                        ignored(std::mem::take(ignored_batch))?;
-                    }
-                }
-                ScanEvent::Warning(message) => warn(message),
-            }
-        }
+        held_batches += usize::from(hold_chunk(chunk, batch, ignored_batch, &mut held, upcoming));
     }
     Ok(())
 }
@@ -462,6 +574,37 @@ pub(crate) fn scan_descriptor(
     ignore: &[String],
     report_ignored: bool,
     sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+    ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
+    warn: &mut dyn FnMut(ScanWarning),
+) -> Result<u64> {
+    scan_descriptor_ahead(
+        root,
+        scan_root,
+        expected_root,
+        follow_root,
+        hold_destination_for_test,
+        ignore,
+        report_ignored,
+        sink,
+        None,
+        ignored,
+        warn,
+    )
+}
+
+/// `scan_descriptor`, which with `upcoming` also shows it the batches after
+/// the first as soon as they are complete (`receive_scan`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scan_descriptor_ahead(
+    root: Arc<Root>,
+    scan_root: &[u8],
+    expected_root: Option<SourceLeafIdentity>,
+    follow_root: bool,
+    hold_destination_for_test: bool,
+    ignore: &[String],
+    report_ignored: bool,
+    sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+    upcoming: Option<&mut dyn FnMut(&[Entry])>,
     ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
     warn: &mut dyn FnMut(ScanWarning),
 ) -> Result<u64> {
@@ -493,7 +636,7 @@ pub(crate) fn scan_descriptor(
     let scan_started = Instant::now();
     batch.push(root_entry);
     let mut ignored_batch = Vec::new();
-    let (tx, rx) = mpsc::sync_channel(BATCH / FIRST_BATCH);
+    let (tx, rx) = mpsc::sync_channel(queued_chunks(upcoming.is_some()));
     let scan_root = scan_root.to_vec();
     let producer = std::thread::Builder::new()
         .name("syq-descriptor-scan-producer".into())
@@ -520,6 +663,7 @@ pub(crate) fn scan_descriptor(
         &mut batch,
         &mut ignored_batch,
         sink,
+        upcoming,
         ignored,
         warn,
     );
@@ -557,7 +701,7 @@ pub(crate) fn scan_descriptor_selected(
         }
     }
     directories.reverse();
-    let (tx, rx) = mpsc::sync_channel(BATCH / FIRST_BATCH);
+    let (tx, rx) = mpsc::sync_channel(queued_chunks(false));
     let scan_root = scan_root.to_vec();
     let scan_started = Instant::now();
     let producer = std::thread::Builder::new()
@@ -574,6 +718,7 @@ pub(crate) fn scan_descriptor_selected(
         &mut batch,
         &mut ignored_batch,
         sink,
+        None,
         &mut |_| Ok(()),
         warn,
     );
@@ -1045,6 +1190,7 @@ mod tests {
                 release_tx.send(()).unwrap();
                 Ok(())
             },
+            None,
             &mut |_| Ok(()),
             &mut |_| {},
         )
@@ -1084,6 +1230,7 @@ mod tests {
                 sizes.push(entries.len());
                 Ok(())
             },
+            None,
             &mut |_| Ok(()),
             &mut |_| {},
         )
@@ -1091,5 +1238,118 @@ mod tests {
 
         assert!(sizes.is_empty(), "fast EOF should not flush at 1,000");
         assert_eq!(batch.len(), 2000);
+    }
+
+    /// A chunk of `entries` entries, the first of them followed by a warning
+    /// named `warning`.
+    fn chunk(entries: usize, warning: &str) -> ScanChunk {
+        let mut chunk = vec![
+            ScanEvent::Entry(entry()),
+            ScanEvent::Warning(ScanWarning {
+                message: warning.into(),
+                path: None,
+                error: String::new(),
+            }),
+        ];
+        chunk.extend((1..entries).map(|_| ScanEvent::Entry(entry())));
+        chunk
+    }
+
+    /// With every chunk already there, batches after the first are shown as
+    /// soon as they are complete, `AHEAD` at most being held, and are then
+    /// given to the sink in the same order with the warnings in their places.
+    #[test]
+    fn later_batches_are_shown_while_earlier_ones_wait_and_arrive_in_order() {
+        const BATCHES: usize = 7;
+        let (tx, rx) = mpsc::sync_channel(BATCHES + 1);
+        for index in 0..BATCHES {
+            tx.send(chunk(BATCH, &format!("w{index}"))).unwrap();
+        }
+        // The last batch is partial.
+        tx.send(chunk(10, "last")).unwrap();
+        drop(tx);
+
+        let events = std::cell::RefCell::new(Vec::new());
+        let waiting = std::cell::Cell::new(0usize);
+        let most = std::cell::Cell::new(0usize);
+        let mut batch = Vec::new();
+        let mut ignored_batch = Vec::new();
+        receive_scan(
+            &rx,
+            Instant::now(),
+            &mut batch,
+            &mut ignored_batch,
+            &mut |entries| {
+                waiting.set(waiting.get().saturating_sub(1));
+                events.borrow_mut().push(format!("take {}", entries.len()));
+                Ok(())
+            },
+            Some(&mut |entries: &[Entry]| {
+                waiting.set(waiting.get() + 1);
+                most.set(most.get().max(waiting.get()));
+                events.borrow_mut().push(format!("show {}", entries.len()));
+            }),
+            &mut |_| Ok(()),
+            &mut |warning| events.borrow_mut().push(warning.message),
+        )
+        .unwrap();
+
+        // The first batch is never shown: it is taken before any other is
+        // read. The partial last one is shown, and left for the caller.
+        let full = format!("{BATCH}");
+        let expected: Vec<String> = [
+            "w0", "take", // the first batch, by itself
+            "show", "show", "show", "show", // batches 1 to 4 fill the limit
+            "w1", "take", "show", // each batch taken makes room for one
+            "w2", "take", "show", "w3", "take", "show 10", "w4", "take", "w5", "take", "w6",
+            "take", "last",
+        ]
+        .iter()
+        .map(|event| match *event {
+            "take" | "show" => format!("{event} {full}"),
+            other => other.to_string(),
+        })
+        .collect();
+        assert_eq!(*events.borrow(), expected);
+        assert_eq!(most.get(), AHEAD);
+        assert_eq!(batch.len(), 10);
+    }
+
+    /// A batch is not held back for the ones after it: with the producer
+    /// stalled, the only complete batch goes to the sink.
+    #[test]
+    fn a_complete_batch_does_not_wait_for_the_next_to_be_scanned() {
+        let (tx, rx) = mpsc::sync_channel(4);
+        let (release_tx, release_rx) = mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            tx.send(chunk(BATCH, "first")).unwrap();
+            tx.send(chunk(BATCH, "second")).unwrap();
+            release_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the second batch waited for a third");
+        });
+        let mut taken = 0;
+        let mut shown = 0;
+        let mut batch = Vec::new();
+        let mut ignored_batch = Vec::new();
+        receive_scan(
+            &rx,
+            Instant::now(),
+            &mut batch,
+            &mut ignored_batch,
+            &mut |_| {
+                taken += 1;
+                if taken == 2 {
+                    release_tx.send(()).unwrap();
+                }
+                Ok(())
+            },
+            Some(&mut |_: &[Entry]| shown += 1),
+            &mut |_| Ok(()),
+            &mut |_| {},
+        )
+        .unwrap();
+        producer.join().unwrap();
+        assert_eq!((taken, shown), (2, 1));
     }
 }

@@ -33,6 +33,7 @@ mod comparing;
 mod diagnostics;
 mod directory_stream;
 mod dry_run;
+mod early_lookups;
 mod hardlinks;
 mod planner;
 mod publication;
@@ -5013,6 +5014,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         },
         active_source: None,
         hardlinks: Default::default(),
+        early_lookups: Default::default(),
     };
 
     let mut scan_err = None;
@@ -6300,43 +6302,93 @@ fn stat_and_canonicalize(
     Ok((entry, canonical))
 }
 
+/// What a source scan gives the planner (`scan_into_planner`).
+enum Scanned<'a> {
+    /// The next batch to plan. `shown` when it was `Upcoming` before.
+    Batch { entries: Vec<Entry>, shown: bool },
+    /// A batch the scan has complete while earlier ones are still to be
+    /// planned (`Conn::scan_ahead`). It comes as a `Batch` in its turn.
+    Upcoming(&'a [Entry]),
+}
+
 /// Run a source scan whose batches feed the planner, and remember whether it
 /// reported any problem — `scan_warned` is what gates --delete, so every
-/// source walk must go through here.
+/// source walk must go through here. With `ahead`, `f` is also shown the
+/// batches to come, when the planner looks destinations up early
+/// (`Planner::looks_up_early`).
 fn scan_into_planner(
     pl: &mut Planner<'_>,
     src: &mut dyn Conn,
     root: &[u8],
     source: Option<&RegisteredPath>,
-    follow_root: bool,
+    (follow_root, ahead): (bool, bool),
     ignore: &[String],
-    mut f: impl FnMut(&mut Planner<'_>, Vec<Entry>) -> Result<()>,
+    f: impl FnMut(&mut Planner<'_>, Scanned<'_>) -> Result<()>,
 ) -> Result<()> {
     let progress = pl.progress;
     let quiet = pl.opts.quiet;
     let warned = std::cell::Cell::new(false);
-    let res = src.scan(
-        root,
-        source,
-        follow_root,
-        ignore,
-        false,
-        &mut |batch| f(pl, batch),
-        &mut |_| Ok(()),
-        &mut |w| {
-            let w = w.to_string();
-            // "skipping …" is a notice (nothing the copy owes is missing);
-            // anything else from the scanner means an entry was lost.
-            if w.starts_with("skipping ") {
-                if !quiet {
-                    progress.eprintln(&format!("syq: {w}"));
-                }
-            } else {
-                warned.set(true);
-                progress.error(&format!("syq: {w}"));
+    let mut warn = |w: crate::proto::ScanWarning| {
+        let w = w.to_string();
+        // "skipping …" is a notice (nothing the copy owes is missing);
+        // anything else from the scanner means an entry was lost.
+        if w.starts_with("skipping ") {
+            if !quiet {
+                progress.eprintln(&format!("syq: {w}"));
             }
-        },
-    );
+        } else {
+            warned.set(true);
+            progress.error(&format!("syq: {w}"));
+        }
+    };
+    let ahead = ahead && pl.looks_up_early();
+    // The planner, `f`, and how many batches were shown and not yet planned.
+    let state = std::cell::RefCell::new((pl, f, 0usize));
+    let mut sink = |entries: Vec<Entry>| {
+        let (pl, f, shown) = &mut *state.borrow_mut();
+        let was_shown = *shown > 0;
+        *shown -= usize::from(was_shown);
+        f(
+            pl,
+            Scanned::Batch {
+                entries,
+                shown: was_shown,
+            },
+        )
+    };
+    let res = if ahead {
+        src.scan_ahead(
+            root,
+            source,
+            follow_root,
+            ignore,
+            false,
+            &mut sink,
+            &mut |entries| {
+                let (pl, f, shown) = &mut *state.borrow_mut();
+                // Only a hint: the batch's own turn reports what goes wrong.
+                if f(pl, Scanned::Upcoming(entries)).is_ok() {
+                    *shown += 1;
+                }
+            },
+            &mut |_| Ok(()),
+            &mut warn,
+        )
+    } else {
+        src.scan(
+            root,
+            source,
+            follow_root,
+            ignore,
+            false,
+            &mut sink,
+            &mut |_| Ok(()),
+            &mut warn,
+        )
+    };
+    let (pl, ..) = state.into_inner();
+    // Batches shown but never planned leave their lookups unanswered.
+    pl.drop_early_lookups();
     if warned.get() {
         pl.scan_warned = true;
     }
