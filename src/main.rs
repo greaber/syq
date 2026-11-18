@@ -38,6 +38,7 @@ mod inode_metadata;
 mod janky_cat;
 #[cfg(target_os = "linux")]
 mod local_copy;
+mod lock_file;
 mod mapping;
 mod native_map;
 mod native_rm;

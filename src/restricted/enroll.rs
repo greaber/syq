@@ -355,7 +355,7 @@ pub(super) fn complete_local_enrollment(
         0o600,
     )?;
     let directory = open_directory(directory)?;
-    lock_directory(&directory)?;
+    let _lock = lock_directory(&directory)?;
     remove_leaf_locked(&directory, PENDING_FILE)?;
     remove_leaf_locked(&directory, REFRESH_FILE)
 }
@@ -794,7 +794,7 @@ pub(super) fn enroll(
 ) -> Result<(LocalEnrollment, PathBuf, Option<LoginSigner>)> {
     let base = local_state_base()?;
     let base_lock = open_directory(&base)?;
-    lock_directory(&base_lock)?;
+    let _lock = lock_directory(&base_lock)?;
     let account = |metadata_host: &str, metadata_port: Option<u16>, target_login: &str| {
         metadata_host == host && metadata_port == port && target_login == login
     };

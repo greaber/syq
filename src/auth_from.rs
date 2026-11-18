@@ -1,13 +1,13 @@
 //! User-selected authorization defaults. This file is independent of SSH
 //! persistence state so older binaries can keep using their existing settings.
 use crate::cli::AuthFrom;
+use crate::lock_file::LockFile;
 use crate::persistence::Domain;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -411,15 +411,9 @@ fn update_inner(
     }
     // A read-modify-write changes one override while preserving concurrent
     // changes made by another `persist auth-from` command.
-    loop {
-        if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX) } == 0 {
-            break;
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error).context("lock authorization configuration");
-        }
-    }
+    let lock = LockFile::adopt(directory);
+    lock.exclusive()
+        .context("lock authorization configuration")?;
     let mut config = read(&path)?;
     match (host, value) {
         (None, value) => config.default = value.map(spelling),

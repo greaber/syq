@@ -32,38 +32,35 @@ fn private_file(path: &Path, limit: u64, create: bool) -> Result<File> {
     Ok(file)
 }
 
-struct KeeperLock(File);
-impl Drop for KeeperLock {
-    fn drop(&mut self) {
-        // Forked descriptors must not keep the lock after its owner finishes.
-        unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
+/// Open the empty lock file beside an account record, or a keeper's.
+fn lock_file(path: &Path, create: bool) -> Result<LockFile> {
+    let lock = LockFile::open(path, create)
+        .with_context(|| format!("open SSH account state {}", path.display()))?;
+    anyhow::ensure!(
+        lock.file().metadata()?.len() == 0,
+        "unexpected SSH account state file {}",
+        path.display()
+    );
+    Ok(lock)
 }
 
 /// The caller validated and closed this recorded master. A concurrent new
 /// keeper may replace its index entry: take its lock and compare before removal.
 /// Keep the lock file itself so concurrent starters continue sharing one inode.
 pub(super) fn retire_record(path: &Path, control: &Path) -> Result<()> {
-    let lock = match private_file(&path.with_extension("lock"), 0, true) {
+    let lock = match lock_file(&path.with_extension("lock"), true) {
         Ok(lock) => lock,
         Err(error) if not_found(&error) && !path.exists() => return Ok(()),
         Err(error) => return Err(error),
     };
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::WouldBlock {
-            return Ok(());
-        }
-        return Err(error).with_context(|| {
-            format!(
-                "lock SSH account state {}",
-                path.with_extension("lock").display()
-            )
-        });
+    if !lock.try_exclusive().with_context(|| {
+        format!(
+            "lock SSH account state {}",
+            path.with_extension("lock").display()
+        )
+    })? {
+        return Ok(());
     }
-    let _lock = KeeperLock(lock);
     let Some(record) = read_record(path)? else {
         return Ok(());
     };
@@ -89,15 +86,8 @@ fn keepers_running(domain: &Domain) -> Result<usize> {
         if !index_name(&path, "lock") {
             continue;
         }
-        let lock = private_file(&path, 0, false)?;
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::WouldBlock {
-                return Err(error.into());
-            }
+        if lock_file(&path, false)?.held()? {
             running += 1;
-        } else {
-            drop(KeeperLock(lock));
         }
     }
     Ok(running)
@@ -417,15 +407,17 @@ mod tests {
         crate::persistence::prepare_endpoint(scope, None, "host.invalid", None, None).unwrap()
     }
 
-    fn pool_lock(control: &Path) -> File {
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(crate::session_pool::lock_path(control))
-            .unwrap()
+    fn pool_lock(control: &Path) -> LockFile {
+        LockFile::adopt(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(crate::session_pool::lock_path(control))
+                .unwrap(),
+        )
     }
 
     fn record(control: PathBuf) -> Record {
@@ -443,7 +435,7 @@ mod tests {
         }
     }
 
-    fn stored_record(root: &Path, control: PathBuf) -> (PathBuf, File) {
+    fn stored_record(root: &Path, control: PathBuf) -> (PathBuf, LockFile) {
         let path = root.join(format!("{}.json", "a".repeat(64)));
         let mut file = OpenOptions::new()
             .write(true)
@@ -459,7 +451,7 @@ mod tests {
             .mode(0o600)
             .open(path.with_extension("lock"))
             .unwrap();
-        (path, lock)
+        (path, LockFile::adopt(lock))
     }
 
     #[test]
@@ -478,7 +470,7 @@ mod tests {
         assert!(!scope.exists());
         assert!(!path.exists());
         assert_eq!(
-            lock.metadata().unwrap().ino(),
+            lock.file().metadata().unwrap().ino(),
             path.with_extension("lock").metadata().unwrap().ino()
         );
         retire_record(&path, &control).unwrap();
@@ -511,11 +503,7 @@ mod tests {
         let scope = root.path().join("approved-old");
         let control = registered_control(&scope);
         let (path, lock) = stored_record(root.path(), control.clone());
-        assert_eq!(
-            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
-        let lock = KeeperLock(lock);
+        assert!(lock.try_exclusive().unwrap());
         retire_record(&path, &control).unwrap();
         assert!(path.exists());
         assert!(scope.exists());
@@ -614,10 +602,7 @@ mod tests {
         // existing master cleanup removes it. It must still exist at pool exit.
         drop(UnixListener::bind(&control).unwrap());
         let lock = pool_lock(&control);
-        assert_eq!(
-            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
+        assert!(lock.try_exclusive().unwrap());
         let listener = UnixListener::bind(crate::session_pool::socket_path(&control)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let observed_control = control.clone();
@@ -660,7 +645,7 @@ mod tests {
             }
             // flock is shared with transient forked descriptors in parallel
             // tests; release it explicitly before reporting pool completion.
-            assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+            drop(lock);
         });
         let result = close_master(&record(control.clone()));
         pool.join().unwrap();
@@ -786,10 +771,8 @@ mod tests {
             .mode(0o600)
             .open(index.join(format!("{}.lock", "a".repeat(64))))
             .unwrap();
-        assert_eq!(
-            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
+        let lock = LockFile::adopt(lock);
+        assert!(lock.try_exclusive().unwrap());
         let approved = scope.join("approved-starting");
         crate::persistence::initialize_scope(&approved).unwrap();
         assert_eq!(keepers_running(&domain).unwrap(), 1);

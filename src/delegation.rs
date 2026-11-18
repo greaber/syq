@@ -71,6 +71,7 @@ const REDEMPTION_RECORD_LEN: usize = REDEMPTION_MAGIC.len() + 8 + 32 + 32;
 
 use crate::directive::Directive;
 use crate::enrollment::EnrollmentId;
+use crate::lock_file::LockFile;
 
 /// A one-redemption nonce generated independently for every signed request.
 /// It is intentionally not constructible from `proto::CopyId`.
@@ -1126,7 +1127,8 @@ impl ReplayStore {
             .open_lock()
             .with_context(|| format!("open replay lock in {}", self.path.display()))?;
         validate_private_file(&lock, "replay lock")?;
-        flock_exclusive(lock.as_raw_fd()).context("lock replay redeem store")?;
+        let lock = LockFile::adopt(lock);
+        lock.exclusive().context("lock replay redeem store")?;
         // Timestamp and revalidate only after a potentially queued lock wait.
         // No stale ReceiverContext observation may authorize a later redeem.
         let redeemed_at = redeemed_at()?;
@@ -1347,18 +1349,6 @@ fn readat_optional(directory: RawFd, name: &str, maximum: usize) -> Result<Optio
         bail!("replay redeem exceeds its fixed format; refusing request");
     }
     Ok(Some(contents))
-}
-
-fn flock_exclusive(fd: RawFd) -> io::Result<()> {
-    loop {
-        if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
 }
 
 fn linkat(old_directory: RawFd, old: &str, new_directory: RawFd, new: &str) -> io::Result<()> {

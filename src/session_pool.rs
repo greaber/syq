@@ -16,15 +16,16 @@
 //! the ordinary OpenSSH prompt or warning.
 
 use crate::descriptor_broker::{receive_message, send_message};
+use crate::lock_file::{LockFile, PROBE_GRACE};
 use crate::process::CommandExt as _;
 use crate::proto::{ConnectionRole, FrameWriter};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
@@ -106,49 +107,26 @@ fn suffixed(path: &Path, suffix: &[u8]) -> PathBuf {
 
 /// Whether a pool holds this endpoint's lock. Liveness is the lock, not the
 /// socket file: a stale socket cannot claim to be alive, and two pools
-/// cannot race each other's sockets. A `flock` lock is held by every copy of
-/// its descriptor, so a process that forked while a pool held it keeps it
-/// until it execs; that window is microseconds, and every caller tolerates
-/// a briefly stale answer: `ensure` is best effort and `stop` waits.
+/// cannot race each other's sockets. Every caller tolerates a briefly stale
+/// answer: `ensure` is best effort and `stop` waits.
 pub(crate) fn is_running(control: &Path) -> bool {
-    matches!(try_lock(control, false), Ok(None))
+    LockFile::is_held(&lock_path(control)).unwrap_or(false)
 }
 
-/// Take the lock, or report who holds it. `Ok(None)` means another pool has
-/// it; `Err` means the lock file could not be opened.
-fn try_lock(control: &Path, create: bool) -> Result<Option<File>> {
+/// Take the lock for a starting pool, or None when another pool has it.
+/// The start retries for [`PROBE_GRACE`], so that a concurrent
+/// `is_running` cannot make it exit as a duplicate.
+fn lock_for_start(control: &Path) -> Result<Option<LockFile>> {
     let path = lock_path(control);
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .write(create)
-        .create(create)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    let file = match options.open(&path) {
-        Ok(file) => file,
-        Err(error) if !create && error.kind() == io::ErrorKind::NotFound => {
-            bail!("no session pool lock");
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("open {}", path.display()));
-        }
-    };
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
-        bail!(
-            "session pool lock {} must be a regular file owned by the current user",
-            path.display()
-        );
+    let lock = LockFile::open(&path, true).with_context(|| format!("open {}", path.display()))?;
+    if lock
+        .try_exclusive_within(PROBE_GRACE)
+        .with_context(|| format!("lock {}", path.display()))?
+    {
+        Ok(Some(lock))
+    } else {
+        Ok(None)
     }
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        return Ok(Some(file));
-    }
-    let error = io::Error::last_os_error();
-    if error.kind() == io::ErrorKind::WouldBlock {
-        return Ok(None);
-    }
-    Err(error).with_context(|| format!("lock {}", path.display()))
 }
 
 /// Start a pool for this endpoint unless one is running. Best effort and
@@ -343,15 +321,15 @@ pub(crate) fn owned_name(name: &[u8]) -> Option<&[u8]> {
 /// Startup can exit before Pool exists. Own only this lock inode so every
 /// early return removes its file without deleting another pool's replacement.
 struct PoolLock {
-    file: File,
+    _file: LockFile,
     path: PathBuf,
     identity: (u64, u64),
 }
 impl PoolLock {
-    fn new(control: &Path, file: File) -> Result<Self> {
-        let metadata = file.metadata()?;
+    fn new(control: &Path, file: LockFile) -> Result<Self> {
+        let metadata = file.file().metadata()?;
         Ok(Self {
-            file,
+            _file: file,
             path: lock_path(control),
             identity: (metadata.dev(), metadata.ino()),
         })
@@ -367,9 +345,8 @@ impl PoolLock {
 }
 impl Drop for PoolLock {
     fn drop(&mut self) {
+        // `_file` releases the lock after this.
         self.remove_path();
-        // A concurrent fork can retain this open file description until exec.
-        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
@@ -432,7 +409,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<()> {
         .parent()
         .context("control socket path has no parent")?;
     crate::persistence::validate_scope(scope)?;
-    let Some(lock) = try_lock(&control, true)? else {
+    let Some(lock) = lock_for_start(&control)? else {
         // Another pool serves this endpoint.
         return Ok(());
     };
@@ -881,7 +858,7 @@ mod tests {
     fn pool_lock_drop_preserves_a_replaced_inode() {
         let root = startup_scope();
         let control = root.path().join("cm-00112233aabbccdd");
-        let held = PoolLock::new(&control, try_lock(&control, true).unwrap().unwrap()).unwrap();
+        let held = PoolLock::new(&control, lock_for_start(&control).unwrap().unwrap()).unwrap();
         let path = lock_path(&control);
         fs::remove_file(&path).unwrap();
         fs::write(&path, b"keep").unwrap();
@@ -929,9 +906,9 @@ mod tests {
         let temporary = crate::test_support::tempdir().unwrap();
         let control = temporary.path().join("cm-00112233aabbccdd");
         assert!(!is_running(&control));
-        let held = try_lock(&control, true).unwrap().unwrap();
+        let held = lock_for_start(&control).unwrap().unwrap();
         assert!(is_running(&control));
-        assert!(try_lock(&control, true).unwrap().is_none());
+        assert!(lock_for_start(&control).unwrap().is_none());
         drop(held);
         // Another test in this process may be between fork and exec with a
         // copy of the descriptor, which keeps the lock for a moment.
@@ -945,6 +922,22 @@ mod tests {
         }
         stop(&control).unwrap();
         assert!(!lock_path(&control).exists());
+    }
+
+    #[test]
+    fn a_starting_pool_waits_out_a_status_probe() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let control = temporary.path().join("cm-00112233aabbccdd");
+        // A concurrent `is_running` holds the lock while the pool starts.
+        let probe = LockFile::open(&lock_path(&control), true).unwrap();
+        assert!(probe.try_shared().unwrap());
+        let probing = std::thread::spawn(move || {
+            std::thread::sleep(PROBE_GRACE / 4);
+            drop(probe);
+        });
+        let lock = lock_for_start(&control).unwrap();
+        probing.join().unwrap();
+        assert!(lock.is_some(), "a probe made a starting pool exit");
     }
 
     /// A pool counts the sessions using its master apart from its own
@@ -965,7 +958,7 @@ mod tests {
             sessions_in_use(&control, CLIENT_IO_TIMEOUT),
             linux.then_some(1)
         );
-        let lock = PoolLock::new(&control, try_lock(&control, true).unwrap().unwrap()).unwrap();
+        let lock = PoolLock::new(&control, lock_for_start(&control).unwrap().unwrap()).unwrap();
         let socket = socket_path(&control);
         let listener = UnixListener::bind(&socket).unwrap();
         let mut child = Command::new("sleep")
@@ -1036,7 +1029,7 @@ mod tests {
     fn stop_waits_for_a_starting_pool_to_bind_its_socket() {
         let temporary = crate::test_support::tempdir().unwrap();
         let control = temporary.path().join("cm-00112233aabbccdd");
-        let held = try_lock(&control, true).unwrap().unwrap();
+        let held = lock_for_start(&control).unwrap().unwrap();
         let socket = socket_path(&control);
         let starter = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));

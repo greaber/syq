@@ -36,8 +36,6 @@ use std::collections::BTreeMap;
 #[cfg(test)]
 use std::io::Write;
 #[cfg(test)]
-use std::os::fd::AsRawFd;
-#[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
@@ -200,7 +198,7 @@ fn cache_path() -> Option<PathBuf> {
 }
 
 #[cfg(test)]
-fn lock_file(path: &Path, exclusive: bool) -> std::io::Result<std::fs::File> {
+fn lock_file(path: &Path, exclusive: bool) -> std::io::Result<crate::lock_file::LockFile> {
     let lock_path = path.with_extension("json.lock");
     use std::os::unix::fs::OpenOptionsExt;
     let lock = std::fs::OpenOptions::new()
@@ -221,10 +219,8 @@ fn lock_file(path: &Path, exclusive: bool) -> std::io::Result<std::fs::File> {
     } else {
         libc::LOCK_SH
     };
-    if unsafe { libc::flock(lock.as_raw_fd(), operation) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(lock)
+    crate::lock_file::flock(&lock, operation)?;
+    Ok(crate::lock_file::LockFile::adopt(lock))
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@
 //! update reminders that point at `brew upgrade`. Official release builds embed
 //! the Ed25519 public key supplied by the release workflow at compile time.
 
+use crate::lock_file::LockFile;
 use crate::process::CommandExt as _;
 use crate::remote_helper::Target;
 use anyhow::{anyhow, bail, Context, Result};
@@ -974,17 +975,11 @@ fn install_release(
 /// another syq that holds it. Where the filesystem cannot lock a directory,
 /// as some network filesystems cannot, the update goes ahead unlocked, and
 /// says so.
-fn lock_directory(directory: &Path) -> Result<Option<File>> {
-    use std::os::fd::AsRawFd;
-    let file = File::open(directory).with_context(|| format!("open {}", directory.display()))?;
-    let lock = |operation| {
-        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
-    };
-    let failed = |error: std::io::Error| -> Result<Option<File>> {
+fn lock_directory(directory: &Path) -> Result<Option<LockFile>> {
+    let lock = LockFile::adopt(
+        File::open(directory).with_context(|| format!("open {}", directory.display()))?,
+    );
+    let failed = |error: std::io::Error| -> Result<Option<LockFile>> {
         if !locking_unsupported(&error) {
             return Err(error).with_context(|| format!("lock {}", directory.display()));
         }
@@ -994,21 +989,18 @@ fn lock_directory(directory: &Path) -> Result<Option<File>> {
         );
         Ok(None)
     };
-    match lock(libc::LOCK_EX | libc::LOCK_NB) {
-        Ok(()) => return Ok(Some(file)),
-        Err(error) if error.raw_os_error() == Some(libc::EWOULDBLOCK) => {}
+    match lock.try_exclusive() {
+        Ok(true) => return Ok(Some(lock)),
+        Ok(false) => {}
         Err(error) => return failed(error),
     }
     crate::output::diagnostic!(
         "syq: waiting for another syq update in {} to finish",
         directory.display()
     );
-    loop {
-        match lock(libc::LOCK_EX) {
-            Ok(()) => return Ok(Some(file)),
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return failed(error),
-        }
+    match lock.exclusive() {
+        Ok(()) => Ok(Some(lock)),
+        Err(error) => failed(error),
     }
 }
 

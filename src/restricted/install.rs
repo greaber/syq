@@ -117,7 +117,7 @@ fn install_receiver(home: &Path) -> Result<PathBuf> {
     let contents = fs::read(&running)
         .with_context(|| format!("read the running syq {}", running.display()))?;
     let opened = open_directory(&directory)?;
-    lock_directory(&opened)?;
+    let _lock = lock_directory(&opened)?;
     atomic_replace_executable_locked(&opened, crate::update::STORED_EXECUTABLE, &contents)?;
     delegation::validate_regular_executable(&receiver, "stored receiver")?;
     Ok(receiver)
@@ -512,7 +512,7 @@ fn install_changes(
     let directory = open_directory(&ssh)?;
     // The authorized-keys directory lock is the receiver lifecycle lock too:
     // receivers take it when they start, and revocation holds it.
-    lock_directory(&directory)?;
+    let _lock = lock_directory(&directory)?;
     require_writable_authorized_keys(&ssh)?;
     let state_base = ensure_private_chain(home, &SERVER_STATE)?;
     let state = state_base.join(request.id.to_string());
@@ -737,7 +737,7 @@ pub(super) fn revoke_for_account(
     // Serialize revocation with enrollment updates and receiver admission.
     let ssh = ensure_directory_chain(home, &[".ssh"])?;
     let directory = open_directory(&ssh)?;
-    lock_directory(&directory)?;
+    let lock = lock_directory(&directory)?;
     let state = enrollment_state(home, request.id);
     // Check the state before the line changes, so a failure leaves both.
     let base = state.parent().context("enrollment state has no parent")?;
@@ -770,6 +770,7 @@ pub(super) fn revoke_for_account(
         active::revoke(&state, leases)?;
         remove_revoked_state(&state)?;
     }
+    drop(lock);
     drop(directory);
     crate::output::command_println!("revoked {}", request.id);
     Ok(())

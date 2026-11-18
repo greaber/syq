@@ -5,12 +5,12 @@
 //! their processes have stopped without identifying or signalling a numeric PID.
 
 use super::{atomic_write, lock_directory, open_directory};
+use crate::lock_file::LockFile;
 #[cfg(test)]
 use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io;
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -28,7 +28,7 @@ pub(super) fn require_not_revoked(state: &Path) -> Result<()> {
     }
 }
 
-pub(super) fn open_leases(state: &Path) -> Result<File> {
+pub(super) fn open_leases(state: &Path) -> Result<LockFile> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -46,21 +46,7 @@ pub(super) fn open_leases(state: &Path) -> Result<File> {
     {
         bail!("active receiver leases must be a private, singly linked regular file");
     }
-    Ok(file)
-}
-
-fn try_lock(file: &File, operation: libc::c_int) -> Result<bool> {
-    loop {
-        if unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) } == 0 {
-            return Ok(true);
-        }
-        let error = io::Error::last_os_error();
-        match error.kind() {
-            io::ErrorKind::Interrupted => continue,
-            io::ErrorKind::WouldBlock => return Ok(false),
-            _ => return Err(error).context("lock active receiver leases"),
-        }
-    }
+    Ok(LockFile::adopt(file))
 }
 
 /// Start the standalone receiver's watcher. Its lease lives in the watcher
@@ -74,7 +60,7 @@ pub(super) fn watch(
     deadline: Instant,
 ) -> Result<()> {
     let lifecycle = open_directory(&home.join(".ssh"))?;
-    lock_directory(&lifecycle)?;
+    let _lock = lock_directory(&lifecycle)?;
     crate::delegation::validate_private_directory_path(state)?;
     let directory = open_directory(state)?;
     let metadata = directory.metadata()?;
@@ -83,7 +69,7 @@ pub(super) fn watch(
     }
     require_not_revoked(state)?;
     let lease = open_leases(state)?;
-    if !try_lock(&lease, libc::LOCK_SH)? {
+    if !lease.try_shared().context("lock active receiver leases")? {
         bail!("receiver enrollment is being revoked");
     }
     // Include any helper child (such as interface discovery) in shutdown,
@@ -126,16 +112,19 @@ pub(super) fn watch(
 /// Caller holds the SSH directory lifecycle lock until state removal finishes.
 /// Leave the marker and credentials' local bookkeeping intact on failure so a
 /// retry can finish revocation; never reopen admission after a partial failure.
-pub(super) fn revoke(state: &Path, leases: &File) -> Result<()> {
+pub(super) fn revoke(state: &Path, leases: &LockFile) -> Result<()> {
     atomic_write(state, "revoked", b"revoked\n", 0o600)?;
     wait_for_receivers(leases, SHUTDOWN_TIMEOUT)
 }
 
-fn wait_for_receivers(leases: &File, timeout: Duration) -> Result<()> {
+fn wait_for_receivers(leases: &LockFile, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     let mut next_progress = Instant::now() + Duration::from_secs(1);
     loop {
-        if try_lock(leases, libc::LOCK_EX)? {
+        if leases
+            .try_exclusive()
+            .context("lock active receiver leases")?
+        {
             return Ok(());
         }
         let now = Instant::now();
@@ -285,7 +274,7 @@ mod tests {
         let mut second = worker(home, &state, "second", "blocked");
         let mut unrelated = worker(home, &other, "unrelated", "blocked");
         let leases = open_leases(&state).unwrap();
-        assert!(!try_lock(&leases, libc::LOCK_EX).unwrap());
+        assert!(!leases.try_exclusive().unwrap());
         revoke(&state, &leases).unwrap();
         assert!(!exited(&mut first).success());
         assert!(!exited(&mut second).success());
@@ -376,7 +365,7 @@ mod tests {
         private_dir(&state_path);
         let state = state_path.as_path();
         let held = open_leases(state).unwrap();
-        assert!(try_lock(&held, libc::LOCK_SH).unwrap());
+        assert!(held.try_shared().unwrap());
         let leases = open_leases(state).unwrap();
         atomic_write(state, "revoked", b"revoked\n", 0o600).unwrap();
         let error = wait_for_receivers(&leases, Duration::from_millis(20)).unwrap_err();

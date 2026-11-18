@@ -3,12 +3,12 @@ use super::{local_config::LocalPlan, persistent, SessionRequest};
 use crate::auth_from::Provider;
 use crate::cli::NativeEndpoint;
 use crate::destination::ssh_auth::{self, ResolvedPolicy};
+use crate::lock_file::LockFile;
 use crate::persistence::Domain;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -357,14 +357,16 @@ pub(super) fn wait(domain: &Domain) -> Result<()> {
             if path.extension().is_none_or(|ext| ext != "lock") {
                 continue;
             }
-            let Some(lock) = private_file(&path, true, 0)? else {
-                continue;
+            let lock = match LockFile::open(&path, false) {
+                Ok(lock) => lock,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
             };
-            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() != std::io::ErrorKind::WouldBlock {
-                    return Err(error.into());
-                }
+            anyhow::ensure!(
+                lock.file().metadata()?.len() == 0,
+                "SSH resolution metadata must be a bounded owner-only file"
+            );
+            if lock.held()? {
                 running += 1;
             }
         }
