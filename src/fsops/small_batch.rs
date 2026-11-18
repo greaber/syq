@@ -3729,8 +3729,7 @@ mod tests {
         // something already at its name. Only a new empty file of ours is
         // used as opened; a symlink, a FIFO, a second link to a file of ours,
         // and a file holding data are replaced by an exclusive creation.
-        // Nothing
-        // planted at the name receives the copy's data.
+        // Nothing planted at the name receives the copy's data.
         let temporary = crate::test_support::tempdir().unwrap();
         let mut ops = receiver(temporary.path());
         let mut wanted = put("file", b"contents");
