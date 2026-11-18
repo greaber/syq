@@ -89,7 +89,7 @@ impl Receiver {
         }
         // Reuse the approved transport constraints and one-listener allowance.
         match &authority {
-            SessionAuthority::Receive(authority) => authority
+            crate::restricted::Checker::Destination(authority) => authority
                 .authorize(
                     &mut crate::proto::Request::TcpListen {
                         send_rate: None,
@@ -102,7 +102,7 @@ impl Receiver {
                     true,
                 )
                 .map(drop)?,
-            SessionAuthority::Send { authority, .. } => {
+            crate::restricted::Checker::Source { authority, .. } => {
                 authority.authorize_reverse_tcp(request.ports, &request.congestion_control)?
             }
         }
@@ -198,21 +198,7 @@ impl Receiver {
             let _ = watch_channel.read(&mut [0]);
             let _ = watch_socket.shutdown(Shutdown::Both);
         });
-        let result = match authority {
-            SessionAuthority::Receive(authority) => {
-                crate::server::run_named_tcp(socket, serve_channel, &request.key, authority)
-            }
-            SessionAuthority::Send {
-                authority,
-                descriptors,
-            } => crate::server::run_named_source_tcp(
-                socket,
-                serve_channel,
-                &request.key,
-                authority,
-                descriptors,
-            ),
-        };
+        let result = crate::server::run_named_tcp(socket, serve_channel, &request.key, authority);
         let _ = lifetime.shutdown(Shutdown::Both);
         let _ = watcher.join();
         result
