@@ -38,11 +38,19 @@ pub(super) fn trusts_absence(args: &Args) -> bool {
         // An object with the same contents is accepted, where a write that
         // must create its object would be refused.
         Some(IfExists::ErrorIfDifferent) => false,
-        // Either way the object is refused, here by the write's
-        // `If-None-Match: *`. A dry run sends no write and would report nothing.
+        // Either way a file is refused, here by the write's
+        // `If-None-Match: *`. A dry run sends no write and would report
+        // nothing. Directory markers are `trusts_absence_of`'s concern.
         Some(IfExists::Error) => !args.dry_run,
         _ => true,
     }
+}
+
+/// Whether a listed absence may also be relied on for `key`, in a copy that
+/// relies on them at all. A directory marker that exists is accepted under
+/// `--if-exists=error`, where a write that must create it would be refused.
+pub(super) fn trusts_absence_of(args: &Args, key: &str) -> bool {
+    !(key.ends_with('/') && args.protects_existing_contents())
 }
 
 /// Whether a copy to `bucket` lists its destination to learn which planned
@@ -240,8 +248,10 @@ impl Walk {
                     "S3 listing returned a key outside the requested prefix"
                 );
                 if let Some(index) = self.keys.find(&entry.key) {
-                    self.sizes[index].store(entry.size, Relaxed);
-                    found += 1;
+                    // A key listed twice still counts once.
+                    if self.sizes[index].swap(entry.size, Relaxed) == UNKNOWN {
+                        found += 1;
+                    }
                 }
             }
             if page.next.is_none() || found == self.keys.len() {

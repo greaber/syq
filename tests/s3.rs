@@ -1509,6 +1509,10 @@ fn serve(
         serve_latency_pages(&mut socket, first);
         return;
     }
+    if fault == "copy-pages" {
+        serve_copy_pages(&mut socket, first, &probes);
+        return;
+    }
     if fault.starts_with("upload-pages") {
         serve_upload_pages(&mut socket, first, &probes, fault == "upload-pages-fail");
         return;
@@ -5363,6 +5367,92 @@ fn serve_upload_pages(socket: &mut TcpStream, first: &str, probes: &AtomicUsize,
         .collect();
     let xml = format!("<ListBucketResult>{next}{objects}</ListBucketResult>");
     reply(socket, 200, &[], xml.as_bytes(), false);
+}
+
+/// Bucket to bucket: the source holds `data/k00` to `data/k19` and the
+/// directory marker `data/sub/`; the destination holds the even ones under
+/// `out/`. `probes` counts the destination's HEADs.
+fn serve_copy_pages(socket: &mut TcpStream, first: &str, probes: &AtomicUsize) {
+    let method = first.split_whitespace().next().unwrap();
+    let target = first.split_whitespace().nth(1).unwrap();
+    let url = url::Url::parse(&format!("http://fixture{target}")).unwrap();
+    let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+    let object = |key: &str, size: usize| {
+        format!("<Contents><Key>{key}</Key><Size>{size}</Size></Contents>")
+    };
+    let page = |objects: String| {
+        format!("<ListBucketResult><IsTruncated>false</IsTruncated>{objects}</ListBucketResult>")
+    };
+    match (method, url.path()) {
+        ("GET", "/source/") => {
+            assert_eq!(query["prefix"], "data/");
+            let mut objects: String = (0..20)
+                .map(|n| object(&format!("data/k{n:02}"), 4))
+                .collect();
+            objects.push_str(&object("data/sub/", 0));
+            reply(socket, 200, &[], page(objects).as_bytes(), false);
+        }
+        ("GET", "/destination/") => {
+            // The listing starts just below the first destination key.
+            assert_eq!(query["prefix"], "out/");
+            assert_eq!(query["start-after"], "out/k0/");
+            let objects = (0..20)
+                .step_by(2)
+                .map(|n| object(&format!("out/k{n:02}"), 4))
+                .collect();
+            reply(socket, 200, &[], page(objects).as_bytes(), false);
+        }
+        ("HEAD", "/source/data") => reply(socket, 404, &[], b"", true),
+        ("HEAD", path) if path.starts_with("/source/data/") => {
+            let length = if path.ends_with('/') { "0" } else { "4" };
+            reply(
+                socket,
+                200,
+                &[
+                    ("Content-Length".into(), length.into()),
+                    ("ETag".into(), "\"source\"".into()),
+                    (
+                        "Last-Modified".into(),
+                        "Wed, 01 Jan 2020 00:00:00 GMT".into(),
+                    ),
+                ],
+                b"",
+                true,
+            );
+        }
+        ("HEAD", path) if path.starts_with("/destination/out/k") => {
+            // Only keys the listing showed present are asked about.
+            let number: usize = path["/destination/out/k".len()..].parse().unwrap();
+            assert_eq!(number % 2, 0, "HEAD for a key the listing showed absent");
+            probes.fetch_add(1, Ordering::Relaxed);
+            reply(socket, 404, &[], b"", true);
+        }
+        _ => panic!("unexpected copy-pages request: {first}"),
+    }
+}
+
+#[test]
+fn s3_bucket_copy_asks_only_about_destination_keys_its_listing_shows() {
+    let server = Server::start("copy-pages");
+    let temp = crate::test_support::tempdir().unwrap();
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--from",
+            "s3://source",
+            "--srcs-in",
+            "data",
+            "--to",
+            "s3://destination",
+            "--into",
+            "out",
+            "--dry-run",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    // Ten destination keys exist. The other ten and the directory marker
+    // `out/sub/` are absent from the listing and get no HEAD.
+    assert_eq!(server.probes.load(Ordering::Relaxed), 10);
 }
 
 #[test]

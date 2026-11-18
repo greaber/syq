@@ -9,6 +9,8 @@ struct Bucket {
     honors_start: bool,
     /// The request, counted from one, whose page comes back out of order.
     disordered: Option<usize>,
+    /// A key that every page of an unordered listing repeats first.
+    repeated: Option<String>,
     /// Each request's lower bound, and whether it continued the last one.
     requests: RefCell<Vec<(String, bool)>>,
 }
@@ -19,6 +21,7 @@ impl Bucket {
             ordered: true,
             honors_start: true,
             disordered: None,
+            repeated: None,
             requests: RefCell::default(),
         }
     }
@@ -58,6 +61,18 @@ impl Store for Bucket {
         let next = matching.next().map(|_| entries.last().unwrap().key.clone());
         if self.disordered == Some(self.requests.borrow().len()) {
             entries.swap(10, 20);
+        }
+        if let Some(key) = &self.repeated {
+            entries.insert(
+                0,
+                Entry {
+                    key: key.clone(),
+                    size: self.objects[key],
+                    last_modified: None,
+                    etag: None,
+                },
+            );
+            entries.truncate(1000);
         }
         Ok(Page {
             next,
@@ -261,6 +276,22 @@ async fn directory_bucket_needs_the_whole_listing() {
     );
     assert_eq!(bucket.requests.borrow().len(), 2);
 
+    // A key the listing repeats is one key found, not two: the listing must
+    // go on to the page that holds the other.
+    bucket.repeated = Some("data/f0000".to_owned());
+    bucket.requests.borrow_mut().clear();
+    let plan = [
+        "data/f0000".to_owned(),
+        "data/f1400".to_owned(),
+        "data/new".to_owned(),
+    ];
+    assert_eq!(
+        discover(&bucket, "data/", &plan).await,
+        [Listed::Present(1), Listed::Present(1401), Listed::Absent]
+    );
+    assert_eq!(bucket.requests.borrow().len(), 2);
+    bucket.repeated = None;
+
     // Two keys allow one page, which cannot show that the second is absent.
     bucket.requests.borrow_mut().clear();
     let plan = ["data/f0000".to_owned(), "data/new".to_owned()];
@@ -346,6 +377,13 @@ fn absence_is_trusted_only_where_a_wrong_answer_costs_no_more_than_an_upload() {
             let args = Args::parse_args(&argv).unwrap();
             assert_eq!(trusts_absence(&args), trusted, "{route:?} {flags:?}");
             assert_eq!(lists_destination(&args, "bucket"), trusted);
+            // An existing directory marker is accepted under the policies
+            // that protect contents, so only a HEAD may say one is absent.
+            let protecting = flags
+                .iter()
+                .any(|flag| flag.starts_with("--if-exists=error"));
+            assert!(trusts_absence_of(&args, "data/file"));
+            assert_eq!(trusts_absence_of(&args, "data/directory/"), !protecting);
             // A directory bucket's listing decides nothing from order.
             assert!(lists_destination(&args, "bucket--usw2-az1--x-s3"));
         }

@@ -792,16 +792,25 @@ pub(super) fn from_head(
     })
 }
 
-/// Existence needs only one object, regardless of the size of the prefix.
-pub(super) async fn prefix_exists(client: &Client, bucket: &str, prefix: &str) -> Result<bool> {
-    let output = client
+/// List at most one key under a prefix.
+pub(super) async fn list_one(
+    client: &Client,
+    bucket: &str,
+    prefix: &str,
+) -> Result<aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output> {
+    client
         .list_objects_v2()
         .bucket(bucket)
         .prefix(prefix)
         .max_keys(1)
         .send()
         .await
-        .map_err(listing_failure)?;
+        .map_err(listing_failure)
+}
+
+/// Existence needs only one object, regardless of the size of the prefix.
+pub(super) async fn prefix_exists(client: &Client, bucket: &str, prefix: &str) -> Result<bool> {
+    let output = list_one(client, bucket, prefix).await?;
     anyhow::ensure!(
         !output.contents().is_empty() || output.is_truncated() != Some(true),
         "S3 existence listing was truncated without an object"

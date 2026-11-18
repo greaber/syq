@@ -907,7 +907,7 @@ impl Engine {
                 // concurrency from a response seen before it starts, and a
                 // destination that cannot be listed fails here, as it does
                 // for the copies that list.
-                client::prefix_exists(&self.client, &self.options.bucket, &prefix).await?;
+                client::list_one(&self.client, &self.options.bucket, &prefix).await?;
                 return Ok(());
             }
             plan.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
@@ -968,10 +968,14 @@ impl Engine {
             .discovery
             .get()
             .map(|discovery| discovery.lookup(position));
+        let trusted = discovery::trusts_absence_of(&self.args, key);
         async move {
             match (complete, reached) {
                 (Some(listed), _) => listed,
-                (None, Some(reached)) => reached.await,
+                (None, Some(reached)) => match reached.await {
+                    Listed::Absent if !trusted => Listed::Unknown,
+                    listed => listed,
+                },
                 (None, None) => Listed::Unknown,
             }
         }
