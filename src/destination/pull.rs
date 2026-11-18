@@ -55,16 +55,16 @@ pub(super) struct ReadRequest {
 #[serde(deny_unknown_fields)]
 pub(super) struct Issued {
     /// The signed directive, base64url-encoded.
-    directive: String,
+    pub(super) directive: String,
     /// The enrollment's entry key, which only starts its receiver.
-    entry_key: forward::EntryKeyText,
+    pub(super) entry_key: forward::EntryKeyText,
     /// The account the enrollment is for.
-    login: String,
+    pub(super) login: String,
     /// What this machine's known_hosts files say about the source.
-    known_hosts: String,
+    pub(super) known_hosts: String,
     /// What they leave out of its configuration, without its value, for a
     /// notice.
-    known_hosts_left_out: Option<String>,
+    pub(super) known_hosts_left_out: Option<String>,
 }
 
 impl std::fmt::Debug for Issued {
@@ -381,131 +381,6 @@ pub(super) fn prepare(args: &mut crate::cli::Args, selection: handoff::Selection
     args.receiver_host = Some(receiver.receiver_host);
     args.receiver_keys = Some(Arc::new(receiver.directory));
     Ok(())
-}
-
-impl Receiver {
-    /// Approve a server's copy from another server to itself: show the
-    /// command and what it reads, then, over this machine's own SSH, set up
-    /// or refresh the source account's enrollment and sign its directive.
-    /// The server connects to the source's receiver itself; this machine is
-    /// not part of the copy after it replies.
-    pub(super) fn pull(&self, request: ReadRequest, mut stream: TrackedStream) -> Result<()> {
-        let ReadRequest {
-            target,
-            command,
-            cwd,
-            inputs,
-        } = request;
-        // The server waits this long for the reply, from when it asked.
-        let budget = Instant::now() + REQUEST_TIMEOUT + forward::SETUP_TIMEOUT;
-        let request_lock = self.request_lock.try_lock().map_err(|_| {
-            anyhow::anyhow!("another transfer is awaiting approval; retry after it is decided")
-        })?;
-        forward::target_endpoint(&target)?;
-        crate::approval_command::check_authorizer(&command, &self.name)?;
-        let args = crate::approval_command::parse(&command)?;
-        anyhow::ensure!(
-            eligible_target(&args)? == target,
-            "the requesting command reads from a different server"
-        );
-        // A source deletes nothing.
-        let caps = crate::directive::Caps {
-            max_bytes: self.max_bytes,
-            max_entries: self.max_entries,
-            max_delete: 0,
-        };
-        // What the source's receiver will allow, before its home is known.
-        let preview = crate::directive::issue(
-            crate::directive::Binding {
-                enrollment: crate::enrollment::EnrollmentId::random(),
-                generation: 1,
-                account: "preview".into(),
-                role: crate::directive::Role::Source,
-            },
-            command.clone(),
-            cwd.clone(),
-            (inputs.clone(), Some(caps)),
-            // Unused: a source has no results.
-            [1; 32],
-        )?;
-        let reads = crate::directive::source_rules(
-            &preview,
-            Path::new(std::ffi::OsStr::from_bytes(REQUEST_ROOT)),
-        )?;
-        let count = self.forward_count.fetch_add(1, Ordering::AcqRel);
-        let _slot = forward::Slot(&self.forward_count);
-        anyhow::ensure!(
-            count < 8,
-            "too many copies from other servers are waiting for approval or setup here; retry after one is decided"
-        );
-        let (generation, _channel) = {
-            // Serialize registration with revocation, including reconnects.
-            let _sessions = self.sessions.lock().unwrap();
-            (
-                self.generation.load(Ordering::Acquire),
-                self.active_streams.track(stream.try_clone()?)?,
-            )
-        };
-        let socket = stream.try_clone()?;
-        let cancelled = || {
-            self.stop.load(Ordering::Acquire)
-                || self.generation.load(Ordering::Acquire) != generation
-                || requester_closed(&socket)
-        };
-        let source = forward::Account::find(&target, &cancelled)?;
-        // A source only reads, so a root login can serve a download too:
-        // the receiver refuses root only where it would write.
-        if args.dry_run {
-            source.ready_for_dry_run()?;
-        }
-        // Automatic approval of writes to this machine does not authorize
-        // use of its SSH credentials on another host.
-        self.approvals.request_source(
-            &self.requester,
-            &command,
-            &cwd,
-            (&target, source.enrollment, source.is_root()),
-            &reads,
-            self.notifications,
-            cancelled,
-        )?;
-        anyhow::ensure!(!cancelled(), "source copy disconnected before setup");
-        // This lock only serializes decisions, not enrollment.
-        drop(request_lock);
-        let policy = source.policy(&cancelled)?;
-        let mut setup = crate::process::self_command()?;
-        setup.arg("--return-prepare");
-        let prepared = forward::prepare_in_child(
-            setup,
-            &forward::Prepare {
-                command,
-                cwd,
-                inputs,
-                caps,
-                accounts: forward::Accounts::Source(source.setup(&policy)),
-                results_key: None,
-                via: Some((
-                    self.server_user.clone(),
-                    self.tcp_peer.host.clone(),
-                    self.tcp_peer.port,
-                )),
-                allow_enrollment: !args.dry_run,
-            },
-            budget,
-            &cancelled,
-        )
-        .with_context(|| format!("approve the copy from {target:?}"))?;
-        anyhow::ensure!(!cancelled(), "source copy disconnected before setup");
-        let issued = Issued {
-            directive: prepared.directive,
-            entry_key: prepared.entry_key,
-            login: policy.login_user.clone(),
-            known_hosts: policy.known_hosts_for_others()?,
-            // The configured value stays here: it can hold commands and paths.
-            known_hosts_left_out: policy.left_out_kind().map(str::to_owned),
-        };
-        write_message(&mut stream, &Reply::SourceDirective(Box::new(issued)))
-    }
 }
 
 #[cfg(test)]

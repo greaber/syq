@@ -90,32 +90,7 @@ impl Conn for LocalConn {
                 ),
             "only stop and shrink requests are valid during a read stream"
         );
-        if self.role != LocalConnectionRole::Control
-            && matches!(
-                &req,
-                Request::TcpListen { .. }
-                    | Request::DescriptorCopy(_)
-                    | Request::ListDir { .. }
-                    | Request::ListDirDetails { .. }
-                    | Request::ListDirNoFollowFinal { .. }
-                    | Request::NativeMap(_)
-                    | Request::NativeRemove { .. }
-                    | Request::CheckOperatorDirectory { .. }
-                    | Request::CheckOperatorDirectoryAncestry { .. }
-                    | Request::CheckOperatorDirectoryAncestryWithAccess { .. }
-                    | Request::CheckSearchableOperatorDirectory { .. }
-                    | Request::PrepareDestinationPath { .. }
-                    | Request::RestoreDestinationPath
-                    | Request::RegisterSourceRoots { .. }
-                    | Request::CreateOperatorDirectory { .. }
-                    | Request::AnchorDestination { .. }
-                    | Request::PrepareSmallFiles(_)
-                    | Request::CopySmallFiles(_)
-                    | Request::PruneLookup { .. }
-                    | Request::DestinationResults { .. }
-                    | Request::FinishDestinationResults
-            )
-        {
+        if self.role != LocalConnectionRole::Control && req.control_only() {
             self.pending.push_back(Response::Err(
                 "request is allowed only on the control connection".into(),
             ));

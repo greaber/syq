@@ -80,58 +80,19 @@ impl RemoteSpec {
     ) -> Result<RemoteConn> {
         let (stream, channel, key) = reverse.accept()?;
         stream.set_nodelay(true)?;
-        let handshake = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let observation = Arc::new(crate::transfer_observations::RemoteSample::default());
-        let replies = reply_queue(self.read_ahead, &role);
-        let (rx, reader, batch_receipts) = spawn_observed_reader(
-            Box::new(RecordReader::new(
-                crate::bwlimit::activity::ActivityIo {
-                    inner: stream.try_clone()?,
-                    bytes: pacing
-                        .filter(|p| p.remote_sender)
-                        .and_then(|p| p.activity.clone()),
-                    handshake_pending: handshake.clone(),
-                },
-                Some(Cipher::new(&key, 0, 2)),
-            )),
-            replies,
-            reply_bytes(&role),
-            observation.clone(),
-        )?;
-        let conn = RemoteConn {
-            batch_receipts,
-            transport_stop: pacing.map(|p| p.scheduler.clone()),
-            observation,
-            child: None,
-            approved_login: None,
-            worker_setup: None,
-            w: FrameWriter::new(
-                Box::new(RecordWriter::new(
-                    super::paced_output(stream.try_clone()?, pacing, &handshake)?,
-                    Some(Cipher::new(&key, 0, 1)),
-                )),
-                compress,
-            ),
-            rx: Some(rx),
-            replies,
-            deferred: Default::default(),
-            reader: Some(reader),
-            label: format!("{} (reverse tcp {})", self.label(), stream.peer_addr()?),
-            dead: false,
-            rpc_observation: None,
-            write_stream: None,
-            peer: None,
-            tcp_socket: Some(Arc::new(stream)),
+        let label = format!("{} (reverse tcp {})", self.label(), stream.peer_addr()?);
+        let transport = Transport {
+            records: Some((Some(Cipher::new(&key, 0, 1)), Some(Cipher::new(&key, 0, 2)))),
+            tcp_socket: Some(Arc::new(stream.try_clone()?)),
             named_socket: Some(channel),
-            multiplexed_ssh: false,
-            detached: false,
+            ..Transport::new(stream.try_clone()?, stream, label, pacing.cloned())
         };
-        let conn = hello(conn, compress, Vec::new(), role)?;
-        handshake.store(false, std::sync::atomic::Ordering::Release);
-        conn.tcp_socket.as_ref().unwrap().set_read_timeout(None)?;
-        conn.tcp_socket.as_ref().unwrap().set_write_timeout(None)?;
-        self.record_peer(&conn);
-        Ok(conn)
+        self.open(transport, compress, role, |conn| {
+            let conn = conn?;
+            conn.tcp_socket.as_ref().unwrap().set_read_timeout(None)?;
+            conn.tcp_socket.as_ref().unwrap().set_write_timeout(None)?;
+            Ok(conn)
+        })
     }
 }
 
