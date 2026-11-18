@@ -21,6 +21,10 @@ pub(super) struct DryRunChanges {
     pub(super) metadata_files: u64,
     pub(super) metadata_directories: std::collections::HashSet<PathBytes>,
     pub(super) type_replacements: u64,
+    /// Hard-link followers a dry run would link: counted as copied files,
+    /// as a real copy counts them, but summarized as metadata-only entries
+    /// rather than regular files.
+    pub(super) linked_files: u64,
 }
 
 impl DryRunChanges {

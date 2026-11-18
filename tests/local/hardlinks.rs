@@ -118,6 +118,53 @@ fn hardlinks_dry_run_and_multiple_roots() {
     );
 }
 
+/// A dry run previews a hard-link representative as it does a plain file,
+/// and counts each linked name once, as a metadata-only entry.
+#[test]
+fn hardlinks_dry_run_previews_representative_like_a_file() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"data");
+    fs::hard_link(t.path("src/a"), t.path("src/b")).unwrap();
+    write(&t.path("src/c"), b"x");
+    let preview = |args: &[&str]| {
+        let out = syq(args);
+        assert!(out.status.success(), "{}", stderr_of(&out));
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+
+    let out = preview(&["-naHv", &t.s("src/"), &t.s("dst/")]);
+    assert!(
+        out.contains(&format!(
+            "create file {} (destination missing)",
+            t.s("dst/a")
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains("changes: 2 regular files; 1 metadata-only entry\n"),
+        "{out}"
+    );
+    assert!(!t.path("dst").exists());
+
+    fs::create_dir(t.path("dst")).unwrap();
+    std::os::unix::fs::symlink("elsewhere", t.path("dst/a")).unwrap();
+    let out = preview(&["-naHv", &t.s("src/"), &t.s("dst/")]);
+    assert!(
+        out.contains(&format!(
+            "replace with file {} (destination is symlink)",
+            t.s("dst/a")
+        )),
+        "{out}"
+    );
+    // The destination folder's own metadata may differ too.
+    assert!(out.contains("changes: 2 regular files; "), "{out}");
+    assert!(out.contains("; 1 type replacement among them"), "{out}");
+}
+
 #[test]
 fn hardlinks_reject_nonregular_groups_before_copying() {
     let t = Tmp::new();
