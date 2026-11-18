@@ -5645,6 +5645,9 @@ fn server_copy_heads_overlap_and_storage_class_is_explicit() {
         "server-copy-multipart-storage-class",
         "server-copy-override-storage-class",
         "server-copy-multipart-override-storage-class",
+        // The command's header also replaces a copied source class.
+        "server-copy-copied-override-storage-class",
+        "server-copy-multipart-copied-override-storage-class",
     ] {
         let server = Server::start(fault);
         let temp = crate::test_support::tempdir().unwrap();
@@ -5682,6 +5685,9 @@ fn server_copy_heads_overlap_and_storage_class_is_explicit() {
             ]);
         } else if fault.contains("storage-class") {
             args.extend(["--s3-header", "x-amz-storage-class: INTELLIGENT_TIERING"]);
+        }
+        if fault.contains("copied") {
+            args.push("--copy-metadata=storage-class");
         }
         let probe = format!("{WRITE_PROBE}: yes");
         args.extend(["--s3-write-header", &probe]);
