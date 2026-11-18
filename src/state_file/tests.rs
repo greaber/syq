@@ -15,7 +15,11 @@ fn names(directory: &Path) -> Vec<OsString> {
 fn replace_publishes_whole_contents_with_the_requested_mode() {
     let directory = crate::test_support::tempdir().unwrap();
     let path = directory.path().join("state.json");
-    for durability in [Durability::RenameOnly, Durability::Synced] {
+    for durability in [
+        Durability::RenameOnly,
+        Durability::FileSynced,
+        Durability::Synced,
+    ] {
         assert!(write_atomic(&path, b"one", 0o600, Publish::Replace, durability).unwrap());
         assert!(write_atomic(&path, b"two", 0o600, Publish::Replace, durability).unwrap());
         assert_eq!(fs::read(&path).unwrap(), b"two");
@@ -31,14 +35,30 @@ fn replace_publishes_whole_contents_with_the_requested_mode() {
     )
     .unwrap());
     assert_eq!(fs::metadata(&executable).unwrap().mode() & 0o7777, 0o700);
-    assert_eq!(names(directory.path()), ["state.json", "tool"]);
+    // A mode the creation call cannot give (it creates owner-only) is set
+    // afterwards, so the file gets exactly the requested mode.
+    let shared = directory.path().join("shared");
+    assert!(write_atomic(
+        &shared,
+        b"x",
+        0o640,
+        Publish::Replace,
+        Durability::RenameOnly
+    )
+    .unwrap());
+    assert_eq!(fs::metadata(&shared).unwrap().mode() & 0o7777, 0o640);
+    assert_eq!(names(directory.path()), ["shared", "state.json", "tool"]);
 }
 
 #[test]
 fn no_clobber_keeps_the_existing_file_and_leaves_no_temporary() {
     let directory = crate::test_support::tempdir().unwrap();
     let path = directory.path().join("record");
-    for durability in [Durability::RenameOnly, Durability::Synced] {
+    for durability in [
+        Durability::RenameOnly,
+        Durability::FileSynced,
+        Durability::Synced,
+    ] {
         let _ = fs::remove_file(&path);
         assert!(write_atomic(&path, b"first", 0o600, Publish::NoClobber, durability).unwrap());
         assert!(!write_atomic(&path, b"second", 0o600, Publish::NoClobber, durability).unwrap());

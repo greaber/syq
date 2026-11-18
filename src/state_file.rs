@@ -47,6 +47,10 @@ pub(crate) enum Durability {
     /// Readers see the old or the new contents, but a power loss may lose
     /// the change. For caches and state that a restart recreates.
     RenameOnly,
+    /// The file's contents are synced before the rename, but not the
+    /// directory entry: after a power loss the old or the new file survives,
+    /// never a partly written one.
+    FileSynced,
     /// The file and the directory entry are synced before returning.
     Synced,
 }
@@ -96,7 +100,7 @@ pub(crate) fn write_atomic_at(
             file.set_permissions(std::fs::Permissions::from_mode(mode))?;
         }
         file.write_all(contents)?;
-        if durability == Durability::Synced {
+        if durability != Durability::RenameOnly {
             file.sync_all()?;
         }
         // Close before publishing: Linux refuses to run an executable that

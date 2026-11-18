@@ -429,7 +429,7 @@ fn update_inner(
         &bytes,
         0o600,
         crate::state_file::Publish::Replace,
-        crate::state_file::Durability::Synced,
+        crate::state_file::Durability::FileSynced,
     )
     .context("write authorization preferences")?;
     Ok(config)

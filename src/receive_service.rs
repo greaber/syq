@@ -527,7 +527,7 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
         &bytes,
         0o600,
         crate::state_file::Publish::Replace,
-        crate::state_file::Durability::Synced,
+        crate::state_file::Durability::FileSynced,
     )?;
     Ok(())
 }

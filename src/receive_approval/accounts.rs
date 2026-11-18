@@ -298,8 +298,6 @@ pub(super) fn update_permissions<P: StoredPermission>(
     if let Some(permission) = add {
         permission.validate()?;
     }
-    path.parent()
-        .context("account permission directory missing")?;
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -341,19 +339,18 @@ pub(super) fn update_permissions<P: StoredPermission>(
             state.permissions.sort_by(|a, b| a.id.cmp(&b.id));
         }
     }
-    let bytes = serde_json::to_vec_pretty(&state)?;
+    let mut bytes = serde_json::to_vec_pretty(&state)?;
     anyhow::ensure!(
         bytes.len() < MAX_STATE,
         "remembered account permissions exceed the state-file size limit"
     );
-    let mut bytes = bytes;
     bytes.push(b'\n');
     crate::state_file::write_atomic(
         path,
         &bytes,
         0o600,
         crate::state_file::Publish::Replace,
-        crate::state_file::Durability::Synced,
+        crate::state_file::Durability::FileSynced,
     )?;
     Ok(())
 }

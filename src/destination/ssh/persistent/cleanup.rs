@@ -274,7 +274,10 @@ fn cleanup_master_present(scope: &Path) -> Result<()> {
                 .with_context(|| format!("open SSH account state {}", record.display()))?;
             let record = crate::state_file::read_open(
                 record,
-                &format_args!("SSH account state {}", control.display()),
+                &format_args!(
+                    "SSH account state {}",
+                    control.with_extension("json").display()
+                ),
                 crate::persistence::MAX_ENDPOINT_RECORD,
                 crate::state_file::FileRule::NoGroupOther,
             )?;

@@ -988,7 +988,7 @@ fn write_global_config(enabled: bool) -> Result<()> {
         &bytes,
         0o600,
         crate::state_file::Publish::Replace,
-        crate::state_file::Durability::Synced,
+        crate::state_file::Durability::FileSynced,
     )
     .with_context(|| format!("replace persistence configuration {}", path.display()))?;
     Ok(())
