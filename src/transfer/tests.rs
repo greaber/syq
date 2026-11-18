@@ -6446,26 +6446,25 @@ fn an_aborted_copy_takes_every_reply_of_a_wide_patch_stream() {
 
 #[test]
 fn a_wide_patch_stream_cannot_use_up_the_decoded_message_allowance() {
-    // Other connections' replies hold all but 100 granules of the
-    // process's decoded-message allowance, as those of many workers can.
-    // A stream of 320 single-block pieces from a remote source would have
-    // 256 replies queued at once; it keeps to the sixteen a stream may
-    // always have, and the copy completes. With the allowance free again,
-    // the same stream widens.
+    // A stream of 320 single-block pieces from a remote source has up to
+    // 256 replies queued at once. Other connections' replies hold all but
+    // 100 granules of the process's decoded-message allowance, as those of
+    // many workers can: the stream's further replies take reserved slots
+    // instead, and the copy completes. With every slot taken by other
+    // connections, it keeps to the sixteen a stream may always have.
     let granule = crate::wire_budget::RESERVATION_GRANULE;
     let reply = postcard::to_stdvec(&0u32).unwrap();
-    let mut others: Vec<_> = (0..crate::wire_budget::MEMORY_LIMIT / granule - 100)
+    let _others: Vec<_> = (0..crate::wire_budget::MEMORY_LIMIT / granule - 100)
         .map(|_| crate::wire_budget::decode::<u32>(&reply).unwrap())
         .collect();
     let how = Holding {
         budgeted_source: true,
         ..Holding::default()
     };
-    for crowded in [true, false] {
-        let case = format!("crowded={crowded}");
-        if !crowded {
-            others.clear();
-        }
+    for slots_taken in [false, true] {
+        let case = format!("slots_taken={slots_taken}");
+        let taken = crate::wire_budget::ReservedReplies::default();
+        while slots_taken && taken.reserve() {}
         let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path();
         let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
@@ -6476,7 +6475,7 @@ fn a_wide_patch_stream_cannot_use_up_the_decoded_message_allowance() {
             "{case}"
         );
         assert_eq!(worker.progress.files_done.load(Relaxed), 1, "{case}");
-        if crowded {
+        if slots_taken {
             assert_eq!(held.reads, crate::transfer_tuning::COMPARE_WINDOW, "{case}");
         } else {
             assert!(held.reads > 64, "{case}: {} reads", held.reads);

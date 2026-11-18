@@ -205,11 +205,11 @@ pub trait Conn: Send {
     fn reply_queue(&self) -> Option<usize> {
         None
     }
-    /// Reserve the memory one more reply takes while it waits in this
-    /// connection's reply queue, before a request that the caller sends
-    /// beyond those it always may; false when the decoded-message
-    /// allowance has no room for it. A connection whose replies are not
-    /// decoded by a reader needs none.
+    /// Reserve a slot for one more reply to wait in this connection's reply
+    /// queue, before a request that the caller sends beyond those it always
+    /// may, so that the reply takes no room from the decoded-message
+    /// allowance (`wire_budget::ReservedReplies`); false when none is free.
+    /// A connection whose replies are not decoded by a reader needs none.
     fn reserve_reply(&self) -> bool {
         true
     }

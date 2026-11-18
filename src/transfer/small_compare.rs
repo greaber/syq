@@ -228,11 +228,11 @@ fn unacknowledged(
 }
 
 /// Whether a connection with `outstanding` requests awaiting replies may be
-/// sent another. Up to `COMPARE_WINDOW` may always await theirs. Each
-/// further reply first reserves the room it takes while queued
-/// (`Conn::reserve_reply`), so that however many workers stream, their
-/// replies cannot use up the decoded-message allowance; without room, the
-/// stream takes a reply first.
+/// sent another. Up to `COMPARE_WINDOW` may always await theirs, as many as
+/// before the window widened. Each further reply first reserves a slot of
+/// its own (`Conn::reserve_reply`), so that however many workers stream,
+/// their replies take no more of the decoded-message allowance than
+/// sixteen per connection; without a slot, the stream takes a reply first.
 fn wide_room(conn: &dyn Conn, outstanding: usize) -> bool {
     outstanding < COMPARE_WINDOW || conn.reserve_reply()
 }
