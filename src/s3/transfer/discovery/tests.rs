@@ -63,6 +63,7 @@ impl Store for Bucket {
             entries.swap(10, 20);
         }
         if let Some(key) = &self.repeated {
+            // In addition to the page's own keys, so that none is left out.
             entries.insert(
                 0,
                 Entry {
@@ -72,7 +73,6 @@ impl Store for Bucket {
                     etag: None,
                 },
             );
-            entries.truncate(1000);
         }
         Ok(Page {
             next,
@@ -276,18 +276,23 @@ async fn directory_bucket_needs_the_whole_listing() {
     );
     assert_eq!(bucket.requests.borrow().len(), 2);
 
-    // A key the listing repeats is one key found, not two: the listing must
-    // go on to the page that holds the other.
+    // A key the listing repeats is one key found, not two. The first page
+    // holds `f0000` twice and `f0001`: three matches for three planned keys,
+    // but the third key is on the next page and must not be called absent.
     bucket.repeated = Some("data/f0000".to_owned());
     bucket.requests.borrow_mut().clear();
     let plan = [
         "data/f0000".to_owned(),
+        "data/f0001".to_owned(),
         "data/f1400".to_owned(),
-        "data/new".to_owned(),
     ];
     assert_eq!(
         discover(&bucket, "data/", &plan).await,
-        [Listed::Present(1), Listed::Present(1401), Listed::Absent]
+        [
+            Listed::Present(1),
+            Listed::Present(2),
+            Listed::Present(1401)
+        ]
     );
     assert_eq!(bucket.requests.borrow().len(), 2);
     bucket.repeated = None;
