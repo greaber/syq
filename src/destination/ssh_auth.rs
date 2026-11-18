@@ -444,8 +444,7 @@ pub(crate) fn prepare(request: &ssh::SessionRequest) -> Result<()> {
     } else {
         load_registration(name)?
     };
-    let selection =
-        handoff::Selection::new(name.clone(), registration, handoff::Kind::Account, None);
+    let selection = handoff::Selection::new(name.clone(), registration, handoff::Kind::Account);
     handoff::maybe_exec(&selection, false)
 }
 

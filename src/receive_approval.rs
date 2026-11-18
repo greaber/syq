@@ -1365,7 +1365,7 @@ impl Queue {
         command: &[Vec<u8>],
         cwd: &str,
         (target, enrollment, as_root): (&str, crate::restricted::EnrollmentState, bool),
-        request: &crate::destination::pull::PullRequest,
+        request: &crate::restricted::source::SourcePolicy,
         notifications: Notifications,
         cancelled: impl Fn() -> bool,
     ) -> Result<()> {
