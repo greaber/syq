@@ -4680,9 +4680,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
         let transport_activity = transport_budget.is_some();
         progress.tuning_transport.store(transport_activity, Relaxed);
-        let tuning_key = (autotune && args.tuning_options.is_none())
-            .then(|| tune::network_path_key(&src_ep, &dst_ep))
-            .flatten();
         let mut selected_history = None;
         if let Some(history) = progress.tuning_history.get() {
             let key = tune::history::context_key(
@@ -4751,7 +4748,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         }
         Ok((
             all_remote_endpoints_use_tcp,
-            tuning_key,
             selected_history
                 .as_ref()
                 .filter(|hint| hint.refine)
@@ -4765,7 +4761,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     };
     let mut planning = Some(progress.clock.planning.begin());
     let workers_started = std::cell::Cell::new(false);
-    if transport_setup.as_ref().is_some_and(|(tcp, _, _)| *tcp)
+    if transport_setup.as_ref().is_some_and(|(tcp, _)| *tcp)
         && remote_root_initially_missing
         && !opts.dry_run
         && !opts.inplace
@@ -4778,7 +4774,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         connect_after_file_plan.store(true, Relaxed);
         spawn_workers(
             args.connections,
-            transport_setup.as_ref().and_then(|(_, _, refine)| *refine),
+            transport_setup.as_ref().and_then(|(_, refine)| *refine),
         );
         workers_started.set(true);
     } else if (fresh_destination
@@ -4813,7 +4809,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let streaming_ready =
         !defer_destination_mutations && !opts.dry_run && transport_setup.is_some();
     let streaming_connections = args.connections;
-    let streaming_refine = transport_setup.as_ref().and_then(|(_, _, refine)| *refine);
+    let streaming_refine = transport_setup.as_ref().and_then(|(_, refine)| *refine);
     let streaming_worker_hint = std::cell::Cell::new(0);
     let start_rule = |workers: usize| StartRule {
         workers,
@@ -5123,7 +5119,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         transport_setup = Some(finish_transport_setup(&mut args)?);
         planning = Some(progress.clock.planning.begin());
     }
-    let (all_remote_endpoints_use_tcp, _tuning_key, refine_start) =
+    let (all_remote_endpoints_use_tcp, refine_start) =
         transport_setup.expect("transport setup completed before releasing planned work");
     if scan_err.is_none() && !st.collision {
         match st.assess_fresh_capacity() {

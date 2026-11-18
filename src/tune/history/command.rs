@@ -166,10 +166,7 @@ pub(crate) fn run(args: &[std::ffi::OsString]) -> Result<i32> {
             db.execute("DELETE FROM runs", [])?;
             // Return the freed space; VACUUM's cost follows the kept data.
             db.execute_batch("VACUUM;")?;
-            writeln!(
-                output,
-                "Cleared tuning history. The legacy connection-count cache is unchanged."
-            )?;
+            writeln!(output, "Cleared tuning history.")?;
         }
         _ => unreachable!(),
     }
@@ -195,7 +192,7 @@ fn date(day: i64) -> String {
 pub(super) fn read_run(db: &Connection, id: i64) -> Result<Value> {
     let row = db
         .query_row(
-            "SELECT day,build,context,status,workers,summary,lost,eligible FROM runs WHERE id=?1",
+            "SELECT day,build,context,status,summary,lost,eligible FROM runs WHERE id=?1",
             [id],
             |r| {
                 Ok((
@@ -203,19 +200,19 @@ pub(super) fn read_run(db: &Connection, id: i64) -> Result<Value> {
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
-                    r.get::<_, Option<u32>>(4)?,
-                    r.get::<_, Option<String>>(5)?,
-                    r.get::<_, i64>(6)?,
-                    r.get::<_, i64>(7)? == 1,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, i64>(5)?,
+                    // Whether later copies can start from this run's measurements.
+                    r.get::<_, i64>(6)? == super::inference::MEASUREMENTS,
                 ))
             },
         )
         .optional()?
         .context(format!("no transfer {id} in tuning history"))?;
-    let (day, build, context, status, workers, summary, lost, eligible) = row;
+    let (day, build, context, status, summary, lost, eligible) = row;
     Ok(json!({"id":id, "date":date(day), "build":build,
         "context":serde_json::from_str::<Value>(&context)?, "status":status,
-        "selected_workers":workers, "recommendation_eligible":eligible,
+        "recommendation_eligible":eligible,
         "summary":summary.map(|s|serde_json::from_str::<Value>(&s)).transpose()?,
         "lost_events":lost}))
 }
