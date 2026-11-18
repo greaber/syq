@@ -11,7 +11,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 pub(crate) const MEMORY_LIMIT: usize = 512 << 20;
-const RESERVATION_GRANULE: usize = 64 << 10;
+pub(crate) const RESERVATION_GRANULE: usize = 64 << 10;
 /// Decompressed bytes beyond the bytes that arrived, across the frames a
 /// server's connections hold. Without it, a peer could make each queued
 /// frame hold up to `MAX_FRAME` for a few bytes sent.
@@ -124,20 +124,94 @@ pub(crate) struct Hold {
     expansion: Option<Expansion>,
 }
 
+/// The process's decoded-collection allowance.
+fn memory_budget() -> &'static Arc<Budget> {
+    static BUDGET: OnceLock<Arc<Budget>> = OnceLock::new();
+    BUDGET.get_or_init(|| {
+        Arc::new(Budget {
+            used: AtomicUsize::new(0),
+            limit: MEMORY_LIMIT,
+        })
+    })
+}
+
+/// Most of the allowance that reserved replies may take, with everything
+/// else it holds: the other half stays for messages decoded as they come.
+const RESERVED_REPLIES_LIMIT: usize = MEMORY_LIMIT / 2;
+
+thread_local! {
+    /// The reserved replies of the connection this thread reads, if any.
+    static READING: std::cell::RefCell<Option<ReservedReplies>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Room reserved in the allowance, a granule each, for replies to requests
+/// a connection sends beyond those it always may. The thread reading that
+/// connection decodes each next message into a reserved granule, while one
+/// is left, rather than reserve one then, so those replies cannot find the
+/// allowance used up. A sender that cannot reserve one sends no further
+/// request until a reply is taken.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ReservedReplies(Arc<Reserved>);
+
+#[derive(Debug, Default)]
+struct Reserved {
+    granules: AtomicUsize,
+}
+
+impl ReservedReplies {
+    /// Reserve room for one more reply, if the allowance has it.
+    pub(crate) fn reserve(&self) -> bool {
+        let reserved = memory_budget()
+            .used
+            .fetch_update(Relaxed, Relaxed, |used| {
+                used.checked_add(RESERVATION_GRANULE)
+                    .filter(|total| *total <= RESERVED_REPLIES_LIMIT)
+            })
+            .is_ok();
+        if reserved {
+            self.0.granules.fetch_add(1, Relaxed);
+        }
+        reserved
+    }
+
+    /// Decode this thread's messages into these reserved granules first.
+    pub(crate) fn read_on_this_thread(&self) {
+        READING.with(|reading| *reading.borrow_mut() = Some(self.clone()));
+    }
+
+    /// Take one reserved granule, if any is left.
+    fn take(&self) -> bool {
+        self.0
+            .granules
+            .fetch_update(Relaxed, Relaxed, |granules| granules.checked_sub(1))
+            .is_ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn granules(&self) -> usize {
+        self.0.granules.load(Relaxed)
+    }
+}
+
+impl Drop for Reserved {
+    fn drop(&mut self) {
+        let granules = *self.granules.get_mut();
+        memory_budget()
+            .used
+            .fetch_sub(granules * RESERVATION_GRANULE, Relaxed);
+    }
+}
+
 impl Hold {
     pub(crate) fn new() -> Self {
-        static BUDGET: OnceLock<Arc<Budget>> = OnceLock::new();
+        // A granule reserved ahead for this message is already counted.
+        let reserved =
+            READING.with(|reading| reading.borrow().as_ref().is_some_and(ReservedReplies::take));
         Self {
-            budget: BUDGET
-                .get_or_init(|| {
-                    Arc::new(Budget {
-                        used: AtomicUsize::new(0),
-                        limit: MEMORY_LIMIT,
-                    })
-                })
-                .clone(),
+            budget: memory_budget().clone(),
             used: 0,
-            reserved: 0,
+            reserved: if reserved { RESERVATION_GRANULE } else { 0 },
             exhausted: false,
             expansion: None,
         }
@@ -696,5 +770,55 @@ mod tests {
         let shared = budget();
         assert!(decode_with_hold::<Vec<Vec<String>>>(&bytes, hold(&shared)).is_err());
         assert_eq!(shared.used.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn a_reply_decodes_into_room_reserved_for_it_and_frees_it_when_dropped() {
+        let used = || memory_budget().used.load(Relaxed);
+        let start = used();
+        let reserved = ReservedReplies::default();
+        assert!(reserved.reserve());
+        assert_eq!(used(), start + RESERVATION_GRANULE);
+        // The reading thread decodes into the reserved granule, and another
+        // thread does not.
+        let bytes = postcard::to_stdvec(&7u32).unwrap();
+        std::thread::spawn({
+            let reserved = reserved.clone();
+            move || {
+                reserved.read_on_this_thread();
+                let first = decode::<u32>(&bytes).unwrap();
+                assert_eq!(used(), start + RESERVATION_GRANULE);
+                // None is left: the next one reserves its own.
+                let second = decode::<u32>(&bytes).unwrap();
+                assert_eq!(used(), start + 2 * RESERVATION_GRANULE);
+                drop((first, second));
+            }
+        })
+        .join()
+        .unwrap();
+        assert_eq!((used(), reserved.granules()), (start, 0));
+        // Room left unused is freed with the connection's replies.
+        assert!(reserved.reserve());
+        drop(reserved);
+        assert_eq!(used(), start);
+    }
+
+    #[test]
+    fn replies_are_reserved_only_while_half_the_allowance_is_free() {
+        let used = || memory_budget().used.load(Relaxed);
+        let start = used();
+        let reserved = ReservedReplies::default();
+        let mut granules = 0;
+        while reserved.reserve() {
+            granules += 1;
+        }
+        assert!(used() <= RESERVED_REPLIES_LIMIT);
+        assert!(used() + RESERVATION_GRANULE > RESERVED_REPLIES_LIMIT);
+        assert_eq!(reserved.granules(), granules);
+        // What is left can still be decoded as it comes.
+        let bytes = postcard::to_stdvec(&7u32).unwrap();
+        assert!(decode::<u32>(&bytes).is_ok());
+        drop(reserved);
+        assert_eq!(used(), start);
     }
 }

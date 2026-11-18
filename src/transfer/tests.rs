@@ -6182,12 +6182,80 @@ impl Conn for WideSource {
     }
 }
 
+/// A remote source whose reader, as a connection's does, holds room in the
+/// decoded-message allowance for each reply from when it arrives until it is
+/// taken, decoding into room reserved for it first. A reply that does not
+/// fit fails, and so does every later one, as the reader stops.
+struct BudgetedSource {
+    inner: QueuingSource,
+    holds: std::collections::VecDeque<std::io::Result<crate::wire_budget::Budgeted<u32>>>,
+    reserved: crate::wire_budget::ReservedReplies,
+    failed: bool,
+}
+
+impl Conn for BudgetedSource {
+    fn send(&mut self, request: Request) -> Result<()> {
+        self.inner.send(request)?;
+        let reply = postcard::to_stdvec(&0u32).unwrap();
+        self.holds
+            .push_back(crate::wire_budget::decode::<u32>(&reply));
+        Ok(())
+    }
+    fn recv(&mut self) -> Result<Response> {
+        let hold = self.holds.pop_front().context("missing reply")?;
+        anyhow::ensure!(!self.failed, "the reader stopped");
+        if let Err(error) = hold {
+            self.failed = true;
+            return Err(error.into());
+        }
+        self.inner.recv()
+    }
+    fn reply_queue(&self) -> Option<usize> {
+        Some(crate::transfer_tuning::COMPARE_REQUESTS)
+    }
+    fn reserve_reply(&self) -> bool {
+        self.reserved.reserve()
+    }
+    fn is_dead(&self) -> bool {
+        self.failed
+    }
+    fn scan(
+        &mut self,
+        _: &[u8],
+        _: Option<&RegisteredPath>,
+        _: bool,
+        _: &[String],
+        _: bool,
+        _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
+        _: &mut dyn FnMut(crate::proto::ScanWarning),
+    ) -> Result<u64> {
+        unreachable!()
+    }
+    fn native_remove(
+        &mut self,
+        _: Option<&[u8]>,
+        _: Option<&[u8]>,
+        _: &[NativeRemoveSelection],
+        _: bool,
+        _: bool,
+        _: usize,
+        _: &mut dyn FnMut(Vec<String>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
+    ) -> Result<()> {
+        unreachable!()
+    }
+}
+
 /// How `stream_into_holding_destination` streams.
 #[derive(Clone, Copy, Default)]
 struct Holding {
     /// Read from a remote source (`WideSource`) rather than an in-process
     /// one.
     remote_source: bool,
+    /// Read from a remote source whose replies hold room in the
+    /// decoded-message allowance (`BudgetedSource`); this thread reads it.
+    budgeted_source: bool,
     /// Stream to a command-restricted receiver.
     restricted: bool,
     /// The receiver refuses every streamed begin.
@@ -6220,10 +6288,19 @@ fn stream_into_holding_destination(
     let source = QueuingSource {
         ops: crate::fsops::FsOps::new(),
         replies: Default::default(),
-        in_process: !how.remote_source,
+        in_process: !(how.remote_source || how.budgeted_source),
         most: reads.clone(),
     };
-    worker.src = if how.remote_source {
+    worker.src = if how.budgeted_source {
+        let reserved = crate::wire_budget::ReservedReplies::default();
+        reserved.read_on_this_thread();
+        Box::new(BudgetedSource {
+            inner: source,
+            holds: Default::default(),
+            reserved,
+            failed: false,
+        })
+    } else if how.remote_source {
         Box::new(WideSource(source))
     } else {
         Box::new(source)
@@ -6369,6 +6446,46 @@ fn an_aborted_copy_takes_every_reply_of_a_wide_patch_stream() {
         );
         assert_eq!(worker.progress.files_done.load(Relaxed), 0, "{case}");
         assert_eq!(worker.progress.bytes_done.load(Relaxed), 0, "{case}");
+    }
+}
+
+#[test]
+fn a_wide_patch_stream_cannot_use_up_the_decoded_message_allowance() {
+    // Other connections' replies hold all but 100 granules of the
+    // process's decoded-message allowance, as those of many workers can.
+    // A stream of 320 single-block pieces from a remote source would have
+    // 256 replies queued at once; it keeps to the sixteen a stream may
+    // always have, and the copy completes. With the allowance free again,
+    // the same stream widens.
+    let granule = crate::wire_budget::RESERVATION_GRANULE;
+    let reply = postcard::to_stdvec(&0u32).unwrap();
+    let mut others: Vec<_> = (0..crate::wire_budget::MEMORY_LIMIT / granule - 100)
+        .map(|_| crate::wire_budget::decode::<u32>(&reply).unwrap())
+        .collect();
+    let how = Holding {
+        budgeted_source: true,
+        ..Holding::default()
+    };
+    for crowded in [true, false] {
+        let case = format!("crowded={crowded}");
+        if !crowded {
+            others.clear();
+        }
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
+        let (_, worker, held) = stream_into_holding_destination(root, &files, how, |_, _| {});
+        assert_eq!(
+            read(root, "source/file"),
+            read(root, "target/file"),
+            "{case}"
+        );
+        assert_eq!(worker.progress.files_done.load(Relaxed), 1, "{case}");
+        if crowded {
+            assert_eq!(held.reads, crate::transfer_tuning::COMPARE_WINDOW, "{case}");
+        } else {
+            assert!(held.reads > 64, "{case}: {} reads", held.reads);
+        }
     }
 }
 

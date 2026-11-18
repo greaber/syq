@@ -102,6 +102,8 @@ impl Drop for Sending {
 pub(crate) struct Replies {
     rx: mpsc::Receiver<io::Result<ReceivedResponse>>,
     bytes: Option<Arc<QueuedBytes>>,
+    /// Room its reader decodes replies into, reserved as requests are sent.
+    reserved: crate::wire_budget::ReservedReplies,
 }
 
 type Reply = io::Result<ReceivedResponse>;
@@ -110,8 +112,18 @@ impl Replies {
     pub(super) fn new(
         rx: mpsc::Receiver<io::Result<ReceivedResponse>>,
         bytes: Option<Arc<QueuedBytes>>,
+        reserved: crate::wire_budget::ReservedReplies,
     ) -> Self {
-        Self { rx, bytes }
+        Self {
+            rx,
+            bytes,
+            reserved,
+        }
+    }
+
+    /// Reserve the room one more reply takes while it is queued here.
+    pub(super) fn reserve_reply(&self) -> bool {
+        self.reserved.reserve()
     }
 
     pub(crate) fn recv(&self) -> Result<Reply, RecvError> {
@@ -156,7 +168,7 @@ impl Replies {
 
 impl From<mpsc::Receiver<io::Result<ReceivedResponse>>> for Replies {
     fn from(rx: mpsc::Receiver<io::Result<ReceivedResponse>>) -> Self {
-        Self::new(rx, None)
+        Self::new(rx, None, Default::default())
     }
 }
 
