@@ -492,7 +492,8 @@ fn run() {
     }
     // A coordinator for a copy between two servers that this syq's build
     // started reports a destination's receiver of another build by its
-    // status, so that the syq that started it can update the receiver.
+    // status, so that the syq that started it can mark its record of the
+    // enrollment out of date and the next copy updates the receiver.
     let reports_other_build = args.delegated
         && std::env::var_os(remote_to_remote::REPORT_OTHER_BUILD).is_some_and(|value| value == "1");
     let result = if args.stream_mapping_fd.is_some() {

@@ -1710,12 +1710,12 @@ assert_same_tree source /tmp/syq-real-ssh/pscope-source \
 printf 'case: login keys sign restricted copies\n'
 python3 /usr/local/libexec/syq-test-receiver-keys.py
 
-printf 'case: a copy started here updates a receiver of another build and runs once more\n'
+printf 'case: a copy refused by a receiver of another build updates it on the next copy\n'
 # The laptop's record says the destination's receiver runs this build, as
 # after restoring the laptop's state from a backup, but the lab's second
 # build has updated the receiver since. The receiver refuses the copy for
-# its build; syq updates it to this build and runs the copy once more,
-# leaving nothing of the refused attempt in the results.
+# its build; syq says so and marks its record out of date, so the next
+# copy updates the receiver to this build first.
 make_tree source /tmp/syq-real-ssh/rebuild-source rebuild
 syq cp --no-progress --from source --srcs-in /tmp/syq-real-ssh/rebuild-source \
     --to destination --into /tmp/syq-real-ssh/rebuild-first
@@ -1739,29 +1739,28 @@ stale_receiver() {
 }
 stale_receiver
 ssh destination 'rm -rf /tmp/syq-real-ssh/rebuild-destination'
-# A dry run says so and updates nothing.
-if rebuild_output=$(syq cp --no-progress --dry-run \
-    --from source --srcs-in /tmp/syq-real-ssh/rebuild-source \
-    --to destination --into /tmp/syq-real-ssh/rebuild-destination 2>&1); then
+rebuild_copy() {
+    syq cp --no-progress "$@" \
+        --from source --srcs-in /tmp/syq-real-ssh/rebuild-source \
+        --to destination --into /tmp/syq-real-ssh/rebuild-destination 2>&1
+}
+# The refused copy says to run it again, and changes nothing there.
+if rebuild_output=$(rebuild_copy); then
     printf '%s\n' "$rebuild_output" >&2
-    echo 'a dry run against a receiver of another build unexpectedly succeeded' >&2
+    echo 'a copy against a receiver of another build unexpectedly succeeded' >&2
     exit 1
 fi
 case "$rebuild_output" in
-    *'a dry run does not update it, but the next copy does'*) ;;
+    *'the restricted receiver on '*'runs another syq build; run the copy again, which updates it first'*) ;;
     *) printf '%s\n' "$rebuild_output" >&2; exit 1 ;;
 esac
+ssh destination 'test ! -e /tmp/syq-real-ssh/rebuild-destination'
+# The next copy updates the receiver and runs.
 rm -f /tmp/syq-real-ssh-rebuild.ndjson
-rebuild_output=$(syq cp --no-progress --results /tmp/syq-real-ssh-rebuild.ndjson \
-    --from source --srcs-in /tmp/syq-real-ssh/rebuild-source \
-    --to destination --into /tmp/syq-real-ssh/rebuild-destination 2>&1) || {
+rebuild_output=$(rebuild_copy --results /tmp/syq-real-ssh-rebuild.ndjson) || {
     printf '%s\n' "$rebuild_output" >&2
     exit 1
 }
-case "$rebuild_output" in
-    *'runs another syq build than this one; updating it to this build and trying once more'*) ;;
-    *) printf '%s\n' "$rebuild_output" >&2; exit 1 ;;
-esac
 assert_same_tree source /tmp/syq-real-ssh/rebuild-source \
     destination /tmp/syq-real-ssh/rebuild-destination rebuild
 test "$(syq receiver list | awk -F '\t' '$3 == "syq@destination" { print $4 }')" = \
@@ -1773,17 +1772,48 @@ kinds = [record["type"] for record in records]
 assert kinds.count("run") == 1 and "error" not in kinds, records
 assert records[-1]["type"] == "result" and records[-1]["status"] == "success", records[-1]
 PYTHON
-# A detached copy is run once more the same way, before it detaches.
+# A dry run says so and updates nothing, and the next copy updates it.
+stale_receiver
+ssh destination 'rm -rf /tmp/syq-real-ssh/rebuild-destination'
+if rebuild_output=$(rebuild_copy --dry-run); then
+    printf '%s\n' "$rebuild_output" >&2
+    echo 'a dry run against a receiver of another build unexpectedly succeeded' >&2
+    exit 1
+fi
+case "$rebuild_output" in
+    *'a dry run does not update it, but the next copy does'*) ;;
+    *) printf '%s\n' "$rebuild_output" >&2; exit 1 ;;
+esac
+rebuild_output=$(rebuild_copy) || {
+    printf '%s\n' "$rebuild_output" >&2
+    exit 1
+}
+assert_same_tree source /tmp/syq-real-ssh/rebuild-source \
+    destination /tmp/syq-real-ssh/rebuild-destination rebuild-after-dry-run
+# A detached copy is refused the same way, before it detaches.
 stale_receiver
 ssh destination 'rm -rf /tmp/syq-real-ssh/rebuild-detached'
-rebuild_output=$(syq cp --no-progress --detach \
-    --from source --srcs-in /tmp/syq-real-ssh/rebuild-source \
-    --to destination --into /tmp/syq-real-ssh/rebuild-detached 2>&1) || {
+rebuild_detached() {
+    syq cp --no-progress --detach \
+        --from source --srcs-in /tmp/syq-real-ssh/rebuild-source \
+        --to destination --into /tmp/syq-real-ssh/rebuild-detached 2>&1
+}
+if rebuild_output=$(rebuild_detached); then
+    printf '%s\n' "$rebuild_output" >&2
+    echo 'a detached copy against a receiver of another build unexpectedly started' >&2
+    exit 1
+fi
+case "$rebuild_output" in
+    *'syq: started on '*) printf '%s\n' "$rebuild_output" >&2; exit 1 ;;
+    *'runs another syq build; run the copy again, which updates it first'*) ;;
+    *) printf '%s\n' "$rebuild_output" >&2; exit 1 ;;
+esac
+rebuild_output=$(rebuild_detached) || {
     printf '%s\n' "$rebuild_output" >&2
     exit 1
 }
 case "$rebuild_output" in
-    *'updating it to this build and trying once more'*'syq: started on '*) ;;
+    *'syq: started on '*) ;;
     *) printf '%s\n' "$rebuild_output" >&2; exit 1 ;;
 esac
 rebuild_deadline=$(($(date +%s) + 60))

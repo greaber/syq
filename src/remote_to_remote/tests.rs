@@ -548,60 +548,6 @@ fn destination_results_supply_its_changes_whatever_the_human_output_does() {
     }
 }
 
-/// Before a restricted destination's results start, the coordinator's
-/// records are held back: an attempt that is run again because the
-/// receiver runs another build leaves nothing in the results. Otherwise
-/// they are written, in order, once the destination's results start or the
-/// relay ends.
-#[test]
-fn coordinator_records_wait_for_the_destination_results_to_start() {
-    let setup = serde_json::json!({"type": "error", "message": "syq: setting up"});
-    let relayed = |input: &[u8]| {
-        let (stream, expectation) = destination(true);
-        let (file, writer) = results_file();
-        let mut relay = Relay::new(TOKEN, Some(writer), Some(expectation), (false, false));
-        relay.hold_until_destination_starts();
-        relay_output(input, &mut Vec::new(), &mut None, &mut relay).unwrap();
-        (stream, file, relay)
-    };
-    let messages = |file| -> Vec<String> {
-        read_records(file)
-            .iter()
-            .filter_map(|record| record["message"].as_str().map(str::to_owned))
-            .collect()
-    };
-    // Run again: nothing of it reaches the results.
-    let (_, file, mut relay) = relayed(&coordinator_line(setup.clone(), 0));
-    assert!(relay.discard_held());
-    drop(relay);
-    assert!(read_records(file).is_empty());
-    // Not run again: written when the relay ends, as before.
-    let (_, file, relay) = relayed(&coordinator_line(setup.clone(), 0));
-    drop(relay);
-    assert_eq!(messages(file), ["syq: setting up"]);
-    // Started: written ahead of the destination's records, and the copy
-    // can no longer be run again.
-    let (mut stream, expectation) = destination(true);
-    let (file, writer) = results_file();
-    let mut relay = Relay::new(TOKEN, Some(writer), Some(expectation), (false, false));
-    relay.hold_until_destination_starts();
-    let mut input = coordinator_line(setup, 0);
-    input.extend(destination_lines(&mut stream, 0));
-    relay_output(input.as_slice(), &mut Vec::new(), &mut None, &mut relay).unwrap();
-    assert!(!relay.discard_held());
-    let records = read_records(file);
-    assert_eq!(records[0]["message"], "syq: setting up", "{records:?}");
-    assert!(records.len() > 1, "{records:?}");
-    // More than a refused attempt sends is written at once, and the copy
-    // can no longer be run again.
-    let long = serde_json::json!({"type": "error", "message": "x".repeat(600 * 1024)});
-    let mut input = coordinator_line(long.clone(), 0);
-    input.extend(coordinator_line(long, 1));
-    let (_, file, mut relay) = relayed(&input);
-    assert_eq!(read_records(file.try_clone().unwrap()).len(), 2);
-    assert!(!relay.discard_held());
-}
-
 #[test]
 fn destination_refusals_and_failures_decide_the_outcome() {
     // A refusal makes the copy refused even if the coordinator reported

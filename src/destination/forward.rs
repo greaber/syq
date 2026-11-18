@@ -1067,9 +1067,6 @@ impl Prepare {
                 .transpose()?,
             agent: account.agent.as_deref(),
             allow_enrollment: self.allow_enrollment,
-            // This server's own syq connects to the receiver: a refusal for
-            // its build is that server's, which no refresh here changes.
-            retry_of: None,
             // No terminal: never prompt. Where the SSH configuration
             // would ask about a host key nobody knows, accept it the first
             // time, as `accept-new` does.
