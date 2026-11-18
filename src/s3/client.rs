@@ -346,13 +346,6 @@ pub(super) async fn connect_authorized(
     authorization: Option<std::sync::Arc<super::authorization::Authorization>>,
     outage: Option<std::sync::Arc<super::outage::Outage>>,
 ) -> Result<(Client, Option<String>)> {
-    let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
-    if let Some(profile) = &options.profile {
-        loader = loader.profile_name(profile);
-    }
-    if let Some(region) = &options.region {
-        loader = loader.region(Region::new(region.clone()));
-    }
     let shared = if let Some(authorization) = &authorization {
         options.endpoint = Some(authorization.configuration.endpoint.clone());
         options.region = Some(authorization.configuration.region.clone());
@@ -372,8 +365,46 @@ pub(super) async fn connect_authorized(
             .behavior_version(aws_config::BehaviorVersion::latest())
             .build()
     } else {
-        loader.load().await
+        local_config(options).await
     };
+    connect_with(options, shared, control, uploads, authorization, outage).await
+}
+
+/// Connects with this machine's own configuration, like [`connect`], and also
+/// returns the credentials provider the client signs with.
+pub(super) async fn connect_local(
+    options: &mut Options,
+    control: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    uploads: std::sync::Arc<super::upload_http::Cancellation>,
+) -> Result<(
+    Client,
+    Option<aws_credential_types::provider::SharedCredentialsProvider>,
+)> {
+    let shared = local_config(options).await;
+    let credentials = shared.credentials_provider();
+    let (client, _) = connect_with(options, shared, control, uploads, None, None).await?;
+    Ok((client, credentials))
+}
+
+async fn local_config(options: &Options) -> aws_types::SdkConfig {
+    let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+    if let Some(profile) = &options.profile {
+        loader = loader.profile_name(profile);
+    }
+    if let Some(region) = &options.region {
+        loader = loader.region(Region::new(region.clone()));
+    }
+    loader.load().await
+}
+
+async fn connect_with(
+    options: &mut Options,
+    shared: aws_types::SdkConfig,
+    control: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    uploads: std::sync::Arc<super::upload_http::Cancellation>,
+    authorization: Option<std::sync::Arc<super::authorization::Authorization>>,
+    outage: Option<std::sync::Arc<super::outage::Outage>>,
+) -> Result<(Client, Option<String>)> {
     let transport = aws_smithy_http_client::Builder::new()
         .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
             aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,

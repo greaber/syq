@@ -472,22 +472,13 @@ impl Signer {
             automatic_concurrency: false,
             automatic_part_size: false,
         };
-        let (client, _) = super::client::connect(
+        let (client, credentials) = super::client::connect_local(
             &mut options,
             Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
             Arc::default(),
         )
         .await?;
-        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
-        if let Some(profile) = &request.profile {
-            loader = loader.profile_name(profile);
-        }
-        if let Some(region) = &request.region {
-            loader = loader.region(aws_types::region::Region::new(region.clone()));
-        }
-        let config = loader.load().await;
-        let credentials = config
-            .credentials_provider()
+        let credentials = credentials
             .context("no storage credential provider configured on authorizing machine")?
             .provide_credentials()
             .await
