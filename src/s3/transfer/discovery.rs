@@ -305,7 +305,7 @@ impl Discovery {
                         // The copy is still complete: the keys this listing
                         // did not reach are checked with HEAD.
                         progress.warning(&format!(
-                            "S3 destination listing stopped, so the remaining destination keys are checked one at a time: {error:#}"
+                            "S3 destination listing stopped; each remaining destination key is checked with its own request: {error:#}"
                         ));
                         false
                     });
