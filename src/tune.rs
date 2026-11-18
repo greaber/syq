@@ -27,18 +27,10 @@ pub(crate) mod history;
 mod network;
 pub(crate) mod trace;
 
-use crate::conn::{DataTransport, Endpoint};
+use crate::conn::Endpoint;
 use crate::sched::Sched;
-#[cfg(test)]
-use serde::Deserialize;
 use serde::Serialize;
 use std::collections::BTreeMap;
-#[cfg(test)]
-use std::io::Write;
-#[cfg(test)]
-use std::os::fd::AsRawFd;
-#[cfg(test)]
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex};
@@ -129,60 +121,12 @@ fn required_remaining_activity(rate: Option<f64>, workers: usize, sample: Durati
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-#[cfg(test)]
-struct TuningCache {
-    /// Legacy path+transport → last settled count. Keep the released format;
-    /// filesystem-specific evidence lives in the separate history store.
-    paths: BTreeMap<String, usize>,
-}
-
 fn endpoint_key(endpoint: &Endpoint) -> String {
     match endpoint {
         Endpoint::Local { .. } => "local".into(),
         Endpoint::Remote(spec) if spec.local_process => "local".into(),
         Endpoint::Remote(spec) => spec.label(),
     }
-}
-
-fn transport_label(endpoint: &Endpoint) -> Option<&'static str> {
-    match endpoint {
-        Endpoint::Local { .. } => None,
-        Endpoint::Remote(spec) if spec.local_process => None,
-        Endpoint::Remote(spec) => Some(match spec.data_transport() {
-            DataTransport::Ssh => "ssh",
-            DataTransport::EncryptedTcp | DataTransport::UnencryptedTcp => "tcp",
-        }),
-    }
-}
-
-/// Stable identity for the directional data path. TCP and ssh results never
-/// seed one another. This legacy cache excludes local-only work; the history
-/// store can reuse local results when both filesystems are known.
-pub fn path_key(src: &Endpoint, dst: &Endpoint) -> Option<String> {
-    if !src.is_remote() && !dst.is_remote() {
-        return None;
-    }
-    let transport = [transport_label(src), transport_label(dst)]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join("+");
-    Some(format!(
-        "{}>{}|{transport}",
-        endpoint_key(src),
-        endpoint_key(dst)
-    ))
-}
-
-/// Network-aware keys are additive: released binaries keep reading/writing
-/// their own unscoped entries in the unchanged legacy paths map.
-pub fn network_path_key(src: &Endpoint, dst: &Endpoint) -> Option<String> {
-    let key = path_key(src, dst)?;
-    if transport_label(src).is_none() && transport_label(dst).is_none() {
-        return Some(key);
-    }
-    Some(network_key(&key, network::fingerprint().as_deref()))
 }
 
 fn network_key(key: &str, network: Option<&str>) -> String {
@@ -192,83 +136,13 @@ fn network_key(key: &str, network: Option<&str>) -> String {
     )
 }
 
+/// The history file is named after this path, which an older connection-count
+/// cache used; keep it so the history stays where earlier releases put it.
 fn cache_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("SYQ_TUNING_CACHE") {
         return (!path.is_empty()).then(|| PathBuf::from(path));
     }
     crate::user_dirs::cache_dir().map(|root| root.join("syq/tuning.json"))
-}
-
-#[cfg(test)]
-fn lock_file(path: &Path, exclusive: bool) -> std::io::Result<std::fs::File> {
-    let lock_path = path.with_extension("json.lock");
-    use std::os::unix::fs::OpenOptionsExt;
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .mode(0o600)
-        .open(lock_path)?;
-    if !lock.metadata()?.is_file() {
-        return Err(std::io::Error::other(
-            "tuning cache lock is not a regular file",
-        ));
-    }
-    let operation = if exclusive {
-        libc::LOCK_EX
-    } else {
-        libc::LOCK_SH
-    };
-    if unsafe { libc::flock(lock.as_raw_fd(), operation) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(lock)
-}
-
-#[cfg(test)]
-fn read_cache(path: &Path) -> TuningCache {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
-}
-
-#[cfg(test)]
-fn cached_at(path: &Path, key: &str) -> Option<usize> {
-    // The cache is replaced by rename, so a read without the lock still sees
-    // a complete file. Not being able to create the lock, as on a read-only
-    // home, must not hide a cache that is there.
-    let _lock = lock_file(path, false).ok();
-    read_cache(path).paths.get(key).copied().map(|n| n.max(MIN))
-}
-
-#[cfg(test)]
-fn remember_at(path: &Path, key: &str, connections: usize) -> std::io::Result<()> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let _lock = lock_file(path, true)?;
-    let mut cache = read_cache(path);
-    cache.paths.insert(key.to_string(), connections.max(MIN));
-    let temporary = parent.join(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("tuning"),
-        std::process::id()
-    ));
-    let mut file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary)?;
-    file.write_all(&serde_json::to_vec_pretty(&cache)?)?;
-    file.sync_all()?;
-    std::fs::rename(temporary, path)?;
-    Ok(())
 }
 
 /// Next count up / down by `factor`, always moving by at least one.
@@ -392,9 +266,6 @@ pub struct Policy {
     /// Highest count that was actually activated, not merely requested.
     pub peak: usize,
     active: usize,
-    /// Legacy recommendation state used only by historical fixture/simulator tests.
-    #[cfg(test)]
-    recommended: usize,
     /// Initial discovery doubles unless closely matched evidence supports refinement.
     startup_doubling: bool,
     require_gain: bool,
@@ -421,8 +292,6 @@ impl Policy {
             max,
             peak: n,
             active: n,
-            #[cfg(test)]
-            recommended: n,
             startup_doubling: true,
             require_gain: false,
             state: State::Initial,
@@ -459,12 +328,6 @@ impl Policy {
             State::Explore { from, .. } => from,
             _ => self.n,
         }
-    }
-
-    /// Best accepted count for diagnostics. Startup inference uses observations.
-    #[cfg(test)]
-    pub fn recommended(&self) -> usize {
-        self.recommended
     }
 
     /// Connections required now (including rollback), and the earliest
@@ -580,41 +443,6 @@ impl Policy {
     /// Whether the live policy completed a comparison; not a persistence gate.
     pub fn measured(&self) -> bool {
         self.comparisons > 0
-    }
-
-    /// A starting guess is useful before discovery finishes. Smaller startup
-    /// probes need more: the settled count must be near the recent best and a
-    /// nearby higher count must have failed to improve it. A rejected doubling
-    /// alone leaves too wide a bracket; cancelled warmups and hitting a ceiling
-    /// are not plateau measurements either.
-    #[cfg(test)]
-    pub fn discovery_complete(&self) -> bool {
-        let settled = self.settled();
-        // Plateau evidence for the live count must not be attached to a
-        // different recommendation retained after an inconclusive increase.
-        if settled != self.recommended {
-            return false;
-        }
-        let Some(current) = self.points.get(&settled) else {
-            return false;
-        };
-        let recent =
-            |point: &Point| self.tick.saturating_sub(point.measured_at) <= EVIDENCE_MAX_AGE;
-        current.score > 0.0
-            && recent(current)
-            && current.score >= self.recent_best() * (1.0 - NEAR_BEST_TOLERANCE)
-            && self
-                .points
-                .range((
-                    std::ops::Bound::Excluded(settled),
-                    std::ops::Bound::Unbounded,
-                ))
-                .next()
-                .is_some_and(|(&higher, point)| {
-                    higher <= step_up(settled)
-                        && recent(point)
-                        && current.score >= point.score * (1.0 - NEAR_BEST_TOLERANCE)
-                })
     }
 
     fn probe_base(&self) -> Option<f64> {
@@ -893,15 +721,6 @@ impl Policy {
                         self.startup_doubling = true;
                         self.points
                             .retain(|n, point| *n <= self.n || point.score > score);
-                    }
-                    #[cfg(test)]
-                    {
-                        self.recommended = match direction {
-                            Direction::Up => self.n,
-                            // A partial reduction of an inconclusive increase is
-                            // not evidence to raise the future starting count.
-                            Direction::Down => self.recommended.min(self.n),
-                        };
                     }
                     self.fails[idx] = 0;
                     self.due[inverse] = self.due[inverse].max(self.tick + PROBE_EVERY);

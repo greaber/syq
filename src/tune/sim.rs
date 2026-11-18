@@ -152,6 +152,8 @@ struct Outcome {
     connection_secs: f64,
     handshakes: usize,
     policy: Policy,
+    /// Measured (active workers, rate) samples, as history would record them.
+    observations: Vec<(usize, f64)>,
 }
 
 fn copy(s: &Scenario, policy: Policy, rng: &mut Rng) -> Outcome {
@@ -181,6 +183,7 @@ fn copy_observing(
     let mut last_rate: Option<f64> = None;
     let mut reached = None;
     let mut tail_rollback_blocked = false;
+    let mut observations = Vec::new();
     let mut drift = rng.normal();
     let mut noise = (s.sigma * drift - 0.5 * s.sigma * s.sigma).exp();
 
@@ -274,6 +277,7 @@ fn copy_observing(
                 connection_secs,
                 handshakes,
                 policy,
+                observations,
             };
         }
         // Noise is an external wall-clock process, independent of activations
@@ -303,6 +307,9 @@ fn copy_observing(
         (sample_start, sample_bytes) = (t, 0.0);
         last_rate = Some(measured);
         let enough = total - done >= measured * SAMPLE_SECS * MEASUREMENT_SAMPLES;
+        if enough {
+            observations.push((active, measured));
+        }
         if policy.n > active {
             if !enough {
                 policy.cancel_unapplied();
@@ -495,23 +502,43 @@ fn report() {
             prepare: true,
         };
         let mut remembered = vec![Vec::new(); 6];
-        for seed in 0..SEEDS {
+        let key = history::tests::key("a");
+        // Each copy writes a real history store, so use fewer seeds here.
+        for seed in 0..SEEDS / 10 {
             let mut rng = Rng(seed);
-            let mut next = Policy::new(s.start, 1, LIMIT);
+            let temp = crate::test_support::tempdir().unwrap();
+            let path = temp.path().join("history.sqlite");
             for run in remembered.iter_mut() {
-                let start = next.active();
-                let policy = copy(&s, next, &mut rng).policy;
-                let count = if policy.measured() {
-                    policy.recommended()
-                } else {
-                    start
+                // Start each copy as production does, from the recorded history.
+                let writer = history::tests::recorder(&path);
+                let next = match writer.starting_count(&key, false) {
+                    Some(hint) if hint.refine => Policy::refine(hint.workers, 1, LIMIT),
+                    Some(hint) => Policy::new(hint.workers, 1, LIMIT),
+                    None => Policy::new(s.start, 1, LIMIT),
                 };
+                let out = copy(&s, next, &mut rng);
+                writer.context(&key);
+                writer.event(
+                    "learning_context",
+                    serde_json::json!({"consistent":true,"automatic":true}),
+                );
+                let mut segment = None;
+                for &(workers, rate) in &out.observations {
+                    if segment != Some(workers) {
+                        writer.event("transition", serde_json::json!({}));
+                        segment = Some(workers);
+                    }
+                    writer.event(
+                        "observation",
+                        serde_json::json!({"active":workers,"seconds":SAMPLE_SECS,
+                            "rate":rate,"usable":true}),
+                    );
+                }
+                writer.complete(true, serde_json::json!({}));
+                let count = writer
+                    .starting_count(&key, false)
+                    .map_or(s.start, |hint| hint.workers);
                 run.push(count as f64);
-                next = if policy.measured() && policy.discovery_complete() {
-                    Policy::refine(count, 1, LIMIT)
-                } else {
-                    Policy::new(count, 1, LIMIT)
-                };
             }
         }
         let row: Vec<String> = remembered

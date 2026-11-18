@@ -4,23 +4,6 @@ use super::*;
 const MAX: usize = 64;
 
 #[test]
-fn cache_lock_refuses_symlinks_and_non_regular_files() {
-    let dir = crate::test_support::tempdir().unwrap();
-    let cache = dir.path().join("tuning.json");
-    let lock = cache.with_extension("json.lock");
-    let victim = dir.path().join("victim");
-    std::fs::write(&victim, b"untouched").unwrap();
-    std::os::unix::fs::symlink(&victim, &lock).unwrap();
-    assert!(lock_file(&cache, true).is_err());
-    assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
-    std::fs::remove_file(&lock).unwrap();
-    std::fs::create_dir(&lock).unwrap();
-    assert!(lock_file(&cache, false).is_err());
-    std::fs::remove_dir(&lock).unwrap();
-    assert!(lock_file(&cache, true).is_ok());
-}
-
-#[test]
 fn local_start_reduces_only_for_one_or_two_cpus() {
     assert_eq!(local_start_for_parallelism(1), START_LOCAL_LOW_CPU);
     assert_eq!(local_start_for_parallelism(2), START_LOCAL_LOW_CPU);
@@ -28,7 +11,7 @@ fn local_start_reduces_only_for_one_or_two_cpus() {
     assert_eq!(local_start_for_parallelism(128), START_LOCAL);
 }
 
-fn remote(host: &str, tcp: bool) -> Endpoint {
+pub(super) fn remote(host: &str, tcp: bool) -> Endpoint {
     Endpoint::Remote(crate::conn::RemoteSpec {
         local_process: false,
         user: Some("user".into()),
@@ -59,17 +42,6 @@ fn remote(host: &str, tcp: bool) -> Endpoint {
         receiver_host: None,
         read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
     })
-}
-
-fn temporary_cache(name: &str) -> PathBuf {
-    crate::test_support::temp_dir().join(format!(
-        "syq-tune-test-{}-{name}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ))
 }
 
 fn measure(p: &mut Policy, score: f64) {
@@ -223,42 +195,6 @@ fn plateau_hint_keeps_modest_probes() {
 }
 
 #[test]
-fn measured_search_and_cancelled_probe_do_not_imply_a_plateau() {
-    let mut p = Policy::new(8, MIN, MAX);
-    assert!(!p.discovery_complete());
-    measure(&mut p, 80.0);
-    p.observe(160.0); // 16 helped; 32 is still only a proposal.
-    assert!(p.measured());
-    assert!(!p.discovery_complete());
-    p.cancel_unapplied();
-    assert!(!p.discovery_complete());
-
-    let mut capped = Policy::new(8, MIN, 16);
-    measure(&mut capped, 80.0);
-    measure(&mut capped, 160.0);
-    assert!(!capped.discovery_complete());
-}
-
-#[test]
-fn plateau_evidence_requires_a_nearby_recent_upper_measurement() {
-    let mut wide = Policy::new(8, MIN, MAX);
-    measure(&mut wide, 80.0);
-    measure(&mut wide, 80.0); // 16 did not help, but 8..16 still needs refinement.
-    assert!(!wide.discovery_complete());
-
-    let mut close = Policy::refine(8, MIN, MAX);
-    measure(&mut close, 80.0);
-    measure(&mut close, 60.0); // 10 clearly hurt: a nearby completed comparison.
-    assert_eq!(close.settled(), 8);
-    assert!(close.discovery_complete());
-    let mut slower = close.clone();
-    slower.observe(1.0);
-    assert!(!slower.discovery_complete());
-    close.tick += EVIDENCE_MAX_AGE + 1;
-    assert!(!close.discovery_complete());
-}
-
-#[test]
 fn doubling_a_weak_start_reaches_the_plateau_before_premature_refinement() {
     // Controlled worker/throughput model, not a wall-clock transfer benchmark.
     // The cache may supply the same count as a default; only strong evidence
@@ -292,7 +228,6 @@ fn upward_gain_continues_but_inconclusive_result_holds() {
     measure(&mut unnecessary, 104.0);
     assert_eq!(unnecessary.settled(), 13);
     assert_eq!(unnecessary.state, State::Hold);
-    assert!(!unnecessary.discovery_complete());
 }
 
 #[test]
@@ -361,7 +296,6 @@ fn uncached_start_reaches_full_rate_without_accepting_slower_reductions() {
             let rate = p.n.min(cap) as f64 * 10e6;
             measure(&mut p, rate);
             assert!(p.settled() >= cap, "history {:?}", p.history);
-            assert_eq!(p.recommended(), cap);
         }
     }
 }
@@ -403,7 +337,6 @@ fn flat_throughput_does_not_justify_a_reduction() {
     for _ in 0..200 {
         measure(&mut p, 100.0);
         assert!(p.settled() >= START_SSH, "history {:?}", p.history);
-        assert_eq!(p.recommended(), START_SSH);
     }
 }
 
@@ -448,73 +381,6 @@ fn a_short_run_has_no_cacheable_comparison() {
     assert!(!p.measured());
     measure(&mut p, 80.0);
     assert!(p.measured());
-}
-
-#[test]
-fn cache_preserves_counts_above_64_and_clamps_only_zero() {
-    let dir = temporary_cache("roundtrip");
-    let path = dir.join("tuning.json");
-    remember_at(&path, "a>b|tcp", 13).unwrap();
-    remember_at(&path, "a>b|ssh", MAX + 100).unwrap();
-    assert_eq!(cached_at(&path, "a>b|tcp"), Some(13));
-    assert_eq!(cached_at(&path, "a>b|ssh"), Some(MAX + 100));
-    remember_at(&path, "zero", 0).unwrap();
-    assert_eq!(cached_at(&path, "zero"), Some(MIN));
-    assert_eq!(cached_at(&path, "b>a|tcp"), None);
-    std::fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn cache_key_separates_direction_and_transport() {
-    let local = Endpoint::local();
-    let ssh = remote("host", false);
-    let tcp = remote("host", true);
-    assert_ne!(path_key(&local, &ssh), path_key(&ssh, &local));
-    assert_ne!(path_key(&local, &ssh), path_key(&local, &tcp));
-    assert_eq!(path_key(&local, &local), None);
-}
-
-#[test]
-fn tcp_fallback_changes_the_cache_key() {
-    let local = Endpoint::local();
-    let remote = remote("host", true);
-    let initial = path_key(&local, &remote);
-    let Endpoint::Remote(spec) = &remote else {
-        unreachable!()
-    };
-    spec.tcp.lock().unwrap().as_mut().unwrap().failed = true;
-    assert_ne!(path_key(&local, &remote), initial);
-}
-
-#[test]
-fn corrupt_cache_is_ignored_and_replaced() {
-    let dir = temporary_cache("corrupt");
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("tuning.json");
-    std::fs::write(&path, b"not json").unwrap();
-    assert_eq!(cached_at(&path, "a>b|tcp"), None);
-    remember_at(&path, "a>b|tcp", 7).unwrap();
-    assert_eq!(cached_at(&path, "a>b|tcp"), Some(7));
-    std::fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn cache_is_read_when_its_lock_cannot_be_created() {
-    use std::os::unix::fs::PermissionsExt;
-    if unsafe { libc::geteuid() } == 0 {
-        return; // root ignores directory permissions
-    }
-    let dir = temporary_cache("readonly");
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("tuning.json");
-    remember_at(&path, "a>b|tcp", 9).unwrap();
-    std::fs::remove_file(path.with_extension("json.lock")).unwrap();
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
-    let cached = cached_at(&path, "a>b|tcp");
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    assert_eq!(cached, Some(9));
-    assert!(!path.with_extension("json.lock").exists());
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -981,7 +847,6 @@ fn inconclusive_doubling_keeps_capacity_without_another_increase() {
         assert_eq!(policy.state, State::Hold);
         assert!(!policy.startup_doubling);
         assert!(policy.measured());
-        assert!(!policy.discovery_complete());
         assert_eq!(
             policy.due[Direction::Up.index()],
             policy.tick + 2 * PROBE_EVERY
@@ -1011,54 +876,21 @@ fn downward_gain_requirement_preserves_clear_upward_loss_rollback() {
 }
 
 #[test]
-fn repeated_inconclusive_copies_do_not_raise_the_recommended_start() {
-    // End copies before or after downward probes. Neither keeping a larger
-    // count nor partially reducing it should ratchet the next start upward.
-    for refine in [false, true] {
-        for loss_per_doubling in [1.0_f64, 0.97] {
-            for measurements in 2..=60 {
-                let mut start = 8;
-                for _ in 0..6 {
-                    let mut policy = if refine {
-                        Policy::refine(start, 1, 256)
-                    } else {
-                        Policy::new(start, 1, 256)
-                    };
-                    for _ in 0..measurements {
-                        let score = 100.0 * loss_per_doubling.powf((policy.n as f64 / 8.0).log2());
-                        measure(&mut policy, score);
-                    }
-                    assert!(policy.measured());
-                    assert!(
-                        policy.recommended() <= start,
-                        "start={start}, samples={measurements}, refine={refine}, \
-                         loss={loss_per_doubling}, policy={policy:?}"
-                    );
-                    start = policy.recommended();
-                }
-            }
-        }
-    }
-}
-
-#[test]
-fn recommendation_changes_only_with_justified_growth_or_reduction() {
+fn settled_count_changes_only_with_justified_growth_or_reduction() {
     let mut policy = Policy::new(8, 1, 64);
-    measure(&mut policy, 100.0); // Proposed 16 is not a recommendation yet.
-    assert_eq!(policy.recommended(), 8);
+    measure(&mut policy, 100.0); // Proposed 16 is not settled yet.
+    assert_eq!(policy.settled(), 8);
     measure(&mut policy, 200.0); // Clear gain at 16; propose 32.
-    assert_eq!(policy.recommended(), 16);
-    measure(&mut policy, 200.0); // Keep 32 live, but not for the next copy.
+    assert_eq!(policy.settled(), 16);
+    measure(&mut policy, 200.0); // An inconclusive increase keeps 32 live.
     assert_eq!(policy.settled(), 32);
-    assert_eq!(policy.recommended(), 16);
 
     assert!(policy.begin(Direction::Down, 200.0));
     policy.activated();
     assert_eq!(policy.n, 24);
     measure(&mut policy, 220.0);
     assert_eq!(policy.settled(), 24);
-    assert_eq!(policy.recommended(), 16); // Partial rollback must not save 24.
-                                          // Allow earlier, slower lower-count measurements to age before retrying.
+    // Allow earlier, slower lower-count measurements to age before retrying.
     for _ in 0..EVIDENCE_MAX_AGE * 4 {
         if policy.settled() < 16 {
             break;
@@ -1066,11 +898,10 @@ fn recommendation_changes_only_with_justified_growth_or_reduction() {
         let score = 1000.0 / policy.n as f64;
         measure(&mut policy, score);
     }
-    assert!(policy.recommended() < 16);
-    assert_eq!(policy.recommended(), policy.settled());
-    let lower = policy.recommended();
+    assert!(policy.settled() < 16);
+    let lower = policy.settled();
     policy.cancel_unapplied();
-    assert_eq!(policy.recommended(), lower);
+    assert_eq!(policy.settled(), lower);
 }
 
 #[test]
@@ -1128,7 +959,6 @@ fn downward_probe_requires_a_measured_speed_increase() {
             if score * 0.95 > 100.0 { lower } else { 32 },
             "score={score}"
         );
-        assert_eq!(policy.recommended(), policy.settled());
     }
 }
 
@@ -1139,30 +969,7 @@ fn aging_evidence_does_not_make_a_slower_reduction_acceptable() {
         let score = p.n.min(32) as f64 * 100.0 / 32.0;
         measure(&mut p, score);
         assert!(p.settled() >= 32, "settled below full speed: {p:?}");
-        assert_eq!(p.recommended(), 32);
     }
-}
-
-#[test]
-fn network_keys_preserve_the_v060_legacy_map() {
-    let dir = crate::test_support::tempdir().unwrap();
-    let path = dir.path().join("tuning.json");
-    let fixture = br#"{"paths":{"local>user@host|tcp":128,"user@host>local|ssh":4}}"#;
-    std::fs::write(&path, fixture).unwrap();
-    let old = "local>user@host|tcp";
-    let home = network_key(old, Some("home"));
-    let office = network_key(old, Some("office"));
-    let unknown = network_key(old, None);
-    assert_eq!(cached_at(&path, &home), None);
-    assert_eq!(cached_at(&path, &unknown), Some(128));
-    remember_at(&path, &home, 8).unwrap();
-    remember_at(&path, &office, 32).unwrap();
-    assert_eq!(cached_at(&path, old), Some(128));
-    assert_eq!(cached_at(&path, &home), Some(8));
-    assert_eq!(cached_at(&path, &office), Some(32));
-    remember_at(&path, old, 64).unwrap();
-    assert_eq!(cached_at(&path, &home), Some(8));
-    assert_eq!(cached_at(&path, &office), Some(32));
 }
 
 #[test]
@@ -1181,7 +988,7 @@ fn upward_gain_uses_live_baseline_despite_higher_historical_scores() {
         );
         p.fails[Direction::Up.index()] = 2;
         measure(&mut p, 70.0);
-        assert_eq!(p.recommended(), 10);
+        assert_eq!(p.settled(), 10);
         assert_eq!(p.fails[Direction::Up.index()], 0);
         assert!(p.n > 10, "a current gain must continue upward: {p:?}");
         assert_eq!(p.probe_base(), Some(70.0));
@@ -1201,7 +1008,6 @@ fn smaller_upward_gain_does_not_resume_growth_below_old_high_water() {
     );
     measure(&mut p, 66.0);
     assert_eq!(p.n, 10);
-    assert_eq!(p.recommended(), 8);
     assert!(matches!(p.state, State::Hold));
 }
 
