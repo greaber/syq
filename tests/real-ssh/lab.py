@@ -169,7 +169,7 @@ print(json.dumps(any(hashlib.sha256(p.open("rb").read(v["size"])).hexdigest() ==
 }
 
 
-def probe(host, name, timeout=60, **values):
-    script = "import json, sys\nfrom pathlib import Path\nv = json.load(sys.stdin)\n" + PROBES[name]
+def probe(host, selector, /, *, timeout=60, **values):
+    script = "import json, sys\nfrom pathlib import Path\nv = json.load(sys.stdin)\n" + PROBES[selector]
     return json.loads(remote(host, "python3 -c " + shlex.quote(script), stdin=json.dumps(values),
                              timeout=timeout))
