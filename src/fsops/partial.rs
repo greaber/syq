@@ -1852,10 +1852,6 @@ impl FsOps {
             d
         };
         let mut userspace_fallback = copy_pair_unsupported && use_userspace_fallback;
-        if copy_pair_unsupported && !use_userspace_fallback {
-            // Only an in-place copy reaches this point; it has no sidecar.
-            return Ok(CopyLocalOutcome::Unsupported);
-        }
         #[cfg(debug_assertions)]
         if std::env::var_os("SYQ_TEST_COPY_LOCAL_EXDEV").is_some() {
             unsupported_copy_pairs().lock().unwrap().insert(copy_pair);
