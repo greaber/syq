@@ -17,9 +17,7 @@ use crate::sys::{
 use crate::write_gate::CachedFile;
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
-#[cfg(target_os = "linux")]
-use std::collections::HashSet;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 #[cfg(target_os = "linux")]
