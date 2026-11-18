@@ -96,7 +96,9 @@ where
     } else {
         let mut read = open(size)?;
         let mut parts = Vec::new();
-        let mut buffer = vec![0; 1024 * 1024];
+        // Most files are far smaller than the read size, and preparation
+        // hashes many at once: a full buffer each costs far more memory.
+        let mut buffer = vec![0; size.min(1024 * 1024) as usize];
         for index in 0..size.div_ceil(part_size).max(1) {
             let mut hash = native.hasher();
             let mut offset = index * part_size;
