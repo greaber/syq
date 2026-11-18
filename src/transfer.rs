@@ -2476,8 +2476,10 @@ impl Opts {
         mode_hint(self.widen_dirs, needed, self.rsync_creation)
     }
 
-    /// The hint for a destination-only directory pruning could not list,
-    /// which only `all` enters, and no mode where the grant bars widening.
+    /// The hint for a directory inside the copy that only `all` lets the
+    /// copy enter, and no mode where the grant bars widening: a
+    /// destination-only directory pruning could not list, or an existing
+    /// `--as` directory the copy cannot search.
     pub(super) fn entering_hint(&self) -> Option<&'static str> {
         if self.keep_bars_widening() {
             return Some(KEEP_BARS_WIDENING);
@@ -4045,7 +4047,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     "search destination directory {}: Permission denied (os error 13); \
                      an owned destination directory lacks the required owner permissions; {}",
                     display_plan_target(dst, &dst_root, &args),
-                    opts.hint_for(WidenDirs::All).unwrap_or_default()
+                    opts.entering_hint().unwrap_or_default()
                 );
             }
         }

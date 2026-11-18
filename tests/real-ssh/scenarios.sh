@@ -2371,6 +2371,24 @@ for keep_errors in /tmp/syq-real-ssh-keep-prune.err /tmp/syq-real-ssh-keep-previ
 done
 ssh destination 'cd /tmp/syq-real-ssh/keep-prune && test ! -e stale && test -e gone/extra && test -e gone-too/extra && test "$(cat sub/new)" = sub/new && test "$(stat -c %a gone gone-too | tr "\n" " ")" = "555 555 " && chmod 755 gone gone-too /tmp/syq-real-ssh/keep-preview/sub /tmp/syq-real-ssh/keep-preview/second'
 
+# An existing --as directory the copy cannot search is refused up front with
+# the same reason, not with the suggestion to widen more.
+ssh destination 'mkdir /tmp/syq-real-ssh/keep-as && chmod 600 /tmp/syq-real-ssh/keep-as'
+keep_status=0
+syq cp --no-progress --if-exists=keep --widen-dirs=rsync \
+    --from source /tmp/syq-real-ssh/keep-tree \
+    --to destination --as /tmp/syq-real-ssh/keep-as \
+    2>/tmp/syq-real-ssh-keep-as.err || keep_status=$?
+cat /tmp/syq-real-ssh-keep-as.err >&2
+test "$keep_status" = 1
+grep -F 'search destination directory' /tmp/syq-real-ssh-keep-as.err |
+    grep -F -e "--if-exists=keep lets the restricted receiver change no existing directory's permissions" >/dev/null
+if grep -F 'may help' /tmp/syq-real-ssh-keep-as.err >&2; then
+    echo 'a keep copy suggested a widening mode that cannot help' >&2
+    exit 1
+fi
+ssh destination 'test "$(stat -c %a /tmp/syq-real-ssh/keep-as)" = 600 && chmod 755 /tmp/syq-real-ssh/keep-as'
+
 printf 'case: ordinary and restricted receivers update the same files in place\n'
 # Under --in-place=update both receivers write a file of their own with one
 # name where it is, and replace one with another name and one more widely
