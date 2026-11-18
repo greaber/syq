@@ -233,6 +233,9 @@ pub(crate) struct Root {
     #[cfg(target_os = "linux")]
     type_facts: OnceLock<&'static crate::fsops::TypeFacts>,
     network: OnceLock<bool>,
+    /// Whether a close on the root's filesystem reports no write error
+    /// (`TypeFacts::quiet_close`), read when a written file first asks.
+    quiet_close: OnceLock<bool>,
     /// The profile of the root's own device as `Profile` bits, with
     /// `PROFILE_KNOWN` set once read, so that publication there looks it up
     /// without a system call or a lock.
@@ -308,6 +311,7 @@ impl Root {
             #[cfg(target_os = "linux")]
             type_facts: OnceLock::new(),
             network: OnceLock::new(),
+            quiet_close: OnceLock::new(),
             root_profile: AtomicU16::new(0),
             other_profiles: Mutex::new(HashMap::new()),
             #[cfg(test)]
@@ -383,6 +387,51 @@ impl Root {
     #[cfg(test)]
     pub(crate) fn assume_network_file_system_for_test(&self) {
         let _ = self.network.set(true);
+    }
+
+    /// Whether closing a descriptor of a file on device `dev` beneath this
+    /// root may report a write error (see `TypeFacts::quiet_close`). Only
+    /// the root's own device can be known to report none: the root's open
+    /// directory keeps that filesystem mounted and its device number its
+    /// own, so what was read once holds for as long as the root does. A
+    /// filesystem mounted beneath the root can be replaced by another that
+    /// is given the same number, so a file there always may. A file an
+    /// overlay shows with the root's device number (see `type_facts`) is
+    /// written through the root's filesystem, whose `flush` is the only
+    /// one the overlay calls. After the first, a lookup is one atomic load.
+    pub(crate) fn close_reports_writes_on(&self, dev: u64) -> bool {
+        dev != self.identity.dev || !*self.quiet_close.get_or_init(|| self.close_is_quiet())
+    }
+
+    /// Whether a close on the root's filesystem reports no write error.
+    /// Other systems have no filesystem known for it (macOS decides its
+    /// own check from the file's filesystem).
+    fn close_is_quiet(&self) -> bool {
+        // A test that fails the check of a file's writes, or stands in for
+        // an unknown filesystem, has the check made.
+        #[cfg(debug_assertions)]
+        if [
+            "SYQ_TEST_FAIL_WRITER_CLOSE",
+            "SYQ_TEST_CONSERVATIVE_FILESYSTEM",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+        {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.type_facts().quiet_close
+        }
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
+    /// Stand in for a filesystem whose close does or does not report write
+    /// errors, before anything asks.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn assume_quiet_close_for_test(&self, quiet: bool) {
+        self.quiet_close.set(quiet).unwrap();
     }
 
     /// What syq relies on the filesystem `directory`, on device `dev`, is
