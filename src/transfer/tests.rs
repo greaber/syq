@@ -2942,6 +2942,19 @@ fn endpoint_semantic_error_kind_wins_over_numeric_errno() {
 }
 
 #[test]
+fn data_corrupted_in_transit_has_no_os_kind() {
+    // `syq rm` records share this mapping: no OS error caused the failure.
+    let error = WireError {
+        message: "data corrupted in transit".into(),
+        io_kind: Some(WireIoKind::CorruptedInTransit),
+        raw_os_error: None,
+        condition_not_met: false,
+        unchanged: false,
+    };
+    assert_eq!(wire_os_kind(&error), None);
+}
+
+#[test]
 fn mkdir_apply_error_preserves_endpoint_os_kind() {
     let error = WireError {
         message: "destination is full".into(),

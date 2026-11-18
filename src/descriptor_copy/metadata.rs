@@ -14,7 +14,6 @@ use std::{
 pub(crate) struct Policy {
     pub preserve: u8,
     pub if_exists: Option<crate::cli::IfExists>,
-    pub restore_named_mtime: bool,
     pub skip_newer: bool,
     pub specials: bool,
     pub overrides: Option<crate::mapping::Metadata>,
@@ -27,7 +26,6 @@ impl Policy {
                 | if args.owner { flags::OWNER } else { 0 }
                 | if args.group { flags::GROUP } else { 0 }
                 | if args.times { flags::TIMES } else { 0 },
-            restore_named_mtime: true,
             skip_newer: args.update,
             specials: args.devices,
             overrides: None,

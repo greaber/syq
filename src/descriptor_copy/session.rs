@@ -10,7 +10,7 @@ use anyhow::Result;
 use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
-    Arc, Condvar, Mutex,
+    Arc, Mutex,
 };
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -38,10 +38,6 @@ impl Control {
     }
 }
 
-struct Connections {
-    idle: Vec<Box<dyn Conn>>,
-    leased: usize,
-}
 struct LocalSession(DescriptorSessionSlot);
 impl Drop for LocalSession {
     fn drop(&mut self) {
@@ -81,10 +77,10 @@ pub(crate) struct Session {
     control: Mutex<Control>,
     abandoned: Mutex<Vec<u64>>,
     next_entry: AtomicU64,
-    connections: Mutex<Connections>,
-    available: Condvar,
+    // Idle data connections. Callers hold a `Resources.workers` permit for
+    // each leased one, so that semaphore bounds them.
+    connections: Mutex<Vec<Box<dyn Conn>>>,
     data_started: Mutex<bool>,
-    limit: usize,
     pub budget: Arc<Semaphore>,
     // Keep the previous FIFO reuse order as entries share the buffer cache.
     resources: Arc<Resources>,
@@ -131,17 +127,8 @@ impl Session {
             }),
             abandoned: Mutex::new(Vec::new()),
             next_entry: AtomicU64::new(1),
-            connections: Mutex::new(Connections {
-                idle: Vec::new(),
-                leased: 0,
-            }),
-            available: Condvar::new(),
+            connections: Mutex::new(Vec::new()),
             data_started: Mutex::new(false),
-            limit: if args.connections_default {
-                args.automatic_worker_limit()
-            } else {
-                args.connections
-            },
             budget: resources.budget.clone(),
             resources,
             _local: local,
@@ -249,19 +236,8 @@ impl Session {
         cancelled: &AtomicBool,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<Worker> {
-        let mut connections = self.connections.lock().unwrap();
-        while connections.leased >= self.limit {
-            anyhow::ensure!(!cancelled.load(Relaxed), "stream cancelled");
-            connections = self
-                .available
-                .wait_timeout(connections, Duration::from_millis(100))
-                .unwrap()
-                .0;
-        }
         anyhow::ensure!(!cancelled.load(Relaxed), "stream cancelled");
-        connections.leased += 1;
-        let cached = connections.idle.pop();
-        drop(connections);
+        let cached = self.connections.lock().unwrap().pop();
         let mut worker = Worker {
             session: self.clone(),
             connection: None,
@@ -357,14 +333,13 @@ impl Worker {
 }
 impl Drop for Worker {
     fn drop(&mut self) {
-        let mut connections = self.session.connections.lock().unwrap();
-        connections.leased -= 1;
         if self.reusable {
-            connections
-                .idle
+            self.session
+                .connections
+                .lock()
+                .unwrap()
                 .push(self.connection.take().expect("completed worker connection"));
         }
-        self.session.available.notify_one();
     }
 }
 
