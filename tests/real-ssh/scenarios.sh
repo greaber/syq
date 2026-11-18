@@ -76,6 +76,7 @@ case "${SYQ_REAL_SSH_SUITE:-core}" in
         ;;
     storage)
         python3 /usr/local/libexec/syq-test-storage-authorization.py
+        python3 /usr/local/libexec/syq-test-server-storage.py
         exit 0
         ;;
     benchmark)
@@ -926,6 +927,9 @@ python3 /usr/local/libexec/syq-test-provider-between-servers.py
 
 printf 'case: storage authorization through the return connection\n'
 python3 /usr/local/libexec/syq-test-storage-authorization.py
+
+printf 'case: copies between a server and a bucket signed by the invoking machine\n'
+python3 /usr/local/libexec/syq-test-server-storage.py
 
 printf 'case: explicit automatic approval supports unattended copies\n'
 syq persist receive on --auto-approve-root "$receive_root"

@@ -15,6 +15,7 @@ native Linux notification actions control return copies
 return copies hand off between server PATH builds
 remote commands run through the return connection
 storage authorization through the return connection
+copies between a server and a bucket signed by the invoking machine
 explicit automatic approval supports unattended copies
 named return rejects traversal and receiver symlink escape
 a copied receiver identity cannot displace a responsive laptop

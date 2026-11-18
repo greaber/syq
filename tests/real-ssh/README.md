@@ -51,8 +51,9 @@ runs do not run these suites.
 The suite also runs a pinned local S3 server fixture on the runner: PGSTY Silo,
 a maintained fork of the MinIO server. Storage checks approve
 requests through the return connection and disconnect receiving before uploads
-and downloads finish. The source has no storage credentials. To run only these
-checks:
+and downloads finish. They also copy between the source and a bucket from the
+runner, which signs the source's storage requests over its SSH session. The
+source has no storage credentials. To run only these checks:
 
 ```sh
 scripts/test-real-ssh.py --suite storage
