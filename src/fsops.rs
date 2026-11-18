@@ -73,6 +73,7 @@ pub(crate) fn copy_donor_range(
 mod btrfs;
 mod entry;
 mod fs_caps;
+pub(crate) mod keep;
 mod leases;
 mod limits;
 pub(crate) mod lookups;
@@ -2033,15 +2034,22 @@ impl FsOps {
                                         condition,
                                     )?;
                                     let current = held.metadata()?;
-                                    vouch::require(&target, &held, &current, &file.meta, checked)?;
-                                    set_meta_file_known(&held, &file.meta, repair, &current)?;
-                                    require_rooted_named_identity(
-                                        &target.root,
-                                        &target.relative,
-                                        &target.label,
+                                    let keeping = keep::Keeping {
+                                        handle: keep::Handle::Open,
+                                        recheck_any: true,
+                                        setting: None,
+                                    };
+                                    match keep::keep_existing(
+                                        (&target).into(),
                                         &held,
+                                        &current,
+                                        (&file.meta, checked),
                                         condition,
-                                    )
+                                        keeping,
+                                    )? {
+                                        keep::Keep::Kept(_) => Ok(()),
+                                        keep::Keep::Replace(error) => Err(error),
+                                    }
                                 })()
                                 .err()
                                 .map(|error| wire_error(&error))

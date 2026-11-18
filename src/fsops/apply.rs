@@ -207,6 +207,24 @@ pub(super) fn with_rooted_partial<T>(
     }
 }
 
+impl TargetCondition {
+    /// Whether an object found with this identity and change time meets
+    /// the condition. `Absent` is met only by finding nothing.
+    pub(crate) fn check(self, dev: u64, ino: u64, ctime: (i64, u32)) -> bool {
+        match self {
+            TargetCondition::Any => true,
+            TargetCondition::Absent => false,
+            TargetCondition::Matches { dev: d, ino: i } => (dev, ino) == (d, i),
+            TargetCondition::MatchesFingerprint {
+                dev: d,
+                ino: i,
+                ctime: c,
+                ctime_nsec: n,
+            } => (dev, ino, ctime) == (d, i, (c, n)),
+        }
+    }
+}
+
 /// Observe the object at a destination path and hold it to the planner's
 /// condition. `Absent` requires nothing there (the following `*at` creation
 /// then fails atomically if something appears); the matching conditions
@@ -217,39 +235,25 @@ pub(super) fn observe_rooted_condition(
 ) -> Result<Option<crate::rooted::RootMetadata>> {
     let observed = target.root.metadata_optional(&target.relative)?;
     let label = &target.label;
-    match (condition, observed) {
-        (TargetCondition::Any, observed) => Ok(observed),
-        (TargetCondition::Absent, None) => Ok(None),
-        (TargetCondition::Absent, Some(_)) => Err(condition_not_met(format!(
+    match observed {
+        Some(metadata)
+            if condition.check(
+                metadata.dev,
+                metadata.ino,
+                (metadata.ctime, metadata.ctime_nsec),
+            ) =>
+        {
+            Ok(Some(metadata))
+        }
+        None if matches!(condition, TargetCondition::Any | TargetCondition::Absent) => Ok(None),
+        _ if condition == TargetCondition::Absent => Err(condition_not_met(format!(
             "destination {} appeared before no-replace creation",
             label.display()
         ))),
-        (TargetCondition::Matches { dev, ino }, Some(metadata))
-            if metadata.dev == dev && metadata.ino == ino =>
-        {
-            Ok(Some(metadata))
-        }
-        (
-            TargetCondition::MatchesFingerprint {
-                dev,
-                ino,
-                ctime,
-                ctime_nsec,
-            },
-            Some(metadata),
-        ) if metadata.dev == dev
-            && metadata.ino == ino
-            && metadata.ctime == ctime
-            && metadata.ctime_nsec == ctime_nsec =>
-        {
-            Ok(Some(metadata))
-        }
-        (TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. }, _) => {
-            Err(condition_not_met(format!(
-                "destination {} changed before it could be replaced",
-                label.display()
-            )))
-        }
+        _ => Err(condition_not_met(format!(
+            "destination {} changed before it could be replaced",
+            label.display()
+        ))),
     }
 }
 
@@ -366,15 +370,22 @@ fn apply_one_rooted(
             require_open_target_known(&opened, &target.label, *condition)?;
             // Only a file the receiver can vouch for is changed in place;
             // the copy replaces any other (`vouch`).
-            vouch::require(target, &file, &opened, meta, *flags)?;
-            set_meta_handle_known_portable(&file, meta, *flags, &opened)?;
-            require_rooted_named_identity_known(
-                &target.root,
-                &target.relative,
-                &target.label,
+            let keeping = keep::Keeping {
+                handle: keep::Handle::Path,
+                recheck_any: true,
+                setting: None,
+            };
+            match keep::keep_existing(
+                target.into(),
+                &file,
                 &opened,
+                (meta, *flags),
                 *condition,
-            )
+                keeping,
+            )? {
+                keep::Keep::Kept(_) => Ok(()),
+                keep::Keep::Replace(error) => Err(error),
+            }
         }
         Op::Rmdir { .. } | Op::Unlink { .. } => crate::deletion::DirectoryBatch::default().remove(
             root,
@@ -660,7 +671,7 @@ pub(crate) fn set_handle_metadata(
             (Err(error), _) => return Err(error.into()),
         }
     }
-    set_meta_handle_known_portable(handle, meta, flags & !flags::TIMES, current)
+    set_meta_handle_known(handle, meta, flags & !flags::TIMES, current)
 }
 
 /// Set the times of the symlink `current` describes, which this receiver
@@ -1272,36 +1283,24 @@ pub(super) fn require_rooted_condition(
     condition: TargetCondition,
     label: &Path,
 ) -> Result<()> {
-    match condition {
-        TargetCondition::Any => Ok(()),
-        TargetCondition::Absent => Err(condition_not_met(format!(
+    if condition.check(
+        metadata.dev,
+        metadata.ino,
+        (metadata.ctime, metadata.ctime_nsec),
+    ) {
+        return Ok(());
+    }
+    Err(condition_not_met(if condition == TargetCondition::Absent {
+        format!(
             "destination {} appeared before metadata update",
             label.display()
-        ))),
-        TargetCondition::Matches { dev, ino } if (metadata.dev, metadata.ino) == (dev, ino) => {
-            Ok(())
-        }
-        TargetCondition::MatchesFingerprint {
-            dev,
-            ino,
-            ctime,
-            ctime_nsec,
-        } if (
-            metadata.dev,
-            metadata.ino,
-            metadata.ctime,
-            metadata.ctime_nsec,
-        ) == (dev, ino, ctime, ctime_nsec) =>
-        {
-            Ok(())
-        }
-        TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. } => {
-            Err(condition_not_met(format!(
-                "destination {} changed before metadata update",
-                label.display()
-            )))
-        }
-    }
+        )
+    } else {
+        format!(
+            "destination {} changed before metadata update",
+            label.display()
+        )
+    }))
 }
 
 pub(super) fn require_rooted_metadata(
@@ -1440,111 +1439,34 @@ pub(super) fn require_open_target_known(
     path: &Path,
     condition: TargetCondition,
 ) -> Result<()> {
-    match condition {
-        TargetCondition::Any => Ok(()),
-        TargetCondition::Absent => Err(condition_not_met(format!(
-            "destination {} appeared after the new-path precondition was checked",
-            path.display()
-        ))),
-        TargetCondition::Matches { dev, ino } => {
-            if metadata.dev() != dev || metadata.ino() != ino {
-                return Err(condition_not_met(format!(
-                    "destination {} changed after the existing-path precondition was checked",
-                    path.display()
-                )));
-            }
-            Ok(())
-        }
-        TargetCondition::MatchesFingerprint {
-            dev,
-            ino,
-            ctime,
-            ctime_nsec,
-        } => {
-            if metadata.dev() != dev
-                || metadata.ino() != ino
-                || metadata.ctime() != ctime
-                || metadata.ctime_nsec() as u32 != ctime_nsec
-            {
-                return Err(condition_not_met(format!(
-                    "destination {} changed after the existing-path precondition was checked",
-                    path.display()
-                )));
-            }
-            Ok(())
-        }
+    if condition.check(
+        metadata.dev(),
+        metadata.ino(),
+        (metadata.ctime(), metadata.ctime_nsec() as u32),
+    ) {
+        return Ok(());
     }
+    let precondition = if condition == TargetCondition::Absent {
+        "appeared after the new-path"
+    } else {
+        "changed after the existing-path"
+    };
+    Err(condition_not_met(format!(
+        "destination {} {precondition} precondition was checked",
+        path.display()
+    )))
 }
 
-#[cfg(target_os = "linux")]
+/// Apply `meta` under `flags` to the object `file`, a metadata handle
+/// (`Root::open_metadata`), refers to, whose metadata `current` was read
+/// through it.
 pub(super) fn set_meta_handle_known(
     file: &File,
     meta: &Meta,
     flags: u8,
     current: &fs::Metadata,
 ) -> Result<()> {
-    let fd = file.as_raw_fd();
-    let empty = c"";
-    // Owner first: chown clears setuid/setgid, so mode must follow it.
-    let owner_changed =
-        apply_owner_if_changed(flags, meta, current.uid(), current.gid(), |uid, gid| {
-            let r = unsafe {
-                libc::fchownat(
-                    fd,
-                    empty.as_ptr(),
-                    uid.unwrap_or(u32::MAX),
-                    gid.unwrap_or(u32::MAX),
-                    libc::AT_EMPTY_PATH,
-                )
-            };
-            if r == 0 {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
-            }
-        })?;
-    if owner_changed {
-        super::access_changed(file);
-    }
-    // A Linux ACL before the mode (see `apply_acls`).
-    let narrowed = crate::inode_metadata::apply_acls(
-        file,
-        meta.inode_metadata.as_deref(),
-        meta.mode,
-        flags & flags::MODE != 0,
-    )?;
-    if flags & flags::MODE != 0 {
-        let current = narrowed.unwrap_or(current.mode() & 0o7777);
-        let wanted = meta.mode & 0o7777;
-        if current != wanted || (owner_changed && wanted & 0o6000 != 0) {
-            set_mode_handle(file, wanted)?;
-            super::access_changed(file);
-        }
-    }
-    if flags & flags::TIMES != 0 {
-        bail!("metadata-only O_PATH repair does not support timestamp changes");
-    }
-    crate::inode_metadata::apply_after_acls(file, meta.inode_metadata.as_deref(), meta.mode)
-}
-
-#[cfg(target_os = "linux")]
-pub(super) fn set_meta_handle_known_portable(
-    file: &File,
-    meta: &Meta,
-    flags: u8,
-    current: &fs::Metadata,
-) -> Result<()> {
-    set_meta_handle_known(file, meta, flags, current)
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(super) fn set_meta_handle_known_portable(
-    file: &File,
-    meta: &Meta,
-    flags: u8,
-    current: &fs::Metadata,
-) -> Result<()> {
-    set_meta_file_known(file, meta, flags, current)
+    set_meta_file_inner(file, keep::Handle::Path, meta, flags, current, false, true)
 }
 
 #[cfg(target_os = "linux")]
