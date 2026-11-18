@@ -1722,27 +1722,8 @@ fn attempt_small_copy(
     drop(_native_work);
     drop(finalization);
     progress.finish(exit_code == 0);
-    let terminal = crate::results::ResultRecord {
-        status,
-        exit_code,
-        dry_run: false,
-        files_transferred: progress.files_done.load(Relaxed),
-        files_unchanged: progress.files_unchanged.load(Relaxed),
-        files_excluded: progress.excluded(),
-        directories_created: 0,
-        symlinks_created: 0,
-        specials_created: 0,
-        errors,
-        bytes_transferred: progress.bytes_done.load(Relaxed),
-        bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
-        timings: progress.timings(),
-        bytes_total_known: None,
-        deletions_planned: None,
-        deletions_completed: None,
-        deletions_blocked: None,
-        replaced_not_in_place: None,
-        extra: Default::default(),
-    };
+    // The shortcut neither plans directories nor prunes.
+    let terminal = progress.result_record(status, exit_code, false, false, false);
     let elapsed = progress.display_elapsed().as_secs_f64();
     if !args.quiet && !args.suppress_summary {
         print_transfer_summary(
@@ -2293,36 +2274,18 @@ pub fn run(mut args: Args) -> Result<i32> {
                     os_kind,
                 );
             }
-            results.emit_result(&crate::results::ResultRecord {
-                status: crate::results::Status::Failed,
-                exit_code: 1,
+            // Mutations that settled (and streamed their records) before
+            // the run died must not vanish from the aggregates. Deletion
+            // counts are what the deletion pass did before the run died;
+            // zeros mean it never got that far, and status "failed" already
+            // marks every aggregate here as pre-failure state.
+            results.emit_result(&progress.result_record(
+                crate::results::Status::Failed,
+                1,
                 dry_run,
-                files_transferred: progress.files_done.load(Relaxed),
-                files_unchanged: progress.files_unchanged.load(Relaxed),
-                files_excluded: progress.excluded(),
-                // Mutations that settled (and streamed their records)
-                // before the run died must not vanish from the aggregates.
-                directories_created: progress.directories_created.load(Relaxed),
-                symlinks_created: progress.symlinks_created.load(Relaxed),
-                specials_created: progress.specials_created.load(Relaxed),
-                errors: progress.errors.load(Relaxed),
-                bytes_transferred: progress.bytes_done.load(Relaxed),
-                bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
-                timings: progress.timings(),
-                // What the deletion pass did before the run died; zeros
-                // mean it never got that far, and status "failed" already
-                // marks every aggregate here as pre-failure state.
-                deletions_planned: prune.then(|| progress.deletions_planned.load(Relaxed)),
-                deletions_completed: prune.then(|| progress.deletions_completed.load(Relaxed)),
-                deletions_blocked: prune.then(|| progress.deletions_blocked.load(Relaxed)),
-                bytes_total_known: None,
-                replaced_not_in_place: in_place_update.then(|| {
-                    crate::results::ReplacedNotInPlace::from_counts(
-                        &progress.in_place_refusals.counts(),
-                    )
-                }),
-                extra: Default::default(),
-            });
+                prune,
+                in_place_update,
+            ));
         }
     }
     outcome
@@ -5435,11 +5398,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     // live runs; drop it here so the terminal record and the human dry-run
     // summary count the same set (spec: summary renders from the record).
     dry_run_changes.directories.remove(&dst_root);
-    let created_counts = (
-        progress.directories_created.load(Relaxed),
-        progress.symlinks_created.load(Relaxed),
-        progress.specials_created.load(Relaxed),
-    );
     drop(st);
     // Every change is settled: end the destination's results, which also
     // ends its grant.
@@ -5483,58 +5441,22 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     };
     drop(finalization);
     progress.finish(exit_code == 0);
-    let (deletions_planned, deletions_completed, deletions_blocked) = if opts.delete {
-        let planned = match delete_plan {
-            DeletePlan::Planned(n) => n,
-            _ => 0,
-        };
-        (
-            Some(planned),
-            Some(deleted),
-            Some(if max_delete_hit { planned } else { 0 }),
-        )
-    } else {
-        (None, None, None)
-    };
     // Hard v1 rule: the human summary below renders from this same struct,
     // so the numbers a person reads and a machine parses cannot disagree.
-    let terminal = crate::results::ResultRecord {
+    let mut terminal = progress.result_record(
         status,
         exit_code,
-        dry_run: opts.dry_run,
-        files_transferred: progress.files_done.load(Relaxed),
-        files_unchanged: progress.files_unchanged.load(Relaxed),
-        files_excluded: progress.excluded(),
-        // Live counters only move when mutations run; a dry run reports the
-        // planned work it traced instead.
-        directories_created: if opts.dry_run {
-            dry_run_changes.directories.len() as u64
-        } else {
-            created_counts.0
-        },
-        symlinks_created: if opts.dry_run {
-            dry_run_changes.symlinks
-        } else {
-            created_counts.1
-        },
-        specials_created: if opts.dry_run {
-            dry_run_changes.specials
-        } else {
-            created_counts.2
-        },
-        errors,
-        bytes_transferred: progress.bytes_done.load(Relaxed),
-        bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
-        timings: progress.timings(),
-        bytes_total_known: None,
-        deletions_planned,
-        deletions_completed,
-        deletions_blocked,
-        replaced_not_in_place: opts.inplace_update.then(|| {
-            crate::results::ReplacedNotInPlace::from_counts(&progress.in_place_refusals.counts())
-        }),
-        extra: Default::default(),
-    };
+        opts.dry_run,
+        opts.delete,
+        opts.inplace_update,
+    );
+    // Live counters only move when mutations run; a dry run reports the
+    // planned work it traced instead.
+    if opts.dry_run {
+        terminal.directories_created = dry_run_changes.directories.len() as u64;
+        terminal.symlinks_created = dry_run_changes.symlinks;
+        terminal.specials_created = dry_run_changes.specials;
+    }
 
     if let (Some(history), Some(initial)) = (
         progress.tuning_history.get(),

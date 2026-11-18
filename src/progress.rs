@@ -176,6 +176,37 @@ impl Progress {
         self.files_excluded.load(Relaxed) + self.paths_ignored.load(Relaxed)
     }
 
+    /// A copy's terminal record from these counters. `prune` and
+    /// `in_place_update` add the fields only those runs report.
+    pub(crate) fn result_record(
+        &self,
+        status: crate::results::Status,
+        exit_code: i32,
+        dry_run: bool,
+        prune: bool,
+        in_place_update: bool,
+    ) -> crate::results::ResultRecord {
+        crate::results::ResultRecord {
+            files_transferred: self.files_done.load(Relaxed),
+            files_unchanged: self.files_unchanged.load(Relaxed),
+            files_excluded: self.excluded(),
+            directories_created: self.directories_created.load(Relaxed),
+            symlinks_created: self.symlinks_created.load(Relaxed),
+            specials_created: self.specials_created.load(Relaxed),
+            errors: self.errors.load(Relaxed),
+            bytes_transferred: self.bytes_done.load(Relaxed),
+            bytes_unchanged: self.bytes_unchanged.load(Relaxed),
+            timings: self.timings(),
+            deletions_planned: prune.then(|| self.deletions_planned.load(Relaxed)),
+            deletions_completed: prune.then(|| self.deletions_completed.load(Relaxed)),
+            deletions_blocked: prune.then(|| self.deletions_blocked.load(Relaxed)),
+            replaced_not_in_place: in_place_update.then(|| {
+                crate::results::ReplacedNotInPlace::from_counts(&self.in_place_refusals.counts())
+            }),
+            ..crate::results::ResultRecord::new(status, exit_code, dry_run)
+        }
+    }
+
     pub fn new(enabled: bool, force: bool, width: Option<usize>) -> Arc<Self> {
         Self::starting_at(enabled, force, width, Instant::now())
     }
