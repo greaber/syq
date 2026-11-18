@@ -54,7 +54,52 @@ fn connect_registered(
     };
     Ok((stream, configuration))
 }
-pub(crate) fn sign(stream: &mut UnixStream, requests: &[Unsigned]) -> Result<Vec<String>> {
+/// What the machine that started a copy on a server sends first on the
+/// signing session it serves over that copy's SSH session.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Opening {
+    pub configuration: Configuration,
+    /// The command's `--s3-header` and `--s3-write-header` values, which the
+    /// server sends with its own requests. They can hold secrets such as an
+    /// encryption key, so they travel here rather than on the server's
+    /// command line, which other accounts there can read.
+    pub headers: Vec<(String, String)>,
+    pub write_headers: Vec<(String, String)>,
+}
+
+/// Serves a signing session to the server this machine started a copy on.
+/// The command typed here is the approval, so there is no prompt: `signer`
+/// holds the request derived from that command and refuses anything outside
+/// it, exactly as it does for a request approved on a receiving machine.
+pub(crate) fn serve_started_copy(
+    stream: &mut (impl Read + Write),
+    signer: &Signer,
+    headers: Vec<(String, String)>,
+    write_headers: Vec<(String, String)>,
+) -> Result<Option<String>> {
+    write_message(
+        stream,
+        &Opening {
+            configuration: signer.configuration.clone(),
+            headers,
+            write_headers,
+        },
+    )?;
+    serve_signing(stream, signer, || false)
+}
+
+/// Reads what [`serve_started_copy`] sends first.
+pub(crate) fn open_started_copy(stream: &mut impl Read) -> Result<Opening> {
+    read_message(stream)
+}
+
+/// `signer` names the machine that signs, for messages.
+pub(crate) fn sign(
+    stream: &mut UnixStream,
+    requests: &[Unsigned],
+    signer: &str,
+) -> Result<Vec<String>> {
     // Keep the bounded wire messages, but send them continuously while reading
     // replies. Waiting after each message makes preparation cost one network
     // round trip per 128 requests. Writing all messages before reading instead
@@ -79,9 +124,11 @@ pub(crate) fn sign(stream: &mut UnixStream, requests: &[Unsigned]) -> Result<Vec
         let received = (|| -> Result<Vec<String>> {
             let mut result = Vec::with_capacity(requests.len());
             while result.len() < requests.len() {
-                match read_message(stream).context(
-                    "authorizing machine disconnected during preparation; reconnect and rerun the copy",
-                )? {
+                match read_message(stream).with_context(|| {
+                    format!(
+                        "{signer} disconnected during preparation; reconnect and rerun the copy"
+                    )
+                })? {
                     SigningReply::Signed(urls) => {
                         anyhow::ensure!(
                             !urls.is_empty() && result.len() + urls.len() <= requests.len(),
@@ -89,7 +136,7 @@ pub(crate) fn sign(stream: &mut UnixStream, requests: &[Unsigned]) -> Result<Vec
                         );
                         result.extend(urls);
                     }
-                    SigningReply::Error(error) => bail!("authorizing machine: {error}"),
+                    SigningReply::Error(error) => bail!("{signer}: {error}"),
                     _ => bail!("invalid storage signing response"),
                 }
             }
@@ -189,17 +236,18 @@ impl Receiver {
             &mut stream,
             &SigningReply::Configuration(signer.configuration.clone()),
         )?;
-        serve_signing(&mut stream, &signer, receiving_stopped)
+        serve_signing(&mut stream, &signer, receiving_stopped).map(drop)
     }
 }
 
 /// Signs each batch the approved requester sends until it finishes. One
-/// refused request ends the session without signing the rest of its batch.
+/// refused request ends the session without signing the rest of its batch;
+/// the refusal sent to the requester is returned.
 pub(crate) fn serve_signing(
     stream: &mut (impl Read + Write),
     signer: &Signer,
     receiving_stopped: impl Fn() -> bool,
-) -> Result<()> {
+) -> Result<Option<String>> {
     loop {
         // Once approved, queued bytes are valid pipelined requests. The
         // approval-phase probe treats those bytes as cancellation; rely on
@@ -224,13 +272,14 @@ pub(crate) fn serve_signing(
                     }
                 }
                 Err(error) => {
-                    write_message(stream, &SigningReply::Error(error.to_string()))?;
-                    return Ok(());
+                    let refusal = error.to_string();
+                    write_message(stream, &SigningReply::Error(refusal.clone()))?;
+                    return Ok(Some(refusal));
                 }
             },
             SigningRequest::Finish => {
                 write_message(stream, &SigningReply::Finished)?;
-                return Ok(());
+                return Ok(None);
             }
         }
     }
@@ -321,7 +370,7 @@ mod pipeline_tests {
             write_message(&mut server, &SigningReply::Finished).unwrap();
         });
         assert_eq!(
-            sign(&mut client, &requests).unwrap(),
+            sign(&mut client, &requests, "authorizing machine").unwrap(),
             requests.into_iter().map(|r| r.key).collect::<Vec<_>>()
         );
         finish(&mut client).unwrap();
@@ -353,7 +402,7 @@ mod pipeline_tests {
                 }
             }
         });
-        let urls = sign(&mut client, &requests).unwrap();
+        let urls = sign(&mut client, &requests, "authorizing machine").unwrap();
         assert_eq!(urls.len(), 10_000);
         for (request, url) in requests.iter().zip(urls) {
             assert_eq!(url, format!("{}?{}", request.key, "x".repeat(9000)));
@@ -437,7 +486,7 @@ mod pipeline_tests {
             let mut buffer = [0; 4096];
             while std::io::Read::read(&mut server, &mut buffer).unwrap() != 0 {}
         });
-        let error = sign(&mut client, &requests()).unwrap_err();
+        let error = sign(&mut client, &requests(), "authorizing machine").unwrap_err();
         assert!(
             error.to_string().contains("outside approved paths"),
             "{error:#}"

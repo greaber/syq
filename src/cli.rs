@@ -574,6 +574,10 @@ pub struct Args {
     /// then end of input when that syq ends.
     #[arg(skip)]
     pub(crate) requester_stdin: Option<u64>,
+    /// On a server: the machine that started this copy signs its storage
+    /// requests, and runs the build with this identity.
+    #[arg(skip)]
+    pub(crate) storage_signing: Option<String>,
     /// Syq extension: skip paths matching a gitignore-style PATTERN (repeatable). Skipping a
     /// directory skips its whole subtree, so to copy only *.jpg use: --syq-ignore '*'
     /// --syq-ignore '!*/' --syq-ignore '!*.jpg'
@@ -2637,19 +2641,30 @@ fn parse_native_copy_with(argv: &[OsString], sources: SourceProbe) -> Result<Arg
         .as_deref()
         .filter(|s| s.starts_with("s3://"))
         .map(str::to_owned);
-    let s3_options = crate::s3::Options::parse(s3, s3_from.as_deref(), s3_to.as_deref(), &matches)?;
+    // The other endpoint of a copy with one S3 endpoint: an SSH server, which
+    // then runs the copy while this machine signs its storage requests.
+    let s3_server = [
+        (s3_from.is_none(), copy.selection.from.as_deref()),
+        (s3_to.is_none(), copy.to.as_deref()),
+    ]
+    .into_iter()
+    .find_map(|(other, endpoint)| endpoint.filter(|_| other))
+    .filter(|_| s3_from.is_some() || s3_to.is_some());
+    if let Some(name) = s3_server.and_then(|endpoint| endpoint.strip_prefix('@')) {
+        bail!("S3 copies cannot use receiving machine @{name}; run syq on that machine to copy between it and the bucket");
+    }
+    let s3_options = crate::s3::Options::parse_between(
+        s3,
+        s3_from.as_deref(),
+        s3_to.as_deref(),
+        &matches,
+        s3_server.is_some(),
+    )?;
     if s3_options.is_some() {
-        let other = [
-            (s3_from.is_none(), copy.selection.from.as_deref()),
-            (s3_to.is_none(), copy.to.as_deref()),
-        ]
-        .into_iter()
-        .find_map(|(other, endpoint)| endpoint.filter(|_| other));
-        if let Some(endpoint) = other {
-            if let Some(name) = endpoint.strip_prefix('@') {
-                bail!("S3 copies cannot use receiving machine @{name}; run syq on that machine to copy between it and the bucket");
+        if s3_server.is_some() {
+            if copy.mapping.is_some() || copy.stream_mapping_fd.is_some() {
+                bail!("--mapping and --stream-mapping-fd are not supported for copies between an SSH server and S3; run syq on the server for those");
             }
-            bail!("S3 copies with an SSH endpoint are not supported; run syq on the machine holding the files");
         }
         if s3_from.is_some() {
             copy.selection.from = None;
@@ -3417,6 +3432,9 @@ fn apply_internal_native_direct(args: &mut Args) -> Result<()> {
         args.max_delete_from_approver |=
             utf8(crate::remote_to_remote::MAX_DELETE_FROM_APPROVER)?.as_deref() == Some("1");
     }
+    if args.delegated {
+        args.storage_signing = utf8(crate::s3::authorization::started::SIGNING_ENV)?;
+    }
     args.requester_stdin = utf8(crate::remote_to_remote::REQUESTER_STDIN)?
         .map(|bytes| {
             bytes
@@ -3919,6 +3937,14 @@ impl Location {
 
     pub fn is_remote(&self) -> bool {
         self.host.is_some()
+    }
+
+    /// Whether this names a host reached over SSH, rather than a receiving
+    /// machine (`@NAME`) or a bucket.
+    pub(crate) fn is_ssh_server(&self) -> bool {
+        self.host
+            .as_deref()
+            .is_some_and(|host| !host.starts_with('@') && !host.starts_with("s3://"))
     }
 
     /// rsync trailing-slash semantics: "copy the contents" rather than the dir.

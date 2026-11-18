@@ -9,6 +9,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+pub(crate) mod started;
 mod transport;
 pub(super) use transport::{http_client, signed_header};
 
@@ -650,6 +651,13 @@ pub(crate) struct Authorization {
     pub configuration: Configuration,
     pub bucket: String,
     state: Mutex<State>,
+    /// The machine that started this copy over SSH signs for it, rather
+    /// than a receiving machine that approved it.
+    started_elsewhere: bool,
+    /// Whether the storage service has answered a request, and whether one
+    /// sent to it got no answer.
+    answered: std::sync::atomic::AtomicBool,
+    unanswered: std::sync::atomic::AtomicBool,
 }
 impl std::fmt::Debug for Authorization {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -671,7 +679,45 @@ impl Authorization {
                 connection: Some(connection),
                 requests: BTreeMap::new(),
             }),
+            started_elsewhere: false,
+            answered: Default::default(),
+            unanswered: Default::default(),
         }
+    }
+    /// Whether the machine that started this copy signs for it.
+    pub(crate) fn started_elsewhere(&self) -> bool {
+        self.started_elsewhere
+    }
+    fn signer(&self) -> &'static str {
+        if self.started_elsewhere {
+            "the machine that started this copy"
+        } else {
+            "authorizing machine"
+        }
+    }
+    fn expired(&self) -> anyhow::Error {
+        if self.started_elsewhere {
+            anyhow::anyhow!(
+                "the signed storage URLs for this copy have expired; they last at most {} hours. Run the copy again to continue it",
+                started::LIFETIME / 3600
+            )
+        } else {
+            anyhow::anyhow!("storage authorization expired; rerun the copy for fresh approval")
+        }
+    }
+    pub(super) fn record_answer(&self, answered: bool) {
+        let flag = if answered {
+            &self.answered
+        } else {
+            &self.unanswered
+        };
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// Whether requests were sent to the storage service and none of them
+    /// was ever answered.
+    pub(crate) fn never_answered(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.unanswered.load(Relaxed) && !self.answered.load(Relaxed)
     }
     pub(super) fn authorize(&self, requests: Vec<Unsigned>) -> Result<()> {
         let mut state = self.state.lock().unwrap();
@@ -682,8 +728,17 @@ impl Authorization {
         if missing.is_empty() {
             return Ok(());
         }
-        let stream = state.connection.as_mut().with_context(|| format!("request {request:?} was not prepared before storage authorization disconnected; rerun for fresh approval", request = missing[0]))?;
-        let signed = crate::destination::storage::sign(stream, &missing)?;
+        let signer = self.signer();
+        let started_elsewhere = self.started_elsewhere;
+        let stream = state.connection.as_mut().with_context(|| {
+            let request = &missing[0];
+            if started_elsewhere {
+                format!("request {request:?} was not signed before the copy started moving data; run the copy again")
+            } else {
+                format!("request {request:?} was not prepared before storage authorization disconnected; rerun for fresh approval")
+            }
+        })?;
+        let signed = crate::destination::storage::sign(stream, &missing, signer)?;
         anyhow::ensure!(
             signed.len() == missing.len(),
             "incomplete storage authorization response"
@@ -692,10 +747,9 @@ impl Authorization {
         Ok(())
     }
     pub(super) fn signed(&self, request: Unsigned) -> Result<String> {
-        anyhow::ensure!(
-            now()? < self.configuration.expires_at,
-            "storage authorization expired; rerun the copy for fresh approval"
-        );
+        if now()? >= self.configuration.expires_at {
+            return Err(self.expired());
+        }
         if request.method == "PUT" {
             let mut streaming = request.clone();
             streaming.headers.remove("content-md5");
@@ -712,6 +766,11 @@ impl Authorization {
             .fmt(aws_smithy_types::date_time::Format::DateTime)?;
         let authorization = self.clone();
         tokio::task::spawn_blocking(move || authorization.finish_preparation()).await??;
+        if self.started_elsewhere {
+            // That machine stays connected for the whole copy, and losing it
+            // stops the copy, so there is nothing to tell anyone.
+            return Ok(());
+        }
         crate::output::diagnostic!("syq: storage authorization ready; the authorizing machine may disconnect. Authorization expires at {deadline}; provider policies or credential revocation may shorten it.");
         Ok(())
     }

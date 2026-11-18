@@ -20,6 +20,7 @@ impl HttpConnector for Connector {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
         let inner = self.inner.clone();
         let authorization = self.authorization.clone();
+        let authorization_for_answer = self.authorization.clone();
         // Every failure before the request is sent is local: the request does
         // not fit the authorization, or the authorization has expired or was
         // refused. Sending it again cannot succeed.
@@ -68,6 +69,8 @@ impl HttpConnector for Connector {
                         .map_err(|_| failure("invalid authorized storage request"))?,
                 )
                 .await
+                .inspect(|_| authorization_for_answer.record_answer(true))
+                .inspect_err(|_| authorization_for_answer.record_answer(false))
                 .map_err(redaction::connector_error)
         })
     }
