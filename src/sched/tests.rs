@@ -1010,16 +1010,29 @@ impl HoldingWorkers {
         workers
     }
 
-    /// Every worker is asleep waiting for work.
+    /// Every worker is asleep waiting for work, with no wakeup on its way.
+    /// A worker counts as waiting from the moment it is woken until it
+    /// runs, and one that ran late would take a file queued meanwhile. So
+    /// once all of them wait, wake them all and see each begin waiting
+    /// again.
     fn wait_until_all_wait(&self) {
+        let workers = self.threads.len();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while self.sched.inner.lock().unwrap().waiting_workers < self.threads.len() {
+        let wait_for = |settled: &dyn Fn(&Inner) -> bool| loop {
+            let inner = self.sched.inner.lock().unwrap();
+            if settled(&inner) {
+                break inner.waits;
+            }
+            drop(inner);
             assert!(
                 std::time::Instant::now() < deadline,
                 "workers did not return to waiting for work"
             );
             std::thread::sleep(Duration::from_millis(1));
-        }
+        };
+        let waits = wait_for(&|inner| inner.waiting_workers == workers);
+        self.sched.cv.notify_all();
+        wait_for(&|inner| inner.waiting_workers == workers && inner.waits >= waits + workers);
     }
 
     /// The files the workers take, which must be exactly `expected`.
@@ -1166,13 +1179,14 @@ fn a_burst_keeps_the_start_gate_and_yields_to_release_scan_end_and_abort() {
     waiting.expect_taken(vec![3], "file returned unstarted");
     waiting.wait_until_all_wait();
 
-    // The scan's end wakes workers for a burst it finds open.
-    sched.push_file(burst_job(4));
-    waiting.expect_none_taken("burst still open");
+    // The scan's end wakes workers for a burst it finds open. Finishing
+    // the earlier files wakes them too, so that comes first.
     for index in 0..4 {
         sched.ranges_ready(index, Vec::new());
     }
     waiting.wait_until_all_wait();
+    sched.push_file(burst_job(4));
+    waiting.expect_none_taken("burst still open");
     sched.scan_done();
     waiting.expect_taken(vec![4], "scan ended during a burst");
     drop(burst);
@@ -1196,6 +1210,39 @@ fn a_burst_keeps_the_start_gate_and_yields_to_release_scan_end_and_abort() {
 }
 
 #[test]
+fn planning_that_waits_inside_a_burst_announces_its_files_first() {
+    let sched = Arc::new(Sched::new(64, 128));
+    sched.release_preflighted_work();
+    let waiting = HoldingWorkers::start(&sched, 3);
+    let burst = sched.file_burst();
+    sched.push_file(burst_job(0));
+    sched.push_file(burst_job(1));
+    waiting.expect_none_taken("burst open");
+    // Planning is about to wait for a reply.
+    sched.announce_queued_files();
+    waiting.expect_taken(vec![0, 1], "files announced inside a burst");
+    waiting.wait_until_all_wait();
+    // The burst goes on.
+    sched.push_file(burst_job(2));
+    waiting.expect_none_taken("burst still open");
+    drop(burst);
+    waiting.expect_taken(vec![2], "burst ended");
+
+    // Before work is released, announcing starts nothing.
+    let unreleased = Arc::new(Sched::new(64, 128));
+    let held = HoldingWorkers::start(&unreleased, 2);
+    let burst = unreleased.file_burst();
+    unreleased.push_file(burst_job(0));
+    unreleased.announce_queued_files();
+    held.expect_none_taken("announced before work was released");
+    drop(burst);
+    unreleased.release_preflighted_work();
+    held.expect_taken(vec![0], "work released");
+    held.finish(1);
+    waiting.finish(3);
+}
+
+#[test]
 fn waiting_workers_divide_a_burst_into_whole_batches() {
     // Four workers wait while planning queues forty small files. Woken for
     // each file, the first would take a batch of the one or two queued by
@@ -1206,17 +1253,24 @@ fn waiting_workers_divide_a_burst_into_whole_batches() {
     sched.release_preflighted_work();
     let (tx, batches) = std::sync::mpsc::channel();
     let hold = Arc::new(std::sync::Barrier::new(workers + 1));
+    // A worker sizes its batch and takes it in two steps. Another sizing
+    // its own between them would count files the first is about to take;
+    // this test is about when the workers are woken, so keep them apart.
+    let claiming = Arc::new(Mutex::new(()));
     let threads: Vec<_> = (0..workers)
         .map(|_| {
             let sched = sched.clone();
             let tx = tx.clone();
             let hold = hold.clone();
+            let claiming = claiming.clone();
             std::thread::spawn(move || {
                 let Item::File(first) = sched.next() else {
                     panic!("expected a file");
                 };
+                let claim = claiming.lock().unwrap();
                 let target = sched.begin_fast_batch(workers, 2048);
                 let more = sched.take_small_near(first, 4096, target - 1, u64::MAX);
+                drop(claim);
                 sched.mark_fast(more.len());
                 tx.send(1 + more.len()).unwrap();
                 // Hold the batch until every worker has taken one.

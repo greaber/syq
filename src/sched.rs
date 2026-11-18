@@ -632,6 +632,9 @@ struct Inner {
     probing: usize,
     /// Workers asleep in `next`, including notified peers until they reacquire the lock.
     waiting_workers: usize,
+    /// How many times a worker has begun waiting in `next`.
+    #[cfg(test)]
+    waits: usize,
     /// Files owned by the pipelined small-file path. Unlike ordinary probes,
     /// these will not expose ranges another worker can steal.
     fast_probing: usize,
@@ -738,6 +741,8 @@ impl Sched {
                 failed: HashSet::new(),
                 probing: 0,
                 waiting_workers: 0,
+                #[cfg(test)]
+                waits: 0,
                 fast_probing: 0,
                 fast_batches: 0,
                 fast_groups: Vec::new(),
@@ -815,13 +820,21 @@ impl Sched {
     /// would take the few files queued at that moment as a batch of its own.
     /// Workers that are not waiting take the files as they are queued.
     ///
-    /// A burst must not span anything planning waits on, such as a request
-    /// to either end: until it ends, its files have only the workers that
-    /// were already busy.
+    /// Until a burst ends, its files have only the workers that were already
+    /// busy, so it covers planning that waits on nothing. Planning that has
+    /// to wait inside one, as for a reply from the destination, calls
+    /// `announce_queued_files` first.
     #[must_use = "the burst ends, and wakes workers, when this is dropped"]
     pub fn file_burst(&self) -> FileBurst<'_> {
         self.inner.lock().unwrap().bursts += 1;
         FileBurst { sched: self }
+    }
+
+    /// Wake workers for the files queued so far, inside a burst too.
+    /// Planning calls this before it waits on anything while a burst may be
+    /// open, so that the files it has queued do not wait as well.
+    pub fn announce_queued_files(&self) {
+        self.wake_for_queued_files(self.inner.lock().unwrap());
     }
 
     /// Wake a waiting worker for each queued file, and all of them when
@@ -1347,6 +1360,10 @@ impl Sched {
                 return None;
             }
             g.waiting_workers += 1;
+            #[cfg(test)]
+            {
+                g.waits += 1;
+            }
             g = self.cv.wait(g).unwrap();
             g.waiting_workers -= 1;
         }

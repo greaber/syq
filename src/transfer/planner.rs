@@ -1902,8 +1902,11 @@ impl Planner<'_> {
     }
 
     /// Plan leaves whose directories exist, queuing their files as one
-    /// burst: planning them waits on nothing, so the workers waiting for
-    /// work are woken once for all of them (`Sched::file_burst`).
+    /// burst, so that the workers waiting for work are woken once for all
+    /// of them (`Sched::file_burst`). Planning a leaf waits on nothing but
+    /// a few questions about ownership, which announce the queued files
+    /// first (`announce_before_asking`); anything else that waits here must
+    /// do the same.
     fn plan_leaves(
         &mut self,
         leaves: impl IntoIterator<Item = (Planned, Option<Entry>)>,
@@ -5062,7 +5065,18 @@ impl Planner<'_> {
 
     /// The receiving account's user ID, asked once.
     fn receiver_uid(&mut self) -> Result<u32> {
+        self.announce_before_asking(self.receiver_uid.is_none());
         receiver_uid(&mut *self.dst, &mut self.receiver_uid)
+    }
+
+    /// Deciding about a leaf is about to wait for the destination's answer,
+    /// when `asking`. That can happen while the leaf's files are queued as a
+    /// burst (`plan_leaves`): the files queued so far get their workers
+    /// first, rather than wait for the reply too.
+    fn announce_before_asking(&self, asking: bool) {
+        if asking {
+            self.sched.announce_queued_files();
+        }
     }
 
     /// Whether the existing file `destination` must be replaced rather than
@@ -5286,6 +5300,7 @@ impl Planner<'_> {
     /// letting the receiver create anything anyone could see.
     fn new_file_owner(&mut self, dst: &[u8]) -> Option<crate::proto::NewFileOwner> {
         if self.new_file_owner.is_none() {
+            self.announce_before_asking(true);
             let directory = dst
                 .iter()
                 .rposition(|&c| c == b'/')
@@ -5322,6 +5337,7 @@ impl Planner<'_> {
         let directory = match self.parent_groups.get(&parent) {
             Some(directory) => *directory,
             None => {
+                self.announce_before_asking(true);
                 let directory = self
                     .stat_many(vec![parent.clone()])
                     .ok()
