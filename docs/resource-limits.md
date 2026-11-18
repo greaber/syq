@@ -11,7 +11,7 @@ Supply comma-separated `KEY=VALUE` pairs:
 |---|---|---|
 | `bandwidth` | `0` (unlimited) | Aggregate byte rate across the copy's workers; what is counted depends on the route |
 | `workers` | Automatic | Ceiling of 1–65536 filesystem copy-worker slots |
-| `s3-requests` | Automatic | Ceiling of 1–65536 simultaneous S3 data requests across objects; excludes idle sockets and metadata requests, apart from the [extra checks of unchanged objects](tuning.md#s3-copies) |
+| `s3-requests` | Automatic | Ceiling of 1–65536 simultaneous S3 data requests across objects; excludes idle sockets and metadata requests, apart from each object's own metadata requests in a copy between buckets and the [extra checks of unchanged objects](tuning.md#s3-copies) |
 | `s3-objects` | Automatic | Ceiling of 1–65536 S3 objects in progress, including preparation and finalization |
 | `s3-parts-per-object` | Automatic | Ceiling of 1–1024 simultaneous parts or ranges per S3 object |
 
