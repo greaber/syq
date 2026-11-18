@@ -26,6 +26,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use crate::delegation::{CopyOperation, DestinationPlacement, GrantConstraints};
+use crate::lock_file::LockFile;
 use crate::private_broker::{BrokerDirectory, PrivateBroker, PrivateBrokerConfig, TrackedStream};
 
 pub(crate) mod account_copy;
@@ -2314,14 +2315,7 @@ fn register_inner(
         bail!("receiving laptop handshake failed");
     }
     let directory = registry()?;
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(directory.join(format!("{name}.lock")))?;
+    let lock = LockFile::open(&directory.join(format!("{name}.lock")), true)?;
     // A registration that takes over proves the receiver while the service
     // it replaces still receives, and checks the name's owner again once it
     // holds the name.
@@ -2336,7 +2330,7 @@ fn register_inner(
         if !take_name(&lock, libc::STDIN_FILENO, TAKE_OVER_WAIT)? {
             return Ok(0);
         }
-    } else if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    } else if !lock.try_exclusive().unwrap_or(false) {
         // A responsive holder is a duplicate, even when a copied home directory
         // gives both machines the same identity. Never replace a held lock.
         if read_registration(name).is_ok_and(|previous| {
@@ -2412,7 +2406,7 @@ fn register_inner(
 /// name's `lock` as soon as the registration holding it ends, each within
 /// `wait`. False when the laptop gave up first, closing `input`; one that
 /// waited too long is tried again by the laptop (`RECONNECT_PENDING`).
-fn take_name(lock: &fs::File, input: RawFd, wait: Duration) -> Result<bool> {
+fn take_name(lock: &LockFile, input: RawFd, wait: Duration) -> Result<bool> {
     let timed_out = |what: &str| {
         Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
             .with_context(|| format!("the receiving service did not {what} in time"))
@@ -2451,18 +2445,10 @@ fn take_name(lock: &fs::File, input: RawFd, wait: Duration) -> Result<bool> {
     // A thread waits for the lock, so that the name is taken the moment
     // it is free. Should this give up first, the thread's lock ends with its
     // copy of the descriptor.
-    let waiter = lock.try_clone()?;
+    let waiter = lock.file().try_clone()?;
     let (taken, taking) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = loop {
-            if unsafe { libc::flock(waiter.as_raw_fd(), libc::LOCK_EX) } == 0 {
-                break Ok(());
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::Interrupted {
-                break Err(error);
-            }
-        };
+        let result = crate::lock_file::flock(&waiter, libc::LOCK_EX);
         // The lock belongs to the open file both descriptors share, so
         // `lock` keeps it. Closing this copy first means the name is free
         // again as soon as the caller drops `lock`.
@@ -2574,15 +2560,8 @@ fn destinations(action: DestinationAction) -> Result<i32> {
         DestinationAction::Forget { name } => {
             validate_name(&name)?;
             let directory = registry()?;
-            let lock = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(directory.join(format!("{name}.lock")))?;
-            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let lock = LockFile::open(&directory.join(format!("{name}.lock")), true)?;
+            if !lock.try_exclusive().unwrap_or(false) {
                 bail!("destination @{name} is still registered; stop its receiver first");
             }
             identity::forget(&directory, &name)?;
