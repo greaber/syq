@@ -2197,7 +2197,7 @@ impl Planner<'_> {
 
     /// A dry run's account of a regular file the copy would write: it is
     /// missing, of another kind, or not known to match, or `replace` says it
-    /// matches but would be replaced for its metadata.
+    /// matches but would be replaced (`must_replace`).
     pub(super) fn preview_changed_file(
         &mut self,
         (dst_path, dst_rel): (&[u8], &[u8]),
