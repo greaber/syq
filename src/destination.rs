@@ -1081,7 +1081,10 @@ fn select_copy(
     }
     let destination = args.locations.last().and_then(|l| l.host.as_deref());
     let name = match (route, destination) {
-        (Route::ToNamed, Some(host)) => host.strip_prefix('@').unwrap_or(host).to_owned(),
+        (Route::ToNamed, Some(host)) => host
+            .strip_prefix('@')
+            .expect("a named destination")
+            .to_owned(),
         (_, None) => return Ok(None),
         (_, Some(_)) => {
             if handoff::selected_name(handoff::Kind::Copy).is_some() {

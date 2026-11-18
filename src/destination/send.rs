@@ -34,6 +34,10 @@ pub(crate) fn source_name(args: &crate::cli::Args) -> Option<&str> {
 /// that its endpoints can be one. Parsing checks this, so a receiving name
 /// never reaches ssh.
 pub(crate) fn check_endpoints(args: &crate::cli::Args) -> Result<String> {
+    anyhow::ensure!(
+        crate::route::classify(args) == crate::route::Route::FromNamed,
+        "copy source is not a receiving machine"
+    );
     let name = source_name(args).context("copy source is not a receiving machine")?;
     let (destination, sources) = args
         .locations

@@ -62,7 +62,7 @@ pub(crate) fn classify(args: &Args) -> Route {
 
 /// A command option a route can refuse.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum Opt {
+enum Opt {
     Rsh,
     SyqPath,
     NoBootstrap,
@@ -97,13 +97,13 @@ const AUTO: &[CoordinateAt] = &[CoordinateAt::Auto];
 const AUTO_OR_SOURCE: &[CoordinateAt] = &[CoordinateAt::Auto, CoordinateAt::Src];
 
 /// The options a route refuses, and the one message that refuses them.
-pub(crate) struct Refusal {
-    pub(crate) options: &'static [Opt],
-    pub(crate) message: &'static str,
+struct Refusal {
+    options: &'static [Opt],
+    message: &'static str,
 }
 
 /// What each approved route refuses. `Own` refuses nothing here.
-pub(crate) fn refusal(route: Route) -> Option<Refusal> {
+fn refusal(route: Route) -> Option<Refusal> {
     use Opt::*;
     let (options, message): (&'static [Opt], _) = match route {
         Route::Own => return None,
