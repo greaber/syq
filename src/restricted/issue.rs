@@ -242,7 +242,8 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
 pub(crate) enum EnrollmentState {
     /// There is none: the first copy sets it up.
     Missing,
-    /// It is for another build, or a refresh did not finish: the next copy
+    /// It is for another build, a refresh did not finish, or its receiver
+    /// was found to run another build: the next copy
     /// updates syq on the server and rewrites its `authorized_keys` line.
     Outdated,
     Ready,

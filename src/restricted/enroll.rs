@@ -11,13 +11,16 @@ pub(super) fn local_state_base() -> Result<PathBuf> {
 
 pub(super) const ENROLLMENT_FILE: &str = "enrollment.json";
 pub(super) const PENDING_FILE: &str = "pending.json";
-/// Present while a refresh of an active enrollment has not been confirmed.
-/// The server may have applied it, as when the reply was lost, so the next
-/// copy logs in to finish it even if the recorded key can still sign.
+/// Present while a refresh of an active enrollment has not been confirmed,
+/// or once its receiver refused a copy for running another build than the
+/// record says. The server may have applied the refresh, as when the reply
+/// was lost, or another build may have updated it, so the next copy logs in
+/// to refresh it even if the recorded key can still sign.
 pub(super) const REFRESH_FILE: &str = "refreshing";
 
 /// Whether an active enrollment must log in again before a copy uses it:
-/// it runs another build, or a refresh of it was never confirmed.
+/// it runs another build, or a refresh of it was never confirmed, or its
+/// receiver was found to run another build than the record says.
 pub(super) fn needs_refresh(metadata: &LocalEnrollment, directory: &Path) -> bool {
     metadata.release != crate::identity::build() || directory.join(REFRESH_FILE).exists()
 }

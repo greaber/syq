@@ -1683,8 +1683,7 @@ fn a_directive_is_recorded_only_after_every_check_passes() {
 
     config.signer = delegation::TrustedSigner::new(login.public_key(), None, None).unwrap();
     // A copy approved before this server recreated its record of the
-    // directives that ran, as a refused copy signed again is, may have run
-    // against the record that was lost.
+    // directives that ran may have run against the record that was lost.
     let issued = crate::directive::Signed::decode(&valid)
         .unwrap()
         .directive
