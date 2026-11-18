@@ -15,7 +15,7 @@ import tempfile
 import time
 
 PROGRESS_SECONDS = 3
-POLL_SECONDS = 0.05
+POLL_SECONDS = 0.1
 
 
 def run(*args, stdin=None, success=True, env=None, timeout=60, text=True):
@@ -38,16 +38,14 @@ def wait_for(description, observe, timeout, *, done=bool, details=None):
     deadline it fails with that state, followed by `details()` if given."""
     deadline = time.monotonic() + timeout
     progress = time.monotonic() + PROGRESS_SECONDS
-    while True:
+    state = None
+    while time.monotonic() < deadline:
         state = observe()
         if done(state):
             return state
-        now = time.monotonic()
-        if now >= deadline:
-            break
-        if now >= progress:
+        if time.monotonic() >= progress:
             print(f"Waiting for {description}; last state: {state!r}", flush=True)
-            progress = now + PROGRESS_SECONDS
+            progress = time.monotonic() + PROGRESS_SECONDS
         time.sleep(POLL_SECONDS)
     message = f"timed out after {timeout}s waiting for {description}; last state: {state!r}"
     if details is not None:
