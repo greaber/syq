@@ -42,7 +42,7 @@ import subprocess
 import sys
 
 from dispatched_checks import (BRANCH_WORKFLOWS, acknowledgement_reason, apply_resolutions,
-                               branch_dispatched_runs, branch_runs, check_results,
+                               branch_runs, check_results, fetch_branch_runs,
                                dispatched_runs, failed_checks, fetch_commit_statuses, fetch_jobs,
                                fetch_resolutions, in_parallel, merged_pull_requests,
                                post_acknowledgement, read_acknowledgement, result_lines,
@@ -226,7 +226,7 @@ def report(json_report, check):
     # directly rather than from the recent merges shared with other branches.
     lookups = [lambda: open_pull_request(branch) if branch != "HEAD" else None,
                lambda: merged_pull_requests(REPOSITORY),
-               lambda: branch_dispatched_runs(REPOSITORY, branch) if branch != "HEAD" else []]
+               lambda: fetch_branch_runs(REPOSITORY, branch) if branch != "HEAD" else ([], [])]
     lookups += [lambda workflow=workflow, event=event: master_run(workflow, event)
                 for workflow in WORKFLOWS for event in ("push", "schedule")]
     lookups += [lambda workflow=workflow: dispatched_runs(REPOSITORY, workflow)
@@ -234,12 +234,12 @@ def report(json_report, check):
     results = in_parallel(lookups)
     # The recent runs on every branch can crowd out this branch's older ones,
     # which are looked up directly.
-    pr, merged, own_runs = results[:3]
+    pr, merged, (own_merged, own_branch_runs) = results[:3]
     latest_runs = results[3:3 + 2 * len(WORKFLOWS)]
     annotate_master_runs(latest_runs)
     latest = iter(latest_runs)
     runs = {run.get("databaseId"): run for workflow_runs in results[3 + 2 * len(WORKFLOWS):]
-            + [own_runs] for run in workflow_runs}
+            + [own_branch_runs] for run in workflow_runs}
     runs = list(runs.values())
     master_runs = []
     for workflow in WORKFLOWS:
@@ -267,6 +267,7 @@ def report(json_report, check):
     # Failed dispatched checks on this branch, and those merged branches left behind.
     # A merged branch needs its jobs read only while its failing workflows have
     # had no full run on master since the merge.
+    own_runs = branch_runs(runs, branch, own_merged) if branch != "HEAD" else []
     merged_runs = [(merged_pr, branch_runs(runs, merged_pr.get("headRefName"), merged,
                                            merged_pr.get("mergedAt") or ""))
                    for merged_pr in merged]

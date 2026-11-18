@@ -80,15 +80,21 @@ def branch_runs(runs, branch, merged, until=None):
             and since < (run.get("createdAt") or "") and (until is None or run["createdAt"] <= until)]
 
 
+def fetch_branch_runs(repository, branch):
+    """The merged pull requests from a branch name and every recent dispatched
+    run on that branch, before any merge filtering."""
+    found = in_parallel([lambda: merged_from_branch(repository, branch)] + [
+        lambda workflow=workflow: dispatched_runs(repository, workflow, branch)
+        for workflow in BRANCH_WORKFLOWS])
+    return found[0], [run for workflow_runs in found[1:] for run in workflow_runs]
+
+
 def branch_dispatched_runs(repository, branch, until=None):
     """A branch's dispatched runs since an earlier pull request from the same
     branch name merged, and up to `until` (a merge time) when given. Branch
     names get reused, so earlier merges are looked up by name."""
-    found = in_parallel([lambda: merged_from_branch(repository, branch)] + [
-        lambda workflow=workflow: dispatched_runs(repository, workflow, branch)
-        for workflow in BRANCH_WORKFLOWS])
-    return branch_runs([run for workflow_runs in found[1:] for run in workflow_runs],
-                       branch, found[0], until)
+    merged, runs = fetch_branch_runs(repository, branch)
+    return branch_runs(runs, branch, merged, until)
 
 
 def fetch_jobs(repository, runs):
@@ -160,7 +166,7 @@ def acknowledgement_reason(parser, reason, link, link_option, link_required):
     reason = (reason or "").strip()
     if not 1 <= len(reason) <= 140 or any(c in reason for c in "\r\n"):
         parser.error("--reason must be one line of 1–140 characters")
-    if (link is not None or link_required) and (
+    if (link or link_required) and (
             not link or not link.startswith("https://") or any(c.isspace() for c in link)):
         parser.error(f"{link_option} requires an HTTPS URL")
     return reason

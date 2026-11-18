@@ -67,7 +67,7 @@ def check_release(tag):
     os.chdir(root.stdout.strip())
     check = ReleaseCheck(tag)
     for issue in check.issues():
-        raise ToolError(issue["message"])
+        raise ToolError(f"{issue['message']}\nNext: {issue['next_action']}")
     for workflow in check.certification["workflows"]:
         print(f"Full release CI: {workflow['workflow']} certified at {workflow['evidence_commit']}",
               flush=True)

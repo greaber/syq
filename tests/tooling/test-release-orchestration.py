@@ -729,7 +729,7 @@ class PreflightTests(Scratch):
         option_scripts.mkdir()
         shutil.copy(SCRIPTS / "release-preflight.py", option_scripts)
         for name in ["release_checks.py", "verify-release-ci.py", "release_test_inputs.py",
-                     "tooling.py", "check-python-api-sync.py"]:
+                     "tooling.py"]:
             (option_scripts / name).symlink_to(SCRIPTS / name)
         for options in ["", 'namespaces="git"', 'namespaces="git, file",valid-before="20990101"']:
             with self.subTest(options=options):
@@ -759,6 +759,20 @@ class PreflightTests(Scratch):
         self.assertEqual(status, 1, report)
         self.assertEqual([item["message"] for item in report["missing"]],
                          [f"required check conformance is missing on certified commit {self.head}"])
+
+    def test_api_follow_ups_are_read_from_the_checked_repository(self):
+        # The candidate's own inventory decides, not that of the scripts' checkout.
+        (self.repo / "sdk/python/native-api.json").write_text(
+            '{"schema":1,"commands":{"copy":{"sdk":"supported","follow_up":["example"]}}}\n')
+        self.git(self.repo, "commit", "-qam", "pending follow-up")
+        candidate = self.git(self.repo, "rev-parse", "HEAD")
+        self.git(self.repo, "update-ref", "refs/remotes/origin/master", candidate)
+        env = {"SYQ_TEST_PREFLIGHT_HEAD": candidate}
+        self.assertFails(self.preflight(**env), "syq copy: Python SDK follow-up required")
+        status, report = self.readiness(**env)
+        self.assertEqual(status, 1, report)
+        self.assertTrue(any("Python native API synchronization failed" in item["message"]
+                            for item in report["missing"]))
 
     def test_branch_names_do_not_define_the_candidate(self):
         # Branch names and the coordination branch tip do not define the candidate.

@@ -37,9 +37,12 @@ def release_ci(repository, commit):
     sys.stdout.flush()
     ci = subprocess.run([str(SCRIPTS / "verify-release-ci.py"), "--json", repository, commit],
                         stdout=subprocess.PIPE, text=True)
-    if ci.returncode not in (0, 1):
-        raise ToolError(f"release CI inspection failed with exit status {ci.returncode}")
-    return json.loads(ci.stdout)
+    try:
+        if ci.returncode in (0, 1):
+            return json.loads(ci.stdout)
+    except ValueError:
+        pass
+    raise ToolError(f"release CI inspection failed with exit status {ci.returncode}")
 
 
 def failed_checks(repository, commit, checks, certification=None):
@@ -111,7 +114,8 @@ def ssh_evidence():
 
 
 class ReleaseCheck:
-    """The release preconditions for a tag at the current checkout's HEAD.
+    """The release preconditions for a tag at HEAD of the checkout at the
+    current directory, which must be its top level.
     `issues()` fills in what it inspected as it goes: `commit`,
     `remote_master`, `ssh`, and the CI `certification` report."""
 
@@ -174,7 +178,8 @@ class ReleaseCheck:
         if not notes.is_file() or not notes.read_text().strip():
             yield issue(f"curated release notes are missing: {notes}",
                         f"Write {notes} and merge them with the version change.")
-        api = subprocess.run([sys.executable, str(SCRIPTS / "check-python-api-sync.py")],
+        # The checked repository's own inventory, wherever these scripts live.
+        api = subprocess.run([sys.executable, "scripts/check-python-api-sync.py"],
                              capture_output=True, text=True)
         if api.returncode:
             yield issue("Python native API synchronization failed: "
