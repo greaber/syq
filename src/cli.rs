@@ -2661,10 +2661,8 @@ fn parse_native_copy_with(argv: &[OsString], sources: SourceProbe) -> Result<Arg
         s3_server.is_some(),
     )?;
     if s3_options.is_some() {
-        if s3_server.is_some() {
-            if copy.mapping.is_some() || copy.stream_mapping_fd.is_some() {
-                bail!("--mapping and --stream-mapping-fd are not supported for copies between an SSH server and S3; run syq on the server for those");
-            }
+        if s3_server.is_some() && (copy.mapping.is_some() || copy.stream_mapping_fd.is_some()) {
+            bail!("--mapping and --stream-mapping-fd are not supported for copies between an SSH server and S3; run syq on the server for those");
         }
         if s3_from.is_some() {
             copy.selection.from = None;
