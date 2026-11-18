@@ -13,7 +13,7 @@ lists every argument.
 
 ## Install
 
-The [syq package on PyPI](https://pypi.org/project/syq/) supports Python 3.13.4+
+The [syq package on PyPI](https://pypi.org/project/syq/) supports Python 3.10+
 on Linux and macOS:
 
 ```sh
