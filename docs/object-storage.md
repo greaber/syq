@@ -161,7 +161,8 @@ server keeps the records of interrupted uploads and downloads, and your
 machine signs again.
 
 Requests are signed before data starts moving and stay valid for 24 hours, or
-until your credentials expire if that is sooner. A copy that runs longer fails
+until your credentials expire if that is sooner, as temporary credentials
+often do within an hour; syq then says when. A copy that runs longer fails
 its remaining files; run it again to continue.
 
 These copies do not support `--detach`, `--auth-from`, `--mapping`,

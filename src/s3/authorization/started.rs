@@ -53,6 +53,25 @@ pub(crate) fn signer(request: Request) -> Result<Signer> {
         .context("prepare to sign the server's storage requests with this machine's credentials")
 }
 
+/// A time as messages show it.
+pub(crate) fn time(seconds: u64) -> String {
+    aws_smithy_types::DateTime::from_secs(seconds as i64)
+        .fmt(aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|_| format!("{seconds} seconds after 1970"))
+}
+
+/// What the starting machine says once when its credentials expire, and its
+/// signed URLs with them, well before [`LIFETIME`] is up.
+pub(crate) fn early_expiry_notice(configuration: &Configuration) -> Option<String> {
+    let full = now().ok()?.checked_add(LIFETIME)?;
+    (configuration.expires_at + 300 < full).then(|| {
+        format!(
+            "this machine's storage credentials expire at {}, and the URLs it signs for the server with them; a copy still running then fails its remaining files and can be run again to continue",
+            time(configuration.expires_at)
+        )
+    })
+}
+
 /// The command's headers as the opening message carries them.
 pub(crate) fn header_pairs(headers: &[crate::s3::Header]) -> Vec<(String, String)> {
     headers
@@ -408,6 +427,34 @@ mod tests {
         args.storage_signing = None;
         attach(&mut args).unwrap();
         assert!(args.storage_authorization.is_none());
+    }
+
+    #[test]
+    fn credentials_that_expire_early_are_announced_and_named_at_expiry() {
+        let mut signer = Signer::fixture(request(&command(UPLOAD)).unwrap());
+        signer.configuration.expires_at = now().unwrap() + LIFETIME;
+        assert_eq!(early_expiry_notice(&signer.configuration), None);
+        signer.configuration.expires_at = now().unwrap() + 3600;
+        let notice = early_expiry_notice(&signer.configuration).unwrap();
+        assert!(
+            notice.contains(&format!(
+                "credentials expire at {}",
+                time(signer.configuration.expires_at)
+            )),
+            "{notice}"
+        );
+        let (local, _remote) = UnixStream::pair().unwrap();
+        let mut authorization = Authorization::new("bucket".into(), signer.configuration, local);
+        authorization.started_elsewhere = true;
+        authorization.configuration.expires_at = 1;
+        let error = authorization
+            .signed(Unsigned::new("GET", "backups/dataset/a"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("expired at 1970-01-01T00:00:01Z") && error.contains("credentials"),
+            "{error}"
+        );
     }
 
     #[test]

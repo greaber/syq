@@ -2218,6 +2218,23 @@ mod storage_signing {
     }
 
     #[test]
+    fn signing_requests_outlive_a_results_failure_and_unreadable_ones_end_the_session() {
+        let (mut requests, to_signer) = UnixStream::pair().unwrap();
+        let mut relay = Relay::new(TOKEN, None, None, (false, false));
+        relay.storage = Some(to_signer);
+        // Results nobody asked for fail the results relay.
+        relay.line(format!("syq-results-{TOKEN}:{{}}").as_bytes());
+        assert!(relay.failure.is_some());
+        relay.line(format!("{}aGVsbG8", started::line_prefix(TOKEN)).as_bytes());
+        let mut received = [0; 5];
+        requests.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"hello");
+        // The signer sees the end of a session whose bytes cannot be read.
+        relay.line(format!("{}!", started::line_prefix(TOKEN)).as_bytes());
+        assert_eq!(requests.read(&mut received).unwrap(), 0);
+    }
+
+    #[test]
     fn losing_the_starting_machine_while_signing_fails_the_copy_and_stops_it() {
         let mut session = session(UPLOAD);
         session

@@ -698,7 +698,8 @@ impl Authorization {
     fn expired(&self) -> anyhow::Error {
         if self.started_elsewhere {
             anyhow::anyhow!(
-                "the signed storage URLs for this copy have expired; they last at most {} hours. Run the copy again to continue it",
+                "the signed storage URLs for this copy expired at {}; they last {} hours, or until the credentials that signed them expire if that is sooner. Run the copy again to continue it",
+                started::time(self.configuration.expires_at),
                 started::LIFETIME / 3600
             )
         } else {

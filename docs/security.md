@@ -594,8 +594,16 @@ differ:
   can delete only with `--prune` or `--prune-before`, and with `--dry-run` can
   only read. The server says which requests it needs, and your machine refuses
   to sign any outside those limits, which ends the copy.
+
+  The limits are whole paths, not the files the copy selects. An upload with
+  `--into backups` covers everything under `backups`, not only the sources
+  you named, and an upload with no placement option covers the whole bucket.
+  `--where`, `--ignore`, `--copy-if` and `--max-delete` shape what an honest
+  server does; they do not narrow what your machine will sign. Name a
+  destination directory used for nothing else when that matters.
 - **Shorter life.** The URLs last 24 hours, or until your credentials expire
-  if that is sooner, instead of up to seven days.
+  if that is sooner, instead of up to seven days. Syq says so when your
+  credentials expire first.
 - **Headers.** Values given with `--s3-header` and `--s3-write-header`, such as
   a customer-provided encryption key, are sent to the server because it makes
   the requests.

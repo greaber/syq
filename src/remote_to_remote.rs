@@ -134,6 +134,16 @@ impl Relay {
     }
 
     fn line(&mut self, line: &[u8]) {
+        // Signing requests go to the signer whatever became of the results:
+        // the server waits for an answer to each. If they cannot be passed
+        // on, the session ends, which stops the server's copy.
+        if let Some(bytes) = line.strip_prefix(self.storage_prefix.as_slice()) {
+            if let Err(error) = self.storage_bytes(bytes) {
+                self.storage = None;
+                self.failure.get_or_insert(error);
+            }
+            return;
+        }
         if self.failure.is_some() {
             return;
         }
@@ -141,8 +151,6 @@ impl Relay {
             self.coordinator_record(record)
         } else if let Some(frame) = line.strip_prefix(self.destination_prefix.as_slice()) {
             self.destination_frame(frame)
-        } else if let Some(bytes) = line.strip_prefix(self.storage_prefix.as_slice()) {
-            self.storage_bytes(bytes)
         } else {
             Ok(())
         };
@@ -2043,16 +2051,12 @@ fn run_remote(
     // while the SSH session starts.
     let signer = storage
         .map(|_| {
-            let signer = std::sync::Arc::new(StorageSigner {
-                request: crate::s3::authorization::started::request(args)?,
-                signer: std::sync::OnceLock::new(),
-            });
+            let request = crate::s3::authorization::started::request(args)?;
+            let signer = std::sync::Arc::new(StorageSigner::default());
             let prepared = signer.clone();
             std::thread::Builder::new()
                 .name("storage-signer".into())
-                .spawn(move || {
-                    prepared.get();
-                })
+                .spawn(move || prepared.prepare(request))
                 .context("start the storage signer")?;
             anyhow::Ok(signer)
         })
@@ -2579,6 +2583,8 @@ fn run_remote(
         )
     });
     let run = |mut relay: Option<Relay>| {
+        // Set once this attempt's SSH command has ended.
+        let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         // The signing session of this attempt: the relay hands the server's
         // requests to the signer, which answers on the server's input.
         let signing = signer
@@ -2593,6 +2599,7 @@ fn run_remote(
                 let options = storage.expect("a signer serves a storage copy");
                 Ok((
                     signer.clone(),
+                    ended.clone(),
                     requests,
                     crate::s3::authorization::started::header_pairs(&options.headers),
                     crate::s3::authorization::started::header_pairs(&options.write_headers),
@@ -2627,6 +2634,7 @@ fn run_remote(
             let entry_key = entry_key.clone();
             let directive = directive.clone();
             let sources = sources_input.clone();
+            let quiet = args.quiet;
             std::thread::spawn(move || {
                 // Named sources first, which the coordinator reads before it
                 // parses its arguments, then the entry key and the
@@ -2648,14 +2656,23 @@ fn run_remote(
                 // Without the marker the coordinator only stops following;
                 // failing to write it must not fail the copy.
                 let _ = stdin.write_all(&[REQUESTER_MARKER]);
-                let Some((signer, requests, headers, write_headers)) = signing else {
+                let Some((signer, ended, requests, headers, write_headers)) = signing else {
                     return Ok::<_, std::io::Error>(Some(stdin));
                 };
-                let Ok(signer) = signer.get() else {
+                // An SSH command that has already ended needs no signer:
+                // stop waiting for credentials that may take a while.
+                let Some(Ok(signer)) = signer.wait(&ended) else {
                     // Closing the coordinator's input stops it; this machine
                     // reports why once it has.
                     return Ok(None);
                 };
+                if !quiet {
+                    if let Some(notice) = crate::s3::authorization::started::early_expiry_notice(
+                        &signer.configuration,
+                    ) {
+                        crate::output::diagnostic!("syq: {notice}");
+                    }
+                }
                 let mut session = SigningSession {
                     requests,
                     replies: stdin,
@@ -2672,10 +2689,15 @@ fn run_remote(
                         "syq: refused to sign a storage request from the server: {refusal}"
                     ),
                     Ok(None) => {}
-                    Err(error) if crate::output::debug() => {
-                        crate::output::diagnostic!("syq: storage signing ended: {error:#}")
+                    // The session ended without an answer the server could
+                    // act on. Closing its input stops a copy still waiting
+                    // for one; a copy that already ended is unaffected.
+                    Err(error) => {
+                        if crate::output::debug() {
+                            crate::output::diagnostic!("syq: storage signing ended: {error:#}");
+                        }
+                        return Ok(None);
                     }
-                    Err(_) => {}
                 }
                 Ok(Some(session.replies))
             })
@@ -2688,9 +2710,9 @@ fn run_remote(
             }),
             (_, relay) => Ok(relay),
         };
-        let status = child
-            .wait()
-            .with_context(|| format!("wait for {:?}", rsh[0]))?;
+        let status = child.wait();
+        ended.store(true, std::sync::atomic::Ordering::Release);
+        let status = status.with_context(|| format!("wait for {:?}", rsh[0]))?;
         let written = input
             .map(|writer| {
                 writer
@@ -2699,7 +2721,7 @@ fn run_remote(
                     .and_then(|written| written.map_err(anyhow::Error::from))
             })
             .transpose();
-        if let Some(Err(error)) = signer.as_ref().map(|signer| signer.get()) {
+        if let Some(Err(error)) = signer.as_ref().and_then(|signer| signer.ready()) {
             bail!("{error}");
         }
         if status.success() {
@@ -3219,19 +3241,50 @@ fn wait_for_requester_loss(
 /// This machine's signer for a copy it started on a server, prepared once:
 /// loading credentials and finding the bucket's region can take a moment,
 /// so that starts while the SSH session does.
+#[derive(Default)]
 struct StorageSigner {
-    request: crate::s3::authorization::Request,
     signer: std::sync::OnceLock<Result<crate::s3::authorization::Signer, String>>,
+    prepared: (std::sync::Mutex<()>, std::sync::Condvar),
 }
 
 impl StorageSigner {
-    /// The signer, or why this machine cannot sign. Whoever asks first
-    /// prepares it; anyone asking meanwhile waits for that.
-    fn get(&self) -> &Result<crate::s3::authorization::Signer, String> {
-        self.signer.get_or_init(|| {
-            crate::s3::authorization::started::signer(self.request.clone())
-                .map_err(|error| format!("{error:#}"))
-        })
+    /// Prepare the signer for `request`, or record why this machine cannot
+    /// sign, and wake whoever waits for it.
+    fn prepare(&self, request: crate::s3::authorization::Request) {
+        let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::s3::authorization::started::signer(request).map_err(|error| format!("{error:#}"))
+        }))
+        .unwrap_or_else(|_| Err("preparing to sign storage requests failed".into()));
+        let _ = self.signer.set(prepared);
+        let _waiters = self.prepared.0.lock().unwrap();
+        self.prepared.1.notify_all();
+    }
+
+    /// The signer, or why this machine cannot sign, if that is known yet.
+    fn ready(&self) -> Option<&Result<crate::s3::authorization::Signer, String>> {
+        self.signer.get()
+    }
+
+    /// Wait until `ready`, or return `None` once `ended` is set.
+    fn wait(
+        &self,
+        ended: &std::sync::atomic::AtomicBool,
+    ) -> Option<&Result<crate::s3::authorization::Signer, String>> {
+        let mut waiting = self.prepared.0.lock().unwrap();
+        loop {
+            if let Some(signer) = self.ready() {
+                return Some(signer);
+            }
+            if ended.load(std::sync::atomic::Ordering::Acquire) {
+                return None;
+            }
+            // `ended` has no notification of its own.
+            (waiting, _) = self
+                .prepared
+                .1
+                .wait_timeout(waiting, std::time::Duration::from_millis(50))
+                .unwrap();
+        }
     }
 }
 

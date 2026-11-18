@@ -120,6 +120,10 @@ impl Lab {
         executable::write_executable(
             &temp.path().join("bin/ssh"),
             br#"#!/bin/sh
+if [ -n "${LAB_SSH_FAILS:-}" ]; then
+    echo 'ssh: connect to host server: refused' >&2
+    exit 255
+fi
 while [ "$#" -gt 0 ]; do
     case "$1" in
         -O) exit 1 ;;
@@ -351,6 +355,45 @@ fn missing_credentials_here_fail_the_copy_without_starting_transfers() {
         output_text(&output).contains("this machine's credentials"),
         "{}",
         output_text(&output)
+    );
+    assert_eq!(lab.requests(), "");
+}
+
+#[test]
+fn a_failed_ssh_command_does_not_wait_for_slow_credentials() {
+    let lab = Lab::start("ok");
+    // Credentials that take much longer to arrive than ssh takes to fail.
+    let helper = lab.path("bin/slow-credentials");
+    executable::write_executable(&helper, "#!/bin/sh\nexec sleep 20\n", 0o755);
+    std::fs::write(
+        lab.path("aws-config"),
+        format!(
+            "[profile slow]\ncredential_process = {}\n",
+            helper.display()
+        ),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let output = lab
+        .command(Path::new(env!("CARGO_BIN_EXE_syq")))
+        .args(["--s3-profile", "slow"])
+        .args(UPLOAD)
+        .env("LAB_SSH_FAILS", "1")
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .env_remove("AWS_SECRET_ACCESS_KEY")
+        .env("AWS_CONFIG_FILE", lab.path("aws-config"))
+        .capture_output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", output_text(&output));
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "waited {:?} for credentials",
+        started.elapsed()
+    );
+    let text = output_text(&output);
+    assert!(
+        text.contains("refused") && text.contains("exit 255"),
+        "{text}"
     );
     assert_eq!(lab.requests(), "");
 }
