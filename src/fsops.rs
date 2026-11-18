@@ -717,14 +717,12 @@ fn errstr(e: &anyhow::Error) -> String {
 
 pub(crate) fn wire_error(error: &anyhow::Error) -> WireError {
     let condition_not_met = is_condition_not_met(error);
-    let unchanged = is_unchanged(error);
     if error.chain().any(|cause| cause.is::<CorruptedInTransit>()) {
         return WireError {
             message: errstr(error),
             io_kind: Some(WireIoKind::CorruptedInTransit),
             raw_os_error: None,
             condition_not_met,
-            unchanged,
         };
     }
     if let Some(wire) = crate::conn::wire_error_of(error) {
@@ -733,7 +731,6 @@ pub(crate) fn wire_error(error: &anyhow::Error) -> WireError {
             io_kind: wire.io_kind,
             raw_os_error: wire.raw_os_error,
             condition_not_met,
-            unchanged,
         };
     }
     let io_error = error
@@ -744,7 +741,6 @@ pub(crate) fn wire_error(error: &anyhow::Error) -> WireError {
         io_kind: io_error.map(wire_io_kind),
         raw_os_error: io_error.and_then(io::Error::raw_os_error),
         condition_not_met,
-        unchanged,
     }
 }
 
@@ -958,13 +954,6 @@ pub struct FsOps {
     /// This connection's number, which the files it publishes are
     /// remembered by (`stages`).
     stage_connection: u64,
-    /// The request being executed is a Finalize that may only be answered
-    /// as one that already published its file, and is refused otherwise,
-    /// with this reason (`set_finalize_repeat_only`).
-    finalize_repeat_only: Option<&'static str>,
-    /// A Finalize was answered as one that already published its file,
-    /// since `take_finalize_repeated`.
-    finalize_repeated: bool,
     comparison_window: Option<ComparisonWindow>,
     partial_candidates: HashMap<FileLocation, HashMap<PathBytes, Vec<PathBytes>>>,
     partial_directory_order: VecDeque<FileLocation>,
@@ -1237,20 +1226,6 @@ impl FsOps {
         self.stage_scope
     }
 
-    /// Let the next requests publish nothing new: a Finalize among them is
-    /// answered only as one that already published its file (`stages`),
-    /// and fails with `refusal` otherwise. A restricted receiver sets this
-    /// for a Finalize its signed limits leave no room for.
-    pub(crate) fn set_finalize_repeat_only(&mut self, refusal: Option<&'static str>) {
-        self.finalize_repeat_only = refusal;
-    }
-
-    /// Whether a Finalize was answered as one that already published its
-    /// file since this was last asked: it changed nothing.
-    pub(crate) fn take_finalize_repeated(&mut self) -> bool {
-        std::mem::take(&mut self.finalize_repeated)
-    }
-
     fn observed_payload_hash(&self, bytes: &[u8]) -> ContentDigest {
         let _hash = self
             .operation
@@ -1305,8 +1280,6 @@ impl FsOps {
             held_basis: None,
             stage_scope: 0,
             stage_connection: stages::new_connection(),
-            finalize_repeat_only: None,
-            finalize_repeated: false,
             comparison_window: None,
             partial_candidates: HashMap::new(),
             partial_directory_order: VecDeque::new(),
@@ -1878,10 +1851,7 @@ impl FsOps {
                 Err(error) => {
                     return Ok(Response::SmallFilesCopied(SmallCopyResponse {
                         anchor,
-                        outcome: SmallCopyOutcome::StagingFailed(WireError {
-                            unchanged: true,
-                            ..wire_error(&error)
-                        }),
+                        outcome: SmallCopyOutcome::StagingFailed(wire_error(&error)),
                     }))
                 }
             }
@@ -1895,12 +1865,9 @@ impl FsOps {
         {
             return Ok(Response::SmallFilesCopied(SmallCopyResponse {
                 anchor,
-                outcome: SmallCopyOutcome::StagingFailed(WireError {
-                    unchanged: true,
-                    ..wire_error(&anyhow::anyhow!(
-                        "destination contents differ (--if-exists=error-if-different)"
-                    ))
-                }),
+                outcome: SmallCopyOutcome::StagingFailed(wire_error(&anyhow::anyhow!(
+                    "destination contents differ (--if-exists=error-if-different)"
+                ))),
             }));
         }
 
@@ -3712,12 +3679,9 @@ impl FsOps {
             let (skipped, run): (Vec<usize>, Vec<usize>) =
                 indices.iter().partition(|&&i| under_failed(i));
             for i in skipped {
-                out[i] = Some(WireError {
-                    unchanged: true,
-                    ..WireError::from(
-                        "operation skipped because the no-replace creation it depends on failed",
-                    )
-                });
+                out[i] = Some(WireError::from(
+                    "operation skipped because the no-replace creation it depends on failed",
+                ));
             }
             run
         };

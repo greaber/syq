@@ -1139,39 +1139,6 @@ pub(crate) fn is_condition_not_met_wire(error: &WireError) -> bool {
     error.condition_not_met
 }
 
-/// The marker of an operation that changed nothing: found impossible
-/// before it started (`WireError::unchanged`).
-#[derive(Debug)]
-pub(crate) struct Unchanged(pub(crate) String);
-
-impl std::fmt::Display for Unchanged {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for Unchanged {}
-
-/// The error for an operation found impossible before it changed anything.
-pub(crate) fn unchanged(message: String) -> anyhow::Error {
-    anyhow::Error::new(Unchanged(message))
-}
-
-/// Whether `error` says nothing was changed: an unmet condition
-/// (`condition_not_met`) or another reason found before starting
-/// (`unchanged`), here or at the receiver.
-pub(crate) fn is_unchanged(error: &anyhow::Error) -> bool {
-    is_condition_not_met(error)
-        || error.downcast_ref::<Unchanged>().is_some()
-        || error.chain().any(|cause| cause.is::<Unchanged>())
-        || crate::conn::wire_error_of(error).is_some_and(is_unchanged_wire)
-}
-
-/// The same for an error the receiver sent.
-pub(crate) fn is_unchanged_wire(error: &WireError) -> bool {
-    error.unchanged || error.condition_not_met
-}
-
 impl FsOps {
     /// On a filesystem whose inode numbers cannot show which file a name
     /// leads to (`Profile::link_counts_trusted`), a condition that names

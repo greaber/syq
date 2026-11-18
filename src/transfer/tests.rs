@@ -1696,7 +1696,6 @@ fn a_policy_skip_read_before_a_connection_fails_stays_a_skip() {
             io_kind: None,
             raw_os_error: None,
             condition_not_met: true,
-            unchanged: true,
         }),
         Response::Ok,
     ]);
@@ -2217,7 +2216,6 @@ fn later_batch_read_error_keeps_publications_and_requeues_unwritten_files() {
             io_kind: Some(crate::proto::WireIoKind::PermissionDenied),
             raw_os_error: None,
             condition_not_met: false,
-            unchanged: false,
         }));
 
     let mut worker = pipeline_worker(&sched, &src, &dst, false);
@@ -3000,7 +2998,6 @@ fn endpoint_semantic_error_kind_wins_over_numeric_errno() {
         // policy.
         raw_os_error: Some(libc::ENOSPC),
         condition_not_met: false,
-        unchanged: false,
     };
     assert_eq!(wire_os_kind(&error), Some("quota_exceeded"));
     assert!(capacity_os_kind(wire_os_kind(&error)));
@@ -3015,7 +3012,6 @@ fn data_corrupted_in_transit_has_no_os_kind() {
         io_kind: Some(WireIoKind::CorruptedInTransit),
         raw_os_error: None,
         condition_not_met: false,
-        unchanged: false,
     };
     assert_eq!(wire_os_kind(&error), None);
 }
@@ -3027,7 +3023,6 @@ fn mkdir_apply_error_preserves_endpoint_os_kind() {
         io_kind: Some(WireIoKind::NoSpace),
         raw_os_error: Some(libc::ENOSPC),
         condition_not_met: false,
-        unchanged: false,
     };
     let error = mkdir_apply_result(vec![None, Some(error)]).unwrap_err();
     assert_eq!(os_kind_of(&error), Some("no_space"));
@@ -6234,7 +6229,7 @@ fn restricted_destination(
             {
                 return Response::Err(crate::fsops::OPEN_PATCH_STREAM.into());
             }
-            let mut settlement = match gate.authorize(&mut request, false) {
+            let settlement = match gate.authorize(&mut request, false) {
                 Ok(settlement) => settlement,
                 Err(error) => {
                     let error = format!("{error:#}");
@@ -6255,7 +6250,7 @@ fn restricted_destination(
             ) {
                 before_patch();
             }
-            let response = settlement.execute(&mut ops, |ops| ops.handle(&request));
+            let response = ops.handle(&request);
             gate.settle(settlement, &response, ops.patch_stream_open());
             // Record what was executed, without the data of pieces.
             if let Request::PatchData { hash, .. } = request {
@@ -6381,11 +6376,12 @@ fn copy_through_restricted_receiver_with(
         sched.push_file(job);
     }
     sched.scan_done();
+    // A file whose patch fails counts again when it is copied whole.
     let authority = Arc::new(
         crate::restricted::tests::time_preserving_test_authority_for(
             root,
             64 << 20,
-            files.len().max(8) as u64,
+            (2 * files.len()).max(8) as u64,
             permissions,
         ),
     );
@@ -7106,7 +7102,6 @@ fn directory_access_advice_needs_evidence_and_an_available_option() {
         io_kind: Some(WireIoKind::OwnedDirectoryPermissions),
         raw_os_error: Some(libc::EACCES),
         condition_not_met: false,
-        unchanged: false,
     };
     assert_eq!(wire_os_kind(&error), Some("permission_denied"));
     let error = endpoint_error(error).context("prepare file");
@@ -7278,7 +7273,6 @@ fn a_restricted_receivers_listed_failures_are_left_to_it() {
                     io_kind: Some(WireIoKind::PermissionDenied),
                     raw_os_error: Some(13),
                     condition_not_met: false,
-                    unchanged: false,
                 })
             }));
         }
