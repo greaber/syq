@@ -2253,6 +2253,55 @@ fn a_full_destination_ends_final_directory_metadata_after_the_requests_already_s
 
 #[cfg(debug_assertions)]
 #[test]
+fn a_failure_in_a_later_final_metadata_request_names_its_directory() {
+    // A file takes the place of a directory in the third request once the
+    // copy has filled it. The four requests sent before any reply are each
+    // matched to their own directories: only that one fails, by name, and
+    // the rest, in every request, get their times.
+    let t = Tmp::new();
+    timed_directories(&t, "src", 4300, 1_500_000_000);
+    let ready = t.path("metadata-ready");
+    let continuation = t.path("metadata-continue");
+    let mut child = copy_recording_final_metadata(&t, "-a", true)
+        .env("SYQ_TEST_DIRECTORY_METADATA_READY_FILE", &ready)
+        .env("SYQ_TEST_DIRECTORY_METADATA_CONTINUE_FILE", &continuation)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "final directory metadata");
+    fs::remove_dir(t.path("dst/d2500")).unwrap();
+    write(&t.path("dst/d2500"), b"planted");
+    release_confinement_barrier(&continuation);
+
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    let errors: Vec<String> = stderr_of(&output)
+        .lines()
+        .filter(|line| line.contains("/d"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].contains("d2500") && errors[0].contains("no longer a directory"),
+        "{errors:?}"
+    );
+    assert_eq!(
+        final_metadata_requests(&t),
+        [(1000, 0), (1000, 1), (1000, 2), (1000, 3), (301, 3)]
+    );
+    assert_eq!(read(&t.path("dst/d2500")), b"planted");
+    for index in (0..4300).filter(|index| *index != 2500) {
+        assert_eq!(
+            directory_time(&t, "dst", index),
+            1_500_000_000 + index,
+            "d{index:04}"
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
 fn a_directory_loses_search_access_only_once_the_requests_before_it_are_answered() {
     if unsafe { libc::geteuid() } == 0 {
         return;
