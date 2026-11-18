@@ -114,6 +114,12 @@ struct PipelineState {
     deferred: std::collections::VecDeque<u64>,
     arrived: std::collections::HashMap<u64, Response>,
     next_deferred: u64,
+    /// Answer `send_timing_ok` as a remote connection does: without
+    /// waiting, and with this round trip once its reply has been read.
+    timed: Option<std::time::Duration>,
+    timed_round_trip: Option<std::time::Duration>,
+    /// An automatic small-file endpoint refuses its hashing configuration.
+    refuse_configuration: bool,
     /// Setting up telemetry on the connection fails.
     fail_observe: bool,
     /// The addresses of the actors telemetry was set up with, in order.
@@ -121,6 +127,9 @@ struct PipelineState {
 }
 
 struct PipelineConn(Arc<Mutex<PipelineState>>);
+
+/// The place in `PipelineState::deferred` of a `send_timing_ok` reply.
+const TIMED_REPLY: u64 = u64::MAX;
 
 impl PipelineConn {
     /// Read the replies of deferred requests, oldest first: all of them, or
@@ -131,6 +140,13 @@ impl PipelineConn {
                 return Ok(());
             };
             let reply = self.receive()?;
+            if id == TIMED_REPLY {
+                crate::conn::ok(reply, "configure hashing")
+                    .map_err(|error| crate::conn::DeferredRequestError(format!("{error:#}")))?;
+                let mut state = self.0.lock().unwrap();
+                state.timed_round_trip = state.timed;
+                continue;
+            }
             self.0.lock().unwrap().arrived.insert(id, reply);
             if until == Some(id) {
                 return Ok(());
@@ -225,6 +241,23 @@ impl Conn for PipelineConn {
         anyhow::ensure!(!state.fail_observe, "injected telemetry failure");
         state.observed_by.push(Arc::as_ptr(actor) as usize);
         Ok(())
+    }
+    fn send_timing_ok(
+        &mut self,
+        request: Request,
+        what: &'static str,
+    ) -> Result<Option<std::time::Duration>> {
+        if self.0.lock().unwrap().timed.is_none() {
+            let sent = std::time::Instant::now();
+            crate::conn::ok(self.call(request)?, what)?;
+            return Ok(Some(sent.elapsed()));
+        }
+        self.send(request)?;
+        self.0.lock().unwrap().deferred.push_back(TIMED_REPLY);
+        Ok(None)
+    }
+    fn take_timed_round_trip(&mut self) -> Option<std::time::Duration> {
+        self.0.lock().unwrap().timed_round_trip.take()
     }
     fn send_pending(&mut self, request: Request) -> Result<crate::conn::PendingReply> {
         if !self.0.lock().unwrap().defers {
@@ -325,7 +358,11 @@ impl Conn for PipelineConn {
                         state.received,
                         "latency check requires drained requests"
                     );
-                    Response::Ok
+                    if state.refuse_configuration {
+                        Response::Err("hash policy differs from the authorized copy".into())
+                    } else {
+                        Response::Ok
+                    }
                 }
                 Request::ReadSmallBatch(reads) => Response::SmallBlocks(
                     reads
@@ -589,6 +626,7 @@ fn pipeline_worker(
         fast_batch_files: 1,
         batch_budget: WorkBudget::default(),
         range_budget: None,
+        setup_latency: None,
         comparison: Default::default(),
         setup_elapsed: std::time::Duration::ZERO,
         publications: Default::default(),
@@ -1744,6 +1782,130 @@ fn cancelled_range_drains_without_reporting_or_publishing_an_innocent_file() {
         .iter()
         .all(|r| matches!(r, Request::WriteRange { .. })));
     assert_eq!(worker.progress.errors.load(Relaxed), 0);
+}
+
+#[test]
+fn a_worker_does_not_wait_for_its_hashing_configuration() {
+    use std::time::Duration;
+    let timed = |round_trip| {
+        Arc::new(Mutex::new(PipelineState {
+            timed: Some(Duration::from_millis(round_trip)),
+            replies: [Response::Ok].into(),
+            ..Default::default()
+        }))
+    };
+    let (src, dst) = (timed(30), timed(50));
+    let sched = Arc::new(Sched::new(512, 8192));
+    sched.scan_done();
+    let mut worker = pipeline_worker(&sched, &src, &dst, false);
+    worker.run(None).unwrap();
+    for state in [&src, &dst] {
+        let state = state.lock().unwrap();
+        assert!(matches!(state.requests[..], [Request::ConfigureHashing(_)]));
+        assert_eq!(state.received, 0, "the reply was waited for");
+    }
+    let default = worker.batch_budget.latency_target();
+
+    // The allowance comes from both round trips, once both replies have
+    // been read ahead of a later one.
+    for (state, both) in [(&src, false), (&dst, true)] {
+        state.lock().unwrap().replies.push_back(Response::Ok);
+        let conn = if both {
+            &mut worker.dst
+        } else {
+            &mut worker.src
+        };
+        assert!(matches!(conn.recv().unwrap(), Response::Ok));
+        assert_eq!(
+            worker.settle_setup_latency(),
+            both.then_some(Duration::from_millis(80))
+        );
+        if !both {
+            assert_eq!(worker.batch_budget.latency_target(), default);
+        }
+    }
+    assert_eq!(
+        worker.batch_budget.latency_target(),
+        Duration::from_millis(80) * crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH as u32
+    );
+    assert_eq!(worker.settle_setup_latency(), None, "settled once");
+}
+
+#[test]
+fn a_refused_hashing_configuration_fails_the_copy_at_the_first_reply() {
+    let sched = Arc::new(Sched::new(512, 8192));
+    sched.push_file(pipeline_job(b"first", 4096));
+    sched.scan_done();
+    let src = Arc::new(Mutex::new(PipelineState {
+        timed: Some(Default::default()),
+        replies: [Response::Ok].into(),
+        ..Default::default()
+    }));
+    let dst = Arc::new(Mutex::new(PipelineState {
+        timed: Some(Default::default()),
+        replies: [
+            Response::Err("hash policy differs from the authorized copy".into()),
+            // What the receiver answers the preparation sent behind it.
+            Response::Prepared(Preparation::default()),
+        ]
+        .into(),
+        ..Default::default()
+    }));
+    let mut worker = pipeline_worker(&sched, &src, &dst, false);
+    let error = worker.run(None).unwrap_err();
+    assert_eq!(
+        format!("{error:#}"),
+        "configure hashing: hash policy differs from the authorized copy"
+    );
+    assert!(sched.is_aborted(), "the copy goes on without its policy");
+    assert!(!worker.transport_dead());
+    assert_eq!(worker.progress.files_done.load(Relaxed), 0);
+    let destination = dst.lock().unwrap();
+    assert!(
+        !destination
+            .requests
+            .iter()
+            .any(|request| matches!(request, Request::WriteRange { .. })),
+        "data was sent after the refusal"
+    );
+}
+
+#[test]
+fn a_refused_hashing_configuration_fails_the_copy_not_each_small_file() {
+    // Within the test worker's 512-byte requests, so batched.
+    let size = 256;
+    let sched = Arc::new(Sched::new(4 << 20, 32 << 20));
+    for name in [&b"first"[..], b"second", b"third"] {
+        sched.push_file(pipeline_job(name, size));
+    }
+    sched.scan_done();
+    let endpoint = |refuse| {
+        Arc::new(Mutex::new(PipelineState {
+            timed: Some(Default::default()),
+            auto_small_size: Some(size),
+            refuse_configuration: refuse,
+            ..Default::default()
+        }))
+    };
+    let (src, dst) = (endpoint(false), endpoint(true));
+    let mut worker = pipeline_worker(&sched, &src, &dst, false);
+    Arc::get_mut(&mut worker.opts).unwrap().tuning = Default::default();
+    let error = worker.run(None).unwrap_err();
+    assert_eq!(
+        format!("{error:#}"),
+        "configure hashing: hash policy differs from the authorized copy"
+    );
+    assert!(sched.is_aborted());
+    assert_eq!(worker.progress.errors.load(Relaxed), 0, "listed per file");
+    assert_eq!(worker.progress.files_done.load(Relaxed), 0);
+    assert!(
+        dst.lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|request| matches!(request, Request::PutSmallBatch(_))),
+        "the files were not sent as a small batch"
+    );
 }
 
 #[test]

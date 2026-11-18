@@ -144,6 +144,24 @@ pub trait Conn: Send {
     fn send_expecting_ok(&mut self, req: Request, what: &'static str) -> Result<()> {
         ok(self.call(req)?, what).map(|_| ())
     }
+    /// `send_expecting_ok` for a request whose round trip is a latency
+    /// sample. A connection that waits for the reply here returns how long
+    /// that took. One that does not returns `None`, and
+    /// `take_timed_round_trip` gives the time once the reply has been read.
+    fn send_timing_ok(
+        &mut self,
+        req: Request,
+        what: &'static str,
+    ) -> Result<Option<std::time::Duration>> {
+        let sent = std::time::Instant::now();
+        ok(self.call(req)?, what)?;
+        Ok(Some(sent.elapsed()))
+    }
+    /// The round trip of a request sent with `send_timing_ok` whose reply
+    /// was read since, from sending it to when the reply began to arrive.
+    fn take_timed_round_trip(&mut self) -> Option<std::time::Duration> {
+        None
+    }
     fn call(&mut self, req: Request) -> Result<Response> {
         let expected = reply_shape(&req);
         self.send(req)?;
@@ -428,7 +446,7 @@ pub(crate) enum PendingReply {
 /// A request sent without waiting for its reply failed. Requests sent after
 /// it assumed it succeeded, so the connection refuses every later reply.
 #[derive(Debug)]
-pub(crate) struct DeferredRequestError(String);
+pub(crate) struct DeferredRequestError(pub(crate) String);
 
 impl std::fmt::Display for DeferredRequestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -446,8 +464,12 @@ pub(crate) fn is_deferred_request_error(error: &anyhow::Error) -> bool {
 
 /// A request sent without waiting for its reply.
 enum Deferred {
-    /// Its reply must be `Ok`.
-    Ok(&'static str),
+    /// Its reply must be `Ok`. `timed` is when a request whose round trip
+    /// is wanted was sent (`Conn::send_timing_ok`).
+    Ok {
+        what: &'static str,
+        timed: Option<std::time::Instant>,
+    },
     /// Its reply is kept until the caller takes it.
     Reply {
         id: u64,
@@ -467,6 +489,9 @@ struct DeferredReplies {
     failed: Option<String>,
     /// Every request sent, deferred or not (`Conn::requests_sent`).
     sent: u64,
+    /// The round trip of the last timed request whose reply was read, until
+    /// taken.
+    round_trip: Option<std::time::Duration>,
 }
 
 pub(crate) fn tcp_congestion_fallback_note(requested: Option<&str>) -> String {
@@ -1234,7 +1259,11 @@ impl RemoteConn {
                 break;
             };
             match deferred {
-                Deferred::Ok(what) => {
+                Deferred::Ok { what, timed } => {
+                    if let Some(sent) = timed {
+                        self.deferred.round_trip =
+                            Some(first.started_at.saturating_duration_since(sent));
+                    }
                     if let Err(error) = ok(first.into_inner(), what) {
                         self.deferred.pending.clear();
                         self.deferred.failed = Some(format!("{error:#}"));
@@ -1442,8 +1471,38 @@ impl Conn for RemoteConn {
     }
     fn send_expecting_ok(&mut self, req: Request, what: &'static str) -> Result<()> {
         self.send(req)?;
-        self.deferred.pending.push_back(Deferred::Ok(what));
+        self.deferred
+            .pending
+            .push_back(Deferred::Ok { what, timed: None });
         Ok(())
+    }
+    fn send_timing_ok(
+        &mut self,
+        req: Request,
+        what: &'static str,
+    ) -> Result<Option<std::time::Duration>> {
+        let sent = std::time::Instant::now();
+        self.send(req)?;
+        self.deferred.pending.push_back(Deferred::Ok {
+            what,
+            timed: Some(sent),
+        });
+        Ok(None)
+    }
+    fn take_timed_round_trip(&mut self) -> Option<std::time::Duration> {
+        // Read the reply if it has arrived, without waiting for it. A
+        // failure it shows is kept for the next reply that is read.
+        if self.deferred.round_trip.is_none()
+            && self.rx.is_some()
+            && self
+                .deferred
+                .pending
+                .iter()
+                .any(|deferred| matches!(deferred, Deferred::Ok { timed: Some(_), .. }))
+        {
+            let _ = self.receive_arrived_deferred();
+        }
+        self.deferred.round_trip.take()
     }
     fn send_pending(&mut self, req: Request) -> Result<PendingReply> {
         let expected = reply_shape(&req);
@@ -1513,7 +1572,17 @@ impl Conn for RemoteConn {
             self.write_stream.is_none(),
             "streaming writes are already active"
         );
-        self.receive_deferred(None)?;
+        // A reply that must be `Ok` need not be waited for: the receipts
+        // tell it from a batch's reply, which never is one. Any other reply
+        // still owed is read first.
+        if self
+            .deferred
+            .pending
+            .iter()
+            .any(|deferred| matches!(deferred, Deferred::Reply { .. }))
+        {
+            self.receive_deferred(None)?;
+        }
         self.batch_receipts.begin(progress).map(Some)
     }
     fn recv_with_wait(&mut self) -> Result<(Response, std::time::Duration)> {
