@@ -2287,10 +2287,11 @@ done
 printf 'case: a keep grant fails only the changes inside directories it may not widen\n'
 # Two read-only directories at the destination, one holding a file; the
 # source has that file, a new one in each, and more beside them.
-# --if-exists=keep lets a restricted receiver change no existing directory,
-# so --widen-dirs widens neither, under rsync or all: the new files in them
-# fail by name, everything else is copied, and the copy says why once. An
-# ordinary receiver that may not widen leaves the same tree and status.
+# --if-exists=keep lets a restricted receiver change no existing directory's
+# permissions, so --widen-dirs widens neither, under rsync or all: the new
+# files in them fail by name, everything else is copied, and the copy says
+# why once. An ordinary receiver that may not widen leaves the same tree and
+# status.
 keep_tree=$(cat <<'PY_KEEP_TREE'
 import os, sys
 root = sys.argv[1]
@@ -2324,7 +2325,7 @@ for keep_receiver in ordinary rsync all; do
     grep -F 'syq: sub/new: ' "$keep_errors" >/dev/null
     grep -F 'syq: second/new: ' "$keep_errors" >/dev/null
     if [ "$keep_receiver" != ordinary ]; then
-        test "$(grep -c -F -e '--if-exists=keep lets the restricted receiver change no existing directory' "$keep_errors")" = 1
+        test "$(grep -c -F -e "--if-exists=keep lets the restricted receiver change no existing directory's permissions" "$keep_errors")" = 1
         grep -F 'it is not widened either' "$keep_errors" >/dev/null
         if grep -F -e refused -e contradicts "$keep_errors" >&2; then
             echo 'the restricted receiver refused a request of the keep copy' >&2
@@ -2336,6 +2337,39 @@ done
 cmp /tmp/syq-real-ssh-keep-ordinary.manifest /tmp/syq-real-ssh-keep-rsync.manifest
 cmp /tmp/syq-real-ssh-keep-ordinary.manifest /tmp/syq-real-ssh-keep-all.manifest
 ssh destination 'cd /tmp/syq-real-ssh/keep-rsync && test "$(cat sub/old)" = existing && test ! -e sub/new && test ! -e second/new && test "$(cat beside)" = beside && test "$(cat fresh/file)" = fresh/file && test "$(stat -c %a sub second | tr "\n" " ")" = "555 555 "'
+
+# Pruning under the same grant: destination-only files in read-only
+# directories fail to be removed, by name, and one beside them is removed.
+ssh destination 'mkdir -p /tmp/syq-real-ssh/keep-prune/gone /tmp/syq-real-ssh/keep-prune/gone-too && cd /tmp/syq-real-ssh/keep-prune && touch gone/extra gone-too/extra stale && chmod 555 gone gone-too'
+keep_status=0
+syq cp --no-progress --if-exists=keep --widen-dirs=all --prune \
+    --from source --srcs-in /tmp/syq-real-ssh/keep-tree \
+    --to destination --into /tmp/syq-real-ssh/keep-prune \
+    2>/tmp/syq-real-ssh-keep-prune.err || keep_status=$?
+cat /tmp/syq-real-ssh-keep-prune.err >&2
+test "$keep_status" = 23
+grep -F 'syq: delete gone/extra: ' /tmp/syq-real-ssh-keep-prune.err >/dev/null
+grep -F 'syq: delete gone-too/extra: ' /tmp/syq-real-ssh-keep-prune.err >/dev/null
+# A preview names the directories it cannot look inside.
+ssh destination 'mkdir -p /tmp/syq-real-ssh/keep-preview/sub /tmp/syq-real-ssh/keep-preview/second && chmod 600 /tmp/syq-real-ssh/keep-preview/sub /tmp/syq-real-ssh/keep-preview/second'
+keep_status=0
+syq cp --no-progress --if-exists=keep --widen-dirs=rsync --dry-run \
+    --from source --srcs-in /tmp/syq-real-ssh/keep-tree \
+    --to destination --into /tmp/syq-real-ssh/keep-preview \
+    >/dev/null 2>/tmp/syq-real-ssh-keep-preview.err || keep_status=$?
+cat /tmp/syq-real-ssh-keep-preview.err >&2
+test "$keep_status" = 23
+test "$(grep -c -F 'not inspected: you own this directory, but it lacks owner search permission' /tmp/syq-real-ssh-keep-preview.err)" = 2
+# Either way the copy says why once, and the receiver refuses nothing.
+for keep_errors in /tmp/syq-real-ssh-keep-prune.err /tmp/syq-real-ssh-keep-preview.err; do
+    test "$(grep -c -F -e "--if-exists=keep lets the restricted receiver change no existing directory's permissions" "$keep_errors")" = 1
+    grep -F 'it is not widened either' "$keep_errors" >/dev/null
+    if grep -F -e refused -e contradicts "$keep_errors" >&2; then
+        echo 'the restricted receiver refused a request of the keep copy' >&2
+        exit 1
+    fi
+done
+ssh destination 'cd /tmp/syq-real-ssh/keep-prune && test ! -e stale && test -e gone/extra && test -e gone-too/extra && test "$(cat sub/new)" = sub/new && test "$(stat -c %a gone gone-too | tr "\n" " ")" = "555 555 " && chmod 755 gone gone-too /tmp/syq-real-ssh/keep-preview/sub /tmp/syq-real-ssh/keep-preview/second'
 
 printf 'case: ordinary and restricted receivers update the same files in place\n'
 # Under --in-place=update both receivers write a file of their own with one

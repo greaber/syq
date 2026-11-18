@@ -4317,7 +4317,7 @@ impl Planner<'_> {
             // patterns apply from the root, so with those the whole root is
             // walked again instead.
             let enter = self.opts.widen_dirs == crate::cli::WidenDirs::All
-                && self.opts.may_widen_directory_permissions();
+                && self.opts.widens_inside_copy();
             let subtrees = ignore
                 .iter()
                 .all(|pattern| ignore_pattern_is_unanchored(pattern));
@@ -4442,7 +4442,7 @@ impl Planner<'_> {
                     None => false,
                 };
                 let hint = match self.opts.entering_hint().filter(|_| owned) {
-                    Some(hint) => format!("; {hint}"),
+                    Some(hint) => format!("; {}", self.opts.said_once(hint)),
                     None => String::new(),
                 };
                 // A preview names the directory it could not inspect.
@@ -4479,7 +4479,7 @@ impl Planner<'_> {
             // already widened to be entered has a new change time, so only
             // its identity is required.
             let unwritable: std::collections::HashMap<PathBytes, TargetCondition> =
-                if self.opts.may_widen_directory_permissions() {
+                if self.opts.widens_inside_copy() {
                     walk.entries
                         .iter()
                         .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o300 != 0o300)
@@ -5467,7 +5467,7 @@ impl Planner<'_> {
                         "syq: {}: not inspected: you own this directory, but it lacks owner search permission{}",
                         display(&path),
                         match self.opts.hint_for(needed).filter(|_| hint) {
-                            Some(hint) => format!("; {hint}"),
+                            Some(hint) => format!("; {}", self.opts.said_once(hint)),
                             None => String::new(),
                         }
                     ),

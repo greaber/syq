@@ -240,7 +240,7 @@ pub struct Opts {
     /// Directories already named as needing temporary access; failures
     /// beneath them do not repeat the hint.
     pub access_noted: Mutex<std::collections::HashSet<PathBytes>>,
-    /// A directory was named with `KEEP_BARS_WIDENING`, which is said once.
+    /// A directory was named with `KEEP_BARS_WIDENING` (`Opts::said_once`).
     pub keep_widening_explained: AtomicBool,
     pub devices: bool,
     pub checksum: bool,
@@ -2369,7 +2369,7 @@ pub(crate) fn mode_hint(
 
 /// Why `--widen-dirs` widens no directory inside the copy
 /// (`Opts::keep_bars_widening`), in place of the hint naming a wider mode.
-const KEEP_BARS_WIDENING: &str = "--if-exists=keep lets the restricted receiver change no existing directory, so --widen-dirs does not widen it";
+const KEEP_BARS_WIDENING: &str = "--if-exists=keep lets the restricted receiver change no existing directory's permissions, so --widen-dirs does not widen it";
 
 /// Add the hint to a failed lookup or creation of the destination path, which
 /// the receiver found blocked by an owned directory lacking owner permission.
@@ -2485,6 +2485,16 @@ impl Opts {
         self.hint_for(WidenDirs::All)
     }
 
+    /// `hint` as a message that names a directory carries it: why a grant
+    /// bars widening is said in full once in a copy, and briefly after that.
+    pub(super) fn said_once(&self, hint: &'static str) -> &'static str {
+        if hint == KEEP_BARS_WIDENING && self.keep_widening_explained.swap(true, Relaxed) {
+            "it is not widened either"
+        } else {
+            hint
+        }
+    }
+
     /// The hint for a failure inside the copy, which `rsync` widens.
     pub(super) fn failure_hint(&self) -> Option<&'static str> {
         self.hint_for(WidenDirs::Rsync)
@@ -2531,14 +2541,7 @@ impl Opts {
         };
         self.access_noted.lock().unwrap().insert(parent.clone());
         let missing = !mode & 0o300;
-        // Why a grant bars widening is said once; later directories are
-        // only named.
-        let hint = match self.hint_for(widens).unwrap_or_default() {
-            KEEP_BARS_WIDENING if self.keep_widening_explained.swap(true, Relaxed) => {
-                "it is not widened either"
-            }
-            hint => hint,
-        };
+        let hint = self.said_once(self.hint_for(widens).unwrap_or_default());
         progress.warning(&format!(
             "{}: you own this directory, but it lacks owner {} permission; {hint}",
             display(&parent),

@@ -6360,6 +6360,11 @@ fn a_keep_grant_copy_asks_a_restricted_receiver_to_widen_no_directory_inside_it(
             (approved == DirectoryWidening::Rsync).then_some("--widen-dirs=all may help")
         );
         assert_eq!(opts.entering_hint(), Some(hint));
+        // The reason is given in full once, whichever message carries it.
+        assert_eq!(opts.said_once(hint), hint);
+        assert_eq!(opts.said_once(hint), "it is not widened either");
+        let other = "--widen-dirs=all may help";
+        assert_eq!(opts.said_once(other), other);
 
         // Only the directory the copy goes into is asked for, under `all`.
         if approved == DirectoryWidening::All {
