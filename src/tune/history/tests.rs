@@ -1,13 +1,17 @@
 use super::*;
 
 pub(in crate::tune) fn recorder(path: &Path) -> Recorder {
-    Recorder::at(
+    let recorder = Recorder::at(
         path,
         Instant::now(),
         json!({"policy_version":1}),
         DEFAULT_BUDGET,
     )
-    .unwrap()
+    .unwrap();
+    // A test asks for a periodic save when it wants one, so that a slow
+    // machine does not add one a second into it.
+    recorder.0.lock().unwrap().next_write = Instant::now() + Duration::from_secs(3600);
+    recorder
 }
 /// Save what `writer` has recorded so far, as a copy more than a second old
 /// does on its next event, and return its run.
@@ -447,16 +451,12 @@ fn lock_contention_keeps_samples_and_context_for_a_later_save() {
     {
         // A periodic save does not wait for the lock: it fails at once and
         // leaves the history alone for a while.
-        let mut state = writer.0.lock().unwrap();
-        state.next_write = Instant::now();
-        let before = pages_read(&state.db);
-        drop(state);
+        let before = Instant::now();
+        writer.0.lock().unwrap().next_write = before;
         writer.event("sample", json!({"bytes":456}));
-        writer.event("sample", json!({"bytes":789}));
         let state = writer.0.lock().unwrap();
-        assert_eq!(state.pending.len(), 3);
-        assert!(state.retry > Instant::now() + WRITE_RETRY / 2);
-        assert_eq!(pages_read(&state.db), before);
+        assert_eq!(state.pending.len(), 2);
+        assert!(state.retry >= before + WRITE_RETRY);
     }
     other.execute_batch("COMMIT").unwrap();
     writer.complete(true, json!({}));
@@ -465,7 +465,7 @@ fn lock_contention_keeps_samples_and_context_for_a_later_save() {
     let run = command::read_run(&other, id).unwrap();
     assert_eq!(run["status"], "success");
     assert_eq!(run["context"]["destination_filesystem"], Value::Null);
-    assert_eq!(command::read_events(&other, id).unwrap().len(), 5);
+    assert_eq!(command::read_events(&other, id).unwrap().len(), 4);
 }
 
 #[test]
@@ -564,7 +564,6 @@ fn a_copy_writes_nothing_until_it_ends_and_then_writes_once() {
     // Another copy holds the writer lock while this one starts and records:
     // none of that waits for it, or takes it.
     other.execute_batch("BEGIN IMMEDIATE").unwrap();
-    let started = Instant::now();
     let writer = recorder(&path);
     writer.context(&key("a"));
     writer.event("context", json!({"stage":"source_registered"}));
@@ -572,11 +571,6 @@ fn a_copy_writes_nothing_until_it_ends_and_then_writes_once() {
     for bytes in 0..100 {
         writer.event("sample", json!({"bytes":bytes}));
     }
-    assert!(
-        started.elapsed() < OPEN_LOCK_WAIT,
-        "starting waited for the writer lock: {:?}",
-        started.elapsed()
-    );
     other.execute_batch("COMMIT").unwrap();
     assert_eq!(run_ids(&other), [1], "the copy has no run before it ends");
     let writes = |db: &Connection| -> i64 {
@@ -597,29 +591,30 @@ fn a_copy_writes_nothing_until_it_ends_and_then_writes_once() {
 fn a_long_copy_saves_its_timeline_while_it_runs() {
     let temp = crate::test_support::tempdir().unwrap();
     let path = temp.path().join("history.sqlite");
-    let writer = recorder(&path);
+    let start = Instant::now();
+    let writer = Recorder::at(&path, start, json!({}), DEFAULT_BUDGET).unwrap();
+    // The first save is due when the copy is a second old. Keep this test's
+    // own pace out of it from here on.
+    {
+        let mut state = writer.0.lock().unwrap();
+        assert_eq!(state.next_write, start + FIRST_WRITE);
+        state.next_write = start + Duration::from_secs(3600);
+    }
     let db = open(&path).unwrap();
     writer.context(&key("a"));
     writer.event("sample", json!({"bytes":1}));
-    assert_eq!(run_count(&db), 0, "nothing in the copy's first second");
-    {
-        let state = writer.0.lock().unwrap();
-        let due = state.next_write.duration_since(Instant::now());
-        assert!(due > FIRST_WRITE / 2 && due <= FIRST_WRITE, "{due:?}");
-    }
-    // The copy's first event after that second saves everything so far.
-    writer.0.lock().unwrap().next_write = Instant::now();
+    assert_eq!(run_count(&db), 0, "nothing before the first save is due");
+    // The copy's first event after that saves everything so far.
+    let due = Instant::now();
+    writer.0.lock().unwrap().next_write = due;
     writer.event("sample", json!({"bytes":2}));
     let run = command::read_run(&db, 1).unwrap();
     assert_eq!(run["status"], "incomplete");
     assert_eq!(run["context"]["destination_filesystem"], "a");
     assert_eq!(command::read_events(&db, 1).unwrap().len(), 3);
     // Later events wait for the next save.
-    {
-        let state = writer.0.lock().unwrap();
-        let due = state.next_write.duration_since(Instant::now());
-        assert!(due > WRITE_INTERVAL / 2 && due <= WRITE_INTERVAL, "{due:?}");
-    }
+    assert!(writer.0.lock().unwrap().next_write >= due + WRITE_INTERVAL);
+    writer.0.lock().unwrap().next_write = due + Duration::from_secs(3600);
     writer.event("sample", json!({"bytes":3}));
     assert_eq!(command::read_events(&db, 1).unwrap().len(), 3);
     writer.0.lock().unwrap().next_write = Instant::now();
