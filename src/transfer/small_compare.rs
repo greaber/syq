@@ -77,12 +77,13 @@ const STREAM_BUFFER_BYTES: u64 = crate::proto::MAX_DIFFERING_FILE_BYTES;
 
 /// Most piece data a worker has sent and the destination not yet
 /// acknowledged while streaming patches: what sixteen full pieces carry.
-/// No syq process holds the pieces sent: each is written to its connection
-/// before the worker reads another, and a receiver decodes only a few
-/// requests ahead of the one it serves. The bound keeps what one stream has
-/// in flight within what it had when sixteen pieces were.
+/// The worker does not keep the pieces it sent: each is written to its
+/// connection before it reads another, and a receiver decodes only a few
+/// requests ahead of the one it serves. A piece is one whole comparison
+/// block when that is larger, so every piece fits the bound.
 const UNACKNOWLEDGED_PIECE_BYTES: u64 = 16 * PATCH_PIECE_BYTES;
 const _: () = assert!(PATCH_PIECE_BYTES <= UNACKNOWLEDGED_PIECE_BYTES);
+const _: () = assert!(crate::proto::MAX_HASH_BLOCK_BYTES <= UNACKNOWLEDGED_PIECE_BYTES);
 
 /// Files and source bytes per group.
 const COMPARE_GROUP_FILES: usize = 256;
@@ -238,6 +239,8 @@ struct StreamState {
     failed: bool,
     /// The receiver refused its begin, so no patch is open there to end.
     refused: bool,
+    /// The receiver accepted its begin.
+    opened: bool,
     /// The source changed while it was read, to this or nothing.
     changed: Option<Option<Entry>>,
     /// Bytes of its pieces the receiver acknowledged, counted as progress
@@ -848,12 +851,21 @@ impl Worker {
             // sends no more pieces, and owe no more acknowledgments than the
             // destination's connection queues.
             self.arrived_replies(batch, streams, states, &mut destination, outcomes)?;
-            let piece = match step {
-                StreamStep::Piece(_, _, len) => u64::from(len),
-                _ => 0,
+            // A command-restricted receiver records each piece that reaches
+            // it after refusing the patch's begin, so until the begin is
+            // answered, only as many follow it as sixteen requests allow.
+            let (piece, stream) = match step {
+                StreamStep::Piece(index, _, len) => (u64::from(len), Some(index)),
+                _ => (0, None),
+            };
+            let restricted = self.opts.restricted_receiver;
+            let unopened = |states: &[StreamState]| {
+                restricted
+                    && stream.is_some_and(|index| !states[index].opened && !states[index].failed)
             };
             while destination.len() >= acknowledgments
                 || unacknowledged(&destination) + piece > UNACKNOWLEDGED_PIECE_BYTES
+                || (unopened(states) && destination.len() >= COMPARE_WINDOW)
             {
                 let (step, _) = destination.pop_front().expect("pending reply");
                 let reply = self.dst.recv()?;
@@ -863,6 +875,12 @@ impl Worker {
                 StreamStep::Piece(index, off, len) => {
                     let state = &mut states[index];
                     buffered -= u64::from(len);
+                    // Its reads may all have been sent before the copy was
+                    // aborted: no further piece is sent, and the patch is
+                    // not published.
+                    if self.sched.is_aborted() {
+                        state.failed = true;
+                    }
                     let piece = match ok(response, "read streamed patch piece") {
                         Ok(Response::Block {
                             off: at,
@@ -1021,6 +1039,7 @@ impl Worker {
                         state.counted += u64::from(*len);
                         self.progress.add_bytes(u64::from(*len));
                     }
+                    (StreamStep::Begin(_), Response::Ok) => state.opened = true,
                     (_, Response::Ok) => {}
                     (StreamStep::Begin(_), Response::Err(_) | Response::EndpointError(_)) => {
                         state.failed = true;

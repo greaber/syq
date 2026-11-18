@@ -6074,6 +6074,8 @@ struct HoldingDestination<F> {
     most: Arc<Mutex<(usize, usize)>>,
     pieces: usize,
     sent: F,
+    /// Refuse every streamed begin, as a receiver's grant can.
+    refuse_begin: bool,
 }
 
 impl<F: FnMut(usize) + Send> Conn for HoldingDestination<F> {
@@ -6082,7 +6084,13 @@ impl<F: FnMut(usize) + Send> Conn for HoldingDestination<F> {
             Request::PatchData { data, .. } => data.len(),
             _ => 0,
         };
-        self.replies.push_back((self.ops.handle(&request), piece));
+        let reply = match request {
+            Request::PatchBegin { .. } if self.refuse_begin => {
+                Response::Err("refused by the grant".into())
+            }
+            request => self.ops.handle(&request),
+        };
+        self.replies.push_back((reply, piece));
         assert!(self.replies.len() <= self.queue, "reply queue overrun");
         let pieces = self.replies.iter().filter(|(_, len)| *len > 0).count();
         let bytes = self.replies.iter().map(|(_, len)| len).sum();
@@ -6132,41 +6140,124 @@ impl<F: FnMut(usize) + Send> Conn for HoldingDestination<F> {
     }
 }
 
-/// Stream `files`' patches from an in-process source into a destination
-/// that holds its replies in a queue of `queue`, calling `sent` with each
-/// piece's count, and return the most pieces and piece bytes that awaited
-/// acknowledgment at once.
+/// A remote source, which queues its replies within a reply queue of
+/// `COMPARE_REQUESTS`, as a worker connection's does.
+struct WideSource(QueuingSource);
+
+impl Conn for WideSource {
+    fn send(&mut self, request: Request) -> Result<()> {
+        self.0.send(request)
+    }
+    fn recv(&mut self) -> Result<Response> {
+        self.0.recv()
+    }
+    fn reply_queue(&self) -> Option<usize> {
+        Some(crate::transfer_tuning::COMPARE_REQUESTS)
+    }
+    fn scan(
+        &mut self,
+        _: &[u8],
+        _: Option<&RegisteredPath>,
+        _: bool,
+        _: &[String],
+        _: bool,
+        _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
+        _: &mut dyn FnMut(crate::proto::ScanWarning),
+    ) -> Result<u64> {
+        unreachable!()
+    }
+    fn native_remove(
+        &mut self,
+        _: Option<&[u8]>,
+        _: Option<&[u8]>,
+        _: &[NativeRemoveSelection],
+        _: bool,
+        _: bool,
+        _: usize,
+        _: &mut dyn FnMut(Vec<String>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
+    ) -> Result<()> {
+        unreachable!()
+    }
+}
+
+/// How `stream_into_holding_destination` streams.
+#[derive(Clone, Copy, Default)]
+struct Holding {
+    /// Read from a remote source (`WideSource`) rather than an in-process
+    /// one.
+    remote_source: bool,
+    /// Stream to a command-restricted receiver.
+    restricted: bool,
+    /// The receiver refuses every streamed begin.
+    refuse_begin: bool,
+}
+
+/// What `stream_into_holding_destination` observed: the most pieces and
+/// piece bytes that awaited acknowledgment at once, the most source reads
+/// and read data that awaited the worker at once, and the pieces sent.
+struct Held {
+    pieces: usize,
+    bytes: usize,
+    reads: usize,
+    read_data: usize,
+    sent: usize,
+}
+
+/// Stream `files`' patches into a destination that holds its replies in a
+/// queue of `COMPARE_REQUESTS`, calling `sent` with each piece's count.
 fn stream_into_holding_destination(
     root: &std::path::Path,
     files: &[(&str, usize, Vec<std::ops::Range<usize>>)],
-    queue: usize,
+    how: Holding,
     sent: impl FnMut(&Sched, usize) + Send + 'static,
-) -> (Arc<Sched>, Worker, (usize, usize)) {
+) -> (Arc<Sched>, Worker, Held) {
     let sched = edited_jobs(root, files);
     let unused = Arc::new(Mutex::new(PipelineState::default()));
     let mut worker = pipeline_worker(&sched, &unused, &unused, true);
-    worker.src = Box::new(QueuingSource {
+    let reads = Arc::new(Mutex::new((0, 0)));
+    let source = QueuingSource {
         ops: crate::fsops::FsOps::new(),
         replies: Default::default(),
-        in_process: true,
-        most: Default::default(),
-    });
+        in_process: !how.remote_source,
+        most: reads.clone(),
+    };
+    worker.src = if how.remote_source {
+        Box::new(WideSource(source))
+    } else {
+        Box::new(source)
+    };
     let most = Arc::new(Mutex::new((0, 0)));
+    let pieces = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut sent = sent;
-    let aborting = sched.clone();
+    let (aborting, counted) = (sched.clone(), pieces.clone());
     worker.dst = Box::new(HoldingDestination {
         ops: crate::fsops::FsOps::test_destination(&root.join("target")),
-        queue,
+        queue: crate::transfer_tuning::COMPARE_REQUESTS,
         replies: Default::default(),
         most: most.clone(),
         pieces: 0,
-        sent: move |pieces| sent(&aborting, pieces),
+        sent: move |pieces| {
+            counted.store(pieces, Relaxed);
+            sent(&aborting, pieces)
+        },
+        refuse_begin: how.refuse_begin,
     });
     worker.fast_batch_files = files.len();
-    Arc::get_mut(&mut worker.opts).unwrap().block = 1 << 20;
+    let opts = Arc::get_mut(&mut worker.opts).unwrap();
+    opts.block = 1 << 20;
+    opts.restricted_receiver = how.restricted;
     worker.process_item(sched.next()).unwrap();
-    let most = *most.lock().unwrap();
-    (sched, worker, most)
+    let (most, reads) = (*most.lock().unwrap(), *reads.lock().unwrap());
+    let held = Held {
+        pieces: most.0,
+        bytes: most.1,
+        reads: reads.0,
+        read_data: reads.1,
+        sent: pieces.load(Relaxed),
+    };
+    (sched, worker, held)
 }
 
 /// Every other 64 KiB block of the first `len` bytes.
@@ -6181,17 +6272,38 @@ fn scattered_blocks(len: usize) -> Vec<std::ops::Range<usize>> {
 fn a_streamed_patch_of_single_block_pieces_keeps_its_reply_queue_of_them_in_flight() {
     // 20 MiB of scattered blocks differ, which streams as 320 pieces of one
     // block each. The destination's reply queue, not a count of sixteen,
-    // limits the pieces awaiting acknowledgment.
-    let temporary = crate::test_support::tempdir().unwrap();
-    let root = temporary.path();
-    let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
-    let (sched, worker, (pieces, bytes)) =
-        stream_into_holding_destination(root, &files, 256, |_, _| {});
-    assert!(!sched.is_aborted());
-    assert_eq!(read(root, "source/file"), read(root, "target/file"));
-    assert_eq!(worker.progress.files_done.load(Relaxed), 1);
-    assert_eq!(worker.progress.bytes_done.load(Relaxed), 20 << 20);
-    assert_eq!((pieces, bytes), (256, 16 << 20));
+    // limits the pieces awaiting acknowledgment, and a remote source's
+    // reply queue and the read-ahead buffer the reads awaiting the worker.
+    for remote_source in [false, true] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
+        let how = Holding {
+            remote_source,
+            ..Holding::default()
+        };
+        let (sched, worker, held) = stream_into_holding_destination(root, &files, how, |_, _| {});
+        let case = format!("remote_source={remote_source}");
+        assert!(!sched.is_aborted());
+        assert_eq!(
+            read(root, "source/file"),
+            read(root, "target/file"),
+            "{case}"
+        );
+        assert_eq!(worker.progress.files_done.load(Relaxed), 1, "{case}");
+        assert_eq!(worker.progress.bytes_done.load(Relaxed), 20 << 20, "{case}");
+        assert_eq!((held.pieces, held.bytes), (256, 16 << 20), "{case}");
+        if remote_source {
+            assert!(held.reads > 16, "{case}: {} reads", held.reads);
+            assert!(
+                held.read_data <= 16 << 20,
+                "{case}: {} bytes",
+                held.read_data
+            );
+        } else {
+            assert_eq!(held.reads, 1, "{case}");
+        }
+    }
 }
 
 #[test]
@@ -6201,12 +6313,13 @@ fn a_streamed_patchs_unacknowledged_pieces_stay_within_their_byte_bound() {
     // the reply queue would take all twenty pieces.
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path();
+    let rewritten = [0..40 << 20].to_vec();
     let files = [
-        ("first", 40 << 20, vec![0..40 << 20]),
-        ("second", 40 << 20, vec![0..40 << 20]),
+        ("first", 40 << 20, rewritten.clone()),
+        ("second", 40 << 20, rewritten),
     ];
-    let (_, worker, (pieces, bytes)) =
-        stream_into_holding_destination(root, &files, 256, |_, _| {});
+    let (_, worker, held) =
+        stream_into_holding_destination(root, &files, Holding::default(), |_, _| {});
     for (name, ..) in &files {
         assert_eq!(
             read(root, &format!("source/{name}")),
@@ -6215,29 +6328,79 @@ fn a_streamed_patchs_unacknowledged_pieces_stay_within_their_byte_bound() {
         );
     }
     assert_eq!(worker.progress.files_done.load(Relaxed), 2);
-    assert_eq!((pieces, bytes), (16, 64 << 20));
+    assert_eq!((held.pieces, held.bytes), (16, 64 << 20));
 }
 
 #[test]
 fn an_aborted_copy_takes_every_reply_of_a_wide_patch_stream() {
     // The copy is aborted, as by a fatal error elsewhere, once a hundred
-    // single-block pieces await acknowledgment: no further piece is sent,
-    // every reply in flight is taken, and the patch is not published.
-    let temporary = crate::test_support::tempdir().unwrap();
-    let root = temporary.path();
-    let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
-    let (sched, mut worker, (pieces, _)) =
-        stream_into_holding_destination(root, &files, 256, |sched, pieces| {
-            if pieces == 100 {
-                sched.abort();
-            }
-        });
-    assert!(sched.is_aborted());
-    assert_eq!(pieces, 100);
-    assert!(worker.dst.recv().is_err(), "a reply was left unread");
-    assert_ne!(read(root, "source/file"), read(root, "target/file"));
-    assert_eq!(worker.progress.files_done.load(Relaxed), 0);
-    assert_eq!(worker.progress.bytes_done.load(Relaxed), 0);
+    // single-block pieces were sent: no further piece is sent, every reply
+    // in flight is taken, and the patch is not published. A remote source
+    // has had every piece read by then.
+    for remote_source in [false, true] {
+        let case = format!("remote_source={remote_source}");
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
+        let how = Holding {
+            remote_source,
+            ..Holding::default()
+        };
+        let (sched, mut worker, held) =
+            stream_into_holding_destination(root, &files, how, |sched, pieces| {
+                if pieces == 100 {
+                    sched.abort();
+                }
+            });
+        assert!(sched.is_aborted());
+        assert_eq!((held.pieces, held.sent), (100, 100), "{case}");
+        assert!(
+            worker.dst.recv().is_err(),
+            "{case}: a reply was left unread"
+        );
+        assert!(worker.src.recv().is_err(), "{case}: a read was left unread");
+        assert_ne!(
+            read(root, "source/file"),
+            read(root, "target/file"),
+            "{case}"
+        );
+        assert_eq!(worker.progress.files_done.load(Relaxed), 0, "{case}");
+        assert_eq!(worker.progress.bytes_done.load(Relaxed), 0, "{case}");
+    }
+}
+
+#[test]
+fn a_restricted_receiver_gets_few_pieces_before_it_answers_a_streamed_begin() {
+    // A command-restricted receiver records each piece that reaches it after
+    // it refused the patch's begin. Until the begin is answered, at most
+    // fifteen pieces follow it; once it is accepted, the window widens.
+    for refuse_begin in [true, false] {
+        let case = format!("refuse_begin={refuse_begin}");
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
+        let how = Holding {
+            restricted: true,
+            refuse_begin,
+            ..Holding::default()
+        };
+        let (_, worker, held) = stream_into_holding_destination(root, &files, how, |_, _| {});
+        if refuse_begin {
+            assert_eq!(
+                held.sent,
+                crate::transfer_tuning::COMPARE_WINDOW - 1,
+                "{case}"
+            );
+            assert_eq!(worker.progress.files_done.load(Relaxed), 0, "{case}");
+        } else {
+            assert_eq!(held.pieces, 256, "{case}");
+            assert_eq!(
+                read(root, "source/file"),
+                read(root, "target/file"),
+                "{case}"
+            );
+        }
+    }
 }
 
 /// A connection that fails, and stays dead, as a dropped one does: at its
