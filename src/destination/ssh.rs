@@ -343,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn source_scope_is_local_metadata_and_not_a_remote_approval_dependency() {
+    fn source_scope_is_parsed_as_local_metadata() {
         let argv: Vec<OsString> = [
             "ssh",
             "--pscope",
