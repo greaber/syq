@@ -28,8 +28,9 @@ workers. It counts compressed bytes, so compressible files can copy faster. A
 relay between two servers applies the rate to each leg separately. Local, S3
 and descriptor copies count file data before compression.
 
-Buffering allows short bursts. For local and descriptor copies,
-[`bw-pacing`](tuning.md#transfer-controls) chooses how requests are spaced.
+Buffering allows short bursts. Local copies and filesystem descriptor copies
+split file data into requests of at most 125 ms of the rate (and at least
+512 bytes), though small files can still go out in groups.
 S3 uploads can burst by up to one part, and copies between buckets aren't
 limited, since their data doesn't pass through this machine. A capped local
 copy uses normal copying instead of filesystem cloning.

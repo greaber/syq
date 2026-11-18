@@ -270,12 +270,9 @@ fn direct_file(file: &File, size: u64) -> Result<Option<File>> {
         } else {
             // Linux before 6.1 lacks STATX_DIOALIGN. Restrict the probe to the
             // two filesystems exercised by this implementation, on our new file.
-            let mut fs = std::mem::MaybeUninit::<libc::statfs>::zeroed();
-            if unsafe { libc::fstatfs(file.as_raw_fd(), fs.as_mut_ptr()) } != 0 {
-                return Ok(None);
-            }
-            let fs = unsafe { fs.assume_init() };
-            if fs.f_type != libc::XFS_SUPER_MAGIC && fs.f_type != libc::EXT4_SUPER_MAGIC {
+            if !crate::fsops::file_system_of(file)
+                .is_ok_and(|file_system| file_system.facts().direct_io_tested)
+            {
                 return Ok(None);
             }
         }

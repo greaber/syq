@@ -415,7 +415,7 @@ impl Approver<'_> {
                 let (authority, approved) =
                     receiver.approve_write(*write, (&command, &cwd, &inputs), &cancelled)?;
                 return receiver.serve_under_token(
-                    SessionAuthority::Receive(authority),
+                    crate::restricted::Checker::Destination(authority),
                     cancelled,
                     stream,
                     |token| Reply::Approved(Approved { token, ..approved }),
@@ -452,10 +452,7 @@ impl Approver<'_> {
                     .map(|root| root.as_os_str().as_bytes().to_vec());
                 let authority = crate::restricted::source::SourceAuthority::new(policy)?;
                 return receiver.serve_under_token(
-                    SessionAuthority::Send {
-                        authority,
-                        descriptors: Default::default(),
-                    },
+                    crate::restricted::Checker::source(authority),
                     cancelled,
                     stream,
                     |token| {
@@ -798,7 +795,7 @@ impl Receiver {
     /// `START_TIMEOUT`, and reply with the token.
     fn serve_under_token(
         &self,
-        authority: SessionAuthority,
+        authority: crate::restricted::Checker,
         cancelled: &dyn Fn() -> bool,
         stream: &mut impl Write,
         reply: impl FnOnce(String) -> Reply,

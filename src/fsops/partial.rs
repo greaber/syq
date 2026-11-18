@@ -4521,7 +4521,7 @@ fn remove_unwritten_partial(root: &Root, relative: &RelativePath) -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        if !super::fs_caps::leases_show_writers(&file) {
+        if !root.leases_show_writers_on(metadata.dev(), &file) {
             return false;
         }
         // Nothing releases this lease when it is broken: a writer's open
@@ -4814,16 +4814,9 @@ pub(crate) fn check_destination_writes(file: &File, label: &Path) -> Result<()> 
     #[cfg(target_os = "macos")]
     {
         let check = || -> io::Result<()> {
-            let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
-            // SAFETY: fstatfs initializes stats, including a NUL-terminated type
-            // name, on success. Inspect this inode, not a root that might have
-            // a different filesystem mounted underneath it.
-            crate::sys::retry_zero(|| unsafe {
-                libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr())
-            })?;
-            let stats = unsafe { stats.assume_init() };
-            let kind = unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) };
-            if matches!(kind.to_bytes(), b"nfs" | b"smbfs") {
+            // Inspect this inode, not a root that might have a different
+            // filesystem mounted underneath it.
+            if matches!(super::file_system_of(file)?.kind(), b"nfs" | b"smbfs") {
                 // Use ordinary fsync: Rust's sync_all/sync_data request the
                 // stronger, expensive F_FULLFSYNC on macOS. Local filesystems
                 // need neither this flush nor an ineffective duplicate close.
