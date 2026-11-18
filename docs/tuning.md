@@ -74,6 +74,14 @@ ceilings, pass the same keys to `--resource-limits` instead. Part size grows
 when needed to stay within S3's limit of 10,000 parts per upload. For retries,
 see [`--s3-retries`](object-storage.md#retries).
 
+When most objects are already up to date, a copy mostly asks the service
+about each object and transfers little. Syq then checks more objects at once
+than it would transfer, for as long as that finds unchanged objects faster:
+up to 256 of these metadata requests, and fewer once the service asks it to
+slow down. Objects that do need a transfer still wait for their turn under
+the usual limits. Setting `s3-objects` turns this off, and `s3-requests` and
+an `s3-objects` ceiling bound these requests too.
+
 <a id="s3-streams"></a>
 
 For S3 streams, see [Descriptor copies](object-storage.md#descriptor-copies).
