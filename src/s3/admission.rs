@@ -278,34 +278,47 @@ impl Controller {
         }
     }
 
-    /// The service asked for fewer requests. Besides rejecting the increase,
-    /// halve the room above the transfer limit for the rest of the copy, so
-    /// repeated attempts cannot keep reaching the rate it refuses.
+    /// The service asked for fewer requests. Halve the room above the
+    /// transfer limit, at once and for the rest of the copy, so that
+    /// checking settles below the rate the service refuses instead of
+    /// returning to it.
     fn throttled(&mut self) -> usize {
-        if self.limit > self.minimum {
-            self.maximum = self.minimum + (self.limit - self.minimum) / 2;
+        let before = self.limit;
+        if before <= self.minimum {
+            // The transfer limit alone keeps this many objects in progress.
+            // At least add nothing to them for a while.
+            return self.reject();
         }
-        self.reject()
+        self.maximum = self.minimum + (before - self.minimum) / 2;
+        self.limit = self.maximum;
+        self.upper = self.maximum + 1;
+        self.lower = self.lower.min(self.limit - 1);
+        self.retreated(before)
     }
 
-    /// Something other than the measured rate shows that checking more
-    /// objects at once does not help: they queue for transfer slots, or the
-    /// service asks for fewer requests. Return to the transfer limit, as
+    /// Checked objects queue for transfer slots, so checking more of them
+    /// at once only lengthens that queue. Return to the transfer limit, as
     /// after a failed increase, and leave the next one to a later revisit.
     fn reject(&mut self) -> usize {
         let before = self.limit;
+        let up = usize::from(true);
+        self.failures[up] = (self.failures[up] + 1).min(3);
+        self.revisit_at[up] = self.scores + (8 << self.failures[up]);
+        self.limit = self.minimum;
+        self.upper = self.minimum + 1;
+        self.lower = self.lower.min(self.minimum.saturating_sub(1));
+        self.upward = true;
+        self.retreated(before)
+    }
+
+    /// The limit was lowered on evidence other than the measured rate.
+    fn retreated(&mut self, before: usize) -> usize {
         self.probe = None;
         self.probe_completed = 0;
         self.growth_baseline = None;
-        self.upper = self.minimum + 1;
-        self.failures[1] = (self.failures[1] + 1).min(3);
-        self.revisit_at[1] = self.scores + (8 << self.failures[1]);
-        self.lower = self.lower.min(self.minimum.saturating_sub(1));
-        self.limit = self.minimum;
-        self.upward = true;
         self.hold = 1;
         if before != self.limit {
-            // The rate at the transfer limit is not a change of conditions.
+            // The rate at the lower limit is not a change of conditions.
             self.reference = None;
             self.changed_scores = 0;
             self.sampler.reset();

@@ -834,19 +834,34 @@ fn throttling_halves_the_room_checking_may_use() {
     let mut controller = Controller::checking(32, 256);
     exercise(&mut controller, 256);
     let reached = controller.limit;
-    assert_eq!(controller.throttled(), 32);
-    assert_eq!(controller.maximum, 32 + (reached - 32) / 2);
+    assert!(reached > 200);
+    // It continues from halfway, and never again goes higher.
+    let halved = 32 + (reached - 32) / 2;
+    assert_eq!(controller.throttled(), halved);
+    assert_eq!(controller.maximum, halved);
+    assert!(controller.probe.is_none());
     for _ in 0..500 {
         let active = controller.limit;
-        assert!(active <= controller.maximum);
+        assert!((32..=halved).contains(&active));
         controller.observe(active as f64, active, 10000, 16, 0.0);
     }
-    assert!(controller.limit > 32, "checking never resumed");
-    // Throttled at the transfer limit, the room is not this controller's
-    // to give up.
+    assert!(controller.limit > halved * 9 / 10, "{}", controller.limit);
+    // Repeated throttling brings it down to the transfer limit, where it
+    // has no room left to give up.
+    for _ in 0..8 {
+        controller.throttled();
+    }
+    assert_eq!((controller.limit, controller.maximum), (32, 32));
+    for _ in 0..100 {
+        assert_eq!(controller.observe(32.0, 32, 10000, 16, 0.0), 32);
+    }
+    // Throttled before it has grown, it keeps its room and waits.
     let mut idle = Controller::checking(32, 256);
     assert_eq!(idle.throttled(), 32);
     assert_eq!(idle.maximum, 256);
+    for _ in 0..16 {
+        assert_eq!(idle.observe(32.0, 32, 10000, 16, 0.0), 32);
+    }
 }
 
 #[test]
@@ -930,8 +945,7 @@ async fn throttling_responses_stop_checking_from_adding_requests() {
             "threshold {threshold}: peak {peak}"
         );
         if threshold != 0 {
-            // An attempt above the threshold ends within a sample, and each
-            // one halves how far the next may go.
+            // Each sample above the threshold halves how far checking goes.
             let throttled = outage.throttled_responses();
             assert!((1..1_000).contains(&throttled), "throttled {throttled}");
         }
