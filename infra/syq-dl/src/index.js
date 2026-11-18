@@ -134,7 +134,7 @@ async function resolveLatestTag(env, ctx, asset) {
     ctx.waitUntil(
       cache.put(
         key,
-        new Response(tag, { headers: { "cache-control": `public, max-age=${LATEST_TTL_SECONDS}` } }),
+        new Response(tag, { headers: { "cache-control": LATEST_CACHE_CONTROL } }),
       ),
     );
   }

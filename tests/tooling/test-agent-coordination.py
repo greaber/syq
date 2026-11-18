@@ -451,6 +451,14 @@ class CoordinationTests(unittest.TestCase):
         self.assertEqual(self.triage(review, 'revise')['status'], 'needs_revision')
         self.assertEqual(len(self.launches()), 1)
 
+    def test_auto_revise_requires_the_pushed_head(self):
+        self.review_setup()
+        review = self.wait(self.review())
+        with (self.cwd / 'file').open('a') as out: out.write('fix in progress\n')
+        self.triage(review, 'revise', code=2)
+        self.assertEqual(self.cmd('review', 'status', review['id'])['status'], 'review_ready')
+        self.assertEqual(len(self.launches()), 1)
+
     def test_stop_keeps_report_available_without_restarting(self):
         self.review_setup(); review = self.review(behavior='hold')
         self.cmd('review', 'stop-loop', review['id'], '--agent', 'implementer')
