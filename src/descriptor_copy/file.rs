@@ -192,7 +192,7 @@ impl FileSession {
         ops: &mut crate::fsops::FsOps,
     ) -> Result<Self> {
         let existed = !matches!(&selected, PinnedPath::Missing(_));
-        let (file, destination) = if write {
+        let (file, destination, original) = if write {
             // An existing file keeps its mode; None gives a new one its
             // source's permissions, limited as creating it would limit them.
             let (root, target, existing_mode) = match selected {
@@ -229,8 +229,7 @@ impl FileSession {
             // The stage is in the target's own directory, including when
             // that directory is a mount point beneath the selected root.
             let root = std::sync::Arc::new(root);
-            let (temporary, file) = ops.open_descriptor_stage(&root, &target)?;
-            let created = file.metadata()?;
+            let (temporary, file, created) = ops.open_descriptor_stage(&root, &target)?;
             (
                 file,
                 Some(Destination {
@@ -250,6 +249,7 @@ impl FileSession {
                     metadata,
                     existed,
                 }),
+                created,
             )
         } else {
             let PinnedPath::Leaf(leaf) = selected else {
@@ -258,9 +258,10 @@ impl FileSession {
             if !leaf.metadata().is_file() {
                 bail!("stream source must be one regular file");
             }
-            (leaf.open_read()?, None)
+            let file = leaf.open_read()?;
+            let original = file.metadata()?;
+            (file, None, original)
         };
-        let original = file.metadata()?;
         Ok(Self {
             original,
             file,

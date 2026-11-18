@@ -544,12 +544,13 @@ impl FsOps {
 
     /// The stage of a descriptor copy's destination `target` below `root`,
     /// under a partial name of a copy of its own: a new file, created
-    /// exclusively and owner-only, and registered, as any stage is.
+    /// exclusively and owner-only, and registered, as any stage is, with
+    /// its metadata read as it was created.
     pub(crate) fn open_descriptor_stage(
         &mut self,
         root: &Arc<Root>,
         target: &RelativePath,
-    ) -> Result<(RelativePath, File)> {
+    ) -> Result<(RelativePath, File, fs::Metadata)> {
         let mut copy_id = CopyId::default();
         getrandom::fill(&mut copy_id).context("generate a descriptor copy's identity")?;
         let target = RootedTarget {
@@ -559,7 +560,8 @@ impl FsOps {
             create_missing_parents: false,
         };
         let stage = self.open_stage(&target, &copy_id, StagePolicy::new(Sidecar::Stage))?;
-        Ok((stage.relative, stage.file))
+        let created = stage.metadata()?;
+        Ok((stage.relative, stage.file, created))
     }
 
     /// Create a new stage at `relative` as `policy` says, with its metadata
