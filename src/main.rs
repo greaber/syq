@@ -110,21 +110,29 @@ fn tune_allocator() {}
 
 /// glibc gives each new thread its own arena, up to eight per CPU, and keeps
 /// freed memory in the arena that freed it. An S3 command runs up to 32
-/// tokio workers and a blocking pool, and the HTTP client's per-connection
-/// buffers left in their arenas raise its peak memory to several times its
-/// live heap. A few shared arenas keep it near the live heap at no measured
-/// cost in time or CPU there. File copies would pay for a cap in user CPU,
-/// so only S3 commands get it. glibc fixes the limit when a thread first
-/// needs a ninth arena, so call this before starting the S3 runtime.
+/// tokio workers and a blocking pool of up to a few hundred threads, and the
+/// HTTP buffers they leave in their arenas raise its peak memory well above
+/// its live heap. Limiting S3 commands to 32 arenas halves the peak of a
+/// large upload with no measurable CPU cost. Fewer arenas would also shrink
+/// downloads, but cost CPU in lock contention on many small files, as any
+/// cap does in file copies, which therefore keep glibc's default. glibc
+/// fixes the limit when a thread first needs a ninth arena, so call this
+/// before starting the S3 runtime.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn limit_allocator_arenas_for_s3() {
+    // An arena limit the user set for glibc stays in force.
+    let tunables = std::env::var("GLIBC_TUNABLES").unwrap_or_default();
+    if std::env::var_os("MALLOC_ARENA_MAX").is_some() || tunables.contains("glibc.malloc.arena_max")
+    {
+        return;
+    }
     unsafe {
         libc::mallopt(libc::M_ARENA_MAX, S3_ARENAS);
     }
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-const S3_ARENAS: libc::c_int = 4;
+const S3_ARENAS: libc::c_int = 32;
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn limit_allocator_arenas_for_s3() {}
