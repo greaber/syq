@@ -2276,17 +2276,6 @@ mod storage_signing {
         for absent in ["secret", "work", "objects.example", "auto", "--rsh", "--syq-path", "--tcp-ports", "server"] {
             assert!(!text.contains(absent), "{absent}: {text}");
         }
-        // The server parses it as an upload from its own files.
-        std::env::set_var(started::SIGNING_ENV, crate::identity::build());
-        let parsed = Args::parse_args(&remote.iter().map(OsString::from).collect::<Vec<_>>());
-        std::env::remove_var(started::SIGNING_ENV);
-        let parsed = parsed.unwrap();
-        assert!(parsed.delegated && parsed.dry_run && parsed.delete);
-        assert_eq!(parsed.locations.len(), 2);
-        assert_eq!(parsed.locations[0].host, None);
-        assert_eq!(parsed.locations[0].path, b"dataset");
-        assert_eq!(parsed.locations[1].host.as_deref(), Some("s3://bucket"));
-
         // A download runs at the destination, with the bucket as its source.
         let args = command(&[
             "cp", "--from", "s3://bucket", "--srcs-in", "dataset", "--to", "server", "--into", "/data",

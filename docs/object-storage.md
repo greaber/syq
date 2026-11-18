@@ -165,8 +165,8 @@ until your credentials expire if that is sooner. A copy that runs longer fails
 its remaining files; run it again to continue.
 
 These copies do not support `--detach`, `--auth-from`, `--mapping`,
-`--stream-mapping-fd` or the SSH route options (`--via`, `--coordinate-at`,
-`--peer-auth` and the TCP options). `syq rm`, copies between two buckets and
+`--stream-mapping-fd` or the options for copies between two servers
+(`--coordinate-at`, `--peer-auth` and the TCP options). `syq rm`, copies between two buckets and
 copies that also name a second server or a receiving machine (`@NAME`) cannot
 run through a server this way.
 
