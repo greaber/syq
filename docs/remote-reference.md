@@ -109,8 +109,8 @@ file data by default; change these for one copy with
 changes the copy asks hostB to make: files written, directories, links and
 special files created, metadata changes, and deletions. Each counts when hostB
 accepts the request for it, even if hostB then finds nothing to change, and
-one sent again after a dropped connection counts again. The copy must start within 24 hours of authorization and
-finish within seven days of it.
+one sent again after a dropped connection counts again. The copy must start
+within 24 hours of authorization and finish within seven days of it.
 
 A copy between two servers can name up to 1,024 sources, like any copy, but
 long paths lower that number. A restricted copy's signed command holds at most
