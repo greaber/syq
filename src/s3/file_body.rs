@@ -49,7 +49,9 @@ impl Pool {
         self.idle.lock().unwrap_or_else(|e| e.into_inner())
     }
     fn take(&'static self) -> Buffer {
-        let buffer = self.idle().pop().unwrap_or_else(|| vec![0; CHUNK]);
+        // Release the lock before allocating a new buffer.
+        let idle = self.idle().pop();
+        let buffer = idle.unwrap_or_else(|| vec![0; CHUNK]);
         Buffer {
             buffer,
             len: 0,

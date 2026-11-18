@@ -193,12 +193,13 @@ async fn a_body_dropped_mid_read_returns_its_buffer() {
     // The first chunk's buffer is the only one, so the next read takes it.
     drop(frame(&mut chunks).await.unwrap().unwrap());
     assert_eq!(pool.idle().len(), 1);
-    // Start that read, then drop the body before it completes.
-    let started = std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut chunks).poll_frame(cx)));
-    if let Poll::Ready(frame) = started.await {
-        drop(frame);
-    }
+    // Holding the pool's lock stops that read before it takes the buffer, so
+    // it is still pending when the body is dropped.
+    let idle = pool.idle();
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    assert!(Pin::new(&mut chunks).poll_frame(&mut cx).is_pending());
     drop(chunks);
+    drop(idle);
     // The abandoned read holds the last other reference until it finishes.
     tokio::time::timeout(Duration::from_secs(10), async {
         while Arc::strong_count(&opened) > 1 {
@@ -209,4 +210,82 @@ async fn a_body_dropped_mid_read_returns_its_buffer() {
     .expect("the abandoned read finishes");
     // A buffer kept by the abandoned read would leave the pool empty.
     eventually_idle(pool, 1).await;
+}
+
+/// The SDK sends the body unchanged next to a precomputed request checksum,
+/// as storage-authorized uploads do.
+#[tokio::test]
+async fn the_sdk_sends_the_body_that_matches_its_request_checksum() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let temp = crate::test_support::tempdir().unwrap();
+    let data = patterned(2 * CHUNK + 11);
+    let opened = opened(temp.path(), &data);
+    let checksum = crate::s3::checksum::Algorithm::Sha256
+        .digest(&data)
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(socket.read_u8().await.unwrap());
+        }
+        let head = String::from_utf8(head).unwrap();
+        let header = |name: &str| {
+            head.lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.trim().to_owned())
+        };
+        let length: usize = header("content-length").unwrap().parse().unwrap();
+        let mut body = vec![0; length];
+        socket.read_exact(&mut body).await.unwrap();
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nETag: \"x\"\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        (header("x-amz-checksum-sha256"), body)
+    });
+    let sdk =
+        aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::config::Builder::new()
+                .behavior_version_latest()
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    "test", "test", None, None, "fixture",
+                ))
+                .stalled_stream_protection(
+                    aws_sdk_s3::config::StalledStreamProtectionConfig::disabled(),
+                )
+                .endpoint_url(endpoint)
+                .force_path_style(true)
+                .request_checksum_calculation(
+                    aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+                )
+                .build(),
+        );
+    sdk.put_object()
+        .bucket("bucket")
+        .key("object")
+        .body(aws_sdk_s3::primitives::ByteStream::new(body(
+            opened.source.clone(),
+            opened.source.open().unwrap(),
+            0,
+            data.len() as u64,
+        )))
+        .content_length(data.len() as i64)
+        .checksum_sha256(&checksum)
+        .customize()
+        .config_override(crate::s3::client::without_sdk_retries())
+        .disable_payload_signing()
+        .send()
+        .await
+        .unwrap();
+    let (header, received) = tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(header.as_deref(), Some(checksum.as_str()));
+    assert!(received == data, "the body differs from the file");
 }
