@@ -34,7 +34,11 @@ pub(crate) fn source_name(args: &crate::cli::Args) -> Option<&str> {
 /// that its endpoints can be one. Parsing checks this, so a receiving name
 /// never reaches ssh.
 pub(crate) fn check_endpoints(args: &crate::cli::Args) -> Result<String> {
-    let name = source_name(args).context("copy source is not a receiving machine")?;
+    anyhow::ensure!(
+        crate::route::classify(args) == crate::route::Route::FromNamed,
+        "copy source is not a receiving machine"
+    );
+    let name = source_name(args).expect("a source on a receiving machine");
     let (destination, sources) = args
         .locations
         .split_last()
@@ -62,16 +66,7 @@ pub(crate) fn check_endpoints(args: &crate::cli::Args) -> Result<String> {
 /// that the copy can be one.
 pub(crate) fn eligible(args: &crate::cli::Args) -> Result<String> {
     let name = check_endpoints(args)?;
-    if args.rsh.is_some()
-        || args.syq_path.is_some()
-        || args.detach
-        || args.restricted_grant.is_some()
-        || args.no_tcp_encryption
-        || args.peer_auth != crate::cli::PeerAuth::Restricted
-        || args.coordinate_at != crate::cli::CoordinateAt::Auto
-    {
-        bail!("copies from receiving machines own their connection; --rsh, --syq-path, --detach, --peer-auth, --coordinate-at, and --no-tcp-encryption cannot be combined with them");
-    }
+    crate::route::refuse_options(crate::route::Route::FromNamed, args)?;
     anyhow::ensure!(
         args.descriptor_copy.is_none(),
         "copies from receiving machines take named files; --src-fd and --as-fd are not supported with them"
@@ -106,7 +101,8 @@ fn sending_command(command: &[Vec<u8>], name: &str) -> Result<crate::cli::Args> 
 
 pub(super) fn select(args: &crate::cli::Args) -> Result<Option<handoff::Selection>> {
     // A copy already approved has its route.
-    if source_name(args).is_none() || args.named_source.is_some() {
+    if crate::route::classify(args) != crate::route::Route::FromNamed || args.named_source.is_some()
+    {
         return Ok(None);
     }
     let name = check_endpoints(args)?;

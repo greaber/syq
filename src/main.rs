@@ -63,6 +63,7 @@ mod resume;
 mod rm;
 #[cfg_attr(all(target_os = "macos", not(test)), deny(clippy::disallowed_methods))]
 mod rooted;
+mod route;
 mod s3;
 mod scan;
 mod sched;

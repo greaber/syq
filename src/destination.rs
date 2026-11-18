@@ -1032,6 +1032,8 @@ fn select_copy(
     if args.interface != crate::cli::Interface::NativeCp {
         return Ok(None);
     }
+    use crate::route::Route;
+    let route = crate::route::classify(args);
     // Files on a receiving machine: it approves the copy, whatever else
     // this machine could use.
     if let Some(selection) = send::select(args)? {
@@ -1053,72 +1055,38 @@ fn select_copy(
             return Ok(None);
         }
     }
-    let is_pull = args
-        .locations
-        .split_last()
-        .is_some_and(|(destination, sources)| {
-            !destination.is_remote() && sources.iter().any(|source| source.is_remote())
-        });
-    if is_pull {
+    // A copy from a receiving machine took its route above.
+    if route == Route::Download {
         return pull::select(args, progress);
     }
     match &args.auth_from {
         crate::cli::AuthFrom::Provider(_) => return forward::select(args, progress),
         crate::cli::AuthFrom::Ssh => {
-            if args
-                .locations
-                .split_last()
-                .is_some_and(|(destination, sources)| {
-                    destination.is_remote()
-                        && destination
-                            .host
-                            .as_deref()
-                            .is_none_or(|host| !host.starts_with('@'))
-                        && !sources.is_empty()
-                        && sources.iter().all(|source| {
-                            source.is_remote()
-                                && source
-                                    .host
-                                    .as_deref()
-                                    .is_none_or(|host| !host.starts_with('@'))
-                        })
-                })
-            {
-                return Ok(None);
-            }
-            let (destination, sources) = args
-                .locations
-                .split_last()
-                .context("copy endpoints missing")?;
-            if args.interface != crate::cli::Interface::NativeCp
-                || sources.iter().any(|source| source.is_remote())
-                || !destination.is_remote()
-                || destination
-                    .host
-                    .as_deref()
-                    .is_some_and(|host| host.starts_with('@'))
-            {
-                bail!(
+            let sources = &args.locations[..args.locations.len().saturating_sub(1)];
+            return match route {
+                Route::Upload => Ok(None),
+                Route::Between if sources.iter().all(|source| source.is_remote()) => Ok(None),
+                _ => bail!(
                     "--auth-from ssh requires local sources and an ordinary SSH --to destination"
-                );
-            }
-            return Ok(None);
+                ),
+            };
         }
         crate::cli::AuthFrom::Auto => {}
     }
-    let Some(destination) = args.locations.last() else {
-        return Ok(None);
-    };
-    let Some(host) = destination.host.as_deref() else {
-        return Ok(None);
-    };
-    let Some(name) = host.strip_prefix('@') else {
-        if handoff::selected_name(handoff::Kind::Copy).is_some() {
-            bail!("receiver destinations require @NAME; retry the command with --to @NAME");
+    let destination = args.locations.last().and_then(|l| l.host.as_deref());
+    let name = match (route, destination) {
+        (Route::ToNamed, Some(host)) => host
+            .strip_prefix('@')
+            .expect("a named destination")
+            .to_owned(),
+        (_, None) => return Ok(None),
+        (_, Some(_)) => {
+            if handoff::selected_name(handoff::Kind::Copy).is_some() {
+                bail!("receiver destinations require @NAME; retry the command with --to @NAME");
+            }
+            return forward::select(args, progress);
         }
-        return forward::select(args, progress);
     };
-    let name = name.to_owned();
     let registration = load_registration(&name)?;
     if args.interface != crate::cli::Interface::NativeCp
         || args.locations[..args.locations.len() - 1]
@@ -1127,15 +1095,7 @@ fn select_copy(
     {
         bail!("named destinations require syq cp with local sources");
     }
-    if args.syq_path.is_some()
-        || args.rsh.is_some()
-        || args.detach
-        || args.restricted_grant.is_some()
-        || args.no_tcp_encryption
-        || args.peer_auth != crate::cli::PeerAuth::Restricted
-    {
-        bail!("named destinations own their connection; --syq-path, --rsh, --detach, --peer-auth, and --no-tcp-encryption cannot be combined with them");
-    }
+    crate::route::refuse_options(Route::ToNamed, args)?;
     if args.connections_opt.is_some()
         && args.connections > usize::from(crate::delegation::MAX_CONNECTIONS)
     {

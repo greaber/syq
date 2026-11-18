@@ -279,21 +279,21 @@ pub(crate) fn apply_copy(args: &mut crate::cli::Args) -> Result<()> {
     if args.auth_from_explicit || args.s3.is_some() {
         return Ok(());
     }
-    let location = if let Some((location, _)) = crate::destination::account_copy::remote(args) {
-        Some(location)
-    } else if crate::destination::forward_target(args).is_ok() {
-        args.locations.last()
-    } else if crate::destination::pull::eligible_target(args).is_ok() {
-        args.locations.first()
-    } else if crate::destination::coordinated_targets(args).is_ok() {
-        // The same rule as for an upload above: a saved choice applies only
-        // to a copy the approved route can carry. With --rsh or another
-        // option it refuses, the server's own SSH runs the copy; an explicit
-        // --auth-from with such an option is refused instead.
-        args.auth_from = between_servers(args)?;
-        return Ok(());
-    } else {
-        return Ok(());
+    use crate::destination::{account_copy, forward_target, pull};
+    use crate::route::Route;
+    // A saved choice applies only to a copy that an account connection or
+    // the approved route can carry. With --rsh or another option they
+    // refuse, the server's own SSH runs the copy; an explicit --auth-from
+    // with such an option is refused instead.
+    let carried = account_copy::remote(args).is_some();
+    let location = match crate::route::classify(args) {
+        Route::Upload if carried || forward_target(args).is_ok() => args.locations.last(),
+        Route::Download if carried || pull::eligible_target(args).is_ok() => args.locations.first(),
+        Route::Between if crate::destination::coordinated_targets(args).is_ok() => {
+            args.auth_from = between_servers(args)?;
+            return Ok(());
+        }
+        _ => return Ok(()),
     };
     let host = location
         .and_then(|location| location.host.as_deref())
