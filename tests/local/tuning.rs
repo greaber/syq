@@ -914,8 +914,10 @@ fn a_bandwidth_cap_sends_requests_of_125_ms_of_its_rate() {
         .run()
         .unwrap();
     assert_output_ok(&out);
+    // Eight 256 KiB requests at 2 MiB/s; the first goes out on the pacing
+    // clock's idle credit, so the last is admitted after 875 ms.
     assert!(
-        start.elapsed() >= std::time::Duration::from_millis(900),
+        start.elapsed() >= std::time::Duration::from_millis(750),
         "{out:?}"
     );
     let observed = tuning_observed(&out);

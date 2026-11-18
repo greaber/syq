@@ -99,8 +99,8 @@ impl BandwidthLimit {
         }
     }
 
-    /// The largest request a capped filesystem copy sends: `BURST` of the
-    /// rate, at least 512 bytes. This sizes requests; it does not bound
+    /// The largest request a capped local or filesystem descriptor copy
+    /// sends: `BURST` of the rate, at least 512 bytes. This sizes requests; it does not bound
     /// bytes on the network.
     pub fn request_bytes(&self) -> u64 {
         ((self.bytes_per_sec as u128 * BURST.as_millis() / 1000).min(u64::MAX as u128) as u64)

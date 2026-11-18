@@ -342,7 +342,7 @@ impl FromStr for TransferTuning {
                         "s3-retries is no longer a --performance-tuning key; use --s3-retries N"
                     ),
                     "bw-pacing" => bail!(
-                        "bw-pacing is no longer a --performance-tuning key; under a bandwidth cap, filesystem copies always use requests of up to 125 ms of the rate"
+                        "bw-pacing is no longer a --performance-tuning key; see the performance tuning reference"
                     ),
                     _ => bail!("unknown tuning option {name:?}; see --help-all"),
                 }

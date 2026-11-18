@@ -1534,8 +1534,10 @@ fn stream_controls_check_hashes_pace_and_keep_payload_clean() {
         "two-range paced download opened idle workers: {}",
         stderr_of(&out)
     );
+    // Two 64 KiB ranges at 512 KiB/s: the second waits 125 ms beyond the
+    // pacing clock's idle credit.
     assert!(
-        start.elapsed().as_millis() >= 240,
+        start.elapsed().as_millis() >= 115,
         "download ignored bandwidth limit"
     );
     write(&t.path("target"), b"old");
