@@ -5924,18 +5924,11 @@ fn operator_directory_request(
     symlink_policy: OperatorSymlinkPolicy,
     require_search: bool,
 ) -> Request {
-    if require_search {
-        Request::CheckSearchableOperatorDirectory {
-            path: path.to_vec(),
-            allow_missing,
-            symlink_policy,
-        }
-    } else {
-        Request::CheckOperatorDirectory {
-            path: path.to_vec(),
-            allow_missing,
-            symlink_policy,
-        }
+    Request::CheckOperatorDirectory {
+        path: path.to_vec(),
+        allow_missing,
+        symlink_policy,
+        require_search,
     }
 }
 
@@ -5970,16 +5963,10 @@ fn check_operator_directory_ancestry(
     shared_suffixes: Vec<PathBytes>,
     access: Option<bool>,
 ) -> Result<Vec<SourceDirectoryRelations>> {
-    let request = match access {
-        Some(selection_in_copy) => Request::CheckOperatorDirectoryAncestryWithAccess {
-            checks,
-            shared_suffixes,
-            selection_in_copy,
-        },
-        None => Request::CheckOperatorDirectoryAncestry {
-            checks,
-            shared_suffixes,
-        },
+    let request = Request::CheckOperatorDirectoryAncestry {
+        checks,
+        shared_suffixes,
+        access,
     };
     match ok(conn.call(request)?, "destination ancestry")? {
         Response::DirectoryRelations(relations) => Ok(relations),

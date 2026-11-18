@@ -76,18 +76,24 @@ fn ensure_same<T: serde::Serialize>(requested: &T, derived: &T) -> Result<()> {
     Ok(())
 }
 
-/// Copies to this machine, the receiving machine `receiver`.
-/// The copy `command` asks this machine, the receiving machine `receiver`,
-/// to approve: a `syq cp` to `@receiver`. This machine derives what the copy
-/// may do from the command (`directive::receiving_rules`). The server
-/// supplies ignore rules and the mapping's digest, which this machine does
-/// not check. Neither reaches beyond the scopes, policy and limits the
+/// Parse `command` and check it as `check_receiving_command` does.
+#[cfg(test)]
+pub(crate) fn receiving_command(command: &[Vec<u8>], receiver: &str) -> Result<crate::cli::Args> {
+    let args = parse(command)?;
+    check_receiving_command(&args, receiver)?;
+    Ok(args)
+}
+
+/// Check `args`, the copy a server asks this machine, the receiving machine
+/// `receiver`, to approve: a `syq cp` to `@receiver`. This machine derives
+/// what the copy may do from the command (`directive::receiving_rules`). The
+/// server supplies ignore rules and the mapping's digest, which this machine
+/// does not check. Neither reaches beyond the scopes, policy and limits the
 /// command states, and ignore rules only narrow a copy, but a mapping's
 /// entries can also set the permissions and group of the files they list
 /// without the matching copy option. The prompt warns of that
 /// (`receive_approval::copy_warnings`).
-pub(crate) fn receiving_command(command: &[Vec<u8>], receiver: &str) -> Result<crate::cli::Args> {
-    let args = parse(command)?;
+pub(crate) fn check_receiving_command(args: &crate::cli::Args, receiver: &str) -> Result<()> {
     anyhow::ensure!(
         args.interface == crate::cli::Interface::NativeCp && args.s3.is_none(),
         "copy requests must come from syq cp"
@@ -97,14 +103,13 @@ pub(crate) fn receiving_command(command: &[Vec<u8>], receiver: &str) -> Result<c
         destination.host.as_deref() == Some(&format!("@{receiver}")),
         "the requesting command copies to a different destination"
     );
-    Ok(args)
+    crate::directive::check_receiving(args)
 }
 
 /// Validate the authorizer chosen on the requesting host. An omitted or `auto`
 /// flag can select this registered receiving name without consulting this
 /// machine's preferences; an explicit name must match the addressed receiver.
-pub(crate) fn check_authorizer(command: &[Vec<u8>], receiver: &str) -> Result<()> {
-    let args = parse(command)?;
+pub(crate) fn check_authorizer(args: &crate::cli::Args, receiver: &str) -> Result<()> {
     anyhow::ensure!(
         matches!(args.auth_from, crate::cli::AuthFrom::Auto)
             || matches!(&args.auth_from, crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name)) if name == receiver),
@@ -119,8 +124,7 @@ pub(crate) fn check_authorizer(command: &[Vec<u8>], receiver: &str) -> Result<()
 /// the provider cannot check it is the one named; an omitted or `auto` flag
 /// can select it by a saved choice. It must not name a receiving machine or
 /// the requester's own SSH access.
-pub(crate) fn check_provider_authorizer(command: &[Vec<u8>]) -> Result<()> {
-    let args = parse(command)?;
+pub(crate) fn check_provider_authorizer(args: &crate::cli::Args) -> Result<()> {
     anyhow::ensure!(
         matches!(
             args.auth_from,

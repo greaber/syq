@@ -330,8 +330,8 @@ fn seen_at(path: &Path) -> Option<Seen> {
 /// process sees it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Follows {
-    /// Nothing: the service predates following updates, its path is gone,
-    /// or its path is a release in the binary store, which never changes.
+    /// Nothing: it started without a path to follow, its path is gone, or
+    /// its path is a release in the binary store, which never changes.
     /// Commands replace it (`receive_service::refresh_outdated`).
     Nothing,
     /// The file this process runs, so it switches to this build by itself.
