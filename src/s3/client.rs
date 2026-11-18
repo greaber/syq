@@ -334,7 +334,7 @@ async fn bucket_region(client: &Client, bucket: &str) -> std::result::Result<Str
 pub(super) async fn connect(
     options: &mut Options,
     control: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    uploads: std::sync::Arc<super::upload_http::Cancellation>,
+    uploads: std::sync::Arc<super::cancel::Cancellation>,
 ) -> Result<(Client, Option<String>)> {
     connect_authorized(options, control, uploads, None, None).await
 }
@@ -342,17 +342,10 @@ pub(super) async fn connect(
 pub(super) async fn connect_authorized(
     options: &mut Options,
     control: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    uploads: std::sync::Arc<super::upload_http::Cancellation>,
+    uploads: std::sync::Arc<super::cancel::Cancellation>,
     authorization: Option<std::sync::Arc<super::authorization::Authorization>>,
     outage: Option<std::sync::Arc<super::outage::Outage>>,
 ) -> Result<(Client, Option<String>)> {
-    let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
-    if let Some(profile) = &options.profile {
-        loader = loader.profile_name(profile);
-    }
-    if let Some(region) = &options.region {
-        loader = loader.region(Region::new(region.clone()));
-    }
     let shared = if let Some(authorization) = &authorization {
         options.endpoint = Some(authorization.configuration.endpoint.clone());
         options.region = Some(authorization.configuration.region.clone());
@@ -372,15 +365,52 @@ pub(super) async fn connect_authorized(
             .behavior_version(aws_config::BehaviorVersion::latest())
             .build()
     } else {
-        loader.load().await
+        local_config(options).await
     };
+    connect_with(options, shared, control, uploads, authorization, outage).await
+}
+
+/// Connects with this machine's own configuration, like [`connect`], and also
+/// returns the credentials provider the client signs with.
+pub(super) async fn connect_local(
+    options: &mut Options,
+    control: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    uploads: std::sync::Arc<super::cancel::Cancellation>,
+) -> Result<(
+    Client,
+    Option<aws_credential_types::provider::SharedCredentialsProvider>,
+)> {
+    let shared = local_config(options).await;
+    let credentials = shared.credentials_provider();
+    let (client, _) = connect_with(options, shared, control, uploads, None, None).await?;
+    Ok((client, credentials))
+}
+
+async fn local_config(options: &Options) -> aws_types::SdkConfig {
+    let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+    if let Some(profile) = &options.profile {
+        loader = loader.profile_name(profile);
+    }
+    if let Some(region) = &options.region {
+        loader = loader.region(Region::new(region.clone()));
+    }
+    loader.load().await
+}
+
+async fn connect_with(
+    options: &mut Options,
+    shared: aws_types::SdkConfig,
+    control: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    uploads: std::sync::Arc<super::cancel::Cancellation>,
+    authorization: Option<std::sync::Arc<super::authorization::Authorization>>,
+    outage: Option<std::sync::Arc<super::outage::Outage>>,
+) -> Result<(Client, Option<String>)> {
     let transport = aws_smithy_http_client::Builder::new()
         .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
             aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
         ))
         .build_with_resolver(super::dns::CoalescingDns::default());
-    let sleep =
-        aws_sdk_s3::config::SharedAsyncSleep::new(super::upload_http::Sleep(uploads.clone()));
+    let sleep = aws_sdk_s3::config::SharedAsyncSleep::new(super::cancel::Sleep(uploads.clone()));
     let transport = super::upload_http::client(transport, uploads);
     let transport = match authorization {
         Some(authorization) => super::authorization::http_client(transport, authorization),
@@ -1141,16 +1171,10 @@ pub(super) fn metadata_update_request(
         )
         .header("x-amz-metadata-directive", "REPLACE")
         .header("x-amz-tagging-directive", "COPY");
-    for (name, value) in desired.metadata().into_iter().flat_map(|m| m.iter()) {
-        request = request.header(&format!("x-amz-meta-{name}"), value);
-    }
+    request
+        .headers
+        .extend(super::metadata_copy::object_headers(desired));
     for (name, value) in [
-        ("content-type", desired.content_type()),
-        ("content-encoding", desired.content_encoding()),
-        ("content-language", desired.content_language()),
-        ("content-disposition", desired.content_disposition()),
-        ("cache-control", desired.cache_control()),
-        ("expires", desired.expires_string()),
         (
             "x-amz-storage-class",
             desired.storage_class().map(|v| v.as_str()),
@@ -1168,16 +1192,17 @@ pub(super) fn metadata_update_request(
             head.bucket_key_enabled()
                 .map(|v| if v { "true" } else { "false" }),
         ),
-        (
-            "x-amz-website-redirect-location",
-            desired.website_redirect_location(),
-        ),
     ] {
         if let Some(value) = value {
             request = request.header(name, value);
         }
     }
     merge_metadata_encryption(&mut request, overrides)?;
+    // Headers the command adds replace the object's own, as the client adds
+    // them to the request, so the description is what is sent.
+    for Header(name, value) in overrides {
+        request.headers.insert(name.clone(), value.clone());
+    }
     Ok(request)
 }
 
@@ -1231,11 +1256,6 @@ fn merge_metadata_encryption(
                     request.headers.remove(name);
                 }
             }
-        }
-    }
-    for Header(name, value) in overrides {
-        if name.starts_with("x-amz-server-side-encryption") {
-            request.headers.insert(name.clone(), value.clone());
         }
     }
     Ok(())

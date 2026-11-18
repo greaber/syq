@@ -977,6 +977,12 @@ pub enum WireRequest<Data> {
         prefix: PathBytes,
         limit: u16,
         symlink_policy: OperatorSymlinkPolicy,
+        /// Reply with DetailedDirectoryEntries, adding on-demand metadata.
+        detailed: bool,
+        /// Report a final symlink to a directory as a directory. Removal
+        /// completion clears this while keeping `symlink_policy` for the
+        /// directory being listed.
+        follow_final_symlinks: bool,
     },
     /// Resolve all native removal selectors to endpoint-owned handles before
     /// mutation, then remove through those handles using an endpoint-local
@@ -1000,20 +1006,30 @@ pub enum WireRequest<Data> {
         follow: bool,
     },
     /// Resolve an operator-supplied directory component by component. A
-    /// missing suffix is accepted only when requested.
+    /// missing suffix is accepted only when requested. With `require_search`,
+    /// also require kernel-checked search access to the selected directory:
+    /// a copy that cannot widen its destination refuses one it cannot enter,
+    /// as rsync does.
     CheckOperatorDirectory {
         path: PathBytes,
         allow_missing: bool,
         symlink_policy: OperatorSymlinkPolicy,
+        require_search: bool,
     },
     /// Compare candidate directories beneath the retained operator selection
     /// with exact source-directory descriptors. This is a control-only safety
     /// query and never reopens either operator pathname. Every check's source
     /// is also compared with each of `shared_suffixes`, which the receiver
     /// resolves once for all of them.
+    ///
+    /// With `access`, the check may briefly add owner search permission to
+    /// owned directories it must enter. `Some(false)` means the selected
+    /// directory is the parent of an exact placement and keeps its mode. The
+    /// receiver restores modes before returning DirectoryRelations.
     CheckOperatorDirectoryAncestry {
         checks: Vec<DirectoryAncestryCheck>,
         shared_suffixes: Vec<PathBytes>,
+        access: Option<bool>,
     },
     /// Resolve every operator source selection, then atomically register its
     /// opened directory or parent descriptor. Only a control connection may
@@ -1249,14 +1265,6 @@ pub enum WireRequest<Data> {
     Shutdown,
     /// Supply only payloads requested by PrepareSmallFiles on this session.
     CopySmallFiles(Vec<SmallCopyPayload>),
-    /// On-demand completion metadata. Appended to preserve existing wire tags.
-    ListDirDetails {
-        directory: PathBytes,
-        confined_root: Option<PathBytes>,
-        prefix: PathBytes,
-        limit: u16,
-        symlink_policy: OperatorSymlinkPolicy,
-    },
     /// Experimental source-only stream. Start replies Ok, then emits Block
     /// frames (or one error). StopReadStream is required even at the end of the
     /// interval; ReadStreamDone fences every frame belonging to this stream.
@@ -1269,16 +1277,6 @@ pub enum WireRequest<Data> {
     /// StopReadStream is still required, even if the source has passed `end`.
     ShrinkReadStream {
         end: u64,
-    },
-    /// Removal completion classifies final symlinks as non-directories while
-    /// retaining the requested following policy for the directory being listed.
-    ListDirNoFollowFinal {
-        directory: PathBytes,
-        confined_root: Option<PathBytes>,
-        prefix: PathBytes,
-        limit: u16,
-        symlink_policy: OperatorSymlinkPolicy,
-        detailed: bool,
     },
     /// Install a signed mapping on the restricted control connection before filesystem requests.
     MappingChunk {
@@ -1427,23 +1425,6 @@ pub enum WireRequest<Data> {
         directories: Vec<(PathBytes, TargetCondition)>,
         remember: bool,
         access: u32,
-    },
-    /// Ancestry validation that may briefly add owner search permission to
-    /// owned directories it must enter. With `selection_in_copy` false, the
-    /// selected directory is the parent of an exact placement and keeps its
-    /// mode. The receiver restores modes before returning DirectoryRelations.
-    CheckOperatorDirectoryAncestryWithAccess {
-        checks: Vec<DirectoryAncestryCheck>,
-        shared_suffixes: Vec<PathBytes>,
-        selection_in_copy: bool,
-    },
-    /// Select an operator directory and require kernel-checked search access:
-    /// a copy that cannot widen its destination refuses one it cannot enter,
-    /// as rsync does.
-    CheckSearchableOperatorDirectory {
-        path: PathBytes,
-        allow_missing: bool,
-        symlink_policy: OperatorSymlinkPolicy,
     },
     /// The receiving process's effective user ID, so the sender can tell
     /// which existing directories it owns. Asked only once an existing
@@ -1658,6 +1639,34 @@ impl Request {
                 | Request::FileHash { .. }
                 | Request::TransportStats
                 | Request::Shutdown
+        )
+    }
+
+    /// Requests only a control connection may execute: they create or use
+    /// session capabilities, select operator paths, or list directories.
+    /// Shared by remote dispatch and the in-process adapter.
+    pub(crate) fn control_only(&self) -> bool {
+        matches!(
+            self,
+            Request::TcpListen { .. }
+                | Request::CreateSendBudget { .. }
+                | Request::DescriptorCopy(_)
+                | Request::ListDir { .. }
+                | Request::NativeMap(_)
+                | Request::NativeRemove { .. }
+                | Request::CheckOperatorDirectory { .. }
+                | Request::CheckOperatorDirectoryAncestry { .. }
+                | Request::PrepareDestinationPath { .. }
+                | Request::RestoreDestinationPath
+                | Request::RegisterSourceRoots { .. }
+                | Request::CreateOperatorDirectory { .. }
+                | Request::AnchorDestination { .. }
+                | Request::PrepareSmallFiles(_)
+                | Request::CopySmallFiles(_)
+                | Request::PruneLookup { .. }
+                | Request::DestinationResults { .. }
+                | Request::FinishDestinationResults
+                | Request::MappingChunk { .. }
         )
     }
 }
@@ -2781,19 +2790,3 @@ impl<R: Read> FrameReader<R> {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod completion_compat_tests {
-    use super::*;
-    #[test]
-    fn released_v032_completion_request_keeps_its_wire_encoding() {
-        // Generated with unchanged src/proto.rs from tag v0.3.2. Do not regenerate
-        // these when editing the current writer or reader.
-        let bytes = include_bytes!("../tests/fixtures/completion/list-dir-v0.3.2.bin");
-        let request: Request = postcard::from_bytes(bytes).unwrap();
-        assert!(
-            matches!(&request, Request::ListDir { directory, prefix, limit: 1000, symlink_policy: OperatorSymlinkPolicy::Refuse, confined_root: None } if directory == b"/data" && prefix == b"al")
-        );
-        assert_eq!(postcard::to_stdvec(&request).unwrap(), bytes);
-    }
-}

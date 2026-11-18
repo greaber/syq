@@ -3,8 +3,10 @@
 
 Usage: scripts/test-s3.py [SYQ_BINARY]
 
-Without SYQ_BINARY, builds target/debug/syq first. SYQ_S3_TEST_TIMEOUT raises
-the 1800-second overall check deadline for slow hosts.
+Without SYQ_BINARY, builds target/debug/syq first. SYQ_BINARY must also be a
+debug build: the checks use test hooks that release builds leave out, such as
+SYQ_TEST_S3_TREAT_HTTP_AS_HTTPS. SYQ_S3_TEST_TIMEOUT raises the 1800-second
+overall check deadline for slow hosts.
 """
 import importlib.util
 import os

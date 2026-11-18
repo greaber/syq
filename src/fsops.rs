@@ -2,7 +2,8 @@
 //! by `syq --server` for remote endpoints, so both sides behave identically.
 
 use crate::descriptor_broker::{
-    acquire_descriptor, DescriptorSessionSlot, DescriptorTicket, RegisteredRootId, MAX_SOURCE_ROOTS,
+    acquire_descriptor, acquire_descriptors, DescriptorSessionSlot, DescriptorTicket,
+    RegisteredRootId, MAX_SOURCE_ROOTS,
 };
 use crate::proto::*;
 use crate::rooted::{
@@ -16,9 +17,7 @@ use crate::sys::{
 use crate::write_gate::CachedFile;
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
-#[cfg(target_os = "linux")]
-use std::collections::HashSet;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 #[cfg(target_os = "linux")]
@@ -1293,23 +1292,15 @@ impl FsOps {
         path: &[u8],
         allow_missing: bool,
         symlink_policy: OperatorSymlinkPolicy,
+        require_search: bool,
     ) -> Result<Option<DirectoryAnchor>> {
         let (selection, anchor) = select_operator_directory(path, allow_missing, symlink_policy)?;
-        self.operator_selection = Some(selection);
-        Ok(anchor)
-    }
-
-    fn check_searchable_operator_directory(
-        &mut self,
-        path: &[u8],
-        allow_missing: bool,
-        symlink_policy: OperatorSymlinkPolicy,
-    ) -> Result<Option<DirectoryAnchor>> {
-        let (selection, anchor) = select_operator_directory(path, allow_missing, symlink_policy)?;
-        // Looking up "." through the retained handle asks the kernel about
-        // search permission, including ACLs and the receiving user's identity.
-        open_operator_directory_at(&selection.directory, b".")
-            .context("search selected destination directory")?;
+        if require_search {
+            // Looking up "." through the retained handle asks the kernel about
+            // search permission, including ACLs and the receiving user's identity.
+            open_operator_directory_at(&selection.directory, b".")
+                .context("search selected destination directory")?;
+        }
         self.operator_selection = Some(selection);
         Ok(anchor)
     }
@@ -2365,32 +2356,48 @@ impl FsOps {
         if sources.len() > MAX_SOURCE_ROOTS {
             bail!(too_many_sources(sources.len()));
         }
-        let mut roots = HashMap::with_capacity(sources.len());
         let endpoint_ticket = &sources[0].ticket;
+        let mut ids = HashSet::with_capacity(sources.len());
+        let mut tickets = Vec::with_capacity(sources.len() * 2);
         for source in sources {
             source.validate()?;
             if !source.ticket.same_session(endpoint_ticket) {
                 bail!("source roots belong to different endpoint sessions");
             }
             let id = source.selection.root();
-            if roots.contains_key(&id) {
+            if !ids.insert(id) {
                 bail!(
                     "source worker received duplicate registered root {}",
                     id.get()
                 );
             }
-            let acquire = |ticket: &DescriptorTicket| {
-                if claim_foreign_session {
-                    acquire_descriptor(ticket)
-                } else {
-                    self.descriptor_session.acquire(ticket)
-                }
+            tickets.push(&source.ticket);
+            if let (Some(ticket), Some(_)) = (&source.leaf_ticket, &source.expected_leaf) {
+                tickets.push(ticket);
+            }
+        }
+        // Claim every descriptor at once: over one broker connection when
+        // they belong to another process's session, rather than a
+        // connection (and a broker thread) for each.
+        let mut descriptors = if claim_foreign_session {
+            acquire_descriptors(&tickets)?
+        } else {
+            self.descriptor_session.acquire_many(&tickets)?
+        }
+        .into_iter();
+        let mut roots = HashMap::with_capacity(sources.len());
+        for source in sources {
+            let id = source.selection.root();
+            let mut acquire = || {
+                descriptors
+                    .next()
+                    .context("descriptor broker returned too few source descriptors")
             };
-            let directory = acquire(&source.ticket)?;
+            let directory = acquire()?;
             let root = Arc::new(Root::from_directory(directory)?);
             let leaf_object = match (&source.leaf_ticket, &source.expected_leaf) {
-                (Some(ticket), Some(expected)) => {
-                    let object = acquire(ticket)?;
+                (Some(_), Some(expected)) => {
+                    let object = acquire()?;
                     let metadata = root_metadata_from_std(
                         &object
                             .metadata()
@@ -2909,14 +2916,10 @@ impl FsOps {
             | Request::Hello { .. }
             | Request::TcpListen { .. }
             | Request::ListDir { .. }
-            | Request::ListDirDetails { .. }
-            | Request::ListDirNoFollowFinal { .. }
             | Request::NativeMap(_)
             | Request::NativeRemove { .. }
             | Request::CheckOperatorDirectory { .. }
             | Request::CheckOperatorDirectoryAncestry { .. }
-            | Request::CheckOperatorDirectoryAncestryWithAccess { .. }
-            | Request::CheckSearchableOperatorDirectory { .. }
             | Request::PrepareDestinationPath { .. }
             | Request::RestoreDestinationPath
             | Request::RegisterSourceRoots { .. }
@@ -2953,57 +2956,16 @@ impl FsOps {
         follow_final_symlinks: bool,
     ) -> Result<Response> {
         const MAX_COMPLETION_ENTRIES: usize = 1_000;
-        if directory.contains(&0)
-            || confined_root.is_some_and(|root| root.contains(&0))
-            || prefix.contains(&0)
-            || prefix.contains(&b'/')
-        {
-            bail!("invalid completion directory or prefix");
-        }
-        check_completion_directory(directory, confined_root, symlink_policy)?;
-        let limit = usize::from(requested_limit).min(MAX_COMPLETION_ENTRIES);
-        if limit == 0 {
-            return Ok(if detailed {
-                Response::DetailedDirectoryEntries {
-                    entries: Vec::new(),
-                    details: Vec::new(),
-                    truncated: false,
-                }
-            } else {
-                Response::DirectoryEntries {
-                    entries: Vec::new(),
-                    truncated: false,
-                }
-            });
-        }
-        let mut entries = Vec::new();
-        let mut truncated = false;
-        for item in std::fs::read_dir(resolve(directory))? {
-            let item = item?;
-            let name = item.file_name().into_vec();
-            if name == b"." || name == b".." || !name.starts_with(prefix) {
-                continue;
-            }
-            if !prefix.starts_with(b".") && name.starts_with(b".") {
-                continue;
-            }
-            if entries.len() == limit {
-                truncated = true;
-                break;
-            }
-            let file_type = item.file_type()?;
-            let directory = file_type.is_dir()
-                || (file_type.is_symlink()
-                    && follow_final_symlinks
-                    && check_completion_directory(
-                        item.path().as_os_str().as_bytes(),
-                        confined_root,
-                        symlink_policy,
-                    )
-                    .is_ok());
-            entries.push(CompletionEntry { name, directory });
-        }
-        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        let (entries, truncated) = list_completion_directory(
+            directory,
+            confined_root,
+            prefix,
+            usize::from(requested_limit).min(MAX_COMPLETION_ENTRIES),
+            symlink_policy,
+            follow_final_symlinks,
+            false,
+            false,
+        )?;
         if detailed {
             let details = crate::completion_details::describe(&resolve(directory), &entries);
             Ok(Response::DetailedDirectoryEntries {
@@ -4293,12 +4255,14 @@ mod completion_details_tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("alpha"), b"hello").unwrap();
         std::fs::write(root.join("alpine"), b"other").unwrap();
-        let request = |directory: &Path, limit| Request::ListDirDetails {
+        let request = |directory: &Path, limit| Request::ListDir {
             directory: directory.as_os_str().as_bytes().to_vec(),
             confined_root: Some(root.as_os_str().as_bytes().to_vec()),
             prefix: b"al".to_vec(),
             limit,
             symlink_policy: OperatorSymlinkPolicy::Refuse,
+            detailed: true,
+            follow_final_symlinks: true,
         };
         let response = FsOps::new().handle(&request(&root, 1));
         let Response::DetailedDirectoryEntries {
