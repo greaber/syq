@@ -1301,9 +1301,14 @@ fn tcp_handshake_deadline_does_not_reset_after_partial_reads() {
         Arc::new(std::sync::atomic::AtomicBool::new(true)),
         Instant::now() + Duration::from_millis(100),
         "TCP Hello timed out",
-    );
+    )
+    .on_socket();
     client.write_all(b"a").unwrap();
     reader.read_exact(&mut [0]).unwrap();
+    // The read itself was bounded by what remained of the deadline, not by
+    // the socket's own longer timeout.
+    let bound = reader.inner.read_timeout().unwrap().unwrap();
+    assert!(bound <= Duration::from_millis(100), "{bound:?}");
     std::thread::sleep(Duration::from_millis(150));
     client.write_all(b"b").unwrap();
     assert_eq!(

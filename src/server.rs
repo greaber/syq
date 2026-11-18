@@ -560,7 +560,9 @@ fn serve_accepted(
 /// Bound every read by the Hello deadline until `serve` clears `pending`
 /// after acknowledging Hello: each read first waits, at most until the
 /// deadline, for the descriptor to become readable. Unbuffered input only,
-/// since the wait cannot see bytes another buffer already read.
+/// since the wait cannot see bytes another buffer already read. A socket's
+/// read is also bounded by what remains (`on_socket`), since a socket
+/// reported readable can still block.
 struct HandshakeReader<R> {
     inner: R,
     pending: Arc<std::sync::atomic::AtomicBool>,
@@ -568,6 +570,8 @@ struct HandshakeReader<R> {
     /// Once the first byte arrives, the deadline becomes this much later.
     hello_timeout: Option<Duration>,
     timed_out: &'static str,
+    /// Set the socket's receive timeout to what remains before each read.
+    socket: bool,
 }
 
 impl<R> HandshakeReader<R> {
@@ -583,6 +587,15 @@ impl<R> HandshakeReader<R> {
             deadline,
             hello_timeout: None,
             timed_out,
+            socket: false,
+        }
+    }
+
+    /// `inner` is a socket: bound each read itself by what remains too.
+    fn on_socket(self) -> Self {
+        Self {
+            socket: true,
+            ..self
         }
     }
 
@@ -635,6 +648,14 @@ impl<R: Read + std::os::fd::AsRawFd> Read for HandshakeReader<R> {
                     }
                 }
             }
+            if self.socket {
+                let remaining = self
+                    .deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|time| !time.is_zero())
+                    .ok_or_else(|| io::Error::new(ErrorKind::TimedOut, self.timed_out))?;
+                set_receive_timeout(self.inner.as_raw_fd(), remaining)?;
+            }
         }
         let count = self.inner.read(buf)?;
         if count > 0 {
@@ -647,6 +668,36 @@ impl<R: Read + std::os::fd::AsRawFd> Read for HandshakeReader<R> {
         }
         Ok(count)
     }
+}
+
+/// Set socket `fd`'s receive timeout to `timeout`, which is not zero.
+fn set_receive_timeout(fd: std::os::fd::RawFd, timeout: Duration) -> io::Result<()> {
+    let seconds = libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX);
+    // Below a million, so it fits every platform's `suseconds_t`.
+    let mut micros = timeout.subsec_micros() as libc::suseconds_t;
+    if seconds == 0 && micros == 0 {
+        // Zero would mean no timeout at all.
+        micros = 1;
+    }
+    let value = libc::timeval {
+        tv_sec: seconds,
+        tv_usec: micros,
+    };
+    // SAFETY: `value` is a live timeval of the size passed, for a socket the
+    // caller keeps open.
+    let result = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            std::ptr::addr_of!(value).cast(),
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Most connections handed to one receiver that it serves at once, as for
@@ -894,7 +945,8 @@ pub(crate) fn run_named(
         pending.clone(),
         Instant::now() + timeout,
         "named channel Hello timed out",
-    );
+    )
+    .on_socket();
     let result = serve(
         reader,
         w,
@@ -925,7 +977,8 @@ pub(crate) fn run_named_tcp(
         pending.clone(),
         Instant::now() + Duration::from_secs(10),
         "TCP Hello timed out",
-    );
+    )
+    .on_socket();
     let result = serve(
         RecordReader::new(reader, Some(Cipher::new(key, 0, 1))),
         RecordWriter::new(stream.try_clone()?, Some(Cipher::new(key, 0, 2))),
@@ -2123,7 +2176,8 @@ fn serve_tcp(
         handshake_pending.clone(),
         handshake_deadline,
         "TCP Hello timed out",
-    );
+    )
+    .on_socket();
     // The client tells us its connection id first (plaintext), so both sides
     // derive the same nonces.
     let mut idbuf = [0u8; 4];
