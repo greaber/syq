@@ -1104,17 +1104,9 @@ pub(super) fn require_operator_link_fallback_allowed(policy: OperatorSymlinkPoli
 
 #[cfg(target_os = "linux")]
 pub(super) fn operator_descriptor_is_procfs(file: &File) -> Result<bool> {
-    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    loop {
-        if unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) } == 0 {
-            let stats = unsafe { stats.assume_init() };
-            return Ok(stats.f_type as u32 == libc::PROC_SUPER_MAGIC as u32);
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error).context("identify operator descriptor filesystem");
-        }
-    }
+    let file_system =
+        crate::fsops::file_system_of(file).context("identify operator descriptor filesystem")?;
+    Ok(file_system.magic() == crate::fsops::PROC_SUPER_MAGIC)
 }
 
 /// Upgrade a retained Linux `O_PATH` object to a readable descriptor without

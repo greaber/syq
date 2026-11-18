@@ -66,11 +66,7 @@ fn block_size(_: &File) -> io::Result<u64> {
 #[cfg(target_os = "macos")]
 fn block_size(file: &File) -> io::Result<u64> {
     // F_PUNCHHOLE requires filesystem block alignment, unlike Linux fallocate.
-    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    if unsafe { libc::fstatfs(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(u64::from(unsafe { stat.assume_init() }.f_bsize).max(1))
+    Ok(crate::fsops::file_system_of(file)?.block_size())
 }
 
 fn punch(file: &File, offset: u64, len: u64) -> io::Result<()> {
