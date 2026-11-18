@@ -818,6 +818,7 @@ impl Sched {
     /// A burst must not span anything planning waits on, such as a request
     /// to either end: until it ends, its files have only the workers that
     /// were already busy.
+    #[must_use = "the burst ends, and wakes workers, when this is dropped"]
     pub fn file_burst(&self) -> FileBurst<'_> {
         self.inner.lock().unwrap().bursts += 1;
         FileBurst { sched: self }
