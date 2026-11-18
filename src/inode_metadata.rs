@@ -721,15 +721,27 @@ mod platform {
             let file = File::create(dir.path().join("file")).unwrap();
             write(&file, b"user.extra", Some(b"1")).unwrap();
             write(&file, b"user.changed", Some(b"1")).unwrap();
-            let metadata = |privileged, values: &[(&[u8], &[u8])]| InodeMetadata {
-                xattrs: Some(ExtendedAttributes {
-                    privileged,
-                    values: values
-                        .iter()
-                        .map(|(n, v)| (n.to_vec(), v.to_vec()))
-                        .collect(),
-                }),
-                ..Default::default()
+            // Keep labels the host gives new files, such as `security.selinux`.
+            let labels = names(&file)
+                .unwrap()
+                .into_iter()
+                .filter(|name| super::super::privileged_attribute(name))
+                .map(|name| {
+                    let value = get(&file, &name).unwrap().unwrap();
+                    (name, value)
+                })
+                .collect::<Vec<_>>();
+            let metadata = |privileged, values: &[(&[u8], &[u8])]| {
+                let mut values = values
+                    .iter()
+                    .map(|(n, v)| (n.to_vec(), v.to_vec()))
+                    .chain(labels.iter().cloned())
+                    .collect::<Vec<_>>();
+                values.sort();
+                InodeMetadata {
+                    xattrs: Some(ExtendedAttributes { privileged, values }),
+                    ..Default::default()
+                }
             };
             let user_only = metadata(true, &[(b"user.changed", b"2"), (b"user.missing", b"1")]);
             assert!(would_change(&file, &user_only, 0o644).unwrap());
