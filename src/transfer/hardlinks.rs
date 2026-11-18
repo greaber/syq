@@ -235,6 +235,13 @@ impl Planner<'_> {
         // Publish the complete assertion map before any worker can see a job.
         // The jobs are then queued together.
         let _burst = self.sched.file_burst();
+        self.leaf_parents = self.group_question_parents(
+            self.hardlinks
+                .groups
+                .iter()
+                .filter_map(|group| group.preview.as_deref())
+                .map(|(leaf, destination)| (leaf, destination.as_ref())),
+        );
         for index in 0..self.hardlinks.groups.len() {
             let (leaf, destination) = *self.hardlinks.groups[index].preview.take().unwrap();
             let representative = self.enqueue(
@@ -247,6 +254,7 @@ impl Planner<'_> {
             );
             self.hardlinks.groups[index].representative = representative;
         }
+        self.leaf_parents = Vec::new();
         Ok(())
     }
 
