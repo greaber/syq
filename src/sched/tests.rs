@@ -986,6 +986,9 @@ struct HoldingWorkers {
 
 impl HoldingWorkers {
     fn start(sched: &Arc<Sched>, workers: usize) -> Self {
+        // The copy's first file wakes everyone, whoever waits to learn of
+        // file work included. These tests are about the files after it.
+        sched.anticipate_file_work();
         let (tx, taken) = std::sync::mpsc::channel();
         let threads = (0..workers)
             .map(|_| {
@@ -1199,6 +1202,7 @@ fn waiting_workers_divide_a_burst_into_whole_batches() {
     // then; woken when the burst ends, each takes a quarter.
     let workers = 4;
     let sched = Arc::new(Sched::new(4096, 8192));
+    sched.anticipate_file_work();
     sched.release_preflighted_work();
     let (tx, batches) = std::sync::mpsc::channel();
     let hold = Arc::new(std::sync::Barrier::new(workers + 1));
@@ -1231,6 +1235,10 @@ fn waiting_workers_divide_a_burst_into_whole_batches() {
         let _burst = sched.file_burst();
         for index in 0..40 {
             sched.push_file(burst_job(index));
+            if index == 4 {
+                // Time for a worker woken by these files to take them.
+                std::thread::sleep(Duration::from_millis(30));
+            }
         }
     }
     let sizes: Vec<usize> = (0..workers)
@@ -1247,13 +1255,16 @@ fn waiting_workers_divide_a_burst_into_whole_batches() {
 
 #[test]
 fn trickled_bursts_and_returned_work_leave_nothing_queued_while_workers_wait() {
-    // Planning queues files in bursts and singly, with pauses, while
-    // workers take batches, return some unstarted and finish the rest. The
-    // scan never ends, so only the wakeups for queued files can bring a
-    // waiting worker back: every file must still be finished.
+    // Planning queues files in bursts and singly while workers take
+    // batches, return some unstarted and finish the rest. The scan never
+    // ends, so only the wakeups for queued files can bring a waiting worker
+    // back. After every other step planning pauses until the workers have
+    // finished everything queued so far, as a slow scan would: no later
+    // file's wakeup can then rescue a file left queued.
     const FILES: usize = 4000;
     let workers = 6;
     let sched = Arc::new(Sched::new(4096, 8192));
+    sched.anticipate_file_work();
     sched.release_preflighted_work();
     let finished = Arc::new(AtomicUsize::new(0));
     let threads: Vec<_> = (0..workers)
@@ -1261,12 +1272,8 @@ fn trickled_bursts_and_returned_work_leave_nothing_queued_while_workers_wait() {
             let sched = sched.clone();
             let finished = finished.clone();
             std::thread::spawn(move || {
-                let mut turn = worker;
-                loop {
-                    let item = sched.next();
-                    let Item::File(first) = item else {
-                        break;
-                    };
+                let mut turn: usize = worker;
+                while let Item::File(first) = sched.next() {
                     turn += 1;
                     if turn.is_multiple_of(5) {
                         // Retired before it started: the file goes back.
@@ -1286,38 +1293,43 @@ fn trickled_bursts_and_returned_work_leave_nothing_queued_while_workers_wait() {
             })
         })
         .collect();
+    let wait_for = |queued: usize, step: usize| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while finished.load(Relaxed) < queued {
+            if std::time::Instant::now() >= deadline {
+                let (left, waiting) = {
+                    let inner = sched.inner.lock().unwrap();
+                    (inner.files.len(), inner.waiting_workers)
+                };
+                panic!(
+                    "step {step}: {} of {queued} queued files finished; {left} left queued with {waiting} workers waiting",
+                    finished.load(Relaxed),
+                );
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+    };
     let mut queued = 0;
     let mut step = 0usize;
     while queued < FILES {
         step += 1;
-        // Bursts of 1 to 97 files, every third file queued singly.
-        let burst = (step * 37 % 97 + 1).min(FILES - queued);
         if step.is_multiple_of(3) {
             sched.push_file(burst_job(queued));
             queued += 1;
         } else {
+            // Bursts of 1 to 97 files.
+            let burst = (step * 37 % 97 + 1).min(FILES - queued);
             let _burst = sched.file_burst();
             for _ in 0..burst {
                 sched.push_file(burst_job(queued));
                 queued += 1;
             }
         }
-        if step.is_multiple_of(4) {
-            // Let the workers drain the queue and wait again.
-            std::thread::sleep(Duration::from_micros(300));
+        if step.is_multiple_of(2) {
+            wait_for(queued, step);
         }
     }
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while finished.load(Relaxed) < FILES {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "{} of {FILES} files finished; {} left queued with {} workers waiting",
-            finished.load(Relaxed),
-            sched.inner.lock().unwrap().files.len(),
-            sched.inner.lock().unwrap().waiting_workers,
-        );
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    wait_for(FILES, step);
     assert_eq!(finished.load(Relaxed), FILES);
     sched.scan_done();
     for thread in threads {
