@@ -5023,7 +5023,8 @@ fn only_a_device_that_ignores_a_chmod_skips_the_width_check() {
     let widen = || fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
     widen();
     let mut ops = FsOps::new();
-    ops.note_created_mode(&file, &file.metadata().unwrap(), 0o600);
+    let probed = ops.note_created_mode(&file, &file.metadata().unwrap(), 0o600);
+    assert_eq!(probed.map(|probed| probed.mode() & 0o777), Some(0o600));
     assert_eq!(ops.fixed_wide_modes(dev), Some(false));
     assert_eq!(file.metadata().unwrap().mode() & 0o777, 0o600);
     assert!(ops.wider_than(0o644, dev, Some(0o600)));
@@ -5031,8 +5032,9 @@ fn only_a_device_that_ignores_a_chmod_skips_the_width_check() {
     widen();
     let mut ops = FsOps::new();
     REFUSE_MODE_PROBE.set(true);
-    ops.note_created_mode(&file, &file.metadata().unwrap(), 0o600);
+    let probed = ops.note_created_mode(&file, &file.metadata().unwrap(), 0o600);
     REFUSE_MODE_PROBE.set(false);
+    assert!(probed.is_none());
     assert_eq!(ops.fixed_wide_modes(dev), Some(false));
     assert!(ops.wider_than(0o644, dev, Some(0o600)));
     // Every file reports 0755 and a chmod does not show.
@@ -5044,6 +5046,23 @@ fn only_a_device_that_ignores_a_chmod_skips_the_width_check() {
     assert!(!ops.wider_than(0o644, dev, Some(0o600)));
     assert!(ops.wider_than(0o644, dev.wrapping_add(1), Some(0o600)));
     assert!(!ops.wider_than(0o600, dev.wrapping_add(1), Some(0o600)));
+}
+
+#[test]
+fn a_new_stage_shows_the_mode_its_probe_left() {
+    // Publication skips the chmod to the wanted mode when the stage's
+    // metadata already shows it. A stage that came out wider than asked and
+    // was narrowed by the device probe must not show the wider mode, or a
+    // file wanted in that mode would be published narrower.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let mut ops = destination_ops(temporary.path());
+    let target = ops.destination_mutation_target(b"file").unwrap();
+    WIDEN_NEW_STAGES.set(Some(0o644));
+    let stage = ops.open_stage(&target, &[45; 16], StagePolicy::new(Sidecar::Stage));
+    WIDEN_NEW_STAGES.set(None);
+    let stage = stage.unwrap();
+    assert_eq!(stage.file.metadata().unwrap().mode() & 0o777, 0o600);
+    assert_eq!(stage.metadata().unwrap().mode() & 0o777, 0o600);
 }
 
 #[test]

@@ -1376,7 +1376,7 @@ impl FsOps {
     /// or copied in the kernel, with the differing blocks written over it
     /// (`seed_patch_stage`). A stage made as the clone, as on macOS, holds it
     /// already; any other stage that can take the copy was created empty for
-    /// it (`create_seeded_stage`). When the file cannot be copied so, or
+    /// it (`create_stage`). When the file cannot be copied so, or
     /// changed after it was hashed, the stage holds the assembled file
     /// instead, its reused blocks read and checked again. The write is
     /// observed unless `unobserved` collects its bytes for a caller that
@@ -3728,8 +3728,8 @@ mod tests {
         // The sidecar is created without O_EXCL, so the open can land on
         // something already at its name. Only a new empty file of ours is
         // used as opened; a symlink, a FIFO, a second link to a file of ours,
-        // and a file holding data are left to the checked path, which
-        // replaces what is not a safe sidecar and reuses what is. Nothing
+        // and a file holding data are replaced by an exclusive creation.
+        // Nothing
         // planted at the name receives the copy's data.
         let temporary = crate::test_support::tempdir().unwrap();
         let mut ops = receiver(temporary.path());

@@ -618,12 +618,21 @@ impl FsOps {
             mode = PRIVATE_PARTIAL_MODE;
             (file, created) = create(mode)?;
         }
-        self.note_created_mode(&file, &created, mode);
+        #[cfg(test)]
+        if let Some(wider) = WIDEN_NEW_STAGES.get() {
+            file.set_permissions(fs::Permissions::from_mode(wider))?;
+            created = file.metadata()?;
+        }
+        // Publication decides its chmod from this metadata, so it must show
+        // what a probe left.
+        if let Some(probed) = self.note_created_mode(&file, &created, mode) {
+            created = probed;
+        }
         Ok((file, created))
     }
 
     /// Remove this copy's sidecar when its group or other bits exceed
-    /// `widest`, as `open_private_partial_rooted` replaces such a sidecar.
+    /// `widest`, as `reuse_held_stage` replaces such a sidecar.
     fn discard_wider_partial(
         &mut self,
         target: &RootedTarget,
@@ -4463,21 +4472,25 @@ impl FsOps {
     /// it. A refusal proves nothing about the device, since whether a file's
     /// mode may change can depend on that file's own ACL (NFSv4
     /// ACE4_WRITE_ACL), so the device keeps the check. Either way the device
-    /// is probed once per connection.
+    /// is probed once per connection. Returns the file's metadata as the
+    /// probe left it, when it changed the mode: `created` no longer shows it.
     pub(super) fn note_created_mode(
         &mut self,
         file: &File,
         created: &fs::Metadata,
         requested: u32,
-    ) {
+    ) -> Option<fs::Metadata> {
         let requested = requested & 0o777;
         let wider = |mode: u32| reported_mode(mode) & 0o777 & !requested != 0;
         if !wider(created.mode()) || self.fixed_wide_modes(created.dev()).is_some() {
-            return;
+            return None;
         }
-        let fixed = probe_mode_change(file, requested).is_ok()
-            && file.metadata().is_ok_and(|now| wider(now.mode()));
+        let now = probe_mode_change(file, requested)
+            .ok()
+            .and_then(|()| file.metadata().ok());
+        let fixed = now.as_ref().is_some_and(|now| wider(now.mode()));
         self.fixed_wide_mode_devices.insert(created.dev(), fixed);
+        now
     }
 }
 
@@ -4490,6 +4503,10 @@ thread_local! {
     /// Refuses the mode change that probes a device, as a file's own ACL can.
     pub(super) static REFUSE_MODE_PROBE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// A mode this thread's new stages are widened to once created, as a
+    /// directory's inherited ACL can widen a new file.
+    pub(super) static WIDEN_NEW_STAGES: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Change the mode of a probed file, or refuse as a test asks.
