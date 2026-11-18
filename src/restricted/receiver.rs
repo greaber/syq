@@ -567,11 +567,10 @@ pub(crate) fn is_sessions_full(error: &anyhow::Error) -> bool {
 
 /// What a session the forced command started may go on to do.
 pub(crate) enum Session {
-    /// Serve a copy a verified directive allows.
-    Copy(std::sync::Arc<RestrictedAuthority>),
-    /// Serve the reads a verified directive for this account as a copy's
-    /// source allows, to the server that started the copy.
-    Source(std::sync::Arc<super::source::SourceAuthority>),
+    /// Serve a copy a verified directive allows: its writes as the copy's
+    /// destination, or, as its source, the reads it allows to the server
+    /// that started the copy.
+    Serve(super::Checker),
     /// This session's input and output were handed to the running copy its
     /// worker ticket names, which has served them.
     Worker,
@@ -808,10 +807,9 @@ pub(super) fn session_for(
         // Reads follow the signed command, as the account's own would: the
         // approving machine's prompt showed what it names.
         Rules::Source(reads) => {
-            return Ok(Session::Source(super::source::SourceAuthority::new(
-                *reads,
-                verified.execution_deadline,
-            )?));
+            return Ok(Session::Serve(super::Checker::source(
+                super::source::SourceAuthority::new(*reads, verified.execution_deadline)?,
+            )));
         }
     };
     let results_key = load_results_key(state)?;
@@ -821,8 +819,8 @@ pub(super) fn session_for(
         constraints.extra_options.follow_dst,
         Some((home, canonical_home)),
     )?;
-    Ok(Session::Copy(std::sync::Arc::new(
-        RestrictedAuthority::new(
+    Ok(Session::Serve(super::Checker::Destination(
+        std::sync::Arc::new(RestrictedAuthority::new(
             root,
             grant,
             constraints,
@@ -830,7 +828,7 @@ pub(super) fn session_for(
             results_key,
             verified.execution_deadline,
             protected,
-        )?,
+        )?),
     )))
 }
 
@@ -1117,32 +1115,12 @@ pub(crate) fn dispatch_receiver_command(argv: &[OsString]) -> Option<Result<i32>
                 entry_public_key: entry_key.public_key().to_openssh()?,
             };
             let target = endpoint(&target_login, &host, port)?;
-            let encoded = serde_json::to_vec(&request)?;
-            let configured = run_management_over_route(
-                &target,
-                EnrollmentRoute::Configured,
-                id,
-                ManagementAction::Revoke,
-                &encoded,
-            );
-            match (configured, via.as_ref()) {
-                (Ok(_), _) => {}
-                (Err(configured_error), Some(via))
-                    if is_enrollment_transport_failure(&configured_error) =>
-                {
-                    run_management_over_route(
-                        &target,
-                        EnrollmentRoute::ProxyJump { jump: via },
-                        id,
-                        ManagementAction::Revoke,
-                        &encoded,
-                    )
-                    .with_context(|| {
-                        format!("revoking along your SSH configuration's route also failed: {configured_error:#}")
-                    })?;
-                }
-                (Err(error), _) => return Err(error),
-            }
+            over_routes(
+                "revoking",
+                via.as_ref(),
+                || None,
+                |route| revoke_over_route(&target, route, id, &request),
+            )?;
             remove_local_enrollment(&directory)?;
             crate::output::command_println!("revoked {id} from {}", target.label());
             Ok(0)

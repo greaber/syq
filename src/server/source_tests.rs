@@ -129,13 +129,23 @@ impl SourceServer {
         let source = authority.clone();
         let descriptors = session.clone();
         let thread = std::thread::spawn(move || {
-            run_authorized_source(
+            let checker = Checker::Source {
+                authority: source,
+                descriptors,
+            };
+            let session = checker.connection_session();
+            let result = serve(
                 server.try_clone().unwrap(),
                 writer(server),
-                source,
-                descriptors,
-                (None, None),
-            )
+                ServeSession {
+                    over_ssh: true,
+                    allow_tcp: true,
+                    checker: Some(checker.clone()),
+                    ..ServeSession::new(session.clone())
+                },
+            );
+            checker.end_connection(&session, true);
+            result
         });
         let mut control = Channel::new(client, thread);
         assert!(matches!(
@@ -165,8 +175,13 @@ impl SourceServer {
         let input = self.connections.track(server).unwrap();
         let source = self.authority.clone();
         let descriptors = self.session.clone();
-        let thread =
-            std::thread::spawn(move || run_named_source(input, output, source, descriptors, false));
+        let thread = std::thread::spawn(move || {
+            let checker = Checker::Source {
+                authority: source,
+                descriptors,
+            };
+            run_named(input, output, checker, false)
+        });
         let mut worker = Channel::new(client, thread);
         let hello = worker.hello(role);
         (worker, hello)

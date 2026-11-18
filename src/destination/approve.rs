@@ -215,7 +215,7 @@ impl<'a> Approver<'a> {
         let (authority, approved) =
             receiver.approve_write(args, asked.parts(), self.caps, self.cancelled)?;
         receiver.serve_under_token(
-            SessionAuthority::Receive(authority),
+            crate::restricted::Checker::Destination(authority),
             self.cancelled,
             stream,
             |token| Reply::Approved(Approved { token, ..approved }),
@@ -267,10 +267,7 @@ impl<'a> Approver<'a> {
             Instant::now() + send::LIFETIME,
         )?;
         receiver.serve_under_token(
-            SessionAuthority::Send {
-                authority,
-                descriptors: Default::default(),
-            },
+            crate::restricted::Checker::source(authority),
             self.cancelled,
             stream,
             |token| Reply::SendApproved(Box::new(send::SendApproved::new(token, base, selections))),
@@ -658,7 +655,7 @@ impl Receiver {
     /// `START_TIMEOUT`, and reply with the token.
     fn serve_under_token(
         &self,
-        authority: SessionAuthority,
+        authority: crate::restricted::Checker,
         cancelled: &dyn Fn() -> bool,
         stream: &mut impl Write,
         reply: impl FnOnce(String) -> Reply,

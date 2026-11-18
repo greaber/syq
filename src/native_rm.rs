@@ -973,9 +973,8 @@ fn require_unlinked_directory(directory: &File) -> Result<()> {
     check_removed_directory(directory.metadata(), || {
         // Probe only the ambiguous positive-link case, not normal local
         // removals. Failure to identify FUSE preserves the original check.
-        let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
-        retry_zero(|| unsafe { libc::fstatfs(directory.as_raw_fd(), stats.as_mut_ptr()) }).is_ok()
-            && unsafe { stats.assume_init() }.f_type as u32 == libc::FUSE_SUPER_MAGIC as u32
+        crate::fsops::file_system_of(directory)
+            .is_ok_and(|file_system| file_system.magic() == crate::fsops::FUSE_SUPER_MAGIC)
     })
 }
 
