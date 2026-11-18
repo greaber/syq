@@ -2204,36 +2204,7 @@ impl RestrictedAuthority {
                 // A caller-supplied identity is accepted only when it names
                 // the observed object, never on its own authority, and only
                 // where numbers can show that.
-                self.existence_only_where_numbers_mislead(&metadata, condition);
-                match *condition {
-                    Any => {
-                        *condition = Matches {
-                            dev: metadata.dev,
-                            ino: metadata.ino,
-                        }
-                    }
-                    Absent => bail!(
-                        "no-replace creation of {label} contradicts the signed existing-object policy"
-                    ),
-                    Matches { dev, ino } if (dev, ino) == (metadata.dev, metadata.ino) => {}
-                    MatchesFingerprint {
-                        dev,
-                        ino,
-                        ctime,
-                        ctime_nsec,
-                    } if (dev, ino, ctime, ctime_nsec)
-                        == (
-                            metadata.dev,
-                            metadata.ino,
-                            metadata.ctime,
-                            metadata.ctime_nsec,
-                        ) => {}
-                    Matches { .. } | MatchesFingerprint { .. } => {
-                        return Err(kept(format!(
-                            "requested identity for {label} does not match the object the receiver observed"
-                        )))
-                    }
-                }
+                self.pin_to_observed(&metadata, condition, &label, "creation")?;
                 if !directory {
                     // Metadata later in this same batch lands on the new
                     // inode, not the one it replaces, so it must not be
@@ -2351,7 +2322,6 @@ impl RestrictedAuthority {
         label: &str,
         condition: Option<&mut proto::TargetCondition>,
     ) -> Result<()> {
-        use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
         let Some(metadata) = self.rooted_metadata(path)? else {
             return Err(kept(format!(
                 "signed grant creates nothing: {label} does not exist"
@@ -2360,7 +2330,22 @@ impl RestrictedAuthority {
         let Some(condition) = condition else {
             return Ok(());
         };
-        self.existence_only_where_numbers_mislead(&metadata, condition);
+        self.pin_to_observed(&metadata, condition, label, "update")
+    }
+
+    /// Hold `condition` to `observed`, the object the receiver found at
+    /// `label`: `Any` becomes its device and inode, a sender's identity is
+    /// accepted only when it names that object (and only where numbers can
+    /// show that), and a no-replace `verb` contradicts the policy.
+    fn pin_to_observed(
+        &self,
+        metadata: &RootMetadata,
+        condition: &mut proto::TargetCondition,
+        label: &str,
+        verb: &str,
+    ) -> Result<()> {
+        use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
+        self.existence_only_where_numbers_mislead(metadata, condition);
         match *condition {
             Any => {
                 *condition = Matches {
@@ -2369,7 +2354,7 @@ impl RestrictedAuthority {
                 }
             }
             Absent => {
-                bail!("no-replace update of {label} contradicts the signed existing-object policy")
+                bail!("no-replace {verb} of {label} contradicts the signed existing-object policy")
             }
             Matches { dev, ino } if (dev, ino) == (metadata.dev, metadata.ino) => {}
             MatchesFingerprint {
