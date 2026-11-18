@@ -206,6 +206,35 @@ impl Engine {
         checksums: bool,
     ) -> Result<Option<(Object, HeadObjectOutput)>> {
         let _slot = self.tuning.requests.acquire().await;
+        self.head_unadmitted(bucket, key, checksums).await
+    }
+
+    /// `copy_head` for an object of the copy itself. While objects beyond
+    /// the transfer limit are being checked, their number bounds these
+    /// requests instead of the request budget, which is sized for transfers
+    /// and would hold checking at its starting value. A request count the
+    /// user set always bounds them.
+    async fn object_head(
+        &self,
+        bucket: &str,
+        key: &str,
+        checksums: bool,
+        slot: &TransferSlot,
+    ) -> Result<Option<(Object, HeadObjectOutput)>> {
+        let _slot = if self.tuning.requests_set() || !slot.beyond_limit() {
+            Some(self.tuning.requests.acquire().await)
+        } else {
+            None
+        };
+        self.head_unadmitted(bucket, key, checksums).await
+    }
+
+    async fn head_unadmitted(
+        &self,
+        bucket: &str,
+        key: &str,
+        checksums: bool,
+    ) -> Result<Option<(Object, HeadObjectOutput)>> {
         let Some(output) = client::head_output(
             &self.client,
             bucket,
@@ -249,12 +278,12 @@ impl Engine {
         if self.authorization.is_some() {
             let prepared = Arc::new(Mutex::new(Vec::with_capacity(plan.len())));
             let mut position = 0..;
-            parallel(plan, workers, |mut job| {
+            parallel(plan, workers, |mut job, mut slot| {
                 let listed = self.listed(position.next().unwrap(), &copy_destination_key(&job));
                 let engine = self.clone();
                 let prepared = prepared.clone();
                 async move {
-                    match engine.prepare_copy(&mut job, listed.await).await {
+                    match engine.prepare_copy(&mut job, listed.await, &mut slot).await {
                         Ok(work) => prepared.lock().await.push((job, work)),
                         Err(error) => engine.settle(
                             job.key.as_bytes(),
@@ -287,11 +316,11 @@ impl Engine {
                 return Err(error);
             }
             let workers = self.object_workers(prepared.iter().map(|(job, _)| job.size))?;
-            parallel(prepared, workers, |(job, work)| {
+            parallel(prepared, workers, |(job, work), mut slot| {
                 let engine = self.clone();
                 async move {
                     let result = engine
-                        .execute_copy(work)
+                        .execute_copy(work, &mut slot)
                         .await
                         .map_err(|e| engine.copy_error(e));
                     engine.settle(job.key.as_bytes(), &job.path, job.kind, &result, None);
@@ -304,7 +333,7 @@ impl Engine {
                 self.prune(std::mem::take(&mut prune), None).await?;
             }
             let mut position = 0..;
-            parallel(plan, workers, |mut job| {
+            parallel(plan, workers, |mut job, mut slot| {
                 let listed = self.listed(position.next().unwrap(), &copy_destination_key(&job));
                 let engine = self.clone();
                 async move {
@@ -313,7 +342,7 @@ impl Engine {
                     let listed = listed.await;
                     engine.check_cancelled()?;
                     let result = engine
-                        .copy_object(&mut job, listed)
+                        .copy_object(&mut job, listed, &mut slot)
                         .await
                         .map_err(|error| engine.copy_error(error));
                     engine.settle(job.key.as_bytes(), &job.path, job.kind, &result, None);
@@ -329,7 +358,12 @@ impl Engine {
         Ok(())
     }
 
-    async fn prepare_copy(&self, job: &mut Download, listed: Listed) -> Result<CopyPreparation> {
+    async fn prepare_copy(
+        &self,
+        job: &mut Download,
+        listed: Listed,
+        slot: &mut TransferSlot,
+    ) -> Result<CopyPreparation> {
         let source_bucket = self.options.route.source_bucket().unwrap();
         let key = copy_destination_key(job).into_owned();
         local::key_path(key.trim_end_matches('/').as_bytes())?;
@@ -346,14 +380,18 @@ impl Engine {
             if listed == Listed::Absent {
                 Ok(None)
             } else {
-                self.copy_head(&self.options.bucket, &key, comparable).await
+                self.object_head(&self.options.bucket, &key, comparable, slot)
+                    .await
             }
         };
         let planned = job.copy_source.is_some();
         let source = async {
             match job.copy_source.take() {
                 Some(source) => Ok(Some(*source)),
-                None => self.copy_head(source_bucket, &job.key, comparable).await,
+                None => {
+                    self.object_head(source_bucket, &job.key, comparable, slot)
+                        .await
+                }
             }
         };
         let (source, existing) = tokio::try_join!(source, destination)?;
@@ -446,7 +484,7 @@ impl Engine {
                 && checksums_could_decide(&source, old)
                 && full_object_checksums(old_head).iter().any(Option::is_some)
             {
-                match self.copy_head(source_bucket, &job.key, true).await {
+                match self.object_head(source_bucket, &job.key, true, slot).await {
                     Ok(Some((now, head))) if now.etag == source.etag && now.size == source.size => {
                         Some(head)
                     }
@@ -544,6 +582,8 @@ impl Engine {
             self.progress.bytes_done.fetch_add(source.size, Relaxed);
             return Ok(CopyPreparation::Preview(source.size));
         }
+        // Everything from here changes the destination.
+        slot.claim().await;
         self.check_cancelled()?;
         if matching_contents {
             let old_head = &existing.as_ref().unwrap().1;
@@ -689,12 +729,24 @@ impl Engine {
         (request, object)
     }
 
-    async fn copy_object(&self, job: &mut Download, listed: Listed) -> Result<Option<u64>> {
-        self.execute_copy(self.prepare_copy(job, listed).await?)
-            .await
+    async fn copy_object(
+        &self,
+        job: &mut Download,
+        listed: Listed,
+        slot: &mut TransferSlot,
+    ) -> Result<Option<u64>> {
+        let work = self.prepare_copy(job, listed, slot).await?;
+        self.execute_copy(work, slot).await
     }
 
-    async fn execute_copy(&self, work: CopyPreparation) -> Result<Option<u64>> {
+    async fn execute_copy(
+        &self,
+        work: CopyPreparation,
+        slot: &mut TransferSlot,
+    ) -> Result<Option<u64>> {
+        if !matches!(work, CopyPreparation::Skipped | CopyPreparation::Preview(_)) {
+            slot.claim().await;
+        }
         let work = match work {
             CopyPreparation::Skipped => return Ok(None),
             CopyPreparation::Preview(size) => return Ok(Some(size)),

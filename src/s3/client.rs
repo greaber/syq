@@ -119,6 +119,19 @@ impl Intercept for ObserveOutage {
     fn name(&self) -> &'static str {
         "SyqS3Outage"
     }
+    // Every attempt's response, including those that are then retried. S3
+    // answers 503 when asked to slow down, and HEAD carries no error code.
+    fn read_after_transmit(
+        &self,
+        context: &BeforeDeserializationInterceptorContextRef<'_>,
+        _: &RuntimeComponents,
+        _: &mut ConfigBag,
+    ) -> std::result::Result<(), BoxError> {
+        if matches!(context.response().status().as_u16(), 429 | 503) {
+            self.0.throttled();
+        }
+        Ok(())
+    }
     fn read_after_execution(
         &self,
         context: &FinalizerInterceptorContextRef<'_>,
