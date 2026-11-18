@@ -873,8 +873,8 @@ impl Service {
                                 &session.identity.user,
                                 &settings.name,
                             );
-                            crate::destination::forward::Approver {
-                                origin: crate::destination::forward::Origin::Provider,
+                            crate::destination::approve::Approver {
+                                origin: crate::destination::approve::Origin::Provider,
                                 requester: &requester,
                                 approvals: &session.profile.approvals,
                                 notifications: settings.notifications,
@@ -887,7 +887,7 @@ impl Service {
                                 forward_count: &session.forward_count,
                                 cancelled: &cancelled,
                             }
-                            .approve(*request, &mut stream)
+                            .approve((*request).into(), &mut stream)
                         }
                     }
                 })();

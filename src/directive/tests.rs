@@ -541,6 +541,18 @@ fn commands_a_receiver_cannot_enforce_yield_no_rules() {
             "copies to this machine",
         ),
         (&["rsync", "-a", "a", "host-b:b"], "syq cp"),
+        // A receiving machine keeps the directives of copies to it and
+        // signs none; a copy from one is served by that machine.
+        (
+            &["cp", "--src", "data", "--to", "@laptop", "--into", "runs"][..],
+            "is not a copy to a server",
+        ),
+        (
+            &[
+                "cp", "--from", "@laptop", "--src", "data", "--to", "host-b", "--into", "runs",
+            ],
+            "is not a copy to a server",
+        ),
         (
             &[
                 "cp",

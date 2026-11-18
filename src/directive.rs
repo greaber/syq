@@ -464,6 +464,13 @@ pub(crate) fn destination_rules(
     home: &Path,
 ) -> Result<(Grant, GrantConstraints)> {
     let args = destination_command(directive)?;
+    ensure!(
+        matches!(
+            crate::route::classify(&args),
+            crate::route::Route::Upload | crate::route::Route::Between
+        ),
+        "the directive's command is not a copy to a server of the files of the server that asks or of another server"
+    );
     let destination = args.locations.last().expect("a destination's command");
     let destination_path = normalize_absolute(OsStr::from_bytes(&destination.path), home)?
         .into_os_string()
@@ -486,13 +493,20 @@ pub(crate) fn receiving_rules(
     destination: &[u8],
 ) -> Result<(Grant, GrantConstraints)> {
     let args = destination_command(directive)?;
+    check_receiving(&args)?;
+    rules_at(directive, &args, destination, false)
+}
+
+/// Check that `args` is a copy to a receiving machine that it can approve
+/// itself, as the server that asks checks it (`destination::check_to_named`).
+pub(crate) fn check_receiving(args: &Args) -> Result<()> {
     // Its data comes over this machine's own connection, or TCP it dials
     // itself, which is always encrypted.
     ensure!(
         !args.no_tcp_encryption,
         "copies to a receiving machine always encrypt their data; leave out --no-tcp-encryption"
     );
-    rules_at(directive, &args, destination, false)
+    crate::destination::check_to_named(args)
 }
 
 /// As `receiving_rules`, for the copy `args` states, in place of the command

@@ -63,17 +63,19 @@ fn each_refusal_names_the_options_it_refuses() {
         Route::Download,
         Route::Between,
     ] {
-        let refusal = refusal(route).unwrap();
-        let named: Vec<_> = refusal.options.iter().filter_map(|&o| flag(o)).collect();
-        for option in every {
-            assert_eq!(
-                refusal.message.contains(option),
-                named.contains(&option),
-                "{route:?} {option}"
-            );
+        assert!(!refusals(route).is_empty());
+        for refusal in refusals(route) {
+            let named: Vec<_> = refusal.options.iter().filter_map(|&o| flag(o)).collect();
+            for option in every {
+                assert_eq!(
+                    refusal.message.contains(option),
+                    named.contains(&option),
+                    "{route:?} {option}"
+                );
+            }
         }
     }
-    assert!(refusal(Route::Own).is_none());
+    assert!(refusals(Route::Own).is_empty());
 }
 
 /// Today's refusals per route, option by option.
@@ -99,11 +101,8 @@ fn routes_refuse_their_options() {
         (&["--no-bootstrap"], [false, false, true, true, true]),
         (&["--detach"], [true; 5]),
         (&["--peer-auth", "broker"], [true; 5]),
-        (
-            &["--coordinate-at", "src"],
-            [false, true, true, true, false],
-        ),
-        (&["--coordinate-at", "dst"], [false, true, true, true, true]),
+        (&["--coordinate-at", "src"], [true, true, true, true, false]),
+        (&["--coordinate-at", "dst"], [true; 5]),
         (&["--no-tcp-encryption"], [true, true, false, false, false]),
         (&[], [false; 5]),
     ];
