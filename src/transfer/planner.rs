@@ -3727,8 +3727,6 @@ impl Planner<'_> {
         }
         match ok(
             self.dst.call(Request::PlanBatch {
-                partial_paths: Vec::new(),
-                copy_id: self.opts.copy_id,
                 directories: directories.clone(),
                 others: others.clone(),
                 strict_metadata: self.opts.expressions.update.is_some(),
@@ -3736,11 +3734,9 @@ impl Planner<'_> {
             "plan destination batch",
         )? {
             Response::BatchPlan {
-                partial_paths,
                 directories: dir_stats,
                 others: other_stats,
-            } if partial_paths.is_empty()
-                && dir_stats.len() == directories.len()
+            } if dir_stats.len() == directories.len()
                 && other_stats
                     .as_ref()
                     .is_none_or(|stats| stats.len() == others.len()) =>

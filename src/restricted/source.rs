@@ -297,8 +297,7 @@ impl SourceAuthority {
                         .get(&root.selection.root())
                         .context("source worker root was not approved")?;
                     ensure!(
-                        !root.allow_unconfined_paths
-                            && root.ticket.same_session(&approved.ticket)
+                        root.ticket.same_session(&approved.ticket)
                             && root.selection == approved.selection
                             && root.expected_leaf == approved.expected_leaf
                             && match (&root.leaf_ticket, &approved.leaf_ticket) {
@@ -397,7 +396,6 @@ impl SourceConnection {
             base,
             selections,
             symlink_policy,
-            allow_unconfined_paths,
             shared_workers,
             independent_handoff_workers,
         } = request
@@ -408,7 +406,6 @@ impl SourceConnection {
         ensure!(
             base == &policy.base
                 && *symlink_policy == policy.symlink_policy
-                && !allow_unconfined_paths
                 && selections.len() == policy.selections.len()
                 && selections
                     .iter()
@@ -452,10 +449,6 @@ impl SourceConnection {
                     ),
                     _ => {}
                 }
-                ensure!(
-                    !root.allow_unconfined_paths,
-                    "unconfined source registration refused"
-                );
             }
             for root in roots {
                 state.roots.insert(root.selection.root(), root.clone());

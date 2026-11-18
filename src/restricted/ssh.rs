@@ -239,7 +239,6 @@ mod tests {
     ) -> Result<(FrameReader<std::io::PipeReader>, FrameWriter<W>)> {
         let mut writer = FrameWriter::new(input, false);
         writer.write_msg(&Request::Hello {
-            identity: crate::identity::build().into(),
             compress: false,
             debug: false,
             token: Vec::new(),

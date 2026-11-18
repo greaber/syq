@@ -135,36 +135,6 @@ pub(super) struct RootedTarget {
     pub(super) create_missing_parents: bool,
 }
 
-// One filename-limit observation for adjacent siblings in a read-only batch
-// chunk. This avoids repeating parent resolution (including missing-parent
-// probes). The cache opens no descriptors and ends with the chunk. Later
-// requests query again; file operations keep their own confined resolution.
-#[derive(Default)]
-pub(super) struct PartialNameLimits {
-    pub(super) last: Option<(Arc<Root>, PathBuf, usize)>,
-}
-
-impl PartialNameLimits {
-    pub(super) fn get_or_query(
-        &mut self,
-        root: &Arc<Root>,
-        parent: &Path,
-        query: impl FnOnce() -> Result<usize>,
-    ) -> Result<usize> {
-        if let Some((previous_root, previous_parent, limit)) = &self.last {
-            if Arc::ptr_eq(previous_root, root) && previous_parent == parent {
-                return Ok(*limit);
-            }
-        }
-        self.last = None;
-        let limit = query()?;
-        // Keep the actual root alive: device/inode can coincide across
-        // distinct mount views, and a raw pointer could otherwise be reused.
-        self.last = Some((root.clone(), parent.to_path_buf(), limit));
-        Ok(limit)
-    }
-}
-
 impl RootedTarget {
     pub(super) fn partial_name_max(&self) -> Result<usize> {
         self.root.partial_name_max(&self.relative)
@@ -192,7 +162,7 @@ fn rooted_partial_target_with_limit(
 ) -> Result<(RelativePath, PathBuf)> {
     let relative_path = target.relative.to_path_buf();
     // Derive the visible component from the logical command-line spelling so
-    // PartialPaths and every state-machine request keep one stable sidecar
+    // every state-machine request keeps one stable sidecar
     // name, including the PATH_MAX compact form. Only the resulting component
     // is placed beneath the retained root.
     let label = partial_path_with_name_max(&target.label, copy_id, component_limit)?;

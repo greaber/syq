@@ -6038,7 +6038,6 @@ fn register_source_roots(
             base,
             selections,
             symlink_policy,
-            allow_unconfined_paths: false,
             shared_workers,
             independent_handoff_workers,
         })?,

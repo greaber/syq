@@ -198,14 +198,6 @@ fn ordinary_partial_planning_and_copy_do_not_query_name_limits() {
     let mut ops = rooted(dir.path());
     let root = ops.destination_root.as_ref().unwrap().clone();
     let names = ["short".to_owned(), "x".repeat(255)];
-    let paths: Vec<_> = names
-        .iter()
-        .map(|name| format!("nested/{name}").into_bytes())
-        .collect();
-    assert!(ops
-        .partial_paths(&paths, &[9; 16])
-        .iter()
-        .all(Result::is_ok));
     let mut request = Request::PutSmallBatch(
         names
             .iter()

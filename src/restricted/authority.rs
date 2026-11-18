@@ -3774,22 +3774,17 @@ impl RestrictedAuthority {
                     ino: metadata.ino,
                 });
             }
-            Request::PartialPaths { paths, .. } | Request::PruneLookup { paths } => {
+            Request::PruneLookup { paths } => {
                 for path in paths {
                     self.check_observation_path(path)?;
                 }
             }
             Request::PlanBatch {
-                partial_paths,
                 directories,
                 others,
                 ..
             } => {
-                for path in partial_paths
-                    .iter()
-                    .chain(directories.iter())
-                    .chain(others.iter())
-                {
+                for path in directories.iter().chain(others.iter()) {
                     self.check_observation_path(path)?;
                 }
             }

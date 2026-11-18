@@ -512,7 +512,6 @@ mod tests {
                 stream,
             };
             let hello = channel.call(crate::proto::Request::Hello {
-                identity: crate::identity::build().into(),
                 compress: false,
                 debug: false,
                 token: Vec::new(),
@@ -592,7 +591,6 @@ mod tests {
             base: base.clone(),
             selections,
             symlink_policy,
-            allow_unconfined_paths: false,
             shared_workers: 1,
             independent_handoff_workers: 0,
         };
@@ -688,7 +686,6 @@ mod tests {
             base,
             selections,
             symlink_policy,
-            allow_unconfined_paths: false,
             shared_workers: 1,
             independent_handoff_workers: 0,
         })? {
@@ -1406,11 +1403,8 @@ mod tests {
 
         // What the approved command registers, and what other commands
         // would register in its place.
-        let register =
-            |base: &SourceRootBase,
-             selections: &[(&[u8], bool)],
-             symlink_policy,
-             allow_unconfined_paths| Request::RegisterSourceRoots {
+        let register = |base: &SourceRootBase, selections: &[(&[u8], bool)], symlink_policy| {
+            Request::RegisterSourceRoots {
                 base: base.clone(),
                 selections: selections
                     .iter()
@@ -1420,10 +1414,10 @@ mod tests {
                     })
                     .collect(),
                 symlink_policy,
-                allow_unconfined_paths,
                 shared_workers: 1,
                 independent_handoff_workers: 0,
-            };
+            }
+        };
         let (base, refuse) = (&approved.base, OperatorSymlinkPolicy::Refuse);
         let private = SourceRootBase {
             path: Some(root.join("private").as_os_str().as_bytes().to_vec()),
@@ -1439,37 +1433,23 @@ mod tests {
         for (other, request) in [
             (
                 "another file",
-                register(base, &[(b"secret", false)], refuse, false),
+                register(base, &[(b"secret", false)], refuse),
             ),
             (
                 "another source too",
-                register(
-                    base,
-                    &[(b"notes", false), (b"secret", false)],
-                    refuse,
-                    false,
-                ),
+                register(base, &[(b"notes", false), (b"secret", false)], refuse),
             ),
             (
                 "another --root",
-                register(&private, &[(b"token", false)], refuse, false),
+                register(&private, &[(b"token", false)], refuse),
             ),
             (
                 "an unconfined base",
-                register(&unconfined, &[(b"notes", false)], refuse, false),
+                register(&unconfined, &[(b"notes", false)], refuse),
             ),
             (
                 "--follow-src",
-                register(
-                    base,
-                    &[(b"notes", true)],
-                    OperatorSymlinkPolicy::FollowAll,
-                    false,
-                ),
-            ),
-            (
-                "unconfined paths",
-                register(base, &[(b"notes", false)], refuse, true),
+                register(base, &[(b"notes", true)], OperatorSymlinkPolicy::FollowAll),
             ),
         ] {
             match control.call(request).unwrap() {
@@ -1479,7 +1459,7 @@ mod tests {
                 response => panic!("{other} was registered: {response:?}"),
             }
         }
-        let approved_registration = register(base, &[(b"notes", false)], refuse, false);
+        let approved_registration = register(base, &[(b"notes", false)], refuse);
         let roots = match control.call(approved_registration).unwrap() {
             Response::SourceRootsRegistered(roots) => roots,
             other => panic!("registration failed: {other:?}"),
