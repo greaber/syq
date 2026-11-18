@@ -15,12 +15,17 @@ fn enrollment_upload_selects_and_verifies_the_remote_platform() {
     use flate2::{write::GzEncoder, Compression};
     use sha2::{Digest, Sha256};
     if let Ok(case) = std::env::var("SYQ_ENROLLMENT_TEST_CHILD") {
-        let result = run_management_over_route(
+        let request = RevokeRequest {
+            version: CONFIG_VERSION,
+            id: EnrollmentId::test_v4(1),
+            target_login: "receiver".into(),
+            entry_public_key: String::new(),
+        };
+        let result = revoke_over_route(
             &endpoint("receiver", "fixture", None).unwrap(),
             EnrollmentRoute::Configured,
             EnrollmentId::test_v4(1),
-            ManagementAction::Revoke,
-            b"{}",
+            &request,
         );
         assert_eq!(
             result.is_ok(),
@@ -82,10 +87,16 @@ fn enrollment_upload_selects_and_verifies_the_remote_platform() {
             br#"#!/bin/sh
 for argument do command=$argument; done
 case "$command" in
-    *'uname -s'*) printf '%s\n%s\n' "$SYQ_TEST_REMOTE_OS" "$SYQ_TEST_REMOTE_ARCH" ;;
-    *'--restricted-revoke'*) cat > "$SYQ_TEST_UPLOAD" ;;
+    *'--restricted-revoke'*) ;;
     *) exit 91 ;;
 esac
+printf 'login\n' >> "$SYQ_TEST_LOGINS"
+# The session's greeting, for a store without this build.
+printf '%s\n' "$SYQ_TEST_REMOTE_OS" "$SYQ_TEST_REMOTE_ARCH" "$HOME" 1000 receiver '' '' '' '' 0
+IFS= read -r request; IFS= read -r target; IFS= read -r expected
+[ -z "$target" ] || exit 92
+echo upload
+cat > "$SYQ_TEST_UPLOAD"
 "#,
             0o700,
         );
@@ -161,6 +172,7 @@ esac
             )
             .env("SYQ_TEST_FIXTURES", root)
             .env("SYQ_TEST_UPLOAD", root.join("uploaded"))
+            .env("SYQ_TEST_LOGINS", root.join("logins"))
             .env("SYQ_TEST_REMOTE_OS", os)
             .env("SYQ_TEST_REMOTE_ARCH", arch)
             .capture_output()
@@ -171,6 +183,12 @@ esac
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        // One login revokes, whatever it uploads.
+        assert_eq!(
+            fs::read_to_string(root.join("logins")).unwrap(),
+            "login\n",
+            "{case}"
+        );
         if matches!(case, "valid" | "source-helpers" | "local-source-helpers") {
             assert_eq!(fs::read(root.join("uploaded")).unwrap(), binary);
         } else if case == "local-release" {
@@ -179,7 +197,11 @@ esac
                 fs::read(std::env::current_exe().unwrap()).unwrap()
             );
         } else {
-            assert!(!root.join("uploaded").exists(), "{case}");
+            // Nothing is sent when the build cannot be had.
+            assert!(
+                fs::read(root.join("uploaded")).unwrap_or_default().is_empty(),
+                "{case}"
+            );
         }
     }
 }
@@ -2536,11 +2558,12 @@ fn the_local_build_is_hashed_without_reading_it_whole() {
     assert_eq!(build.bytes().unwrap(), contents);
 }
 
+/// An uploaded build is staged for its one session: removed when it
+/// exits, whether it succeeds or fails, with the request passed intact.
 #[test]
 fn management_stage_is_scoped_to_one_shell_session() {
-    fn invoke(home: &Path, stage: &str, script: &[u8], request: &[u8]) -> std::process::Output {
-        let remote = management_remote_command(stage, ManagementAction::Revoke, request)
-            .expect("build management command");
+    fn invoke(home: &Path, script: &[u8], request: &[u8]) -> std::process::Output {
+        let remote = install_remote_command(".syq-stage-test", ManagementAction::Revoke);
         let mut child = Command::new("/bin/sh")
             .arg("-c")
             .arg(remote)
@@ -2550,26 +2573,27 @@ fn management_stage_is_scoped_to_one_shell_session() {
             .stderr(Stdio::piped())
             .spawn_guarded()
             .unwrap();
-        child.stdin.take().unwrap().write_all(script).unwrap();
+        let mut input = child.stdin.take().unwrap();
+        input.write_all(request).unwrap();
+        input.write_all(b"\n\n\n").unwrap();
+        input.write_all(script).unwrap();
+        drop(input);
         child.wait_with_output().unwrap()
     }
 
     let temporary = crate::test_support::tempdir().unwrap();
     let request = br#"{"value":"' ; exit 91; #"}"#;
-    let output = invoke(
-        temporary.path(),
-        ".syq-stage-test-success",
-        b"#!/bin/sh\ncat\n",
-        request,
-    );
+    let output = invoke(temporary.path(), b"#!/bin/sh\ncat\n", request);
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(output.stdout, request);
+    assert!(output
+        .stdout
+        .ends_with(b"upload\n{\"value\":\"' ; exit 91; #\"}"));
     let store = temporary.path().join(".local/lib/syq");
-    assert!(!store.join(".syq-stage-test-success").exists());
+    assert!(!store.join(".syq-stage-test").exists());
     assert!(store.is_dir());
     // The store's own directory is private; the ones above it are not
     // syq's to restrict.
@@ -2577,12 +2601,11 @@ fn management_stage_is_scoped_to_one_shell_session() {
 
     let output = invoke(
         temporary.path(),
-        ".syq-stage-test-failure",
         b"#!/bin/sh\nexit 23\n",
         b"failure request",
     );
     assert_eq!(output.status.code(), Some(23));
-    assert!(!store.join(".syq-stage-test-failure").exists());
+    assert!(!store.join(".syq-stage-test").exists());
 }
 
 #[test]
@@ -2590,10 +2613,14 @@ fn the_enrollment_session_installs_with_a_stored_build_instead_of_an_upload() {
     let temporary = crate::test_support::tempdir().unwrap();
     let home = temporary.path();
     // The session as the account's login shell runs it: `shell -c COMMAND`.
-    let session_in = |shell: &str, home: &Path, input: &[u8]| -> std::process::Output {
+    let session_as = |action: ManagementAction,
+                      shell: &str,
+                      home: &Path,
+                      input: &[u8]|
+     -> std::process::Output {
         let mut child = Command::new(shell)
             .arg("-c")
-            .arg(in_sh(&install_remote_command(".syq-stage-test")))
+            .arg(in_sh(&install_remote_command(".syq-stage-test", action)))
             .env("HOME", home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2614,6 +2641,9 @@ fn the_enrollment_session_installs_with_a_stored_build_instead_of_an_upload() {
             .lines()
             .map(str::to_owned)
             .collect()
+    };
+    let session_in = |shell: &str, home: &Path, input: &[u8]| {
+        session_as(ManagementAction::Install, shell, home, input)
     };
     let session = |input: &[u8]| session_in("/bin/sh", home, input);
     let run = |input: &[u8]| lines(session(input));
@@ -2682,6 +2712,16 @@ fn the_enrollment_session_installs_with_a_stored_build_instead_of_an_upload() {
     assert_eq!(greeting[8].trim(), "linux-x86_64");
     assert_eq!(greeting[10], "stored");
     assert_eq!(greeting[11], r#"stored --restricted-install {"request":2}"#);
+    // Revoking starts the same stored build, or the upload, as the revoker.
+    let revoke = |input: &[u8]| lines(session_as(ManagementAction::Revoke, "/bin/sh", home, input));
+    let greeting = revoke(format!("{{\"request\":5}}\nlinux-x86_64\n{stored_hash}\n").as_bytes());
+    assert_eq!(greeting[10], "stored");
+    assert_eq!(greeting[11], r#"stored --restricted-revoke {"request":5}"#);
+    let mut input = format!("{{\"request\":6}}\nlinux-x86_64\n{}\n", "0".repeat(64)).into_bytes();
+    input.extend_from_slice(sent);
+    let greeting = revoke(&input);
+    assert_eq!(greeting[10], "upload");
+    assert_eq!(greeting[11], r#"sent --restricted-revoke {"request":6}"#);
     // Anything else offered is not started: the session asks for this
     // machine's build and runs that.
     let refused = |target: &str, hash: &str| {
