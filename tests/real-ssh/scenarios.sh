@@ -153,6 +153,79 @@ assert_same_tree() {
     diff -u "$source_manifest" "$destination_manifest"
 }
 
+# file_digest HOST PATH: the file's SHA-256, where a HOST of - is this machine.
+file_digest() {
+    if [ "$1" = - ]; then
+        sha256sum <"$2"
+    else
+        # shellcheck disable=SC2029
+        ssh "$1" "sha256sum <$2"
+    fi
+}
+
+# assert_small_copy RESULTS DEBUG COUNT SOURCE_HOST SOURCE DESTINATION_HOST DESTINATION
+# A small copy run with SYQ_DEBUG=1 and --results settled successfully with
+# one file in its result's COUNT, took the one-turn path, and left the
+# destination with the source's bytes.
+assert_small_copy() {
+    small_status=$(tail -n 1 "$1")
+    case "$small_status" in
+        *'"status":"success"'*'"type":"result"'*) ;;
+        *)
+            echo 'small copy did not settle successfully:' >&2
+            cat "$1" "$2" >&2
+            return 1
+            ;;
+    esac
+    case "$small_status" in
+        *"\"$3\":1,"*|*"\"$3\":1}"*) ;;
+        *) cat "$1" >&2; return 1 ;;
+    esac
+    if ! grep -q 'small copy: published' "$2"; then
+        echo 'small copy did not use the one-turn path:' >&2
+        cat "$2" >&2
+        return 1
+    fi
+    test "$(file_digest "$4" "$5")" = "$(file_digest "$6" "$7")"
+}
+
+# exercise_tuning NAME WORKERS TUNING SECONDS
+# With the tuning overrides TUNING and WORKERS workers at 8 MB/s, each copy
+# ending within SECONDS: an upload and a download over TCP and over SSH, then
+# a copy between servers coordinated by the source, the destination, and here.
+exercise_tuning() {
+    tuning_name=$1
+    tuning_workers=$2
+    tuning_overrides=$3
+    tuning_seconds=$4
+    for transport in tcp ssh; do
+        if [ "$transport" = ssh ]; then set -- --no-tcp; else set --; fi
+        timeout --kill-after=5s "$tuning_seconds" syq cp /tmp/syq-real-ssh-tuning.bin --to source \
+            --as "/tmp/syq-real-ssh/$tuning_name-$transport" \
+            --performance-tuning "workers=$tuning_workers" --no-progress \
+            --resource-limits bandwidth=8M --performance-tuning "$tuning_overrides" "$@"
+        timeout --kill-after=5s "$tuning_seconds" syq cp --from source "/tmp/syq-real-ssh/$tuning_name-$transport" \
+            --as "/tmp/syq-real-ssh-$tuning_name-$transport-download" \
+            --performance-tuning "workers=$tuning_workers" --no-progress \
+            --resource-limits bandwidth=8M --performance-tuning "$tuning_overrides" "$@"
+        cmp /tmp/syq-real-ssh-tuning.bin "/tmp/syq-real-ssh-$tuning_name-$transport-download"
+    done
+    for coordinator in src dst local; do
+        case "$coordinator" in
+            src) set -- ;;
+            dst) set -- --peer-auth broker --no-tcp ;;
+            local) set -- --no-tcp ;;
+        esac
+        timeout --kill-after=5s "$tuning_seconds" syq cp --from source "/tmp/syq-real-ssh/$tuning_name-tcp" \
+            --to destination --as "/tmp/syq-real-ssh/$tuning_name-$coordinator" --coordinate-at "$coordinator" \
+            --performance-tuning "workers=$tuning_workers" --no-progress --resource-limits bandwidth=8M \
+            --performance-tuning "$tuning_overrides" "$@"
+        # shellcheck disable=SC2029
+        ssh destination cat "/tmp/syq-real-ssh/$tuning_name-$coordinator" > "/tmp/syq-real-ssh-$tuning_name-check"
+        cmp /tmp/syq-real-ssh-tuning.bin "/tmp/syq-real-ssh-$tuning_name-check"
+    done
+}
+
 assert_preview_counts() {
     python3 - "$1" "$2" "$3" <<'PYTHON'
 import sys
@@ -1279,42 +1352,6 @@ awk -F '\t' '
     END { exit !(file && directory) }
 ' /tmp/syq-completion-details-lines
 
-# file_digest HOST PATH: the file's SHA-256, where a HOST of - is this machine.
-file_digest() {
-    if [ "$1" = - ]; then
-        sha256sum <"$2"
-    else
-        # shellcheck disable=SC2029
-        ssh "$1" "sha256sum <$2"
-    fi
-}
-
-# assert_small_copy RESULTS DEBUG COUNT SOURCE_HOST SOURCE DESTINATION_HOST DESTINATION
-# A small copy run with SYQ_DEBUG=1 and --results settled successfully with
-# one file in its result's COUNT, took the one-turn path, and left the
-# destination with the source's bytes.
-assert_small_copy() {
-    small_status=$(tail -n 1 "$1")
-    case "$small_status" in
-        *'"status":"success"'*'"type":"result"'*) ;;
-        *)
-            echo 'small copy did not settle successfully:' >&2
-            cat "$1" "$2" >&2
-            return 1
-            ;;
-    esac
-    case "$small_status" in
-        *"\"$3\":1,"*|*"\"$3\":1}"*) ;;
-        *) cat "$1" >&2; return 1 ;;
-    esac
-    if ! grep -q 'small copy: published' "$2"; then
-        echo 'small copy did not use the one-turn path:' >&2
-        cat "$2" >&2
-        return 1
-    fi
-    test "$(file_digest "$4" "$5")" = "$(file_digest "$6" "$7")"
-}
-
 printf 'case: small native push to an ordinary SSH destination takes one turn\n'
 small_source=/tmp/syq-real-ssh-small.bin
 small_debug=/tmp/syq-real-ssh-small.debug
@@ -2319,43 +2356,6 @@ assert_same_tree \
     source /tmp/syq-real-ssh/relay-source \
     destination /tmp/syq-real-ssh/relay-destination \
     relay
-
-# exercise_tuning NAME WORKERS TUNING SECONDS
-# With the tuning overrides TUNING and WORKERS workers at 8 MB/s, each copy
-# ending within SECONDS: an upload and a download over TCP and over SSH, then
-# a copy between servers coordinated by the source, the destination, and here.
-exercise_tuning() {
-    tuning_name=$1
-    tuning_workers=$2
-    tuning_overrides=$3
-    tuning_seconds=$4
-    for transport in tcp ssh; do
-        if [ "$transport" = ssh ]; then set -- --no-tcp; else set --; fi
-        timeout --kill-after=5s "$tuning_seconds" syq cp /tmp/syq-real-ssh-tuning.bin --to source \
-            --as "/tmp/syq-real-ssh/$tuning_name-$transport" \
-            --performance-tuning "workers=$tuning_workers" --no-progress \
-            --resource-limits bandwidth=8M --performance-tuning "$tuning_overrides" "$@"
-        timeout --kill-after=5s "$tuning_seconds" syq cp --from source "/tmp/syq-real-ssh/$tuning_name-$transport" \
-            --as "/tmp/syq-real-ssh-$tuning_name-$transport-download" \
-            --performance-tuning "workers=$tuning_workers" --no-progress \
-            --resource-limits bandwidth=8M --performance-tuning "$tuning_overrides" "$@"
-        cmp /tmp/syq-real-ssh-tuning.bin "/tmp/syq-real-ssh-$tuning_name-$transport-download"
-    done
-    for coordinator in src dst local; do
-        case "$coordinator" in
-            src) set -- ;;
-            dst) set -- --peer-auth broker --no-tcp ;;
-            local) set -- --no-tcp ;;
-        esac
-        timeout --kill-after=5s "$tuning_seconds" syq cp --from source "/tmp/syq-real-ssh/$tuning_name-tcp" \
-            --to destination --as "/tmp/syq-real-ssh/$tuning_name-$coordinator" --coordinate-at "$coordinator" \
-            --performance-tuning "workers=$tuning_workers" --no-progress --resource-limits bandwidth=8M \
-            --performance-tuning "$tuning_overrides" "$@"
-        # shellcheck disable=SC2029
-        ssh destination cat "/tmp/syq-real-ssh/$tuning_name-$coordinator" > "/tmp/syq-real-ssh-$tuning_name-check"
-        cmp /tmp/syq-real-ssh-tuning.bin "/tmp/syq-real-ssh-$tuning_name-check"
-    done
-}
 
 printf 'case: tuning overrides for range uploads, downloads, direct copies, and relay\n'
 dd if=/dev/urandom of=/tmp/syq-real-ssh-tuning.bin bs=1M count=9 status=none
