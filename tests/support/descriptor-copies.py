@@ -122,14 +122,14 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
                     child = subprocess.Popen(command, pass_fds=(a.fileno(),), stdout=subprocess.PIPE,
                                              stderr=subprocess.PIPE, env=ENV, start_new_session=True)
                     CHILDREN.append(child)
-                    wait_for(lambda: list(target.parent.glob('.syq-stream-*')), 'staging file', interval=.0001)
+                    wait_for(lambda: list(target.parent.glob('.*.syq-tmp.*')), 'staging file', interval=.0001)
                     assert target.read_bytes() == DATA
                     child.send_signal(signal.SIGTERM)
                     _, error = child.communicate(timeout=10)
                     assert child.returncode != 0, error
                     assert fcntl.fcntl(a, fcntl.F_GETFL) == before
                     assert target.read_bytes() == DATA
-                    wait_for(lambda: not list(target.parent.glob('.syq-stream-*')),
+                    wait_for(lambda: not list(target.parent.glob('.*.syq-tmp.*')),
                              f'staging cleanup (remote={ssh}, nonblocking={nonblocking})')
             # Broken consumers fail. Remote path sources remain regular files.
             child = subprocess.Popen([SYQ, 'cp', '--if-exists=update', *options, *source, str(target), '--as-fd', '1'],
@@ -207,7 +207,7 @@ with tempfile.TemporaryDirectory(prefix='syq-descriptors-') as temporary:
             os.mkfifo(tree / 'nested-pipe')
             run([str(tree), '--as', str(directory / 'tree-copy')])
             assert not (directory / 'tree-copy' / 'nested-pipe').exists()
-            assert not list(target.parent.glob('.syq-stream-*'))
+            assert not list(target.parent.glob('.*.syq-tmp.*'))
             print('descriptor file copies passed:', 'SSH helper' if ssh else 'local', flush=True)
         # Environment options have the same validation as explicit options.
         # Reject unsupported settings before opening input or mutating output.
