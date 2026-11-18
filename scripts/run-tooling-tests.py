@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Run tooling tests and the rsync harness; --quick selects the cheap default checks."""
+"""Run tooling tests and the rsync harness; --quick selects the cheap default checks
+and --group the tests of the named groups that scripts/ci-scope.py selects."""
 import argparse
 import os
 from pathlib import Path
@@ -37,6 +38,25 @@ QUICK_TESTS = (
     "tests/rsync-compat/harness_test.py",
 )
 HARNESS = Path("tests/rsync-compat/harness_test.py")
+# The groups scripts/ci-scope.py selects by changed path. Every test in
+# tests/tooling belongs to one, so selecting all groups runs all of them.
+GROUPS = {
+    "package": ("test-cargo-package.py",),
+    "installer": ("test-installer.py",),
+    "benchmark": ("test-benchmark-concurrency.py", "test-try-benchmark.py"),
+    "release": ("test-python-sdk-release-tools.py", "test-release-tools.py"),
+    "orchestration": ("test-find-release-build.py", "test-generated-sdk-post-merge-ci.py",
+                      "test-nightly-ci.py", "test-release-orchestration.py",
+                      "test-release-readiness.py", "test-release-test-inputs.py",
+                      "test-release-timings.py", "test-tooling-discovery.py", "test-tooling.py"),
+    "focused": ("test-run-focused-check.py",),
+    "branch": ("test-agent-coordination.py", "test-branch-status.py",
+               "test-dispatched-checks-status.py"),
+    # ci.yml also checks workflow syntax and script references for this group.
+    "workflows": ("test-doc-selector.cjs", "test-doc-site.py", "test-doc-tools.py",
+                  "test-tool-examples.py"),
+    "setup": ("test-rust-test-timeouts.py", "test-setup.sh"),
+}
 
 
 def discover(directory):
@@ -49,9 +69,18 @@ def discover(directory):
     return tests
 
 
-def select_tests(root, quick=False):
-    tests = discover(root / "tests/tooling") + [root / HARNESS]
-    if quick:
+def select_tests(root, quick=False, groups=()):
+    tooling = discover(root / "tests/tooling")
+    tests = tooling + [root / HARNESS]
+    if groups:
+        unknown = [name for name in groups if name not in GROUPS]
+        if unknown:
+            raise ToolError(f"unknown group: {' '.join(unknown)} (choose from {' '.join(GROUPS)})")
+        selected = {root / "tests/tooling" / name for group in groups for name in GROUPS[group]}
+        # Discovery order: test-cargo-package.py builds the syq that ci.yml passes
+        # to test-release-tools.py.
+        tests = [test for test in tooling if test in selected]
+    elif quick:
         selected = [root / path for path in QUICK_TESTS]
         unknown = set(selected) - set(tests)
         if unknown:
@@ -94,10 +123,13 @@ def run_tests(tests, root):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true", help="list discovered tests without running them")
-    parser.add_argument("--quick", action="store_true",
-                        help="run the measured cheap group (no builds or external services)")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--quick", action="store_true",
+                           help="run the measured cheap group (no builds or external services)")
+    selection.add_argument("--group", nargs="+", default=[], metavar="NAME",
+                           help=f"run the tests of these groups: {' '.join(GROUPS)}")
     args = parser.parse_args()
-    tests = select_tests(ROOT, quick=args.quick)
+    tests = select_tests(ROOT, quick=args.quick, groups=args.group)
     if args.list:
         for test in tests:
             print(test.relative_to(ROOT))

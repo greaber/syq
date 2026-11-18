@@ -45,7 +45,6 @@ jobs:
           scripts/verify-release-tag.py \
             "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_SHA" master sdks
       - name: Require Python tag version to match package
-        if: startsWith(github.ref, 'refs/tags/sdk-python-v')
         run: |
           version=$(python3 -c \
             'import tomllib; print(tomllib.load(open("sdk/python/pyproject.toml", "rb"))["project"]["version"])')
@@ -53,7 +52,7 @@ jobs:
 
   candidate-python:
     name: find prepared Python distributions
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/sdk-python-v')
+    if: github.event_name == 'push'
     needs: verify-tag
     runs-on: ubuntu-26.04
     timeout-minutes: 80
@@ -82,7 +81,7 @@ jobs:
     if: >-
       !cancelled() && (github.event_name == 'workflow_dispatch' ||
       (needs.verify-tag.result == 'success' && needs.candidate-python.result == 'success' &&
-      needs.candidate-python.outputs.run-id == '' && startsWith(github.ref, 'refs/tags/sdk-python-v')))
+      needs.candidate-python.outputs.run-id == ''))
     needs: [verify-tag, candidate-python]
     strategy:
       fail-fast: false
@@ -192,7 +191,6 @@ jobs:
     name: publish Python SDK
     if: >-
       always() && !cancelled() && github.event_name == 'push' &&
-      startsWith(github.ref, 'refs/tags/sdk-python-v') &&
       needs.verify-tag.result == 'success' && needs.candidate-python.result == 'success' &&
       (needs.build-python.result == 'success' ||
        (needs.build-python.result == 'skipped' && needs.candidate-python.outputs.run-id != ''))
