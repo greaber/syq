@@ -79,19 +79,28 @@ fn send_scan_chunk(
         .is_ok()
 }
 
-fn inspect_descriptor_children(
+/// Stat `names` in an open directory, in order, each with its path beneath
+/// `parent`. Large listings are inspected on a shared pool when `parallel`.
+pub(crate) fn inspect_descriptor_children(
     root: &Root,
     directory: &File,
     parent: &[u8],
     names: &[PathBytes],
     parallel: bool,
+    read_symlink_target: bool,
 ) -> Vec<(PathBytes, Result<(Entry, RootMetadata)>)> {
     let inspect = |name: &PathBytes| {
         let relative = join(parent, name);
         let result = (|| {
             let metadata = root.metadata_in_directory(directory, name)?;
-            let entry =
-                rooted_entry_in_directory(root, directory, name, relative.clone(), metadata, true)?;
+            let entry = rooted_entry_in_directory(
+                root,
+                directory,
+                name,
+                relative.clone(),
+                metadata,
+                read_symlink_target,
+            )?;
             Ok((entry, metadata))
         })();
         (relative, result)
@@ -196,6 +205,7 @@ impl DescriptorScan<'_> {
             &directory.relative,
             &batch,
             parallel_stats,
+            true,
         )) {
             let (entry, metadata) = match result {
                 Ok(result) => result,
@@ -449,6 +459,25 @@ fn receive_scan(
     Ok(())
 }
 
+/// Read a selected scan root's metadata and entry, checked against its pinned
+/// identity before and after.
+pub(crate) fn read_selected_root(
+    root: &Root,
+    scan_root: &[u8],
+    expected: Option<&SourceLeafIdentity>,
+) -> Result<(RootMetadata, Entry)> {
+    let scan_relative = RelativePath::new(scan_root)?;
+    let metadata = root.metadata(&scan_relative)?;
+    if let Some(expected) = expected {
+        require_source_leaf_identity(expected, metadata)?;
+    }
+    let root_entry = rooted_source_entry(root, &scan_relative, Vec::new(), metadata, expected)?;
+    if let Some(expected) = expected {
+        require_source_leaf_identity(expected, root.metadata(&scan_relative)?)?;
+    }
+    Ok((metadata, root_entry))
+}
+
 /// Walk a subtree beneath an already-adopted endpoint authority root. The
 /// request supplies only a strict path relative to that root; no pathname is
 /// reconstructed and descendant symlinks are reported rather than traversed.
@@ -468,21 +497,7 @@ pub(crate) fn scan_descriptor(
     if follow_root {
         anyhow::bail!("a descriptor-rooted scan never follows a root symlink");
     }
-    let scan_relative = RelativePath::new(scan_root)?;
-    let metadata = root.metadata(&scan_relative)?;
-    if let Some(expected) = expected_root.as_ref() {
-        require_source_leaf_identity(expected, metadata)?;
-    }
-    let root_entry = rooted_source_entry(
-        &root,
-        &scan_relative,
-        Vec::new(),
-        metadata,
-        expected_root.as_ref(),
-    )?;
-    if let Some(expected) = expected_root.as_ref() {
-        require_source_leaf_identity(expected, root.metadata(&scan_relative)?)?;
-    }
+    let (metadata, root_entry) = read_selected_root(&root, scan_root, expected_root.as_ref())?;
     if root_entry.kind != crate::proto::Kind::Dir {
         sink(vec![root_entry])?;
         return Ok(0);

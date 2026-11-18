@@ -19,12 +19,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::cli::{native_basename, Args, SourceSelection};
-use crate::fsops::{require_source_leaf_identity, rooted_entry_in_directory, rooted_source_entry};
-use crate::proto::{Entry, Kind, OperatorSymlinkPolicy, SourceLeafIdentity};
-use crate::rooted::{
-    read_open_symlink, OperatorFinalComponent, OperatorResolver, PinnedPath, RelativePath, Root,
-    OPERATOR_SYMLINK_FOLLOW_ADVICE,
-};
+use crate::fsops::{PinnedSource, SourceSelector};
+use crate::proto::{Entry, Kind, OperatorSymlinkPolicy, SourceLeafIdentity, SourceRootBase};
+use crate::rooted::{PinnedPath, RelativePath, Root, OPERATOR_SYMLINK_FOLLOW_ADVICE};
 
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize,
@@ -168,11 +165,6 @@ struct MapSelection {
     emitted_source: Vec<u8>,
 }
 
-struct MapBase {
-    directory: Option<File>,
-    confined: bool,
-}
-
 struct PendingMapEntry {
     root_relative: Vec<u8>,
     entry: Entry,
@@ -210,7 +202,7 @@ pub fn write_local(options: &Options, out: &mut impl Write) -> Result<()> {
     } else {
         OperatorSymlinkPolicy::Refuse
     };
-    let base = pin_base(options, &options.sources, symlink_policy)?;
+    let selector = source_selector(options, symlink_policy)?;
     let destinations = options.destinations()?;
     let mut policy = crate::expression::Policy::compile(options.where_expression.as_deref(), None)?;
     policy.now = options.expression_now;
@@ -225,7 +217,7 @@ pub fn write_local(options: &Options, out: &mut impl Write) -> Result<()> {
     // again to emit it, so many selectors do not hold descriptors open.
     let mut links = Vec::new();
     for location in &options.sources {
-        let selection = pin_selection(&base, location, follow_src, symlink_policy)?;
+        let selection = pin_selection(&selector, location, follow_src)?;
         let (_, root) = selected_root(&selection)?;
         if crate::transfer::refuses_named_symlink(location.selection, root.kind) {
             links.push(location.path.as_slice());
@@ -240,159 +232,67 @@ pub fn write_local(options: &Options, out: &mut impl Write) -> Result<()> {
         ));
     }
     for (location, destination) in options.sources.iter().zip(destinations) {
-        let selection = pin_selection(&base, location, follow_src, symlink_policy)?;
+        let selection = pin_selection(&selector, location, follow_src)?;
         hold_map_selection_for_test()?;
         emit_selection(location, selection, &destination, &mut emitter)?;
     }
     Ok(())
 }
 
-fn pin_base(
+fn source_selector(
     args: &Options,
-    locations: &[Source],
     symlink_policy: OperatorSymlinkPolicy,
-) -> Result<MapBase> {
+) -> Result<SourceSelector> {
     if args.cwd.is_some() && args.root.is_some() {
         bail!("--cwd and --root are mutually exclusive");
     }
-    let (path, confined) = if let Some(path) = args.root.as_deref() {
-        (Some(path), true)
-    } else {
-        (args.cwd.as_deref(), false)
+    let base = SourceRootBase {
+        path: args.root.clone().or_else(|| args.cwd.clone()),
+        confined: args.root.is_some(),
     };
-    if let Some(path) = path {
-        if path.is_empty() {
-            bail!("source base may not be empty");
-        }
-        if path.contains(&0) {
-            bail!("source base contains NUL");
-        }
+    base.validate()?;
+    for location in &args.sources {
+        crate::cli::validate_native_source_selector(&location.path, base.confined)?;
     }
-    let needs_base = confined
-        || locations
-            .iter()
-            .any(|location| !crate::fsops::resolve(&location.path).is_absolute());
-    if !needs_base {
-        return Ok(MapBase {
-            directory: None,
-            confined,
-        });
-    }
-    let path = crate::fsops::resolve(path.unwrap_or(b"."));
-    let mut hops = Vec::new();
-    let selection = OperatorResolver::resolve_process(
-        path.as_os_str().as_bytes(),
+    let needs_base = args
+        .sources
+        .iter()
+        .any(|location| !crate::fsops::resolve(&location.path).is_absolute());
+    SourceSelector::new(
+        "syq map source base",
+        &base,
+        None,
         symlink_policy,
-        OperatorFinalComponent::Directory,
-        false,
-        &mut hops,
+        needs_base,
     )
-    .with_context(|| format!("resolve syq map source base {}", path.display()))?;
-    match selection {
-        PinnedPath::Directory(directory) => Ok(MapBase {
-            directory: Some(directory.into_parts().0),
-            confined,
-        }),
-        PinnedPath::Leaf(_) | PinnedPath::OpenFile(_) => {
-            bail!("syq map source base is not a directory")
-        }
-        PinnedPath::Missing(_) => unreachable!("map base resolution requires an existing path"),
-    }
 }
 
 fn pin_selection(
-    base: &MapBase,
+    selector: &SourceSelector,
     location: &Source,
     follow_src: bool,
-    symlink_policy: OperatorSymlinkPolicy,
 ) -> Result<MapSelection> {
     let path = crate::fsops::resolve(&location.path);
-    let mut hops = Vec::new();
-    let selection = if path.is_absolute() {
-        if base.confined {
-            bail!(
-                "source {} beneath --root must be relative",
-                display(&location.path)
-            );
-        }
-        OperatorResolver::resolve_process(
-            path.as_os_str().as_bytes(),
-            symlink_policy,
-            OperatorFinalComponent::Entry {
-                follow_symlink: follow_src,
-            },
-            false,
-            &mut hops,
-        )
-    } else {
-        OperatorResolver::beneath(
-            base.directory
-                .as_ref()
-                .expect("relative map selection requires a pinned base"),
-            base.confined,
-            symlink_policy,
-        )?
-        .resolve(
-            path.as_os_str().as_bytes(),
-            OperatorFinalComponent::Entry {
-                follow_symlink: follow_src,
-            },
-            false,
-            &mut hops,
-        )
-    };
-    let selection =
-        selection.with_context(|| format!("resolve source {}", display(&location.path)))?;
-    match selection {
-        PinnedPath::Directory(directory) => {
-            let emitted_source = emitted_source(location, directory.resolved_relative())?;
-            let (directory, _) = directory.into_parts();
-            Ok(MapSelection {
-                root: Arc::new(Root::from_directory(directory)?),
-                relative: Vec::new(),
-                expected_leaf: None,
-                _leaf_object: None,
-                emitted_source,
-            })
-        }
-        PinnedPath::Leaf(leaf) => {
-            if location.selection == SourceSelection::Contents && leaf.metadata().is_symlink() {
-                bail!(
-                    "--srcs-in {} is a symlink; {OPERATOR_SYMLINK_FOLLOW_ADVICE}",
-                    display(&location.path)
-                );
-            }
-            let emitted_source = emitted_source(location, leaf.resolved_relative())?;
-            let (parent, name, metadata, object) = leaf.into_parts();
-            if object.is_none() && !metadata.is_fifo() {
-                bail!("this platform cannot retain the selected map source leaf safely");
-            }
-            let symlink_target = if metadata.is_symlink() {
-                Some(
-                    read_open_symlink(object.as_ref().expect("symlink object was checked"))?.context(
-                        "this platform cannot snapshot a selected map symlink through its pinned object (macOS 13 or newer is required on Darwin)",
-                    )?,
-                )
-            } else {
-                None
-            };
-            Ok(MapSelection {
-                root: Arc::new(Root::from_directory(parent)?),
-                relative: name.as_bytes().to_vec(),
-                expected_leaf: Some(SourceLeafIdentity {
-                    dev: metadata.dev,
-                    ino: metadata.ino,
-                    file_type: metadata.file_type(),
-                    symlink_atime: metadata.is_symlink().then_some(metadata.atime),
-                    symlink_target,
-                }),
-                _leaf_object: object,
-                emitted_source,
-            })
-        }
-        PinnedPath::Missing(_) => unreachable!("map selection requires an existing path"),
-        PinnedPath::OpenFile(_) => unreachable!("map selection never opens a procfs input"),
+    let pinned = selector.resolve(&path, follow_src, || {
+        format!("resolve source {}", display(&location.path))
+    })?;
+    if location.selection == SourceSelection::Contents
+        && matches!(&pinned, PinnedPath::Leaf(leaf) if leaf.metadata().is_symlink())
+    {
+        bail!(
+            "--srcs-in {} is a symlink; {OPERATOR_SYMLINK_FOLLOW_ADVICE}",
+            display(&location.path)
+        );
     }
+    let source = PinnedSource::new(pinned, true)?;
+    let emitted_source = emitted_source(location, source.resolved_relative.as_deref())?;
+    Ok(MapSelection {
+        root: Arc::new(Root::from_directory(source.directory)?),
+        relative: source.relative,
+        expected_leaf: source.expected_leaf,
+        _leaf_object: source.object,
+        emitted_source,
+    })
 }
 
 fn emitted_source(location: &Source, resolved_relative: Option<&[u8]>) -> Result<Vec<u8>> {
@@ -414,25 +314,12 @@ fn emitted_source(location: &Source, resolved_relative: Option<&[u8]>) -> Result
     Ok(resolved_relative.to_vec())
 }
 
-/// The selected root's metadata and entry, checked against the pinned
-/// identity.
 fn selected_root(selection: &MapSelection) -> Result<(crate::rooted::RootMetadata, Entry)> {
-    let scan_relative = RelativePath::new(&selection.relative)?;
-    let metadata = selection.root.metadata(&scan_relative)?;
-    if let Some(expected) = selection.expected_leaf.as_ref() {
-        require_source_leaf_identity(expected, metadata)?;
-    }
-    let root_entry = rooted_source_entry(
+    crate::scan::read_selected_root(
         &selection.root,
-        &scan_relative,
-        Vec::new(),
-        metadata,
+        &selection.relative,
         selection.expected_leaf.as_ref(),
-    )?;
-    if let Some(expected) = selection.expected_leaf.as_ref() {
-        require_source_leaf_identity(expected, selection.root.metadata(&scan_relative)?)?;
-    }
-    Ok((metadata, root_entry))
+    )
 }
 
 /// Check a selected root's type against its selector.
@@ -543,19 +430,18 @@ fn push_directory_children(
     names.sort();
     let start = pending.len();
     pending.reserve(names.len());
-    for name in names {
-        let metadata = root.metadata_in_directory(&directory, &name)?;
-        let output_relative = join_rel(output_relative, &name);
-        let entry = rooted_entry_in_directory(
-            root,
-            &directory,
-            &name,
-            output_relative,
-            metadata,
-            read_symlink_target,
-        )?;
+    let inspected = crate::scan::inspect_descriptor_children(
+        root,
+        &directory,
+        output_relative,
+        &names,
+        true,
+        read_symlink_target,
+    );
+    for (name, (_, inspected)) in names.iter().zip(inspected) {
+        let (entry, metadata) = inspected?;
         pending.push(PendingMapEntry {
-            root_relative: join_rel(root_relative, &name),
+            root_relative: join_rel(root_relative, name),
             entry,
             metadata,
         });
@@ -632,4 +518,40 @@ fn join_rel(prefix: &[u8], name: &[u8]) -> Vec<u8> {
 
 fn display(path: &[u8]) -> String {
     Path::new(OsStr::from_bytes(path)).display().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A helper receives map options over the wire, so it checks selectors
+    /// itself, as source registration does, instead of relying on the
+    /// client's command-line checks.
+    #[test]
+    fn helper_refuses_empty_nul_and_absolute_confined_selectors() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let base = temp.path().as_os_str().as_bytes().to_vec();
+        let refused = |path: &[u8], root: Option<Vec<u8>>| {
+            let options = Options {
+                cwd: None,
+                root,
+                target: None,
+                sources: vec![Source {
+                    path: path.to_vec(),
+                    selection: SourceSelection::Named,
+                }],
+                follow: false,
+                include: Vec::new(),
+                where_expression: None,
+                expression_now: 0,
+            };
+            let mut out = Vec::new();
+            let error = write_local(&options, &mut out).unwrap_err();
+            assert!(out.is_empty());
+            format!("{error:#}")
+        };
+        assert_eq!(refused(b"", None), "source selectors may not be empty");
+        assert_eq!(refused(b"a\0b", None), "source selector contains NUL");
+        assert!(refused(&base, Some(base.clone())).contains("beneath --root must be relative"));
+    }
 }
