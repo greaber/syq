@@ -4,12 +4,11 @@ use crate::destination_results::{Change, Failure};
 pub(super) struct AuthorityState {
     /// Objects this grant created and the executor confirmed. The
     /// existing-object policy is about what existed before the transfer, so
-    /// later operations on these are the transfer's own business.
+    /// later operations on these are the transfer's own business. A
+    /// creation authorized but not yet confirmed is not here: a second
+    /// creation of the same path races at the kernel instead of trusting an
+    /// outcome that has not happened yet.
     pub(super) created: HashSet<Vec<u8>>,
-    /// Creations authorized but not yet confirmed or rolled back. They never
-    /// grant the shortcut above: a second creation of the same path races at
-    /// the kernel instead of trusting an outcome that has not happened yet.
-    pub(super) provisional: HashSet<Vec<u8>>,
     /// Bytes each staged, in-place or patched file this copy is writing
     /// may occupy on disk, keyed by the destination path and the partial
     /// this grant declared for it: preallocation and basis seeding are
@@ -985,7 +984,6 @@ impl RestrictedAuthority {
             deletions: Default::default(),
             state: Mutex::new(AuthorityState {
                 created: HashSet::new(),
-                provisional: HashSet::new(),
                 reserved: HashMap::new(),
                 reserved_bytes: 0,
                 next_reservation_hold: 0,
@@ -1700,7 +1698,6 @@ impl RestrictedAuthority {
             self.settled.notify_all();
         }
         for creation in creations {
-            state.provisional.remove(&creation.path);
             if creation.persist && !failed(creation.index) {
                 state.created.insert(creation.path);
             }
@@ -1963,13 +1960,6 @@ impl RestrictedAuthority {
         }
     }
 
-    pub(super) fn forget_provisional(&self, pending: &[PendingCreation]) {
-        let mut state = self.state.lock().unwrap();
-        for creation in pending {
-            state.provisional.remove(&creation.path);
-        }
-    }
-
     /// Bind an operation that creates or replaces the object at `path` to the
     /// signed existing-object policy. `Skip` retains whatever existed before
     /// the transfer, so creation is forced to be no-replace; `MustExist`
@@ -2079,7 +2069,6 @@ impl RestrictedAuthority {
                                 "replacement of {label} contradicts the signed existing-object policy"
                             ),
                         }
-                        self.state.lock().unwrap().provisional.insert(path.to_vec());
                         pending.push(PendingCreation {
                             index,
                             path: path.to_vec(),
@@ -2282,7 +2271,6 @@ impl RestrictedAuthority {
                         "replacement of {label} contradicts the signed existing-object policy"
                     ),
                 }
-                self.state.lock().unwrap().provisional.insert(path.to_vec());
                 pending.push(PendingCreation {
                     index,
                     path: path.to_vec(),
@@ -3600,7 +3588,6 @@ impl RestrictedAuthority {
                 if let StreamStep::CopySmallCopy(prepared) = step {
                     self.settle_unexecuted(*prepared, &format!("{error:#}"));
                 }
-                self.forget_provisional(&pending);
                 self.release_patch_holds(outcomes.into_iter());
                 // What it asked for, classified before taking the state lock:
                 // classifying may look at the destination.
