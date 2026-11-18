@@ -34,7 +34,12 @@ use std::time::Duration;
 
 const HANDOFF_MAGIC: &[u8; 8] = b"SYQFD001";
 const SECRET_LEN: usize = TICKET_SECRET_LEN;
-const HANDOFF_REQUEST_LEN: usize = HANDOFF_MAGIC.len() + SECRET_LEN + size_of::<u64>() + 1;
+/// One claim: the registered root's identifier and the descriptor kind.
+const CLAIM_LEN: usize = size_of::<u64>() + 1;
+/// A connection's first request authenticates it and carries its first claim
+/// (or asks to hand over a connection). Further claims follow as bare
+/// [`CLAIM_LEN`] records.
+const HANDOFF_REQUEST_LEN: usize = HANDOFF_MAGIC.len() + SECRET_LEN + CLAIM_LEN;
 const RESPONSE_OK: u8 = 0;
 const RESPONSE_REJECTED: u8 = 1;
 const RESPONSE_INTERNAL: u8 = 2;
@@ -313,6 +318,13 @@ impl DescriptorTicket {
             RegisteredDescriptorKind::StreamWrite => Ok(true),
             _ => bail!("stream worker requires an exact stream file ticket"),
         }
+    }
+
+    fn claim(&self) -> [u8; CLAIM_LEN] {
+        let mut claim = [0u8; CLAIM_LEN];
+        claim[..size_of::<u64>()].copy_from_slice(&self.root_id.0.to_be_bytes());
+        claim[size_of::<u64>()] = self.kind.wire_byte();
+        claim
     }
 
     #[cfg(test)]
@@ -693,18 +705,28 @@ impl DescriptorSessionSlot {
     }
 
     pub(crate) fn acquire(&self, ticket: &DescriptorTicket) -> Result<File> {
+        Ok(self.acquire_many(&[ticket])?.remove(0))
+    }
+
+    /// Acquire several descriptors of one endpoint session: cloned from this
+    /// process's registry when it owns the session, otherwise claimed over a
+    /// single broker connection.
+    pub(crate) fn acquire_many(&self, tickets: &[&DescriptorTicket]) -> Result<Vec<File>> {
         let session = self
             .session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(session) = session.as_ref() {
-            return session.acquire(ticket);
+            return tickets
+                .iter()
+                .map(|ticket| session.acquire(ticket))
+                .collect();
         }
         drop(session);
         if self.closed.load(Ordering::Acquire) {
             bail!("descriptor session is closed");
         }
-        acquire_descriptor(ticket)
+        acquire_descriptors(tickets)
     }
 
     /// End the control session even if its detached TCP listener still holds
@@ -737,33 +759,59 @@ impl DescriptorSessionSlot {
 /// descriptor refers to the exact registered object even if its original
 /// pathname has been renamed or replaced.
 pub(crate) fn acquire_descriptor(ticket: &DescriptorTicket) -> Result<File> {
-    let mut stream = ticket
+    Ok(acquire_descriptors(&[ticket])?.remove(0))
+}
+
+/// Claim several registered descriptors of one endpoint session over a
+/// single broker connection, in order. The first request authenticates the
+/// connection with the session secret; the broker checks every claim against
+/// its registry exactly as it checks a claim on a connection of its own, and
+/// closes the connection after the first one it refuses.
+pub(crate) fn acquire_descriptors(tickets: &[&DescriptorTicket]) -> Result<Vec<File>> {
+    let Some(first) = tickets.first() else {
+        return Ok(Vec::new());
+    };
+    if tickets.iter().any(|ticket| !ticket.same_session(first)) {
+        bail!("descriptor tickets belong to different endpoint sessions");
+    }
+    let mut stream = first
         .broker
         .connect(BrokerBase::Account)
         .context("connect to descriptor broker")?;
     stream.set_read_timeout(Some(BROKER_IO_TIMEOUT))?;
     stream.set_write_timeout(Some(BROKER_IO_TIMEOUT))?;
-    let mut request = [0u8; HANDOFF_REQUEST_LEN];
-    request[..HANDOFF_MAGIC.len()].copy_from_slice(HANDOFF_MAGIC);
-    let secret_start = HANDOFF_MAGIC.len();
-    request[secret_start..secret_start + SECRET_LEN].copy_from_slice(ticket.broker.secret());
-    let root_start = secret_start + SECRET_LEN;
-    let root_end = root_start + size_of::<u64>();
-    request[root_start..root_end].copy_from_slice(&ticket.root_id.0.to_be_bytes());
-    request[root_end] = ticket.kind.wire_byte();
-    stream.write_all(&request)?;
-
-    let (status, descriptor) = receive_descriptor(&stream)?;
-    match (status, descriptor) {
-        (RESPONSE_OK, Some(descriptor)) => Ok(descriptor),
-        (RESPONSE_OK, None) => bail!("descriptor broker returned success without a descriptor"),
-        (RESPONSE_REJECTED, None) => bail!("descriptor broker rejected the session root request"),
-        (RESPONSE_INTERNAL, None) => {
-            bail!("descriptor broker could not duplicate the session root")
+    let mut descriptors = Vec::with_capacity(tickets.len());
+    for (index, ticket) in tickets.iter().enumerate() {
+        if index == 0 {
+            let mut request = [0u8; HANDOFF_REQUEST_LEN];
+            request[..HANDOFF_MAGIC.len()].copy_from_slice(HANDOFF_MAGIC);
+            let secret_start = HANDOFF_MAGIC.len();
+            request[secret_start..secret_start + SECRET_LEN]
+                .copy_from_slice(ticket.broker.secret());
+            request[secret_start + SECRET_LEN..].copy_from_slice(&ticket.claim());
+            stream.write_all(&request)?;
+        } else {
+            stream.write_all(&ticket.claim())?;
         }
-        (_, Some(_)) => bail!("descriptor broker attached a descriptor to an error response"),
-        (status, None) => bail!("descriptor broker returned unknown status {status}"),
+        // One claim at a time: a reply is read before the next claim is
+        // sent, so replies never queue up and run together on the socket.
+        let (status, descriptor) = receive_descriptor(&stream)?;
+        descriptors.push(match (status, descriptor) {
+            (RESPONSE_OK, Some(descriptor)) => descriptor,
+            (RESPONSE_OK, None) => {
+                bail!("descriptor broker returned success without a descriptor")
+            }
+            (RESPONSE_REJECTED, None) => {
+                bail!("descriptor broker rejected the session root request")
+            }
+            (RESPONSE_INTERNAL, None) => {
+                bail!("descriptor broker could not duplicate the session root")
+            }
+            (_, Some(_)) => bail!("descriptor broker attached a descriptor to an error response"),
+            (status, None) => bail!("descriptor broker returned unknown status {status}"),
+        });
     }
+    Ok(descriptors)
 }
 
 /// A connection handed to the process that owns its descriptor session. The
@@ -975,7 +1023,36 @@ fn serve_request(
     if request[HANDOFF_REQUEST_LEN - 1] == CONNECTION_REQUEST {
         return accept_connection(stream, connections);
     }
-    serve_acquire(&mut stream, &request, registry)
+    let mut claim: [u8; CLAIM_LEN] = request[secret_start + SECRET_LEN..]
+        .try_into()
+        .expect("request claim has a fixed length");
+    // Later claims on this connection carry no secret of their own: the
+    // first request authenticated the connection for this session, and
+    // every claim is still checked against the registry.
+    while serve_claim(&mut stream, &claim, registry)? {
+        match read_claim(&mut stream)? {
+            Some(next) => claim = next,
+            None => break,
+        }
+    }
+    Ok(())
+}
+
+/// The next claim on a connection, or `None` when the client closed it
+/// between claims.
+fn read_claim(stream: &mut TrackedStream) -> io::Result<Option<[u8; CLAIM_LEN]>> {
+    let mut claim = [0u8; CLAIM_LEN];
+    let first = loop {
+        match stream.read(&mut claim) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => break result?,
+        }
+    };
+    if first == 0 {
+        return Ok(None);
+    }
+    stream.read_exact(&mut claim[first..])?;
+    Ok(Some(claim))
 }
 
 /// Take a connection another process hands over: its descriptors, then the
@@ -1029,31 +1106,36 @@ fn accept_connection(stream: TrackedStream, connections: &HandlerCell) -> Result
     })
 }
 
-fn serve_acquire(
+/// Answer one claim. Returns whether it was granted; the connection ends
+/// after a refused claim.
+fn serve_claim(
     stream: &mut TrackedStream,
-    request: &[u8; HANDOFF_REQUEST_LEN],
+    claim: &[u8; CLAIM_LEN],
     registry: &RegisteredRootRegistry,
-) -> Result<()> {
-    let secret_start = HANDOFF_MAGIC.len();
-    let root_start = secret_start + SECRET_LEN;
-    let root_end = root_start + size_of::<u64>();
+) -> Result<bool> {
     let root_id = RegisteredRootId(u64::from_be_bytes(
-        request[root_start..root_end]
+        claim[..size_of::<u64>()]
             .try_into()
-            .expect("request root identifier has a fixed length"),
+            .expect("claim root identifier has a fixed length"),
     ));
-    let Some(kind) = RegisteredDescriptorKind::from_wire_byte(request[root_end]) else {
+    let Some(kind) = RegisteredDescriptorKind::from_wire_byte(claim[size_of::<u64>()]) else {
         stream.write_all(&[RESPONSE_REJECTED])?;
-        return Ok(());
+        return Ok(false);
     };
     match registry.acquire_optional(root_id, kind) {
         Ok(Some(directory)) => {
-            send_message(stream.as_raw_fd(), &[RESPONSE_OK], &[directory.as_raw_fd()])?
+            send_message(stream.as_raw_fd(), &[RESPONSE_OK], &[directory.as_raw_fd()])?;
+            Ok(true)
         }
-        Ok(None) => stream.write_all(&[RESPONSE_REJECTED])?,
-        Err(_) => stream.write_all(&[RESPONSE_INTERNAL])?,
+        Ok(None) => {
+            stream.write_all(&[RESPONSE_REJECTED])?;
+            Ok(false)
+        }
+        Err(_) => {
+            stream.write_all(&[RESPONSE_INTERNAL])?;
+            Ok(false)
+        }
     }
-    Ok(())
 }
 
 const MAX_MESSAGE_DESCRIPTORS: usize = 3;
@@ -1542,6 +1624,122 @@ mod tests {
             .status_guarded()
             .unwrap();
         assert!(status.success(), "descriptor handoff subprocess failed");
+    }
+
+    #[test]
+    fn one_connection_claims_every_descriptor_in_order() {
+        // An independent worker claims all of its source descriptors over one
+        // broker connection. Each comes back in request order as the exact
+        // registered object; a ticket presented twice is answered twice, as it
+        // would be on a connection of its own.
+        let temp = crate::test_support::tempdir().unwrap();
+        let mut handles = Vec::new();
+        let mut identities = Vec::new();
+        for index in 0..40 {
+            let directory = temp.path().join(format!("d{index}"));
+            std::fs::create_dir(&directory).unwrap();
+            let leaf = directory.join("f");
+            std::fs::write(&leaf, b"leaf").unwrap();
+            let identity = |path: &std::path::Path| {
+                let metadata = std::fs::symlink_metadata(path).unwrap();
+                (metadata.dev(), metadata.ino())
+            };
+            identities.push(identity(&directory));
+            identities.push(identity(&leaf));
+            handles.push((
+                File::open(&directory).unwrap(),
+                Some(File::open(&leaf).unwrap()),
+            ));
+        }
+        let slot = DescriptorSessionSlot::default();
+        let registrations = slot.register_source_handles(handles).unwrap();
+        let mut tickets: Vec<&DescriptorTicket> = registrations
+            .iter()
+            .flat_map(|(directory, leaf)| [directory, leaf.as_ref().unwrap()])
+            .collect();
+        tickets.push(tickets[1]);
+        identities.push(identities[1]);
+
+        let fresh = DescriptorSessionSlot::default();
+        let descriptors = fresh.acquire_many(&tickets).unwrap();
+        assert_eq!(descriptors.len(), identities.len());
+        for (descriptor, identity) in descriptors.iter().zip(&identities) {
+            let metadata = descriptor.metadata().unwrap();
+            assert_eq!((metadata.dev(), metadata.ino()), *identity);
+            assert_ne!(
+                unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn a_claim_that_was_not_granted_fails_the_whole_batch() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let slot = DescriptorSessionSlot::default();
+        let granted = slot.register(File::open(temp.path()).unwrap()).unwrap();
+        // A root this session never registered, and a registered directory
+        // asked for as an exact source object it does not have.
+        let mut unknown = granted.clone();
+        unknown.root_id = RegisteredRootId(granted.root_id.0 + 100);
+        let mut wrong_kind = granted.clone();
+        wrong_kind.kind = RegisteredDescriptorKind::SourceLeaf;
+        for bad in [&unknown, &wrong_kind] {
+            for batch in [[&granted, bad, &granted], [bad, &granted, &granted]] {
+                let error = acquire_descriptors(&batch).unwrap_err().to_string();
+                assert!(error.contains("rejected"), "{error}");
+            }
+        }
+
+        // A ticket from another session, or with a forged secret, cannot join
+        // a connection that another ticket authenticated.
+        let other = DescriptorSessionSlot::default();
+        let foreign = other.register(File::open(temp.path()).unwrap()).unwrap();
+        let mut forged = granted.clone();
+        forged.broker.secret_mut()[0] ^= 1;
+        for bad in [&foreign, &forged] {
+            let error = acquire_descriptors(&[&granted, bad])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("different endpoint sessions"), "{error}");
+        }
+        let error = acquire_descriptors(&[&forged]).unwrap_err().to_string();
+        assert!(error.contains("rejected"), "{error}");
+    }
+
+    #[test]
+    fn broker_ends_a_connection_after_a_refused_claim() {
+        // Claims after the first carry no secret. One the registry refuses,
+        // or one asking to hand over a connection, gets a refusal and the
+        // connection ends: the worker cannot go on asking.
+        let temp = crate::test_support::tempdir().unwrap();
+        let slot = DescriptorSessionSlot::default();
+        let granted = slot.register(File::open(temp.path()).unwrap()).unwrap();
+        let mut unknown = granted.clone();
+        unknown.root_id = RegisteredRootId(granted.root_id.0 + 100);
+        let mut handoff = granted.claim();
+        handoff[size_of::<u64>()] = CONNECTION_REQUEST;
+        for refused in [unknown.claim(), handoff] {
+            let mut stream = granted.broker.connect(BrokerBase::Account).unwrap();
+            stream.set_read_timeout(Some(BROKER_IO_TIMEOUT)).unwrap();
+            let mut request = [0u8; HANDOFF_REQUEST_LEN];
+            request[..HANDOFF_MAGIC.len()].copy_from_slice(HANDOFF_MAGIC);
+            request[HANDOFF_MAGIC.len()..HANDOFF_MAGIC.len() + SECRET_LEN]
+                .copy_from_slice(granted.broker.secret());
+            request[HANDOFF_MAGIC.len() + SECRET_LEN..].copy_from_slice(&granted.claim());
+            stream.write_all(&request).unwrap();
+            let (status, descriptor) = receive_descriptor(&stream).unwrap();
+            assert_eq!(status, RESPONSE_OK);
+            assert!(descriptor.unwrap().metadata().unwrap().is_dir());
+
+            stream.write_all(&refused).unwrap();
+            let (status, descriptor) = receive_descriptor(&stream).unwrap();
+            assert_eq!(status, RESPONSE_REJECTED);
+            assert!(descriptor.is_none());
+            let mut rest = Vec::new();
+            stream.read_to_end(&mut rest).unwrap();
+            assert!(rest.is_empty());
+        }
     }
 
     #[test]
