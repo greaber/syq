@@ -318,19 +318,26 @@ impl Engine {
             None => bail!("{}", super::outage::Outage::message()),
         }
     }
-    /// Report a request that syq retried itself and has now given up on.
-    fn report_final<E: aws_sdk_s3::error::ProvideErrorMetadata>(
-        &self,
-        error: &aws_sdk_s3::error::SdkError<
-            E,
-            aws_smithy_runtime_api::client::orchestrator::HttpResponse,
-        >,
-    ) {
-        self.outage.failed(retryable(error));
-    }
     fn check_cancelled(&self) -> Result<()> {
         anyhow::ensure!(!self.cancelled.load(Relaxed), "S3 copy cancelled");
         Ok(())
+    }
+    fn upload_request<'a>(
+        &'a self,
+        key: &'a str,
+        part: Option<i32>,
+        algorithm: Algorithm,
+        checksum: Option<&'a str>,
+    ) -> super::upload_send::Upload<'a> {
+        super::upload_send::Upload {
+            key,
+            part,
+            algorithm,
+            checksum,
+            retries: self.options.retries,
+            content_md5: &self.content_md5,
+            outage: Some(&self.outage),
+        }
     }
 
     async fn copy(self: Arc<Self>) -> Result<()> {
@@ -1376,93 +1383,52 @@ impl Engine {
                 source.kind() == ObjectKind::File && small.is_none() && self.tuning.local_latency();
             let sync_file =
                 synchronous.then(|| crate::s3::upload_http::FileBody::new(source.clone(), 0, size));
-            let mut fallback = None;
-            let mut retry_with_md5 = false;
-            let mut attempt = 0;
-            loop {
-                self.check_cancelled()?;
-                if algorithm == Algorithm::None
-                    && fallback.is_none()
-                    && (retry_with_md5 || self.content_md5.load(Relaxed))
-                {
-                    fallback = Some(match checksum {
-                        Some(md5) => md5.to_owned(),
-                        None => content_md5(&source, small.as_ref(), 0, size).await?,
-                    });
-                }
-                let body = if let Some(bytes) = &small {
-                    ByteStream::from(bytes.clone())
-                } else if synchronous {
-                    crate::s3::upload_http::body(size)
-                } else {
-                    file_body(&source, 0, size).await?
-                };
-                self.pace(size).await?;
-                let request = self
-                    .client
-                    .put_object()
-                    .bucket(&self.options.bucket)
-                    .key(&source.key)
-                    .body(body)
-                    .content_length(size as i64)
-                    .set_checksum_sha256(algorithm.header(Algorithm::Sha256, checksum))
-                    .set_content_md5(
-                        algorithm
-                            .header(Algorithm::Md5, checksum)
-                            .or_else(|| fallback.clone()),
-                    )
-                    .set_metadata(Some(metadata.encode()))
-                    .set_if_none_match(must_be_new.then(|| "*".into()))
-                    .customize()
-                    .config_override(super::client::without_sdk_retries())
-                    .disable_payload_signing();
-                let request = if let Some(file) = &sync_file {
-                    request.interceptor(file.clone())
-                } else {
-                    request
-                };
-                let result = request.send().await;
-                if let Some(file) = &sync_file {
-                    file.drain().await;
-                }
-                match result {
-                    Ok(_) => {
-                        self.outage.responded();
-                        // Content-MD5 fixed the rejection, so send it from now on.
-                        if fallback.is_some() {
-                            self.content_md5.store(true, Relaxed);
+            self.upload_request(&source.key, None, algorithm, checksum)
+                .send(
+                    content_md5(&source, small.as_ref(), 0, size),
+                    |content_md5| {
+                        let (source, small, sync_file, metadata) =
+                            (&source, &small, &sync_file, &metadata);
+                        async move {
+                            self.check_cancelled()?;
+                            let body = if let Some(bytes) = &small {
+                                ByteStream::from(bytes.clone())
+                            } else if synchronous {
+                                crate::s3::upload_http::body(size)
+                            } else {
+                                file_body(&source, 0, size).await?
+                            };
+                            self.pace(size).await?;
+                            let request = self
+                                .client
+                                .put_object()
+                                .bucket(&self.options.bucket)
+                                .key(&source.key)
+                                .body(body)
+                                .content_length(size as i64)
+                                .set_checksum_sha256(algorithm.header(Algorithm::Sha256, checksum))
+                                .set_content_md5(content_md5)
+                                .set_metadata(Some(metadata.encode()))
+                                .set_if_none_match(must_be_new.then(|| "*".into()))
+                                .customize()
+                                .config_override(super::client::without_sdk_retries())
+                                .disable_payload_signing();
+                            let request = if let Some(file) = &sync_file {
+                                request.interceptor(file.clone())
+                            } else {
+                                request
+                            };
+                            let result = request.send().await;
+                            if let Some(file) = &sync_file {
+                                file.drain().await;
+                            }
+                            Ok(result)
                         }
-                        break;
-                    }
-                    Err(e)
-                        if algorithm == Algorithm::None
-                            && fallback.is_none()
-                            && super::checksum::requires_checksum(&e) =>
-                    {
-                        retry_with_md5 = true;
-                    }
-                    Err(e)
-                        if attempt < self.options.retries
-                            && super::checksum::corrupted(&e).is_some() =>
-                    {
-                        self.progress.warning(&format!(
-                            "{}: the destination received corrupted data ({}); retrying",
-                            source.key,
-                            super::checksum::corrupted(&e).unwrap_or_default()
-                        ));
-                        super::backoff(attempt).await;
-                        attempt += 1;
-                    }
-                    Err(e) if retryable(&e) && attempt < self.options.retries => {
-                        super::retry::after_error(attempt, &e).await;
-                        attempt += 1;
-                    }
-                    Err(e) => {
-                        self.report_final(&e);
-                        return Err(e.into_service_error()).context("S3 PUT failed");
-                    }
-                }
-            }
+                    },
+                )
+                .await?
+                .map_err(|e| e.into_service_error())
+                .context("S3 PUT failed")?;
             self.tuning.requests.completed(size);
             self.progress.add_bytes(size);
         } else {
@@ -1549,125 +1515,77 @@ impl Engine {
                                     length,
                                 )
                             });
-                            let mut fallback = None;
-                            let mut retry_with_md5 = false;
-                            let mut attempt = 0;
-                            loop {
-                                self.check_cancelled()?;
-                                if algorithm == Algorithm::None
-                                    && fallback.is_none()
-                                    && (retry_with_md5 || self.content_md5.load(Relaxed))
-                                {
-                                    fallback = Some(match checksum {
-                                        Some(md5) => md5.to_owned(),
-                                        None => content_md5(source, None, offset, length).await?,
-                                    });
-                                }
-                                let body = if sync_file.is_some() {
-                                    crate::s3::upload_http::body(length)
-                                } else {
-                                    file_body(source, offset, length).await?
-                                };
-                                self.pace(length).await?;
-                                let request = self
-                                    .client
-                                    .upload_part()
-                                    .bucket(&self.options.bucket)
-                                    .key(&source.key)
-                                    .upload_id(&upload.upload_id)
-                                    .part_number(number)
-                                    .body(body)
-                                    .content_length(length as i64)
-                                    .set_checksum_sha256(
-                                        algorithm.header(Algorithm::Sha256, checksum),
-                                    )
-                                    .set_content_md5(
-                                        algorithm
-                                            .header(Algorithm::Md5, checksum)
-                                            .or_else(|| fallback.clone()),
-                                    )
-                                    .customize()
-                                    .config_override(super::client::without_sdk_retries())
-                                    .disable_payload_signing();
-                                let request = if let Some(file) = &sync_file {
-                                    request.interceptor(file.clone())
-                                } else {
-                                    request
-                                };
-                                let result = request.send().await;
-                                if let Some(file) = &sync_file {
-                                    file.drain().await;
-                                }
-                                match result {
-                                    Ok(output) => {
-                                        self.outage.responded();
-                                        let etag =
-                                            output.e_tag().context("S3 part omitted ETag")?;
-                                        if fallback.is_some() {
-                                            self.content_md5.store(true, Relaxed);
-                                        }
-                                        if !algorithm.is_sha256() {
-                                            let mut acknowledged = acknowledged.lock().await;
-                                            acknowledged.parts.insert(
-                                                number,
-                                                UploadedPart {
-                                                    etag: etag.into(),
-                                                    checksum: recorded.to_owned(),
-                                                    length,
-                                                },
-                                            );
-                                            acknowledged.dirty = true;
-                                            // The record grows with each part. Saving at most
-                                            // once a second bounds its rewrites; an unsaved
-                                            // acknowledgment only uploads that part again.
-                                            if acknowledged.saved.elapsed()
-                                                >= Duration::from_secs(1)
-                                            {
-                                                save(&acknowledged.parts)?;
-                                                acknowledged.saved = tokio::time::Instant::now();
-                                                acknowledged.dirty = false;
-                                            }
-                                        }
-                                        self.tuning.requests.completed(length);
-                                        self.progress.add_bytes(length);
-                                        return Ok(CompletedPart::builder()
+                            let output = self
+                                .upload_request(&source.key, Some(number), algorithm, checksum)
+                                .send(content_md5(source, None, offset, length), |content_md5| {
+                                    let sync_file = &sync_file;
+                                    async move {
+                                        self.check_cancelled()?;
+                                        let body = if sync_file.is_some() {
+                                            crate::s3::upload_http::body(length)
+                                        } else {
+                                            file_body(source, offset, length).await?
+                                        };
+                                        self.pace(length).await?;
+                                        let request = self
+                                            .client
+                                            .upload_part()
+                                            .bucket(&self.options.bucket)
+                                            .key(&source.key)
+                                            .upload_id(&upload.upload_id)
                                             .part_number(number)
-                                            .e_tag(etag)
+                                            .body(body)
+                                            .content_length(length as i64)
                                             .set_checksum_sha256(
                                                 algorithm.header(Algorithm::Sha256, checksum),
                                             )
-                                            .build());
+                                            .set_content_md5(content_md5)
+                                            .customize()
+                                            .config_override(super::client::without_sdk_retries())
+                                            .disable_payload_signing();
+                                        let request = if let Some(file) = &sync_file {
+                                            request.interceptor(file.clone())
+                                        } else {
+                                            request
+                                        };
+                                        let result = request.send().await;
+                                        if let Some(file) = &sync_file {
+                                            file.drain().await;
+                                        }
+                                        Ok(result)
                                     }
-                                    Err(e)
-                                        if algorithm == Algorithm::None
-                                            && fallback.is_none()
-                                            && super::checksum::requires_checksum(&e) =>
-                                    {
-                                        retry_with_md5 = true;
-                                    }
-                                    Err(e)
-                                        if attempt < self.options.retries
-                                            && super::checksum::corrupted(&e).is_some() =>
-                                    {
-                                        self.progress.warning(&format!(
-                                            "{}: the destination received corrupted data in part {number} ({}); retrying",
-                                            source.key,
-                                            super::checksum::corrupted(&e).unwrap_or_default()
-                                        ));
-                                        super::backoff(attempt).await;
-                                        attempt += 1;
-                                    }
-                                    Err(e) if retryable(&e) && attempt < self.options.retries => {
-                                        super::retry::after_error(attempt, &e).await;
-                                        attempt += 1;
-                                    }
-                                    Err(e) => {
-                                        self.report_final(&e);
-                                        return Err(e.into_service_error())
-                                            .context("upload part; rerun the command to resume");
-                                    }
+                                })
+                                .await?
+                                .map_err(|e| e.into_service_error())
+                                .context("upload part; rerun the command to resume")?;
+                            let etag = output.e_tag().context("S3 part omitted ETag")?;
+                            if !algorithm.is_sha256() {
+                                let mut acknowledged = acknowledged.lock().await;
+                                acknowledged.parts.insert(
+                                    number,
+                                    UploadedPart {
+                                        etag: etag.into(),
+                                        checksum: recorded.to_owned(),
+                                        length,
+                                    },
+                                );
+                                acknowledged.dirty = true;
+                                // The record grows with each part. Saving at most
+                                // once a second bounds its rewrites; an unsaved
+                                // acknowledgment only uploads that part again.
+                                if acknowledged.saved.elapsed() >= Duration::from_secs(1) {
+                                    save(&acknowledged.parts)?;
+                                    acknowledged.saved = tokio::time::Instant::now();
+                                    acknowledged.dirty = false;
                                 }
                             }
+                            self.tuning.requests.completed(length);
+                            self.progress.add_bytes(length);
+                            Ok(CompletedPart::builder()
+                                .part_number(number)
+                                .e_tag(etag)
+                                .set_checksum_sha256(algorithm.header(Algorithm::Sha256, checksum))
+                                .build())
                         }
                     })
                     .buffer_unordered(self.part_workers())

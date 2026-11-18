@@ -234,6 +234,8 @@ async fn entries_share_s3_admission_and_failed_producer_does_not_cancel_client()
     options.endpoint = Some(endpoint);
     options.part_size = 8; // The independent fixture accepts tiny multipart parts.
     options.concurrency = 2;
+    // Uploads retry in syq's own loop; fail the 500 fixture key at once.
+    options.retries = 0;
     let session = Session {
         authorization: None,
         client,
