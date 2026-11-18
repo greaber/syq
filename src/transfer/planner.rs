@@ -3543,6 +3543,7 @@ impl Planner<'_> {
             .unzip();
         let errors = self.apply(ops)?;
         let capacity_error = first_capacity_error(&errors);
+        // The files to replace are queued together, after the reply.
         let _burst = self.sched.file_burst();
         for ((dst, kind, replacement), error) in entries.into_iter().zip(errors) {
             match (error, replacement) {
