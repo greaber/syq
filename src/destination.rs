@@ -1831,11 +1831,12 @@ pub(crate) fn serve_background(
         }
     };
     let not_started = |_: &anyhow::Error| report(Prepared::NotStarted);
-    let mut tcp_peer = crate::conn::RemoteSpec::local_receiver(false);
-    tcp_peer.local_process = false;
-    tcp_peer.host = spec.endpoint.host.clone();
-    tcp_peer.port = spec.endpoint.port;
-    tcp_peer.rsh = vec!["ssh".into()];
+    let mut tcp_peer = crate::conn::RemoteSpec::new(
+        None,
+        spec.endpoint.host.clone(),
+        spec.endpoint.port,
+        vec!["ssh".into()],
+    );
     if let Some(user) = &spec.endpoint.user {
         tcp_peer.rsh.extend(["-l".into(), user.clone()]);
     }

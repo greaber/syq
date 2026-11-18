@@ -344,6 +344,7 @@ fn approved_sources_never_admit_mutation_or_pathname_authority() {
             path: b"/".to_vec(),
             allow_missing: true,
             symlink_policy: OperatorSymlinkPolicy::FollowAll,
+            require_search: false,
         },
         Request::ListDir {
             directory: b"/".to_vec(),
@@ -351,6 +352,8 @@ fn approved_sources_never_admit_mutation_or_pathname_authority() {
             prefix: Vec::new(),
             limit: 1000,
             symlink_policy: OperatorSymlinkPolicy::FollowAll,
+            detailed: false,
+            follow_final_symlinks: true,
         },
         Request::CreateSendBudget { rate: 1 },
         Request::TcpListen {

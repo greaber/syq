@@ -70,16 +70,18 @@ pub(crate) struct Request {
 }
 impl Request {
     pub(crate) fn validate(&self) -> Result<()> {
-        anyhow::ensure!(
-            !self.bucket.is_empty()
-                && self
-                    .bucket
+        fn valid_bucket(bucket: &str) -> bool {
+            !bucket.is_empty()
+                && bucket
                     .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b)),
-            "invalid storage bucket"
-        );
+                    .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b))
+        }
+        fn valid_scope_count(scopes: &[Scope]) -> bool {
+            !scopes.is_empty() && scopes.len() <= 1024
+        }
+        anyhow::ensure!(valid_bucket(&self.bucket), "invalid storage bucket");
         anyhow::ensure!(
-            !self.scopes.is_empty() && self.scopes.len() <= 1024,
+            valid_scope_count(&self.scopes),
             "storage authorization requires 1 to 1024 source or destination scopes"
         );
         anyhow::ensure!(
@@ -88,15 +90,11 @@ impl Request {
         );
         if let Some(source) = &self.source {
             anyhow::ensure!(
-                !source.bucket.is_empty()
-                    && source
-                        .bucket
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b)),
+                valid_bucket(&source.bucket),
                 "invalid storage source bucket"
             );
             anyhow::ensure!(
-                !source.scopes.is_empty() && source.scopes.len() <= 1024,
+                valid_scope_count(&source.scopes),
                 "storage authorization requires 1 to 1024 source scopes"
             );
         }
@@ -472,22 +470,13 @@ impl Signer {
             automatic_concurrency: false,
             automatic_part_size: false,
         };
-        let (client, _) = super::client::connect(
+        let (client, credentials) = super::client::connect_local(
             &mut options,
             Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
             Arc::default(),
         )
         .await?;
-        let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
-        if let Some(profile) = &request.profile {
-            loader = loader.profile_name(profile);
-        }
-        if let Some(region) = &request.region {
-            loader = loader.region(aws_types::region::Region::new(region.clone()));
-        }
-        let config = loader.load().await;
-        let credentials = config
-            .credentials_provider()
+        let credentials = credentials
             .context("no storage credential provider configured on authorizing machine")?
             .provide_credentials()
             .await
@@ -718,6 +707,24 @@ pub(crate) async fn connect(
 /// same request from the command it shows for approval.
 pub(crate) fn request_for(args: &crate::cli::Args, options: &super::Options) -> Result<Request> {
     let upload = options.route == super::Route::Upload || options.route.is_server_copy();
+    // Every location but the last, as keys under the source's base.
+    let source_scopes = || -> Result<Vec<Scope>> {
+        let base = super::local::key_path(
+            args.native_source_root
+                .as_deref()
+                .or(args.native_source_cwd.as_deref())
+                .unwrap_or(b"."),
+        )?;
+        args.locations[..args.locations.len() - 1]
+            .iter()
+            .map(|source| {
+                Ok(Scope {
+                    key: super::local::join(&base, &super::local::key_path(&source.path)?),
+                    descendants: true,
+                })
+            })
+            .collect()
+    };
     let scopes = if args.rm {
         let base = super::local::key_path(
             args.native_rm_root
@@ -750,44 +757,15 @@ pub(crate) fn request_for(args: &crate::cli::Args, options: &super::Options) -> 
             descendants: true,
         }]
     } else {
-        let base = super::local::key_path(
-            args.native_source_root
-                .as_deref()
-                .or(args.native_source_cwd.as_deref())
-                .unwrap_or(b"."),
-        )?;
-        args.locations[..args.locations.len() - 1]
-            .iter()
-            .map(|source| {
-                Ok(Scope {
-                    key: super::local::join(&base, &super::local::key_path(&source.path)?),
-                    descendants: true,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?
+        source_scopes()?
     };
     let source = options
         .route
         .source_bucket()
         .map(|bucket| -> Result<_> {
-            let base = super::local::key_path(
-                args.native_source_root
-                    .as_deref()
-                    .or(args.native_source_cwd.as_deref())
-                    .unwrap_or(b"."),
-            )?;
-            let scopes = args.locations[..args.locations.len() - 1]
-                .iter()
-                .map(|source| {
-                    Ok(Scope {
-                        key: super::local::join(&base, &super::local::key_path(&source.path)?),
-                        descendants: true,
-                    })
-                })
-                .collect::<Result<_>>()?;
             Ok(ReadAccess {
                 bucket: bucket.into(),
-                scopes,
+                scopes: source_scopes()?,
             })
         })
         .transpose()?;

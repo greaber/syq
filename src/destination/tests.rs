@@ -743,7 +743,7 @@ fn route(registration: Registration, approved: &Approved) -> String {
 fn control(registration: Registration, approved: &Approved) -> crate::conn::RemoteConn {
     let mut spec = crate::conn::RemoteSpec::local_receiver(true);
     spec.restricted_grant = Some(route(registration, approved));
-    spec.connect_with(false, false).unwrap()
+    spec.connect(false).unwrap()
 }
 
 #[test]
@@ -2340,7 +2340,7 @@ fn named_workers_refuse_mutations_before_transport_shutdown() {
             .receiving();
         let mut spec = crate::conn::RemoteSpec::local_receiver(true);
         spec.restricted_grant = Some(route(registration, &approved));
-        let mut control = spec.connect_with(false, false).unwrap();
+        let mut control = spec.connect(false).unwrap();
         if tcp {
             let pending = spec
                 .begin_tcp_setup(&mut control, false, (0, 0), None, None)
@@ -2418,7 +2418,7 @@ fn named_tcp_workers_obey_limits_and_revocation() {
         let approved = approve(&registration, command, inputs);
         let mut spec = crate::conn::RemoteSpec::local_receiver(true);
         spec.restricted_grant = Some(route(registration, &approved));
-        let mut control = spec.connect_with(false, false).unwrap();
+        let mut control = spec.connect(false).unwrap();
         let pending = spec
             .begin_tcp_setup(&mut control, false, (0, 0), None, None)
             .unwrap();
@@ -2484,7 +2484,7 @@ fn named_tcp_connect_failure_uses_approved_ssh_worker() {
     let approved = approve(&registration, command, inputs);
     let mut spec = crate::conn::RemoteSpec::local_receiver(true);
     spec.restricted_grant = Some(route(registration, &approved));
-    let mut control = spec.connect_with(false, false).unwrap();
+    let mut control = spec.connect(false).unwrap();
     let pending = spec
         .begin_tcp_setup(&mut control, false, (0, 0), None, None)
         .unwrap();
@@ -2544,7 +2544,7 @@ fn named_tcp_workers_connect_concurrently() {
     let approved = approve(&registration, command, inputs);
     let mut spec = crate::conn::RemoteSpec::local_receiver(true);
     spec.restricted_grant = Some(route(registration, &approved));
-    let mut control = spec.connect_with(false, false).unwrap();
+    let mut control = spec.connect(false).unwrap();
     let pending = spec
         .begin_tcp_setup(&mut control, false, (0, 0), None, None)
         .unwrap();
@@ -2594,7 +2594,7 @@ fn named_tcp_idle_and_partial_arrivals_do_not_block_worker() {
     let approved = approve(&registration, command, inputs);
     let mut spec = crate::conn::RemoteSpec::local_receiver(true);
     spec.restricted_grant = Some(route(registration, &approved));
-    let mut control = spec.connect_with(false, false).unwrap();
+    let mut control = spec.connect(false).unwrap();
     let pending = spec
         .begin_tcp_setup(&mut control, false, (0, 0), None, None)
         .unwrap();
@@ -2697,7 +2697,7 @@ fn a_named_route_probe_that_reaches_nothing_answers_with_no_route() {
     let approved = approve(&registration, command, inputs);
     let mut spec = crate::conn::RemoteSpec::local_receiver(true);
     spec.restricted_grant = Some(route(registration, &approved));
-    let _control = spec.connect_with(false, false).unwrap();
+    let _control = spec.connect(false).unwrap();
     // Opening the control channel measured the round trip that bounds the
     // receiving machine's probes, rather than leaving them the full second.
     assert!(spec.diagnostics().route_round_trip.is_some());
@@ -2758,7 +2758,7 @@ fn a_copy_sent_here_gets_tcp_only_when_its_command_allows_it() {
         let approved = approve(&registration, command, inputs);
         let mut spec = crate::conn::RemoteSpec::local_receiver(true);
         spec.restricted_grant = Some(route(registration, &approved));
-        let _control = spec.connect_with(false, false).unwrap();
+        let _control = spec.connect(false).unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let probed = tcp::probe(
             spec.restricted_grant.as_deref().unwrap(),

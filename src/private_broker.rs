@@ -495,6 +495,12 @@ pub(crate) struct PrivateBroker {
 }
 
 impl PrivateBroker {
+    /// Connections accepted so far, closed ones included.
+    #[cfg(test)]
+    pub(crate) fn opened_connections(&self) -> u64 {
+        self.connections.opened()
+    }
+
     pub(crate) fn start<F>(config: PrivateBrokerConfig<'_>, handler: F) -> Result<Self>
     where
         F: Fn(TrackedStream, Arc<ConnectionRegistry>) + Send + Sync + 'static,
