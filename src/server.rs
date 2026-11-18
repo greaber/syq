@@ -608,16 +608,31 @@ impl<R: Read + std::os::fd::AsRawFd> Read for HandshakeReader<R> {
         }
         if self.pending.load(Acquire) {
             // A signal can end a wait early; the next one waits for what
-            // remains of the deadline.
-            let input = self.inner.as_raw_fd();
+            // remains of the deadline. Any other failure ends the read.
+            let mut ready = libc::pollfd {
+                fd: self.inner.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
             loop {
                 let remaining = self
                     .deadline
                     .checked_duration_since(Instant::now())
                     .filter(|time| !time.is_zero())
                     .ok_or_else(|| io::Error::new(ErrorKind::TimedOut, self.timed_out))?;
-                if crate::sys::readable_within(input, remaining) {
-                    break;
+                let millis = libc::c_int::try_from(remaining.as_micros().div_ceil(1000))
+                    .unwrap_or(libc::c_int::MAX);
+                // SAFETY: `ready` is one initialized pollfd for a descriptor
+                // `inner` keeps open.
+                match unsafe { libc::poll(&mut ready, 1, millis) } {
+                    0 => {}
+                    count if count > 0 => break,
+                    _ => {
+                        let error = io::Error::last_os_error();
+                        if error.kind() != ErrorKind::Interrupted {
+                            return Err(error);
+                        }
+                    }
                 }
             }
         }
