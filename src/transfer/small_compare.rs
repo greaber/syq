@@ -27,7 +27,9 @@
 //! its patches one after another, each next one beginning as the last ends.
 //! Pieces are pipelined: up to `STREAM_BUFFER_BYTES` of them are read ahead
 //! from a remote source, and those sent await their acknowledgments within
-//! the destination's reply queue.
+//! the destination's reply queue and `UNACKNOWLEDGED_PIECE_BYTES`. Scattered
+//! changes make pieces of a single block, so a stream needs as many pieces
+//! in flight as its connections queue to fill a long link.
 //!
 //! A worker streams the first of its batch's patches itself and leaves the
 //! others in the queue (`Sched::share_patches`), for workers that have
@@ -72,6 +74,15 @@ static NEXT_COMPARE_BATCH: AtomicU64 = AtomicU64::new(1);
 /// Most piece data a worker reads ahead of sending it while streaming a
 /// patch: as much as a group's patches hold.
 const STREAM_BUFFER_BYTES: u64 = crate::proto::MAX_DIFFERING_FILE_BYTES;
+
+/// Most piece data a worker has sent and the destination not yet
+/// acknowledged while streaming patches: what sixteen full pieces carry.
+/// No syq process holds the pieces sent: each is written to its connection
+/// before the worker reads another, and a receiver decodes only a few
+/// requests ahead of the one it serves. The bound keeps what one stream has
+/// in flight within what it had when sixteen pieces were.
+const UNACKNOWLEDGED_PIECE_BYTES: u64 = 16 * PATCH_PIECE_BYTES;
+const _: () = assert!(PATCH_PIECE_BYTES <= UNACKNOWLEDGED_PIECE_BYTES);
 
 /// Files and source bytes per group.
 const COMPARE_GROUP_FILES: usize = 256;
@@ -200,6 +211,19 @@ enum StreamStep {
     /// The source's metadata read after the patch's last piece.
     Recheck(usize),
     End(usize),
+}
+
+/// The piece data sent to the destination and not yet acknowledged.
+fn unacknowledged(
+    destination: &std::collections::VecDeque<(StreamStep, std::time::Instant)>,
+) -> u64 {
+    destination
+        .iter()
+        .map(|(step, _)| match step {
+            StreamStep::Ack(_, len) => u64::from(*len),
+            _ => 0,
+        })
+        .sum()
 }
 
 /// What streaming one patch has learned.
@@ -727,15 +751,12 @@ impl Worker {
         use std::collections::VecDeque;
         // An in-process source answers each read as it is sent, and its
         // piece moves on before the next is read. A remote one's reads queue
-        // within its reply queue and the read-ahead buffer.
-        let reads = self
-            .src
-            .reply_queue()
-            .map_or(1, |queue| queue.min(COMPARE_WINDOW));
-        let acknowledgments = self
-            .dst
-            .reply_queue()
-            .map_or(COMPARE_WINDOW, |queue| queue.min(COMPARE_WINDOW));
+        // within its reply queue and the read-ahead buffer. Sent pieces await
+        // their acknowledgments within the destination's reply queue, so that
+        // its reader never stops reading replies while this worker sends, and
+        // within `UNACKNOWLEDGED_PIECE_BYTES`.
+        let reads = self.src.reply_queue().unwrap_or(1);
+        let acknowledgments = self.dst.reply_queue().unwrap_or(COMPARE_WINDOW);
         let mut source: VecDeque<(StreamStep, std::time::Instant)> = VecDeque::new();
         let mut destination: VecDeque<(StreamStep, std::time::Instant)> = VecDeque::new();
         // The patch whose reads are being sent, and the piece bytes read
@@ -827,7 +848,13 @@ impl Worker {
             // sends no more pieces, and owe no more acknowledgments than the
             // destination's connection queues.
             self.arrived_replies(batch, streams, states, &mut destination, outcomes)?;
-            while destination.len() >= acknowledgments {
+            let piece = match step {
+                StreamStep::Piece(_, _, len) => u64::from(len),
+                _ => 0,
+            };
+            while destination.len() >= acknowledgments
+                || unacknowledged(&destination) + piece > UNACKNOWLEDGED_PIECE_BYTES
+            {
                 let (step, _) = destination.pop_front().expect("pending reply");
                 let reply = self.dst.recv()?;
                 self.streamed_reply(batch, streams, states, step, reply, outcomes)?;

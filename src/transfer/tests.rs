@@ -5397,6 +5397,18 @@ fn differing_jobs(
     root: &std::path::Path,
     files: &[(&str, usize, std::ops::Range<usize>)],
 ) -> Arc<Sched> {
+    let files: Vec<_> = files
+        .iter()
+        .map(|(name, len, changed)| (*name, *len, vec![changed.clone()]))
+        .collect();
+    edited_jobs(root, &files)
+}
+
+/// `differing_jobs` for sources that rewrite several ranges.
+fn edited_jobs(
+    root: &std::path::Path,
+    files: &[(&str, usize, Vec<std::ops::Range<usize>>)],
+) -> Arc<Sched> {
     use std::os::unix::fs::MetadataExt;
     for directory in ["source", "target"] {
         std::fs::create_dir_all(root.join(directory)).unwrap();
@@ -5405,7 +5417,9 @@ fn differing_jobs(
     for (n, (name, len, changed)) in files.iter().enumerate() {
         let old: Vec<u8> = (0..*len).map(|i| ((i * 7 + n) % 251) as u8).collect();
         let mut new = old.clone();
-        new[changed.clone()].fill(n as u8 + 1);
+        for changed in changed {
+            new[changed.clone()].fill(n as u8 + 1);
+        }
         let (source, target) = (
             root.join("source").join(name),
             root.join("target").join(name),
@@ -6047,6 +6061,183 @@ fn an_aborted_copy_sends_nothing_further_for_groups_in_flight() {
     assert_eq!(published, 1);
     // The patch already sent settled its file, which counts.
     assert_eq!(worker.progress.files_done.load(Relaxed), 1);
+}
+
+/// A destination that serves each request as it is sent but, as a remote
+/// one, holds its replies until they are asked for, within a reply queue of
+/// `queue`. It records the most streamed patch pieces, and piece bytes, that
+/// awaited acknowledgment at once, and calls `sent` with each piece's count.
+struct HoldingDestination<F> {
+    ops: crate::fsops::FsOps,
+    queue: usize,
+    replies: std::collections::VecDeque<(Response, usize)>,
+    most: Arc<Mutex<(usize, usize)>>,
+    pieces: usize,
+    sent: F,
+}
+
+impl<F: FnMut(usize) + Send> Conn for HoldingDestination<F> {
+    fn send(&mut self, request: Request) -> Result<()> {
+        let piece = match &request {
+            Request::PatchData { data, .. } => data.len(),
+            _ => 0,
+        };
+        self.replies.push_back((self.ops.handle(&request), piece));
+        assert!(self.replies.len() <= self.queue, "reply queue overrun");
+        let pieces = self.replies.iter().filter(|(_, len)| *len > 0).count();
+        let bytes = self.replies.iter().map(|(_, len)| len).sum();
+        let mut most = self.most.lock().unwrap();
+        *most = (most.0.max(pieces), most.1.max(bytes));
+        drop(most);
+        if piece > 0 {
+            self.pieces += 1;
+            (self.sent)(self.pieces);
+        }
+        Ok(())
+    }
+    fn recv(&mut self) -> Result<Response> {
+        self.replies
+            .pop_front()
+            .map(|(reply, _)| reply)
+            .ok_or_else(|| anyhow::anyhow!("missing reply"))
+    }
+    fn reply_queue(&self) -> Option<usize> {
+        Some(self.queue)
+    }
+    fn scan(
+        &mut self,
+        _: &[u8],
+        _: Option<&RegisteredPath>,
+        _: bool,
+        _: &[String],
+        _: bool,
+        _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
+        _: &mut dyn FnMut(crate::proto::ScanWarning),
+    ) -> Result<u64> {
+        unreachable!()
+    }
+    fn native_remove(
+        &mut self,
+        _: Option<&[u8]>,
+        _: Option<&[u8]>,
+        _: &[NativeRemoveSelection],
+        _: bool,
+        _: bool,
+        _: usize,
+        _: &mut dyn FnMut(Vec<String>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
+    ) -> Result<()> {
+        unreachable!()
+    }
+}
+
+/// Stream `files`' patches from an in-process source into a destination
+/// that holds its replies in a queue of `queue`, calling `sent` with each
+/// piece's count, and return the most pieces and piece bytes that awaited
+/// acknowledgment at once.
+fn stream_into_holding_destination(
+    root: &std::path::Path,
+    files: &[(&str, usize, Vec<std::ops::Range<usize>>)],
+    queue: usize,
+    sent: impl FnMut(&Sched, usize) + Send + 'static,
+) -> (Arc<Sched>, Worker, (usize, usize)) {
+    let sched = edited_jobs(root, files);
+    let unused = Arc::new(Mutex::new(PipelineState::default()));
+    let mut worker = pipeline_worker(&sched, &unused, &unused, true);
+    worker.src = Box::new(QueuingSource {
+        ops: crate::fsops::FsOps::new(),
+        replies: Default::default(),
+        in_process: true,
+        most: Default::default(),
+    });
+    let most = Arc::new(Mutex::new((0, 0)));
+    let mut sent = sent;
+    let aborting = sched.clone();
+    worker.dst = Box::new(HoldingDestination {
+        ops: crate::fsops::FsOps::test_destination(&root.join("target")),
+        queue,
+        replies: Default::default(),
+        most: most.clone(),
+        pieces: 0,
+        sent: move |pieces| sent(&aborting, pieces),
+    });
+    worker.fast_batch_files = files.len();
+    Arc::get_mut(&mut worker.opts).unwrap().block = 1 << 20;
+    worker.process_item(sched.next()).unwrap();
+    let most = *most.lock().unwrap();
+    (sched, worker, most)
+}
+
+/// Every other 64 KiB block of the first `len` bytes.
+fn scattered_blocks(len: usize) -> Vec<std::ops::Range<usize>> {
+    (0..len)
+        .step_by(128 << 10)
+        .map(|start| start..start + (64 << 10))
+        .collect()
+}
+
+#[test]
+fn a_streamed_patch_of_single_block_pieces_keeps_its_reply_queue_of_them_in_flight() {
+    // 20 MiB of scattered blocks differ, which streams as 320 pieces of one
+    // block each. The destination's reply queue, not a count of sixteen,
+    // limits the pieces awaiting acknowledgment.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
+    let (sched, worker, (pieces, bytes)) =
+        stream_into_holding_destination(root, &files, 256, |_, _| {});
+    assert!(!sched.is_aborted());
+    assert_eq!(read(root, "source/file"), read(root, "target/file"));
+    assert_eq!(worker.progress.files_done.load(Relaxed), 1);
+    assert_eq!(worker.progress.bytes_done.load(Relaxed), 20 << 20);
+    assert_eq!((pieces, bytes), (256, 16 << 20));
+}
+
+#[test]
+fn a_streamed_patchs_unacknowledged_pieces_stay_within_their_byte_bound() {
+    // Two rewritten files of 40 MiB, streamed one after another in 4 MiB
+    // pieces: 80 MiB, more than may await acknowledgment at once, although
+    // the reply queue would take all twenty pieces.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let files = [
+        ("first", 40 << 20, vec![0..40 << 20]),
+        ("second", 40 << 20, vec![0..40 << 20]),
+    ];
+    let (_, worker, (pieces, bytes)) =
+        stream_into_holding_destination(root, &files, 256, |_, _| {});
+    for (name, ..) in &files {
+        assert_eq!(
+            read(root, &format!("source/{name}")),
+            read(root, &format!("target/{name}")),
+            "{name}"
+        );
+    }
+    assert_eq!(worker.progress.files_done.load(Relaxed), 2);
+    assert_eq!((pieces, bytes), (16, 64 << 20));
+}
+
+#[test]
+fn an_aborted_copy_takes_every_reply_of_a_wide_patch_stream() {
+    // The copy is aborted, as by a fatal error elsewhere, once a hundred
+    // single-block pieces await acknowledgment: no further piece is sent,
+    // every reply in flight is taken, and the patch is not published.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
+    let (sched, mut worker, (pieces, _)) =
+        stream_into_holding_destination(root, &files, 256, |sched, pieces| {
+            if pieces == 100 {
+                sched.abort();
+            }
+        });
+    assert!(sched.is_aborted());
+    assert_eq!(pieces, 100);
+    assert!(worker.dst.recv().is_err(), "a reply was left unread");
+    assert_ne!(read(root, "source/file"), read(root, "target/file"));
+    assert_eq!(worker.progress.files_done.load(Relaxed), 0);
+    assert_eq!(worker.progress.bytes_done.load(Relaxed), 0);
 }
 
 /// A connection that fails, and stays dead, as a dropped one does: at its
