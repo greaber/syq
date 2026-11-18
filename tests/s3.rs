@@ -13,6 +13,9 @@ mod streams;
 #[path = "s3/listing.rs"]
 mod listing;
 
+#[path = "s3/checking.rs"]
+mod checking;
+
 #[path = "s3/map.rs"]
 mod map;
 
@@ -292,6 +295,14 @@ fn serve(
             "object-writing header on {first}"
         );
         probes.fetch_add(1, Ordering::Relaxed);
+    }
+    if fault == "checking" {
+        checking::serve(
+            &mut socket,
+            method,
+            first.split_whitespace().nth(1).unwrap(),
+        );
+        return;
     }
     if fault.starts_with("existing-policy") {
         existing_policy::serve(
@@ -2433,6 +2444,49 @@ fn s3_mapping_download_overlaps_heads_and_validates_before_copying() {
             }
         }
     }
+}
+
+#[test]
+fn s3_rerun_checks_unchanged_objects_beyond_the_transfer_limit() {
+    use checking::{CHANGED, GETS, HEADS, MODIFIED, SIZE, UNCHANGED};
+    let server = Server::start("checking");
+    let temp = crate::test_support::tempdir().unwrap();
+    let destination = temp.path().join("out");
+    std::fs::create_dir(&destination).unwrap();
+    let name = |index| destination.join(&checking::key(index)["data/".len()..]);
+    let modified = std::time::UNIX_EPOCH + Duration::from_secs(MODIFIED);
+    for index in 0..UNCHANGED {
+        // Only size and time are compared, so the files can stay sparse.
+        let file = std::fs::File::create(name(index)).unwrap();
+        file.set_len(SIZE).unwrap();
+        file.set_modified(modified).unwrap();
+    }
+    let output = server
+        .command_with_part_size(temp.path(), 0, false)
+        .args(["--s3-endpoint", &server.address])
+        .args(["--from", "s3://bucket", "--srcs-in", "data", "--into"])
+        .arg(&destination)
+        .capture_output()
+        .unwrap();
+    assert!(output.status.success(), "{}", output_text(&output));
+    for index in UNCHANGED..UNCHANGED + CHANGED {
+        assert_eq!(std::fs::read(name(index)).unwrap(), b"x");
+    }
+    assert_eq!(std::fs::metadata(name(0)).unwrap().len(), SIZE);
+    // Transfers start at 32 objects. Unchanged objects give no transfer
+    // samples to raise that with, so more of them are checked at once...
+    assert!(
+        HEADS.peak() > 32,
+        "{} metadata requests at once",
+        HEADS.peak()
+    );
+    assert!(HEADS.peak() <= 256, "{} metadata requests", HEADS.peak());
+    // ...while the objects that then need a transfer still take turns.
+    assert!(
+        (1..=32).contains(&GETS.peak()),
+        "{} downloads at once",
+        GETS.peak()
+    );
 }
 
 #[test]
