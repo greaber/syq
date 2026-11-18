@@ -2297,8 +2297,12 @@ impl RestrictedAuthority {
     /// Where inode numbers cannot show which file a name leads to
     /// (`fsops::Profile::link_counts_trusted`), a sender's identity for the
     /// object observed as `observed` is set aside: the change is pinned to
-    /// what is there, as on any receiver there (`FsOps`'s
-    /// `existence_only_where_numbers_mislead`).
+    /// what is there. The object's own filesystem decides where its profile
+    /// is known, and the root's otherwise. `FsOps`'s
+    /// `existence_only_where_numbers_mislead`, which runs again at
+    /// execution, judges every object by the root's: judged by the root
+    /// here, a file on an untrusted mount below a trusted root would be
+    /// refused whenever the sender's numbers for it went stale.
     fn existence_only_where_numbers_mislead(
         &self,
         observed: &RootMetadata,
