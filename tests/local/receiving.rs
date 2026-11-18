@@ -6151,9 +6151,10 @@ fn settings_that_drop_a_connection_stop_its_older_service_without_a_login() {
 }
 
 /// A service from before syq followed updates cannot say whether a copy is
-/// in progress through it. Commands leave it running and say what replaces
-/// it; `persist connect` or `persist receive on` run by hand replaces it at
-/// once, saying that this cuts off any copy in progress.
+/// in progress through it, and this build cannot read its requests. Commands
+/// leave it running and say what replaces it, as status, pending requests
+/// and approvals do; `persist connect` or `persist receive on` run by hand
+/// replaces it at once, saying that this cuts off any copy in progress.
 #[test]
 fn a_service_from_before_syq_followed_updates_is_replaced_only_by_hand() {
     let t = Tmp::new();
@@ -6162,7 +6163,7 @@ fn a_service_from_before_syq_followed_updates_is_replaced_only_by_hand() {
     installed.connect();
     let syq = Path::new(env!("CARGO_BIN_EXE_syq"));
     let fix = format!(
-        "receiving through test-server runs syq v0.7.1, from before syq 0.8.0, which cannot say whether a copy is in progress through it; `syq persist connect test-server --pscope {}` replaces it with this version now",
+        "receiving through test-server runs syq v0.7.1, a release before 0.8.0 that cannot say whether a copy is in progress through it; `syq persist connect test-server --pscope {}` replaces it with this version now",
         installed.scope.display()
     );
     let replace = [
@@ -6176,8 +6177,18 @@ fn a_service_from_before_syq_followed_updates_is_replaced_only_by_hand() {
         ][..],
         &["receive", "on"],
     ];
+    let id = "0123456789abcdef0123456789abcdef";
     for (pass, command) in replace.into_iter().enumerate() {
-        let old = other_service(&installed, serde_json::json!([]), None);
+        let old = other_service(
+            &installed,
+            serde_json::json!([{
+                "id": id, "from": "test-server",
+                "expires_at": 4102444800u64, "notification": "none",
+                "destination": "/inbox", "permission": "write", "max_bytes": 1,
+                "max_entries": 1, "max_delete": 0, "preserve_permissions": false
+            }]),
+            None,
+        );
         fs::write(t.path("source"), b"data").unwrap();
         let copied = installed
             .command(
@@ -6203,6 +6214,33 @@ fn a_service_from_before_syq_followed_updates_is_replaced_only_by_hand() {
                 "{command:?}: {}",
                 stderr_of(output)
             );
+        }
+        if pass == 0 {
+            // Its requests are not listed, and cannot be answered here.
+            let pending = installed.persist(syq, &["receive", "pending", "--json"]);
+            assert_output_ok(&pending);
+            assert_eq!(String::from_utf8_lossy(&pending.stdout), "[]\n");
+            assert!(
+                stderr_of(&pending).contains(&fix),
+                "{}",
+                stderr_of(&pending)
+            );
+            let approved = installed.persist(syq, &["receive", "approve", id]);
+            assert!(!approved.status.success());
+            assert!(
+                stderr_of(&approved).contains(&format!(
+                    "held by a service this version cannot read: {fix}"
+                )),
+                "{}",
+                stderr_of(&approved)
+            );
+            // Structured status shows it as a failed connection saying so.
+            for args in [&["status", "--json"][..], &["receive", "status", "--json"]] {
+                let shown = installed.persist(syq, args);
+                assert_output_ok(&shown);
+                let stdout = String::from_utf8_lossy(&shown.stdout);
+                assert!(stdout.contains(&fix), "{args:?}: {stdout}");
+            }
         }
 
         let replaced = installed.persist(syq, command);

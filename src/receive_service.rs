@@ -612,6 +612,11 @@ struct Status {
     /// Whether it stops in answer to a `stop_if_idle` request.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     stopping: bool,
+    /// For a service from before syq followed updates, which this command
+    /// cannot read, what replaces it (`OlderService`). Its other fields are
+    /// only what that message names (`statuses`).
+    #[serde(skip)]
+    older: Option<String>,
 }
 /// What a receiving service has in progress.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -812,12 +817,46 @@ impl std::fmt::Display for OlderService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "receiving through {} runs syq {}, from before syq 0.8.0, which cannot say whether a copy is in progress through it; `{}` replaces it with this version now",
+            "receiving through {} runs syq {}, a release before 0.8.0 that cannot say whether a copy is in progress through it; `{}` replaces it with this version now",
             self.endpoint, self.build, self.fix
         )
     }
 }
 impl std::error::Error for OlderService {}
+impl OlderService {
+    /// A status for it, as a connection that failed with this message.
+    fn status(&self) -> Status {
+        Status {
+            version: VERSION,
+            identity: self.build.clone(),
+            pid: 0,
+            endpoint: self.endpoint.clone(),
+            name: String::new(),
+            connection: ConnectionState {
+                phase: "failed".into(),
+                error: Some(self.to_string()),
+                ..Default::default()
+            },
+            approval: None,
+            pending: Vec::new(),
+            decision_error: None,
+            profiles: Vec::new(),
+            busy: Busy::default(),
+            started_from: None,
+            switch: None,
+            stopping: false,
+            older: Some(self.to_string()),
+        }
+    }
+}
+/// The status of the service at `control`, with one from before syq
+/// followed updates as a failed connection naming what replaces it (`older`).
+fn status_or_older(control: &Path) -> Result<Status> {
+    status(control, false).or_else(|error| match error.downcast::<OlderService>() {
+        Ok(older) => Ok(older.status()),
+        Err(error) => Err(error),
+    })
+}
 /// Whether nothing answered on a control socket, as while a locked service
 /// is starting or stopping, rather than the service replying with an error.
 fn unanswered(error: &anyhow::Error) -> bool {
@@ -950,6 +989,8 @@ pub(crate) fn ensure(domain: &Domain, control: &Path, remote: &crate::conn::Remo
             false
         }
         Ok(_) => false,
+        // Commands say so once a minute (`refresh_outdated`).
+        Err(error) if error.downcast_ref::<OlderService>().is_some() => false,
         Err(error) => {
             crate::output::diagnostic!(
                 "syq: background receiving through {}: {error:#}",
@@ -1647,7 +1688,7 @@ pub(crate) struct NamedConnection {
     pub connection: ConnectionState,
 }
 pub(crate) fn connection_status(control: &Path) -> Option<ReceivingStatus> {
-    status(control, false).ok().map(|s| ReceivingStatus {
+    status_or_older(control).ok().map(|s| ReceivingStatus {
         switch: switch_report(control, &s),
         busy: s.busy,
         build: s.identity,
@@ -2419,7 +2460,7 @@ fn apply_preferences_reporting(
                 continue;
             }
             crate::output::diagnostic!("syq: {}", switching_notice(&endpoint, &build));
-            if let Err(error) = reconnect_with_this_build(domain, &control, &endpoint, true) {
+            if let Err(error) = reconnect_with_this_build(domain, &control, &endpoint) {
                 // What stopping it now cuts off, when it still runs.
                 let cut = match running_status(&control, Retry::No, ANSWER_TIMEOUT) {
                     Ok(Some(now)) if now.identity == build && !now.busy.idle() => {
@@ -2498,18 +2539,11 @@ fn apply_preferences_reporting(
 }
 
 /// Start this build's receiving service through `endpoint` and wait until
-/// it is online. With `force`, as for a settings change, whatever runs
-/// there is replaced at once, even when busy; without, as for a switch, a
-/// service that started meanwhile is replaced only once idle, and one that
-/// follows another installed syq is left, which is no failure. In a
-/// terminal ssh may ask for the login; without one, as a switch does,
-/// within its bounds on logging in and on its time (`run_switch`).
-fn reconnect_with_this_build(
-    domain: &Domain,
-    control: &Path,
-    endpoint: &str,
-    force: bool,
-) -> Result<()> {
+/// it is online, replacing whatever runs there at once, even when busy, as
+/// for a settings change. In a terminal ssh may ask for the login; without
+/// one, as a switch does, within its bounds on logging in and on its time
+/// (`run_switch`).
+fn reconnect_with_this_build(domain: &Domain, control: &Path, endpoint: &str) -> Result<()> {
     if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
         return crate::persistence::connect_domain(
             domain,
@@ -2517,21 +2551,17 @@ fn reconnect_with_this_build(
             None,
             false,
             Duration::from_secs(30),
-            if force { Replace::Now } else { Replace::IfIdle },
+            Replace::Now,
             crate::persistence::Login::Bounded,
         );
     }
-    let (status, pid) = run_switch_process(if force {
-        replace_now_command(domain, endpoint)
-    } else {
-        switch_command(domain, endpoint)
-    })?;
-    let now = running_status(control, Retry::No, ANSWER_TIMEOUT)?;
-    // A switch that ended well said what it left running, if anything, or
-    // left the connection to another switch under way.
-    if !force && status.success() {
-        return Ok(());
-    }
+    let (status, pid) = run_switch_process(replace_now_command(domain, endpoint))?;
+    // One from before syq followed updates still runs, as when the switch
+    // could not log in: what the switch recorded says why.
+    let now = match running_status(control, Retry::No, ANSWER_TIMEOUT) {
+        Ok(now) => now,
+        Err(error) => Some(error.downcast::<OlderService>()?.status()),
+    };
     let online = now.as_ref().is_some_and(|now| {
         now.identity == crate::identity::build() && now.connection.phase == "online"
     });
@@ -2776,6 +2806,7 @@ fn serve(
                                 }),
                                 switch: follower.as_ref().and_then(switch::Follower::report),
                                 stopping: shutdown.load(Ordering::Acquire),
+                                older: None,
                                 profiles,
                                 decision_error,
                             };
@@ -2811,8 +2842,10 @@ fn statuses(domain: &Domain) -> Result<Vec<Status>> {
     Ok(all_controls(domain)?
         .into_iter()
         .filter_map(|control| {
-            let running = status(&control, false).ok().map(|mut state| {
-                state.switch = switch_report(&control, &state);
+            let running = status_or_older(&control).ok().map(|mut state| {
+                if state.older.is_none() {
+                    state.switch = switch_report(&control, &state);
+                }
                 state
             });
             running.or_else(|| {
@@ -2829,6 +2862,7 @@ fn statuses(domain: &Domain) -> Result<Vec<Status>> {
                     started_from: None,
                     switch: None,
                     stopping: false,
+                    older: None,
                     profiles: Vec::new(),
                     connection: ConnectionState {
                         phase: "inactive".into(),
@@ -2999,8 +3033,17 @@ fn pending(domain: &Domain, json: bool, wait: bool, timeout: u64) -> Result<()> 
     }
     let deadline = Instant::now() + Duration::from_secs(timeout);
     let mut progress = Instant::now();
+    let mut said = false;
     loop {
-        let mut requests: Vec<_> = statuses(domain)?
+        let states = statuses(domain)?;
+        // A service this command cannot read may hold requests too.
+        for older in states.iter().filter_map(|state| state.older.as_ref()) {
+            if !said {
+                crate::output::diagnostic!("syq: {older}");
+            }
+        }
+        said = true;
+        let mut requests: Vec<_> = states
             .into_iter()
             .flat_map(|status| status.pending)
             .collect();
@@ -3050,9 +3093,17 @@ fn decide(domain: &Domain, id: &str, allow: bool, remember: bool) -> Result<()> 
     if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!("use the complete request ID from syq persist receive pending");
     }
+    // A service this command cannot read may hold the request.
+    let mut older = None;
     for control in all_controls(domain)? {
-        let Ok(state) = status(&control, false) else {
-            continue;
+        let state = match status(&control, false) {
+            Ok(state) => state,
+            Err(error) => {
+                if let Ok(error) = error.downcast::<OlderService>() {
+                    older.get_or_insert(error);
+                }
+                continue;
+            }
         };
         if let Some(request) = state.pending.iter().find(|request| request.id == id) {
             anyhow::ensure!(!remember || (allow && request.can_remember()), "--remember applies only to SSH account requests that support remembering; update syq and reconnect receiving if needed");
@@ -3114,6 +3165,9 @@ fn decide(domain: &Domain, id: &str, allow: bool, remember: bool) -> Result<()> 
             );
             return Ok(());
         }
+    }
+    if let Some(older) = older {
+        bail!("approval is unknown, expired, or already answered, or held by a service this version cannot read: {older}");
     }
     bail!("approval is unknown, expired, or already answered")
 }
@@ -3392,15 +3446,22 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                     }
                 }
                 for state in connections {
-                    if let Some(note) = build_note(
-                        &state.identity,
-                        state.started_from.as_deref(),
-                        state.switch.as_ref(),
-                        &state.busy,
-                        Some(&state.endpoint),
-                        &connect_command(&state.endpoint, domain.explicit_path()),
-                        true,
-                    ) {
+                    if let Some(note) = state
+                        .older
+                        .is_none()
+                        .then(|| {
+                            build_note(
+                                &state.identity,
+                                state.started_from.as_deref(),
+                                state.switch.as_ref(),
+                                &state.busy,
+                                Some(&state.endpoint),
+                                &connect_command(&state.endpoint, domain.explicit_path()),
+                                true,
+                            )
+                        })
+                        .flatten()
+                    {
                         crate::output::command_human_stdout!("  {}: {note}", state.endpoint);
                     }
                     if state.profiles.is_empty() {
@@ -3466,6 +3527,9 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
                     .into_iter()
                     .filter(|s| s.endpoint == host)
                     .collect();
+                if let Some(older) = states.iter().find_map(|s| s.older.as_ref()) {
+                    bail!("{older}");
+                }
                 if names.iter().all(|name| {
                     states.iter().any(|s| {
                         if s.profiles.is_empty() {
@@ -3847,6 +3911,7 @@ mod tests {
             started_from: None,
             switch: None,
             stopping: false,
+            older: None,
             profiles,
         };
         let mut bytes = Vec::new();
@@ -4001,6 +4066,7 @@ mod tests {
                 started_from: None,
                 switch: None,
                 stopping: false,
+                older: None,
                 profiles: Vec::new(),
             };
             write_status(&mut client, &state).unwrap();
@@ -4029,6 +4095,7 @@ mod tests {
             started_from: None,
             switch: None,
             stopping,
+            older: None,
         }
     }
 
@@ -4284,7 +4351,7 @@ mod tests {
         assert!(error.downcast_ref::<OlderService>().is_some(), "{error:#}");
         assert_eq!(
             error.to_string(),
-            "receiving through example runs syq v0.7.1, from before syq 0.8.0, which cannot say whether a copy is in progress through it; `syq persist connect example` replaces it with this version now"
+            "receiving through example runs syq v0.7.1, a release before 0.8.0 that cannot say whether a copy is in progress through it; `syq persist connect example` replaces it with this version now"
         );
         let current = serde_json::to_value(answer("v0.8.0", Busy::default(), false)).unwrap();
         assert_eq!(decode_status(&control, current).unwrap().identity, "v0.8.0");
