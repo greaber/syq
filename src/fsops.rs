@@ -74,6 +74,7 @@ pub(crate) fn copy_donor_range(
 mod btrfs;
 mod entry;
 mod fs_caps;
+pub(crate) mod keep;
 mod leases;
 mod limits;
 pub(crate) mod lookups;
@@ -2018,23 +2019,29 @@ impl FsOps {
                                 // readable inode that was hashed; O_PATH metadata
                                 // handles intentionally cannot change timestamps.
                                 (|| -> Result<()> {
-                                    require_rooted_named_identity(
+                                    let current = held.metadata()?;
+                                    require_rooted_named_identity_known(
                                         &target.root,
                                         &target.relative,
                                         &target.label,
-                                        &held,
+                                        &current,
                                         condition,
                                     )?;
-                                    let current = held.metadata()?;
-                                    vouch::require(&target, &held, &current, &file.meta, checked)?;
-                                    set_meta_file_known(&held, &file.meta, repair, &current)?;
-                                    require_rooted_named_identity(
-                                        &target.root,
-                                        &target.relative,
-                                        &target.label,
+                                    let keeping = keep::Keeping {
+                                        handle: keep::Handle::Open,
+                                        recheck_any: true,
+                                        setting: None,
+                                    };
+                                    keep::keep_existing(
+                                        (&target).into(),
                                         &held,
+                                        &current,
+                                        (&file.meta, checked),
                                         condition,
-                                    )
+                                        keeping,
+                                    )?
+                                    .required()
+                                    .map(drop)
                                 })()
                                 .err()
                                 .map(|error| wire_error(&error))

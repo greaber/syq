@@ -1152,9 +1152,22 @@ impl FsOps {
             // left: the complete file there remains the winner, and the old
             // one needs nothing.
             if current.nlink() > 0 {
-                vouch::require(&target, &held.file, &current, meta, flags)?;
-                set_meta_file_known(&held.file, meta, flags, &current)
-                    .with_context(|| format!("set metadata on basis {}", held.label.display()))?;
+                // `Any` may finish through the retained inode after a
+                // concurrent publication.
+                let keeping = keep::Keeping {
+                    handle: keep::Handle::Open,
+                    recheck_any: false,
+                    setting: Some("set metadata on basis"),
+                };
+                return keep::keep_existing(
+                    (&target).into(),
+                    &held.file,
+                    &current,
+                    (meta, flags),
+                    condition,
+                    keeping,
+                )?
+                .required();
             }
         }
         // `Any` may finish through the retained inode after a concurrent
@@ -4888,7 +4901,7 @@ pub(super) fn set_meta_file_known(
     flags: u8,
     current: &fs::Metadata,
 ) -> Result<()> {
-    set_meta_file_inner(f, meta, flags, current, false, true)
+    set_meta_file_inner(f, keep::Handle::Open, meta, flags, current, false, true)
 }
 
 /// Set a written file's metadata from the metadata read when it was created.
@@ -4901,7 +4914,7 @@ pub(super) fn set_meta_written_file(
     flags: u8,
     created: &fs::Metadata,
 ) -> Result<()> {
-    set_meta_file_inner(f, meta, flags, created, false, false)
+    set_meta_file_inner(f, keep::Handle::Open, meta, flags, created, false, false)
 }
 
 /// Give an existing file `--in-place=update` wrote its final metadata,
@@ -4932,7 +4945,15 @@ pub(super) fn finish_updated_metadata(
 }
 
 pub(super) fn set_meta_file_for_publication(f: &File, meta: &Meta, flags: u8) -> Result<()> {
-    set_meta_file_inner(f, meta, flags, &f.metadata()?, true, true)
+    set_meta_file_inner(
+        f,
+        keep::Handle::Open,
+        meta,
+        flags,
+        &f.metadata()?,
+        true,
+        true,
+    )
 }
 
 /// The same for a staged file about to be published.
@@ -4942,11 +4963,16 @@ pub(super) fn set_meta_written_file_for_publication(
     flags: u8,
     created: &fs::Metadata,
 ) -> Result<()> {
-    set_meta_file_inner(f, meta, flags, created, true, false)
+    set_meta_file_inner(f, keep::Handle::Open, meta, flags, created, true, false)
 }
 
-fn set_meta_file_inner(
+/// Apply `meta` under `flags` to the file `f` refers to, whose metadata
+/// `current` was read through it, through `f` alone. A `Handle::Path`
+/// handle on Linux goes through the calls that take a handle with an empty
+/// path, and cannot set times; an open descriptor through the plain ones.
+pub(super) fn set_meta_file_inner(
     f: &File,
+    handle: keep::Handle,
     meta: &Meta,
     flags: u8,
     current: &fs::Metadata,
@@ -4970,10 +4996,20 @@ fn set_meta_file_inner(
         // Do not hand that account the staging inode's owner read permission.
         f.set_permissions(fs::Permissions::from_mode(0o000))?;
     }
+    // A metadata-only handle cannot set times on Linux: refuse before
+    // changing anything.
+    let path_handle = cfg!(target_os = "linux") && handle == keep::Handle::Path;
+    if path_handle && flags & flags::TIMES != 0 {
+        bail!("metadata-only O_PATH repair does not support timestamp changes");
+    }
     // Owner first: chown clears setuid/setgid, so final mode follows it.
     let owner_changed =
         apply_owner_if_changed(flags, meta, current.uid(), current.gid(), |uid, gid| {
-            std::os::unix::fs::fchown(f, uid, gid)
+            if path_handle {
+                chown_path_handle(f, uid, gid)
+            } else {
+                std::os::unix::fs::fchown(f, uid, gid)
+            }
         })?;
     if owner_changed {
         super::access_changed(f);
@@ -5015,7 +5051,11 @@ fn set_meta_file_inner(
         let cur = narrowed.unwrap_or(current.mode() & 0o7777);
         let want = meta.mode & 0o7777;
         if cur != want || ((owner_changed || !times_current) && want & 0o6000 != 0) {
-            f.set_permissions(fs::Permissions::from_mode(want))?;
+            if path_handle {
+                set_mode_handle(f, want)?;
+            } else {
+                f.set_permissions(fs::Permissions::from_mode(want))?;
+            }
             super::access_changed(f);
         }
     }
@@ -5028,6 +5068,29 @@ fn set_meta_file_inner(
     } else {
         crate::inode_metadata::apply_after_acls(f, meta.inode_metadata.as_deref(), meta.mode)
     }
+}
+
+/// Change the owner and group of the file an `O_PATH` handle refers to.
+fn chown_path_handle(f: &File, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let r = unsafe {
+            libc::fchownat(
+                f.as_raw_fd(),
+                c"".as_ptr(),
+                uid.unwrap_or(u32::MAX),
+                gid.unwrap_or(u32::MAX),
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        if r == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    std::os::unix::fs::fchown(f, uid, gid)
 }
 
 /// Apply only ownership fields whose requested values differ from the
