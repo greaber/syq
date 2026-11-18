@@ -3724,6 +3724,14 @@ fn other_service(
     busy: Option<serde_json::Value>,
 ) -> std::thread::JoinHandle<Vec<serde_json::Value>> {
     let (socket, lock) = retire_service(installed);
+    // It receives as the fixture's profile, where the scope keeps one.
+    let name = fs::read(installed.scope.join("receive.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .map_or_else(
+            || "".into(),
+            |settings| settings["profiles"][0]["name"].clone(),
+        );
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     std::thread::spawn(move || {
@@ -3754,7 +3762,7 @@ fn other_service(
             let request = read_provider_frame(&mut stream);
             let mut answer = serde_json::json!({
                 "version": 2, "identity": "v0.7.1", "pid": 0,
-                "endpoint": "test-server", "name": "",
+                "endpoint": "test-server", "name": name,
                 "connection": {"phase": "online", "error": null, "ssh_pid": null},
                 "pending": pending.clone()
             });
@@ -6178,6 +6186,9 @@ fn a_service_from_before_syq_followed_updates_is_replaced_only_by_hand() {
         &["receive", "on"],
     ];
     let id = "0123456789abcdef0123456789abcdef";
+    let settings: serde_json::Value =
+        serde_json::from_slice(&read(&installed.scope.join("receive.json"))).unwrap();
+    let profile = settings["profiles"][0]["name"].as_str().unwrap().to_owned();
     for (pass, command) in replace.into_iter().enumerate() {
         let old = other_service(
             &installed,
@@ -6207,6 +6218,10 @@ fn a_service_from_before_syq_followed_updates_is_replaced_only_by_hand() {
         assert_output_ok(&copied);
         let shown = installed.persist(syq, &["status"]);
         assert_output_ok(&shown);
+        // Nothing switches it by itself.
+        let stdout = String::from_utf8_lossy(&shown.stdout);
+        assert!(stdout.contains(&fix), "{stdout}");
+        assert!(!stdout.contains("switches it"), "{stdout}");
         // A command looks at a connection once a minute.
         for output in [&shown].into_iter().chain((pass == 0).then_some(&copied)) {
             assert!(
@@ -6234,8 +6249,13 @@ fn a_service_from_before_syq_followed_updates_is_replaced_only_by_hand() {
                 "{}",
                 stderr_of(&approved)
             );
-            // Structured status shows it as a failed connection saying so.
-            for args in [&["status", "--json"][..], &["receive", "status", "--json"]] {
+            // Structured status shows it as a failed connection saying so,
+            // also when it selects the service's receiving name.
+            for args in [
+                &["status", "--json"][..],
+                &["receive", "status", "--json"],
+                &["receive", "status", "--json", "--name", &profile],
+            ] {
                 let shown = installed.persist(syq, args);
                 assert_output_ok(&shown);
                 let stdout = String::from_utf8_lossy(&shown.stdout);

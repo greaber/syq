@@ -278,7 +278,7 @@ impl RemindedInstall {
         match self {
             RemindedInstall::Standalone => "run `syq --self-update`",
             RemindedInstall::Reinstall => {
-                "reinstall syq with the standalone installer, which `syq --self-update` needs from then on"
+                "reinstall syq with the standalone installer, so that `syq --self-update` works again"
             }
             RemindedInstall::Homebrew => "run `brew upgrade syq`",
         }
@@ -1862,6 +1862,10 @@ mod tests {
         assert_eq!(
             RemindedInstall::Standalone.advice(),
             "run `syq --self-update`"
+        );
+        assert_eq!(
+            RemindedInstall::Reinstall.advice(),
+            "reinstall syq with the standalone installer, so that `syq --self-update` works again"
         );
     }
 

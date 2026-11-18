@@ -798,6 +798,7 @@ fn decode_status(control: &Path, status: serde_json::Value) -> Result<Status> {
             ),
             endpoint: text("endpoint"),
             build: text("identity"),
+            name: text("name"),
         }
         .into());
     }
@@ -811,6 +812,8 @@ fn decode_status(control: &Path, status: serde_json::Value) -> Result<Status> {
 pub(crate) struct OlderService {
     endpoint: String,
     build: String,
+    /// Its receiving name, which status selects by (`--name`).
+    name: String,
     fix: String,
 }
 impl std::fmt::Display for OlderService {
@@ -831,7 +834,7 @@ impl OlderService {
             identity: self.build.clone(),
             pid: 0,
             endpoint: self.endpoint.clone(),
-            name: String::new(),
+            name: self.name.clone(),
             connection: ConnectionState {
                 phase: "failed".into(),
                 error: Some(self.to_string()),
@@ -1681,6 +1684,9 @@ pub(crate) struct ReceivingStatus {
     pub started_from: Option<String>,
     pub switch: Option<switch::Report>,
     pub busy: Busy,
+    /// Whether it is from before syq followed updates (`OlderService`), so
+    /// that only its connection's error says what to do about it.
+    pub older: bool,
 }
 #[derive(Serialize)]
 pub(crate) struct NamedConnection {
@@ -1689,7 +1695,12 @@ pub(crate) struct NamedConnection {
 }
 pub(crate) fn connection_status(control: &Path) -> Option<ReceivingStatus> {
     status_or_older(control).ok().map(|s| ReceivingStatus {
-        switch: switch_report(control, &s),
+        switch: s
+            .older
+            .is_none()
+            .then(|| switch_report(control, &s))
+            .flatten(),
+        older: s.older.is_some(),
         busy: s.busy,
         build: s.identity,
         started_from: s.started_from,
