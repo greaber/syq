@@ -326,7 +326,8 @@ mod tests {
             // Options this route refuses, and limits no source allows.
             read_request(command(&["--rsh", "ssh"])),
             read_request(command(&["--receiver-max-entries", "0"])),
-            // A copy to another server, not to the requester.
+            // A copy between servers, which this request sends no
+            // results key for.
             read_request(
                 [
                     "cp", "--from", "backup", "--src", "x", "--to", "other", "--as", "y",

@@ -1221,6 +1221,11 @@ fn copies_from_a_receiving_machine_ask_it_and_explain_an_old_helper() {
         send.keys().map(String::as_str).collect::<Vec<_>>(),
         ["command", "cwd", "inputs", "results_key"]
     );
+    assert_eq!(
+        send["inputs"],
+        serde_json::json!({"ignore": [], "mapping": null}),
+        "{request}"
+    );
     assert!(
         send["command"]
             .as_array()

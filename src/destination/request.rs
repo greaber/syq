@@ -200,10 +200,14 @@ pub(super) fn prepare(args: &mut crate::cli::Args, approving: Approving) -> Resu
         command,
         cwd: crate::approval_command::current_directory(),
         // The rules come from the command; only what it read from files
-        // travels beside it.
-        inputs: crate::directive::Inputs {
-            ignore: args.ignore_lines.clone(),
-            mapping: crate::directive::mapping_authorization(args)?,
+        // travels beside it. A copy from a receiving machine reads its
+        // sources as they are, whatever this server ignores or maps.
+        inputs: match &asking {
+            Asking::FromNamed(_) => Default::default(),
+            _ => crate::directive::Inputs {
+                ignore: args.ignore_lines.clone(),
+                mapping: crate::directive::mapping_authorization(args)?,
+            },
         },
         results_key: match &asking {
             Asking::Between { results_key, .. } => Some(*results_key),

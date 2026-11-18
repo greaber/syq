@@ -48,16 +48,17 @@ def check(current, helper, *, legacy=False):
 
             def respond():
                 try:
-                    for expected in ("Ping", "Copy"):
+                    # A helper of an older build asks with `Forward`.
+                    for expected in (("Ping",), ("Copy", "Forward")):
                         conn, _ = listener.accept()
                         with conn:
                             conn.settimeout(5)
                             with conn.makefile("rb") as stream:
                                 size, = struct.unpack("!I", stream.read(4))
                                 message = json.loads(stream.read(size))["message"]
-                            assert message == expected or expected in message, message
-                            messages.append(expected)
-                            response = "Ready" if expected == "Ping" else {"Error": "denied by timing fixture"}
+                            assert message in expected or any(name in message for name in expected), message
+                            messages.append(expected[0])
+                            response = "Ready" if expected == ("Ping",) else {"Error": "denied by timing fixture"}
                             data = json.dumps(response).encode()
                             conn.sendall(struct.pack("!I", len(data)) + data)
                 except Exception as error:
