@@ -97,6 +97,7 @@ pub(crate) fn receiving_command(command: &[Vec<u8>], receiver: &str) -> Result<c
         destination.host.as_deref() == Some(&format!("@{receiver}")),
         "the requesting command copies to a different destination"
     );
+    crate::directive::check_receiving(&args)?;
     Ok(args)
 }
 

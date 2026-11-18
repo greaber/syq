@@ -5,10 +5,9 @@
 //! the same channels and reverse TCP that copies sent to it use.
 use super::*;
 use crate::proto::{SourceRootBase, SourceRootSelection};
-use crate::restricted::source::SourceAuthority;
 
 /// How long the reads a send approves last at most.
-const LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+pub(super) const LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// What the receiving machine approved: the token that opens the copy's
 /// channels and the source base and selections its reads are confined to.
@@ -20,6 +19,20 @@ pub(crate) struct SendApproved {
     token: String,
     base: SourceRootBase,
     selections: Vec<SourceRootSelection>,
+}
+
+impl SendApproved {
+    pub(super) fn new(
+        token: String,
+        base: SourceRootBase,
+        selections: Vec<SourceRootSelection>,
+    ) -> Self {
+        Self {
+            token,
+            base,
+            selections,
+        }
+    }
 }
 
 /// The receiving name a copy's sources are on, when they are on one.
@@ -90,7 +103,7 @@ pub(crate) fn request(args: &crate::cli::Args) -> Result<pull::PullRequest> {
 /// The copy `command` asks this machine, the receiving machine `name`, to
 /// send: a `syq cp --from @name` to the requesting server. This machine
 /// derives what the copy may read from the command alone.
-fn sending_command(command: &[Vec<u8>], name: &str) -> Result<crate::cli::Args> {
+pub(super) fn sending_command(command: &[Vec<u8>], name: &str) -> Result<crate::cli::Args> {
     let args = crate::approval_command::parse(command)?;
     anyhow::ensure!(
         eligible(&args)? == name,
@@ -233,7 +246,11 @@ fn join(directory: &Path, path: &[u8]) -> Vec<u8> {
 /// the command's `-C` becomes a prefix of each selection. Either way every
 /// component resolves beneath the root's descriptor, so neither a symlink
 /// nor a directory replaced during the copy leads outside it.
-fn resolve(cwd: &Path, root: Option<&Path>, request: &mut pull::PullRequest) -> Result<()> {
+pub(super) fn resolve(
+    cwd: &Path,
+    root: Option<&Path>,
+    request: &mut pull::PullRequest,
+) -> Result<()> {
     let Some(root) = root else {
         request.base.path = Some(match request.base.path.take().map(expand_home) {
             Some(path) if path.starts_with(b"/") => path,
@@ -283,7 +300,7 @@ fn resolve(cwd: &Path, root: Option<&Path>, request: &mut pull::PullRequest) -> 
 /// `..` resolved by name is where reading goes. When it follows them, `..`
 /// can lead from where a link led, so the paths keep their spelling and the
 /// prompt says that links are followed.
-fn exact_paths(request: &pull::PullRequest) -> Vec<(Vec<u8>, &'static str)> {
+pub(super) fn exact_paths(request: &pull::PullRequest) -> Vec<(Vec<u8>, &'static str)> {
     let by_name = request.symlink_policy == crate::proto::OperatorSymlinkPolicy::Refuse;
     let base = request.base.path.as_deref().unwrap_or(b"/");
     request
@@ -315,106 +332,6 @@ fn exact_paths(request: &pull::PullRequest) -> Vec<(Vec<u8>, &'static str)> {
             (path, scope)
         })
         .collect()
-}
-
-impl Receiver {
-    /// Approve sending files on this machine to the requesting server:
-    /// derive what the copy may read from its command, within this
-    /// machine's limits and receiving profile, ask, and keep the authority
-    /// made from it under a token that opens the copy's control once,
-    /// within `START_TIMEOUT`.
-    pub(super) fn send(
-        &self,
-        command: Vec<Vec<u8>>,
-        cwd: String,
-        mut stream: TrackedStream,
-    ) -> Result<()> {
-        let _request = self.request_lock.try_lock().map_err(|_| {
-            anyhow::anyhow!("another transfer is awaiting approval; retry after it is decided")
-        })?;
-        let args = sending_command(&command, &self.name)?;
-        // A source deletes nothing.
-        let caps = crate::directive::Caps {
-            max_bytes: self.max_bytes,
-            max_entries: self.max_entries,
-            max_delete: 0,
-        };
-        let mut request = pull::source_request(&args, Some(&caps))?;
-        resolve(&self.cwd, self.root.as_deref(), &mut request)?;
-        request.validate()?;
-        {
-            let mut sessions = self.sessions.lock().unwrap();
-            sessions.retain(|_, s| s.opened || s.issued.elapsed() < START_TIMEOUT);
-            if sessions.len() >= 8 {
-                bail!("too many active transfers; wait for one to finish");
-            }
-        }
-        let generation = self.generation.load(Ordering::Acquire);
-        let socket = stream.try_clone()?;
-        let cancelled = || {
-            self.stop.load(Ordering::Acquire)
-                || self.generation.load(Ordering::Acquire) != generation
-                || requester_closed(&socket)
-        };
-        // Sending is never approved automatically: --auto-approve-root
-        // governs only what servers may write here.
-        self.approvals.request_send(
-            &self.requester,
-            &command,
-            &cwd,
-            &exact_paths(&request),
-            &self.cwd,
-            request
-                .base
-                .confined
-                .then_some(request.base.path.as_deref())
-                .flatten(),
-            request.symlink_policy != crate::proto::OperatorSymlinkPolicy::Refuse
-                || request
-                    .selections
-                    .iter()
-                    .any(|selection| selection.follow_root),
-            (&request.limits, request.preview),
-            self.notifications,
-            cancelled,
-        )?;
-        // Start the authority's clock at approval, after a long prompt.
-        let mut policy = request.policy(Instant::now() + LIFETIME);
-        policy.outer_root = self
-            .root
-            .as_ref()
-            .map(|root| root.as_os_str().as_bytes().to_vec());
-        let authority = SourceAuthority::new(policy)?;
-        let mut sessions = self.sessions.lock().unwrap();
-        if cancelled() {
-            bail!("copy disconnected before approval could be used");
-        }
-        let token = random_token()?;
-        sessions.insert(
-            token.clone(),
-            Session {
-                tcp: None,
-                authority: SessionAuthority::Send {
-                    authority,
-                    descriptors: Default::default(),
-                },
-                issued: Instant::now(),
-                opened: false,
-                channels: Arc::new(crate::private_broker::ConnectionRegistry::new(
-                    Duration::from_secs(10),
-                )),
-            },
-        );
-        drop(sessions);
-        write_message(
-            &mut stream,
-            &Reply::SendApproved(Box::new(SendApproved {
-                token,
-                base: request.base,
-                selections: request.selections,
-            })),
-        )
-    }
 }
 
 #[cfg(test)]

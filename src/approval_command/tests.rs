@@ -111,6 +111,76 @@ fn a_receiving_machine_approves_only_copies_to_its_own_name() {
     }
 }
 
+/// A copy to a receiving machine is checked there as its server checks it:
+/// shapes and options only a forged request carries are refused, with the
+/// messages the server gives them.
+#[test]
+fn a_receiving_machine_refuses_what_its_server_would() {
+    for (argv, message) in [
+        (
+            &[
+                "cp", "--from", "server", "results", "--to", "@laptop", "--into", "runs",
+            ][..],
+            "named destinations require syq cp with local sources",
+        ),
+        (
+            &[
+                "cp", "--src", "results", "--to", "@laptop", "--into", "runs", "--rsh", "ssh",
+            ],
+            "named destinations own their connection",
+        ),
+        (
+            &[
+                "cp",
+                "--src",
+                "results",
+                "--to",
+                "@laptop",
+                "--into",
+                "runs",
+                "--coordinate-at",
+                "src",
+            ],
+            "--coordinate-at currently applies only to copies between two remote endpoints",
+        ),
+        (
+            &[
+                "cp",
+                "--src",
+                "results",
+                "--to",
+                "@laptop",
+                "--into",
+                "runs",
+                "--follow-dst",
+                "--widen-dirs",
+                "all",
+            ],
+            "--widen-dirs all cannot be combined with --follow-dst",
+        ),
+        // The receiving machine's own message, as its rules give it.
+        (
+            &[
+                "cp",
+                "--src",
+                "results",
+                "--to",
+                "@laptop",
+                "--into",
+                "runs",
+                "--no-tcp-encryption",
+            ],
+            "copies to a receiving machine always encrypt their data",
+        ),
+    ] {
+        let error = receiving_command(&command(argv), "laptop").unwrap_err();
+        assert!(
+            format!("{error:#}").contains(message),
+            "{argv:?}: {error:#}"
+        );
+    }
+}
+
 #[test]
 fn server_files_supply_only_their_own_contents() {
     // Parsing on this machine must not read the server's files.
