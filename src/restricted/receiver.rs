@@ -930,7 +930,6 @@ fn verify_with<T>(
 
 /// Refuse a directive issued before this server recreated its record of the
 /// directives that ran: it may have run against the record that was lost.
-/// A refused copy that is signed again keeps the time it was first issued.
 /// Both times are in whole seconds, so one issued in the second the record
 /// was recreated may be from before it, and is refused too.
 pub(super) fn require_issued_since_record(

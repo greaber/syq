@@ -7,7 +7,6 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -200,7 +199,7 @@ fn read_inner(path: &Path) -> Result<Config> {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(path)
     };
-    let mut file = match open(path) {
+    let file = match open(path) {
         Ok(file) => file,
         // Keep the ordinary read to one open. A final symlink resolves once;
         // a dangling target is an error, never a missing/default preference.
@@ -215,21 +214,12 @@ fn read_inner(path: &Path) -> Result<Config> {
         }
         Err(error) => return Err(error).context("open authorization preferences"),
     };
-    let metadata = file.metadata()?;
-    anyhow::ensure!(
-        metadata.is_file()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o022 == 0,
-        "authorization preferences must be a regular file owned by this user and not writable by others"
-    );
-    let mut contents = Vec::new();
-    Read::by_ref(&mut file)
-        .take(MAX_CONFIG_BYTES + 1)
-        .read_to_end(&mut contents)?;
-    anyhow::ensure!(
-        contents.len() as u64 <= MAX_CONFIG_BYTES,
-        "authorization preferences are too large"
-    );
+    let contents = crate::state_file::read_open(
+        file,
+        &"authorization preferences",
+        MAX_CONFIG_BYTES as usize,
+        crate::state_file::FileRule::NoGroupOtherWrite,
+    )?;
     let config: Config =
         serde_json::from_slice(&contents).context("parse authorization preferences")?;
     config.validate()?;
@@ -289,21 +279,21 @@ pub(crate) fn apply_copy(args: &mut crate::cli::Args) -> Result<()> {
     if args.auth_from_explicit || args.s3.is_some() {
         return Ok(());
     }
-    let location = if let Some((location, _)) = crate::destination::account_copy::remote(args) {
-        Some(location)
-    } else if crate::destination::forward_target(args).is_ok() {
-        args.locations.last()
-    } else if crate::destination::pull::eligible_target(args).is_ok() {
-        args.locations.first()
-    } else if crate::destination::coordinated_targets(args).is_ok() {
-        // The same rule as for an upload above: a saved choice applies only
-        // to a copy the approved route can carry. With --rsh or another
-        // option it refuses, the server's own SSH runs the copy; an explicit
-        // --auth-from with such an option is refused instead.
-        args.auth_from = between_servers(args)?;
-        return Ok(());
-    } else {
-        return Ok(());
+    use crate::destination::{account_copy, forward_target, pull};
+    use crate::route::Route;
+    // A saved choice applies only to a copy that an account connection or
+    // the approved route can carry. With --rsh or another option they
+    // refuse, the server's own SSH runs the copy; an explicit --auth-from
+    // with such an option is refused instead.
+    let carried = account_copy::remote(args).is_some();
+    let location = match crate::route::classify(args) {
+        Route::Upload if carried || forward_target(args).is_ok() => args.locations.last(),
+        Route::Download if carried || pull::eligible_target(args).is_ok() => args.locations.first(),
+        Route::Between if crate::destination::coordinated_targets(args).is_ok() => {
+            args.auth_from = between_servers(args)?;
+            return Ok(());
+        }
+        _ => return Ok(()),
     };
     let host = location
         .and_then(|location| location.host.as_deref())
@@ -424,14 +414,18 @@ fn update_inner(
             config.hosts.remove(host);
         }
     }
-    let mut temporary = tempfile::NamedTempFile::new_in(&parent)?;
-    serde_json::to_writer_pretty(&mut temporary, &config)?;
-    temporary.write_all(b"\n")?;
-    temporary.as_file().sync_all()?;
-    temporary
-        .persist(&path)
-        .map_err(|error| error.error)
-        .context("write authorization preferences")?;
+    let mut bytes = serde_json::to_vec_pretty(&config)?;
+    bytes.push(b'\n');
+    crate::state_file::write_atomic_at(
+        lock.file(),
+        path.file_name()
+            .context("authorization configuration filename missing")?,
+        &bytes,
+        0o600,
+        crate::state_file::Publish::Replace,
+        crate::state_file::Durability::FileSynced,
+    )
+    .context("write authorization preferences")?;
     Ok(config)
 }
 
@@ -498,6 +492,7 @@ pub(crate) fn run(domain: &Domain, command: PreferenceCommand) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     #[test]
     fn provider_values_preserve_return_state_and_distinguish_native_hosts() {
         let returning = Provider::parse("@laptop").unwrap();

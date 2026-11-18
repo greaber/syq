@@ -634,35 +634,16 @@ pub(crate) fn coordinated_endpoints(args: &Args) -> Result<(&Location, &Location
         .split_last()
         .context("the command names no destination")?;
     let source = sources.first().context("the command names no source")?;
-    let plain = |location: &Location| {
-        location.is_remote()
-            && location
-                .host
-                .as_deref()
-                .is_some_and(|host| !host.starts_with('@'))
-    };
     ensure!(
-        plain(source) && plain(destination) && sources.iter().all(|s| s.same_host(source)),
+        crate::route::classify(args) == crate::route::Route::Between
+            && sources.iter().all(|s| s.same_host(source)),
         "a copy between two servers needs its sources on one SSH server and its destination on another"
     );
     ensure!(
         !source.same_host(destination),
         "the source and destination of a copy between two servers must be different accounts"
     );
-    ensure!(
-        args.rsh.is_none()
-            && args.syq_path.is_none()
-            && !args.no_bootstrap
-            && !args.detach
-            && !args.relay
-            && args.restricted_grant.is_none()
-            && args.peer_auth == crate::cli::PeerAuth::Restricted
-            && matches!(
-                args.coordinate_at,
-                crate::cli::CoordinateAt::Auto | crate::cli::CoordinateAt::Src
-            ),
-        "a copy between two servers approved by another machine runs on the source with the destination's restricted receiver; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --detach, --peer-auth or --coordinate-at local or dst"
-    );
+    crate::route::refuse_options(crate::route::Route::Between, args)?;
     // The approving machine never sees a mapping's contents, and on the
     // source a mapping chooses which files are read.
     ensure!(

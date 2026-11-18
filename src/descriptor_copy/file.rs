@@ -471,14 +471,11 @@ impl FileSession {
                     let base = match destination.source_meta.clone() {
                         Some(mut meta) => {
                             meta.mode = destination.mode;
-                            let times = if destination.metadata.restore_named_mtime {
-                                crate::proto::flags::TIMES
-                            } else {
-                                0
-                            };
                             Some((
                                 meta,
-                                crate::proto::flags::MODE | times | destination.metadata.preserve,
+                                crate::proto::flags::MODE
+                                    | crate::proto::flags::TIMES
+                                    | destination.metadata.preserve,
                             ))
                         }
                         None if destination.metadata.overrides.is_some() => {

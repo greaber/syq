@@ -126,7 +126,8 @@ pub(super) fn print_remote_control_diagnostics(spec: &RemoteSpec, args: &Args) {
             crate::output::diagnostic!("  ssh client: {version}");
         }
         let helper_mode = remote_helper_mode(spec, args.interface);
-        crate::output::diagnostic!("  helper: {} ({helper_mode})", peer.identity);
+        // The wire preamble already required the helper's build to match ours.
+        crate::output::diagnostic!("  helper: {} ({helper_mode})", crate::identity::build());
     }
 }
 

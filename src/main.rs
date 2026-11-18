@@ -64,6 +64,7 @@ mod resume;
 mod rm;
 #[cfg_attr(all(target_os = "macos", not(test)), deny(clippy::disallowed_methods))]
 mod rooted;
+mod route;
 mod s3;
 mod scan;
 mod sched;
@@ -71,6 +72,7 @@ mod sched;
 mod server;
 mod session_pool;
 mod sparse;
+mod state_file;
 mod stream_mapping;
 mod streaming;
 #[cfg_attr(all(target_os = "macos", not(test)), deny(clippy::disallowed_methods))]
@@ -491,7 +493,8 @@ fn run() {
     }
     // A coordinator for a copy between two servers that this syq's build
     // started reports a destination's receiver of another build by its
-    // status, so that the syq that started it can update the receiver.
+    // status, so that the syq that started it can mark its record of the
+    // enrollment out of date and the next copy updates the receiver.
     let reports_other_build = args.delegated
         && std::env::var_os(remote_to_remote::REPORT_OTHER_BUILD).is_some_and(|value| value == "1");
     let result = if args.stream_mapping_fd.is_some() {

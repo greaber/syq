@@ -23,6 +23,7 @@ pub(crate) mod stream;
 mod transfer;
 mod tuning;
 mod upload_http;
+mod upload_send;
 mod writer;
 
 use anyhow::{bail, Context, Result};

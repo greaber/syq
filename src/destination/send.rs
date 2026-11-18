@@ -34,7 +34,11 @@ pub(crate) fn source_name(args: &crate::cli::Args) -> Option<&str> {
 /// that its endpoints can be one. Parsing checks this, so a receiving name
 /// never reaches ssh.
 pub(crate) fn check_endpoints(args: &crate::cli::Args) -> Result<String> {
-    let name = source_name(args).context("copy source is not a receiving machine")?;
+    anyhow::ensure!(
+        crate::route::classify(args) == crate::route::Route::FromNamed,
+        "copy source is not a receiving machine"
+    );
+    let name = source_name(args).expect("a source on a receiving machine");
     let (destination, sources) = args
         .locations
         .split_last()
@@ -62,16 +66,7 @@ pub(crate) fn check_endpoints(args: &crate::cli::Args) -> Result<String> {
 /// that the copy can be one.
 pub(crate) fn eligible(args: &crate::cli::Args) -> Result<String> {
     let name = check_endpoints(args)?;
-    if args.rsh.is_some()
-        || args.syq_path.is_some()
-        || args.detach
-        || args.restricted_grant.is_some()
-        || args.no_tcp_encryption
-        || args.peer_auth != crate::cli::PeerAuth::Restricted
-        || args.coordinate_at != crate::cli::CoordinateAt::Auto
-    {
-        bail!("copies from receiving machines own their connection; --rsh, --syq-path, --detach, --peer-auth, --coordinate-at, and --no-tcp-encryption cannot be combined with them");
-    }
+    crate::route::refuse_options(crate::route::Route::FromNamed, args)?;
     anyhow::ensure!(
         args.descriptor_copy.is_none(),
         "copies from receiving machines take named files; --src-fd and --as-fd are not supported with them"
@@ -106,7 +101,8 @@ fn sending_command(command: &[Vec<u8>], name: &str) -> Result<crate::cli::Args> 
 
 pub(super) fn select(args: &crate::cli::Args) -> Result<Option<handoff::Selection>> {
     // A copy already approved has its route.
-    if source_name(args).is_none() || args.named_source.is_some() {
+    if crate::route::classify(args) != crate::route::Route::FromNamed || args.named_source.is_some()
+    {
         return Ok(None);
     }
     let name = check_endpoints(args)?;
@@ -512,7 +508,6 @@ mod tests {
                 stream,
             };
             let hello = channel.call(crate::proto::Request::Hello {
-                identity: crate::identity::build().into(),
                 compress: false,
                 debug: false,
                 token: Vec::new(),
@@ -592,7 +587,6 @@ mod tests {
             base: base.clone(),
             selections,
             symlink_policy,
-            allow_unconfined_paths: false,
             shared_workers: 1,
             independent_handoff_workers: 0,
         };
@@ -688,7 +682,6 @@ mod tests {
             base,
             selections,
             symlink_policy,
-            allow_unconfined_paths: false,
             shared_workers: 1,
             independent_handoff_workers: 0,
         })? {
@@ -1406,11 +1399,8 @@ mod tests {
 
         // What the approved command registers, and what other commands
         // would register in its place.
-        let register =
-            |base: &SourceRootBase,
-             selections: &[(&[u8], bool)],
-             symlink_policy,
-             allow_unconfined_paths| Request::RegisterSourceRoots {
+        let register = |base: &SourceRootBase, selections: &[(&[u8], bool)], symlink_policy| {
+            Request::RegisterSourceRoots {
                 base: base.clone(),
                 selections: selections
                     .iter()
@@ -1420,10 +1410,10 @@ mod tests {
                     })
                     .collect(),
                 symlink_policy,
-                allow_unconfined_paths,
                 shared_workers: 1,
                 independent_handoff_workers: 0,
-            };
+            }
+        };
         let (base, refuse) = (&approved.base, OperatorSymlinkPolicy::Refuse);
         let private = SourceRootBase {
             path: Some(root.join("private").as_os_str().as_bytes().to_vec()),
@@ -1439,37 +1429,23 @@ mod tests {
         for (other, request) in [
             (
                 "another file",
-                register(base, &[(b"secret", false)], refuse, false),
+                register(base, &[(b"secret", false)], refuse),
             ),
             (
                 "another source too",
-                register(
-                    base,
-                    &[(b"notes", false), (b"secret", false)],
-                    refuse,
-                    false,
-                ),
+                register(base, &[(b"notes", false), (b"secret", false)], refuse),
             ),
             (
                 "another --root",
-                register(&private, &[(b"token", false)], refuse, false),
+                register(&private, &[(b"token", false)], refuse),
             ),
             (
                 "an unconfined base",
-                register(&unconfined, &[(b"notes", false)], refuse, false),
+                register(&unconfined, &[(b"notes", false)], refuse),
             ),
             (
                 "--follow-src",
-                register(
-                    base,
-                    &[(b"notes", true)],
-                    OperatorSymlinkPolicy::FollowAll,
-                    false,
-                ),
-            ),
-            (
-                "unconfined paths",
-                register(base, &[(b"notes", false)], refuse, true),
+                register(base, &[(b"notes", true)], OperatorSymlinkPolicy::FollowAll),
             ),
         ] {
             match control.call(request).unwrap() {
@@ -1479,7 +1455,7 @@ mod tests {
                 response => panic!("{other} was registered: {response:?}"),
             }
         }
-        let approved_registration = register(base, &[(b"notes", false)], refuse, false);
+        let approved_registration = register(base, &[(b"notes", false)], refuse);
         let roots = match control.call(approved_registration).unwrap() {
             Response::SourceRootsRegistered(roots) => roots,
             other => panic!("registration failed: {other:?}"),

@@ -354,8 +354,7 @@ pub enum TargetCondition {
 pub struct SmallRead {
     pub path: PathBytes,
     /// Authoritative source capability. `path` is only a diagnostic/legacy
-    /// spelling when this is present; omission is reserved for the explicit
-    /// rsync `--insecure-links` compatibility path.
+    /// spelling when this is present.
     pub source: Option<RegisteredPath>,
     pub attempt: u32,
     pub len: u32,
@@ -766,9 +765,6 @@ pub struct RegisteredSourceRoot {
     /// Present only for an exact leaf. Workers retain `leaf_ticket` when
     /// available; an unpinned FIFO has identity checks but no inode-reuse guard.
     pub expected_leaf: Option<SourceLeafIdentity>,
-    /// Permit this explicitly opted-in rsync session to use legacy unconfined
-    /// source pathnames for `--insecure-links` compatibility.
-    pub allow_unconfined_paths: bool,
     /// A selected directory's permission bits when it was registered, so a
     /// coordinator that creates a destination for its contents needs no
     /// lookup of its own. None for an exact leaf.
@@ -900,8 +896,7 @@ pub enum ConnectionRole {
     Control,
     /// A data connection reserved for reading a source endpoint. Discovery
     /// metadata, block/file hashes, and range/small reads are confined to the
-    /// registered roots unless the registration explicitly permits the rsync
-    /// `--insecure-links` compatibility path.
+    /// registered roots.
     SourceWorker {
         /// Every registered parent and exact-object descriptor is acquired
         /// before HelloOk. Local and same-process TCP workers clone in process;
@@ -944,7 +939,6 @@ pub type Request = WireRequest<Payload>;
 ))]
 pub enum WireRequest<Data> {
     Hello {
-        identity: String,
         compress: bool,
         debug: bool,
         token: Vec<u8>,
@@ -967,8 +961,8 @@ pub enum WireRequest<Data> {
     /// `report_ignored`: also send the paths the patterns pruned (ScanIgnored).
     Scan {
         root: PathBytes,
-        /// Authoritative registered source reference. Its parallel `root`
-        /// spelling is used only by the explicit `--insecure-links` opt-out.
+        /// Authoritative registered source reference. Without one, `root` is
+        /// beneath the session's destination root.
         source: Option<RegisteredPath>,
         follow_root: bool,
         ignore: Vec<String>,
@@ -1001,7 +995,7 @@ pub enum WireRequest<Data> {
     StatMany {
         paths: Vec<PathBytes>,
         /// Authoritative registered source references. Parallel `paths` are
-        /// used only outside a source session or by `--insecure-links`.
+        /// used only outside a source session.
         sources: Option<Vec<RegisteredPath>>,
         follow: bool,
     },
@@ -1029,9 +1023,6 @@ pub enum WireRequest<Data> {
         base: SourceRootBase,
         selections: Vec<SourceRootSelection>,
         symlink_policy: OperatorSymlinkPolicy,
-        /// Explicit rsync compatibility opt-out. It permits legacy unconfined
-        /// source discovery only for the session created by this registration.
-        allow_unconfined_paths: bool,
         /// Fixed source workers that can share the control helper process.
         /// Automatic copies pass zero: estimate only the registry and control
         /// session, not speculative future workers. This reserves no handles.
@@ -1065,21 +1056,13 @@ pub enum WireRequest<Data> {
         check_empty: bool,
         target: Option<DestinationFilesystemTarget>,
     },
-    /// Compute receiver-side sidecar names for collision preflight. The opaque
-    /// suffix also reserves shortened spellings after a filename-limit retry.
-    PartialPaths {
-        paths: Vec<PathBytes>,
-        copy_id: CopyId,
-    },
     Apply {
         ops: Vec<Op>,
     },
-    /// Resolve sidecar names and inspect an existing destination batch in one
-    /// turn. Leaf stats are returned only when every directory is still a
-    /// directory, so callers can preserve parent-before-child replacement.
+    /// Inspect an existing destination batch in one turn. Leaf stats are
+    /// returned only when every directory is still a directory, so callers
+    /// can preserve parent-before-child replacement.
     PlanBatch {
-        partial_paths: Vec<PathBytes>,
-        copy_id: CopyId,
         directories: Vec<PathBytes>,
         others: Vec<PathBytes>,
         /// Fail on unreadable entries instead of treating them as absent.
@@ -1682,7 +1665,6 @@ impl Request {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Response {
     HelloOk {
-        identity: String,
         descriptors: Option<crate::resources::Descriptors>,
         platform: String,
         supports_confined_socket_nodes: bool,
@@ -1701,9 +1683,6 @@ pub enum Response {
     /// failures, for which the coordinator may safely fall back to SSH.
     TcpCongestionRejected(String),
     ScanBatch(Vec<Entry>),
-    /// No longer sent; ScanWarnAt replaced it. Kept so later responses keep
-    /// their wire numbers.
-    ScanWarn(String),
     /// Paths (relative to the root) skipped because the ignore patterns matched them.
     ScanIgnored(Vec<PathBytes>),
     ScanDone,
@@ -1723,9 +1702,7 @@ pub enum Response {
     DestinationRegistered(DescriptorTicket),
     SourceRootsRegistered(Vec<RegisteredSourceRoot>),
     DestinationFilesystemInfo(DestinationFilesystemInfo),
-    PathResults(Vec<std::result::Result<PathBytes, String>>),
     BatchPlan {
-        partial_paths: Vec<std::result::Result<PathBytes, String>>,
         directories: Vec<Option<Entry>>,
         /// None means a directory was missing or a non-directory, so the
         /// caller must apply directory changes before inspecting leaves.
@@ -1834,8 +1811,7 @@ pub enum Response {
     },
     /// Reply to ReceiverUser: the receiving process's effective user ID.
     ReceiverUser(u32),
-    /// A scan warning with its path. Replaces ScanWarn, which carried only
-    /// text.
+    /// A scan warning with its path.
     ScanWarnAt(ScanWarning),
     /// Reply to NewFileOwner.
     NewFileOwner(NewFileOwner),
@@ -2157,18 +2133,13 @@ impl SizeHint for Request {
             Request::StatMany { paths, .. } | Request::PruneLookup { paths, .. } => {
                 paths.iter().map(|p| p.len() + 8).sum::<usize>() + 16
             }
-            Request::PartialPaths { paths, .. } => {
-                paths.iter().map(|path| path.len() + 8).sum::<usize>() + 32
-            }
             Request::PlanBatch {
-                partial_paths,
                 directories,
                 others,
                 ..
             } => {
-                partial_paths
+                directories
                     .iter()
-                    .chain(directories)
                     .chain(others)
                     .map(|path| path.len() + 8)
                     .sum::<usize>()
@@ -2299,15 +2270,9 @@ impl SizeHint for Response {
                     + 16
             }
             Response::BatchPlan {
-                partial_paths,
                 directories,
                 others,
-            } => {
-                partial_paths.len() * 96
-                    + directories.len() * 96
-                    + others.as_ref().map_or(0, |items| items.len() * 96)
-                    + 32
-            }
+            } => directories.len() * 96 + others.as_ref().map_or(0, |items| items.len() * 96) + 32,
             Response::Hashes(v) | Response::HeldHashes { hashes: v, .. } => v.len() * 32 + 24,
             Response::SeededBasis(seed) => seed.hashes.len() * 32 + 24,
             Response::DestinationResults(v) => v.len() + 16,
@@ -2376,13 +2341,6 @@ impl<W: Write> FrameWriter<W> {
         self.w.into_inner().map_err(|error| error.into_error())
     }
 
-    fn compressor() -> crate::compression::Compressor {
-        // SYQ_HELPER_RELEASE=v0.6.0 explicitly selects released helpers. Their
-        // codec byte only accepts raw and Zstd; preserve that concrete case.
-        // Other peers must match our exact build before reading any frame.
-        crate::compression::Compressor::new(crate::identity::build() == "v0.6.0")
-    }
-
     pub fn new(w: W, compress: bool) -> Self {
         Self::with_admission(w, compress, Vec::new())
     }
@@ -2395,7 +2353,7 @@ impl<W: Write> FrameWriter<W> {
             compress,
             preamble_written: false,
             admission,
-            compression: Self::compressor(),
+            compression: crate::compression::Compressor::new(),
         }
     }
 
@@ -2407,7 +2365,7 @@ impl<W: Write> FrameWriter<W> {
             compress,
             preamble_written: true,
             admission: Vec::new(),
-            compression: Self::compressor(),
+            compression: crate::compression::Compressor::new(),
         }
     }
 
@@ -2828,7 +2786,7 @@ mod tests;
 mod completion_compat_tests {
     use super::*;
     #[test]
-    fn released_v032_completion_messages_keep_their_wire_encoding() {
+    fn released_v032_completion_request_keeps_its_wire_encoding() {
         // Generated with unchanged src/proto.rs from tag v0.3.2. Do not regenerate
         // these when editing the current writer or reader.
         let bytes = include_bytes!("../tests/fixtures/completion/list-dir-v0.3.2.bin");
@@ -2837,11 +2795,5 @@ mod completion_compat_tests {
             matches!(&request, Request::ListDir { directory, prefix, limit: 1000, symlink_policy: OperatorSymlinkPolicy::Refuse, confined_root: None } if directory == b"/data" && prefix == b"al")
         );
         assert_eq!(postcard::to_stdvec(&request).unwrap(), bytes);
-        let bytes = include_bytes!("../tests/fixtures/completion/directory-entries-v0.3.2.bin");
-        let response: Response = postcard::from_bytes(bytes).unwrap();
-        assert!(
-            matches!(&response, Response::DirectoryEntries { entries, truncated: false } if entries.len() == 1 && entries[0].name == b"alpha" && !entries[0].directory)
-        );
-        assert_eq!(postcard::to_stdvec(&response).unwrap(), bytes);
     }
 }

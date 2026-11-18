@@ -1,8 +1,9 @@
 //! Publishing a file without waiting for its round trips.
 //!
-//! A file written in ranges is published in two steps once its last write is
-//! acknowledged: the source is checked again (a stat after its last read),
-//! and only if it is unchanged does the destination publish it (`Finalize`).
+//! A file whose contents are complete at the destination is published in two
+//! steps: the source is checked again (a stat after its last read), and only
+//! if it is unchanged does the destination publish it (`Finalize`). A file
+//! the destination already matched needs only the first.
 //! Each step is a round trip. Rather than wait for them, a worker sends the
 //! step's request and starts its next file; its next requests travel behind
 //! it on the same connection, so their round trips overlap. The worker
@@ -66,11 +67,11 @@ fn source_recheck_reply(response: Response) -> Result<Option<Entry>> {
 
 impl Worker {
     /// Publish the file at `idx`, whose contents are complete at the
-    /// destination, without waiting for the round trips: as
-    /// `finish_file` does, or, when `matched`, as `finish_matched_file`
-    /// does. A failure of this file is reported here; an error returned
-    /// means this worker's connection failed, and the file is queued to be
-    /// published again.
+    /// destination, without waiting for the round trips: check its source
+    /// again and, unless `matched` (its contents and metadata are already
+    /// in place), `Finalize` it. A failure of this file is reported here;
+    /// an error returned means this worker's connection failed, and the
+    /// file is queued to be published again.
     pub(super) fn publish(&mut self, idx: usize, matched: bool) -> Result<()> {
         let room = self.settle_publications(false).and_then(|()| {
             while self.publications.len() >= DEFERRED_PUBLICATIONS {

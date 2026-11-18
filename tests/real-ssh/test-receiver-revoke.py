@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Revoke two active restricted copies in the disposable OpenSSH lab."""
+import functools
 import hashlib
 import json
+import operator
 import os
 from pathlib import Path
 import shlex
@@ -9,8 +11,9 @@ import signal
 import subprocess
 import sys
 import tempfile
-import time
 import uuid
+
+import syq_real_ssh_lab as lab
 
 
 def run(*args, **kwargs):
@@ -29,19 +32,8 @@ def enrollment():
     return matches[0]
 
 
-def wait_for(label, probe, seconds=25):
-    deadline = time.monotonic() + seconds
-    progress = 0
-    last = None
-    while time.monotonic() < deadline:
-        done, last = probe()
-        if done:
-            return last
-        if time.monotonic() >= progress:
-            print(f"Waiting for {label}: {last}", flush=True)
-            progress = time.monotonic() + 2
-        time.sleep(.1)
-    raise AssertionError(f"{label} timed out; last state: {last}")
+# Each probe returns (done, last observed state).
+wait_for = functools.partial(lab.wait_for, timeout=25, done=operator.itemgetter(0))
 
 
 def stop(process):

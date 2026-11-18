@@ -2,6 +2,7 @@
 """Exercise complete release assembly and Ed25519 signing with small stand-in
 binaries. Optionally reuse a candidate already built by the caller:
 tests/tooling/test-release-tools.py --syq /absolute/path/to/syq
+or through SYQ_RELEASE_TOOLS_SYQ, which passes through scripts/run-tooling-tests.py.
 """
 from support import SCRIPTS
 
@@ -412,10 +413,13 @@ def main():
             print("usage: tests/tooling/test-release-tools.py [--syq PATH]", file=sys.stderr)
             sys.exit(2)
         CANONICALIZER = arguments[1]
-        if not os.path.isfile(CANONICALIZER) or not os.access(CANONICALIZER, os.X_OK):
-            print(f"missing executable syq canonicalizer: {CANONICALIZER}", file=sys.stderr)
-            sys.exit(1)
         del sys.argv[1:3]
+    else:
+        CANONICALIZER = os.environ.get("SYQ_RELEASE_TOOLS_SYQ") or None
+    if CANONICALIZER is not None and (not os.path.isfile(CANONICALIZER)
+                                      or not os.access(CANONICALIZER, os.X_OK)):
+        print(f"missing executable syq canonicalizer: {CANONICALIZER}", file=sys.stderr)
+        sys.exit(1)
     require_ed25519_openssl()
     if CANONICALIZER is None:
         manifest = str(REPOSITORY / "Cargo.toml")

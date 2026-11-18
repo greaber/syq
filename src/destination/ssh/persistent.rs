@@ -12,7 +12,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -74,56 +74,43 @@ fn ensure_master_parent(domain: &Domain) -> Result<PathBuf> {
 pub(super) fn directory(domain: &Domain) -> Result<PathBuf> {
     ensure_master_parent(domain)?;
     let path = domain.approved_index_path();
-    match fs::DirBuilder::new().mode(0o700).create(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
-    }
-    existing_directory(domain)?.context("SSH authority directory disappeared")
+    crate::state_file::open_private_dir(
+        &path,
+        "SSH authority index",
+        true,
+        crate::state_file::DirRule::NoGroupOther,
+    )?;
+    Ok(path)
 }
 pub(super) fn existing_directory(domain: &Domain) -> Result<Option<PathBuf>> {
     let path = domain.approved_index_path();
-    let metadata = match path.symlink_metadata() {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    if !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o077 != 0
-    {
-        bail!("SSH authority index must be an owner-only directory");
-    }
-    Ok(Some(path))
+    Ok(crate::state_file::open_private_dir(
+        &path,
+        "SSH authority index",
+        false,
+        crate::state_file::DirRule::NoGroupOther,
+    )?
+    .map(|_| path))
 }
 // Separate from ordinary persistence: account authorization follows its return
 // connection even when global persistence/automatic receiving is disabled.
 fn read_generation(path: &Path) -> Result<Option<String>> {
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+    let Some(generation) = crate::state_file::read_private(
+        path,
+        "SSH account generation",
+        64,
+        crate::state_file::FileRule::NoGroupOther,
+    )?
+    else {
+        return Ok(None);
     };
-    let metadata = file.metadata()?;
     anyhow::ensure!(
-        metadata.is_file()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o077 == 0
-            && metadata.len() == 64,
-        "SSH account generation must be a bounded owner-only file"
-    );
-    use std::io::Read as _;
-    let mut generation = String::new();
-    file.take(65).read_to_string(&mut generation)?;
-    anyhow::ensure!(
-        generation.len() == 64 && generation.bytes().all(|b| b.is_ascii_hexdigit()),
+        generation.len() == 64 && generation.iter().all(u8::is_ascii_hexdigit),
         "invalid SSH account generation"
     );
-    Ok(Some(generation))
+    Ok(Some(
+        String::from_utf8(generation).expect("hexadecimal digits are UTF-8"),
+    ))
 }
 fn generation_path(domain: &Domain) -> PathBuf {
     domain.approved_index_path().join(GENERATION)
@@ -139,14 +126,16 @@ fn ensure_generation_at(directory: &Path) -> Result<String> {
     let mut random = [0u8; 32];
     getrandom::fill(&mut random)?;
     let generation = blake3::hash(&random).to_hex().to_string();
-    let mut file = tempfile::NamedTempFile::new_in(directory)?;
-    file.write_all(generation.as_bytes())?;
-    match file.persist_noclobber(&path) {
-        Ok(_) => Ok(generation),
-        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-            read_generation(&path)?.context("SSH account generation changed during startup; retry")
-        }
-        Err(error) => Err(error.error.into()),
+    if crate::state_file::write_atomic(
+        &path,
+        generation.as_bytes(),
+        0o600,
+        crate::state_file::Publish::NoClobber,
+        crate::state_file::Durability::RenameOnly,
+    )? {
+        Ok(generation)
+    } else {
+        read_generation(&path)?.context("SSH account generation changed during startup; retry")
     }
 }
 pub(super) fn generation_open(domain: &Domain, generation: &str) -> Result<bool> {
@@ -186,24 +175,16 @@ fn read_record(path: &Path) -> Result<Option<Record>> {
     })
 }
 fn read_record_inner(path: &Path) -> Result<Option<Record>> {
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+    let Some(record) = crate::state_file::read_private(
+        path,
+        "SSH authority record",
+        16384,
+        crate::state_file::FileRule::NoGroupOther,
+    )?
+    else {
+        return Ok(None);
     };
-    let metadata = file.metadata()?;
-    if !metadata.is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o077 != 0
-        || metadata.len() > 16384
-    {
-        bail!("SSH authority record must be a bounded owner-only file");
-    }
-    let record: Record = serde_json::from_reader(file)?;
+    let record: Record = serde_json::from_slice(&record)?;
     record.authorizer.validate()?;
     if record.version != provider_state_version(&record.authorizer) {
         bail!("unsupported SSH authority record; reconnect with syq persist connect");
@@ -315,19 +296,15 @@ fn peer_path(record: &Record) -> std::path::PathBuf {
 }
 
 fn read_peer(record: &Record) -> Result<super::super::ssh_auth::Peer> {
-    let file = OpenOptions::new().read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(peer_path(record))
+    let file = crate::state_file::open_private(&peer_path(record))
         .context("approved account has no pinned peer metadata; reconnect with syq persist connect ENDPOINT --auth-from @NAME")?;
-    let metadata = file.metadata()?;
-    anyhow::ensure!(
-        metadata.is_file()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o077 == 0
-            && metadata.len() <= 128 * 1024,
-        "approved SSH peer metadata must be a bounded owner-only file"
-    );
-    let peer: super::super::ssh_auth::Peer = serde_json::from_reader(file)?;
+    let peer = crate::state_file::read_open(
+        file,
+        &"approved SSH peer metadata",
+        128 * 1024,
+        crate::state_file::FileRule::NoGroupOther,
+    )?;
+    let peer: super::super::ssh_auth::Peer = serde_json::from_slice(&peer)?;
     peer.validate_endpoint(&record.endpoint)?;
     Ok(peer)
 }
@@ -1072,11 +1049,15 @@ fn path_of(index: &Option<Index>) -> PathBuf {
 }
 /// Write `record` at `path` in one step.
 fn write_record(path: &Path, record: &Record) -> Result<()> {
-    let mut temporary =
-        tempfile::NamedTempFile::new_in(path.parent().context("record has no directory")?)?;
-    serde_json::to_writer(&mut temporary, record)?;
-    temporary.write_all(b"\n")?;
-    temporary.persist(path)?;
+    let mut bytes = serde_json::to_vec(record)?;
+    bytes.push(b'\n');
+    crate::state_file::write_atomic(
+        path,
+        &bytes,
+        0o600,
+        crate::state_file::Publish::Replace,
+        crate::state_file::Durability::RenameOnly,
+    )?;
     Ok(())
 }
 impl Drop for Index {
@@ -1308,18 +1289,16 @@ fn keeper(startup: Startup) -> Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(peer_path(&record))?;
-    serde_json::to_writer(&mut peer_file, session.peer())?;
-    peer_file.write_all(b"\n")?;
+    let mut peer = serde_json::to_vec(session.peer())?;
+    peer.push(b'\n');
+    peer_file.write_all(&peer)?;
     let mut generation_file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(record.control.with_extension("generation"))?;
     generation_file.write_all(startup.generation.as_bytes())?;
-    let mut temporary = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
-    serde_json::to_writer(&mut temporary, &record)?;
-    temporary.write_all(b"\n")?;
-    temporary.persist(&path)?;
+    write_record(&path, &record)?;
     let index = Index(path);
     super::super::write_message(
         &mut std::io::stdout().lock(),

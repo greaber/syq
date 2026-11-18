@@ -1,6 +1,7 @@
 """Command-policy checks; no credentials, network or benchmark binaries needed."""
 import importlib.util
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 
@@ -38,6 +39,14 @@ class TransferSettings(unittest.TestCase):
         self.assertEqual(benchmark.transfer_tuning_mode(args), 'shared-overrides')
         self.assertEqual(benchmark.transfer_tuning(args), 's3-objects=16')
         self.assertEqual(benchmark.s5cmd_transfer_flags(args), ['--numworkers', '16', 'cp'])
+
+
+class WorkloadFiles(unittest.TestCase):
+    def test_file_size_is_exact_when_not_a_multiple_of_the_block(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / 'large.bin'
+            benchmark.write_repeated(path, b'0123456789', 25)
+            self.assertEqual(path.read_bytes(), b'0123456789' * 2 + b'01234')
 
 
 if __name__ == '__main__':

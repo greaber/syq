@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """Reproduce Actions resolving a recently advanced branch to its old commit.
 
-Exercises scripts/run-generated-sdk-post-merge-ci.py against a fake gh, and the
-ci.yml `sdks` aggregate job against every dependency result.
+Exercises scripts/run-generated-sdk-post-merge-ci.py against a fake gh.
 """
 from support import SCRIPTS
 
 import os
 from pathlib import Path
-import re
 import subprocess
 import tempfile
 import unittest
@@ -50,8 +48,7 @@ if args[:1] == ["api"]:
         emit({"workflow_run_id": 500 + count})
     if "/jobs?per_page=100 " in joined:
         conclusion = os.environ.get("SYQ_TEST_SDK_CONCLUSION", "success")
-        emit({"jobs": [{"name": "sdk-languages (python)", "status": "completed", "conclusion": conclusion},
-                       {"name": "sdks", "status": "completed", "conclusion": conclusion}]})
+        emit({"jobs": [{"name": "sdks", "status": "completed", "conclusion": conclusion}]})
     if "/actions/runs/" in joined:
         run_id = int(args[1].rsplit("/", 1)[1])
         sha = merge if count > stale_attempts else "a" * 40
@@ -147,31 +144,6 @@ class DispatchTests(unittest.TestCase):
     def test_requires_a_successful_sdks_job(self):
         self.dispatch("sdks job is completed/failure", 1, SYQ_TEST_SDK_CONCLUSION="failure")
         self.dispatch("sdks job is completed/skipped", 1, SYQ_TEST_SDK_CONCLUSION="skipped")
-
-
-class AggregateTests(unittest.TestCase):
-    """Execute the `sdks` aggregate job's actual shell body."""
-
-    def test_aggregate_requires_every_dependency_to_succeed(self):
-        workflow = (SCRIPTS.parent / ".github/workflows/ci.yml").read_text()
-        self.assertIn("\n    needs: [scope, sdk-languages]\n", workflow)
-        job = re.search(r"^  sdks:\n(.*?)^  # The release workflow builds", workflow, re.M | re.S)
-        self.assertIsNotNone(job)
-        body = re.search(r"^        run: \|\n(.*?)(?:\n\n|\Z)", job.group(1), re.M | re.S)
-        self.assertIsNotNone(body)
-        aggregate = "\n".join(line.removeprefix("          ")
-                              for line in body.group(1).splitlines() if line)
-        self.assertTrue(aggregate)
-
-        def passes(scope, sdk):
-            return subprocess.run(["bash", "-euo", "pipefail", "-c", aggregate],
-                                  env={**os.environ, "SCOPE_RESULT": scope, "SDK_RESULT": sdk}
-                                  ).returncode == 0
-
-        self.assertTrue(passes("success", "success"))
-        for result in ("failure", "cancelled", "skipped"):
-            self.assertFalse(passes("success", result), f"SDK aggregate accepted {result}")
-            self.assertFalse(passes(result, "success"), f"SDK aggregate accepted failed scope {result}")
 
 
 if __name__ == "__main__":

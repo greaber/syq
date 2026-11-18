@@ -13,7 +13,9 @@ machine holding its 16 leaves copies from another working. A copy's workers
 refused that way start again without the wait of a failed worker, and
 revoking works while refused connections keep arriving.
 """
+import functools
 import json
+import operator
 import os
 from pathlib import Path
 import shlex
@@ -22,6 +24,8 @@ import subprocess
 import tempfile
 import threading
 import time
+
+import syq_real_ssh_lab as lab
 
 PROVIDER = '/usr/local/lib/syq-test-sk.so'
 SOURCE_FILE = '/tmp/syq-real-ssh-key-source'
@@ -77,19 +81,8 @@ def remote_text(command):
     return remote(command, stdout=subprocess.PIPE).stdout.decode()
 
 
-def wait_for(label, probe, seconds=30):
-    deadline = time.monotonic() + seconds
-    progress = 0
-    last = None
-    while time.monotonic() < deadline:
-        done, last = probe()
-        if done:
-            return last
-        if time.monotonic() >= progress:
-            print(f'Waiting for {label}: {last}', flush=True)
-            progress = time.monotonic() + 2
-        time.sleep(.1)
-    raise AssertionError(f'{label} timed out; last state: {last}')
+# Each probe returns (done, last observed state).
+wait_for = functools.partial(lab.wait_for, timeout=30, done=operator.itemgetter(0))
 
 
 def enrollment():
@@ -581,7 +574,7 @@ def session_slots(parent):
                                                  start_new_session=True)
                                 for _ in range(8)]
                     wait_for('sessions to take slots', lambda: (
-                        count() >= baseline[0] + len(holders), count()), seconds=8)
+                        count() >= baseline[0] + len(holders), count()), timeout=8)
         except BaseException:
             release(holders)
             raise
@@ -596,7 +589,7 @@ def session_slots(parent):
             except ProcessLookupError:
                 pass
             holder.wait()
-        wait_for('released sessions to end', lambda: (count() <= baseline[0], count()), seconds=8)
+        wait_for('released sessions to end', lambda: (count() <= baseline[0], count()), timeout=8)
 
     def refused_at_once(command, expected):
         started = time.monotonic()

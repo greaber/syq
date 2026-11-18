@@ -239,7 +239,6 @@ mod tests {
     ) -> Result<(FrameReader<std::io::PipeReader>, FrameWriter<W>)> {
         let mut writer = FrameWriter::new(input, false);
         writer.write_msg(&Request::Hello {
-            identity: crate::identity::build().into(),
             compress: false,
             debug: false,
             token: Vec::new(),
@@ -416,6 +415,7 @@ mod tests {
                 // child before the cleanup has run.
                 .env("SYQ_TEST_TERMINATION_CAP_MS", "10000");
             let output = crate::process::capture_output_bounded(
+                "test subprocess",
                 &mut command,
                 Instant::now() + Duration::from_secs(20),
                 &|| false,

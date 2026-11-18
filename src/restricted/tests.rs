@@ -274,7 +274,6 @@ fn released_enrollment_state_is_never_read_or_touched() {
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
         refresh: false,
         replaces: None,
-        keep_used: false,
     };
     let InstallResponse::Installed { generation, .. } =
         install_for_account(&request, &account, home).unwrap()
@@ -377,7 +376,6 @@ fn install_request(
         signer: delegation::TrustedSigner::new(login.public_key(), None, None).unwrap(),
         refresh,
         replaces: None,
-        keep_used: false,
     }
 }
 
@@ -583,20 +581,6 @@ fn an_unusable_record_of_used_grants_is_recreated_under_a_new_generation() {
     assert_eq!(config(home).record_since, None);
     let replay = enrollment_state(home, id).join("replay");
     fs::remove_dir(&replay).unwrap();
-    // A refresh for a refused copy that is signed again under the same
-    // request keeps the record or fails, changing nothing.
-    let mut keeping = install_request(&account, id, &entry, &login, true);
-    keeping.keep_used = true;
-    let reason = refused(install_for_account(&keeping, &account, home).unwrap());
-    assert!(reason.contains("is unusable"), "{reason}");
-    assert!(!replay.exists());
-    let generation = |home: &Path| {
-        read_receiver_config(&enrollment_state(home, id))
-            .unwrap()
-            .unwrap()
-            .generation
-    };
-    assert_eq!(generation(home), 1);
     let refresh = install_request(&account, id, &entry, &login, true);
     let before = crate::directive::now().unwrap();
     assert_eq!(
@@ -604,8 +588,7 @@ fn an_unusable_record_of_used_grants_is_recreated_under_a_new_generation() {
         (2, true)
     );
     assert!(replay.is_dir());
-    // Receivers refuse directives issued before the record was recreated,
-    // such as a refused copy signed again after the first ran.
+    // Receivers refuse directives issued before the record was recreated.
     let since = config(home).record_since.unwrap();
     assert!((before..=crate::directive::now().unwrap()).contains(&since));
     assert_eq!(fs::metadata(&replay).unwrap().mode() & 0o777, 0o700);
@@ -614,10 +597,6 @@ fn an_unusable_record_of_used_grants_is_recreated_under_a_new_generation() {
     // With the record in place, a refresh changes nothing.
     assert_eq!(
         installed(install_for_account(&refresh, &account, home).unwrap()),
-        (2, false)
-    );
-    assert_eq!(
-        installed(install_for_account(&keeping, &account, home).unwrap()),
         (2, false)
     );
     assert_eq!(config(home).record_since, Some(since));
@@ -664,9 +643,9 @@ fn an_unusable_record_of_used_grants_is_recreated_under_a_new_generation() {
 }
 
 /// A copy that ran, whose record of used copies was then lost and
-/// recreated, is refused when it is signed again as the same copy, as a
-/// retry signs it, even within the second the record was recreated. A copy
-/// approved after that runs.
+/// recreated, is refused when it is signed again as the same copy, even
+/// within the second the record was recreated. A copy approved after that
+/// runs.
 #[test]
 fn a_copy_signed_again_after_its_record_was_recreated_is_refused() {
     let (account, home) = enrollment_home();
@@ -985,59 +964,6 @@ pub(super) fn test_directive(
         [7; 32],
     )
     .unwrap()
-}
-
-/// A copy its receiver refused for running another build is signed again
-/// as the same copy: for its own enrollment, under its request ID, and with
-/// its start and finish times, so the receiver's record of used directives
-/// runs it at most once, and no later than the first could have run.
-#[test]
-fn a_refused_copy_is_signed_again_as_the_same_copy() {
-    let enrollment = EnrollmentId::random();
-    // Signed a while before the refusal, and still in its start window.
-    let mut first = test_directive(enrollment, 3, "backup");
-    for time in [
-        &mut first.issued_at,
-        &mut first.not_before,
-        &mut first.start_by,
-        &mut first.finish_by,
-    ] {
-        *time -= 600;
-    }
-    let retry = Retry::of(&first);
-    let mut again = test_directive(enrollment, 4, "backup");
-    assert_ne!(again.request_id, first.request_id);
-    assert_ne!(again.issued_at, first.issued_at);
-    assert_ne!(again.start_by, first.start_by);
-    assert_ne!(again.finish_by, first.finish_by);
-    retry.apply(&mut again).unwrap();
-    assert_eq!(
-        (
-            again.request_id,
-            again.issued_at,
-            again.not_before,
-            again.start_by,
-            again.finish_by
-        ),
-        (
-            first.request_id,
-            first.issued_at,
-            first.not_before,
-            first.start_by,
-            first.finish_by
-        )
-    );
-    assert_eq!(again.binding.generation, 4);
-    // Not for another enrollment, as one set up again after a revoke.
-    let mut other = test_directive(EnrollmentId::random(), 1, "backup");
-    assert!(retry.apply(&mut other).is_err());
-    // Not once it may no longer start.
-    let mut expired = first.clone();
-    expired.start_by = crate::directive::now().unwrap() - 1;
-    let error = Retry::of(&expired)
-        .apply(&mut test_directive(enrollment, 4, "backup"))
-        .unwrap_err();
-    assert!(format!("{error:#}").contains("expired"), "{error:#}");
 }
 
 pub(super) fn sign_test_directive(
@@ -1757,8 +1683,7 @@ fn a_directive_is_recorded_only_after_every_check_passes() {
 
     config.signer = delegation::TrustedSigner::new(login.public_key(), None, None).unwrap();
     // A copy approved before this server recreated its record of the
-    // directives that ran, as a refused copy signed again is, may have run
-    // against the record that was lost.
+    // directives that ran may have run against the record that was lost.
     let issued = crate::directive::Signed::decode(&valid)
         .unwrap()
         .directive
@@ -3964,6 +3889,36 @@ fn local_records_track_pending_enrollments_and_unconfirmed_refreshes() {
     assert!(needs_refresh(&other_build, &directory));
 }
 
+/// A copy refused for a receiver of another build, while this machine's
+/// record says it runs this one, marks the record out of date: the next copy
+/// logs in to refresh it, as it does for another build or a lost reply.
+#[test]
+fn a_record_marked_for_refresh_is_refreshed_by_the_next_copy() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let base = temporary.path();
+    fs::set_permissions(base, fs::Permissions::from_mode(0o700)).unwrap();
+    let id = EnrollmentId::random();
+    let directory = base.join(id.to_string());
+    ensure_directory(&directory, 0o700).unwrap();
+    store_entry_key(&directory, &generate_test_key("entry").unwrap()).unwrap();
+    let metadata = local_record(id, "host", None);
+    complete_local_enrollment(&directory, &metadata).unwrap();
+    let plan = || plan_enrollment(base, ("host", None, "backup"), Refresh::IfOutdated).unwrap();
+    assert!(matches!(plan(), Planned::Current(..)));
+    // Another enrollment's mark changes nothing.
+    mark_for_refresh_in(base, EnrollmentId::random()).unwrap();
+    assert!(!needs_refresh(&metadata, &directory));
+    mark_for_refresh_in(base, id).unwrap();
+    assert!(needs_refresh(&metadata, &directory));
+    let Planned::Session(plan) = plan() else {
+        panic!("a marked record was used as it is");
+    };
+    assert_eq!(
+        (plan.id, plan.refresh, plan.replaces.is_none()),
+        (id, true, true)
+    );
+}
+
 /// A complete local record for enrollment `id` of `backup@host:port`.
 fn local_record(id: EnrollmentId, host: &str, port: Option<u16>) -> LocalEnrollment {
     let login = generate_test_key("login").unwrap();
@@ -4313,8 +4268,6 @@ fn authority_rejects_scope_and_option_escalation() {
     authority.authorize(&mut stat, false).unwrap();
 
     let mut plan = Request::PlanBatch {
-        partial_paths: vec![target.clone()],
-        copy_id: [3; 16],
         directories: vec![target.clone()],
         others: vec![target.clone()],
         strict_metadata: false,
@@ -8732,7 +8685,6 @@ fn a_root_writer_is_refused_before_enrolling() {
             jump: None,
             agent: None,
             allow_enrollment: true,
-            retry_of: None,
             batch: true,
             results_key: None,
             role,
@@ -8958,7 +8910,6 @@ fn restricted_authority_rejects_caller_source_registration() {
             follow_root: false,
         }],
         symlink_policy: proto::OperatorSymlinkPolicy::Refuse,
-        allow_unconfined_paths: false,
         shared_workers: 0,
         independent_handoff_workers: 0,
     };
@@ -14960,4 +14911,29 @@ fn restricted_receivers_refuse_unchecked_keeps() {
         format!("{error:#}").contains("keeps existing files atomically"),
         "{error:#}"
     );
+}
+
+/// A path lies beneath a prefix only across a slash; `/` is a prefix of
+/// every absolute path only for the protected-path rule.
+#[test]
+fn paths_lie_beneath_a_prefix_only_across_a_slash() {
+    assert_eq!(beneath(b"/a/b/c", b"/a/b"), Some(&b"c"[..]));
+    assert_eq!(beneath(b"/a/b", b"/a/b"), None);
+    assert_eq!(beneath(b"/a/bc", b"/a/b"), None);
+    assert_eq!(beneath(b"/a", b"/"), None);
+    assert!(at_or_beneath(b"/a/b", b"/a/b"));
+    assert!(at_or_beneath(b"/a/b/c", b"/a/b"));
+    assert!(!at_or_beneath(b"/a/bc", b"/a/b"));
+    assert!(!at_or_beneath(b"/a", b"/"));
+    assert!(path_is_at_or_below(b"/a", b"/"));
+    assert!(path_is_at_or_below(b"/", b"/"));
+    assert!(!path_is_at_or_below(b"/a/bc", b"/a/b"));
+    let scope = |descendants| MutationScope {
+        path: b"/a/b".to_vec(),
+        descendants,
+    };
+    assert!(RestrictedAuthority::scope_allows(&scope(false), b"/a/b"));
+    assert!(!RestrictedAuthority::scope_allows(&scope(false), b"/a/b/c"));
+    assert!(RestrictedAuthority::scope_allows(&scope(true), b"/a/b/c"));
+    assert!(!RestrictedAuthority::scope_allows(&scope(true), b"/a/bc"));
 }

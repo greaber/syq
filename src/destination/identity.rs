@@ -29,14 +29,13 @@ fn load_key_from(directory: &Path) -> Result<PrivateKey> {
     // Invalid or unreadable existing state is never silently regenerated.
     if !path.try_exists()? {
         let key = generate_key()?;
-        let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
-        temporary.write_all(key.to_openssh(LineEnding::LF)?.as_bytes())?;
-        temporary.as_file().sync_all()?;
-        match temporary.persist_noclobber(&path) {
-            Ok(_) => fs::File::open(directory)?.sync_all()?,
-            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
+        crate::state_file::write_atomic(
+            &path,
+            key.to_openssh(LineEnding::LF)?.as_bytes(),
+            0o600,
+            crate::state_file::Publish::NoClobber,
+            crate::state_file::Durability::Synced,
+        )?;
     }
     let encoded = crate::delegation::read_private_regular(&path, "receiver identity key", 8192)?;
     let key = PrivateKey::from_openssh(encoded).context("read receiver identity key; restore its backup or explicitly replace the server's name assignments")?;
@@ -172,14 +171,20 @@ pub(super) fn claim(directory: &Path, name: &str, key: &str) -> Result<()> {
     // the Ed25519 key size even when the wire key carries a long comment.
     let mut key = PublicKey::from_openssh(key)?;
     key.set_comment("");
-    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
-    temporary.write_all(&serde_json::to_vec(&Owner {
+    let owner = serde_json::to_vec(&Owner {
         version: 1,
         public_key: key.to_openssh()?,
-    })?)?;
-    temporary.as_file().sync_all()?;
-    temporary.persist_noclobber(directory.join(format!("{name}.owner")))?;
-    fs::File::open(directory)?.sync_all()?;
+    })?;
+    let path = directory.join(format!("{name}.owner"));
+    if !crate::state_file::write_atomic(
+        &path,
+        &owner,
+        0o600,
+        crate::state_file::Publish::NoClobber,
+        crate::state_file::Durability::Synced,
+    )? {
+        return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists).into());
+    }
     Ok(())
 }
 

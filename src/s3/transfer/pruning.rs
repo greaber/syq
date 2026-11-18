@@ -271,8 +271,6 @@ impl Engine {
                         &self.client,
                         &self.options.bucket,
                         &prefix,
-                        None,
-                        &mut HashSet::new(),
                         self.options.concurrency,
                     )
                     .await?
@@ -358,8 +356,6 @@ impl Engine {
                         &self.client,
                         &self.options.bucket,
                         &prefix,
-                        None,
-                        &mut HashSet::new(),
                         self.options.concurrency,
                     )
                     .await?

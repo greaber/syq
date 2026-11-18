@@ -5,7 +5,6 @@ use crate::persistence::Domain;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const VERSION: u16 = 1;
@@ -290,9 +289,6 @@ pub(super) fn update_permissions<P: StoredPermission>(
     if let Some(permission) = add {
         permission.validate()?;
     }
-    let parent = path
-        .parent()
-        .context("account permission directory missing")?;
     let lock = LockFile::open(&path.with_extension("lock"), true)?;
     if !lock.try_exclusive()? {
         bail!("account permissions are being changed; retry shortly");
@@ -319,16 +315,19 @@ pub(super) fn update_permissions<P: StoredPermission>(
             state.permissions.sort_by(|a, b| a.id.cmp(&b.id));
         }
     }
-    let bytes = serde_json::to_vec_pretty(&state)?;
+    let mut bytes = serde_json::to_vec_pretty(&state)?;
     anyhow::ensure!(
         bytes.len() < MAX_STATE,
         "remembered account permissions exceed the state-file size limit"
     );
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary.write_all(&bytes)?;
-    temporary.write_all(b"\n")?;
-    temporary.as_file().sync_all()?;
-    temporary.persist(path).map_err(|error| error.error)?;
+    bytes.push(b'\n');
+    crate::state_file::write_atomic(
+        path,
+        &bytes,
+        0o600,
+        crate::state_file::Publish::Replace,
+        crate::state_file::Durability::FileSynced,
+    )?;
     Ok(())
 }
 

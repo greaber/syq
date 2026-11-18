@@ -1981,9 +1981,8 @@ impl Planner<'_> {
         }
         match p.e.kind {
             Kind::File => self.plan_file(p, dst_entry, target_condition, leaf_ops),
-            Kind::Symlink => self.plan_symlink(p, dst_entry, leaf_ops),
-            Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => {
-                self.plan_special(p, dst_entry, leaf_ops)
+            Kind::Symlink | Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev => {
+                self.plan_link_or_special(p, dst_entry, leaf_ops)
             }
             Kind::Dir | Kind::Other => unreachable!("handled in the mapping loop"),
         }
@@ -2179,72 +2178,7 @@ impl Planner<'_> {
             // serialize all reads in the planner.
             self.enqueue((src_path, source), dst_path, rel, dst_rel, e, dst_entry);
         } else if opts.dry_run {
-            self.note_directory_change(&dst_path, true);
-            self.progress.files_total.fetch_add(1, Relaxed);
-            self.progress.bytes_total.fetch_add(e.size, Relaxed);
-            self.progress.add_files(1);
-            // Dry aggregates mean planned work, bytes included —
-            // files_done already moves here, so bytes_done must
-            // too or the terminal record contradicts its traces.
-            self.progress.bytes_done.fetch_add(e.size, Relaxed);
-            self.dry_run_changes.regular_files += 1;
-            if dst_entry.as_ref().is_some_and(|d| d.kind != Kind::File) {
-                self.dry_run_changes.type_replacements += 1;
-            }
-            let refused = self.update_refusal_for(
-                (&dst_path, &dst_rel),
-                &e,
-                dst_entry.as_ref(),
-                replace,
-                None,
-            );
-            if let Some(reason) = refused {
-                self.progress.in_place_refusals.add(reason);
-            }
-            self.emit_trace(
-                "transfer_file",
-                &dst_rel,
-                "file",
-                Some(e.size),
-                match &dst_entry {
-                    None => "destination_missing",
-                    Some(d) if d.kind != Kind::File => "type_differs",
-                    Some(d) if d.size != e.size => "content_differs",
-                    Some(_) => "metadata_differs",
-                },
-            );
-            if opts.verbose > 0 {
-                let shown = display(&dst_path);
-                let action = match &dst_entry {
-                    _ if replace => format!(
-                        "replace file {shown} (requested file metadata differs, and it cannot be changed in place)"
-                    ),
-                    None => format!("create file {shown} (destination missing)"),
-                    Some(d) if d.kind != Kind::File => format!(
-                        "replace with file {shown} (destination is {})",
-                        kind_label(d.kind)
-                    ),
-                    Some(d) if d.size != e.size => {
-                        format!("update file {shown} (size differs)")
-                    }
-                    Some(_) if opts.checksum => {
-                        format!("update file {shown} (content comparison requested)")
-                    }
-                    Some(d) if opts.hash_or_copy && opts.metadata_matches(&dst_rel, &e, d) => {
-                        format!("update file {shown} (size and time not trusted)")
-                    }
-                    Some(d)
-                        if opts.flags & flags::TIMES != 0
-                            && (d.mtime, d.mtime_nsec) != (e.mtime, e.mtime_nsec) =>
-                    {
-                        format!("update file {shown} (modification time differs)")
-                    }
-                    Some(_) => {
-                        format!("update file {shown} (content quick check unavailable)")
-                    }
-                };
-                self.progress.println(&action);
-            }
+            self.preview_changed_file((&dst_path, &dst_rel), &e, dst_entry.as_ref(), replace);
         } else {
             if opts.changes_directory_certainly(&e, dst_entry.as_ref()) {
                 self.note_directory_change(&dst_path, true);
@@ -2257,6 +2191,78 @@ impl Planner<'_> {
                 e.clone(),
                 dst_entry,
             );
+        }
+    }
+
+    /// A dry run's account of a regular file the copy would write: it is
+    /// missing, of another kind, or not known to match, or `replace` says it
+    /// matches but would be replaced (`must_replace`).
+    pub(super) fn preview_changed_file(
+        &mut self,
+        (dst_path, dst_rel): (&[u8], &[u8]),
+        e: &Entry,
+        dst_entry: Option<&Entry>,
+        replace: bool,
+    ) {
+        let opts = self.opts;
+        self.note_directory_change(dst_path, true);
+        self.progress.files_total.fetch_add(1, Relaxed);
+        self.progress.bytes_total.fetch_add(e.size, Relaxed);
+        self.progress.add_files(1);
+        // Dry aggregates mean planned work, bytes included —
+        // files_done already moves here, so bytes_done must
+        // too or the terminal record contradicts its traces.
+        self.progress.bytes_done.fetch_add(e.size, Relaxed);
+        if dst_entry.is_some_and(|d| d.kind != Kind::File) {
+            self.dry_run_changes.type_replacements += 1;
+        }
+        let refused = self.update_refusal_for((dst_path, dst_rel), e, dst_entry, replace, None);
+        if let Some(reason) = refused {
+            self.progress.in_place_refusals.add(reason);
+        }
+        self.emit_trace(
+            "transfer_file",
+            dst_rel,
+            "file",
+            Some(e.size),
+            match dst_entry {
+                None => "destination_missing",
+                Some(d) if d.kind != Kind::File => "type_differs",
+                Some(d) if d.size != e.size => "content_differs",
+                Some(_) => "metadata_differs",
+            },
+        );
+        if opts.verbose > 0 {
+            let shown = display(dst_path);
+            let action = match dst_entry {
+                _ if replace => format!(
+                    "replace file {shown} (requested file metadata differs, and it cannot be changed in place)"
+                ),
+                None => format!("create file {shown} (destination missing)"),
+                Some(d) if d.kind != Kind::File => format!(
+                    "replace with file {shown} (destination is {})",
+                    kind_label(d.kind)
+                ),
+                Some(d) if d.size != e.size => {
+                    format!("update file {shown} (size differs)")
+                }
+                Some(_) if opts.checksum => {
+                    format!("update file {shown} (content comparison requested)")
+                }
+                Some(d) if opts.hash_or_copy && opts.metadata_matches(dst_rel, e, d) => {
+                    format!("update file {shown} (size and time not trusted)")
+                }
+                Some(d)
+                    if opts.flags & flags::TIMES != 0
+                        && (d.mtime, d.mtime_nsec) != (e.mtime, e.mtime_nsec) =>
+                {
+                    format!("update file {shown} (modification time differs)")
+                }
+                Some(_) => {
+                    format!("update file {shown} (content quick check unavailable)")
+                }
+            };
+            self.progress.println(&action);
         }
     }
 
@@ -2372,9 +2378,14 @@ impl Planner<'_> {
         });
     }
 
-    /// Queue the creation or replacement of a mapped symlink unless the
-    /// destination already matches.
-    fn plan_symlink(&mut self, leaf: Planned, dst_entry: Option<Entry>, leaf_ops: &mut LeafOps) {
+    /// Queue the creation or replacement of a mapped symlink or special file
+    /// unless the destination already matches.
+    fn plan_link_or_special(
+        &mut self,
+        leaf: Planned,
+        dst_entry: Option<Entry>,
+        leaf_ops: &mut LeafOps,
+    ) {
         let opts = self.opts;
         let Planned {
             dst: dst_path,
@@ -2383,6 +2394,12 @@ impl Planner<'_> {
             e,
             ..
         } = leaf;
+        let symlink = e.kind == Kind::Symlink;
+        let (action, kind) = if symlink {
+            ("create_symlink", "symlink")
+        } else {
+            ("create_special", "special")
+        };
         if self.skip_existing(&dst_entry) {
             self.progress.files_excluded.fetch_add(1, Relaxed);
             return;
@@ -2398,11 +2415,16 @@ impl Planner<'_> {
             self.progress.files_excluded.fetch_add(1, Relaxed);
             return;
         }
+        // A special file has no target, so this is empty for one.
         let target = e.link.clone().unwrap_or_default();
-        let same = dst_entry
-            .as_ref()
-            .is_some_and(|d| d.kind == Kind::Symlink && d.link.as_deref() == Some(&target[..]));
-
+        let same = dst_entry.as_ref().is_some_and(|d| {
+            d.kind == e.kind
+                && if symlink {
+                    d.link.as_deref() == Some(&target[..])
+                } else {
+                    d.rdev == e.rdev
+                }
+        });
         if dst_entry.is_some()
             && (opts.if_exists == Some(crate::cli::IfExists::Error)
                 || (!same && opts.if_exists == Some(crate::cli::IfExists::ErrorIfDifferent)))
@@ -2428,125 +2450,28 @@ impl Planner<'_> {
             );
             return;
         }
+        // How messages show the entry after its path: a symlink's target.
+        let arrow = || {
+            if symlink {
+                format!(" -> {}", display(&target))
+            } else {
+                String::new()
+            }
+        };
         self.note_directory_change(&dst_path, true);
         if opts.dry_run {
-            self.dry_run_changes.symlinks += 1;
-            if dst_entry.as_ref().is_some_and(|d| d.kind != Kind::Symlink) {
-                self.dry_run_changes.type_replacements += 1;
+            if symlink {
+                self.dry_run_changes.symlinks += 1;
+            } else {
+                self.dry_run_changes.specials += 1;
             }
-            self.emit_trace(
-                "create_symlink",
-                &dst_rel,
-                "symlink",
-                None,
-                match &dst_entry {
-                    None => "destination_missing",
-                    Some(d) if d.kind != Kind::Symlink => "type_differs",
-                    Some(_) => "content_differs",
-                },
-            );
-            if opts.verbose > 0 {
-                let shown = display(&dst_path);
-                let action = match &dst_entry {
-                    None => format!(
-                        "create symlink {shown} -> {} (destination missing)",
-                        display(&target)
-                    ),
-                    Some(d) if d.kind != Kind::Symlink => format!(
-                        "replace with symlink {shown} -> {} (destination is {})",
-                        display(&target),
-                        kind_label(d.kind)
-                    ),
-                    Some(_) => format!(
-                        "update symlink {shown} -> {} (target differs)",
-                        display(&target)
-                    ),
-                };
-                self.progress.println(&action);
-            }
-            return;
-        }
-        leaf_ops.names.push(QueuedLeafOp {
-            dst_rel: dst_rel.clone(),
-            action: "create_symlink",
-            kind: "symlink",
-            name: format!("{rel} -> {}", display(&target)),
-            quiet: false,
-        });
-        // The symlink gets its metadata before it is published.
-        leaf_ops.ops.push(Op::Symlink {
-            path: dst_path.clone(),
-            target,
-            condition: self.leaf_condition_for(&dst_path, dst_entry.as_ref()),
-            meta: opts.metadata_for(&dst_rel, &e),
-            flags: opts.flags_for(&dst_rel) & !flags::MODE,
-        });
-    }
-
-    /// Queue the creation or replacement of a mapped special file unless the
-    /// destination already matches.
-    fn plan_special(&mut self, leaf: Planned, dst_entry: Option<Entry>, leaf_ops: &mut LeafOps) {
-        let opts = self.opts;
-        let Planned {
-            dst: dst_path,
-            dst_rel,
-            rel,
-            e,
-            ..
-        } = leaf;
-        if self.skip_existing(&dst_entry) {
-            self.progress.files_excluded.fetch_add(1, Relaxed);
-            return;
-        }
-        if self.refuse_directory_target(&dst_path, &dst_rel, e.kind, dst_entry.as_ref()) {
-            return;
-        }
-        if opts.if_exists == Some(crate::cli::IfExists::UpdateIfOlder)
-            && dst_entry
-                .as_ref()
-                .is_some_and(|d| (d.mtime, d.mtime_nsec) > (e.mtime, e.mtime_nsec))
-        {
-            self.progress.files_excluded.fetch_add(1, Relaxed);
-            return;
-        }
-        let same = dst_entry
-            .as_ref()
-            .is_some_and(|d| d.kind == e.kind && d.rdev == e.rdev);
-        if dst_entry.is_some()
-            && (opts.if_exists == Some(crate::cli::IfExists::Error)
-                || (!same && opts.if_exists == Some(crate::cli::IfExists::ErrorIfDifferent)))
-        {
-            self.existing_conflict(
-                &dst_path,
-                &dst_rel,
-                if same {
-                    "destination already exists"
-                } else {
-                    "destination contents differ"
-                },
-            );
-            return;
-        }
-        if same {
-            self.plan_explicit_leaf_metadata(
-                &dst_path,
-                &dst_rel,
-                &e,
-                dst_entry.as_ref().unwrap(),
-                leaf_ops,
-            );
-            return;
-        }
-        self.note_directory_change(&dst_path, true);
-        if opts.dry_run {
-            self.dry_run_changes.specials += 1;
             if dst_entry.as_ref().is_some_and(|d| d.kind != e.kind) {
                 self.dry_run_changes.type_replacements += 1;
             }
             self.emit_trace(
-                "create_special",
+                action,
                 &dst_rel,
-                "special",
+                kind,
                 None,
                 match &dst_entry {
                     None => "destination_missing",
@@ -2556,19 +2481,21 @@ impl Planner<'_> {
             );
             if opts.verbose > 0 {
                 let shown = display(&dst_path);
+                let label = kind_label(e.kind);
+                let arrow = arrow();
                 let action = match &dst_entry {
-                    None => format!(
-                        "create {} {shown} (destination missing)",
-                        kind_label(e.kind)
-                    ),
+                    None => format!("create {label} {shown}{arrow} (destination missing)"),
                     Some(d) if d.kind != e.kind => format!(
-                        "replace with {} {shown} (destination is {})",
-                        kind_label(e.kind),
+                        "replace with {label} {shown}{arrow} (destination is {})",
                         kind_label(d.kind)
                     ),
                     Some(_) => format!(
-                        "update {} {shown} (device identity differs)",
-                        kind_label(e.kind)
+                        "update {label} {shown}{arrow} ({})",
+                        if symlink {
+                            "target differs"
+                        } else {
+                            "device identity differs"
+                        }
                     ),
                 };
                 self.progress.println(&action);
@@ -2577,27 +2504,39 @@ impl Planner<'_> {
         }
         leaf_ops.names.push(QueuedLeafOp {
             dst_rel: dst_rel.clone(),
-            action: "create_special",
-            kind: "special",
-            name: rel,
+            action,
+            kind,
+            name: if symlink { rel + &arrow() } else { rel },
             quiet: false,
         });
+        let condition = self.leaf_condition_for(&dst_path, dst_entry.as_ref());
         let meta = opts.metadata_for(&dst_rel, &e);
         let flags = opts.flags_for(&dst_rel);
-        // Without a mode to apply, the node takes the source's permission
-        // bits as creating it limits them, and none of its special bits. It
-        // gets its metadata before it is published.
-        leaf_ops.ops.push(Op::Mknod {
-            path: dst_path.clone(),
-            mode: if flags & flags::MODE == 0 {
-                e.mode & !0o7000
-            } else {
-                e.mode
-            },
-            rdev: e.rdev,
-            condition: self.leaf_condition_for(&dst_path, dst_entry.as_ref()),
-            meta,
-            flags,
+        // The entry gets its metadata before it is published.
+        leaf_ops.ops.push(if symlink {
+            Op::Symlink {
+                path: dst_path.clone(),
+                target,
+                condition,
+                meta,
+                flags: flags & !flags::MODE,
+            }
+        } else {
+            // Without a mode to apply, the node takes the source's
+            // permission bits as creating it limits them, and none of its
+            // special bits.
+            Op::Mknod {
+                path: dst_path.clone(),
+                mode: if flags & flags::MODE == 0 {
+                    e.mode & !0o7000
+                } else {
+                    e.mode
+                },
+                rdev: e.rdev,
+                condition,
+                meta,
+                flags,
+            }
         });
     }
 
@@ -3788,8 +3727,6 @@ impl Planner<'_> {
         }
         match ok(
             self.dst.call(Request::PlanBatch {
-                partial_paths: Vec::new(),
-                copy_id: self.opts.copy_id,
                 directories: directories.clone(),
                 others: others.clone(),
                 strict_metadata: self.opts.expressions.update.is_some(),
@@ -3797,11 +3734,9 @@ impl Planner<'_> {
             "plan destination batch",
         )? {
             Response::BatchPlan {
-                partial_paths,
                 directories: dir_stats,
                 others: other_stats,
-            } if partial_paths.is_empty()
-                && dir_stats.len() == directories.len()
+            } if dir_stats.len() == directories.len()
                 && other_stats
                     .as_ref()
                     .is_none_or(|stats| stats.len() == others.len()) =>
@@ -5124,7 +5059,7 @@ impl Planner<'_> {
     /// or it is to get new names as a hard-link representative and its
     /// owner is not one the receiver accepts. This predicts the receiver's
     /// decision from the scan; the receiver decides for itself, and a file
-    /// it refuses is replaced then (`Worker::replace_instead`).
+    /// it refuses is replaced then (`Worker::replacing`).
     pub(super) fn must_replace(
         &mut self,
         (dst, rel): (&[u8], &[u8]),

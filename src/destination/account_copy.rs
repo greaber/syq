@@ -1,6 +1,6 @@
 //! Ordinary operations use account access selected by their authorizer.
 //! Narrow grants keep their own authority.
-use crate::cli::{Args, AuthFrom, CoordinateAt, Interface, Location, NativeEndpoint, PeerAuth};
+use crate::cli::{Args, AuthFrom, CoordinateAt, Interface, Location, NativeEndpoint};
 use anyhow::{bail, Result};
 
 /// Resolve a matching helper before commands consume stdin or open results.
@@ -59,32 +59,19 @@ pub(crate) fn prepare_handoff(args: &Args) -> Result<()> {
 pub(crate) fn remote(args: &Args) -> Option<(&Location, bool)> {
     if args.interface != Interface::NativeCp
         || args.s3.is_some()
-        || args.rsh.is_some()
-        || args.detach
-        || args.restricted_grant.is_some()
-        || args.peer_auth != PeerAuth::Restricted
-        || args.coordinate_at != CoordinateAt::Auto
+        || crate::route::refuses_account_access(args)
     {
         return None;
     }
     let (destination, sources) = args.locations.split_last()?;
     let source = sources.first()?;
-    let (location, pull) = if destination.is_remote() && sources.iter().all(|s| !s.is_remote()) {
-        (destination, false)
-    } else if !destination.is_remote()
-        && source.is_remote()
-        && sources
-            .iter()
-            .all(|s| s.host == source.host && s.user == source.user && s.port == source.port)
-    {
-        (source, true)
-    } else {
-        return None;
-    };
-    if location.host.as_deref()?.starts_with('@') {
-        return None;
+    match crate::route::classify(args) {
+        crate::route::Route::Upload => Some((destination, false)),
+        crate::route::Route::Download if sources.iter().all(|s| s.same_host(source)) => {
+            Some((source, true))
+        }
+        _ => None,
     }
-    Some((location, pull))
 }
 
 pub(super) fn select(args: &mut Args) -> Result<bool> {

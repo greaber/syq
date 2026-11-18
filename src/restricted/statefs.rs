@@ -99,48 +99,19 @@ pub(super) fn read_leaf(
     maximum: usize,
     private: bool,
 ) -> Result<Option<Vec<u8>>> {
-    let name = leaf_name(name)?;
-    let fd = loop {
-        let fd = unsafe {
-            libc::openat(
-                directory.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY
-                    | libc::O_NOFOLLOW
-                    | libc::O_NONBLOCK
-                    | libc::O_NOCTTY
-                    | libc::O_CLOEXEC,
-            )
-        };
-        if fd >= 0 {
-            break fd;
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::NotFound {
-            return Ok(None);
-        }
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error).with_context(|| format!("open private state {name:?}"));
-        }
+    leaf_name(name)?;
+    let rule = if private {
+        crate::state_file::FileRule::Exact0600
+    } else {
+        crate::state_file::FileRule::Regular
     };
-    let mut file = unsafe { File::from_raw_fd(fd) };
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        bail!("state file must be a regular file");
-    }
-    if private
-        && (metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o7777 != 0o600)
-    {
-        bail!("private state file must be target-owned with mode 0600");
-    }
-    let mut contents = Vec::new();
-    std::io::Read::by_ref(&mut file)
-        .take(maximum as u64 + 1)
-        .read_to_end(&mut contents)?;
-    if contents.len() > maximum {
-        bail!("private state file exceeds {maximum} bytes");
-    }
-    Ok(Some(contents))
+    crate::state_file::read_private_at(
+        directory,
+        name.as_ref(),
+        &format!("private state file {name:?}"),
+        maximum,
+        rule,
+    )
 }
 
 pub(super) fn atomic_write(
@@ -162,68 +133,20 @@ pub(super) fn atomic_write_locked(
     mode: u32,
     existing_private: bool,
 ) -> Result<()> {
-    let destination = leaf_name(name)?;
+    leaf_name(name)?;
     if let Some(existing) = read_leaf(directory, name, MAX_AUTHORIZED_KEYS, existing_private)? {
         let _ = existing;
     }
-    let mut random = [0u8; 8];
-    getrandom::fill(&mut random).context("generate atomic state filename")?;
-    let temporary_name = format!(
-        ".syq-write-{}-{}",
-        std::process::id(),
-        u64::from_le_bytes(random)
-    );
-    let temporary = leaf_name(&temporary_name)?;
-    let fd = loop {
-        let fd = unsafe {
-            libc::openat(
-                directory.as_raw_fd(),
-                temporary.as_ptr(),
-                libc::O_WRONLY
-                    | libc::O_CREAT
-                    | libc::O_EXCL
-                    | libc::O_NOFOLLOW
-                    | libc::O_NOCTTY
-                    | libc::O_CLOEXEC,
-                (mode & 0o600) as libc::c_int,
-            )
-        };
-        if fd >= 0 {
-            break fd;
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error).context("create atomic private state file");
-        }
-    };
-    let mut file = unsafe { File::from_raw_fd(fd) };
-    let write_result = (|| -> Result<()> {
-        file.write_all(contents)?;
-        file.sync_all()?;
-        loop {
-            let result = unsafe {
-                libc::renameat(
-                    directory.as_raw_fd(),
-                    temporary.as_ptr(),
-                    directory.as_raw_fd(),
-                    destination.as_ptr(),
-                )
-            };
-            if result == 0 {
-                break;
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::Interrupted {
-                return Err(error).context("publish atomic private state file");
-            }
-        }
-        directory.sync_all()?;
-        Ok(())
-    })();
-    if write_result.is_err() {
-        let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) };
-    }
-    write_result
+    crate::state_file::write_atomic_at(
+        directory,
+        name.as_ref(),
+        contents,
+        mode,
+        crate::state_file::Publish::Replace,
+        crate::state_file::Durability::Synced,
+    )
+    .context("publish atomic private state file")?;
+    Ok(())
 }
 
 pub(super) fn atomic_replace_executable_locked(
@@ -231,66 +154,17 @@ pub(super) fn atomic_replace_executable_locked(
     name: &str,
     contents: &[u8],
 ) -> Result<()> {
-    let destination = leaf_name(name)?;
-    let mut random = [0u8; 8];
-    getrandom::fill(&mut random).context("generate atomic receiver filename")?;
-    let temporary_name = format!(
-        ".syq-receiver-write-{}-{}",
-        std::process::id(),
-        u64::from_le_bytes(random)
-    );
-    let temporary = leaf_name(&temporary_name)?;
-    let fd = loop {
-        let fd = unsafe {
-            libc::openat(
-                directory.as_raw_fd(),
-                temporary.as_ptr(),
-                libc::O_WRONLY
-                    | libc::O_CREAT
-                    | libc::O_EXCL
-                    | libc::O_NOFOLLOW
-                    | libc::O_NOCTTY
-                    | libc::O_CLOEXEC,
-                0o700,
-            )
-        };
-        if fd >= 0 {
-            break fd;
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error).context("create atomic restricted receiver");
-        }
-    };
-    let mut file = unsafe { File::from_raw_fd(fd) };
-    let write_result = (|| -> Result<()> {
-        file.set_permissions(fs::Permissions::from_mode(0o700))?;
-        file.write_all(contents)?;
-        file.sync_all()?;
-        loop {
-            let result = unsafe {
-                libc::renameat(
-                    directory.as_raw_fd(),
-                    temporary.as_ptr(),
-                    directory.as_raw_fd(),
-                    destination.as_ptr(),
-                )
-            };
-            if result == 0 {
-                break;
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::Interrupted {
-                return Err(error).context("publish restricted receiver");
-            }
-        }
-        directory.sync_all()?;
-        Ok(())
-    })();
-    if write_result.is_err() {
-        let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) };
-    }
-    write_result
+    leaf_name(name)?;
+    crate::state_file::write_atomic_at(
+        directory,
+        name.as_ref(),
+        contents,
+        0o700,
+        crate::state_file::Publish::Replace,
+        crate::state_file::Durability::Synced,
+    )
+    .context("publish restricted receiver")?;
+    Ok(())
 }
 
 pub(super) fn remove_leaf_locked(directory: &File, name: &str) -> Result<()> {

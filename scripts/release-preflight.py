@@ -6,28 +6,20 @@ Usage: scripts/release-preflight.py vMAJOR.MINOR.PATCH
 import base64
 import binascii
 import glob
-import json
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
-import tomllib
 
-from tooling import ToolError, cargo_version, check_conclusion, json_output, output, report_errors
+from release_checks import REPOSITORY as CANONICAL_REPOSITORY, REQUIRED_CHECKS, ReleaseCheck
+from tooling import ToolError, json_output, output, report_errors
 
 SCRIPTS = Path(os.path.abspath(__file__)).parent
-CANONICAL_REPOSITORY = "greaber/syq"
 HOMEBREW_REPOSITORY = "greaber/homebrew-tap"
 RELEASE_ENVIRONMENT = "release"
-REQUIRED_CHECKS = "rust,sdks,macos,linux-arm64,conformance"
 CRATES_AUTH_ACTION = "rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9"
-
-
-def succeeds(*args):
-    return subprocess.run(list(args), stdout=subprocess.DEVNULL,
-                          stderr=subprocess.DEVNULL).returncode == 0
 
 
 def git_config(*args):
@@ -43,17 +35,6 @@ def gh_api(*args):
 def require(condition, message):
     if not condition:
         raise ToolError(message)
-
-
-def lock_version(path):
-    """The syq version recorded in Cargo.lock."""
-    try:
-        with open(path, "rb") as source:
-            packages = tomllib.load(source).get("package", [])
-    except (OSError, ValueError) as error:
-        raise ToolError(f"cannot read {path}: {error}") from None
-    versions = [package.get("version") for package in packages if package.get("name") == "syq"]
-    return versions[0] if versions else None
 
 
 def pinned_identity(signers):
@@ -78,75 +59,19 @@ def workflow_actions():
     return sorted(actions)
 
 
-def check_repository(tag):
+def check_release(tag):
+    """Fail on the first release precondition that readiness would report."""
     root = subprocess.run(["git", "rev-parse", "--show-toplevel"], stdout=subprocess.PIPE,
                           stderr=subprocess.DEVNULL, text=True)
     require(root.returncode == 0, "run this from the syq repository")
     os.chdir(root.stdout.strip())
-    require(not output("git", "status", "--porcelain").strip(), "working tree is not clean")
-    sys.stdout.flush()
-    output(sys.executable, "scripts/check-python-api-sync.py", stdout=None)
-
-    origin_url = git_config("--get", "remote.origin.url").removesuffix(".git")
-    require(origin_url in (f"git@github.com:{CANONICAL_REPOSITORY}",
-                           f"ssh://git@github.com/{CANONICAL_REPOSITORY}",
-                           f"https://github.com/{CANONICAL_REPOSITORY}"),
-            f"origin is not the canonical {CANONICAL_REPOSITORY} repository")
-    require(os.environ.get("GH_HOST", "github.com") == "github.com", "GH_HOST must be github.com")
-    resolved = subprocess.run(["gh", "repo", "view", CANONICAL_REPOSITORY, "--json",
-                               "nameWithOwner", "--jq", ".nameWithOwner"],
-                              stdout=subprocess.PIPE, text=True)
-    require(resolved.stdout.strip() == CANONICAL_REPOSITORY, "gh resolved an unexpected repository")
-
-    head = output("git", "rev-parse", "HEAD").strip()
-    tracking = subprocess.run(["git", "rev-parse", "refs/remotes/origin/master"],
-                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-    require(tracking.returncode == 0, "origin/master is unavailable; fetch it first")
-    listing = output("git", "ls-remote", "origin", "refs/heads/master").split()
-    remote_master = listing[0] if listing else ""
-    require(tracking.stdout.strip() == remote_master,
-            f"origin/master is stale; fetch remote master ({remote_master})")
-    require(succeeds("git", "merge-base", "--is-ancestor", head, remote_master),
-            f"release candidate {head} is not merged into remote master ({remote_master})")
-
-    notes = Path(f".github/release-notes/{tag}.md")
-    require(notes.is_file() and notes.stat().st_size > 0, f"release notes are missing: {notes}")
-    output(str(SCRIPTS / "release-readiness.py"), tag, "--verify-ssh", stdout=None)
-
-    version = tag.removeprefix("v")
-    package_version = cargo_version("Cargo.toml")
-    require(package_version == version, f"tag {tag} does not match Cargo.toml version {package_version}")
-    locked_version = lock_version("Cargo.lock")
-    require(locked_version == version,
-            f"Cargo.lock syq version {locked_version} does not match {version}")
-
-    require(not succeeds("git", "show-ref", "--verify", "--quiet", f"refs/tags/{tag}"),
-            f"local tag {tag} already exists")
-    remote_tags = subprocess.run(["git", "ls-remote", "--tags", "origin", f"refs/tags/{tag}",
-                                  f"refs/tags/{tag}^{{}}"], stdout=subprocess.PIPE, text=True)
-    require(remote_tags.returncode == 0, f"cannot inspect remote tag {tag}")
-    require(not remote_tags.stdout.strip(), f"remote tag {tag} already exists")
-    return head
-
-
-def check_ci(head):
-    ci = subprocess.run([str(SCRIPTS / "verify-release-ci.py"), "--json", CANONICAL_REPOSITORY,
-                         head], stdout=subprocess.PIPE, text=True)
-    if ci.returncode:
-        print(ci.stdout.strip(), file=sys.stderr)
-        raise ToolError("full release CI is not ready")
-    evidence = {}
-    for workflow in json.loads(ci.stdout)["workflows"]:
+    check = ReleaseCheck(tag)
+    for issue in check.issues():
+        raise ToolError(f"{issue['message']}\nNext: {issue['next_action']}")
+    for workflow in check.certification["workflows"]:
         print(f"Full release CI: {workflow['workflow']} certified at {workflow['evidence_commit']}",
               flush=True)
-        evidence[workflow["workflow"]] = workflow["evidence_commit"]
-    for check_name in REQUIRED_CHECKS.split(","):
-        checked_commit = evidence["rsync-compat.yml" if check_name == "conformance" else "ci.yml"]
-        checks = gh_api(f"repos/{CANONICAL_REPOSITORY}/commits/{checked_commit}"
-                        "/check-runs?filter=latest&per_page=100")
-        conclusion = check_conclusion(checks, check_name)
-        require(conclusion == "success",
-                f"required check {check_name} is {conclusion} on {checked_commit}")
+    return check.commit
 
 
 def check_signing_key():
@@ -249,9 +174,8 @@ def main():
         return 2
     for tool in ("git", "gh", "curl", "ssh-keygen"):
         require(shutil.which(tool), f"release preflight needs {tool}")
-    head = check_repository(tag)
     try:
-        check_ci(head)
+        head = check_release(tag)
         signing_fingerprint = check_signing_key()
         check_repository_policy()
         check_unpublished(tag)
@@ -259,7 +183,7 @@ def main():
         raise ToolError(f"unexpected GitHub or registry response ({error!r})") from None
     print(f"Release preflight passed for {tag} at {head}.")
     print(f"Tag signing key: {signing_fingerprint}")
-    print(f"Required checks: {REQUIRED_CHECKS}")
+    print(f"Required checks: {','.join(REQUIRED_CHECKS)}")
     print("No existing GitHub release, crates.io version, or Homebrew formula was found.")
     return 0
 

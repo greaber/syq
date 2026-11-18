@@ -122,8 +122,10 @@ activate publication. Validation and repository protections still apply.
 
 Start with `scripts/release-readiness.py v<version>` (add `--json` for automation).
 Exit 0 means the candidate is ready for preflight, 1 means work is missing, and
-2 means inspection failed. The report includes the candidate SHA, remote master,
-local real-SSH evidence, all three CI certifications, and next actions. Apart
+2 means inspection failed. Readiness and preflight check the same preparation,
+evidence, and CI requirements, so a ready candidate passes those parts of
+preflight. The report includes the candidate SHA, remote master, local real-SSH
+evidence, all three CI certifications, and next actions. Apart
 from `--check-ssh` and the macOS lint described next, it is read-only. It never
 tags, publishes, dispatches CI, or merges a PR. If the requested tag exists,
 inspect `release-status.py` and resume or verify that release rather than

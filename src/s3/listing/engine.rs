@@ -6,7 +6,11 @@ use super::pattern::Pattern;
 use anyhow::{ensure, Result};
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde::Serialize;
-use std::{collections::VecDeque, future::Future};
+use std::{
+    collections::VecDeque,
+    future::Future,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 const MAX_CHILDREN: usize = 256;
 // Recursive discovery has no selective pattern to amortize empty/small child
@@ -19,8 +23,41 @@ const MAX_RECURSIVE_PROBES: usize = 4;
 pub(in crate::s3) struct Entry {
     pub key: String,
     pub size: u64,
-    pub last_modified: Option<String>,
+    /// Seconds and nanoseconds since the Unix epoch.
+    #[serde(serialize_with = "serialize_time")]
+    pub last_modified: Option<(i64, u32)>,
     pub etag: Option<String>,
+}
+
+fn serialize_time<S: serde::Serializer>(
+    time: &Option<(i64, u32)>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match time {
+        Some((secs, nanos)) => serializer.serialize_str(
+            &aws_smithy_types::DateTime::from_secs_and_nanos(*secs, *nanos)
+                .fmt(aws_smithy_types::date_time::Format::DateTime)
+                .map_err(serde::ser::Error::custom)?,
+        ),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// Directories to skip while listing, such as subtrees a copy ignores.
+pub(in crate::s3) struct Prune<'a> {
+    /// The byte length of the topmost pruned directory containing `key`, or
+    /// of `key` itself when it names a directory (a common prefix or a marker).
+    pub subtree: &'a (dyn Fn(&str, bool) -> Option<usize> + Sync),
+    /// Delimiter requests left for looking past a first page in which every
+    /// object lies in a pruned directory. Shared by the whole enumeration.
+    pub probes: AtomicUsize,
+}
+impl Prune<'_> {
+    fn take_probe(&self) -> bool {
+        self.probes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+    }
 }
 
 #[derive(Default)]
@@ -89,6 +126,7 @@ enum Job {
 struct Batch {
     entries: Vec<Entry>,
     jobs: Vec<Job>,
+    pruned: Vec<String>,
 }
 
 fn scan_batch(prefix: String, delimiter: bool, page: Page, start_after: Option<&str>) -> Batch {
@@ -104,6 +142,7 @@ fn scan_batch(prefix: String, delimiter: bool, page: Page, start_after: Option<&
             })
             .into_iter()
             .collect(),
+        pruned: Vec::new(),
     }
 }
 
@@ -168,6 +207,7 @@ async fn read_after(
 async fn execute(
     store: &impl Store,
     pattern: Option<&Pattern>,
+    prune: Option<&Prune<'_>>,
     job: Job,
     split: bool,
 ) -> Result<Batch> {
@@ -176,7 +216,7 @@ async fn execute(
             prefix,
             depth,
             start_after,
-        } => return recursive(store, prefix, depth, split, start_after.as_deref()).await,
+        } => return recursive(store, prune, prefix, depth, split, start_after.as_deref()).await,
         Job::Scan {
             prefix,
             delimiter,
@@ -213,7 +253,7 @@ async fn execute(
     let part = &pattern.components[component];
     let query = format!("{prefix}{}", part.literal_prefix());
     if part.recursive() {
-        return recursive(store, query, depth, split, None).await;
+        return recursive(store, None, query, depth, split, None).await;
     }
     if !split && component + 1 < pattern.components.len() {
         let page = read(store, &query, false, None).await?;
@@ -246,6 +286,7 @@ async fn execute(
                 depth: 0,
             })
             .collect(),
+        pruned: Vec::new(),
     })
 }
 
@@ -267,14 +308,92 @@ fn dense_children(query: &str, page: &Page) -> usize {
     counts.values().filter(|count| **count >= 256).count()
 }
 
+/// When every object on a truncated first page lies in a pruned directory,
+/// list directories instead, so that the pruned ones need not be enumerated.
+/// Follow a single unpruned child at most as deep as the probe budget allows.
+/// Returns `None` when probing was not tried or did not pay off.
+async fn lookahead(
+    store: &impl Store,
+    prune: &Prune<'_>,
+    query: &str,
+    depth: usize,
+    flat: &Page,
+) -> Result<Option<Batch>> {
+    let budget = prune.probes.load(Ordering::Relaxed);
+    let mut reachable = false;
+    if budget == 0
+        || flat.next.is_none()
+        || flat.entries.is_empty()
+        || !flat.entries.iter().all(|entry| {
+            let directory = entry.size == 0 && entry.key.ends_with('/');
+            (prune.subtree)(&entry.key, directory).is_some_and(|boundary| {
+                reachable |= entry.key[..boundary]
+                    .strip_prefix(query)
+                    .is_some_and(|relative| relative.matches('/').count() < budget);
+                true
+            })
+        })
+        || !reachable
+    {
+        return Ok(None);
+    }
+    let mut probe = query.to_owned();
+    let mut parents = Vec::new();
+    while prune.take_probe() {
+        let page = read(store, &probe, true, None).await?;
+        let (pruned, included): (Vec<_>, Vec<_>) = page
+            .prefixes
+            .into_iter()
+            .partition(|child| (prune.subtree)(child, true).is_some());
+        if page.next.is_some() || included.len() > 1 {
+            break;
+        }
+        parents.extend(page.entries);
+        if !pruned.is_empty() {
+            // Objects at the visited levels and the pruned and remaining
+            // children together replace the flat sample.
+            return Ok(Some(Batch {
+                entries: parents,
+                jobs: included
+                    .into_iter()
+                    .map(|prefix| Job::Recursive {
+                        prefix,
+                        depth: depth + 1,
+                        start_after: None,
+                    })
+                    .collect(),
+                pruned,
+            }));
+        }
+        let Some(child) = included.into_iter().next() else {
+            break;
+        };
+        // The sampled objects all lie in pruned directories under this one
+        // child. Follow it rather than refetching the flat sample per level.
+        probe = child;
+    }
+    Ok(None)
+}
+
 async fn recursive(
     store: &impl Store,
+    prune: Option<&Prune<'_>>,
     query: String,
     depth: usize,
     split: bool,
     start_after: Option<&str>,
 ) -> Result<Batch> {
     let mut flat = read_after(store, &query, false, None, start_after).await?;
+    if let Some(prune) = prune {
+        if start_after.is_none() {
+            if let Some(batch) = lookahead(store, prune, &query, depth, &flat).await? {
+                return Ok(batch);
+            }
+        }
+        // The dense split below would request every small sibling of two
+        // dense directories separately; filtered listings stay flat instead.
+        return Ok(scan_batch(query, false, flat, start_after));
+    }
     if flat.next.is_none()
         || !split
         || !store.ordered()
@@ -344,6 +463,7 @@ async fn recursive(
                 depth: depth + 1,
             })
             .collect(),
+        pruned: Vec::new(),
     })
 }
 
@@ -377,6 +497,7 @@ pub(super) async fn enumerate(
     enumerate_jobs(
         store,
         Some(pattern),
+        None,
         concurrency,
         Job::Discover {
             prefix: String::new(),
@@ -385,21 +506,29 @@ pub(super) async fn enumerate(
         },
         &mut emit,
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 /// Literal prefixes from copy/removal selectors must never be parsed as globs.
 /// This only changes request scheduling; callers still validate and interpret
 /// object metadata, source types and destination mappings.
+///
+/// With `prune`, the listing stays flat apart from the lookahead, and
+/// directories it names may be skipped: their common prefixes are returned
+/// instead of being listed. Objects in pruned directories may still be
+/// emitted, so callers must classify every entry themselves.
 pub(in crate::s3) async fn enumerate_prefix(
     store: &impl Store,
     prefix: &str,
     concurrency: usize,
+    prune: Option<&Prune<'_>>,
     mut emit: impl FnMut(Entry) -> Result<()>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     enumerate_jobs(
         store,
         None,
+        prune,
         concurrency,
         Job::Recursive {
             prefix: prefix.to_owned(),
@@ -414,10 +543,11 @@ pub(in crate::s3) async fn enumerate_prefix(
 async fn enumerate_jobs(
     store: &impl Store,
     pattern: Option<&Pattern>,
+    prune: Option<&Prune<'_>>,
     concurrency: usize,
     first: Job,
     emit: &mut impl FnMut(Entry) -> Result<()>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     ensure!(
         (1..=256).contains(&concurrency),
         "concurrency must be between 1 and 256"
@@ -427,6 +557,7 @@ async fn enumerate_jobs(
         slots: tokio::sync::Semaphore::new(concurrency),
     };
     let mut pending = VecDeque::from([first]);
+    let mut pruned = Vec::new();
     let mut active = FuturesUnordered::new();
     loop {
         while active.len() < concurrency {
@@ -434,10 +565,10 @@ async fn enumerate_jobs(
                 break;
             };
             let split = concurrency > 1 && pending.len() + active.len() < SPLIT_QUEUE_LIMIT;
-            active.push(execute(&store, pattern, job, split));
+            active.push(execute(&store, pattern, prune, job, split));
         }
         let Some(batch) = active.next().await else {
-            return Ok(());
+            return Ok(pruned);
         };
         let batch = batch?;
         for entry in batch.entries {
@@ -446,5 +577,6 @@ async fn enumerate_jobs(
             }
         }
         pending.extend(batch.jobs);
+        pruned.extend(batch.pruned);
     }
 }

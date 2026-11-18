@@ -78,32 +78,20 @@ impl std::fmt::Debug for Issued {
 /// The source of `args`, a copy from one SSH server to this machine that a
 /// receiving machine can approve, as the command names it.
 pub(crate) fn eligible_target(args: &crate::cli::Args) -> Result<String> {
-    use crate::cli::{CoordinateAt, Interface, PeerAuth};
-    let (destination, sources) = args
+    use crate::route::Route;
+    let (_, sources) = args
         .locations
         .split_last()
         .context("copy endpoints missing")?;
     let source = sources.first().context("copy source missing")?;
-    if args.interface != Interface::NativeCp
+    if args.interface != crate::cli::Interface::NativeCp
         || args.s3.is_some()
-        || destination.is_remote()
-        || !source.is_remote()
-        || sources.iter().any(|other| {
-            other.host != source.host || other.user != source.user || other.port != source.port
-        })
+        || crate::route::classify(args) != Route::Download
+        || sources.iter().any(|other| !other.same_host(source))
     {
         bail!("source authorization requires syq cp from one SSH server to this machine");
     }
-    if args.rsh.is_some()
-        || args.syq_path.is_some()
-        || args.no_bootstrap
-        || args.detach
-        || args.restricted_grant.is_some()
-        || args.peer_auth != PeerAuth::Restricted
-        || args.coordinate_at != CoordinateAt::Auto
-    {
-        bail!("a copy from another server that a receiving machine approves reads it through that server's restricted receiver; it cannot be combined with --rsh, --syq-path, --no-bootstrap, --detach, --peer-auth, or --coordinate-at");
-    }
+    crate::route::refuse_options(Route::Download, args)?;
     anyhow::ensure!(args.descriptor_copy.is_none(), "source authorization requires pathname file selections; descriptor streams are not supported");
     let target = crate::remote_to_remote::endpoint_arg(source, None, None);
     forward::target_endpoint(&target)?;

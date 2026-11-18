@@ -1,4 +1,5 @@
 """Native SSH tools reuse approved accounts without a source key or forwarded agent."""
+import functools
 import json
 import os
 from pathlib import Path
@@ -6,18 +7,18 @@ import shlex
 import signal
 import subprocess
 
+import syq_real_ssh_lab as lab
+
 
 NATIVE_PATH = "PATH=/usr/bin:/bin:/usr/local/bin"
 
 
-def run(*args, data=None, success=True):
-    result = subprocess.run(args, input=data, capture_output=True, timeout=40)
-    assert (result.returncode == 0) == success, (args, result)
-    return result.stdout
+# Bytes in and out.
+run = functools.partial(lab.run, timeout=40, text=False)
 
 
 def source(*args, data=None, success=True):
-    return run("ssh", "source", shlex.join(["env", NATIVE_PATH, *args]), data=data, success=success)
+    return run("ssh", "source", shlex.join(["env", NATIVE_PATH, *args]), stdin=data, success=success)
 
 
 def no_pending():

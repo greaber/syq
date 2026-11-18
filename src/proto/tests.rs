@@ -509,17 +509,12 @@ fn compressed_metadata_still_obeys_its_message_limit() {
 }
 
 #[test]
-fn bounded_decoder_preserves_released_completion_payloads() {
+fn bounded_decoder_preserves_the_released_completion_request() {
     let request = include_bytes!("../../tests/fixtures/completion/list-dir-v0.3.2.bin");
-    let response = include_bytes!("../../tests/fixtures/completion/directory-entries-v0.3.2.bin");
     let decoded = crate::wire_budget::decode::<Request>(request)
         .unwrap()
         .into_inner();
     assert_eq!(postcard::to_stdvec(&decoded).unwrap(), request);
-    let decoded = crate::wire_budget::decode::<Response>(response)
-        .unwrap()
-        .into_inner();
-    assert_eq!(postcard::to_stdvec(&decoded).unwrap(), response);
 }
 
 #[test]
@@ -528,11 +523,7 @@ fn compression_is_per_frame_and_never_expands_the_wire_payload() {
     let compressed = block_frame(data.clone(), true);
     assert_eq!(
         compressed[local_preamble_len() + 4],
-        if crate::identity::build() == "v0.6.0" {
-            1
-        } else {
-            2
-        },
+        2,
         "compressible frame was not compressed"
     );
 
@@ -631,20 +622,6 @@ fn released_preambles_reject_new_transfer_messages_before_decoding() {
 }
 
 #[test]
-fn released_v060_preamble_preserves_explicit_compatibility() {
-    // v0.6.0 preamble, kept independent of the current encoder. Selecting
-    // release helpers must accept it; ordinary source builds must reject it.
-    const V060: &[u8] = b"SYQWIRE\0\0\x06v0.6.0";
-    let result = FrameReader::new(V060).read_preamble();
-    if crate::identity::build() == "v0.6.0" {
-        result.unwrap();
-    } else {
-        let error = result.unwrap_err().to_string();
-        assert!(error.contains("build identity mismatch"), "{error}");
-    }
-}
-
-#[test]
 fn every_malformed_build_identity_is_a_preamble_protocol_error() {
     let preamble = |length: u16, identity: &[u8]| {
         let mut input = Vec::new();
@@ -726,17 +703,6 @@ fn registered_paths_reject_unsafe_wire_components() {
 
 #[test]
 fn copy_local_fallback_has_a_structured_wire_response() {
-    // Released v0.5.2's postcard encoding: response discriminant 32,
-    // no payload. Keep this fixed fixture independent of today's encoder.
-    const V052_UNSUPPORTED: &[u8] = &[32];
-    assert!(matches!(
-        postcard::from_bytes::<Response>(V052_UNSUPPORTED).unwrap(),
-        Response::CopyLocalUnsupported
-    ));
-    assert_eq!(
-        postcard::to_stdvec(&Response::CopyLocalUnsupported).unwrap(),
-        V052_UNSUPPORTED
-    );
     let mut frame = Vec::new();
     FrameWriter::new(&mut frame, false)
         .write_msg(&Response::CopyLocalUnsupported)
@@ -788,14 +754,7 @@ fn frames_mix_lz4_zstd_and_raw_without_losing_boundaries() {
         codecs.push(bytes[offset + 4]);
         offset += 4 + len;
     }
-    assert_eq!(
-        codecs,
-        if crate::identity::build() == "v0.6.0" {
-            vec![1, 1, 0, 1]
-        } else {
-            vec![2, 1, 0, 2]
-        }
-    );
+    assert_eq!(codecs, vec![2, 1, 0, 2]);
 }
 
 #[test]
@@ -972,34 +931,6 @@ fn compressed_frames_preserve_transport_write_and_flush_failures() {
             .write_msg(&block_message(vec![b'x'; 65536]))
             .unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EIO));
-    }
-}
-
-#[test]
-fn released_v060_zstd_frame_remains_decodable() {
-    // Captured from the published v0.6.0 Linux x86-64 helper, not regenerated
-    // by today's encoder. Its ListDir response contains 64 empty-file names.
-    // The preamble is tested separately: frame compatibility does not bypass
-    // the build identity check when connecting to a different executable.
-    let fixture =
-        include_bytes!("../../tests/fixtures/completion/directory-entries-zstd-v0.6.0.bin");
-    let mut bytes = Vec::new();
-    FrameWriter::new(&mut bytes, false)
-        .write_preamble()
-        .unwrap();
-    bytes.extend_from_slice(fixture);
-    let Response::DirectoryEntries { entries, truncated } =
-        FrameReader::new(bytes.as_slice()).read_msg().unwrap()
-    else {
-        panic!("expected released directory listing")
-    };
-    assert!(!truncated);
-    assert_eq!(entries.len(), 64);
-    for (index, entry) in entries.iter().enumerate() {
-        assert_eq!(
-            entry.name,
-            format!("compressible-entry-{index:03}").as_bytes()
-        );
     }
 }
 

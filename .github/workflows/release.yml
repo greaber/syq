@@ -111,7 +111,7 @@ jobs:
           name: source-crate
           path: ${{ runner.temp }}/source-crate
       - name: Require identical source-package bytes before any publication
-        run: scripts/verify-prepared-crate.py "$GITHUB_REF_NAME" "$RUNNER_TEMP/source-crate"
+        run: scripts/prepare-release-crate.py --verify "$GITHUB_REF_NAME" "$RUNNER_TEMP/source-crate"
       - name: Download every target
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:

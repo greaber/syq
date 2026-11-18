@@ -79,7 +79,10 @@ such as a development build and an installed one, logs in after each switch.
 A server that connects to the receiver itself, to run or coordinate a copy,
 needs the same build as the machine that approves the copy. Otherwise the receiver
 refuses the copy and names both builds; update syq on whichever machine is
-older.
+older. If your laptop's record of the receiver is out of date, for example
+after you restore the laptop's state from a backup, a copy between two
+servers fails saying that the receiver runs another syq build. Run the copy
+again: syq updates the receiver first.
 
 If `syq receiver list` shows an enrollment as `unusable`, this syq can't read
 the record your laptop keeps for it, for example because a newer syq wrote it.

@@ -300,7 +300,7 @@ pub(super) fn failure<E>(
 
 /// Every listing reports failures the same way. A named source is looked up
 /// with a HEAD and a listing at once, and either one may be the first to fail.
-fn listing_failure(
+pub(super) fn listing_failure(
     error: aws_sdk_s3::error::SdkError<
         aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Error,
         aws_smithy_runtime_api::client::orchestrator::HttpResponse,
@@ -912,12 +912,6 @@ impl ListingObjects {
             Self::Timed(objects) => objects.push((key, size, time)),
         }
     }
-    fn clear(&mut self) {
-        match self {
-            Self::Plain(objects) => objects.clear(),
-            Self::Timed(objects) => objects.clear(),
-        }
-    }
     fn is_empty(&self) -> bool {
         match self {
             Self::Plain(objects) => objects.is_empty(),
@@ -953,30 +947,55 @@ impl Listing {
     }
 }
 
-/// Reuse the bounded recursive planner for existing literal-prefix operations.
-/// Filtered copies retain the exclusion-directed lookahead below: it can prune
-/// an ignored subtree without enumerating or interpreting its descendants.
-async fn parallel_listing(
+/// List every object under a literal prefix with the bounded parallel engine.
+pub(super) async fn list(
     client: &Client,
     bucket: &str,
     prefix: &str,
     concurrency: usize,
+) -> Result<Listing> {
+    list_with_times(client, bucket, prefix, None, concurrency, false).await
+}
+
+/// Delimiter requests a filtered listing may spend looking past a first page
+/// in which every object is in an ignored directory. Deep chains must not
+/// turn a flat listing into an unbounded walk.
+const LOOKAHEAD_PROBES: usize = 4;
+
+/// Like [`list`], optionally keeping each object's LIST timestamp. With
+/// `matcher`, ignored objects are left out and counted, and an ignored
+/// directory counts once however many objects it holds, as in a filesystem
+/// walk. The listing can then skip ignored directories without enumerating
+/// them.
+pub(super) async fn list_with_times(
+    client: &Client,
+    bucket: &str,
+    prefix: &str,
+    matcher: Option<&ignore::gitignore::Gitignore>,
+    concurrency: usize,
     retain_times: bool,
 ) -> Result<Listing> {
-    use super::listing::engine::{self, Entry, Page, Store};
-    struct S3<'a> {
-        client: &'a Client,
-        bucket: &'a str,
-        root: &'a str,
-        retain_times: bool,
-        discovery_denied: std::sync::atomic::AtomicBool,
+    use super::listing::{
+        self,
+        engine::{self, Page, Prune, Store},
+    };
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+    fn denied(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<RequestFailure>()
+            .is_some_and(|failure| failure.status == Some(403))
     }
-    impl Store for S3<'_> {
+    /// Notes refusals of requests that an exact-prefix IAM policy may deny.
+    struct Checked<'a> {
+        inner: listing::S3<'a>,
+        root: &'a str,
+        discovery_denied: AtomicBool,
+    }
+    impl Store for Checked<'_> {
         fn ordered(&self) -> bool {
-            // Directory buckets do not promise lexicographic LIST order.
-            !self.bucket.ends_with("--x-s3")
+            self.inner.ordered()
         }
-
         async fn page(
             &self,
             prefix: &str,
@@ -984,336 +1003,90 @@ async fn parallel_listing(
             token: Option<&str>,
             start_after: Option<&str>,
         ) -> Result<Page> {
-            let response = self
-                .client
-                .list_objects_v2()
-                .bucket(self.bucket)
-                .prefix(prefix)
-                .max_keys(1000)
-                .set_delimiter(delimiter.then(|| "/".into()))
-                .set_continuation_token(token.map(str::to_owned))
-                .set_start_after(start_after.map(str::to_owned))
-                .send()
+            self.inner
+                .page(prefix, delimiter, token, start_after)
                 .await
-                .map_err(|error| {
-                    if (delimiter || prefix != self.root)
-                        && error
-                            .raw_response()
-                            .is_some_and(|response| response.status().as_u16() == 403)
-                    {
-                        self.discovery_denied
-                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                .inspect_err(|error| {
+                    if (delimiter || prefix != self.root) && denied(error) {
+                        self.discovery_denied.store(true, Relaxed);
                     }
-                    listing_failure(error)
-                })?;
-            // Preserve this path's existing SDK decoding and failure context.
-            // Transfer metadata still comes from HEAD/GET, not LIST.
-            let entries = response
-                .contents()
-                .iter()
-                .map(|object| {
-                    Ok(Entry {
-                        key: object.key().context("S3 listing omitted key")?.to_owned(),
-                        size: u64::try_from(object.size().context("S3 listing omitted size")?)?,
-                        last_modified: if self.retain_times {
-                            object
-                                .last_modified()
-                                .map(|t| t.fmt(aws_smithy_types::date_time::Format::DateTime))
-                                .transpose()?
-                        } else {
-                            None
-                        },
-                        etag: None,
-                    })
                 })
-                .collect::<Result<_>>()?;
-            let prefixes = response
-                .common_prefixes()
-                .iter()
-                .map(|child| {
-                    Ok(child
-                        .prefix()
-                        .context("S3 listing omitted common prefix")?
-                        .to_owned())
-                })
-                .collect::<Result<_>>()?;
-            let next = if response.is_truncated() == Some(true) {
-                Some(
-                    response
-                        .next_continuation_token()
-                        .context("truncated S3 listing omitted continuation token")?
-                        .to_owned(),
-                )
-            } else {
-                None
-            };
-            Ok(Page {
-                entries,
-                prefixes,
-                next,
-            })
         }
     }
-    let mut objects = ListingObjects::new(retain_times);
-    let store = S3 {
-        client,
-        bucket,
+    let store = Checked {
+        inner: listing::S3 {
+            client: client.clone(),
+            bucket,
+        },
         root: prefix,
-        retain_times,
-        discovery_denied: std::sync::atomic::AtomicBool::new(false),
+        discovery_denied: AtomicBool::new(false),
     };
-    let collect = |objects: &mut ListingObjects, entry: Entry| -> Result<()> {
-        let time = entry
-            .last_modified
-            .as_deref()
-            .map(|value| {
-                aws_smithy_types::DateTime::from_str(
-                    value,
-                    aws_smithy_types::date_time::Format::DateTime,
-                )
-                .map(|time| (time.secs(), time.subsec_nanos()))
-            })
-            .transpose()?;
-        objects.push(entry.key, entry.size, time);
-        Ok(())
-    };
-    let outcome = engine::enumerate_prefix(&store, prefix, concurrency.min(32), |entry| {
-        collect(&mut objects, entry)
-    })
-    .await;
-    if let Err(error) = outcome {
-        if !store
-            .discovery_denied
-            .load(std::sync::atomic::Ordering::Relaxed)
-            || error
-                .downcast_ref::<RequestFailure>()
-                .is_none_or(|failure| failure.status != Some(403))
-        {
-            return Err(error);
-        }
-        // Exact-prefix IAM policies can permit the original LIST while denying
-        // discovery or child prefixes. No caller has consumed the plan yet.
-        objects.clear();
-        engine::enumerate_prefix(&store, prefix, 1, |entry| collect(&mut objects, entry)).await?;
-    }
-    // Previously LIST delivered keys in order. Preserve planning/claim order
-    // for callers despite concurrent subtree completion.
-    objects.sort();
-    Ok(Listing {
-        found: !objects.is_empty(),
-        objects,
-        excluded: 0,
-    })
-}
-
-/// Keep flat listings for small trees and filename filters. Only switch to
-/// directory discovery when the first full page contains only excluded descendants.
-/// A complete directory probe can prune children or descend through a single
-/// included child toward excluded descendants. Limit probes to four per source
-/// selector: deep chains must not turn a flat listing into an unbounded walk.
-/// Wide or truncated probes reuse the flat sample instead of fanning out.
-pub(super) async fn list(
-    client: &Client,
-    bucket: &str,
-    prefix: &str,
-    matcher: Option<&ignore::gitignore::Gitignore>,
-    excluded_subtrees: &mut std::collections::HashSet<String>,
-    concurrency: usize,
-) -> Result<Listing> {
-    list_with_times(
-        client,
-        bucket,
-        prefix,
+    let subtree = |key: &str, directory: bool| match exclusion(
         matcher,
-        excluded_subtrees,
-        concurrency,
-        false,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn list_with_times(
-    client: &Client,
-    bucket: &str,
-    prefix: &str,
-    matcher: Option<&ignore::gitignore::Gitignore>,
-    excluded_subtrees: &mut std::collections::HashSet<String>,
-    concurrency: usize,
-    retain_times: bool,
-) -> Result<Listing> {
-    if matcher.is_none() {
-        return parallel_listing(client, bucket, prefix, concurrency, retain_times).await;
-    }
-    let mut result = Listing {
-        objects: ListingObjects::new(retain_times),
-        found: false,
-        excluded: 0,
+        prefix,
+        key,
+        directory,
+        &HashSet::new(),
+    ) {
+        Some(Exclusion::Subtree(boundary)) => Some(boundary.len()),
+        _ => None,
     };
-    let mut probes_remaining = 4;
-    let mut pending = vec![prefix.to_owned()];
-    while let Some(current) = pending.pop() {
-        let mut token = None;
-        loop {
-            let mut directories = false;
-            let mut output = client
-                .list_objects_v2()
-                .bucket(bucket)
-                .prefix(&current)
-                .set_continuation_token(token.clone())
-                .send()
-                .await
-                .map_err(listing_failure)?;
-            result.found |= !output.contents().is_empty() || !output.common_prefixes().is_empty();
-            let mut reachable_exclusion = false;
-            if probes_remaining > 0
-                && token.is_none()
-                && output.is_truncated() == Some(true)
-                && !output.contents().is_empty()
-                && output.contents().iter().all(|object| {
-                    object.key().is_some_and(|key| {
-                        if let Some(Exclusion::Subtree(boundary)) = exclusion(
-                            matcher,
-                            prefix,
-                            key,
-                            object.size() == Some(0) && key.ends_with('/'),
-                            excluded_subtrees,
-                        ) {
-                            reachable_exclusion |=
-                                boundary.strip_prefix(&current).is_some_and(|relative| {
-                                    relative.bytes().filter(|byte| *byte == b'/').count()
-                                        < probes_remaining
-                                });
-                            true
-                        } else {
-                            false
+    let mut fallback = false;
+    loop {
+        let prune = matcher.map(|_| Prune {
+            subtree: &subtree,
+            probes: AtomicUsize::new(if fallback { 0 } else { LOOKAHEAD_PROBES }),
+        });
+        let mut objects = ListingObjects::new(retain_times);
+        let mut excluded = 0;
+        let mut subtrees = HashSet::new();
+        let outcome = engine::enumerate_prefix(
+            &store,
+            prefix,
+            if fallback { 1 } else { concurrency.min(32) },
+            prune.as_ref(),
+            |entry| {
+                let directory = is_directory_marker(&entry.key, entry.size);
+                match exclusion(matcher, prefix, &entry.key, directory, &subtrees) {
+                    Some(exclusion) => {
+                        // A filename-only exclusion still encounters the key
+                        // and preserves its path validation.
+                        if exclusion == Exclusion::File {
+                            super::local::key_path(entry.key.as_bytes())?;
                         }
-                    })
-                })
-                && reachable_exclusion
-            {
-                let mut probe_prefix = current.clone();
-                let mut parent_objects = Vec::new();
-                while probes_remaining > 0 {
-                    probes_remaining -= 1;
-                    let mut directory_page = client
-                        .list_objects_v2()
-                        .bucket(bucket)
-                        .prefix(&probe_prefix)
-                        .delimiter("/")
-                        .send()
-                        .await
-                        .map_err(listing_failure)?;
-                    let mut included = 0;
-                    let mut excluded = 0;
-                    for child in directory_page.common_prefixes() {
-                        let child = child.prefix().context("S3 listing omitted common prefix")?;
-                        anyhow::ensure!(
-                            child.starts_with(&probe_prefix)
-                                && child.len() > probe_prefix.len()
-                                && child.ends_with('/'),
-                            "S3 listing returned an invalid common prefix"
-                        );
-                        if exclusion(matcher, prefix, child, true, excluded_subtrees).is_some() {
-                            excluded += 1;
-                        } else {
-                            included += 1;
-                        }
+                        excluded += exclusion.count(&mut subtrees);
                     }
-                    if directory_page.is_truncated() == Some(true) || included > 1 {
-                        break;
-                    }
-                    for object in directory_page.contents() {
-                        anyhow::ensure!(
-                            object
-                                .key()
-                                .context("S3 listing omitted key")?
-                                .starts_with(&probe_prefix),
-                            "S3 listing returned a key outside the requested prefix"
-                        );
-                    }
-                    if excluded > 0 {
-                        // Commit the lookahead only once it actually prunes.
-                        // Ancestor objects and this page replace the sample;
-                        // intermediate prefixes have already been visited.
-                        parent_objects.extend(directory_page.contents.take().unwrap_or_default());
-                        directory_page.contents = Some(parent_objects);
-                        output = directory_page;
-                        directories = true;
-                        break;
-                    }
-                    if included == 0 {
-                        break;
-                    }
-                    // Every sampled object was under an excluded ancestor and
-                    // this page has just one child. Follow that child without
-                    // refetching the same flat sample at each directory level.
-                    probe_prefix = directory_page.common_prefixes()[0]
-                        .prefix()
-                        .context("S3 listing omitted common prefix")?
-                        .to_owned();
-                    parent_objects.extend(directory_page.contents.take().unwrap_or_default());
+                    None => objects.push(entry.key, entry.size, entry.last_modified),
                 }
-                // If the budget or a wide page stopped lookahead, the original
-                // flat sample and its continuation token are still usable.
-            }
-            for object in output.contents() {
-                let key = object.key().context("S3 listing omitted key")?;
-                anyhow::ensure!(
-                    key.starts_with(&current),
-                    "S3 listing returned a key outside the requested prefix"
-                );
-                let size = u64::try_from(object.size().context("S3 listing omitted size")?)?;
-                let directory = is_directory_marker(key, size);
-                if let Some(excluded) =
-                    exclusion(matcher, prefix, key, directory, excluded_subtrees)
-                {
-                    // A filename-only exclusion still encounters the key and
-                    // preserves its path validation. Pruned descendants do not.
-                    if excluded == Exclusion::File {
-                        super::local::key_path(key.as_bytes())?;
+                Ok(())
+            },
+        )
+        .await;
+        match outcome {
+            Ok(pruned) => {
+                for child in pruned {
+                    if let Some(exclusion) = exclusion(matcher, prefix, &child, true, &subtrees) {
+                        excluded += exclusion.count(&mut subtrees);
                     }
-                    result.excluded += excluded.count(excluded_subtrees);
-                } else {
-                    let time = if retain_times {
-                        object
-                            .last_modified()
-                            .map(|time| (time.secs(), time.subsec_nanos()))
-                    } else {
-                        None
-                    };
-                    result.objects.push(key.to_owned(), size, time);
                 }
+                // Keep planning and claim order independent of the order in
+                // which concurrent subtrees complete.
+                objects.sort();
+                return Ok(Listing {
+                    found: !objects.is_empty() || excluded > 0,
+                    objects,
+                    excluded,
+                });
             }
-            for child in output.common_prefixes() {
-                let child = child.prefix().context("S3 listing omitted common prefix")?;
-                anyhow::ensure!(
-                    directories
-                        && child.starts_with(&current)
-                        && child.len() > current.len()
-                        && child.ends_with('/'),
-                    "S3 listing returned an invalid common prefix"
-                );
-                if let Some(excluded) = exclusion(matcher, prefix, child, true, excluded_subtrees) {
-                    result.excluded += excluded.count(excluded_subtrees);
-                } else {
-                    pending.push(child.to_owned());
-                }
+            // Exact-prefix IAM policies can permit the original LIST while
+            // denying discovery or child prefixes. No caller has consumed the
+            // plan yet.
+            Err(error) if !fallback && store.discovery_denied.load(Relaxed) && denied(&error) => {
+                fallback = true;
             }
-            if output.is_truncated() != Some(true) {
-                break;
-            }
-            let next = output
-                .next_continuation_token()
-                .context("truncated S3 listing omitted continuation token")?
-                .to_owned();
-            if token.as_ref() == Some(&next) {
-                bail!("S3 listing repeated its continuation token");
-            }
-            token = Some(next);
+            Err(error) => return Err(error),
         }
     }
-    Ok(result)
 }
 
 // GET metadata is authoritative for the body returned by that same request.
@@ -1465,30 +1238,6 @@ fn merge_metadata_encryption(
             request.headers.insert(name.clone(), value.clone());
         }
     }
-    Ok(())
-}
-
-pub(super) async fn copy_metadata(
-    client: &Client,
-    bucket: &str,
-    update: super::authorization::Unsigned,
-) -> Result<()> {
-    client
-        .copy_object()
-        .bucket(bucket)
-        .key(&update.key)
-        .copy_source(update.headers["x-amz-copy-source"].clone())
-        .customize()
-        .map_request(move |mut request| {
-            for (name, value) in &update.headers {
-                request
-                    .headers_mut()
-                    .try_insert(name.clone(), value.clone())?;
-            }
-            Ok::<_, aws_smithy_runtime_api::http::HttpError>(request)
-        })
-        .send()
-        .await?;
     Ok(())
 }
 

@@ -10,7 +10,7 @@ scripts/pr-checks.py, and the dispatched-checks commit status on pull requests.
 """
 from concurrent.futures import ThreadPoolExecutor
 
-from tooling import ToolError, json_output
+from tooling import ToolError, json_output, output
 
 # Workflows whose manually dispatched runs test task branches. Focused jobs
 # carry their test or script in the job name so reruns of one check match.
@@ -80,6 +80,23 @@ def branch_runs(runs, branch, merged, until=None):
             and since < (run.get("createdAt") or "") and (until is None or run["createdAt"] <= until)]
 
 
+def fetch_branch_runs(repository, branch):
+    """The merged pull requests from a branch name and every recent dispatched
+    run on that branch, before any merge filtering."""
+    found = in_parallel([lambda: merged_from_branch(repository, branch)] + [
+        lambda workflow=workflow: dispatched_runs(repository, workflow, branch)
+        for workflow in BRANCH_WORKFLOWS])
+    return found[0], [run for workflow_runs in found[1:] for run in workflow_runs]
+
+
+def branch_dispatched_runs(repository, branch, until=None):
+    """A branch's dispatched runs since an earlier pull request from the same
+    branch name merged, and up to `until` (a merge time) when given. Branch
+    names get reused, so earlier merges are looked up by name."""
+    merged, runs = fetch_branch_runs(repository, branch)
+    return branch_runs(runs, branch, merged, until)
+
+
 def fetch_jobs(repository, runs):
     """The jobs of the given runs, by run ID."""
     runs = {run.get("databaseId"): run for run in runs}
@@ -143,6 +160,40 @@ def fetch_commit_statuses(repository, heads):
     return dict(zip(heads, in_parallel([lambda head=head: statuses(head) for head in heads])))
 
 
+def acknowledgement_reason(parser, reason, link, link_option, link_required):
+    """The validated reason for an acknowledgement status; exits through
+    `parser.error` when the reason or its HTTPS link is unusable."""
+    reason = (reason or "").strip()
+    if not 1 <= len(reason) <= 140 or any(c in reason for c in "\r\n"):
+        parser.error("--reason must be one line of 1–140 characters")
+    if (link or link_required) and (
+            not link or not link.startswith("https://") or any(c.isspace() for c in link)):
+        parser.error(f"{link_option} requires an HTTPS URL")
+    return reason
+
+
+def post_acknowledgement(repository, head, context, reason, link=None):
+    """Record an acknowledgement as a successful commit status: the reason is
+    its description and the optional link its target URL."""
+    output("gh", "api", "--method", "POST", f"repos/{repository}/statuses/{head}",
+           "-f", "state=success", "-f", f"context={context}", "-f", f"description={reason}",
+           *(["-f", f"target_url={link}"] if link else []), status=2)
+
+
+def read_acknowledgement(by_head, head, context, link_key, link_required=False):
+    """The acknowledgement recorded by the latest status of `context` on
+    `head`, with its link under `link_key`, or None. Only a successful status
+    with a reason (and a link when required) counts."""
+    status = by_head.get(head, {}).get(context, {})
+    reason = (status.get("description") or "").strip()
+    if status.get("state") != "success" or not reason or (link_required
+                                                          and not status.get("target_url")):
+        return None
+    return {"reason": reason, link_key: status.get("target_url"),
+            "actor": (status.get("creator") or {}).get("login"),
+            "created_at": status.get("created_at"), "url": status.get("url")}
+
+
 def apply_resolutions(number, results, by_head):
     """Attach resolutions without changing test conclusions. Commit statuses
     preserve the reason, author, time, and optional replacement link. Only the
@@ -151,14 +202,11 @@ def apply_resolutions(number, results, by_head):
     """
     annotated = []
     for entry in results:
-        resolution = by_head.get(entry["head"], {}).get(
-            resolution_context(number, entry.get("job_id")), {})
-        reason = (resolution.get("description") or "").strip()
-        if unresolved(entry) and resolution.get("state") == "success" and reason:
-            entry = dict(entry, resolution={
-                "reason": reason, "replacement": resolution.get("target_url"),
-                "actor": (resolution.get("creator") or {}).get("login"),
-                "created_at": resolution.get("created_at"), "url": resolution.get("url")})
+        resolution = read_acknowledgement(by_head, entry["head"],
+                                          resolution_context(number, entry.get("job_id")),
+                                          "replacement")
+        if unresolved(entry) and resolution:
+            entry = dict(entry, resolution=resolution)
         annotated.append(entry)
     return annotated
 

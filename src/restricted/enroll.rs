@@ -11,13 +11,16 @@ pub(super) fn local_state_base() -> Result<PathBuf> {
 
 pub(super) const ENROLLMENT_FILE: &str = "enrollment.json";
 pub(super) const PENDING_FILE: &str = "pending.json";
-/// Present while a refresh of an active enrollment has not been confirmed.
-/// The server may have applied it, as when the reply was lost, so the next
-/// copy logs in to finish it even if the recorded key can still sign.
+/// Present while a refresh of an active enrollment has not been confirmed,
+/// or once its receiver refused a copy for running another build than the
+/// record says. The server may have applied the refresh, as when the reply
+/// was lost, or another build may have updated it, so the next copy logs in
+/// to refresh it even if the recorded key can still sign.
 pub(super) const REFRESH_FILE: &str = "refreshing";
 
 /// Whether an active enrollment must log in again before a copy uses it:
-/// it runs another build, or a refresh of it was never confirmed.
+/// it runs another build, or a refresh of it was never confirmed, or its
+/// receiver was found to run another build than the record says.
 pub(super) fn needs_refresh(metadata: &LocalEnrollment, directory: &Path) -> bool {
     metadata.release != crate::identity::build() || directory.join(REFRESH_FILE).exists()
 }
@@ -750,8 +753,6 @@ pub(super) struct Plan {
     pub(super) entry_key: Option<PrivateKey>,
     pub(super) refresh: bool,
     pub(super) replaces: Option<ReplacedEnrollment>,
-    /// The server must keep the record of used directives (`InstallRequest`).
-    pub(super) keep_used: bool,
 }
 
 enum Session {
@@ -772,11 +773,6 @@ pub(super) enum Refresh {
     IfOutdated,
     /// Always, as to find the login key again.
     Always,
-    /// Always, for a copy its receiver refused for running another build,
-    /// which is then signed again as the same copy: only this enrollment,
-    /// and only keeping the server's record of the directives that ran.
-    /// Nothing is set up anew or replaced.
-    SameRecord(EnrollmentId),
 }
 
 /// The enrollment for `login@host:port`, set up when there is none, and
@@ -809,64 +805,51 @@ pub(super) fn enroll(
         atomic_write(&plan.directory, REFRESH_FILE, b"", 0o600)?;
     }
     let lost = (plan.refresh, plan.id, plan.directory.clone());
-    let (metadata, directory, signer) = match run_session(
-        &target,
-        (jump, batch),
-        (host, port, login),
-        plan,
-        check,
-    )? {
-        (Session::Installed(installed), directory) => {
-            let (metadata, signer) = *installed;
-            (metadata, directory, signer)
-        }
-        (Session::StateMissing, _) => {
-            // The server lost this enrollment's state. Enroll under a new ID
-            // instead of re-creating the old one, so no grant can be replayed
-            // against an empty record, and remove the old line. Not for a
-            // refused copy signed again: its record is gone with the state.
-            let (_, old_id, old_directory) = lost;
-            if refresh == Refresh::SameRecord(old_id) {
-                bail!(
-                        "{} has lost the state of enrollment {old_id}, so the copy it refused is not run again; run the copy again",
-                        target.label()
-                    );
+    let (metadata, directory, signer) =
+        match run_session(&target, (jump, batch), (host, port, login), plan, check)? {
+            (Session::Installed(installed), directory) => {
+                let (metadata, signer) = *installed;
+                (metadata, directory, signer)
             }
-            let old_key = load_entry_key(&old_directory)?;
-            crate::output::diagnostic!(
-                "syq: {} has lost the state of enrollment {old_id}; enrolling again",
-                target.label()
-            );
-            let replaced = ReplacedEnrollment {
-                id: old_id,
-                entry_public_key: old_key.public_key().to_openssh()?,
-            };
-            let records = load_enrollment_records_in(&base)?;
-            refuse_beside_unusable(&records.unusable, (host, port, login))?;
-            let pending = records
-                .pending
-                .into_iter()
-                .find(|(pending, _)| account(&pending.host, pending.port, &pending.target_login));
-            match run_session(
-                &target,
-                (jump, batch),
-                (host, port, login),
-                replacement_plan(&base, pending, replaced)?,
-                check,
-            )? {
-                (Session::Installed(installed), directory) => {
-                    // Keep the old record until its replacement is installed,
-                    // so a failure here can still name the line to remove.
-                    remove_local_enrollment(&old_directory)?;
-                    let (metadata, signer) = *installed;
-                    (metadata, directory, signer)
-                }
-                (Session::StateMissing, _) => {
-                    bail!("the server reported missing state for a new enrollment")
+            (Session::StateMissing, _) => {
+                // The server lost this enrollment's state. Enroll under a new ID
+                // instead of re-creating the old one, so no grant can be replayed
+                // against an empty record, and remove the old line.
+                let (_, old_id, old_directory) = lost;
+                let old_key = load_entry_key(&old_directory)?;
+                crate::output::diagnostic!(
+                    "syq: {} has lost the state of enrollment {old_id}; enrolling again",
+                    target.label()
+                );
+                let replaced = ReplacedEnrollment {
+                    id: old_id,
+                    entry_public_key: old_key.public_key().to_openssh()?,
+                };
+                let records = load_enrollment_records_in(&base)?;
+                refuse_beside_unusable(&records.unusable, (host, port, login))?;
+                let pending = records.pending.into_iter().find(|(pending, _)| {
+                    account(&pending.host, pending.port, &pending.target_login)
+                });
+                match run_session(
+                    &target,
+                    (jump, batch),
+                    (host, port, login),
+                    replacement_plan(&base, pending, replaced)?,
+                    check,
+                )? {
+                    (Session::Installed(installed), directory) => {
+                        // Keep the old record until its replacement is installed,
+                        // so a failure here can still name the line to remove.
+                        remove_local_enrollment(&old_directory)?;
+                        let (metadata, signer) = *installed;
+                        (metadata, directory, signer)
+                    }
+                    (Session::StateMissing, _) => {
+                        bail!("the server reported missing state for a new enrollment")
+                    }
                 }
             }
-        }
-    };
+        };
     Ok((metadata, directory, Some(signer)))
 }
 
@@ -893,17 +876,6 @@ pub(super) fn plan_enrollment(
         .active
         .into_iter()
         .find(|(metadata, _)| account(&metadata.host, metadata.port, &metadata.target_login));
-    if let Refresh::SameRecord(id) = refresh {
-        if !active
-            .as_ref()
-            .is_some_and(|(metadata, _)| metadata.id == id)
-        {
-            bail!(
-                "restricted copying on {} is no longer enrollment {id}, which this copy was signed for; run the copy again",
-                endpoint(login, host, port)?.label()
-            );
-        }
-    }
     if let Some((metadata, directory)) = active {
         if refresh == Refresh::IfOutdated && !needs_refresh(&metadata, &directory) {
             return Ok(Planned::Current(metadata, directory));
@@ -914,7 +886,6 @@ pub(super) fn plan_enrollment(
             directory,
             refresh: true,
             replaces: None,
-            keep_used: matches!(refresh, Refresh::SameRecord(_)),
         }));
     }
     // Anything but a refresh of the active enrollment installs a line for
@@ -932,7 +903,6 @@ pub(super) fn plan_enrollment(
                 directory,
                 refresh: false,
                 replaces: None,
-                keep_used: false,
             },
             None => new_plan(base, None),
         },
@@ -955,7 +925,6 @@ pub(super) fn replacement_plan(
             directory,
             refresh: false,
             replaces: Some(replaced),
-            keep_used: false,
         },
         None => new_plan(base, Some(replaced)),
     })
@@ -969,7 +938,6 @@ fn new_plan(base: &Path, replaces: Option<ReplacedEnrollment>) -> Plan {
         entry_key: None,
         refresh: false,
         replaces,
-        keep_used: false,
     }
 }
 
@@ -1261,7 +1229,6 @@ fn install_over_route(
             signer: login_key.trusted.clone(),
             refresh: plan.refresh,
             replaces: plan.replaces.clone(),
-            keep_used: plan.keep_used,
         };
         Ok((login_key, (offer, build), request))
     })();

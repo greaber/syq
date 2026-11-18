@@ -514,6 +514,7 @@ fn inspect_ssh_configuration_at(
     }
     command.args(["--", host]).env("LC_ALL", "C");
     let output = crate::process::capture_output_bounded(
+        "SSH policy inspection",
         &mut command,
         deadline,
         cancelled,
@@ -1128,6 +1129,7 @@ fn read_known_host_keys_bounded(
             continue;
         }
         let output = crate::process::capture_output_bounded(
+            "SSH policy inspection",
             Command::new(keygen)
                 .args(["-F", lookup, "-f"])
                 .arg(file)

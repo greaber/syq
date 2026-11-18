@@ -2,7 +2,7 @@
 //! TCP data connections (see `crypto.rs`) when the client asks for them.
 
 use crate::descriptor_broker::DescriptorSessionSlot;
-use crate::fsops::{self, FsOps};
+use crate::fsops::FsOps;
 use crate::proto::*;
 use crate::tcp_records::{Cipher, RecordReader, RecordWriter};
 use anyhow::{bail, Context, Result};
@@ -258,8 +258,6 @@ struct ServeSession {
     handshake_pending: Option<Arc<std::sync::atomic::AtomicBool>>,
     ssh_worker_ticket: Option<std::result::Result<String, String>>,
     allow_tcp: bool,
-    /// A bridged control may carry metadata and results, never file payloads.
-    metadata_control: bool,
     /// A local copy's receiver: listen for data on loopback only and
     /// advertise no interface addresses.
     loopback_only: bool,
@@ -357,7 +355,6 @@ pub fn run(local_receiver: bool) -> Result<()> {
             handshake_pending: None,
             ssh_worker_ticket: None,
             allow_tcp: true,
-            metadata_control: false,
             loopback_only: local_receiver,
             named_socket: None,
             authority: None,
@@ -476,14 +473,13 @@ fn peek_hello() -> (Vec<u8>, Option<Request>) {
 fn handed_worker_ticket(hello: &Request) -> Option<crate::descriptor_broker::DescriptorTicket> {
     match hello {
         Request::Hello {
-            identity,
             role:
                 ConnectionRole::DestinationWorker {
                     destination: Some(destination),
                     ..
                 },
             ..
-        } if identity == crate::identity::build() => Some(destination.ticket.clone()),
+        } => Some(destination.ticket.clone()),
         _ => None,
     }
 }
@@ -543,7 +539,6 @@ pub(crate) fn serve_handed_restricted(
             handshake_pending: Some(pending),
             ssh_worker_ticket: None,
             allow_tcp: false,
-            metadata_control: false,
             loopback_only: false,
             named_socket: None,
             authority: Some(authority),
@@ -590,7 +585,6 @@ pub(crate) fn serve_handed_source(
             handshake_pending: Some(pending),
             ssh_worker_ticket: None,
             allow_tcp: false,
-            metadata_control: false,
             loopback_only: false,
             named_socket: None,
             authority: None,
@@ -725,7 +719,6 @@ fn serve_handed(
         handshake_pending: None,
         ssh_worker_ticket: None,
         allow_tcp: false,
-        metadata_control: false,
         loopback_only: false,
         named_socket,
         authority: None,
@@ -834,7 +827,6 @@ fn run_restricted(authority: Arc<crate::restricted::RestrictedAuthority>) -> Res
             handshake_pending: Some(pending),
             ssh_worker_ticket: Some(ticket),
             allow_tcp: true,
-            metadata_control: false,
             loopback_only: false,
             named_socket: None,
             authority: Some(Arc::clone(&authority)),
@@ -903,80 +895,6 @@ fn run_restricted_source(authority: Arc<crate::restricted::source::SourceAuthori
     client_gone_result(result, client_gone.load(Relaxed))
 }
 
-fn file_payload_request(request: &Request) -> bool {
-    // Keep this exhaustive: every new protocol operation must explicitly
-    // choose whether it can carry file data over the relayed control channel.
-    match request {
-        Request::ReadRange { .. }
-        | Request::ReadSmallBatch(_)
-        | Request::WriteRange { .. }
-        | Request::PutSmallBatch(_)
-        | Request::CopySmallFiles(_)
-        | Request::ReadStream(_)
-        | Request::DescriptorCopy(_)
-        | Request::ReadComparedRange { .. }
-        | Request::ReadDifferingBatch { .. }
-        | Request::PatchSmallBatch(_)
-        | Request::PatchBegin { .. }
-        | Request::PatchData { .. }
-        | Request::PatchEnd { .. } => true,
-        Request::Hello { .. }
-        | Request::TcpListen { .. }
-        | Request::Scan { .. }
-        | Request::ListDir { .. }
-        | Request::NativeRemove { .. }
-        | Request::StatMany { .. }
-        | Request::CheckOperatorDirectory { .. }
-        | Request::CheckOperatorDirectoryAncestry { .. }
-        | Request::CheckOperatorDirectoryAncestryWithAccess { .. }
-        | Request::CheckSearchableOperatorDirectory { .. }
-        | Request::PrepareDestinationPath { .. }
-        | Request::RestoreDestinationPath
-        | Request::RegisterSourceRoots { .. }
-        | Request::CreateOperatorDirectory { .. }
-        | Request::AnchorDestination { .. }
-        | Request::DestinationFilesystemInfo { .. }
-        | Request::PartialPaths { .. }
-        | Request::WidenDirectories { .. }
-        | Request::Apply { .. }
-        | Request::PlanBatch { .. }
-        | Request::ProbePartial { .. }
-        | Request::Prepare { .. }
-        | Request::HashAndHold { .. }
-        | Request::HashExistingBatch { .. }
-        | Request::FinishBasis { .. }
-        | Request::SeedBasis { .. }
-        | Request::CopyLocal { .. }
-        | Request::HashBlocks { .. }
-        | Request::Finalize { .. }
-        | Request::FileHash { .. }
-        | Request::Canonicalize { .. }
-        | Request::TransportStats
-        | Request::ReceiverUser
-        | Request::NewFileOwner { .. }
-        | Request::DestinationResults { .. }
-        | Request::FinishDestinationResults
-        | Request::Shutdown
-        | Request::ListDirDetails { .. }
-        | Request::StopReadStream
-        | Request::WriteStreamFence
-        | Request::ShrinkReadStream { .. }
-        | Request::ListDirNoFollowFinal { .. }
-        | Request::MappingChunk { .. }
-        | Request::PruneLookup { .. }
-        | Request::ConfigureHashing(_)
-        | Request::ValidateDigest { .. }
-        | Request::BindStream(_)
-        | Request::ConfigurePreservation { .. }
-        | Request::NativeMap(_)
-        | Request::PrepareSmallFiles(_)
-        | Request::StageBasis { .. }
-        | Request::HashWindow { .. }
-        | Request::ReuseComparedRange { .. }
-        | Request::CreateSendBudget { .. } => false,
-    }
-}
-
 /// An authenticated named-destination channel. Worker admission and path
 /// checks are identical to restricted TCP workers; SSH encrypts these streams.
 pub(crate) fn run_named(
@@ -1007,7 +925,6 @@ pub(crate) fn run_named(
             handshake_pending: None,
             ssh_worker_ticket: None,
             allow_tcp: false,
-            metadata_control: false,
             loopback_only: false,
             named_socket: Some(socket),
             authority: Some(Arc::clone(&authority)),
@@ -1053,7 +970,6 @@ pub(crate) fn run_named_source(
             handshake_pending: None,
             ssh_worker_ticket: None,
             allow_tcp: false,
-            metadata_control: false,
             loopback_only: false,
             named_socket: Some(socket),
             authority: None,
@@ -1095,7 +1011,6 @@ pub(crate) fn run_named_source_tcp(
             handshake_pending: Some(pending),
             ssh_worker_ticket: None,
             allow_tcp: false,
-            metadata_control: false,
             loopback_only: false,
             named_socket: Some(channel),
             authority: None,
@@ -1131,7 +1046,6 @@ fn run_authorized_source<R: Read + Send + 'static, W: Write>(
             handshake_pending: pending,
             ssh_worker_ticket,
             allow_tcp: true,
-            metadata_control: false,
             loopback_only: false,
             named_socket: None,
             authority: None,
@@ -1142,47 +1056,6 @@ fn run_authorized_source<R: Read + Send + 'static, W: Write>(
     authority.close();
     descriptor_session.close();
     result
-}
-
-/// A private-broker source worker. Its outer SSH/Unix-channel authentication
-/// must be complete before entry. Only source worker Hello roles are allowed;
-/// the live authority validates the exact descriptors installed by control.
-#[cfg(test)]
-pub(crate) fn run_authorized_source_worker(
-    input: crate::private_broker::TrackedStream,
-    output: std::os::unix::net::UnixStream,
-    authority: Arc<crate::restricted::source::SourceAuthority>,
-    descriptor_session: DescriptorSessionSlot,
-) -> Result<()> {
-    let socket = output.try_clone()?;
-    let timeout = socket
-        .read_timeout()?
-        .context("source worker handshake requires a timeout")?;
-    let reader = NamedHandshakeReader {
-        inner: input,
-        socket: socket.try_clone()?,
-        deadline: Instant::now() + timeout,
-    };
-    serve(
-        reader,
-        output,
-        false,
-        None,
-        None,
-        None,
-        ServeSession {
-            owns_process: false,
-            handshake_pending: None,
-            ssh_worker_ticket: None,
-            allow_tcp: false,
-            metadata_control: false,
-            loopback_only: false,
-            named_socket: Some(socket),
-            authority: None,
-            source_authority: Some(authority),
-            descriptor_session,
-        },
-    )
 }
 
 /// A laptop-initiated TCP worker, admitted through its approved SSH channel.
@@ -1211,7 +1084,6 @@ pub(crate) fn run_named_tcp(
             handshake_pending: Some(pending),
             ssh_worker_ticket: None,
             allow_tcp: false,
-            metadata_control: false,
             loopback_only: false,
             named_socket: Some(channel),
             authority: Some(authority),
@@ -1250,7 +1122,6 @@ fn serve<R: Read + Send + 'static, W: Write>(
         handshake_pending,
         ssh_worker_ticket,
         allow_tcp,
-        metadata_control,
         loopback_only,
         named_socket,
         authority,
@@ -1297,7 +1168,6 @@ fn serve<R: Read + Send + 'static, W: Write>(
     let (hello, _hello_hold) = r.read_budgeted::<Request>()?.into_parts();
     match hello {
         Request::Hello {
-            identity,
             compress,
             debug: d,
             token,
@@ -1311,7 +1181,7 @@ fn serve<R: Read + Send + 'static, W: Write>(
             }
             // The token is the credential: once it matches, the peer is
             // authenticated. Claim its connection id now, and never free it,
-            // so a later failure (identity mismatch or a failed HelloOk write)
+            // so a later failure (such as a failed HelloOk write)
             // can't make the id available to a replay.
             if let Some(id) = connection_id {
                 id.claim()?;
@@ -1325,19 +1195,6 @@ fn serve<R: Read + Send + 'static, W: Write>(
                 }
                 _ => None,
             };
-            let expected_identity = crate::identity::build();
-            if identity != expected_identity {
-                w.write_msg(&Response::Err(format!(
-                    "build identity mismatch (remote {expected_identity}, client {identity})"
-                )))?;
-                bail!("build identity mismatch");
-            }
-            if metadata_control && !matches!(requested_role, ConnectionRole::Control) {
-                w.write_msg(&Response::Err(
-                    "bridged connection requires the control role".into(),
-                ))?;
-                bail!("bridged connection requires the control role");
-            }
             if let Some(authority) = &authority {
                 authority.validate_hello(compress)?;
             }
@@ -1508,7 +1365,6 @@ fn serve<R: Read + Send + 'static, W: Write>(
         descriptors: is_control
             .then(crate::resources::Descriptors::current)
             .flatten(),
-        identity: crate::identity::build().to_string(),
         platform: crate::identity::platform(),
         supports_confined_socket_nodes: crate::identity::supports_confined_socket_nodes(),
         ssh_worker_ticket: if is_control { ssh_worker_ticket } else { None },
@@ -1544,7 +1400,6 @@ fn serve<R: Read + Send + 'static, W: Write>(
     .context("start request reader")?;
     let server_actor = ops.observations.actor("server");
     let mut w = ObservedWriter {
-        compress: w.compress,
         inner: w,
         registry: ops.observations.clone(),
         actor: server_actor.clone(),
@@ -1586,13 +1441,6 @@ fn serve<R: Read + Send + 'static, W: Write>(
             w.write_msg(&Response::Err(crate::fsops::OPEN_PATCH_STREAM.into()))?;
             continue;
         }
-        if metadata_control && file_payload_request(&req) {
-            w.write_msg(&Response::Err(
-                "file payload requires a direct data worker".into(),
-            ))?;
-            continue;
-        }
-
         if !is_control
             && matches!(
                 &req,
@@ -1831,7 +1679,6 @@ fn serve<R: Read + Send + 'static, W: Write>(
                     port_hi,
                     loopback_only,
                     debug,
-                    w.compress,
                     congestion_control.as_deref(),
                     send_rate,
                     authority.clone(),
@@ -1944,13 +1791,12 @@ fn serve<R: Read + Send + 'static, W: Write>(
                         continue;
                     }
                 };
-                let root = match ops.scan_root(&root) {
-                    Ok(root) => root,
-                    Err(error) => {
-                        w.write_msg(&Response::Err(format!("{error:#}")))?;
-                        continue;
-                    }
-                };
+                if source_scan.is_none() && destination_scan.is_none() {
+                    w.write_msg(&Response::Err(
+                        "scan names neither a registered source nor a destination root".into(),
+                    ))?;
+                    continue;
+                }
                 // Warnings are collected and sent between batches so a single
                 // writer borrow suffices.
                 let warns = std::cell::RefCell::new(Vec::new());
@@ -2011,23 +1857,15 @@ fn serve<R: Read + Send + 'static, W: Write>(
                         &mut ignored,
                         &mut |msg| warns.borrow_mut().push(msg),
                     )
-                } else if let Some((destination_root, relative)) = destination_scan {
+                } else {
+                    let (destination_root, relative) =
+                        destination_scan.expect("checked before the scan");
                     crate::scan::scan_descriptor(
                         destination_root,
                         &relative,
                         None,
                         follow_root,
                         true,
-                        &ignore,
-                        report_ignored,
-                        &mut sink,
-                        &mut ignored,
-                        &mut |msg| warns.borrow_mut().push(msg),
-                    )
-                } else {
-                    crate::scan::scan(
-                        &fsops::resolve(&root),
-                        follow_root,
                         &ignore,
                         report_ignored,
                         &mut sink,
@@ -2241,7 +2079,6 @@ fn tcp_listen(
     hi: u16,
     loopback_only: bool,
     debug: bool,
-    compress: bool,
     congestion_control: Option<&str>,
     send_rate: Option<u64>,
     authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
@@ -2315,7 +2152,6 @@ fn tcp_listen(
                     key,
                     token,
                     debug,
-                    compress,
                     next_id,
                     live,
                     max_live,
@@ -2337,7 +2173,6 @@ fn accept_data_connections(
     key: Option<Vec<u8>>,
     token: Vec<u8>,
     debug: bool,
-    compress: bool,
     next_id: Arc<AtomicU32>,
     live: Arc<AtomicU32>,
     max_live: u32,
@@ -2406,11 +2241,8 @@ fn accept_data_connections(
             .spawn(move || {
                 if let Err(e) = serve_tcp(
                     stream,
-                    id,
                     key,
                     token,
-                    debug,
-                    compress,
                     &seen,
                     authority.clone(),
                     source_authority.clone(),
@@ -2434,11 +2266,8 @@ fn accept_data_connections(
 #[allow(clippy::too_many_arguments)]
 fn serve_tcp(
     stream: TcpStream,
-    id: u32,
     key: Option<Vec<u8>>,
     token: Vec<u8>,
-    _debug: bool,
-    _compress: bool,
     seen: &std::sync::Mutex<std::collections::HashSet<u32>>,
     authority: Option<Arc<crate::restricted::RestrictedAuthority>>,
     source_authority: Option<Arc<crate::restricted::source::SourceAuthority>>,
@@ -2469,7 +2298,6 @@ fn serve_tcp(
     let mut idbuf = [0u8; 4];
     handshake_reader.read_exact(&mut idbuf)?;
     let conn_id = u32::from_be_bytes(idbuf);
-    let _ = id;
     // Reject aliases before emitting encrypted records.
     if conn_id > crate::tcp_records::CONNECTION_ID_MAX {
         bail!("TCP connection id {conn_id} exceeds nonce space");
@@ -2521,7 +2349,6 @@ fn serve_tcp(
             handshake_pending: Some(handshake_pending),
             ssh_worker_ticket: None,
             allow_tcp: true,
-            metadata_control: false,
             loopback_only: false,
             named_socket: None,
             authority,
@@ -2627,7 +2454,6 @@ impl Read for TcpHandshakeReader {
 /// the existing reader before entering the bounded data-reply queue.
 struct ObservedWriter<W: Write> {
     inner: FrameWriter<W>,
-    compress: bool,
     registry: Arc<crate::transfer_observations::Registry>,
     actor: Arc<crate::transfer_observations::Actor>,
     last: std::time::Instant,

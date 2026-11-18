@@ -1,6 +1,8 @@
 """Source-shell copies the runner approves for the destination's enrolled
 receiver; all paths are disposable."""
+import functools
 import json
+import operator
 import os
 from pathlib import Path
 import shlex
@@ -10,11 +12,10 @@ import subprocess
 import tempfile
 import time
 
+import syq_real_ssh_lab as lab
 
-def run(*args, success=True, stdin=None):
-    result = subprocess.run(args, input=stdin, capture_output=True, text=True, timeout=40)
-    assert (result.returncode == 0) == success, (args, result)
-    return result.stdout
+
+run = functools.partial(lab.run, timeout=40)
 
 
 def remote(command, *, success=True):
@@ -198,19 +199,8 @@ def setup_processes():
     return found
 
 
-def wait_until(label, probe, seconds=20):
-    deadline = time.monotonic() + seconds
-    progress = time.monotonic() + 5
-    last = None
-    while time.monotonic() < deadline:
-        done, last = probe()
-        if done:
-            return
-        if time.monotonic() >= progress:
-            print(f"Waiting for {label}: {last}", flush=True)
-            progress += 5
-        time.sleep(.1)
-    raise AssertionError(f"{label} timed out; last state: {last}")
+# Each probe returns (done, last observed state).
+wait_until = functools.partial(lab.wait_for, timeout=20, done=operator.itemgetter(0))
 
 
 def destination_enrollments():
@@ -489,7 +479,7 @@ try:
     # The setup child and the login it held end with it, well before the
     # setup deadline.
     wait_until("the setup to end", lambda: (not alive(login) and not setup_processes(),
-                                             (alive(login), setup_processes())), seconds=10)
+                                             (alive(login), setup_processes())), timeout=10)
     assert destination_enrollments() == []
 finally:
     hold.unlink(missing_ok=True)
@@ -624,7 +614,7 @@ def restart_receiving(environment):
     run("syq", "persist", "receive", "off")
     try:
         wait_until("the receiving service to stop", lambda: (not receive_service_pids(), receive_service_pids()),
-                   seconds=15)
+                   timeout=15)
     except AssertionError:
         for pid in receive_service_pids():
             os.kill(pid, signal.SIGTERM)
