@@ -89,7 +89,10 @@ impl Source {
             self.meta.mtime_nsec as i64,
             self.meta.ctime,
             self.meta.ctime_nsec as i64,
-        ) {
+        ) || (m.nlink() == 0 && self.meta.nlink > 0)
+        {
+            // Some filesystems, such as ZFS, keep the change time when the
+            // last name of a file is removed.
             return Err(self.changed());
         }
         Ok(())

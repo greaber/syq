@@ -605,6 +605,19 @@ fn now() -> Result<u64> {
 struct State {
     connection: Option<std::os::unix::net::UnixStream>,
     requests: BTreeMap<Unsigned, String>,
+    /// Why signing failed. A failed exchange ends the signing session, so
+    /// every later request it has not prepared fails for the same reason.
+    failure: Option<String>,
+}
+impl State {
+    fn ended(&self) -> Result<()> {
+        match &self.failure {
+            Some(failure) => anyhow::bail!(
+                "storage authorization ended after an earlier request failed ({failure}); rerun the copy for fresh approval"
+            ),
+            None => Ok(()),
+        }
+    }
 }
 pub(crate) struct Authorization {
     pub configuration: Configuration,
@@ -630,6 +643,7 @@ impl Authorization {
             state: Mutex::new(State {
                 connection: Some(connection),
                 requests: BTreeMap::new(),
+                failure: None,
             }),
         }
     }
@@ -642,14 +656,26 @@ impl Authorization {
         if missing.is_empty() {
             return Ok(());
         }
+        state.ended()?;
         let stream = state.connection.as_mut().with_context(|| format!("request {request:?} was not prepared before storage authorization disconnected; rerun for fresh approval", request = missing[0]))?;
-        let signed = crate::destination::storage::sign(stream, &missing)?;
-        anyhow::ensure!(
-            signed.len() == missing.len(),
-            "incomplete storage authorization response"
-        );
-        state.requests.extend(missing.into_iter().zip(signed));
-        Ok(())
+        let signed = crate::destination::storage::sign(stream, &missing).and_then(|signed| {
+            anyhow::ensure!(
+                signed.len() == missing.len(),
+                "incomplete storage authorization response"
+            );
+            Ok(signed)
+        });
+        match signed {
+            Ok(signed) => {
+                state.requests.extend(missing.into_iter().zip(signed));
+                Ok(())
+            }
+            Err(error) => {
+                state.connection = None;
+                state.failure = Some(format!("{error:#}"));
+                Err(error)
+            }
+        }
     }
     pub(super) fn signed(&self, request: Unsigned) -> Result<String> {
         anyhow::ensure!(
@@ -677,6 +703,8 @@ impl Authorization {
     }
     pub(super) fn finish_preparation(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap();
+        // Preparation that failed must not count as finished.
+        state.ended()?;
         if let Some(mut stream) = state.connection.take() {
             crate::destination::storage::finish(&mut stream)?;
         }

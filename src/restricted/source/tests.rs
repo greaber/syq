@@ -31,7 +31,6 @@ fn policy(path: &Path) -> SourcePolicy {
             max_deletions: 0,
         },
         preview: false,
-        deadline: Instant::now() + Duration::from_secs(30),
         outer_root: None,
     }
 }
@@ -56,7 +55,8 @@ struct Fixture {
 impl Fixture {
     fn new(policy: SourcePolicy) -> Self {
         let request = registration(&policy);
-        let authority = SourceAuthority::new(policy).unwrap();
+        let authority =
+            SourceAuthority::new(policy, Instant::now() + Duration::from_secs(30)).unwrap();
         let control = authority.acquire(&ConnectionRole::Control, false).unwrap();
         let mut ops = FsOps::new();
         let response = control.register(&mut ops, &request).unwrap();
@@ -108,7 +108,7 @@ fn registration_checks_approved_selectors_before_opening_paths() {
     fs::write(&path, b"approved").unwrap();
     let policy = policy(&path);
     let request = registration(&policy);
-    let authority = SourceAuthority::new(policy).unwrap();
+    let authority = SourceAuthority::new(policy, Instant::now() + Duration::from_secs(30)).unwrap();
     let control = authority.acquire(&ConnectionRole::Control, false).unwrap();
     let mut ops = FsOps::new();
     for changed in 0..4 {
@@ -317,7 +317,8 @@ fn followed_operator_symlinks_work_but_never_escape_a_hard_root() {
         follow_root: true,
     };
     let request = registration(&escaped);
-    let authority = SourceAuthority::new(escaped).unwrap();
+    let authority =
+        SourceAuthority::new(escaped, Instant::now() + Duration::from_secs(30)).unwrap();
     let control = authority.acquire(&ConnectionRole::Control, false).unwrap();
     assert!(error_response(
         &control.register(&mut FsOps::new(), &request).unwrap()
@@ -519,9 +520,8 @@ fn control_close_and_expiry_revoke_existing_workers_and_pending_output() {
         .authority
         .check_response(&Response::ReadStreamDone)
         .unwrap();
-    let mut expired = policy(temp.path());
-    expired.deadline = Instant::now() - Duration::from_secs(1);
-    let authority = SourceAuthority::new(expired).unwrap();
+    let expired = policy(temp.path());
+    let authority = SourceAuthority::new(expired, Instant::now() - Duration::from_secs(1)).unwrap();
     assert!(authority.acquire(&ConnectionRole::Control, false).is_err());
 }
 
@@ -699,7 +699,8 @@ fn typed_source_selections_cannot_gain_a_different_read_scope() {
         let mut policy = policy(path);
         policy.selection_types = vec![kind];
         let request = registration(&policy);
-        let authority = SourceAuthority::new(policy).unwrap();
+        let authority =
+            SourceAuthority::new(policy, Instant::now() + Duration::from_secs(30)).unwrap();
         let control = authority.acquire(&ConnectionRole::Control, false).unwrap();
         assert!(control.register(&mut FsOps::new(), &request).is_err());
         assert!(authority.state.lock().unwrap().roots.is_empty());
@@ -724,7 +725,7 @@ fn overlapping_native_descriptor_estimates_keep_the_live_worker_limit() {
         *shared_workers = 2;
         *independent_handoff_workers = 2;
     }
-    let authority = SourceAuthority::new(policy).unwrap();
+    let authority = SourceAuthority::new(policy, Instant::now() + Duration::from_secs(30)).unwrap();
     let control = authority.acquire(&ConnectionRole::Control, false).unwrap();
     let mut ops = FsOps::new();
     let Response::SourceRootsRegistered(roots) = control.register(&mut ops, &request).unwrap()
@@ -762,14 +763,14 @@ fn relative_selections_are_read_from_the_resolved_base() {
     // The registration still has to be the command's.
     let mut other = policy_with_base(b"elsewhere");
     other.resolved_base = Some(temp.path().as_os_str().as_bytes().to_vec());
-    let authority = SourceAuthority::new(other).unwrap();
+    let authority = SourceAuthority::new(other, Instant::now() + Duration::from_secs(30)).unwrap();
     let control = authority.acquire(&ConnectionRole::Control, false).unwrap();
     let changed = registration(&policy_with_base(b"projects"));
     assert!(control.register(&mut FsOps::new(), &changed).is_err());
     // A resolved base is absolute.
     let mut relative = policy(Path::new("data"));
     relative.resolved_base = Some(b"projects".to_vec());
-    assert!(SourceAuthority::new(relative).is_err());
+    assert!(SourceAuthority::new(relative, Instant::now() + Duration::from_secs(30)).is_err());
 }
 
 fn policy_with_base(base: &[u8]) -> SourcePolicy {
@@ -823,7 +824,7 @@ fn a_linked_home_reads_relative_sources_without_following_links() {
             independent_handoff_workers: 0,
         };
         let authority =
-            SourceAuthority::new(reads.policy(Instant::now() + Duration::from_secs(30))).unwrap();
+            SourceAuthority::new(reads.clone(), Instant::now() + Duration::from_secs(30)).unwrap();
         let control = authority
             .acquire(&ConnectionRole::Control, reads.compressed)
             .unwrap();

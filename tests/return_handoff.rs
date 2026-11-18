@@ -592,10 +592,7 @@ fn a_copy_asks_the_new_connection_once_after_its_receiver_switched() {
     assert_switched_failure(&output, "receiving machine: refused by the test");
     assert_eq!(requests.len(), 1, "{requests:?}");
     assert_eq!(requests[0]["secret"], "new-secret");
-    assert!(
-        requests[0]["message"].get("Request").is_some(),
-        "{requests:?}"
-    );
+    assert!(requests[0]["message"].get("Copy").is_some(), "{requests:?}");
 }
 
 /// One that switched to another build cannot take this build's request:
@@ -612,9 +609,20 @@ fn a_copy_whose_receiver_switched_to_another_build_asks_to_run_it_again() {
 }
 
 /// A copy refused by a receiving connection that is stopping for a switch
-/// waits a little for the new connection to register, then asks it once.
+/// waits a little for the new connection to register, then asks it once,
+/// whichever route it asks the receiving machine to approve: every route
+/// sends the same request through the same retry.
 #[test]
 fn a_copy_refused_while_its_receiver_switches_asks_the_new_connection() {
+    for command in [
+        &["cp", "source", "--to", "@laptop", "--into", "dst"][..],
+        &["cp", "--from", "@laptop", "source", "--into", "dst"],
+    ] {
+        asks_the_new_connection_after_a_switch(command);
+    }
+}
+
+fn asks_the_new_connection_after_a_switch(command: &[&str]) {
     let fixture = Fixture::new();
     let build = String::from_utf8(fixture.run(&["--build-identity"]).stdout).unwrap();
     let build = build.trim().to_owned();
@@ -673,10 +681,10 @@ fn a_copy_refused_while_its_receiver_switches_asks_the_new_connection() {
             register_at(&home, &new_socket, &registered_build, "new-secret");
         }),
     );
-    let output = fixture.run(&["cp", "source", "--to", "@laptop", "--into", "dst"]);
+    let output = fixture.run(command);
     assert_switched_failure(&output, "receiving machine: refused by the test");
     assert_eq!(old.join().unwrap()["secret"], "old-secret");
     let request = new.join().unwrap();
     assert_eq!(request["secret"], "new-secret");
-    assert!(request["message"].get("Request").is_some(), "{request}");
+    assert!(request["message"].get("Copy").is_some(), "{request}");
 }

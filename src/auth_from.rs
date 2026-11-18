@@ -279,7 +279,7 @@ pub(crate) fn apply_copy(args: &mut crate::cli::Args) -> Result<()> {
     if args.auth_from_explicit || args.s3.is_some() {
         return Ok(());
     }
-    use crate::destination::{account_copy, forward_target, pull};
+    use crate::destination::{account_copy, forward, pull};
     use crate::route::Route;
     // A saved choice applies only to a copy that an account connection or
     // the approved route can carry. With --rsh or another option they
@@ -287,9 +287,9 @@ pub(crate) fn apply_copy(args: &mut crate::cli::Args) -> Result<()> {
     // with such an option is refused instead.
     let carried = account_copy::remote(args).is_some();
     let location = match crate::route::classify(args) {
-        Route::Upload if carried || forward_target(args).is_ok() => args.locations.last(),
+        Route::Upload if carried || forward::eligible_target(args).is_ok() => args.locations.last(),
         Route::Download if carried || pull::eligible_target(args).is_ok() => args.locations.first(),
-        Route::Between if crate::destination::coordinated_targets(args).is_ok() => {
+        Route::Between if forward::eligible_peer(args).is_ok() => {
             args.auth_from = between_servers(args)?;
             return Ok(());
         }

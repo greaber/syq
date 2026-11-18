@@ -713,11 +713,12 @@ fn approve(
 ) -> Approved {
     let (_, reply) = exchange(
         registration,
-        Message::Request {
+        Message::Copy(Box::new(approve::Asked {
             cwd: String::new(),
             command,
             inputs,
-        },
+            results_key: None,
+        })),
         Duration::from_secs(10),
         Some(Duration::from_secs(10)),
     )
@@ -827,11 +828,12 @@ fn a_copy_here_naming_another_authorizer_is_refused_before_asking() {
     let (command, inputs) = requested(Path::new("source"), &["--auth-from", "@other"]);
     let error = exchange(
         &registration,
-        Message::Request {
+        Message::Copy(Box::new(approve::Asked {
             cwd: String::new(),
             command,
             inputs,
-        },
+            results_key: None,
+        })),
         Duration::from_secs(5),
         Some(Duration::from_secs(5)),
     )
@@ -855,11 +857,12 @@ fn named_denial_does_not_issue_authority_or_touch_destination() {
     let caller = std::thread::spawn(move || {
         exchange(
             &registration,
-            Message::Request {
+            Message::Copy(Box::new(approve::Asked {
                 cwd: String::new(),
                 command,
                 inputs,
-            },
+                results_key: None,
+            })),
             Duration::from_secs(5),
             Some(Duration::from_secs(5)),
         )
@@ -1277,7 +1280,6 @@ fn a_named_copy_the_receiving_machine_would_refuse_fails_before_asking() {
             "laptop".into(),
             registration.clone(),
             handoff::Kind::Copy,
-            None,
         )));
         let error = format!("{:#}", prepare(&mut args).unwrap_err());
         assert!(
@@ -1562,11 +1564,12 @@ fn a_named_pruning_dry_run_is_refused_where_pruning_is_off() {
         let (command, inputs) = requested(&source, options);
         exchange(
             &registration,
-            Message::Request {
+            Message::Copy(Box::new(approve::Asked {
                 cwd: String::new(),
                 command,
                 inputs,
-            },
+                results_key: None,
+            })),
             Duration::from_secs(10),
             Some(Duration::from_secs(10)),
         )
@@ -2056,11 +2059,12 @@ fn named_limits_and_scope_validation_precede_approval() {
     let ask = |command: Vec<Vec<u8>>, inputs| {
         exchange(
             &registration,
-            Message::Request {
+            Message::Copy(Box::new(approve::Asked {
                 cwd: String::new(),
                 command,
                 inputs,
-            },
+                results_key: None,
+            })),
             Duration::from_secs(2),
             Some(Duration::from_secs(2)),
         )
@@ -2217,11 +2221,12 @@ fn a_symlink_above_a_laptop_destination_needs_follow_dst() {
         std::thread::spawn(move || {
             exchange(
                 &registration,
-                Message::Request {
+                Message::Copy(Box::new(approve::Asked {
                     cwd: String::new(),
                     command,
                     inputs: Default::default(),
-                },
+                    results_key: None,
+                })),
                 Duration::from_secs(10),
                 Some(Duration::from_secs(10)),
             )
