@@ -1,7 +1,10 @@
 //! Which route a copy takes, as its endpoints show, and the options each
-//! route that another machine approves refuses. The machine that asks, the
-//! machine that approves and the directive's checks all classify a command
-//! here, so they agree on its route.
+//! route that another machine approves refuses. The machine that asks
+//! classifies a command here. So do the approvers of routes 3, 4 and 6 and
+//! of copies from a receiving machine, and the source's directive checks.
+//! The route 2 approver (`approval_command::receiving_command`) and the
+//! destination's directive checks (`directive::destination_command`) still
+//! test the destination themselves.
 use crate::cli::{Args, CoordinateAt, Location, PeerAuth};
 use anyhow::{bail, Result};
 

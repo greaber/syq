@@ -38,7 +38,7 @@ pub(crate) fn check_endpoints(args: &crate::cli::Args) -> Result<String> {
         crate::route::classify(args) == crate::route::Route::FromNamed,
         "copy source is not a receiving machine"
     );
-    let name = source_name(args).context("copy source is not a receiving machine")?;
+    let name = source_name(args).expect("a source on a receiving machine");
     let (destination, sources) = args
         .locations
         .split_last()
