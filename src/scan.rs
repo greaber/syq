@@ -25,6 +25,10 @@ const FIRST_BATCH_MAX_DELAY: Duration = Duration::from_millis(50);
 /// one's destination up as it is shown, and a control connection keeps this
 /// many requests in flight (`conn::reply_queue`).
 pub(crate) const AHEAD: usize = crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH;
+/// Warnings and ignored paths such a scan holds with those batches before it
+/// stops reading ahead, so that a scan producing mostly these, faster than
+/// they are reported, holds no more of them than about a batch's worth.
+const HELD_NOTES: usize = BATCH;
 /// What a scan shows each batch it has complete while earlier ones wait.
 pub(crate) type Upcoming<'a> = &'a mut dyn FnMut(&[Entry]);
 /// Chunks a scan's producer queues for its consumer: about one batch, or
@@ -424,25 +428,40 @@ enum Held {
     Warning(ScanWarning),
 }
 
+impl Held {
+    /// What it counts towards `HELD_NOTES`.
+    fn notes(&self) -> usize {
+        match self {
+            Held::Batch(_) => 0,
+            Held::Ignored(paths) => paths.len(),
+            Held::Warning(_) => 1,
+        }
+    }
+}
+
 /// Add a chunk's events to `held` in order, with the batch it completes, if
 /// any, last: shown to `upcoming` first. Returns whether it completed one.
 fn hold_chunk(
     chunk: ScanChunk,
     batch: &mut Vec<Entry>,
     ignored_batch: &mut Vec<PathBytes>,
-    held: &mut VecDeque<Held>,
+    (held, held_notes): (&mut VecDeque<Held>, &mut usize),
     upcoming: Option<Upcoming<'_>>,
 ) -> bool {
+    let mut hold = |note: Held| {
+        *held_notes += note.notes();
+        held.push_back(note);
+    };
     for event in chunk {
         match event {
             ScanEvent::Entry(entry) => batch.push(entry),
             ScanEvent::Ignored(path) => {
                 ignored_batch.push(path);
                 if ignored_batch.len() >= BATCH {
-                    held.push_back(Held::Ignored(std::mem::take(ignored_batch)));
+                    hold(Held::Ignored(std::mem::take(ignored_batch)));
                 }
             }
-            ScanEvent::Warning(message) => held.push_back(Held::Warning(message)),
+            ScanEvent::Warning(message) => hold(Held::Warning(message)),
         }
     }
     if batch.len() < BATCH {
@@ -471,8 +490,10 @@ fn arrived_chunk(rx: &Receiver<ScanChunk>) -> Result<ScanChunk, TryRecvError> {
 /// Give the scan's events to `sink`, `ignored` and `warn` in order. With
 /// `upcoming`, batches after the first are also shown to it as soon as they
 /// are complete: up to `AHEAD` are held, filled only from chunks that have
-/// already arrived, so no batch waits for a later one to be scanned. The
-/// last, partial batch is shown too; the caller gives it to `sink`.
+/// already arrived, so no batch waits for a later one to be scanned, and
+/// only while fewer than `HELD_NOTES` warnings and ignored paths are held
+/// with them. The last, partial batch is shown too; the caller gives it to
+/// `sink`.
 #[allow(clippy::too_many_arguments)]
 fn receive_scan(
     rx: &Receiver<ScanChunk>,
@@ -487,17 +508,18 @@ fn receive_scan(
     let mut first_batch = true;
     let mut held = VecDeque::new();
     let mut held_batches = 0;
+    let mut held_notes = 0;
     let mut finished = false;
     loop {
         if let Some(upcoming) = &mut upcoming {
-            while !first_batch && !finished && held_batches < AHEAD {
+            while !first_batch && !finished && held_batches < AHEAD && held_notes < HELD_NOTES {
                 match arrived_chunk(rx) {
                     Ok(chunk) => {
                         held_batches += usize::from(hold_chunk(
                             chunk,
                             batch,
                             ignored_batch,
-                            &mut held,
+                            (&mut held, &mut held_notes),
                             Some(&mut **upcoming),
                         ));
                     }
@@ -511,7 +533,9 @@ fn receive_scan(
                 }
             }
         }
-        match held.pop_front() {
+        let next = held.pop_front();
+        held_notes -= next.as_ref().map_or(0, Held::notes);
+        match next {
             Some(Held::Batch(entries)) => {
                 held_batches -= 1;
                 sink(entries)?;
@@ -558,7 +582,13 @@ fn receive_scan(
             }
             break;
         };
-        held_batches += usize::from(hold_chunk(chunk, batch, ignored_batch, &mut held, upcoming));
+        held_batches += usize::from(hold_chunk(
+            chunk,
+            batch,
+            ignored_batch,
+            (&mut held, &mut held_notes),
+            upcoming,
+        ));
     }
     Ok(())
 }
@@ -1315,6 +1345,70 @@ mod tests {
         assert_eq!(*events.borrow(), expected);
         assert_eq!(most.get(), AHEAD);
         assert_eq!(batch.len(), 10);
+    }
+
+    /// A scan that produces warnings faster than they are reported, and no
+    /// further batch, holds a bounded number of them: it reports what it
+    /// holds before it reads more.
+    #[test]
+    fn warnings_without_batches_are_not_read_ahead_without_bound() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const CHUNKS: usize = 40;
+        const QUEUED: usize = 2;
+        let (tx, rx) = mpsc::sync_channel(QUEUED);
+        let sent = Arc::new(AtomicUsize::new(0));
+        let produced = sent.clone();
+        let producer = std::thread::spawn(move || {
+            tx.send(chunk(BATCH, "first")).unwrap();
+            for _ in 0..CHUNKS {
+                let warnings = (0..FIRST_BATCH)
+                    .map(|_| {
+                        ScanEvent::Warning(ScanWarning {
+                            message: "later".into(),
+                            path: None,
+                            error: String::new(),
+                        })
+                    })
+                    .collect();
+                tx.send(warnings).unwrap();
+                produced.fetch_add(FIRST_BATCH, Ordering::SeqCst);
+            }
+        });
+        let mut reported = 0;
+        let mut most_unreported = 0;
+        let mut batch = Vec::new();
+        let mut ignored_batch = Vec::new();
+        receive_scan(
+            &rx,
+            Instant::now(),
+            &mut batch,
+            &mut ignored_batch,
+            &mut |_| Ok(()),
+            Some(&mut |_: &[Entry]| {}),
+            &mut |_| Ok(()),
+            &mut |warning| {
+                if warning.message != "later" {
+                    return;
+                }
+                // Slow at first, so that the producer gets ahead.
+                if reported < 20 {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                reported += 1;
+                most_unreported =
+                    most_unreported.max(sent.load(Ordering::SeqCst).saturating_sub(reported));
+            },
+        )
+        .unwrap();
+        producer.join().unwrap();
+        assert_eq!(reported, CHUNKS * FIRST_BATCH);
+        // Held, plus the chunk that crossed the limit, plus what the
+        // channel and the producer's own hand hold.
+        let bound = HELD_NOTES + (QUEUED + 2) * FIRST_BATCH;
+        assert!(
+            most_unreported <= bound,
+            "{most_unreported} warnings were read ahead of their report (bound {bound})"
+        );
     }
 
     /// A batch is not held back for the ones after it: with the producer
