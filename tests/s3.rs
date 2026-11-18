@@ -5270,6 +5270,17 @@ fn serve_upload_pages(socket: &mut TcpStream, first: &str, probes: &AtomicUsize,
         );
         return;
     }
+    if query.get("max-keys").map(|n| n.as_ref()) == Some("1") {
+        // The one request a copy sends when it will not rely on a listing.
+        reply(
+            socket,
+            200,
+            &[],
+            b"<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>data/f0000</NextContinuationToken><Contents><Key>data/f0000</Key><Size>1</Size></Contents></ListBucketResult>",
+            false,
+        );
+        return;
+    }
     let after = match query.get("continuation-token") {
         Some(token) => token.to_string(),
         None => {
@@ -5368,9 +5379,14 @@ fn s3_upload_asks_about_every_key_where_a_wrong_absence_would_change_the_result(
             output_text(&output)
         );
         // No listing decides that a key is absent: all 305 keys get a HEAD,
-        // including the five new ones the default policy leaves to the listing.
-        assert_eq!(server.probes.load(Ordering::Relaxed), 0, "{flags:?}");
-        assert_eq!(server.requests.load(Ordering::Relaxed), 305, "{flags:?}");
+        // including the five new ones the default policy leaves to the
+        // listing. The one LIST asks for a single key.
+        assert_eq!(server.probes.load(Ordering::Relaxed), 1, "{flags:?}");
+        assert_eq!(
+            server.requests.load(Ordering::Relaxed),
+            1 + 305,
+            "{flags:?}"
+        );
     }
 }
 

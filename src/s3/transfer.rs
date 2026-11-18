@@ -895,6 +895,11 @@ impl Engine {
         if !self.args.delete {
             if !discovery::lists_destination(&self.args, &self.options.bucket) {
                 // Every key gets its HEAD, so a listing would save nothing.
+                // One request still goes first: the copy sizes its
+                // concurrency from a response seen before it starts, and a
+                // destination that cannot be listed fails here, as it does
+                // for the copies that list.
+                client::prefix_exists(&self.client, &self.options.bucket, &prefix).await?;
                 return Ok(());
             }
             plan.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
