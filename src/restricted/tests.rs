@@ -5619,9 +5619,9 @@ fn a_preparation_after_its_copy_ended_holds_nothing() {
     let authority = existence_authority_with_results(&root, &results_policy().1, 60_000);
     let mut ops = authority.test_ops();
     let mut request = prepare_request(&file);
-    let settlement = authority.authorize(&mut request, false).unwrap();
+    let mut settlement = authority.authorize(&mut request, false).unwrap();
     crate::fsops::release_stages(authority.stage_scope());
-    let response = ops.handle(&request);
+    let response = settlement.execute(&mut ops, |ops| ops.handle(&request));
     authority.settle(settlement, &response);
     assert!(
         format!("{response:?}").contains("the copy has ended"),
@@ -9473,8 +9473,8 @@ fn execute_authorized(
     ops: &mut crate::fsops::FsOps,
     mut request: Request,
 ) -> proto::Response {
-    let settlement = authority.authorize(&mut request, false).unwrap();
-    let response = ops.handle(&request);
+    let mut settlement = authority.authorize(&mut request, false).unwrap();
+    let response = settlement.execute(ops, |ops| ops.handle(&request));
     authority.settle(settlement, &response);
     response
 }
@@ -13949,8 +13949,7 @@ fn changes_check_existence_only_where_numbers_mislead() {
 }
 
 /// A small copy counts its files against the entry limit when it is
-/// prepared, and keeps the count when it ends without its payloads or its
-/// staging fails.
+/// prepared, and keeps the count when its staging fails.
 #[test]
 fn a_small_copy_counts_its_files_when_prepared() {
     let temporary = crate::test_support::tempdir().unwrap();
@@ -14020,8 +14019,21 @@ fn a_small_copy_counts_its_files_when_prepared() {
             "{response:?}"
         );
     };
-    // Prepared, then left without its payloads: the file still counts.
+    // Different contents under `error-if-different`: nothing is staged,
+    // and the file still counts.
     prepare(&mut gate, &mut ops);
+    assert_eq!(changes(), 1);
+    let response = execute_on_connection(&mut gate, &mut ops, payload()).unwrap();
+    assert!(
+        matches!(
+            response,
+            proto::Response::SmallFilesCopied(proto::SmallCopyResponse {
+                outcome: proto::SmallCopyOutcome::StagingFailed(_),
+                ..
+            })
+        ),
+        "{response:?}"
+    );
     assert_eq!(changes(), 1);
     let refused = execute_on_connection(
         &mut gate,

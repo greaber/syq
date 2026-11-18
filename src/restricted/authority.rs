@@ -1839,17 +1839,10 @@ impl RestrictedAuthority {
                     let refused = stage == FileStage::Prepare
                         && matches!(response, proto::Response::EndpointError(error)
                             if crate::fsops::vouch::is_replace_required_wire(error));
-                    // A Finalize of a file with no reservation that
-                    // succeeded is taken to be one sent again after the
-                    // Finalize that published the file lost its reply: it
-                    // leaves alone any newer file the copy writes under its
-                    // name. A Finalize that raced a newer preparation of
-                    // the same file could instead have published that file,
-                    // which the results then list as unfinished.
-                    if stage == FileStage::Finalize
-                        && charged.unreserved_finalize
-                        && outcome_error(index).is_none()
-                    {
+                    // A Finalize answered as one that already published its
+                    // file changed nothing, and leaves alone any newer file
+                    // the copy writes under its name.
+                    if stage == FileStage::Finalize && charged.repeated {
                         continue;
                     }
                     // A published file is no longer in flight; what it
@@ -2737,9 +2730,7 @@ impl RestrictedAuthority {
                 .expect("the reservation was found under the same lock")
                 .counted = true;
         }
-        Ok(Charged {
-            unreserved_finalize: own_file_change && matches!(request, Request::Finalize { .. }),
-        })
+        Ok(Charged::default())
     }
 
     /// Settle a request whose execution never started, as a small copy
@@ -4092,11 +4083,25 @@ pub(crate) struct Settlement {
 /// (`charge_request`).
 #[derive(Debug, Default)]
 pub(super) struct Charged {
-    /// A Finalize of a file with no reservation: it can only publish
-    /// nothing new, as one sent again after the Finalize that published the
-    /// file lost its reply, and it leaves alone any newer file the copy
-    /// writes under the name.
-    unreserved_finalize: bool,
+    /// The receiver answered the Finalize as one that already published
+    /// its file (`Settlement::execute`).
+    repeated: bool,
+}
+
+impl Settlement {
+    /// Execute the authorized request with `execute` on `ops`, noting for
+    /// `settle` whether a Finalize was answered as one that already
+    /// published its file.
+    pub(crate) fn execute<T>(
+        &mut self,
+        ops: &mut crate::fsops::FsOps,
+        execute: impl FnOnce(&mut crate::fsops::FsOps) -> T,
+    ) -> T {
+        ops.take_finalize_repeated();
+        let result = execute(ops);
+        self.charged.repeated = ops.take_finalize_repeated();
+        result
+    }
 }
 
 /// What a request does to its connection's streamed patch.

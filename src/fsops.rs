@@ -956,6 +956,9 @@ pub struct FsOps {
     /// This connection's number, which the files it publishes are
     /// remembered by (`stages`).
     stage_connection: u64,
+    /// A Finalize was answered as one that already published its file,
+    /// since `take_finalize_repeated`.
+    finalize_repeated: bool,
     comparison_window: Option<ComparisonWindow>,
     partial_candidates: HashMap<FileLocation, HashMap<PathBytes, Vec<PathBytes>>>,
     partial_directory_order: VecDeque<FileLocation>,
@@ -1228,6 +1231,12 @@ impl FsOps {
         self.stage_scope
     }
 
+    /// Whether a Finalize was answered as one that already published its
+    /// file since this was last asked: it changed nothing.
+    pub(crate) fn take_finalize_repeated(&mut self) -> bool {
+        std::mem::take(&mut self.finalize_repeated)
+    }
+
     fn observed_payload_hash(&self, bytes: &[u8]) -> ContentDigest {
         let _hash = self
             .operation
@@ -1282,6 +1291,7 @@ impl FsOps {
             held_basis: None,
             stage_scope: 0,
             stage_connection: stages::new_connection(),
+            finalize_repeated: false,
             comparison_window: None,
             partial_candidates: HashMap::new(),
             partial_directory_order: VecDeque::new(),

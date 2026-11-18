@@ -3101,7 +3101,10 @@ impl FsOps {
         let held_for = stages::of(self.stage_scope, target, copy_id, inplace);
         let (held, finalizing) = match stages::finalize(held_for) {
             Some(stages::Found::Held(held, finalizing)) => (*held, finalizing),
-            Some(stages::Found::Published(identity)) => return Ok(identity),
+            Some(stages::Found::Published(identity)) => {
+                self.finalize_repeated = true;
+                return Ok(identity);
+            }
             None => return Err(stages::not_held(&target.label)),
         };
         // An in-place request whose name held another file wrote a stage
