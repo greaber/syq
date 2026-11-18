@@ -137,6 +137,231 @@ fn retention_shrinks_a_history_far_over_budget_and_returns_its_space() {
     assert!(command::read_run(&db, current_id).is_ok());
 }
 
+/// A history holding `runs` copies from today that never recorded an
+/// outcome, about 4.5 KiB each, after one finished run. This is what copies
+/// leave when their final save finds the history locked, or when they are
+/// killed.
+fn unfinished_history(path: &Path, runs: i64) -> Connection {
+    recorder(path).complete(true, json!({}));
+    let db = open(path).unwrap();
+    db.execute(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<?2)
+         INSERT INTO runs(day,updated_day,build,context)
+         SELECT ?1,?1,'unfinished',printf('%.400c','x') FROM n",
+        params![day(), runs],
+    )
+    .unwrap();
+    db.execute_batch(
+        "INSERT INTO events
+         SELECT id,0,0,printf('%.2048c','x') FROM runs WHERE status='incomplete'",
+    )
+    .unwrap();
+    db
+}
+
+/// How many pages this connection has read from the history so far.
+fn pages_read(db: &Connection) -> i64 {
+    let (mut current, mut highest) = (0, 0);
+    // SAFETY: the handle belongs to this open connection, and both outputs
+    // are valid for the call.
+    let code = unsafe {
+        rusqlite::ffi::sqlite3_db_status(
+            db.handle(),
+            rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS,
+            &mut current,
+            &mut highest,
+            0,
+        )
+    };
+    assert_eq!(code, rusqlite::ffi::SQLITE_OK);
+    i64::from(current)
+}
+
+fn used_bytes(db: &Connection) -> i64 {
+    let pragma = |name| -> i64 { db.pragma_query_value(None, name, |r| r.get(0)).unwrap() };
+    (pragma("page_count") - pragma("freelist_count")) * pragma("page_size")
+}
+
+fn run_ids(db: &Connection) -> Vec<i64> {
+    db.prepare("SELECT id FROM runs ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+#[test]
+fn a_prune_step_reads_a_bounded_part_of_a_history_it_cannot_shrink_by_age() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let runs = 6000;
+    let db = unfinished_history(&path, runs);
+    // Leave nothing that finished: every run is one a copy may be recording.
+    db.execute("DELETE FROM runs WHERE status!='incomplete'", [])
+        .unwrap();
+    let table: i64 = db
+        .query_row("SELECT count(*) FROM dbstat WHERE name='runs'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let current = recorder(&path);
+    let current_id = current.0.lock().unwrap().id;
+    // A connection that has read nothing yet, as a copy's is for these pages.
+    let db = open(&path).unwrap();
+    let before = pages_read(&db);
+    // No time allows exactly one step, which must still delete something.
+    prune_within(&db, 1 << 20, current_id, Duration::ZERO).unwrap();
+    let read = pages_read(&db) - before;
+    let kept = run_ids(&db);
+    assert_eq!(kept.len() as i64, runs, "one run deleted");
+    assert_eq!(kept[0], 3, "the oldest run goes first");
+    // The step reads its window of the oldest runs and the run it deletes,
+    // not every run, however many the history holds.
+    assert!(
+        read <= 100 && table >= 5 * read,
+        "{read} pages read of {table} holding runs"
+    );
+}
+
+#[test]
+fn a_finishing_copy_reads_little_of_a_history_full_of_unfinished_runs() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let runs = 6000;
+    let observer = unfinished_history(&path, runs);
+    let writer = Recorder::at(&path, Instant::now(), json!({}), 1 << 20).unwrap();
+    writer.context(&key("a"));
+    writer.complete(true, json!({}));
+    let state = writer.0.lock().unwrap();
+    let read = pages_read(&state.db);
+    let deleted = runs + 2 - run_ids(&observer).len() as i64;
+    assert!(deleted > 0, "every copy shrinks a history over its budget");
+    assert_eq!(
+        command::read_run(&observer, state.id).unwrap()["status"],
+        "success"
+    );
+    // Opening, recording and choosing what to delete read a fixed number of
+    // pages; deleting a run reads that run. Nothing reads the whole history.
+    assert!(
+        read <= 150 + 3 * deleted,
+        "{read} pages read while deleting {deleted} runs"
+    );
+}
+
+#[test]
+fn unfinished_runs_go_oldest_first_once_nothing_else_can_and_the_newest_stay() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let db = unfinished_history(&path, 2000);
+    let current = recorder(&path);
+    let current_id = current.0.lock().unwrap().id;
+    let budget = 2 << 20;
+    assert!(used_bytes(&db) > 4 * budget);
+    prune_within(&db, budget as u64, current_id, Duration::from_secs(60)).unwrap();
+    assert!(used_bytes(&db) <= budget, "{}", used_bytes(&db));
+    let kept = run_ids(&db);
+    // More than the protected runs fit, and what is kept is the newest.
+    assert!(kept.len() as i64 > ACTIVE_RUNS + 1, "{}", kept.len());
+    assert_eq!(*kept.last().unwrap(), current_id);
+    assert_eq!(
+        kept.len() as i64,
+        current_id - kept[0] + 1,
+        "kept runs are the newest ones"
+    );
+    // However small the budget, a run this close behind the finishing copy
+    // may still be recording and stays.
+    prune_within(&db, 1, current_id, Duration::from_secs(60)).unwrap();
+    assert_eq!(
+        run_ids(&db),
+        (current_id - ACTIVE_RUNS..=current_id).collect::<Vec<_>>()
+    );
+    // A later copy's step finds nothing it may delete, and reads no further.
+    let db = open(&path).unwrap();
+    let before = pages_read(&db);
+    prune_within(&db, 1, current_id, Duration::from_secs(60)).unwrap();
+    assert!(pages_read(&db) - before <= 100);
+}
+
+#[test]
+fn an_unfinished_run_outlives_finished_ones_among_the_oldest() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    // A long copy still recording, followed by far more finished runs than
+    // separate it from the newest.
+    let long = recorder(&path);
+    let long_id = long.0.lock().unwrap().id;
+    let db = open(&path).unwrap();
+    db.execute_batch(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1000)
+         INSERT INTO runs(day,updated_day,build,status,summary)
+         SELECT 0,0,'old','success',printf('%.4096c','x') FROM n;",
+    )
+    .unwrap();
+    let current = recorder(&path);
+    let current_id = current.0.lock().unwrap().id;
+    assert!(long_id < current_id - ACTIVE_RUNS);
+    let budget = 1 << 20;
+    prune_within(&db, budget as u64, current_id, Duration::from_secs(60)).unwrap();
+    assert!(used_bytes(&db) <= budget);
+    let kept = run_ids(&db);
+    assert_eq!(kept[0], long_id, "the unfinished run stays");
+    assert!(kept[1] > long_id + 500, "finished runs went: {}", kept[1]);
+    long.event("sample", json!({"bytes":1}));
+    long.complete(true, json!({}));
+    assert_eq!(
+        command::read_run(&db, long_id).unwrap()["status"],
+        "success"
+    );
+}
+
+#[test]
+fn pruning_leaves_room_so_the_next_copies_only_check_the_size() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    recorder(&path).complete(true, json!({}));
+    let db = open(&path).unwrap();
+    let budget: i64 = 1 << 20;
+    // Finished runs up to just over the budget, as a steady stream leaves.
+    while used_bytes(&db) <= budget {
+        db.execute_batch(
+            "INSERT INTO runs(day,updated_day,build,status,summary)
+             VALUES (0,0,'old','success',printf('%.4096c','x'));",
+        )
+        .unwrap();
+    }
+    let full = run_ids(&db).len();
+    let first = Recorder::at(&path, Instant::now(), json!({}), budget as u64).unwrap();
+    let first_id = first.0.lock().unwrap().id;
+    prune_within(&db, budget as u64, first_id, Duration::from_secs(60)).unwrap();
+    let used = used_bytes(&db);
+    assert!(used <= budget - budget / PRUNE_SLACK, "{used}");
+    assert!(
+        used > budget - 2 * budget / PRUNE_SLACK,
+        "only a little more than the excess goes: {used}"
+    );
+    let pruned = run_ids(&db).len();
+    assert!(pruned < full);
+    // The free pages stay for later runs, except those over the budget.
+    let file: i64 = db
+        .pragma_query_value(None, "page_count", |r| r.get::<_, i64>(0))
+        .unwrap()
+        * 4096;
+    assert!(file <= budget && file > used, "{file} {used}");
+    first.complete(true, json!({}));
+    for _ in 0..4 {
+        Recorder::at(&path, Instant::now(), json!({}), budget as u64)
+            .unwrap()
+            .complete(true, json!({}));
+    }
+    assert_eq!(run_ids(&db).len(), pruned + 4, "nothing more deleted");
+    let rewritten: i64 = db
+        .pragma_query_value(None, "page_count", |r| r.get::<_, i64>(0))
+        .unwrap()
+        * 4096;
+    assert_eq!(rewritten, file, "new runs reuse the free pages");
+}
+
 #[test]
 fn lock_contention_keeps_samples_and_context_for_later_flush() {
     let temp = crate::test_support::tempdir().unwrap();
