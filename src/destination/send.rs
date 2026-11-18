@@ -394,10 +394,7 @@ impl Receiver {
             token.clone(),
             Session {
                 tcp: None,
-                authority: SessionAuthority::Send {
-                    authority,
-                    descriptors: Default::default(),
-                },
+                authority: crate::restricted::Checker::source(authority),
                 issued: Instant::now(),
                 opened: false,
                 channels: Arc::new(crate::private_broker::ConnectionRegistry::new(

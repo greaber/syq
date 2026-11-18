@@ -1387,49 +1387,6 @@ impl<T: Write + AsRawFd> Write for DeadlineIo<'_, T> {
     }
 }
 
-pub(crate) struct HandshakeInput<R> {
-    inner: R,
-    pending: Arc<AtomicBool>,
-    deadline: Instant,
-    hello_timeout: Duration,
-    started: bool,
-}
-impl<R> HandshakeInput<R> {
-    pub(crate) fn new(
-        inner: R,
-        pending: Arc<AtomicBool>,
-        start_timeout: Duration,
-        hello_timeout: Duration,
-    ) -> Self {
-        Self {
-            inner,
-            pending,
-            deadline: Instant::now() + start_timeout,
-            hello_timeout,
-            started: false,
-        }
-    }
-}
-impl<R: Read + AsRawFd> Read for HandshakeInput<R> {
-    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        if bytes.is_empty() {
-            return Ok(0);
-        }
-        if self.pending.load(Ordering::Acquire) {
-            wait_fd(self.inner.as_raw_fd(), libc::POLLIN, self.deadline, None)?;
-        }
-        let count = self.inner.read(bytes)?;
-        if count > 0 && !self.started {
-            // Preparing the source and reaching us through the return relay is
-            // separate from completing Hello. Neither phase can wait forever,
-            // and subsequent partial bytes never extend the Hello deadline.
-            self.started = true;
-            self.deadline = Instant::now() + self.hello_timeout;
-        }
-        Ok(count)
-    }
-}
-
 /// The SSH route this machine's configuration gives `target`, for reading
 /// that configuration without contacting the server.
 pub(super) fn target_spec(target: &str) -> Result<crate::conn::RemoteSpec> {
@@ -1651,57 +1608,6 @@ mod tests {
         assert_eq!(issue(&named).unwrap(), "alice@server:2222");
         named.via = Some((None, "-oProxyCommand=evil".into(), None));
         assert!(issue(&named).is_err());
-    }
-
-    #[test]
-    fn hello_has_a_separate_start_budget_and_partial_bytes_do_not_extend_it() {
-        let (reader, mut writer) = UnixStream::pair().unwrap();
-        let pending = Arc::new(AtomicBool::new(true));
-        let mut input = HandshakeInput::new(
-            reader,
-            pending,
-            Duration::from_secs(2),
-            Duration::from_millis(150),
-        );
-        // Source preparation may exceed the entire Hello budget.
-        std::thread::sleep(Duration::from_millis(200));
-        writer.write_all(b"a").unwrap();
-        let mut byte = [0];
-        input.read_exact(&mut byte).unwrap();
-        assert_eq!(byte, *b"a");
-        let sender = std::thread::spawn(move || {
-            for _ in 0..8 {
-                std::thread::sleep(Duration::from_millis(40));
-                if writer.write_all(b"b").is_err() {
-                    break;
-                }
-            }
-        });
-        let error = input.read_exact(&mut [0; 8]).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-        drop(input);
-        sender.join().unwrap();
-    }
-
-    #[test]
-    fn an_idle_hello_expires_but_completed_transfers_have_no_hello_deadline() {
-        let (reader, mut writer) = UnixStream::pair().unwrap();
-        let pending = Arc::new(AtomicBool::new(true));
-        let mut input = HandshakeInput::new(
-            reader,
-            pending.clone(),
-            Duration::from_millis(20),
-            Duration::from_millis(20),
-        );
-        assert_eq!(input.read(&mut []).unwrap(), 0);
-        let error = input.read(&mut [0]).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-        // Once the server has accepted Hello, the reader belongs to the copy.
-        pending.store(false, Ordering::Release);
-        writer.write_all(b"data").unwrap();
-        let mut bytes = [0; 4];
-        input.read_exact(&mut bytes).unwrap();
-        assert_eq!(&bytes, b"data");
     }
 
     #[test]

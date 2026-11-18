@@ -32,7 +32,7 @@ pub(crate) mod account_copy;
 pub(crate) mod exec;
 pub(crate) mod forward;
 pub(crate) mod notices;
-pub(crate) use forward::{DeadlineIo, HandshakeInput};
+pub(crate) use forward::DeadlineIo;
 pub(crate) mod handoff;
 mod identity;
 pub(crate) mod pull;
@@ -1265,61 +1265,10 @@ fn decode_route(grant: &str) -> Result<Route> {
     )?)
 }
 
-/// What an approved copy may do here: write files it sends, or read files
-/// this machine sends.
-#[derive(Clone)]
-enum SessionAuthority {
-    Receive(Arc<crate::restricted::RestrictedAuthority>),
-    Send {
-        authority: Arc<crate::restricted::source::SourceAuthority>,
-        /// Shared by the copy's control and workers: workers can use only
-        /// the roots its control registered.
-        descriptors: crate::descriptor_broker::DescriptorSessionSlot,
-    },
-}
-/// What one open channel of a copy holds against its approved connections.
-#[allow(dead_code)]
-enum ChannelPermit {
-    Receive(crate::server::ConnectionPermit),
-    Send(crate::restricted::source::ChannelPermit),
-}
-
-impl SessionAuthority {
-    /// Count one channel against the approved connections before its hello.
-    /// A copy's own control does not count against a receiver's workers.
-    fn permit(&self, control: bool) -> Result<Option<ChannelPermit>> {
-        Ok(match self {
-            Self::Receive(_) if control => None,
-            Self::Receive(authority) => Some(ChannelPermit::Receive(
-                crate::server::ConnectionPermit::acquire(Arc::clone(authority))?,
-            )),
-            Self::Send { authority, .. } => Some(ChannelPermit::Send(authority.open_channel()?)),
-        })
-    }
-    #[cfg(test)]
-    fn receiving(&self) -> Arc<crate::restricted::RestrictedAuthority> {
-        match self {
-            Self::Receive(authority) => Arc::clone(authority),
-            Self::Send { .. } => panic!("not a receiving session"),
-        }
-    }
-    fn close(&self) {
-        match self {
-            Self::Receive(authority) => authority.close_control(),
-            Self::Send { authority, .. } => authority.close(),
-        }
-    }
-    fn is_open(&self) -> bool {
-        match self {
-            Self::Receive(authority) => authority.control_is_open(),
-            Self::Send { authority, .. } => authority.is_open(),
-        }
-    }
-}
-
 struct Session {
     tcp: Option<crate::conn::TcpInfo>,
-    authority: SessionAuthority,
+    /// What the approved copy may do here.
+    authority: crate::restricted::Checker,
     issued: Instant,
     opened: bool,
     channels: Arc<crate::private_broker::ConnectionRegistry>,
@@ -1622,7 +1571,7 @@ impl Receiver {
             token.clone(),
             Session {
                 tcp: None,
-                authority: SessionAuthority::Receive(authority),
+                authority: crate::restricted::Checker::Destination(authority),
                 issued: Instant::now(),
                 opened: false,
                 channels: Arc::new(crate::private_broker::ConnectionRegistry::new(
@@ -1676,21 +1625,7 @@ impl Receiver {
             // Keep the bounded Hello deadline until the server has
             // validated its complete handshake. Pending workers already
             // consume their per-transfer connection allowance.
-            match &authority {
-                SessionAuthority::Receive(authority) => {
-                    crate::server::run_named(stream, writer, Arc::clone(authority), control)
-                }
-                SessionAuthority::Send {
-                    authority,
-                    descriptors,
-                } => crate::server::run_named_source(
-                    stream,
-                    writer,
-                    Arc::clone(authority),
-                    descriptors.clone(),
-                    control,
-                ),
-            }
+            crate::server::run_named(stream, writer, authority.clone(), control)
         })();
         if control {
             // Opening consumes the token even if the reply fails. Do

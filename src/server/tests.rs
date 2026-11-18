@@ -66,20 +66,11 @@ fn streaming_fence_survives_revocation_without_authorizing_more_writes() {
         serve(
             socket.try_clone().unwrap(),
             socket.try_clone().unwrap(),
-            false,
-            None,
-            None,
-            Some(socket),
             ServeSession {
-                owns_process: false,
-                handshake_pending: None,
-                ssh_worker_ticket: None,
+                tcp_socket: Some(socket),
                 allow_tcp: true,
-                loopback_only: false,
-                named_socket: None,
-                authority: Some(server_authority),
-                source_authority: None,
-                descriptor_session: DescriptorSessionSlot::default(),
+                checker: Some(Checker::Destination(server_authority)),
+                ..ServeSession::new(DescriptorSessionSlot::default())
             },
         )
         .unwrap();
@@ -193,20 +184,11 @@ fn a_restricted_connection_with_a_streamed_patch_open_carries_nothing_else() {
             serve(
                 socket.try_clone().unwrap(),
                 socket.try_clone().unwrap(),
-                false,
-                None,
-                None,
-                Some(socket),
                 ServeSession {
-                    owns_process: false,
-                    handshake_pending: None,
-                    ssh_worker_ticket: None,
+                    tcp_socket: Some(socket),
                     allow_tcp: true,
-                    loopback_only: false,
-                    named_socket: None,
-                    authority: Some(server_authority.clone()),
-                    source_authority: None,
-                    descriptor_session: DescriptorSessionSlot::default(),
+                    checker: Some(Checker::Destination(server_authority.clone())),
+                    ..ServeSession::new(DescriptorSessionSlot::default())
                 },
             )
             .unwrap();
@@ -596,20 +578,10 @@ fn a_read_stream_does_not_hold_room_its_stop_needs() {
         serve(
             socket.try_clone().unwrap(),
             socket.try_clone().unwrap(),
-            false,
-            None,
-            None,
-            Some(socket),
             ServeSession {
-                owns_process: false,
-                handshake_pending: None,
-                ssh_worker_ticket: None,
+                tcp_socket: Some(socket),
                 allow_tcp: true,
-                loopback_only: false,
-                named_socket: None,
-                authority: None,
-                source_authority: None,
-                descriptor_session,
+                ..ServeSession::new(descriptor_session)
             },
         )
     });
@@ -743,20 +715,10 @@ fn tcp_server_joins_request_reader_on_shutdown() {
                 dropped: observed,
             },
             socket.try_clone().unwrap(),
-            false,
-            None,
-            None,
-            Some(socket),
             ServeSession {
-                owns_process: false,
-                handshake_pending: None,
-                ssh_worker_ticket: None,
+                tcp_socket: Some(socket),
                 allow_tcp: true,
-                loopback_only: false,
-                named_socket: None,
-                authority: None,
-                source_authority: None,
-                descriptor_session: server_session,
+                ..ServeSession::new(server_session)
             },
         )
         .unwrap();
@@ -997,20 +959,9 @@ fn rejected_destination_ticket_is_not_acknowledged_as_ready() {
         serve(
             socket.try_clone().unwrap(),
             socket,
-            false,
-            None,
-            None,
-            None,
             ServeSession {
-                owns_process: false,
-                handshake_pending: None,
-                ssh_worker_ticket: None,
                 allow_tcp: true,
-                loopback_only: false,
-                named_socket: None,
-                authority: None,
-                source_authority: None,
-                descriptor_session: DescriptorSessionSlot::default(),
+                ..ServeSession::new(DescriptorSessionSlot::default())
             },
         )
         .unwrap_err()
@@ -1064,20 +1015,9 @@ fn rejected_source_ticket_is_not_acknowledged_as_ready() {
         serve(
             socket.try_clone().unwrap(),
             socket,
-            false,
-            None,
-            None,
-            None,
             ServeSession {
-                owns_process: false,
-                handshake_pending: None,
-                ssh_worker_ticket: None,
                 allow_tcp: true,
-                loopback_only: false,
-                named_socket: None,
-                authority: None,
-                source_authority: None,
-                descriptor_session: DescriptorSessionSlot::default(),
+                ..ServeSession::new(DescriptorSessionSlot::default())
             },
         )
         .unwrap_err()
@@ -1159,8 +1099,7 @@ fn tcp_rejects_replayed_hello_with_high_connection_id_bits() {
             Some(key.clone()),
             token.to_vec(),
             &seen,
-            Some(authority.clone()),
-            None,
+            Some(Checker::Destination(authority.clone())),
             DescriptorSessionSlot::default(),
             None,
             std::time::Instant::now() + Duration::from_secs(1),
@@ -1213,8 +1152,7 @@ fn tcp_unauthenticated_connection_does_not_take_its_id() {
             Some(key.clone()),
             token.to_vec(),
             &seen,
-            Some(authority.clone()),
-            None,
+            Some(Checker::Destination(authority.clone())),
             DescriptorSessionSlot::default(),
             None,
             std::time::Instant::now() + Duration::from_secs(3),
@@ -1282,7 +1220,6 @@ fn tcp_partial_handshakes_time_out_without_reserving_ids() {
                     b"timeout-test".to_vec(),
                     &seen,
                     None,
-                    None,
                     DescriptorSessionSlot::default(),
                     None,
                     std::time::Instant::now() + Duration::from_millis(100),
@@ -1319,8 +1256,7 @@ fn tcp_hello_clears_timeouts_only_after_authentication() {
                 server_key,
                 b"valid-token".to_vec(),
                 &seen,
-                Some(authority),
-                None,
+                Some(Checker::Destination(authority)),
                 DescriptorSessionSlot::default(),
                 None,
                 std::time::Instant::now() + Duration::from_millis(100),
@@ -1360,14 +1296,14 @@ fn tcp_handshake_deadline_does_not_reset_after_partial_reads() {
     server
         .set_read_timeout(Some(Duration::from_secs(1)))
         .unwrap();
-    let mut reader = TcpHandshakeReader {
-        stream: server,
-        pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        deadline: std::time::Instant::now() + Duration::from_millis(100),
-    };
+    let mut reader = HandshakeReader::new(
+        server,
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        Instant::now() + Duration::from_millis(100),
+        "TCP Hello timed out",
+    );
     client.write_all(b"a").unwrap();
     reader.read_exact(&mut [0]).unwrap();
-    assert!(reader.stream.read_timeout().unwrap().is_some());
     std::thread::sleep(Duration::from_millis(150));
     client.write_all(b"b").unwrap();
     assert_eq!(
@@ -1421,8 +1357,7 @@ fn unauthenticated_sockets_do_not_consume_signed_worker_permits() {
         false,
         None,
         None,
-        Some(authority.clone()),
-        None,
+        Some(Checker::Destination(authority.clone())),
         descriptor_session.clone(),
     )
     .unwrap();
@@ -1515,20 +1450,9 @@ fn stream_worker_rebinds_only_live_files_from_its_original_session() {
         serve(
             socket.try_clone().unwrap(),
             socket.try_clone().unwrap(),
-            false,
-            None,
-            None,
-            Some(socket),
             ServeSession {
-                owns_process: false,
-                handshake_pending: None,
-                ssh_worker_ticket: None,
-                allow_tcp: false,
-                loopback_only: false,
-                named_socket: None,
-                authority: None,
-                source_authority: None,
-                descriptor_session: shared,
+                tcp_socket: Some(socket),
+                ..ServeSession::new(shared)
             },
         )
         .unwrap();
@@ -1650,11 +1574,12 @@ fn a_signal_does_not_lift_the_ssh_worker_hello_deadline() {
     let (input, _writer) = std::io::pipe().unwrap();
     let (sender, received) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
-        let mut reader = PipeHandshakeReader {
-            input: std::fs::File::from(std::os::fd::OwnedFd::from(input)),
-            pending: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            deadline: Instant::now() + Duration::from_millis(500),
-        };
+        let mut reader = HandshakeReader::new(
+            std::fs::File::from(std::os::fd::OwnedFd::from(input)),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            Instant::now() + Duration::from_millis(500),
+            "SSH worker Hello timed out",
+        );
         let mut byte = [0];
         sender
             .send(reader.read(&mut byte).map_err(|error| error.kind()))
@@ -1719,7 +1644,7 @@ fn a_receiver_ends_after_the_workers_handed_to_it_report_their_end() {
     use std::os::unix::net::UnixStream;
     let temp = crate::test_support::tempdir().unwrap();
     let slot = DescriptorSessionSlot::default();
-    let live = Arc::new(AtomicU32::new(0));
+    let live = HandedWorkers::default();
     slot.serve_handed_connections(handed_connection_handler(slot.clone(), live.clone()));
     let ticket = slot
         .register(std::fs::File::open(temp.path()).unwrap())
@@ -1758,7 +1683,7 @@ fn a_receiver_ends_after_the_workers_handed_to_it_report_their_end() {
     close_after_handed(&slot, &live, Duration::from_secs(5));
     ending.join().unwrap();
     handed.wait().unwrap();
-    assert_eq!(live.load(Relaxed), 0);
+    assert_eq!(live.0.load(Relaxed), 0);
 }
 
 #[test]
@@ -1817,20 +1742,9 @@ fn a_scan_without_a_registered_source_or_destination_root_is_refused() {
         serve(
             server.try_clone().unwrap(),
             server,
-            true,
-            None,
-            None,
-            None,
             ServeSession {
-                owns_process: false,
-                handshake_pending: None,
-                ssh_worker_ticket: None,
-                allow_tcp: false,
-                loopback_only: false,
-                named_socket: None,
-                authority: None,
-                source_authority: None,
-                descriptor_session: DescriptorSessionSlot::default(),
+                over_ssh: true,
+                ..ServeSession::new(DescriptorSessionSlot::default())
             },
         )
     });
@@ -1867,4 +1781,55 @@ fn a_scan_without_a_registered_source_or_destination_root_is_refused() {
     drop(writer);
     drop(reader);
     served.join().unwrap().unwrap();
+}
+
+#[test]
+fn hello_has_a_separate_start_budget_and_partial_bytes_do_not_extend_it() {
+    let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut input = HandshakeReader::starting(
+        reader,
+        pending,
+        (Duration::from_secs(2), Duration::from_millis(150)),
+        "Hello timed out",
+    );
+    // Source preparation may exceed the entire Hello budget.
+    std::thread::sleep(Duration::from_millis(200));
+    writer.write_all(b"a").unwrap();
+    let mut byte = [0];
+    input.read_exact(&mut byte).unwrap();
+    assert_eq!(byte, *b"a");
+    let sender = std::thread::spawn(move || {
+        for _ in 0..8 {
+            std::thread::sleep(Duration::from_millis(40));
+            if writer.write_all(b"b").is_err() {
+                break;
+            }
+        }
+    });
+    let error = input.read_exact(&mut [0; 8]).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    drop(input);
+    sender.join().unwrap();
+}
+
+#[test]
+fn an_idle_hello_expires_but_completed_transfers_have_no_hello_deadline() {
+    let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let mut input = HandshakeReader::starting(
+        reader,
+        pending.clone(),
+        (Duration::from_millis(20), Duration::from_millis(20)),
+        "Hello timed out",
+    );
+    assert_eq!(input.read(&mut []).unwrap(), 0);
+    let error = input.read(&mut [0]).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    // Once the server has accepted Hello, the reader belongs to the copy.
+    pending.store(false, Release);
+    writer.write_all(b"data").unwrap();
+    let mut bytes = [0; 4];
+    input.read_exact(&mut bytes).unwrap();
+    assert_eq!(&bytes, b"data");
 }
