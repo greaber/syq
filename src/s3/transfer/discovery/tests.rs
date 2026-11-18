@@ -7,6 +7,8 @@ struct Bucket {
     objects: BTreeMap<String, u64>,
     ordered: bool,
     honors_start: bool,
+    /// The request, counted from one, whose page comes back out of order.
+    disordered: Option<usize>,
     /// Each request's lower bound, and whether it continued the last one.
     requests: RefCell<Vec<(String, bool)>>,
 }
@@ -16,6 +18,7 @@ impl Bucket {
             objects: keys.into_iter().zip(1..).collect(),
             ordered: true,
             honors_start: true,
+            disordered: None,
             requests: RefCell::default(),
         }
     }
@@ -42,7 +45,7 @@ impl Store for Bucket {
             .objects
             .range::<str, _>((lower, Bound::Unbounded))
             .filter(|(key, _)| key.starts_with(prefix));
-        let entries: Vec<_> = matching
+        let mut entries: Vec<_> = matching
             .by_ref()
             .take(1000)
             .map(|(key, size)| Entry {
@@ -52,8 +55,12 @@ impl Store for Bucket {
                 etag: None,
             })
             .collect();
+        let next = matching.next().map(|_| entries.last().unwrap().key.clone());
+        if self.disordered == Some(self.requests.borrow().len()) {
+            entries.swap(10, 20);
+        }
         Ok(Page {
-            next: matching.next().map(|_| entries.last().unwrap().key.clone()),
+            next,
             entries,
             prefixes: Vec::new(),
         })
@@ -202,6 +209,36 @@ async fn listing_that_ignores_the_start_decides_nothing() {
     let listed = discover(&bucket, "big/", &plan).await;
     assert!(listed.iter().all(|listed| *listed == Listed::Unknown));
     assert_eq!(bucket.requests.borrow().len(), 1);
+}
+
+#[tokio::test]
+async fn page_out_of_order_withdraws_every_decision() {
+    let existing: Vec<_> = (0..5000).map(|f| format!("data/f{f:04}")).collect();
+    let mut bucket = Bucket::new(existing.clone());
+    bucket.disordered = Some(3);
+    let listed = discover(&bucket, "data/", &existing).await;
+    // Two pages decided 2,000 keys before the third showed that this
+    // listing's order cannot be relied on.
+    assert!(listed.iter().all(|listed| *listed == Listed::Unknown));
+    assert_eq!(bucket.requests.borrow().len(), 3);
+}
+
+#[tokio::test]
+async fn listing_never_starts_at_a_key_too_long_for_s3() {
+    let bucket = Bucket::new(["data/b".to_owned(), "data/c".to_owned()]);
+    let long = format!("data/a{}", "a".repeat(MAX_KEY));
+    let plan = [long, "data/b".to_owned(), "data/d".to_owned()];
+    assert_eq!(
+        discover(&bucket, "data/", &plan).await,
+        [Listed::Unknown, Listed::Present(1), Listed::Absent]
+    );
+    assert_eq!(*bucket.requests.borrow(), [("data/a".to_owned(), false)]);
+
+    // Nothing is requested for a plan of such keys alone.
+    let bucket = Bucket::new(["data/b".to_owned()]);
+    let plan = [format!("data/a{}", "a".repeat(MAX_KEY))];
+    assert_eq!(discover(&bucket, "data/", &plan).await, [Listed::Unknown]);
+    assert!(bucket.requests.borrow().is_empty());
 }
 
 #[tokio::test]

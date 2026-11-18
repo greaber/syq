@@ -43,6 +43,9 @@ const SLACK_PAGES: usize = 2;
 /// response also opened the connection.
 const PAGES_BEFORE_COPY: usize = 2;
 
+/// The longest key S3 stores, in bytes.
+const MAX_KEY: usize = 1024;
+
 const UNKNOWN: u64 = u64::MAX;
 const ABSENT: u64 = u64::MAX - 1;
 
@@ -124,6 +127,15 @@ impl Walk {
         let (token, after) = match &self.token {
             Some(token) => (Some(token.as_str()), self.passed.as_str()),
             None => {
+                // A planned key too long for S3 fails on its own when it is
+                // copied. A listing asked to start there might be refused,
+                // which would fail every key instead.
+                while self.keys.get(self.decided).len() > MAX_KEY {
+                    self.decided += 1;
+                    if self.decided == self.keys.len() {
+                        return Ok(false);
+                    }
+                }
                 start = predecessor(self.keys.get(self.decided));
                 (None, start.as_str())
             }
@@ -290,7 +302,11 @@ impl Discovery {
                 let mut more = true;
                 while more && !cancelled.load(Relaxed) {
                     more = walk.page(&store).await.unwrap_or_else(|error| {
-                        progress.error(&format!("list S3 destination: {error:#}"));
+                        // The copy is still complete: the keys this listing
+                        // did not reach are checked with HEAD.
+                        progress.warning(&format!(
+                            "S3 destination listing stopped, so the remaining destination keys are checked one at a time: {error:#}"
+                        ));
                         false
                     });
                     sender.send_replace(Reach {

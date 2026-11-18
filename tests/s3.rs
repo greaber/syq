@@ -1498,8 +1498,8 @@ fn serve(
         serve_latency_pages(&mut socket, first);
         return;
     }
-    if fault == "upload-pages" {
-        serve_upload_pages(&mut socket, first, &probes);
+    if fault.starts_with("upload-pages") {
+        serve_upload_pages(&mut socket, first, &probes, fault == "upload-pages-fail");
         return;
     }
     if fault.starts_with("wrong-region") {
@@ -5248,8 +5248,9 @@ fn serve_latency_pages(socket: &mut TcpStream, first: &str) {
 }
 
 /// A destination of 3,000 keys, `data/f0000` to `data/f2999`, listed in key
-/// order a thousand at a time. `probes` counts the LIST requests.
-fn serve_upload_pages(socket: &mut TcpStream, first: &str, probes: &AtomicUsize) {
+/// order a thousand at a time. `probes` counts the LIST requests; with
+/// `fail`, the third is refused.
+fn serve_upload_pages(socket: &mut TcpStream, first: &str, probes: &AtomicUsize, fail: bool) {
     if first.starts_with("HEAD ") {
         reply(socket, 404, &[], b"", true);
         return;
@@ -5259,7 +5260,16 @@ fn serve_upload_pages(socket: &mut TcpStream, first: &str, probes: &AtomicUsize)
     let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
     assert!(first.starts_with("GET ") && query.contains_key("list-type"));
     assert_eq!(query["prefix"], "data/");
-    probes.fetch_add(1, Ordering::Relaxed);
+    if probes.fetch_add(1, Ordering::Relaxed) == 2 && fail {
+        reply(
+            socket,
+            500,
+            &[],
+            b"<Error><Code>InternalError</Code></Error>",
+            false,
+        );
+        return;
+    }
     let after = match query.get("continuation-token") {
         Some(token) => token.to_string(),
         None => {
@@ -5320,6 +5330,47 @@ fn s3_upload_pages_through_a_large_destination_while_copying() {
     // shows the five new keys absent. Listed keys get a HEAD, new ones none.
     assert_eq!(server.probes.load(Ordering::Relaxed), 3);
     assert_eq!(server.requests.load(Ordering::Relaxed), 3 + 300);
+}
+
+#[test]
+fn s3_upload_continues_with_head_when_a_later_listing_page_fails() {
+    let server = Server::start("upload-pages-fail");
+    let temp = crate::test_support::tempdir().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    for n in (0..3000).step_by(10) {
+        std::fs::write(data.join(format!("f{n:04}")), b"x").unwrap();
+    }
+    for n in 0..5 {
+        std::fs::write(data.join(format!("zz{n}")), b"x").unwrap();
+    }
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--srcs-in",
+            "data",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "data",
+            "--dry-run",
+        ],
+    );
+    // The copy is complete without the listing, so it succeeds and says once
+    // what happened.
+    assert!(output.status.success(), "{}", output_text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .matches("warning: S3 destination listing stopped")
+            .count(),
+        1,
+        "{stderr}"
+    );
+    // Two pages show 200 planned keys present. The 105 keys the failed page
+    // would have covered get a HEAD as well.
+    assert_eq!(server.probes.load(Ordering::Relaxed), 3);
+    assert_eq!(server.requests.load(Ordering::Relaxed), 3 + 200 + 105);
 }
 
 #[test]

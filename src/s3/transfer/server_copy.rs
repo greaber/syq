@@ -308,9 +308,12 @@ impl Engine {
                 let listed = self.listed(position.next().unwrap(), &copy_destination_key(&job));
                 let engine = self.clone();
                 async move {
+                    // Checked after the wait, which can outlast a
+                    // cancellation by one listing request.
+                    let listed = listed.await;
                     engine.check_cancelled()?;
                     let result = engine
-                        .copy_object(&mut job, listed.await)
+                        .copy_object(&mut job, listed)
                         .await
                         .map_err(|error| engine.copy_error(error));
                     engine.settle(job.key.as_bytes(), &job.path, job.kind, &result, None);

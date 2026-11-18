@@ -460,9 +460,12 @@ impl Engine {
                         let key = source.key.clone();
                         let label = source.label.clone();
                         let kind = source.kind();
+                        // Checked after the wait, which can outlast a
+                        // cancellation by one listing request.
+                        let listed = listed.await;
                         engine.check_cancelled()?;
                         let expected = source.expected_hash.as_ref().cloned();
-                        let result = engine.upload(source, listed.await).await;
+                        let result = engine.upload(source, listed).await;
                         engine.settle(&label, &key, kind, &result, expected.as_ref());
                         Ok(result.ok().flatten())
                     }
