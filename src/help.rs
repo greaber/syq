@@ -266,7 +266,7 @@ pub(crate) fn filesystem(command: Command) -> Command {
         // Shared parser fields need command-specific explanations.
         if removal {
             if let Some((_, help)) = REMOVAL_SELECTION_HELP.iter().find(|(name, _)| *name == id) {
-                arg = arg.help(*help);
+                arg = arg.help(*help).long_help(None::<&'static str>);
             }
         }
         if rm && id == "verbose" {
@@ -296,7 +296,7 @@ pub(crate) fn filesystem(command: Command) -> Command {
 }
 
 /// `syq rm` shares the copy selection options; this is what they mean there.
-const REMOVAL_SELECTION_HELP: &[(&str, &str)] = &[
+pub(crate) const REMOVAL_SELECTION_HELP: &[(&str, &str)] = &[
     ("cwd", "Resolve relative paths from DIR on the removal endpoint"),
     ("root", "Confine resolution and removal beneath DIR"),
     ("follow", "Like --follow-src; also follow symlinks in the --results path"),

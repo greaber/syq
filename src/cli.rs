@@ -1283,6 +1283,11 @@ pub(crate) fn command_for_completion(name: &str) -> Option<clap::Command> {
 
 /// A source selector of `cp`, `map`, and `rm`. The parser checks, shell
 /// completion, and help read this table instead of listing the options.
+/// A new selector also needs `NativeSourceArgs::selectors`, the
+/// `--src-fd` conflict list, `rm`'s wording in `help::filesystem`, and, if
+/// it names non-directories, the pipe and descriptor source lists in
+/// `selected_stream_source` and `parse_descriptor_copy`;
+/// `selector_and_placement_tables_match_the_parser` checks all but the last.
 pub(crate) struct SourceSelector {
     /// The clap argument id.
     pub(crate) id: &'static str,
@@ -1353,7 +1358,8 @@ pub(crate) fn source_selector_option(option: &[u8]) -> bool {
 }
 
 /// A copy placement option, in the order `NativeCopyFields::placements`
-/// returns their values.
+/// returns their values. A new one also needs the `placement` group and the
+/// `--as-fd` conflict list.
 pub(crate) struct PlacementOption {
     /// The clap argument id.
     pub(crate) id: &'static str,
@@ -1455,7 +1461,7 @@ struct NativeSourceArgs {
 
 impl NativeSourceArgs {
     /// The selector values, in `SOURCE_SELECTORS` order.
-    fn selectors(&self) -> [&Vec<OsString>; 8] {
+    fn selectors(&self) -> [&Vec<OsString>; SOURCE_SELECTORS.len()] {
         [
             &self.src,
             &self.srcs_in,
@@ -1468,7 +1474,7 @@ impl NativeSourceArgs {
         ]
     }
 
-    fn selectors_mut(&mut self) -> [&mut Vec<OsString>; 8] {
+    fn selectors_mut(&mut self) -> [&mut Vec<OsString>; SOURCE_SELECTORS.len()] {
         [
             &mut self.src,
             &mut self.srcs_in,
@@ -1819,7 +1825,7 @@ struct NativeCopyFields {
 
 impl NativeCopyFields {
     /// The placement values, in `PLACEMENT_OPTIONS` order.
-    fn placements(&self) -> [&Option<OsString>; 6] {
+    fn placements(&self) -> [&Option<OsString>; PLACEMENT_OPTIONS.len()] {
         [
             &self.into,
             &self.into_new,
@@ -1830,7 +1836,7 @@ impl NativeCopyFields {
         ]
     }
 
-    fn placements_mut(&mut self) -> [&mut Option<OsString>; 6] {
+    fn placements_mut(&mut self) -> [&mut Option<OsString>; PLACEMENT_OPTIONS.len()] {
         [
             &mut self.into,
             &mut self.into_new,
@@ -3111,11 +3117,13 @@ fn lower_native_selectors(
                 trim_native_trailing_slashes(path.into_vec())
             };
             validate_native_source_selector(&path, confined)?;
-            let mut location = Location::native(endpoint.clone(), path.clone(), selection);
-            if s3_keys {
+            Ok(if s3_keys {
+                let mut location = Location::native(endpoint.clone(), path.clone(), selection);
                 location.path = path;
-            }
-            Ok(location)
+                location
+            } else {
+                Location::native(endpoint.clone(), path, selection)
+            })
         })
         .collect()
 }

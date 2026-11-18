@@ -1530,33 +1530,37 @@ fn selector_and_placement_tables_match_the_parser() {
     };
     use clap::{CommandFactory, FromArgMatches};
 
+    // Every selector field of the shared struct is in the table.
+    let shared = <super::NativeSourceArgs as clap::Args>::augment_args(clap::Command::new("t"));
+    let mut source_ids: Vec<_> = shared
+        .get_arguments()
+        .map(|arg| arg.get_id().to_string())
+        .filter(|id| !matches!(id.as_str(), "cwd" | "root" | "follow" | "follow_src"))
+        .collect();
+    let mut table_ids: Vec<_> = SOURCE_SELECTORS.iter().map(|s| s.id.to_owned()).collect();
+    source_ids.sort();
+    table_ids.sort();
+    assert_eq!(
+        source_ids, table_ids,
+        "SOURCE_SELECTORS lists every selector"
+    );
+    // `syq rm` words every shared option for removal.
+    for arg in shared.get_arguments() {
+        let id = arg.get_id().as_str();
+        assert!(
+            crate::help::REMOVAL_SELECTION_HELP
+                .iter()
+                .any(|(name, _)| *name == id),
+            "REMOVAL_SELECTION_HELP has {id}"
+        );
+    }
+
     for command in [
         NativeCopyCommand::command(),
         NativeMapCommand::command(),
         NativeRmCommand::command(),
     ] {
         let name = command.get_name().to_owned();
-        let source_ids: Vec<_> = command
-            .get_arguments()
-            .filter(|arg| {
-                matches!(arg.get_value_names(), Some(names) if names == ["PATH"] || names == ["DIR"])
-                    && arg.get_action().takes_values()
-                    && matches!(arg.get_action(), clap::ArgAction::Append)
-                    && !matches!(arg.get_id().as_str(), "trees")
-            })
-            .filter(|arg| {
-                arg.get_long().is_none_or(|long| long.starts_with("src")) || arg.is_positional()
-            })
-            .map(|arg| arg.get_id().to_string())
-            .collect();
-        let mut table_ids: Vec<_> = SOURCE_SELECTORS.iter().map(|s| s.id.to_owned()).collect();
-        let mut source_ids = source_ids;
-        source_ids.sort();
-        table_ids.sort();
-        assert_eq!(
-            source_ids, table_ids,
-            "{name}: SOURCE_SELECTORS lists every selector"
-        );
         for selector in &SOURCE_SELECTORS {
             let arg = command
                 .get_arguments()
