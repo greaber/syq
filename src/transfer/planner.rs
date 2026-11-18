@@ -2179,72 +2179,7 @@ impl Planner<'_> {
             // serialize all reads in the planner.
             self.enqueue((src_path, source), dst_path, rel, dst_rel, e, dst_entry);
         } else if opts.dry_run {
-            self.note_directory_change(&dst_path, true);
-            self.progress.files_total.fetch_add(1, Relaxed);
-            self.progress.bytes_total.fetch_add(e.size, Relaxed);
-            self.progress.add_files(1);
-            // Dry aggregates mean planned work, bytes included —
-            // files_done already moves here, so bytes_done must
-            // too or the terminal record contradicts its traces.
-            self.progress.bytes_done.fetch_add(e.size, Relaxed);
-            self.dry_run_changes.regular_files += 1;
-            if dst_entry.as_ref().is_some_and(|d| d.kind != Kind::File) {
-                self.dry_run_changes.type_replacements += 1;
-            }
-            let refused = self.update_refusal_for(
-                (&dst_path, &dst_rel),
-                &e,
-                dst_entry.as_ref(),
-                replace,
-                None,
-            );
-            if let Some(reason) = refused {
-                self.progress.in_place_refusals.add(reason);
-            }
-            self.emit_trace(
-                "transfer_file",
-                &dst_rel,
-                "file",
-                Some(e.size),
-                match &dst_entry {
-                    None => "destination_missing",
-                    Some(d) if d.kind != Kind::File => "type_differs",
-                    Some(d) if d.size != e.size => "content_differs",
-                    Some(_) => "metadata_differs",
-                },
-            );
-            if opts.verbose > 0 {
-                let shown = display(&dst_path);
-                let action = match &dst_entry {
-                    _ if replace => format!(
-                        "replace file {shown} (requested file metadata differs, and it cannot be changed in place)"
-                    ),
-                    None => format!("create file {shown} (destination missing)"),
-                    Some(d) if d.kind != Kind::File => format!(
-                        "replace with file {shown} (destination is {})",
-                        kind_label(d.kind)
-                    ),
-                    Some(d) if d.size != e.size => {
-                        format!("update file {shown} (size differs)")
-                    }
-                    Some(_) if opts.checksum => {
-                        format!("update file {shown} (content comparison requested)")
-                    }
-                    Some(d) if opts.hash_or_copy && opts.metadata_matches(&dst_rel, &e, d) => {
-                        format!("update file {shown} (size and time not trusted)")
-                    }
-                    Some(d)
-                        if opts.flags & flags::TIMES != 0
-                            && (d.mtime, d.mtime_nsec) != (e.mtime, e.mtime_nsec) =>
-                    {
-                        format!("update file {shown} (modification time differs)")
-                    }
-                    Some(_) => {
-                        format!("update file {shown} (content quick check unavailable)")
-                    }
-                };
-                self.progress.println(&action);
-            }
+            self.preview_changed_file((&dst_path, &dst_rel), &e, dst_entry.as_ref(), replace);
         } else {
             if opts.changes_directory_certainly(&e, dst_entry.as_ref()) {
                 self.note_directory_change(&dst_path, true);
@@ -2257,6 +2192,78 @@ impl Planner<'_> {
                 e.clone(),
                 dst_entry,
             );
+        }
+    }
+
+    /// A dry run's account of a regular file the copy would write: it is
+    /// missing, of another kind, or not known to match, or `replace` says it
+    /// matches but would be replaced (`must_replace`).
+    pub(super) fn preview_changed_file(
+        &mut self,
+        (dst_path, dst_rel): (&[u8], &[u8]),
+        e: &Entry,
+        dst_entry: Option<&Entry>,
+        replace: bool,
+    ) {
+        let opts = self.opts;
+        self.note_directory_change(dst_path, true);
+        self.progress.files_total.fetch_add(1, Relaxed);
+        self.progress.bytes_total.fetch_add(e.size, Relaxed);
+        self.progress.add_files(1);
+        // Dry aggregates mean planned work, bytes included —
+        // files_done already moves here, so bytes_done must
+        // too or the terminal record contradicts its traces.
+        self.progress.bytes_done.fetch_add(e.size, Relaxed);
+        if dst_entry.is_some_and(|d| d.kind != Kind::File) {
+            self.dry_run_changes.type_replacements += 1;
+        }
+        let refused = self.update_refusal_for((dst_path, dst_rel), e, dst_entry, replace, None);
+        if let Some(reason) = refused {
+            self.progress.in_place_refusals.add(reason);
+        }
+        self.emit_trace(
+            "transfer_file",
+            dst_rel,
+            "file",
+            Some(e.size),
+            match dst_entry {
+                None => "destination_missing",
+                Some(d) if d.kind != Kind::File => "type_differs",
+                Some(d) if d.size != e.size => "content_differs",
+                Some(_) => "metadata_differs",
+            },
+        );
+        if opts.verbose > 0 {
+            let shown = display(dst_path);
+            let action = match dst_entry {
+                _ if replace => format!(
+                    "replace file {shown} (requested file metadata differs, and it cannot be changed in place)"
+                ),
+                None => format!("create file {shown} (destination missing)"),
+                Some(d) if d.kind != Kind::File => format!(
+                    "replace with file {shown} (destination is {})",
+                    kind_label(d.kind)
+                ),
+                Some(d) if d.size != e.size => {
+                    format!("update file {shown} (size differs)")
+                }
+                Some(_) if opts.checksum => {
+                    format!("update file {shown} (content comparison requested)")
+                }
+                Some(d) if opts.hash_or_copy && opts.metadata_matches(dst_rel, e, d) => {
+                    format!("update file {shown} (size and time not trusted)")
+                }
+                Some(d)
+                    if opts.flags & flags::TIMES != 0
+                        && (d.mtime, d.mtime_nsec) != (e.mtime, e.mtime_nsec) =>
+                {
+                    format!("update file {shown} (modification time differs)")
+                }
+                Some(_) => {
+                    format!("update file {shown} (content quick check unavailable)")
+                }
+            };
+            self.progress.println(&action);
         }
     }
 

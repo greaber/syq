@@ -5418,7 +5418,8 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     let max_delete_hit = st.max_delete_hit;
     let mut dry_run_changes = std::mem::take(&mut st.dry_run_changes);
     if opts.dry_run {
-        dry_run_changes.regular_files = progress.files_done.load(Relaxed);
+        dry_run_changes.regular_files =
+            progress.files_done.load(Relaxed) - dry_run_changes.linked_files;
         dry_run_changes.metadata_files += opts.dry_run_metadata_files.load(Relaxed);
     }
     // The destination container is created outside per-entry accounting in

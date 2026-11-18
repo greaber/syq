@@ -162,30 +162,12 @@ impl Planner<'_> {
                     );
                 }
             } else {
-                self.note_directory_change(&leaf.dst, true);
-                self.progress.files_total.fetch_add(1, Relaxed);
-                self.progress.bytes_total.fetch_add(leaf.e.size, Relaxed);
-                self.progress.bytes_done.fetch_add(leaf.e.size, Relaxed);
-                self.progress.add_files(1);
-                self.emit_trace(
-                    "transfer_file",
-                    &leaf.dst_rel,
-                    "file",
-                    Some(leaf.e.size),
-                    if destination.is_none() {
-                        "destination_missing"
-                    } else if replaced {
-                        "metadata_differs"
-                    } else {
-                        "content_differs"
-                    },
+                self.preview_changed_file(
+                    (&leaf.dst, &leaf.dst_rel),
+                    &leaf.e,
+                    destination.as_ref(),
+                    replaced,
                 );
-                if replaced && self.opts.verbose > 0 {
-                    self.progress.println(&format!(
-                        "replace file {} (requested file metadata differs, and it cannot be changed in place)",
-                        display(&leaf.dst)
-                    ));
-                }
             }
             self.hardlinks
                 .by_inode
@@ -515,6 +497,7 @@ impl Planner<'_> {
             self.progress.files_total.fetch_add(1, Relaxed);
             self.progress.add_files(1);
             self.dry_run_changes.metadata_files += 1;
+            self.dry_run_changes.linked_files += 1;
             self.emit_trace(
                 "transfer_file",
                 &follower.rel,
