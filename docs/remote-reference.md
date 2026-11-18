@@ -132,6 +132,16 @@ except into its SSH configuration or syq's own programs and state.
 `--widen-dirs all` widens nothing above the destination's parent directory,
 and can't be combined with `--follow-dst` and `--into`.
 
+With `--if-exists=keep`, a restricted copy replaces none of the files and
+directories it finds in the destination on hostB and changes the metadata of
+none of them, not even a directory's permissions for a moment. So
+`--widen-dirs` does not widen the existing directories the copy includes. Syq
+names each one that lacks the owner permission a change needs, and says why
+with the first; those changes fail one by one, and everything else is copied.
+`--widen-dirs all` still briefly widens the directory the copy goes into and
+the directory that holds the destination, which it may need to reach the
+destination or to create it, as in any restricted copy.
+
 <a id="signed-results"></a>
 
 ## Results from the destination
