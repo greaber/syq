@@ -282,6 +282,47 @@ fn storage_requests_must_match_the_command_shown() {
 }
 
 #[test]
+fn storage_source_scopes_name_each_source_under_its_base() {
+    let keys = |scopes: &[crate::s3::authorization::Scope]| {
+        scopes
+            .iter()
+            .map(|scope| (scope.key.clone(), scope.descendants))
+            .collect::<Vec<_>>()
+    };
+    let sources = vec![("base/a/x".to_owned(), true), ("base/b".to_owned(), true)];
+    let download = storage_request(&command(&[
+        "cp",
+        "a/x",
+        "b",
+        "--cwd",
+        "base",
+        "--from",
+        "s3://bucket",
+        "--into",
+        "local",
+    ]));
+    assert_eq!(keys(&download.scopes), sources);
+    assert!(download.source.is_none());
+    let server_copy = storage_request(&command(&[
+        "cp",
+        "a/x",
+        "b",
+        "--cwd",
+        "base",
+        "--from",
+        "s3://source",
+        "--to",
+        "s3://bucket",
+        "--into",
+        "copy",
+    ]));
+    assert_eq!(keys(&server_copy.scopes), [("copy".to_owned(), true)]);
+    let source = server_copy.source.unwrap();
+    assert_eq!(source.bucket, "source");
+    assert_eq!(keys(&source.scopes), sources);
+}
+
+#[test]
 fn storage_removal_and_streams_derive_the_same_request() {
     let removal = command(&[
         "rm",
