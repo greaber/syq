@@ -427,11 +427,21 @@ impl FileSession {
                                 label: &label,
                                 preview: false,
                             };
-                            if crate::fsops::vouch::allows(
-                                place, &existing, &current, &meta, flags,
-                            )? {
-                                crate::fsops::set_meta_file(&existing, &meta, flags)?;
-                            } else {
+                            use crate::fsops::keep;
+                            let keeping = keep::Keeping {
+                                handle: keep::Handle::Open,
+                                recheck_any: false,
+                                setting: None,
+                            };
+                            let kept = keep::keep_existing(
+                                place,
+                                &existing,
+                                &current,
+                                (&meta, flags),
+                                crate::proto::TargetCondition::Any,
+                                keeping,
+                            )?;
+                            if let keep::Keep::Replace(_) = kept {
                                 // The receiver changes no metadata in place
                                 // on a file it cannot vouch for: the stage,
                                 // which holds the same contents, replaces

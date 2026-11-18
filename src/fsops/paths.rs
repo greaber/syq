@@ -1,11 +1,5 @@
 use super::*;
 
-#[derive(Default)]
-pub(super) struct NameMaxCache {
-    pub(super) paths: HashMap<PathBuf, usize>,
-    pub(super) devices: HashMap<u64, usize>,
-}
-
 pub fn resolve(p: &[u8]) -> PathBuf {
     if p.is_empty() {
         return PathBuf::from(".");
@@ -64,77 +58,6 @@ pub(super) fn base32(bytes: &[u8]) -> String {
     out
 }
 
-pub(super) fn name_max(parent: &Path) -> usize {
-    static CACHE: OnceLock<Mutex<NameMaxCache>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(NameMaxCache::default()));
-    name_max_cached(parent, cache, |_candidate, directory| {
-        let limit = unsafe { libc::fpathconf(directory.as_raw_fd(), libc::_PC_NAME_MAX) };
-        if limit > 0 {
-            limit as usize
-        } else {
-            COMMON_NAME_MAX
-        }
-    })
-}
-
-pub(super) fn name_max_cached(
-    parent: &Path,
-    cache: &Mutex<NameMaxCache>,
-    query: impl Fn(&Path, &File) -> usize,
-) -> usize {
-    let parent = if parent.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        parent
-    };
-    let key = lexical_absolute(parent);
-    if let Some(limit) = cache.lock().unwrap().paths.get(&key).copied() {
-        return limit;
-    }
-
-    // Resolve from a retained root one component at a time. A pathname lstat
-    // would still follow symlinks in intermediate components when a descendant
-    // exists. Planning refuses directory copies onto such a symlink; use the
-    // containing real directory's limit until that conflict is reported.
-    let Ok(root) = Root::open(Path::new("/")) else {
-        return COMMON_NAME_MAX;
-    };
-    let Ok(relative) = key.strip_prefix(Path::new("/")) else {
-        return COMMON_NAME_MAX;
-    };
-    let Ok(relative) = RelativePath::new(relative.as_os_str().as_bytes()) else {
-        return COMMON_NAME_MAX;
-    };
-    let Ok((directory, consumed)) = root.open_nearest_directory(&relative) else {
-        return COMMON_NAME_MAX;
-    };
-    let mut candidate = PathBuf::from("/");
-    for component in key
-        .components()
-        .filter_map(|component| match component {
-            std::path::Component::Normal(component) => Some(component),
-            _ => None,
-        })
-        .take(consumed)
-    {
-        candidate.push(component);
-    }
-    let Ok(metadata) = directory.metadata() else {
-        return COMMON_NAME_MAX;
-    };
-    let dev = metadata.dev();
-    let cached = cache.lock().unwrap().devices.get(&dev).copied();
-    let limit = cached.unwrap_or_else(|| query(&candidate, &directory));
-    let mut cache = cache.lock().unwrap();
-    if cache.paths.len() >= NAME_MAX_CACHE_CAP {
-        cache.paths.clear();
-    }
-    cache.devices.entry(dev).or_insert(limit);
-    cache.paths.insert(candidate, limit);
-    cache.paths.insert(key, limit);
-    limit
-}
-
 /// `path` made absolute with `.` and `..` resolved by name, without looking
 /// at the filesystem: `/a/b/../c` is `/a/c`, and `..` at `/` stays at `/`.
 pub(crate) fn lexical_absolute(path: &Path) -> PathBuf {
@@ -182,14 +105,16 @@ pub(super) fn path_component_budget(parent: &Path, component_limit: usize) -> us
     component_limit.min(path_budget)
 }
 
+/// The sidecar name tests expect beside `final_` on a filesystem with the
+/// common name limit.
+#[cfg(test)]
+pub fn partial_path(final_: &Path, copy_id: &CopyId) -> Result<PathBuf> {
+    partial_path_with_name_max(final_, copy_id, COMMON_NAME_MAX)
+}
+
 /// Private adjacent partial for this invocation and file. Keep a readable
 /// basename prefix where space allows; the suffix always identifies the file
 /// independently of prefix truncation.
-pub fn partial_path(final_: &Path, copy_id: &CopyId) -> Result<PathBuf> {
-    let parent = final_.parent().unwrap_or_else(|| Path::new(""));
-    partial_path_with_name_max(final_, copy_id, name_max(parent))
-}
-
 pub(crate) fn partial_path_with_name_max(
     final_: &Path,
     copy_id: &CopyId,

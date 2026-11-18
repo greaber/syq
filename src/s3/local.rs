@@ -17,6 +17,16 @@ use std::{
     sync::Arc,
 };
 
+/// The file at a source's path is no longer the one selected for the copy.
+#[derive(Debug)]
+pub(super) struct SourceChanged(String);
+impl std::fmt::Display for SourceChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "source changed during S3 copy: {}", self.0)
+    }
+}
+impl std::error::Error for SourceChanged {}
+
 #[derive(Clone)]
 pub(super) struct Source {
     pub root: Arc<Root>,
@@ -80,12 +90,13 @@ impl Source {
             self.meta.ctime,
             self.meta.ctime_nsec as i64,
         ) {
-            bail!(
-                "source changed during S3 copy: {}",
-                String::from_utf8_lossy(&self.label)
-            );
+            return Err(self.changed());
         }
         Ok(())
+    }
+    /// The error for a source that no longer matches its selected file.
+    pub fn changed(&self) -> anyhow::Error {
+        SourceChanged(String::from_utf8_lossy(&self.label).into_owned()).into()
     }
     pub fn metadata(&self, hash: Option<String>) -> Metadata {
         let mut metadata = Metadata {

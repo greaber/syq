@@ -1,6 +1,7 @@
 mod redaction;
 
 use super::*;
+use crate::s3::retry::Permanent;
 use aws_smithy_runtime_api::client::{
     http::{
         http_client_fn, HttpClient, HttpConnector, HttpConnectorFuture, SharedHttpClient,
@@ -19,10 +20,11 @@ impl HttpConnector for Connector {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
         let inner = self.inner.clone();
         let authorization = self.authorization.clone();
+        // Every failure before the request is sent is local: the request does
+        // not fit the authorization, or the authorization has expired or was
+        // refused. Sending it again cannot succeed.
         HttpConnectorFuture::new(async move {
-            let mut request = request
-                .try_into_http1x()
-                .map_err(|e| ConnectorError::other(e.into(), None))?;
+            let mut request = request.try_into_http1x().map_err(Permanent::connector)?;
             // The SDK serializes tag XML and adds CRC32 only during send.
             // Use the existing late Content-MD5 capability, so prepared tag
             // writes can still run after the authorizer disconnects. Unlike an
@@ -42,15 +44,12 @@ impl HttpConnector for Connector {
                     .headers_mut()
                     .insert("content-md5", http::HeaderValue::from_str(&md5).unwrap());
             }
-            let unsigned = describe(&mut request, &authorization)
-                .map_err(|e| ConnectorError::other(e.into(), None))?;
-            let payload = unsigned
-                .payload_sha256()
-                .map_err(|e| ConnectorError::other(e.into(), None))?;
+            let unsigned = describe(&mut request, &authorization).map_err(Permanent::connector)?;
+            let payload = unsigned.payload_sha256().map_err(Permanent::connector)?;
             let signed = tokio::task::spawn_blocking(move || authorization.signed(unsigned))
                 .await
                 .map_err(|_| failure("storage authorization task failed"))?
-                .map_err(|e| ConnectorError::other(e.into(), None))?;
+                .map_err(Permanent::connector)?;
             *request.uri_mut() = signed
                 .parse()
                 .map_err(|_| failure("invalid authorized storage URL"))?;
@@ -74,7 +73,7 @@ impl HttpConnector for Connector {
     }
 }
 fn failure(message: &'static str) -> ConnectorError {
-    ConnectorError::other(anyhow::anyhow!(message).into(), None)
+    Permanent::connector(anyhow::anyhow!(message))
 }
 
 pub(in crate::s3) fn http_client(
@@ -454,5 +453,105 @@ mod tests {
         );
         *request.uri_mut() = "https://another.example/fixture/key".parse().unwrap();
         assert!(describe(&mut request, &authorization).is_err());
+    }
+
+    /// A delegated authorization that expired, or that cannot sign a request
+    /// it did not prepare, ends an upload at once instead of after retries.
+    #[tokio::test(start_paused = true)]
+    async fn unusable_authorization_fails_uploads_without_retries() {
+        use crate::s3::upload_send::tests::{client_with, failed_put, static_credentials, Failing};
+        let unreachable = Failing(|| unreachable!("no request is sent"));
+        let unreachable = http_client_fn(move |_, _| SharedHttpConnector::new(unreachable.clone()));
+        let authorization = |expires_at, connected: bool| {
+            let (socket, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            drop(peer);
+            let authorization = Arc::new(Authorization::new(
+                "b".into(),
+                Configuration {
+                    endpoint: "https://storage.example".into(),
+                    region: "auto".into(),
+                    expires_at,
+                    requested_lifetime: 60,
+                },
+                socket,
+            ));
+            if !connected {
+                authorization.state.lock().unwrap().connection = None;
+            }
+            authorization
+        };
+        let later = now().unwrap() + 60;
+        for (authorization, message) in [
+            (
+                authorization(0, false),
+                "storage authorization expired; rerun the copy for fresh approval",
+            ),
+            (
+                authorization(later, false),
+                "was not prepared before storage authorization disconnected",
+            ),
+            (
+                authorization(later, true),
+                "authorizing machine disconnected during preparation",
+            ),
+        ] {
+            let client = client_with(
+                http_client(unreachable.clone(), authorization),
+                static_credentials(),
+            );
+            let (attempts, waited, error) = failed_put(&client).await;
+            assert_eq!(
+                (attempts, waited),
+                (1, std::time::Duration::ZERO),
+                "{error:#}"
+            );
+            assert!(format!("{error:#}").contains(message), "{error:#}");
+        }
+        // The authorizing machine refuses the request; the refusal is final.
+        let (socket, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let authorizer = std::thread::spawn(move || {
+            crate::destination::read_message::<serde_json::Value>(&mut peer).unwrap();
+            crate::destination::write_message(
+                &mut peer,
+                &serde_json::json!({ "Error": "outside approved paths" }),
+            )
+            .unwrap();
+        });
+        let authorization = Arc::new(Authorization::new(
+            "b".into(),
+            Configuration {
+                endpoint: "https://storage.example".into(),
+                region: "auto".into(),
+                expires_at: later,
+                requested_lifetime: 60,
+            },
+            socket,
+        ));
+        let client = client_with(
+            http_client(unreachable, authorization),
+            static_credentials(),
+        );
+        let (attempts, waited, error) = failed_put(&client).await;
+        authorizer.join().unwrap();
+        assert_eq!(
+            (attempts, waited),
+            (1, std::time::Duration::ZERO),
+            "{error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("authorizing machine: outside approved paths"),
+            "{error:#}"
+        );
+    }
+
+    /// Redacting a connector error keeps its mark as permanent.
+    #[test]
+    fn redaction_keeps_a_permanent_mark() {
+        let error = crate::s3::retry::Permanent::connector(anyhow::anyhow!(
+            "source changed: https://storage.example/key?X-Amz-Signature=secret"
+        ));
+        let redacted = redaction::connector_error(error);
+        assert!(!format!("{redacted:?}").contains("secret"));
+        assert!(crate::s3::retry::marked_permanent(&redacted));
     }
 }

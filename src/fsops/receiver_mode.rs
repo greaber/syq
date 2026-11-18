@@ -67,8 +67,7 @@ impl ReceiverDirectories {
     pub(super) fn resolve_op<'a>(
         &self,
         op: &'a Op,
-        destination_root: Option<Arc<Root>>,
-        destination_prefix: Option<&[u8]>,
+        scope: apply::DestinationScope<'_>,
     ) -> Cow<'a, Op> {
         match op {
             Op::SetFileMetaIfSame { flags, .. } if flags & flags::RECEIVER_MODE != 0 => {
@@ -90,8 +89,7 @@ impl ReceiverDirectories {
                 let mut condition = *condition;
                 // A failed decision keeps the mode; the operation itself
                 // reports what is wrong with its path.
-                let target =
-                    apply::operation_target(path, destination_root, destination_prefix, false);
+                let target = scope.target(path);
                 if let Ok(Some((mode, identity))) =
                     target.and_then(|target| self.directory_mode(&target, meta.mode))
                 {

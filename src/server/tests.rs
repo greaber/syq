@@ -436,6 +436,8 @@ fn compressed_request() -> Vec<u8> {
         limit: 1,
         symlink_policy: OperatorSymlinkPolicy::Refuse,
         confined_root: None,
+        detailed: false,
+        follow_final_symlinks: true,
     };
     let mut bytes = Vec::new();
     FrameWriter::new(&mut bytes, true)

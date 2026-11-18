@@ -534,39 +534,27 @@ fn connect_receiving(
     login: Login,
 ) -> Result<()> {
     let unattended = login == Login::Unattended;
+    // A switch runs in the background: a login that needs the user fails
+    // rather than asks, as receiving's own reconnects do.
+    // An unreachable server fails soon, as an ordinary failure, rather
+    // than at the login's deadline as one that needs the user
+    // (`switch::LoginWatch`); as the new service's login does.
+    let rsh = match login {
+        Login::Ask => vec!["ssh".into()],
+        Login::Bounded => vec!["ssh".into(), "-o".into(), "ConnectTimeout=10".into()],
+        Login::Unattended => vec![
+            "ssh".into(),
+            "-o".into(),
+            "BatchMode=yes".into(),
+            "-o".into(),
+            "ConnectTimeout=10".into(),
+        ],
+    };
     let remote = crate::conn::RemoteSpec {
-        local_process: false,
-        user: endpoint.user,
-        host: endpoint.host,
-        port: endpoint.port,
-        // A switch runs in the background: a login that needs the user fails
-        // rather than asks, as receiving's own reconnects do.
-        // An unreachable server fails soon, as an ordinary failure, rather
-        // than at the login's deadline as one that needs the user
-        // (`switch::LoginWatch`); as the new service's login does.
-        rsh: match login {
-            Login::Ask => vec!["ssh".into()],
-            Login::Bounded => vec!["ssh".into(), "-o".into(), "ConnectTimeout=10".into()],
-            Login::Unattended => vec![
-                "ssh".into(),
-                "-o".into(),
-                "BatchMode=yes".into(),
-                "-o".into(),
-                "ConnectTimeout=10".into(),
-            ],
-        },
         bootstrap_helper: syq_path.is_none() && !no_bootstrap,
         syq_path,
-        restricted_grant: None,
-        helper_install: Default::default(),
         ssh_multiplexer: Some(multiplexer.clone()),
-        quiet: false,
-        pacing: Default::default(),
-        tcp: Default::default(),
-        diagnostics: Default::default(),
-        primed_control: Default::default(),
-        receiver_host: None,
-        read_ahead: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
+        ..crate::conn::RemoteSpec::new(endpoint.user, endpoint.host, endpoint.port, rsh)
     };
     crate::output::command_human_stdout!("Connecting to {}...", remote.label());
     // This uses the same pinned-helper bootstrap and authentication as a copy.
@@ -580,7 +568,7 @@ fn connect_receiving(
         );
         remote.connect_for_authorization(true)
     } else {
-        remote.connect_with(true, false)
+        remote.connect(true)
     };
     let connection = match connected {
         Ok(connection) => connection,

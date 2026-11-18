@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Local fault-injection checks for automatic S3 transfers. No cloud credentials."""
 import shutil, http.server, json, os, pathlib, signal, subprocess, sys, tempfile, threading, time, urllib.parse
+import fake_s3
 binary = str(pathlib.Path(sys.argv[1]).resolve())
 events = []
 scenario = "upload"
@@ -8,27 +9,14 @@ upload_started = threading.Event()
 uploads_finished = threading.Condition()
 download_started = threading.Event()
 download_finished = threading.Event()
-class Handler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *args): pass
-    def send_response(self, *args):
-        super().send_response(*args)
-        # This HTTP/1.0 server closes every connection after one response. Say
-        # so: a client that pools the connection may otherwise send its next
-        # request just as the server closes, and see a broken pipe.
-        self.send_header("Connection", "close")
-    def respond(self, status, body=b"", headers=None):
-        self.send_response(status)
-        self.send_header("Content-Length", str(len(body)))
-        for k,v in (headers or {}).items(): self.send_header(k,v)
-        self.end_headers()
-        if self.command != "HEAD": self.wfile.write(body)
+class Handler(fake_s3.Handler):
     def do_HEAD(self):
         if scenario.startswith("download"):
-            self.respond(200, b"x"*11, {"ETag": '"fixture"', "Last-Modified": "Mon, 01 Jan 2024 00:00:00 GMT"})
-        else: self.respond(404)
+            self.reply(200, b"x"*11, {"ETag": '"fixture"', "Last-Modified": "Mon, 01 Jan 2024 00:00:00 GMT"})
+        else: self.reply(404)
     def do_GET(self):
         if "list-type=" in self.path:
-            self.respond(200,b"<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>")
+            self.reply(200,fake_s3.LIST_EMPTY)
         else:
             self.send_response(200); self.send_header("Content-Length","11"); self.send_header("ETag",'"fixture"'); self.end_headers()
             if scenario == "download-interrupted":
@@ -44,13 +32,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 download_finished.set()
                 return
             self.wfile.write(b"bad" if scenario=="download-truncated" else b"hello world")
-            self.close_connection=True
     def do_POST(self):
-        length=int(self.headers.get("Content-Length","0")); self.rfile.read(length)
+        self.body()
         if "uploadId=" in self.path:
-            events.append(("complete",time.monotonic())); self.respond(200,b'<CompleteMultipartUploadResult><ETag>"whole"</ETag></CompleteMultipartUploadResult>')
+            events.append(("complete",time.monotonic())); self.reply(200,b'<CompleteMultipartUploadResult><ETag>"whole"</ETag></CompleteMultipartUploadResult>')
         else:
-            events.append(("create",time.monotonic())); self.respond(200,b"<InitiateMultipartUploadResult><UploadId>fixture</UploadId></InitiateMultipartUploadResult>")
+            events.append(("create",time.monotonic())); self.reply(200,b"<InitiateMultipartUploadResult><UploadId>fixture</UploadId></InitiateMultipartUploadResult>")
     def do_PUT(self):
         # Ordinary uploads rely on HTTPS: no request checksum and no payload hash.
         # The injected InvalidRequest failures are retried once with Content-MD5.
@@ -85,10 +72,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if scenario in ("upload-delayed", "upload-single-delayed"): time.sleep(7)
         events.append(("put-end",time.monotonic(),part))
         if (scenario=="upload-failure" and part==1) or scenario=="upload-single-failure":
-            self.respond(400,b"<Error><Code>InvalidRequest</Code><Message>injected failure</Message></Error>")
-        else: self.respond(200,headers={"ETag":'"part"'})
+            self.reply(400,b"<Error><Code>InvalidRequest</Code><Message>injected failure</Message></Error>")
+        else: self.reply(200,headers={"ETag":'"part"'})
     def do_DELETE(self):
-        events.append(("abort",time.monotonic())); self.respond(204)
+        events.append(("abort",time.monotonic())); self.reply(204)
 server=http.server.ThreadingHTTPServer(("127.0.0.1",0),Handler)
 thread=threading.Thread(target=server.serve_forever);thread.start()
 try:
