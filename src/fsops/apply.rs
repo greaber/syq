@@ -375,17 +375,16 @@ fn apply_one_rooted(
                 recheck_any: true,
                 setting: None,
             };
-            match keep::keep_existing(
+            keep::keep_existing(
                 target.into(),
                 &file,
                 &opened,
                 (meta, *flags),
                 *condition,
                 keeping,
-            )? {
-                keep::Keep::Kept(_) => Ok(()),
-                keep::Keep::Replace(error) => Err(error),
-            }
+            )?
+            .required()
+            .map(drop)
         }
         Op::Rmdir { .. } | Op::Unlink { .. } => crate::deletion::DirectoryBatch::default().remove(
             root,

@@ -2039,17 +2039,16 @@ impl FsOps {
                                         recheck_any: true,
                                         setting: None,
                                     };
-                                    match keep::keep_existing(
+                                    keep::keep_existing(
                                         (&target).into(),
                                         &held,
                                         &current,
                                         (&file.meta, checked),
                                         condition,
                                         keeping,
-                                    )? {
-                                        keep::Keep::Kept(_) => Ok(()),
-                                        keep::Keep::Replace(error) => Err(error),
-                                    }
+                                    )?
+                                    .required()
+                                    .map(drop)
                                 })()
                                 .err()
                                 .map(|error| wire_error(&error))

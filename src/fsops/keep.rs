@@ -40,6 +40,17 @@ pub(crate) enum Keep {
     Replace(anyhow::Error),
 }
 
+impl Keep {
+    /// The identity of a file that had to be kept, or the error saying it
+    /// must be replaced.
+    pub(crate) fn required(self) -> Result<Option<(u64, u64)>> {
+        match self {
+            Keep::Kept(identity) => Ok(identity),
+            Keep::Replace(error) => Err(error),
+        }
+    }
+}
+
 /// Keep `file`, the existing file at `place` whose metadata `current` was
 /// read through it, with `meta` under `flags`: vouch for the change
 /// (`vouch::require`), make it through `file`, then require that the name

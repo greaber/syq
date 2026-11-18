@@ -1177,18 +1177,15 @@ impl FsOps {
                     recheck_any: false,
                     setting: Some("set metadata on basis"),
                 };
-                let kept = keep::keep_existing(
+                return keep::keep_existing(
                     (&target).into(),
                     &held.file,
                     &current,
                     (meta, flags),
                     condition,
                     keeping,
-                )?;
-                return match kept {
-                    keep::Keep::Kept(identity) => Ok(identity),
-                    keep::Keep::Replace(error) => Err(error),
-                };
+                )?
+                .required();
             }
         }
         // `Any` may finish through the retained inode after a concurrent
