@@ -42,7 +42,8 @@ unchanged. The selected release runs the whole command, including on servers,
 so an older release brings its older limitations and bugs too. If such a
 command starts receiving or the SSH authorization provider on your laptop,
 your normal installation later switches them to its own version, [as after an
-update](persistence-reference.md#connection-lifetime-and-waits). Stored
+update](persistence-reference.md#connection-lifetime-and-waits), except
+receiving that a release before 0.8.0 started. Stored
 releases stay until you delete them; see
 [stored releases](environment.md#stored-releases-and-helpers).
 
@@ -78,7 +79,10 @@ helpers and installation exceptions.
 ## Updates
 
 Use `syq --self-update` for a standalone installation, or `brew upgrade syq`
-for Homebrew. Commands already running keep their own version, and receiving
+for Homebrew. A `syq` that a Python package installed is upgraded with the
+tool that installed it, such as `pip install --upgrade syq`;
+`syq --self-update` declines to replace it and says so. Commands already
+running keep their own version, and receiving
 [switches to the new version](persistence-reference.md#connection-lifetime-and-waits)
 once nothing is in progress.
 

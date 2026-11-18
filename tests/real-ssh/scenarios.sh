@@ -243,6 +243,16 @@ if changes:
 PYTHON
 }
 
+# Remote filename completion through the helper of the completion cases.
+completion_output=/tmp/syq-real-ssh-completion.out
+completion_expected=/tmp/syq-real-ssh-completion.expected
+complete_remote() {
+    syq completion __complete fish 6 -- \
+        syq cp --syq-path /tmp/syq-real-ssh/completion-helper --from source \
+        /tmp/syq-real-ssh/completion/al >"$completion_output"
+    cmp "$completion_expected" "$completion_output"
+}
+
 make_tree() {
     host=$1
     root=$2
@@ -1243,18 +1253,10 @@ export SYQ_REAL_SSH_SENT_ENV=pool-original
 trace=/tmp/syq-real-ssh-ssh.trace
 rm -f "$trace"
 syq persist on >/dev/null
-completion_output=/tmp/syq-real-ssh-completion.out
-completion_expected=/tmp/syq-real-ssh-completion.expected
 {
     printf '%s\000' '/tmp/syq-real-ssh/completion/alpha file'
     printf '%s\000' '/tmp/syq-real-ssh/completion/alpine/'
 } >"$completion_expected"
-complete_remote() {
-    syq completion __complete fish 6 -- \
-        syq cp --syq-path /tmp/syq-real-ssh/completion-helper --from source \
-        /tmp/syq-real-ssh/completion/al >"$completion_output"
-    cmp "$completion_expected" "$completion_output"
-}
 # Completed logins of the completion's own: the first becomes the master.
 direct_logins() {
     awk -F '\t' '

@@ -54,7 +54,8 @@ shell itself, run `eval "$(tmux show-environment -s SSH_AUTH_SOCK)"`.
 | `~/.config/syq/auth-from.json` | Choices saved with [`syq persist auth-from`](commands/persist.md#syq-persist-auth-from) |
 | `~/.config/syq/account-permissions-v1.json` | [Account permissions](persistence-reference.md#account-permissions) you chose to remember |
 | `~/.syq-receiver-identity/` | The key your [receiving names](persistence-reference.md#back-up-the-receiving-identity) are tied to; keep it in private backups |
-| `~/.config/syq/install.json`, `last-update-check` | Install receipt and update-check timing |
+| `~/.config/syq/last-update-check` | Update-check timing |
+| `.syq-install.json` beside a standalone install's `syq` | Install receipt that `syq --self-update` reads. Installs made before 0.6.0 keep theirs in `~/.config/syq/install.json`, and the next self-update copies it here |
 | `~/.local/lib/syq/` | [Stored releases and helpers](#stored-releases-and-helpers) |
 | `$XDG_RUNTIME_DIR/syq-persist-UID/` | Persistent connection sockets |
 | `$XDG_RUNTIME_DIR/syq-UID/` | Sockets of copies that are running |

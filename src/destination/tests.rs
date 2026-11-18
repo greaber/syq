@@ -294,25 +294,11 @@ fn registration_reads_only_its_secret_line_from_standard_input() {
 fn a_registration_that_takes_over_waits_for_its_service_and_the_name() {
     let dir = crate::test_support::tempdir().unwrap();
     let path = dir.path().join("laptop.lock");
-    let open = || {
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .unwrap()
-    };
-    let free = || {
-        let probe = open();
-        unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
-    };
+    let open = || LockFile::open(&path, true).unwrap();
+    let free = || !open().held().unwrap();
     let hold = || {
         let held = open();
-        assert_eq!(
-            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
+        assert!(held.try_exclusive().unwrap());
         held
     };
     let timed_out = |error: anyhow::Error| {
@@ -828,6 +814,35 @@ fn named_parser_rejects_oversize_truncated_and_wrong_generation() {
         read_message::<Reply>(&mut stream).unwrap(),
         Reply::Error(_)
     ));
+}
+
+/// A copy to this machine that names another machine as its authorizer is
+/// refused before anyone is asked, as the other approvers refuse one.
+#[test]
+fn a_copy_here_naming_another_authorizer_is_refused_before_asking() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let root = temp.path().join("receiving");
+    fs::create_dir(&root).unwrap();
+    let (_broker, receiver, registration, prompts) = broker(&root, Approval::Ask);
+    let (command, inputs) = requested(Path::new("source"), &["--auth-from", "@other"]);
+    let error = exchange(
+        &registration,
+        Message::Request {
+            cwd: String::new(),
+            command,
+            inputs,
+        },
+        Duration::from_secs(5),
+        Some(Duration::from_secs(5)),
+    )
+    .err()
+    .expect("refused");
+    assert!(
+        format!("{error:#}").contains("the requesting command authorizes from a different machine"),
+        "{error:#}"
+    );
+    assert!(prompts.try_recv().is_err());
+    assert!(receiver.sessions.lock().unwrap().is_empty());
 }
 
 #[test]

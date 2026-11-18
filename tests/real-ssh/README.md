@@ -35,14 +35,15 @@ scripts/test-real-ssh.py --case 'relaying between two SSH endpoints'
 scripts/test-real-ssh.py --skip-case 'shell completion'
 ```
 
-Many cases build on files, settings, or shell functions from earlier cases.
+Many cases build on files or settings from earlier cases. Shell functions that
+more than one case calls are defined before the first case.
 If a selected case fails before its own checks, add the cases it builds on.
 A subset is for iteration: run the whole suite when it is relevant to a change.
 
 Full nightly and manual `ci.yml` runs build the lab image once, then run the
-core suite, the metadata and benchmark suites below, and the alternate SSH
-profile as parallel jobs on GitHub's Linux runners. The core suite includes the
-storage checks. The alternate profile skips the cases listed in
+core suite, the benchmark suite below, and the alternate SSH profile as
+parallel jobs on GitHub's Linux runners. The core suite includes the storage
+and metadata checks. The alternate profile skips the cases listed in
 `max-sessions-1.skip`: cases unaffected by the destination limit, and workflows
 that require concurrent sessions on one connection. New cases run in both profiles. Pull requests and post-merge
 runs do not run these suites.

@@ -62,7 +62,7 @@ pub(crate) fn mark_for_refresh(id: EnrollmentId) -> Result<()> {
 /// [`mark_for_refresh`] for the enrollment records below `base`.
 pub(super) fn mark_for_refresh_in(base: &Path, id: EnrollmentId) -> Result<()> {
     let base_lock = open_directory(base)?;
-    lock_directory(&base_lock)?;
+    let _lock = lock_directory(&base_lock)?;
     match load_enrollment_records_in(base)?
         .active
         .into_iter()
