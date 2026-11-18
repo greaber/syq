@@ -15,6 +15,8 @@ import signal
 import subprocess
 import time
 
+from syq_real_ssh_lab import run, wait_for
+
 NATIVE_PATH = "PATH=/usr/bin:/bin:/usr/local/bin"
 BIN = Path("/tmp/syq-account-switch-bin")
 OLD = BIN / "syq"
@@ -23,29 +25,8 @@ NAME = "switching-laptop"
 FAST = {"SYQ_TEST_SWITCH_CHECK_MS": "200", "SYQ_TEST_SWITCH_QUIET_MS": "1000"}
 
 
-def run(*args, data=None, success=True, env=None):
-    result = subprocess.run(args, input=data, capture_output=True, text=True, timeout=60,
-                            env=None if env is None else {**os.environ, **env})
-    assert (result.returncode == 0) == success, (args, result)
-    return result.stdout
-
-
 def source(*args, success=True):
     return run("ssh", "source", shlex.join(["env", NATIVE_PATH, *args]), success=success)
-
-
-def wait_for(description, predicate, timeout=60):
-    deadline, progress = time.monotonic() + timeout, time.monotonic() + 5
-    state = None
-    while time.monotonic() < deadline:
-        state = predicate()
-        if state:
-            return state
-        if time.monotonic() >= progress:
-            print("Waiting for", description, "last state:", state, flush=True)
-            progress += 5
-        time.sleep(.2)
-    raise AssertionError(("Timed out", description, "last state", state))
 
 
 def receiving(scope):
@@ -70,8 +51,8 @@ try:
     root.mkdir(exist_ok=True)
     shutil.copy2("/usr/local/bin/syq-other-build", OLD)
     run(str(OLD), "persist", "receive", "on", "--pscope", scope, "--name", NAME, "--notify", "off",
-        "--root", str(root), "--all-connections", env=FAST)
-    run(str(OLD), "persist", "connect", "source", "--pscope", scope, env=FAST)
+        "--root", str(root), "--all-connections", env={**os.environ, **FAST})
+    run(str(OLD), "persist", "connect", "source", "--pscope", scope, env={**os.environ, **FAST})
     assert receiving(scope)["identity"] == other_build
 
     # The server opens an approved account connection through the laptop.
