@@ -766,9 +766,6 @@ pub struct RegisteredSourceRoot {
     /// Present only for an exact leaf. Workers retain `leaf_ticket` when
     /// available; an unpinned FIFO has identity checks but no inode-reuse guard.
     pub expected_leaf: Option<SourceLeafIdentity>,
-    /// Permit this explicitly opted-in rsync session to use legacy unconfined
-    /// source pathnames for `--insecure-links` compatibility.
-    pub allow_unconfined_paths: bool,
     /// A selected directory's permission bits when it was registered, so a
     /// coordinator that creates a destination for its contents needs no
     /// lookup of its own. None for an exact leaf.
@@ -1028,9 +1025,6 @@ pub enum WireRequest<Data> {
         base: SourceRootBase,
         selections: Vec<SourceRootSelection>,
         symlink_policy: OperatorSymlinkPolicy,
-        /// Explicit rsync compatibility opt-out. It permits legacy unconfined
-        /// source discovery only for the session created by this registration.
-        allow_unconfined_paths: bool,
         /// Fixed source workers that can share the control helper process.
         /// Automatic copies pass zero: estimate only the registry and control
         /// session, not speculative future workers. This reserves no handles.
@@ -1064,21 +1058,13 @@ pub enum WireRequest<Data> {
         check_empty: bool,
         target: Option<DestinationFilesystemTarget>,
     },
-    /// Compute receiver-side sidecar names for collision preflight. The opaque
-    /// suffix also reserves shortened spellings after a filename-limit retry.
-    PartialPaths {
-        paths: Vec<PathBytes>,
-        copy_id: CopyId,
-    },
     Apply {
         ops: Vec<Op>,
     },
-    /// Resolve sidecar names and inspect an existing destination batch in one
-    /// turn. Leaf stats are returned only when every directory is still a
-    /// directory, so callers can preserve parent-before-child replacement.
+    /// Inspect an existing destination batch in one turn. Leaf stats are
+    /// returned only when every directory is still a directory, so callers
+    /// can preserve parent-before-child replacement.
     PlanBatch {
-        partial_paths: Vec<PathBytes>,
-        copy_id: CopyId,
         directories: Vec<PathBytes>,
         others: Vec<PathBytes>,
         /// Fail on unreadable entries instead of treating them as absent.
@@ -1718,9 +1704,7 @@ pub enum Response {
     DestinationRegistered(DescriptorTicket),
     SourceRootsRegistered(Vec<RegisteredSourceRoot>),
     DestinationFilesystemInfo(DestinationFilesystemInfo),
-    PathResults(Vec<std::result::Result<PathBytes, String>>),
     BatchPlan {
-        partial_paths: Vec<std::result::Result<PathBytes, String>>,
         directories: Vec<Option<Entry>>,
         /// None means a directory was missing or a non-directory, so the
         /// caller must apply directory changes before inspecting leaves.
@@ -2151,18 +2135,13 @@ impl SizeHint for Request {
             Request::StatMany { paths, .. } | Request::PruneLookup { paths, .. } => {
                 paths.iter().map(|p| p.len() + 8).sum::<usize>() + 16
             }
-            Request::PartialPaths { paths, .. } => {
-                paths.iter().map(|path| path.len() + 8).sum::<usize>() + 32
-            }
             Request::PlanBatch {
-                partial_paths,
                 directories,
                 others,
                 ..
             } => {
-                partial_paths
+                directories
                     .iter()
-                    .chain(directories)
                     .chain(others)
                     .map(|path| path.len() + 8)
                     .sum::<usize>()
@@ -2293,15 +2272,9 @@ impl SizeHint for Response {
                     + 16
             }
             Response::BatchPlan {
-                partial_paths,
                 directories,
                 others,
-            } => {
-                partial_paths.len() * 96
-                    + directories.len() * 96
-                    + others.as_ref().map_or(0, |items| items.len() * 96)
-                    + 32
-            }
+            } => directories.len() * 96 + others.as_ref().map_or(0, |items| items.len() * 96) + 32,
             Response::Hashes(v) | Response::HeldHashes { hashes: v, .. } => v.len() * 32 + 24,
             Response::SeededBasis(seed) => seed.hashes.len() * 32 + 24,
             Response::DestinationResults(v) => v.len() + 16,

@@ -461,13 +461,6 @@ fn remote_vector_replies_must_match_request_counts() {
                 },
                 Response::Applied(vec![None; count]),
             ),
-            (
-                Request::PartialPaths {
-                    paths: vec![b"file".to_vec()],
-                    copy_id: [0; 16],
-                },
-                Response::PathResults(vec![Ok(b"partial".to_vec()); count]),
-            ),
         ];
         for (request, response) in cases {
             let mut conn = connection_replaying(&[response]);
@@ -677,7 +670,6 @@ fn local_workers_clone_the_control_descriptor_session_in_process() {
                 follow_root: false,
             }],
             symlink_policy: OperatorSymlinkPolicy::Refuse,
-            allow_unconfined_paths: false,
             shared_workers: 1,
             independent_handoff_workers: 0,
         })
@@ -717,7 +709,6 @@ fn local_source_worker_rejects_destination_mutation_requests() {
                 follow_root: false,
             }],
             symlink_policy: OperatorSymlinkPolicy::Refuse,
-            allow_unconfined_paths: false,
             shared_workers: 1,
             independent_handoff_workers: 0,
         })

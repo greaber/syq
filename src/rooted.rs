@@ -1546,8 +1546,8 @@ impl Root {
                         DirectoryHandle::Borrowed(_) => self.identity.dev,
                         DirectoryHandle::Owned(directory) => directory.metadata()?.dev(),
                     };
-                    // Serialize the first query too: PartialPaths resolves a
-                    // batch in parallel, and every worker must reuse the first
+                    // Serialize the first query too: a batch may resolve in
+                    // parallel, and every worker must reuse the first
                     // fpathconf result instead of issuing the same filesystem
                     // round trip concurrently.
                     let mut cache = cache.lock().unwrap();

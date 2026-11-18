@@ -4313,8 +4313,6 @@ fn authority_rejects_scope_and_option_escalation() {
     authority.authorize(&mut stat, false).unwrap();
 
     let mut plan = Request::PlanBatch {
-        partial_paths: vec![target.clone()],
-        copy_id: [3; 16],
         directories: vec![target.clone()],
         others: vec![target.clone()],
         strict_metadata: false,
@@ -8958,7 +8956,6 @@ fn restricted_authority_rejects_caller_source_registration() {
             follow_root: false,
         }],
         symlink_policy: proto::OperatorSymlinkPolicy::Refuse,
-        allow_unconfined_paths: false,
         shared_workers: 0,
         independent_handoff_workers: 0,
     };

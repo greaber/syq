@@ -96,7 +96,6 @@ fn registration(policy: &SourcePolicy) -> Request {
         base: policy.base.clone(),
         selections: policy.selections.clone(),
         symlink_policy: policy.symlink_policy,
-        allow_unconfined_paths: false,
         shared_workers: 1,
         independent_handoff_workers: 0,
     }

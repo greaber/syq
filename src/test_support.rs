@@ -71,7 +71,6 @@ pub(crate) fn register_source_roots<P: AsRef<std::path::Path>>(
             })
             .collect(),
         symlink_policy: crate::proto::OperatorSymlinkPolicy::Refuse,
-        allow_unconfined_paths: false,
         shared_workers: 0,
         independent_handoff_workers,
     }

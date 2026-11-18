@@ -325,7 +325,6 @@ fn reply_shape(req: &Request) -> Option<(&'static str, usize)> {
             Some(("widen directories", directories.len()))
         }
         Request::Apply { ops, .. } => Some(("apply", ops.len())),
-        Request::PartialPaths { paths, .. } => Some(("partial paths", paths.len())),
         _ => None,
     }
 }
@@ -368,7 +367,6 @@ fn assemble_reply(
             Response::Stats(values) => Some(values.len()),
             Response::Applied(values) => Some(values.len()),
             Response::WidenedDirectories(values) => Some(values.len()),
-            Response::PathResults(values) => Some(values.len()),
             _ => None,
         };
         if actual.is_some_and(|actual| actual != expected) {

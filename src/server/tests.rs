@@ -580,7 +580,6 @@ fn a_read_stream_does_not_hold_room_its_stop_needs() {
         ticket,
         leaf_ticket: None,
         expected_leaf: None,
-        allow_unconfined_paths: false,
         directory_mode: None,
     };
     // Leave room for one frame of unknown decoded size, not two.
@@ -729,7 +728,6 @@ fn tcp_server_joins_request_reader_on_shutdown() {
         ticket,
         leaf_ticket: None,
         expected_leaf: None,
-        allow_unconfined_paths: false,
         directory_mode: None,
     };
     let server_session = descriptor_session.clone();
@@ -967,7 +965,6 @@ fn tcp_server_joins_request_reader_on_shutdown() {
                 follow_root: false,
             }],
             symlink_policy: OperatorSymlinkPolicy::Refuse,
-            allow_unconfined_paths: false,
             shared_workers: 0,
             independent_handoff_workers: 0,
         })
@@ -1054,7 +1051,6 @@ fn rejected_source_ticket_is_not_acknowledged_as_ready() {
         ticket,
         leaf_ticket: None,
         expected_leaf: None,
-        allow_unconfined_paths: false,
         directory_mode: None,
     };
     owner.close();
