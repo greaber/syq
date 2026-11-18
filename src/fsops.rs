@@ -2026,14 +2026,14 @@ impl FsOps {
                                 // readable inode that was hashed; O_PATH metadata
                                 // handles intentionally cannot change timestamps.
                                 (|| -> Result<()> {
-                                    require_rooted_named_identity(
+                                    let current = held.metadata()?;
+                                    require_rooted_named_identity_known(
                                         &target.root,
                                         &target.relative,
                                         &target.label,
-                                        &held,
+                                        &current,
                                         condition,
                                     )?;
-                                    let current = held.metadata()?;
                                     let keeping = keep::Keeping {
                                         handle: keep::Handle::Open,
                                         recheck_any: true,

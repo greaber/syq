@@ -5088,8 +5088,13 @@ pub(super) fn set_meta_file_inner(
         // Do not hand that account the staging inode's owner read permission.
         f.set_permissions(fs::Permissions::from_mode(0o000))?;
     }
-    // Owner first: chown clears setuid/setgid, so final mode follows it.
+    // A metadata-only handle cannot set times on Linux: refuse before
+    // changing anything.
     let path_handle = cfg!(target_os = "linux") && handle == keep::Handle::Path;
+    if path_handle && flags & flags::TIMES != 0 {
+        bail!("metadata-only O_PATH repair does not support timestamp changes");
+    }
+    // Owner first: chown clears setuid/setgid, so final mode follows it.
     let owner_changed =
         apply_owner_if_changed(flags, meta, current.uid(), current.gid(), |uid, gid| {
             if path_handle {
@@ -5110,7 +5115,6 @@ pub(super) fn set_meta_file_inner(
         )?;
     }
     if flags & flags::TIMES != 0
-        && !path_handle
         && (!times_current
             || current.mtime() != meta.mtime
             || current.mtime_nsec() as u32 != meta.mtime_nsec)
@@ -5146,9 +5150,6 @@ pub(super) fn set_meta_file_inner(
             }
             super::access_changed(f);
         }
-    }
-    if path_handle && flags & flags::TIMES != 0 {
-        bail!("metadata-only O_PATH repair does not support timestamp changes");
     }
     if before_publication {
         crate::inode_metadata::apply_after_acls_before_publication(
