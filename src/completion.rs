@@ -8,6 +8,7 @@
 
 use crate::cli::{parse_native_endpoint, AuthFrom, NativeEndpoint};
 use crate::conn::{Conn, RemoteConn, RemoteSpec, SshMultiplexer};
+use crate::lock_file::LockFile;
 use crate::proto::{CompletionEntry, OperatorSymlinkPolicy, Request, Response};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
@@ -17,7 +18,6 @@ use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -364,41 +364,17 @@ fn open_cache_directory(path: &Path, create: bool) -> Result<Option<File>> {
     }
 }
 
-struct CacheLock(File);
-
-impl Drop for CacheLock {
-    fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
-}
-
-fn lock_cache(parent: &Path, _directory: &File) -> Result<CacheLock> {
+fn lock_cache(parent: &Path, _directory: &File) -> Result<LockFile> {
     let path = parent.join(CACHE_LOCK);
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&path)
+    let lock = LockFile::open(&path, true)
         .with_context(|| format!("open completion cache lock {}", path.display()))?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
-        bail!(
-            "completion cache lock {} must be a regular file owned by the current user",
-            path.display()
-        );
+    if !lock
+        .try_exclusive()
+        .with_context(|| format!("lock completion cache {}", path.display()))?
+    {
+        bail!("completion cache is busy; try again");
     }
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::WouldBlock {
-            bail!("completion cache is busy; try again");
-        }
-        return Err(error).with_context(|| format!("lock completion cache {}", path.display()));
-    }
-    Ok(CacheLock(file))
+    Ok(lock)
 }
 
 fn read_cache() -> Result<CompletionCache> {
