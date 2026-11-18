@@ -206,21 +206,14 @@ pub(crate) fn register_standalone_install_at(binary: PathBuf) -> Result<()> {
 /// for a different executable (or malformed metadata) is not such a record.
 pub(crate) fn was_standalone_install(binary: &Path) -> Result<bool> {
     let (parent, name) = install_path_parts(binary)?;
-    let path = receipt_read_path(receipt_path(parent, name))?;
+    let path = receipt_path(parent, name);
     match fs::metadata(&path) {
         Ok(metadata) if !metadata.is_file() => return Ok(false),
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error).context("inspect previous standalone install receipt"),
     }
-    let bytes = if is_legacy_receipt(&path) {
-        match read_legacy_receipt(&path) {
-            Ok(bytes) => bytes,
-            Err(_) => return Ok(false),
-        }
-    } else {
-        fs::read(&path).context("read previous standalone install receipt")?
-    };
+    let bytes = fs::read(&path).context("read previous standalone install receipt")?;
     let Ok(receipt) = parse_receipt(&bytes) else {
         return Ok(false);
     };
@@ -1445,7 +1438,21 @@ fn managed_receipt() -> Result<(PathBuf, InstallReceipt)> {
         bail!("source builds must be rebuilt or replaced with a standalone install");
     }
     let current = canonical_current_exe()?;
-    let path = receipt_read_path(receipt_path_for(&current)?)?;
+    let path = receipt_path_for(&current)?;
+    // Releases before 0.6.0 kept the receipt in the configuration
+    // directory, away from the executable it names. Reinstalling writes one
+    // beside it.
+    if let Some(legacy) = config_dir()
+        .map(|dir| dir.join("install.json"))
+        .ok()
+        .filter(|legacy| !path.exists() && legacy.exists())
+    {
+        bail!(
+            "{} has no install receipt beside it, only one in {}, where syq before 0.6.0 kept it; reinstall syq with the standalone installer",
+            current.display(),
+            legacy.display()
+        );
+    }
     let receipt = read_receipt(&path)?;
     if canonical_or_original(&receipt.binary) != current {
         bail!(
@@ -1458,54 +1465,9 @@ fn managed_receipt() -> Result<(PathBuf, InstallReceipt)> {
 }
 
 fn read_receipt(path: &Path) -> Result<InstallReceipt> {
-    let bytes = if is_legacy_receipt(path) {
-        read_legacy_receipt(path)?
-    } else {
-        fs::read(path).with_context(|| format!("read {}", path.display()))?
-    };
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
     parse_receipt(&bytes)
         .with_context(|| format!("read standalone install receipt {}", path.display()))
-}
-
-/// The most a receipt may hold; one is a few hundred bytes.
-const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
-
-fn is_legacy_receipt(path: &Path) -> bool {
-    legacy_receipt_path().is_ok_and(|legacy| legacy == path)
-}
-
-/// Read the receipt that released versions kept in the configuration
-/// directory, away from the executable it names. It must be a regular file
-/// of this user's that group and others cannot write, as syq wrote it, and
-/// is read without following a link: whoever could put it there could
-/// otherwise choose which executable an update replaces.
-fn read_legacy_receipt(path: &Path) -> Result<Vec<u8>> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
-        .open(path)
-        .with_context(|| format!("open {}", path.display()))?;
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("inspect {}", path.display()))?;
-    if !metadata.is_file()
-        || metadata.uid() != crate::rooted::own_uid()
-        || metadata.mode() & 0o022 != 0
-    {
-        bail!(
-            "{} must be a regular file that you own and nobody else can write",
-            path.display()
-        );
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_RECEIPT_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("read {}", path.display()))?;
-    if bytes.len() as u64 > MAX_RECEIPT_BYTES {
-        bail!("{} is too large to be an install receipt", path.display());
-    }
-    Ok(bytes)
 }
 
 fn parse_receipt(bytes: &[u8]) -> Result<InstallReceipt> {
@@ -1556,27 +1518,13 @@ fn receipt_path_for(binary: &Path) -> Result<PathBuf> {
     Ok(receipt_path(parent, name))
 }
 
-fn receipt_read_path(adjacent: PathBuf) -> Result<PathBuf> {
-    // Released versions stored their receipt in XDG_CONFIG_HOME. Read it only
-    // when no adjacent receipt exists, keeping malformed new state visible.
-    match fs::symlink_metadata(&adjacent) {
-        Ok(_) => Ok(adjacent),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => legacy_receipt_path(),
-        Err(error) => Err(error).context("inspect standalone install receipt"),
-    }
-}
-
-fn legacy_receipt_path() -> Result<PathBuf> {
-    Ok(config_dir()?.join("install.json"))
-}
-
 fn check_stamp_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("last-update-check"))
 }
 
 fn config_dir() -> Result<PathBuf> {
     let base = crate::user_dirs::config_dir().ok_or_else(|| {
-        anyhow!("cannot locate the standalone install receipt: no home directory or absolute XDG_CONFIG_HOME")
+        anyhow!("cannot locate the syq configuration directory: no home directory or absolute XDG_CONFIG_HOME")
     })?;
     Ok(base.join("syq"))
 }

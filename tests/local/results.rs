@@ -1424,7 +1424,8 @@ fn persistence_status_escapes_peer_errors_but_json_preserves_them() {
     let response = serde_json::to_vec(&serde_json::json!({
         "version": 2, "identity": "old-daemon-fixture", "pid": 1,
         "endpoint": "example", "name": "laptop",
-        "connection": {"phase": "failed", "error": error, "ssh_pid": null}
+        "connection": {"phase": "failed", "error": error, "ssh_pid": null},
+        "busy": {"requests": 0, "pending": 0}
     }))
     .unwrap();
     let server = std::thread::spawn(move || {
