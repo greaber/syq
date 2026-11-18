@@ -9,9 +9,12 @@ const TAG = /^v\d+\.\d+\.\d+$/;
 const ASSET = /^[A-Za-z0-9._-]{1,100}$/;
 const TARGETS = ["linux-x86_64", "linux-aarch64", "macos-arm64", "macos-x86_64"];
 const CLIENT = /^(syq|syq-python-sdk)\/(\d+\.\d+\.\d+)/;
-// Tagged assets never change once published.
+// Tagged assets never change once published. /latest/ responses change with
+// each release, so clients may keep them only as long as the tag is cached.
 const ASSET_TTL_SECONDS = 365 * 24 * 60 * 60;
 const LATEST_TTL_SECONDS = 300;
+const ASSET_CACHE_CONTROL = `public, max-age=${ASSET_TTL_SECONDS}, immutable`;
+const LATEST_CACHE_CONTROL = `public, max-age=${LATEST_TTL_SECONDS}`;
 
 export default {
   async fetch(request, env, ctx) {
@@ -39,8 +42,9 @@ export default {
       return new Response("not found", { status: 404 });
     }
 
+    const cacheControl = latest ? LATEST_CACHE_CONTROL : ASSET_CACHE_CONTROL;
     const response = tag
-      ? await serveAsset(env, ctx, request, tag, asset)
+      ? await serveAsset(env, ctx, request, tag, asset, cacheControl)
       : redirect(`${env.GITHUB_RELEASES}/latest/download/${asset}`);
     ctx.waitUntil(
       record(env, request, { asset, tag, latest, status: response.status }).catch(() => {}),
@@ -57,12 +61,14 @@ function redirect(location) {
 }
 
 // Serve /<tag>/<asset> from the edge cache, filling it from GitHub on a miss.
-async function serveAsset(env, ctx, request, tag, asset) {
+// The edge-cache entry is keyed by tag and always immutable; the client
+// response carries `cacheControl`.
+async function serveAsset(env, ctx, request, tag, asset, cacheControl) {
   const cacheKey = new Request(`https://${new URL(request.url).host}/${tag}/${asset}`);
   const cache = caches.default;
   const hit = await cache.match(cacheKey);
   if (hit) {
-    return withCacheStatus(hit, "hit", request.method);
+    return withCacheStatus(hit, "hit", request.method, cacheControl);
   }
   const origin = `${env.GITHUB_RELEASES}/download/${tag}/${asset}`;
   let upstream;
@@ -80,18 +86,24 @@ async function serveAsset(env, ctx, request, tag, asset) {
   const headers = new Headers({
     "content-type": "application/octet-stream",
     "content-disposition": `attachment; filename="${asset}"`,
-    "cache-control": `public, max-age=${ASSET_TTL_SECONDS}, immutable`,
+    "cache-control": ASSET_CACHE_CONTROL,
   });
   const length = upstream.headers.get("content-length");
   if (length) headers.set("content-length", length);
   const [toClient, toCache] = upstream.body.tee();
   ctx.waitUntil(cache.put(cacheKey, new Response(toCache, { status: 200, headers })));
-  return withCacheStatus(new Response(toClient, { status: 200, headers }), "miss", request.method);
+  return withCacheStatus(
+    new Response(toClient, { status: 200, headers }),
+    "miss",
+    request.method,
+    cacheControl,
+  );
 }
 
-function withCacheStatus(response, status, method) {
+function withCacheStatus(response, status, method, cacheControl) {
   const headers = new Headers(response.headers);
   headers.set("x-syq-cache", status);
+  headers.set("cache-control", cacheControl);
   return new Response(method === "HEAD" ? null : response.body, {
     status: response.status,
     headers,
