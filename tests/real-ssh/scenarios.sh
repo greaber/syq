@@ -1104,7 +1104,9 @@ ahead_copy() {
     ssh source 'rm -f /tmp/syq-ahead-early'
     rm -f /tmp/syq-ahead-claims
     # The scan holds every batch it may, so each lookup that can go early does.
-    ssh source 'SYQ_TEST_SCAN_AHEAD_WAIT=1 SYQ_TEST_EARLY_LOOKUPS=/tmp/syq-ahead-early syq cp --if-exists=keep --no-progress --srcs-in /tmp/syq-real-ssh/ahead-tree --to @laptop --into ahead'
+    # $1: more options, quoted for the source's shell.
+    # shellcheck disable=SC2029
+    ssh source "SYQ_TEST_SCAN_AHEAD_WAIT=1 SYQ_TEST_EARLY_LOOKUPS=/tmp/syq-ahead-early syq cp --if-exists=keep --no-progress --srcs-in /tmp/syq-real-ssh/ahead-tree --to @laptop --into ahead ${1-}"
     # What became of each early lookup, and what the receiver's record gave
     # each publication.
     # A copy into an empty destination asks about no batch.
@@ -1162,6 +1164,16 @@ ahead_sent=$(ahead_count /tmp/syq-ahead-fates sent)
 if [ "$ahead_sent" -lt 2 ] || [ "$ahead_sent" -ne "$(ahead_count /tmp/syq-ahead-fates used)" ] ||
     [ -s /tmp/syq-ahead-claimed ]; then
     echo 'an unchanged copy did not use every lookup it sent ahead:' >&2
+    cat /tmp/syq-ahead-fates /tmp/syq-ahead-claimed >&2
+    exit 1
+fi
+# The same with --where selecting a tenth of the files: the lookups sent
+# ahead name the selected entries, so each is used.
+ahead_copy "--where 'src.name glob \"*5\"'"
+ahead_sent=$(ahead_count /tmp/syq-ahead-fates sent)
+if [ "$ahead_sent" -lt 2 ] || [ "$ahead_sent" -ne "$(ahead_count /tmp/syq-ahead-fates used)" ] ||
+    [ -s /tmp/syq-ahead-claimed ]; then
+    echo 'an unchanged copy with --where did not use every lookup it sent ahead:' >&2
     cat /tmp/syq-ahead-fates /tmp/syq-ahead-claimed >&2
     exit 1
 fi
