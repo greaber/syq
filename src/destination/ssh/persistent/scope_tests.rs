@@ -397,11 +397,8 @@ fn a_keeper_waits_while_status_looks_at_its_lock() {
         .join(format!("{}.json", "a".repeat(64)));
     let lock = keeper_lock_path(&path, &record.control).unwrap();
     private_write(&lock, b"");
-    let looking = File::open(&lock).unwrap();
-    assert_eq!(
-        unsafe { libc::flock(looking.as_raw_fd(), libc::LOCK_SH) },
-        0
-    );
+    let looking = LockFile::open(&lock, false).unwrap();
+    assert!(looking.try_shared().unwrap());
     let releasing = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(100));
         drop(looking);

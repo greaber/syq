@@ -1,4 +1,5 @@
 use super::*;
+use crate::lock_file::LockFile;
 
 pub(super) fn current_account() -> Result<(String, PathBuf)> {
     let uid = unsafe { libc::geteuid() };
@@ -78,16 +79,11 @@ pub(super) fn open_directory(path: &Path) -> Result<File> {
         .with_context(|| format!("open private directory {}", path.display()))
 }
 
-pub(super) fn lock_directory(directory: &File) -> Result<()> {
-    loop {
-        if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX) } == 0 {
-            return Ok(());
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error).context("lock private directory");
-        }
-    }
+/// Lock `directory` until the returned lock is dropped.
+pub(super) fn lock_directory(directory: &File) -> Result<LockFile> {
+    let lock = LockFile::adopt(directory.try_clone().context("lock private directory")?);
+    lock.exclusive().context("lock private directory")?;
+    Ok(lock)
 }
 
 pub(super) fn leaf_name(name: &str) -> Result<CString> {
@@ -126,7 +122,7 @@ pub(super) fn atomic_write(
 ) -> Result<()> {
     delegation::validate_private_directory_path(directory_path)?;
     let directory = open_directory(directory_path)?;
-    lock_directory(&directory)?;
+    let _lock = lock_directory(&directory)?;
     atomic_write_locked(&directory, name, contents, mode, true)
 }
 
