@@ -995,18 +995,10 @@ fn option_name(arg: &clap::Arg) -> Vec<u8> {
         .into_bytes()
 }
 
+/// Source options; positional sources are counted separately.
 fn selector_id(id: &str) -> bool {
-    matches!(
-        id,
-        "src"
-            | "srcs_in"
-            | "src_non_dir"
-            | "src_dir"
-            | "srcs"
-            | "src_non_dirs"
-            | "src_dirs"
-            | "src_fd"
-    )
+    id == "src_fd"
+        || crate::cli::source_selector(id).is_some_and(|selector| selector.option.is_some())
 }
 
 impl<'a> CompletionContext<'a> {
@@ -1136,18 +1128,7 @@ impl<'a> CompletionContext<'a> {
     }
 
     fn destination_started(&self) -> bool {
-        [
-            "as_fd",
-            "to",
-            "into",
-            "into_new",
-            "into_existing",
-            "as",
-            "as_new",
-            "as_existing",
-        ]
-        .iter()
-        .any(|id| self.present.contains(*id))
+        self.present.iter().any(|id| crate::cli::destination_id(id))
     }
 
     fn sources_allowed(&self, command: &str) -> bool {
@@ -1272,29 +1253,18 @@ fn complete_argument(
 /// Copy options whose path completion also serves sources and destinations,
 /// but whose value must be a directory.
 fn directories_only_id(id: &str) -> bool {
-    matches!(
-        id,
-        "cwd" | "root" | "srcs_in" | "src_dir" | "src_dirs" | "into" | "into_new" | "into_existing"
-    )
+    matches!(id, "cwd" | "root")
+        || crate::cli::source_selector(id).is_some_and(crate::cli::SourceSelector::directories_only)
+        || crate::cli::placement_option(id)
+            .is_some_and(crate::cli::PlacementOption::directories_only)
 }
 
 fn native_copy_source_option(option: &[u8]) -> bool {
+    let option = option.split(|byte| *byte == b'=').next().unwrap_or(option);
     matches!(
-        option.split(|byte| *byte == b'=').next().unwrap_or(option),
-        b"--from"
-            | b"--src-fd"
-            | b"-C"
-            | b"--cwd"
-            | b"--root"
-            | b"--src"
-            | b"--srcs-in"
-            | b"--src-non-dir"
-            | b"--src-dir"
-            | b"--srcs"
-            | b"--src-non-dirs"
-            | b"--src-dirs"
-            | b"--mapping"
-    )
+        option,
+        b"--from" | b"--src-fd" | b"-C" | b"--cwd" | b"--root" | b"--mapping"
+    ) || crate::cli::source_selector_option(option)
 }
 
 fn split_inline_option(current: &[u8]) -> Option<(&[u8], &[u8])> {
@@ -1327,12 +1297,12 @@ fn value_completion(
             b"--to" => Some(ValueCompletion::NamedOrSshDestination),
             b"--auth-from" => Some(ValueCompletion::AuthFrom),
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
-            b"--src" | b"--srcs-in" | b"--src-non-dir" | b"--src-dir" | b"--srcs"
-            | b"--src-non-dirs" | b"--src-dirs" => {
+            option if crate::cli::source_selector_option(option) => {
                 Some(ValueCompletion::SourcePath { apply_base: true })
             }
-            b"--into" | b"--into-new" | b"--into-existing" | b"--as" | b"--as-new"
-            | b"--as-existing" => Some(ValueCompletion::DestinationPath),
+            option if crate::cli::placement_option_name(option) => {
+                Some(ValueCompletion::DestinationPath)
+            }
             b"--mapping" | b"--results" | b"--ignore-from" => Some(ValueCompletion::LocalPath {
                 directories_only: false,
             }),
@@ -1348,8 +1318,7 @@ fn value_completion(
             }),
             b"--on" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
-            b"--src" | b"--srcs-in" | b"--src-non-dir" | b"--src-dir" | b"--srcs"
-            | b"--src-non-dirs" | b"--src-dirs" => {
+            option if crate::cli::source_selector_option(option) => {
                 Some(ValueCompletion::SourcePath { apply_base: true })
             }
             b"--pscope" => Some(ValueCompletion::LocalPath {
@@ -1364,8 +1333,7 @@ fn value_completion(
             b"--auth-from" => Some(ValueCompletion::AuthFrom),
             b"--from" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
-            b"--src" | b"--srcs-in" | b"--src-non-dir" | b"--src-dir" | b"--srcs"
-            | b"--src-non-dirs" | b"--src-dirs" => {
+            option if crate::cli::source_selector_option(option) => {
                 Some(ValueCompletion::SourcePath { apply_base: true })
             }
             b"--as" => Some(ValueCompletion::LocalPath {

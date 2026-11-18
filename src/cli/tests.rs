@@ -1522,3 +1522,156 @@ fn receiving_names_are_refused_where_no_receiving_machine_can_serve() {
         assert!(!super::Location::parse(operand).unwrap().is_remote());
     }
 }
+
+#[test]
+fn selector_and_placement_tables_match_the_parser() {
+    use super::{
+        NativeCopyCommand, NativeMapCommand, NativeRmCommand, PLACEMENT_OPTIONS, SOURCE_SELECTORS,
+    };
+    use clap::{CommandFactory, FromArgMatches};
+
+    for command in [
+        NativeCopyCommand::command(),
+        NativeMapCommand::command(),
+        NativeRmCommand::command(),
+    ] {
+        let name = command.get_name().to_owned();
+        let source_ids: Vec<_> = command
+            .get_arguments()
+            .filter(|arg| {
+                matches!(arg.get_value_names(), Some(names) if names == ["PATH"] || names == ["DIR"])
+                    && arg.get_action().takes_values()
+                    && matches!(arg.get_action(), clap::ArgAction::Append)
+                    && !matches!(arg.get_id().as_str(), "trees")
+            })
+            .filter(|arg| {
+                arg.get_long().is_none_or(|long| long.starts_with("src")) || arg.is_positional()
+            })
+            .map(|arg| arg.get_id().to_string())
+            .collect();
+        let mut table_ids: Vec<_> = SOURCE_SELECTORS.iter().map(|s| s.id.to_owned()).collect();
+        let mut source_ids = source_ids;
+        source_ids.sort();
+        table_ids.sort();
+        assert_eq!(
+            source_ids, table_ids,
+            "{name}: SOURCE_SELECTORS lists every selector"
+        );
+        for selector in &SOURCE_SELECTORS {
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_id() == selector.id)
+                .unwrap_or_else(|| panic!("{name} has {}", selector.id));
+            assert_eq!(
+                arg.get_long().map(|long| format!("--{long}")).as_deref(),
+                selector.option,
+                "{name} {}",
+                selector.id
+            );
+            assert_eq!(arg.is_positional(), selector.option.is_none());
+            let max = arg.get_num_args().map_or(1, |range| range.max_values());
+            if !arg.is_positional() {
+                assert_eq!(max > 1, selector.variadic, "{name} {}", selector.id);
+            }
+            let value_name = if selector.directories_only() {
+                "DIR"
+            } else {
+                "PATH"
+            };
+            assert_eq!(
+                arg.get_value_names().unwrap(),
+                [value_name],
+                "{name} {}",
+                selector.id
+            );
+        }
+    }
+
+    // The value accessors return the fields in table order.
+    let mut words = vec!["syq cp".to_owned()];
+    for selector in &SOURCE_SELECTORS {
+        if let Some(option) = selector.option {
+            words.push(format!("{option}={}", selector.id));
+        } else {
+            words.push(selector.id.to_owned());
+        }
+    }
+    words.extend(["--into".to_owned(), "x".to_owned()]);
+    let matches = NativeCopyCommand::command()
+        .try_get_matches_from(&words)
+        .unwrap();
+    let mut parsed = NativeCopyCommand::from_arg_matches(&matches).unwrap();
+    let selectors = parsed.copy.selection.source.selectors();
+    for (selector, values) in SOURCE_SELECTORS.iter().zip(selectors) {
+        assert_eq!(values, &[OsString::from(selector.id)]);
+    }
+    let selectors_mut = parsed.copy.selection.source.selectors_mut();
+    for (selector, values) in SOURCE_SELECTORS.iter().zip(selectors_mut) {
+        assert_eq!(values, &[OsString::from(selector.id)]);
+    }
+
+    let mut copy = NativeCopyCommand::command();
+    copy.build();
+    for (index, placement) in PLACEMENT_OPTIONS.iter().enumerate() {
+        let arg = copy
+            .get_arguments()
+            .find(|arg| arg.get_id() == placement.id)
+            .unwrap();
+        assert_eq!(format!("--{}", arg.get_long().unwrap()), placement.option);
+        let value_name = if placement.directories_only() {
+            "DIR"
+        } else {
+            "PATH"
+        };
+        assert_eq!(arg.get_value_names().unwrap(), [value_name]);
+        let matches = NativeCopyCommand::command()
+            .try_get_matches_from(["syq cp", "a", placement.option, "v"])
+            .unwrap();
+        let mut parsed = NativeCopyCommand::from_arg_matches(&matches).unwrap();
+        for (other, value) in parsed.copy.placements().into_iter().enumerate() {
+            assert_eq!(value.is_some(), other == index, "{}", placement.id);
+        }
+        for (other, value) in parsed.copy.placements_mut().into_iter().enumerate() {
+            assert_eq!(value.is_some(), other == index, "{}", placement.id);
+        }
+    }
+    let mut group: Vec<_> = copy
+        .get_groups()
+        .find(|group| group.get_id() == "placement")
+        .unwrap()
+        .get_args()
+        .map(|id| id.to_string())
+        .collect();
+    let mut table: Vec<_> = PLACEMENT_OPTIONS.iter().map(|p| p.id.to_owned()).collect();
+    group.sort();
+    table.sort();
+    assert_eq!(
+        group, table,
+        "PLACEMENT_OPTIONS lists every placement option"
+    );
+
+    // Clap attributes cannot read the tables; keep their conflict lists complete.
+    let conflicts = |id: &str| -> Vec<String> {
+        let arg = copy.get_arguments().find(|arg| arg.get_id() == id).unwrap();
+        copy.get_arg_conflicts_with(arg)
+            .into_iter()
+            .map(|arg| arg.get_id().to_string())
+            .collect()
+    };
+    let src_fd = conflicts("src_fd");
+    for selector in &SOURCE_SELECTORS {
+        assert!(
+            src_fd.iter().any(|id| id == selector.id),
+            "--src-fd conflicts with {}",
+            selector.id
+        );
+    }
+    let as_fd = conflicts("as_fd");
+    for placement in &PLACEMENT_OPTIONS {
+        assert!(
+            as_fd.iter().any(|id| id == placement.id),
+            "--as-fd conflicts with {}",
+            placement.id
+        );
+    }
+}

@@ -269,21 +269,7 @@ fn identity_from_root(metadata: RootMetadata) -> Identity {
     }
 }
 
-fn validate_selector(path: &[u8], confined: bool) -> Result<()> {
-    if path.is_empty() {
-        bail!("source selectors may not be empty");
-    }
-    if confined && (path.starts_with(b"/") || path == b"~" || path.starts_with(b"~/")) {
-        bail!(
-            "source selector {:?} beneath --root must be relative",
-            String::from_utf8_lossy(path)
-        );
-    }
-    if path.contains(&0) {
-        bail!("source selector contains NUL");
-    }
-    Ok(())
-}
+use crate::cli::validate_native_source_selector as validate_selector;
 
 fn require_kind(kind: NativeRemoveKind, identity: Identity, label: &[u8]) -> Result<()> {
     match kind {
