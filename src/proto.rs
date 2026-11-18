@@ -354,8 +354,7 @@ pub enum TargetCondition {
 pub struct SmallRead {
     pub path: PathBytes,
     /// Authoritative source capability. `path` is only a diagnostic/legacy
-    /// spelling when this is present; omission is reserved for the explicit
-    /// rsync `--insecure-links` compatibility path.
+    /// spelling when this is present.
     pub source: Option<RegisteredPath>,
     pub attempt: u32,
     pub len: u32,
@@ -897,8 +896,7 @@ pub enum ConnectionRole {
     Control,
     /// A data connection reserved for reading a source endpoint. Discovery
     /// metadata, block/file hashes, and range/small reads are confined to the
-    /// registered roots unless the registration explicitly permits the rsync
-    /// `--insecure-links` compatibility path.
+    /// registered roots.
     SourceWorker {
         /// Every registered parent and exact-object descriptor is acquired
         /// before HelloOk. Local and same-process TCP workers clone in process;
@@ -963,8 +961,8 @@ pub enum WireRequest<Data> {
     /// `report_ignored`: also send the paths the patterns pruned (ScanIgnored).
     Scan {
         root: PathBytes,
-        /// Authoritative registered source reference. Its parallel `root`
-        /// spelling is used only by the explicit `--insecure-links` opt-out.
+        /// Authoritative registered source reference. Without one, `root` is
+        /// beneath the session's destination root.
         source: Option<RegisteredPath>,
         follow_root: bool,
         ignore: Vec<String>,
@@ -997,7 +995,7 @@ pub enum WireRequest<Data> {
     StatMany {
         paths: Vec<PathBytes>,
         /// Authoritative registered source references. Parallel `paths` are
-        /// used only outside a source session or by `--insecure-links`.
+        /// used only outside a source session.
         sources: Option<Vec<RegisteredPath>>,
         follow: bool,
     },

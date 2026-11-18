@@ -2531,8 +2531,7 @@ impl FsOps {
     }
 
     /// Resolve a source scan to its retained root. Once source roots exist,
-    /// omission is never an implicit fallback: only a registration carrying
-    /// the explicit `--insecure-links` permission may use the legacy pathname.
+    /// a scan must carry a registered source reference.
     pub(crate) fn source_scan_root(
         &self,
         source: Option<&RegisteredPath>,
