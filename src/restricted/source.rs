@@ -27,6 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+#[derive(Clone, Debug)]
 pub(crate) struct SourcePolicy {
     pub base: SourceRootBase,
     pub selections: Vec<SourceRootSelection>,
@@ -47,11 +48,11 @@ pub(crate) struct SourcePolicy {
     /// by whole-file hash, as a preview does, but no request that returns
     /// file contents, or block hashes, is served.
     pub preview: bool,
-    pub deadline: Instant,
     /// A directory the base must resolve beneath (`FsOps::set_source_outer_root`).
     pub outer_root: Option<Vec<u8>>,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct SourceTcpPolicy {
     /// Whether the approved command lets the data go over TCP, and
     /// unencrypted.
@@ -90,6 +91,8 @@ struct State {
 
 pub(crate) struct SourceAuthority {
     policy: SourcePolicy,
+    /// When the reads end.
+    deadline: Instant,
     state: Mutex<State>,
 }
 
@@ -109,7 +112,7 @@ pub(crate) struct SourceConnection {
 }
 
 impl SourceAuthority {
-    pub(crate) fn new(policy: SourcePolicy) -> Result<Arc<Self>> {
+    pub(crate) fn new(policy: SourcePolicy, deadline: Instant) -> Result<Arc<Self>> {
         policy.base.validate()?;
         ensure!(
             !policy.selections.is_empty(),
@@ -144,6 +147,7 @@ impl SourceAuthority {
         }
         Ok(Arc::new(Self {
             policy,
+            deadline,
             state: Mutex::new(State {
                 open: true,
                 control_admitted: false,
@@ -241,7 +245,7 @@ impl SourceAuthority {
     fn check_open(&self, state: &State) -> Result<()> {
         ensure!(state.open, "source authorization is closed");
         ensure!(
-            Instant::now() <= self.policy.deadline,
+            Instant::now() <= self.deadline,
             "source authorization expired"
         );
         Ok(())
