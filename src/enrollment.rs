@@ -513,6 +513,7 @@ pub(crate) fn asks_about_new_host_keys(config: &[u8]) -> bool {
 /// Arguments for the trusted local OpenSSH client that enrolls HostB.  A jump
 /// host receives only an opaque TCP stream; it never receives an agent socket
 /// or an authenticated HostB session.
+///
 /// `unattended`: nobody is watching this login.
 pub(crate) fn enrollment_ssh_args_raw(
     target: &SshEndpoint,

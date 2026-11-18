@@ -35,6 +35,11 @@ fn enrollment_upload_selects_and_verifies_the_remote_platform() {
             ),
             "{result:?}"
         );
+        // SSH failing after the greeting still lets the revocation go
+        // through `--via`.
+        if case == "dropped" {
+            assert!(is_enrollment_transport_failure(&result.unwrap_err()));
+        }
         return;
     }
     let (os, arch, target) = if crate::remote_helper::Target::local().unwrap().key == "macos-arm64"
@@ -62,6 +67,7 @@ fn enrollment_upload_selects_and_verifies_the_remote_platform() {
         "source-build",
         "source-helpers",
         "local-source-helpers",
+        "dropped",
     ] {
         let (os, arch) = if matches!(case, "local-release" | "local-source-helpers") {
             (
@@ -95,6 +101,8 @@ printf 'login\n' >> "$SYQ_TEST_LOGINS"
 printf '%s\n' "$SYQ_TEST_REMOTE_OS" "$SYQ_TEST_REMOTE_ARCH" "$HOME" 1000 receiver '' '' '' '' 0
 IFS= read -r request; IFS= read -r target; IFS= read -r expected
 [ -z "$target" ] || exit 92
+# A login that drops after the greeting.
+[ "$SYQ_ENROLLMENT_TEST_CHILD" != dropped ] || exit 255
 echo upload
 cat > "$SYQ_TEST_UPLOAD"
 "#,
@@ -2715,15 +2723,20 @@ fn the_enrollment_session_installs_with_a_stored_build_instead_of_an_upload() {
     assert_eq!(greeting[10], "stored");
     assert_eq!(greeting[11], r#"stored --restricted-install {"request":2}"#);
     // Revoking starts the same stored build, or the upload, as the revoker.
+    // It sends no authorized_keys: the revoker reads them under its lock.
+    fs::create_dir_all(home.join(".ssh")).unwrap();
+    fs::write(home.join(".ssh/authorized_keys"), "ssh-ed25519 AAAA key\n").unwrap();
     let revoke = |input: &[u8]| lines(session_as(ManagementAction::Revoke, "/bin/sh", home, input));
     let greeting = revoke(format!("{{\"request\":5}}\nlinux-x86_64\n{stored_hash}\n").as_bytes());
     assert_eq!(greeting[10], "stored");
+    assert_eq!(greeting[9], "0");
     assert_eq!(greeting[11], r#"stored --restricted-revoke {"request":5}"#);
     let mut input = format!("{{\"request\":6}}\nlinux-x86_64\n{}\n", "0".repeat(64)).into_bytes();
     input.extend_from_slice(sent);
     let greeting = revoke(&input);
     assert_eq!(greeting[10], "upload");
     assert_eq!(greeting[11], r#"sent --restricted-revoke {"request":6}"#);
+    fs::remove_file(home.join(".ssh/authorized_keys")).unwrap();
     // Anything else offered is not started: the session asks for this
     // machine's build and runs that.
     let refused = |target: &str, hash: &str| {

@@ -772,14 +772,20 @@ pub(super) fn revoke_over_route(
         }
     }
     if !finished.status.success() {
-        bail!(
-            "revocation over SSH failed ({}){}",
-            finished.status,
-            finished
-                .reason
-                .map(|reason| format!(": {reason}"))
-                .unwrap_or_default()
-        );
+        // Revoking again is harmless, so whenever SSH itself failed (255),
+        // even after the greeting, the revocation may go through `--via`.
+        return Err(enrollment_ssh_error(
+            target,
+            finished.status.code() == Some(255),
+            format_args!(
+                "{}{}",
+                finished.status,
+                finished
+                    .reason
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default()
+            ),
+        ));
     }
     finished.write
 }
@@ -1404,7 +1410,7 @@ fn install_over_route(
 
 /// The enrollment session's commands, for `sh`. The greeting reports the
 /// platform, the account's user ID and name, where it keeps syq's state, the platforms the store
-/// has this build for, and `authorized_keys`. The session then reads the
+/// has this build for, and `authorized_keys` (empty when revoking). The session then reads the
 /// request and, when the enrolling machine offers a stored build, its
 /// platform and the SHA-256 of the build that machine would install. It
 /// answers `stored` when it starts that stored build, or `upload` when it
@@ -1438,7 +1444,13 @@ pub(super) fn install_remote_command(stage: &str, action: ManagementAction) -> S
         "digest() { if command -v sha256sum >/dev/null 2>&1; then o=$(sha256sum < \"$1\") || return 1; elif command -v shasum >/dev/null 2>&1; then o=$(shasum -a 256 < \"$1\") || return 1; elif command -v openssl >/dev/null 2>&1; then o=$(openssl dgst -sha256 < \"$1\") || return 1; o=${o##* }; else return 1; fi; printf '%s' \"${o%%[[:space:]]*}\"; }".to_owned(),
         "for f in \"$s\"/*/syq; do t=${f%/syq}; t=${t##*/}; if stored \"$t\"; then printf '%s ' \"$t\"; fi; done".to_owned(),
         "printf '\\n'".to_owned(),
-        "if test -f \"$HOME/.ssh/authorized_keys\"; then wc -c <\"$HOME/.ssh/authorized_keys\"; cat \"$HOME/.ssh/authorized_keys\"; else printf '0\\n'; fi".to_owned(),
+        match action {
+            ManagementAction::Install => "if test -f \"$HOME/.ssh/authorized_keys\"; then wc -c <\"$HOME/.ssh/authorized_keys\"; cat \"$HOME/.ssh/authorized_keys\"; else printf '0\\n'; fi",
+            // Revoking finds no login key, and the revoker reads the file
+            // itself, under its lock.
+            ManagementAction::Revoke => "printf '0\\n'",
+        }
+        .to_owned(),
         "IFS= read -r request; IFS= read -r target; IFS= read -r expected".to_owned(),
         format!(
             "if [ -n \"$target\" ] && stored \"$target\" && h=$(digest \"$s/$target/syq\") && [ \"$h\" = \"$expected\" ]; then echo stored; printf '%s' \"$request\" | \"$s/$target/syq\" {action}; else echo upload; {stage}; printf '%s' \"$request\" | \"$p\" {action}; fi",
