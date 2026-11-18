@@ -41,11 +41,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ssh_key::HashAlg;
 use std::ffi::{CString, OsStr};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::{self, File};
+use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -71,6 +71,7 @@ const REDEMPTION_RECORD_LEN: usize = REDEMPTION_MAGIC.len() + 8 + 32 + 32;
 
 use crate::directive::Directive;
 use crate::enrollment::EnrollmentId;
+use crate::lock_file::LockFile;
 
 /// A one-redemption nonce generated independently for every signed request.
 /// It is intentionally not constructible from `proto::CopyId`.
@@ -1083,11 +1084,7 @@ impl ReplayStore {
     fn reject_if_redeemed(&self, request: RequestId, digest: [u8; 32]) -> Result<()> {
         request.validate()?;
         let final_name = format!("redeemed-{}", request.file_component());
-        if let Some(existing) = readat_optional(
-            self.directory.as_raw_fd(),
-            &final_name,
-            REDEMPTION_RECORD_LEN + 1,
-        )? {
+        if let Some(existing) = readat_optional(&self.directory, &final_name)? {
             validate_redeem_record(&existing, request, digest)?;
             bail!("signed request has already been redeemed");
         }
@@ -1126,110 +1123,69 @@ impl ReplayStore {
             .open_lock()
             .with_context(|| format!("open replay lock in {}", self.path.display()))?;
         validate_private_file(&lock, "replay lock")?;
-        flock_exclusive(lock.as_raw_fd()).context("lock replay redeem store")?;
+        let lock = LockFile::adopt(lock);
+        lock.exclusive().context("lock replay redeem store")?;
         // Timestamp and revalidate only after a potentially queued lock wait.
         // No stale ReceiverContext observation may authorize a later redeem.
         let redeemed_at = redeemed_at()?;
 
         let final_name = format!("redeemed-{}", request.file_component());
-        if let Some(existing) = readat_optional(
-            self.directory.as_raw_fd(),
-            &final_name,
-            REDEMPTION_RECORD_LEN + 1,
-        )? {
+        if let Some(existing) = readat_optional(&self.directory, &final_name)? {
             validate_redeem_record(&existing, request, digest)?;
             bail!("signed request has already been redeemed");
         }
 
-        let temporary_name = format!(
-            ".redeemed-{}-{}.tmp",
-            request.file_component(),
-            hex(&random_array::<16>()?)
-        );
-        let mut temporary = openat_file(
-            self.directory.as_raw_fd(),
-            &temporary_name,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        let record = redeem_record(request, digest, redeemed_at)?;
+        // No-replace publication: a crash can only leave an already-redeemed
+        // request, never a successful-but-forgotten redeem.
+        let published = crate::state_file::write_atomic_at(
+            &self.directory,
+            final_name.as_ref(),
+            &record,
             0o600,
+            crate::state_file::Publish::NoClobber,
+            crate::state_file::Durability::Synced,
         )
         .with_context(|| format!("create replay redeem in {}", self.path.display()))?;
-        if let Err(error) = validate_private_file(&temporary, "temporary replay redeem") {
-            let _ = unlinkat(self.directory.as_raw_fd(), &temporary_name);
-            return Err(error);
-        }
-        let record = redeem_record(request, digest, redeemed_at)?;
-        if let Err(error) = (|| -> io::Result<()> {
-            temporary.write_all(&record)?;
-            temporary.sync_all()?;
-            linkat(
-                self.directory.as_raw_fd(),
-                &temporary_name,
-                self.directory.as_raw_fd(),
-                &final_name,
-            )?;
-            // Persist the no-replace publication before removing the temporary
-            // name. A crash after this point can only leave an already-redeemed
-            // request, never a successful-but-forgotten redeem.
-            self.directory.sync_all()?;
-            unlinkat(self.directory.as_raw_fd(), &temporary_name)?;
-            self.directory.sync_all()?;
-            Ok(())
-        })() {
-            let _ = unlinkat(self.directory.as_raw_fd(), &temporary_name);
-            if error.kind() == io::ErrorKind::AlreadyExists {
-                if let Some(existing) = readat_optional(
-                    self.directory.as_raw_fd(),
-                    &final_name,
-                    REDEMPTION_RECORD_LEN + 1,
-                )? {
-                    validate_redeem_record(&existing, request, digest)?;
-                    bail!("signed request has already been redeemed");
-                }
+        if !published {
+            if let Some(existing) = readat_optional(&self.directory, &final_name)? {
+                validate_redeem_record(&existing, request, digest)?;
+                bail!("signed request has already been redeemed");
             }
-            return Err(error).context("durably publish replay redeem");
+            return Err(io::Error::from(io::ErrorKind::AlreadyExists))
+                .context("durably publish replay redeem");
         }
         Ok(())
     }
 }
 
 pub(crate) fn validate_private_directory(directory: &File, path: &Path) -> Result<()> {
-    let metadata = directory
-        .metadata()
-        .with_context(|| format!("inspect private directory {}", path.display()))?;
-    if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
-        bail!(
-            "private directory {} must belong to this account and not be a symlink",
-            path.display()
-        );
-    }
-    let mode = metadata.permissions().mode() & 0o777;
-    if mode != 0o700 {
-        bail!(
-            "private directory {} must have mode 0700 (found {:04o})",
-            path.display(),
-            mode
-        );
-    }
-    Ok(())
+    crate::state_file::check_private_dir(
+        directory,
+        path,
+        "private directory",
+        crate::state_file::DirRule::Exact0700,
+    )
 }
 
 pub(crate) fn validate_private_directory_path(path: &Path) -> Result<()> {
-    let directory = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .with_context(|| format!("open private directory {}", path.display()))?;
-    validate_private_directory(&directory, path)
+    open_private_directory(path, "open private directory")?;
+    Ok(())
 }
 
 fn open_existing_replay_directory(path: &Path) -> Result<File> {
-    let directory = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .with_context(|| format!("open replay state directory {}", path.display()))?;
-    validate_private_directory(&directory, path)?;
-    Ok(directory)
+    open_private_directory(path, "open replay state directory")
+}
+
+fn open_private_directory(path: &Path, absent: &str) -> Result<File> {
+    crate::state_file::open_private_dir(
+        path,
+        "private directory",
+        false,
+        crate::state_file::DirRule::Exact0700,
+    )?
+    .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+    .with_context(|| format!("{absent} {}", path.display()))
 }
 
 fn validate_private_file(file: &File, label: &str) -> Result<()> {
@@ -1258,17 +1214,15 @@ pub(crate) fn validate_regular_executable(path: &Path, label: &str) -> Result<()
 }
 
 pub(crate) fn read_private_regular(path: &Path, label: &str, maximum: usize) -> Result<Vec<u8>> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
-        .open(path)
+    let file = crate::state_file::open_private(path)
         .with_context(|| format!("open {label} {}", path.display()))?;
-    validate_private_file(&file, &format!("{label} {}", path.display()))?;
-    let mut contents = Vec::new();
-    Read::by_ref(&mut file)
-        .take(maximum as u64 + 1)
-        .read_to_end(&mut contents)?;
-    if contents.is_empty() || contents.len() > maximum {
+    let contents = crate::state_file::read_open(
+        file,
+        &format_args!("{label} {}", path.display()),
+        maximum,
+        crate::state_file::FileRule::Exact0600,
+    )?;
+    if contents.is_empty() {
         bail!("{label} size is outside the supported range");
     }
     Ok(contents)
@@ -1327,66 +1281,14 @@ fn openat_os_file(
     }
 }
 
-fn readat_optional(directory: RawFd, name: &str, maximum: usize) -> Result<Option<Vec<u8>>> {
-    let mut file = match openat_file(
+fn readat_optional(directory: &File, name: &str) -> Result<Option<Vec<u8>>> {
+    crate::state_file::read_private_at(
         directory,
-        name,
-        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        0,
-    ) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("open replay record {name}")),
-    };
-    validate_private_file(&file, "replay redeem")?;
-    let mut contents = Vec::new();
-    Read::by_ref(&mut file)
-        .take(maximum as u64)
-        .read_to_end(&mut contents)?;
-    if contents.len() >= maximum {
-        bail!("replay redeem exceeds its fixed format; refusing request");
-    }
-    Ok(Some(contents))
-}
-
-fn flock_exclusive(fd: RawFd) -> io::Result<()> {
-    loop {
-        if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
-}
-
-fn linkat(old_directory: RawFd, old: &str, new_directory: RawFd, new: &str) -> io::Result<()> {
-    let old = CString::new(old)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in old state filename"))?;
-    let new = CString::new(new)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in new state filename"))?;
-    if unsafe { libc::linkat(old_directory, old.as_ptr(), new_directory, new.as_ptr(), 0) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-fn unlinkat(directory: RawFd, name: &str) -> io::Result<()> {
-    let name = CString::new(name)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in state filename"))?;
-    if unsafe { libc::unlinkat(directory, name.as_ptr(), 0) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-fn random_array<const N: usize>() -> Result<[u8; N]> {
-    let mut bytes = [0u8; N];
-    getrandom::fill(&mut bytes).context("generate private state filename")?;
-    Ok(bytes)
+        name.as_ref(),
+        "replay redeem",
+        REDEMPTION_RECORD_LEN,
+        crate::state_file::FileRule::Exact0600,
+    )
 }
 
 fn hex(bytes: &[u8]) -> String {

@@ -1029,49 +1029,15 @@ fn local_identity() -> Result<ProviderIdentity> {
     }
 }
 
-struct Lock(File);
-impl Drop for Lock {
-    fn drop(&mut self) {
-        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
-    }
-}
-fn acquire_lock(domain: &Domain, create: bool) -> Result<Option<Lock>> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(create)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(domain.runtime_path().join(LOCK_FILE))?;
-    let metadata = file.metadata()?;
-    anyhow::ensure!(
-        metadata.is_file()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o077 == 0,
-        "provider lock must be owned and private"
-    );
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        return Ok(Some(Lock(file)));
-    }
-    let error = std::io::Error::last_os_error();
-    if error.kind() == std::io::ErrorKind::WouldBlock {
-        return Ok(None);
-    }
-    Err(error.into())
+/// Take the provider's lock, or None when another provider holds it. A
+/// start retries for [`PROBE_GRACE`], so that `is_running` cannot make it
+/// exit.
+fn acquire_lock(domain: &Domain) -> Result<Option<LockFile>> {
+    let lock = LockFile::open(&domain.runtime_path().join(LOCK_FILE), true)?;
+    Ok(lock.try_exclusive_within(PROBE_GRACE)?.then_some(lock))
 }
 fn is_running(domain: &Domain) -> Result<bool> {
-    match acquire_lock(domain, false) {
-        Ok(lock) => Ok(lock.is_none()),
-        Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            Ok(false)
-        }
-        Err(error) => Err(error),
-    }
+    Ok(LockFile::is_held(&domain.runtime_path().join(LOCK_FILE))?)
 }
 
 /// Called only by explicit local receiving commands, never by an inbound SSH
@@ -1181,7 +1147,7 @@ pub(crate) fn stop(domain: &Domain) -> Result<()> {
 }
 
 struct Runtime {
-    _lock: Lock,
+    _lock: LockFile,
     _socket: SocketCleanup,
     listener: UnixListener,
     service: Arc<Service>,
@@ -1196,7 +1162,7 @@ impl Runtime {
             domain.enabled()? && preferences(&domain)?.enabled(),
             "receiving is off in this scope"
         );
-        let lock = lock_for_start(|| acquire_lock(&domain, true))?
+        let lock = acquire_lock(&domain)?
             .context("local SSH authorization provider is already running")?;
         // Only a UTF-8 path can be reported in a status.
         let follower = started_from
@@ -2353,7 +2319,7 @@ mod tests {
         answers: usize,
     ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Sender<()>) {
         let (go, started) = std::sync::mpsc::channel();
-        let lock = acquire_lock(domain, true).unwrap().unwrap();
+        let lock = acquire_lock(domain).unwrap().unwrap();
         let domain = domain.clone();
         let path = domain.runtime_path().join(SOCKET_FILE);
         let early = exposed.then(|| {
@@ -2430,7 +2396,7 @@ mod tests {
     #[test]
     fn status_finds_no_provider_once_a_stopping_one_has_ended() {
         let (_directory, domain, _) = fixture();
-        let lock = acquire_lock(&domain, true).unwrap().unwrap();
+        let lock = acquire_lock(&domain).unwrap().unwrap();
         let path = domain.runtime_path().join(SOCKET_FILE);
         let listener = UnixListener::bind(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -2449,7 +2415,7 @@ mod tests {
     #[test]
     fn a_provider_that_never_answers_fails_within_its_bound() {
         let (_directory, domain, _) = fixture();
-        let _lock = acquire_lock(&domain, true).unwrap().unwrap();
+        let _lock = acquire_lock(&domain).unwrap().unwrap();
         let started = Instant::now();
         let Err(error) = running(&domain, Duration::from_millis(200), || Control::Status) else {
             panic!("a provider that never answered was reported");
@@ -2469,7 +2435,7 @@ mod tests {
     #[test]
     fn a_starting_provider_waits_out_a_status_probe_before_giving_up() {
         let (_directory, domain, _) = fixture();
-        let _owner = acquire_lock(&domain, true).unwrap().unwrap();
+        let _owner = acquire_lock(&domain).unwrap().unwrap();
         let started = Instant::now();
         let error = Runtime::new(domain.clone(), None).err().unwrap();
         assert!(started.elapsed() >= PROBE_GRACE, "{:?}", started.elapsed());
@@ -2483,11 +2449,11 @@ mod tests {
     /// requests it received.
     fn stand_in_provider(
         domain: &Domain,
-        lock: Lock,
+        lock: LockFile,
         build: &'static str,
         pid: u32,
         busy: usize,
-        then: impl FnOnce(Lock) + Send + 'static,
+        then: impl FnOnce(LockFile) + Send + 'static,
     ) -> std::thread::JoinHandle<Vec<&'static str>> {
         let path = domain.runtime_path().join(SOCKET_FILE);
         let listener = UnixListener::bind(&path).unwrap();
@@ -2572,7 +2538,7 @@ mod tests {
         // The process that agreed lives on after it gives up the lock, as
         // this test's own does; the next one is another. It takes the lock
         // as the first lets go, before a probe of the switch could.
-        let lock = acquire_lock(&domain, true).unwrap().unwrap();
+        let lock = acquire_lock(&domain).unwrap().unwrap();
         let first = stand_in_provider(
             &domain,
             lock,
@@ -2599,7 +2565,7 @@ mod tests {
     /// settings does. Returns the requests it received.
     fn other_build_provider(domain: &Domain) -> std::thread::JoinHandle<Vec<&'static str>> {
         const OTHER: &str = "v0.0.1+other";
-        let lock = acquire_lock(domain, true).unwrap().unwrap();
+        let lock = acquire_lock(domain).unwrap().unwrap();
         let path = domain.runtime_path().join(SOCKET_FILE);
         let listener = UnixListener::bind(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();

@@ -1,3 +1,5 @@
+use crate::fsops;
+
 #[test]
 fn read_stream_shrinks_before_the_next_read_and_fences_late_updates() {
     use std::sync::mpsc;
@@ -73,7 +75,6 @@ fn streaming_fence_survives_revocation_without_authorizing_more_writes() {
                 handshake_pending: None,
                 ssh_worker_ticket: None,
                 allow_tcp: true,
-                metadata_control: false,
                 loopback_only: false,
                 named_socket: None,
                 authority: Some(server_authority),
@@ -94,7 +95,6 @@ fn streaming_fence_survives_revocation_without_authorizing_more_writes() {
     let mut writer = FrameWriter::new(socket.try_clone().unwrap(), true);
     writer
         .write_msg(&Request::Hello {
-            identity: crate::identity::build().to_string(),
             compress: true,
             debug: false,
             token: Vec::new(),
@@ -202,7 +202,6 @@ fn a_restricted_connection_with_a_streamed_patch_open_carries_nothing_else() {
                     handshake_pending: None,
                     ssh_worker_ticket: None,
                     allow_tcp: true,
-                    metadata_control: false,
                     loopback_only: false,
                     named_socket: None,
                     authority: Some(server_authority.clone()),
@@ -223,7 +222,6 @@ fn a_restricted_connection_with_a_streamed_patch_open_carries_nothing_else() {
         let mut writer = FrameWriter::new(socket.try_clone().unwrap(), true);
         writer
             .write_msg(&Request::Hello {
-                identity: crate::identity::build().to_string(),
                 compress: true,
                 debug: false,
                 token: Vec::new(),
@@ -584,7 +582,6 @@ fn a_read_stream_does_not_hold_room_its_stop_needs() {
         ticket,
         leaf_ticket: None,
         expected_leaf: None,
-        allow_unconfined_paths: false,
         directory_mode: None,
     };
     // Leave room for one frame of unknown decoded size, not two.
@@ -608,7 +605,6 @@ fn a_read_stream_does_not_hold_room_its_stop_needs() {
                 handshake_pending: None,
                 ssh_worker_ticket: None,
                 allow_tcp: true,
-                metadata_control: false,
                 loopback_only: false,
                 named_socket: None,
                 authority: None,
@@ -625,7 +621,6 @@ fn a_read_stream_does_not_hold_room_its_stop_needs() {
     let mut reader = FrameReader::new(socket.try_clone().unwrap());
     writer
         .write_msg(&Request::Hello {
-            identity: crate::identity::build().to_string(),
             compress: false,
             debug: false,
             token: Vec::new(),
@@ -735,7 +730,6 @@ fn tcp_server_joins_request_reader_on_shutdown() {
         ticket,
         leaf_ticket: None,
         expected_leaf: None,
-        allow_unconfined_paths: false,
         directory_mode: None,
     };
     let server_session = descriptor_session.clone();
@@ -758,7 +752,6 @@ fn tcp_server_joins_request_reader_on_shutdown() {
                 handshake_pending: None,
                 ssh_worker_ticket: None,
                 allow_tcp: true,
-                metadata_control: false,
                 loopback_only: false,
                 named_socket: None,
                 authority: None,
@@ -777,7 +770,6 @@ fn tcp_server_joins_request_reader_on_shutdown() {
     let mut reader = FrameReader::new(socket);
     writer
         .write_msg(&Request::Hello {
-            identity: crate::identity::build().to_string(),
             compress: false,
             debug: false,
             token: Vec::new(),
@@ -975,7 +967,6 @@ fn tcp_server_joins_request_reader_on_shutdown() {
                 follow_root: false,
             }],
             symlink_policy: OperatorSymlinkPolicy::Refuse,
-            allow_unconfined_paths: false,
             shared_workers: 0,
             independent_handoff_workers: 0,
         })
@@ -1015,7 +1006,6 @@ fn rejected_destination_ticket_is_not_acknowledged_as_ready() {
                 handshake_pending: None,
                 ssh_worker_ticket: None,
                 allow_tcp: true,
-                metadata_control: false,
                 loopback_only: false,
                 named_socket: None,
                 authority: None,
@@ -1031,7 +1021,6 @@ fn rejected_destination_ticket_is_not_acknowledged_as_ready() {
     let mut reader = FrameReader::new(socket);
     writer
         .write_msg(&Request::Hello {
-            identity: crate::identity::build().to_string(),
             compress: false,
             debug: false,
             token: Vec::new(),
@@ -1064,7 +1053,6 @@ fn rejected_source_ticket_is_not_acknowledged_as_ready() {
         ticket,
         leaf_ticket: None,
         expected_leaf: None,
-        allow_unconfined_paths: false,
         directory_mode: None,
     };
     owner.close();
@@ -1085,7 +1073,6 @@ fn rejected_source_ticket_is_not_acknowledged_as_ready() {
                 handshake_pending: None,
                 ssh_worker_ticket: None,
                 allow_tcp: true,
-                metadata_control: false,
                 loopback_only: false,
                 named_socket: None,
                 authority: None,
@@ -1101,7 +1088,6 @@ fn rejected_source_ticket_is_not_acknowledged_as_ready() {
     let mut reader = FrameReader::new(socket);
     writer
         .write_msg(&Request::Hello {
-            identity: crate::identity::build().to_string(),
             compress: false,
             debug: false,
             token: Vec::new(),
@@ -1120,7 +1106,6 @@ fn rejected_source_ticket_is_not_acknowledged_as_ready() {
 
 fn tcp_test_hello(token: &[u8]) -> Request {
     Request::Hello {
-        identity: crate::identity::build().to_string(),
         compress: true,
         debug: false,
         token: token.to_vec(),
@@ -1171,11 +1156,8 @@ fn tcp_rejects_replayed_hello_with_high_connection_id_bits() {
         client.shutdown(std::net::Shutdown::Write).unwrap();
         let result = serve_tcp(
             server,
-            0,
             Some(key.clone()),
             token.to_vec(),
-            false,
-            false,
             &seen,
             Some(authority.clone()),
             None,
@@ -1228,11 +1210,8 @@ fn tcp_unauthenticated_connection_does_not_take_its_id() {
     let serve = |stream| {
         serve_tcp(
             stream,
-            0,
             Some(key.clone()),
             token.to_vec(),
-            false,
-            false,
             &seen,
             Some(authority.clone()),
             None,
@@ -1299,11 +1278,8 @@ fn tcp_partial_handshakes_time_out_without_reserving_ids() {
                 let seen = std::sync::Mutex::new(std::collections::HashSet::new());
                 let result = serve_tcp(
                     server,
-                    0,
                     key,
                     b"timeout-test".to_vec(),
-                    false,
-                    false,
                     &seen,
                     None,
                     None,
@@ -1340,11 +1316,8 @@ fn tcp_hello_clears_timeouts_only_after_authentication() {
             let seen = std::sync::Mutex::new(std::collections::HashSet::new());
             serve_tcp(
                 server,
-                0,
                 server_key,
                 b"valid-token".to_vec(),
-                false,
-                false,
                 &seen,
                 Some(authority),
                 None,
@@ -1414,7 +1387,6 @@ fn authenticated_worker(port: u16, token: &[u8]) -> std::result::Result<TcpStrea
     let mut writer = FrameWriter::new(RecordWriter::new(socket.try_clone()?, None), false);
     let mut reader = FrameReader::new(RecordReader::new(socket.try_clone()?, None));
     writer.write_msg(&Request::Hello {
-        identity: crate::identity::build().to_string(),
         compress: true,
         debug: false,
         token: token.to_vec(),
@@ -1447,7 +1419,6 @@ fn unauthenticated_sockets_do_not_consume_signed_worker_permits() {
         0,
         false,
         false,
-        true,
         None,
         None,
         Some(authority.clone()),
@@ -1553,7 +1524,6 @@ fn stream_worker_rebinds_only_live_files_from_its_original_session() {
                 handshake_pending: None,
                 ssh_worker_ticket: None,
                 allow_tcp: false,
-                metadata_control: false,
                 loopback_only: false,
                 named_socket: None,
                 authority: None,
@@ -1574,7 +1544,6 @@ fn stream_worker_rebinds_only_live_files_from_its_original_session() {
     let mut writer = FrameWriter::new(socket.try_clone().unwrap(), true);
     writer
         .write_msg(&Request::Hello {
-            identity: crate::identity::build().to_string(),
             compress: true,
             debug: false,
             token: Vec::new(),
@@ -1764,7 +1733,6 @@ fn a_receiver_ends_after_the_workers_handed_to_it_report_their_end() {
     let mut reader = FrameReader::new(worker.try_clone().unwrap());
     writer
         .write_msg(&Request::Hello {
-            identity: crate::identity::build().to_string(),
             compress: false,
             debug: false,
             token: Vec::new(),
@@ -1838,4 +1806,65 @@ fn client_output_notes_only_a_closed_pipe() {
         assert!(output.write_all(b"reply").is_err());
         assert_eq!(gone.load(std::sync::atomic::Ordering::Relaxed), noted);
     }
+}
+
+#[test]
+fn a_scan_without_a_registered_source_or_destination_root_is_refused() {
+    let tree = crate::test_support::tempdir().unwrap();
+    std::fs::write(tree.path().join("file"), b"data").unwrap();
+    let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+    let served = std::thread::spawn(move || {
+        serve(
+            server.try_clone().unwrap(),
+            server,
+            true,
+            None,
+            None,
+            None,
+            ServeSession {
+                owns_process: false,
+                handshake_pending: None,
+                ssh_worker_ticket: None,
+                allow_tcp: false,
+                loopback_only: false,
+                named_socket: None,
+                authority: None,
+                source_authority: None,
+                descriptor_session: DescriptorSessionSlot::default(),
+            },
+        )
+    });
+    let mut writer = FrameWriter::new(client.try_clone().unwrap(), false);
+    let mut reader = FrameReader::new(client);
+    writer
+        .write_msg(&Request::Hello {
+            compress: false,
+            debug: false,
+            token: Vec::new(),
+            role: ConnectionRole::Control,
+        })
+        .unwrap();
+    assert!(matches!(
+        reader.read_msg::<Response>().unwrap(),
+        Response::HelloOk { .. }
+    ));
+    writer
+        .write_msg(&Request::Scan {
+            root: tree.path().as_os_str().as_bytes().to_vec(),
+            source: None,
+            follow_root: false,
+            ignore: Vec::new(),
+            report_ignored: false,
+        })
+        .unwrap();
+    let response = reader.read_msg::<Response>().unwrap();
+    assert!(
+        matches!(&response, Response::Err(error)
+            if error.contains("neither a registered source nor a destination root")),
+        "{response:?}"
+    );
+    writer.write_msg(&Request::Shutdown).unwrap();
+    drop(writer);
+    drop(reader);
+    served.join().unwrap().unwrap();
 }

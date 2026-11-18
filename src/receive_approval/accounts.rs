@@ -1,12 +1,10 @@
 //! Remembered account permissions are local policy, separate from receiving
 //! settings and account connection indexes used by older syq versions.
+use crate::lock_file::LockFile;
 use crate::persistence::Domain;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 const VERSION: u16 = 1;
@@ -280,14 +278,6 @@ pub(super) fn prepare_store(domain: &Domain, filename: &str) -> Result<PathBuf> 
     Ok(path)
 }
 
-struct PermissionLock(std::fs::File);
-impl Drop for PermissionLock {
-    fn drop(&mut self) {
-        // A concurrently forked child can temporarily retain this open file
-        // description before exec closes it. End writer ownership explicitly.
-        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
-    }
-}
 fn update(path: &Path, add: Option<&AccountPermission>, remove: Option<&str>) -> Result<()> {
     update_permissions(path, add, remove)
 }
@@ -299,28 +289,10 @@ pub(super) fn update_permissions<P: StoredPermission>(
     if let Some(permission) = add {
         permission.validate()?;
     }
-    let parent = path
-        .parent()
-        .context("account permission directory missing")?;
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path.with_extension("lock"))?;
-    let metadata = lock.metadata()?;
-    anyhow::ensure!(
-        metadata.is_file()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o077 == 0,
-        "account permission lock must be owned and private"
-    );
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    let lock = LockFile::open(&path.with_extension("lock"), true)?;
+    if !lock.try_exclusive()? {
         bail!("account permissions are being changed; retry shortly");
     }
-    let _lock = PermissionLock(lock);
     let mut state: State<P> = read_permissions(path)?;
     if let Some(id) = remove {
         let count = state.permissions.len();
@@ -343,23 +315,26 @@ pub(super) fn update_permissions<P: StoredPermission>(
             state.permissions.sort_by(|a, b| a.id.cmp(&b.id));
         }
     }
-    let bytes = serde_json::to_vec_pretty(&state)?;
+    let mut bytes = serde_json::to_vec_pretty(&state)?;
     anyhow::ensure!(
         bytes.len() < MAX_STATE,
         "remembered account permissions exceed the state-file size limit"
     );
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary.write_all(&bytes)?;
-    temporary.write_all(b"\n")?;
-    temporary.as_file().sync_all()?;
-    temporary.persist(path).map_err(|error| error.error)?;
+    bytes.push(b'\n');
+    crate::state_file::write_atomic(
+        path,
+        &bytes,
+        0o600,
+        crate::state_file::Publish::Replace,
+        crate::state_file::Durability::FileSynced,
+    )?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 
     fn permission() -> AccountPermission {
         let identity = |host: &str, key: u8| {
@@ -581,42 +556,6 @@ mod tests {
         write(&path, &bytes);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(read(&path).is_err());
-    }
-
-    #[test]
-    fn writer_unlocks_even_while_a_forked_description_remains_open() {
-        let temp = crate::test_support::tempdir().unwrap();
-        let path = temp.path().join("account-permissions-v1.lock");
-        write(&path, b"");
-        let first = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        assert_eq!(
-            unsafe { libc::flock(first.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
-        // dup and fork both retain the same open file description. Keep one
-        // alive to model the child before it reaches close-on-exec.
-        let inherited = first.try_clone().unwrap();
-        let lock = PermissionLock(first);
-        let second = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        assert_ne!(
-            unsafe { libc::flock(second.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
-        drop(lock);
-        assert_eq!(
-            unsafe { libc::flock(second.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
-        drop(PermissionLock(second));
-        drop(inherited);
     }
 
     #[test]

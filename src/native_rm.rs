@@ -269,21 +269,7 @@ fn identity_from_root(metadata: RootMetadata) -> Identity {
     }
 }
 
-fn validate_selector(path: &[u8], confined: bool) -> Result<()> {
-    if path.is_empty() {
-        bail!("source selectors may not be empty");
-    }
-    if confined && (path.starts_with(b"/") || path == b"~" || path.starts_with(b"~/")) {
-        bail!(
-            "source selector {:?} beneath --root must be relative",
-            String::from_utf8_lossy(path)
-        );
-    }
-    if path.contains(&0) {
-        bail!("source selector contains NUL");
-    }
-    Ok(())
-}
+use crate::cli::validate_native_source_selector as validate_selector;
 
 fn require_kind(kind: NativeRemoveKind, identity: Identity, label: &[u8]) -> Result<()> {
     match kind {
@@ -323,48 +309,36 @@ fn open_base(
             }
         }
     }
-    if root.is_none()
-        && selections
-            .iter()
-            .all(|selection| crate::fsops::resolve(&selection.path).is_absolute())
-    {
-        let directory = resolve_base_path(b".", false, "endpoint working directory", traces)?;
-        let identity = identity_from_file(&directory)?;
-        traces.push(format!(
-            "endpoint working directory pinned as {}:{}",
-            identity.dev, identity.ino
-        ));
-        return Ok((directory, false));
-    }
-    if let Some(path) = root {
-        let directory = resolve_base_path(path, follow, "--root", traces)?;
-        let identity = identity_from_file(&directory)?;
-        traces.push(format!(
-            "--root {:?} pinned as {}:{}",
-            String::from_utf8_lossy(path),
-            identity.dev,
-            identity.ino
-        ));
-        return Ok((directory, true));
-    }
-    if let Some(path) = cwd {
-        let directory = resolve_base_path(path, follow, "--cwd", traces)?;
-        let identity = identity_from_file(&directory)?;
-        traces.push(format!(
-            "--cwd {:?} pinned as {}:{}",
-            String::from_utf8_lossy(path),
-            identity.dev,
-            identity.ino
-        ));
-        return Ok((directory, false));
-    }
-    let directory = resolve_base_path(b".", false, "endpoint working directory", traces)?;
+    // Absolute selections ignore --cwd; --root always applies.
+    let base = match (root, cwd) {
+        (Some(path), _) => Some(("--root", path, true)),
+        (None, Some(path))
+            if !selections
+                .iter()
+                .all(|selection| crate::fsops::resolve(&selection.path).is_absolute()) =>
+        {
+            Some(("--cwd", path, false))
+        }
+        _ => None,
+    };
+    let (directory, rooted, pinned) = match base {
+        Some((option, path, rooted)) => (
+            resolve_base_path(path, follow, option, traces)?,
+            rooted,
+            format!("{option} {:?}", String::from_utf8_lossy(path)),
+        ),
+        None => (
+            resolve_base_path(b".", false, "endpoint working directory", traces)?,
+            false,
+            "endpoint working directory".to_owned(),
+        ),
+    };
     let identity = identity_from_file(&directory)?;
     traces.push(format!(
-        "endpoint working directory pinned as {}:{}",
+        "{pinned} pinned as {}:{}",
         identity.dev, identity.ino
     ));
-    Ok((directory, false))
+    Ok((directory, rooted))
 }
 
 fn resolve_base_path(
@@ -373,12 +347,6 @@ fn resolve_base_path(
     option: &str,
     traces: &mut Vec<String>,
 ) -> Result<File> {
-    if path.is_empty() {
-        bail!("{option} may not be empty");
-    }
-    if path.contains(&0) {
-        bail!("{option} contains NUL");
-    }
     let path = crate::fsops::resolve(path);
     let mut hops = Vec::new();
     let selected = OperatorResolver::resolve_process(
@@ -424,10 +392,7 @@ struct DirectoryJob {
 enum Task {
     Scan(Arc<DirectoryJob>),
     Leaf {
-        selector: u64,
-        name: PinnedName,
-        _object: Option<File>,
-        label: PathBytes,
+        leaf: PinnedLeaf,
         parent: Option<Arc<DirectoryJob>>,
     },
     Leaves {
@@ -568,13 +533,7 @@ pub(crate) fn remove(
 
     let tasks = resolved.into_iter().map(|selected| match selected {
         ResolvedSelection::Missing => unreachable!(),
-        ResolvedSelection::Leaf(leaf) => Task::Leaf {
-            selector: leaf.selector,
-            name: leaf.name,
-            _object: leaf._object,
-            label: leaf.label,
-            parent: None,
-        },
+        ResolvedSelection::Leaf(leaf) => Task::Leaf { leaf, parent: None },
         ResolvedSelection::Directory(directory) => Task::Scan(Arc::new(DirectoryJob {
             selector: directory.selector,
             partials_only: directory.partials_only,
@@ -620,22 +579,8 @@ fn process_task(pool: &Arc<Pool>, task: Task) {
     }
     match task {
         Task::Scan(job) => scan_directory(pool, job),
-        Task::Leaf {
-            selector,
-            name,
-            _object,
-            label,
-            parent,
-        } => {
-            let failed = process_leaf(
-                pool,
-                PinnedLeaf {
-                    selector,
-                    name,
-                    _object,
-                    label,
-                },
-            );
+        Task::Leaf { leaf, parent } => {
+            let failed = process_leaf(pool, leaf);
             if let Some(parent) = parent {
                 if failed {
                     directory_part_failed(pool, parent);
@@ -743,12 +688,8 @@ fn scan_directory(pool: &Arc<Pool>, job: Arc<DirectoryJob>) {
     let mut bytes = 0u64;
     let flush = |leaves: &mut Vec<PinnedLeaf>| {
         if leaves.len() == 1 {
-            let leaf = leaves.pop().unwrap();
             pool.submit(Task::Leaf {
-                selector: leaf.selector,
-                name: leaf.name,
-                _object: leaf._object,
-                label: leaf.label,
+                leaf: leaves.pop().unwrap(),
                 parent: Some(job.clone()),
             });
         } else if !leaves.is_empty() {

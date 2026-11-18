@@ -6,7 +6,8 @@ import shlex
 import signal
 import subprocess
 import tempfile
-import time
+
+import syq_real_ssh_lab as lab
 
 
 def run(*args, env=None, ok=True):
@@ -36,19 +37,8 @@ def profile(name, env=None):
                 for p in c["profiles"] if p["settings"]["name"] == name)
 
 
-def wait_for(description, predicate, timeout=15):
-    deadline = time.monotonic() + timeout
-    last = None
-    progress = time.monotonic()
-    while time.monotonic() < deadline:
-        last = predicate()
-        if last:
-            return last
-        if time.monotonic() - progress >= 5:
-            print(f"Waiting for {description}: {last!r}", flush=True)
-            progress = time.monotonic()
-        time.sleep(.1)
-    raise AssertionError(f"Timed out waiting for {description}: {last!r}; {state()}")
+def wait_for(description, observe, timeout=15, done=bool):
+    return lab.wait_for(description, observe, timeout, done=done, details=state)
 
 
 def start_copy(name, target, *options):
@@ -59,10 +49,9 @@ def start_copy(name, target, *options):
 
 
 def pending(count):
-    def matching():
-        requests = json.loads(receive("pending", "--json").stdout)
-        return requests if len(requests) == count else None
-    return wait_for(f"{count} pending requests", matching)
+    return wait_for(f"{count} pending requests",
+                    lambda: json.loads(receive("pending", "--json").stdout),
+                    done=lambda requests: len(requests) == count)
 
 
 def finish(process, success=True):

@@ -6,6 +6,7 @@ use crate::auth_from::Provider;
 use crate::cli::NativeEndpoint;
 use crate::destination::forward::DeadlineIo;
 use crate::destination::{read_message, write_message};
+use crate::lock_file::LockFile;
 use crate::persistence::Domain;
 use crate::process::CommandExt as _;
 use crate::receive_service::provider::{self as service, SessionRequest, Ticket};
@@ -15,7 +16,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -121,73 +122,32 @@ fn record_path(domain: &Domain, provider: &Provider, build: &str) -> Result<Path
     Ok(index(domain).join(format!("{name}.json")))
 }
 fn owned_directory(path: &Path) -> Result<bool> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
-    anyhow::ensure!(
-        metadata.is_dir()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o077 == 0,
-        "SSH provider directory must be owned and private: {}",
-        path.display()
-    );
-    Ok(true)
+    Ok(crate::state_file::open_private_dir(
+        path,
+        "SSH provider directory",
+        false,
+        crate::state_file::DirRule::NoGroupOther,
+    )?
+    .is_some())
 }
 fn directory(domain: &Domain) -> Result<PathBuf> {
     domain.ensure_runtime()?;
     let path = index(domain);
-    match fs::DirBuilder::new().mode(0o700).create(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
-    }
-    anyhow::ensure!(
-        owned_directory(&path)?,
-        "SSH provider directory disappeared"
-    );
+    crate::state_file::open_private_dir(
+        &path,
+        "SSH provider directory",
+        true,
+        crate::state_file::DirRule::NoGroupOther,
+    )?;
     Ok(path)
 }
-fn lock_file(path: &Path, create: bool) -> Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(create)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path)?;
-    let metadata = file.metadata()?;
+fn lock_file(path: &Path, create: bool) -> Result<LockFile> {
+    let lock = LockFile::open(path, create)?;
     anyhow::ensure!(
-        metadata.is_file()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o077 == 0
-            && metadata.len() == 0,
+        lock.file().metadata()?.len() == 0,
         "SSH provider lock must be an empty owned private file"
     );
-    Ok(file)
-}
-fn try_lock(file: &File) -> Result<bool> {
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        return Ok(true);
-    }
-    let error = std::io::Error::last_os_error();
-    if error.kind() == std::io::ErrorKind::WouldBlock {
-        return Ok(false);
-    }
-    Err(error.into())
-}
-fn lock_is_available(lock: File) -> Result<bool> {
-    if !try_lock(&lock)? {
-        return Ok(false);
-    }
-    // A concurrent fork can inherit this open-file description. Closing our
-    // descriptor alone would leave that child holding the temporary probe lock.
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(true)
+    Ok(lock)
 }
 /// The record of this build's keeper for `provider`.
 fn read_record(domain: &Domain, provider: &Provider) -> Result<Option<Record>> {
@@ -257,9 +217,13 @@ fn validate_ticket(ticket: &Ticket) -> Result<()> {
 }
 fn write_record(domain: &Domain, record: &Record) -> Result<()> {
     let path = record_path(domain, &record.provider, &record.build)?;
-    let mut file = tempfile::NamedTempFile::new_in(index(domain))?;
-    file.write_all(&serde_json::to_vec(record)?)?;
-    file.persist(path)?;
+    crate::state_file::write_atomic(
+        &path,
+        &serde_json::to_vec(record)?,
+        0o600,
+        crate::state_file::Publish::Replace,
+        crate::state_file::Durability::RenameOnly,
+    )?;
     Ok(())
 }
 fn active(domain: &Domain, record: &Record) -> bool {
@@ -286,7 +250,7 @@ fn existing(domain: &Domain, provider: &Provider) -> Result<Option<Record>> {
         Err(error) if missing(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
-    if lock_is_available(lock)? {
+    if !lock.held()? {
         return Ok(None);
     }
     let metadata = match fs::symlink_metadata(record.forwarded()) {
@@ -420,8 +384,13 @@ fn stop_master(record: &Record) -> Result<()> {
         .args(["-O", "exit"])
         .args(endpoint_arguments(record.endpoint()?));
     let deadline = Instant::now() + Duration::from_secs(5);
-    let output =
-        crate::process::capture_output_bounded(&mut command, deadline, &|| false, 16 * 1024)?;
+    let output = crate::process::capture_output_bounded(
+        "SSH provider shutdown",
+        &mut command,
+        deadline,
+        &|| false,
+        16 * 1024,
+    )?;
     if !output.status.success() && !remove_abandoned_control(record)? {
         bail!(
             "SSH provider refused shutdown: {}",
@@ -487,7 +456,7 @@ fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
     let deadline = Instant::now() + SETUP;
     // Only this build's keeper holds it: wait for one starting to be ready,
     // or one ending to end.
-    while !try_lock(&lock)? {
+    while !lock.try_exclusive()? {
         if let Some(record) = existing(domain, provider)? {
             return Ok(record);
         }
@@ -557,15 +526,25 @@ fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
     anyhow::ensure!(!cancelled(), "SSH provider setup cancelled");
     let spec = helper_spec(&owner.record)?;
     let mut probe = spec.helper_command(&["--build-identity".into()]);
-    let result =
-        crate::process::capture_output_bounded(&mut probe, deadline, &cancelled, 16 * 1024)?;
+    let result = crate::process::capture_output_bounded(
+        "SSH provider helper check",
+        &mut probe,
+        deadline,
+        &cancelled,
+        16 * 1024,
+    )?;
     if crate::remote_helper::needs_install(result.status.code()) {
         let mut install = crate::process::self_command()?;
         install
             .arg(INSTALL)
             .arg(serde_json::to_string(&owner.record)?);
-        let result =
-            crate::process::capture_output_bounded(&mut install, deadline, &cancelled, 64 * 1024)?;
+        let result = crate::process::capture_output_bounded(
+            "SSH provider helper installation",
+            &mut install,
+            deadline,
+            &cancelled,
+            64 * 1024,
+        )?;
         anyhow::ensure!(
             result.status.success(),
             "could not install SSH provider helper: {}",
@@ -580,9 +559,10 @@ fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
         );
     }
     anyhow::ensure!(!cancelled(), "SSH provider setup cancelled");
-    launch_keeper(domain, &owner.record, &lock, deadline, &cancelled)?;
+    launch_keeper(domain, &owner.record, lock.file(), deadline, &cancelled)?;
     owner.armed = false;
-    drop(lock);
+    // The keeper holds the lock now.
+    drop(lock.into_inherited());
     existing(domain, provider)?.context("SSH provider ended before it became ready")
 }
 
@@ -740,6 +720,7 @@ fn forward_service(record: &Record, remote: &Path) -> Result<()> {
         ))
         .args(endpoint_arguments(record.endpoint()?));
     let output = crate::process::capture_output_bounded(
+        "SSH provider socket forwarding",
         &mut command,
         Instant::now() + Duration::from_secs(10),
         &|| false,
@@ -776,6 +757,9 @@ fn keeper(startup: Startup) -> Result<()> {
     let domain = Domain::select(startup.scope.as_deref())?;
     validate_record(&domain, &startup.record.provider, &startup.record)?;
     anyhow::ensure!(startup.lock_fd > 2, "invalid SSH provider startup lock");
+    // Not a LockFile: until `ensure` finishes the handoff, the parent holds
+    // the same open file description, so unlocking here when the keeper
+    // fails early would release the parent's lock too. Closing does not.
     let lock = unsafe { File::from_raw_fd(startup.lock_fd) };
     let expected = lock_file(
         &record_path(&domain, &startup.record.provider, &startup.record.build)?
@@ -783,7 +767,7 @@ fn keeper(startup: Startup) -> Result<()> {
         false,
     )?;
     let actual_metadata = lock.metadata()?;
-    let expected_metadata = expected.metadata()?;
+    let expected_metadata = expected.file().metadata()?;
     anyhow::ensure!(
         (actual_metadata.dev(), actual_metadata.ino())
             == (expected_metadata.dev(), expected_metadata.ino()),
@@ -970,7 +954,7 @@ pub(crate) fn stop_all(domain: &Domain) -> Result<()> {
     loop {
         let mut running = false;
         for lock in &locks {
-            match try_lock(lock) {
+            match lock.try_exclusive() {
                 Ok(acquired) => running |= !acquired,
                 Err(error) => errors.push(format!("{error:#}")),
             }
@@ -999,7 +983,7 @@ pub(crate) fn cleanup_domain(domain: &Domain) -> Result<()> {
         }
         let result = (|| -> Result<()> {
             let lock = lock_file(&path.with_extension("lock"), false)?;
-            anyhow::ensure!(try_lock(&lock)?, "SSH provider keeper is still active");
+            anyhow::ensure!(lock.try_exclusive()?, "SSH provider keeper is still active");
             let bytes =
                 crate::delegation::read_private_regular(&path, "SSH provider record", 16 * 1024)?;
             let record: Record = serde_json::from_slice(&bytes)?;
@@ -1020,13 +1004,22 @@ pub(crate) fn cleanup_domain(domain: &Domain) -> Result<()> {
     if errors.is_empty() {
         for entry in fs::read_dir(index(domain))? {
             let path = entry?.path();
+            // A writer killed before publishing leaves its temporary file;
+            // every keeper has stopped, so nothing will publish it.
+            if path
+                .file_name()
+                .is_some_and(crate::state_file::is_own_temp_name)
+            {
+                fs::remove_file(path)?;
+                continue;
+            }
             anyhow::ensure!(
                 entry_key(&path, "lock") || entry_key(&path, "stop"),
                 "unrecognized SSH provider state: {}",
                 path.display()
             );
             let file = lock_file(&path, false)?;
-            anyhow::ensure!(try_lock(&file)?, "SSH provider keeper is still active");
+            anyhow::ensure!(file.try_exclusive()?, "SSH provider keeper is still active");
             fs::remove_file(path)?;
         }
         fs::remove_dir(index(domain))?;
@@ -1092,6 +1085,7 @@ pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::net::UnixListener;
 
     fn provider() -> Provider {
@@ -1148,10 +1142,10 @@ mod tests {
         assert_ne!(path(&record), path(&other));
         // Its keeper runs, holding its lock.
         let other_lock = lock_file(&path(&other).with_extension("lock"), true).unwrap();
-        assert!(try_lock(&other_lock).unwrap());
+        assert!(other_lock.try_exclusive().unwrap());
         // This build's keeper starts without waiting for it.
         let lock = lock_file(&path(&record).with_extension("lock"), true).unwrap();
-        assert!(try_lock(&lock).unwrap());
+        assert!(lock.try_exclusive().unwrap());
         assert_eq!(
             read_record(&domain, &record.provider)
                 .unwrap()
@@ -1215,13 +1209,26 @@ mod tests {
         assert!(!older.directory.exists());
     }
 
+    #[test]
+    fn persist_off_removes_temporaries_a_killed_writer_left() {
+        let (_root, domain, record) = cleanup_fixture();
+        let current = record_path(&domain, &record.provider, &record.build).unwrap();
+        drop(lock_file(&current.with_extension("lock"), true).unwrap());
+        for name in [".tmpAb12Z9", ".syq-tmp-123-00ff00ff00ff00ff"] {
+            fs::write(index(&domain).join(name), b"{").unwrap();
+        }
+        stop_all(&domain).unwrap();
+        cleanup_domain(&domain).unwrap();
+        assert!(!index(&domain).exists());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn abandoned_provider_socket_does_not_block_shutdown_or_reconnect_cleanup() {
         let (_root, domain, record) = cleanup_fixture();
         let path = record_path(&domain, &record.provider, &record.build).unwrap();
         let lock = lock_file(&path.with_extension("lock"), true).unwrap();
-        assert!(try_lock(&lock).unwrap());
+        assert!(lock.try_exclusive().unwrap());
         for path in [record.control(), record.forwarded()] {
             drop(UnixListener::bind(&path).unwrap());
             fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -1387,12 +1394,12 @@ mod tests {
         let probe = lock_file(&path, true).unwrap();
         // A cloned descriptor shares flock ownership just as an inherited one
         // does, without needing a concurrent fork to reproduce the race.
-        let inherited = probe.try_clone().unwrap();
-        assert!(lock_is_available(probe).unwrap());
+        let inherited = probe.file().try_clone().unwrap();
+        assert!(!probe.held().unwrap());
         let keeper = lock_file(&path, false).unwrap();
-        let acquired = try_lock(&keeper).unwrap();
-        let available_while_owned = lock_is_available(lock_file(&path, false).unwrap()).unwrap();
-        assert_eq!(unsafe { libc::flock(keeper.as_raw_fd(), libc::LOCK_UN) }, 0);
+        let acquired = keeper.try_exclusive().unwrap();
+        let available_while_owned = !lock_file(&path, false).unwrap().held().unwrap();
+        drop(keeper);
         drop(inherited);
         assert!(
             acquired,
@@ -1455,7 +1462,7 @@ mod tests {
         )
         .unwrap();
         assert!(local_binding(&domain, &provider).unwrap().is_none());
-        assert!(try_lock(&lock).unwrap());
+        assert!(lock.try_exclusive().unwrap());
         assert_eq!(
             local_binding(&domain, &provider).unwrap(),
             record.binding().unwrap()
@@ -1483,7 +1490,6 @@ mod tests {
             socket.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
-        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(lock);
         assert!(local_binding(&domain, &provider).unwrap().is_none());
     }

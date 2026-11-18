@@ -90,9 +90,9 @@ pruning. Filesystem pruning always tunes its own workers.
 Syq starts each filesystem copy from the number of workers, and so of
 connections, that worked for earlier copies of the same kind, then keeps
 adjusting. `--performance-tuning workers=N`
-bypasses the remembered count, and `--resource-limits workers=N` caps it. To
-turn off both the history and remembered counts, set `SYQ_TUNING_CACHE` to an
-empty value.
+bypasses the remembered count, and `--resource-limits workers=N` caps it. The
+counts come from the tuning history below. To turn it off, so that each copy
+starts from the default count, set `SYQ_TUNING_CACHE` to an empty value.
 
 ## Inspect tuning history
 

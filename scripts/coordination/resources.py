@@ -1,7 +1,6 @@
-import sys
 import time
 
-from .store import Error, identifier, name, publish
+from .store import Error, identifier, name, poll, publish
 
 
 def conflict(left, right):
@@ -61,23 +60,18 @@ def release(store, ticket, agent, cancel=False):
 
 
 def wait(store, ticket, agent, timeout):
-    deadline = time.monotonic() + timeout
-    progress = 0
+    def held():
+        with store.locked() as state:
+            request = dict(owned(state, ticket, agent))
+        if request['status'] == 'held':
+            return request
+        if request['status'] != 'queued':
+            raise Error(f"Ticket is {request['status']}")
+        return None
     try:
-        while True:
-            with store.locked() as state:
-                request = dict(owned(state, ticket, agent))
-            if request['status'] == 'held':
-                return request
-            if request['status'] != 'queued':
-                raise Error(f"Ticket is {request['status']}")
-            if time.monotonic() >= deadline:
-                raise Error(f'Timed out waiting for {ticket}; ticket retained. Last observed status: queued. '
+        return poll(held, timeout, lambda: f'Waiting for {ticket}: queued',
+                    lambda: f'Timed out waiting for {ticket}; ticket retained. Last observed status: queued. '
                             'Wait again with the same ticket, or inspect status and cancel/release it.')
-            if time.monotonic() >= progress:
-                print(f'Waiting for {ticket}: queued', file=sys.stderr, flush=True)
-                progress = time.monotonic() + 10
-            time.sleep(min(0.25, max(0, deadline - time.monotonic())))
     except KeyboardInterrupt:
         # This command has not handed resources to its caller. If scheduling raced
         # with interruption, release that unused grant too. Never expire used claims.

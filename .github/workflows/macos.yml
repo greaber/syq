@@ -109,9 +109,9 @@ jobs:
     if: github.event_name != 'workflow_dispatch' || inputs.test_name == ''
     runs-on: ubuntu-26.04
     outputs:
-      needed: ${{ steps.changes.outputs.needed }}
-      sdk: ${{ steps.changes.outputs.sdk }}
-      release_tooling: ${{ steps.changes.outputs.release_tooling }}
+      needed: ${{ steps.changes.outputs.macos_needed }}
+      sdk: ${{ steps.changes.outputs.macos_sdk }}
+      release_tooling: ${{ steps.changes.outputs.macos_release_tooling }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -128,37 +128,9 @@ jobs:
         run: scripts/setup.sh github jq python
       - id: changes
         env:
-          COMPLETE: ${{ inputs.complete }}
+          SYQ_CI_COMPLETE: ${{ inputs.complete }}
           GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          event=$GITHUB_EVENT_PATH
-          task_branch=false
-          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$GITHUB_REF" != refs/heads/master ]]; then
-            # Classify a task branch's changes as its pull request would be.
-            task_branch=true
-            event=$RUNNER_TEMP/branch-event.json
-            printf '{"pull_request":{"base":{"sha":"%s"},"head":{"sha":"%s"}}}\n' \
-              "$(git rev-parse origin/master)" "$(git rev-parse HEAD)" > "$event"
-          fi
-          scope=$(scripts/ci-scope.py "$event")
-          # ci-scope output is a machine-readable key=value contract.
-          value() { sed -n "s/^$1=//p" <<< "$scope"; }
-          # Only explicit macOS changes select this platform after a merge.
-          # Manual and changed-input nightly runs select the suite.
-          needed=$(value macos)
-          if [[ "$task_branch" == true ]]; then needed=true; fi
-          all=false
-          if [[ "$(value full_suite)" == true || "$COMPLETE" == true ]]; then all=true; fi
-          sdk=$all
-          if [[ "$(value python_sdk)" == true ]]; then sdk=true; fi
-          release_tooling=$all
-          checks=" $(value tooling_checks) "
-          for check in release orchestration installer; do
-            if [[ "$checks" == *" $check "* ]]; then release_tooling=true; fi
-          done
-          printf '%s\n' "needed=$needed" "sdk=$sdk" "release_tooling=$release_tooling" |
-            tee -a "$GITHUB_OUTPUT"
+        run: scripts/ci-scope.py --macos "$GITHUB_EVENT_PATH" >> "$GITHUB_OUTPUT"
 
   suite:
     # Cancel matching automatic checks and earlier manual runs on the same
@@ -241,28 +213,14 @@ jobs:
         run: python3 tests/tooling/test-try-benchmark.py
       - name: Release tooling suites
         if: needs.scope.outputs.release_tooling == 'true'
+        env:
+          # Test the candidate built above instead of building syq again.
+          SYQ_RELEASE_TOOLS_SYQ: ${{ github.workspace }}/target/debug/syq
         run: |
           status=0
-          run() {
-            echo "=== $*"
-            if ! "$@"; then
-              echo "=== $* failed"
-              status=1
-            fi
-          }
-          # Test the candidate built above instead of building syq again.
-          run tests/tooling/test-release-tools.py --syq "$GITHUB_WORKSPACE/target/debug/syq"
-          for suite in \
-            tests/tooling/test-release-orchestration.py \
-            tests/tooling/test-generated-sdk-post-merge-ci.py \
-            tests/tooling/test-release-readiness.py \
-            tests/tooling/test-release-timings.py \
-            tests/tooling/test-find-release-build.py \
-            tests/tooling/test-installer.py \
-            scripts/test-homebrew-formula.py
-          do
-            run "$suite"
-          done
+          # The groups are MACOS_TOOLING in scripts/ci-scope.py.
+          scripts/run-tooling-tests.py --group release orchestration installer || status=1
+          scripts/test-homebrew-formula.py || status=1
           exit "$status"
       # Last, because it removes syq's own build output to rebuild it from the sdist.
       - name: Test and package Python SDK
@@ -292,6 +250,14 @@ jobs:
           env -u PYTHONPATH uv run --isolated --python "$UV_PYTHON" \
             --with "$1" \
             python scripts/check-python-wheel.py --version "$SYQ_CANDIDATE_VERSION"
+          # Run the tests against the wheel on the oldest Python it supports.
+          floor=$(sed -n 's/^requires-python = ">=\(.*\)"/\1/p' sdk/python/pyproject.toml)
+          test -n "$floor"
+          uv export --project sdk/python --frozen --only-dev --no-emit-project \
+            --quiet --output-file target/sdk-python-dev-requirements.txt
+          env -u PYTHONPATH uv run --isolated --python "$floor" \
+            --with "$1" --with-requirements target/sdk-python-dev-requirements.txt \
+            python -m unittest discover -s sdk/python/tests
           rm -rf -- target/sdk-python-from-sdist
           # Archive mtimes can repeat across commits. Rebuild syq itself while
           # keeping dependencies outside the disposable extraction directory.

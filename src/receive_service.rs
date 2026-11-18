@@ -4,6 +4,7 @@ pub(crate) mod provider;
 mod successor;
 pub(crate) mod switch;
 
+use crate::lock_file::{LockFile, PROBE_GRACE};
 use crate::persistence::Domain;
 use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
@@ -459,35 +460,16 @@ fn save_settings(domain: &Domain, settings: &Preferences) -> Result<()> {
     }
     atomic_json(&path, settings)
 }
-struct SettingsLock(File);
-impl Drop for SettingsLock {
-    fn drop(&mut self) {
-        // A parallel fork retains the same open file description until exec.
-        // Release writer ownership now, even if that temporary copy survives.
-        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
-    }
-}
-fn settings_lock(domain: &Domain) -> Result<SettingsLock> {
+fn settings_lock(domain: &Domain) -> Result<LockFile> {
     let path = config_path(domain)?.with_file_name("receive.lock");
     if domain.is_default() {
         fs::create_dir_all(path.parent().unwrap())?;
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)?;
-    let meta = file.metadata()?;
-    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
-        bail!("receive preferences lock must be owned and private");
-    }
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    let lock = LockFile::open(&path, true)?;
+    if !lock.try_exclusive()? {
         bail!("receive preferences are being changed; retry shortly");
     }
-    Ok(SettingsLock(file))
+    Ok(lock)
 }
 fn current_settings_exist(domain: &Domain) -> Result<bool> {
     let path = config_path(domain)?;
@@ -520,11 +502,15 @@ fn ensure_current_settings(domain: &Domain) -> Result<Preferences> {
     Ok(config)
 }
 fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    let mut file = tempfile::NamedTempFile::new_in(path.parent().context("missing state parent")?)?;
-    serde_json::to_writer(&mut file, value)?;
-    file.write_all(b"\n")?;
-    file.as_file().sync_all()?;
-    file.persist(path).map_err(|e| e.error)?;
+    let mut bytes = serde_json::to_vec(value)?;
+    bytes.push(b'\n');
+    crate::state_file::write_atomic(
+        path,
+        &bytes,
+        0o600,
+        crate::state_file::Publish::Replace,
+        crate::state_file::Durability::FileSynced,
+    )?;
     Ok(())
 }
 fn suffixed(control: &Path, suffix: &[u8]) -> PathBuf {
@@ -910,47 +896,14 @@ fn write_status(writer: &mut impl Write, status: &Status) -> Result<()> {
     crate::destination::write_framed(writer, status, MAX_STATUS, "receiving status")
 }
 
-fn try_lock(control: &Path, create: bool) -> Result<Option<File>> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(create)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(suffixed(control, LOCK))?;
-    let meta = file.metadata()?;
-    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
-        bail!("background receiving lock must be owned and private");
-    }
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        return Ok(Some(file));
-    }
-    let error = std::io::Error::last_os_error();
-    if error.kind() == std::io::ErrorKind::WouldBlock {
-        return Ok(None);
-    }
-    Err(error.into())
+/// Take the service's lock, or None when another service holds it. A start
+/// retries for [`PROBE_GRACE`], so that `is_running` cannot make it exit.
+fn try_lock(control: &Path) -> Result<Option<LockFile>> {
+    let lock = LockFile::open(&suffixed(control, LOCK), true)?;
+    Ok(lock.try_exclusive_within(PROBE_GRACE)?.then_some(lock))
 }
 pub(crate) fn is_running(control: &Path) -> bool {
-    matches!(try_lock(control, false), Ok(None))
-}
-/// is_running and the provider's check probe a lock by taking it for a
-/// moment. A service or provider that starts during such a probe would take
-/// the probe for another owner, so it retries for longer than a probe holds
-/// the lock before concluding that another copy is running.
-const PROBE_GRACE: Duration = Duration::from_millis(100);
-fn lock_for_start<T>(mut attempt: impl FnMut() -> Result<Option<T>>) -> Result<Option<T>> {
-    let deadline = Instant::now() + PROBE_GRACE;
-    loop {
-        if let Some(lock) = attempt()? {
-            return Ok(Some(lock));
-        }
-        if Instant::now() >= deadline {
-            return Ok(None);
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    LockFile::is_held(&suffixed(control, LOCK)).unwrap_or(false)
 }
 fn read_spec(control: &Path) -> Result<ServiceSpec> {
     let bytes = crate::delegation::read_private_regular(
@@ -2665,7 +2618,7 @@ fn run(domain: &Domain, control: &Path, started_from: Option<PathBuf>) -> Result
     if scope.join(CLOSING).exists() || !domain.enabled()? {
         return Ok(());
     }
-    let Some(_lock) = lock_for_start(|| try_lock(control, true))? else {
+    let Some(_lock) = try_lock(control)? else {
         return Ok(());
     };
     if scope.join(CLOSING).exists() || !preferences(domain)?.enabled() {
@@ -3795,10 +3748,9 @@ mod tests {
         let writer = settings_lock(&domain).unwrap();
         // dup and fork share the open file description that owns flock. This
         // deterministically models another test between fork and close-on-exec.
-        let inherited = writer.0.try_clone().unwrap();
+        let inherited = writer.file().try_clone().unwrap();
         let error = settings_lock(&domain)
-            .err()
-            .expect("an active writer must still exclude a second writer");
+            .expect_err("an active writer must still exclude a second writer");
         assert!(error.to_string().contains("preferences are being changed"));
         drop(writer);
         let next = settings_lock(&domain)
@@ -4039,10 +3991,10 @@ mod tests {
 
     /// Hold the control's lock as a service does between taking it and binding
     /// its socket, or after removing the socket while it stops.
-    fn locked_control() -> (impl Sized, PathBuf, File) {
+    fn locked_control() -> (impl Sized, PathBuf, LockFile) {
         let root = crate::test_support::short_tempdir().unwrap();
         let control = root.path().join("cm-test");
-        let lock = try_lock(&control, true).unwrap().unwrap();
+        let lock = try_lock(&control).unwrap().unwrap();
         assert!(is_running(&control));
         (root, control, lock)
     }
@@ -4121,16 +4073,16 @@ mod tests {
     /// to a service that takes over.
     fn stand_in(
         control: &Path,
-        lock: File,
+        lock: LockFile,
         reply: impl Fn(&LocalRequest) -> Status + Send + 'static,
     ) -> std::thread::JoinHandle<Vec<String>> {
         stand_in_then(control, lock, reply, drop)
     }
     fn stand_in_then(
         control: &Path,
-        lock: File,
+        lock: LockFile,
         reply: impl Fn(&LocalRequest) -> Status + Send + 'static,
-        then: impl FnOnce(File) + Send + 'static,
+        then: impl FnOnce(LockFile) + Send + 'static,
     ) -> std::thread::JoinHandle<Vec<String>> {
         let socket = suffixed(control, SOCKET);
         let listener = UnixListener::bind(&socket).unwrap();
@@ -4476,29 +4428,25 @@ mod tests {
     fn a_starting_service_waits_out_a_status_probe() {
         let root = crate::test_support::short_tempdir().unwrap();
         let control = root.path().join("cm-test");
-        // A status check holds the lock during the first attempt, then ends.
-        let mut probe = Some(try_lock(&control, true).unwrap().unwrap());
-        let mut attempts = 0;
-        let lock = lock_for_start(|| {
-            attempts += 1;
-            let attempt = try_lock(&control, true);
-            probe.take();
-            attempt
-        })
-        .unwrap();
+        // A status check holds the lock as the service starts, then ends.
+        let probe = LockFile::open(&suffixed(&control, LOCK), true).unwrap();
+        assert!(probe.try_shared().unwrap());
+        let probing = std::thread::spawn(move || {
+            std::thread::sleep(PROBE_GRACE / 10);
+            drop(probe);
+        });
+        let lock = try_lock(&control).unwrap();
+        probing.join().unwrap();
         assert!(lock.is_some());
-        assert_eq!(attempts, 2);
     }
 
     #[test]
     fn a_service_started_beside_a_running_one_gives_up_after_the_grace() {
         let root = crate::test_support::short_tempdir().unwrap();
         let control = root.path().join("cm-test");
-        let _owner = try_lock(&control, true).unwrap().unwrap();
+        let _owner = try_lock(&control).unwrap().unwrap();
         let started = Instant::now();
-        assert!(lock_for_start(|| try_lock(&control, true))
-            .unwrap()
-            .is_none());
+        assert!(try_lock(&control).unwrap().is_none());
         let elapsed = started.elapsed();
         assert!(
             elapsed >= PROBE_GRACE && elapsed < Duration::from_secs(5),

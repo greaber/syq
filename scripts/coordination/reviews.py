@@ -10,7 +10,7 @@ import sys
 import time
 import uuid
 
-from .store import Error, identifier, name, notify, publish, run
+from .store import Error, identifier, name, notify, poll, publish, run
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'agent-coordination.py'
 # Reviewers run as the user runs their own review sessions: a strong model at
@@ -211,26 +211,23 @@ def start(store, args):
 
 def settle(store, review_id):
     """Wait, within a deadline, for the previous reviewer process to finish its turn."""
-    deadline = time.monotonic() + SETTLE_SECONDS
-    progress = 0
-    while True:
+    current = {}
+    def settled():
+        nonlocal current
         with store.locked() as state:
             review = get(state, review_id)
             reconcile(review)
             if not running(review):
-                return
+                return True
             current = review['rounds'][-1]
         if 'pid' not in current:
             raise Error('An interactive reviewer from an earlier version of this tool is still running'
                         + (f' in tmux pane {review["pane"]}' if review.get('pane') else '')
                         + '; exit it before starting another round')
-        if time.monotonic() >= deadline:
-            raise Error(f'Reviewer process {current["pid"]} is still running after {SETTLE_SECONDS} s; '
-                        f'retry once it exits (log: {current.get("log")})')
-        if time.monotonic() >= progress:
-            print(f'Waiting for reviewer process {current["pid"]} to exit', file=sys.stderr, flush=True)
-            progress = time.monotonic() + 10
-        time.sleep(0.25)
+        return None
+    poll(settled, SETTLE_SECONDS, lambda: f'Waiting for reviewer process {current["pid"]} to exit',
+         lambda: f'Reviewer process {current["pid"]} is still running after {SETTLE_SECONDS} s; '
+                 f'retry once it exits (log: {current.get("log")})')
 
 
 def launch(store, review_id, snap, allow_unchanged=False):
@@ -507,13 +504,8 @@ def stop(store, review_id, agent):
             os.killpg(group, signum)
         except ProcessLookupError:
             break
-        deadline = time.monotonic() + STOP_SECONDS
-        progress = 0
-        while alive(group) and time.monotonic() < deadline:
-            if time.monotonic() >= progress:
-                print(f'Waiting for reviewer process group {group} to exit', file=sys.stderr, flush=True)
-                progress = time.monotonic() + 5
-            time.sleep(0.1)
+        poll(lambda: None if alive(group) else True, STOP_SECONDS,
+             lambda: f'Waiting for reviewer process group {group} to exit', interval=0.1, every=5)
     if group is not None and alive(group):
         raise Error(f'Reviewer process group {group} is still running after SIGKILL')
     with store.locked() as state:
@@ -570,7 +562,9 @@ def triage(store, args):
     if args.action == 'complete' and args.unresolved:
         raise Error('Unresolved findings require discussion, not completion')
     snap = None
-    if args.action in ('complete', 'revise'):
+    # Only completion and an automatic next round use the PR head; recording a
+    # revision for the implementer to make does not need a clean, pushed tree.
+    if args.action == 'complete' or (args.action == 'revise' and copy['mode'] == 'auto'):
         snap = snapshot(copy['repo'], copy['pr'], copy['repository'])
         if args.action == 'complete' and snap['sha'] != args.sha:
             raise Error('Head has changed since review; review the new revision before completing')
@@ -619,15 +613,10 @@ def next_round(store, review_id, agent, allow_unchanged=False):
 
 
 def wait(store, review_id, timeout):
-    deadline = time.monotonic() + timeout
-    progress = 0
-    while True:
+    review = {}
+    def finished():
+        nonlocal review
         review = status(store, review_id)
-        if review['status'] not in ('starting', 'waiting_review'):
-            return review
-        if time.monotonic() >= deadline:
-            raise Error(f"Timed out; {review_id} remains {review['status']}. Reviewer continues; wait again.")
-        if time.monotonic() >= progress:
-            print(f"Waiting for {review_id}: {review['status']}", file=sys.stderr, flush=True)
-            progress = time.monotonic() + 10
-        time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+        return review if review['status'] not in ('starting', 'waiting_review') else None
+    return poll(finished, timeout, lambda: f"Waiting for {review_id}: {review['status']}",
+                lambda: f"Timed out; {review_id} remains {review['status']}. Reviewer continues; wait again.")

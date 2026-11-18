@@ -29,10 +29,9 @@ import json
 import os
 import sys
 
-from dispatched_checks import (BRANCH_WORKFLOWS, apply_resolutions, branch_runs, dispatched_runs,
-                               failed_checks, fetch_jobs, fetch_resolutions, in_parallel,
-                               merged_from_branch, resolution_context, result_lines, running,
-                               undecided, unresolved)
+from dispatched_checks import (acknowledgement_reason, apply_resolutions, branch_dispatched_runs,
+                               failed_checks, fetch_jobs, fetch_resolutions, post_acknowledgement,
+                               resolution_context, result_lines, running, undecided, unresolved)
 from tooling import ToolError, json_output, output, report_errors
 
 CONTEXT = "dispatched-checks"
@@ -86,13 +85,7 @@ def status(pr, failed, active, resolved=()):
 def post(repository, pr, *, job_id=None, reason=None, replacement=None):
     failed, active = [], []
     if not pr.get("isCrossRepository"):
-        branch = pr.get("headRefName")
-        # Branch names get reused; only runs since this name's latest merge count.
-        runs = in_parallel([lambda: merged_from_branch(repository, branch)] + [
-            lambda workflow=workflow: dispatched_runs(repository, workflow, branch)
-            for workflow in BRANCH_WORKFLOWS])
-        runs = branch_runs([run for workflow_runs in runs[1:] for run in workflow_runs],
-                           branch, runs[0])
+        runs = branch_dispatched_runs(repository, pr.get("headRefName"))
         failed = failed_checks(runs, fetch_jobs(repository, undecided(runs)))
         active = running(runs)
     if job_id is not None:
@@ -100,10 +93,8 @@ def post(repository, pr, *, job_id=None, reason=None, replacement=None):
         if entry is None:
             raise ToolError(f"job {job_id} is not a current failed dispatched check of PR "
                             f"#{pr['number']}", 2)
-        output("gh", "api", "--method", "POST", f"repos/{repository}/statuses/{entry['head']}",
-               "-f", "state=success", "-f",
-               f"context={resolution_context(pr['number'], job_id)}", "-f", f"description={reason}",
-               *(["-f", f"target_url={replacement}"] if replacement else []), status=2)
+        post_acknowledgement(repository, entry["head"], resolution_context(pr["number"], job_id),
+                             reason, replacement)
         print(f"Resolved job {job_id} at {entry['head'][:7]}: {reason}")
     lookup_error = None
     try:
@@ -145,12 +136,8 @@ def main():
     if job_id is not None:
         if len(args.pull_requests) != 1 or job_id <= 0:
             parser.error("resolving requires one pull request and a positive job ID")
-        args.reason = (args.reason or "").strip()
-        if not 1 <= len(args.reason) <= 140 or any(c in args.reason for c in "\r\n"):
-            parser.error("--reason must be one line of 1–140 characters")
-        if args.replacement and (not args.replacement.startswith("https://") or
-                                 any(c.isspace() for c in args.replacement)):
-            parser.error("--replacement requires --resolve-job and an HTTPS URL")
+        args.reason = acknowledgement_reason(parser, args.reason, args.replacement,
+                                             "--replacement", link_required=False)
     elif args.reason is not None or args.replacement is not None:
         parser.error("--reason and --replacement require --resolve-job")
     repository = os.environ.get("GITHUB_REPOSITORY", "")

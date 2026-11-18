@@ -260,6 +260,7 @@ enum Credentials {
 fn credentials(spec: &crate::conn::RemoteSpec) -> Credentials {
     // ssh's own view of the destination: its agent and identity files.
     let Ok(output) = crate::process::capture_output_bounded(
+        "SSH credential check",
         &mut spec.ssh_hostname_command(),
         Instant::now() + Duration::from_secs(5),
         &|| false,

@@ -3,6 +3,7 @@ use super::{foreground, local_config::LocalPlan, resolution, SessionRequest, Tty
 use crate::auth_from::Provider;
 use crate::cli::{AuthFrom, NativeEndpoint};
 use crate::destination::ssh_auth::{LinkReply, LinkRequest};
+use crate::lock_file::LockFile;
 use crate::persistence::Domain;
 use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
@@ -11,7 +12,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -73,56 +74,43 @@ fn ensure_master_parent(domain: &Domain) -> Result<PathBuf> {
 pub(super) fn directory(domain: &Domain) -> Result<PathBuf> {
     ensure_master_parent(domain)?;
     let path = domain.approved_index_path();
-    match fs::DirBuilder::new().mode(0o700).create(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
-    }
-    existing_directory(domain)?.context("SSH authority directory disappeared")
+    crate::state_file::open_private_dir(
+        &path,
+        "SSH authority index",
+        true,
+        crate::state_file::DirRule::NoGroupOther,
+    )?;
+    Ok(path)
 }
 pub(super) fn existing_directory(domain: &Domain) -> Result<Option<PathBuf>> {
     let path = domain.approved_index_path();
-    let metadata = match path.symlink_metadata() {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    if !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o077 != 0
-    {
-        bail!("SSH authority index must be an owner-only directory");
-    }
-    Ok(Some(path))
+    Ok(crate::state_file::open_private_dir(
+        &path,
+        "SSH authority index",
+        false,
+        crate::state_file::DirRule::NoGroupOther,
+    )?
+    .map(|_| path))
 }
 // Separate from ordinary persistence: account authorization follows its return
 // connection even when global persistence/automatic receiving is disabled.
 fn read_generation(path: &Path) -> Result<Option<String>> {
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+    let Some(generation) = crate::state_file::read_private(
+        path,
+        "SSH account generation",
+        64,
+        crate::state_file::FileRule::NoGroupOther,
+    )?
+    else {
+        return Ok(None);
     };
-    let metadata = file.metadata()?;
     anyhow::ensure!(
-        metadata.is_file()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o077 == 0
-            && metadata.len() == 64,
-        "SSH account generation must be a bounded owner-only file"
-    );
-    use std::io::Read as _;
-    let mut generation = String::new();
-    file.take(65).read_to_string(&mut generation)?;
-    anyhow::ensure!(
-        generation.len() == 64 && generation.bytes().all(|b| b.is_ascii_hexdigit()),
+        generation.len() == 64 && generation.iter().all(u8::is_ascii_hexdigit),
         "invalid SSH account generation"
     );
-    Ok(Some(generation))
+    Ok(Some(
+        String::from_utf8(generation).expect("hexadecimal digits are UTF-8"),
+    ))
 }
 fn generation_path(domain: &Domain) -> PathBuf {
     domain.approved_index_path().join(GENERATION)
@@ -138,14 +126,16 @@ fn ensure_generation_at(directory: &Path) -> Result<String> {
     let mut random = [0u8; 32];
     getrandom::fill(&mut random)?;
     let generation = blake3::hash(&random).to_hex().to_string();
-    let mut file = tempfile::NamedTempFile::new_in(directory)?;
-    file.write_all(generation.as_bytes())?;
-    match file.persist_noclobber(&path) {
-        Ok(_) => Ok(generation),
-        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-            read_generation(&path)?.context("SSH account generation changed during startup; retry")
-        }
-        Err(error) => Err(error.error.into()),
+    if crate::state_file::write_atomic(
+        &path,
+        generation.as_bytes(),
+        0o600,
+        crate::state_file::Publish::NoClobber,
+        crate::state_file::Durability::RenameOnly,
+    )? {
+        Ok(generation)
+    } else {
+        read_generation(&path)?.context("SSH account generation changed during startup; retry")
     }
 }
 pub(super) fn generation_open(domain: &Domain, generation: &str) -> Result<bool> {
@@ -185,24 +175,16 @@ fn read_record(path: &Path) -> Result<Option<Record>> {
     })
 }
 fn read_record_inner(path: &Path) -> Result<Option<Record>> {
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+    let Some(record) = crate::state_file::read_private(
+        path,
+        "SSH authority record",
+        16384,
+        crate::state_file::FileRule::NoGroupOther,
+    )?
+    else {
+        return Ok(None);
     };
-    let metadata = file.metadata()?;
-    if !metadata.is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o077 != 0
-        || metadata.len() > 16384
-    {
-        bail!("SSH authority record must be a bounded owner-only file");
-    }
-    let record: Record = serde_json::from_reader(file)?;
+    let record: Record = serde_json::from_slice(&record)?;
     record.authorizer.validate()?;
     if record.version != provider_state_version(&record.authorizer) {
         bail!("unsupported SSH authority record; reconnect with syq persist connect");
@@ -314,19 +296,15 @@ fn peer_path(record: &Record) -> std::path::PathBuf {
 }
 
 fn read_peer(record: &Record) -> Result<super::super::ssh_auth::Peer> {
-    let file = OpenOptions::new().read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(peer_path(record))
+    let file = crate::state_file::open_private(&peer_path(record))
         .context("approved account has no pinned peer metadata; reconnect with syq persist connect ENDPOINT --auth-from @NAME")?;
-    let metadata = file.metadata()?;
-    anyhow::ensure!(
-        metadata.is_file()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o077 == 0
-            && metadata.len() <= 128 * 1024,
-        "approved SSH peer metadata must be a bounded owner-only file"
-    );
-    let peer: super::super::ssh_auth::Peer = serde_json::from_reader(file)?;
+    let peer = crate::state_file::read_open(
+        file,
+        &"approved SSH peer metadata",
+        128 * 1024,
+        crate::state_file::FileRule::NoGroupOther,
+    )?;
+    let peer: super::super::ssh_auth::Peer = serde_json::from_slice(&peer)?;
     peer.validate_endpoint(&record.endpoint)?;
     Ok(peer)
 }
@@ -630,17 +608,10 @@ pub(crate) struct StatusSnapshot {
     pub rows: Vec<Status>,
     pub errors: Vec<String>,
 }
-/// Whether another process holds the lock on `path`. Looking takes a
-/// shared lock for a moment, which a keeper taking it then retries.
+/// Whether another process holds the lock on `path`, which a keeper taking
+/// it retries for (`take_keeper_lock`).
 fn held(path: &Path) -> bool {
-    let Ok(file) = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path)
-    else {
-        return false;
-    };
-    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) != 0 }
+    LockFile::is_held(path).unwrap_or(false)
 }
 
 pub(crate) fn status(domain: &Domain) -> Result<StatusSnapshot> {
@@ -1078,11 +1049,15 @@ fn path_of(index: &Option<Index>) -> PathBuf {
 }
 /// Write `record` at `path` in one step.
 fn write_record(path: &Path, record: &Record) -> Result<()> {
-    let mut temporary =
-        tempfile::NamedTempFile::new_in(path.parent().context("record has no directory")?)?;
-    serde_json::to_writer(&mut temporary, record)?;
-    temporary.write_all(b"\n")?;
-    temporary.persist(path)?;
+    let mut bytes = serde_json::to_vec(record)?;
+    bytes.push(b'\n');
+    crate::state_file::write_atomic(
+        path,
+        &bytes,
+        0o600,
+        crate::state_file::Publish::Replace,
+        crate::state_file::Durability::RenameOnly,
+    )?;
     Ok(())
 }
 impl Drop for Index {
@@ -1130,22 +1105,8 @@ fn keeper(startup: Startup) -> Result<()> {
     let path = selected_index_path(&domain, &request.provider, &request.destination, selected)?;
     // Released last, after the scope is removed and everything in it ended,
     // which `persist off` relies on (`keeper_lock_path`).
-    let mut keeper_lock: Option<File> = None;
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path.with_extension("lock"))?;
-    let metadata = lock.metadata()?;
-    if !metadata.is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o077 != 0
-    {
-        bail!("SSH authority lock must be an owner-only file");
-    }
+    let mut keeper_lock: Option<LockFile> = None;
+    let lock = LockFile::open(&path.with_extension("lock"), true)?;
     let signals = foreground::Signals::new()?;
     let started = Instant::now();
     let deadline = started + Duration::from_secs(330);
@@ -1162,12 +1123,8 @@ fn keeper(startup: Startup) -> Result<()> {
                 &Ok::<_, String>(cached.endpoint().host.clone()),
             );
         }
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        if lock.try_exclusive()? {
             break;
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::WouldBlock {
-            return Err(error.into());
         }
         if Instant::now() >= deadline {
             bail!("another SSH account request did not become ready within 330 seconds");
@@ -1332,18 +1289,16 @@ fn keeper(startup: Startup) -> Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(peer_path(&record))?;
-    serde_json::to_writer(&mut peer_file, session.peer())?;
-    peer_file.write_all(b"\n")?;
+    let mut peer = serde_json::to_vec(session.peer())?;
+    peer.push(b'\n');
+    peer_file.write_all(&peer)?;
     let mut generation_file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(record.control.with_extension("generation"))?;
     generation_file.write_all(startup.generation.as_bytes())?;
-    let mut temporary = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
-    serde_json::to_writer(&mut temporary, &record)?;
-    temporary.write_all(b"\n")?;
-    temporary.persist(&path)?;
+    write_record(&path, &record)?;
     let index = Index(path);
     super::super::write_message(
         &mut std::io::stdout().lock(),
@@ -1478,29 +1433,19 @@ fn keeper_lock_path(record: &Path, control: &Path) -> Option<PathBuf> {
     Some(record.parent()?.join(format!("{name}.lock")))
 }
 
-fn take_keeper_lock(record: &Path, control: &Path) -> Result<File> {
+fn take_keeper_lock(record: &Path, control: &Path) -> Result<LockFile> {
     let path = keeper_lock_path(record, control).context("SSH account index has no directory")?;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&path)
+    let lock = LockFile::open(&path, true)
         .with_context(|| format!("create SSH account keeper lock {}", path.display()))?;
     // No other keeper has this name, but someone counting keepers can hold
-    // it for a moment (`held`).
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "SSH account keeper lock {} is held",
-            path.display()
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    Ok(file)
+    // it for a moment (`held`), and an older build's count until a child it
+    // forked meanwhile execs.
+    anyhow::ensure!(
+        lock.try_exclusive_within(Duration::from_secs(2))?,
+        "SSH account keeper lock {} is held",
+        path.display()
+    );
+    Ok(lock)
 }
 
 /// How many sessions use the master at `control`, apart from the session

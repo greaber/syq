@@ -85,11 +85,9 @@ case "${SYQ_REAL_SSH_SUITE:-core}" in
     *) echo 'unknown real-SSH suite' >&2; exit 2 ;;
 esac
 
-remote_manifest() {
-    host=$1
-    root=$2
-    output=$3
-    ssh "$host" sh -s -- "$root" >"$output" <<'EOF'
+# Every entry below a directory, with its type, mode and link target, and
+# every file's digest, in a stable order.
+manifest_script=$(cat <<'EOF'
 set -eu
 cd "$1"
 {
@@ -97,6 +95,42 @@ cd "$1"
     find . -type f -exec sha256sum {} +
 } | LC_ALL=C sort
 EOF
+)
+
+remote_manifest() {
+    printf '%s\n' "$manifest_script" | ssh "$1" sh -s -- "$2" >"$3"
+}
+
+local_manifest() {
+    sh -c "$manifest_script" sh "$1"
+}
+
+# wait_until SECONDS DESCRIPTION COMMAND [ARGUMENT...]
+# Runs COMMAND until it succeeds, which it must within SECONDS. What COMMAND
+# prints is the state it observed: the wait reports the latest every five
+# seconds, and fails with it at the deadline.
+wait_until() {
+    wait_deadline=$(($(date +%s) + $1))
+    wait_progress=$(($(date +%s) + 5))
+    wait_seconds=$1
+    wait_description=$2
+    shift 2
+    while :; do
+        if wait_state=$("$@" 2>&1); then
+            return 0
+        fi
+        wait_now=$(date +%s)
+        if [ "$wait_now" -ge "$wait_deadline" ]; then
+            printf 'timed out after %ss waiting for %s; last state:\n%s\n' \
+                "$wait_seconds" "$wait_description" "$wait_state" >&2
+            return 1
+        fi
+        if [ "$wait_now" -ge "$wait_progress" ]; then
+            printf 'waiting for %s; last state:\n%s\n' "$wait_description" "$wait_state" >&2
+            wait_progress=$((wait_now + 5))
+        fi
+        sleep 0.2
+    done
 }
 
 assert_same_tree() {
@@ -119,13 +153,85 @@ assert_same_tree() {
     diff -u "$source_manifest" "$destination_manifest"
 }
 
+# file_digest HOST PATH: the file's SHA-256, where a HOST of - is this machine.
+file_digest() {
+    if [ "$1" = - ]; then
+        sha256sum <"$2"
+    else
+        # shellcheck disable=SC2029
+        ssh "$1" "sha256sum <$2"
+    fi
+}
+
+# assert_small_copy RESULTS DEBUG COUNT SOURCE_HOST SOURCE DESTINATION_HOST DESTINATION
+# A small copy run with SYQ_DEBUG=1 and --results settled successfully with
+# one file in its result's COUNT, took the one-turn path, and left the
+# destination with the source's bytes.
+assert_small_copy() {
+    small_status=$(tail -n 1 "$1")
+    case "$small_status" in
+        *'"status":"success"'*'"type":"result"'*) ;;
+        *)
+            echo 'small copy did not settle successfully:' >&2
+            cat "$1" "$2" >&2
+            return 1
+            ;;
+    esac
+    case "$small_status" in
+        *"\"$3\":1,"*|*"\"$3\":1}"*) ;;
+        *) cat "$1" >&2; return 1 ;;
+    esac
+    if ! grep -q 'small copy: published' "$2"; then
+        echo 'small copy did not use the one-turn path:' >&2
+        cat "$2" >&2
+        return 1
+    fi
+    test "$(file_digest "$4" "$5")" = "$(file_digest "$6" "$7")"
+}
+
+# exercise_tuning NAME WORKERS TUNING SECONDS
+# With the tuning overrides TUNING and WORKERS workers at 8 MB/s, each copy
+# ending within SECONDS: an upload and a download over TCP and over SSH, then
+# a copy between servers coordinated by the source, the destination, and here.
+exercise_tuning() {
+    tuning_name=$1
+    tuning_workers=$2
+    tuning_overrides=$3
+    tuning_seconds=$4
+    for transport in tcp ssh; do
+        if [ "$transport" = ssh ]; then set -- --no-tcp; else set --; fi
+        timeout --kill-after=5s "$tuning_seconds" syq cp /tmp/syq-real-ssh-tuning.bin --to source \
+            --as "/tmp/syq-real-ssh/$tuning_name-$transport" \
+            --performance-tuning "workers=$tuning_workers" --no-progress \
+            --resource-limits bandwidth=8M --performance-tuning "$tuning_overrides" "$@"
+        timeout --kill-after=5s "$tuning_seconds" syq cp --from source "/tmp/syq-real-ssh/$tuning_name-$transport" \
+            --as "/tmp/syq-real-ssh-$tuning_name-$transport-download" \
+            --performance-tuning "workers=$tuning_workers" --no-progress \
+            --resource-limits bandwidth=8M --performance-tuning "$tuning_overrides" "$@"
+        cmp /tmp/syq-real-ssh-tuning.bin "/tmp/syq-real-ssh-$tuning_name-$transport-download"
+    done
+    for coordinator in src dst local; do
+        case "$coordinator" in
+            src) set -- ;;
+            dst) set -- --peer-auth broker --no-tcp ;;
+            local) set -- --no-tcp ;;
+        esac
+        timeout --kill-after=5s "$tuning_seconds" syq cp --from source "/tmp/syq-real-ssh/$tuning_name-tcp" \
+            --to destination --as "/tmp/syq-real-ssh/$tuning_name-$coordinator" --coordinate-at "$coordinator" \
+            --performance-tuning "workers=$tuning_workers" --no-progress --resource-limits bandwidth=8M \
+            --performance-tuning "$tuning_overrides" "$@"
+        # shellcheck disable=SC2029
+        ssh destination cat "/tmp/syq-real-ssh/$tuning_name-$coordinator" > "/tmp/syq-real-ssh-$tuning_name-check"
+        cmp /tmp/syq-real-ssh-tuning.bin "/tmp/syq-real-ssh-$tuning_name-check"
+    done
+}
+
 assert_preview_counts() {
     python3 - "$1" "$2" "$3" <<'PYTHON'
-import json, sys
-from pathlib import Path
-records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+import sys
+from syq_real_ssh_lab import successful_results
+records = successful_results(sys.argv[1])
 result = records[-1]
-assert result['type'] == 'result' and result['status'] == 'success', records
 assert result['dry_run'] and result['errors'] == 0, result
 assert result['files_transferred'] == int(sys.argv[2]), result
 assert result['files_unchanged'] == int(sys.argv[3]), result
@@ -468,14 +574,19 @@ while True:
         break
 PYOLD
 upgrade_old_pid=$!
-upgrade_deadline=$(($(date +%s) + 30))
-while [ ! -e /tmp/syq-upgrade-old-ready ]; do
-    if ! kill -0 "$upgrade_old_pid" 2>/dev/null || [ "$(date +%s)" -ge "$upgrade_deadline" ]; then
-        cat /tmp/syq-upgrade-old.log >&2
-        exit 1
+# Done once the old build's receiving is ready, or has exited.
+upgrade_old_settled() {
+    test -e /tmp/syq-upgrade-old-ready && return
+    if kill -0 "$upgrade_old_pid" 2>/dev/null; then
+        echo 'not ready'
+        return 1
     fi
-    sleep 0.1
-done
+}
+if ! wait_until 30 "the old build's receiving" upgrade_old_settled ||
+    [ ! -e /tmp/syq-upgrade-old-ready ]; then
+    cat /tmp/syq-upgrade-old.log >&2
+    exit 1
+fi
 # The restart the old build's message gives.
 syq persist connect source --pscope "$upgrade_scope"
 wait "$upgrade_old_pid"
@@ -811,13 +922,7 @@ syq persist receive on --auto-approve-root "$receive_root"
 syq persist receive wait source --timeout 30
 ssh source 'test -z "${SSH_AUTH_SOCK:-}"; SYQ_TEST_REQUIRE_TCP=1 syq cp --performance-tuning workers=2 --copy-metadata permissions --srcs-in /tmp/syq-real-ssh/return-source --to @laptop --into first'
 remote_manifest source /tmp/syq-real-ssh/return-source /tmp/syq-return-source.manifest
-(
-    cd "$receive_root/first"
-    {
-        find . -mindepth 1 -printf '%y %m %p -> %l\n'
-        find . -type f -exec sha256sum {} +
-    } | LC_ALL=C sort
-) > /tmp/syq-return-local.manifest
+local_manifest "$receive_root/first" > /tmp/syq-return-local.manifest
 diff -u /tmp/syq-return-source.manifest /tmp/syq-return-local.manifest
 ssh_copy_summary=$(ssh source 'syq cp --no-tcp /tmp/syq-real-ssh/return-source/subdir/chunks.bin --to @laptop --as ssh-copy')
 cmp "$receive_root/first/subdir/chunks.bin" "$receive_root/ssh-copy"
@@ -877,13 +982,7 @@ rows = sqlite3.connect("/tmp/syq-network-tree.sqlite").execute(
 assert rows and all(json.loads(row[0])["data"]["network_destination"] for row in rows), rows
 NETWORK_SEEN
 remote_manifest source /tmp/syq-real-ssh/network-tree /tmp/syq-network-tree-source.manifest
-(
-    cd "$receive_root/network-tree"
-    {
-        find . -mindepth 1 -printf '%y %m %p -> %l\n'
-        find . -type f -exec sha256sum {} +
-    } | LC_ALL=C sort
-) > /tmp/syq-network-tree-local.manifest
+local_manifest "$receive_root/network-tree" > /tmp/syq-network-tree-local.manifest
 diff -u /tmp/syq-network-tree-source.manifest /tmp/syq-network-tree-local.manifest
 # A copy that keeps existing files, into a directory that holds one, on a
 # filesystem without a no-replace rename: the receiver records the
@@ -895,30 +994,23 @@ printf 'kept\n' >"$receive_root/network-keep/d0/existing"
 rm -f /tmp/syq-network-held /tmp/syq-network-continue
 ssh source 'syq cp --if-exists=keep --copy-metadata permissions --srcs-in /tmp/syq-real-ssh/network-tree --to @laptop --into network-keep' &
 keep_copy=$!
-waited=0
-until [ -e /tmp/syq-network-held ] && [ -e "$receive_root/network-keep/d0/s0/f0" ]; do
-    if [ "$waited" -ge 300 ]; then
-        printf 'held: %s; published below a created directory: %s\n' \
-            "$(test -e /tmp/syq-network-held && echo yes || echo no)" \
-            "$(test -e "$receive_root/network-keep/d0/s0/f0" && echo yes || echo no)" >&2
-        touch /tmp/syq-network-continue
-        exit 1
-    fi
-    sleep 0.1
-    waited=$((waited + 1))
-done
+network_keep_held() {
+    test -e /tmp/syq-network-held && test -e "$receive_root/network-keep/d0/s0/f0" && return
+    printf 'held: %s; published below a created directory: %s\n' \
+        "$(test -e /tmp/syq-network-held && echo yes || echo no)" \
+        "$(test -e "$receive_root/network-keep/d0/s0/f0" && echo yes || echo no)"
+    return 1
+}
+if ! wait_until 30 'the receiver to hold with a file published' network_keep_held; then
+    touch /tmp/syq-network-continue
+    exit 1
+fi
 test ! -e "$receive_root/network-keep/d7/s3"
 touch /tmp/syq-network-continue
 wait "$keep_copy"
 test "$(cat "$receive_root/network-keep/d0/existing")" = kept
 rm "$receive_root/network-keep/d0/existing"
-(
-    cd "$receive_root/network-keep"
-    {
-        find . -mindepth 1 -printf '%y %m %p -> %l\n'
-        find . -type f -exec sha256sum {} +
-    } | LC_ALL=C sort
-) > /tmp/syq-network-keep-local.manifest
+local_manifest "$receive_root/network-keep" > /tmp/syq-network-keep-local.manifest
 # The directory that held the existing file keeps its own mode.
 grep -v '^d [0-7]* ./d0 -> $' /tmp/syq-network-tree-source.manifest >/tmp/syq-network-keep-source.manifest
 grep -v '^d [0-7]* ./d0 -> $' /tmp/syq-network-keep-local.manifest | diff -u /tmp/syq-network-keep-source.manifest -
@@ -960,13 +1052,7 @@ done
 NETWORK_DEEP
 ssh source 'syq cp --if-exists=keep --copy-metadata permissions --srcs-in /tmp/syq-real-ssh/network-deep --to @laptop --into network-deep-keep'
 remote_manifest source /tmp/syq-real-ssh/network-deep /tmp/syq-network-deep-source.manifest
-(
-    cd "$receive_root/network-deep-keep"
-    {
-        find . -mindepth 1 -printf '%y %m %p -> %l\n'
-        find . -type f -exec sha256sum {} +
-    } | LC_ALL=C sort
-) | diff -u /tmp/syq-network-deep-source.manifest -
+local_manifest "$receive_root/network-deep-keep" | diff -u /tmp/syq-network-deep-source.manifest -
 syq persist off
 syq persist connect source
 syq persist receive wait source --timeout 30
@@ -982,13 +1068,7 @@ for d in 0 1 2 3 4 5 6 7; do
     done
 done
 ssh source 'syq cp --if-exists=keep --copy-metadata permissions --srcs-in /tmp/syq-real-ssh/network-deep --to @laptop --into local-deep-keep'
-(
-    cd "$receive_root/local-deep-keep"
-    {
-        find . -mindepth 1 -printf '%y %m %p -> %l\n'
-        find . -type f -exec sha256sum {} +
-    } | LC_ALL=C sort
-) | diff -u /tmp/syq-network-deep-source.manifest -
+local_manifest "$receive_root/local-deep-keep" | diff -u /tmp/syq-network-deep-source.manifest -
 
 printf 'case: named return rejects traversal and receiver symlink escape\n'
 ln -s /tmp/syq-real-ssh-receive-other "$receive_root/escape"
@@ -1027,26 +1107,17 @@ source_prefix=$(ssh source 'dd if=/tmp/syq-real-ssh/return-source/resume.bin bs=
 # after 8 seconds at this rate; several would each fill a part of it.
 timeout 45 ssh source 'SYQ_TEST_REQUIRE_TCP=1 syq cp --resource-limits bandwidth=512,workers=1 /tmp/syq-real-ssh/return-source/resume.bin --to @laptop --as interrupted' &
 return_copy_pid=$!
-deadline=$(($(date +%s) + 25))
-next_progress=$(($(date +%s) + 5))
-while :; do
+named_partial_ready() {
     partial_count=$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-tmp.*' | wc -l)
     if [ "$partial_count" -eq 1 ]; then
         partial=$(find "$receive_root" -maxdepth 1 -type f -name '.interrupted.syq-tmp.*')
         partial_prefix=$(dd if="$partial" bs=1M count=4 status=none | sha256sum)
-        if [ "$partial_prefix" = "$source_prefix" ]; then break; fi
+        if [ "$partial_prefix" = "$source_prefix" ]; then return; fi
     fi
-    now=$(date +%s)
-    if [ "$now" -ge "$deadline" ]; then
-        echo "named partial readiness timed out: partial_count=$partial_count" >&2
-        exit 1
-    fi
-    if [ "$now" -ge "$next_progress" ]; then
-        echo "waiting for named copy partial: partial_count=$partial_count" >&2
-        next_progress=$((now + 5))
-    fi
-    sleep 0.1
-done
+    echo "partial_count=$partial_count"
+    return 1
+}
+wait_until 25 'the named copy partial' named_partial_ready
 # One complete 4 MiB prefix is now present and eligible for resume checks.
 # Only kill the receiver's owned SSH child; the tracing wrapper is its parent.
 receive_wrapper=$(syq persist receive status --json | python3 -c 'import json,sys; print(next(s["connection"]["ssh_pid"] for s in json.load(sys.stdin)["connections"] if s["endpoint"] == "source"))')
@@ -1211,36 +1282,27 @@ open_spares() {
 complete_remote
 # Completion can return just before its tracing SSH wrapper logs process exit.
 # Wait for that structured event before asserting the completed login count.
-deadline=$(($(date +%s) + 5))
-while :; do
+# Done once a login has ended; the count must then be exactly one.
+completion_login_ended() {
     logins=$(direct_logins)
-    if [ "$logins" -eq 1 ]; then break; fi
-    if [ "$logins" -gt 1 ] || [ "$(date +%s)" -ge "$deadline" ]; then
-        echo "first completion login count: expected 1, observed $logins" >&2
-        cat "$trace" >&2
-        exit 1
-    fi
-    sleep 0.1
-done
-deadline=$(($(date +%s) + 15))
-next_progress=$(($(date +%s) + 5))
-while :; do
+    echo "direct_logins=$logins"
+    [ "$logins" -ge 1 ]
+}
+if ! wait_until 5 'the first completion login to end' completion_login_ended ||
+    [ "$(direct_logins)" -ne 1 ]; then
+    echo "first completion login count: expected 1, observed $(direct_logins)" >&2
+    cat "$trace" >&2
+    exit 1
+fi
+session_pool_ready() {
     spares=$(open_spares)
-    if [ "$spares" -ge 1 ]; then
-        break
-    fi
-    now=$(date +%s)
-    if [ "$now" -ge "$deadline" ]; then
-        echo "session pool readiness timed out: open_spares=$spares" >&2
-        cat "$trace" >&2
-        exit 1
-    fi
-    if [ "$now" -ge "$next_progress" ]; then
-        echo "waiting for session pool: open_spares=$spares" >&2
-        next_progress=$((now + 5))
-    fi
-    sleep 0.1
-done
+    echo "open_spares=$spares"
+    [ "$spares" -ge 1 ]
+}
+if ! wait_until 15 'the session pool' session_pool_ready; then
+    cat "$trace" >&2
+    exit 1
+fi
 syq persist status --json | python3 -c 'import json,sys; s=json.load(sys.stdin); assert any(c["session_pool"] for c in s["connections"]),s'
 # Later completions take the ready session: no login of their own, and
 # their changed environment does not replace the pool's inherited values.
@@ -1290,7 +1352,6 @@ awk -F '\t' '
     END { exit !(file && directory) }
 ' /tmp/syq-completion-details-lines
 
-
 printf 'case: small native push to an ordinary SSH destination takes one turn\n'
 small_source=/tmp/syq-real-ssh-small.bin
 small_debug=/tmp/syq-real-ssh-small.debug
@@ -1300,23 +1361,8 @@ ssh source 'rm -rf /tmp/syq-real-ssh/small-destination && install -d /tmp/syq-re
 SYQ_DEBUG=1 syq cp --no-progress --results "$small_results" \
     "$small_source" --to source --into /tmp/syq-real-ssh/small-destination \
     2>"$small_debug"
-small_status=$(tail -n 1 "$small_results")
-case "$small_status" in
-    *'"status":"success"'*'"type":"result"'*) ;;
-    *)
-        echo 'small push did not settle successfully:' >&2
-        cat "$small_results" "$small_debug" >&2
-        exit 1
-        ;;
-esac
-if ! grep -q 'small copy: published' "$small_debug"; then
-    echo 'small push did not use the one-turn path:' >&2
-    cat "$small_debug" >&2
-    exit 1
-fi
-small_expected=$(sha256sum "$small_source" | cut -d ' ' -f 1)
-small_actual=$(ssh source 'sha256sum /tmp/syq-real-ssh/small-destination/syq-real-ssh-small.bin' | cut -d ' ' -f 1)
-test "$small_expected" = "$small_actual"
+assert_small_copy "$small_results" "$small_debug" files_transferred \
+    - "$small_source" source /tmp/syq-real-ssh/small-destination/syq-real-ssh-small.bin
 
 printf 'case: persistent debug output closes with the copying process\n'
 small_scope=$(syq persist on --ephemeral)
@@ -1354,24 +1400,17 @@ for small_case in unchanged updated; do
         cat "$small_debug" >&2
         exit 1
     fi
-    small_status=$(tail -n 1 "$small_results")
-    case "$small_status" in
-        *'"status":"success"'*'"type":"result"'*) ;;
-        *) cat "$small_results" "$small_debug" >&2; exit 1 ;;
-    esac
-    case "$small_case:$small_status" in
-        unchanged:*'"files_unchanged":1'*|updated:*'"files_transferred":1'*) ;;
-        *) cat "$small_results" >&2; exit 1 ;;
-    esac
-    if ! grep -q 'small copy: published' "$small_debug" ||
-        grep -q 'TCP route probes started' "$small_debug" ||
+    small_count=files_transferred
+    if [ "$small_case" = unchanged ]; then
+        small_count=files_unchanged
+    fi
+    assert_small_copy "$small_results" "$small_debug" "$small_count" \
+        - "$small_source" source /tmp/syq-real-ssh/small-destination/syq-real-ssh-small.bin
+    if grep -q 'TCP route probes started' "$small_debug" ||
         ! grep -q 'OpenSSH_' "$small_debug"; then
         cat "$small_debug" >&2
         exit 1
     fi
-    small_expected=$(sha256sum "$small_source" | cut -d ' ' -f 1)
-    small_actual=$(ssh source 'sha256sum /tmp/syq-real-ssh/small-destination/syq-real-ssh-small.bin' | cut -d ' ' -f 1)
-    test "$small_expected" = "$small_actual"
 done
 
 printf 'case: restricted copies refuse an SSH control-plane destination\n'
@@ -1434,27 +1473,17 @@ for small_case in new unchanged updated; do
         cat "$small_debug" >&2
         exit 1
     fi
-    small_status=$(tail -n 1 "$small_results")
-    case "$small_status" in
-        *'"status":"success"'*) ;;
-        *) cat "$small_results" "$small_debug" >&2; exit 1 ;;
-    esac
-    case "$small_case:$small_status" in
-        new:*'"files_transferred":1'*|unchanged:*'"files_unchanged":1'*) ;;
-        updated:*'"files_transferred":1'*) ;;
-        *) cat "$small_results" >&2; exit 1 ;;
-    esac
-    if ! grep -q 'small copy: published' "$small_debug" ||
-        ! grep -q 'syq-receiver\|restricted' "$small_debug"; then
+    small_count=files_transferred
+    if [ "$small_case" = unchanged ]; then
+        small_count=files_unchanged
+    fi
+    assert_small_copy "$small_results" "$small_debug" "$small_count" \
+        source "$restricted_small_source" destination "$restricted_small/restricted-small.bin"
+    if ! grep -q 'syq-receiver\|restricted' "$small_debug"; then
         echo 'small copy to a restricted destination did not use the one-turn path:' >&2
         cat "$small_debug" >&2
         exit 1
     fi
-    # shellcheck disable=SC2029
-    small_expected=$(ssh source "sha256sum $restricted_small_source" | cut -d ' ' -f 1)
-    # shellcheck disable=SC2029
-    small_actual=$(ssh destination "sha256sum $restricted_small/restricted-small.bin" | cut -d ' ' -f 1)
-    test "$small_expected" = "$small_actual"
 done
 
 printf 'case: a capped small copy to a restricted destination takes one turn within the cap\n'
@@ -1470,22 +1499,16 @@ if ! SYQ_DEBUG=1 syq cp --no-progress --no-compress --resource-limits bandwidth=
     cat "$small_debug" >&2
     exit 1
 fi
-if ! grep -q 'small copy: published' "$small_debug" ||
-    ! tail -n 1 "$small_results" | python3 -c '
+assert_small_copy "$small_results" "$small_debug" files_transferred \
+    source "$restricted_capped" destination "$restricted_small/restricted-small-capped.bin"
+if ! tail -n 1 "$small_results" | python3 -c '
 import json, sys
-record = json.load(sys.stdin)
-sys.exit(not (record["status"] == "success" and record["files_transferred"] == 1
-              and record["timings"]["transfer_ms"] >= 700))
+sys.exit(json.load(sys.stdin)["timings"]["transfer_ms"] < 700)
 '; then
-    echo 'capped small copy to a restricted destination skipped the one-turn path or the cap:' >&2
+    echo 'capped small copy to a restricted destination skipped the cap:' >&2
     cat "$small_results" "$small_debug" >&2
     exit 1
 fi
-# shellcheck disable=SC2029
-small_expected=$(ssh source "sha256sum $restricted_capped" | cut -d ' ' -f 1)
-# shellcheck disable=SC2029
-small_actual=$(ssh destination "sha256sum $restricted_small/restricted-small-capped.bin" | cut -d ' ' -f 1)
-test "$small_expected" = "$small_actual"
 
 printf 'case: a copy between two servers started here takes 1,024 named sources\n'
 # Short paths fit the source's command line; 1,024 of about 175 bytes need
@@ -1511,9 +1534,9 @@ for many_case in short long; do
         exit 1
     fi
     python3 - "$many_results" <<'PYTHON'
-import json, sys
-result = [json.loads(line) for line in open(sys.argv[1])][-1]
-assert result["type"] == "result" and result["status"] == "success", result
+import sys
+from syq_real_ssh_lab import successful_results
+result = successful_results(sys.argv[1])[-1]
 assert result["files_transferred"] == 1024 and result["errors"] == 0, result
 PYTHON
     # shellcheck disable=SC2029
@@ -1687,12 +1710,12 @@ assert_same_tree source /tmp/syq-real-ssh/pscope-source \
 printf 'case: login keys sign restricted copies\n'
 python3 /usr/local/libexec/syq-test-receiver-keys.py
 
-printf 'case: a copy started here updates a receiver of another build and runs once more\n'
+printf 'case: a copy refused by a receiver of another build updates it on the next copy\n'
 # The laptop's record says the destination's receiver runs this build, as
 # after restoring the laptop's state from a backup, but the lab's second
 # build has updated the receiver since. The receiver refuses the copy for
-# its build; syq updates it to this build and runs the copy once more,
-# leaving nothing of the refused attempt in the results.
+# its build; syq says so and marks its record out of date, so the next
+# copy updates the receiver to this build first.
 make_tree source /tmp/syq-real-ssh/rebuild-source rebuild
 syq cp --no-progress --from source --srcs-in /tmp/syq-real-ssh/rebuild-source \
     --to destination --into /tmp/syq-real-ssh/rebuild-first
@@ -1716,29 +1739,28 @@ stale_receiver() {
 }
 stale_receiver
 ssh destination 'rm -rf /tmp/syq-real-ssh/rebuild-destination'
-# A dry run says so and updates nothing.
-if rebuild_output=$(syq cp --no-progress --dry-run \
-    --from source --srcs-in /tmp/syq-real-ssh/rebuild-source \
-    --to destination --into /tmp/syq-real-ssh/rebuild-destination 2>&1); then
+rebuild_copy() {
+    syq cp --no-progress "$@" \
+        --from source --srcs-in /tmp/syq-real-ssh/rebuild-source \
+        --to destination --into /tmp/syq-real-ssh/rebuild-destination 2>&1
+}
+# The refused copy says to run it again, and changes nothing there.
+if rebuild_output=$(rebuild_copy); then
     printf '%s\n' "$rebuild_output" >&2
-    echo 'a dry run against a receiver of another build unexpectedly succeeded' >&2
+    echo 'a copy against a receiver of another build unexpectedly succeeded' >&2
     exit 1
 fi
 case "$rebuild_output" in
-    *'a dry run does not update it, but the next copy does'*) ;;
+    *'the restricted receiver on '*'runs another syq build; run the copy again, which updates it first'*) ;;
     *) printf '%s\n' "$rebuild_output" >&2; exit 1 ;;
 esac
+ssh destination 'test ! -e /tmp/syq-real-ssh/rebuild-destination'
+# The next copy updates the receiver and runs.
 rm -f /tmp/syq-real-ssh-rebuild.ndjson
-rebuild_output=$(syq cp --no-progress --results /tmp/syq-real-ssh-rebuild.ndjson \
-    --from source --srcs-in /tmp/syq-real-ssh/rebuild-source \
-    --to destination --into /tmp/syq-real-ssh/rebuild-destination 2>&1) || {
+rebuild_output=$(rebuild_copy --results /tmp/syq-real-ssh-rebuild.ndjson) || {
     printf '%s\n' "$rebuild_output" >&2
     exit 1
 }
-case "$rebuild_output" in
-    *'runs another syq build than this one; updating it to this build and trying once more'*) ;;
-    *) printf '%s\n' "$rebuild_output" >&2; exit 1 ;;
-esac
 assert_same_tree source /tmp/syq-real-ssh/rebuild-source \
     destination /tmp/syq-real-ssh/rebuild-destination rebuild
 test "$(syq receiver list | awk -F '\t' '$3 == "syq@destination" { print $4 }')" = \
@@ -1750,17 +1772,48 @@ kinds = [record["type"] for record in records]
 assert kinds.count("run") == 1 and "error" not in kinds, records
 assert records[-1]["type"] == "result" and records[-1]["status"] == "success", records[-1]
 PYTHON
-# A detached copy is run once more the same way, before it detaches.
+# A dry run says so and updates nothing, and the next copy updates it.
+stale_receiver
+ssh destination 'rm -rf /tmp/syq-real-ssh/rebuild-destination'
+if rebuild_output=$(rebuild_copy --dry-run); then
+    printf '%s\n' "$rebuild_output" >&2
+    echo 'a dry run against a receiver of another build unexpectedly succeeded' >&2
+    exit 1
+fi
+case "$rebuild_output" in
+    *'a dry run does not update it, but the next copy does'*) ;;
+    *) printf '%s\n' "$rebuild_output" >&2; exit 1 ;;
+esac
+rebuild_output=$(rebuild_copy) || {
+    printf '%s\n' "$rebuild_output" >&2
+    exit 1
+}
+assert_same_tree source /tmp/syq-real-ssh/rebuild-source \
+    destination /tmp/syq-real-ssh/rebuild-destination rebuild-after-dry-run
+# A detached copy is refused the same way, before it detaches.
 stale_receiver
 ssh destination 'rm -rf /tmp/syq-real-ssh/rebuild-detached'
-rebuild_output=$(syq cp --no-progress --detach \
-    --from source --srcs-in /tmp/syq-real-ssh/rebuild-source \
-    --to destination --into /tmp/syq-real-ssh/rebuild-detached 2>&1) || {
+rebuild_detached() {
+    syq cp --no-progress --detach \
+        --from source --srcs-in /tmp/syq-real-ssh/rebuild-source \
+        --to destination --into /tmp/syq-real-ssh/rebuild-detached 2>&1
+}
+if rebuild_output=$(rebuild_detached); then
+    printf '%s\n' "$rebuild_output" >&2
+    echo 'a detached copy against a receiver of another build unexpectedly started' >&2
+    exit 1
+fi
+case "$rebuild_output" in
+    *'syq: started on '*) printf '%s\n' "$rebuild_output" >&2; exit 1 ;;
+    *'runs another syq build; run the copy again, which updates it first'*) ;;
+    *) printf '%s\n' "$rebuild_output" >&2; exit 1 ;;
+esac
+rebuild_output=$(rebuild_detached) || {
     printf '%s\n' "$rebuild_output" >&2
     exit 1
 }
 case "$rebuild_output" in
-    *'updating it to this build and trying once more'*'syq: started on '*) ;;
+    *'syq: started on '*) ;;
     *) printf '%s\n' "$rebuild_output" >&2; exit 1 ;;
 esac
 rebuild_deadline=$(($(date +%s) + 60))
@@ -1825,39 +1878,23 @@ killed_partials() {
     # shellcheck disable=SC2029
     ssh destination "find $killed_root -maxdepth 1 -type f -name '.*.syq-tmp.*' -printf '%f %s\\n' 2>/dev/null | sort"
 }
-wait_for_killed_partials() {
-    wanted=$1
-    deadline=$(($(date +%s) + 30))
-    next_progress=$(($(date +%s) + 5))
-    while :; do
-        listing=$(killed_partials)
-        if [ "$(printf '%s' "$listing" | grep -c .)" -eq "$wanted" ]; then
-            break
-        fi
-        now=$(date +%s)
-        if [ "$now" -ge "$deadline" ]; then
-            printf 'timed out waiting for %s partials; found:\n%s\n' "$wanted" "$listing" >&2
-            exit 1
-        fi
-        if [ "$now" -ge "$next_progress" ]; then
-            printf 'waiting for %s partials; found:\n%s\n' "$wanted" "$listing" >&2
-            next_progress=$((now + 5))
-        fi
-        sleep 0.2
-    done
+killed_partials_are() {
+    listing=$(killed_partials)
+    printf '%s\n' "$listing"
+    [ "$(printf '%s' "$listing" | grep -c .)" -eq "$1" ]
 }
 syq cp --no-progress --resource-limits bandwidth=32 \
     --performance-tuning workers=2,copy-path=ranges \
     --from source --srcs-in /tmp/syq-real-ssh/killed-source \
     --to destination --into "$killed_root" &
 killed_copy_pid=$!
-wait_for_killed_partials 2
+wait_until 30 '2 partials' killed_partials_are 2
 ssh source 'pkill -KILL -n -x syq'
 if wait "$killed_copy_pid"; then
     echo 'a copy whose coordinator was killed reported success' >&2
     exit 1
 fi
-wait_for_killed_partials 1
+wait_until 30 '1 partial' killed_partials_are 1
 # shellcheck disable=SC2029
 test "$(ssh destination "find $killed_root -maxdepth 1 -type f -name '.long.syq-tmp.*' -size 6291456c" | grep -c .)" -eq 1
 # shellcheck disable=SC2029
@@ -2013,19 +2050,13 @@ PY_LINKED_DESTINATION
         exit 1
     fi
     python3 - "$linked_results" "$linked_debug" "$linked_run" <<'PY_LINKED_RESULTS'
-import json, sys
-from pathlib import Path
-records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
-assert records[-1]['type'] == 'result' and records[-1]['status'] == 'success', records
+import sys
+from syq_real_ssh_lab import successful_results, tuning_observed
+records = successful_results(sys.argv[1])
 assert records[-1]['errors'] == 0, records[-1]
 if sys.argv[3] != 'whole':
     assert records[-1]['bytes_transferred'] == 4 * 65536, records[-1]
-    marker = 'syq: tuning observed: '
-    observed = [
-        json.loads(line.split(marker, 1)[1])
-        for line in Path(sys.argv[2]).read_text().splitlines()
-        if marker in line
-    ]
+    observed = tuning_observed(sys.argv[2])
     assert any(
         (counts.get('compared_files'), counts.get('kept_files'), counts.get('patched_files')) == (8, 0, 8)
         for counts in observed
@@ -2357,36 +2388,8 @@ assert_same_tree \
     relay
 
 printf 'case: tuning overrides for range uploads, downloads, direct copies, and relay\n'
-tuning=copy-path=ranges,request-size=2M,pipeline-depth=64,split-min-size=8M,bw-pacing=average
 dd if=/dev/urandom of=/tmp/syq-real-ssh-tuning.bin bs=1M count=9 status=none
-for transport in tcp ssh; do
-    if [ "$transport" = ssh ]; then
-        set -- --no-tcp
-    else
-        set --
-    fi
-    syq cp /tmp/syq-real-ssh-tuning.bin --to source \
-        --as "/tmp/syq-real-ssh/tuning-$transport" --performance-tuning workers=1 --no-progress \
-        --resource-limits bandwidth=8M --performance-tuning "$tuning" "$@"
-    syq cp --from source "/tmp/syq-real-ssh/tuning-$transport" \
-        --as "/tmp/syq-real-ssh-tuning-$transport-download" --performance-tuning workers=1 --no-progress \
-        --resource-limits bandwidth=8M --performance-tuning "$tuning" "$@"
-    cmp /tmp/syq-real-ssh-tuning.bin "/tmp/syq-real-ssh-tuning-$transport-download"
-done
-for coordinator in src dst local; do
-    case "$coordinator" in
-        src) set -- ;;
-        dst) set -- --peer-auth broker --no-tcp ;;
-        local) set -- --no-tcp ;;
-    esac
-    syq cp --from source /tmp/syq-real-ssh/tuning-tcp --to destination \
-        --as "/tmp/syq-real-ssh/tuning-$coordinator" --coordinate-at "$coordinator" \
-        --performance-tuning workers=1 --no-progress --resource-limits bandwidth=8M --performance-tuning "$tuning" "$@"
-    ssh destination sh -s -- "$coordinator" > /tmp/syq-real-ssh-tuning-check <<'EOF'
-cat "/tmp/syq-real-ssh/tuning-$1"
-EOF
-    cmp /tmp/syq-real-ssh-tuning.bin /tmp/syq-real-ssh-tuning-check
-done
+exercise_tuning tuning 1 copy-path=ranges,request-size=2M,pipeline-depth=64,split-min-size=8M,bw-pacing=average 120s
 
 printf 'case: restricted authorization accepts 128 workers\n'
 syq cp --from source /tmp/syq-real-ssh/tuning-tcp --to destination \
@@ -2411,31 +2414,7 @@ for transport in tcp ssh; do
 done
 
 printf 'case: experimental streaming over TCP/SSH and each coordinator\n'
-streaming=copy-path=streaming,request-size=128K,split-min-size=1M,bw-pacing=average
-for transport in tcp ssh; do
-    if [ "$transport" = ssh ]; then set -- --no-tcp; else set --; fi
-    timeout --kill-after=5s 25s syq cp /tmp/syq-real-ssh-tuning.bin --to source \
-        --as "/tmp/syq-real-ssh/streaming-$transport" --performance-tuning workers=2 --no-progress \
-        --resource-limits bandwidth=8M --performance-tuning "$streaming" "$@"
-    timeout --kill-after=5s 25s syq cp --from source "/tmp/syq-real-ssh/streaming-$transport" \
-        --as "/tmp/syq-real-ssh-streaming-$transport-download" --performance-tuning workers=2 --no-progress \
-        --resource-limits bandwidth=8M --performance-tuning "$streaming" "$@"
-    cmp /tmp/syq-real-ssh-tuning.bin "/tmp/syq-real-ssh-streaming-$transport-download"
-done
-for coordinator in src dst local; do
-    case "$coordinator" in
-        src) set -- ;;
-        dst) set -- --peer-auth broker --no-tcp ;;
-        local) set -- --no-tcp ;;
-    esac
-    timeout --kill-after=5s 25s syq cp --from source /tmp/syq-real-ssh/streaming-tcp --to destination \
-        --as "/tmp/syq-real-ssh/streaming-$coordinator" --coordinate-at "$coordinator" \
-        --performance-tuning workers=2 --no-progress --resource-limits bandwidth=8M --performance-tuning "$streaming" "$@"
-    ssh destination sh -s -- "$coordinator" > /tmp/syq-real-ssh-streaming-check <<'EOF'
-cat "/tmp/syq-real-ssh/streaming-$1"
-EOF
-    cmp /tmp/syq-real-ssh-tuning.bin /tmp/syq-real-ssh-streaming-check
-done
+exercise_tuning streaming 2 copy-path=streaming,request-size=128K,split-min-size=1M,bw-pacing=average 25s
 
 printf 'case: batch overrides through a command-restricted receiver\n'
 ssh source 'mkdir /tmp/syq-real-ssh/tuning-batches; for n in 1 2 3 4 5 6 7; do dd if=/dev/urandom of=/tmp/syq-real-ssh/tuning-batches/$n bs=1024 count=600 status=none; done'
@@ -2479,10 +2458,9 @@ if ! SYQ_DEBUG=1 syq cp --no-progress --results "$grouped_results" \
     exit 1
 fi
 python3 - "$grouped_results" "$grouped_debug" <<'PYTHON'
-import json, sys
-from pathlib import Path
-records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
-assert records[-1]['type'] == 'result' and records[-1]['status'] == 'success', records
+import sys
+from syq_real_ssh_lab import successful_results, tuning_observed
+records = successful_results(sys.argv[1])
 assert records[-1]['bytes_transferred'] == 4 * 65536, records[-1]
 # The receiver lists the files it patched; kept files are unchanged.
 operations = {
@@ -2492,12 +2470,7 @@ operations = {
 }
 assert operations == {f'file-{n}': ('transfer_file', 'succeeded') for n in range(1, 5)}, operations
 assert records[-1]['files_unchanged'] == 4, records[-1]
-marker = 'syq: tuning observed: '
-observed = [
-    json.loads(line.split(marker, 1)[1])
-    for line in Path(sys.argv[2]).read_text().splitlines()
-    if marker in line
-]
+observed = tuning_observed(sys.argv[2])
 assert any(
     (counts.get('compared_files'), counts.get('kept_files'), counts.get('patched_files')) == (8, 4, 4)
     for counts in observed
@@ -2531,17 +2504,11 @@ if ! SYQ_DEBUG=1 syq cp --no-progress --results "$streamed_results" \
     exit 1
 fi
 python3 - "$streamed_results" "$streamed_debug" <<'PYTHON'
-import json, sys
-from pathlib import Path
-records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
-assert records[-1]['type'] == 'result' and records[-1]['status'] == 'success', records
+import sys
+from syq_real_ssh_lab import successful_results, tuning_observed
+records = successful_results(sys.argv[1])
 assert records[-1]['bytes_transferred'] == 20 << 20, records[-1]
-marker = 'syq: tuning observed: '
-observed = [
-    json.loads(line.split(marker, 1)[1])
-    for line in Path(sys.argv[2]).read_text().splitlines()
-    if marker in line
-]
+observed = tuning_observed(sys.argv[2])
 assert any(counts.get('streamed_patches') == 1 for counts in observed), observed
 PYTHON
 assert_same_tree source /tmp/syq-real-ssh/streamed-source \

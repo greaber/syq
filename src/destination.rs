@@ -14,7 +14,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -26,6 +26,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use crate::delegation::{CopyOperation, DestinationPlacement, GrantConstraints};
+use crate::lock_file::LockFile;
 use crate::private_broker::{BrokerDirectory, PrivateBroker, PrivateBrokerConfig, TrackedStream};
 
 pub(crate) mod account_copy;
@@ -612,18 +613,12 @@ fn registry() -> Result<PathBuf> {
 fn private_directory(name: &str) -> Result<PathBuf> {
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME is unset")?);
     let path = home.join(name);
-    match fs::DirBuilder::new().mode(0o700).create(&path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e.into()),
-    }
-    let metadata = fs::symlink_metadata(&path)?;
-    if !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o777 != 0o700
-    {
-        bail!("destination registry must be an owned directory with mode 0700");
-    }
+    crate::state_file::open_private_dir(
+        &path,
+        "destination registry",
+        true,
+        crate::state_file::DirRule::Exact0700,
+    )?;
     Ok(path)
 }
 /// Completion only lists local names; it never creates state or asks a laptop
@@ -633,13 +628,15 @@ pub(crate) fn registered_names() -> Vec<String> {
         return Vec::new();
     };
     let directory = PathBuf::from(home).join(".syq-destinations-v3");
-    let Ok(metadata) = fs::symlink_metadata(&directory) else {
-        return Vec::new();
-    };
-    if !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o777 != 0o700
-    {
+    if !matches!(
+        crate::state_file::open_private_dir(
+            &directory,
+            "destination registry",
+            false,
+            crate::state_file::DirRule::Exact0700,
+        ),
+        Ok(Some(_))
+    ) {
         return Vec::new();
     }
     let Ok(entries) = fs::read_dir(directory) else {
@@ -680,18 +677,16 @@ fn read_existing_registration_at(directory: &Path, name: &str) -> Result<Option<
             directory.display()
         ))
     };
-    let metadata = match fs::symlink_metadata(directory) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(unreadable(error.into())),
-    };
-    if !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o777 != 0o700
+    if crate::state_file::open_private_dir(
+        directory,
+        "destination registry",
+        false,
+        crate::state_file::DirRule::Exact0700,
+    )
+    .map_err(unreadable)?
+    .is_none()
     {
-        return Err(unreadable(anyhow::anyhow!(
-            "destination registry must be an owned directory with mode 0700"
-        )));
+        return Ok(None);
     }
     let path = directory.join(format!("{name}.json"));
     let encoded =
@@ -1038,6 +1033,8 @@ fn select_copy(
     if args.interface != crate::cli::Interface::NativeCp {
         return Ok(None);
     }
+    use crate::route::Route;
+    let route = crate::route::classify(args);
     // Files on a receiving machine: it approves the copy, whatever else
     // this machine could use.
     if let Some(selection) = send::select(args)? {
@@ -1059,72 +1056,38 @@ fn select_copy(
             return Ok(None);
         }
     }
-    let is_pull = args
-        .locations
-        .split_last()
-        .is_some_and(|(destination, sources)| {
-            !destination.is_remote() && sources.iter().any(|source| source.is_remote())
-        });
-    if is_pull {
+    // A copy from a receiving machine took its route above.
+    if route == Route::Download {
         return pull::select(args, progress);
     }
     match &args.auth_from {
         crate::cli::AuthFrom::Provider(_) => return forward::select(args, progress),
         crate::cli::AuthFrom::Ssh => {
-            if args
-                .locations
-                .split_last()
-                .is_some_and(|(destination, sources)| {
-                    destination.is_remote()
-                        && destination
-                            .host
-                            .as_deref()
-                            .is_none_or(|host| !host.starts_with('@'))
-                        && !sources.is_empty()
-                        && sources.iter().all(|source| {
-                            source.is_remote()
-                                && source
-                                    .host
-                                    .as_deref()
-                                    .is_none_or(|host| !host.starts_with('@'))
-                        })
-                })
-            {
-                return Ok(None);
-            }
-            let (destination, sources) = args
-                .locations
-                .split_last()
-                .context("copy endpoints missing")?;
-            if args.interface != crate::cli::Interface::NativeCp
-                || sources.iter().any(|source| source.is_remote())
-                || !destination.is_remote()
-                || destination
-                    .host
-                    .as_deref()
-                    .is_some_and(|host| host.starts_with('@'))
-            {
-                bail!(
+            let sources = &args.locations[..args.locations.len().saturating_sub(1)];
+            return match route {
+                Route::Upload => Ok(None),
+                Route::Between if sources.iter().all(|source| source.is_remote()) => Ok(None),
+                _ => bail!(
                     "--auth-from ssh requires local sources and an ordinary SSH --to destination"
-                );
-            }
-            return Ok(None);
+                ),
+            };
         }
         crate::cli::AuthFrom::Auto => {}
     }
-    let Some(destination) = args.locations.last() else {
-        return Ok(None);
-    };
-    let Some(host) = destination.host.as_deref() else {
-        return Ok(None);
-    };
-    let Some(name) = host.strip_prefix('@') else {
-        if handoff::selected_name(handoff::Kind::Copy).is_some() {
-            bail!("receiver destinations require @NAME; retry the command with --to @NAME");
+    let destination = args.locations.last().and_then(|l| l.host.as_deref());
+    let name = match (route, destination) {
+        (Route::ToNamed, Some(host)) => host
+            .strip_prefix('@')
+            .expect("a named destination")
+            .to_owned(),
+        (_, None) => return Ok(None),
+        (_, Some(_)) => {
+            if handoff::selected_name(handoff::Kind::Copy).is_some() {
+                bail!("receiver destinations require @NAME; retry the command with --to @NAME");
+            }
+            return forward::select(args, progress);
         }
-        return forward::select(args, progress);
     };
-    let name = name.to_owned();
     let registration = load_registration(&name)?;
     if args.interface != crate::cli::Interface::NativeCp
         || args.locations[..args.locations.len() - 1]
@@ -1133,15 +1096,7 @@ fn select_copy(
     {
         bail!("named destinations require syq cp with local sources");
     }
-    if args.syq_path.is_some()
-        || args.rsh.is_some()
-        || args.detach
-        || args.restricted_grant.is_some()
-        || args.no_tcp_encryption
-        || args.peer_auth != crate::cli::PeerAuth::Restricted
-    {
-        bail!("named destinations own their connection; --syq-path, --rsh, --detach, --peer-auth, and --no-tcp-encryption cannot be combined with them");
-    }
+    crate::route::refuse_options(Route::ToNamed, args)?;
     if args.connections_opt.is_some()
         && args.connections > usize::from(crate::delegation::MAX_CONNECTIONS)
     {
@@ -1480,7 +1435,10 @@ impl Receiver {
         {
             bail!("named destination build mismatch; restart with matching syq builds");
         }
-        if envelope.secret != self.secret {
+        if !bool::from(subtle::ConstantTimeEq::ct_eq(
+            envelope.secret.as_bytes(),
+            self.secret.as_bytes(),
+        )) {
             bail!("named destination authentication failed");
         }
         match envelope.message {
@@ -1765,17 +1723,6 @@ pub(crate) fn requester_closed(socket: &UnixStream) -> bool {
         )
 }
 
-struct OwnedSsh(Child);
-impl Drop for OwnedSsh {
-    fn drop(&mut self) {
-        // The child is always started in a new process group. Kill the entire
-        // group, including ProxyCommand helpers, and reap its leader.
-        unsafe {
-            libc::kill(-(self.0.id() as i32), libc::SIGKILL);
-        }
-        let _ = self.0.wait();
-    }
-}
 const RETURN_SSH_OPTIONS: &[&str] = &[
     "-a",
     "-x",
@@ -2225,30 +2172,29 @@ pub(crate) fn serve_background(
                 .arg(format!("{} {}", spec.program, shell_words::join(&args)))
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .process_group(0);
-            let mut child = OwnedSsh(
-                command
-                    .spawn_guarded()
-                    .context("start receiving SSH connection")?,
-            );
+                .stderr(Stdio::piped());
+            // ssh runs in its own process group. Polling or dropping `child`
+            // kills that group, including any ProxyCommand helpers, before
+            // reaping ssh, so the group id cannot be reused in between.
+            let mut child = crate::process_group::ProcessGroup::spawn(&mut command)
+                .context("start receiving SSH connection")?;
             // A pipe takes this short line at once. If ssh has already
             // exited, the wait below reports why.
-            if let Some(input) = child.0.stdin.as_mut() {
+            if let Some(input) = child.child.stdin.as_mut() {
                 let _ = input.write_all(format!("{}\n", receiver.secret).as_bytes());
             }
             {
                 let mut state = state.lock().unwrap();
                 state.phase = "connecting".into();
                 state.error = None;
-                state.ssh_pid = Some(child.0.id());
+                state.ssh_pid = Some(child.child.id());
                 state.attempted = Some(Instant::now());
                 state.retry = None;
             }
             // One `Waiting` before `Ready` from a registration that takes
             // over, so the channel never fills.
             let (ready, readiness) = mpsc::sync_channel(2);
-            let mut stdout = child.0.stdout.take().unwrap();
+            let mut stdout = child.child.stdout.take().unwrap();
             let reader = std::thread::spawn(move || {
                 let first = read_message::<Reply>(&mut stdout);
                 let waiting = take_over && matches!(first, Ok(Reply::Waiting));
@@ -2256,7 +2202,7 @@ pub(crate) fn serve_background(
                     let _ = ready.send(read_message::<Reply>(&mut stdout));
                 }
             });
-            let mut stderr = child.0.stderr.take().unwrap();
+            let mut stderr = child.child.stderr.take().unwrap();
             let errors = Arc::new(Mutex::new(Vec::new()));
             let captured = errors.clone();
             let error_reader = std::thread::spawn(move || {
@@ -2276,7 +2222,7 @@ pub(crate) fn serve_background(
             let mut logged_in = false;
             // Whether the server was told to take the name.
             let mut told = false;
-            while !stop.load(Ordering::Acquire) && child.0.try_wait()?.is_none() {
+            while !stop.load(Ordering::Acquire) && child.poll()?.is_none() {
                 while let Ok(message) = readiness.try_recv() {
                     let ready = match message {
                         Ok(Reply::Ready) => true,
@@ -2296,7 +2242,7 @@ pub(crate) fn serve_background(
                 // when the replaced service's registration lets go of it.
                 if take_over && logged_in && !told && !preparing() {
                     told = true;
-                    if let Some(input) = child.0.stdin.as_mut() {
+                    if let Some(input) = child.child.stdin.as_mut() {
                         let _ = input.write_all(b"\n");
                     }
                 }
@@ -2310,7 +2256,7 @@ pub(crate) fn serve_background(
                 }
                 let _ = woken.recv_timeout(Duration::from_millis(50));
             }
-            let exit = child.0.try_wait()?;
+            let exit = child.poll()?;
             drop(child);
             drop(readiness);
             let _ = reader.join();
@@ -2508,14 +2454,7 @@ fn register_inner(
         bail!("receiving laptop handshake failed");
     }
     let directory = registry()?;
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(directory.join(format!("{name}.lock")))?;
+    let lock = LockFile::open(&directory.join(format!("{name}.lock")), true)?;
     // A registration that takes over proves the receiver while the service
     // it replaces still receives, and checks the name's owner again once it
     // holds the name.
@@ -2530,7 +2469,7 @@ fn register_inner(
         if !take_name(&lock, libc::STDIN_FILENO, TAKE_OVER_WAIT)? {
             return Ok(0);
         }
-    } else if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    } else if !lock.try_exclusive().unwrap_or(false) {
         // A responsive holder is a duplicate, even when a copied home directory
         // gives both machines the same identity. Never replace a held lock.
         if read_registration(name).is_ok_and(|previous| {
@@ -2561,9 +2500,13 @@ fn register_inner(
     };
     identity::claim(&directory, name, &public_key)?;
     let path = directory.join(format!("{name}.json"));
-    let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
-    temporary.write_all(&serde_json::to_vec(&registration)?)?;
-    temporary.persist(&path)?;
+    crate::state_file::write_atomic(
+        &path,
+        &serde_json::to_vec(&registration)?,
+        0o600,
+        crate::state_file::Publish::Replace,
+        crate::state_file::Durability::RenameOnly,
+    )?;
     let meta = fs::symlink_metadata(&path)?;
     guard.record = Some((path, (meta.dev(), meta.ino())));
     // Drop the advertisement before releasing its name lock, including on a
@@ -2602,7 +2545,7 @@ fn register_inner(
 /// name's `lock` as soon as the registration holding it ends, each within
 /// `wait`. False when the laptop gave up first, closing `input`; one that
 /// waited too long is tried again by the laptop (`RECONNECT_PENDING`).
-fn take_name(lock: &fs::File, input: RawFd, wait: Duration) -> Result<bool> {
+fn take_name(lock: &LockFile, input: RawFd, wait: Duration) -> Result<bool> {
     let timed_out = |what: &str| {
         Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
             .with_context(|| format!("the receiving service did not {what} in time"))
@@ -2641,18 +2584,10 @@ fn take_name(lock: &fs::File, input: RawFd, wait: Duration) -> Result<bool> {
     // A thread waits for the lock, so that the name is taken the moment
     // it is free. Should this give up first, the thread's lock ends with its
     // copy of the descriptor.
-    let waiter = lock.try_clone()?;
+    let waiter = lock.file().try_clone()?;
     let (taken, taking) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = loop {
-            if unsafe { libc::flock(waiter.as_raw_fd(), libc::LOCK_EX) } == 0 {
-                break Ok(());
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::Interrupted {
-                break Err(error);
-            }
-        };
+        let result = crate::lock_file::flock(&waiter, libc::LOCK_EX);
         // The lock belongs to the open file both descriptors share, so
         // `lock` keeps it. Closing this copy first means the name is free
         // again as soon as the caller drops `lock`.
@@ -2764,15 +2699,8 @@ fn destinations(action: DestinationAction) -> Result<i32> {
         DestinationAction::Forget { name } => {
             validate_name(&name)?;
             let directory = registry()?;
-            let lock = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(directory.join(format!("{name}.lock")))?;
-            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let lock = LockFile::open(&directory.join(format!("{name}.lock")), true)?;
+            if !lock.try_exclusive().unwrap_or(false) {
                 bail!("destination @{name} is still registered; stop its receiver first");
             }
             identity::forget(&directory, &name)?;

@@ -37,10 +37,6 @@ pub(crate) struct Issue<'a> {
     /// Whether this may set up or refresh the enrollment: never for a dry
     /// run.
     pub allow_enrollment: bool,
-    /// This copy as the receiver refused it for running another build:
-    /// refresh that enrollment, keeping the server's record of the
-    /// directives that ran, and sign the copy again as the same copy.
-    pub retry_of: Option<Retry>,
     /// Enroll without prompting, for the receiving service, which has no
     /// terminal. Where the SSH configuration would ask about a host key
     /// nobody knows, the login accepts it the first time, as `accept-new`
@@ -53,57 +49,27 @@ pub(crate) struct Issue<'a> {
     pub role: Role,
 }
 
-/// A copy the receiver refused for running another build, as it was signed:
-/// for one enrollment, under one request ID, within one start and finish
-/// time. Signed again after a refresh that keeps the server's record of the
-/// directives that ran, it can run at most once, whatever the coordinator
-/// did with the first, and no later than the first could.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Retry {
-    enrollment: EnrollmentId,
-    request_id: RequestId,
-    /// The issue, not-before, start-by and finish-by times.
-    times: [i64; 4],
+/// Mark this machine's record of enrollment `id` out of date, so the next
+/// copy that uses it logs in to refresh it first, as after a refresh whose
+/// reply was lost: for a copy its receiver refused for running another build
+/// while the record says it runs this one, as after restoring this machine's
+/// state from a backup. A record that is gone, or replaced by another
+/// enrollment, needs no mark: the next copy does not use it.
+pub(crate) fn mark_for_refresh(id: EnrollmentId) -> Result<()> {
+    mark_for_refresh_in(&local_state_base()?, id)
 }
 
-impl Retry {
-    pub(super) fn of(directive: &Directive) -> Self {
-        Self {
-            enrollment: directive.binding.enrollment,
-            request_id: directive.request_id,
-            times: [
-                directive.issued_at,
-                directive.not_before,
-                directive.start_by,
-                directive.finish_by,
-            ],
-        }
-    }
-
-    /// Refuse to sign the copy again once it may no longer start.
-    pub(super) fn require_unexpired(self) -> Result<()> {
-        if directive::now()? > self.times[2] {
-            bail!("this copy's approval to start has expired, so it is not run again; run the copy again");
-        }
-        Ok(())
-    }
-
-    /// Make `directive`, for the refreshed enrollment, the same copy again.
-    pub(super) fn apply(self, directive: &mut Directive) -> Result<()> {
-        anyhow::ensure!(
-            directive.binding.enrollment == self.enrollment,
-            "this copy was signed for enrollment {}",
-            self.enrollment
-        );
-        self.require_unexpired()?;
-        let [issued_at, not_before, start_by, finish_by] = self.times;
-        directive.request_id = self.request_id;
-        directive.issued_at = issued_at;
-        directive.not_before = not_before;
-        directive.start_by = start_by;
-        directive.finish_by = finish_by;
-        // Signing checks the directive's bounds again.
-        Ok(())
+/// [`mark_for_refresh`] for the enrollment records below `base`.
+pub(super) fn mark_for_refresh_in(base: &Path, id: EnrollmentId) -> Result<()> {
+    let base_lock = open_directory(base)?;
+    let _lock = lock_directory(&base_lock)?;
+    match load_enrollment_records_in(base)?
+        .active
+        .into_iter()
+        .find(|(metadata, _)| metadata.id == id)
+    {
+        Some((_, directory)) => atomic_write(&directory, REFRESH_FILE, b"", 0o600),
+        None => Ok(()),
     }
 }
 
@@ -123,7 +89,6 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
         jump,
         agent: destination_agent,
         allow_enrollment,
-        retry_of,
         batch,
         results_key,
         role,
@@ -200,24 +165,13 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
             "",
         )?;
     }
-    if let Some(retry) = retry_of {
-        retry.require_unexpired()?;
-    }
-    // A refused copy is signed again only for its own enrollment, kept as
-    // it is: never one set up anew or replaced, as after a revoke.
-    let refresh = retry_of.map_or(Refresh::Always, |retry| {
-        Refresh::SameRecord(retry.enrollment)
-    });
     let (metadata, directory, signer) = match found {
-        Some((metadata, directory))
-            if retry_of.is_none() && !needs_refresh(&metadata, &directory) =>
-        {
+        Some((metadata, directory)) if !needs_refresh(&metadata, &directory) => {
             (metadata, directory, None)
         }
         _ if !allow_enrollment => bail!(
             "a dry run does not set up restricted copying on {account} for this syq build; the next copy does, or run `syq receiver enroll {account}`"
         ),
-        _ if retry_of.is_some() => enroll_now(refresh)?,
         _ => enroll_now(Refresh::IfOutdated)?,
     };
     let signer = match signer {
@@ -240,7 +194,7 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
             // login's key. That rewrites only the trusted signer; the entry
             // key, and so copies in flight, stay.
             drop((metadata, directory));
-            let (metadata, directory, signer) = enroll_now(refresh)?;
+            let (metadata, directory, signer) = enroll_now(Refresh::Always)?;
             (
                 metadata,
                 directory,
@@ -249,11 +203,7 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
         }
     };
     let entry_key = load_entry_key(&directory)?;
-    let mut directive = directive_for(metadata.id, metadata.generation)?;
-    if let Some(retry) = retry_of {
-        retry.apply(&mut directive)?;
-    }
-    let retry = Retry::of(&directive);
+    let directive = directive_for(metadata.id, metadata.generation)?;
     let destination_path = if is_destination {
         checked_destination(
             &directive,
@@ -284,7 +234,6 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
         directive: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signed),
         enrollment_id: metadata.id,
         generation: metadata.generation,
-        retry,
     })
 }
 
@@ -293,7 +242,8 @@ pub(crate) fn prepare_transfer(issue: Issue<'_>) -> Result<PreparedTransfer> {
 pub(crate) enum EnrollmentState {
     /// There is none: the first copy sets it up.
     Missing,
-    /// It is for another build, or a refresh did not finish: the next copy
+    /// It is for another build, a refresh did not finish, or its receiver
+    /// was found to run another build: the next copy
     /// updates syq on the server and rewrites its `authorized_keys` line.
     Outdated,
     Ready,

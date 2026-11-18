@@ -135,36 +135,6 @@ pub(super) struct RootedTarget {
     pub(super) create_missing_parents: bool,
 }
 
-// One filename-limit observation for adjacent siblings in a read-only batch
-// chunk. This avoids repeating parent resolution (including missing-parent
-// probes). The cache opens no descriptors and ends with the chunk. Later
-// requests query again; file operations keep their own confined resolution.
-#[derive(Default)]
-pub(super) struct PartialNameLimits {
-    pub(super) last: Option<(Arc<Root>, PathBuf, usize)>,
-}
-
-impl PartialNameLimits {
-    pub(super) fn get_or_query(
-        &mut self,
-        root: &Arc<Root>,
-        parent: &Path,
-        query: impl FnOnce() -> Result<usize>,
-    ) -> Result<usize> {
-        if let Some((previous_root, previous_parent, limit)) = &self.last {
-            if Arc::ptr_eq(previous_root, root) && previous_parent == parent {
-                return Ok(*limit);
-            }
-        }
-        self.last = None;
-        let limit = query()?;
-        // Keep the actual root alive: device/inode can coincide across
-        // distinct mount views, and a raw pointer could otherwise be reused.
-        self.last = Some((root.clone(), parent.to_path_buf(), limit));
-        Ok(limit)
-    }
-}
-
 impl RootedTarget {
     pub(super) fn partial_name_max(&self) -> Result<usize> {
         self.root.partial_name_max(&self.relative)
@@ -192,7 +162,7 @@ fn rooted_partial_target_with_limit(
 ) -> Result<(RelativePath, PathBuf)> {
     let relative_path = target.relative.to_path_buf();
     // Derive the visible component from the logical command-line spelling so
-    // PartialPaths and every state-machine request keep one stable sidecar
+    // every state-machine request keeps one stable sidecar
     // name, including the PATH_MAX compact form. Only the resulting component
     // is placed beneath the retained root.
     let label = partial_path_with_name_max(&target.label, copy_id, component_limit)?;
@@ -668,7 +638,7 @@ fn set_new_leaf_metadata(
 /// set, and the birth time follows. `created` is the temporary name of an
 /// entry this receiver just created there, for a symlink's times where the
 /// kernel cannot set them through its handle (`set_handle_times`).
-fn set_handle_metadata(
+pub(crate) fn set_handle_metadata(
     handle: &File,
     meta: &Meta,
     flags: u8,
@@ -1002,7 +972,16 @@ pub(super) fn open_created_directory(
 /// ACL it inherited, or else by the umask, and the setgid bit of `current`,
 /// which it inherited from its parent. Creation never sets other bits.
 pub(crate) fn created_directory_mode(directory: &File, proposed: u32, current: u32) -> Result<u32> {
-    Ok(crate::inode_metadata::creation_mode(directory, proposed)? | (current & 0o2000))
+    let permitted = crate::inode_metadata::default_permissions(directory)?;
+    Ok(created_directory_mode_permitted(
+        permitted, proposed, current,
+    ))
+}
+
+/// `created_directory_mode` for a directory whose default ACL or umask is
+/// already known to permit the bits `permitted`.
+pub(crate) fn created_directory_mode_permitted(permitted: u32, proposed: u32, current: u32) -> u32 {
+    (proposed & permitted & 0o777) | (current & 0o2000)
 }
 
 /// Create the directory `target` names, or accept an existing one as the
@@ -1566,29 +1545,6 @@ pub(super) fn set_meta_handle_known_portable(
     current: &fs::Metadata,
 ) -> Result<()> {
     set_meta_file_known(file, meta, flags, current)
-}
-
-/// Give the file `file` refers to the owner `uid` and group `gid`, where
-/// given. `file` may be an `O_PATH` handle, which `fchown` refuses.
-pub(crate) fn chown_handle(file: &File, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        let r = unsafe {
-            libc::fchownat(
-                file.as_raw_fd(),
-                c"".as_ptr(),
-                uid.unwrap_or(u32::MAX),
-                gid.unwrap_or(u32::MAX),
-                libc::AT_EMPTY_PATH,
-            )
-        };
-        if r != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    std::os::unix::fs::fchown(file, uid, gid)?;
-    Ok(())
 }
 
 #[cfg(target_os = "linux")]

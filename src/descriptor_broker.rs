@@ -63,15 +63,6 @@ pub(crate) const MAX_SOURCE_ROOTS: usize = 1024;
 /// streams it registers besides.
 pub(crate) const DEFAULT_MAX_ROOTS: usize = MAX_SOURCE_ROOTS + 256;
 const DEFAULT_MAX_CONNECTIONS: usize = 256;
-const FD_CONTROL_LEN: usize =
-    unsafe { libc::CMSG_SPACE(size_of::<RawFd>() as libc::c_uint) as usize };
-
-#[repr(C)]
-union FdControl {
-    _align: libc::cmsghdr,
-    bytes: [u8; FD_CONTROL_LEN],
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub(crate) struct RegisteredRootId(u64);
 
@@ -762,7 +753,7 @@ pub(crate) fn acquire_descriptor(ticket: &DescriptorTicket) -> Result<File> {
     request[root_end] = ticket.kind.wire_byte();
     stream.write_all(&request)?;
 
-    let (status, descriptor) = receive_descriptor(stream.as_raw_fd())?;
+    let (status, descriptor) = receive_descriptor(&stream)?;
     match (status, descriptor) {
         (RESPONSE_OK, Some(descriptor)) => Ok(descriptor),
         (RESPONSE_OK, None) => bail!("descriptor broker returned success without a descriptor"),
@@ -1056,53 +1047,13 @@ fn serve_acquire(
         return Ok(());
     };
     match registry.acquire_optional(root_id, kind) {
-        Ok(Some(directory)) => send_descriptor(stream.as_raw_fd(), directory.as_raw_fd())?,
+        Ok(Some(directory)) => {
+            send_message(stream.as_raw_fd(), &[RESPONSE_OK], &[directory.as_raw_fd()])?
+        }
         Ok(None) => stream.write_all(&[RESPONSE_REJECTED])?,
         Err(_) => stream.write_all(&[RESPONSE_INTERNAL])?,
     }
     Ok(())
-}
-
-fn send_descriptor(socket: RawFd, descriptor: RawFd) -> io::Result<()> {
-    let mut status = [RESPONSE_OK];
-    let mut iovec = libc::iovec {
-        iov_base: status.as_mut_ptr().cast(),
-        iov_len: status.len(),
-    };
-    let mut control = FdControl {
-        bytes: [0; FD_CONTROL_LEN],
-    };
-    let mut message: libc::msghdr = unsafe { zeroed() };
-    message.msg_iov = &mut iovec;
-    message.msg_iovlen = 1;
-    message.msg_control = unsafe { control.bytes.as_mut_ptr().cast() };
-    message.msg_controllen = FD_CONTROL_LEN as _;
-    unsafe {
-        let header = libc::CMSG_FIRSTHDR(&message);
-        if header.is_null() {
-            return Err(io::Error::other("SCM_RIGHTS control buffer is too small"));
-        }
-        (*header).cmsg_level = libc::SOL_SOCKET;
-        (*header).cmsg_type = libc::SCM_RIGHTS;
-        (*header).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as libc::c_uint) as _;
-        std::ptr::write_unaligned(libc::CMSG_DATA(header).cast::<RawFd>(), descriptor);
-    }
-    loop {
-        let sent = unsafe { libc::sendmsg(socket, &message, 0) };
-        if sent == 1 {
-            return Ok(());
-        }
-        if sent >= 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "descriptor broker sent an incomplete response",
-            ));
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
 }
 
 const MAX_MESSAGE_DESCRIPTORS: usize = 3;
@@ -1283,8 +1234,10 @@ fn receive_message_once(
     payload.truncate(received as usize);
     let mut descriptors = Vec::new();
     let mut malformed = message.msg_flags & libc::MSG_CTRUNC != 0;
-    // SAFETY: as in receive_descriptor; every received descriptor is wrapped
-    // exactly once so a rejection closes all of them.
+    // SAFETY: recvmsg filled `control` through `message` and set
+    // `msg_controllen` to the bytes it wrote, which bounds the header walk.
+    // Every SCM_RIGHTS payload holds descriptors this process now owns; each
+    // is wrapped exactly once so a later rejection closes all of them.
     unsafe {
         let mut header = libc::CMSG_FIRSTHDR(&message);
         while !header.is_null() {
@@ -1321,95 +1274,34 @@ fn receive_message_once(
     Ok((payload, descriptors))
 }
 
-fn receive_descriptor(socket: RawFd) -> io::Result<(u8, Option<File>)> {
-    let mut status = [0u8];
-    let mut iovec = libc::iovec {
-        iov_base: status.as_mut_ptr().cast(),
-        iov_len: status.len(),
-    };
-    let mut control = FdControl {
-        bytes: [0; FD_CONTROL_LEN],
-    };
-    let mut message: libc::msghdr = unsafe { zeroed() };
-    message.msg_iov = &mut iovec;
-    message.msg_iovlen = 1;
-    message.msg_control = unsafe { control.bytes.as_mut_ptr().cast() };
-    message.msg_controllen = FD_CONTROL_LEN as _;
-    #[cfg(target_os = "linux")]
-    let flags = libc::MSG_CMSG_CLOEXEC;
-    // Darwin cannot apply close-on-exec atomically with recvmsg. Workers claim
-    // their roots synchronously in serve's Hello initialization; this function
-    // sets FD_CLOEXEC before HelloOk or the worker's request-reader startup.
-    // Other connections may be initializing concurrently, so the whole receiver
-    // process must remain free of child launches. run_transfer isolates local
-    // destinations, and the macOS receiver modules deny subprocess APIs through
-    // Clippy (see main.rs and clippy.toml). The Linux network probe is cfg-gated.
-    #[cfg(not(target_os = "linux"))]
-    let flags = 0;
-    loop {
-        let received = unsafe { libc::recvmsg(socket, &mut message, flags) };
-        if received == 1 {
-            break;
-        }
-        if received == 0 {
-            return Err(io::Error::new(
+/// Receive the broker's one-byte status and the descriptor sent with it.
+fn receive_descriptor(socket: &UnixStream) -> io::Result<(u8, Option<File>)> {
+    // Room for a second byte detects an oversized response.
+    let (status, mut descriptors) =
+        receive_message(socket, 2).map_err(|error| match error.kind() {
+            io::ErrorKind::UnexpectedEof => io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "descriptor broker closed without a response",
-            ));
-        }
-        if received > 0 {
-            return Err(io::Error::new(
+            ),
+            io::ErrorKind::InvalidData => io::Error::new(
                 io::ErrorKind::InvalidData,
-                "descriptor broker returned an oversized response",
-            ));
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
+                "descriptor broker returned malformed ancillary data",
+            ),
+            _ => error,
+        })?;
+    if status.len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "descriptor broker returned an oversized response",
+        ));
     }
-
-    let mut descriptors = Vec::new();
-    let mut malformed = message.msg_flags & libc::MSG_CTRUNC != 0;
-    // SAFETY: recvmsg filled `control` through `message` and set
-    // `msg_controllen` to the bytes it wrote, which bounds the header walk.
-    // Every SCM_RIGHTS payload holds descriptors this process now owns; each
-    // is wrapped exactly once so a later rejection closes all of them.
-    unsafe {
-        let mut header = libc::CMSG_FIRSTHDR(&message);
-        while !header.is_null() {
-            let header_len = libc::CMSG_LEN(0) as usize;
-            let control_len = (*header).cmsg_len as usize;
-            if (*header).cmsg_level == libc::SOL_SOCKET
-                && (*header).cmsg_type == libc::SCM_RIGHTS
-                && control_len >= header_len
-            {
-                let data_len = control_len - header_len;
-                malformed |= data_len == 0 || !data_len.is_multiple_of(size_of::<RawFd>());
-                for index in 0..data_len / size_of::<RawFd>() {
-                    let raw = std::ptr::read_unaligned(
-                        libc::CMSG_DATA(header).cast::<RawFd>().add(index),
-                    );
-                    descriptors.push(File::from_raw_fd(raw));
-                }
-            } else {
-                malformed = true;
-            }
-            header = libc::CMSG_NXTHDR(&message, header);
-        }
-    }
-    if malformed || descriptors.len() > 1 {
-        drop(descriptors);
+    if descriptors.len() > 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "descriptor broker returned malformed ancillary data",
         ));
     }
-    let descriptor = descriptors.pop();
-    if let Some(file) = &descriptor {
-        set_close_on_exec(file)?;
-    }
-    Ok((status[0], descriptor))
+    Ok((status[0], descriptors.pop()))
 }
 
 fn set_close_on_exec(file: &File) -> io::Result<()> {
@@ -1910,6 +1802,43 @@ mod message_receive_tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Instant;
+
+    #[test]
+    fn claim_response_accepts_one_status_and_at_most_one_descriptor() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let file = File::create(temporary.path().join("payload")).unwrap();
+        let receive = |payload: &[u8], descriptors: &[RawFd]| {
+            let (receiver, sender) = UnixStream::pair().unwrap();
+            send_message(sender.as_raw_fd(), payload, descriptors).unwrap();
+            drop(sender);
+            receive_descriptor(&receiver)
+        };
+
+        let (status, descriptor) = receive(&[RESPONSE_OK], &[file.as_raw_fd()]).unwrap();
+        assert_eq!(status, RESPONSE_OK);
+        let flags = unsafe { libc::fcntl(descriptor.unwrap().as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        let (status, descriptor) = receive(&[RESPONSE_REJECTED], &[]).unwrap();
+        assert_eq!((status, descriptor.is_none()), (RESPONSE_REJECTED, true));
+
+        let error = receive(&[RESPONSE_OK, 0], &[]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "descriptor broker returned an oversized response"
+        );
+        let error = receive(&[RESPONSE_OK], &[file.as_raw_fd(), file.as_raw_fd()]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "descriptor broker returned malformed ancillary data"
+        );
+        let (receiver, sender) = UnixStream::pair().unwrap();
+        drop(sender);
+        let error = receive_descriptor(&receiver).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "descriptor broker closed without a response"
+        );
+    }
 
     #[test]
     fn delayed_message_keeps_descriptors_protected_and_socket_flags_unchanged() {

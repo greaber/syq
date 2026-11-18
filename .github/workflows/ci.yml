@@ -39,8 +39,6 @@ jobs:
     runs-on: ubuntu-26.04
     outputs:
       native: ${{ steps.changes.outputs.native }}
-      sdks: ${{ steps.changes.outputs.sdks }}
-      sdk_matrix: ${{ steps.changes.outputs.sdk_matrix }}
       python_sdk: ${{ steps.changes.outputs.python_sdk }}
       tooling: ${{ steps.changes.outputs.tooling }}
       tooling_checks: ${{ steps.changes.outputs.tooling_checks }}
@@ -133,7 +131,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/syq-tools
-          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-shellcheck-jq-python-nextest${{ (needs.scope.outputs.all_tooling == 'true' || needs.scope.outputs.quick_tooling == 'true') && '-node' || '' }}-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-shellcheck-jq-python-nextest${{ needs.scope.outputs.tooling == 'true' && '-node' || '' }}-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
       - name: Install pinned development tools
         if: >-
           needs.scope.outputs.native == 'true' ||
@@ -144,7 +142,7 @@ jobs:
           SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
         run: |
           scripts/setup.sh github shellcheck jq python cargo-nextest
-          if [[ "${{ needs.scope.outputs.all_tooling }}" == true || "${{ needs.scope.outputs.quick_tooling }}" == true ]]; then
+          if [[ "${{ needs.scope.outputs.tooling }}" == true ]]; then
             scripts/setup.sh github node
           fi
       # Cargo caches hold one entry per toolchain and dependency set. Only
@@ -222,66 +220,19 @@ jobs:
       - name: Test every repository tooling script
         if: needs.scope.outputs.all_tooling == 'true'
         run: scripts/run-tooling-tests.py
-      - name: Test Cargo package identity
+      - name: Test the selected repository tooling groups
         if: >-
           needs.scope.outputs.all_tooling != 'true' &&
-          contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' package ')
-        run: tests/tooling/test-cargo-package.py
-      - name: Test installer tooling
-        if: >-
-          needs.scope.outputs.all_tooling != 'true' &&
-          contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' installer ')
-        run: tests/tooling/test-installer.py
-      - name: Test benchmark tooling
-        if: >-
-          needs.scope.outputs.all_tooling != 'true' &&
-          contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' benchmark ')
-        run: |
-          python3 tests/tooling/test-try-benchmark.py
-          python3 tests/tooling/test-benchmark-concurrency.py
-      - name: Test release tooling
-        if: >-
-          needs.scope.outputs.all_tooling != 'true' &&
-          contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' release ')
+          needs.scope.outputs.tooling_checks != ''
         env:
           TOOLING_CHECKS: ${{ needs.scope.outputs.tooling_checks }}
         run: |
+          # test-cargo-package.py runs first and builds a syq to reuse.
           if [[ " $TOOLING_CHECKS " == *" package "* ]]; then
-            tests/tooling/test-release-tools.py --syq "$GITHUB_WORKSPACE/target/package-identity/debug/syq"
-          else
-            tests/tooling/test-release-tools.py
+            export SYQ_RELEASE_TOOLS_SYQ="$GITHUB_WORKSPACE/target/package-identity/debug/syq"
           fi
-      - name: Test release orchestration
-        if: >-
-          needs.scope.outputs.all_tooling != 'true' &&
-          contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' orchestration ')
-        run: |
-          tests/tooling/test-release-orchestration.py
-          tests/tooling/test-tooling.py
-          python3 tests/tooling/test-tooling-discovery.py
-          tests/tooling/test-generated-sdk-post-merge-ci.py
-          tests/tooling/test-release-readiness.py
-          tests/tooling/test-release-timings.py
-          tests/tooling/test-find-release-build.py
-      - name: Test focused check dispatch
-        if: >-
-          needs.scope.outputs.all_tooling != 'true' &&
-          contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' focused ')
-        run: python3 tests/tooling/test-run-focused-check.py
-      - name: Test branch status tooling
-        if: >-
-          needs.scope.outputs.all_tooling != 'true' &&
-          contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' branch ')
-        run: |
-          tests/tooling/test-branch-status.py
-          tests/tooling/test-dispatched-checks-status.py
-      - name: Test the development setup
-        if: >-
-          needs.scope.outputs.all_tooling != 'true' &&
-          contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' setup ')
-        run: |
-          tests/tooling/test-setup.sh
-          python3 tests/tooling/test-rust-test-timeouts.py
+          read -r -a groups <<< "$TOOLING_CHECKS"
+          scripts/run-tooling-tests.py --group "${groups[@]}"
       - name: Validate workflow syntax and script references
         if: >-
           contains(format(' {0} ', needs.scope.outputs.tooling_checks), ' workflows ')
@@ -359,15 +310,12 @@ jobs:
           fi
           exit "$status"
 
-  sdk-languages:
-    strategy:
-      fail-fast: false
-      matrix:
-        sdk: ${{ fromJSON(needs.scope.outputs.sdk_matrix || '["none"]') }}
+  # Release preflight and generated-SDK validation require the check name `sdks`.
+  sdks:
     # Cancel only matching automatic checks and later selections of the same
     # suite on the same branch; other manual runs keep a unique group.
     concurrency:
-      group: ${{ github.workflow }}-sdks-${{ matrix.sdk }}-${{ github.event_name == 'push' && github.ref || needs.scope.outputs.suite_selection == 'true' && format('{0}-selected', github.ref) || github.run_id }}-${{ needs.scope.result }}-${{ needs.scope.outputs.python_sdk }}
+      group: ${{ github.workflow }}-sdks-${{ github.event_name == 'push' && github.ref || needs.scope.outputs.suite_selection == 'true' && format('{0}-selected', github.ref) || github.run_id }}-${{ needs.scope.result }}-${{ needs.scope.outputs.python_sdk }}
       cancel-in-progress: ${{ github.event_name == 'push' || needs.scope.outputs.suite_selection == 'true' }}
     needs: scope
     if: >-
@@ -379,27 +327,27 @@ jobs:
         if: needs.scope.result != 'success'
         run: echo 'Path classification failed.' >&2; exit 1
       - name: Complete the required check when SDKs are unaffected
-        if: needs.scope.outputs[format('{0}_sdk', matrix.sdk)] != 'true'
+        if: needs.scope.outputs.python_sdk != 'true'
         run: echo 'SDK validation is not needed for this change set.'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: needs.scope.outputs[format('{0}_sdk', matrix.sdk)] == 'true'
+        if: needs.scope.outputs.python_sdk == 'true'
         with:
           persist-credentials: false
       - name: Cache pinned development tools
-        if: needs.scope.outputs[format('{0}_sdk', matrix.sdk)] == 'true'
+        if: needs.scope.outputs.python_sdk == 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/syq-tools
-          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-${{ matrix.sdk }}-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
+          key: pinned-tools-${{ runner.os }}-${{ runner.arch }}-python-${{ hashFiles('scripts/setup.lock', 'scripts/setup.sh') }}
       - name: Install pinned development tools
-        if: needs.scope.outputs[format('{0}_sdk', matrix.sdk)] == 'true'
+        if: needs.scope.outputs.python_sdk == 'true'
         env:
           SYQ_TOOLS_DIR: ${{ runner.temp }}/syq-tools
         run: >-
           scripts/setup.sh github uv python jq
       - name: Restore Cargo dependencies and build output
         id: cargo-cache
-        if: matrix.sdk == 'python' && needs.scope.outputs.python_sdk == 'true'
+        if: needs.scope.outputs.python_sdk == 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -411,7 +359,7 @@ jobs:
           restore-keys: |
             cargo-ci-sdks-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
       - name: Require the matching Python SDK for the latest syq release
-        if: matrix.sdk == 'python' && needs.scope.outputs.python_sdk == 'true'
+        if: needs.scope.outputs.python_sdk == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -429,10 +377,10 @@ jobs:
             exit 1
           }
       - name: Build the candidate syq executable
-        if: matrix.sdk == 'python' && needs.scope.outputs.python_sdk == 'true'
+        if: needs.scope.outputs.python_sdk == 'true'
         run: cargo build --locked --bin syq
       - name: Test and package Python SDK
-        if: matrix.sdk == 'python' && needs.scope.outputs.python_sdk == 'true'
+        if: needs.scope.outputs.python_sdk == 'true'
         env:
           PYTHONPATH: sdk/python/src
           SYQ_CANDIDATE_EXECUTABLE: ${{ github.workspace }}/target/debug/syq
@@ -457,6 +405,14 @@ jobs:
           env -u PYTHONPATH uv run --isolated --python "$UV_PYTHON" \
             --with "$1" \
             python scripts/check-python-wheel.py --version "$SYQ_CANDIDATE_VERSION"
+          # Run the tests against the wheel on the oldest Python it supports.
+          floor=$(sed -n 's/^requires-python = ">=\(.*\)"/\1/p' sdk/python/pyproject.toml)
+          test -n "$floor"
+          uv export --project sdk/python --frozen --only-dev --no-emit-project \
+            --quiet --output-file target/sdk-python-dev-requirements.txt
+          env -u PYTHONPATH uv run --isolated --python "$floor" \
+            --with "$1" --with-requirements target/sdk-python-dev-requirements.txt \
+            python -m unittest discover -s sdk/python/tests
           rm -rf -- target/sdk-python-from-sdist
           # Rebuild syq from the archive, reusing only its compiled dependencies.
           # Archive mtimes can repeat across commits, so discard syq artifacts first.
@@ -472,7 +428,7 @@ jobs:
       - name: Save Cargo dependencies and build output
         if: >-
           github.ref == 'refs/heads/master' &&
-          matrix.sdk == 'python' && needs.scope.outputs.python_sdk == 'true' &&
+          needs.scope.outputs.python_sdk == 'true' &&
           steps.cargo-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -482,23 +438,6 @@ jobs:
             ~/.cargo/git/db
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
-
-  # Keep the public check name consumed by generated-SDK validation and release
-  # preflight. A successful subset cannot hide a failed/cancelled matrix job.
-  sdks:
-    needs: [scope, sdk-languages]
-    if: >-
-      always() &&
-      (needs.scope.outputs.skip_unselected != 'true' || needs.scope.outputs.python_sdk == 'true')
-    runs-on: ubuntu-26.04
-    steps:
-      - name: Require successful SDK validation
-        env:
-          SCOPE_RESULT: ${{ needs.scope.result }}
-          SDK_RESULT: ${{ needs.sdk-languages.result }}
-        run: |
-          test "$SCOPE_RESULT" = success
-          test "$SDK_RESULT" = success
 
   # The release workflow builds on this runner; libc field types differ from
   # x86-64 (st_nlink is u32 here), so include it in full validation.

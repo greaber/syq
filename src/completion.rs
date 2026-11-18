@@ -8,17 +8,17 @@
 
 use crate::cli::{parse_native_endpoint, AuthFrom, NativeEndpoint};
 use crate::conn::{Conn, RemoteConn, RemoteSpec, SshMultiplexer};
+use crate::lock_file::LockFile;
 use crate::proto::{CompletionEntry, OperatorSymlinkPolicy, Request, Response};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::ffi::{CString, OsString};
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -339,93 +339,47 @@ fn cache_path() -> Result<PathBuf> {
 
 fn open_cache_directory(path: &Path, create: bool) -> Result<Option<File>> {
     if create {
-        std::fs::create_dir_all(path)
-            .with_context(|| format!("create completion cache directory {}", path.display()))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create completion cache directory {}", path.display()))?;
+        }
     }
-    let path_c = CString::new(path.as_os_str().as_bytes())
-        .context("completion cache directory path contains NUL")?;
-    let descriptor = unsafe {
-        libc::open(
-            path_c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if descriptor < 0 {
-        let error = std::io::Error::last_os_error();
-        if !create
-            && matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            )
+    match crate::state_file::open_private_dir(
+        path,
+        "completion cache directory",
+        create,
+        crate::state_file::DirRule::Tighten,
+    ) {
+        Err(error)
+            if !create
+                && error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.raw_os_error() == Some(libc::ENOTDIR))
+                }) =>
         {
-            return Ok(None);
+            Ok(None)
         }
-        return Err(error).with_context(|| {
-            format!(
-                "open completion cache directory {} (symlinks are refused)",
-                path.display()
-            )
-        });
-    }
-    let directory = unsafe { File::from_raw_fd(descriptor) };
-    let metadata = directory.metadata()?;
-    if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
-        bail!(
-            "completion cache directory {} must be owned by the current user",
-            path.display()
-        );
-    }
-    if metadata.mode() & 0o077 != 0 && unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("restrict completion cache directory {}", path.display()));
-    }
-    Ok(Some(directory))
-}
-
-struct CacheLock(File);
-
-impl Drop for CacheLock {
-    fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
-        }
+        result => result,
     }
 }
 
-fn lock_cache(parent: &Path, _directory: &File) -> Result<CacheLock> {
+fn lock_cache(parent: &Path, _directory: &File) -> Result<LockFile> {
     let path = parent.join(CACHE_LOCK);
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&path)
+    let lock = LockFile::open(&path, true)
         .with_context(|| format!("open completion cache lock {}", path.display()))?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
-        bail!(
-            "completion cache lock {} must be a regular file owned by the current user",
-            path.display()
-        );
+    if !lock
+        .try_exclusive()
+        .with_context(|| format!("lock completion cache {}", path.display()))?
+    {
+        bail!("completion cache is busy; try again");
     }
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::WouldBlock {
-            bail!("completion cache is busy; try again");
-        }
-        return Err(error).with_context(|| format!("lock completion cache {}", path.display()));
-    }
-    Ok(CacheLock(file))
+    Ok(lock)
 }
 
 fn read_cache() -> Result<CompletionCache> {
     let path = cache_path()?;
-    let mut file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&path)
-    {
+    let file = match crate::state_file::open_private(&path) {
         Ok(file) => file,
         Err(error)
             if matches!(
@@ -437,24 +391,12 @@ fn read_cache() -> Result<CompletionCache> {
         }
         Err(error) => return Err(error).with_context(|| format!("open {}", path.display())),
     };
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
-        bail!(
-            "completion cache {} must be a regular file owned by the current user",
-            path.display()
-        );
-    }
-    if metadata.mode() & 0o077 != 0 {
-        bail!(
-            "completion cache {} must not be accessible by group or other users",
-            path.display()
-        );
-    }
-    if metadata.len() > MAX_CACHE_BYTES {
-        bail!("completion cache {} exceeds 1 MiB", path.display());
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes)?;
+    let bytes = crate::state_file::read_open(
+        file,
+        &format_args!("completion cache {}", path.display()),
+        MAX_CACHE_BYTES as usize,
+        crate::state_file::FileRule::NoGroupOther,
+    )?;
     let mut cache: CompletionCache = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse completion cache {}", path.display()))?;
     cache.endpoints.truncate(MAX_CACHED_ENDPOINTS);
@@ -483,13 +425,15 @@ fn update_cache(mut update: impl FnMut(&mut CompletionCache) -> bool) -> Result<
     // per token.
     let mut bytes = serde_json::to_vec_pretty(&cache)?;
     bytes.push(b'\n');
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("create temporary completion cache in {}", parent.display()))?;
-    temporary.write_all(&bytes)?;
-    temporary
-        .persist(&path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("replace completion cache {}", path.display()))?;
+    crate::state_file::write_atomic_at(
+        &directory,
+        path.file_name().expect("cache file has a name"),
+        &bytes,
+        0o600,
+        crate::state_file::Publish::Replace,
+        crate::state_file::Durability::RenameOnly,
+    )
+    .with_context(|| format!("replace completion cache {}", path.display()))?;
     Ok(true)
 }
 
@@ -995,18 +939,10 @@ fn option_name(arg: &clap::Arg) -> Vec<u8> {
         .into_bytes()
 }
 
+/// Source options; positional sources are counted separately.
 fn selector_id(id: &str) -> bool {
-    matches!(
-        id,
-        "src"
-            | "srcs_in"
-            | "src_non_dir"
-            | "src_dir"
-            | "srcs"
-            | "src_non_dirs"
-            | "src_dirs"
-            | "src_fd"
-    )
+    id == "src_fd"
+        || crate::cli::source_selector(id).is_some_and(|selector| selector.option.is_some())
 }
 
 impl<'a> CompletionContext<'a> {
@@ -1136,18 +1072,7 @@ impl<'a> CompletionContext<'a> {
     }
 
     fn destination_started(&self) -> bool {
-        [
-            "as_fd",
-            "to",
-            "into",
-            "into_new",
-            "into_existing",
-            "as",
-            "as_new",
-            "as_existing",
-        ]
-        .iter()
-        .any(|id| self.present.contains(*id))
+        self.present.iter().any(|id| crate::cli::destination_id(id))
     }
 
     fn sources_allowed(&self, command: &str) -> bool {
@@ -1272,29 +1197,18 @@ fn complete_argument(
 /// Copy options whose path completion also serves sources and destinations,
 /// but whose value must be a directory.
 fn directories_only_id(id: &str) -> bool {
-    matches!(
-        id,
-        "cwd" | "root" | "srcs_in" | "src_dir" | "src_dirs" | "into" | "into_new" | "into_existing"
-    )
+    matches!(id, "cwd" | "root")
+        || crate::cli::source_selector(id).is_some_and(crate::cli::SourceSelector::directories_only)
+        || crate::cli::placement_option(id)
+            .is_some_and(crate::cli::PlacementOption::directories_only)
 }
 
 fn native_copy_source_option(option: &[u8]) -> bool {
+    let option = option.split(|byte| *byte == b'=').next().unwrap_or(option);
     matches!(
-        option.split(|byte| *byte == b'=').next().unwrap_or(option),
-        b"--from"
-            | b"--src-fd"
-            | b"-C"
-            | b"--cwd"
-            | b"--root"
-            | b"--src"
-            | b"--srcs-in"
-            | b"--src-non-dir"
-            | b"--src-dir"
-            | b"--srcs"
-            | b"--src-non-dirs"
-            | b"--src-dirs"
-            | b"--mapping"
-    )
+        option,
+        b"--from" | b"--src-fd" | b"-C" | b"--cwd" | b"--root" | b"--mapping"
+    ) || crate::cli::source_selector_option(option)
 }
 
 fn split_inline_option(current: &[u8]) -> Option<(&[u8], &[u8])> {
@@ -1327,12 +1241,12 @@ fn value_completion(
             b"--to" => Some(ValueCompletion::NamedOrSshDestination),
             b"--auth-from" => Some(ValueCompletion::AuthFrom),
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
-            b"--src" | b"--srcs-in" | b"--src-non-dir" | b"--src-dir" | b"--srcs"
-            | b"--src-non-dirs" | b"--src-dirs" => {
+            option if crate::cli::source_selector_option(option) => {
                 Some(ValueCompletion::SourcePath { apply_base: true })
             }
-            b"--into" | b"--into-new" | b"--into-existing" | b"--as" | b"--as-new"
-            | b"--as-existing" => Some(ValueCompletion::DestinationPath),
+            option if crate::cli::placement_option_name(option) => {
+                Some(ValueCompletion::DestinationPath)
+            }
             b"--mapping" | b"--results" | b"--ignore-from" => Some(ValueCompletion::LocalPath {
                 directories_only: false,
             }),
@@ -1348,8 +1262,7 @@ fn value_completion(
             }),
             b"--on" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
-            b"--src" | b"--srcs-in" | b"--src-non-dir" | b"--src-dir" | b"--srcs"
-            | b"--src-non-dirs" | b"--src-dirs" => {
+            option if crate::cli::source_selector_option(option) => {
                 Some(ValueCompletion::SourcePath { apply_base: true })
             }
             b"--pscope" => Some(ValueCompletion::LocalPath {
@@ -1364,8 +1277,7 @@ fn value_completion(
             b"--auth-from" => Some(ValueCompletion::AuthFrom),
             b"--from" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
             b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
-            b"--src" | b"--srcs-in" | b"--src-non-dir" | b"--src-dir" | b"--srcs"
-            | b"--src-non-dirs" | b"--src-dirs" => {
+            option if crate::cli::source_selector_option(option) => {
                 Some(ValueCompletion::SourcePath { apply_base: true })
             }
             b"--as" => Some(ValueCompletion::LocalPath {

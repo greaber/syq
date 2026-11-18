@@ -479,6 +479,7 @@ mod tests {
             // Well short of the child's own 30-second wait and of a stalled
             // cleanup's minute.
             let output = super::super::capture_output_bounded(
+                "test subprocess",
                 &mut command,
                 Instant::now() + Duration::from_secs(20),
                 &|| false,

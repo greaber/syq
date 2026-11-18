@@ -8,50 +8,16 @@ import json
 import os
 from pathlib import Path
 import shlex
-import signal
 import socket
 import subprocess
 import sys
 import tempfile
-import time
+
+import syq_real_ssh_lab as lab
+from syq_real_ssh_lab import digest, remote, run, stop
 
 
 NATIVE_PATH = "PATH=/usr/bin:/bin:/usr/local/bin"
-
-
-def run(*args, stdin=None, success=True, env=None):
-    result = subprocess.run(args, input=stdin, capture_output=True, text=True,
-                            timeout=60, env=env)
-    assert (result.returncode == 0) == success, (args, result)
-    return result.stdout
-
-
-def remote(host, command, **kwargs):
-    return run("ssh", host, command, **kwargs)
-
-
-def wait_for(description, predicate, timeout=25):
-    deadline, progress = time.monotonic() + timeout, time.monotonic() + 3
-    state = None
-    while time.monotonic() < deadline:
-        state = predicate()
-        if state:
-            return state
-        if time.monotonic() >= progress:
-            print("Waiting for", description, "last state:", state, flush=True)
-            progress += 3
-        time.sleep(.1)
-    raise AssertionError(("Timed out", description, "last state", state))
-
-
-def stop(process):
-    if process.poll() is None:
-        os.killpg(process.pid, signal.SIGTERM)
-        try:
-            process.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=3)
 
 
 def cleanup_actions(actions):
@@ -68,37 +34,12 @@ def cleanup_actions(actions):
             raise AssertionError(failures)
 
 
-@contextlib.contextmanager
 def running(command):
-    with tempfile.TemporaryFile() as output:
-        process = subprocess.Popen(["ssh", "requester", command], stdin=subprocess.DEVNULL,
-                                   stdout=output, stderr=output, start_new_session=True)
-        try:
-            yield process, output
-        except BaseException:
-            print(os.pread(output.fileno(), 1024 * 1024, 0).decode(errors="replace"), flush=True)
-            raise
-        finally:
-            stop(process)
+    return lab.running("requester", command)
 
 
 def finish(process, output, success=True):
-    deadline, offset = time.monotonic() + 90, 0
-    while True:
-        try:
-            status = process.wait(timeout=5)
-            break
-        except subprocess.TimeoutExpired:
-            data = os.pread(output.fileno(), 1024 * 1024, offset)
-            offset += len(data)
-            print(data.decode(errors="replace"), end="", flush=True)
-            print("Waiting for the provider-approved copy", flush=True)
-            assert time.monotonic() < deadline, "provider-approved copy exceeded its deadline"
-    text = os.pread(output.fileno(), 1024 * 1024, 0).decode(errors="replace")
-    print(text, end="", flush=True)
-    assert status != 124, "provider-approved copy reached its safety timeout"
-    assert (status == 0) == success, (status, text)
-    return text
+    return lab.finish(process, output, "provider-approved copy", success)
 
 
 @contextlib.contextmanager
@@ -149,7 +90,7 @@ def provider_sshd(root, public_key, environment):
             except OSError:
                 return False
         try:
-            wait_for("fixture provider SSH listener", ready, timeout=15)
+            lab.wait_for("fixture provider SSH listener", ready, 15)
             yield port, key.with_suffix(".pub").read_text()
         except BaseException:
             log.seek(0)
@@ -163,16 +104,7 @@ def provider_sshd(root, public_key, environment):
 
 
 def enrollments():
-    rows = {}
-    for line in run("syq", "receiver", "list").splitlines():
-        fields = line.split("\t")
-        if len(fields) >= 3 and fields[1] == "active":
-            rows[fields[2]] = fields[0]
-    return rows
-
-
-def digest(host, path):
-    return remote(host, "sha256sum " + shlex.quote(path)).split()[0]
+    return {account: identifier for identifier, account in lab.enrollments()}
 
 
 def main():
@@ -334,8 +266,8 @@ def main():
                     scopes.append(requester("syq", "persist", "on", "--ephemeral").strip())
                 with running(command("picked", scope=scopes[0])) as (picked, picked_output), \
                         running(command("passed", scope=scopes[1])) as (passed, passed_output):
-                    requests = wait_for("both logins' requests", lambda: (
-                        lambda requests: requests if len(requests) == 2 else None)(pending()))
+                    requests = lab.wait_for("both logins' requests", pending, 25,
+                                            done=lambda requests: len(requests) == 2)
                     for request in requests:
                         checked(request)
                     chosen = [request for request in requests if "/picked" in request["destination"]]

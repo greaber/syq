@@ -3,13 +3,12 @@ use super::{local_config::LocalPlan, persistent, SessionRequest};
 use crate::auth_from::Provider;
 use crate::cli::NativeEndpoint;
 use crate::destination::ssh_auth::{self, ResolvedPolicy};
+use crate::lock_file::LockFile;
 use crate::persistence::Domain;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -102,27 +101,23 @@ fn existing_directory(domain: &Domain) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     let path = domain.approved_index_path().join(DIRECTORY);
-    let metadata = match path.symlink_metadata() {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    anyhow::ensure!(
-        metadata.is_dir()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o077 == 0,
-        "SSH resolution cache must be an owner-only directory"
-    );
-    Ok(Some(path))
+    Ok(crate::state_file::open_private_dir(
+        &path,
+        "SSH resolution cache",
+        false,
+        crate::state_file::DirRule::NoGroupOther,
+    )?
+    .map(|_| path))
 }
 fn directory(domain: &Domain) -> Result<PathBuf> {
     let path = persistent::directory(domain)?.join(DIRECTORY);
-    match fs::DirBuilder::new().mode(0o700).create(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
-    }
-    existing_directory(domain)?.context("SSH resolution directory disappeared")
+    crate::state_file::open_private_dir(
+        &path,
+        "SSH resolution cache",
+        true,
+        crate::state_file::DirRule::NoGroupOther,
+    )?;
+    Ok(path)
 }
 fn read_at(
     path: &Path,
@@ -130,11 +125,16 @@ fn read_at(
     requested: &NativeEndpoint,
     provider: &str,
 ) -> Result<Option<Entry>> {
-    let Some(file) = private_file(path, false, MAX_FILE)? else {
+    let Some(entry) = crate::state_file::read_private(
+        path,
+        "SSH resolution metadata",
+        MAX_FILE as usize,
+        crate::state_file::FileRule::NoGroupOther,
+    )?
+    else {
         return Ok(None);
     };
-    let entry: Entry =
-        serde_json::from_reader(file.take(MAX_FILE + 1)).context("read SSH resolution metadata")?;
+    let entry: Entry = serde_json::from_slice(&entry).context("read SSH resolution metadata")?;
     anyhow::ensure!(
         entry.version == persistent::provider_state_version(authorizer)
             && entry.authorizer == *authorizer
@@ -156,9 +156,13 @@ fn store_at(path: &Path, entry: &Entry) -> Result<()> {
         "SSH resolution metadata is too large"
     );
     // Never recreate a cache directory after scope shutdown removed it.
-    let mut temporary = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
-    temporary.write_all(&bytes)?;
-    temporary.persist(path)?;
+    crate::state_file::write_atomic(
+        path,
+        &bytes,
+        0o600,
+        crate::state_file::Publish::Replace,
+        crate::state_file::Durability::RenameOnly,
+    )?;
     Ok(())
 }
 
@@ -331,6 +335,14 @@ fn state_paths(domain: &Domain, locks_only: bool) -> Result<Vec<PathBuf>> {
         if locks_only && path.extension().is_none_or(|ext| ext != "lock") {
             continue;
         }
+        // Cleanup removes a temporary file that a killed writer left.
+        if path
+            .file_name()
+            .is_some_and(crate::state_file::is_own_temp_name)
+        {
+            paths.push(path);
+            continue;
+        }
         anyhow::ensure!(
             path.extension()
                 .is_some_and(|ext| ext == "json" || ext == "lock")
@@ -357,14 +369,16 @@ pub(super) fn wait(domain: &Domain) -> Result<()> {
             if path.extension().is_none_or(|ext| ext != "lock") {
                 continue;
             }
-            let Some(lock) = private_file(&path, true, 0)? else {
-                continue;
+            let lock = match LockFile::open(&path, false) {
+                Ok(lock) => lock,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
             };
-            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() != std::io::ErrorKind::WouldBlock {
-                    return Err(error.into());
-                }
+            anyhow::ensure!(
+                lock.file().metadata()?.len() == 0,
+                "SSH resolution metadata must be a bounded owner-only file"
+            );
+            if lock.held()? {
                 running += 1;
             }
         }
@@ -621,5 +635,19 @@ mod tests {
             .selected,
             changed.selected
         );
+    }
+
+    #[test]
+    fn cleanup_removes_temporaries_a_killed_writer_left() {
+        let (_root, domain, entry) = fixture();
+        let path = entry_path(&domain, &entry);
+        store_at(&path, &entry).unwrap();
+        let directory = path.parent().unwrap();
+        for name in [".tmpAb12Z9", ".syq-tmp-123-00ff00ff00ff00ff"] {
+            fs::write(directory.join(name), b"{").unwrap();
+            fs::set_permissions(directory.join(name), fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        cleanup(&domain).unwrap();
+        assert!(!directory.exists());
     }
 }

@@ -9,7 +9,6 @@ the workflow commit, is reachable from the protected branch, and has every
 named CI check concluded successfully. Native releases may reuse ancestor
 evidence only for unchanged test inputs; SDK checks remain exact.
 """
-import json
 import os
 from pathlib import Path
 import re
@@ -18,7 +17,8 @@ import subprocess
 import sys
 import tempfile
 
-from tooling import ToolError, check_conclusion, json_output, report_errors
+from release_checks import failed_checks, release_ci
+from tooling import ToolError, json_output, report_errors
 
 SCRIPTS = Path(os.path.abspath(__file__)).parent
 
@@ -101,24 +101,14 @@ def main():
                         f"{protected_branch}")
 
     # Native releases may reuse ancestor evidence for unchanged test inputs.
-    evidence = {}
+    certification = None
     if re.match(r"v[0-9]", tag):
-        certification = subprocess.run([str(SCRIPTS / "verify-release-ci.py"), "--json",
-                                         repository, target_commit],
-                                        stdout=subprocess.PIPE, text=True)
-        if certification.returncode:
+        certification = release_ci(repository, target_commit)
+        if not certification["ready"]:
             raise ToolError(f"full release CI does not certify {target_commit}")
-        evidence = {workflow["workflow"]: workflow["evidence_commit"]
-                    for workflow in json.loads(certification.stdout)["workflows"]}
-    for check_name in required_checks.split(","):
-        workflow = "rsync-compat.yml" if check_name == "conformance" else "ci.yml"
-        checked_commit = evidence.get(workflow, target_commit)
-        check_runs = json_output("gh", "api", f"repos/{repository}/commits/{checked_commit}"
-                                 "/check-runs?filter=latest&per_page=100")
-        conclusion = check_conclusion(check_runs, check_name)
-        if conclusion != "success":
-            raise ToolError(f"required check {check_name} is {conclusion} on certified commit "
-                            f"{checked_commit}")
+    for check, conclusion, checked in failed_checks(repository, target_commit,
+                                                    required_checks.split(","), certification):
+        raise ToolError(f"required check {check} is {conclusion} on certified commit {checked}")
 
     print(f"verified signed annotated tag {tag} at {target_commit} on {protected_branch} "
           f"with checks {required_checks}")

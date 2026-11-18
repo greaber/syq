@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -86,6 +87,29 @@ class Store:
         path = self.root / relative
         atomic(path, text)
         return str(path)
+
+
+def poll(check, timeout, progress, timed_out=None, interval=0.25, every=10):
+    """Return the first result of `check()` that is not None, retrying every `interval` s.
+
+    Prints `progress()` to stderr at most every `every` s while waiting. After `timeout` s,
+    raises Error(`timed_out()`), or returns None when `timed_out` is not given.
+    """
+    deadline = time.monotonic() + timeout
+    report = 0
+    while True:
+        result = check()
+        if result is not None:
+            return result
+        now = time.monotonic()
+        if now >= deadline:
+            if timed_out is None:
+                return None
+            raise Error(timed_out())
+        if now >= report:
+            print(progress(), file=sys.stderr, flush=True)
+            report = now + every
+        time.sleep(min(interval, max(0, deadline - time.monotonic())))
 
 
 def publish(store, state, topic, author, title, body):

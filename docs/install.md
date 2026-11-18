@@ -79,7 +79,10 @@ helpers and installation exceptions.
 ## Updates
 
 Use `syq --self-update` for a standalone installation, or `brew upgrade syq`
-for Homebrew. Commands already running keep their own version, and receiving
+for Homebrew. A `syq` that a Python package installed is upgraded with the
+tool that installed it, such as `pip install --upgrade syq`;
+`syq --self-update` declines to replace it and says so. Commands already
+running keep their own version, and receiving
 [switches to the new version](persistence-reference.md#connection-lifetime-and-waits)
 once nothing is in progress.
 

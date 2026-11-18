@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod command;
 mod inference;
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 pub(crate) use command::{command_for_help, run};
 const SCHEMA: i64 = 2;
 const DEFAULT_BUDGET: u64 = 10 << 20;
@@ -40,7 +40,6 @@ struct Writer {
     lost: i64,
     budget: u64,
     finished: bool,
-    recommendation: Option<(usize, bool)>,
     measurements: inference::Eligibility,
     measurement_segment: i64,
     salt: [u8; 32],
@@ -270,7 +269,6 @@ impl Recorder {
             lost: 0,
             budget,
             finished: false,
-            recommendation: None,
             measurements: Default::default(),
             measurement_segment: 0,
             salt,
@@ -372,78 +370,18 @@ impl Recorder {
             .flatten()
     }
 
-    #[cfg(test)]
-    pub(crate) fn hint(&self, key: &ContextKey, allow_route: bool) -> Option<Hint> {
-        let state = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        select_hint(&state.db, key, allow_route).ok().flatten()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn recommend(&self, workers: usize, discovery_complete: bool) {
-        self.0
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .recommendation = Some((workers, discovery_complete));
-    }
-
-    pub(crate) fn complete(&self, success: bool, mut summary: Value) {
-        let recommendation = self
-            .0
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .recommendation;
-        if let Some((_, discovery_complete)) = recommendation {
-            summary["discovery_complete"] = json!(discovery_complete);
-        }
-        self.finish(
-            success,
-            recommendation.is_some(),
-            recommendation.map(|(workers, _)| workers),
-            summary,
-        );
-    }
-
-    pub(crate) fn finish(
-        &self,
-        success: bool,
-        eligible: bool,
-        workers: Option<usize>,
-        summary: Value,
-    ) {
+    /// Record the outcome and the final summary. Later events are ignored.
+    pub(crate) fn complete(&self, success: bool, summary: Value) {
         self.event("finish", summary.clone());
         let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
         if state.finished {
             return;
         }
-        if let Err(error) = state.finish(success, eligible, workers, summary) {
+        if let Err(error) = state.finish(success, summary) {
             diagnostic(&error);
         }
         state.finished = true;
     }
-}
-
-#[cfg(test)]
-fn select_hint(db: &Connection, key: &ContextKey, allow_route: bool) -> Result<Option<Hint>> {
-    if let (Some(src), Some(dst)) = (&key.source_filesystem, &key.destination_filesystem) {
-        let hint = db.query_row("SELECT id,workers,summary FROM runs WHERE route=?1 AND mode=?2 AND source_fs=?3 AND destination_fs=?4 AND status='success' AND eligible=1 AND workers>0 ORDER BY id DESC LIMIT 1",
-            params![key.route,key.mode,src,dst], |r| {
-                // The additive summary field leaves old histories usable as
-                // starting guesses, without mistaking them for completed search.
-                let summary: Option<String> = r.get(2)?;
-                let refine = summary.as_deref()
-                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                    .is_some_and(|s| s["discovery_complete"] == true);
-                Ok(Hint {run:r.get(0)?,workers:r.get::<_,u32>(1)? as usize,matched:"filesystems".into(),refine})
-            }).optional()?;
-        if hint.is_some() {
-            return Ok(hint);
-        }
-    }
-    if !allow_route {
-        return Ok(None);
-    }
-    Ok(db.query_row("SELECT id,workers FROM runs WHERE route=?1 AND mode=?2 AND status='success' AND eligible=1 AND workers>0 ORDER BY id DESC LIMIT 1",
-        params![key.route,key.mode], |r| Ok(Hint {run:r.get(0)?,workers:r.get::<_,u32>(1)? as usize,matched:"route".into(),refine:false})).optional()?)
 }
 
 impl Writer {
@@ -461,7 +399,7 @@ impl Writer {
     fn write_pending(&self, transaction: &rusqlite::Transaction<'_>) -> Result<()> {
         // Context revisions (for example, discovering a mixed-filesystem tree)
         // must survive contention just like samples. Finish flushes this before
-        // publishing any recommendation under the context.
+        // recording the outcome under the context.
         if let Some(key) = &self.pending_context {
             transaction.execute("UPDATE runs SET context=?1,route=?2,source_fs=?3,destination_fs=?4,mode=?5 WHERE id=?6",
                 params![serde_json::to_string(key)?, key.route, key.source_filesystem, key.destination_filesystem, key.mode, self.id])?;
@@ -504,26 +442,18 @@ impl Writer {
         self.last_flush = Instant::now();
     }
 
-    fn finish(
-        &mut self,
-        success: bool,
-        eligible: bool,
-        workers: Option<usize>,
-        summary: Value,
-    ) -> Result<()> {
+    fn finish(&mut self, success: bool, summary: Value) -> Result<()> {
         let summary = serde_json::to_string(&summary)?;
-        let eligibility = if success && self.lost == 0 {
-            if self.measurements.reusable() {
-                inference::MEASUREMENTS
-            } else {
-                i64::from(eligible && workers.is_some())
-            }
+        // The `workers` column and the older `eligible` values belong to
+        // runs from earlier releases; this build leaves `workers` unset.
+        let eligibility = if success && self.lost == 0 && self.measurements.reusable() {
+            inference::MEASUREMENTS
         } else {
             0
         };
         // Pay at most one small lock wait for the entire final save. Once the
         // immediate transaction owns the writer lock, samples, context and the
-        // recommendation commit together without per-statement busy waits.
+        // outcome commit together without per-statement busy waits.
         self.db.busy_timeout(FINISH_LOCK_WAIT)?;
         let transaction = rusqlite::Transaction::new_unchecked(
             &self.db,
@@ -533,11 +463,10 @@ impl Writer {
         let transaction = transaction?;
         self.write_pending(&transaction)?;
         transaction.execute(
-            "UPDATE runs SET status=?1,eligible=?2,workers=?3,summary=?4,lost=?5 WHERE id=?6",
+            "UPDATE runs SET status=?1,eligible=?2,summary=?3,lost=?4 WHERE id=?5",
             params![
                 if success { "success" } else { "failed" },
                 eligibility,
-                workers.map(|n| n as u32),
                 summary,
                 self.lost,
                 self.id
