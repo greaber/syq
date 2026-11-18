@@ -76,16 +76,7 @@ fn ensure_same<T: serde::Serialize>(requested: &T, derived: &T) -> Result<()> {
     Ok(())
 }
 
-/// Copies to this machine, the receiving machine `receiver`.
-/// The copy `command` asks this machine, the receiving machine `receiver`,
-/// to approve: a `syq cp` to `@receiver`. This machine derives what the copy
-/// may do from the command (`directive::receiving_rules`). The server
-/// supplies ignore rules and the mapping's digest, which this machine does
-/// not check. Neither reaches beyond the scopes, policy and limits the
-/// command states, and ignore rules only narrow a copy, but a mapping's
-/// entries can also set the permissions and group of the files they list
-/// without the matching copy option. The prompt warns of that
-/// (`receive_approval::copy_warnings`).
+/// Parse `command` and check it as `check_receiving_command` does.
 #[cfg(test)]
 pub(crate) fn receiving_command(command: &[Vec<u8>], receiver: &str) -> Result<crate::cli::Args> {
     let args = parse(command)?;
@@ -93,7 +84,15 @@ pub(crate) fn receiving_command(command: &[Vec<u8>], receiver: &str) -> Result<c
     Ok(args)
 }
 
-/// The check of `receiving_command`, for a command already parsed.
+/// Check `args`, the copy a server asks this machine, the receiving machine
+/// `receiver`, to approve: a `syq cp` to `@receiver`. This machine derives
+/// what the copy may do from the command (`directive::receiving_rules`). The
+/// server supplies ignore rules and the mapping's digest, which this machine
+/// does not check. Neither reaches beyond the scopes, policy and limits the
+/// command states, and ignore rules only narrow a copy, but a mapping's
+/// entries can also set the permissions and group of the files they list
+/// without the matching copy option. The prompt warns of that
+/// (`receive_approval::copy_warnings`).
 pub(crate) fn check_receiving_command(args: &crate::cli::Args, receiver: &str) -> Result<()> {
     anyhow::ensure!(
         args.interface == crate::cli::Interface::NativeCp && args.s3.is_none(),
