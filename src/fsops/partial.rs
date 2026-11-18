@@ -3065,8 +3065,7 @@ impl FsOps {
     /// held while its name still leads to it and the copy goes on, so that
     /// it can be finalized again. A Finalize sent again after its connection dropped waits for
     /// the first one, and then finds the file held again, or published, and
-    /// then answers as the first one did. One that may publish nothing new
-    /// (`set_finalize_repeat_only`) only answers so.
+    /// then answers as the first one did.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn finalize_rooted(
         &mut self,
@@ -3080,13 +3079,7 @@ impl FsOps {
         expected: Option<&crate::hashing::ExpectedHashes>,
     ) -> Result<Option<(u64, u64)>> {
         let held_for = stages::of(self.stage_scope, target, copy_id, inplace);
-        let found = match self.finalize_repeat_only {
-            Some(refusal) => Some(stages::Found::Published(
-                stages::repeated(held_for).ok_or_else(|| anyhow!(refusal))?,
-            )),
-            None => stages::finalize(held_for),
-        };
-        let (held, finalizing) = match found {
+        let (held, finalizing) = match stages::finalize(held_for) {
             Some(stages::Found::Held(held, finalizing)) => (*held, finalizing),
             Some(stages::Found::Published(identity)) => {
                 self.finalize_repeated = true;
@@ -4532,7 +4525,7 @@ fn remove_unwritten_partial(root: &Root, relative: &RelativePath) -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        if !super::fs_caps::leases_show_writers(&file) {
+        if !root.leases_show_writers_on(metadata.dev(), &file) {
             return false;
         }
         // Nothing releases this lease when it is broken: a writer's open
@@ -4845,16 +4838,9 @@ pub(crate) fn check_destination_writes(file: &File, label: &Path) -> Result<()> 
     #[cfg(target_os = "macos")]
     {
         let check = || -> io::Result<()> {
-            let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
-            // SAFETY: fstatfs initializes stats, including a NUL-terminated type
-            // name, on success. Inspect this inode, not a root that might have
-            // a different filesystem mounted underneath it.
-            crate::sys::retry_zero(|| unsafe {
-                libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr())
-            })?;
-            let stats = unsafe { stats.assume_init() };
-            let kind = unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) };
-            if matches!(kind.to_bytes(), b"nfs" | b"smbfs") {
+            // Inspect this inode, not a root that might have a different
+            // filesystem mounted underneath it.
+            if matches!(super::file_system_of(file)?.kind(), b"nfs" | b"smbfs") {
                 // Use ordinary fsync: Rust's sync_all/sync_data request the
                 // stronger, expensive F_FULLFSYNC on macOS. Local filesystems
                 // need neither this flush nor an ineffective duplicate close.

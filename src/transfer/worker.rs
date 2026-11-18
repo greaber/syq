@@ -3016,11 +3016,7 @@ impl Worker {
                 .observation
                 .as_ref()
                 .map(|a| a.span(crate::transfer_observations::Stage::Pacing));
-            if self.opts.tuning.bw_pacing == Some(crate::transfer_tuning::BwPacing::Average) {
-                limit.wait_prepaid(bytes);
-            } else {
-                limit.wait(bytes);
-            }
+            limit.wait(bytes);
         }
     }
 

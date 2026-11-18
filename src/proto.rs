@@ -1925,10 +1925,6 @@ pub struct WireError {
     /// receiver found this before changing anything
     /// (`fsops::condition_not_met`).
     pub condition_not_met: bool,
-    /// The receiver changed nothing for this operation: its condition was
-    /// not met, or it found it could not be done before starting
-    /// (`fsops::unchanged`).
-    pub unchanged: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
@@ -2034,7 +2030,6 @@ impl From<String> for WireError {
             io_kind: None,
             raw_os_error: None,
             condition_not_met: false,
-            unchanged: false,
         }
     }
 }

@@ -224,11 +224,17 @@ pub(crate) struct Root {
     identity: RootIdentity,
     #[cfg(target_os = "linux")]
     partial_name_limits: OnceLock<Mutex<HashMap<Vec<Vec<u8>>, usize>>>,
+    /// What the root's filesystem type implies, once read: its descriptor
+    /// keeps that filesystem mounted, so its device number cannot be given
+    /// to another while the root exists. A file with the root's device
+    /// number is not always on the root's filesystem: an overlay whose
+    /// layers are on other filesystems shows some of its files with their
+    /// layer's device (kernels before 5.7, without `xino`).
     #[cfg(target_os = "linux")]
-    bounds_replacement: OnceLock<bool>,
+    type_facts: OnceLock<&'static crate::fsops::TypeFacts>,
     network: OnceLock<bool>,
     /// Whether a close on the root's filesystem reports no write error
-    /// (`fsops::close_is_quiet`), read when a written file first asks.
+    /// (`TypeFacts::quiet_close`), read when a written file first asks.
     quiet_close: OnceLock<bool>,
     /// The profile of the root's own device as `Profile` bits, with
     /// `PROFILE_KNOWN` set once read, so that publication there looks it up
@@ -303,7 +309,7 @@ impl Root {
             #[cfg(target_os = "linux")]
             partial_name_limits: OnceLock::new(),
             #[cfg(target_os = "linux")]
-            bounds_replacement: OnceLock::new(),
+            type_facts: OnceLock::new(),
             network: OnceLock::new(),
             quiet_close: OnceLock::new(),
             root_profile: AtomicU16::new(0),
@@ -336,17 +342,38 @@ impl Root {
     fn bounds_replacement(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
-            *self.bounds_replacement.get_or_init(|| {
-                let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
-                // SAFETY: fstatfs writes only into the local struct.
-                unsafe {
-                    libc::fstatfs(self.directory.as_raw_fd(), stats.as_mut_ptr()) != 0
-                        || stats.assume_init().f_type as u32 != libc::XFS_SUPER_MAGIC as u32
-                }
-            })
+            self.type_facts().bounds_replacement
         }
         #[cfg(not(target_os = "linux"))]
         false
+    }
+
+    /// What the root's filesystem type implies, read once; a failed read
+    /// is answered as an unknown type and tried again next time.
+    #[cfg(target_os = "linux")]
+    fn type_facts(&self) -> &'static crate::fsops::TypeFacts {
+        if let Some(facts) = self.type_facts.get() {
+            return facts;
+        }
+        match crate::fsops::file_system_of(&self.directory) {
+            Ok(file_system) => self.type_facts.get_or_init(|| file_system.facts()),
+            Err(_) => &crate::fsops::UNKNOWN_TYPE,
+        }
+    }
+
+    /// Whether a read lease on `file`, on device `dev`, shows every write
+    /// to it (`fsops::leases_show_writers`). On the root's own device, where
+    /// the root's type does not trust leases, the answer is no without
+    /// asking the filesystem, which on NFS is a request to the server. Only
+    /// that conservative answer is taken from the root: a file with its
+    /// device number can be on an overlay (see `type_facts`), so a yes is
+    /// asked of the file's own filesystem.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn leases_show_writers_on(&self, dev: u64, file: &File) -> bool {
+        if dev == self.identity.dev && !crate::fsops::leases_trusted(self.type_facts()) {
+            return false;
+        }
+        crate::fsops::leases_show_writers(file)
     }
 
     /// Whether this root lies on a network filesystem, where each operation
@@ -363,18 +390,41 @@ impl Root {
     }
 
     /// Whether closing a descriptor of a file on device `dev` beneath this
-    /// root may report a write error (see `fsops::close_is_quiet`). Only
+    /// root may report a write error (see `TypeFacts::quiet_close`). Only
     /// the root's own device can be known to report none: the root's open
     /// directory keeps that filesystem mounted and its device number its
     /// own, so what was read once holds for as long as the root does. A
     /// filesystem mounted beneath the root can be replaced by another that
-    /// is given the same number, so a file there always may. After the
-    /// first, a lookup is one atomic load.
+    /// is given the same number, so a file there always may. A file an
+    /// overlay shows with the root's device number (see `type_facts`) is
+    /// written through the root's filesystem, whose `flush` is the only
+    /// one the overlay calls. After the first, a lookup is one atomic load.
     pub(crate) fn close_reports_writes_on(&self, dev: u64) -> bool {
-        dev != self.identity.dev
-            || !*self
-                .quiet_close
-                .get_or_init(|| crate::fsops::close_is_quiet(&self.directory))
+        dev != self.identity.dev || !*self.quiet_close.get_or_init(|| self.close_is_quiet())
+    }
+
+    /// Whether a close on the root's filesystem reports no write error.
+    /// Other systems have no filesystem known for it (macOS decides its
+    /// own check from the file's filesystem).
+    fn close_is_quiet(&self) -> bool {
+        // A test that fails the check of a file's writes, or stands in for
+        // an unknown filesystem, has the check made.
+        #[cfg(debug_assertions)]
+        if [
+            "SYQ_TEST_FAIL_WRITER_CLOSE",
+            "SYQ_TEST_CONSERVATIVE_FILESYSTEM",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+        {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.type_facts().quiet_close
+        }
+        #[cfg(not(target_os = "linux"))]
+        false
     }
 
     /// Stand in for a filesystem whose close does or does not report write
@@ -3477,12 +3527,7 @@ fn clear_nonblocking(file: &File) -> io::Result<()> {
 /// Identify the filesystem of a held descriptor without resolving its path.
 #[cfg(target_os = "macos")]
 pub(crate) fn filesystem_is(file: &File, name: &[u8]) -> io::Result<bool> {
-    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    // SAFETY: fstatfs initializes the supplied structure on success, including
-    // its NUL-terminated filesystem type name. Retry an interrupted probe.
-    retry_zero(|| unsafe { libc::fstatfs(file.as_raw_fd(), stats.as_mut_ptr()) })?;
-    let stats = unsafe { stats.assume_init() };
-    Ok(unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) }.to_bytes() == name)
+    Ok(crate::fsops::file_system_of(file)?.kind() == name)
 }
 
 /// The account this process runs as, for comparing owners with. Debug

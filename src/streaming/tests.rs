@@ -287,7 +287,6 @@ fn streaming_replies_preserve_errors_and_wait_for_the_fence() {
         io_kind: Some(crate::proto::WireIoKind::NoSpace),
         raw_os_error: None,
         condition_not_met: false,
-        unchanged: false,
     })))
     .unwrap();
     tx.send(queued(Response::Err("later error".into())))
