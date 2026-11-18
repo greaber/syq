@@ -3273,7 +3273,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 // is cleaned up when the copy ends.
                 let ahead = if id == 0 && first_connects_ahead.load(Relaxed) {
                     let sides = connector()?.sides_ahead();
-                    let (opened, ahead) = std::sync::mpsc::sync_channel(1);
+                    // The thread hands its connections over only to a worker
+                    // that is waiting for them. Otherwise it closes them
+                    // itself: closing one sends a request, which a bandwidth
+                    // limit paces, and this worker is joined.
+                    let (opened, ahead) = std::sync::mpsc::sync_channel(0);
                     #[cfg(debug_assertions)]
                     crate::fsops::record_test_event(
                         "SYQ_TEST_WORKER_EVENTS",
