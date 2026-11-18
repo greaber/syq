@@ -1246,57 +1246,6 @@ impl Queue {
         }, notifications, TIMEOUT, cancelled)
     }
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn request_ssh(
-        &self,
-        from: &Requester,
-        command: &[Vec<u8>],
-        cwd: &str,
-        endpoint: &crate::cli::NativeEndpoint,
-        persistent: bool,
-        notifications: Notifications,
-        cancelled: impl Fn() -> bool,
-    ) -> Result<()> {
-        let mut id = [0; 16];
-        getrandom::fill(&mut id).map_err(|e| anyhow::anyhow!("approval ID: {e}"))?;
-        let target = format!(
-            "{}@{}:{}",
-            endpoint.user.as_deref().unwrap_or(""),
-            endpoint.host,
-            endpoint.port.unwrap_or(22)
-        );
-        self.wait(Summary {
-            id: id.iter().map(|b| format!("{b:02x}")).collect(),
-            from: format!("{:?}", from.to_string()),
-            server: from.server.clone(),
-            expires_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + TIMEOUT.as_secs(),
-            notification: "starting".into(),
-            command: crate::approval_command::display(command),
-            server_cwd: shown_directory(cwd),
-            verb: "wants SSH account access",
-            sources_heading: "",
-            sources: Vec::new(),
-            preposition: "to",
-            target: target.clone(),
-            notes: vec![if persistent {
-                "This permits repeated commands and copies through a reusable SSH login while the laptop stays connected. Close it with syq persist off.".into()
-            } else {
-                "This grants account access, not permission for only the displayed command.".into()
-            }],
-            details: Details::Ssh {
-                kind: SshKind::Ssh,
-                reusable: persistent,
-                account: None,
-                destination: target,
-                permission: if persistent {
-                    "May reuse this account's full authority for repeated SSH commands and copies while the laptop stays connected. Copy roots and limits do not apply. Close this login with syq persist off.".into()
-                } else {
-                    "May use this account's full authority for this SSH login. Copy roots and limits do not apply. Session traffic travels directly between the servers.".into()
-                },
-            },
-        }, notifications, TIMEOUT, cancelled)
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn request_account(
         &self,
         from: &Requester,
@@ -3449,16 +3398,11 @@ mod tests {
         let queue = Arc::new(Queue::default());
         let waiter = queue.clone();
         let task = std::thread::spawn(move || {
-            waiter.request_ssh(
+            waiter.request_account(
                 &requester(),
-                &[b"ssh".to_vec(), b"hostB".to_vec()],
+                &[b"ssh".to_vec(), b"destination".to_vec()],
                 "/tmp/project",
-                &crate::cli::NativeEndpoint {
-                    user: Some("alice".into()),
-                    host: "hostB".into(),
-                    port: Some(2222),
-                },
-                false,
+                &account_permission(),
                 Notifications::Off,
                 || false,
             )
@@ -3466,16 +3410,6 @@ mod tests {
         wait_pending(&queue);
         let pending = queue.snapshots().pop().unwrap();
         assert_eq!(pending.kind(), Kind::Ssh);
-        assert!(pending
-            .desktop_description(false)
-            .contains("account access"));
-        assert!(pending
-            .desktop_description(false)
-            .contains("not permission for only"));
-        let details = pending.description(&crate::persistence::Domain::default(), str::to_owned);
-        assert!(details.contains("alice@hostB:2222"));
-        assert!(details.contains("full authority"));
-        assert!(details.contains("directly between the servers"));
         let json = serde_json::to_value(&pending).unwrap();
         assert_eq!(json["kind"], "ssh");
         assert!(json.get("max_bytes").is_none());

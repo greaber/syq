@@ -128,17 +128,6 @@ pub(crate) fn parse(argv: &[OsString]) -> Result<SessionRequest> {
     Ok(request.with_provider(provider))
 }
 
-/// Validate the displayed command without reading the laptop's preferences.
-pub(crate) fn parse_for_approval(argv: &[OsString], expected: &str) -> Result<SessionRequest> {
-    let (request, mode, _) = parse_command(argv)?;
-    match mode {
-        None => {}
-        Some(AuthFrom::Provider(Provider::Return(name))) if name == expected => {}
-        _ => bail!("SSH authorizer does not match the shown command"),
-    }
-    Ok(request.with_provider(Provider::Return(expected.to_owned())))
-}
-
 pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
     let (request, explicit, scope) = parse_command(argv)?;
     let domain = crate::persistence::Domain::select(scope.as_deref())?;
@@ -316,27 +305,14 @@ mod tests {
     }
 
     #[test]
-    fn native_choices_and_approval_validation_do_not_read_preferences() {
+    fn native_choices_parse_without_reading_preferences() {
         for selector in ["auto", "ssh"] {
             let argv: Vec<OsString> = ["ssh", "--auth-from", selector, "hostB", "--", "exit 17"]
                 .into_iter()
                 .map(Into::into)
                 .collect();
             assert!(parse_command(&argv).is_ok());
-            assert!(parse_for_approval(&argv, "laptop").is_err());
         }
-        let argv: Vec<OsString> = ["ssh", "hostB", "--", "exit 17"]
-            .into_iter()
-            .map(Into::into)
-            .collect();
-        let approved = parse_for_approval(&argv, "laptop").unwrap();
-        assert_eq!(approved.provider, Provider::Return("laptop".into()));
-        assert_eq!(approved.command, [OsString::from("exit 17")]);
-        let mismatch: Vec<OsString> = ["ssh", "--auth-from", "@other", "hostB"]
-            .into_iter()
-            .map(Into::into)
-            .collect();
-        assert!(parse_for_approval(&mismatch, "laptop").is_err());
     }
 
     #[test]
@@ -364,7 +340,6 @@ mod tests {
         assert_eq!(parsed.destination.user.as_deref(), Some("bob"));
         assert_eq!(parsed.destination.host, "destination");
         assert_eq!(parsed.destination.port, Some(2200));
-        assert!(parse_for_approval(&argv, "laptop").is_err());
     }
 
     #[test]
@@ -387,10 +362,8 @@ mod tests {
             scope.as_deref(),
             Some(std::path::Path::new("/does/not/exist/on/provider"))
         );
-        let approved = parse_for_approval(&argv, "laptop").unwrap();
-        assert_eq!(approved.destination, request.destination);
         assert_eq!(
-            approved.ssh_arguments(&approved.destination).unwrap(),
+            request.ssh_arguments(&request.destination).unwrap(),
             [
                 OsString::from("--"),
                 OsString::from("hostB"),
