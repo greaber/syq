@@ -3582,8 +3582,6 @@ fn hash_range(file: &File, offset: u64, length: u64, algorithm: HashAlgorithm) -
     Ok(Digest::from_hash(algorithm, &hash.finalize()).value)
 }
 
-/// The bytes a seeded part is hashed in at a time, by each thread.
-const SEED_HASH_CHUNK: usize = 1 << 20;
 /// The most threads seeding a new partial.
 const SEED_THREADS: usize = 4;
 
@@ -3651,7 +3649,8 @@ fn seed_download_parts(
             .map(|_| {
                 scope.spawn(|| -> Result<Vec<(u64, String)>> {
                     let mut scratch = super::file_body::scratch();
-                    let buffer = &mut scratch[..SEED_HASH_CHUNK.min(part_size as usize)];
+                    let length = scratch.len().min(part_size as usize);
+                    let buffer = &mut scratch[..length];
                     let mut kept = Vec::new();
                     while let Some(&(index, hash)) = parts.get(next.fetch_add(1, Relaxed)) {
                         if let Some(hash) = seed_part(buffer, index, hash)? {

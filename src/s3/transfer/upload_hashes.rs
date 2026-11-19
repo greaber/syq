@@ -173,7 +173,8 @@ where
             let mut native = native.hasher();
             let mut subtrees = Vec::new();
             let mut buffer = crate::s3::file_body::scratch();
-            let buffer = &mut buffer[..part_size.min(1024 * 1024) as usize];
+            let length = buffer.len().min(part_size as usize);
+            let buffer = &mut buffer[..length];
             let mut offset = start;
             while offset < end {
                 let subtree_start = offset;
