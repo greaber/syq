@@ -583,32 +583,74 @@ impl Planner<'_> {
             return Ok(());
         }
         self.assert_mutation_root()?;
+        // Up to four requests await their replies, as for the links. Each
+        // part's operations are built when its turn to be sent comes, so
+        // that only the parts in flight hold their metadata.
+        let unanswered = self.dst.reply_queue().map_or(1, |replies| {
+            replies.min(super::directory_stream::REQUESTS_IN_FLIGHT)
+        });
+        self.withdraw_early_lookups();
         // The files to replace are queued together.
         let _burst = self.sched.file_burst();
-        for groups in self.hardlinks.kept_parts(&kept, 8192) {
-            let ops = groups
-                .iter()
-                .map(|&group| {
-                    let kept = self.hardlinks.groups[group].kept.as_ref().unwrap();
-                    Op::SetFileMetaIfSame {
-                        path: kept.leaf.dst.clone(),
-                        condition: kept.condition,
-                        meta: self.opts.metadata_for(&kept.leaf.dst_rel, &kept.leaf.e),
-                        // Its metadata matches (`keeps_representative`): none
-                        // of it needs fixing.
-                        flags: self.opts.ownership_flags(&kept.leaf.dst_rel)
-                            | flags::REPORT_IDENTITY,
+        let mut parts = self.hardlinks.kept_parts(&kept, 8192).into_iter();
+        let mut ready = std::collections::VecDeque::new();
+        let mut in_flight = std::collections::VecDeque::new();
+        // What ends the checks: a failure to send or an unusable reply, or a
+        // full destination. Nothing more is sent, and the replies to the
+        // requests already sent are still settled.
+        let mut failure = None;
+        let mut capacity_error = None;
+        loop {
+            while failure.is_none() && capacity_error.is_none() && in_flight.len() < unanswered {
+                if ready.is_empty() {
+                    let Some(groups) = parts.next() else {
+                        break;
+                    };
+                    #[cfg(debug_assertions)]
+                    let _ = crate::fsops::record_test_event(
+                        "SYQ_TEST_HARDLINK_EVENTS",
+                        format_args!("check {}", groups.len()),
+                    );
+                    let mut rest = groups;
+                    for ops in metadata_requests(self.kept_checks(groups)) {
+                        let (these, later) = rest.split_at(ops.len());
+                        rest = later;
+                        ready.push_back((ops, these));
                     }
-                })
-                .collect();
-            #[cfg(debug_assertions)]
-            let _ = crate::fsops::record_test_event(
-                "SYQ_TEST_HARDLINK_EVENTS",
-                format_args!("check {}", groups.len()),
-            );
-            let (errors, refused_whole) = self.apply_requests(metadata_requests(ops))?;
-            let capacity_error = first_capacity_error(&errors);
-            for ((&group, error), whole) in groups.iter().zip(errors).zip(refused_whole) {
+                    continue;
+                }
+                let (ops, groups) = ready.pop_front().unwrap();
+                match self.dst.send_pending(Request::Apply { ops }) {
+                    Ok(reply) => in_flight.push_back((reply, groups)),
+                    Err(error) => failure = Some(error),
+                }
+            }
+            let Some((reply, groups)) = in_flight.pop_front() else {
+                break;
+            };
+            let response = match self.dst.take_reply(reply) {
+                Ok(response) => response,
+                // No usable reply came: the connection is lost or out of
+                // step, so the replies after it are not waited for.
+                Err(error) => return Err(failure.unwrap_or(error)),
+            };
+            if failure.is_some() {
+                continue;
+            }
+            // A restricted receiver refuses a request whole when it would
+            // break the grant, a limit say (`applied`).
+            let whole = self.opts.restricted_receiver && matches!(response, Response::Err(_));
+            let errors = match self.applied(response, groups.len()) {
+                Ok(errors) => errors,
+                Err(error) => {
+                    failure = Some(error);
+                    continue;
+                }
+            };
+            if capacity_error.is_none() {
+                capacity_error = first_capacity_error(&errors);
+            }
+            for (&group, error) in groups.iter().zip(errors) {
                 match error {
                     None => self.representative_kept(group),
                     Some(error)
@@ -623,11 +665,32 @@ impl Planner<'_> {
                     Some(error) => self.representative_check_failed(group, &error),
                 }
             }
-            if let Some(error) = capacity_error {
-                return Err(endpoint_error(error)).context("apply destination changes");
-            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        if let Some(error) = capacity_error {
+            return Err(endpoint_error(error)).context("apply destination changes");
         }
         Ok(())
+    }
+
+    /// The checks of the kept representatives of `groups`, in order.
+    fn kept_checks(&self, groups: &[usize]) -> Vec<Op> {
+        groups
+            .iter()
+            .map(|&group| {
+                let kept = self.hardlinks.groups[group].kept.as_ref().unwrap();
+                Op::SetFileMetaIfSame {
+                    path: kept.leaf.dst.clone(),
+                    condition: kept.condition,
+                    meta: self.opts.metadata_for(&kept.leaf.dst_rel, &kept.leaf.e),
+                    // Its metadata matches (`keeps_representative`): none of
+                    // it needs fixing.
+                    flags: self.opts.ownership_flags(&kept.leaf.dst_rel) | flags::REPORT_IDENTITY,
+                }
+            })
+            .collect()
     }
 
     /// Before any worker starts, check the sources of the representatives
