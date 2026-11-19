@@ -22,8 +22,9 @@ struct Active {
     received: VecDeque<(u64, u64, Instant)>,
 }
 
-/// The caller enters with no outstanding destination requests and issues only
-/// PutSmallBatch until this scope ends. Dropping it retracts receipts the
+/// The caller enters with no outstanding destination requests, other than
+/// ones whose reply is a plain `Ok`, and issues only PutSmallBatch until this
+/// scope ends. Dropping it retracts receipts the
 /// worker never consumed; consumed receipts keep the usual file retry rules.
 /// After a failed drain the connection must be discarded, as for other RPCs.
 pub(crate) struct BatchProgress(Arc<BatchReceipts>);
@@ -65,6 +66,12 @@ impl BatchReceipts {
         let Some(active) = active.as_mut() else {
             return;
         };
+        // A batch is answered with its files' results or an error, never a
+        // plain `Ok`: this answers a request sent before the batches whose
+        // reply was not waited for (`Conn::send_expecting_ok`).
+        if matches!(response, Response::Ok) {
+            return;
+        }
         let Some(sizes) = active.pending.pop_front() else {
             return;
         };
@@ -238,7 +245,6 @@ mod tests {
     fn rejected_or_malformed_receipts_do_not_count_as_work() {
         for response in [
             Response::Err("denied".into()),
-            Response::Ok,
             Response::Applied(vec![]),
             Response::PublishedBatch(vec![Ok(None), Ok(None)]),
             Response::PublishedBatch(vec![Err("denied".into())]),
@@ -253,6 +259,22 @@ mod tests {
             assert_eq!(Meter::bytes(&*progress), 0);
             assert_eq!(Meter::files(&*progress), 0);
         }
+    }
+
+    #[test]
+    fn a_plain_ok_is_not_a_batch_receipt() {
+        let receipts = Arc::new(BatchReceipts::default());
+        let progress = Progress::new(false, false, None);
+        let scope = receipts.begin(progress.clone()).unwrap();
+        receipts.request(&test_request(&[32])).unwrap();
+        // The reply to a request sent before the batches, not waited for.
+        receipts.response(&Response::Ok);
+        assert_eq!(scope.received_count(), 0);
+        assert!(scope.consume().is_err(), "no batch was answered");
+        receipts.response(&Response::PublishedBatch(vec![Ok(None)]));
+        assert_eq!(scope.received_count(), 1);
+        assert_eq!(Meter::bytes(&*progress), 32);
+        scope.consume().unwrap();
     }
 
     #[test]

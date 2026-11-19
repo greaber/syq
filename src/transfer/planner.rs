@@ -82,6 +82,10 @@ pub(super) struct Planner<'a> {
     /// The group and mode of destination directories, as `must_replace`
     /// read them for a root receiver; None for one that does not exist.
     pub(super) parent_groups: std::collections::HashMap<PathBytes, Option<(u32, u32)>>,
+    /// The directories the leaves being planned may ask about
+    /// (`group_question_parents`): the first question reads them all, in
+    /// one request, rather than each wait for its own reply.
+    pub(super) leaf_parents: Vec<PathBytes>,
     /// Who a file the receiver creates in the destination belongs to, once
     /// asked (`Request::NewFileOwner`).
     pub(super) new_file_owner: Option<crate::proto::NewFileOwner>,
@@ -1973,15 +1977,61 @@ impl Planner<'_> {
     /// do the same.
     fn plan_leaves(
         &mut self,
-        leaves: impl IntoIterator<Item = (Planned, Option<Entry>)>,
+        leaves: Vec<(Planned, Option<Entry>)>,
         dst_root: &[u8],
         leaf_ops: &mut LeafOps,
     ) -> Result<()> {
         let _burst = self.sched.file_burst();
-        for (leaf, entry) in leaves {
-            self.plan_leaf(leaf, entry, dst_root, leaf_ops)?;
+        self.leaf_parents = self.group_question_parents(
+            leaves
+                .iter()
+                .map(|(leaf, destination)| (leaf, destination.as_ref())),
+        );
+        let planned = leaves
+            .into_iter()
+            .try_for_each(|(leaf, entry)| self.plan_leaf(leaf, entry, dst_root, leaf_ops));
+        self.leaf_parents = Vec::new();
+        planned
+    }
+
+    /// The directories whose group planning `leaves` may ask a root
+    /// receiver (`new_file_group_may_differ`) and has not read: those of the
+    /// existing files the copy would write in place or link new names to,
+    /// where it does not copy the group. Only a file the copy does not
+    /// keep by its size and time is written in place (`plan_file`); one
+    /// missed here is asked by itself.
+    pub(super) fn group_question_parents<'l>(
+        &self,
+        leaves: impl Iterator<Item = (&'l Planned, Option<&'l Entry>)>,
+    ) -> Vec<PathBytes> {
+        let opts = self.opts;
+        if !(opts.inplace_update || opts.hardlinks) || self.receiver_uid.is_some_and(|uid| uid != 0)
+        {
+            return Vec::new();
         }
-        Ok(())
+        let mut parents: Vec<PathBytes> = Vec::new();
+        for (leaf, destination) in leaves {
+            let Some(destination) = destination.filter(|d| d.kind == Kind::File) else {
+                continue;
+            };
+            let asks = leaf.e.kind == Kind::File
+                && opts.flags_for(&leaf.dst_rel) & flags::GROUP == 0
+                && ((opts.hardlinks && leaf.e.nlink > 1)
+                    || (opts.inplace_update
+                        && !(opts.keeps_matching_file(&leaf.dst_rel)
+                            && opts.metadata_matches(&leaf.dst_rel, &leaf.e, destination))));
+            let Some(parent) = super::directory_stream::parent_of(&leaf.dst).filter(|_| asks)
+            else {
+                continue;
+            };
+            // A directory's files are planned together.
+            if parents.last().is_none_or(|last| last != parent)
+                && !self.parent_groups.contains_key(parent)
+            {
+                parents.push(parent.to_vec());
+            }
+        }
+        parents
     }
 
     /// Decide what one mapped leaf needs, given what its destination holds.
@@ -2183,9 +2233,7 @@ impl Planner<'_> {
         // Content is up to date, but its metadata differs, and the receiver
         // cannot change it in place: the file is replaced as a changed file
         // is (`must_replace`).
-        let quick = same
-            && opts.trusts_size_and_time()
-            && (opts.dry_run || opts.expected_for(&dst_rel).is_none());
+        let quick = same && opts.keeps_matching_file(&dst_rel);
         let replace = quick
             && dst_entry.as_ref().is_some_and(|d| {
                 (opts.metadata_fix_flags(&dst_rel, &e, d) != 0
@@ -5423,25 +5471,14 @@ impl Planner<'_> {
         group: u32,
         new_file: crate::proto::NewFileOwner,
     ) -> bool {
-        let Some(parent) = dst
-            .iter()
-            .rposition(|&c| c == b'/')
-            .map(|i| dst[..i.max(1)].to_vec())
-        else {
+        let Some(parent) = super::directory_stream::parent_of(dst) else {
             return true;
         };
-        let directory = match self.parent_groups.get(&parent) {
+        let directory = match self.parent_groups.get(parent) {
             Some(directory) => *directory,
             None => {
                 self.announce_before_asking(true);
-                let directory = self
-                    .stat_many(vec![parent.clone()])
-                    .ok()
-                    .and_then(|mut stats| stats.pop().flatten())
-                    .filter(|entry| entry.kind == Kind::Dir)
-                    .map(|entry| (entry.gid, entry.mode));
-                self.parent_groups.insert(parent, directory);
-                directory
+                self.read_parent_groups(parent.to_vec())
             }
         };
         match directory {
@@ -5451,6 +5488,34 @@ impl Planner<'_> {
                 parent_group != group || (parent_mode & 0o2000 == 0 && new_file.group != group)
             }
         }
+    }
+
+    /// Read the group and mode of the directory `parent` into
+    /// `parent_groups`, and with it, in the same request, those of the
+    /// other directories the leaves being planned may ask about
+    /// (`leaf_parents`): a tree of small directories otherwise waits a
+    /// round trip for each. A directory that cannot be read counts as
+    /// missing, so a file there is replaced. This is a plain lookup, not
+    /// the planner's own (`Planner::stat_many`): that one fails as a whole
+    /// when a `--copy-if` copy sees an entry change between its two reads,
+    /// as these directories do while workers publish into them.
+    fn read_parent_groups(&mut self, parent: PathBytes) -> Option<(u32, u32)> {
+        let mut parents = std::mem::take(&mut self.leaf_parents);
+        parents.push(parent.clone());
+        parents.sort_unstable();
+        parents.dedup();
+        let mut stats = stat_many(self.dst, parents.clone(), false)
+            .unwrap_or_default()
+            .into_iter();
+        for path in parents {
+            let directory = stats
+                .next()
+                .flatten()
+                .filter(|entry| entry.kind == Kind::Dir)
+                .map(|entry| (entry.gid, entry.mode));
+            self.parent_groups.insert(path, directory);
+        }
+        self.parent_groups.get(&parent).copied().flatten()
     }
 
     /// Sort existing directories whose owner lacks write or search

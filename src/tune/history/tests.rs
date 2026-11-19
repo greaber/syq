@@ -1,14 +1,31 @@
 use super::*;
 
 pub(in crate::tune) fn recorder(path: &Path) -> Recorder {
-    Recorder::at(
+    let recorder = Recorder::at(
         path,
         Instant::now(),
         json!({"policy_version":1}),
         DEFAULT_BUDGET,
     )
-    .unwrap()
+    .unwrap();
+    // A test asks for a periodic save when it wants one, so that a slow
+    // machine does not add one a second into it.
+    recorder.0.lock().unwrap().next_write = Instant::now() + Duration::from_secs(3600);
+    recorder
 }
+/// Save what `writer` has recorded so far, as a copy more than a second old
+/// does on its next event, and return its run.
+pub(in crate::tune) fn saved(writer: &Recorder) -> i64 {
+    let mut state = writer.0.lock().unwrap();
+    state.save().unwrap();
+    state.id.expect("a saved run has a row")
+}
+
+fn run_count(db: &Connection) -> i64 {
+    db.query_row("SELECT count(*) FROM runs", [], |r| r.get(0))
+        .unwrap()
+}
+
 pub(in crate::tune) fn key(destination: &str) -> ContextKey {
     ContextKey {
         route: "route".into(),
@@ -23,16 +40,17 @@ pub(in crate::tune) fn key(destination: &str) -> ContextKey {
 fn partial_history_is_durable_without_a_successful_finish() {
     let temp = crate::test_support::tempdir().unwrap();
     let path = temp.path().join("history.sqlite");
-    let id;
     {
+        // A copy that stops without recording an outcome, as when it panics,
+        // saves what it has as it is dropped.
         let writer = recorder(&path);
-        id = writer.0.lock().unwrap().id;
         writer.event(
             "sample",
             json!({"bytes":100,"files":2,"disposition":"warmup_excluded"}),
         );
     }
     let db = open(&path).unwrap();
+    let id = 1;
     assert_eq!(command::read_run(&db, id).unwrap()["status"], "incomplete");
     let events = command::read_events(&db, id).unwrap();
     assert_eq!(events.len(), 2);
@@ -81,16 +99,16 @@ fn retention_removes_whole_old_runs_and_keeps_current_and_active() {
     let old = recorder(&path);
     old.complete(true, json!({}));
     let active = recorder(&path);
+    let active = saved(&active);
     let current = recorder(&path);
     current.complete(true, json!({}));
+    let (old, current) = (saved(&old), saved(&current));
     let db = open(&path).unwrap();
-    prune(&db, 1, current.0.lock().unwrap().id).unwrap();
-    assert!(command::read_run(&db, old.0.lock().unwrap().id).is_err());
-    assert!(command::read_events(&db, old.0.lock().unwrap().id)
-        .unwrap()
-        .is_empty());
-    assert!(command::read_run(&db, active.0.lock().unwrap().id).is_ok());
-    assert!(command::read_run(&db, current.0.lock().unwrap().id).is_ok());
+    prune(&db, 1, current).unwrap();
+    assert!(command::read_run(&db, old).is_err());
+    assert!(command::read_events(&db, old).unwrap().is_empty());
+    assert!(command::read_run(&db, active).is_ok());
+    assert!(command::read_run(&db, current).is_ok());
 }
 
 #[test]
@@ -107,7 +125,7 @@ fn retention_shrinks_a_history_far_over_budget_and_returns_its_space() {
     )
     .unwrap();
     let current = recorder(&path);
-    let current_id = current.0.lock().unwrap().id;
+    let current_id = saved(&current);
     let budget = 256 << 10;
     prune_within(&db, budget, current_id, Duration::from_secs(60)).unwrap();
     let pages: i64 = db
@@ -211,7 +229,7 @@ fn a_prune_step_reads_a_bounded_part_of_a_history_it_cannot_shrink_by_age() {
         })
         .unwrap();
     let current = recorder(&path);
-    let current_id = current.0.lock().unwrap().id;
+    let current_id = saved(&current);
     // A connection that has read nothing yet, as a copy's is for these pages.
     let db = open(&path).unwrap();
     let before = pages_read(&db);
@@ -243,7 +261,7 @@ fn a_finishing_copy_reads_little_of_a_history_full_of_unfinished_runs() {
     let deleted = runs + 2 - run_ids(&observer).len() as i64;
     assert!(deleted > 0, "every copy shrinks a history over its budget");
     assert_eq!(
-        command::read_run(&observer, state.id).unwrap()["status"],
+        command::read_run(&observer, state.id.unwrap()).unwrap()["status"],
         "success"
     );
     // Opening, recording and choosing what to delete read a fixed number of
@@ -260,7 +278,7 @@ fn unfinished_runs_go_oldest_first_once_nothing_else_can_and_the_newest_stay() {
     let path = temp.path().join("history.sqlite");
     let db = unfinished_history(&path, 2000);
     let current = recorder(&path);
-    let current_id = current.0.lock().unwrap().id;
+    let current_id = saved(&current);
     let budget = 2 << 20;
     assert!(used_bytes(&db) > 4 * budget);
     prune_within(&db, budget as u64, current_id, Duration::from_secs(60)).unwrap();
@@ -295,7 +313,7 @@ fn an_unfinished_run_outlives_finished_ones_among_the_oldest() {
     // A long copy still recording, followed by far more finished runs than
     // separate it from the newest.
     let long = recorder(&path);
-    let long_id = long.0.lock().unwrap().id;
+    let long_id = saved(&long);
     let db = open(&path).unwrap();
     db.execute_batch(
         "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1000)
@@ -304,7 +322,7 @@ fn an_unfinished_run_outlives_finished_ones_among_the_oldest() {
     )
     .unwrap();
     let current = recorder(&path);
-    let current_id = current.0.lock().unwrap().id;
+    let current_id = saved(&current);
     assert!(long_id < current_id - ACTIVE_RUNS);
     let budget = 1 << 20;
     prune_within(&db, budget as u64, current_id, Duration::from_secs(60)).unwrap();
@@ -337,7 +355,7 @@ fn pruning_leaves_room_so_the_next_copies_only_check_the_size() {
     }
     let full = run_ids(&db).len();
     let first = Recorder::at(&path, Instant::now(), json!({}), budget as u64).unwrap();
-    let first_id = first.0.lock().unwrap().id;
+    let first_id = saved(&first);
     prune_within(&db, budget as u64, first_id, Duration::from_secs(60)).unwrap();
     let used = used_bytes(&db);
     assert!(used <= budget - budget / PRUNE_SLACK, "{used}");
@@ -388,12 +406,12 @@ fn a_run_deleted_while_its_copy_records_stops_recording() {
     let temp = crate::test_support::tempdir().unwrap();
     let path = temp.path().join("history.sqlite");
     let writer = recorder(&path);
-    let id = writer.0.lock().unwrap().id;
+    let id = saved(&writer);
     let other = open(&path).unwrap();
     // As another copy's pruning or `tuning-cache clear` does.
     other.execute("DELETE FROM runs WHERE id=?1", [id]).unwrap();
     writer.event("sample", json!({"bytes":1}));
-    writer.flush();
+    saved(&writer);
     {
         let state = writer.0.lock().unwrap();
         assert!(state.finished && state.pending.is_empty());
@@ -404,7 +422,7 @@ fn a_run_deleted_while_its_copy_records_stops_recording() {
     let before = pages_read(&writer.0.lock().unwrap().db);
     writer.context(&key("a"));
     writer.event("sample", json!({"bytes":2}));
-    writer.flush();
+    saved(&writer);
     writer.complete(true, json!({}));
     {
         let state = writer.0.lock().unwrap();
@@ -418,35 +436,40 @@ fn a_run_deleted_while_its_copy_records_stops_recording() {
 }
 
 #[test]
-fn lock_contention_keeps_samples_and_context_for_later_flush() {
+fn lock_contention_keeps_samples_and_context_for_a_later_save() {
     let temp = crate::test_support::tempdir().unwrap();
     let path = temp.path().join("history.sqlite");
     let writer = recorder(&path);
     writer.context(&key("a"));
+    let id = saved(&writer);
     let other = open(&path).unwrap();
     other.execute_batch("BEGIN IMMEDIATE").unwrap();
     let mut mixed = key("a");
     mixed.destination_filesystem = None;
     writer.context(&mixed);
     writer.event("sample", json!({"bytes":123}));
-    writer.flush();
-    assert_eq!(writer.0.lock().unwrap().pending.len(), 1);
+    {
+        // A periodic save does not wait for the lock: it fails at once and
+        // leaves the history alone for a while.
+        let before = Instant::now();
+        writer.0.lock().unwrap().next_write = before;
+        writer.event("sample", json!({"bytes":456}));
+        let state = writer.0.lock().unwrap();
+        assert_eq!(state.pending.len(), 2);
+        assert!(state.retry >= before + WRITE_RETRY);
+    }
     other.execute_batch("COMMIT").unwrap();
     writer.complete(true, json!({}));
     assert!(writer.0.lock().unwrap().pending.is_empty());
     assert!(writer.0.lock().unwrap().pending_context.is_none());
-    let run = command::read_run(&other, writer.0.lock().unwrap().id).unwrap();
+    let run = command::read_run(&other, id).unwrap();
+    assert_eq!(run["status"], "success");
     assert_eq!(run["context"]["destination_filesystem"], Value::Null);
-    assert_eq!(
-        command::read_events(&other, writer.0.lock().unwrap().id)
-            .unwrap()
-            .len(),
-        3
-    );
+    assert_eq!(command::read_events(&other, id).unwrap().len(), 4);
 }
 
 #[test]
-fn final_save_preserves_pending_evidence_and_restores_nonblocking_writes() {
+fn a_final_save_that_finds_the_history_locked_writes_nothing() {
     let temp = crate::test_support::tempdir().unwrap();
     let path = temp.path().join("history.sqlite");
     let recorder = recorder(&path);
@@ -461,41 +484,62 @@ fn final_save_preserves_pending_evidence_and_restores_nonblocking_writes() {
         Some(rusqlite::Error::SqliteFailure(error, _))
             if error.code == rusqlite::ErrorCode::DatabaseBusy
     ));
-    let timeout: i64 = writer
-        .db
-        .pragma_query_value(None, "busy_timeout", |r| r.get(0))
-        .unwrap();
-    assert_eq!(timeout, 0);
     assert!(!writer.pending.is_empty());
     assert!(writer.pending_context.is_some());
     other.execute_batch("COMMIT").unwrap();
-    assert_eq!(
-        command::read_run(&other, writer.id).unwrap()["status"],
-        "incomplete"
-    );
+    assert_eq!(run_count(&other), 0, "no run left without its outcome");
 
+    // Nothing was half-saved: the same save succeeds once the lock is free.
     writer.finish(true, json!({"files":1})).unwrap();
-    let timeout: i64 = writer
-        .db
-        .pragma_query_value(None, "busy_timeout", |r| r.get(0))
-        .unwrap();
-    assert_eq!(timeout, 0);
     assert!(writer.pending.is_empty());
     assert!(writer.pending_context.is_none());
-    let run = command::read_run(&other, writer.id).unwrap();
+    let run = command::read_run(&other, writer.id.unwrap()).unwrap();
     assert_eq!(run["status"], "success");
     assert_eq!(run["context"]["destination_filesystem"], "a");
-    assert!(command::read_events(&other, writer.id)
+    assert!(command::read_events(&other, writer.id.unwrap())
         .unwrap()
         .iter()
         .any(|e| e["kind"] == "sample"));
 }
 
 #[test]
-fn failed_final_save_does_not_publish_partial_context_or_samples() {
+fn a_copy_that_cannot_save_its_run_at_its_end_leaves_no_run() {
     let temp = crate::test_support::tempdir().unwrap();
     let path = temp.path().join("history.sqlite");
+    let writer = recorder(&path);
+    writer.context(&key("a"));
+    writer.event("sample", json!({"bytes":123}));
+    let other = open(&path).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    writer.complete(true, json!({}));
+    // Nor does it try again when it is dropped.
+    let before = pages_read(&writer.0.lock().unwrap().db);
+    other.execute_batch("COMMIT").unwrap();
+    writer.event("sample", json!({"bytes":456}));
+    assert_eq!(pages_read(&writer.0.lock().unwrap().db), before);
+    drop(writer);
+    assert_eq!(run_count(&other), 0);
+}
+
+#[test]
+fn a_failed_final_save_does_not_publish_partial_context_or_samples() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    // A copy that ends before its first periodic save writes all or nothing.
+    {
+        let recorder = recorder(&path);
+        let mut writer = recorder.0.lock().unwrap();
+        writer.pending_context = Some(key("a"));
+        writer.db.execute_batch("CREATE TRIGGER fail_event BEFORE INSERT ON events WHEN NEW.sequence=0 BEGIN SELECT RAISE(ABORT,'injected failure'); END;").unwrap();
+        assert!(writer.finish(true, json!({})).is_err());
+        assert_eq!(run_count(&writer.db), 0);
+        assert!(writer.id.is_none() && !writer.pending.is_empty());
+        writer.db.execute_batch("DROP TRIGGER fail_event").unwrap();
+        writer.finished = true;
+    }
+    // A longer copy keeps what its earlier saves wrote, and no more.
     let recorder = recorder(&path);
+    let id = saved(&recorder);
     let mut writer = recorder.0.lock().unwrap();
     writer.pending_context = Some(key("a"));
     writer
@@ -503,15 +547,199 @@ fn failed_final_save_does_not_publish_partial_context_or_samples() {
         .push(json!({"sequence":1,"elapsed_us":1,"kind":"sample","data":{}}));
     writer.db.execute_batch("CREATE TRIGGER fail_completion BEFORE UPDATE OF status ON runs BEGIN SELECT RAISE(ABORT,'injected failure'); END;").unwrap();
     assert!(writer.finish(true, json!({})).is_err());
-    let run = command::read_run(&writer.db, writer.id).unwrap();
+    let run = command::read_run(&writer.db, id).unwrap();
     assert_eq!(run["status"], "incomplete");
     assert_eq!(run["context"], json!({}));
-    assert_eq!(
-        command::read_events(&writer.db, writer.id).unwrap().len(),
-        1
-    );
+    assert_eq!(command::read_events(&writer.db, id).unwrap().len(), 1);
     assert!(!writer.pending.is_empty());
     assert!(writer.pending_context.is_some());
+}
+
+#[test]
+fn a_copy_writes_nothing_until_it_ends_and_then_writes_once() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    measured_run(&path, &key("a"), &[(8, 100.0), (16, 200.0)]);
+    let other = open(&path).unwrap();
+    // Another copy holds the writer lock while this one starts and records:
+    // none of that waits for it, or takes it.
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let writer = recorder(&path);
+    writer.context(&key("a"));
+    writer.event("context", json!({"stage":"source_registered"}));
+    // Its connection waits for no lock, so a starting count that it reads
+    // was read without waiting for the writer.
+    assert_eq!(writer.starting_count(&key("a"), false).unwrap().workers, 16);
+    for bytes in 0..100 {
+        writer.event("sample", json!({"bytes":bytes}));
+    }
+    other.execute_batch("COMMIT").unwrap();
+    assert_eq!(run_ids(&other), [1], "the copy has no run before it ends");
+    let writes = |db: &Connection| -> i64 {
+        db.query_row("SELECT total_changes()", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(writes(&writer.0.lock().unwrap().db), 0);
+    writer.complete(true, json!({"files":1}));
+    let run = command::read_run(&other, 2).unwrap();
+    assert_eq!(run["status"], "success");
+    assert_eq!(run["context"]["destination_filesystem"], "a");
+    assert_eq!(run["summary"]["files"], 1);
+    // The start event, the context event, the samples and the finish.
+    assert_eq!(command::read_events(&other, 2).unwrap().len(), 103);
+}
+
+#[test]
+fn a_copy_whose_history_opens_late_writes_nothing_as_it_starts() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    // The copy's clock started well before its history opened, as when
+    // choosing its authorization first connected to a server.
+    let start = Instant::now()
+        .checked_sub(Duration::from_secs(30))
+        .expect("the machine has been up for half a minute");
+    let writer = Recorder::at(&path, start, json!({}), DEFAULT_BUDGET).unwrap();
+    writer.context(&key("a"));
+    writer.event("context", json!({"stage":"source_registered"}));
+    {
+        let mut state = writer.0.lock().unwrap();
+        assert!(state.next_write > Instant::now());
+        assert!(state.id.is_none() && state.pending.len() == 2);
+        // Keep this test's own pace out of the rest.
+        state.next_write = Instant::now() + Duration::from_secs(3600);
+    }
+    writer.complete(true, json!({}));
+    let db = open(&path).unwrap();
+    let events = command::read_events(&db, 1).unwrap();
+    assert_eq!(events.len(), 3);
+    assert!(events[0]["elapsed_us"].as_u64().unwrap() >= 30_000_000);
+}
+
+#[test]
+fn a_save_that_found_the_history_locked_leaves_it_alone_for_a_while() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let writer = recorder(&path);
+    let db = open(&path).unwrap();
+    {
+        // As after a save that found the lock taken, with a save now due.
+        let mut state = writer.0.lock().unwrap();
+        state.retry = Instant::now() + Duration::from_secs(3600);
+        state.next_write = Instant::now();
+    }
+    for worker in 0..WRITE_EVENTS + 1 {
+        writer.event("worker", json!({"worker":worker}));
+    }
+    // The lock is free, yet nothing tried it: neither the save that is due
+    // nor the one that many unsaved events ask for.
+    assert_eq!(run_count(&db), 0);
+    writer.0.lock().unwrap().retry = Instant::now();
+    writer.event("worker", json!({}));
+    assert_eq!(
+        command::read_events(&db, 1).unwrap().len(),
+        WRITE_EVENTS + 3
+    );
+}
+
+#[test]
+fn a_long_copy_saves_its_timeline_while_it_runs() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let start = Instant::now();
+    let writer = Recorder::at(&path, start, json!({}), DEFAULT_BUDGET).unwrap();
+    // The first save is due a second after the history opened. Keep this
+    // test's own pace out of it from here on.
+    {
+        let mut state = writer.0.lock().unwrap();
+        assert!(state.next_write >= start + FIRST_WRITE);
+        assert!(state.next_write <= Instant::now() + FIRST_WRITE);
+        state.next_write = start + Duration::from_secs(3600);
+    }
+    let db = open(&path).unwrap();
+    writer.context(&key("a"));
+    writer.event("sample", json!({"bytes":1}));
+    assert_eq!(run_count(&db), 0, "nothing before the first save is due");
+    // The copy's first event after that saves everything so far.
+    let due = Instant::now();
+    writer.0.lock().unwrap().next_write = due;
+    writer.event("sample", json!({"bytes":2}));
+    let run = command::read_run(&db, 1).unwrap();
+    assert_eq!(run["status"], "incomplete");
+    assert_eq!(run["context"]["destination_filesystem"], "a");
+    assert_eq!(command::read_events(&db, 1).unwrap().len(), 3);
+    // Later events wait for the next save.
+    assert!(writer.0.lock().unwrap().next_write >= due + WRITE_INTERVAL);
+    writer.0.lock().unwrap().next_write = due + Duration::from_secs(3600);
+    writer.event("sample", json!({"bytes":3}));
+    assert_eq!(command::read_events(&db, 1).unwrap().len(), 3);
+    writer.0.lock().unwrap().next_write = Instant::now();
+    writer.event("sample", json!({"bytes":4}));
+    assert_eq!(command::read_events(&db, 1).unwrap().len(), 5);
+    writer.complete(true, json!({}));
+    assert_eq!(command::read_run(&db, 1).unwrap()["status"], "success");
+    assert_eq!(command::read_events(&db, 1).unwrap().len(), 6);
+    assert_eq!(run_count(&db), 1);
+}
+
+#[test]
+fn many_unsaved_events_are_saved_whatever_the_copy_s_age() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let writer = recorder(&path);
+    let db = open(&path).unwrap();
+    // The start event is the first of them.
+    for worker in 1..WRITE_EVENTS - 1 {
+        writer.event("worker", json!({"worker":worker}));
+    }
+    assert_eq!(run_count(&db), 0);
+    writer.event("worker", json!({"worker":WRITE_EVENTS}));
+    assert_eq!(
+        command::read_events(&db, 1).unwrap().len(),
+        WRITE_EVENTS,
+        "saved before any could be dropped"
+    );
+    assert_eq!(writer.0.lock().unwrap().lost, 0);
+}
+
+#[test]
+fn a_finishing_copy_waits_for_the_history_no_longer_than_it_ran() {
+    assert_eq!(finish_wait(Duration::ZERO), Duration::ZERO);
+    assert_eq!(
+        finish_wait(Duration::from_millis(8)),
+        Duration::from_millis(8)
+    );
+    assert_eq!(finish_wait(Duration::from_secs(1)), FINISH_LOCK_WAIT);
+    assert_eq!(finish_wait(Duration::from_secs(3600)), FINISH_LOCK_WAIT);
+}
+
+#[test]
+fn taking_the_writer_lock_waits_for_it_no_longer_than_allowed() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let writer = recorder(&path);
+    let state = writer.0.lock().unwrap();
+    let other = open(&path).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let busy = |result: Result<rusqlite::Transaction<'_>>| {
+        matches!(
+            result.unwrap_err().downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::DatabaseBusy
+        )
+    };
+    assert!(busy(begin_within(&state.db, Duration::ZERO)));
+    let started = Instant::now();
+    let wait = Duration::from_millis(30);
+    assert!(busy(begin_within(&state.db, wait)));
+    assert!(started.elapsed() >= wait, "{:?}", started.elapsed());
+    // It takes the lock as soon as the other connection lets go.
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            other.execute_batch("COMMIT").unwrap();
+        });
+        begin_within(&state.db, Duration::from_secs(60)).unwrap();
+    });
 }
 
 #[test]
@@ -545,7 +773,7 @@ fn decisions_include_comparison_evidence_and_unapplied_candidates() {
     trace.end(&policy, false);
     writer.complete(true, json!({}));
     let db = open(&path).unwrap();
-    let events = command::read_events(&db, writer.0.lock().unwrap().id).unwrap();
+    let events = command::read_events(&db, saved(&writer)).unwrap();
     let start = events.iter().find(|e| e["kind"] == "policy_start").unwrap();
     assert_eq!(
         start["data"]["policy_version"],
@@ -626,9 +854,9 @@ fn concurrent_initialization_shares_one_identity_key() {
     assert_eq!(
         open(&path)
             .unwrap()
-            .query_row("SELECT count(*) FROM runs", [], |r| r.get::<_, i64>(0))
+            .query_row("SELECT count(*) FROM metadata", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        2
+        1
     );
 }
 
@@ -661,7 +889,7 @@ fn trace_distinguishes_acceptance_rejection_and_pending_comparison() {
     trace.observe(&mut policy, 80.0, "stable");
     assert_eq!(policy.settled(), 10);
     trace.end(&policy, false);
-    let events = command::read_events(&open(&path).unwrap(), writer.0.lock().unwrap().id).unwrap();
+    let events = command::read_events(&open(&path).unwrap(), saved(&writer)).unwrap();
     let decisions: Vec<_> = events.iter().filter(|e| e["kind"] == "decision").collect();
     assert_eq!(decisions[0]["data"]["before"]["startup_doubling"], false);
     assert_eq!(decisions[0]["data"]["after"]["requested"], 10);
@@ -747,7 +975,7 @@ fn tcp_preflight_preserves_evidence_without_storing_addresses() {
     first.complete(true, json!({}));
     let second = recorder(&path);
     second.tcp_probe("source", "user@example.invalid", &probe);
-    second.flush();
+    saved(&second);
     let db = open(&path).unwrap();
     let first_events = command::read_events(&db, 1).unwrap();
     let second_events = command::read_events(&db, 2).unwrap();
@@ -791,7 +1019,7 @@ fn trace_records_inconclusive_upward_hold_without_claiming_a_plateau() {
     policy.activated();
     trace.observe(&mut policy, 100.0, "stable");
     trace.end(&policy, false);
-    let events = command::read_events(&open(&path).unwrap(), writer.0.lock().unwrap().id).unwrap();
+    let events = command::read_events(&open(&path).unwrap(), saved(&writer)).unwrap();
     let decision = events
         .iter()
         .rev()
@@ -893,7 +1121,7 @@ fn repeated_inconclusive_copies_do_not_raise_the_starting_count() {
         // The live copy keeps the inconclusive increase.
         assert_eq!(policy.settled(), larger);
         let writer = measured_run(&path, &context, &[(start, 100.0), (larger, 97.0)]);
-        let run = command::read_run(&open(&path).unwrap(), writer.0.lock().unwrap().id).unwrap();
+        let run = command::read_run(&open(&path).unwrap(), saved(&writer)).unwrap();
         assert_eq!(run["recommendation_eligible"], true);
     }
 }
@@ -976,8 +1204,7 @@ fn trace_clock_units_match_the_driver() {
         let trace =
             super::super::trace::Trace::new(Some(writer.clone()), &policy, super::super::SAMPLE);
         trace.end(&policy, false);
-        let events =
-            command::read_events(&open(&path).unwrap(), writer.0.lock().unwrap().id).unwrap();
+        let events = command::read_events(&open(&path).unwrap(), saved(&writer)).unwrap();
         let start = &events.iter().find(|e| e["kind"] == "policy_start").unwrap()["data"];
         assert_eq!(
             start["clock_unit"],
@@ -1211,15 +1438,15 @@ fn measurement_rows_retry_and_prune_with_their_events() {
         "observation",
         json!({"active":8,"seconds":0.5,"rate":100.0,"usable":true}),
     );
-    writer.flush();
+    assert!(writer.0.lock().unwrap().save().is_err());
     assert_eq!(
         db.query_row::<i64, _, _>("SELECT count(*) FROM measurements", [], |r| r.get(0))
             .unwrap(),
         0
     );
     db.execute_batch("COMMIT").unwrap();
-    writer.flush();
-    writer.flush();
+    saved(&writer);
+    saved(&writer);
     assert_eq!(
         db.query_row::<i64, _, _>("SELECT count(*) FROM measurements", [], |r| r.get(0))
             .unwrap(),
@@ -1228,7 +1455,7 @@ fn measurement_rows_retry_and_prune_with_their_events() {
     assert_eq!(db.query_row::<i64,_,_>("SELECT count(*) FROM measurements m JOIN events e ON m.run=e.run AND m.sequence=e.sequence",[],|r| r.get(0)).unwrap(),1);
     writer.complete(true, json!({}));
     let current = recorder(&path);
-    prune(&db, 1, current.0.lock().unwrap().id).unwrap();
+    prune(&db, 1, saved(&current)).unwrap();
     assert_eq!(
         db.query_row::<i64, _, _>("SELECT count(*) FROM measurements", [], |r| r.get(0))
             .unwrap(),

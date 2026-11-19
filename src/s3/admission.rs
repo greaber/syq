@@ -771,7 +771,9 @@ where
                 gate: gate.clone(),
                 held: false,
             };
-            let future = work(job, slot);
+            // A job's future can be tens of kilobytes. Box it once here
+            // rather than move it into the task and again into its allocation.
+            let future = Box::pin(work(job, slot));
             tasks.spawn(async move { (prepared, future.await) });
         }
         if tasks.is_empty() {
