@@ -252,7 +252,7 @@ impl RunEvidence {
         // Prefer the fewest workers within the live tuner's own tolerance of the
         // best rate. A larger count has to measure clearly faster to become the
         // run's choice, and only then does it bound the start from below. With a
-        // smaller margin, noise that favours the larger count would raise the
+        // smaller margin, noise that favors the larger count would raise the
         // next copy's start, which tries a still larger count, and so on.
         let workers = points
             .iter()
