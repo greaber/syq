@@ -25,11 +25,12 @@
 //! when the source changed while it was read. A destination connection
 //! carries nothing else while a patch is open on it, so a worker streams
 //! its patches one after another, each next one beginning as the last ends.
-//! Pieces are pipelined: up to `STREAM_BUFFER_BYTES` of them are read ahead
-//! from a remote source, and those sent await their acknowledgments within
-//! the destination's reply queue and `UNACKNOWLEDGED_PIECE_BYTES`. Scattered
-//! changes make pieces of a single block, so a stream needs as many pieces
-//! in flight as its connections queue to fill a long link.
+//! Pieces are pipelined. From a remote source, sixteen are read ahead, or
+//! more within `STREAM_READ_AHEAD_BYTES`, and never more than
+//! `STREAM_BUFFER_BYTES`. Those sent await their acknowledgments within the
+//! destination's reply queue and `UNACKNOWLEDGED_PIECE_BYTES`: scattered
+//! changes make pieces of a single block, so a stream needs many of them in
+//! flight to fill a long link.
 //!
 //! A worker streams the first of its batch's patches itself and leaves the
 //! others in the queue (`Sched::share_patches`), for workers that have
@@ -74,6 +75,11 @@ static NEXT_COMPARE_BATCH: AtomicU64 = AtomicU64::new(1);
 /// Most piece data a worker reads ahead of sending it while streaming a
 /// patch: as much as a group's patches hold.
 const STREAM_BUFFER_BYTES: u64 = crate::proto::MAX_DIFFERING_FILE_BYTES;
+/// Piece data a worker may read ahead from a remote source beyond sixteen
+/// reads, within `STREAM_BUFFER_BYTES`: enough for scattered single-block
+/// pieces to fill a long link, while what waits for a stalled destination
+/// stays near what sixteen such reads held.
+const STREAM_READ_AHEAD_BYTES: u64 = 2 << 20;
 
 /// Most piece data a worker has sent and the destination not yet
 /// acknowledged while streaming patches: what sixteen full pieces carry.
@@ -801,7 +807,11 @@ impl Worker {
                 }
                 let job = &jobs[streams[reading].file];
                 if let Some(&(off, len)) = state.ranges.get(state.next) {
-                    if buffered > 0 && buffered + u64::from(len) > STREAM_BUFFER_BYTES {
+                    let after = buffered + u64::from(len);
+                    if buffered > 0
+                        && (after > STREAM_BUFFER_BYTES
+                            || (after > STREAM_READ_AHEAD_BYTES && source.len() >= COMPARE_WINDOW))
+                    {
                         break;
                     }
                     self.src.send(Request::ReadRange {

@@ -6584,16 +6584,20 @@ fn a_streamed_patch_of_single_block_pieces_keeps_its_reply_queue_of_them_in_flig
         );
         assert_eq!(worker.progress.files_done.load(Relaxed), 1, "{case}");
         assert_eq!(worker.progress.bytes_done.load(Relaxed), 20 << 20, "{case}");
-        // The reply queue less the room it keeps for replies still owed.
-        assert_eq!((held.pieces, held.bytes), (240, 15 << 20), "{case}");
         if remote_source {
+            // Pieces follow the source's reads.
+            assert!(held.pieces > 16, "{case}: {} pieces", held.pieces);
+            // Reads beyond sixteen within 2 MiB of read-ahead, and one
+            // piece more.
             assert!(held.reads > 16, "{case}: {} reads", held.reads);
             assert!(
-                held.read_data <= 16 << 20,
+                held.read_data <= (2 << 20) + (64 << 10),
                 "{case}: {} bytes",
                 held.read_data
             );
         } else {
+            // The reply queue less the room it keeps for replies still owed.
+            assert_eq!((held.pieces, held.bytes), (240, 15 << 20), "{case}");
             assert_eq!(held.reads, 1, "{case}");
         }
     }
@@ -6632,7 +6636,7 @@ fn an_aborted_copy_takes_every_reply_of_a_wide_patch_stream() {
     // The copy is aborted, as by a fatal error elsewhere, once a hundred
     // single-block pieces were sent: no further piece is sent, every reply
     // in flight is taken, and the patch is not published. A remote source
-    // has had every piece read by then.
+    // has further pieces read by then, which are not sent.
     for remote_source in [false, true] {
         let case = format!("remote_source={remote_source}");
         let temporary = crate::test_support::tempdir().unwrap();
@@ -6649,7 +6653,10 @@ fn an_aborted_copy_takes_every_reply_of_a_wide_patch_stream() {
                 }
             });
         assert!(sched.is_aborted());
-        assert_eq!((held.pieces, held.sent), (100, 100), "{case}");
+        assert_eq!(held.sent, 100, "{case}");
+        if !remote_source {
+            assert_eq!(held.pieces, 100, "{case}");
+        }
         assert!(
             worker.dst.recv().is_err(),
             "{case}: a reply was left unread"
@@ -6669,12 +6676,13 @@ fn an_aborted_copy_takes_every_reply_of_a_wide_patch_stream() {
 // does.
 #[test]
 fn a_wide_patch_stream_cannot_use_up_the_decoded_message_allowance() {
-    // A stream of 320 single-block pieces from a remote source has up to
-    // 256 replies queued at once. Other connections' messages hold all but
-    // 1 MiB of the process's decoded-message allowance, as those of many
-    // workers can. Each queued reply holds what it is counted for, about
-    // 1 KiB, so the stream stays wide and the copy completes; at 64 KiB a
-    // reply, 16 of them would have used up what is left.
+    // A stream of 320 single-block pieces from a remote source has more
+    // than sixteen of its reads' replies queued at once. Other connections'
+    // messages hold all but 1 MiB of the process's decoded-message
+    // allowance, as those of many workers can. Each queued reply holds what
+    // it is counted for, about 1 KiB, so the stream stays wide and the copy
+    // completes; at 64 KiB a reply, 16 of them would have used up what is
+    // left.
     let others = postcard::to_stdvec(&vec![
         0u64;
         (crate::wire_budget::MEMORY_LIMIT - (1 << 20)) / 64 - 1
@@ -6691,7 +6699,7 @@ fn a_wide_patch_stream_cannot_use_up_the_decoded_message_allowance() {
     let (_, worker, held) = stream_into_holding_destination(root, &files, how, |_, _| {});
     assert_eq!(read(root, "source/file"), read(root, "target/file"));
     assert_eq!(worker.progress.files_done.load(Relaxed), 1);
-    assert!(held.reads > 64, "{} reads", held.reads);
+    assert!(held.reads > 16, "{} reads", held.reads);
 }
 
 #[test]
