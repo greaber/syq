@@ -403,13 +403,13 @@ fn interrupted_partial_from(args: &[&str], dir: &Path, cwd: Option<&Path>) -> Pa
     // a rerun that looks in that time must leave the partial in place.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut next_progress = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    while unsafe { libc::kill(-(child.id() as i32), 0) } == 0 {
+    while let Some(running) = live_group_members(child.id() as i32) {
         assert!(
             std::time::Instant::now() < deadline,
-            "the stopped partial copy's process group is still running"
+            "the stopped partial copy's process group is still running: {running}"
         );
         if std::time::Instant::now() >= next_progress {
-            eprintln!("waiting for the stopped partial copy's process group to exit");
+            eprintln!("waiting for the stopped partial copy's process group to exit: {running}");
             next_progress += std::time::Duration::from_secs(1);
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -422,6 +422,40 @@ fn interrupted_partial_from(args: &[&str], dir: &Path, cwd: Option<&Path>) -> Pa
     let mut partials = partial_files(dir);
     assert_eq!(partials.len(), 1, "expected one prepared partial");
     partials.pop().unwrap()
+}
+
+/// The members of process group `group` that have not exited, by PID and
+/// state, or None when there are none. An exited member that nobody has
+/// reaped yet, as a container's PID 1 may leave it, holds no files.
+#[cfg(debug_assertions)]
+fn live_group_members(group: i32) -> Option<String> {
+    if unsafe { libc::kill(-group, 0) } != 0 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut live = Vec::new();
+        for entry in fs::read_dir("/proc").unwrap().flatten() {
+            let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            // After the command name: state, parent and process group.
+            let Some((_, fields)) = stat.rsplit_once(") ") else {
+                continue;
+            };
+            let fields: Vec<&str> = fields.split_whitespace().collect();
+            if fields.get(2) == Some(&group.to_string().as_str()) && fields[0] != "Z" {
+                live.push(format!(
+                    "{} {}",
+                    entry.file_name().to_string_lossy(),
+                    fields[0]
+                ));
+            }
+        }
+        (!live.is_empty()).then(|| live.join(", "))
+    }
+    #[cfg(not(target_os = "linux"))]
+    Some(format!("group {group}"))
 }
 
 /// Whether a rerun that publishes a file removes the partials earlier copies
