@@ -213,10 +213,23 @@ pub(super) fn finish() {
     }
 }
 
-pub(super) fn object_concurrency(before: usize, after: usize, activity_per_second: f64) {
+/// A change of the transfer limit, or with `checking` of the number of
+/// objects in progress while those beyond that limit are only checked. The
+/// rate is transferred bytes plus file credit, or checked objects.
+pub(super) fn object_concurrency(
+    checking: bool,
+    before: usize,
+    after: usize,
+    activity_per_second: f64,
+) {
     if let Some(trace) = trace() {
+        let phase = if checking {
+            "checking_concurrency"
+        } else {
+            "object_concurrency"
+        };
         record(
-            json!({"phase":"object_concurrency","at_s":trace.start.elapsed().as_secs_f64(),"before":before,"after":after,"activity_per_second":activity_per_second}),
+            json!({"phase":phase,"at_s":trace.start.elapsed().as_secs_f64(),"before":before,"after":after,"activity_per_second":activity_per_second}),
         );
     }
 }

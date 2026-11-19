@@ -2906,6 +2906,24 @@ pub(crate) fn time_preserving_test_authority_for(
     authority
 }
 
+/// A signed-grant authority over `root/target` that keeps existing objects
+/// (`--if-exists=keep`) and approves the widening `approved`, for other
+/// modules' tests.
+pub(crate) fn keep_test_authority_widening(
+    root: &Path,
+    approved: DirectoryWidening,
+) -> RestrictedAuthority {
+    let mut authority = existence_authority(
+        root,
+        ExistingDestinationPolicy::Skip,
+        DestinationPlacement::ExactPath,
+        RootExistence::Any,
+    )
+    .unwrap();
+    authority.extra_options.widen_dirs = approved;
+    authority
+}
+
 /// A signed-grant authority over `root/target` that lets the copy update
 /// existing files in place (`--in-place=update`), preserving times, for up
 /// to `entries` paths, for other modules' tests.
@@ -4780,6 +4798,149 @@ fn restricted_widening_follows_the_approved_mode() {
         );
         assert_eq!(fs::metadata(&root).unwrap().mode() & 0o777, 0o500);
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
+/// A grant that keeps existing objects (`--if-exists=keep`) widens none of
+/// the copy's existing directories, whatever mode was approved: a request
+/// naming one is refused whole and changes nothing. A directory the grant
+/// created is its own to widen, and under `all` so is the directory the copy
+/// goes into, which the grant does not keep. A copy asks for none of the
+/// refused ones (`transfer::Opts::keep_bars_widening`). The grant's other
+/// protections are as before: nothing replaces an existing directory or
+/// file, or changes its metadata.
+#[test]
+fn a_keep_grant_widens_no_existing_directory_of_the_copy() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let identity = |path: &Path| {
+        let metadata = fs::metadata(path).unwrap();
+        proto::TargetCondition::Matches {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    };
+    let fingerprint = |path: &Path| {
+        let metadata = fs::metadata(path).unwrap();
+        proto::TargetCondition::MatchesFingerprint {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            ctime: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec() as u32,
+        }
+    };
+    let widen = |directories: Vec<(&Path, proto::TargetCondition)>| Request::WidenDirectories {
+        access: 0o300,
+        remember: true,
+        directories: directories
+            .into_iter()
+            .map(|(path, condition)| (path_bytes(path), condition))
+            .collect(),
+    };
+    let mode = |path: &Path| fs::metadata(path).unwrap().mode() & 0o7777;
+    let read_only = |path: &Path| {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o555)).unwrap();
+    };
+    for approved in [DirectoryWidening::Rsync, DirectoryWidening::All] {
+        let temp = crate::test_support::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let target = root.join("target");
+        let sub = target.join("sub");
+        let old = sub.join("old");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(&old, b"existing").unwrap();
+        let mut authority = existence_authority(
+            &root,
+            ExistingDestinationPolicy::Skip,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
+        )
+        .unwrap();
+        authority.extra_options.widen_dirs = approved;
+        let mut ops = authority.test_ops();
+        let refused = |request: &mut Request| {
+            let error = authority.authorize(request, false).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("contradicts the signed existing-object policy"),
+                "{approved:?}: {error:#}"
+            );
+        };
+
+        // A directory the copy made is the grant's own.
+        let made = target.join("made");
+        let response = execute_authorized(&authority, &mut ops, apply(mkdir(&made)));
+        assert!(
+            matches!(response, proto::Response::Applied(ref errors) if errors.iter().all(Option::is_none)),
+            "{response:?}"
+        );
+        read_only(&made);
+        let response =
+            execute_authorized(&authority, &mut ops, widen(vec![(&made, identity(&made))]));
+        assert!(
+            matches!(response, proto::Response::WidenedDirectories(ref outcomes)
+                if matches!(outcomes[..], [Ok(Some(_))])),
+            "{response:?}"
+        );
+        assert_eq!(mode(&made), 0o755, "{approved:?}");
+
+        // An existing one, the destination itself included, is not, however
+        // the request names it, and one in a request refuses all of it.
+        read_only(&made);
+        read_only(&sub);
+        for existing in [&sub, &target] {
+            refused(&mut widen(vec![(existing, identity(existing))]));
+            refused(&mut widen(vec![(existing, fingerprint(existing))]));
+        }
+        refused(&mut widen(vec![
+            (&made, identity(&made)),
+            (&sub, identity(&sub)),
+        ]));
+        assert_eq!((mode(&made), mode(&sub)), (0o555, 0o555), "{approved:?}");
+
+        // Only `all` widens the directory the copy goes into.
+        assert_eq!(
+            authority
+                .authorize(
+                    &mut widen(vec![(&root, proto::TargetCondition::Any)]),
+                    false
+                )
+                .is_ok(),
+            approved == DirectoryWidening::All,
+            "{approved:?}"
+        );
+
+        // Nothing replaces what exists, or changes its metadata.
+        refused(&mut apply(Op::Mkdir {
+            path: path_bytes(&sub),
+            mode: 0o755,
+            condition: identity(&sub),
+        }));
+        let mut replace = small_put(&old);
+        let Request::PutSmallBatch(puts) = &mut replace else {
+            unreachable!()
+        };
+        puts[0].condition = identity(&old);
+        puts[0].replaces = true;
+        refused(&mut replace);
+        for existing in [&sub, &old] {
+            let error = authority
+                .authorize(&mut apply(set_meta(existing)), false)
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("may not be modified"),
+                "{approved:?}: {error:#}"
+            );
+        }
+        // A put that names no object leaves the existing file as it was.
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut put = small_put(&old);
+        if let Ok(mut settlement) = authority.authorize(&mut put, false) {
+            let response = settlement.execute(&mut ops, |ops| ops.handle(&put));
+            authority.settle(settlement, &response);
+        }
+        assert_eq!(fs::read(&old).unwrap(), b"existing", "{approved:?}");
+        assert_eq!(mode(&sub), 0o755, "{approved:?}");
     }
 }
 

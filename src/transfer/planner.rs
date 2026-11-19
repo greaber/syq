@@ -706,7 +706,7 @@ impl Planner<'_> {
                     Scanned::Upcoming(entries) => {
                         // Only after the first batch, which settles `sub`.
                         anyhow::ensure!(!first, "a scan showed its first batch early");
-                        pl.show_upcoming(entries, &sub, dst_root);
+                        pl.show_upcoming(entries, src_root, &sub, dst_root);
                         return Ok(());
                     }
                 };
@@ -1321,27 +1321,10 @@ impl Planner<'_> {
         dst_root: &[u8],
         early: &mut Option<super::early_lookups::EarlyLookup>,
     ) -> Result<()> {
-        let batch = if self.opts.expressions.selection.is_some() && !self.mapping_mode {
+        let batch = if self.filters_scanned_entries() {
             let mut selected = Vec::with_capacity(batch.len());
             for entry in batch {
-                // Directories bypass --where: they are created and receive
-                // metadata as in an unfiltered copy.
-                if entry.kind == Kind::Dir {
-                    selected.push(entry);
-                    continue;
-                }
-                let relative = self
-                    .src_overrides
-                    .get(&entry.path)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&entry.path);
-                let path = crate::expression::source_path(src_root, relative);
-                let included = self
-                    .opts
-                    .expressions
-                    .selects(&crate::expression::File::from_entry(&entry), path)
-                    .with_context(|| format!("source {}", display(path)))?;
-                if !included {
+                if !self.selects_scanned_entry(&entry, src_root)? {
                     // Selection never makes a source counterpart extraneous.
                     if self.opts.delete {
                         let dst = join(dst_root, &join(sub, &entry.path));
@@ -1462,6 +1445,33 @@ impl Planner<'_> {
             self.dst_seen = std::collections::HashMap::new();
             self.delete_roots = Vec::new();
         }
+    }
+
+    /// Whether `plan_batch` drops the scanned entries `--where` leaves out.
+    /// A mapping's entries are filtered as they are read instead.
+    pub(super) fn filters_scanned_entries(&self) -> bool {
+        self.opts.expressions.selection.is_some() && !self.mapping_mode
+    }
+
+    /// Whether `--where` selects a scanned entry. It sees only the entry,
+    /// its source path and the time the command started, so it gives the
+    /// same answer whenever it is asked.
+    pub(super) fn selects_scanned_entry(&self, entry: &Entry, src_root: &[u8]) -> Result<bool> {
+        // Directories bypass --where: they are created and receive metadata
+        // as in an unfiltered copy.
+        if entry.kind == Kind::Dir {
+            return Ok(true);
+        }
+        let relative = self
+            .src_overrides
+            .get(&entry.path)
+            .map(Vec::as_slice)
+            .unwrap_or(&entry.path);
+        let path = crate::expression::source_path(src_root, relative);
+        self.opts
+            .expressions
+            .selects(&crate::expression::File::from_entry(entry), path)
+            .with_context(|| format!("source {}", display(path)))
     }
 
     /// The mapping loop: decide and claim everything about each entry.
@@ -1855,7 +1865,7 @@ impl Planner<'_> {
                 self.stat_directories_with_dry_run_overlay(&dirs, dst_root)?
             };
             let fill = self.fill_access();
-            if opts.may_widen_directory_permissions()
+            if opts.widens_inside_copy()
                 && stats
                     .iter()
                     .flatten()
@@ -4317,7 +4327,7 @@ impl Planner<'_> {
             // patterns apply from the root, so with those the whole root is
             // walked again instead.
             let enter = self.opts.widen_dirs == crate::cli::WidenDirs::All
-                && self.opts.may_widen_directory_permissions();
+                && self.opts.widens_inside_copy();
             let subtrees = ignore
                 .iter()
                 .all(|pattern| ignore_pattern_is_unanchored(pattern));
@@ -4421,17 +4431,16 @@ impl Planner<'_> {
             }
             // Only `all` enters a destination-only directory pruning cannot
             // read, so one the receiving account owns names that mode.
-            let unlisted: std::collections::HashMap<&[u8], &Entry> = if warnings.is_empty()
-                || self.opts.hint_for(crate::cli::WidenDirs::All).is_none()
-            {
-                Default::default()
-            } else {
-                walk.entries
-                    .iter()
-                    .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o500 != 0o500)
-                    .map(|entry| (entry.path.as_slice(), entry))
-                    .collect()
-            };
+            let unlisted: std::collections::HashMap<&[u8], &Entry> =
+                if warnings.is_empty() || self.opts.entering_hint().is_none() {
+                    Default::default()
+                } else {
+                    walk.entries
+                        .iter()
+                        .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o500 != 0o500)
+                        .map(|entry| (entry.path.as_slice(), entry))
+                        .collect()
+                };
             for (base, warning) in warnings {
                 self.delete_walk_failed = true;
                 let directory = warning.path.as_ref().map(|path| join(&base, path));
@@ -4442,12 +4451,8 @@ impl Planner<'_> {
                     Some(entry) => receiver_owns(&mut *self.dst, &mut self.receiver_uid, entry)?,
                     None => false,
                 };
-                let hint = match self
-                    .opts
-                    .hint_for(crate::cli::WidenDirs::All)
-                    .filter(|_| owned)
-                {
-                    Some(hint) => format!("; {hint}"),
+                let hint = match self.opts.entering_hint().filter(|_| owned) {
+                    Some(hint) => format!("; {}", self.opts.said_once(hint)),
                     None => String::new(),
                 };
                 // A preview names the directory it could not inspect.
@@ -4484,7 +4489,7 @@ impl Planner<'_> {
             // already widened to be entered has a new change time, so only
             // its identity is required.
             let unwritable: std::collections::HashMap<PathBytes, TargetCondition> =
-                if self.opts.may_widen_directory_permissions() {
+                if self.opts.widens_inside_copy() {
                     walk.entries
                         .iter()
                         .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o300 != 0o300)
@@ -5468,7 +5473,7 @@ impl Planner<'_> {
                         "syq: {}: not inspected: you own this directory, but it lacks owner search permission{}",
                         display(&path),
                         match self.opts.hint_for(needed).filter(|_| hint) {
-                            Some(hint) => format!("; {hint}"),
+                            Some(hint) => format!("; {}", self.opts.said_once(hint)),
                             None => String::new(),
                         }
                     ),
@@ -5476,7 +5481,8 @@ impl Planner<'_> {
                     Some("permission_denied"),
                 );
                 uninspected.push(path);
-            } else if hint {
+            } else if hint && self.opts.hint_for(needed).is_some() {
+                // A mode that already widens `needed` leaves nothing to name.
                 self.opts
                     .access_limited
                     .lock()
@@ -5512,7 +5518,7 @@ impl Planner<'_> {
     }
 
     fn prepare_existing_directories(&mut self, mut paths: Vec<PathBytes>) -> Result<()> {
-        if !self.opts.may_widen_directory_permissions() {
+        if !self.opts.widens_inside_copy() {
             return Ok(());
         }
         let fill = self.fill_access();
@@ -5800,7 +5806,7 @@ fn receiver_uid(dst: &mut dyn Conn, cache: &mut Option<u32>) -> Result<u32> {
 /// Temporarily add owner access to `directories` and remember the original
 /// modes of those actually changed; returns how many changed. The receiver
 /// widens only owned directories, never as root.
-fn widen_directory_batch(
+pub(super) fn widen_directory_batch(
     dst: &mut dyn Conn,
     opts: &Opts,
     progress: &Progress,
@@ -5809,7 +5815,14 @@ fn widen_directory_batch(
     access: u32,
 ) -> Result<usize> {
     let mut widened = 0;
-    let mut directories = directories.into_iter().peekable();
+    // A grant that bars widening the copy's directories leaves only the
+    // directory the copy goes into to ask for: the receiver would refuse the
+    // whole request for another, and the copy with it.
+    let barred = opts.keep_bars_widening();
+    let mut directories = directories
+        .into_iter()
+        .filter(|(path, _)| !barred || opts.outer_directory.get() == Some(path))
+        .peekable();
     while directories.peek().is_some() {
         let batch: Vec<_> = directories.by_ref().take(1000).collect();
         let names: Vec<_> = batch.iter().map(|(path, _)| path.clone()).collect();
