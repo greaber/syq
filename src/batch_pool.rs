@@ -431,9 +431,13 @@ mod tests {
                 })
             };
             let busy = [scope.spawn(hold), scope.spawn(hold)];
-            while *lock(&together.arrived) < 4 {
-                std::thread::yield_now();
-            }
+            let arrived = lock(&together.arrived);
+            let (arrived, waited) = together
+                .changed
+                .wait_timeout_while(arrived, Duration::from_secs(30), |arrived| *arrived < 4)
+                .unwrap();
+            assert!(!waited.timed_out(), "only {} of 4 shares started", *arrived);
+            drop(arrived);
             // This batch's requests find no thread free: the caller takes
             // every share, withdraws the requests and returns at once.
             let caller = std::thread::current().id();
@@ -462,6 +466,66 @@ mod tests {
         assert_eq!(panic.downcast_ref::<&str>(), Some(&"both panic"));
         assert_eq!(queued(&pool), 0);
         assert_eq!(pool.map(&[1, 2, 3], |n| n * 2), [2, 4, 6]);
+    }
+
+    /// A panic payload whose drop finishes only once the batch has returned.
+    struct WaitsForTheCaller {
+        returned: Arc<(Mutex<bool>, Condvar)>,
+        timed_out: Arc<AtomicBool>,
+    }
+
+    impl Drop for WaitsForTheCaller {
+        fn drop(&mut self) {
+            let (returned, changed) = &*self.returned;
+            let (_returned, waited) = changed
+                .wait_timeout_while(lock(returned), Duration::from_secs(10), |returned| {
+                    !*returned
+                })
+                .unwrap();
+            if waited.timed_out() {
+                self.timed_out.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[test]
+    fn a_second_panic_is_dropped_after_its_thread_has_reported() {
+        let pool = BatchPool::new("syq-test-pool", 3).unwrap();
+        let caller = std::thread::current().id();
+        let together = Together::new();
+        let returned = Arc::new((Mutex::new(false), Condvar::new()));
+        let timed_out = Arc::new(AtomicBool::new(false));
+        // Both pool threads panic. The first payload goes to the caller; the
+        // second is dropped on its pool thread, and its drop waits for the
+        // batch to return. Dropped before the thread reports that it is done,
+        // it would wait for a batch that waits for it.
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            pool.map(&[(); 3], |()| {
+                assert!(together.meet(3));
+                if std::thread::current().id() != caller {
+                    std::panic::panic_any(WaitsForTheCaller {
+                        returned: returned.clone(),
+                        timed_out: timed_out.clone(),
+                    });
+                }
+            })
+        }));
+        *lock(&returned.0) = true;
+        returned.1.notify_all();
+        let panic = outcome.expect_err("the panic must reach the caller");
+        assert!(panic.is::<WaitsForTheCaller>());
+        drop(panic);
+        // Wait for the second payload's drop: the pool's threads hold the
+        // only other references to the flags.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while Arc::strong_count(&timed_out) > 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the second payload was not dropped"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!timed_out.load(Ordering::SeqCst));
     }
 
     /// Many threads ask at once, with batches of every size around the
