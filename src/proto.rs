@@ -732,11 +732,16 @@ pub enum Op {
     Unlink { path: PathBytes },
 }
 
+/// An `Op::SetMeta`'s share of its request (`Op::size_hint`).
+pub(crate) fn set_meta_size_hint(path: &[u8], meta: &Meta) -> usize {
+    path.len() + meta.size_hint() + 64
+}
+
 impl Op {
     pub(crate) fn size_hint(&self) -> usize {
         match self {
             Self::SetMeta { path, meta, .. } | Self::SetFileMetaIfSame { path, meta, .. } => {
-                path.len() + meta.size_hint() + 64
+                set_meta_size_hint(path, meta)
             }
             Self::Hardlink { path, source, .. } => path.len() + source.len() + 64,
             Self::Symlink {

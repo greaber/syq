@@ -5931,19 +5931,15 @@ fn request_sized(mut ops: Vec<Op>) -> Vec<Vec<Op>> {
 }
 
 /// The final directory metadata still to send, deepest first, as the
-/// requests it goes in: each with the directories it changes.
+/// requests it goes in: each with the directories it changes. Only the
+/// metadata of the request being sent is copied.
 struct DirectoryMetadataRequests<'a> {
     pending: &'a [DirectoryMetadata],
-    /// The rest of a batch too large for one request.
-    split: std::collections::VecDeque<(&'a [DirectoryMetadata], Vec<Op>)>,
 }
 
 impl<'a> DirectoryMetadataRequests<'a> {
     fn new(pending: &'a [DirectoryMetadata]) -> Self {
-        Self {
-            pending,
-            split: std::collections::VecDeque::new(),
-        }
+        Self { pending }
     }
 }
 
@@ -5951,28 +5947,24 @@ impl<'a> Iterator for DirectoryMetadataRequests<'a> {
     type Item = (&'a [DirectoryMetadata], Vec<Op>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.split.is_empty() && !self.pending.is_empty() {
-            let (mut batch, rest) = self
-                .pending
-                .split_at(directory_metadata_batch_len(self.pending));
-            self.pending = rest;
-            let ops = batch
-                .iter()
-                .map(|(path, meta, flags, _, condition)| Op::SetMeta {
-                    path: path.clone(),
-                    meta: meta.clone(),
-                    flags: *flags,
-                    condition: *condition,
-                    directory: true,
-                })
-                .collect();
-            for ops in request_sized(ops) {
-                let (directories, later) = batch.split_at(ops.len());
-                batch = later;
-                self.split.push_back((directories, ops));
-            }
+        if self.pending.is_empty() {
+            return None;
         }
-        self.split.pop_front()
+        let (batch, rest) = self
+            .pending
+            .split_at(directory_metadata_batch_len(self.pending));
+        self.pending = rest;
+        let ops = batch
+            .iter()
+            .map(|(path, meta, flags, _, condition)| Op::SetMeta {
+                path: path.clone(),
+                meta: meta.clone(),
+                flags: *flags,
+                condition: *condition,
+                directory: true,
+            })
+            .collect();
+        Some((batch, ops))
     }
 }
 
@@ -5988,21 +5980,26 @@ const DIRECTORIES_PER_REQUEST: usize = 4096;
 /// goes in a later request, which the receiver runs once the earlier ones
 /// are done.
 ///
-/// A request also ends before the failures of all its operations could
-/// overfill its reply (`proto::METADATA_REPLY_BYTES`). Each failure's error
-/// names its directory, so a request of very long paths holds fewer.
+/// A request also ends before its operations pass the request budget
+/// (`proto::METADATA_BATCH_BYTES`), which preserved attribute values can
+/// fill, and before the failures of all of them could overfill its reply
+/// (`proto::METADATA_REPLY_BYTES`). Each failure's error names its
+/// directory, so a request of very long paths holds fewer.
 fn directory_metadata_batch_len(entries: &[DirectoryMetadata]) -> usize {
     let maximum = entries.len().min(DIRECTORIES_PER_REQUEST);
     let deepest = entries[0].3;
-    let mut reply = 0;
+    let (mut request, mut reply) = (0, 0);
     entries[..maximum]
         .iter()
         .enumerate()
         .position(|(index, (path, meta, flags, depth, _))| {
+            request += crate::proto::set_meta_size_hint(path, meta);
             reply += crate::proto::failed_set_meta_hint(path, meta);
             // The first always goes: it is as deep as itself, and a request
             // carries at least one operation.
-            (index > 0 && reply > crate::proto::METADATA_REPLY_BYTES)
+            (index > 0
+                && (request > crate::proto::METADATA_BATCH_BYTES
+                    || reply > crate::proto::METADATA_REPLY_BYTES))
                 || (*depth < deepest
                     && flags & (flags::MODE | flags::RECEIVER_MODE) != 0
                     && meta.mode & 0o100 == 0)
@@ -6162,7 +6159,7 @@ mod directory_metadata_tests {
     }
 
     #[test]
-    fn final_metadata_too_large_for_one_request_goes_in_halves_with_its_directories() {
+    fn final_metadata_too_large_for_one_request_fills_requests_with_its_directories() {
         // Nine directories whose extended attributes together exceed the
         // frame budget, then one at a shallower depth that removes search
         // access.
@@ -6210,15 +6207,17 @@ mod directory_metadata_tests {
                     })
                     .collect();
                 assert_eq!(paths, sent);
+                let request = Request::Apply { ops: ops.clone() };
+                assert!(encoded_len(&request) <= crate::proto::METADATA_BATCH_BYTES);
+                assert!(fits_its_frame(&request));
                 paths.iter().map(|path| path[0]).collect()
             })
             .collect();
-        // Halved as `Planner::apply` halves any request, until at most three
-        // of these directories go together: 9 into 4 and 5, the 4 into 2 and
-        // 2, the 5 into 2 and 3. The narrowed directory waits for all of them.
+        // Three of these directories fill a request's budget. The narrowed
+        // directory waits for all of them.
         assert_eq!(
             names,
-            [vec![0, 1], vec![2, 3], vec![4, 5], vec![6, 7, 8], vec![9]]
+            [vec![0, 1, 2], vec![3, 4, 5], vec![6, 7, 8], vec![9]]
         );
     }
 
