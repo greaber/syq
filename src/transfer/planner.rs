@@ -6082,12 +6082,15 @@ pub(super) fn widen_directory_batch(
     // directory the copy goes into to ask for: the receiver would refuse the
     // whole request for another, and the copy with it.
     let barred = opts.keep_bars_widening();
-    let mut directories = directories
+    let directories: Vec<_> = directories
         .into_iter()
         .filter(|(path, _)| !barred || opts.outer_directory.get() == Some(path))
-        .peekable();
-    while directories.peek().is_some() {
-        let batch: Vec<_> = directories.by_ref().take(1000).collect();
+        .collect();
+    // At most 1,000 go together, fewer when their failures, each naming its
+    // directory, could overfill the reply.
+    for batch in reply_sized(directories, 1000, |(path, _)| {
+        crate::proto::failed_path_hint(path)
+    }) {
         let names: Vec<_> = batch.iter().map(|(path, _)| path.clone()).collect();
         let response = ok(
             dst.call(Request::WidenDirectories {
@@ -6221,18 +6224,18 @@ fn reply_sized_slices<T>(
     })
 }
 
-/// `reply_sized_slices` for operations to send, moved rather than copied.
-fn reply_sized(ops: Vec<Op>, most: usize, hint: impl Fn(&Op) -> usize) -> Vec<Vec<Op>> {
-    let lengths: Vec<usize> = reply_sized_slices(&ops, most, hint)
-        .map(<[Op]>::len)
+/// `reply_sized_slices` for items to send, moved rather than copied.
+fn reply_sized<T>(items: Vec<T>, most: usize, hint: impl Fn(&T) -> usize) -> Vec<Vec<T>> {
+    let lengths: Vec<usize> = reply_sized_slices(&items, most, hint)
+        .map(<[T]>::len)
         .collect();
     if lengths.len() <= 1 {
-        return (!ops.is_empty()).then_some(ops).into_iter().collect();
+        return (!items.is_empty()).then_some(items).into_iter().collect();
     }
-    let mut ops = ops.into_iter();
+    let mut items = items.into_iter();
     lengths
         .into_iter()
-        .map(|len| ops.by_ref().take(len).collect())
+        .map(|len| items.by_ref().take(len).collect())
         .collect()
 }
 

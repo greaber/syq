@@ -4,20 +4,19 @@ pub(crate) mod provider;
 mod successor;
 pub(crate) mod switch;
 
-use crate::lock_file::{LockFile, PROBE_GRACE};
+use crate::lock_file::LockFile;
 use crate::persistence::Domain;
 use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::process::CommandExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{
@@ -39,7 +38,9 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(15);
 /// bind a starting service only reads its preferences and endpoint record;
 /// a stopping one leaves at most one 1-second query unanswered.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(2);
-const ANSWER_POLL: Duration = Duration::from_millis(20);
+/// How often the service looks at its scope, its preferences and the file
+/// it follows, which bounds how long a change takes to be noticed.
+const TICK: Duration = Duration::from_millis(200);
 pub(crate) const CLOSING: &str = ".syq-persistence-closing";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -504,9 +505,12 @@ fn ensure_current_settings(domain: &Domain) -> Result<Preferences> {
 fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
+    write_json_bytes(path, &bytes)
+}
+fn write_json_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     crate::state_file::write_atomic(
         path,
-        &bytes,
+        bytes,
         0o600,
         crate::state_file::Publish::Replace,
         crate::state_file::Durability::FileSynced,
@@ -759,9 +763,10 @@ fn query_retry(
     )
 }
 fn send(control: &Path, request: &LocalRequest) -> Result<Status> {
-    let mut socket = UnixStream::connect(suffixed(control, SOCKET))?;
-    socket.set_read_timeout(Some(Duration::from_secs(1)))?;
-    socket.set_write_timeout(Some(Duration::from_secs(1)))?;
+    // Older builds and released stand-ins may leave the socket's mode as
+    // bound, so only its owner is checked.
+    let mut socket =
+        crate::service::connect(&suffixed(control, SOCKET), Duration::from_secs(1), false)?;
     crate::destination::write_message(&mut socket, request)?;
     decode_status(control, read_status(&mut socket)?)
 }
@@ -846,45 +851,20 @@ fn status_or_older(control: &Path) -> Result<Status> {
         Err(error) => Err(error),
     })
 }
-/// Whether nothing answered on a control socket, as while a locked service
-/// is starting or stopping, rather than the service replying with an error.
-fn unanswered(error: &anyhow::Error) -> bool {
-    use std::io::ErrorKind::*;
-    error.chain().any(|cause| {
-        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
-            matches!(
-                error.kind(),
-                NotFound
-                    | ConnectionRefused
-                    | ConnectionReset
-                    | BrokenPipe
-                    | UnexpectedEof
-                    | WouldBlock
-                    | TimedOut
-            )
-        })
-    })
-}
 /// Query the service holding this control's lock, waiting up to `timeout` for
 /// it to answer while it starts or stops. None once no service holds the lock.
 fn running_status(control: &Path, retry: Retry, timeout: Duration) -> Result<Option<Status>> {
-    let deadline = Instant::now() + timeout;
-    while is_running(control) {
-        match query_retry(control, false, None, retry) {
-            Ok(state) => return Ok(Some(state)),
-            Err(error) if unanswered(&error) => {
-                if Instant::now() >= deadline {
-                    return Err(error.context(format!(
-                        "receiving service is running but not answering at {}",
-                        suffixed(control, SOCKET).display()
-                    )));
-                }
-                std::thread::sleep(ANSWER_POLL);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(None)
+    crate::service::answer(
+        &suffixed(control, LOCK),
+        timeout,
+        || query_retry(control, false, None, retry),
+        || {
+            format!(
+                "receiving service is running but not answering at {}",
+                suffixed(control, SOCKET).display()
+            )
+        },
+    )
 }
 // Status contains up to 32 full approval summaries, both aggregated and per
 // profile. Keep its local-only bound separate from the remote request envelope.
@@ -899,8 +879,7 @@ fn write_status(writer: &mut impl Write, status: &Status) -> Result<()> {
 /// Take the service's lock, or None when another service holds it. A start
 /// retries for [`PROBE_GRACE`], so that `is_running` cannot make it exit.
 fn try_lock(control: &Path) -> Result<Option<LockFile>> {
-    let lock = LockFile::open(&suffixed(control, LOCK), true)?;
-    Ok(lock.try_exclusive_within(PROBE_GRACE)?.then_some(lock))
+    crate::service::lock_for_start(&suffixed(control, LOCK))
 }
 pub(crate) fn is_running(control: &Path) -> bool {
     LockFile::is_held(&suffixed(control, LOCK)).unwrap_or(false)
@@ -1433,41 +1412,21 @@ fn switch_report(control: &Path, state: &Status) -> Option<switch::Report> {
     if attempt.build == state.identity {
         return None;
     }
-    let (phase, error) = if attempt.phase == "switching" && !process_alive(attempt.pid) {
-        (
-            "failed".to_owned(),
-            Some("the switch ended without a result".to_owned()),
-        )
-    } else {
-        (attempt.phase, attempt.error)
-    };
+    let (phase, error) =
+        if attempt.phase == "switching" && !crate::service::process_alive(attempt.pid) {
+            (
+                "failed".to_owned(),
+                Some("the switch ended without a result".to_owned()),
+            )
+        } else {
+            (attempt.phase, attempt.error)
+        };
     Some(switch::Report {
         to: Some(attempt.build),
         phase,
         error,
     })
 }
-/// Whether process `pid` still runs, and is not a zombie.
-fn process_alive(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
-    if pid <= 0
-        || (unsafe { libc::kill(pid, 0) } != 0
-            && std::io::Error::last_os_error().raw_os_error() != Some(libc::EPERM))
-    {
-        return false;
-    }
-    #[cfg(target_os = "linux")]
-    if fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-        stat.rsplit_once(") ")
-            .is_some_and(|(_, fields)| fields.starts_with('Z'))
-    }) {
-        return false;
-    }
-    true
-}
-
 /// How often commands may start a switch for one connection.
 const SWITCH_ATTEMPT_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -1480,9 +1439,9 @@ fn start_switch(domain: &Domain, endpoint: &str) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut child = command.spawn_guarded()?;
+    let mut switch = crate::process::group::ProcessGroup::leading(command.spawn_guarded()?);
     std::thread::spawn(move || {
-        let _ = switch::wait_and_end_group(&mut child);
+        let _ = switch.wait();
     });
     Ok(())
 }
@@ -1498,9 +1457,9 @@ fn run_switch(args: Vec<OsString>) -> Result<std::process::ExitStatus> {
 fn run_switch_process(args: Vec<OsString>) -> Result<(std::process::ExitStatus, u32)> {
     let mut command = switch_process(args)?;
     command.stdin(Stdio::null());
-    let mut child = command.spawn_guarded()?;
-    let pid = child.id();
-    Ok((switch::wait_and_end_group(&mut child)?, pid))
+    let mut switch = crate::process::group::ProcessGroup::leading(command.spawn_guarded()?);
+    let pid = switch.child.id();
+    Ok((switch.wait()?, pid))
 }
 
 /// `persist connect --when-idle` of this build with `args`, in a session of
@@ -1515,14 +1474,7 @@ fn switch_process(args: Vec<OsString>) -> Result<std::process::Command> {
         .env("SYQ_NO_UPDATE_CHECK", "1")
         .env(switch::STARTED_BY_COMMAND, "1")
         .env("SSH_ASKPASS_REQUIRE", "never");
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    crate::process::new_session(&mut command);
     Ok(command)
 }
 
@@ -1905,28 +1857,19 @@ fn stop_when_idle(control: &Path) -> Result<bool> {
 /// Wait for service process `pid`, which is stopping, to give up the
 /// control: until it has exited, or another service answers on the control.
 fn await_exit(control: &Path, pid: u32) -> Result<()> {
-    let deadline = Instant::now() + STOP_TIMEOUT;
-    let mut progress = Instant::now();
-    while is_running(control) {
-        match status(control, false) {
-            Ok(state) if state.pid != pid => return Ok(()),
-            Ok(_) => {}
-            Err(_) if !process_alive(pid) => return Ok(()),
-            Err(_) => {}
-        }
-        if Instant::now() >= deadline {
-            bail!("background receiver did not stop: {}", control.display());
-        }
-        if progress.elapsed() >= Duration::from_secs(5) {
-            crate::output::diagnostic!(
-                "syq: waiting for background receiver {} to stop",
-                control.display()
-            );
-            progress = Instant::now();
-        }
-        std::thread::sleep(Duration::from_millis(20));
+    ending(control).await_exit(pid, || Ok(status(control, false)?.pid))
+}
+/// How commands wait for the service at `control` to stop.
+fn ending(control: &Path) -> crate::service::Ending {
+    crate::service::Ending {
+        lock: suffixed(control, LOCK),
+        timeout: STOP_TIMEOUT,
+        stuck: format!("background receiver did not stop: {}", control.display()),
+        progress: Some(format!(
+            "waiting for background receiver {} to stop",
+            control.display()
+        )),
     }
-    Ok(())
 }
 
 /// `retry` is what to do with a failed connection to this server: what a
@@ -1940,7 +1883,7 @@ fn ensure_inner(
     replace: Replace,
 ) -> Result<Receiving> {
     let scope = control.parent().context("persistence scope missing")?;
-    crate::persistence::validate_scope(scope)?;
+    // Selecting the domain validates the scope.
     anyhow::ensure!(
         Domain::select(Some(scope))? == *domain,
         "receiving control belongs to a different scope"
@@ -1993,7 +1936,19 @@ fn ensure_inner(
     let spec = service_spec(remote);
     // Keep the connected endpoint even when no profile currently allows it:
     // a later preference change can start receiving without another connect.
-    atomic_json(&suffixed(control, RECORD), &spec)?;
+    // While receiving stays off this runs on every command, so a record that
+    // already holds exactly these bytes is left alone rather than rewritten
+    // and synced.
+    let record = suffixed(control, RECORD);
+    let mut bytes = serde_json::to_vec(&spec)?;
+    bytes.push(b'\n');
+    if crate::delegation::read_private_regular(&record, "background receiving endpoint", 64 * 1024)
+        .ok()
+        .as_deref()
+        != Some(&bytes[..])
+    {
+        write_json_bytes(&record, &bytes)?;
+    }
     if !allowed {
         return Ok(Receiving::Off);
     }
@@ -2037,15 +1992,7 @@ fn spawn(control: &Path) -> Result<Started> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = command
+    let mut child = crate::process::new_session(&mut command)
         .spawn_guarded()
         .context("start background receiving")?;
     let (reaped, started) = std::sync::mpsc::channel();
@@ -2061,22 +2008,7 @@ pub(crate) fn stop(control: &Path) -> Result<()> {
     stop_inner(control, true)
 }
 fn stop_inner(control: &Path, remove_record: bool) -> Result<()> {
-    let deadline = Instant::now() + STOP_TIMEOUT;
-    let mut progress = Instant::now();
-    while is_running(control) {
-        if Instant::now() >= deadline {
-            bail!("background receiver did not stop: {}", control.display());
-        }
-        let _ = status(control, true);
-        if progress.elapsed() >= Duration::from_secs(5) {
-            crate::output::diagnostic!(
-                "syq: waiting for background receiver {} to stop",
-                control.display()
-            );
-            progress = Instant::now();
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    ending(control).stop(|_| status(control, true).map(drop))?;
     for suffix in [SOCKET, RECORD] {
         if suffix == RECORD && !remove_record {
             continue;
@@ -2099,17 +2031,6 @@ fn stop_inner(control: &Path, remove_record: bool) -> Result<()> {
     Ok(())
 }
 
-struct SocketCleanup {
-    path: PathBuf,
-    identity: (u64, u64),
-}
-impl Drop for SocketCleanup {
-    fn drop(&mut self) {
-        if fs::symlink_metadata(&self.path).is_ok_and(|m| (m.dev(), m.ino()) == self.identity) {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
 struct Worker {
     stop: Arc<AtomicBool>,
     /// Dropped to wake the thread from its waits as soon as it is stopped.
@@ -2652,38 +2573,28 @@ fn serve(
     crate::process::running_receiving_connection(spec.endpoint.label(), domain.explicit_path());
     let scope_meta = fs::metadata(scope)?;
     let scope_identity = (scope_meta.dev(), scope_meta.ino());
-    let socket = suffixed(control, SOCKET);
-    match fs::symlink_metadata(&socket) {
-        Ok(meta) if meta.file_type().is_socket() => fs::remove_file(&socket)?,
-        Ok(_) => bail!("unexpected entry at receiving control socket"),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
-    let listener = UnixListener::bind(&socket)?;
-    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
-    listener.set_nonblocking(true)?;
-    let meta = fs::symlink_metadata(&socket)?;
-    let _cleanup = SocketCleanup {
-        path: socket,
-        identity: (meta.dev(), meta.ino()),
-    };
+    let mut server = crate::service::Server::bind(&suffixed(control, SOCKET))?;
     let shutdown = Arc::new(AtomicBool::new(false));
-    let _signals = crate::process::signals::owned(&[libc::SIGINT, libc::SIGTERM], || {
-        let mut registrations = crate::process::signals::Registrations::default();
-        for signal in [libc::SIGINT, libc::SIGTERM] {
-            registrations.push(signal_hook::flag::register(signal, shutdown.clone())?);
-        }
-        Ok(registrations)
-    })?;
+    server.stop_on_signals(&shutdown)?;
     // Only a UTF-8 path can be reported in a status.
     let mut follower = started_from
         .filter(|path| path.to_str().is_some())
         .map(switch::Follower::new);
     let switch_args = switch_command(domain, &spec.endpoint.label());
     let preferences_path = config_path(domain)?;
-    // The preferences file as last read: read it again only once it changed.
-    let preferences_file = || {
-        fs::symlink_metadata(&preferences_path).ok().map(|m| {
+    // The file that says whether persistence is on: the default scope's
+    // switch, or an explicit scope's marker. `Domain::enabled` looks again
+    // whenever it changes.
+    let switch_path = if domain.is_default() {
+        crate::persistence::config_path()
+    } else {
+        Some(scope.join(crate::persistence::SCOPE_MARKER))
+    };
+    let closing = scope.join(CLOSING);
+    let uid = unsafe { libc::geteuid() };
+    // A file as last read: read it again only once it changed.
+    let seen = |path: &Path| {
+        fs::symlink_metadata(path).ok().map(|m| {
             (
                 (m.dev(), m.ino(), m.len()),
                 (m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec()),
@@ -2691,106 +2602,109 @@ fn serve(
         })
     };
     let result = (|| {
-        let mut read = preferences_file();
+        let mut read = seen(&preferences_path);
         let mut config = preferences(domain)?;
-        let mut last_check = Instant::now() - Duration::from_secs(1);
+        // Look at the switch or marker on the first tick, as it may have
+        // changed since the start looked.
+        let mut switch_read = None;
+        let mut next_tick = Instant::now();
         while !shutdown.load(Ordering::Acquire) {
-            if !fs::metadata(scope).is_ok_and(|m| (m.dev(), m.ino()) == scope_identity)
-                || scope.join(CLOSING).exists()
-                || !domain.enabled()?
-            {
-                break;
-            }
-            if last_check.elapsed() >= Duration::from_millis(200) {
-                let file = preferences_file();
+            // Look at the scope and preferences, and the file this service
+            // follows, every `TICK`, and answer requests as they arrive.
+            let now = Instant::now();
+            if now >= next_tick {
+                // The scope must still be the private directory it started
+                // in, and not closing.
+                if !fs::metadata(scope).is_ok_and(|m| {
+                    (m.dev(), m.ino()) == scope_identity && m.uid() == uid && m.mode() & 0o077 == 0
+                }) || closing.exists()
+                {
+                    break;
+                }
+                if let Some(path) = &switch_path {
+                    let file = seen(path);
+                    if switch_read.as_ref() != Some(&file) {
+                        if !domain.enabled()? {
+                            break;
+                        }
+                        switch_read = Some(file);
+                    }
+                }
+                let file = seen(&preferences_path);
                 if file.is_none() || file != read {
                     config = preferences(domain)?;
                     read = file;
                 }
                 reconcile(domain, &mut workers, &config, &spec, Retry::No);
-                last_check = Instant::now();
                 if let Some(follower) = &mut follower {
                     follower.tick(&|| workers.iter().all(ProfileWorker::idle), &switch_args);
                 }
+                next_tick = now + TICK;
             }
-            let mut accepted = false;
-            match listener.accept() {
-                Ok((mut client, _)) => {
-                    accepted = true;
-                    // A client may disconnect before accept or during setup.
-                    // Its socket errors must not stop the receiving service.
-                    if let Ok(request) = read_control_request(&mut client) {
-                        if request.version == VERSION {
-                            if request.stop || (request.stop_if_idle && close_if_idle(&workers)) {
-                                shutdown.store(true, Ordering::Release);
-                            }
-                            let retry = if request.restart {
-                                Retry::Now
-                            } else if request.retry {
-                                Retry::IfDue
-                            } else {
-                                Retry::No
-                            };
-                            if retry != Retry::No {
-                                reconcile(domain, &mut workers, &config, &spec, retry);
-                            }
-                            let decision_error = request.decision.and_then(|decision| {
-                                workers
-                                    .iter()
-                                    .find(|w| {
-                                        w.approvals.snapshots().iter().any(|r| r.id == decision.id)
-                                    })
-                                    .context("approval is unknown, expired, or already answered")
-                                    .and_then(|w| {
-                                        w.approvals.decide_with_remember(
-                                            &decision.id,
-                                            decision.allow,
-                                            decision.kind,
-                                            decision.remember,
-                                        )
-                                    })
-                                    .err()
-                                    .map(|e| e.to_string())
-                            });
-                            let profiles: Vec<_> =
-                                workers.iter().map(ProfileWorker::snapshot).collect();
-                            let (name, connection) = aggregate(&profiles);
-                            let response = Status {
-                                version: VERSION,
-                                identity: crate::identity::build().into(),
-                                pid: std::process::id(),
-                                endpoint: spec.endpoint.label(),
-                                name,
-                                connection,
-                                approval: profiles.first().map(|p| p.settings.approval),
-                                pending: profiles.iter().flat_map(|p| p.pending.clone()).collect(),
-                                busy: busy(&workers),
-                                started_from: follower.as_ref().and_then(|follower| {
-                                    follower.path().to_str().map(str::to_owned)
-                                }),
-                                switch: follower.as_ref().and_then(switch::Follower::report),
-                                stopping: shutdown.load(Ordering::Acquire),
-                                older: None,
-                                profiles,
-                                decision_error,
-                            };
-                            let _ = write_status(&mut client, &response);
+            if !server.wait(Some(next_tick.saturating_duration_since(Instant::now())))? {
+                continue;
+            }
+            if let Some(mut client) = server.accept()? {
+                // A client may disconnect before accept or during setup.
+                // Its socket errors must not stop the receiving service.
+                if let Ok(request) = read_control_request(&mut client) {
+                    if request.version == VERSION {
+                        if request.stop || (request.stop_if_idle && close_if_idle(&workers)) {
+                            shutdown.store(true, Ordering::Release);
                         }
+                        let retry = if request.restart {
+                            Retry::Now
+                        } else if request.retry {
+                            Retry::IfDue
+                        } else {
+                            Retry::No
+                        };
+                        if retry != Retry::No {
+                            reconcile(domain, &mut workers, &config, &spec, retry);
+                        }
+                        let decision_error = request.decision.and_then(|decision| {
+                            workers
+                                .iter()
+                                .find(|w| {
+                                    w.approvals.snapshots().iter().any(|r| r.id == decision.id)
+                                })
+                                .context("approval is unknown, expired, or already answered")
+                                .and_then(|w| {
+                                    w.approvals.decide_with_remember(
+                                        &decision.id,
+                                        decision.allow,
+                                        decision.kind,
+                                        decision.remember,
+                                    )
+                                })
+                                .err()
+                                .map(|e| e.to_string())
+                        });
+                        let profiles: Vec<_> =
+                            workers.iter().map(ProfileWorker::snapshot).collect();
+                        let (name, connection) = aggregate(&profiles);
+                        let response = Status {
+                            version: VERSION,
+                            identity: crate::identity::build().into(),
+                            pid: std::process::id(),
+                            endpoint: spec.endpoint.label(),
+                            name,
+                            connection,
+                            approval: profiles.first().map(|p| p.settings.approval),
+                            pending: profiles.iter().flat_map(|p| p.pending.clone()).collect(),
+                            busy: busy(&workers),
+                            started_from: follower
+                                .as_ref()
+                                .and_then(|follower| follower.path().to_str().map(str::to_owned)),
+                            switch: follower.as_ref().and_then(switch::Follower::report),
+                            stopping: shutdown.load(Ordering::Acquire),
+                            older: None,
+                            profiles,
+                            decision_error,
+                        };
+                        let _ = write_status(&mut client, &response);
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => return Err(e.into()),
-            }
-            // Answer the next request as soon as it arrives, and otherwise
-            // wake for the periodic work above, every 200 ms. A stop is a
-            // request, and signals end the wait too.
-            if !accepted {
-                let mut descriptor = libc::pollfd {
-                    fd: listener.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                unsafe { libc::poll(&mut descriptor, 1, 200) };
             }
         }
         drop(workers);
@@ -3541,6 +3455,8 @@ pub(crate) fn run_command(domain: &Domain, command: ReceiveCommand) -> Result<i3
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock_file::PROBE_GRACE;
+    use std::os::unix::net::UnixListener;
 
     /// The service reads control requests inline, so one that claims to be
     /// large, even as large as a copy request may be, is refused at its
@@ -4408,7 +4324,7 @@ mod tests {
             )),
             "{message}"
         );
-        assert!(unanswered(&error), "{message}");
+        assert!(crate::service::unanswered(&error), "{message}");
     }
 
     #[test]

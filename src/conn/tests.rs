@@ -2394,6 +2394,7 @@ fn a_pool_appearing_after_priming_is_not_queried_during_connect() {
     let directory = crate::test_support::short_tempdir().unwrap();
     let scope = directory.path().join("scope");
     crate::persistence::initialize_scope(&scope).unwrap();
+    let scope = crate::persistence::CheckedScope::check(&scope).unwrap();
     let multiplexer = SshMultiplexer::persistent(&scope, None, "example", None, None).unwrap();
     let socket = crate::session_pool::socket_path(&multiplexer.path);
     let mut spec = RemoteSpec::local_receiver(true);
@@ -2419,14 +2420,16 @@ fn persistent_reuse_uses_auto_master_and_never_shares_with_workers() {
     let directory = crate::test_support::short_tempdir().unwrap();
     let base = directory.path().join("scope");
     crate::persistence::initialize_scope(&base).unwrap();
+    let checked = crate::persistence::CheckedScope::check(&base).unwrap();
     // The socket name is stable per endpoint, and a dead leftover at the
     // path is cleared so a fresh master can bind.
-    let probe = SshMultiplexer::persistent(&base, Some("u"), "example", None, None).unwrap();
+    let probe = SshMultiplexer::persistent(&checked, Some("u"), "example", None, None).unwrap();
     std::fs::write(&probe.path, b"stale").unwrap();
-    let multiplexer = SshMultiplexer::persistent(&base, Some("u"), "example", None, None).unwrap();
+    let multiplexer =
+        SshMultiplexer::persistent(&checked, Some("u"), "example", None, None).unwrap();
     assert_eq!(probe.path, multiplexer.path);
     let alternate_port =
-        SshMultiplexer::persistent(&base, Some("u"), "example", Some(2222), None).unwrap();
+        SshMultiplexer::persistent(&checked, Some("u"), "example", Some(2222), None).unwrap();
     assert_ne!(multiplexer.path, alternate_port.path);
     assert!(!multiplexer.path.exists());
     assert_eq!(
@@ -3205,6 +3208,7 @@ fn only_connections_kept_after_the_command_forward_nothing() {
     let directory = crate::test_support::short_tempdir().unwrap();
     let base = directory.path().join("scope");
     crate::persistence::initialize_scope(&base).unwrap();
+    let checked = crate::persistence::CheckedScope::check(&base).unwrap();
     let spec = |multiplexer: Option<SshMultiplexer>| {
         let mut spec = RemoteSpec::local_receiver(false);
         spec.local_process = false;
@@ -3226,7 +3230,7 @@ fn only_connections_kept_after_the_command_forward_nothing() {
     // The master that persistence keeps, and a session that joins it: a
     // forwarded agent would stay usable on the server until `persist off`.
     let persistent = spec(Some(
-        SshMultiplexer::persistent(&base, None, "example", None, None).unwrap(),
+        SshMultiplexer::persistent(&checked, None, "example", None, None).unwrap(),
     ));
     let control = args(&persistent, SshConnection::Control);
     assert!(control.iter().any(|arg| arg == "ControlPersist=300"));
@@ -3632,6 +3636,38 @@ fn route_probes_give_up_on_a_silent_address_after_their_bound() {
         "{elapsed:?}"
     );
     drop(listener);
+}
+
+/// A resolver that does not answer for the SSH target's name holds the
+/// probes no longer than the longest probe wait, and the advertised
+/// literal is still probed and found.
+#[test]
+fn a_silent_resolver_does_not_hold_up_route_probes() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let candidate = |address: &str, source| TcpCandidate {
+        address: address.into(),
+        speed_mbps: 0,
+        source,
+        reachable: None,
+        selected: false,
+        same_as_ssh_target: false,
+    };
+    let mut candidates = vec![
+        candidate("127.0.0.1", DataAddressSource::RemoteInterface),
+        candidate("ssh-target.invalid", DataAddressSource::SshTarget),
+    ];
+    let wait = std::time::Duration::from_millis(200);
+    let started = std::time::Instant::now();
+    probe_reachable_with(&mut candidates, port, wait, |_, _| {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        Vec::new()
+    })
+    .unwrap();
+    let elapsed = started.elapsed();
+    assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    assert_eq!(candidates[0].reachable, Some(true));
+    assert_ne!(candidates[1].reachable, Some(true));
 }
 
 #[test]

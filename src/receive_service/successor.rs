@@ -29,7 +29,6 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -83,15 +82,7 @@ impl Successor {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         // It outlives the switch, whose group ends with it.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let mut child = command
+        let mut child = crate::process::new_session(&mut command)
             .spawn_guarded()
             .context("start background receiving")?;
         let mut successor = Self {

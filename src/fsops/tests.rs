@@ -9718,3 +9718,89 @@ fn an_unchecked_keep_renames_where_no_replace_would_cost_a_link() {
         }
     }
 }
+
+/// Small files at paths near the longest a system call takes, none of them
+/// UTF-8, fail to be published for want of their directory. Each result is
+/// within what its batch's reply allows for (attribute errors aside, which
+/// `failed_small_file_hint` leaves to the frame's other half).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_small_file_says_no_more_than_its_batch_allowed_for() {
+    use crate::proto::{failed_small_file_hint, SmallPatch};
+    let dir = crate::test_support::tempdir().unwrap();
+    let mut rooted = FsOps::rooted_for_test(dir.path());
+    let root = path_bytes(dir.path());
+    let parent = [root, vec![vec![0xff; 255]; 13].join(&b'/')].join(&b'/');
+    let meta = Meta {
+        inode_metadata: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        mtime: 0,
+        mtime_nsec: 0,
+    };
+    let path = |name: &str| [parent.clone(), name.as_bytes().to_vec()].join(&b'/');
+    let put = |name: &str| SmallPut {
+        path: path(name),
+        copy_id: [7; 16],
+        data: b"new".to_vec(),
+        hash: content_digest(b"new"),
+        meta: meta.clone(),
+        flags: 0,
+        inplace: false,
+        condition: TargetCondition::Any,
+        replaces: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
+    };
+    let patch = |name: &str, update_in_place| SmallPatch {
+        path: path(name),
+        copy_id: [7; 16],
+        len: 3,
+        block: 65536,
+        reuse: vec![None],
+        data: b"new".to_vec(),
+        hash: content_digest(b"new"),
+        basis: None,
+        meta: meta.clone(),
+        flags: 0,
+        unchanged_flags: 0,
+        condition: TargetCondition::Any,
+        update_in_place,
+    };
+    // Each result as its reply carries it.
+    let check = |path: &[u8], encoded: usize, error: &WireError, copies: usize| {
+        assert!(encoded <= failed_small_file_hint(path), "{error:?}");
+        assert!(error.message.len() > copies * 3 * 3300, "{error:?}");
+    };
+    // The directory is missing.
+    let Response::Applied(errors) = rooted.handle(&Request::PutSmallBatch(vec![put("missing")]))
+    else {
+        panic!("unexpected response");
+    };
+    let encoded = postcard::to_extend(&errors[0], Vec::new()).unwrap().len();
+    check(&path("missing"), encoded, errors[0].as_ref().unwrap(), 1);
+    // A file has taken the directory's place: errors name the path twice.
+    let parent_path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&parent));
+    fs::create_dir_all(parent_path.parent().unwrap()).unwrap();
+    fs::write(&parent_path, b"").unwrap();
+    let Response::Applied(errors) = rooted.handle(&Request::PutSmallBatch(vec![put("blocked")]))
+    else {
+        panic!("unexpected response");
+    };
+    let encoded = postcard::to_extend(&errors[0], Vec::new()).unwrap().len();
+    check(&path("blocked"), encoded, errors[0].as_ref().unwrap(), 2);
+    for update in [false, true] {
+        let Response::PatchedBatch(results) =
+            rooted.handle(&Request::PatchSmallBatch(vec![patch("blocked", update)]))
+        else {
+            panic!("unexpected response");
+        };
+        let encoded = postcard::to_extend(&results[0], Vec::new()).unwrap().len();
+        check(
+            &path("blocked"),
+            encoded,
+            &results[0].as_ref().unwrap_err().error,
+            2,
+        );
+    }
+}

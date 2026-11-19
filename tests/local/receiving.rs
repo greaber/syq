@@ -4778,6 +4778,7 @@ fn a_new_service_that_another_takes_the_control_from_leaves_its_record() {
     let control = installed.control();
     let record = PathBuf::from(format!("{}.recv-json", control.display()));
     let socket = PathBuf::from(format!("{}.recv", control.display()));
+    let status_socket = socket.clone();
     let mut other_spec: serde_json::Value = serde_json::from_slice(&read(&record)).unwrap();
     other_spec["identity"] = this_build().into();
     other_spec["program"] = "other-helper".into();
@@ -4795,13 +4796,13 @@ fn a_new_service_that_another_takes_the_control_from_leaves_its_record() {
         }
         fs::write(&record, written.to_string()).unwrap();
         *started.lock().unwrap() = Some(start_other.spawn().unwrap());
+        // The switch gives up on this answer after a second. Wait only until
+        // the other service answers on the control, which it does once it
+        // holds it and before it logs in; the test waits for the login below.
         wait_for(
-            "the other service to receive",
+            "the other service to take the control",
             std::time::Duration::from_secs(20),
-            || {
-                service_status(&socket)
-                    .is_some_and(|state| state["connection"]["phase"] == "online")
-            },
+            || service_status(&socket).is_some(),
         );
     });
     let switched = installed
@@ -4823,6 +4824,14 @@ fn a_new_service_that_another_takes_the_control_from_leaves_its_record() {
     assert_output_ok(&switched);
     old.join().unwrap();
     let mut other = other.lock().unwrap().take().expect("the other service");
+    wait_for(
+        "the other service to receive",
+        std::time::Duration::from_secs(20),
+        || {
+            service_status(&status_socket)
+                .is_some_and(|state| state["connection"]["phase"] == "online")
+        },
+    );
     let state = installed.request(serde_json::json!({"version": 2, "stop": false}));
     assert_eq!(state["pid"], other.id(), "{state}");
     assert_eq!(state["connection"]["phase"], "online", "{state}");

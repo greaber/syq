@@ -1650,18 +1650,34 @@ fn automatic_ssh_restores_workers_for_a_single_file_partial() {
         .env("SYQ_TEST_TUNING_NETWORK", "")
         .env("XDG_CONFIG_HOME", t.path("config"))
         .env("XDG_CACHE_HOME", t.path("cache"))
+        .env("SYQ_TUNING_HISTORY", t.path("history.sqlite"))
         .run()
         .unwrap();
     assert_output_ok(&out);
     assert!(!stderr_of(&out).contains("connections remembered for this path"));
     assert_eq!(read(&t.path("dest/file")), content);
     assert_earlier_partial_removed_where_possible(&partial);
+    // The partial makes the copy ask for every remembered worker. Those
+    // still logging in once the others have copied every block find the
+    // copy over and do not connect, as a loaded machine shows; even the
+    // second starting worker may.
+    let restored: Option<i64> = rusqlite::OptionalExtension::optional(
+        rusqlite::Connection::open(t.path("history.sqlite"))
+            .unwrap()
+            .query_row(
+            "SELECT json_extract(data,'$.data.requested') FROM events WHERE json_extract(data,'$.kind')='transition' AND json_extract(data,'$.data.reason')='direct_copy_needs_userspace_transfer'",
+            [],
+            |row| row.get(0),
+        ),
+    )
+    .unwrap();
+    assert_eq!(restored, Some(8), "{out:?}");
     let connected = fs::read_to_string(events)
         .unwrap()
         .lines()
         .filter(|line| line.starts_with("connected "))
         .count();
-    assert_eq!(connected, 8, "{out:?}");
+    assert!((1..=8).contains(&connected), "{out:?}");
     assert!(stderr_of(&out).contains("SSH startup limited to 2 workers"));
 }
 
@@ -3866,6 +3882,9 @@ fn source_read_ahead_runs_for_tcp_and_ssh_ranges_and_streams() {
                     .args(["--as", &destination])
                     .env("SYQ_DEBUG", "1")
                     .env("SYQ_TEST_LOCAL_READ_AHEAD", "1")
+                    // The helper advises before the reader moves on, so the
+                    // samples see it even when it is starved.
+                    .env("SYQ_TEST_READ_AHEAD_FIRST_ADVICE", "1")
                     .env("FAKE_REMOTE_HOME", t.path("remote-home"))
                     .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
                     .env("FAKE_RSH_LOG", t.path("rsh.log"))
@@ -4343,4 +4362,71 @@ fn missing_remote_target_is_not_looked_up_again_during_planning() {
             "{label}: only the preflight stat\n{lookups}"
         );
     }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn every_failed_small_file_is_reported_when_long_paths_would_overfill_a_reply() {
+    use base64::Engine as _;
+    // 2,048 small files with short names, mapped to destinations below
+    // thirteen directories named with 255 bytes that are not UTF-8, every
+    // one of which the receiver fails to publish. Each error names a path of
+    // about 3,300 bytes, which the receiver shows at three bytes for each:
+    // about 10 KiB. A reply carries a request's errors and holds 8 MiB, less
+    // than a batch of 2,048 of these, and the short source names do not
+    // shorten the request: the requests end before their errors could
+    // overfill a reply, and every failure is reported.
+    let t = Tmp::new();
+    t.expose_remote_syq();
+    let rsh = fake_rsh(&t);
+    let parent = [vec![vec![0xff; 255]; 13].join(&b'/'), b"/deepest".to_vec()].concat();
+    let mut manifest = String::new();
+    for index in 0..2048 {
+        let name = format!("f{index:04}-full");
+        write(&t.path("src").join(&name), b"x");
+        let dst = [parent.clone(), format!("/{name}").into_bytes()].concat();
+        manifest.push_str(&format!(
+            "{{\"src\":{{\"encoding\":\"utf-8\",\"value\":\"{name}\"}},\
+             \"dst\":{{\"encoding\":\"base64\",\"value\":\"{}\"}}}}\n",
+            base64::engine::general_purpose::STANDARD.encode(&dst)
+        ));
+    }
+    write(&t.path("manifest"), manifest.as_bytes());
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args([
+            "cp",
+            "--no-progress",
+            "--mapping",
+            &t.s("manifest"),
+            "-C",
+            &t.s("src"),
+        ])
+        .args(["--to", "fake", "--no-tcp", "--no-bootstrap", "--rsh"])
+        .arg(&rsh)
+        .args(["--into", &t.s("dst")])
+        // The batch a slow link grows to, at once.
+        .args(["--performance-tuning", "workers=1,batch-files=2048"])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
+        .env("SYQ_TEST_FAIL_PUT_SMALL_BEFORE_RENAME", "-full")
+        .run()
+        .unwrap();
+    let stderr = stderr_of(&output);
+    let failed = stderr
+        .lines()
+        .filter(|line| line.contains("injected failure before rename"))
+        .count();
+    assert_eq!(
+        (output.status.code(), failed),
+        (Some(23), 2048),
+        "{}",
+        stderr
+            .lines()
+            .rev()
+            .take(3)
+            .map(|line| line.chars().take(200).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }

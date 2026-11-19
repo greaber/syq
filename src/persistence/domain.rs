@@ -71,12 +71,15 @@ impl Domain {
         }
     }
 
-    pub(crate) fn enable(&self) -> Result<PathBuf> {
+    pub(crate) fn enable(&self) -> Result<super::CheckedScope> {
         let path = self.ensure_runtime()?;
-        if self.is_default() {
+        if self.is_default() && !super::global_config_is(true) {
             super::write_global_config(true)?;
         }
-        Ok(path)
+        Ok(super::CheckedScope {
+            domain: self.clone(),
+            path,
+        })
     }
 
     pub(crate) fn config_file(&self, name: &str) -> Result<PathBuf> {
