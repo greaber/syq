@@ -9720,8 +9720,9 @@ fn an_unchecked_keep_renames_where_no_replace_would_cost_a_link() {
 }
 
 /// Small files at paths near the longest a system call takes, none of them
-/// UTF-8, fail to be published in each way a test can bring about. Each
-/// error is within what its batch's reply allows for.
+/// UTF-8, fail to be published for want of their directory. Each result is
+/// within what its batch's reply allows for (attribute errors aside, which
+/// `failed_small_file_hint` leaves to the frame's other half).
 #[cfg(target_os = "linux")]
 #[test]
 fn a_failed_small_file_says_no_more_than_its_batch_allowed_for() {
@@ -9766,8 +9767,8 @@ fn a_failed_small_file_says_no_more_than_its_batch_allowed_for() {
         condition: TargetCondition::Any,
         update_in_place,
     };
-    let check = |path: &[u8], error: &WireError, copies: usize| {
-        let encoded = postcard::to_extend(&Some(error), Vec::new()).unwrap().len();
+    // Each result as its reply carries it.
+    let check = |path: &[u8], encoded: usize, error: &WireError, copies: usize| {
         assert!(encoded <= failed_small_file_hint(path), "{error:?}");
         assert!(error.message.len() > copies * 3 * 3300, "{error:?}");
     };
@@ -9776,7 +9777,8 @@ fn a_failed_small_file_says_no_more_than_its_batch_allowed_for() {
     else {
         panic!("unexpected response");
     };
-    check(&path("missing"), errors[0].as_ref().unwrap(), 1);
+    let encoded = postcard::to_extend(&errors[0], Vec::new()).unwrap().len();
+    check(&path("missing"), encoded, errors[0].as_ref().unwrap(), 1);
     // A file has taken the directory's place: errors name the path twice.
     let parent_path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&parent));
     fs::create_dir_all(parent_path.parent().unwrap()).unwrap();
@@ -9785,13 +9787,20 @@ fn a_failed_small_file_says_no_more_than_its_batch_allowed_for() {
     else {
         panic!("unexpected response");
     };
-    check(&path("blocked"), errors[0].as_ref().unwrap(), 2);
+    let encoded = postcard::to_extend(&errors[0], Vec::new()).unwrap().len();
+    check(&path("blocked"), encoded, errors[0].as_ref().unwrap(), 2);
     for update in [false, true] {
         let Response::PatchedBatch(results) =
             rooted.handle(&Request::PatchSmallBatch(vec![patch("blocked", update)]))
         else {
             panic!("unexpected response");
         };
-        check(&path("blocked"), &results[0].as_ref().unwrap_err().error, 2);
+        let encoded = postcard::to_extend(&results[0], Vec::new()).unwrap().len();
+        check(
+            &path("blocked"),
+            encoded,
+            &results[0].as_ref().unwrap_err().error,
+            2,
+        );
     }
 }

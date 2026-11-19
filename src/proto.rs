@@ -25,8 +25,8 @@ pub const MAX_HANDSHAKE_FRAME: usize = 1024 * 1024;
 const MAX_METADATA_FRAME: usize = 8 * 1024 * 1024;
 pub(crate) const METADATA_BATCH_BYTES: usize = 6 * 1024 * 1024;
 /// What the failures of one request's operations may add to its reply, by
-/// `failed_path_hint` and `failed_set_meta_hint`: half a metadata frame, so
-/// that the reply still fits should an error come to say more than that allows for.
+/// `failed_path_hint`, `failed_set_meta_hint` and `failed_small_file_hint`:
+/// half a metadata frame, so that the reply still fits should an error come to say more than that allows for.
 pub(crate) const METADATA_REPLY_BYTES: usize = MAX_METADATA_FRAME / 2;
 /// Supported comparison granularity floor, enforced by receivers as well as the CLI.
 /// Smaller blocks increase the number of hashes per file; this is a protocol
@@ -829,11 +829,18 @@ pub(crate) fn failed_path_hint(path: &[u8]) -> usize {
     3 * String::from_utf8_lossy(path).len() + 320
 }
 
-/// The most the failure of a small file's publication (a `SmallPut` or a
+/// What the failure of a small file's publication (a `SmallPut` or a
 /// `SmallPatch`) adds to its batch's reply: that of an operation on its
 /// path (`failed_path_hint`), where an error may name instead the staged
 /// file beside it, whose name is up to 26 bytes longer
 /// (`fsops::partial_path_with_name_max`).
+///
+/// An error applying preserved extended attributes also names one, of at
+/// most 255 bytes, escaped: about 1,020 bytes this leaves out, so that
+/// copies preserving attributes form the groups of ordinary copies. The
+/// other half of the reply's frame holds it: a group holds at most 4,096
+/// files, and with every one of them naming such an attribute the reply
+/// stays under about 7 MB.
 pub(crate) fn failed_small_file_hint(path: &[u8]) -> usize {
     failed_path_hint(path) + 3 * 32
 }
