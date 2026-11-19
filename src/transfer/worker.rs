@@ -2872,7 +2872,7 @@ impl Worker {
                 };
                 validate_range_reply(expected_off, expected_len, off, data.len())?;
                 let n = data.len() as u64;
-                self.dst.send(Request::WriteRange {
+                if let Some(buffer) = self.dst.send_recycling(Request::WriteRange {
                     path: job.dst.clone(),
                     inplace: job.inplace,
                     copy_id: self.copy_id(),
@@ -2880,7 +2880,9 @@ impl Worker {
                     off,
                     hash,
                     data: data.into(),
-                })?;
+                })? {
+                    self.src.reuse_read_buffer(buffer);
+                }
                 pending_writes.push_back((slot, n, started));
                 if pending_writes.len() >= write_window {
                     let write = pending_writes.pop_front().expect("pending write");
@@ -2924,6 +2926,7 @@ impl Worker {
             result.and(source_end).and(destination_end)
         };
         self.range_budget = Some(budget);
+        self.src.release_read_buffer();
         *credited += flights[0].as_ref().expect("primary share").credited;
         for flight in flights.into_iter().skip(1).flatten() {
             if result.is_err() && self.transport_dead() {
@@ -3029,7 +3032,7 @@ impl Worker {
                     break;
                 }
                 self.limit(claimed);
-                self.dst.send(Request::WriteRange {
+                if let Some(buffer) = self.dst.send_recycling(Request::WriteRange {
                     path: job.dst.clone(),
                     inplace: job.inplace,
                     copy_id: self.copy_id(),
@@ -3037,7 +3040,9 @@ impl Worker {
                     off,
                     hash,
                     data: data.into(),
-                })?;
+                })? {
+                    self.src.reuse_read_buffer(buffer);
+                }
                 sent += 1;
                 self.benchmark.streamed_blocks += 1;
                 self.benchmark.max_request_bytes = self.benchmark.max_request_bytes.max(claimed);
@@ -3060,6 +3065,7 @@ impl Worker {
         // error. No following file can consume this one's data or late errors.
         let (source_end, destination_end, _destination_wait) =
             crate::streaming::finish_range(&mut *self.src, &mut *self.dst, sent);
+        self.src.release_read_buffer();
         let source_end = source_end.map(|discarded| {
             self.benchmark.stream_discarded_bytes += discarded;
         });

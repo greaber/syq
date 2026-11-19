@@ -192,6 +192,12 @@ impl Conn for LocalConn {
             _ => None,
         })
     }
+    fn reuse_read_buffer(&mut self, buffer: Vec<u8>) {
+        self.ops.reuse_read_buffer(buffer);
+    }
+    fn release_read_buffer(&mut self) {
+        self.ops.release_read_buffer();
+    }
     fn recv(&mut self) -> Result<Response> {
         let _wait = self.rpc_observation.as_ref().map(|o| o.span(false));
         if self.pending.is_empty() {
