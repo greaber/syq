@@ -7,38 +7,19 @@ use anyhow::{ensure, Result};
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde::Serialize;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     future::Future,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+mod parts;
+
 const MAX_CHILDREN: usize = 256;
+// Recursive discovery has no selective pattern to amortize empty/small child
+// requests. Require evidence of substantial child prefixes and bound speculative fanout.
+const MAX_RECURSIVE_CHILDREN: usize = 64;
 const SPLIT_QUEUE_LIMIT: usize = 4096;
-/// Keys in a full ListObjectsV2 page.
-const PAGE: usize = 1000;
-// A recursive listing hands parts of its keys to further listings that run at
-// the same time. Each of those, and each request for a directory's children
-// to choose them from, can be a request the sequential listing would not have
-// made. It may make this many once it is known to need a third page, and one
-// more for every `PAGES_PER_EXTRA` pages of keys listed, so a listing never
-// costs more than a fixed share over its sequential pages.
-const EXTRA_REQUESTS: usize = 2;
-const PAGES_PER_EXTRA: usize = 4;
-// A listing asks for the children of its prefix once it is known to need a
-// page past this many. A shorter listing rarely has directories large enough
-// to hand over, so the request would only add to its cost.
-const SPARSE_PAGES: usize = 3;
-// A first page with this many keys in one directory asks for the children at
-// once: such a directory is unlikely to be the listing's last.
-const DENSE_DIRECTORY: usize = 256;
-// Directories are handed to another listing only while those not yet handed
-// over are expected to hold twice this many pages.
-const PART_PAGES: usize = 4;
-// A listing that shows two dense directories within three pages, under a
-// prefix with at most this many children, lists every remaining child at
-// once. Unfiltered listings did so before parts existed and keep that start.
-const BURST_CHILDREN: usize = 64;
-const BURST_PAGES: usize = 3;
+const MAX_RECURSIVE_PROBES: usize = 4;
 
 #[derive(Clone, Debug, Serialize)]
 pub(in crate::s3) struct Entry {
@@ -93,6 +74,15 @@ pub(in crate::s3) trait Store {
         true
     }
 
+    /// Whether a listing with more than one request slot may be divided into
+    /// parts that run at the same time (`parts`). Every part but the last
+    /// stops at the first key handed over, so a key that the store returns
+    /// out of UTF-8 byte order after that point would be missed without an
+    /// error. Only stores whose provider documents that order divide.
+    fn divides(&self) -> bool {
+        false
+    }
+
     fn page(
         &self,
         prefix: &str,
@@ -102,8 +92,8 @@ pub(in crate::s3) trait Store {
     ) -> impl Future<Output = Result<Page>>;
 }
 
-// A task can make more than one request at a time; bound actual HTTP requests
-// as well as task count, including with an explicit limit of two.
+// A task can overlap a delimiter probe and a continuation page; bound actual
+// HTTP requests as well as task count, including with an explicit limit of two.
 struct LimitedStore<'a, S> {
     inner: &'a S,
     slots: tokio::sync::Semaphore,
@@ -111,6 +101,9 @@ struct LimitedStore<'a, S> {
 impl<S: Store> Store for LimitedStore<'_, S> {
     fn ordered(&self) -> bool {
         self.inner.ordered()
+    }
+    fn divides(&self) -> bool {
+        self.inner.divides()
     }
     async fn page(
         &self,
@@ -126,8 +119,7 @@ impl<S: Store> Store for LimitedStore<'_, S> {
 
 /// Keys arrived out of order after part of a listing was handed to other
 /// listings, so the listing may have stopped before its last key. A listing
-/// with a concurrency of one hands nothing over and does not depend on the
-/// order.
+/// that is not divided does not depend on the order.
 #[derive(Debug)]
 pub(in crate::s3) struct Unordered;
 impl std::fmt::Display for Unordered {
@@ -139,34 +131,28 @@ impl std::fmt::Display for Unordered {
 }
 impl std::error::Error for Unordered {}
 
+/// Whether this listing is divided into parts rather than listed as below.
+fn in_parts(store: &impl Store, concurrency: usize) -> bool {
+    concurrency > 1 && store.ordered() && store.divides()
+}
+
 #[derive(Clone)]
 enum Job {
     Discover {
         prefix: String,
         component: usize,
+        depth: usize,
+    },
+    Recursive {
+        prefix: String,
+        depth: usize,
+        start_after: Option<String>,
     },
     Scan {
         prefix: String,
         delimiter: bool,
         token: Option<String>,
-    },
-    /// The first page of everything under a prefix.
-    Recursive {
-        prefix: String,
-    },
-    /// A later page of a walk's listing, or the first page of one of its parts.
-    Keys {
-        walk: usize,
-        part: usize,
-        prefix: String,
-        token: Option<String>,
-    },
-    /// One page of a directory's children, to choose parts from.
-    Children {
-        walk: usize,
-        part: usize,
-        directory: String,
-        token: Option<String>,
+        start_after: Option<String>,
     },
 }
 
@@ -176,27 +162,8 @@ struct Batch {
     pruned: Vec<String>,
 }
 
-enum Done {
-    Batch(Batch),
-    First {
-        prefix: String,
-        page: Page,
-    },
-    Keys {
-        walk: usize,
-        part: usize,
-        page: Page,
-    },
-    Children {
-        walk: usize,
-        part: usize,
-        directory: String,
-        page: Page,
-    },
-}
-
-fn scan_batch(prefix: String, delimiter: bool, page: Page) -> Done {
-    Done::Batch(Batch {
+fn scan_batch(prefix: String, delimiter: bool, page: Page, start_after: Option<&str>) -> Batch {
+    Batch {
         entries: page.entries,
         jobs: page
             .next
@@ -204,11 +171,12 @@ fn scan_batch(prefix: String, delimiter: bool, page: Page) -> Done {
                 prefix,
                 delimiter,
                 token: Some(token),
+                start_after: start_after.map(str::to_owned),
             })
             .into_iter()
             .collect(),
         pruned: Vec::new(),
-    })
+    }
 }
 
 pub(in crate::s3) async fn read(
@@ -217,11 +185,29 @@ pub(in crate::s3) async fn read(
     delimiter: bool,
     token: Option<&str>,
 ) -> Result<Page> {
-    // The engine starts every listing at its prefix. Other listings of the
-    // same store start after a key.
-    let page = store.page(prefix, delimiter, token, None).await?;
+    read_after(store, prefix, delimiter, token, None).await
+}
+
+async fn read_after(
+    store: &impl Store,
+    prefix: &str,
+    delimiter: bool,
+    token: Option<&str>,
+    start_after: Option<&str>,
+) -> Result<Page> {
+    // Keep the wire request unchanged for continuation pages. The token carries
+    // the service position; StartAfter remains a local lower bound even when a
+    // provider silently ignores it on the initial request.
+    let mut page = store
+        .page(
+            prefix,
+            delimiter,
+            token,
+            start_after.filter(|_| token.is_none()),
+        )
+        .await?;
     ensure!(
-        page.entries.len() + page.prefixes.len() <= PAGE,
+        page.entries.len() + page.prefixes.len() <= 1000,
         "S3 listing exceeded the requested page size"
     );
     ensure!(
@@ -245,6 +231,9 @@ pub(in crate::s3) async fn read(
             "S3 listing returned an invalid common prefix"
         );
     }
+    if let Some(after) = start_after {
+        page.entries.retain(|entry| entry.key.as_str() > after);
+    }
     Ok(page)
 }
 
@@ -254,41 +243,34 @@ async fn execute(
     prune: Option<&Prune<'_>>,
     job: Job,
     split: bool,
-) -> Result<Done> {
-    let (mut prefix, mut component) = match job {
-        Job::Recursive { prefix } => return recursive(store, prune, prefix).await,
-        Job::Keys {
-            walk,
-            part,
+) -> Result<Batch> {
+    let (mut prefix, mut component, depth) = match job {
+        Job::Recursive {
             prefix,
-            token,
-        } => {
-            let page = read(store, &prefix, false, token.as_deref()).await?;
-            return Ok(Done::Keys { walk, part, page });
-        }
-        Job::Children {
-            walk,
-            part,
-            directory,
-            token,
-        } => {
-            let page = read(store, &directory, true, token.as_deref()).await?;
-            return Ok(Done::Children {
-                walk,
-                part,
-                directory,
-                page,
-            });
-        }
+            depth,
+            start_after,
+        } => return recursive(store, prune, prefix, depth, split, start_after.as_deref()).await,
         Job::Scan {
             prefix,
             delimiter,
             token,
+            start_after,
         } => {
-            let page = read(store, &prefix, delimiter, token.as_deref()).await?;
-            return Ok(scan_batch(prefix, delimiter, page));
+            let page = read_after(
+                store,
+                &prefix,
+                delimiter,
+                token.as_deref(),
+                start_after.as_deref(),
+            )
+            .await?;
+            return Ok(scan_batch(prefix, delimiter, page, start_after.as_deref()));
         }
-        Job::Discover { prefix, component } => (prefix, component),
+        Job::Discover {
+            prefix,
+            component,
+            depth,
+        } => (prefix, component, depth),
     };
     let pattern = pattern.expect("discovery jobs require a pattern");
     // Literal intermediate components need no existence probes: the eventual
@@ -304,21 +286,21 @@ async fn execute(
     let part = &pattern.components[component];
     let query = format!("{prefix}{}", part.literal_prefix());
     if part.recursive() {
-        return recursive(store, None, query).await;
+        return recursive(store, None, query, depth, split, None).await;
     }
     if !split && component + 1 < pattern.components.len() {
         let page = read(store, &query, false, None).await?;
-        return Ok(scan_batch(query, false, page));
+        return Ok(scan_batch(query, false, page, None));
     }
     let page = read(store, &query, true, None).await?;
     if component + 1 == pattern.components.len() {
-        return Ok(scan_batch(query, true, page));
+        return Ok(scan_batch(query, true, page, None));
     }
     if page.next.is_some() || page.prefixes.len() > MAX_CHILDREN {
         let flat = read(store, &query, false, None).await?;
-        return Ok(scan_batch(query, false, flat));
+        return Ok(scan_batch(query, false, flat, None));
     }
-    Ok(Done::Batch(Batch {
+    Ok(Batch {
         entries: page.entries,
         jobs: page
             .prefixes
@@ -334,21 +316,29 @@ async fn execute(
             .map(|prefix| Job::Discover {
                 prefix,
                 component: component + 1,
+                depth: 0,
             })
             .collect(),
         pruned: Vec::new(),
-    }))
+    })
 }
 
-/// Keys on a page in each directory directly under `prefix`.
-fn directories<'a>(prefix: &str, page: &'a Page, counts: &mut HashMap<&'a str, usize>) {
+fn dense_children(query: &str, page: &Page) -> usize {
+    let mut counts = std::collections::HashMap::new();
     for entry in &page.entries {
-        if let Some(slash) = entry.key[prefix.len()..].find('/') {
+        if let Some(slash) = entry
+            .key
+            .strip_prefix(query)
+            .and_then(|suffix| suffix.find('/'))
+        {
             *counts
-                .entry(&entry.key[..prefix.len() + slash + 1])
-                .or_default() += 1;
+                .entry(&entry.key[..query.len() + slash + 1])
+                .or_insert(0usize) += 1;
         }
     }
+    // A quarter-page child can amortize parallel requests at network latency;
+    // tiny directories cannot. This estimates density, not the total key count.
+    counts.values().filter(|count| **count >= 256).count()
 }
 
 /// When every object on a truncated first page, apart from directory markers,
@@ -360,6 +350,7 @@ async fn lookahead(
     store: &impl Store,
     prune: &Prune<'_>,
     query: &str,
+    depth: usize,
     flat: &Page,
 ) -> Result<Option<Batch>> {
     let budget = prune.probes.load(Ordering::Relaxed);
@@ -404,7 +395,11 @@ async fn lookahead(
                 entries: parents,
                 jobs: included
                     .into_iter()
-                    .map(|prefix| Job::Recursive { prefix })
+                    .map(|prefix| Job::Recursive {
+                        prefix,
+                        depth: depth + 1,
+                        start_after: None,
+                    })
                     .collect(),
                 pruned,
             }));
@@ -419,472 +414,96 @@ async fn lookahead(
     Ok(None)
 }
 
-async fn recursive(store: &impl Store, prune: Option<&Prune<'_>>, prefix: String) -> Result<Done> {
-    let page = read(store, &prefix, false, None).await?;
+async fn recursive(
+    store: &impl Store,
+    prune: Option<&Prune<'_>>,
+    query: String,
+    depth: usize,
+    split: bool,
+    start_after: Option<&str>,
+) -> Result<Batch> {
+    let mut flat = read_after(store, &query, false, None, start_after).await?;
     if let Some(prune) = prune {
-        if let Some(batch) = lookahead(store, prune, &prefix, &page).await? {
-            return Ok(Done::Batch(batch));
+        if start_after.is_none() {
+            if let Some(batch) = lookahead(store, prune, &query, depth, &flat).await? {
+                return Ok(batch);
+            }
         }
+        // The dense split below would request every small sibling of two
+        // dense directories separately; filtered listings stay flat instead.
+        return Ok(scan_batch(query, false, flat, start_after));
     }
-    Ok(Done::First { prefix, page })
-}
-
-/// Where a part stands with the children of the directory it is in.
-enum Children {
-    Unlisted,
-    /// The listing went into this child of the directory before. Ask for
-    /// its children if the listing is still in it after another page.
-    Entered,
-    /// A page is on its way.
-    Asked,
-    /// Pages so far end at a continuation token.
-    More(String),
-    Complete,
-    /// Nothing further to hand over from this part.
-    Closed,
-}
-
-/// One listing of a walk: every key under `prefix`, page after page, up to
-/// the first key that belongs to a part handed over.
-struct Part {
-    prefix: String,
-    /// Keys with no slash after this many bytes are objects of a directory
-    /// whose own listing reports them.
-    above: Option<usize>,
-    done: bool,
-    /// The first and last key of the latest page.
-    first: String,
-    last: String,
-    dense: bool,
-    /// The first key that belongs to another part.
-    stop: Option<String>,
-    /// The directory whose children the part is working through, and how
-    /// many pages and children of it the listing has reached.
-    directory: String,
-    pages: usize,
-    reached: usize,
-    children: Children,
-    /// Children after the listing's position not yet handed over, in order,
-    /// and where the latest page of them ended.
-    ahead: VecDeque<String>,
-    listed: String,
-    /// Objects of the directories listed so far that sort after the
-    /// listing's position, in order. Those past `stop` are reported when it
-    /// is set; the listing itself reaches the others.
-    objects: Vec<Entry>,
-    /// Hand over each child by itself, whatever its size.
-    burst: bool,
-}
-
-impl Part {
-    fn new(prefix: String, above: Option<usize>) -> Self {
-        Self {
-            directory: prefix.clone(),
-            prefix,
-            above,
-            done: false,
-            first: String::new(),
-            last: String::new(),
-            dense: false,
-            stop: None,
-            pages: 0,
-            reached: 0,
-            children: Children::Unlisted,
-            ahead: VecDeque::new(),
-            listed: String::new(),
-            objects: Vec::new(),
-            burst: false,
-        }
+    if flat.next.is_none()
+        || !split
+        || !store.ordered()
+        || depth >= MAX_RECURSIVE_PROBES
+        || flat.entries.len() < 1000
+        || dense_children(&query, &flat) == 0
+    {
+        return Ok(scan_batch(query, false, flat, start_after));
     }
-
-    /// The child of the directory that holds the last key, or the key itself
-    /// when it is one of the directory's own objects. `None` once the listing
-    /// has left the directory.
-    fn inside(&self) -> Option<&str> {
-        let rest = self.last.strip_prefix(self.directory.as_str())?;
-        Some(match rest.find('/') {
-            Some(slash) => &self.last[..self.directory.len() + slash + 1],
-            None => &self.last,
+    // Continue useful enumeration while probing. Small two-page trees finish
+    // here, and rejected probes add no sequential round trip to flat scans.
+    let (branches, continuation) = tokio::join!(
+        read(store, &query, true, None),
+        read_after(store, &query, false, flat.next.as_deref(), start_after),
+    );
+    let continuation = continuation?;
+    flat.entries.extend(continuation.entries);
+    flat.next = continuation.next;
+    if flat.next.is_none() {
+        return Ok(scan_batch(query, false, flat, start_after));
+    }
+    let branches = branches?;
+    if branches.next.is_some() || !(2..=MAX_RECURSIVE_CHILDREN).contains(&branches.prefixes.len()) {
+        return Ok(scan_batch(query, false, flat, start_after));
+    }
+    // One dense leading directory says little about its siblings. Spend at
+    // most one more useful flat page looking for a second substantial child.
+    if dense_children(&query, &flat) < 2 {
+        let next = read_after(store, &query, false, flat.next.as_deref(), start_after).await?;
+        flat.entries.extend(next.entries);
+        flat.next = next.next;
+    }
+    if flat.next.is_none() || dense_children(&query, &flat) < 2
+        || !flat.entries.windows(2).all(|pair| pair[0].key < pair[1].key)
+        // Do not replace an observed key with an incomplete directory view.
+        || flat.entries.iter().any(|entry| {
+            !branches.entries.iter().any(|direct| direct.key == entry.key)
+                && !branches.prefixes.iter().any(|child| entry.key.starts_with(child))
         })
+    {
+        return Ok(scan_batch(query, false, flat, start_after));
     }
-
-    /// Drop the children and objects the listing has reached.
-    fn advance(&mut self) {
-        while let Some(child) = self.ahead.front() {
-            if child.as_str() > self.last.as_str() && !self.last.starts_with(child.as_str()) {
-                break;
-            }
-            self.ahead.pop_front();
-            self.reached += 1;
-        }
-        let reached = self.objects.partition_point(|entry| entry.key <= self.last);
-        self.objects.drain(..reached);
-    }
-
-    /// Pages the children ahead are expected to hold, taking each to be as
-    /// large as those the listing has reached.
-    fn expected(&self) -> usize {
-        self.ahead.len() * self.pages / self.reached.max(1)
-    }
-}
-
-/// The shortest start of `name` that the item the listing is inside, and so
-/// every key before it, does not share: the names it covers are all ahead.
-pub(super) fn block(inside: &str, name: &str) -> String {
-    let mut shared = inside
-        .bytes()
-        .zip(name.bytes())
-        .take_while(|(a, b)| a == b)
-        .count();
-    while !name.is_char_boundary(shared) {
-        shared -= 1;
-    }
-    let next = name[shared..].chars().next().map_or(0, char::len_utf8);
-    name[..shared + next].to_owned()
-}
-
-/// Everything under a prefix that needs more than one page.
-///
-/// One request after another lists the keys in order. To finish sooner, the
-/// walk asks for the children of the directory the listing is in and hands
-/// the last of them to listings of their own, which run at the same time.
-/// Each of those lists a prefix that the directories before it do not share
-/// (`block`), so it covers whole directories and ends where they end; the
-/// first listing stops at the first key handed over. No key is reported
-/// twice, and a listing is cut short only where it has handed the rest over:
-/// some servers go on reading a listing that is abandoned, so cutting many
-/// short would cost them far more than the keys are worth.
-///
-/// A part is a walk in small: it can hand over its own children the same way.
-/// When a directory has no children left to hand over, the listing asks for
-/// those of the child it is inside.
-///
-/// A listing relies on keys arriving in order to know where to stop, as
-/// general purpose buckets list them. Each page is checked against the one
-/// before. The parts rely on the children listing naming every directory.
-struct Walk {
-    parts: Vec<Part>,
-    /// Keys listed, which earn the extra requests.
-    keys: usize,
-    /// Extra requests made: child listings and parts started.
-    spent: usize,
-    /// Whether the walk may still make extra requests.
-    dividing: bool,
-    /// Keys in each child of the prefix on the first pages, until the burst
-    /// is decided, and whether the prefix has few enough children for one.
-    sample: Option<HashMap<String, usize>>,
-    narrow: Option<bool>,
-    /// Extra requests granted at once.
-    burst: usize,
-}
-
-impl Walk {
-    fn new(prefix: String, dividing: bool, burst: bool) -> Self {
-        Self {
-            parts: vec![Part::new(prefix, None)],
-            keys: 0,
-            spent: 0,
-            dividing,
-            sample: burst.then(HashMap::new),
-            narrow: None,
-            burst: 0,
-        }
-    }
-
-    /// Take a page of a part's keys. Returns the keys that belong to it and
-    /// the request for its next page.
-    fn keys(&mut self, id: usize, at: usize, mut page: Page) -> Result<(Vec<Entry>, Option<Job>)> {
-        let part = &mut self.parts[at];
-        let mut before = part.last.as_str();
-        let mut ordered = true;
-        for entry in &page.entries {
-            ordered &= entry.key.as_str() > before;
-            before = &entry.key;
-        }
-        if !ordered {
-            if part.stop.is_some() {
-                return Err(Unordered.into());
-            }
-            // Nothing depends on the order yet, and nothing will.
-            self.dividing = false;
-        }
-        let mut finished = page.next.is_none();
-        if let Some(stop) = &part.stop {
-            let within = page.entries.partition_point(|entry| entry.key < *stop);
-            if within < page.entries.len() {
-                page.entries.truncate(within);
-                finished = true;
-            }
-        }
-        self.keys += page.entries.len();
-        if part.pages == 0 {
-            let mut counts = HashMap::new();
-            directories(&part.prefix, &page, &mut counts);
-            part.dense = counts.values().any(|keys| *keys >= DENSE_DIRECTORY);
-        }
-        if at == 0 {
-            if let Some(sample) = &mut self.sample {
-                let mut counts = HashMap::new();
-                directories(&part.prefix, &page, &mut counts);
-                for (directory, keys) in counts {
-                    *sample.entry(directory.to_owned()).or_default() += keys;
-                }
-            }
-        }
-        if let (Some(first), Some(last)) = (page.entries.first(), page.entries.last()) {
-            part.first.clone_from(&first.key);
-            part.last.clone_from(&last.key);
-        }
-        if let Some(above) = part.above {
-            page.entries
-                .retain(|entry| entry.key[above..].contains('/'));
-        }
-        part.pages += 1;
-        if finished {
-            part.done = true;
-            part.ahead = VecDeque::new();
-            part.objects = Vec::new();
-            return Ok((page.entries, None));
-        }
-        part.advance();
-        let job = Job::Keys {
-            walk: id,
-            part: at,
-            prefix: part.prefix.clone(),
-            token: page.next,
-        };
-        Ok((page.entries, Some(job)))
-    }
-
-    /// Take a page of the children of the directory a part is in.
-    fn children(&mut self, at: usize, directory: &str, page: Page) {
-        let part = &mut self.parts[at];
-        if part.done || part.directory != directory || !matches!(part.children, Children::Asked) {
-            return;
-        }
-        let mut before = part.listed.as_str();
-        let mut ordered = true;
-        for child in &page.prefixes {
-            ordered &= child.as_str() > before;
-            before = child;
-        }
-        if !ordered {
-            // The children are of no use out of order. Parts already handed
-            // over do not depend on them.
-            part.children = Children::Closed;
-            return;
-        }
-        if at == 0 && self.narrow.is_none() {
-            self.narrow =
-                Some(page.next.is_none() && (2..=BURST_CHILDREN).contains(&page.prefixes.len()));
-        }
-        if let Some(last) = page.prefixes.last() {
-            part.listed.clone_from(last);
-        }
-        part.ahead.extend(page.prefixes);
-        let above = part.above;
-        part.objects.extend(
-            page.entries
-                .into_iter()
-                .filter(|entry| above.is_none_or(|above| entry.key[above..].contains('/'))),
-        );
-        part.objects.sort_unstable_by(|a, b| a.key.cmp(&b.key));
-        part.advance();
-        part.children = match page.next {
-            // Children the listing has already passed are too small to be
-            // worth a request for every thousand of them.
-            Some(_) if part.ahead.is_empty() && part.listed < part.last => Children::Closed,
-            Some(token) => Children::More(token),
-            None => Children::Complete,
-        };
-    }
-
-    fn allowance(&self) -> usize {
-        let pages = self.keys / PAGE;
-        if pages < 2 && !self.parts[0].dense {
-            return 0;
-        }
-        EXTRA_REQUESTS + pages / PAGES_PER_EXTRA + self.burst
-    }
-
-    /// Grant the burst once the first pages and the prefix's children say
-    /// whether it applies.
-    fn decide_burst(&mut self) {
-        let (Some(sample), Some(narrow)) = (&self.sample, self.narrow) else {
-            return;
-        };
-        let dense = sample
-            .values()
-            .filter(|keys| **keys >= DENSE_DIRECTORY)
-            .count();
-        if narrow && dense >= 2 {
-            self.burst = self.parts[0].ahead.len();
-            self.parts[0].burst = true;
-        } else if narrow && self.parts[0].pages < BURST_PAGES {
-            return;
-        }
-        self.sample = None;
-    }
-
-    /// Queue the extra requests the walk has earned and has room for.
-    /// Objects past a part handed over, and pruned directories left out, are
-    /// added to `entries` and `pruned`.
-    fn divide(
-        &mut self,
-        id: usize,
-        mut room: usize,
-        prune: Option<&Prune<'_>>,
-        jobs: &mut VecDeque<Job>,
-        entries: &mut Vec<Entry>,
-        pruned: &mut Vec<String>,
-    ) {
-        self.decide_burst();
-        let mut at = 0;
-        while self.dividing && at < self.parts.len() {
-            if let Some(prune) = prune {
-                self.leave_out(at, prune, entries, pruned);
-            }
-            if room == 0 || self.spent >= self.allowance() {
-                at += 1;
-                continue;
-            }
-            match self.step(id, at, entries) {
-                Some(job) => {
-                    self.spent += 1;
-                    room -= 1;
-                    jobs.push_back(job);
-                }
-                None => at += 1,
-            }
-        }
-    }
-
-    /// Stop a part's listing short of pruned directories at its end: nothing
-    /// needs to list them.
-    fn leave_out(
-        &mut self,
-        at: usize,
-        prune: &Prune<'_>,
-        entries: &mut Vec<Entry>,
-        pruned: &mut Vec<String>,
-    ) {
-        let part = &mut self.parts[at];
-        if part.done || !matches!(part.children, Children::Complete) {
-            return;
-        }
-        while let Some(child) = part.ahead.pop_back() {
-            if (prune.subtree)(&child, true).is_none() {
-                part.ahead.push_back(child);
-                break;
-            }
-            let past = part.objects.partition_point(|entry| entry.key < child);
-            entries.extend(part.objects.drain(past..));
-            part.stop = Some(child.clone());
-            pruned.push(child);
-        }
-    }
-
-    /// The next extra request for a part, if one is worth making.
-    fn step(&mut self, id: usize, at: usize, entries: &mut Vec<Entry>) -> Option<Job> {
-        let part = &mut self.parts[at];
-        if part.done {
-            return None;
-        }
-        let children = |part: &mut Part, token| {
-            part.children = Children::Asked;
-            Some(Job::Children {
-                walk: id,
-                part: at,
-                directory: part.directory.clone(),
-                token,
+    // Retain every sampled child entry, then resume the partial last child
+    // strictly after the last sampled key. Continuation tokens stay with their
+    // original request; StartAfter establishes a new child-prefix listing.
+    let last = flat.entries.last().unwrap().key.clone();
+    let mut entries: Vec<_> = branches
+        .entries
+        .into_iter()
+        .filter(|entry| start_after.is_none_or(|start| entry.key.as_str() > start))
+        .collect();
+    entries.extend(flat.entries.into_iter().filter(|entry| {
+        branches
+            .prefixes
+            .iter()
+            .any(|prefix| entry.key.starts_with(prefix))
+    }));
+    Ok(Batch {
+        entries,
+        jobs: branches
+            .prefixes
+            .into_iter()
+            .filter(|prefix| prefix >= &last || last.starts_with(prefix))
+            .map(|prefix| Job::Recursive {
+                start_after: last.starts_with(&prefix).then(|| last.clone()),
+                prefix,
+                depth: depth + 1,
             })
-        };
-        match std::mem::replace(&mut part.children, Children::Closed) {
-            Children::Unlisted if part.dense || part.pages >= SPARSE_PAGES => children(part, None),
-            // A listing that has already left the child has nothing to hand
-            // over from it.
-            Children::Entered if part.pages >= 2 => part
-                .last
-                .starts_with(&part.directory)
-                .then(|| children(part, None))
-                .flatten(),
-            Children::More(token) => children(part, Some(token)),
-            Children::Complete => {
-                part.children = Children::Complete;
-                let inside = part.inside()?.to_owned();
-                let Some(name) = part.ahead.back() else {
-                    // Nothing left to hand over here. Look inside the child
-                    // the listing is in, if it holds the whole latest page.
-                    if !inside.ends_with('/')
-                        || inside.len() <= part.directory.len()
-                        || !part.first.starts_with(&inside)
-                    {
-                        return None;
-                    }
-                    part.directory = inside;
-                    part.pages = 1;
-                    part.reached = 1;
-                    part.burst = false;
-                    part.listed.clear();
-                    part.children = Children::Entered;
-                    return None;
-                };
-                // Small directories are not worth a request each. Leave them
-                // to the listing unless enough of them remain.
-                if !part.burst && part.expected() < 2 * PART_PAGES {
-                    return None;
-                }
-                let prefix = if part.burst {
-                    name.clone()
-                } else {
-                    // Nor may it cover the part's stop: a pruned directory
-                    // left out after `name` can start the same way.
-                    let mut prefix = block(&inside, name);
-                    if let Some(stop) = part
-                        .stop
-                        .as_deref()
-                        .filter(|stop| stop.starts_with(&prefix))
-                    {
-                        prefix = block(stop, name);
-                    }
-                    prefix
-                };
-                let from = part
-                    .ahead
-                    .iter()
-                    .rposition(|name| !name.starts_with(&prefix))
-                    .map_or(0, |before| before + 1);
-                let names = part.ahead.split_off(from);
-                let past = part.objects.partition_point(|entry| entry.key < prefix);
-                entries.extend(part.objects.drain(past..));
-                part.stop = Some(prefix.clone());
-                // Objects directly in this directory are reported from its
-                // child listing above, wherever the new part's prefix ends.
-                let above = part.directory.rfind('/').map_or(0, |slash| slash + 1);
-                let above = Some(above.max(part.above.unwrap_or(0)));
-                let directory = part.directory.clone();
-                let mut new = Part::new(prefix.clone(), above);
-                if !prefix.ends_with('/') {
-                    // The part covers several of this directory's children,
-                    // which are already known.
-                    new.directory = directory;
-                    new.ahead = names;
-                    new.children = Children::Complete;
-                }
-                self.parts.push(new);
-                Some(Job::Keys {
-                    walk: id,
-                    part: self.parts.len() - 1,
-                    prefix,
-                    token: None,
-                })
-            }
-            other => {
-                part.children = other;
-                None
-            }
-        }
-    }
+            .collect(),
+        pruned: Vec::new(),
+    })
 }
 
 pub(super) async fn enumerate(
@@ -914,6 +533,9 @@ pub(super) async fn enumerate(
         }
         return Ok(());
     }
+    if in_parts(store, concurrency) {
+        return parts::enumerate(store, pattern, concurrency, &mut emit).await;
+    }
     enumerate_jobs(
         store,
         Some(pattern),
@@ -922,6 +544,7 @@ pub(super) async fn enumerate(
         Job::Discover {
             prefix: String::new(),
             component: 0,
+            depth: 0,
         },
         &mut emit,
     )
@@ -933,13 +556,15 @@ pub(super) async fn enumerate(
 /// This only changes request scheduling; callers still validate and interpret
 /// object metadata, source types and destination mappings.
 ///
-/// Keys arrive in no particular order. With `prune`, directories it names may
-/// be skipped: their common prefixes are returned instead of being listed.
-/// Objects in pruned directories may still be emitted, so callers must
-/// classify every entry themselves.
+/// With `prune`, directories it names may be skipped: their common prefixes
+/// are returned instead of being listed. Objects in pruned directories may
+/// still be emitted, so callers must classify every entry themselves. Unless
+/// the listing is divided into parts, it stays flat with `prune` apart from
+/// the lookahead.
 ///
-/// Fails with [`Unordered`] when keys arrive out of order after part of the
-/// listing was handed to others; a concurrency of one hands nothing over.
+/// A listing in parts fails with [`Unordered`] when keys arrive out of order
+/// after part of it was handed to others; with a concurrency of one, or a
+/// store that does not divide, it is never in parts.
 pub(in crate::s3) async fn enumerate_prefix(
     store: &impl Store,
     prefix: &str,
@@ -947,6 +572,13 @@ pub(in crate::s3) async fn enumerate_prefix(
     prune: Option<&Prune<'_>>,
     mut emit: impl FnMut(Entry) -> Result<()>,
 ) -> Result<Vec<String>> {
+    ensure!(
+        (1..=256).contains(&concurrency),
+        "concurrency must be between 1 and 256"
+    );
+    if in_parts(store, concurrency) {
+        return parts::enumerate_prefix(store, prefix, concurrency, prune, &mut emit).await;
+    }
     enumerate_jobs(
         store,
         None,
@@ -954,6 +586,8 @@ pub(in crate::s3) async fn enumerate_prefix(
         concurrency,
         Job::Recursive {
             prefix: prefix.to_owned(),
+            depth: 0,
+            start_after: None,
         },
         &mut emit,
     )
@@ -972,16 +606,12 @@ async fn enumerate_jobs(
         (1..=256).contains(&concurrency),
         "concurrency must be between 1 and 256"
     );
-    // Directory buckets do not list in key order, and take only prefixes that
-    // end in a slash, so their listings stay whole.
-    let dividing = concurrency > 1 && store.ordered();
     let store = LimitedStore {
         inner: store,
         slots: tokio::sync::Semaphore::new(concurrency),
     };
     let mut pending = VecDeque::from([first]);
     let mut pruned = Vec::new();
-    let mut walks: Vec<Walk> = Vec::new();
     let mut active = FuturesUnordered::new();
     loop {
         while active.len() < concurrency {
@@ -991,46 +621,16 @@ async fn enumerate_jobs(
             let split = concurrency > 1 && pending.len() + active.len() < SPLIT_QUEUE_LIMIT;
             active.push(execute(&store, pattern, prune, job, split));
         }
-        let Some(done) = active.next().await else {
+        let Some(batch) = active.next().await else {
             return Ok(pruned);
         };
-        let (mut entries, walk) = match done? {
-            Done::Batch(batch) => {
-                pending.extend(batch.jobs);
-                pruned.extend(batch.pruned);
-                (batch.entries, None)
-            }
-            Done::First { page, .. } if page.next.is_none() => (page.entries, None),
-            Done::First { prefix, page } => {
-                let id = walks.len();
-                walks.push(Walk::new(prefix, dividing, prune.is_none()));
-                let (entries, job) = walks[id].keys(id, 0, page)?;
-                pending.extend(job);
-                (entries, Some(id))
-            }
-            Done::Keys { walk, part, page } => {
-                let (entries, job) = walks[walk].keys(walk, part, page)?;
-                pending.extend(job);
-                (entries, Some(walk))
-            }
-            Done::Children {
-                walk,
-                part,
-                directory,
-                page,
-            } => {
-                walks[walk].children(part, &directory, page);
-                (Vec::new(), Some(walk))
-            }
-        };
-        if let Some(id) = walk {
-            let room = concurrency.saturating_sub(active.len() + pending.len());
-            walks[id].divide(id, room, prune, &mut pending, &mut entries, &mut pruned);
-        }
-        for entry in entries {
+        let batch = batch?;
+        for entry in batch.entries {
             if pattern.is_none_or(|pattern| pattern.matches(&entry.key)) {
                 emit(entry)?;
             }
         }
+        pending.extend(batch.jobs);
+        pruned.extend(batch.pruned);
     }
 }

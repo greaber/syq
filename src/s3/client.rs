@@ -953,13 +953,16 @@ impl Listing {
 }
 
 /// List every object under a literal prefix with the bounded parallel engine.
+/// `endpoint` is the custom endpoint the client uses, if any: it decides
+/// whether a listing may be divided (`listing::lists_in_byte_order`).
 pub(super) async fn list(
     client: &Client,
+    endpoint: Option<&str>,
     bucket: &str,
     prefix: &str,
     concurrency: usize,
 ) -> Result<Listing> {
-    list_with_times(client, bucket, prefix, None, concurrency, false).await
+    list_with_times(client, endpoint, bucket, prefix, None, concurrency, false).await
 }
 
 /// Delimiter requests a filtered listing may spend looking past a first page
@@ -974,6 +977,7 @@ const LOOKAHEAD_PROBES: usize = 4;
 /// them.
 pub(super) async fn list_with_times(
     client: &Client,
+    endpoint: Option<&str>,
     bucket: &str,
     prefix: &str,
     matcher: Option<&ignore::gitignore::Gitignore>,
@@ -1001,6 +1005,9 @@ pub(super) async fn list_with_times(
         fn ordered(&self) -> bool {
             self.inner.ordered()
         }
+        fn divides(&self) -> bool {
+            self.inner.divides()
+        }
         async fn page(
             &self,
             prefix: &str,
@@ -1022,6 +1029,7 @@ pub(super) async fn list_with_times(
         inner: listing::S3 {
             client: client.clone(),
             bucket,
+            divides: listing::lists_in_byte_order(endpoint),
         },
         root: prefix,
         discovery_denied: AtomicBool::new(false),

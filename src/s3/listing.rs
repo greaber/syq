@@ -74,6 +74,7 @@ pub(crate) fn run(args: &[OsString]) -> Result<i32> {
             let store = S3 {
                 client,
                 bucket: &pattern.bucket,
+                divides: lists_in_byte_order(options.endpoint.as_deref()),
             };
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
@@ -110,15 +111,103 @@ pub(crate) fn run(args: &[OsString]) -> Result<i32> {
 pub(super) struct S3<'a> {
     pub(super) client: aws_sdk_s3::Client,
     pub(super) bucket: &'a str,
+    /// Whether listings may be divided into parts: [`lists_in_byte_order`]
+    /// for the endpoint the client uses.
+    pub(super) divides: bool,
 }
 /// Directory buckets do not promise lexicographic LIST order.
 pub(super) fn lists_in_key_order(bucket: &str) -> bool {
     !bucket.ends_with("--x-s3")
 }
 
+/// Whether the provider at `endpoint` documents that ListObjectsV2 returns
+/// keys in UTF-8 byte order, so that a listing may be divided into parts
+/// (`engine::Store::divides`). `None` is the AWS endpoint the SDK chooses.
+///
+/// Only AWS documents it: "List results are always returned in UTF-8 binary
+/// order" (https://docs.aws.amazon.com/AmazonS3/latest/userguide/ListingKeysUsingAPIs.html),
+/// for general purpose buckets; directory buckets are not in lexicographic
+/// order (https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html)
+/// and are excluded by [`lists_in_key_order`].
+///
+/// Left out: Cloudflare R2, whose S3 API documentation states no order and
+/// for which a different order was reported
+/// (https://community.cloudflare.com/t/r2-listobjectsv2-returns-keys-in-non-standard-lexicographical-order/941399);
+/// Google Cloud Storage, which says "lexicographically by name" without
+/// saying by bytes (https://cloud.google.com/storage/docs/xml-api/get-bucket-list);
+/// Backblaze B2, "sorted alphabetically by key"
+/// (https://www.backblaze.com/apidocs/s3-list-objects-v2); Tigris, whose
+/// S3 compatibility page states no order (https://www.tigrisdata.com/docs/api/s3/);
+/// and every self-hosted or unrecognized endpoint.
+pub(super) fn lists_in_byte_order(endpoint: Option<&str>) -> bool {
+    // The local test servers do not divide otherwise.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("SYQ_TEST_S3_DIVIDE_LISTINGS").is_some_and(|v| v == "1") {
+        return true;
+    }
+    let Some(endpoint) = endpoint else {
+        return true;
+    };
+    url::Url::parse(endpoint)
+        .ok()
+        .and_then(|url| match url.host() {
+            Some(url::Host::Domain(host)) => Some(aws_general_purpose_host(host)),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
+/// Whether `host` is an AWS S3 endpoint for general purpose buckets, in
+/// path-style or virtual-hosted form: global, regional, legacy dash-regional,
+/// dual-stack, FIPS, and VPC interface endpoints, in the AWS and China
+/// partitions (https://docs.aws.amazon.com/general/latest/gr/s3.html,
+/// https://docs.aws.amazon.com/AmazonS3/latest/userguide/privatelink-interface-endpoints.html).
+/// Access points, Object Lambda, Outposts, directory buckets (`s3express`)
+/// and multi-Region access points are not.
+fn aws_general_purpose_host(host: &str) -> bool {
+    let labels: Vec<&str> = host.split('.').collect();
+    let rest = match labels.as_slice() {
+        [rest @ .., "amazonaws", "com"] | [rest @ .., "amazonaws", "com", "cn"] => rest,
+        _ => return false,
+    };
+    let region = |label: &str| {
+        let mut parts = label.split('-');
+        parts
+            .next()
+            .is_some_and(|area| area.len() == 2 && area.bytes().all(|b| b.is_ascii_lowercase()))
+            && label.len() > 3
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && label.ends_with(|c: char| c.is_ascii_digit())
+            && !label.contains("--")
+    };
+    // The service label, then what may follow it.
+    (0..rest.len()).any(|at| {
+        let after = &rest[at + 1..];
+        match rest[at] {
+            "s3" | "s3-fips" => match after {
+                [] => rest[at] == "s3",
+                [r] => region(r),
+                ["dualstack", r] => region(r),
+                [r, "vpce"] => {
+                    rest[at] == "s3" && region(r) && at > 0 && rest[at - 1].starts_with("vpce-")
+                }
+                _ => false,
+            },
+            "s3-external-1" => after.is_empty(),
+            label => after.is_empty() && label.strip_prefix("s3-").is_some_and(region),
+        }
+    })
+}
+
 impl Store for S3<'_> {
     fn ordered(&self) -> bool {
         lists_in_key_order(self.bucket)
+    }
+
+    fn divides(&self) -> bool {
+        self.divides
     }
 
     async fn page(
