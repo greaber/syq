@@ -785,13 +785,14 @@ fn deep_tree(top: &Path, depth: usize, files: usize) {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_remote_removal_reports_each_entry_of_a_tree_nested_beyond_any_path() {
-    // 250 files below 170 directories named with 255 bytes: each result
-    // names a path of about 43 KiB, and the receiver sends at most 200
-    // results together, more than one message holds. Each goes in a
+    // 400 files below 170 directories named with 255 bytes: each result
+    // names a path of about 43 KiB, and the receiver sends up to 200
+    // results together, more than one message holds. However the
+    // receiver's timer cuts the files' results, one batch holds 200. Each goes in a
     // message that holds it, and every entry's removal is reported.
     let t = Tmp::new();
     let ssh = fake_ssh(&t);
-    deep_tree(&t.path("deep"), 170, 250);
+    deep_tree(&t.path("deep"), 170, 400);
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["rm", "--cwd", &t.s(""), "--src-dir", "deep", "-q"])
         .args(["--results", &t.s("results.ndjson")])
@@ -817,11 +818,11 @@ fn a_remote_removal_reports_each_entry_of_a_tree_nested_beyond_any_path() {
         .filter(|record| record["type"] == "removal_result" && record["disposition"] == "removed")
         .count();
     // The files, the 170 directories and the selected one.
-    assert_eq!(removed, 250 + 171);
+    assert_eq!(removed, 400 + 171);
     let result = records.last().unwrap();
     assert_eq!(
         (&result["status"], &result["entries_removed"]),
-        (&serde_json::json!("success"), &serde_json::json!(421))
+        (&serde_json::json!("success"), &serde_json::json!(571))
     );
 }
 
@@ -853,12 +854,12 @@ fn a_remote_removal_reports_selectors_whose_traces_together_exceed_a_message() {
         )
         .run()
         .unwrap();
+    assert_output_ok(&output);
     let records: Vec<serde_json::Value> = String::from_utf8(read(&t.path("results.ndjson")))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_output_ok(&output);
     let result = records.last().unwrap();
     assert_eq!(
         (&result["status"], &result["selectors_missing"]),

@@ -332,7 +332,9 @@ impl NativeRemoveOutcome {
 
 /// A removal's results or traces as the messages that carry them, in order:
 /// each message ends before its items (by `size`) pass half a metadata
-/// frame, and holds at least one. A result names its path, which has no
+/// frame, and holds at least one item. An empty batch is one empty message:
+/// the receiver's sign of life while a removal finds nothing to report.
+/// A result names its path, which has no
 /// length limit: a removal descends from directory to directory, so a tree
 /// can nest far beyond the longest path a system call takes. A trace quotes
 /// its selector, escaping what is not printable.
@@ -341,7 +343,7 @@ pub(crate) fn native_remove_messages<T>(
     size: impl Fn(&T) -> usize,
 ) -> Vec<Vec<T>> {
     let mut messages = Vec::new();
-    while !items.is_empty() {
+    loop {
         let mut bytes = 0usize;
         let len = items
             .iter()
@@ -352,8 +354,10 @@ pub(crate) fn native_remove_messages<T>(
             .map_or(items.len(), |index| index.max(1));
         let rest = items.split_off(len);
         messages.push(std::mem::replace(&mut items, rest));
+        if items.is_empty() {
+            return messages;
+        }
     }
-    messages
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
