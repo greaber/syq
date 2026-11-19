@@ -24,9 +24,9 @@ pub const MAX_READ_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_HANDSHAKE_FRAME: usize = 1024 * 1024;
 const MAX_METADATA_FRAME: usize = 8 * 1024 * 1024;
 pub(crate) const METADATA_BATCH_BYTES: usize = 6 * 1024 * 1024;
-/// What the failures of one request's metadata operations may add to its
-/// reply, by `failed_set_meta_hint`: half a metadata frame, so that the
-/// reply still fits should an error come to say more than that allows for.
+/// What the failures of one request's operations may add to its reply, by
+/// `failed_path_hint` and `failed_set_meta_hint`: half a metadata frame, so
+/// that the reply still fits should an error come to say more than that allows for.
 pub(crate) const METADATA_REPLY_BYTES: usize = MAX_METADATA_FRAME / 2;
 /// Supported comparison granularity floor, enforced by receivers as well as the CLI.
 /// Smaller blocks increase the number of hashes per file; this is a protocol
@@ -317,6 +317,47 @@ pub struct NativeRemoveOutcome {
     /// and dry-run records have no attempts.
     pub attempts: Option<u64>,
     pub failure: Option<NativeRemoveFailure>,
+}
+
+impl NativeRemoveOutcome {
+    pub(crate) fn size_hint(&self) -> usize {
+        self.path.len()
+            + self
+                .failure
+                .as_ref()
+                .map_or(0, |failure| failure.error.message.len())
+            + 48
+    }
+}
+
+/// A removal's results or traces as the messages that carry them, in order:
+/// each message ends before its items (by `size`) pass half a metadata
+/// frame, and holds at least one item. An empty batch is one empty message:
+/// the receiver's sign of life while a removal finds nothing to report.
+/// A result names its path, which has no
+/// length limit: a removal descends from directory to directory, so a tree
+/// can nest far beyond the longest path a system call takes. A trace quotes
+/// its selector, escaping what is not printable.
+pub(crate) fn native_remove_messages<T>(
+    mut items: Vec<T>,
+    size: impl Fn(&T) -> usize,
+) -> Vec<Vec<T>> {
+    let mut messages = Vec::new();
+    loop {
+        let mut bytes = 0usize;
+        let len = items
+            .iter()
+            .position(|item| {
+                bytes = bytes.saturating_add(size(item));
+                bytes > MAX_METADATA_FRAME / 2
+            })
+            .map_or(items.len(), |index| index.max(1));
+        let rest = items.split_off(len);
+        messages.push(std::mem::replace(&mut items, rest));
+        if items.is_empty() {
+            return messages;
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
@@ -757,24 +798,35 @@ impl Op {
 }
 
 /// The most a failed `Op::SetMeta` of `path` adds to its request's `Applied`
-/// reply: the receiver's error, as text, and its other fields.
-///
-/// The text names the path as the receiver displays it, in which each byte
-/// that is not UTF-8 shows as a three-byte replacement character. No error
-/// of this operation names it more than twice (opening its metadata handle
-/// names it for the request and again beneath the destination root); three
-/// are allowed for. The rest of the text is fixed wording and the system's
-/// description of the error, well under 320 bytes with the error's other
-/// fields. An error of preserved ACLs or extended attributes also names one
-/// attribute, of at most 255 bytes, as a list of numbers
-/// (`InodeMetadata::failure_hint`).
+/// reply: that of any operation on the path (`failed_path_hint`), and an
+/// attribute's name when ACLs or extended attributes are preserved: an
+/// error applying them names one, of at most 255 bytes, as a list of
+/// numbers (`InodeMetadata::failure_hint`). No error of this operation
+/// names the path more than twice: opening its metadata handle names it
+/// for the request and again beneath the destination root.
 pub(crate) fn failed_set_meta_hint(path: &[u8], meta: &Meta) -> usize {
-    3 * String::from_utf8_lossy(path).len()
-        + 320
+    failed_path_hint(path)
         + meta
             .inode_metadata
             .as_ref()
             .map_or(0, |inode| inode.failure_hint())
+}
+
+/// The most the failure of an operation on `path` that names no other path
+/// or attribute adds to its request's `Applied` reply: the receiver's error,
+/// as text, and its other fields. This holds for setting a directory's
+/// metadata (`failed_set_meta_hint` adds attributes), creating a directory
+/// and removing an entry (`Op::Mkdir`, `Op::Rmdir`, `Op::Unlink`).
+///
+/// The text names the path as the receiver displays it, in which each byte
+/// that is not UTF-8 shows as a three-byte replacement character. No error
+/// of these operations names it more than twice (a no-replace creation
+/// whose name was taken names it in that condition and in the creation that
+/// failed); three are allowed for. The rest of the text is fixed wording and
+/// the system's description of the error, well under 320 bytes with the
+/// error's other fields.
+pub(crate) fn failed_path_hint(path: &[u8]) -> usize {
+    3 * String::from_utf8_lossy(path).len() + 320
 }
 
 /// Receiver-observed mode and identity before temporary directory access.
@@ -2305,17 +2357,7 @@ impl SizeHint for Response {
             Response::ScanBatch(v) => v.iter().map(Entry::size_hint).sum::<usize>() + 16,
             Response::NativeMapData(data) => data.len() + 16,
             Response::NativeRemoveBatch(v) => {
-                v.iter()
-                    .map(|outcome| {
-                        outcome.path.len()
-                            + outcome
-                                .failure
-                                .as_ref()
-                                .map_or(0, |failure| failure.error.message.len())
-                            + 48
-                    })
-                    .sum::<usize>()
-                    + 16
+                v.iter().map(NativeRemoveOutcome::size_hint).sum::<usize>() + 16
             }
             Response::DirectoryEntries { entries, .. } => {
                 entries

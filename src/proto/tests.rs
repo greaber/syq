@@ -1023,3 +1023,23 @@ fn an_admission_goes_once_before_the_preamble() {
         .unwrap();
     assert!(plain_writer.starts_with(WIRE_PREAMBLE_MAGIC));
 }
+
+#[test]
+fn removal_results_go_in_messages_that_hold_them() {
+    let half = MAX_METADATA_FRAME / 2;
+    let messages =
+        |sizes: Vec<usize>| -> Vec<Vec<usize>> { native_remove_messages(sizes, |size| *size) };
+    // An empty batch is still sent: it shows the receiver is alive.
+    assert_eq!(messages(Vec::new()), [Vec::<usize>::new()]);
+    assert_eq!(messages(vec![1, 2, 3]), [vec![1, 2, 3]]);
+    // A message ends before the item that would pass half a frame.
+    assert_eq!(
+        messages(vec![half / 2, half / 2, 1, half]),
+        [vec![half / 2, half / 2], vec![1], vec![half]]
+    );
+    // An item larger than that goes alone.
+    assert_eq!(
+        messages(vec![1, half + 1, 2]),
+        [vec![1], vec![half + 1], vec![2]]
+    );
+}
