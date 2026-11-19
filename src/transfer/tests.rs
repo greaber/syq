@@ -6071,10 +6071,6 @@ struct HoldingDestination<F> {
     sent: F,
     /// Refuse every streamed begin, as a receiver's grant can.
     refuse_begin: bool,
-    /// Reply slots its requests beyond sixteen reserve, as a remote
-    /// connection's do (`Conn::reserve_reply`); without them, any request
-    /// may be sent.
-    reserved: Option<crate::wire_budget::ReservedReplies>,
 }
 
 impl<F: FnMut(usize) + Send> Conn for HoldingDestination<F> {
@@ -6110,11 +6106,6 @@ impl<F: FnMut(usize) + Send> Conn for HoldingDestination<F> {
     }
     fn reply_queue(&self) -> Option<usize> {
         Some(self.queue)
-    }
-    fn reserve_reply(&self) -> bool {
-        self.reserved
-            .as_ref()
-            .is_none_or(crate::wire_budget::ReservedReplies::reserve)
     }
     fn scan(
         &mut self,
@@ -6187,13 +6178,12 @@ impl Conn for WideSource {
 }
 
 /// A remote source whose reader, as a connection's does, holds room in the
-/// decoded-message allowance for each reply from when it arrives until it is
-/// taken, decoding into room reserved for it first. A reply that does not
-/// fit fails, and so does every later one, as the reader stops.
+/// process's decoded-message allowance for each reply from when it arrives
+/// until it is taken. A reply that does not fit fails, and so does every
+/// later one, as the reader stops.
 struct BudgetedSource {
     inner: QueuingSource,
     holds: std::collections::VecDeque<std::io::Result<crate::wire_budget::Budgeted<Response>>>,
-    reserved: crate::wire_budget::ReservedReplies,
     failed: bool,
 }
 
@@ -6216,9 +6206,6 @@ impl Conn for BudgetedSource {
     }
     fn reply_queue(&self) -> Option<usize> {
         Some(crate::transfer_tuning::COMPARE_REQUESTS)
-    }
-    fn reserve_reply(&self) -> bool {
-        self.reserved.reserve()
     }
     fn is_dead(&self) -> bool {
         self.failed
@@ -6258,11 +6245,8 @@ struct Holding {
     /// one.
     remote_source: bool,
     /// Read from a remote source whose replies hold room in the
-    /// decoded-message allowance (`BudgetedSource`); this thread reads it.
-    /// The destination's further requests then reserve reply slots too.
+    /// decoded-message allowance (`BudgetedSource`).
     budgeted_source: bool,
-    /// The destination's requests beyond sixteen reserve reply slots.
-    destination_slots: bool,
     /// Stream to a command-restricted receiver.
     restricted: bool,
     /// The receiver refuses every streamed begin.
@@ -6299,12 +6283,9 @@ fn stream_into_holding_destination(
         most: reads.clone(),
     };
     worker.src = if how.budgeted_source {
-        let reserved = crate::wire_budget::ReservedReplies::default();
-        reserved.read_on_this_thread();
         Box::new(BudgetedSource {
             inner: source,
             holds: Default::default(),
-            reserved,
             failed: false,
         })
     } else if how.remote_source {
@@ -6327,7 +6308,6 @@ fn stream_into_holding_destination(
             sent(&aborting, pieces)
         },
         refuse_begin: how.refuse_begin,
-        reserved: (how.budgeted_source || how.destination_slots).then(Default::default),
     });
     worker.fast_batch_files = files.len();
     let opts = Arc::get_mut(&mut worker.opts).unwrap();
@@ -6457,81 +6437,33 @@ fn an_aborted_copy_takes_every_reply_of_a_wide_patch_stream() {
     }
 }
 
-// Holds the process's own allowance or slots: run in a process of its own,
-// as nextest does.
+// Holds the process's own allowance: run in a process of its own, as nextest
+// does.
 #[test]
 fn a_wide_patch_stream_cannot_use_up_the_decoded_message_allowance() {
     // A stream of 320 single-block pieces from a remote source has up to
-    // 256 replies queued at once. Other connections' replies hold all but
-    // 100 granules of the process's decoded-message allowance, as those of
-    // many workers can: the stream's further replies take reserved slots
-    // instead, and the copy completes. With every slot taken by other
-    // connections, it keeps to the sixteen requests a stream may always
-    // have on each connection.
-    let granule = crate::wire_budget::RESERVATION_GRANULE;
-    let reply = postcard::to_stdvec(&0u32).unwrap();
-    let _others: Vec<_> = (0..crate::wire_budget::MEMORY_LIMIT / granule - 100)
-        .map(|_| crate::wire_budget::decode::<u32>(&reply).unwrap())
-        .collect();
+    // 256 replies queued at once. Other connections' messages hold all but
+    // 1 MiB of the process's decoded-message allowance, as those of many
+    // workers can. Each queued reply holds what it is counted for, about
+    // 1 KiB, so the stream stays wide and the copy completes; at 64 KiB a
+    // reply, 16 of them would have used up what is left.
+    let others = postcard::to_stdvec(&vec![
+        0u64;
+        (crate::wire_budget::MEMORY_LIMIT - (1 << 20)) / 64 - 1
+    ])
+    .unwrap();
+    let _others = crate::wire_budget::decode::<Vec<u64>>(&others).unwrap();
     let how = Holding {
         budgeted_source: true,
         ..Holding::default()
     };
-    for slots_taken in [false, true] {
-        let case = format!("slots_taken={slots_taken}");
-        let taken = crate::wire_budget::ReservedReplies::default();
-        while slots_taken && taken.reserve() {}
-        let temporary = crate::test_support::tempdir().unwrap();
-        let root = temporary.path();
-        let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
-        let (_, worker, held) = stream_into_holding_destination(root, &files, how, |_, _| {});
-        assert_eq!(
-            read(root, "source/file"),
-            read(root, "target/file"),
-            "{case}"
-        );
-        assert_eq!(worker.progress.files_done.load(Relaxed), 1, "{case}");
-        if slots_taken {
-            assert_eq!(held.reads, crate::transfer_tuning::COMPARE_WINDOW, "{case}");
-        } else {
-            assert!(held.reads > 64, "{case}: {} reads", held.reads);
-        }
-    }
-}
-
-// Holds the process's own allowance or slots: run in a process of its own,
-// as nextest does.
-#[test]
-fn a_wide_patch_stream_keeps_to_sixteen_acknowledgments_without_reply_slots() {
-    // From an in-process source, as in a push, a stream's pieces await
-    // acknowledgment as far as the destination's reply queue allows, each
-    // beyond sixteen with a reply slot. With every slot taken by other
-    // connections, as many await as before the window widened.
-    let window = crate::transfer_tuning::COMPARE_WINDOW;
-    for slots_taken in [false, true] {
-        let case = format!("slots_taken={slots_taken}");
-        let taken = crate::wire_budget::ReservedReplies::default();
-        while slots_taken && taken.reserve() {}
-        let temporary = crate::test_support::tempdir().unwrap();
-        let root = temporary.path();
-        let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
-        let how = Holding {
-            destination_slots: true,
-            ..Holding::default()
-        };
-        let (_, worker, held) = stream_into_holding_destination(root, &files, how, |_, _| {});
-        assert_eq!(
-            read(root, "source/file"),
-            read(root, "target/file"),
-            "{case}"
-        );
-        assert_eq!(worker.progress.files_done.load(Relaxed), 1, "{case}");
-        if slots_taken {
-            assert!(held.pieces <= window, "{case}: {} pieces", held.pieces);
-        } else {
-            assert_eq!(held.pieces, 256, "{case}");
-        }
-    }
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
+    let (_, worker, held) = stream_into_holding_destination(root, &files, how, |_, _| {});
+    assert_eq!(read(root, "source/file"), read(root, "target/file"));
+    assert_eq!(worker.progress.files_done.load(Relaxed), 1);
+    assert!(held.reads > 64, "{} reads", held.reads);
 }
 
 #[test]

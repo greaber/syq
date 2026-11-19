@@ -11,7 +11,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 pub(crate) const MEMORY_LIMIT: usize = 512 << 20;
-pub(crate) const RESERVATION_GRANULE: usize = 64 << 10;
+const RESERVATION_GRANULE: usize = 64 << 10;
 /// Decompressed bytes beyond the bytes that arrived, across the frames a
 /// server's connections hold. Without it, a peer could make each queued
 /// frame hold up to `MAX_FRAME` for a few bytes sent.
@@ -122,126 +122,24 @@ pub(crate) struct Hold {
     reserved: usize,
     exhausted: bool,
     expansion: Option<Expansion>,
-    /// The connection whose reserved reply slot the message was decoded
-    /// into. The slot covers the message's first `REPLY_SLOT_BYTES`, which
-    /// are not charged to the allowance (`ReservedReplies`).
-    slot: Option<ReservedReplies>,
-}
-
-/// The process's decoded-collection allowance.
-fn memory_budget() -> &'static Arc<Budget> {
-    static BUDGET: OnceLock<Arc<Budget>> = OnceLock::new();
-    BUDGET.get_or_init(|| {
-        Arc::new(Budget {
-            used: AtomicUsize::new(0),
-            limit: MEMORY_LIMIT,
-        })
-    })
-}
-
-/// Most replies that all connections' queues together may hold in slots
-/// reserved for them (`ReservedReplies`): a full reply queue of 256 on both
-/// connections of each of sixteen workers.
-pub(crate) const RESERVED_REPLY_SLOTS: usize = 2 * 16 * 256;
-
-/// The accounting a reply slot covers: a reply's own size and its small
-/// collections, which is all a streamed patch's replies decode. A message
-/// that decodes more is charged for the rest, so all slots together allow at
-/// most `RESERVED_REPLY_SLOTS` times this beyond the allowance.
-pub(crate) const REPLY_SLOT_BYTES: usize = 4 << 10;
-
-/// Reserved slots, in every connection's reservations and queued replies.
-static RESERVED_SLOTS: AtomicUsize = AtomicUsize::new(0);
-
-thread_local! {
-    /// The reserved replies of the connection this thread reads, if any.
-    static READING: std::cell::RefCell<Option<ReservedReplies>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Slots, from a count of their own, for the replies to requests that a
-/// connection sends beyond those it always may. The thread reading that
-/// connection decodes each next message into a reserved slot, while one is
-/// left, and the slot covers the message's first `REPLY_SLOT_BYTES` of
-/// accounting: its own size and small collections. So those replies take no
-/// room from the allowance unless they decode more, however many
-/// connections stream, and a sender that cannot
-/// reserve a slot sends no further request until a reply is taken. The data
-/// those replies carry is bounded where they are queued.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct ReservedReplies(Arc<Reserved>);
-
-#[derive(Debug, Default)]
-struct Reserved {
-    slots: AtomicUsize,
-}
-
-impl ReservedReplies {
-    /// Reserve a slot for one more reply, if one is free.
-    pub(crate) fn reserve(&self) -> bool {
-        let reserved = RESERVED_SLOTS
-            .fetch_update(Relaxed, Relaxed, |slots| {
-                (slots < RESERVED_REPLY_SLOTS).then_some(slots + 1)
-            })
-            .is_ok();
-        if reserved {
-            self.0.slots.fetch_add(1, Relaxed);
-        }
-        reserved
-    }
-
-    /// Decode this thread's messages into these reserved slots first.
-    pub(crate) fn read_on_this_thread(&self) {
-        READING.with(|reading| *reading.borrow_mut() = Some(self.clone()));
-    }
-
-    /// Take one reserved slot, if any is left.
-    fn take(&self) -> Option<Self> {
-        self.0
-            .slots
-            .fetch_update(Relaxed, Relaxed, |slots| slots.checked_sub(1))
-            .ok()
-            .map(|_| self.clone())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn slots(&self) -> usize {
-        self.0.slots.load(Relaxed)
-    }
-}
-
-impl Drop for Reserved {
-    fn drop(&mut self) {
-        RESERVED_SLOTS.fetch_sub(*self.slots.get_mut(), Relaxed);
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn reserved_slots() -> usize {
-    RESERVED_SLOTS.load(Relaxed)
 }
 
 impl Hold {
     pub(crate) fn new() -> Self {
-        let slot =
-            READING.with(|reading| reading.borrow().as_ref().and_then(ReservedReplies::take));
+        static BUDGET: OnceLock<Arc<Budget>> = OnceLock::new();
         Self {
-            budget: memory_budget().clone(),
+            budget: BUDGET
+                .get_or_init(|| {
+                    Arc::new(Budget {
+                        used: AtomicUsize::new(0),
+                        limit: MEMORY_LIMIT,
+                    })
+                })
+                .clone(),
             used: 0,
-            // What a slot covers is not charged to the allowance.
-            reserved: if slot.is_some() { REPLY_SLOT_BYTES } else { 0 },
+            reserved: 0,
             exhausted: false,
             expansion: None,
-            slot,
-        }
-    }
-
-    /// Give back the reserved slot of a message that is not queued, so that
-    /// the reply it was reserved for still finds it.
-    pub(crate) fn return_slot(&mut self) {
-        if let Some(slot) = self.slot.take() {
-            slot.0.slots.fetch_add(1, Relaxed);
-            self.reserved -= REPLY_SLOT_BYTES;
         }
     }
 
@@ -302,13 +200,7 @@ impl Hold {
 
 impl Drop for Hold {
     fn drop(&mut self) {
-        let free = if self.slot.is_some() {
-            RESERVED_SLOTS.fetch_sub(1, Relaxed);
-            REPLY_SLOT_BYTES
-        } else {
-            0
-        };
-        self.budget.used.fetch_sub(self.reserved - free, Relaxed);
+        self.budget.used.fetch_sub(self.reserved, Relaxed);
     }
 }
 
@@ -691,7 +583,6 @@ mod tests {
             reserved: 0,
             exhausted: false,
             expansion: None,
-            slot: None,
         }
     }
     fn budget() -> Arc<Budget> {
@@ -805,106 +696,5 @@ mod tests {
         let shared = budget();
         assert!(decode_with_hold::<Vec<Vec<String>>>(&bytes, hold(&shared)).is_err());
         assert_eq!(shared.used.load(Relaxed), 0);
-    }
-
-    // Reads the process's own allowance and slots: run in a process of its
-    // own, as nextest does.
-    #[test]
-    fn a_reply_decodes_into_a_slot_reserved_for_it_and_takes_no_room() {
-        use crate::proto::Response;
-        let used = || memory_budget().used.load(Relaxed);
-        let (start, slots) = (used(), reserved_slots());
-        // The replies a streamed patch waits for: a piece read from its
-        // source, its source's metadata, and an acknowledgment.
-        let replies = [
-            Response::Block {
-                off: 0,
-                hash: Default::default(),
-                data: vec![7; 64 << 10],
-            },
-            Response::Stats(vec![None]),
-            Response::Ok,
-        ]
-        .map(|reply| postcard::to_stdvec(&reply).unwrap());
-        let reserved = ReservedReplies::default();
-        for _ in &replies {
-            assert!(reserved.reserve());
-        }
-        assert_eq!((used(), reserved_slots()), (start, slots + 3));
-        // The reading thread decodes into the reserved slots, taking no room
-        // from the allowance; another thread does not.
-        std::thread::spawn({
-            let reserved = reserved.clone();
-            move || {
-                reserved.read_on_this_thread();
-                let decoded: Vec<_> = replies
-                    .iter()
-                    .map(|reply| decode::<Response>(reply).unwrap())
-                    .collect();
-                assert_eq!((used(), reserved.slots()), (start, 0));
-                // None is left: the next one takes its granule.
-                let more = decode::<Response>(&replies[0]).unwrap();
-                assert_eq!(used(), start + RESERVATION_GRANULE);
-                drop(decoded);
-                assert_eq!(reserved_slots(), slots);
-                drop(more);
-            }
-        })
-        .join()
-        .unwrap();
-        assert_eq!(used(), start);
-        // A message that is not queued gives its slot back to the reply it
-        // was reserved for, and one left unused is freed with the
-        // connection's replies.
-        assert!(reserved.reserve());
-        reserved.read_on_this_thread();
-        let mut unsolicited =
-            decode::<Response>(&postcard::to_stdvec(&Response::Ok).unwrap()).unwrap();
-        assert_eq!(reserved.slots(), 0);
-        unsolicited.hold.return_slot();
-        drop(unsolicited);
-        assert_eq!(
-            (reserved.slots(), reserved_slots(), used()),
-            (1, slots + 1, start)
-        );
-        READING.with(|reading| *reading.borrow_mut() = None);
-        drop(reserved);
-        assert_eq!(reserved_slots(), slots);
-    }
-
-    // Reads the process's own allowance and slots: run in a process of its
-    // own, as nextest does.
-    #[test]
-    fn a_reply_that_decodes_more_than_its_slot_covers_is_charged_the_rest() {
-        let used = || memory_budget().used.load(Relaxed);
-        let start = used();
-        let reserved = ReservedReplies::default();
-        assert!(reserved.reserve());
-        reserved.read_on_this_thread();
-        let bytes = postcard::to_stdvec(&vec![7u64; 256]).unwrap();
-        let decoded = decode::<Vec<u64>>(&bytes).unwrap();
-        assert_eq!(reserved.slots(), 0);
-        assert_eq!(used(), start + RESERVATION_GRANULE - REPLY_SLOT_BYTES);
-        drop(decoded);
-        READING.with(|reading| *reading.borrow_mut() = None);
-        assert_eq!(used(), start);
-    }
-
-    // Reads the process's own allowance and slots: run in a process of its
-    // own, as nextest does.
-    #[test]
-    fn reply_slots_are_limited_and_leave_the_allowance_alone() {
-        let used = || memory_budget().used.load(Relaxed);
-        let start = used();
-        let reserved = ReservedReplies::default();
-        let mut slots = 0;
-        while reserved.reserve() {
-            slots += 1;
-        }
-        assert_eq!(reserved_slots(), RESERVED_REPLY_SLOTS);
-        assert_eq!(reserved.slots(), slots);
-        assert_eq!(used(), start);
-        drop(reserved);
-        assert_eq!(reserved_slots(), RESERVED_REPLY_SLOTS - slots);
     }
 }

@@ -323,43 +323,6 @@ fn try_recv_takes_arrived_deferred_replies_and_waits_for_none() {
     drop(conn);
 }
 
-// Reads the process's reply slots: run in a process of its own, as nextest
-// does.
-#[test]
-fn an_unqueued_frame_leaves_a_reserved_reply_slot_to_the_reply() {
-    // A reply slot reserved after the hello is the next reply's, although an
-    // unsolicited transport statistics frame, which the reader decodes and
-    // drops, arrives before it.
-    let (input, peer) = std::os::unix::net::UnixStream::pair().unwrap();
-    let (rx, thread, _) =
-        spawn_observed_reader(Box::new(input), 4, None, Default::default()).unwrap();
-    let mut writer = FrameWriter::new(peer, false);
-    writer.write_msg(&hello_ok()).unwrap();
-    assert!(matches!(
-        rx.recv().unwrap().unwrap().value,
-        Response::HelloOk { .. }
-    ));
-    let slots = crate::wire_budget::reserved_slots();
-    assert!(rx.reserve_reply());
-    writer
-        .write_msg(&Response::TransportStats(Box::new(TransportStatsReply {
-            tcp: None,
-            observation: None,
-            solicited: false,
-        })))
-        .unwrap();
-    writer.write_msg(&Response::Ok).unwrap();
-    let reply = rx.recv().unwrap().unwrap();
-    assert!(matches!(reply.value, Response::Ok));
-    // The queued reply holds the slot, which the connection no longer does.
-    assert_eq!(crate::wire_budget::reserved_slots(), slots + 1);
-    assert_eq!(rx.reserved_slots(), 0);
-    drop(reply);
-    assert_eq!(crate::wire_budget::reserved_slots(), slots);
-    drop((writer, rx));
-    thread.join().unwrap();
-}
-
 #[test]
 fn observation_frames_do_not_enter_the_data_queue_or_bypass_the_hello() {
     for accepted in [true, false] {

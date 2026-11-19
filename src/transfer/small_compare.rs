@@ -227,16 +227,6 @@ fn unacknowledged(
         .sum()
 }
 
-/// Whether a connection with `outstanding` requests awaiting replies may be
-/// sent another. Up to `COMPARE_WINDOW` may always await theirs, as many as
-/// before the window widened. Each further reply first reserves a slot of
-/// its own (`Conn::reserve_reply`), so that however many workers stream,
-/// their replies take no more of the decoded-message allowance than
-/// sixteen per connection; without a slot, the stream takes a reply first.
-fn wide_room(conn: &dyn Conn, outstanding: usize) -> bool {
-    outstanding < COMPARE_WINDOW || conn.reserve_reply()
-}
-
 /// What streaming one patch has learned.
 #[derive(Default)]
 struct StreamState {
@@ -796,9 +786,7 @@ impl Worker {
                 }
                 let job = &jobs[streams[reading].file];
                 if let Some(&(off, len)) = state.ranges.get(state.next) {
-                    if buffered > 0 && buffered + u64::from(len) > STREAM_BUFFER_BYTES
-                        || !wide_room(&*self.src, source.len())
-                    {
+                    if buffered > 0 && buffered + u64::from(len) > STREAM_BUFFER_BYTES {
                         break;
                     }
                     self.src.send(Request::ReadRange {
@@ -824,9 +812,6 @@ impl Worker {
                         "SYQ_TEST_PATCH_STREAM_RECHECK_CONTINUE_FILE",
                         "streamed patch before its source is checked again",
                     )?;
-                }
-                if !wide_room(&*self.src, source.len()) {
-                    break;
                 }
                 self.src.send(Request::StatMany {
                     paths: vec![job.src.clone()],
@@ -881,7 +866,6 @@ impl Worker {
             while destination.len() >= acknowledgments
                 || unacknowledged(&destination) + piece > UNACKNOWLEDGED_PIECE_BYTES
                 || (unopened(states) && destination.len() >= COMPARE_WINDOW)
-                || !wide_room(&*self.dst, destination.len())
             {
                 let (step, _) = destination.pop_front().expect("pending reply");
                 let reply = self.dst.recv()?;
@@ -961,9 +945,7 @@ impl Worker {
                         destination.push_back((StreamStep::End(index), std::time::Instant::now()));
                     }
                     if index + 1 < streams.len() {
-                        while destination.len() >= acknowledgments
-                            || !wide_room(&*self.dst, destination.len())
-                        {
+                        while destination.len() >= acknowledgments {
                             let (step, _) = destination.pop_front().expect("pending reply");
                             let reply = self.dst.recv()?;
                             self.streamed_reply(batch, streams, states, step, reply, outcomes)?;

@@ -205,14 +205,6 @@ pub trait Conn: Send {
     fn reply_queue(&self) -> Option<usize> {
         None
     }
-    /// Reserve a slot for one more reply to wait in this connection's reply
-    /// queue, before a request that the caller sends beyond those it always
-    /// may, so that the reply takes no room from the decoded-message
-    /// allowance (`wire_budget::ReservedReplies`); false when none is free.
-    /// A connection whose replies are not decoded by a reader needs none.
-    fn reserve_reply(&self) -> bool {
-        true
-    }
     /// Current kernel RTT estimate for a TCP data connection. This is a
     /// local socket query and never sends a protocol request.
     fn tcp_rtt_us(&self) -> Option<u64> {
@@ -885,8 +877,6 @@ fn spawn_observed_reader(
     let (tx, rx) = std::sync::mpsc::sync_channel(replies);
     let queued = bytes.map(replies::QueuedBytes::new);
     let reader_queued = queued.clone();
-    let reserved = crate::wire_budget::ReservedReplies::default();
-    let reader_reserved = reserved.clone();
     let batch_receipts = std::sync::Arc::new(batch_progress::BatchReceipts::default());
     let receipts = batch_receipts.clone();
     let reader = std::thread::Builder::new()
@@ -899,7 +889,6 @@ fn spawn_observed_reader(
                 }
                 tx.send(msg).is_ok()
             };
-            reader_reserved.read_on_this_thread();
             let mut r = FrameReader::new(input);
             r.set_limit(MAX_HANDSHAKE_FRAME);
             let hello = r
@@ -915,17 +904,14 @@ fn spawn_observed_reader(
             }
             r.set_limit(MAX_FRAME);
             loop {
-                let mut msg = r
+                let msg = r
                     .read_budgeted_with_start::<Response>()
                     .map(ReceivedResponse::from_frame);
-                if let Ok(message) = &mut msg {
+                if let Ok(message) = &msg {
                     // A restricted receiver's results are for the syq that
                     // started this coordinator, not for any request here.
-                    // A frame not queued leaves a reserved reply slot to the
-                    // reply it was reserved for.
                     if let Response::DestinationResults(frame) = &message.value {
                         crate::destination_results::relay::forward(frame);
-                        message.hold.return_slot();
                         continue;
                     }
                     if let Response::TransportStats(stats) = &message.value {
@@ -935,7 +921,6 @@ fn spawn_observed_reader(
                             observation.update(value);
                         }
                         if !stats.solicited {
-                            message.hold.return_slot();
                             continue;
                         }
                     }
@@ -953,7 +938,7 @@ fn spawn_observed_reader(
             }
         })
         .map_err(crate::resources::allocation_error)?;
-    Ok((Replies::new(rx, queued, reserved), reader, batch_receipts))
+    Ok((Replies::new(rx, queued), reader, batch_receipts))
 }
 
 fn receive_transport_stats(rx: &Replies, timeout: std::time::Duration) -> Option<TcpSocketStats> {
@@ -1503,9 +1488,6 @@ impl Conn for RemoteConn {
     }
     fn reply_queue(&self) -> Option<usize> {
         Some(self.replies)
-    }
-    fn reserve_reply(&self) -> bool {
-        self.rx.as_ref().is_some_and(Replies::reserve_reply)
     }
     fn detach(&mut self) {
         self.detached = true;
