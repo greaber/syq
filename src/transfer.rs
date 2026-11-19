@@ -5516,7 +5516,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         progress.tuning_history.get(),
         history_context.borrow().as_ref(),
     ) {
-        let final_key = tune::history::current_context_key(
+        let final_key = tune::history::context_key(
             history,
             &src_ep,
             &dst_ep,

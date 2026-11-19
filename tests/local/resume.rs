@@ -63,7 +63,14 @@ fn measured_history_seeds_auto_tuning() {
     );
     assert_eq!(read(&t.path("limited")), read(&t.path("src")));
 
-    assert_output_ok(&run("fixed", Some(3), true));
+    // A fixed count does not start from the history.
+    let fixed = run("fixed", Some(3), true);
+    assert_output_ok(&fixed);
+    assert!(
+        !String::from_utf8_lossy(&fixed.stderr).contains("auto-tuning: starting with"),
+        "{}",
+        String::from_utf8_lossy(&fixed.stderr)
+    );
 }
 
 #[cfg(debug_assertions)]

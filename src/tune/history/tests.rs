@@ -659,6 +659,8 @@ fn a_long_copy_saves_its_timeline_while_it_runs() {
         assert!(state.next_write >= start + FIRST_WRITE);
         assert!(state.next_write <= Instant::now() + FIRST_WRITE);
         state.next_write = start + Duration::from_secs(3600);
+        // Let the history open before another connection races it.
+        assert!(state.ready());
     }
     let db = open(&path).unwrap();
     writer.context(&key("a"));
@@ -1483,6 +1485,8 @@ fn a_copy_starts_without_waiting_for_its_history_to_open() {
         DEFAULT_BUDGET,
         Duration::from_secs(60),
     );
+    // A periodic save would wait for the open, and so for `other`.
+    writer.0.lock().unwrap().next_write = Instant::now() + Duration::from_secs(3600);
     writer.event("planned", json!({"files":1}));
     other.execute_batch("COMMIT").unwrap();
     writer.context(&key("a"));
