@@ -892,7 +892,7 @@ fn copy_warnings(request: &crate::destination::CopyRequest) -> Vec<String> {
             .then(|| {
                 "can show new files under their final names before they are complete".to_owned()
             }),
-        (extra.widen_dirs != crate::delegation::DirectoryWidening::None)
+        widens_existing_folders(request)
             // Under `all`, or `rsync` with deletion, it can add read too,
             // which shows the names inside, and through comparisons more.
             .then(|| "can temporarily open folders you own to read or change them".to_owned()),
@@ -901,6 +901,20 @@ fn copy_warnings(request: &crate::destination::CopyRequest) -> Vec<String> {
     .flatten()
     .collect()
 }
+/// Whether the copy can widen a folder that is already there. A copy that
+/// keeps existing files (`--if-exists=keep`) widens none of the folders it
+/// includes, so `rsync` then widens nothing; `all` still widens the folder
+/// the copy goes into and the one that holds the destination
+/// (`RestrictedAuthority`'s `WidenDirectories` and `PrepareDestinationPath`).
+fn widens_existing_folders(request: &crate::destination::CopyRequest) -> bool {
+    use crate::delegation::{DirectoryWidening, ExistingDestinationPolicy};
+    match request.constraints.extra_options.widen_dirs {
+        DirectoryWidening::None => false,
+        DirectoryWidening::Rsync => request.copy.policy.existing != ExistingDestinationPolicy::Skip,
+        DirectoryWidening::All => true,
+    }
+}
+
 /// Whether any named mutation root exists on this machine, or `None` when
 /// that cannot be told cheaply. Existing directory scopes need no recursive
 /// inspection: merging into them can overwrite children whose names are not
@@ -2250,6 +2264,41 @@ mod tests {
         assert_eq!(warnings(&request), [UNENCRYPTED_TCP_WARNING]);
         request.copy.options.dry_run = true;
         assert!(warnings(&request).is_empty());
+    }
+
+    /// A copy that keeps existing files widens none of the folders it
+    /// includes, so approving `rsync` widening for it warns of nothing; `all`
+    /// still widens the folder the copy goes into, and warns.
+    #[test]
+    fn copy_approvals_warn_of_widening_only_where_a_folder_can_be_widened() {
+        use crate::delegation::{DirectoryWidening, ExistingDestinationPolicy};
+        const WIDENING: &str = "can temporarily open folders you own to read or change them";
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().canonicalize().unwrap().join("data");
+        let mut request = copy_request(&path);
+        let mut warnings = |existing, widen_dirs| {
+            request.copy.policy.existing = existing;
+            request.constraints.extra_options.widen_dirs = widen_dirs;
+            shown_warnings(&Summary::new(&requester(), &[], "~", &request, TIMEOUT, None).unwrap())
+        };
+        for existing in [
+            ExistingDestinationPolicy::Replace,
+            ExistingDestinationPolicy::MustExist,
+            ExistingDestinationPolicy::Skip,
+        ] {
+            let keeps = existing == ExistingDestinationPolicy::Skip;
+            assert!(warnings(existing, DirectoryWidening::None).is_empty());
+            assert_eq!(
+                warnings(existing, DirectoryWidening::Rsync),
+                if keeps { vec![] } else { vec![WIDENING] },
+                "{existing:?}"
+            );
+            assert_eq!(
+                warnings(existing, DirectoryWidening::All),
+                [WIDENING],
+                "{existing:?}"
+            );
+        }
     }
 
     const MAPPING_WARNING: &str = "can use its mapping file to make the files it lists readable or writable by others, create programs that run as you, or give them to any group you belong to";

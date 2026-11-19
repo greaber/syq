@@ -119,6 +119,19 @@ impl Intercept for ObserveOutage {
     fn name(&self) -> &'static str {
         "SyqS3Outage"
     }
+    // Every attempt's response, including those that are then retried. S3
+    // answers 503 when asked to slow down, and HEAD carries no error code.
+    fn read_after_transmit(
+        &self,
+        context: &BeforeDeserializationInterceptorContextRef<'_>,
+        _: &RuntimeComponents,
+        _: &mut ConfigBag,
+    ) -> std::result::Result<(), BoxError> {
+        if matches!(context.response().status().as_u16(), 429 | 503) {
+            self.0.throttled();
+        }
+        Ok(())
+    }
     fn read_after_execution(
         &self,
         context: &FinalizerInterceptorContextRef<'_>,
@@ -779,68 +792,30 @@ pub(super) fn from_head(
     })
 }
 
-/// Existence needs only one object, regardless of the size of the prefix.
-pub(super) async fn prefix_exists(client: &Client, bucket: &str, prefix: &str) -> Result<bool> {
-    let output = client
+/// List at most one key under a prefix.
+pub(super) async fn list_one(
+    client: &Client,
+    bucket: &str,
+    prefix: &str,
+) -> Result<aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output> {
+    client
         .list_objects_v2()
         .bucket(bucket)
         .prefix(prefix)
         .max_keys(1)
         .send()
         .await
-        .map_err(listing_failure)?;
+        .map_err(listing_failure)
+}
+
+/// Existence needs only one object, regardless of the size of the prefix.
+pub(super) async fn prefix_exists(client: &Client, bucket: &str, prefix: &str) -> Result<bool> {
+    let output = list_one(client, bucket, prefix).await?;
     anyhow::ensure!(
         !output.contents().is_empty() || output.is_truncated() != Some(true),
         "S3 existence listing was truncated without an object"
     );
     Ok(!output.contents().is_empty())
-}
-
-/// Bound destination discovery by the size of the upload. An incomplete listing
-/// cannot prove that an upload key is absent, so leave those decisions to HEAD.
-pub(super) async fn upload_listing(
-    client: &Client,
-    bucket: &str,
-    prefix: &str,
-    source_keys: &std::collections::HashSet<&str>,
-) -> Result<Option<std::collections::HashMap<String, u64>>> {
-    let mut keys = std::collections::HashMap::new();
-    let mut token = None;
-    // Never spend as many LIST requests as checking each source with HEAD.
-    // Retain only relevant keys so a large destination cannot grow the cache.
-    for _ in 0..source_keys.len().saturating_sub(1) {
-        let output = client
-            .list_objects_v2()
-            .bucket(bucket)
-            .prefix(prefix)
-            .set_continuation_token(token.clone())
-            .send()
-            .await
-            .map_err(listing_failure)?;
-        for object in output.contents() {
-            let key = object.key().context("S3 listing omitted key")?;
-            anyhow::ensure!(
-                key.starts_with(prefix),
-                "S3 listing returned a key outside the requested prefix"
-            );
-            if source_keys.contains(key) {
-                let size = u64::try_from(object.size().context("S3 listing omitted size")?)?;
-                keys.insert(key.to_owned(), size);
-            }
-        }
-        if output.is_truncated() != Some(true) || keys.len() == source_keys.len() {
-            return Ok(Some(keys));
-        }
-        let next = output
-            .next_continuation_token()
-            .context("truncated S3 listing omitted continuation token")?
-            .to_owned();
-        if token.as_ref() == Some(&next) {
-            bail!("S3 listing repeated its continuation token");
-        }
-        token = Some(next);
-    }
-    Ok(None)
 }
 
 /// The first excluded ancestor is the boundary a filesystem walk would prune.

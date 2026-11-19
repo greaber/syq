@@ -1,6 +1,13 @@
 //! Automatic request scheduling and bounded writers, independent of hash policy.
 use super::*;
-use crate::s3::{admission::Concurrency, writer};
+use crate::s3::{
+    admission::{Checking, Concurrency},
+    writer,
+};
+
+/// The most metadata requests in flight for objects checked beyond the
+/// transfer limit. Tiny objects over a slow link already start this high.
+const CHECKING_REQUESTS: usize = 256;
 
 impl Engine {
     pub(super) fn object_workers(&self, sizes: impl Iterator<Item = u64>) -> Result<Concurrency> {
@@ -18,6 +25,7 @@ impl Engine {
                 maximum: None,
                 initial_probe_up: false,
                 requests: None,
+                checking: None,
             });
         }
         let average = bytes / count;
@@ -112,9 +120,43 @@ impl Engine {
         // rather than first running a second, request-level concurrency search.
         let initial = starting.min(maximum.unwrap_or(starting));
         self.tuning.report(initial);
+        // Finding an object unchanged takes one metadata request, or two
+        // between buckets, so the ceiling counts those requests. A fixed
+        // object count leaves nothing to adjust, a request count the user
+        // set bounds these requests too, and small uploads keep the room
+        // their descriptors leave.
+        let checking = fixed_workers.is_none().then(|| {
+            let requests = self
+                .args
+                .tuning_options
+                .and_then(|tuning| tuning.s3_requests)
+                .into_iter()
+                .chain(
+                    self.args
+                        .resource_limits
+                        .as_ref()
+                        .and_then(|limits| limits.s3_requests),
+                )
+                .fold(CHECKING_REQUESTS, usize::min);
+            let per_object = if self.options.route.is_server_copy() {
+                2
+            } else {
+                1
+            };
+            let maximum = (requests / per_object).max(1).min(object_limit);
+            Checking {
+                maximum: if small_upload {
+                    maximum.min(capacity)
+                } else {
+                    maximum
+                },
+                outage: self.outage.clone(),
+            }
+        });
         Ok(Concurrency {
             initial,
             maximum,
+            checking,
             requests: maximum.map(|_| self.tuning.requests.clone()),
             initial_probe_up: self
                 .tuning

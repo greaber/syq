@@ -1104,7 +1104,9 @@ ahead_copy() {
     ssh source 'rm -f /tmp/syq-ahead-early'
     rm -f /tmp/syq-ahead-claims
     # The scan holds every batch it may, so each lookup that can go early does.
-    ssh source 'SYQ_TEST_SCAN_AHEAD_WAIT=1 SYQ_TEST_EARLY_LOOKUPS=/tmp/syq-ahead-early syq cp --if-exists=keep --no-progress --srcs-in /tmp/syq-real-ssh/ahead-tree --to @laptop --into ahead'
+    # $1: more options, quoted for the source's shell.
+    # shellcheck disable=SC2029
+    ssh source "SYQ_TEST_SCAN_AHEAD_WAIT=1 SYQ_TEST_EARLY_LOOKUPS=/tmp/syq-ahead-early syq cp --if-exists=keep --no-progress --srcs-in /tmp/syq-real-ssh/ahead-tree --to @laptop --into ahead ${1-}"
     # What became of each early lookup, and what the receiver's record gave
     # each publication.
     # A copy into an empty destination asks about no batch.
@@ -1165,10 +1167,53 @@ if [ "$ahead_sent" -lt 2 ] || [ "$ahead_sent" -ne "$(ahead_count /tmp/syq-ahead-
     cat /tmp/syq-ahead-fates /tmp/syq-ahead-claimed >&2
     exit 1
 fi
+# The same with --where selecting a tenth of the files: the lookups sent
+# ahead name the selected entries, so each is used.
+ahead_copy "--where 'src.name glob \"*5\"'"
+ahead_sent=$(ahead_count /tmp/syq-ahead-fates sent)
+if [ "$ahead_sent" -lt 2 ] || [ "$ahead_sent" -ne "$(ahead_count /tmp/syq-ahead-fates used)" ] ||
+    [ -s /tmp/syq-ahead-claimed ]; then
+    echo 'an unchanged copy with --where did not use every lookup it sent ahead:' >&2
+    cat /tmp/syq-ahead-fates /tmp/syq-ahead-claimed >&2
+    exit 1
+fi
 syq persist off
 syq persist connect source
 syq persist receive wait source --timeout 30
 ssh source 'syq persist destinations wait laptop --timeout 30'
+printf 'case: a restricted receiver gets the final metadata of 1,300 directories in requests sent together\n'
+# The directories' final metadata takes two requests, and the server sends
+# the second before the first is answered: this debug build records each
+# request's directories and the requests still unanswered when it went. The
+# laptop's restricted receiver authorizes and runs them in turn, and every
+# directory gets its source's time.
+ssh source sh -s <<'MANY_DIRECTORIES'
+set -eu
+root=/tmp/syq-real-ssh/many-directories
+requests=/tmp/syq-many-directories.requests
+rm -rf "$root" "$requests"
+mkdir -p "$root"
+directory=0
+while [ "$directory" -lt 1300 ]; do
+    mkdir "$root/d$directory"
+    directory=$((directory + 1))
+done
+find "$root" -mindepth 1 -type d -exec touch -d @981173106 {} +
+SYQ_TEST_DIRECTORY_METADATA_REQUESTS=$requests \
+    syq cp --no-progress --srcs-in "$root" --to @laptop --into many-directories
+if [ "$(wc -l <"$requests")" -ne 2 ] || [ "$(head -n 1 "$requests")" != '1000 0' ] ||
+    [ "$(tail -n 1 "$requests" | cut -d ' ' -f 2)" != 1 ]; then
+    echo 'the final directory metadata did not go in two requests sent together:' >&2
+    cat "$requests" >&2
+    exit 1
+fi
+MANY_DIRECTORIES
+test "$(find "$receive_root/many-directories" -mindepth 1 -type d | wc -l)" -eq 1300
+many_times=$(find "$receive_root/many-directories" -mindepth 1 -type d -printf '%Ts\n' | sort -u)
+if [ "$many_times" != 981173106 ]; then
+    printf 'copied directories lack their source time; the times found:\n%s\n' "$many_times" >&2
+    exit 1
+fi
 
 printf 'case: named return rejects traversal and receiver symlink escape\n'
 ln -s /tmp/syq-real-ssh-receive-other "$receive_root/escape"
@@ -2283,6 +2328,111 @@ for mode_receiver in ordinary restricted; do
     # shellcheck disable=SC2029
     test "$(ssh destination "stat -c %a $mode_root/new")" = 755
 done
+
+printf 'case: a keep grant fails only the changes inside directories it may not widen\n'
+# Two read-only directories at the destination, one holding a file; the
+# source has that file, a new one in each, and more beside them.
+# --if-exists=keep lets a restricted receiver change no existing directory's
+# permissions, so --widen-dirs widens neither, under rsync or all: the new
+# files in them fail by name, everything else is copied, and the copy says
+# why once. An ordinary receiver that may not widen leaves the same tree and
+# status.
+keep_tree=$(cat <<'PY_KEEP_TREE'
+import os, sys
+root = sys.argv[1]
+for name in ['sub/old', 'sub/new', 'second/new', 'fresh/file', 'beside']:
+    os.makedirs(os.path.dirname(f'{root}/{name}'), exist_ok=True)
+    with open(f'{root}/{name}', 'w') as f:
+        f.write(name)
+PY_KEEP_TREE
+)
+printf '%s\n' "$keep_tree" | python3 - /tmp/syq-real-ssh-keep-tree
+printf '%s\n' "$keep_tree" | ssh source python3 - /tmp/syq-real-ssh/keep-tree
+for keep_receiver in ordinary rsync all; do
+    keep_destination=/tmp/syq-real-ssh/keep-$keep_receiver
+    keep_errors=/tmp/syq-real-ssh-keep-$keep_receiver.err
+    # The fixture path is set by this loop.
+    # shellcheck disable=SC2029
+    ssh destination "mkdir -p $keep_destination/sub $keep_destination/second && printf existing > $keep_destination/sub/old && chmod 555 $keep_destination/sub $keep_destination/second"
+    keep_status=0
+    if [ "$keep_receiver" = ordinary ]; then
+        syq cp --no-progress --if-exists=keep --widen-dirs=none \
+            --srcs-in /tmp/syq-real-ssh-keep-tree --to destination --into "$keep_destination" \
+            2>"$keep_errors" || keep_status=$?
+    else
+        syq cp --no-progress --if-exists=keep --widen-dirs="$keep_receiver" \
+            --from source --srcs-in /tmp/syq-real-ssh/keep-tree \
+            --to destination --into "$keep_destination" \
+            2>"$keep_errors" || keep_status=$?
+    fi
+    cat "$keep_errors" >&2
+    test "$keep_status" = 23
+    grep -F 'syq: sub/new: ' "$keep_errors" >/dev/null
+    grep -F 'syq: second/new: ' "$keep_errors" >/dev/null
+    if [ "$keep_receiver" != ordinary ]; then
+        test "$(grep -c -F -e "--if-exists=keep lets the restricted receiver change no existing directory's permissions" "$keep_errors")" = 1
+        grep -F 'it is not widened either' "$keep_errors" >/dev/null
+        if grep -F -e refused -e contradicts "$keep_errors" >&2; then
+            echo 'the restricted receiver refused a request of the keep copy' >&2
+            exit 1
+        fi
+    fi
+    remote_manifest destination "$keep_destination" "/tmp/syq-real-ssh-keep-$keep_receiver.manifest"
+done
+cmp /tmp/syq-real-ssh-keep-ordinary.manifest /tmp/syq-real-ssh-keep-rsync.manifest
+cmp /tmp/syq-real-ssh-keep-ordinary.manifest /tmp/syq-real-ssh-keep-all.manifest
+ssh destination 'cd /tmp/syq-real-ssh/keep-rsync && test "$(cat sub/old)" = existing && test ! -e sub/new && test ! -e second/new && test "$(cat beside)" = beside && test "$(cat fresh/file)" = fresh/file && test "$(stat -c %a sub second | tr "\n" " ")" = "555 555 "'
+
+# Pruning under the same grant: destination-only files in read-only
+# directories fail to be removed, by name, and one beside them is removed.
+ssh destination 'mkdir -p /tmp/syq-real-ssh/keep-prune/gone /tmp/syq-real-ssh/keep-prune/gone-too && cd /tmp/syq-real-ssh/keep-prune && touch gone/extra gone-too/extra stale && chmod 555 gone gone-too'
+keep_status=0
+syq cp --no-progress --if-exists=keep --widen-dirs=all --prune \
+    --from source --srcs-in /tmp/syq-real-ssh/keep-tree \
+    --to destination --into /tmp/syq-real-ssh/keep-prune \
+    2>/tmp/syq-real-ssh-keep-prune.err || keep_status=$?
+cat /tmp/syq-real-ssh-keep-prune.err >&2
+test "$keep_status" = 23
+grep -F 'syq: delete gone/extra: ' /tmp/syq-real-ssh-keep-prune.err >/dev/null
+grep -F 'syq: delete gone-too/extra: ' /tmp/syq-real-ssh-keep-prune.err >/dev/null
+# A preview names the directories it cannot look inside.
+ssh destination 'mkdir -p /tmp/syq-real-ssh/keep-preview/sub /tmp/syq-real-ssh/keep-preview/second && chmod 600 /tmp/syq-real-ssh/keep-preview/sub /tmp/syq-real-ssh/keep-preview/second'
+keep_status=0
+syq cp --no-progress --if-exists=keep --widen-dirs=rsync --dry-run \
+    --from source --srcs-in /tmp/syq-real-ssh/keep-tree \
+    --to destination --into /tmp/syq-real-ssh/keep-preview \
+    >/dev/null 2>/tmp/syq-real-ssh-keep-preview.err || keep_status=$?
+cat /tmp/syq-real-ssh-keep-preview.err >&2
+test "$keep_status" = 23
+test "$(grep -c -F 'not inspected: you own this directory, but it lacks owner search permission' /tmp/syq-real-ssh-keep-preview.err)" = 2
+# Either way the copy says why once, and the receiver refuses nothing.
+for keep_errors in /tmp/syq-real-ssh-keep-prune.err /tmp/syq-real-ssh-keep-preview.err; do
+    test "$(grep -c -F -e "--if-exists=keep lets the restricted receiver change no existing directory's permissions" "$keep_errors")" = 1
+    grep -F 'it is not widened either' "$keep_errors" >/dev/null
+    if grep -F -e refused -e contradicts "$keep_errors" >&2; then
+        echo 'the restricted receiver refused a request of the keep copy' >&2
+        exit 1
+    fi
+done
+ssh destination 'cd /tmp/syq-real-ssh/keep-prune && test ! -e stale && test -e gone/extra && test -e gone-too/extra && test "$(cat sub/new)" = sub/new && test "$(stat -c %a gone gone-too | tr "\n" " ")" = "555 555 " && chmod 755 gone gone-too /tmp/syq-real-ssh/keep-preview/sub /tmp/syq-real-ssh/keep-preview/second'
+
+# An existing --as directory the copy cannot search is refused up front with
+# the same reason, not with the suggestion to widen more.
+ssh destination 'mkdir /tmp/syq-real-ssh/keep-as && chmod 600 /tmp/syq-real-ssh/keep-as'
+keep_status=0
+syq cp --no-progress --if-exists=keep --widen-dirs=rsync \
+    --from source /tmp/syq-real-ssh/keep-tree \
+    --to destination --as /tmp/syq-real-ssh/keep-as \
+    2>/tmp/syq-real-ssh-keep-as.err || keep_status=$?
+cat /tmp/syq-real-ssh-keep-as.err >&2
+test "$keep_status" = 1
+grep -F 'search destination directory' /tmp/syq-real-ssh-keep-as.err |
+    grep -F -e "--if-exists=keep lets the restricted receiver change no existing directory's permissions" >/dev/null
+if grep -F 'may help' /tmp/syq-real-ssh-keep-as.err >&2; then
+    echo 'a keep copy suggested a widening mode that cannot help' >&2
+    exit 1
+fi
+ssh destination 'test "$(stat -c %a /tmp/syq-real-ssh/keep-as)" = 600 && chmod 755 /tmp/syq-real-ssh/keep-as'
 
 printf 'case: ordinary and restricted receivers update the same files in place\n'
 # Under --in-place=update both receivers write a file of their own with one

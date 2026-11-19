@@ -82,6 +82,10 @@ pub(super) struct Planner<'a> {
     /// The group and mode of destination directories, as `must_replace`
     /// read them for a root receiver; None for one that does not exist.
     pub(super) parent_groups: std::collections::HashMap<PathBytes, Option<(u32, u32)>>,
+    /// The directories the leaves being planned may ask about
+    /// (`group_question_parents`): the first question reads them all, in
+    /// one request, rather than each wait for its own reply.
+    pub(super) leaf_parents: Vec<PathBytes>,
     /// Who a file the receiver creates in the destination belongs to, once
     /// asked (`Request::NewFileOwner`).
     pub(super) new_file_owner: Option<crate::proto::NewFileOwner>,
@@ -706,7 +710,7 @@ impl Planner<'_> {
                     Scanned::Upcoming(entries) => {
                         // Only after the first batch, which settles `sub`.
                         anyhow::ensure!(!first, "a scan showed its first batch early");
-                        pl.show_upcoming(entries, &sub, dst_root);
+                        pl.show_upcoming(entries, src_root, &sub, dst_root);
                         return Ok(());
                     }
                 };
@@ -1321,27 +1325,10 @@ impl Planner<'_> {
         dst_root: &[u8],
         early: &mut Option<super::early_lookups::EarlyLookup>,
     ) -> Result<()> {
-        let batch = if self.opts.expressions.selection.is_some() && !self.mapping_mode {
+        let batch = if self.filters_scanned_entries() {
             let mut selected = Vec::with_capacity(batch.len());
             for entry in batch {
-                // Directories bypass --where: they are created and receive
-                // metadata as in an unfiltered copy.
-                if entry.kind == Kind::Dir {
-                    selected.push(entry);
-                    continue;
-                }
-                let relative = self
-                    .src_overrides
-                    .get(&entry.path)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&entry.path);
-                let path = crate::expression::source_path(src_root, relative);
-                let included = self
-                    .opts
-                    .expressions
-                    .selects(&crate::expression::File::from_entry(&entry), path)
-                    .with_context(|| format!("source {}", display(path)))?;
-                if !included {
+                if !self.selects_scanned_entry(&entry, src_root)? {
                     // Selection never makes a source counterpart extraneous.
                     if self.opts.delete {
                         let dst = join(dst_root, &join(sub, &entry.path));
@@ -1462,6 +1449,33 @@ impl Planner<'_> {
             self.dst_seen = std::collections::HashMap::new();
             self.delete_roots = Vec::new();
         }
+    }
+
+    /// Whether `plan_batch` drops the scanned entries `--where` leaves out.
+    /// A mapping's entries are filtered as they are read instead.
+    pub(super) fn filters_scanned_entries(&self) -> bool {
+        self.opts.expressions.selection.is_some() && !self.mapping_mode
+    }
+
+    /// Whether `--where` selects a scanned entry. It sees only the entry,
+    /// its source path and the time the command started, so it gives the
+    /// same answer whenever it is asked.
+    pub(super) fn selects_scanned_entry(&self, entry: &Entry, src_root: &[u8]) -> Result<bool> {
+        // Directories bypass --where: they are created and receive metadata
+        // as in an unfiltered copy.
+        if entry.kind == Kind::Dir {
+            return Ok(true);
+        }
+        let relative = self
+            .src_overrides
+            .get(&entry.path)
+            .map(Vec::as_slice)
+            .unwrap_or(&entry.path);
+        let path = crate::expression::source_path(src_root, relative);
+        self.opts
+            .expressions
+            .selects(&crate::expression::File::from_entry(entry), path)
+            .with_context(|| format!("source {}", display(path)))
     }
 
     /// The mapping loop: decide and claim everything about each entry.
@@ -1855,7 +1869,7 @@ impl Planner<'_> {
                 self.stat_directories_with_dry_run_overlay(&dirs, dst_root)?
             };
             let fill = self.fill_access();
-            if opts.may_widen_directory_permissions()
+            if opts.widens_inside_copy()
                 && stats
                     .iter()
                     .flatten()
@@ -1962,15 +1976,61 @@ impl Planner<'_> {
     /// do the same.
     fn plan_leaves(
         &mut self,
-        leaves: impl IntoIterator<Item = (Planned, Option<Entry>)>,
+        leaves: Vec<(Planned, Option<Entry>)>,
         dst_root: &[u8],
         leaf_ops: &mut LeafOps,
     ) -> Result<()> {
         let _burst = self.sched.file_burst();
-        for (leaf, entry) in leaves {
-            self.plan_leaf(leaf, entry, dst_root, leaf_ops)?;
+        self.leaf_parents = self.group_question_parents(
+            leaves
+                .iter()
+                .map(|(leaf, destination)| (leaf, destination.as_ref())),
+        );
+        let planned = leaves
+            .into_iter()
+            .try_for_each(|(leaf, entry)| self.plan_leaf(leaf, entry, dst_root, leaf_ops));
+        self.leaf_parents = Vec::new();
+        planned
+    }
+
+    /// The directories whose group planning `leaves` may ask a root
+    /// receiver (`new_file_group_may_differ`) and has not read: those of the
+    /// existing files the copy would write in place or link new names to,
+    /// where it does not copy the group. Only a file the copy does not
+    /// keep by its size and time is written in place (`plan_file`); one
+    /// missed here is asked by itself.
+    pub(super) fn group_question_parents<'l>(
+        &self,
+        leaves: impl Iterator<Item = (&'l Planned, Option<&'l Entry>)>,
+    ) -> Vec<PathBytes> {
+        let opts = self.opts;
+        if !(opts.inplace_update || opts.hardlinks) || self.receiver_uid.is_some_and(|uid| uid != 0)
+        {
+            return Vec::new();
         }
-        Ok(())
+        let mut parents: Vec<PathBytes> = Vec::new();
+        for (leaf, destination) in leaves {
+            let Some(destination) = destination.filter(|d| d.kind == Kind::File) else {
+                continue;
+            };
+            let asks = leaf.e.kind == Kind::File
+                && opts.flags_for(&leaf.dst_rel) & flags::GROUP == 0
+                && ((opts.hardlinks && leaf.e.nlink > 1)
+                    || (opts.inplace_update
+                        && !(opts.keeps_matching_file(&leaf.dst_rel)
+                            && opts.metadata_matches(&leaf.dst_rel, &leaf.e, destination))));
+            let Some(parent) = super::directory_stream::parent_of(&leaf.dst).filter(|_| asks)
+            else {
+                continue;
+            };
+            // A directory's files are planned together.
+            if parents.last().is_none_or(|last| last != parent)
+                && !self.parent_groups.contains_key(parent)
+            {
+                parents.push(parent.to_vec());
+            }
+        }
+        parents
     }
 
     /// Decide what one mapped leaf needs, given what its destination holds.
@@ -2172,9 +2232,7 @@ impl Planner<'_> {
         // Content is up to date, but its metadata differs, and the receiver
         // cannot change it in place: the file is replaced as a changed file
         // is (`must_replace`).
-        let quick = same
-            && opts.trusts_size_and_time()
-            && (opts.dry_run || opts.expected_for(&dst_rel).is_none());
+        let quick = same && opts.keeps_matching_file(&dst_rel);
         let replace = quick
             && dst_entry.as_ref().is_some_and(|d| {
                 (opts.metadata_fix_flags(&dst_rel, &e, d) != 0
@@ -4317,7 +4375,7 @@ impl Planner<'_> {
             // patterns apply from the root, so with those the whole root is
             // walked again instead.
             let enter = self.opts.widen_dirs == crate::cli::WidenDirs::All
-                && self.opts.may_widen_directory_permissions();
+                && self.opts.widens_inside_copy();
             let subtrees = ignore
                 .iter()
                 .all(|pattern| ignore_pattern_is_unanchored(pattern));
@@ -4421,17 +4479,16 @@ impl Planner<'_> {
             }
             // Only `all` enters a destination-only directory pruning cannot
             // read, so one the receiving account owns names that mode.
-            let unlisted: std::collections::HashMap<&[u8], &Entry> = if warnings.is_empty()
-                || self.opts.hint_for(crate::cli::WidenDirs::All).is_none()
-            {
-                Default::default()
-            } else {
-                walk.entries
-                    .iter()
-                    .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o500 != 0o500)
-                    .map(|entry| (entry.path.as_slice(), entry))
-                    .collect()
-            };
+            let unlisted: std::collections::HashMap<&[u8], &Entry> =
+                if warnings.is_empty() || self.opts.entering_hint().is_none() {
+                    Default::default()
+                } else {
+                    walk.entries
+                        .iter()
+                        .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o500 != 0o500)
+                        .map(|entry| (entry.path.as_slice(), entry))
+                        .collect()
+                };
             for (base, warning) in warnings {
                 self.delete_walk_failed = true;
                 let directory = warning.path.as_ref().map(|path| join(&base, path));
@@ -4442,12 +4499,8 @@ impl Planner<'_> {
                     Some(entry) => receiver_owns(&mut *self.dst, &mut self.receiver_uid, entry)?,
                     None => false,
                 };
-                let hint = match self
-                    .opts
-                    .hint_for(crate::cli::WidenDirs::All)
-                    .filter(|_| owned)
-                {
-                    Some(hint) => format!("; {hint}"),
+                let hint = match self.opts.entering_hint().filter(|_| owned) {
+                    Some(hint) => format!("; {}", self.opts.said_once(hint)),
                     None => String::new(),
                 };
                 // A preview names the directory it could not inspect.
@@ -4484,7 +4537,7 @@ impl Planner<'_> {
             // already widened to be entered has a new change time, so only
             // its identity is required.
             let unwritable: std::collections::HashMap<PathBytes, TargetCondition> =
-                if self.opts.may_widen_directory_permissions() {
+                if self.opts.widens_inside_copy() {
                     walk.entries
                         .iter()
                         .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o300 != 0o300)
@@ -5105,18 +5158,14 @@ impl Planner<'_> {
         Ok(results)
     }
 
-    pub(super) fn apply(&mut self, mut ops: Vec<Op>) -> Result<Vec<Option<WireError>>> {
-        if ops.len() > 1
-            && ops.iter().map(Op::size_hint).sum::<usize>() > crate::proto::METADATA_BATCH_BYTES
-        {
-            let tail = ops.split_off(ops.len() / 2);
-            let mut results = self.apply(ops)?;
-            results.extend(self.apply(tail)?);
-            return Ok(results);
+    pub(super) fn apply(&mut self, ops: Vec<Op>) -> Result<Vec<Option<WireError>>> {
+        let mut results = Vec::with_capacity(ops.len());
+        for ops in request_sized(ops) {
+            let count = ops.len();
+            let response = self.dst.call(Request::Apply { ops })?;
+            results.extend(self.applied(response, count)?);
         }
-        let count = ops.len();
-        let response = self.dst.call(Request::Apply { ops })?;
-        self.applied(response, count)
+        Ok(results)
     }
 
     /// The outcome of each of an `Apply` request's `count` operations.
@@ -5407,25 +5456,14 @@ impl Planner<'_> {
         group: u32,
         new_file: crate::proto::NewFileOwner,
     ) -> bool {
-        let Some(parent) = dst
-            .iter()
-            .rposition(|&c| c == b'/')
-            .map(|i| dst[..i.max(1)].to_vec())
-        else {
+        let Some(parent) = super::directory_stream::parent_of(dst) else {
             return true;
         };
-        let directory = match self.parent_groups.get(&parent) {
+        let directory = match self.parent_groups.get(parent) {
             Some(directory) => *directory,
             None => {
                 self.announce_before_asking(true);
-                let directory = self
-                    .stat_many(vec![parent.clone()])
-                    .ok()
-                    .and_then(|mut stats| stats.pop().flatten())
-                    .filter(|entry| entry.kind == Kind::Dir)
-                    .map(|entry| (entry.gid, entry.mode));
-                self.parent_groups.insert(parent, directory);
-                directory
+                self.read_parent_groups(parent.to_vec())
             }
         };
         match directory {
@@ -5435,6 +5473,34 @@ impl Planner<'_> {
                 parent_group != group || (parent_mode & 0o2000 == 0 && new_file.group != group)
             }
         }
+    }
+
+    /// Read the group and mode of the directory `parent` into
+    /// `parent_groups`, and with it, in the same request, those of the
+    /// other directories the leaves being planned may ask about
+    /// (`leaf_parents`): a tree of small directories otherwise waits a
+    /// round trip for each. A directory that cannot be read counts as
+    /// missing, so a file there is replaced. This is a plain lookup, not
+    /// the planner's own (`Planner::stat_many`): that one fails as a whole
+    /// when a `--copy-if` copy sees an entry change between its two reads,
+    /// as these directories do while workers publish into them.
+    fn read_parent_groups(&mut self, parent: PathBytes) -> Option<(u32, u32)> {
+        let mut parents = std::mem::take(&mut self.leaf_parents);
+        parents.push(parent.clone());
+        parents.sort_unstable();
+        parents.dedup();
+        let mut stats = stat_many(self.dst, parents.clone(), false)
+            .unwrap_or_default()
+            .into_iter();
+        for path in parents {
+            let directory = stats
+                .next()
+                .flatten()
+                .filter(|entry| entry.kind == Kind::Dir)
+                .map(|entry| (entry.gid, entry.mode));
+            self.parent_groups.insert(path, directory);
+        }
+        self.parent_groups.get(&parent).copied().flatten()
     }
 
     /// Sort existing directories whose owner lacks write or search
@@ -5472,7 +5538,7 @@ impl Planner<'_> {
                         "syq: {}: not inspected: you own this directory, but it lacks owner search permission{}",
                         display(&path),
                         match self.opts.hint_for(needed).filter(|_| hint) {
-                            Some(hint) => format!("; {hint}"),
+                            Some(hint) => format!("; {}", self.opts.said_once(hint)),
                             None => String::new(),
                         }
                     ),
@@ -5480,7 +5546,8 @@ impl Planner<'_> {
                     Some("permission_denied"),
                 );
                 uninspected.push(path);
-            } else if hint {
+            } else if hint && self.opts.hint_for(needed).is_some() {
+                // A mode that already widens `needed` leaves nothing to name.
                 self.opts
                     .access_limited
                     .lock()
@@ -5516,7 +5583,7 @@ impl Planner<'_> {
     }
 
     fn prepare_existing_directories(&mut self, mut paths: Vec<PathBytes>) -> Result<()> {
-        if !self.opts.may_widen_directory_permissions() {
+        if !self.opts.widens_inside_copy() {
             return Ok(());
         }
         let fill = self.fill_access();
@@ -5641,23 +5708,67 @@ impl Planner<'_> {
                 "final directory metadata",
             )?;
         }
-        let mut pending = d.as_slice();
-        while !pending.is_empty() {
-            let (chunk, rest) = pending.split_at(directory_metadata_batch_len(pending));
-            pending = rest;
-            let ops: Vec<Op> = chunk
-                .iter()
-                .map(|(p, m, f, _, condition)| Op::SetMeta {
-                    path: p.clone(),
-                    meta: m.clone(),
-                    flags: *f,
-                    condition: *condition,
-                    directory: true,
-                })
-                .collect();
-            let errors = self.apply(ops)?;
+        // A scan takes the replies to the lookups it sent early when it
+        // ends. One that panicked leaves them unanswered, and this pass then
+        // runs as the planner is dropped: their replies are taken first, as
+        // with these requests they would be more than the connection lets
+        // wait.
+        self.withdraw_early_lookups();
+        // The receiver runs requests in the order sent, so several can await
+        // their replies without a later one's changes overtaking an earlier
+        // one's (`directory_metadata_batch_len`).
+        let unanswered = self.dst.reply_queue().map_or(1, |replies| {
+            replies.min(super::directory_stream::REQUESTS_IN_FLIGHT)
+        });
+        let mut requests = DirectoryMetadataRequests::new(&d);
+        let mut in_flight = std::collections::VecDeque::new();
+        // What ends the pass early. Nothing more is sent, and the requests
+        // already sent are still answered: they have changed the directories
+        // they name.
+        let mut failure = None;
+        // A reply was no `Apply` result, so the replies after it may not be
+        // their requests'. They are taken, to leave the connection as it
+        // was, and not read.
+        let mut unmatched = false;
+        loop {
+            while failure.is_none() && in_flight.len() < unanswered {
+                let Some((directories, ops)) = requests.next() else {
+                    break;
+                };
+                // Tests count each request's directories and the requests
+                // still unanswered when it is sent.
+                #[cfg(debug_assertions)]
+                let _ = crate::fsops::record_test_event(
+                    "SYQ_TEST_DIRECTORY_METADATA_REQUESTS",
+                    format_args!("{} {}", ops.len(), in_flight.len()),
+                );
+                match self.dst.send_pending(Request::Apply { ops }) {
+                    Ok(reply) => in_flight.push_back((reply, directories)),
+                    Err(error) => failure = Some(error),
+                }
+            }
+            let Some((reply, directories)) = in_flight.pop_front() else {
+                break;
+            };
+            let response = match self.dst.take_reply(reply) {
+                Ok(response) => response,
+                // No usable reply came: the connection is lost or out of
+                // step, so the replies after it are not waited for.
+                Err(error) => return Err(failure.unwrap_or(error)),
+            };
+            if unmatched {
+                continue;
+            }
+            let errors = match self.applied(response, directories.len()) {
+                Ok(errors) => errors,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    unmatched = true;
+                    continue;
+                }
+            };
             let capacity_error = first_capacity_error(&errors);
-            for ((path, ..), error) in chunk.iter().zip(errors) {
+            for ((path, ..), error) in directories.iter().zip(errors) {
                 if let Some(error) = error {
                     if quiet {
                         continue;
@@ -5671,10 +5782,12 @@ impl Planner<'_> {
                 }
             }
             if let Some(error) = capacity_error {
-                return Err(endpoint_error(error)).context("apply destination changes");
+                failure.get_or_insert_with(|| {
+                    endpoint_error(error).context("apply destination changes")
+                });
             }
         }
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 }
 
@@ -5758,7 +5871,7 @@ fn receiver_uid(dst: &mut dyn Conn, cache: &mut Option<u32>) -> Result<u32> {
 /// Temporarily add owner access to `directories` and remember the original
 /// modes of those actually changed; returns how many changed. The receiver
 /// widens only owned directories, never as root.
-fn widen_directory_batch(
+pub(super) fn widen_directory_batch(
     dst: &mut dyn Conn,
     opts: &Opts,
     progress: &Progress,
@@ -5767,7 +5880,14 @@ fn widen_directory_batch(
     access: u32,
 ) -> Result<usize> {
     let mut widened = 0;
-    let mut directories = directories.into_iter().peekable();
+    // A grant that bars widening the copy's directories leaves only the
+    // directory the copy goes into to ask for: the receiver would refuse the
+    // whole request for another, and the copy with it.
+    let barred = opts.keep_bars_widening();
+    let mut directories = directories
+        .into_iter()
+        .filter(|(path, _)| !barred || opts.outer_directory.get() == Some(path))
+        .peekable();
     while directories.peek().is_some() {
         let batch: Vec<_> = directories.by_ref().take(1000).collect();
         let names: Vec<_> = batch.iter().map(|(path, _)| path.clone()).collect();
@@ -5857,11 +5977,75 @@ fn merge_directory_metadata(
     }
 }
 
+/// A directory's final metadata: its path, the metadata and which of it to
+/// set (`flags`), its depth, and the directory it must still be.
+type DirectoryMetadata = (PathBytes, Meta, u8, usize, TargetCondition);
+
+/// Split `ops` in halves until each part's request fits the metadata frame
+/// budget, keeping their order.
+fn request_sized(mut ops: Vec<Op>) -> Vec<Vec<Op>> {
+    if ops.len() > 1
+        && ops.iter().map(Op::size_hint).sum::<usize>() > crate::proto::METADATA_BATCH_BYTES
+    {
+        let tail = ops.split_off(ops.len() / 2);
+        let mut parts = request_sized(ops);
+        parts.extend(request_sized(tail));
+        return parts;
+    }
+    vec![ops]
+}
+
+/// The final directory metadata still to send, deepest first, as the
+/// requests it goes in: each with the directories it changes.
+struct DirectoryMetadataRequests<'a> {
+    pending: &'a [DirectoryMetadata],
+    /// The rest of a batch too large for one request.
+    split: std::collections::VecDeque<(&'a [DirectoryMetadata], Vec<Op>)>,
+}
+
+impl<'a> DirectoryMetadataRequests<'a> {
+    fn new(pending: &'a [DirectoryMetadata]) -> Self {
+        Self {
+            pending,
+            split: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+impl<'a> Iterator for DirectoryMetadataRequests<'a> {
+    type Item = (&'a [DirectoryMetadata], Vec<Op>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.split.is_empty() && !self.pending.is_empty() {
+            let (mut batch, rest) = self
+                .pending
+                .split_at(directory_metadata_batch_len(self.pending));
+            self.pending = rest;
+            let ops = batch
+                .iter()
+                .map(|(path, meta, flags, _, condition)| Op::SetMeta {
+                    path: path.clone(),
+                    meta: meta.clone(),
+                    flags: *flags,
+                    condition: *condition,
+                    directory: true,
+                })
+                .collect();
+            for ops in request_sized(ops) {
+                let (directories, later) = batch.split_at(ops.len());
+                batch = later;
+                self.split.push_back((directories, ops));
+            }
+        }
+        self.split.pop_front()
+    }
+}
+
 /// Keep ordinary metadata in full batches, even across directory depths. Only
-/// a mode that removes search access needs to wait for deeper operations.
-fn directory_metadata_batch_len(
-    entries: &[(PathBytes, Meta, u8, usize, TargetCondition)],
-) -> usize {
+/// a mode that removes search access needs to wait for deeper operations: it
+/// goes in a later request, which the receiver runs once the earlier ones
+/// are done.
+fn directory_metadata_batch_len(entries: &[DirectoryMetadata]) -> usize {
     let maximum = entries.len().min(1000);
     let deepest = entries[0].3;
     entries[..maximum]
@@ -6023,6 +6207,59 @@ mod directory_metadata_tests {
         assert_eq!(directory_metadata_batch_len(&entries), 12);
         entries[7].2 = flags::RECEIVER_MODE;
         assert_eq!(directory_metadata_batch_len(&entries), 7);
+    }
+
+    #[test]
+    fn final_metadata_too_large_for_one_request_goes_in_halves_with_its_directories() {
+        // Nine directories whose paths together exceed the frame budget, then
+        // one at a shallower depth that removes search access.
+        let long = crate::proto::METADATA_BATCH_BYTES / 4;
+        let entry = |name: u8, len: usize, mode, depth| {
+            (
+                vec![name; len],
+                Meta {
+                    mode,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                    mtime_nsec: 0,
+                    inode_metadata: None,
+                },
+                flags::MODE,
+                depth,
+                TargetCondition::Any,
+            )
+        };
+        let mut entries: Vec<DirectoryMetadata> =
+            (0..9).map(|name| entry(name, long, 0o755, 2)).collect();
+        entries.push(entry(9, 1, 0o600, 1));
+        let requests: Vec<_> = DirectoryMetadataRequests::new(&entries).collect();
+        let names: Vec<Vec<u8>> = requests
+            .iter()
+            .map(|(directories, ops)| {
+                let paths: Vec<_> = directories.iter().map(|(path, ..)| path).collect();
+                let sent: Vec<_> = ops
+                    .iter()
+                    .map(|op| match op {
+                        Op::SetMeta {
+                            path,
+                            directory: true,
+                            ..
+                        } => path,
+                        other => panic!("unexpected operation {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(paths, sent);
+                paths.iter().map(|path| path[0]).collect()
+            })
+            .collect();
+        // Halved as `Planner::apply` halves any request, until at most three
+        // of these paths go together: 9 into 4 and 5, the 4 into 2 and 2, the
+        // 5 into 2 and 3. The narrowed directory waits for all of them.
+        assert_eq!(
+            names,
+            [vec![0, 1], vec![2, 3], vec![4, 5], vec![6, 7, 8], vec![9]]
+        );
     }
 
     #[test]
