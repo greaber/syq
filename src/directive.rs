@@ -17,8 +17,8 @@
 use crate::cli::{Args, Existence, Location, Placement};
 use crate::delegation::{
     self, CopyLimits, CopyOperation, CopyOptions, CopyPolicy, DeletionPolicy, DestinationPlacement,
-    ExistingDestinationPolicy, FilterPolicy, Grant, GrantConstraints, MutationScope,
-    PublicationPolicy, RequestId, RootExistence,
+    DestinationRules, ExistingDestinationPolicy, FilterPolicy, MutationScope, PublicationPolicy,
+    RequestId, RootExistence,
 };
 use crate::enrollment::EnrollmentId;
 use anyhow::{bail, ensure, Context, Result};
@@ -459,10 +459,7 @@ pub(crate) fn issued_digest(directive: &Directive) -> Result<[u8; 32]> {
 /// The rules for the destination of `directive`, on an account whose home
 /// is `home`. The receiver and the signing machine both call this, so the
 /// signing machine checks exactly what the receiver will enforce.
-pub(crate) fn destination_rules(
-    directive: &Directive,
-    home: &Path,
-) -> Result<(Grant, GrantConstraints)> {
+pub(crate) fn destination_rules(directive: &Directive, home: &Path) -> Result<DestinationRules> {
     let args = destination_command(directive)?;
     ensure!(
         matches!(
@@ -491,7 +488,7 @@ pub(crate) fn destination_rules(
 pub(crate) fn receiving_rules(
     directive: &Directive,
     destination: &[u8],
-) -> Result<(Grant, GrantConstraints)> {
+) -> Result<DestinationRules> {
     let args = destination_command(directive)?;
     check_receiving(&args)?;
     rules_at(directive, &args, destination, false)
@@ -516,7 +513,7 @@ pub(crate) fn rules_for_args(
     directive: &Directive,
     args: &Args,
     destination: &[u8],
-) -> Result<(Grant, GrantConstraints)> {
+) -> Result<DestinationRules> {
     rules_at(directive, args, destination, false)
 }
 
@@ -555,46 +552,37 @@ fn rules_at(
     args: &Args,
     destination_path: &[u8],
     follow_dst: bool,
-) -> Result<(Grant, GrantConstraints)> {
+) -> Result<DestinationRules> {
     let (_, sources) = args
         .locations
         .split_last()
         .context("the directive's command names no destination")?;
     let sources = crate::transfer::distinct_native_sources(sources);
     let mut copy = copy_operation(args, &sources, destination_path)?;
+    copy.options.follow_dst = follow_dst;
     if let Some(caps) = &directive.caps {
         caps.apply(&mut copy, args.dry_run && requests_pruning(args))?;
     }
     // A bandwidth limit is a preference, not part of the authorization: the
     // sender paces network bytes, as for an ordinary copy.
-    let mut constraints = GrantConstraints {
-        tcp_congestion: args.tcp_congestion.clone(),
-        tcp: delegation::TcpPermission::of(args),
-        mapping: directive.inputs.mapping.clone(),
-        hashing: Some(crate::hashing::CopyHashing::from_args(args)),
+    let mut rules = DestinationRules {
+        enrollment_id: directive.binding.enrollment,
+        request_id: directive.request_id,
         filters: FilterPolicy {
             ignore: directive.inputs.ignore.clone(),
             destination_roots: filter_destination_roots(args, &sources, destination_path)?,
             delete_excluded: args.delete_excluded,
         },
+        copy,
         root_existence: root_existence_for(args.target_existence),
-        receipt_policy: crate::destination_results::ReceiptPolicy::for_recipient(
-            directive.results_key,
-        ),
-        extra_options: delegation::ExtraCopyOptions {
-            follow_dst,
-            ..extra_copy_options(args)
-        },
+        results_recipient: directive.results_key,
+        tcp_congestion: args.tcp_congestion.clone(),
+        tcp: delegation::TcpPermission::of(args),
+        mapping: directive.inputs.mapping.clone(),
+        hashing: crate::hashing::CopyHashing::from_args(args),
     };
-    delegation::validate_rules(&copy, &mut constraints)?;
-    Ok((
-        Grant {
-            enrollment_id: directive.binding.enrollment,
-            request_id: directive.request_id,
-            copy,
-        },
-        constraints,
-    ))
+    delegation::validate_rules(&mut rules)?;
+    Ok(rules)
 }
 
 /// What the source of `directive` may read, on an account whose home
@@ -737,22 +725,6 @@ pub(crate) fn root_existence_for(existence: Existence) -> RootExistence {
     }
 }
 
-/// The copy options a destination's rules include beyond `CopyOptions`.
-pub(crate) fn extra_copy_options(args: &Args) -> delegation::ExtraCopyOptions {
-    delegation::ExtraCopyOptions {
-        hardlinks: args.hardlinks,
-        acls: args.acls,
-        xattrs: args.xattrs,
-        atimes: args.atimes > 0,
-        crtimes: args.crtimes,
-        sparse: args.sparse,
-        open_noatime: args.open_noatime || args.atimes > 1,
-        widen_dirs: args.widen_dirs.into(),
-        keep_files: args.ignore_existing && !args.only_new_native_entries(),
-        follow_dst: args.follows_native_destination_paths(),
-    }
-}
-
 pub(crate) fn validate_restricted_args(args: &Args) -> Result<()> {
     if let Some(input) = &args.mapping_contents {
         input.validate_restricted_bounds()?;
@@ -889,6 +861,8 @@ pub(crate) fn copy_operation(
         ExistingDestinationPolicy::Skip
     } else if args.existing {
         ExistingDestinationPolicy::MustExist
+    } else if args.ignore_existing {
+        ExistingDestinationPolicy::KeepFiles
     } else {
         ExistingDestinationPolicy::Replace
     };
@@ -917,11 +891,19 @@ pub(crate) fn copy_operation(
             preserve_owner: args.owner,
             preserve_group: args.group,
             preserve_devices: args.devices,
-            compare_existing_by_content: args.checksum,
             dry_run: args.dry_run,
             compressed_transport: args.compress,
             tcp_port_lo,
             tcp_port_hi,
+            hardlinks: args.hardlinks,
+            acls: args.acls,
+            xattrs: args.xattrs,
+            atimes: args.atimes > 0,
+            crtimes: args.crtimes,
+            sparse: args.sparse,
+            open_noatime: args.open_noatime || args.atimes > 1,
+            widen_dirs: args.widen_dirs.into(),
+            follow_dst: args.follows_native_destination_paths(),
         },
         limits: CopyLimits {
             max_entries,

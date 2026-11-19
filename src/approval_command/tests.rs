@@ -201,7 +201,7 @@ fn server_files_supply_only_their_own_contents() {
             ignore: vec!["*.tmp".into()],
             mapping: if mapped { mapping.clone() } else { None },
         };
-        let (_, constraints) =
+        let constraints =
             crate::directive::receiving_rules(&issued(&with_file, inputs.clone()), RECEIVED_AT)
                 .unwrap();
         assert_eq!(constraints.filters.ignore, ["*.tmp"]);
@@ -247,15 +247,15 @@ fn ignore_rules_come_from_the_server_and_only_narrow() {
         )
         .unwrap()
     };
-    let (stated, stated_constraints) = rules(&["a"]);
+    let stated = rules(&["a"]);
     assert_eq!(stated.copy.limits.max_deletions, 5);
-    assert!(!stated_constraints.filters.delete_excluded);
+    assert!(!stated.filters.delete_excluded);
     // Whatever rules the server read, what they restrict is the command's.
     for lines in [&[][..], &["b"], &["!a", "a"]] {
-        let (grant, constraints) = rules(lines);
-        assert_eq!(constraints.filters.ignore, lines);
+        let grant = rules(lines);
+        assert_eq!(grant.filters.ignore, lines);
         assert_eq!(grant.copy, stated.copy);
-        assert!(!constraints.filters.delete_excluded);
+        assert!(!grant.filters.delete_excluded);
     }
 }
 
@@ -269,7 +269,7 @@ fn derivation_ignores_this_machines_files() {
     let fifo = fifo.to_str().unwrap();
     let copy = command(&["cp", "--src", fifo, "--to", "@laptop", "--into", "runs"]);
     receiving_command(&copy, "laptop").unwrap();
-    let (grant, _) = crate::directive::receiving_rules(
+    let grant = crate::directive::receiving_rules(
         &issued(&copy, crate::directive::Inputs::default()),
         RECEIVED_AT,
     )

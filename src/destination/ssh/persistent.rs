@@ -754,9 +754,6 @@ pub(crate) fn stop_all(domain: &Domain) -> Result<()> {
         }
         std::thread::sleep(POLL);
     }
-    if let Err(error) = resolution::wait(domain) {
-        errors.push(format!("{error:#}"));
-    }
     if let Err(error) = cleanup::wait_for_keepers(domain) {
         errors.push(format!("{error:#}"));
     }

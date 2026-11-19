@@ -794,10 +794,7 @@ fn test_dir() -> PathBuf {
 /// A worker whose destination root is the existing directory `root`,
 /// reached by that spelling. Its methods take paths relative to `root`.
 fn destination_ops(root: &Path) -> FsOps {
-    let mut ops = FsOps::new();
-    ops.destination_root = Some(Arc::new(Root::open(root).unwrap()));
-    ops.destination_prefix = Some(path_bytes(root));
-    ops
+    FsOps::rooted_for_test(root)
 }
 
 fn make_fifo(path: &Path, mode: libc::mode_t) {

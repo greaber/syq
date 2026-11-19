@@ -11,10 +11,10 @@ pub(super) fn checked_destination(
     directive: &Directive,
     (home, receiving): (&Path, &[PathBuf]),
 ) -> Result<Vec<u8>> {
-    let (grant, _) = directive::destination_rules(directive, home)?;
+    let rules = directive::destination_rules(directive, home)?;
     let protected = receiver_control_paths(home, None, ControlPaths::Elsewhere(receiving))?;
-    reject_control_plane_scopes(&grant.copy, &protected)?;
-    Ok(grant.copy.destination)
+    reject_control_plane_scopes(&rules.copy, &protected)?;
+    Ok(rules.copy.destination)
 }
 
 /// A copy to approve with a directive: its command and what the command
@@ -310,14 +310,14 @@ impl Container {
 pub(crate) fn receiving_authority(
     container: &Container,
     issued: &Directive,
-    (grant, constraints): (Grant, GrantConstraints),
+    rules: DestinationRules,
 ) -> Result<std::sync::Arc<RestrictedAuthority>> {
-    if constraints.extra_options.follow_dst {
+    if rules.copy.options.follow_dst {
         bail!("copies a receiving machine approves do not follow destination symlinks");
     }
     let (_, home) = current_account()?;
     // Signs only the header of this machine's results for the copy.
-    let key = generate_results_key(grant.enrollment_id)?;
+    let key = generate_results_key(rules.enrollment_id)?;
     let executable = fs::canonicalize(std::env::current_exe()?)?;
     let home = fs::canonicalize(home)?;
     let protected = receiver_control_paths(&home, Some(&executable), ControlPaths::Here)?;
@@ -330,8 +330,7 @@ pub(crate) fn receiving_authority(
     )?;
     let authority = RestrictedAuthority::new(
         confined,
-        grant,
-        constraints,
+        rules,
         directive::issued_digest(issued)?,
         key,
         Instant::now() + std::time::Duration::from_secs(FINISH_WINDOW_SECONDS as u64),

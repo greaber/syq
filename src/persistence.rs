@@ -143,19 +143,7 @@ impl EndpointRecord {
     }
 
     pub(crate) fn label(&self) -> String {
-        let host = if self.host.contains(':') {
-            format!("[{}]", self.host)
-        } else {
-            self.host.clone()
-        };
-        let endpoint = match &self.user {
-            Some(user) => format!("{user}@{host}"),
-            None => host,
-        };
-        match self.port {
-            Some(port) => format!("{endpoint}:{port}"),
-            None => endpoint,
-        }
+        crate::cli::endpoint_label(self.user.as_deref(), &self.host, self.port)
     }
 }
 
@@ -473,7 +461,7 @@ pub(crate) fn connect_domain(
             .then(|| crate::receive_service::keeps_running(multiplexer.control_path()))
             .flatten()
         {
-            report_ready(domain, &endpoint_label(&endpoint), ready);
+            report_ready(domain, &endpoint.label(), ready);
             return Ok(());
         }
     }
@@ -597,16 +585,6 @@ fn connect_receiving(
     drop(connection);
     report_ready(domain, &remote.label(), receiving);
     Ok(())
-}
-
-fn endpoint_label(endpoint: &crate::cli::NativeEndpoint) -> String {
-    EndpointRecord::new(
-        endpoint.user.as_deref(),
-        &endpoint.host,
-        endpoint.port,
-        None,
-    )
-    .label()
 }
 
 fn report_ready(domain: &Domain, label: &str, ready: crate::receive_service::Ready) {

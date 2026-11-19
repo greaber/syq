@@ -1612,14 +1612,22 @@ fn serve<R: Read + Send + 'static, W: Write>(r: R, w: W, session: ServeSession) 
                     dry_run,
                     workers,
                     &mut |messages| {
-                        Ok(wref
-                            .borrow_mut()
-                            .write_msg(&Response::NativeRemoveTrace(messages))?)
+                        for part in crate::proto::native_remove_messages(messages, |m| m.len() + 8)
+                        {
+                            wref.borrow_mut()
+                                .write_msg(&Response::NativeRemoveTrace(part))?;
+                        }
+                        Ok(())
                     },
                     &mut |outcomes| {
-                        Ok(wref
-                            .borrow_mut()
-                            .write_msg(&Response::NativeRemoveBatch(outcomes))?)
+                        for part in crate::proto::native_remove_messages(
+                            outcomes,
+                            crate::proto::NativeRemoveOutcome::size_hint,
+                        ) {
+                            wref.borrow_mut()
+                                .write_msg(&Response::NativeRemoveBatch(part))?;
+                        }
+                        Ok(())
                     },
                 );
                 match result {

@@ -22,13 +22,7 @@ fn pair(records: bool) -> Pair {
     let (secret, public) = generate_recipient().unwrap();
     let binding = binding();
     let signing = key(3);
-    let stream = Stream::start(
-        &ReceiptPolicy::for_recipient(public),
-        binding,
-        &signing,
-        records,
-    )
-    .unwrap();
+    let stream = Stream::start(public, binding, &signing, records).unwrap();
     let reader = Reader::new(Expectation {
         public_key: signing.public_key().to_openssh().unwrap(),
         binding,
@@ -277,8 +271,7 @@ fn dropped_repeated_or_altered_frames_are_detected() {
 fn only_the_destination_key_and_this_grant_start_a_stream() {
     let (secret, public) = generate_recipient().unwrap();
     let binding = binding();
-    let policy = ReceiptPolicy::for_recipient(public);
-    let mut forged = Stream::start(&policy, binding, &key(9), true).unwrap();
+    let mut forged = Stream::start(public, binding, &key(9), true).unwrap();
     let mut reader = Reader::new(Expectation {
         public_key: key(3).public_key().to_openssh().unwrap(),
         binding,
@@ -292,7 +285,7 @@ fn only_the_destination_key_and_this_grant_start_a_stream() {
 
     let (secret, public) = generate_recipient().unwrap();
     let mut other = Stream::start(
-        &ReceiptPolicy::for_recipient(public),
+        public,
         Binding {
             grant_digest: [8; 32],
             ..binding
@@ -321,13 +314,7 @@ fn the_header_says_whether_changes_are_listed() {
 
     let (secret, public) = generate_recipient().unwrap();
     let binding = binding();
-    let mut stream = Stream::start(
-        &ReceiptPolicy::for_recipient(public),
-        binding,
-        &key(3),
-        false,
-    )
-    .unwrap();
+    let mut stream = Stream::start(public, binding, &key(3), false).unwrap();
     let mut reader = Reader::new(Expectation {
         public_key: key(3).public_key().to_openssh().unwrap(),
         binding,
@@ -354,25 +341,6 @@ fn pending_records_wait_for_a_batch_or_a_moment() {
     let sealed = stream.take_frames(now).unwrap();
     assert!(sealed.len() > 1);
     assert!(sealed.iter().all(|frame| frame.len() <= MAX_FRAME_BYTES));
-}
-
-#[test]
-fn signed_grant_policy_bytes_are_unchanged() {
-    // The policy stays in signed grants byte for byte (v0.4.1 fixture in
-    // delegation tests); new grants write these values.
-    let policy = ReceiptPolicy::for_recipient([5; 32]);
-    policy.validate().unwrap();
-    assert_eq!(
-        postcard::to_stdvec(&policy).unwrap(),
-        [
-            [1, 0].as_slice(),
-            &[0x80, 0x92, 0xf4, 0x01],
-            &[0x80, 0x80, 0x80, 0x80, 0x02],
-            &[0, 0],
-            &[5; 32],
-        ]
-        .concat()
-    );
 }
 
 #[test]
