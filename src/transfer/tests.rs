@@ -6278,6 +6278,12 @@ struct HoldingDestination<F> {
     sent: F,
     /// Refuse every streamed begin, as a receiver's grant can.
     refuse_begin: bool,
+    /// Replies still owed when a stream begins, for requests sent before,
+    /// as a deferred publication's are: they wait ahead of the begin's
+    /// reply, and are taken before the next reply, as a connection takes
+    /// them.
+    owed_at_begin: usize,
+    owed: usize,
 }
 
 impl<F: FnMut(usize) + Send> Conn for HoldingDestination<F> {
@@ -6286,6 +6292,11 @@ impl<F: FnMut(usize) + Send> Conn for HoldingDestination<F> {
             Request::PatchData { data, .. } => data.len(),
             _ => 0,
         };
+        if let Request::PatchBegin { .. } = request {
+            let owed = std::mem::take(&mut self.owed_at_begin);
+            self.replies.extend((0..owed).map(|_| (Response::Ok, 0)));
+            self.owed += owed;
+        }
         let reply = match request {
             Request::PatchBegin { .. } if self.refuse_begin => {
                 Response::Err("refused by the grant".into())
@@ -6306,6 +6317,9 @@ impl<F: FnMut(usize) + Send> Conn for HoldingDestination<F> {
         Ok(())
     }
     fn recv(&mut self) -> Result<Response> {
+        for _ in 0..std::mem::take(&mut self.owed) {
+            self.replies.pop_front();
+        }
         self.replies
             .pop_front()
             .map(|(reply, _)| reply)
@@ -6458,6 +6472,9 @@ struct Holding {
     restricted: bool,
     /// The receiver refuses every streamed begin.
     refuse_begin: bool,
+    /// Replies the destination still owes for requests sent before the
+    /// stream began.
+    owed: usize,
 }
 
 /// What `stream_into_holding_destination` observed: the most pieces and
@@ -6515,6 +6532,8 @@ fn stream_into_holding_destination(
             sent(&aborting, pieces)
         },
         refuse_begin: how.refuse_begin,
+        owed_at_begin: how.owed,
+        owed: 0,
     });
     worker.fast_batch_files = files.len();
     let opts = Arc::get_mut(&mut worker.opts).unwrap();
@@ -6543,8 +6562,9 @@ fn scattered_blocks(len: usize) -> Vec<std::ops::Range<usize>> {
 #[test]
 fn a_streamed_patch_of_single_block_pieces_keeps_its_reply_queue_of_them_in_flight() {
     // 20 MiB of scattered blocks differ, which streams as 320 pieces of one
-    // block each. The destination's reply queue, not a count of sixteen,
-    // limits the pieces awaiting acknowledgment, and a remote source's
+    // block each. The destination's reply queue, less room for replies
+    // still owed, and not a count of sixteen, limits the pieces awaiting
+    // acknowledgment, and a remote source's
     // reply queue and the read-ahead buffer the reads awaiting the worker.
     for remote_source in [false, true] {
         let temporary = crate::test_support::tempdir().unwrap();
@@ -6564,7 +6584,8 @@ fn a_streamed_patch_of_single_block_pieces_keeps_its_reply_queue_of_them_in_flig
         );
         assert_eq!(worker.progress.files_done.load(Relaxed), 1, "{case}");
         assert_eq!(worker.progress.bytes_done.load(Relaxed), 20 << 20, "{case}");
-        assert_eq!((held.pieces, held.bytes), (256, 16 << 20), "{case}");
+        // The reply queue less the room it keeps for replies still owed.
+        assert_eq!((held.pieces, held.bytes), (240, 15 << 20), "{case}");
         if remote_source {
             assert!(held.reads > 16, "{case}: {} reads", held.reads);
             assert!(
@@ -6674,6 +6695,29 @@ fn a_wide_patch_stream_cannot_use_up_the_decoded_message_allowance() {
 }
 
 #[test]
+fn a_patch_stream_leaves_room_for_replies_still_owed() {
+    // A worker can begin a stream with replies still owed on its
+    // connection, as for its deferred publications and its setup. The
+    // stream's pieces and those replies together never fill more than the
+    // destination's reply queue.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
+    let how = Holding {
+        owed: super::publication::DEFERRED_PUBLICATIONS + 1,
+        ..Holding::default()
+    };
+    let (_, worker, held) = stream_into_holding_destination(root, &files, how, |_, _| {});
+    assert_eq!(read(root, "source/file"), read(root, "target/file"));
+    assert_eq!(worker.progress.files_done.load(Relaxed), 1);
+    assert!(
+        held.pieces > crate::transfer_tuning::COMPARE_WINDOW,
+        "{} pieces",
+        held.pieces
+    );
+}
+
+#[test]
 fn a_restricted_receiver_gets_few_pieces_before_it_answers_a_streamed_begin() {
     // A command-restricted receiver records each piece that reaches it after
     // it refused the patch's begin. Until the begin is answered, at most
@@ -6697,7 +6741,7 @@ fn a_restricted_receiver_gets_few_pieces_before_it_answers_a_streamed_begin() {
             );
             assert_eq!(worker.progress.files_done.load(Relaxed), 0, "{case}");
         } else {
-            assert_eq!(held.pieces, 256, "{case}");
+            assert_eq!(held.pieces, 240, "{case}");
             assert_eq!(
                 read(root, "source/file"),
                 read(root, "target/file"),

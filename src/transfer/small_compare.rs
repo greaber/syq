@@ -85,6 +85,22 @@ const UNACKNOWLEDGED_PIECE_BYTES: u64 = 16 * PATCH_PIECE_BYTES;
 const _: () = assert!(PATCH_PIECE_BYTES <= UNACKNOWLEDGED_PIECE_BYTES);
 const _: () = assert!(crate::proto::MAX_HASH_BLOCK_BYTES <= UNACKNOWLEDGED_PIECE_BYTES);
 
+/// Replies a stream leaves room for in its connections' reply queues: those
+/// still owed for requests sent before it began, such as a deferred
+/// publication's check or finalize, or the connection's setup.
+const OWED_REPLIES: usize = COMPARE_WINDOW;
+const _: () = assert!(super::publication::DEFERRED_PUBLICATIONS + 1 <= OWED_REPLIES);
+
+/// Pieces and reads a stream may have awaiting replies on a connection whose
+/// reader queues `queue` replies: the queue less the room for replies still
+/// owed, so that the reader never stops reading replies while the worker
+/// sends, and never fewer than sixteen.
+fn stream_window(queue: usize) -> usize {
+    queue
+        .saturating_sub(OWED_REPLIES)
+        .max(queue.min(COMPARE_WINDOW))
+}
+
 /// Files and source bytes per group.
 const COMPARE_GROUP_FILES: usize = 256;
 const COMPARE_GROUP_BYTES: u64 = 4 << 20;
@@ -754,12 +770,11 @@ impl Worker {
         use std::collections::VecDeque;
         // An in-process source answers each read as it is sent, and its
         // piece moves on before the next is read. A remote one's reads queue
-        // within its reply queue and the read-ahead buffer. Sent pieces await
-        // their acknowledgments within the destination's reply queue, so that
-        // its reader never stops reading replies while this worker sends, and
-        // within `UNACKNOWLEDGED_PIECE_BYTES`.
-        let reads = self.src.reply_queue().unwrap_or(1);
-        let acknowledgments = self.dst.reply_queue().unwrap_or(COMPARE_WINDOW);
+        // within its reply queue (`stream_window`) and the read-ahead
+        // buffer. Sent pieces await their acknowledgments within the
+        // destination's reply queue and `UNACKNOWLEDGED_PIECE_BYTES`.
+        let reads = self.src.reply_queue().map_or(1, stream_window);
+        let acknowledgments = self.dst.reply_queue().map_or(COMPARE_WINDOW, stream_window);
         let mut source: VecDeque<(StreamStep, std::time::Instant)> = VecDeque::new();
         let mut destination: VecDeque<(StreamStep, std::time::Instant)> = VecDeque::new();
         // The patch whose reads are being sent, and the piece bytes read
