@@ -344,11 +344,12 @@ impl Planner<'_> {
     /// Whether the planner keeps the existing representative `destination`
     /// of `leaf` without a worker: a worker would keep it on its size and
     /// time alone (`Worker::try_expected_match`), and the scan does not
-    /// predict that the receiver will refuse it (`must_replace`). Not where
-    /// a mapping gives names their own metadata: a later alias may request
-    /// other metadata for the group, which refuses the copy before any name
-    /// of the group is changed, and the planner would already have changed
-    /// this one.
+    /// predict that the receiver will refuse it (`must_replace`), and its
+    /// check would change nothing. A later alias may find the group's
+    /// metadata in conflict (a mapping's, or the source's changing between
+    /// the scans of its names), which refuses the copy before any name of
+    /// the group is changed: a representative whose metadata needs changing
+    /// is left to a worker, which runs only once the group is validated.
     fn keeps_representative(&mut self, leaf: &Planned, destination: &Entry) -> bool {
         // A preview changes nothing.
         !self.opts.dry_run
@@ -359,6 +360,13 @@ impl Planner<'_> {
             && self
                 .opts
                 .metadata_matches(&leaf.dst_rel, &leaf.e, destination)
+            && self
+                .opts
+                .metadata_fix_flags(&leaf.dst_rel, &leaf.e, destination)
+                == 0
+            && !self
+                .opts
+                .inode_metadata_differs(&leaf.dst_rel, &leaf.e, destination)
             && !self.must_replace((&leaf.dst, &leaf.dst_rel), &leaf.e, destination)
     }
 

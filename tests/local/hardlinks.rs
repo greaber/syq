@@ -691,7 +691,8 @@ fn hardlink_reruns_keep_representatives_in_the_planner_and_send_links_ahead() {
         fs::remove_file(t.path("dst/d500/b")).unwrap();
         fs::set_permissions(t.path("dst/d500/a"), fs::Permissions::from_mode(0o600)).unwrap();
         assert_output_ok(&copy_recording_hardlinks(&t, &[], remote).run().unwrap());
-        assert_eq!(hardlink_events(&t), (600, 0, expected), "remote={remote}");
+        // The representative whose mode changes is left to a worker.
+        assert_eq!(hardlink_events(&t), (599, 0, expected), "remote={remote}");
         assert_eq!(linked_pairs(&t, 600), first);
         assert_eq!(
             fs::metadata(t.path("dst/d500/a")).unwrap().mode() & 0o777,
@@ -703,42 +704,28 @@ fn hardlink_reruns_keep_representatives_in_the_planner_and_send_links_ahead() {
 #[cfg(debug_assertions)]
 #[test]
 fn a_kept_representative_the_receiver_then_refuses_is_copied_and_linked() {
-    // The scan finds the representative with one name, so the planner
-    // keeps it and only corrects its mode. Before the receiver does, the
-    // file gains another name, which the copy must not change: the
-    // receiver refuses, and a worker copies the file again for the group.
+    // The planner keeps an unchanged representative, whose other name is
+    // missing. The receiver refuses to keep it (its owner check, as
+    // `SYQ_TEST_REFUSE_REPRESENTATIVE` makes it): a worker copies the file
+    // again, the group is linked to the new file, and a name outside the
+    // copy keeps the old one.
     let t = Tmp::new();
     write(&t.path("src/a"), b"payload");
     fs::hard_link(t.path("src/a"), t.path("src/b")).unwrap();
     run_ok(&["-aH", &t.s("src/"), &t.s("dst/")]);
     fs::remove_file(t.path("dst/b")).unwrap();
-    fs::set_permissions(t.path("dst/a"), fs::Permissions::from_mode(0o600)).unwrap();
-    let ready = t.path("ready");
-    let continuation = t.path("continue");
-    let mut child = copy_recording_hardlinks(&t, &[], false)
-        .env("SYQ_TEST_QUICK_META_READY_FILE", &ready)
-        .env("SYQ_TEST_QUICK_META_CONTINUE_FILE", &continuation)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    wait_for_confinement_marker(&mut child, &ready, "representative metadata check");
     fs::hard_link(t.path("dst/a"), t.path("outside")).unwrap();
-    release_confinement_barrier(&continuation);
-    let output = child.wait_with_output().unwrap();
+    let before = identity(&t.path("dst/a"));
+    let output = copy_recording_hardlinks(&t, &[], false)
+        .env("SYQ_TEST_REFUSE_REPRESENTATIVE", "/a")
+        .run()
+        .unwrap();
     assert_output_ok(&output);
     assert_eq!(hardlink_events(&t), (0, 1, vec![(1, 0)]));
     assert_eq!(identity(&t.path("dst/a")), identity(&t.path("dst/b")));
-    assert_ne!(identity(&t.path("dst/a")), identity(&t.path("outside")));
+    assert_ne!(identity(&t.path("dst/a")), before);
+    assert_eq!(identity(&t.path("outside")), before);
     assert_eq!(read(&t.path("dst/b")), b"payload");
-    assert_eq!(
-        fs::metadata(t.path("dst/a")).unwrap().mode() & 0o777,
-        fs::metadata(t.path("src/a")).unwrap().mode() & 0o777
-    );
-    assert_eq!(
-        fs::metadata(t.path("outside")).unwrap().mode() & 0o777,
-        0o600
-    );
 }
 
 #[cfg(debug_assertions)]
@@ -1268,5 +1255,56 @@ fn a_mapping_with_conflicting_metadata_leaves_an_existing_representative_alone()
             "padding {padding}"
         );
         assert!(!t.path("dst/b").exists());
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_source_whose_mode_changes_between_its_names_leaves_the_existing_file_alone() {
+    // The scan sees the source's first name with one mode and, once the
+    // mode changes, its second name with another: the group's metadata
+    // conflicts and the copy is refused, before any name of the group is
+    // changed. The existing destination file keeps its mode, whether it
+    // needed a change (0640 here) or already matched the first name.
+    for existing in [0o640, 0o600] {
+        let t = Tmp::new();
+        write(&t.path("src/a"), b"payload");
+        fs::create_dir_all(t.path("src/later/nested")).unwrap();
+        fs::hard_link(t.path("src/a"), t.path("src/later/nested/b")).unwrap();
+        fs::set_permissions(t.path("src/a"), fs::Permissions::from_mode(0o600)).unwrap();
+        set_mtime(&t.path("src/a"), 1_600_000_000);
+        write(&t.path("dst/a"), b"payload");
+        set_mtime(&t.path("dst/a"), 1_600_000_000);
+        fs::set_permissions(t.path("dst/a"), fs::Permissions::from_mode(existing)).unwrap();
+        let ready = t.path("ready");
+        let continuation = t.path("continue");
+        let mut child = compat_command()
+            .args(["-aH", "--no-progress", &t.s("src/"), &t.s("dst/")])
+            .env("SYQ_TEST_HOLD_SOURCE_SCAN_DIRECTORY", "later")
+            .env("SYQ_TEST_SOURCE_SCAN_DIRECTORY_READY_FILE", &ready)
+            .env(
+                "SYQ_TEST_SOURCE_SCAN_DIRECTORY_CONTINUE_FILE",
+                &continuation,
+            )
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        wait_for_confinement_marker(&mut child, &ready, "source scan of later");
+        fs::set_permissions(t.path("src/a"), fs::Permissions::from_mode(0o660)).unwrap();
+        release_confinement_barrier(&continuation);
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success(), "{}", stderr_of(&output));
+        assert!(
+            stderr_of(&output).contains("conflicting destination metadata"),
+            "{}",
+            stderr_of(&output)
+        );
+        assert_eq!(
+            fs::metadata(t.path("dst/a")).unwrap().mode() & 0o777,
+            existing,
+            "{existing:o}"
+        );
+        assert!(!t.path("dst/later/nested/b").exists());
     }
 }

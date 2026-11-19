@@ -154,25 +154,28 @@ struct DescriptorDirectory {
     names: Option<std::vec::IntoIter<PathBytes>>,
 }
 
+/// Hold a destination scan, or with `source` a source scan, before it reads
+/// the directory `relative` names, when tests ask for that directory.
 #[cfg(debug_assertions)]
-fn hold_descriptor_directory_for_test(relative: &[u8]) -> Result<()> {
+fn hold_descriptor_directory_for_test(relative: &[u8], source: bool) -> Result<()> {
     use std::os::unix::ffi::OsStrExt as _;
 
-    let Some(expected) = std::env::var_os("SYQ_TEST_HOLD_DESTINATION_SCAN_DIRECTORY") else {
+    let side = if source { "SOURCE" } else { "DESTINATION" };
+    let Some(expected) = std::env::var_os(format!("SYQ_TEST_HOLD_{side}_SCAN_DIRECTORY")) else {
         return Ok(());
     };
     if expected.as_os_str().as_bytes() != relative {
         return Ok(());
     }
     crate::fsops::test_race_barrier(
-        "SYQ_TEST_DESTINATION_SCAN_DIRECTORY_READY_FILE",
-        "SYQ_TEST_DESTINATION_SCAN_DIRECTORY_CONTINUE_FILE",
-        "destination directory scan",
+        &format!("SYQ_TEST_{side}_SCAN_DIRECTORY_READY_FILE"),
+        &format!("SYQ_TEST_{side}_SCAN_DIRECTORY_CONTINUE_FILE"),
+        "directory scan",
     )
 }
 
 #[cfg(not(debug_assertions))]
-fn hold_descriptor_directory_for_test(_relative: &[u8]) -> Result<()> {
+fn hold_descriptor_directory_for_test(_relative: &[u8], _source: bool) -> Result<()> {
     Ok(())
 }
 
@@ -198,8 +201,11 @@ impl DescriptorScan<'_> {
         retain: usize,
         parallel_stats: bool,
     ) -> Result<DirectoryStep> {
-        if directory.names.is_none() && self.hold_destination_for_test {
-            hold_descriptor_directory_for_test(&directory.relative)?;
+        if directory.names.is_none() {
+            hold_descriptor_directory_for_test(
+                &directory.relative,
+                !self.hold_destination_for_test,
+            )?;
         }
         let rooted_directory = RelativePath::new(&join(self.scan_root, &directory.relative))?;
         let opened = match directory.opened.take() {
