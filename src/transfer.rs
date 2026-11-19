@@ -3414,6 +3414,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         fast_batch_files,
                         batch_budget: WorkBudget::default(),
                         range_budget: None,
+                        setup_latency: None,
                         comparison: Default::default(),
                         setup_elapsed: t0.elapsed(),
                         publications: Default::default(),
