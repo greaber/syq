@@ -64,11 +64,6 @@ trace=${SYQ_REAL_SSH_TRACE_FILE:-/tmp/syq-real-ssh-ssh.trace}
 # Append fields so positional readers of the existing columns remain valid.
 printf 'phase=start\tpid=%s\thost=%s\tcontrol_master=%s\tcontrol_path=%s\tcontrol_socket=%s\tstrict_mux=%s\treturn_receiver=%s\tentry_key=%s\tquery=%s\tenrollment=%s\tvia=%s\tjump=%s\n' \
     "$$" "$host" "$control_master" "$control_path" "$control_socket" "$strict_mux" "$return_receiver" "$entry_key" "$query" "$enrollment" "$via" "$jump" >>"$trace"
-# The route test slows this machine's reading of the destination's SSH
-# configuration, so that approving a copy takes a while.
-if [ "$query" = yes ] && [ "$host" = destination ] && [ -f /tmp/syq-real-ssh-slow-config ]; then
-    sleep 10
-fi
 # Every connection to an enrolled receiver uses its entry key. The copy's
 # control connects first and its workers after it, so while the route test
 # blocks workers, the first of these connections passes and the rest fail.
