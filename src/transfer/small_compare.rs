@@ -89,7 +89,7 @@ const _: () = assert!(crate::proto::MAX_HASH_BLOCK_BYTES <= UNACKNOWLEDGED_PIECE
 /// still owed for requests sent before it began, such as a deferred
 /// publication's check or finalize, or the connection's setup.
 const OWED_REPLIES: usize = COMPARE_WINDOW;
-const _: () = assert!(super::publication::DEFERRED_PUBLICATIONS + 1 <= OWED_REPLIES);
+const _: () = assert!(super::publication::DEFERRED_PUBLICATIONS < OWED_REPLIES);
 
 /// Pieces and reads a stream may have awaiting replies on a connection whose
 /// reader queues `queue` replies: the queue less the room for replies still
