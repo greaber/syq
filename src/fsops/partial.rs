@@ -2833,7 +2833,7 @@ impl FsOps {
         }
     }
 
-    /// Free the kept buffer once this connection's range reads are done.
+    /// Free the kept buffer while this connection reads no ranges.
     pub(crate) fn release_read_buffer(&mut self) {
         self.read_buffer = None;
     }

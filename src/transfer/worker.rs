@@ -244,8 +244,10 @@ impl Worker {
     pub(super) fn run_inner(&mut self) -> Result<()> {
         loop {
             if !self.gate.allowed(self.id) {
-                // A parked worker keeps no publication waiting.
+                // A parked worker keeps no publication waiting, nor a range
+                // read buffer.
                 self.settle_between_items(true)?;
+                self.src.release_read_buffer();
                 let _parked = self
                     .observation
                     .as_ref()
@@ -869,6 +871,8 @@ impl Worker {
         mut next_group: impl FnMut(WorkSize) -> Option<std::ops::Range<usize>>,
         results: &mut [Option<SmallPutOutcome>],
     ) -> Result<()> {
+        // Small files are read whole, never into a kept range buffer.
+        self.src.release_read_buffer();
         let mut early = self.dst.track_small_batches(self.progress.clone())?;
         let window = crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH;
         let mut read_window = if self.src.supports_request_pipelining() {
@@ -2926,7 +2930,6 @@ impl Worker {
             result.and(source_end).and(destination_end)
         };
         self.range_budget = Some(budget);
-        self.src.release_read_buffer();
         *credited += flights[0].as_ref().expect("primary share").credited;
         for flight in flights.into_iter().skip(1).flatten() {
             if result.is_err() && self.transport_dead() {
@@ -3052,7 +3055,6 @@ impl Worker {
             }
             Ok(())
         })();
-        self.src.release_read_buffer();
         if result
             .as_ref()
             .is_err_and(|error| error.is::<RangeReplyMismatch>())

@@ -78,7 +78,7 @@ pub trait Conn: Send {
     /// Give back a range read's buffer once its bytes were sent, for a
     /// source that reads ranges in this process to reuse.
     fn reuse_read_buffer(&mut self, _buffer: Vec<u8>) {}
-    /// Free a buffer kept by `reuse_read_buffer` when range reads end.
+    /// Free a buffer kept by `reuse_read_buffer` once range reads pause.
     fn release_read_buffer(&mut self) {}
     fn recv(&mut self) -> Result<Response>;
     /// Arrival timestamp excludes time a reply spent queued behind other
