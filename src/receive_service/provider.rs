@@ -1056,10 +1056,13 @@ fn start(domain: &Domain) -> Result<()> {
     }
     command.stdin(Stdio::null()).stderr(Stdio::null());
     crate::destination::ssh::persistent::protect_keeper_inheritance(&mut command)?;
-    let (provider, mut startup) =
-        crate::process::spawn_detached(command, crate::process::Detach::Session, false)
-            .context("start local SSH authorization provider")?;
-    startup.set_read_timeout(Some(STOP_TIMEOUT))?;
+    let (provider, mut startup) = crate::process::spawn_detached(
+        command,
+        crate::process::Detach::Session,
+        false,
+        Some(STOP_TIMEOUT),
+    )
+    .context("start local SSH authorization provider")?;
     let result: Result<std::result::Result<(), String>> =
         crate::destination::read_message(&mut startup);
     if let Ok(Ok(())) = result {

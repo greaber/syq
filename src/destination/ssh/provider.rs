@@ -587,7 +587,7 @@ fn launch_keeper(
         });
     }
     let (keeper, mut parent) =
-        crate::process::spawn_detached(command, crate::process::Detach::Group, true)?;
+        crate::process::spawn_detached(command, crate::process::Detach::Group, true, None)?;
     write_message(
         &mut parent,
         &Startup {

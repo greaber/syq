@@ -958,7 +958,7 @@ fn start(domain: &Domain, request: SessionRequest, plan: resolution::Plan) -> Re
     // The reader below sees the keeper's end close when the keeper is
     // stopped, which ends an interrupted wait.
     let (keeper, mut parent) =
-        crate::process::spawn_detached(command, crate::process::Detach::Group, true)?;
+        crate::process::spawn_detached(command, crate::process::Detach::Group, true, None)?;
     super::super::write_message(&mut parent, &startup)?;
     let (sender, receiver) = std::sync::mpsc::sync_channel(2);
     let reader = std::thread::spawn(move || loop {

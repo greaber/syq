@@ -339,15 +339,20 @@ pub(crate) enum Detach {
 /// Start `command`, this build in an internal mode, detached as `detach`
 /// says, with the other end of the returned socket pair as its standard
 /// output and, with `input`, its standard input: the child reads what it
-/// is to do there and answers when it is ready. Dropping the group kills
-/// it; `ProcessGroup::detach` leaves it running once it is ready.
+/// is to do there and answers when it is ready. Reads from it wait up to
+/// `read_timeout`, set before the child starts: macOS refuses to set a
+/// timeout on a socket whose other end has closed, as it has once a child
+/// that failed has exited. Dropping the group kills it;
+/// `ProcessGroup::detach` leaves it running once it is ready.
 pub(crate) fn spawn_detached(
     mut command: Command,
     detach: Detach,
     input: bool,
+    read_timeout: Option<std::time::Duration>,
 ) -> std::io::Result<(group::ProcessGroup, std::os::unix::net::UnixStream)> {
     use std::os::fd::OwnedFd;
     let (parent, child) = with_inheritance_guard(std::os::unix::net::UnixStream::pair)?;
+    parent.set_read_timeout(read_timeout)?;
     if input {
         command.stdin(Stdio::from(OwnedFd::from(child.try_clone()?)));
     }
@@ -638,11 +643,14 @@ mod group_tests {
     fn a_detached_child_that_ends_without_answering_is_noticed_at_once() {
         for detach in [super::Detach::Session, super::Detach::Group] {
             let started = Instant::now();
-            let (mut child, mut channel) =
-                super::spawn_detached(Command::new("true"), detach, true).unwrap();
-            channel
-                .set_read_timeout(Some(Duration::from_secs(30)))
-                .unwrap();
+            // The read limit is set before the child can have exited.
+            let (mut child, mut channel) = super::spawn_detached(
+                Command::new("true"),
+                detach,
+                true,
+                Some(Duration::from_secs(30)),
+            )
+            .unwrap();
             let mut byte = [0u8];
             assert_eq!(std::io::Read::read(&mut channel, &mut byte).unwrap(), 0);
             assert!(started.elapsed() < Duration::from_secs(10));
@@ -661,7 +669,7 @@ mod group_tests {
         ] {
             let mut command = Command::new("sh");
             command.args(["-c", "sleep 600 & echo $!; wait"]);
-            let (child, channel) = super::spawn_detached(command, detach, false).unwrap();
+            let (child, channel) = super::spawn_detached(command, detach, false, None).unwrap();
             let pid = child.child.id() as libc::pid_t;
             let mut line = String::new();
             std::io::BufRead::read_line(&mut std::io::BufReader::new(&channel), &mut line).unwrap();
@@ -691,7 +699,7 @@ mod group_tests {
         let mut command = Command::new("sh");
         command.args(["-c", "read line; exit 0"]);
         let (child, mut channel) =
-            super::spawn_detached(command, super::Detach::Group, true).unwrap();
+            super::spawn_detached(command, super::Detach::Group, true, None).unwrap();
         let pid = child.child.id() as libc::pid_t;
         child.detach();
         assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
