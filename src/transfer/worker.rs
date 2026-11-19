@@ -1176,6 +1176,9 @@ impl Worker {
         let mut start = 0;
         let mut bytes = 0u64;
         let mut path_bytes = 0usize;
+        // What the files' failures could add to the reply: each names its
+        // destination, so a group of long paths holds fewer files.
+        let mut replies = crate::proto::SmallFileReplies::default();
         for (i, job) in jobs.iter().enumerate() {
             let source_bytes = source_request_bytes(&job.src, Some(&job.source));
             let file_bytes = job.entry.size.saturating_add(
@@ -1195,15 +1198,21 @@ impl Worker {
                         .min(crate::proto::MAX_READ_BYTES)
                         .min(first_limit.bytes)
                     || path_bytes.saturating_add(source_bytes) > SOURCE_BATCH_PATH_BYTES
-                    || i - start >= group_files.min(first_limit.files))
+                    || i - start >= group_files.min(first_limit.files)
+                    || !replies.fits(
+                        jobs[start..i].iter().map(|job| job.dst.as_slice()),
+                        &job.dst,
+                    ))
             {
                 groups.push(start..i);
                 start = i;
                 bytes = 0;
                 path_bytes = 0;
+                replies.start();
             }
             bytes += file_bytes;
             path_bytes = path_bytes.saturating_add(source_bytes);
+            replies.add(&job.dst);
         }
         if start < jobs.len() {
             groups.push(start..jobs.len());

@@ -390,16 +390,25 @@ impl Worker {
         let mut outcomes: Vec<Option<Compared>> = (0..jobs.len()).map(|_| None).collect();
         let mut unissued = std::collections::VecDeque::new();
         let (_, group_bytes) = self.compare_group_limits();
+        // A group also ends before its files' failures, each naming its
+        // destination, could overfill a reply.
         let (mut start, mut bytes) = (0, 0u64);
+        let mut replies = crate::proto::SmallFileReplies::default();
         for (i, job) in jobs.iter().enumerate() {
             if i > start
                 && (i - start >= COMPARE_GROUP_FILES
-                    || bytes.saturating_add(job.entry.size) > group_bytes)
+                    || bytes.saturating_add(job.entry.size) > group_bytes
+                    || !replies.fits(
+                        jobs[start..i].iter().map(|job| job.dst.as_slice()),
+                        &job.dst,
+                    ))
             {
                 unissued.push_back((start..i).collect::<Vec<_>>());
                 (start, bytes) = (i, 0);
+                replies.start();
             }
             bytes += job.entry.size;
+            replies.add(&job.dst);
         }
         if start < jobs.len() {
             unissued.push_back((start..jobs.len()).collect());
