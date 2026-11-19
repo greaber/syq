@@ -412,7 +412,7 @@ fn interrupted_partial_from(args: &[&str], dir: &Path, cwd: Option<&Path>) -> Pa
             eprintln!("waiting for the stopped partial copy's process group to exit: {running}");
             next_progress += std::time::Duration::from_secs(1);
         }
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert!(
         stopped_early.is_none(),
@@ -426,7 +426,8 @@ fn interrupted_partial_from(args: &[&str], dir: &Path, cwd: Option<&Path>) -> Pa
 
 /// The members of process group `group` that have not exited, by PID and
 /// state, or None when there are none. An exited member that nobody has
-/// reaped yet, as a container's PID 1 may leave it, holds no files.
+/// reaped yet, as a container's PID 1 may leave it, holds no files; one whose
+/// main thread has exited holds them until its last thread has.
 #[cfg(debug_assertions)]
 fn live_group_members(group: i32) -> Option<String> {
     if unsafe { libc::kill(-group, 0) } != 0 {
@@ -434,22 +435,31 @@ fn live_group_members(group: i32) -> Option<String> {
     }
     #[cfg(target_os = "linux")]
     {
+        // After the command name: state, parent and process group.
+        let fields = |stat: &Path| -> Option<(String, String)> {
+            let stat = fs::read_to_string(stat).ok()?;
+            let mut fields = stat.rsplit_once(") ")?.1.split_whitespace();
+            let state = fields.next()?.to_owned();
+            Some((state, fields.nth(1)?.to_owned()))
+        };
+        let group = group.to_string();
         let mut live = Vec::new();
         for entry in fs::read_dir("/proc").unwrap().flatten() {
-            let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            let Some((state, member_group)) = fields(&entry.path().join("stat")) else {
                 continue;
             };
-            // After the command name: state, parent and process group.
-            let Some((_, fields)) = stat.rsplit_once(") ") else {
+            if member_group != group {
                 continue;
-            };
-            let fields: Vec<&str> = fields.split_whitespace().collect();
-            if fields.get(2) == Some(&group.to_string().as_str()) && fields[0] != "Z" {
-                live.push(format!(
-                    "{} {}",
-                    entry.file_name().to_string_lossy(),
-                    fields[0]
-                ));
+            }
+            let threads = fs::read_dir(entry.path().join("task"))
+                .into_iter()
+                .flatten();
+            if threads
+                .flatten()
+                .filter_map(|thread| fields(&thread.path().join("stat")))
+                .any(|(state, _)| state != "Z")
+            {
+                live.push(format!("{} {state}", entry.file_name().to_string_lossy()));
             }
         }
         (!live.is_empty()).then(|| live.join(", "))
