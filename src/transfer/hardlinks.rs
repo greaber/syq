@@ -286,11 +286,9 @@ impl Planner<'_> {
                         condition => condition,
                     },
                     meta: self.opts.metadata_for(&leaf.dst_rel, &leaf.e),
-                    flags: self
-                        .opts
-                        .metadata_fix_flags(&leaf.dst_rel, &leaf.e, &destination)
-                        | self.opts.ownership_flags(&leaf.dst_rel)
-                        | flags::REPORT_IDENTITY,
+                    // Its metadata matches (`keeps_representative`): none
+                    // of it needs fixing.
+                    flags: self.opts.ownership_flags(&leaf.dst_rel) | flags::REPORT_IDENTITY,
                 },
                 dst_rel: leaf.dst_rel.clone(),
                 kind: DeclaredKind::File,
@@ -353,7 +351,6 @@ impl Planner<'_> {
     fn keeps_representative(&mut self, leaf: &Planned, destination: &Entry) -> bool {
         // A preview changes nothing.
         !self.opts.dry_run
-            && self.opts.mapping_metadata.is_empty()
             && destination.kind == Kind::File
             && self.opts.keeps_matching_file(&leaf.dst_rel)
             && !self.opts.protects_existing_contents()
