@@ -5599,6 +5599,18 @@ fn differing_jobs(
     root: &std::path::Path,
     files: &[(&str, usize, std::ops::Range<usize>)],
 ) -> Arc<Sched> {
+    let files: Vec<_> = files
+        .iter()
+        .map(|(name, len, changed)| (*name, *len, vec![changed.clone()]))
+        .collect();
+    edited_jobs(root, &files)
+}
+
+/// `differing_jobs` for sources that rewrite several ranges.
+fn edited_jobs(
+    root: &std::path::Path,
+    files: &[(&str, usize, Vec<std::ops::Range<usize>>)],
+) -> Arc<Sched> {
     use std::os::unix::fs::MetadataExt;
     for directory in ["source", "target"] {
         std::fs::create_dir_all(root.join(directory)).unwrap();
@@ -5607,7 +5619,9 @@ fn differing_jobs(
     for (n, (name, len, changed)) in files.iter().enumerate() {
         let old: Vec<u8> = (0..*len).map(|i| ((i * 7 + n) % 251) as u8).collect();
         let mut new = old.clone();
-        new[changed.clone()].fill(n as u8 + 1);
+        for changed in changed {
+            new[changed.clone()].fill(n as u8 + 1);
+        }
         let (source, target) = (
             root.join("source").join(name),
             root.join("target").join(name),
@@ -6249,6 +6263,501 @@ fn an_aborted_copy_sends_nothing_further_for_groups_in_flight() {
     assert_eq!(published, 1);
     // The patch already sent settled its file, which counts.
     assert_eq!(worker.progress.files_done.load(Relaxed), 1);
+}
+
+/// A destination that serves each request as it is sent but, as a remote
+/// one, holds its replies until they are asked for, within a reply queue of
+/// `queue`. It records the most streamed patch pieces, and piece bytes, that
+/// awaited acknowledgment at once, and calls `sent` with each piece's count.
+struct HoldingDestination<F> {
+    ops: crate::fsops::FsOps,
+    queue: usize,
+    replies: std::collections::VecDeque<(Response, usize)>,
+    most: Arc<Mutex<(usize, usize)>>,
+    pieces: usize,
+    sent: F,
+    /// Refuse every streamed begin, as a receiver's grant can.
+    refuse_begin: bool,
+    /// Replies still owed when a stream begins, for requests sent before,
+    /// as a deferred publication's are: they wait ahead of the begin's
+    /// reply, and are taken before the next reply, as a connection takes
+    /// them.
+    owed_at_begin: usize,
+    owed: usize,
+}
+
+impl<F: FnMut(usize) + Send> Conn for HoldingDestination<F> {
+    fn send(&mut self, request: Request) -> Result<()> {
+        let piece = match &request {
+            Request::PatchData { data, .. } => data.len(),
+            _ => 0,
+        };
+        if let Request::PatchBegin { .. } = request {
+            let owed = std::mem::take(&mut self.owed_at_begin);
+            self.replies.extend((0..owed).map(|_| (Response::Ok, 0)));
+            self.owed += owed;
+        }
+        let reply = match request {
+            Request::PatchBegin { .. } if self.refuse_begin => {
+                Response::Err("refused by the grant".into())
+            }
+            request => self.ops.handle(&request),
+        };
+        self.replies.push_back((reply, piece));
+        assert!(self.replies.len() <= self.queue, "reply queue overrun");
+        let pieces = self.replies.iter().filter(|(_, len)| *len > 0).count();
+        let bytes = self.replies.iter().map(|(_, len)| len).sum();
+        let mut most = self.most.lock().unwrap();
+        *most = (most.0.max(pieces), most.1.max(bytes));
+        drop(most);
+        if piece > 0 {
+            self.pieces += 1;
+            (self.sent)(self.pieces);
+        }
+        Ok(())
+    }
+    fn recv(&mut self) -> Result<Response> {
+        for _ in 0..std::mem::take(&mut self.owed) {
+            self.replies.pop_front();
+        }
+        self.replies
+            .pop_front()
+            .map(|(reply, _)| reply)
+            .ok_or_else(|| anyhow::anyhow!("missing reply"))
+    }
+    fn reply_queue(&self) -> Option<usize> {
+        Some(self.queue)
+    }
+    fn scan(
+        &mut self,
+        _: &[u8],
+        _: Option<&RegisteredPath>,
+        _: bool,
+        _: &[String],
+        _: bool,
+        _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
+        _: &mut dyn FnMut(crate::proto::ScanWarning),
+    ) -> Result<u64> {
+        unreachable!()
+    }
+    fn native_remove(
+        &mut self,
+        _: Option<&[u8]>,
+        _: Option<&[u8]>,
+        _: &[NativeRemoveSelection],
+        _: bool,
+        _: bool,
+        _: usize,
+        _: &mut dyn FnMut(Vec<String>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
+    ) -> Result<()> {
+        unreachable!()
+    }
+}
+
+/// A remote source, which queues its replies within a reply queue of
+/// `COMPARE_REQUESTS`, as a worker connection's does.
+struct WideSource(QueuingSource);
+
+impl Conn for WideSource {
+    fn send(&mut self, request: Request) -> Result<()> {
+        self.0.send(request)
+    }
+    fn recv(&mut self) -> Result<Response> {
+        self.0.recv()
+    }
+    fn reply_queue(&self) -> Option<usize> {
+        Some(crate::transfer_tuning::COMPARE_REQUESTS)
+    }
+    fn scan(
+        &mut self,
+        _: &[u8],
+        _: Option<&RegisteredPath>,
+        _: bool,
+        _: &[String],
+        _: bool,
+        _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
+        _: &mut dyn FnMut(crate::proto::ScanWarning),
+    ) -> Result<u64> {
+        unreachable!()
+    }
+    fn native_remove(
+        &mut self,
+        _: Option<&[u8]>,
+        _: Option<&[u8]>,
+        _: &[NativeRemoveSelection],
+        _: bool,
+        _: bool,
+        _: usize,
+        _: &mut dyn FnMut(Vec<String>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
+    ) -> Result<()> {
+        unreachable!()
+    }
+}
+
+/// A remote source whose reader, as a connection's does, holds room in the
+/// process's decoded-message allowance for each reply from when it arrives
+/// until it is taken. A reply that does not fit fails, and so does every
+/// later one, as the reader stops.
+struct BudgetedSource {
+    inner: QueuingSource,
+    holds: std::collections::VecDeque<std::io::Result<crate::wire_budget::Budgeted<Response>>>,
+    failed: bool,
+}
+
+impl Conn for BudgetedSource {
+    fn send(&mut self, request: Request) -> Result<()> {
+        self.inner.send(request)?;
+        let reply = postcard::to_stdvec(self.inner.replies.back().expect("a reply")).unwrap();
+        self.holds
+            .push_back(crate::wire_budget::decode::<Response>(&reply));
+        Ok(())
+    }
+    fn recv(&mut self) -> Result<Response> {
+        let hold = self.holds.pop_front().context("missing reply")?;
+        anyhow::ensure!(!self.failed, "the reader stopped");
+        if let Err(error) = hold {
+            self.failed = true;
+            return Err(error.into());
+        }
+        self.inner.recv()
+    }
+    fn reply_queue(&self) -> Option<usize> {
+        Some(crate::transfer_tuning::COMPARE_REQUESTS)
+    }
+    fn is_dead(&self) -> bool {
+        self.failed
+    }
+    fn scan(
+        &mut self,
+        _: &[u8],
+        _: Option<&RegisteredPath>,
+        _: bool,
+        _: &[String],
+        _: bool,
+        _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
+        _: &mut dyn FnMut(crate::proto::ScanWarning),
+    ) -> Result<u64> {
+        unreachable!()
+    }
+    fn native_remove(
+        &mut self,
+        _: Option<&[u8]>,
+        _: Option<&[u8]>,
+        _: &[NativeRemoveSelection],
+        _: bool,
+        _: bool,
+        _: usize,
+        _: &mut dyn FnMut(Vec<String>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
+    ) -> Result<()> {
+        unreachable!()
+    }
+}
+
+/// How `stream_into_holding_destination` streams.
+#[derive(Clone, Copy, Default)]
+struct Holding {
+    /// Read from a remote source (`WideSource`) rather than an in-process
+    /// one.
+    remote_source: bool,
+    /// Read from a remote source whose replies hold room in the
+    /// decoded-message allowance (`BudgetedSource`).
+    budgeted_source: bool,
+    /// Stream to a command-restricted receiver.
+    restricted: bool,
+    /// The receiver refuses every streamed begin.
+    refuse_begin: bool,
+    /// Replies the destination still owes for requests sent before the
+    /// stream began.
+    owed: usize,
+}
+
+/// What `stream_into_holding_destination` observed: the most pieces and
+/// piece bytes that awaited acknowledgment at once, the most source reads
+/// and read data that awaited the worker at once, and the pieces sent.
+struct Held {
+    pieces: usize,
+    bytes: usize,
+    reads: usize,
+    read_data: usize,
+    sent: usize,
+}
+
+/// Stream `files`' patches into a destination that holds its replies in a
+/// queue of `COMPARE_REQUESTS`, calling `sent` with each piece's count.
+fn stream_into_holding_destination(
+    root: &std::path::Path,
+    files: &[(&str, usize, Vec<std::ops::Range<usize>>)],
+    how: Holding,
+    sent: impl FnMut(&Sched, usize) + Send + 'static,
+) -> (Arc<Sched>, Worker, Held) {
+    let sched = edited_jobs(root, files);
+    let unused = Arc::new(Mutex::new(PipelineState::default()));
+    let mut worker = pipeline_worker(&sched, &unused, &unused, true);
+    let reads = Arc::new(Mutex::new((0, 0)));
+    let source = QueuingSource {
+        ops: crate::fsops::FsOps::new(),
+        replies: Default::default(),
+        in_process: !(how.remote_source || how.budgeted_source),
+        most: reads.clone(),
+    };
+    worker.src = if how.budgeted_source {
+        Box::new(BudgetedSource {
+            inner: source,
+            holds: Default::default(),
+            failed: false,
+        })
+    } else if how.remote_source {
+        Box::new(WideSource(source))
+    } else {
+        Box::new(source)
+    };
+    let most = Arc::new(Mutex::new((0, 0)));
+    let pieces = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut sent = sent;
+    let (aborting, counted) = (sched.clone(), pieces.clone());
+    worker.dst = Box::new(HoldingDestination {
+        ops: crate::fsops::FsOps::test_destination(&root.join("target")),
+        queue: crate::transfer_tuning::COMPARE_REQUESTS,
+        replies: Default::default(),
+        most: most.clone(),
+        pieces: 0,
+        sent: move |pieces| {
+            counted.store(pieces, Relaxed);
+            sent(&aborting, pieces)
+        },
+        refuse_begin: how.refuse_begin,
+        owed_at_begin: how.owed,
+        owed: 0,
+    });
+    worker.fast_batch_files = files.len();
+    let opts = Arc::get_mut(&mut worker.opts).unwrap();
+    opts.block = 1 << 20;
+    opts.restricted_receiver = how.restricted;
+    worker.process_item(sched.next()).unwrap();
+    let (most, reads) = (*most.lock().unwrap(), *reads.lock().unwrap());
+    let held = Held {
+        pieces: most.0,
+        bytes: most.1,
+        reads: reads.0,
+        read_data: reads.1,
+        sent: pieces.load(Relaxed),
+    };
+    (sched, worker, held)
+}
+
+/// Every other 64 KiB block of the first `len` bytes.
+fn scattered_blocks(len: usize) -> Vec<std::ops::Range<usize>> {
+    (0..len)
+        .step_by(128 << 10)
+        .map(|start| start..start + (64 << 10))
+        .collect()
+}
+
+#[test]
+fn a_streamed_patch_of_single_block_pieces_keeps_its_reply_queue_of_them_in_flight() {
+    // 20 MiB of scattered blocks differ, which streams as 320 pieces of one
+    // block each. The destination's reply queue, less room for replies
+    // still owed, and not a count of sixteen, limits the pieces awaiting
+    // acknowledgment, and a remote source's
+    // reply queue and the read-ahead buffer the reads awaiting the worker.
+    for remote_source in [false, true] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
+        let how = Holding {
+            remote_source,
+            ..Holding::default()
+        };
+        let (sched, worker, held) = stream_into_holding_destination(root, &files, how, |_, _| {});
+        let case = format!("remote_source={remote_source}");
+        assert!(!sched.is_aborted());
+        assert_eq!(
+            read(root, "source/file"),
+            read(root, "target/file"),
+            "{case}"
+        );
+        assert_eq!(worker.progress.files_done.load(Relaxed), 1, "{case}");
+        assert_eq!(worker.progress.bytes_done.load(Relaxed), 20 << 20, "{case}");
+        if remote_source {
+            // Pieces follow the source's reads.
+            assert!(held.pieces > 16, "{case}: {} pieces", held.pieces);
+            // Reads beyond sixteen within 2 MiB of read-ahead, and one
+            // piece more.
+            assert!(held.reads > 16, "{case}: {} reads", held.reads);
+            assert!(
+                held.read_data <= (2 << 20) + (64 << 10),
+                "{case}: {} bytes",
+                held.read_data
+            );
+        } else {
+            // The reply queue less the room it keeps for replies still owed.
+            assert_eq!((held.pieces, held.bytes), (240, 15 << 20), "{case}");
+            assert_eq!(held.reads, 1, "{case}");
+        }
+    }
+}
+
+#[test]
+fn a_streamed_patchs_unacknowledged_pieces_stay_within_their_byte_bound() {
+    // Two rewritten files of 40 MiB, streamed one after another in 4 MiB
+    // pieces: 80 MiB, more than may await acknowledgment at once, although
+    // the reply queue would take all twenty pieces.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let rewritten = vec![std::ops::Range {
+        start: 0,
+        end: 40 << 20,
+    }];
+    let files = [
+        ("first", 40 << 20, rewritten.clone()),
+        ("second", 40 << 20, rewritten),
+    ];
+    let (_, worker, held) =
+        stream_into_holding_destination(root, &files, Holding::default(), |_, _| {});
+    for (name, ..) in &files {
+        assert_eq!(
+            read(root, &format!("source/{name}")),
+            read(root, &format!("target/{name}")),
+            "{name}"
+        );
+    }
+    assert_eq!(worker.progress.files_done.load(Relaxed), 2);
+    assert_eq!((held.pieces, held.bytes), (16, 64 << 20));
+}
+
+#[test]
+fn an_aborted_copy_takes_every_reply_of_a_wide_patch_stream() {
+    // The copy is aborted, as by a fatal error elsewhere, once some of 320
+    // single-block pieces were sent: no further piece is sent, every reply
+    // in flight is taken, and the patch is not published. A remote source
+    // has further pieces read by then, which are not sent; after 300 pieces
+    // it has been sent every read and the recheck.
+    for (remote_source, abort_at) in [(false, 100), (true, 100), (true, 300)] {
+        let case = format!("remote_source={remote_source} abort_at={abort_at}");
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
+        let how = Holding {
+            remote_source,
+            ..Holding::default()
+        };
+        let (sched, mut worker, held) =
+            stream_into_holding_destination(root, &files, how, move |sched, pieces| {
+                if pieces == abort_at {
+                    sched.abort();
+                }
+            });
+        assert!(sched.is_aborted());
+        assert_eq!(held.sent, abort_at, "{case}");
+        if !remote_source {
+            assert_eq!(held.pieces, abort_at, "{case}");
+        }
+        assert!(
+            worker.dst.recv().is_err(),
+            "{case}: a reply was left unread"
+        );
+        assert!(worker.src.recv().is_err(), "{case}: a read was left unread");
+        assert_ne!(
+            read(root, "source/file"),
+            read(root, "target/file"),
+            "{case}"
+        );
+        assert_eq!(worker.progress.files_done.load(Relaxed), 0, "{case}");
+        assert_eq!(worker.progress.bytes_done.load(Relaxed), 0, "{case}");
+    }
+}
+
+// Holds the process's own allowance: run in a process of its own, as nextest
+// does.
+#[test]
+fn a_wide_patch_stream_cannot_use_up_the_decoded_message_allowance() {
+    // A stream of 320 single-block pieces from a remote source has more
+    // than sixteen of its reads' replies queued at once. Other connections'
+    // messages hold all but 1 MiB of the process's decoded-message
+    // allowance, as those of many workers can. Each queued reply holds what
+    // it is counted for, about 1 KiB, so the stream stays wide and the copy
+    // completes; at 64 KiB a reply, 16 of them would have used up what is
+    // left.
+    let others = postcard::to_stdvec(&vec![
+        0u64;
+        (crate::wire_budget::MEMORY_LIMIT - (1 << 20)) / 64 - 1
+    ])
+    .unwrap();
+    let _others = crate::wire_budget::decode::<Vec<u64>>(&others).unwrap();
+    let how = Holding {
+        budgeted_source: true,
+        ..Holding::default()
+    };
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
+    let (_, worker, held) = stream_into_holding_destination(root, &files, how, |_, _| {});
+    assert_eq!(read(root, "source/file"), read(root, "target/file"));
+    assert_eq!(worker.progress.files_done.load(Relaxed), 1);
+    assert!(held.reads > 16, "{} reads", held.reads);
+}
+
+#[test]
+fn a_patch_stream_leaves_room_for_replies_still_owed() {
+    // A worker can begin a stream with replies still owed on its
+    // connection, as for its deferred publications and its setup. The
+    // stream's pieces and those replies together never fill more than the
+    // destination's reply queue.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
+    let how = Holding {
+        owed: super::publication::DEFERRED_PUBLICATIONS + 1,
+        ..Holding::default()
+    };
+    let (_, worker, held) = stream_into_holding_destination(root, &files, how, |_, _| {});
+    assert_eq!(read(root, "source/file"), read(root, "target/file"));
+    assert_eq!(worker.progress.files_done.load(Relaxed), 1);
+    assert!(
+        held.pieces > crate::transfer_tuning::COMPARE_WINDOW,
+        "{} pieces",
+        held.pieces
+    );
+}
+
+#[test]
+fn a_restricted_receiver_gets_few_pieces_before_it_answers_a_streamed_begin() {
+    // A command-restricted receiver records each piece that reaches it after
+    // it refused the patch's begin. Until the begin is answered, at most
+    // fifteen pieces follow it; once it is accepted, the window widens.
+    for refuse_begin in [true, false] {
+        let case = format!("refuse_begin={refuse_begin}");
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
+        let how = Holding {
+            restricted: true,
+            refuse_begin,
+            ..Holding::default()
+        };
+        let (_, worker, held) = stream_into_holding_destination(root, &files, how, |_, _| {});
+        if refuse_begin {
+            assert_eq!(
+                held.sent,
+                crate::transfer_tuning::COMPARE_WINDOW - 1,
+                "{case}"
+            );
+            assert_eq!(worker.progress.files_done.load(Relaxed), 0, "{case}");
+        } else {
+            assert_eq!(held.pieces, 240, "{case}");
+            assert_eq!(
+                read(root, "source/file"),
+                read(root, "target/file"),
+                "{case}"
+            );
+        }
+    }
 }
 
 /// A connection that fails, and stays dead, as a dropped one does: at its
