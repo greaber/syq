@@ -76,7 +76,7 @@ where
             || -> Result<()> {
                 if !whole_hashes.is_empty() {
                     let mut read = open(size)?;
-                    let mut buffer = vec![0; 1024 * 1024];
+                    let mut buffer = crate::s3::file_body::scratch();
                     let mut offset = 0;
                     while offset < size {
                         let length = (size - offset).min(buffer.len() as u64) as usize;
@@ -96,7 +96,7 @@ where
     } else {
         let mut read = open(size)?;
         let mut parts = Vec::new();
-        let mut buffer = vec![0; 1024 * 1024];
+        let mut buffer = crate::s3::file_body::scratch();
         for index in 0..size.div_ceil(part_size).max(1) {
             let mut hash = native.hasher();
             let mut offset = index * part_size;
@@ -172,7 +172,9 @@ where
             let mut read = open(end)?;
             let mut native = native.hasher();
             let mut subtrees = Vec::new();
-            let mut buffer = vec![0; part_size.min(1024 * 1024) as usize];
+            let mut buffer = crate::s3::file_body::scratch();
+            let length = buffer.len().min(part_size as usize);
+            let buffer = &mut buffer[..length];
             let mut offset = start;
             while offset < end {
                 let subtree_start = offset;

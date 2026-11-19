@@ -144,7 +144,7 @@ pub(super) fn hash_file_as(
     algorithm: crate::hashing::HashAlgorithm,
 ) -> Result<String> {
     let mut hasher = algorithm.hasher();
-    let mut buffer = vec![0; 1024 * 1024];
+    let mut buffer = super::file_body::scratch();
     let mut total = 0u64;
     loop {
         let n = file.read(&mut buffer)?;
@@ -659,7 +659,8 @@ impl CreationPermissions {
 /// an unchanged file. Returns false, having changed nothing, when the
 /// receiver cannot vouch for changing its metadata in place
 /// (`fsops::vouch`): the object is then downloaded to replace it. A
-/// `preview` only says which.
+/// `preview` only says which. A kept file is kept through the receiver's
+/// routine (`fsops::keep`).
 pub(super) fn keep_unchanged_file(
     root: &Root,
     path: &RelativePath,
@@ -689,13 +690,28 @@ pub(super) fn keep_unchanged_file(
         label: &label,
         preview,
     };
-    if !crate::fsops::vouch::allows(place, &file, &current, &meta, flags)? {
-        return Ok(false);
+    if preview {
+        return crate::fsops::vouch::allows(place, &file, &current, &meta, flags);
     }
-    if !preview {
-        crate::fsops::set_meta_file(&file, &meta, flags)?;
-    }
-    Ok(true)
+    use crate::fsops::keep;
+    let keeping = keep::Keeping {
+        handle: keep::Handle::Open,
+        // The S3 keep does not look the name up again after setting the
+        // metadata: that would cost each kept file a lookup on the rerun path.
+        recheck_any: false,
+        setting: None,
+    };
+    Ok(matches!(
+        keep::keep_existing(
+            place,
+            &file,
+            &current,
+            (&meta, flags),
+            crate::proto::TargetCondition::Any,
+            keeping,
+        )?,
+        keep::Keep::Kept(_)
+    ))
 }
 
 /// Give the directory at `path` its marker's `metadata` through a handle

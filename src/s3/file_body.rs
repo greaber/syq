@@ -60,6 +60,28 @@ impl Pool {
     }
 }
 
+/// A whole pooled chunk to read a file through, for a pass that hashes it
+/// rather than sending it: dropping it returns the buffer to the pool that
+/// upload bodies use, so hashing reuses their buffers rather than
+/// allocating and zeroing a new one for every file or part.
+pub(super) struct Scratch(Buffer);
+
+/// A [`Scratch`] buffer of 1 MiB.
+pub(super) fn scratch() -> Scratch {
+    Scratch(POOL.take())
+}
+impl std::ops::Deref for Scratch {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0.buffer
+    }
+}
+impl std::ops::DerefMut for Scratch {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.0.buffer
+    }
+}
+
 /// A chunk's bytes. Dropping it, wherever that happens, returns a pooled
 /// buffer to its pool.
 struct Buffer {

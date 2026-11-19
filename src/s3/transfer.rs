@@ -3448,7 +3448,7 @@ impl Engine {
             .await
             .map_err(|e| e.into_service_error())?;
         let mut body = output.body.into_async_read();
-        let mut buffer = vec![0; 1024 * 1024];
+        let mut buffer = super::file_body::scratch();
         let mut hash = algorithm.hasher();
         let mut n = 0;
         loop {
@@ -3555,7 +3555,7 @@ async fn content_md5(
     tokio::task::spawn_blocking(move || {
         let file = source.open()?;
         let mut hash = Algorithm::Md5.hasher().unwrap();
-        let mut buffer = vec![0; length.clamp(1, 1024 * 1024) as usize];
+        let mut buffer = super::file_body::scratch();
         let mut done = 0;
         while done < length {
             let n = buffer.len().min((length - done) as usize);
@@ -3570,7 +3570,7 @@ async fn content_md5(
 }
 
 fn hash_range(file: &File, offset: u64, length: u64, algorithm: HashAlgorithm) -> Result<String> {
-    let mut buffer = vec![0; 1024 * 1024];
+    let mut buffer = super::file_body::scratch();
     let mut done = 0;
     let mut hash = algorithm.hasher();
     while done < length {
@@ -3582,8 +3582,6 @@ fn hash_range(file: &File, offset: u64, length: u64, algorithm: HashAlgorithm) -
     Ok(Digest::from_hash(algorithm, &hash.finalize()).value)
 }
 
-/// The bytes a seeded part is hashed in at a time, by each thread.
-const SEED_HASH_CHUNK: usize = 1 << 20;
 /// The most threads seeding a new partial.
 const SEED_THREADS: usize = 4;
 
@@ -3620,7 +3618,7 @@ fn seed_download_parts(
         .clamp(1, SEED_THREADS)
         .min(parts.len().max(1));
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let seed_part = |buffer: &mut Vec<u8>, index: u64, hash: &String| -> Result<Option<String>> {
+    let seed_part = |buffer: &mut [u8], index: u64, hash: &String| -> Result<Option<String>> {
         let offset = index * part_size;
         let length = part_size.min(size - offset);
         if !cloned {
@@ -3650,10 +3648,12 @@ fn seed_download_parts(
         let workers: Vec<_> = (0..threads)
             .map(|_| {
                 scope.spawn(|| -> Result<Vec<(u64, String)>> {
-                    let mut buffer = vec![0; SEED_HASH_CHUNK.min(part_size as usize)];
+                    let mut scratch = super::file_body::scratch();
+                    let length = scratch.len().min(part_size as usize);
+                    let buffer = &mut scratch[..length];
                     let mut kept = Vec::new();
                     while let Some(&(index, hash)) = parts.get(next.fetch_add(1, Relaxed)) {
-                        if let Some(hash) = seed_part(&mut buffer, index, hash)? {
+                        if let Some(hash) = seed_part(buffer, index, hash)? {
                             kept.push((index, hash));
                         }
                     }
@@ -3717,7 +3717,7 @@ fn holds_digests(file: &std::fs::File, digests: &[Digest]) -> Result<bool> {
         }
     }
     let mut hashers: Vec<_> = algorithms.iter().map(|a| a.hasher()).collect();
-    let mut buffer = vec![0; 1 << 20];
+    let mut buffer = super::file_body::scratch();
     let mut offset = 0;
     loop {
         let count = match file.read_at(&mut buffer, offset) {
