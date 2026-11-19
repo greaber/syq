@@ -615,7 +615,7 @@ fn hardlink_events(t: &Tmp) -> (usize, usize, Vec<(usize, usize)>) {
             "kept" => kept += 1,
             "replaced" => replaced += 1,
             // Counted by the tests that expect them.
-            "worker" | "copied" | "retried" | "failed" => {}
+            "worker" | "copied" | "retried" | "failed" | "check" => {}
             "link" => requests.push((
                 words.next().unwrap().parse().unwrap(),
                 words.next().unwrap().parse().unwrap(),
@@ -895,9 +895,9 @@ fn a_kept_representative_whose_named_source_vanishes_fails_alone() {
 
 #[cfg(debug_assertions)]
 #[test]
-fn a_mapped_representative_given_to_a_worker_keeps_its_source_name() {
+fn a_mapped_representative_whose_source_vanishes_is_reported_with_its_source_name() {
     // A mapping copies `alpha` to `stored`. The kept representative's
-    // source vanishes during the copy, so a worker reports it, naming the
+    // source vanishes during the copy, and its failure names the
     // manifest's source.
     let t = Tmp::new();
     write(&t.path("src/alpha"), b"payload");
@@ -1307,4 +1307,77 @@ fn a_source_whose_mode_changes_between_its_names_leaves_the_existing_file_alone(
         );
         assert!(!t.path("dst/later/nested/b").exists());
     }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn kept_representatives_of_separately_named_sources_are_checked_together() {
+    // Each named source is planned in a batch of its own; the checks of
+    // the representatives the planner keeps wait for none of them, and go
+    // together once planning ends.
+    let t = Tmp::new();
+    for name in ["a", "b", "c"] {
+        write(&t.path(&format!("src/{name}")), name.as_bytes());
+        fs::hard_link(
+            t.path(&format!("src/{name}")),
+            t.path(&format!("outside-{name}")),
+        )
+        .unwrap();
+    }
+    let copy = || {
+        let mut command = compat_command();
+        command.args([
+            "-aH",
+            "--no-progress",
+            &t.s("src/a"),
+            &t.s("src/b"),
+            &t.s("src/c"),
+            &t.s("dst/"),
+        ]);
+        let _ = fs::remove_file(t.path("hardlink-events"));
+        command.env("SYQ_TEST_HARDLINK_EVENTS", t.path("hardlink-events"));
+        command
+    };
+    assert_output_ok(&copy().run().unwrap());
+    assert_output_ok(&copy().run().unwrap());
+    let events = fs::read_to_string(t.path("hardlink-events")).unwrap();
+    assert_eq!(
+        events
+            .lines()
+            .filter(|line| line.starts_with("check"))
+            .collect::<Vec<_>>(),
+        ["check 3"],
+        "{events}"
+    );
+    assert_eq!(events.matches("kept").count(), 3, "{events}");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_kept_representative_whose_source_vanished_is_not_handed_on() {
+    // The source of a kept representative is gone when the planner checks
+    // it again. It fails there: given to a worker as the scan found it, a
+    // file that then took its name with the same size and time would be
+    // kept.
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"first");
+    fs::hard_link(t.path("src/a"), t.path("outside")).unwrap();
+    run_ok(&["-aH", &t.s("src/"), &t.s("dst/")]);
+    let (child, continuation) = held_at_recheck(&t, copy_recording_hardlinks(&t, &[], false));
+    fs::rename(t.path("src/a"), t.path("moved")).unwrap();
+    release_confinement_barrier(&continuation);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    assert!(
+        stderr_of(&output).contains("source changed during transfer (or vanished)"),
+        "{}",
+        stderr_of(&output)
+    );
+    let events = fs::read_to_string(t.path("hardlink-events")).unwrap();
+    assert!(
+        events.contains("kept") && events.contains("failed"),
+        "{events}"
+    );
+    assert!(!events.contains("worker"), "{events}");
+    assert_eq!(read(&t.path("dst/a")), b"first");
 }

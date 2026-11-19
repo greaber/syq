@@ -32,12 +32,15 @@ struct Group {
     followers: Vec<Follower>,
 }
 
-/// An existing representative whose size and time match its source: its
-/// metadata and owner are checked with its batch's other metadata fixes
-/// (`Planner::flush_meta_fixes`), as a worker would check them one file at
-/// a time. One the receiver will not keep is copied by a worker instead.
+/// An existing representative whose size and time match its source, and
+/// whose metadata needs no change: once planning ends, it is checked with
+/// the others (`Planner::check_kept_representatives`), as a worker would
+/// check it by itself. One the receiver will not keep is copied by a worker
+/// instead.
 struct Kept {
     leaf: Planned,
+    /// What its check holds the existing file to.
+    condition: TargetCondition,
     /// The existing file, as the lookup found it.
     destination: Entry,
     /// Its identity once the receiver has accepted it: what the group's
@@ -143,7 +146,6 @@ impl Planner<'_> {
         leaf: Planned,
         destination: Option<Entry>,
         target_condition: TargetCondition,
-        leaf_ops: &mut LeafOps,
     ) {
         let identity = (leaf.e.dev, leaf.e.ino);
         let condition = self.leaf_condition_for(&leaf.dst, destination.as_ref());
@@ -275,33 +277,16 @@ impl Planner<'_> {
                 .fetch_add(leaf.e.size, Relaxed);
             self.progress.add_unchanged_file_bytes(leaf.e.size);
             let group = self.hardlinks.groups.len();
-            // As `Worker::try_expected_match` asks of a representative: its
-            // metadata reconciled, the inode the lookup found, and an owner
-            // the receiver accepts for a file to get new names (`vouch`).
-            leaf_ops.meta_fixes.push(MetaFix {
-                op: Op::SetFileMetaIfSame {
-                    path: leaf.dst.clone(),
-                    condition: match target_condition {
-                        TargetCondition::Any => target_identity(&destination),
-                        condition => condition,
-                    },
-                    meta: self.opts.metadata_for(&leaf.dst_rel, &leaf.e),
-                    // Its metadata matches (`keeps_representative`): none
-                    // of it needs fixing.
-                    flags: self.opts.ownership_flags(&leaf.dst_rel) | flags::REPORT_IDENTITY,
-                },
-                dst_rel: leaf.dst_rel.clone(),
-                kind: DeclaredKind::File,
-                // Kept with the group instead (`representative_to_worker`).
-                replacement: None,
-                hardlink_group: Some(group),
-            });
             self.hardlinks.by_inode.insert(identity, group);
             self.hardlinks.groups.push(Group {
                 representative: 0,
                 preview: None,
                 kept: Some(Box::new(Kept {
                     leaf,
+                    condition: match target_condition {
+                        TargetCondition::Any => target_identity(&destination),
+                        condition => condition,
+                    },
                     destination,
                     identity: None,
                 })),
@@ -465,7 +450,7 @@ impl Planner<'_> {
     /// Whether `error`, from the receiver's check of the representative of
     /// `group` the planner kept, only shows a destination its existing-file
     /// policy keeps, as for a worker (`Worker::kept_by_policy`).
-    pub(super) fn representative_skipped_by_policy(&self, group: usize, error: &WireError) -> bool {
+    fn representative_skipped_by_policy(&self, group: usize, error: &WireError) -> bool {
         let Some(kept) = &self.hardlinks.groups[group].kept else {
             return false;
         };
@@ -474,9 +459,9 @@ impl Planner<'_> {
             && self.policy_condition(&kept.leaf.dst, condition)
     }
 
-    /// The representative of `group`, which the planner kept, failed, and
-    /// is reported: no name is linked to it.
-    pub(super) fn representative_failed(&mut self, group: usize) {
+    /// The representative of `group`, which the planner kept, failed or
+    /// was skipped, and is reported: no name is linked to it.
+    fn representative_failed(&mut self, group: usize) {
         let Some(kept) = &mut self.hardlinks.groups[group].kept else {
             return;
         };
@@ -487,18 +472,49 @@ impl Planner<'_> {
         self.progress
             .bytes_in_unchanged_files
             .fetch_sub(size, Relaxed);
+        #[cfg(debug_assertions)]
+        let _ = crate::fsops::record_test_event("SYQ_TEST_HARDLINK_EVENTS", format_args!("failed"));
+    }
+
+    /// The receiver's check of the representative of `group` failed with
+    /// `error`: settled as a worker settles it, skipped when its
+    /// existing-file policy keeps the destination, and otherwise reported.
+    fn representative_check_failed(&mut self, group: usize, error: &WireError) {
+        let Some(kept) = &self.hardlinks.groups[group].kept else {
+            return;
+        };
+        let rel = kept.leaf.dst_rel.clone();
+        let skipped = self.representative_skipped_by_policy(group, error);
+        self.representative_failed(group);
+        if skipped {
+            self.progress.files_excluded.fetch_add(1, Relaxed);
+            if !self.opts.quiet {
+                self.progress.eprintln(&format!(
+                    "syq: {}: {}",
+                    display(&rel),
+                    self.opts.kept_note()
+                ));
+            }
+        } else {
+            self.report_metadata_failure(Some(&rel), DeclaredKind::File, error);
+        }
     }
 
     /// The source of the representative of `group`, which the planner kept,
-    /// changed, and it is not copied again: it fails, as a file a worker
-    /// cannot retry does, and no name is linked to it.
-    fn representative_source_changed(&mut self, group: usize) {
+    /// changed, vanished or could not be read (`message`), and it is not
+    /// copied again: it fails, as a file a worker cannot retry does, and no
+    /// name is linked to it.
+    fn representative_source_failed(
+        &mut self,
+        group: usize,
+        message: &str,
+        retryable: &'static str,
+    ) {
         let Some(kept) = &self.hardlinks.groups[group].kept else {
             return;
         };
         let rel = kept.leaf.dst_rel.clone();
         self.representative_failed(group);
-        let message = "source changed during transfer (or vanished)";
         self.progress.entry_error_classified(
             &format!("syq: {}: {message}", display(&rel)),
             Some("io"),
@@ -511,23 +527,92 @@ impl Planner<'_> {
                 src: self.mapping_source_rel(&rel).as_deref(),
                 kind: Some(DeclaredKind::File),
             },
-            "yes",
+            retryable,
             "io",
             None,
             message,
             crate::results::ReceiverListing::Unlisted,
         );
-        #[cfg(debug_assertions)]
-        let _ = crate::fsops::record_test_event("SYQ_TEST_HARDLINK_EVENTS", format_args!("failed"));
     }
 
-    /// Before the workers finish, check the sources of the representatives
-    /// the planner kept as a worker checks a file's source before
-    /// publishing it (`source_changed`). One that changed is copied whole
-    /// by a worker from what its source is now. One whose source vanished,
-    /// or cannot be read, goes to a worker, which reports it. A change this
-    /// does not see, or one after it, is found before linking
-    /// (`same_source`).
+    /// Once planning has ended, and before any worker starts, send the
+    /// checks of the representatives the planner kept: the operation a
+    /// worker sent for each (`Worker::try_expected_match`), with the same
+    /// condition and an owner the receiver accepts for a file to get new
+    /// names (`vouch`, `REPORT_IDENTITY`). Their metadata matches, so none
+    /// of it is changed. They go in requests sized by their replies, sent
+    /// ahead of their replies, rather than one per scan batch.
+    ///
+    /// A representative the receiver will not change in place goes to a
+    /// worker to be replaced, and one a restricted receiver refused with
+    /// its whole request goes to a worker to be asked about by itself.
+    /// Any other failure is settled here (`representative_check_failed`).
+    /// A full destination ends the copy, after each failure has been
+    /// settled here.
+    pub(super) fn check_kept_representatives(&mut self) -> Result<()> {
+        let kept: Vec<usize> = (0..self.hardlinks.groups.len())
+            .filter(|&group| self.hardlinks.groups[group].kept.is_some())
+            .collect();
+        if kept.is_empty() {
+            return Ok(());
+        }
+        self.assert_mutation_root()?;
+        // The files to replace are queued together.
+        let _burst = self.sched.file_burst();
+        for groups in kept.chunks(8192) {
+            let ops = groups
+                .iter()
+                .map(|&group| {
+                    let kept = self.hardlinks.groups[group].kept.as_ref().unwrap();
+                    Op::SetFileMetaIfSame {
+                        path: kept.leaf.dst.clone(),
+                        condition: kept.condition,
+                        meta: self.opts.metadata_for(&kept.leaf.dst_rel, &kept.leaf.e),
+                        // Its metadata matches (`keeps_representative`): none
+                        // of it needs fixing.
+                        flags: self.opts.ownership_flags(&kept.leaf.dst_rel)
+                            | flags::REPORT_IDENTITY,
+                    }
+                })
+                .collect();
+            #[cfg(debug_assertions)]
+            let _ = crate::fsops::record_test_event(
+                "SYQ_TEST_HARDLINK_EVENTS",
+                format_args!("check {}", groups.len()),
+            );
+            let (errors, refused_whole) = self.apply_requests(metadata_requests(ops))?;
+            let capacity_error = first_capacity_error(&errors);
+            for ((&group, error), whole) in groups.iter().zip(errors).zip(refused_whole) {
+                match error {
+                    None => self.representative_kept(group),
+                    Some(error)
+                        if capacity_error.is_none()
+                            && (whole || crate::fsops::vouch::is_replace_required_wire(&error)) =>
+                    {
+                        self.representative_to_worker(
+                            group,
+                            crate::fsops::vouch::replace_reason_wire(&error),
+                        )
+                    }
+                    Some(error) => self.representative_check_failed(group, &error),
+                }
+            }
+            if let Some(error) = capacity_error {
+                return Err(endpoint_error(error)).context("apply destination changes");
+            }
+        }
+        Ok(())
+    }
+
+    /// Before any worker starts, check the sources of the representatives
+    /// the receiver kept as a worker checks a file's source before
+    /// publishing it (`source_changed`). One that changed is retried by a
+    /// worker from what its source is now (`requeue_representative`); one
+    /// held to its scanned destination, or whose source vanished or cannot
+    /// be read, fails here. A change this does not see, or one after it, is
+    /// found before linking (`same_source`). The requests are bounded by
+    /// the scanned entries they ask about, which hold any ACLs and extended
+    /// attributes copied, as their replies do.
     pub(super) fn recheck_kept_representatives(&mut self, source: &mut dyn Conn) -> Result<()> {
         #[cfg(debug_assertions)]
         crate::fsops::test_race_barrier(
@@ -545,7 +630,22 @@ impl Planner<'_> {
             .collect();
         // The files to copy again are queued together.
         let _burst = self.sched.file_burst();
-        for groups in kept.chunks(4096) {
+        let mut rest = &kept[..];
+        while !rest.is_empty() {
+            let mut bytes = 0usize;
+            let len = rest
+                .iter()
+                .take(4096)
+                .position(|&group| {
+                    let leaf = self.hardlinks.kept_leaf(group);
+                    bytes = bytes
+                        .saturating_add(source_request_bytes(&leaf.src, Some(&leaf.source)))
+                        .saturating_add(leaf.e.size_hint());
+                    bytes > SOURCE_BATCH_PATH_BYTES
+                })
+                .map_or(rest.len().min(4096), |index| index.max(1));
+            let (groups, later) = rest.split_at(len);
+            rest = later;
             self.recheck_representatives(source, groups)?;
         }
         Ok(())
@@ -553,7 +653,7 @@ impl Planner<'_> {
 
     /// `recheck_kept_representatives` for `groups`, in one request. If it
     /// fails for one of them, as for a named source that vanished, each
-    /// half is asked again, so that only that one goes to a worker.
+    /// half is asked again, so that only that one fails.
     fn recheck_representatives(&mut self, source: &mut dyn Conn, groups: &[usize]) -> Result<()> {
         let (paths, references): (Vec<_>, Vec<_>) = groups
             .iter()
@@ -571,8 +671,8 @@ impl Planner<'_> {
                 self.recheck_representatives(source, first)?;
                 return self.recheck_representatives(source, second);
             }
-            Err(_) => {
-                self.representative_to_worker(groups[0], None);
+            Err(error) => {
+                self.representative_source_failed(groups[0], &format!("{error:#}"), "unknown");
                 return Ok(());
             }
         };
@@ -588,10 +688,15 @@ impl Planner<'_> {
                 // (`leaf_condition_for`), so one held to the file the scan
                 // found, as under `--existing`, is not copied again once
                 // that file has been kept, as a worker does not either.
-                Some(_) if held => self.representative_source_changed(group),
-                Some(now) => self.requeue_representative(group, None, Some(now)),
-                // A source that vanished is reported by the worker.
-                None => self.representative_to_worker(group, None),
+                Some(now) if !held => self.requeue_representative(group, None, Some(now)),
+                // One that vanished is not handed on as the scan found it:
+                // a file that took its place with the same size and time
+                // would be kept.
+                _ => self.representative_source_failed(
+                    group,
+                    "source changed during transfer (or vanished)",
+                    "yes",
+                ),
             }
         }
         Ok(())

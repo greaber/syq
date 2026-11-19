@@ -2232,7 +2232,6 @@ impl Planner<'_> {
                 },
                 dst_entry,
                 target_condition,
-                leaf_ops,
             );
             return;
         }
@@ -2295,7 +2294,6 @@ impl Planner<'_> {
                             entry: e,
                             destination: d.clone(),
                         })),
-                        hardlink_group: None,
                     });
                     return;
                 }
@@ -3675,98 +3673,20 @@ impl Planner<'_> {
         if meta_fixes.is_empty() {
             return Ok(());
         }
-        let unzip = |fixes: Vec<MetaFix>| -> (Vec<Op>, Vec<_>) {
-            fixes
-                .into_iter()
-                .map(|fix| {
-                    (
-                        fix.op,
-                        (fix.dst_rel, fix.kind, fix.replacement, fix.hardlink_group),
-                    )
-                })
-                .unzip()
-        };
-        let (errors, refused_whole, entries) =
-            if !meta_fixes.iter().any(|fix| fix.hardlink_group.is_some()) {
-                let (ops, entries) = unzip(meta_fixes);
-                let errors = self.apply(ops)?;
-                let refused_whole = vec![false; errors.len()];
-                (errors, refused_whole, entries)
-            } else {
-                let (representatives, ordinary): (Vec<_>, Vec<_>) = meta_fixes
-                    .into_iter()
-                    .partition(|fix| fix.hardlink_group.is_some());
-                // Hard-link representatives' checks, many operations that each
-                // used to go alone, are sized by their replies, and the batch's
-                // requests sent ahead of their replies. A restricted receiver
-                // refuses a request whole, and a representative refused with
-                // others goes to a worker, which asks again by itself, where an
-                // ordinary file would fail: there they go in requests of their
-                // own.
-                let (mut ops, mut entries) = unzip(ordinary);
-                let (representative_ops, representative_entries) = unzip(representatives);
-                let requests = if self.opts.restricted_receiver {
-                    let mut requests = if ops.is_empty() {
-                        Vec::new()
-                    } else {
-                        request_sized(ops)
-                    };
-                    requests.extend(metadata_requests(representative_ops));
-                    requests
-                } else {
-                    ops.extend(representative_ops);
-                    metadata_requests(ops)
-                };
-                entries.extend(representative_entries);
-                let (errors, refused_whole) = self.apply_requests(requests)?;
-                (errors, refused_whole, entries)
-            };
+        let (ops, entries): (Vec<_>, Vec<_>) = meta_fixes
+            .into_iter()
+            .map(|fix| (fix.op, (fix.dst_rel, fix.kind, fix.replacement)))
+            .unzip();
+        let errors = self.apply(ops)?;
         let capacity_error = first_capacity_error(&errors);
         // The files to replace are queued together, after the reply.
         let _burst = self.sched.file_burst();
-        for (((dst, kind, replacement, hardlink_group), error), whole) in
-            entries.into_iter().zip(errors).zip(refused_whole)
-        {
-            match (error, replacement, hardlink_group) {
-                (None, _, Some(group)) => self.representative_kept(group),
-                (None, _, None) => {}
-                // A hard-link representative the receiver will not change in
-                // place goes to a worker to be replaced, and one refused with
-                // its whole request by a restricted receiver goes to a worker
-                // to be asked about again by itself, unless a full
-                // destination ends the copy after this batch.
-                (Some(error), _, Some(group))
-                    if capacity_error.is_none()
-                        && (whole || crate::fsops::vouch::is_replace_required_wire(&error)) =>
-                {
-                    self.representative_to_worker(
-                        group,
-                        crate::fsops::vouch::replace_reason_wire(&error),
-                    )
-                }
-                // Any other outcome is settled now, as a worker settles it:
-                // skipped when its existing-file policy keeps the
-                // destination, and otherwise reported. A later batch's full
-                // destination could end the copy before a worker reported it.
-                (Some(error), _, Some(group)) => {
-                    let skipped = self.representative_skipped_by_policy(group, &error);
-                    self.representative_failed(group);
-                    if skipped {
-                        self.progress.files_excluded.fetch_add(1, Relaxed);
-                        if !self.opts.quiet {
-                            self.progress.eprintln(&format!(
-                                "syq: {}: {}",
-                                display(&dst),
-                                self.opts.kept_note()
-                            ));
-                        }
-                    } else {
-                        self.report_metadata_failure(Some(&dst), kind, &error);
-                    }
-                }
+        for ((dst, kind, replacement), error) in entries.into_iter().zip(errors) {
+            match (error, replacement) {
+                (None, _) => {}
                 // The receiver will not change this file's metadata in
                 // place: it is copied as a changed file and replaced.
-                (Some(error), Some(replacement), None)
+                (Some(error), Some(replacement))
                     if crate::fsops::vouch::is_replace_required_wire(&error) =>
                 {
                     let reason = crate::fsops::vouch::replace_reason_wire(&error);
@@ -3793,7 +3713,7 @@ impl Planner<'_> {
                         (reason, false, false),
                     );
                 }
-                (Some(error), _, None) => self.report_metadata_failure(Some(&dst), kind, &error),
+                (Some(error), _) => self.report_metadata_failure(Some(&dst), kind, &error),
             }
         }
         if let Some(error) = capacity_error {
@@ -3802,7 +3722,12 @@ impl Planner<'_> {
         Ok(())
     }
 
-    fn report_metadata_failure(&self, dst: Option<&[u8]>, kind: DeclaredKind, error: &WireError) {
+    pub(super) fn report_metadata_failure(
+        &self,
+        dst: Option<&[u8]>,
+        kind: DeclaredKind,
+        error: &WireError,
+    ) {
         let os_kind = wire_os_kind(error);
         // The receiver's reply to a metadata change.
         let listing = crate::results::ReceiverListing::Listed;
@@ -5287,7 +5212,7 @@ impl Planner<'_> {
     /// lets wait (`directory_stream::REQUESTS_IN_FLIGHT`): the receiver runs
     /// them in the order sent. After a failure nothing more is sent, and the
     /// replies to those already sent are taken.
-    fn apply_requests(
+    pub(super) fn apply_requests(
         &mut self,
         requests: Vec<Vec<Op>>,
     ) -> Result<(Vec<Option<WireError>>, Vec<bool>)> {
@@ -6371,29 +6296,26 @@ pub(super) fn implicit_dir_entry(path: PathBytes) -> Entry {
 /// Each entry of `names` owns two consecutive entries of `ops`: the creation
 /// and then its metadata.
 #[derive(Default)]
-pub(super) struct LeafOps {
+struct LeafOps {
     ops: Vec<Op>,
     names: Vec<QueuedLeafOp>,
     // Metadata-only operations retain the same retry identity as content copies.
-    pub(super) meta_fixes: Vec<MetaFix>,
+    meta_fixes: Vec<MetaFix>,
 }
 
 /// A metadata-only change to an existing destination entry.
-pub(super) struct MetaFix {
-    pub(super) op: Op,
-    pub(super) dst_rel: PathBytes,
-    pub(super) kind: DeclaredKind,
+struct MetaFix {
+    op: Op,
+    dst_rel: PathBytes,
+    kind: DeclaredKind,
     /// How to copy a file the receiver will not change in place instead.
-    pub(super) replacement: Option<Box<Replacement>>,
-    /// The hard-link group whose representative this is, kept by the
-    /// planner (`Planner::keeps_representative`).
-    pub(super) hardlink_group: Option<usize>,
+    replacement: Option<Box<Replacement>>,
 }
 
 /// A planned file copy, kept for a file planned to keep its contents in case
 /// the receiver will not change its metadata in place: it is then copied and
 /// replaced (`fsops::vouch`).
-pub(super) struct Replacement {
+struct Replacement {
     source: (PathBytes, RegisteredPath),
     dst: PathBytes,
     rel: String,

@@ -5206,7 +5206,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
             scan_err = Some(error);
         }
         if scan_err.is_none() && !st.collision && opts.hardlinks && !opts.dry_run {
-            if let Err(error) = st.recheck_kept_representatives(&mut *src_ctl) {
+            if let Err(error) = st
+                .check_kept_representatives()
+                .and_then(|()| st.recheck_kept_representatives(&mut *src_ctl))
+            {
                 scan_err = Some(error);
             }
         }
