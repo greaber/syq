@@ -16,7 +16,7 @@
 //! the ordinary OpenSSH prompt or warning.
 
 use crate::descriptor_broker::{receive_message, send_message};
-use crate::lock_file::{LockFile, PROBE_GRACE};
+use crate::lock_file::LockFile;
 use crate::process::CommandExt as _;
 use crate::proto::{ConnectionRole, FrameWriter};
 use anyhow::{bail, Context, Result};
@@ -25,10 +25,9 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::process::CommandExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -110,39 +109,13 @@ fn suffixed(path: &Path, suffix: &[u8]) -> PathBuf {
 /// cannot race each other's sockets. Every caller tolerates a briefly stale
 /// answer: `ensure` is best effort and `stop` waits.
 pub(crate) fn is_running(control: &Path) -> bool {
-    LockFile::is_held(&lock_path(control)).unwrap_or(false)
+    crate::service::is_running(&lock_path(control)).unwrap_or(false)
 }
 
 /// Take the lock for a starting pool, or None when another pool has it.
-/// The start retries for [`PROBE_GRACE`], so that a concurrent
-/// `is_running` cannot make it exit as a duplicate. A pool that exits
-/// removes its lock file before releasing it, so a start that waited may
-/// get the lock on a removed file: it then opens the file now named.
+/// A pool removes its lock file as it exits (`PoolLock`).
 fn lock_for_start(control: &Path) -> Result<Option<LockFile>> {
-    let path = lock_path(control);
-    let deadline = Instant::now() + PROBE_GRACE;
-    for _ in 0..8 {
-        let lock =
-            LockFile::open(&path, true).with_context(|| format!("open {}", path.display()))?;
-        if !lock
-            .try_exclusive_within(deadline.saturating_duration_since(Instant::now()))
-            .with_context(|| format!("lock {}", path.display()))?
-        {
-            return Ok(None);
-        }
-        let locked = lock.file().metadata()?;
-        match fs::symlink_metadata(&path) {
-            Ok(named) if (named.dev(), named.ino()) == (locked.dev(), locked.ino()) => {
-                return Ok(Some(lock));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| format!("inspect {}", path.display()));
-            }
-        }
-    }
-    Ok(None)
+    crate::service::lock_for_start(&lock_path(control))
 }
 
 /// Start a pool for this endpoint unless one is running. Best effort and
@@ -173,31 +146,19 @@ pub(crate) fn ensure(control: &Path, endpoint: &PoolEndpoint) -> bool {
     if endpoint.ignore_ssh_config {
         command.arg("--no-ssh-config");
     }
-    // SAFETY: setsid takes no arguments, touches no memory, and is safe to
-    // call between fork and exec. It detaches the pool from the terminal so
-    // a Ctrl-C or hangup meant for the command never reaches it.
-    unsafe {
-        command.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    let Ok(mut child) = command.spawn_guarded() else {
+    let Ok(child) = crate::process::new_session(&mut command).spawn_guarded() else {
         return false;
     };
     // The pool outlives this process; reap it only if it exits first.
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
+    crate::process::group::ProcessGroup::leading(child).detach();
     true
 }
 
 /// Take a ready session for `program`, or nothing. Every failure is a
 /// reason to connect directly, never an error for the command.
 pub(crate) fn take(control: &Path, program: &str) -> Option<PooledSession> {
-    let mut stream = UnixStream::connect(socket_path(control)).ok()?;
-    stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT)).ok()?;
-    stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT)).ok()?;
+    let mut stream =
+        crate::service::connect(&socket_path(control), CLIENT_IO_TIMEOUT, false).ok()?;
     let request = ClientRequest {
         identity: crate::identity::build().to_string(),
         program: Some(program.to_string()),
@@ -238,9 +199,7 @@ pub(crate) fn sessions_in_use(control: &Path, timeout: Duration) -> Option<usize
         // A pool that starts meanwhile counts its spare as in use.
         return crate::persistence::mux_clients(control);
     }
-    let mut stream = UnixStream::connect(socket_path(control)).ok()?;
-    stream.set_read_timeout(Some(timeout)).ok()?;
-    stream.set_write_timeout(Some(timeout)).ok()?;
+    let mut stream = crate::service::connect(&socket_path(control), timeout, false).ok()?;
     let request = ClientRequest {
         identity: crate::identity::build().to_string(),
         program: None,
@@ -261,52 +220,35 @@ pub(crate) fn sessions_in_use(control: &Path, timeout: Duration) -> Option<usize
 /// Ask a running pool to exit, wait for it, and remove its files. A pool
 /// that is not running leaves only stale files, which are removed too.
 pub(crate) fn stop(control: &Path) -> Result<()> {
-    let deadline = Instant::now() + STOP_TIMEOUT;
-    let mut requested = false;
-    while is_running(control) {
-        if Instant::now() >= deadline {
-            bail!(
-                "session pool for {} did not exit",
-                control.file_name().unwrap_or_default().to_string_lossy()
-            );
-        }
-        // Startup holds the lock before binding the socket. Retry delivery
-        // within the stop deadline instead of waiting on an unsent request.
-        if !requested {
-            if let Ok(mut stream) = UnixStream::connect(socket_path(control)) {
-                let timeout =
-                    CLIENT_IO_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()));
-                if timeout.is_zero() {
-                    continue;
-                }
-                stream.set_write_timeout(Some(timeout))?;
-                stream.set_read_timeout(Some(timeout))?;
-                let request = ClientRequest {
-                    identity: crate::identity::build().to_string(),
-                    program: None,
-                    exit: true,
-                    in_use: false,
-                };
-                let mut line = serde_json::to_vec(&request)?;
-                line.push(b'\n');
-                if stream.write_all(&line).is_ok() {
-                    // Keep the connection open until the pool consumes the
-                    // request. Closing a queued Unix connection can discard
-                    // its unread data on macOS.
-                    requested = receive_message(&stream, MAX_MESSAGE)
-                        .ok()
-                        .and_then(|(payload, descriptors)| {
-                            if !descriptors.is_empty() {
-                                return None;
-                            }
-                            serde_json::from_slice::<PoolReply>(&payload).ok()
-                        })
-                        .is_some_and(|reply| reply.status == "exiting");
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let ending = crate::service::Ending {
+        lock: lock_path(control),
+        timeout: STOP_TIMEOUT,
+        stuck: format!(
+            "session pool for {} did not exit",
+            control.file_name().unwrap_or_default().to_string_lossy()
+        ),
+        progress: None,
+    };
+    // Startup holds the lock before binding the socket: delivery is retried
+    // within the stop deadline.
+    ending.stop(|left| {
+        let mut stream =
+            crate::service::connect(&socket_path(control), CLIENT_IO_TIMEOUT.min(left), false)?;
+        let request = ClientRequest {
+            identity: crate::identity::build().to_string(),
+            program: None,
+            exit: true,
+            in_use: false,
+        };
+        let mut line = serde_json::to_vec(&request)?;
+        line.push(b'\n');
+        stream.write_all(&line)?;
+        // Keep the connection open until the pool consumes the request.
+        // Closing a queued Unix connection can discard its unread data on
+        // macOS.
+        receive_message(&stream, MAX_MESSAGE)?;
+        Ok(())
+    })?;
     for path in [socket_path(control), lock_path(control)] {
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_dir() => {
@@ -376,9 +318,8 @@ struct Spare {
 struct Pool {
     endpoint: PoolEndpoint,
     control: PathBuf,
-    socket: PathBuf,
-    bound_ino: u64,
-    listener: UnixListener,
+    /// Dropped before the lock, which removes its file after the socket.
+    server: crate::service::Server,
     _lock: PoolLock,
     spares: Vec<Spare>,
     handed: Vec<Child>,
@@ -438,19 +379,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<()> {
     {
         return Ok(());
     }
-    let socket = socket_path(&control);
-    match fs::symlink_metadata(&socket) {
-        Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(&socket)
-            .with_context(|| format!("remove stale session pool socket {}", socket.display()))?,
-        Ok(_) => bail!("unexpected entry at {}", socket.display()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).with_context(|| format!("inspect {}", socket.display())),
-    }
-    let listener =
-        UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
-    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
-    listener.set_nonblocking(true)?;
-    let bound_ino = fs::symlink_metadata(&socket)?.ino();
+    let server = crate::service::Server::bind(&socket_path(&control))?;
     #[cfg(debug_assertions)]
     let idle = std::env::var_os("SYQ_TEST_POOL_IDLE_SECS")
         .and_then(|value| value.to_str()?.parse::<u64>().ok())
@@ -460,9 +389,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<()> {
     let mut pool = Pool {
         endpoint,
         control,
-        socket,
-        bound_ino,
-        listener,
+        server,
         _lock: lock,
         spares: Vec::new(),
         handed: Vec::new(),
@@ -486,33 +413,13 @@ impl Pool {
                 return Ok(());
             }
             // Check child exits during housekeeping without consuming the
-            // hello reply. Darwin does not monitor poll entries with events=0.
-            let mut listener = libc::pollfd {
-                fd: self.listener.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let ready =
-                unsafe { libc::poll(&mut listener, 1, HOUSEKEEPING.as_millis() as libc::c_int) };
-            if ready < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error).context("poll session pool descriptors");
+            // hello reply.
+            if !self.server.wait(Some(HOUSEKEEPING))? {
+                continue;
             }
-            if listener.revents & libc::POLLIN != 0 {
-                loop {
-                    match self.listener.accept() {
-                        Ok((stream, _)) => {
-                            if let Verdict::Exit = self.handle_client(stream) {
-                                return Ok(());
-                            }
-                        }
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                        Err(error) => return Err(error).context("accept session pool client"),
-                    }
+            while let Some(stream) = self.server.accept()? {
+                if let Verdict::Exit = self.handle_client(stream) {
+                    return Ok(());
                 }
             }
         }
@@ -541,9 +448,8 @@ impl Pool {
         }
         // The scope was closed, or someone replaced the socket: nothing that
         // connects there is ours to serve.
-        match fs::symlink_metadata(&self.socket) {
-            Ok(metadata) if metadata.ino() == self.bound_ino => {}
-            _ => return Verdict::Exit,
+        if !self.server.is_bound() {
+            return Verdict::Exit;
         }
         if self.spares.len() < DEPTH && retry_ready(self.last_failure, Instant::now()) {
             match self.open_spare() {
@@ -656,9 +562,6 @@ impl Pool {
 
     fn handle_client(&mut self, mut stream: UnixStream) -> Verdict {
         let _ = stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT));
-        if crate::sys::peer_uid(&stream).ok() != Some(unsafe { libc::geteuid() }) {
-            return Verdict::Continue;
-        }
         let Some(request) = read_request(&mut stream) else {
             return Verdict::Continue;
         };
@@ -750,12 +653,6 @@ impl Pool {
             let _ = spare.child.kill();
             let _ = spare.child.wait();
         }
-        if let Ok(metadata) = fs::symlink_metadata(&self.socket) {
-            if metadata.ino() == self.bound_ino {
-                let _ = fs::remove_file(&self.socket);
-            }
-        }
-        self._lock.remove_path();
     }
 }
 
@@ -818,6 +715,8 @@ fn read_request(stream: &mut UnixStream) -> Option<ClientRequest> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock_file::PROBE_GRACE;
+    use std::os::unix::net::UnixListener;
 
     fn startup_scope() -> tempfile::TempDir {
         let root = tempfile::Builder::new()
@@ -994,8 +893,7 @@ mod tests {
             linux.then_some(1)
         );
         let lock = PoolLock::new(&control, lock_for_start(&control).unwrap().unwrap()).unwrap();
-        let socket = socket_path(&control);
-        let listener = UnixListener::bind(&socket).unwrap();
+        let server = crate::service::Server::bind(&socket_path(&control)).unwrap();
         let mut child = Command::new("sleep")
             .arg("30")
             .stdin(Stdio::piped())
@@ -1027,9 +925,7 @@ mod tests {
                 ignore_ssh_config: true,
             },
             control: control.clone(),
-            bound_ino: fs::symlink_metadata(&socket).unwrap().ino(),
-            socket,
-            listener,
+            server,
             _lock: lock,
             spares: vec![Spare {
                 child,
@@ -1047,7 +943,8 @@ mod tests {
                 let control = control.clone();
                 std::thread::spawn(move || sessions_in_use(&control, CLIENT_IO_TIMEOUT))
             };
-            let (stream, _) = pool.listener.accept().unwrap();
+            assert!(pool.server.wait(Some(CLIENT_IO_TIMEOUT)).unwrap());
+            let stream = pool.server.accept().unwrap().unwrap();
             assert!(matches!(pool.handle_client(stream), Verdict::Continue));
             asking.join().unwrap()
         };
