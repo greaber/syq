@@ -8,7 +8,6 @@
 //! the Ed25519 public key supplied by the release workflow at compile time.
 
 use crate::lock_file::LockFile;
-use crate::process::CommandExt as _;
 use crate::remote_helper::Target;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
@@ -204,13 +203,7 @@ pub(crate) fn register_standalone_install_at(binary: PathBuf) -> Result<()> {
         bail!("source builds must be rebuilt or replaced with a standalone install");
     }
     embedded_public_key()?;
-    let target = Target::local().ok_or_else(|| {
-        anyhow!(
-            "standalone releases do not support {} {}",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        )
-    })?;
+    let target = local_target()?;
     let path = receipt_path_for(&binary)?;
     let receipt = InstallReceipt {
         schema: RECEIPT_SCHEMA,
@@ -220,6 +213,17 @@ pub(crate) fn register_standalone_install_at(binary: PathBuf) -> Result<()> {
         binary,
     };
     write_receipt(&path, &receipt)
+}
+
+/// This host's release target.
+fn local_target() -> Result<Target> {
+    Target::local().ok_or_else(|| {
+        anyhow!(
+            "standalone releases do not support {} {}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })
 }
 
 /// An installation receipt records that this command was already installed. If its
@@ -234,13 +238,10 @@ pub(crate) fn was_standalone_install(binary: &Path) -> Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error).context("inspect previous standalone install receipt"),
     }
-    let bytes = if is_legacy_receipt(&path) {
-        match read_legacy_receipt(&path) {
-            Ok(bytes) => bytes,
-            Err(_) => return Ok(false),
-        }
-    } else {
-        fs::read(&path).context("read previous standalone install receipt")?
+    let bytes = match receipt_bytes(&path) {
+        Ok(bytes) => bytes,
+        Err(_) if is_legacy_receipt(&path) => return Ok(false),
+        Err(error) => return Err(error).context("read previous standalone install receipt"),
     };
     let Ok(receipt) = parse_receipt(&bytes) else {
         return Ok(false);
@@ -668,7 +669,8 @@ fn download_helper(helper: &TrustedCurrentHelper, what: &str) -> Result<Vec<u8>>
         &helper.archive,
         &format!("downloaded {what} archive"),
     )?;
-    let mut binary = Vec::new();
+    // Reserved at the signed size, so the buffer is never copied as it grows.
+    let mut binary = Vec::with_capacity(helper.binary.size as usize + 1);
     GzDecoder::new(archive.as_slice())
         .take(helper.binary.size + 1)
         .read_to_end(&mut binary)
@@ -685,7 +687,16 @@ fn store_helper(store: &Path, path: &Path, binary: &[u8], what: &str) -> Result<
         .parent()
         .ok_or_else(|| anyhow!("the {what} path has no parent directory"))?;
     create_store_directory(store, parent)?;
-    let temporary = TempFile::new(parent, ".bin")?;
+    let temporary = write_sealed(TempFile::new(parent, ".bin")?, binary, what)?;
+    fs::rename(temporary.path(), path)
+        .with_context(|| format!("store verified {what} at {}", path.display()))?;
+    sync_parent(parent)
+}
+
+/// Write `binary` to `temporary`, sync it, and seal it as an executable that
+/// can no longer be written through this process, ready to be renamed into
+/// place.
+fn write_sealed(temporary: TempFile, binary: &[u8], what: &str) -> Result<TempFile> {
     let mut output = temporary.writer()?;
     output
         .write_all(binary)
@@ -694,10 +705,7 @@ fn store_helper(store: &Path, path: &Path, binary: &[u8], what: &str) -> Result<
         .sync_all()
         .with_context(|| format!("sync the {what}"))?;
     drop(output);
-    let temporary = temporary.seal_executable()?;
-    fs::rename(temporary.path(), path)
-        .with_context(|| format!("store verified {what} at {}", path.display()))?;
-    sync_parent(parent)
+    temporary.seal_executable()
 }
 
 /// Create a directory in the binary store. Directories above the store follow
@@ -991,13 +999,7 @@ fn install_release(
     receipt_path: &Path,
     receipt: &mut InstallReceipt,
 ) -> Result<Installed> {
-    let target = Target::local().ok_or_else(|| {
-        anyhow!(
-            "standalone releases do not support {} {}",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        )
-    })?;
+    let target = local_target()?;
     if receipt.target != target.key {
         bail!(
             "standalone install receipt is for {}, but this host is {}",
@@ -1005,21 +1007,25 @@ fn install_release(
             target.key
         );
     }
-    let artifact = release
-        .manifest
-        .artifacts
-        .get(target.key)
-        .ok_or_else(|| anyhow!("release has no artifact for {}", target.key))?;
-    if artifact.binary.name != target.asset {
-        bail!("release artifact name does not match target {}", target.key);
-    }
+    let artifact = helper_from_release(target, release)?;
 
     let executable = canonical_current_exe()?;
     let parent = executable
         .parent()
         .ok_or_else(|| anyhow!("the syq executable has no parent directory"))?;
-    let binary = download_artifact(release, artifact, parent)?;
-    let binary = binary.seal_executable()?;
+    // Beside the executable, so that it can replace it by renaming, and
+    // made before the download, so that a directory it cannot be made in
+    // fails first.
+    let temporary = TempFile::new(parent, ".bin")?;
+    // The downloaded bytes go once they are written, before the probes and
+    // any wait for the directory lock.
+    let binary = write_sealed(
+        temporary,
+        &download_helper(&artifact, SYQ_RELEASE)?,
+        SYQ_RELEASE,
+    )?;
+    // The file that runs and replaces the executable is the one verified.
+    verify_file_as(binary.path(), &artifact.binary, "written syq release")?;
     verify_executable(binary.path(), release)?;
 
     // Updates take turns replacing the executable, and each replaces only
@@ -1092,6 +1098,21 @@ fn locking_unsupported(error: &std::io::Error) -> bool {
     })
 }
 
+/// Run `executable` with `argument` alone, as `what`, within 10 seconds
+/// and 4 KiB of output.
+fn probe(executable: &Path, what: &str, argument: &str) -> std::io::Result<std::process::Output> {
+    crate::process::capture_output_bounded(
+        what,
+        Command::new(executable)
+            .arg(argument)
+            .env("SYQ_NO_UPDATE_CHECK", "1")
+            .stdin(Stdio::null()),
+        std::time::Instant::now() + Duration::from_secs(10),
+        &|| false,
+        4096,
+    )
+}
+
 /// The version of the syq at `executable` now, if any. Unless another update
 /// has replaced it since this process started, that is this process's own.
 fn installed_version(executable: &Path) -> Result<Option<Version>> {
@@ -1111,17 +1132,7 @@ fn installed_version(executable: &Path) -> Result<Option<Version>> {
             executable.display()
         )
     };
-    let output = crate::process::capture_output_bounded(
-        "version check",
-        Command::new(executable)
-            .arg("--version")
-            .env("SYQ_NO_UPDATE_CHECK", "1")
-            .stdin(Stdio::null()),
-        std::time::Instant::now() + Duration::from_secs(10),
-        &|| false,
-        4096,
-    )
-    .map_err(|_| changed())?;
+    let output = probe(executable, "version check", "--version").map_err(|_| changed())?;
     if !output.status.success() {
         return Err(changed());
     }
@@ -1171,51 +1182,6 @@ pub fn write_manifest_signing_payload(path: &Path) -> Result<()> {
     output
         .flush()
         .context("write release manifest signing payload")
-}
-
-fn download_artifact(
-    release: &VerifiedRelease,
-    artifact: &ReleaseArtifact,
-    parent: &Path,
-) -> Result<TempFile> {
-    let archive = TempFile::new(parent, ".gz")?;
-    let binary = TempFile::new(parent, ".bin")?;
-    let url = format!(
-        "{}/{}/{}",
-        release_downloads(),
-        release.manifest.tag,
-        artifact.archive.name
-    );
-    fetch(
-        &url,
-        &archive,
-        FetchMode::Interactive,
-        artifact.archive.size,
-    )?;
-    verify_file_as(
-        archive.path(),
-        &artifact.archive,
-        "downloaded release archive",
-    )?;
-
-    let input = File::open(archive.path()).context("open downloaded release archive")?;
-    let decoder = GzDecoder::new(BufReader::new(input));
-    let output = binary.writer()?;
-    let mut output = BufWriter::new(output);
-    std::io::copy(&mut decoder.take(artifact.binary.size + 1), &mut output)
-        .context("decompress the syq release executable")?;
-    output.flush().context("flush the syq release executable")?;
-    output
-        .get_ref()
-        .sync_all()
-        .context("sync the syq release executable")?;
-    drop(output);
-    verify_file_as(
-        binary.path(),
-        &artifact.binary,
-        "downloaded release executable",
-    )?;
-    Ok(binary)
 }
 
 fn verify_bytes_as(bytes: &[u8], expected: &ReleaseFile, description: &str) -> Result<()> {
@@ -1271,20 +1237,14 @@ fn verify_file_as(path: &Path, expected: &ReleaseFile, description: &str) -> Res
 }
 
 fn verify_executable(path: &Path, release: &VerifiedRelease) -> Result<()> {
-    let version = Command::new(path)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .capture_output()
-        .context("run the downloaded syq update")?;
+    let version =
+        probe(path, "version check", "--version").context("run the downloaded syq update")?;
     if !version.status.success()
         || String::from_utf8_lossy(&version.stdout).trim() != format!("syq {}", release.version)
     {
         bail!("downloaded executable reports an unexpected version");
     }
-    let identity = Command::new(path)
-        .arg("--build-identity")
-        .stdin(Stdio::null())
-        .capture_output()
+    let identity = probe(path, "build identity check", "--build-identity")
         .context("read the downloaded syq build identity")?;
     if !identity.status.success()
         || String::from_utf8_lossy(&identity.stdout).trim() != release.manifest.tag
@@ -1387,41 +1347,12 @@ fn copy_bounded(source: &mut impl Read, destination: &mut impl Write, limit: u64
     Ok(copied)
 }
 
-/// Download `url` into `destination`, writing at most `limit` bytes. The
-/// caller passes the signed size for an archive and a fixed ceiling for a
-/// manifest, so an unverified response cannot fill the disk before its
-/// signature or digest is checked.
-fn fetch(url: &str, destination: &TempFile, mode: FetchMode, limit: u64) -> Result<()> {
-    let mut sink = destination;
-    fetch_into(url, &mut sink, mode, limit)
-}
-
-/// Download a bounded file into memory.
+/// Download `url` into memory, at most `limit` bytes. The caller passes the
+/// signed size for an archive and a fixed ceiling for a manifest, so an
+/// unverified response cannot grow without bound before its signature or
+/// digest is checked.
 fn fetch_bytes(url: &str, mode: FetchMode, limit: u64) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    fetch_into(url, &mut bytes, mode, limit)?;
-    Ok(bytes)
-}
-
-/// Where a download is written; each attempt starts it over.
-trait DownloadSink {
-    fn restart(&mut self) -> Result<Box<dyn Write + '_>>;
-}
-
-impl DownloadSink for &TempFile {
-    fn restart(&mut self) -> Result<Box<dyn Write + '_>> {
-        Ok(Box::new(BufWriter::new(self.writer()?)))
-    }
-}
-
-impl DownloadSink for Vec<u8> {
-    fn restart(&mut self) -> Result<Box<dyn Write + '_>> {
-        self.clear();
-        Ok(Box::new(self))
-    }
-}
-
-fn fetch_into(url: &str, sink: &mut dyn DownloadSink, mode: FetchMode, limit: u64) -> Result<()> {
     #[cfg(any(test, debug_assertions))]
     if let Some(root) = std::env::var_os("SYQ_TEST_FIXTURES").filter(|value| !value.is_empty()) {
         let name = url
@@ -1429,15 +1360,14 @@ fn fetch_into(url: &str, sink: &mut dyn DownloadSink, mode: FetchMode, limit: u6
             .next()
             .filter(|name| !name.is_empty() && !matches!(*name, "." | ".."))
             .ok_or_else(|| anyhow!("test release URL has no fixture name"))?;
-        let mut output = sink.restart()?;
+        bytes.clear();
         copy_bounded(
             &mut File::open(PathBuf::from(root).join(name))?,
-            &mut output,
+            &mut bytes,
             limit,
         )
         .with_context(|| format!("copy test release fixture {name}"))?;
-        output.flush()?;
-        return Ok(());
+        return Ok(bytes);
     }
 
     // An interactive download may take as long as the connection needs,
@@ -1470,21 +1400,18 @@ fn fetch_into(url: &str, sink: &mut dyn DownloadSink, mode: FetchMode, limit: u6
                 request = request.header("x-syq-target", target);
             }
             let response = request.call().with_context(|| format!("request {url}"))?;
-            let mut output = sink.restart()?;
+            bytes.clear();
             copy_bounded_watched(
                 response.into_body().into_reader(),
-                &mut output,
+                &mut bytes,
                 limit,
                 DOWNLOAD_STALL,
             )
             .with_context(|| format!("download {url}"))?;
-            output
-                .flush()
-                .with_context(|| format!("save download {url}"))?;
             Ok(())
         })();
         match result {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(bytes),
             Err(error) => {
                 let retryable = error.downcast_ref::<DownloadTooLarge>().is_none()
                     && !matches!(
@@ -1528,13 +1455,19 @@ fn managed_receipt() -> Result<(PathBuf, InstallReceipt)> {
 }
 
 fn read_receipt(path: &Path) -> Result<InstallReceipt> {
-    let bytes = if is_legacy_receipt(path) {
-        read_legacy_receipt(path)?
-    } else {
-        fs::read(path).with_context(|| format!("read {}", path.display()))?
-    };
-    parse_receipt(&bytes)
+    parse_receipt(&receipt_bytes(path)?)
         .with_context(|| format!("read standalone install receipt {}", path.display()))
+}
+
+/// The bytes of the receipt at `path`: the one releases before 0.6.0 kept in
+/// the configuration directory, read as `read_legacy_receipt` reads it, or
+/// one beside an executable.
+fn receipt_bytes(path: &Path) -> Result<Vec<u8>> {
+    if is_legacy_receipt(path) {
+        read_legacy_receipt(path)
+    } else {
+        fs::read(path).with_context(|| format!("read {}", path.display()))
+    }
 }
 
 /// The most a receipt may hold; one is a few hundred bytes.
@@ -2255,11 +2188,8 @@ mod tests {
 
     #[test]
     fn release_fetches_reject_plain_http() {
-        let parent = crate::test_support::temp_dir();
-        let destination = TempFile::new(&parent, ".http-test").unwrap();
-        let error = fetch(
+        let error = fetch_bytes(
             "http://127.0.0.1:1/release",
-            &destination,
             FetchMode::BackgroundCheck,
             MAX_MANIFEST_BYTES,
         )

@@ -1,6 +1,6 @@
 use super::*;
 use crate::cli::{Args, Existence, Location, Placement};
-use crate::delegation::{CopyLimits, CopyOptions, CopyPolicy, PublicationPolicy};
+use crate::delegation::{CopyLimits, CopyOptions, CopyPolicy, FilterPolicy, PublicationPolicy};
 use crate::directive::{
     copy_operation, filter_destination_roots, normalize_absolute, validate_restricted_args,
     DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRIES,
@@ -231,7 +231,7 @@ fn signed_tcp_congestion_requires_the_exact_approved_algorithm() {
     assert!(authority
         .authorize(&mut listener(Some("cubic")), true)
         .is_err());
-    authority.tcp_congestion = Some("cubic".into());
+    authority.rules.tcp_congestion = Some("cubic".into());
     assert!(authority.authorize(&mut listener(None), true).is_err());
     assert!(authority
         .authorize(&mut listener(Some("bbr")), true)
@@ -1074,15 +1074,6 @@ pub(super) fn sign_test_directive(
     .unwrap()
 }
 
-/// The rules of a copy for a test authority, approved by no one.
-pub(super) fn test_grant(copy: CopyOperation) -> Grant {
-    Grant {
-        enrollment_id: EnrollmentId::random(),
-        request_id: RequestId::fresh(1_900_000_000).unwrap(),
-        copy,
-    }
-}
-
 /// What the receiver of `config` expects of a directive now.
 fn receiver_context(config: &ReceiverEnrollment) -> delegation::ReceiverContext<'_> {
     delegation::ReceiverContext {
@@ -1802,7 +1793,7 @@ fn a_directive_is_recorded_only_after_every_check_passes() {
     }
 
     config.record_since = Some(issued - 1);
-    let ((grant, _), _) = verify(&state, &config, current, &valid, home).unwrap();
+    let (grant, _) = verify(&state, &config, current, &valid, home).unwrap();
     assert_eq!(grant.copy.destination, b"/backup");
     assert_ne!(recorded(), 0);
     let error = verify(&state, &config, current, &valid, home)
@@ -2140,8 +2131,7 @@ fn receivers_refuse_protected_paths_beneath_a_recursive_destination_only() {
         ConfinedRoot::resolve(named, &protected, false, None).and_then(|confined| {
             RestrictedAuthority::new(
                 confined,
-                test_grant(grant),
-                GrantConstraints::default(),
+                DestinationRules::for_test(grant),
                 [0; 32],
                 generate_results_key(EnrollmentId::random()).unwrap(),
                 Instant::now() + std::time::Duration::from_secs(60),
@@ -2201,8 +2191,7 @@ fn named_entries_are_checked_where_they_really_are() {
         ConfinedRoot::resolve(named, protected, true, None).and_then(|confined| {
             RestrictedAuthority::new(
                 confined,
-                test_grant(grant),
-                GrantConstraints::default(),
+                DestinationRules::for_test(grant),
                 [0; 32],
                 generate_results_key(EnrollmentId::random()).unwrap(),
                 Instant::now() + std::time::Duration::from_secs(60),
@@ -2286,8 +2275,7 @@ fn the_copys_lookups_reuse_the_authoritys_directory_listings() {
     let protected = Vec::new();
     let authority = RestrictedAuthority::new(
         ConfinedRoot::resolve(named, &protected, false, None).unwrap(),
-        test_grant(grant),
-        GrantConstraints::default(),
+        DestinationRules::for_test(grant),
         [0; 32],
         generate_results_key(EnrollmentId::random()).unwrap(),
         Instant::now() + std::time::Duration::from_secs(60),
@@ -2888,7 +2876,7 @@ pub(crate) fn time_preserving_test_authority_of(
     maximum_bytes: u64,
 ) -> RestrictedAuthority {
     let mut authority = test_authority(root, DeletionPolicy::Forbid, maximum_bytes);
-    authority.copy.options.preserve_times = true;
+    authority.rules.copy.options.preserve_times = true;
     authority
 }
 
@@ -2901,8 +2889,8 @@ pub(crate) fn time_preserving_test_authority_for(
     permissions: bool,
 ) -> RestrictedAuthority {
     let mut authority = time_preserving_test_authority_of(root, maximum_bytes);
-    authority.copy.limits.max_entries = entries;
-    authority.copy.options.preserve_permissions = permissions;
+    authority.rules.copy.limits.max_entries = entries;
+    authority.rules.copy.options.preserve_permissions = permissions;
     authority
 }
 
@@ -2920,7 +2908,7 @@ pub(crate) fn keep_test_authority_widening(
         RootExistence::Any,
     )
     .unwrap();
-    authority.extra_options.widen_dirs = approved;
+    authority.rules.copy.options.widen_dirs = approved;
     authority
 }
 
@@ -2935,8 +2923,8 @@ pub(crate) fn in_place_update_test_authority_for(root: &Path, entries: u64) -> R
         FilterPolicy::default(),
         PublicationPolicy::InPlaceUpdate,
     );
-    authority.copy.options.preserve_times = true;
-    authority.copy.limits.max_entries = entries;
+    authority.rules.copy.options.preserve_times = true;
+    authority.rules.copy.limits.max_entries = entries;
     authority
 }
 
@@ -2960,17 +2948,11 @@ fn test_authority_with_policy(
     .unwrap()
 }
 
-/// A grant's results policy naming a fresh recipient, and the recipient's
+/// A fresh recipient key for a grant's results, and the recipient's
 /// secret.
-fn results_policy() -> (
-    crate::destination_results::RecipientSecret,
-    crate::destination_results::ReceiptPolicy,
-) {
+fn results_recipient() -> (crate::destination_results::RecipientSecret, [u8; 32]) {
     let (secret, public) = crate::destination_results::generate_recipient().unwrap();
-    (
-        secret,
-        crate::destination_results::ReceiptPolicy::for_recipient(public),
-    )
+    (secret, public)
 }
 
 /// Start an authority's results, as a coordinator between two servers does
@@ -2983,8 +2965,8 @@ fn start_results(
     crate::destination_results::Reader::new(crate::destination_results::Expectation {
         public_key: authority.results_key.public_key().to_openssh().unwrap(),
         binding: crate::destination_results::Binding {
-            enrollment_id: authority.enrollment_id,
-            request_id: authority.request_id,
+            enrollment_id: authority.rules.enrollment_id,
+            request_id: authority.rules.request_id,
             grant_digest: authority.grant_digest,
         },
         secret,
@@ -3085,7 +3067,7 @@ fn test_authority_with_results(
     existing: ExistingDestinationPolicy,
     placement: DestinationPlacement,
     root_existence: RootExistence,
-    results: Option<(PrivateKey, crate::destination_results::ReceiptPolicy)>,
+    results: Option<(PrivateKey, [u8; 32])>,
 ) -> Result<RestrictedAuthority> {
     test_authority_with_options(
         root,
@@ -3097,12 +3079,21 @@ fn test_authority_with_results(
         placement,
         root_existence,
         results,
-        (Default::default(), &[]),
+        (|_| {}, &[]),
     )
 }
 
-/// `test_authority_with_results` with signed extra copy options and the
-/// receiver's protected paths.
+/// Copy options that follow a destination symlink when `follow` is set.
+fn follow_destination(follow: bool) -> fn(&mut CopyOptions) {
+    if follow {
+        |options| options.follow_dst = true
+    } else {
+        |_| {}
+    }
+}
+
+/// `test_authority_with_results` with its copy options changed by
+/// `options`, and the receiver's protected paths.
 #[allow(clippy::too_many_arguments)]
 fn test_authority_with_options(
     root: &Path,
@@ -3113,8 +3104,8 @@ fn test_authority_with_options(
     existing: ExistingDestinationPolicy,
     placement: DestinationPlacement,
     root_existence: RootExistence,
-    results: Option<(PrivateKey, crate::destination_results::ReceiptPolicy)>,
-    (extra_options, protected): (crate::delegation::ExtraCopyOptions, &[ReceiverControlPath]),
+    results: Option<(PrivateKey, [u8; 32])>,
+    (options, protected): (fn(&mut CopyOptions), &[ReceiverControlPath]),
 ) -> Result<RestrictedAuthority> {
     let id = EnrollmentId::random();
     let confined = ConfinedRoot::held(root, fs::File::open(root)?)?;
@@ -3122,62 +3113,63 @@ fn test_authority_with_options(
     if !filters.ignore.is_empty() && filters.destination_roots.is_empty() {
         filters.destination_roots = vec![destination.as_os_str().as_bytes().to_vec()];
     }
-    let grant = Grant {
-        enrollment_id: id,
-        request_id: RequestId::fresh(1_900_000_000).unwrap(),
-        copy: CopyOperation {
-            destination: destination.as_os_str().as_bytes().to_vec(),
-            mutation_scopes: vec![MutationScope {
-                path: destination.as_os_str().as_bytes().to_vec(),
-                descendants: true,
-            }],
-            policy: CopyPolicy {
-                placement,
-                existing,
-                deletion,
-                publication,
-            },
-            options: CopyOptions {
-                recursive: true,
-                preserve_symlinks: true,
-                preserve_permissions: false,
-                receiver_managed_modes: true,
-                preserve_times: false,
-                preserve_owner: false,
-                preserve_group: false,
-                preserve_devices: false,
-                compare_existing_by_content: false,
-                dry_run: false,
-                compressed_transport: true,
-                tcp_port_lo: 47_600,
-                tcp_port_hi: 47_699,
-            },
-            limits: CopyLimits {
-                max_entries: 8,
-                max_total_bytes: maximum_bytes,
-                max_file_bytes: maximum_bytes,
-                hash_block_bytes: 4 << 20,
-                max_connections: TEST_AUTHORITY_MAX_CONNECTIONS,
-                max_deletions: u64::from(deletion != DeletionPolicy::Forbid) * 2,
-            },
+    let mut copy = CopyOperation {
+        destination: destination.as_os_str().as_bytes().to_vec(),
+        mutation_scopes: vec![MutationScope {
+            path: destination.as_os_str().as_bytes().to_vec(),
+            descendants: true,
+        }],
+        policy: CopyPolicy {
+            placement,
+            existing,
+            deletion,
+            publication,
+        },
+        options: CopyOptions {
+            recursive: true,
+            preserve_symlinks: true,
+            preserve_permissions: false,
+            receiver_managed_modes: true,
+            preserve_times: false,
+            preserve_owner: false,
+            preserve_group: false,
+            preserve_devices: false,
+            dry_run: false,
+            compressed_transport: true,
+            tcp_port_lo: 47_600,
+            tcp_port_hi: 47_699,
+            hardlinks: false,
+            acls: false,
+            xattrs: false,
+            atimes: false,
+            crtimes: false,
+            sparse: false,
+            open_noatime: false,
+            widen_dirs: DirectoryWidening::None,
+            follow_dst: false,
+        },
+        limits: CopyLimits {
+            max_entries: 8,
+            max_total_bytes: maximum_bytes,
+            max_file_bytes: maximum_bytes,
+            hash_block_bytes: 4 << 20,
+            max_connections: TEST_AUTHORITY_MAX_CONNECTIONS,
+            max_deletions: u64::from(deletion != DeletionPolicy::Forbid) * 2,
         },
     };
-    let (results_key, receipt_policy) = match results {
-        Some((key, policy)) => (key, policy),
-        None => (generate_results_key(id)?, results_policy().1),
+    options(&mut copy.options);
+    let (results_key, results_recipient) = match results {
+        Some((key, recipient)) => (key, recipient),
+        None => (generate_results_key(id)?, results_recipient().1),
     };
     RestrictedAuthority::new(
         confined,
-        grant,
-        GrantConstraints {
-            tcp_congestion: None,
-            tcp: crate::delegation::TcpPermission::Encrypted,
-            mapping: None,
-            hashing: None,
+        DestinationRules {
+            enrollment_id: id,
             filters,
             root_existence,
-            receipt_policy,
-            extra_options,
+            results_recipient,
+            ..DestinationRules::for_test(copy)
         },
         [0; 32],
         results_key,
@@ -3289,7 +3281,7 @@ fn receivers_protect_the_syq_a_receiving_service_follows() {
         DestinationPlacement::ExactPath,
         RootExistence::Any,
         None,
-        (Default::default(), &protected),
+        (follow_destination(false), &protected),
     )
     .err()
     .map(|error| format!("{error:#}"));
@@ -3369,7 +3361,7 @@ fn receivers_protect_the_sockets_of_running_copies() {
         DestinationPlacement::ExactPath,
         RootExistence::Any,
         None,
-        (Default::default(), &protected),
+        (follow_destination(false), &protected),
     )
     .err()
     .map(|error| format!("{error:#}"));
@@ -3410,7 +3402,7 @@ fn a_link_where_runtime_state_could_be_protects_nothing() {
             DestinationPlacement::ExactPath,
             RootExistence::Any,
             None,
-            (Default::default(), &protected),
+            (follow_destination(false), &protected),
         )
         .unwrap();
         // A place nothing occupies yet stays protected.
@@ -4731,7 +4723,7 @@ fn restricted_widening_follows_the_approved_mode() {
             RootExistence::Any,
         )
         .unwrap();
-        authority.extra_options.widen_dirs = mode;
+        authority.rules.copy.options.widen_dirs = mode;
         let sub = target.join("sub");
         let allowed = |request: &mut Request| authority.authorize(request, false).is_ok();
         assert_eq!(
@@ -4857,7 +4849,7 @@ fn a_keep_grant_widens_no_existing_directory_of_the_copy() {
             RootExistence::Any,
         )
         .unwrap();
-        authority.extra_options.widen_dirs = approved;
+        authority.rules.copy.options.widen_dirs = approved;
         let mut ops = authority.test_ops();
         let refused = |request: &mut Request| {
             let error = authority.authorize(request, false).unwrap_err();
@@ -4980,7 +4972,7 @@ fn restricted_all_widens_ancestors_beneath_the_confinement_root() {
         .unwrap();
         // A destination deeper than its root, as a download's can be.
         authority.destination = path_bytes(&destination);
-        authority.extra_options.widen_dirs = widen;
+        authority.rules.copy.options.widen_dirs = widen;
         let mut request = prepare(&destination);
         let authorized = authority.authorize(&mut request, false);
         assert_eq!(
@@ -5252,7 +5244,7 @@ fn admit_test_mapping(authority: &mut RestrictedAuthority, destination: &str) {
 "#).into_bytes();
     authority.mapping = Some(Mutex::new(crate::mapping::Admission::new(
         crate::mapping::Authorization::from_contents(&manifest),
-        authority.copy.limits.max_entries,
+        authority.rules.copy.limits.max_entries,
     )));
     let settlement = authority
         .authorize(
@@ -5369,9 +5361,9 @@ fn mapping_parents_reopen_and_restore_receiver_permissions() {
                 RootExistence::Any,
             )
             .unwrap();
-            authority.copy.options.preserve_permissions = preserve;
-            authority.copy.options.receiver_managed_modes = !preserve;
-            authority.extra_options.widen_dirs = DirectoryWidening::Rsync;
+            authority.rules.copy.options.preserve_permissions = preserve;
+            authority.rules.copy.options.receiver_managed_modes = !preserve;
+            authority.rules.copy.options.widen_dirs = DirectoryWidening::Rsync;
             admit_test_mapping(&mut authority, "parent/item");
             // The connection that widens a directory restores it.
             let mut ops = authority.test_ops();
@@ -5472,8 +5464,8 @@ fn mapping_new_parents_have_final_modes_without_metadata_updates() {
             .unwrap();
         let parent = target.join("parent");
         let mut authority = test_authority(root.path(), DeletionPolicy::Forbid, 1024);
-        authority.copy.options.preserve_permissions = preserve;
-        authority.copy.options.receiver_managed_modes = !preserve;
+        authority.rules.copy.options.preserve_permissions = preserve;
+        authority.rules.copy.options.receiver_managed_modes = !preserve;
         admit_test_mapping(&mut authority, "parent/item");
         let mut request = apply(Op::Mkdir {
             path: path_bytes(&parent),
@@ -5578,10 +5570,10 @@ fn mapping_receiver_confines_entries_and_protects_existing_parents() {
 "#)
         }).concat().into_bytes();
     let mut authority = tcp_test_authority(root.path());
-    authority.copy.limits.max_entries = 100;
+    authority.rules.copy.limits.max_entries = 100;
     authority.mapping = Some(Mutex::new(crate::mapping::Admission::new(
         crate::mapping::Authorization::from_contents(&manifest),
-        authority.copy.limits.max_entries,
+        authority.rules.copy.limits.max_entries,
     )));
     assert!(authority
         .authorize(&mut prepare_request(&target.join("existing/item")), false)
@@ -5689,8 +5681,8 @@ fn special_file_creation_checks_kind_and_masks_mode() {
             libc::S_IFBLK,
         ] {
             let mut authority = test_authority(root, DeletionPolicy::Forbid, 1024);
-            authority.copy.options.preserve_devices = true;
-            authority.copy.options.preserve_permissions = preserve_permissions;
+            authority.rules.copy.options.preserve_devices = true;
+            authority.rules.copy.options.preserve_permissions = preserve_permissions;
             #[allow(clippy::unnecessary_cast)]
             let kind = kind as u32;
             let mut request = apply(Op::Mknod {
@@ -5762,7 +5754,7 @@ fn signed_skip_allows_seeding_and_retrying_a_new_file() {
             path: path_bytes(&fresh),
             copy_id: [1; 16],
             len: 3,
-            block: authority.copy.limits.hash_block_bytes,
+            block: authority.rules.copy.limits.hash_block_bytes,
             attempt,
             clone_final: false,
         };
@@ -5794,7 +5786,7 @@ fn a_finalize_sent_again_on_another_connection_is_answered_as_published() {
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
     let file = target.join("fresh");
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = existence_authority_with_results(&root, &policy, 60_000);
     let mut reader = start_results(&authority, secret);
     let mut first = authority.test_ops();
@@ -5850,8 +5842,8 @@ fn at_the_entry_limit_a_file_held_without_a_count_is_not_published() {
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
     let (first, held) = (target.join("first"), target.join("held"));
-    let mut authority = existence_authority_with_results(&root, &results_policy().1, 60_000);
-    authority.copy.limits.max_entries = 1;
+    let mut authority = existence_authority_with_results(&root, &results_recipient().1, 60_000);
+    authority.rules.copy.limits.max_entries = 1;
     let mut ops = authority.test_ops();
     publish_written(&authority, &mut ops, &first, b"data");
     // Held by requests the grant never saw.
@@ -5899,7 +5891,7 @@ fn a_preparation_after_its_copy_ended_holds_nothing() {
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
     let file = target.join("late");
-    let authority = existence_authority_with_results(&root, &results_policy().1, 60_000);
+    let authority = existence_authority_with_results(&root, &results_recipient().1, 60_000);
     let mut ops = authority.test_ops();
     let mut request = prepare_request(&file);
     let mut settlement = authority.authorize(&mut request, false).unwrap();
@@ -5979,8 +5971,8 @@ fn a_finalize_sent_again_counts_again() {
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
     let (first, second) = (target.join("first"), target.join("second"));
-    let mut authority = existence_authority_with_results(&root, &results_policy().1, 60_000);
-    authority.copy.limits.max_entries = 2;
+    let mut authority = existence_authority_with_results(&root, &results_recipient().1, 60_000);
+    authority.rules.copy.limits.max_entries = 2;
     let mut ops = authority.test_ops();
     let published = publish_written(&authority, &mut ops, &first, b"data");
     assert_eq!(entries_counted(&authority), 1);
@@ -6013,9 +6005,9 @@ fn a_finalize_sent_again_at_the_entry_limit_is_refused() {
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
     let file = target.join("fresh");
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let mut authority = existence_authority_with_results(&root, &policy, 60_000);
-    authority.copy.limits.max_entries = 1;
+    authority.rules.copy.limits.max_entries = 1;
     let mut reader = start_results(&authority, secret);
     let mut first = authority.test_ops();
     publish_written(&authority, &mut first, &file, b"data");
@@ -6049,7 +6041,7 @@ fn a_finalize_racing_a_newer_preparation_settles_by_what_it_did() {
     fs::create_dir_all(&target).unwrap();
     let file = target.join("fresh");
     let key = (path_bytes(&file), [1; 16]);
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = existence_authority_with_results(&root, &policy, 60_000);
     let mut reader = start_results(&authority, secret);
     let write = |data: &[u8]| Request::WriteRange {
@@ -6138,8 +6130,8 @@ fn a_copy_with_a_dropped_connection_fits_its_files_plus_what_was_in_flight() {
         let files: Vec<_> = (0..FILES)
             .map(|index| target.join(format!("file-{index}")))
             .collect();
-        let mut authority = existence_authority_with_results(&root, &results_policy().1, 60_000);
-        authority.copy.limits.max_entries = limit;
+        let mut authority = existence_authority_with_results(&root, &results_recipient().1, 60_000);
+        authority.rules.copy.limits.max_entries = limit;
         let send = |ops: &mut crate::fsops::FsOps, mut request: Request| {
             let settlement = authority
                 .authorize(&mut request, false)
@@ -6262,7 +6254,7 @@ fn publication_removes_only_its_own_earlier_partials(deletion: DeletionPolicy) {
         RootExistence::Any,
     )
     .unwrap();
-    authority.copy.limits.max_entries = 64;
+    authority.rules.copy.limits.max_entries = 64;
     let mut ops = authority.test_ops();
     let finalize = |path: &Path, inplace: bool| {
         let mut request = finalize_request(path, proto::TargetCondition::Any);
@@ -6306,7 +6298,7 @@ fn publication_removes_only_its_own_earlier_partials(deletion: DeletionPolicy) {
         path: path_bytes(&fresh),
         copy_id: [1; 16],
         len: 3,
-        block: authority.copy.limits.hash_block_bytes,
+        block: authority.rules.copy.limits.hash_block_bytes,
         attempt: 0,
         clone_final: false,
     };
@@ -6367,7 +6359,7 @@ fn restricted_publication_leaves_a_partial_whose_name_may_be_shortened() {
         path: path_bytes(&fresh),
         copy_id: [1; 16],
         len: 3,
-        block: authority.copy.limits.hash_block_bytes,
+        block: authority.rules.copy.limits.hash_block_bytes,
         attempt: 0,
         clone_final: false,
     };
@@ -6416,7 +6408,7 @@ fn signed_skip_policy_retains_preexisting_objects() {
     )
     .unwrap();
     // Requests the executor refuses still count until they settle.
-    authority.copy.limits.max_entries = 64;
+    authority.rules.copy.limits.max_entries = 64;
 
     // New files are staged and published without replacing anything,
     // which the executor refuses where a name exists: a pre-existing
@@ -6811,7 +6803,7 @@ fn must_exist_replacement_and_metadata_execute_as_one_batch() {
         RootExistence::Any,
     )
     .unwrap();
-    authority.copy.options.preserve_times = true;
+    authority.rules.copy.options.preserve_times = true;
     let before = fs::symlink_metadata(&link).unwrap();
 
     // A changed symlink is replaced, given its metadata as it is created.
@@ -6876,7 +6868,7 @@ fn must_exist_replacement_and_metadata_execute_as_one_batch() {
 
 fn existence_authority_with_results(
     root: &Path,
-    policy: &crate::destination_results::ReceiptPolicy,
+    policy: &[u8; 32],
     deadline_ms: u64,
 ) -> RestrictedAuthority {
     let key = generate_results_key(EnrollmentId::random()).unwrap();
@@ -6889,7 +6881,7 @@ fn existence_authority_with_results(
         ExistingDestinationPolicy::Replace,
         DestinationPlacement::ExactPath,
         RootExistence::Any,
-        Some((key, policy.clone())),
+        Some((key, *policy)),
     )
     .unwrap();
     // Waiting for in-flight requests is bounded by the grant deadline;
@@ -6909,7 +6901,7 @@ fn results_report_confirmed_changes_and_end_the_grant() {
     fs::create_dir_all(&target).unwrap();
     fs::write(&kept, b"old").unwrap();
     fs::write(&gone, b"bye").unwrap();
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = existence_authority_with_results(&root, &policy, 60_000);
     let mut reader = start_results(&authority, secret);
 
@@ -6982,7 +6974,7 @@ fn results_report_confirmed_changes_and_end_the_grant() {
     assert!(authority.authorize(&mut observe, false).is_err());
 
     // A request still in flight holds the end back.
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let waiting = existence_authority_with_results(&root, &policy, 200);
     let _reader = start_results(&waiting, secret);
     let settlement = waiting
@@ -6993,7 +6985,7 @@ fn results_report_confirmed_changes_and_end_the_grant() {
 
     // The results list changes in the order they settled: a file published
     // then deleted appears twice.
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let racing = existence_authority_with_results(&root, &policy, 5_000);
     let mut reader = start_results(&racing, secret);
     let vanished = target.join("vanished");
@@ -7022,7 +7014,7 @@ fn results_start_before_any_change_or_not_at_all() {
     fs::create_dir_all(&target).unwrap();
     // A coordinator that changed something first cannot start results that
     // would leave the change out.
-    let (_, policy) = results_policy();
+    let (_, policy) = results_recipient();
     let late = existence_authority_with_results(&root, &policy, 5_000);
     let mut mkdir = apply(Op::Mkdir {
         path: path_bytes(&target.join("early")),
@@ -7050,7 +7042,7 @@ fn results_start_before_any_change_or_not_at_all() {
     assert!(quiet.state.lock().unwrap().file_lifecycles.is_empty());
     assert!(quiet.take_results_frames().is_empty());
     assert!(quiet.finish_results().is_err());
-    let (_, policy) = results_policy();
+    let (_, policy) = results_recipient();
     let twice = existence_authority_with_results(&root, &policy, 5_000);
     twice.start_results(false).unwrap();
     assert!(twice.start_results(false).is_err());
@@ -7073,7 +7065,7 @@ fn observation_only_prepare_releases_absent_reservation_and_skips_lifecycle() {
         RootExistence::Any,
         Some((
             generate_results_key(EnrollmentId::random()).unwrap(),
-            results_policy().1,
+            results_recipient().1,
         )),
     )
     .unwrap();
@@ -7146,7 +7138,7 @@ fn older_observation_does_not_release_newer_real_reservation() {
         RootExistence::Any,
         Some((
             generate_results_key(EnrollmentId::random()).unwrap(),
-            results_policy().1,
+            results_recipient().1,
         )),
     )
     .unwrap();
@@ -7197,7 +7189,7 @@ fn results_count_directories_as_an_ordinary_copy_does() {
     ] {
         let _ = fs::remove_dir_all(root.join("target"));
         let key = generate_results_key(EnrollmentId::random()).unwrap();
-        let (secret, policy) = results_policy();
+        let (secret, policy) = results_recipient();
         let authority = test_authority_with_results(
             &root,
             DeletionPolicy::Forbid,
@@ -7252,7 +7244,7 @@ fn a_small_file_batch_with_links_reports_each_failed_write() {
     let failed = target.join("failed");
     fs::create_dir_all(&target).unwrap();
     let key = generate_results_key(EnrollmentId::random()).unwrap();
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = test_authority_with_results(
         &root,
         DeletionPolicy::Forbid,
@@ -7323,7 +7315,7 @@ fn results_list_each_settled_change_in_ordinary_form() {
     fs::create_dir_all(&target).unwrap();
     fs::write(&removed, b"old").unwrap();
 
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = existence_authority_with_results(&root, &policy, 60_000);
     let mut reader = start_results(&authority, secret);
     let put = |path: &Path| proto::SmallPut {
@@ -7394,7 +7386,7 @@ fn results_report_a_declined_metadata_change_as_the_replacement() {
     fs::create_dir_all(&target).unwrap();
     fs::write(&linked, b"same").unwrap();
     fs::write(&small, b"new").unwrap();
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = existence_authority_with_results(&root, &policy, 60_000);
     let mut reader = start_results(&authority, secret);
     let declined = || proto::WireError {
@@ -7431,7 +7423,7 @@ fn results_report_a_declined_metadata_change_as_the_replacement() {
 
     // A small file that matched but whose metadata the receiver would not
     // change in place, then its replacement.
-    let block = authority.copy.limits.hash_block_bytes;
+    let block = authority.rules.copy.limits.hash_block_bytes;
     let mut hash = Request::HashExistingBatch {
         block,
         files: vec![existing_read(&small, 3)],
@@ -7490,7 +7482,7 @@ fn unfinished_in_place_files_are_reported_failed() {
     fs::create_dir_all(&target).unwrap();
     let in_place = |finished: bool| {
         let key = generate_results_key(EnrollmentId::random()).unwrap();
-        let (secret, policy) = results_policy();
+        let (secret, policy) = results_recipient();
         let authority = test_authority_with_results(
             &root,
             DeletionPolicy::Forbid,
@@ -7584,7 +7576,7 @@ fn refused_preparations_leave_nothing_behind() {
     let root = temporary.path().join("root");
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = existence_authority_with_results(&root, &policy, 60_000);
     let mut reader = start_results(&authority, secret);
     // A coordinator can ask for any number of files the grant refuses.
@@ -7623,7 +7615,7 @@ fn a_refused_write_to_an_unfinished_file_lists_it_once() {
     let image = target.join("image");
     fs::create_dir_all(&target).unwrap();
     let key = generate_results_key(EnrollmentId::random()).unwrap();
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = test_authority_with_results(
         &root,
         DeletionPolicy::Forbid,
@@ -8043,8 +8035,8 @@ fn grant_distinguishes_receiver_modes_from_source_permission_preservation() {
     assert!(receiver_modes.authorize(&mut mixed, false).is_err());
 
     let mut source_modes = test_authority(&root, DeletionPolicy::Forbid, 1024);
-    source_modes.copy.options.preserve_permissions = true;
-    source_modes.copy.options.receiver_managed_modes = false;
+    source_modes.rules.copy.options.preserve_permissions = true;
+    source_modes.rules.copy.options.receiver_managed_modes = false;
     let mut source_mkdir = Request::Apply {
         ops: vec![Op::Mkdir {
             path: target.clone(),
@@ -8077,14 +8069,14 @@ fn explicit_ownership_flags_require_existing_grant_authority() {
         assert!(authority.check_flags(required, 0).is_err());
         assert!(authority.check_flags(attribute | required, 0).is_err());
     }
-    authority.copy.options.preserve_owner = true;
+    authority.rules.copy.options.preserve_owner = true;
     authority
         .check_flags(flags::OWNER | flags::REQUIRE_OWNER, 0)
         .unwrap();
     assert!(authority
         .check_flags(flags::GROUP | flags::REQUIRE_GROUP, 0)
         .is_err());
-    authority.copy.options.preserve_group = true;
+    authority.rules.copy.options.preserve_group = true;
     authority
         .check_flags(flags::GROUP | flags::REQUIRE_GROUP, 0)
         .unwrap();
@@ -8130,7 +8122,7 @@ fn receiver_chosen_modes_keep_existing_objects_and_limit_new_ones() {
     let new_directory_mode = created_mode(&target, 0o777, true);
     let new_file_mode = created_mode(&target, 0o777, false);
     let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
-    authority.extra_options.widen_dirs = DirectoryWidening::Rsync;
+    authority.rules.copy.options.widen_dirs = DirectoryWidening::Rsync;
     let mut ops = authority.test_ops();
     let path = |path: &Path| path.as_os_str().as_bytes().to_vec();
     let applied = |response: proto::Response| matches!(response, proto::Response::Applied(ref errors) if errors.iter().all(Option::is_none));
@@ -8364,7 +8356,7 @@ fn signed_hash_block_and_response_bounds_are_enforced() {
         assert!(authority.authorize(&mut altered, false).is_err());
     }
 
-    authority.copy.limits.hash_block_bytes = proto::MIN_HASH_BLOCK_BYTES;
+    authority.rules.copy.limits.hash_block_bytes = proto::MIN_HASH_BLOCK_BYTES;
     let excessive_entries = proto::MAX_FRAME as u64 / 32 + 1;
     let mut excessive = request(
         proto::MIN_HASH_BLOCK_BYTES,
@@ -8420,11 +8412,11 @@ fn authority_accepts_an_unencrypted_listener_only_when_signed() {
         "{error:#}"
     );
     let mut plain = test_authority(&root, DeletionPolicy::Forbid, 1024);
-    plain.tcp = crate::delegation::TcpPermission::Unencrypted;
+    plain.rules.tcp = crate::delegation::TcpPermission::Unencrypted;
     plain.authorize(&mut listener(), true).unwrap();
     // An encrypted listener is still fine, and the token is still checked.
     let mut plain = test_authority(&root, DeletionPolicy::Forbid, 1024);
-    plain.tcp = crate::delegation::TcpPermission::Unencrypted;
+    plain.rules.tcp = crate::delegation::TcpPermission::Unencrypted;
     let mut short_token = listener();
     if let Request::TcpListen { token, .. } = &mut short_token {
         token.pop();
@@ -8542,10 +8534,10 @@ fn receiver_enforces_authorized_hashing_and_supplies_omitted_expectation() {
         transfer_hash_type: None,
     };
     let expected = Digest::hash_bytes(HashAlgorithm::Sha256, b"data");
-    authority.hashing = Some(CopyHashing {
+    authority.rules.hashing = CopyHashing {
         policy,
         expected_hash: Some(expected.clone()),
-    });
+    };
     let mut accepted = Request::ConfigureHashing(policy);
     authority.authorize(&mut accepted, false).unwrap();
     let mut changed = Request::ConfigureHashing(HashPolicy {
@@ -8581,7 +8573,7 @@ fn grants_that_allow_no_changes_create_no_owner_probe() {
     for case in ["preview", "after results ended", "copy"] {
         let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
         match case {
-            "preview" => authority.copy.options.dry_run = true,
+            "preview" => authority.rules.copy.options.dry_run = true,
             "after results ended" => authority.state.lock().unwrap().results_closing = true,
             _ => {}
         }
@@ -8619,7 +8611,7 @@ fn signed_read_only_modes_reject_every_destination_mutation() {
     let root = temporary.path().join("root");
     fs::create_dir(&root).unwrap();
     let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
-    authority.copy.options.dry_run = true;
+    authority.rules.copy.options.dry_run = true;
     let target = root.join("target").as_os_str().as_bytes().to_vec();
     let mut mutation = Request::Apply {
         ops: vec![Op::Mkdir {
@@ -8682,7 +8674,7 @@ fn directory_as_child_scope_does_not_authorize_unrelated_siblings() {
     let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
     let target = root.join("target").as_os_str().as_bytes().to_vec();
     let allowed = root.join("target/source").as_os_str().as_bytes().to_vec();
-    authority.copy.mutation_scopes = vec![
+    authority.rules.copy.mutation_scopes = vec![
         MutationScope {
             path: target.clone(),
             descendants: false,
@@ -8953,7 +8945,7 @@ fn receiver_admission_keeps_each_authorizations_worker_allowance() {
     let temporary = crate::test_support::tempdir().unwrap();
     for workers in [2, 32, 64, 128] {
         let mut authority = test_authority(temporary.path(), DeletionPolicy::Forbid, 1024);
-        authority.copy.limits.max_connections = workers;
+        authority.rules.copy.limits.max_connections = workers;
         for _ in 0..workers {
             authority.acquire_connection().unwrap();
         }
@@ -9035,7 +9027,7 @@ fn restricted_routes_accept_a_persistence_scope_and_a_zero_size_limit() {
     )
     .unwrap();
     assert_eq!(copy.limits.max_file_bytes, 0);
-    delegation::validate_rules(&copy, &mut GrantConstraints::default()).unwrap();
+    delegation::validate_rules(&mut DestinationRules::for_test(copy)).unwrap();
 }
 
 #[test]
@@ -9425,7 +9417,7 @@ fn hardlinks_need_the_signed_option_and_keep_to_the_existing_object_policy() {
             RootExistence::Any,
         )
         .unwrap();
-        authority.extra_options.hardlinks = true;
+        authority.rules.copy.options.hardlinks = true;
         authority
     };
 
@@ -9442,7 +9434,7 @@ fn hardlinks_need_the_signed_option_and_keep_to_the_existing_object_policy() {
     assert!(authority
         .check_flags(proto::flags::REPORT_IDENTITY, 0)
         .is_err());
-    authority.extra_options.hardlinks = true;
+    authority.rules.copy.options.hardlinks = true;
     authority
         .check_flags(proto::flags::REPORT_IDENTITY, 0)
         .unwrap();
@@ -9501,7 +9493,7 @@ fn a_name_already_linked_records_no_operation_unless_it_changes() {
     fs::write(root.join("target/c"), b"other").unwrap();
     let file = fs::metadata(root.join("target/a")).unwrap();
     let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
-    authority.extra_options.hardlinks = true;
+    authority.rules.copy.options.hardlinks = true;
     authority.start_results(false).unwrap();
     let link = |name: &str, before: &dyn Fn()| {
         let mut request = Request::Apply {
@@ -9596,8 +9588,8 @@ fn signed_grants_authorize_only_their_inode_metadata() {
         .check_metadata(b"/unmapped", &time_meta(), 0)
         .is_err());
 
-    authority.extra_options.acls = true;
-    authority.extra_options.sparse = true;
+    authority.rules.copy.options.acls = true;
+    authority.rules.copy.options.sparse = true;
     let acls_only = crate::inode_metadata::Selection {
         acls: true,
         ..Default::default()
@@ -9690,7 +9682,7 @@ fn signed_comparison_requests_enforce_scope_identity_and_bounds() {
     authority.authorize(&mut allowed, false).unwrap();
     // An in-place grant stages an existing file too, so it compares and
     // reuses blocks as a staged grant does.
-    authority.copy.policy.publication = PublicationPolicy::InPlaceNew;
+    authority.rules.copy.policy.publication = PublicationPolicy::InPlaceNew;
     authority
         .authorize(&mut stage(target.clone(), 8 << 20), false)
         .unwrap();
@@ -9746,7 +9738,7 @@ fn grouped_comparison_keeps_and_patches_files_within_the_grant() {
     }
     let same_inode = fs::metadata(&same).unwrap().ino();
     let authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
-    let block = authority.copy.limits.hash_block_bytes;
+    let block = authority.rules.copy.limits.hash_block_bytes;
 
     let mut hash = Request::HashExistingBatch {
         block,
@@ -9970,7 +9962,7 @@ fn a_stale_patch_holds_no_bytes_and_leaves_its_record_to_the_retry() {
     fs::write(&a, b"same").unwrap();
     fs::hard_link(&a, &b).unwrap();
     let key = generate_results_key(EnrollmentId::random()).unwrap();
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let mut authority = test_authority_with_results(
         &root,
         DeletionPolicy::Forbid,
@@ -9983,7 +9975,7 @@ fn a_stale_patch_holds_no_bytes_and_leaves_its_record_to_the_retry() {
         Some((key, policy)),
     )
     .unwrap();
-    authority.copy.options.preserve_times = true;
+    authority.rules.copy.options.preserve_times = true;
     let mut reader = start_results(&authority, secret);
     let mut ops = authority.test_ops();
     let kept = Ok(proto::SmallPatched {
@@ -10066,7 +10058,7 @@ fn grouped_comparison_refuses_what_the_grant_does_not_authorize() {
     fs::create_dir_all(&target).unwrap();
     fs::write(&file, b"data").unwrap();
     let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
-    let block = authority.copy.limits.hash_block_bytes;
+    let block = authority.rules.copy.limits.hash_block_bytes;
     let hash = |files| Request::HashExistingBatch {
         block,
         files,
@@ -10145,7 +10137,7 @@ fn grouped_comparison_refuses_what_the_grant_does_not_authorize() {
     }
 
     // Each file's hashes may fit a response while the batch's do not.
-    authority.copy.limits.max_file_bytes = u64::MAX;
+    authority.rules.copy.limits.max_file_bytes = u64::MAX;
     let half = (proto::MAX_FRAME as u64 / 33 / 2 + 1) * proto::MIN_HASH_BLOCK_BYTES;
     let mut excessive = Request::HashExistingBatch {
         block: proto::MIN_HASH_BLOCK_BYTES,
@@ -10159,17 +10151,17 @@ fn grouped_comparison_refuses_what_the_grant_does_not_authorize() {
             .to_string(),
         "hash response would exceed protocol limits"
     );
-    authority.copy.limits.max_file_bytes = 1024;
+    authority.rules.copy.limits.max_file_bytes = 1024;
 
     // Files with an expected hash keep checked finalization.
-    authority.hashing = Some(CopyHashing {
+    authority.rules.hashing = CopyHashing {
         policy: HashPolicy {
             algorithm: HashAlgorithm::Blake3,
             transfer_integrity: true,
             transfer_hash_type: None,
         },
         expected_hash: Some(Digest::hash_bytes(HashAlgorithm::Sha256, b"data")),
-    });
+    };
     assert_eq!(
         authority
             .authorize(&mut patch(reused(&target)), false)
@@ -10177,19 +10169,19 @@ fn grouped_comparison_refuses_what_the_grant_does_not_authorize() {
             .to_string(),
         "expected-hash files require checked finalization"
     );
-    authority.hashing = None;
+    authority.rules.hashing.expected_hash = None;
 
-    authority.copy.options.dry_run = true;
+    authority.rules.copy.options.dry_run = true;
     assert!(authority
         .authorize(&mut patch(reused(&file)), false)
         .is_err());
-    authority.copy.options.dry_run = false;
+    authority.rules.copy.options.dry_run = false;
     // An in-place grant stages an existing file as a staged grant does.
-    authority.copy.policy.publication = PublicationPolicy::InPlaceNew;
+    authority.rules.copy.policy.publication = PublicationPolicy::InPlaceNew;
     authority
         .authorize(&mut patch(reused(&file)), false)
         .unwrap();
-    authority.copy.policy.publication = PublicationPolicy::AtomicStaged;
+    authority.rules.copy.policy.publication = PublicationPolicy::AtomicStaged;
 
     // A grant that retains existing files lets a patch neither keep nor
     // replace one.
@@ -10327,7 +10319,7 @@ fn grouped_patch_results_list_published_and_failed_files() {
         fs::write(path, b"old").unwrap();
     }
     let key = generate_results_key(EnrollmentId::random()).unwrap();
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = test_authority_with_results(
         &root,
         DeletionPolicy::Forbid,
@@ -10341,7 +10333,7 @@ fn grouped_patch_results_list_published_and_failed_files() {
     )
     .unwrap();
     let mut reader = start_results(&authority, secret);
-    let block = authority.copy.limits.hash_block_bytes;
+    let block = authority.rules.copy.limits.hash_block_bytes;
     let mut batch = Request::PatchSmallBatch(vec![
         small_patch(&kept, 3, block, vec![Some([0; 32])], b""),
         small_patch(&published, 3, block, vec![None], b"new"),
@@ -10426,7 +10418,7 @@ fn a_failed_patch_is_listed_unless_the_senders_retry_settles_it() {
         fs::create_dir_all(&target).unwrap();
         fs::write(&file, b"old").unwrap();
         let key = generate_results_key(EnrollmentId::random()).unwrap();
-        let (secret, policy) = results_policy();
+        let (secret, policy) = results_recipient();
         let authority = test_authority_with_results(
             &root,
             DeletionPolicy::Forbid,
@@ -10528,7 +10520,7 @@ fn a_metadata_change_does_not_settle_a_failed_patch() {
         fs::create_dir_all(&target).unwrap();
         fs::write(&file, b"old").unwrap();
         let key = generate_results_key(EnrollmentId::random()).unwrap();
-        let (secret, policy) = results_policy();
+        let (secret, policy) = results_recipient();
         let mut authority = test_authority_with_results(
             &root,
             DeletionPolicy::Forbid,
@@ -10541,7 +10533,7 @@ fn a_metadata_change_does_not_settle_a_failed_patch() {
             Some((key, policy)),
         )
         .unwrap();
-        authority.copy.options.preserve_times = true;
+        authority.rules.copy.options.preserve_times = true;
         let mut reader = start_results(&authority, secret);
         let mut ops = authority.test_ops();
         let block = proto::MIN_HASH_BLOCK_BYTES;
@@ -10610,7 +10602,7 @@ fn data_corrupted_in_transit_is_listed_as_an_integrity_failure() {
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
     let key = generate_results_key(EnrollmentId::random()).unwrap();
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = test_authority_with_results(
         &root,
         DeletionPolicy::Forbid,
@@ -10760,7 +10752,7 @@ fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
         fs::write(target.join(name), &old).unwrap();
     }
     let key = generate_results_key(EnrollmentId::random()).unwrap();
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = std::sync::Arc::new(
         test_authority_with_results(
             &root,
@@ -11061,14 +11053,14 @@ fn a_streamed_patch_is_refused_wherever_a_batch_patch_is() {
             error
         );
     }
-    authority.hashing = Some(CopyHashing {
+    authority.rules.hashing = CopyHashing {
         policy: HashPolicy {
             algorithm: HashAlgorithm::Blake3,
             transfer_integrity: true,
             transfer_hash_type: None,
         },
         expected_hash: Some(Digest::hash_bytes(HashAlgorithm::Sha256, b"data")),
-    });
+    };
     // The expected hash is the destination's own, a single file.
     assert_eq!(
         authority
@@ -11077,13 +11069,13 @@ fn a_streamed_patch_is_refused_wherever_a_batch_patch_is() {
             .to_string(),
         "expected-hash files require checked finalization"
     );
-    authority.hashing = None;
+    authority.rules.hashing.expected_hash = None;
     // An in-place grant stages an existing file as a staged grant does.
-    authority.copy.policy.publication = PublicationPolicy::InPlaceNew;
+    authority.rules.copy.policy.publication = PublicationPolicy::InPlaceNew;
     authority
         .authorize(&mut begin(streamed(4 * block, block)), false)
         .unwrap();
-    authority.copy.policy.publication = PublicationPolicy::AtomicStaged;
+    authority.rules.copy.policy.publication = PublicationPolicy::AtomicStaged;
     // A grant that retains existing files lets a patch neither keep nor
     // replace one, streamed or not.
     let retaining = existence_authority(
@@ -11120,11 +11112,11 @@ impl ParityReceiver {
                 FilterPolicy::default(),
                 publication,
             );
-            authority.copy.options.preserve_permissions = preserve;
-            authority.copy.options.receiver_managed_modes = !preserve;
-            authority.copy.options.preserve_devices = true;
-            authority.copy.limits.max_entries = 1000;
-            authority.extra_options.widen_dirs = DirectoryWidening::Rsync;
+            authority.rules.copy.options.preserve_permissions = preserve;
+            authority.rules.copy.options.receiver_managed_modes = !preserve;
+            authority.rules.copy.options.preserve_devices = true;
+            authority.rules.copy.limits.max_entries = 1000;
+            authority.rules.copy.options.widen_dirs = DirectoryWidening::Rsync;
             authority
         });
         let ops = match &authority {
@@ -11520,7 +11512,7 @@ fn both_receivers_write_only_files_they_created() {
         let mut receiver =
             ParityReceiver::new(&root, restricted, true, PublicationPolicy::InPlaceNew);
         if let Some(authority) = receiver.authority.as_mut() {
-            authority.copy.options.preserve_times = true;
+            authority.rules.copy.options.preserve_times = true;
         }
         let case = format!("restricted={restricted}");
 
@@ -11653,7 +11645,7 @@ fn both_receivers_update_in_place_only_files_they_vouch_for() {
         }
         fs::hard_link(target.join("linked"), root.join("outside")).unwrap();
         let key = generate_results_key(EnrollmentId::random()).unwrap();
-        let (secret, policy) = results_policy();
+        let (secret, policy) = results_recipient();
         let mut receiver =
             ParityReceiver::new(&root, restricted, true, PublicationPolicy::InPlaceUpdate);
         let mut reader = None;
@@ -11670,9 +11662,9 @@ fn both_receivers_update_in_place_only_files_they_vouch_for() {
                 Some((key, policy)),
             )
             .unwrap();
-            authority.copy.options.preserve_permissions = true;
-            authority.copy.options.preserve_times = true;
-            authority.copy.limits.max_entries = 1000;
+            authority.rules.copy.options.preserve_permissions = true;
+            authority.rules.copy.options.preserve_times = true;
+            authority.rules.copy.limits.max_entries = 1000;
             reader = Some(start_results(&authority, secret));
             // A connection serves the copy of the authority it was set up
             // for, whose files are let go when it is dropped.
@@ -11830,7 +11822,7 @@ fn both_receivers_settle_each_file_of_an_in_place_batch_alike() {
             .map(|name| fs::metadata(target.join(name)).unwrap().ino())
             .collect();
         let key = generate_results_key(EnrollmentId::random()).unwrap();
-        let (secret, policy) = results_policy();
+        let (secret, policy) = results_recipient();
         let mut receiver =
             ParityReceiver::new(&root, restricted, true, PublicationPolicy::InPlaceUpdate);
         let mut reader = None;
@@ -11847,9 +11839,9 @@ fn both_receivers_settle_each_file_of_an_in_place_batch_alike() {
                 Some((key, policy)),
             )
             .unwrap();
-            authority.copy.options.preserve_permissions = true;
-            authority.copy.options.preserve_times = true;
-            authority.copy.limits.max_entries = 1000;
+            authority.rules.copy.options.preserve_permissions = true;
+            authority.rules.copy.options.preserve_times = true;
+            authority.rules.copy.limits.max_entries = 1000;
             reader = Some(start_results(&authority, secret));
             // A connection serves the copy of the authority it was set up
             // for, whose files are let go when it is dropped.
@@ -12034,7 +12026,7 @@ fn both_receivers_hold_leases_on_the_files_they_compared() {
             eprintln!("note: the test filesystem's leases are not trusted");
         }
         let key = generate_results_key(EnrollmentId::random()).unwrap();
-        let (secret, policy) = results_policy();
+        let (secret, policy) = results_recipient();
         let mut receiver =
             ParityReceiver::new(&root, restricted, true, PublicationPolicy::AtomicStaged);
         let mut reader = None;
@@ -12051,8 +12043,8 @@ fn both_receivers_hold_leases_on_the_files_they_compared() {
                 Some((key, policy)),
             )
             .unwrap();
-            authority.copy.options.preserve_times = true;
-            authority.copy.limits.max_entries = 1000;
+            authority.rules.copy.options.preserve_times = true;
+            authority.rules.copy.limits.max_entries = 1000;
             reader = Some(start_results(&authority, secret));
             // A connection serves the copy of the authority it was set up
             // for, whose files are let go when it is dropped.
@@ -12516,7 +12508,7 @@ fn ordinary_and_restricted_receivers_give_directories_their_groups_first() {
         let mut receiver =
             ParityReceiver::new(&root, restricted, false, PublicationPolicy::AtomicStaged);
         if let Some(authority) = receiver.authority.as_mut() {
-            authority.copy.options.preserve_group = true;
+            authority.rules.copy.options.preserve_group = true;
         }
         let path = |name: &str| path_bytes(&target.join(name));
         let grouped = proto::Meta {
@@ -12617,10 +12609,10 @@ fn link_authority(root: &Path, existing: ExistingDestinationPolicy) -> Restricte
         RootExistence::Any,
     )
     .unwrap();
-    authority.extra_options.hardlinks = true;
-    authority.copy.options.preserve_permissions = true;
-    authority.copy.options.receiver_managed_modes = false;
-    authority.copy.limits.max_deletions = 10;
+    authority.rules.copy.options.hardlinks = true;
+    authority.rules.copy.options.preserve_permissions = true;
+    authority.rules.copy.options.receiver_managed_modes = false;
+    authority.rules.copy.limits.max_deletions = 10;
     authority
 }
 
@@ -12770,11 +12762,11 @@ fn only_keeping_grants_with_hard_links_record_created_files() {
     let root = temporary.path().join("root");
     let mut keep = keeping_link_authority(&root);
     assert!(keep.owned_objects().is_some());
-    keep.extra_options.hardlinks = false;
+    keep.rules.copy.options.hardlinks = false;
     assert!(keep.owned_objects().is_none());
     let mut replace = link_authority(&root, ExistingDestinationPolicy::Replace);
     assert!(replace.owned_objects().is_none());
-    replace.extra_options.hardlinks = false;
+    replace.rules.copy.options.hardlinks = false;
     assert!(replace.owned_objects().is_none());
 }
 
@@ -13280,7 +13272,7 @@ fn a_refusal_racing_the_results_end_is_still_counted() {
     let root = temporary.path().join("root");
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = std::sync::Arc::new(existence_authority_with_results(&root, &policy, 30_000));
     let mut reader = start_results(&authority, secret);
     let mut ops = vec![Op::Mkdir {
@@ -13442,10 +13434,10 @@ fn signed_mapping_metadata_is_applied_without_its_copy_options() {
     )
     .into_bytes();
     let mut authority = test_authority(root.path(), DeletionPolicy::Forbid, 1024);
-    authority.copy.limits.max_entries = 100;
+    authority.rules.copy.limits.max_entries = 100;
     authority.mapping = Some(Mutex::new(crate::mapping::Admission::new(
         crate::mapping::Authorization::from_contents(&manifest),
-        authority.copy.limits.max_entries,
+        authority.rules.copy.limits.max_entries,
     )));
     let settlement = authority
         .authorize(
@@ -13504,7 +13496,7 @@ fn files_the_keep_policy_keeps_are_neither_refused_nor_failed() {
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
     let key = generate_results_key(EnrollmentId::random()).unwrap();
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = test_authority_with_results(
         &root,
         DeletionPolicy::Forbid,
@@ -13560,7 +13552,7 @@ fn small_copies_publish_through_a_restricted_receiver() {
     fs::create_dir_all(&target).unwrap();
     fs::write(target.join("old"), b"stale contents").unwrap();
     let key = generate_results_key(EnrollmentId::random()).unwrap();
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let mut authority = test_authority_with_results(
         &root,
         DeletionPolicy::Forbid,
@@ -13574,7 +13566,7 @@ fn small_copies_publish_through_a_restricted_receiver() {
     )
     .unwrap();
     // Each of the copy's three preparations counts its three files.
-    authority.copy.limits.max_entries = 9;
+    authority.rules.copy.limits.max_entries = 9;
     let authority = std::sync::Arc::new(authority);
     let mut reader = start_results(&authority, secret);
     let mut ops = authority.test_ops();
@@ -13735,13 +13727,10 @@ fn follow_dst_compares_absolute_link_targets_with_the_real_directory() {
     .unwrap();
     let authority = RestrictedAuthority::new(
         ConfinedRoot::resolve(named.as_os_str().as_bytes(), &[], true, None).unwrap(),
-        test_grant(grant),
-        GrantConstraints {
-            extra_options: crate::delegation::ExtraCopyOptions {
-                follow_dst: true,
-                ..Default::default()
-            },
-            ..GrantConstraints::default()
+        {
+            let mut rules = DestinationRules::for_test(grant);
+            rules.copy.options.follow_dst = true;
+            rules
         },
         [0; 32],
         generate_results_key(EnrollmentId::random()).unwrap(),
@@ -13769,10 +13758,7 @@ fn follow_dst_copies_into_the_directory_a_destination_link_leads_to() {
     fs::create_dir_all(&real).unwrap();
     fs::create_dir_all(temporary.path().join("outside")).unwrap();
     fs::create_dir_all(root.join(".ssh")).unwrap();
-    let options = crate::delegation::ExtraCopyOptions {
-        follow_dst: true,
-        ..Default::default()
-    };
+    let options = follow_destination(true);
     let protected = [ReceiverControlPath {
         path: path_bytes(&root.join(".ssh")),
         label: "protected SSH configuration directory",
@@ -13828,7 +13814,7 @@ fn follow_dst_copies_into_the_directory_a_destination_link_leads_to() {
             .is_symlink());
     }
     // Without it, the link is the destination, and nothing follows it.
-    let plain = authority(b"data/real", Default::default()).unwrap();
+    let plain = authority(b"data/real", follow_destination(false)).unwrap();
     let mut put = small_put(&root.join("target/file"));
     assert!(
         plain.authorize(&mut put, false).is_err()
@@ -13881,8 +13867,8 @@ fn follow_dst_is_signed_for_the_receiver() {
         argv.extend(options.iter().map(std::ffi::OsString::from));
         let args = Args::parse_args(&argv).unwrap();
         validate_restricted_args(&args).unwrap();
-        let constraints = crate::directive::extra_copy_options(&args);
-        assert_eq!(constraints.follow_dst, follow, "{options:?}");
+        let copy = copy_operation(&args, &args.locations[..1], b"/backup").unwrap();
+        assert_eq!(copy.options.follow_dst, follow, "{options:?}");
     }
     let args = Args::parse_args(
         &[
@@ -13913,10 +13899,7 @@ fn follow_dst_creates_a_destination_that_does_not_exist_yet() {
     let temporary = crate::test_support::tempdir().unwrap();
     let root = temporary.path().join("root");
     fs::create_dir_all(root.join("real")).unwrap();
-    let options = crate::delegation::ExtraCopyOptions {
-        follow_dst: true,
-        ..Default::default()
-    };
+    let options = follow_destination(true);
     // No symlink: the destination is the confinement root's missing child.
     let authority = test_authority_with_options(
         &root,
@@ -14054,13 +14037,7 @@ fn followed_destinations_reaching_control_files_are_refused_by_identity() {
         DestinationPlacement::DirectoryContents,
         RootExistence::Any,
         None,
-        (
-            crate::delegation::ExtraCopyOptions {
-                follow_dst: true,
-                ..Default::default()
-            },
-            &protected,
-        ),
+        (follow_destination(true), &protected),
     )
     .err()
     .unwrap();
@@ -14070,7 +14047,7 @@ fn followed_destinations_reaching_control_files_are_refused_by_identity() {
     );
 }
 
-/// Under `keep_files` (rsync `--ignore-existing`) an existing file keeps
+/// Under `KeepFiles` (rsync `--ignore-existing`) an existing file keeps
 /// its metadata as well as its contents; an existing directory still takes
 /// the copy's metadata.
 #[test]
@@ -14082,9 +14059,9 @@ fn keep_files_leaves_existing_files_metadata_alone() {
     fs::write(target.join("file"), b"theirs").unwrap();
     fs::set_permissions(target.join("file"), fs::Permissions::from_mode(0o600)).unwrap();
     let mut authority = test_authority(&root, DeletionPolicy::Forbid, 1024);
-    authority.extra_options.keep_files = true;
-    authority.copy.options.preserve_permissions = true;
-    authority.copy.options.receiver_managed_modes = false;
+    authority.rules.copy.policy.existing = ExistingDestinationPolicy::KeepFiles;
+    authority.rules.copy.options.preserve_permissions = true;
+    authority.rules.copy.options.receiver_managed_modes = false;
     let file = path_bytes(&target.join("file"));
     let mut mode = plain_meta();
     mode.mode = 0o644;
@@ -14170,7 +14147,7 @@ fn files_count_against_the_entry_limit_from_their_first_change() {
             None,
         )
         .unwrap();
-        authority.copy.limits.max_entries = 2;
+        authority.rules.copy.limits.max_entries = 2;
         let prepare = |index: u8| {
             let mut request = prepare_request(&target.join(format!("file-{index}")));
             if let Request::Prepare {
@@ -14337,8 +14314,8 @@ fn a_small_copy_counts_its_files_when_prepared() {
         None,
     )
     .unwrap();
-    authority.copy.limits.max_entries = 1;
-    authority.copy.options.preserve_times = true;
+    authority.rules.copy.limits.max_entries = 1;
+    authority.rules.copy.options.preserve_times = true;
     let authority = std::sync::Arc::new(authority);
     let mut ops = authority.test_ops();
     let mut gate = PatchStreamGate::new(authority.clone());
@@ -14449,9 +14426,9 @@ fn a_small_copy_without_payloads_counts_its_metadata_changes() {
         None,
     )
     .unwrap();
-    authority.copy.limits.max_entries = 2;
-    authority.copy.options.preserve_times = true;
-    authority.copy.options.preserve_permissions = true;
+    authority.rules.copy.limits.max_entries = 2;
+    authority.rules.copy.options.preserve_times = true;
+    authority.rules.copy.options.preserve_permissions = true;
     let authority = std::sync::Arc::new(authority);
     let mut ops = authority.test_ops();
     let mut gate = PatchStreamGate::new(authority.clone());
@@ -14578,7 +14555,7 @@ fn a_refused_preparation_keeps_the_count_another_still_shares() {
         FilterPolicy::default(),
         PublicationPolicy::InPlaceUpdate,
     );
-    authority.copy.limits.max_entries = 1;
+    authority.rules.copy.limits.max_entries = 1;
     let mut ops = authority.test_ops();
     for index in 0..2 {
         let path = target.join(format!("file-{index}"));
@@ -14657,13 +14634,7 @@ fn followed_destinations_may_not_create_a_missing_control_directory() {
         DestinationPlacement::DirectoryContents,
         RootExistence::Any,
         None,
-        (
-            crate::delegation::ExtraCopyOptions {
-                follow_dst: true,
-                ..Default::default()
-            },
-            &protected,
-        ),
+        (follow_destination(true), &protected),
     )
     .err()
     .expect("a destination that would hold the missing control directory");
@@ -14697,13 +14668,7 @@ fn a_symlinked_control_path_is_protected_where_it_leads() {
             DestinationPlacement::DirectoryContents,
             RootExistence::Any,
             None,
-            (
-                crate::delegation::ExtraCopyOptions {
-                    follow_dst,
-                    ..Default::default()
-                },
-                &protected,
-            ),
+            (follow_destination(follow_dst), &protected),
         )
         .err()
         .expect("a destination containing the control directory's target");
@@ -14773,7 +14738,7 @@ fn must_exist_takes_the_receivers_own_lookups_for_existence() {
         RootExistence::Any,
     )
     .unwrap();
-    authority.copy.limits.max_entries = 64;
+    authority.rules.copy.limits.max_entries = 64;
     assume_lacking(&authority, false, true);
     let mut ops = authority.test_ops();
     look_up_for_planner(
@@ -14916,7 +14881,7 @@ fn keeping_files_renames_unchecked_beneath_directories_found_empty_or_made() {
         RootExistence::Any,
     )
     .unwrap();
-    authority.copy.limits.max_entries = 64;
+    authority.rules.copy.limits.max_entries = 64;
     assume_lacking(&authority, true, false);
     let mut ops = authority.test_ops();
 
@@ -15042,7 +15007,7 @@ fn an_early_batch_lookup_records_nothing_beneath_a_directory_not_yet_made() {
         RootExistence::Any,
     )
     .unwrap();
-    authority.copy.limits.max_entries = 64;
+    authority.rules.copy.limits.max_entries = 64;
     assume_lacking(&authority, true, false);
     let mut ops = authority.test_ops();
     let recorded = |name: &str| {
@@ -15126,8 +15091,8 @@ fn an_early_batch_lookup_records_nothing_in_a_directory_not_yet_widened() {
         RootExistence::Any,
     )
     .unwrap();
-    authority.copy.limits.max_entries = 64;
-    authority.extra_options.widen_dirs = DirectoryWidening::Rsync;
+    authority.rules.copy.limits.max_entries = 64;
+    authority.rules.copy.options.widen_dirs = DirectoryWidening::Rsync;
     assume_lacking(&authority, false, true);
     let mut ops = authority.test_ops();
     let lookups = authority.lookups.clone().unwrap();
@@ -15218,16 +15183,10 @@ fn an_empty_destination_reached_through_links_is_known_empty() {
             DestinationPlacement::DirectoryContents,
             RootExistence::Any,
             None,
-            (
-                crate::delegation::ExtraCopyOptions {
-                    follow_dst,
-                    ..Default::default()
-                },
-                &protected,
-            ),
+            (follow_destination(follow_dst), &protected),
         )
         .unwrap();
-        authority.copy.limits.max_entries = 64;
+        authority.rules.copy.limits.max_entries = 64;
         assume_lacking(&authority, true, false);
         let mut ops = authority.test_ops();
         carry_out(
@@ -15281,7 +15240,7 @@ fn a_full_record_holds_further_names_to_the_strict_publication() {
         RootExistence::Any,
     )
     .unwrap();
-    authority.copy.limits.max_entries = 64;
+    authority.rules.copy.limits.max_entries = 64;
     authority.lookups = Some(std::sync::Arc::new(PlanningLookups::with_limit(
         Recording::Keep,
         1,
@@ -15334,7 +15293,7 @@ fn keeping_files_renames_unchecked_only_names_the_receiver_found_absent() {
         RootExistence::Any,
     )
     .unwrap();
-    authority.copy.limits.max_entries = 64;
+    authority.rules.copy.limits.max_entries = 64;
     assume_lacking(&authority, true, false);
     let mut ops = authority.test_ops();
     let names = ["present", "absent", "twice", "failed", "raced"];
@@ -15454,7 +15413,7 @@ fn must_exist_updates_existing_files_in_place_and_creates_none() {
         RootExistence::Any,
     )
     .unwrap();
-    let block = authority.copy.limits.hash_block_bytes;
+    let block = authority.rules.copy.limits.hash_block_bytes;
     let mut patch = small_patch(&target.join("there"), 3, block, vec![None], b"new");
     patch.update_in_place = true;
     authority
@@ -15483,7 +15442,7 @@ fn a_late_settlement_leaves_a_newer_reservations_count_alone() {
         FilterPolicy::default(),
         PublicationPolicy::InPlaceUpdate,
     );
-    authority.copy.limits.max_entries = 8;
+    authority.rules.copy.limits.max_entries = 8;
     let mut ops = authority.test_ops();
     let changes = |authority: &RestrictedAuthority| {
         authority.changes.load(std::sync::atomic::Ordering::Relaxed)
