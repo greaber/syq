@@ -750,6 +750,9 @@ fn only_aws_general_purpose_endpoints_divide_listings() {
         "http://localhost:9000",
         "https://minio.example.internal",
         "not a url",
+        // A path names another bucket on the way.
+        "https://s3.us-east-1.amazonaws.com/archive/",
+        "https://s3.us-east-1.amazonaws.com/archive",
     ] {
         assert!(!lists_in_byte_order(Some(endpoint), "bucket"), "{endpoint}");
     }

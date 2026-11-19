@@ -42,10 +42,11 @@ service is back.
 Before it copies or removes a prefix, and for `--prune`, syq lists the
 objects under it. In general purpose buckets on AWS, syq divides a large
 listing with subdirectories into parts that it lists at the same time, so
-the listing can finish sooner when each request takes a while. This costs a
-few more list requests, up to about a quarter more on large listings. When a
-prefix has a few dozen subdirectories that each hold many objects, syq may
-list each of them by itself.
+the listing can finish sooner when each request takes a while. This costs
+more list requests: usually up to about a quarter more on large listings.
+When a prefix has no more than a few dozen subdirectories and the first ones
+hold many objects, syq may list each subdirectory by itself, at a request
+each, however few objects the others hold.
 
 Dividing a listing is safe only when the service returns keys in byte
 order, and only AWS documents that it does. With `--s3-endpoint`, syq divides

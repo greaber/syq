@@ -143,16 +143,27 @@ pub(super) fn lists_in_key_order(bucket: &str) -> bool {
 /// S3 compatibility page states no order (https://www.tigrisdata.com/docs/api/s3/);
 /// and every self-hosted or unrecognized endpoint.
 pub(super) fn lists_in_byte_order(endpoint: Option<&str>, bucket: &str) -> bool {
-    general_purpose_bucket(bucket) && (test_divides() || endpoint.is_none_or(aws_endpoint))
+    general_purpose_bucket(bucket)
+        && endpoint
+            .is_none_or(|endpoint| aws_endpoint(endpoint) || (test_divides() && loopback(endpoint)))
 }
 
-/// The test servers are not AWS. Debug builds let them divide listings.
+/// The test servers are not AWS. Debug builds let them divide listings: they
+/// listen on a loopback address.
 fn test_divides() -> bool {
     #[cfg(debug_assertions)]
     if std::env::var_os("SYQ_TEST_S3_DIVIDE_LISTINGS").is_some_and(|v| v == "1") {
         return true;
     }
     false
+}
+
+fn loopback(endpoint: &str) -> bool {
+    url::Url::parse(endpoint).is_ok_and(|url| match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        _ => false,
+    })
 }
 
 /// Whether `bucket` names a general purpose bucket rather than an ARN or an
@@ -188,6 +199,10 @@ fn aws_endpoint(endpoint: &str) -> bool {
     let Ok(url) = url::Url::parse(endpoint) else {
         return false;
     };
+    // A path would come before the bucket's: another bucket, and a key.
+    if url.path() != "/" {
+        return false;
+    }
     let Some(url::Host::Domain(host)) = url.host() else {
         return false;
     };

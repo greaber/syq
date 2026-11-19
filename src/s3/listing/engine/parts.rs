@@ -336,6 +336,8 @@ struct Part {
     /// and where the latest page of them ended.
     ahead: VecDeque<String>,
     listed: String,
+    /// The last child or object the children pages so far returned.
+    children_end: String,
     /// Objects of the directories listed so far that sort after the
     /// listing's position, in order. Those past `stop` are reported when it
     /// is set; the listing itself reaches the others.
@@ -360,6 +362,7 @@ impl Part {
             children: Children::Unlisted,
             ahead: VecDeque::new(),
             listed: String::new(),
+            children_end: String::new(),
             objects: Vec::new(),
             burst: false,
         }
@@ -542,11 +545,29 @@ impl Walk {
             part.children = Children::Closed;
             return Ok(());
         };
-        let mut before = part.listed.as_str();
-        let mut ordered = true;
-        for child in &page.prefixes {
-            ordered &= child.as_str() > before;
-            before = child;
+        // Children and objects come in separate lists, each in order and all
+        // after those of the page before.
+        let ascending = |mut items: std::slice::Iter<'_, &str>| {
+            let mut before = part.children_end.as_str();
+            items.all(|item| {
+                let ordered = *item > before;
+                before = item;
+                ordered
+            })
+        };
+        let prefixes: Vec<&str> = page.prefixes.iter().map(String::as_str).collect();
+        let objects: Vec<&str> = page
+            .entries
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect();
+        let ordered = ascending(prefixes.iter()) && ascending(objects.iter());
+        let end = prefixes
+            .last()
+            .max(objects.last())
+            .map(|end| (*end).to_owned());
+        if let Some(end) = end {
+            part.children_end = end;
         }
         if !ordered {
             self.parts[at].children = Children::Closed;
@@ -601,7 +622,8 @@ impl Walk {
             .values()
             .filter(|keys| **keys >= DENSE_DIRECTORY)
             .count();
-        if narrow && !root.done {
+        // Master's split also needs a dense directory on the first page.
+        if narrow && !root.done && root.dense {
             if dense >= 2 {
                 self.burst = root.ahead.len();
                 self.parts[0].burst = true;
@@ -625,6 +647,10 @@ impl Walk {
         pruned: &mut Vec<String>,
     ) {
         self.decide_burst();
+        if prune.is_none() && (room == 0 || self.spent >= self.allowance()) {
+            // Nothing to leave out and nothing to ask for.
+            return;
+        }
         let mut at = 0;
         while self.dividing && at < self.parts.len() {
             if let Some(prune) = prune {
@@ -712,6 +738,7 @@ impl Walk {
                     part.reached = 1;
                     part.burst = false;
                     part.listed.clear();
+                    part.children_end.clear();
                     part.children = Children::Entered;
                     return None;
                 };

@@ -92,8 +92,10 @@ def check_parts():
     # check() above copies without the hook; this copy lists in parts.
     with tempfile.TemporaryDirectory(prefix='syq-enumeration-') as temp:
         destination = Path(temp).resolve() / 'download'
-        c.run(['--from', remote, '--srcs-in', prefix, '--into', destination,
-               '--ignore', 'zz ignored/'], env=env | {'SYQ_TEST_S3_DIVIDE_LISTINGS': '1'})
+        copied = c.run(['--from', remote, '--srcs-in', prefix, '--into', destination,
+                        '--ignore', 'zz ignored/'],
+                       env=env | {'SYQ_TEST_S3_DIVIDE_LISTINGS': '1'}, capture=True)
+        assert 'listing divided into parts' in copied.stderr, copied.stderr
         expected = {key[len(prefix) + 1:] for key in objects
                     if not key.endswith('/') and '/zz ignored/' not in key}
         actual = {str(path.relative_to(destination))

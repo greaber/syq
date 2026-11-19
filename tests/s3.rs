@@ -7002,13 +7002,8 @@ fn parallel_listing_failure_stops_copy_and_removal_before_mutation() {
 
 /// Lists `tree/` in order, but every other listing of keys in reverse: once
 /// a divided listing has handed keys over, it must list the prefix again one
-/// request at a time. `reversed` counts the pages served in reverse.
-fn serve_unordered_parts(
-    socket: &mut TcpStream,
-    method: &str,
-    first: &str,
-    reversed: &AtomicUsize,
-) {
+/// request at a time. `starts` counts the listings of `tree/` begun.
+fn serve_unordered_parts(socket: &mut TcpStream, method: &str, first: &str, starts: &AtomicUsize) {
     if method == "HEAD" {
         if first.starts_with("HEAD /bucket/tree ") {
             reply(socket, 404, &[], b"", true);
@@ -7042,9 +7037,11 @@ fn serve_unordered_parts(
     items.dedup();
     let next = (items.len() > start + 1000).then_some(start + 1000);
     let mut page: Vec<_> = items.iter().skip(start).take(1000).collect();
+    if prefix == "tree/" && !delimiter && start == 0 {
+        starts.fetch_add(1, Ordering::Relaxed);
+    }
     if prefix != "tree/" && !delimiter {
         page.reverse();
-        reversed.fetch_add(1, Ordering::Relaxed);
     }
     let body = page
         .iter()
@@ -7098,9 +7095,11 @@ fn a_divided_listing_out_of_order_is_listed_again_whole() {
             "{command}: {}",
             output_text(&output)
         );
-        assert!(
-            server.probes.load(Ordering::Relaxed) > 0,
-            "{command}: the listing was not divided"
+        // Divided first, then listed again whole.
+        assert_eq!(
+            server.probes.load(Ordering::Relaxed),
+            2,
+            "{command}: listings of tree/"
         );
         let (key, kind) = if command == "cp" {
             ("src", "trace")

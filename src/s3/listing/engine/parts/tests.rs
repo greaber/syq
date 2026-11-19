@@ -984,3 +984,60 @@ async fn a_refused_request_for_children_leaves_the_listing_whole() {
         );
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn objects_out_of_order_beside_children_stop_dividing() {
+    /// Returns the objects of every children page in reverse.
+    struct Reversed(Memory);
+    impl Store for Reversed {
+        fn divides(&self) -> bool {
+            true
+        }
+        async fn page(
+            &self,
+            prefix: &str,
+            delimiter: bool,
+            token: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<Page> {
+            let mut page = self.0.page(prefix, delimiter, token, None).await?;
+            if delimiter {
+                page.entries.reverse();
+            }
+            Ok(page)
+        }
+    }
+    let keys = tree(100, 300).chain(["t/a.txt".to_owned(), "t/b.txt".to_owned()]);
+    let store = Reversed(Memory::new(keys));
+    let mut listed = BTreeSet::new();
+    engine::enumerate_prefix(&store, "t/", 32, None, |entry| {
+        assert!(listed.insert(entry.key));
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert!(listed == store.0.keys);
+    assert_eq!(store.0.listings().0.len(), 1, "the listing must stay whole");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_burst_needs_a_dense_first_page() {
+    // Four directories under the dense size on the first page, two large
+    // ones after them, then 58 of one key: four pages.
+    let keys: Vec<_> = (0..4)
+        .flat_map(|d| (0..250).map(move |i| format!("t/a{d}/f{i:04}")))
+        .chain((0..2).flat_map(|d| (0..1000).map(move |i| format!("t/b{d}/f{i:04}"))))
+        .chain((0..58).map(|d| format!("t/c{d:02}/only")))
+        .collect();
+    for key_delay in [1, 5] {
+        let store = Memory::new(keys.clone());
+        store.key_delay.set(key_delay);
+        let (requests, _) = walked(&store, "t/", 32, None).await;
+        // The pages, the children and at most one part, within the
+        // allowance; not a listing for each of the 58.
+        assert!(
+            requests <= 6,
+            "{requests} requests, pages taking {key_delay} ms"
+        );
+    }
+}
