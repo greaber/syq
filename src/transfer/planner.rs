@@ -395,8 +395,9 @@ struct DirectoryStream {
     /// Early metadata for directories that already exist, sent with the
     /// last request.
     last_metadata: Vec<Op>,
-    /// Each directory's share of its request, with its early metadata.
-    sizes: Vec<usize>,
+    /// Each directory's share of its request, with its early metadata, and
+    /// the most their failures could add to its reply.
+    sizes: Vec<(usize, usize)>,
     in_flight: std::collections::VecDeque<SentDirectories>,
     /// Send nothing more: the copy was cancelled or a request failed.
     stopped: bool,
@@ -2983,11 +2984,15 @@ impl Planner<'_> {
             self.plan_leaves(ready, dst_root, leaf_ops)?;
             (self.start_streaming)((!mkdirs.is_empty()).then_some(pending));
         }
-        let sizes: Vec<usize> = mkdirs
+        let sizes: Vec<(usize, usize)> = mkdirs
             .iter()
             .zip(&own_metadata)
             .map(|(op, metadata)| {
-                op.size_hint() + metadata.iter().map(Op::size_hint).sum::<usize>()
+                (
+                    op.size_hint() + metadata.iter().map(Op::size_hint).sum::<usize>(),
+                    crate::proto::failed_path_hint(apply_path(op))
+                        + metadata.iter().map(failed_metadata_hint).sum::<usize>(),
+                )
             })
             .collect();
         let queue = {
@@ -3078,10 +3083,14 @@ impl Planner<'_> {
             } else {
                 usize::MAX
             };
-            let chosen =
-                stream
-                    .queue
-                    .next(growth, &stream.sizes, crate::proto::METADATA_BATCH_BYTES);
+            let chosen = stream.queue.next(
+                growth,
+                &stream.sizes,
+                (
+                    crate::proto::METADATA_BATCH_BYTES,
+                    crate::proto::METADATA_REPLY_BYTES,
+                ),
+            );
             if chosen.is_empty() {
                 // What is left waits for a request in flight. Without one it
                 // would never be sent, and its files never copied.
@@ -3275,8 +3284,12 @@ impl Planner<'_> {
         }
         let mut early = self.early_directory_metadata(planned)?;
         // Narrow existing directories before publishing anything inside them.
-        if !early.existing.is_empty() {
-            self.apply(std::mem::take(&mut early.existing))?;
+        for ops in reply_sized(
+            std::mem::take(&mut early.existing),
+            usize::MAX,
+            failed_metadata_hint,
+        ) {
+            self.apply(ops)?;
         }
         let mut new_dirs: Vec<Op> = planned
             .iter()
@@ -4759,7 +4772,9 @@ impl Planner<'_> {
             for (path, ..) in items {
                 me.note_directory_change(path, true);
             }
-            for chunk in items.chunks(1000) {
+            for chunk in reply_sized_slices(items, 1000, |(path, ..)| {
+                crate::proto::failed_path_hint(path)
+            }) {
                 if opts.dry_run {
                     for (p, rel, kind) in chunk {
                         n += 1;
@@ -5916,6 +5931,49 @@ fn merge_directory_metadata(
 /// set (`flags`), its depth, and the directory it must still be.
 type DirectoryMetadata = (PathBytes, Meta, u8, usize, TargetCondition);
 
+/// The most the failure of an early or final directory metadata operation
+/// adds to its reply (`proto::failed_set_meta_hint`).
+fn failed_metadata_hint(op: &Op) -> usize {
+    match op {
+        Op::SetMeta { path, meta, .. } => crate::proto::failed_set_meta_hint(path, meta),
+        op => crate::proto::failed_path_hint(apply_path(op)),
+    }
+}
+
+/// `items` in order, as consecutive parts of at most `most`, each ending
+/// before the failures of all its operations (by `hint`) could overfill a
+/// reply (`proto::METADATA_REPLY_BYTES`). Each part holds at least one.
+fn reply_sized_slices<T>(
+    mut items: &[T],
+    most: usize,
+    hint: impl Fn(&T) -> usize,
+) -> impl Iterator<Item = &[T]> {
+    std::iter::from_fn(move || {
+        if items.is_empty() {
+            return None;
+        }
+        let mut reply = 0usize;
+        let len = items
+            .iter()
+            .take(most)
+            .position(|item| {
+                reply = reply.saturating_add(hint(item));
+                reply > crate::proto::METADATA_REPLY_BYTES
+            })
+            .map_or(items.len().min(most), |index| index.max(1));
+        let (part, rest) = items.split_at(len);
+        items = rest;
+        Some(part)
+    })
+}
+
+/// `reply_sized_slices` for operations to send.
+fn reply_sized(ops: Vec<Op>, most: usize, hint: impl Fn(&Op) -> usize) -> Vec<Vec<Op>> {
+    reply_sized_slices(&ops, most, hint)
+        .map(<[Op]>::to_vec)
+        .collect()
+}
+
 /// Split `ops` in halves until each part's request fits the metadata frame
 /// budget, keeping their order.
 fn request_sized(mut ops: Vec<Op>) -> Vec<Vec<Op>> {
@@ -6443,6 +6501,103 @@ mod directory_metadata_tests {
             ..attributes(None)
         };
         assert_eq!(times.failure_hint(), 0);
+    }
+
+    // Linux only, as the test above: names that are not UTF-8, at paths
+    // longer than macOS takes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_creation_or_removal_says_no_more_than_its_request_allowed_for() {
+        use crate::proto::failed_path_hint;
+        // Entries at paths near the longest a system call takes fail to be
+        // created or removed in each way a test can bring about.
+        let tree = crate::test_support::tempdir().unwrap();
+        let root = tree.path().as_os_str().as_encoded_bytes().to_vec();
+        let mut receiver = crate::fsops::FsOps::rooted_for_test(tree.path());
+        let parent = vec![vec![0xff; 255]; 13].join(&b'/');
+        let on_disk = |path: &[u8]| {
+            use std::os::unix::ffi::OsStrExt;
+            tree.path().join(std::ffi::OsStr::from_bytes(path))
+        };
+        std::fs::create_dir_all(on_disk(&join(&parent, b"full/inside"))).unwrap();
+        std::fs::write(on_disk(&join(&parent, b"file")), b"").unwrap();
+        let mkdir = |name: &[u8], condition| Op::Mkdir {
+            path: join(&parent, name),
+            mode: 0o755,
+            condition,
+        };
+        let ops = [
+            // Another directory holds the name of a no-replace creation:
+            // its error names the path twice.
+            mkdir(b"full", TargetCondition::Absent),
+            // A file holds the name.
+            mkdir(b"file", TargetCondition::Any),
+            // The parent is a file.
+            mkdir(b"file/new", TargetCondition::Any),
+            // A directory is not empty.
+            Op::Rmdir {
+                path: join(&parent, b"full"),
+            },
+            // A directory has taken a file's place.
+            Op::Unlink {
+                path: join(&parent, b"full"),
+            },
+            // The parent is a file.
+            Op::Rmdir {
+                path: join(&parent, b"file/old"),
+            },
+        ];
+        let expected = [
+            "appeared before no-replace creation",
+            "cannot replace non-directory",
+            "Not a directory",
+            "Directory not empty",
+            "is now a directory",
+            "Not a directory",
+        ];
+        for (op, expected) in ops.iter().zip(expected) {
+            let error = receiver.apply(std::slice::from_ref(op)).remove(0);
+            let error = error.unwrap_or_else(|| panic!("{expected}: the operation succeeded"));
+            assert!(error.message.contains(expected), "{error:?}");
+            let allowed = failed_path_hint(&join(&root, apply_path(op)));
+            assert!(encoded_len(&Some(&error)) <= allowed, "{error:?}");
+            assert!(error.message.len() > 3 * 3300, "{error:?}");
+        }
+        // The no-replace creation's error names the path twice.
+        let twice = receiver.apply(&ops[..1]).remove(0).unwrap();
+        assert!(twice.message.len() > 2 * 3 * 3300, "{twice:?}");
+    }
+
+    #[test]
+    fn removals_go_1000_at_a_time_or_fewer_when_their_failures_could_overfill_a_reply() {
+        let lengths = |path_len: usize| -> Vec<usize> {
+            let paths: Vec<PathBytes> = (0..2500)
+                .map(|index| {
+                    let mut path = vec![0xff; path_len];
+                    path.extend_from_slice(format!("{index:05}").as_bytes());
+                    path
+                })
+                .collect();
+            reply_sized_slices(&paths, 1000, |path| crate::proto::failed_path_hint(path))
+                .map(<[PathBytes]>::len)
+                .collect()
+        };
+        assert_eq!(lengths(50), [1000, 1000, 500]);
+        // Three copies of about 9.8 KiB each when the receiver shows them:
+        // 141 in 4 MiB.
+        let long = lengths(3250);
+        assert_eq!(long.iter().sum::<usize>(), 2500);
+        assert!(
+            long[..long.len() - 1].iter().all(|&len| len == 141),
+            "{long:?}"
+        );
+        // One goes alone, however large.
+        assert_eq!(
+            reply_sized_slices(&[0, 1], 1000, |_| usize::MAX)
+                .map(<[i32]>::len)
+                .collect::<Vec<_>>(),
+            [1, 1]
+        );
     }
 
     #[test]

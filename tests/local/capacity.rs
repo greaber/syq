@@ -229,3 +229,117 @@ fn streaming_capacity_failure_keeps_completed_files_and_reports_abort() {
         }
     }
 }
+
+/// Fourteen nested directories named with 255 bytes that are not UTF-8: a
+/// path below them is about 3,600 bytes, and the receiver shows each of
+/// those bytes as three, so one error naming such a path takes about 11 KiB.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn long_parent() -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    let long = std::ffi::OsStr::from_bytes(&[0xff; 255]);
+    (0..14).fold(PathBuf::new(), |path, _| path.join(long))
+}
+
+/// The lines of `output`'s errors that say the destination is full.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn full_lines(output: &Output) -> usize {
+    stderr_of(output)
+        .lines()
+        .filter(|line| line.contains("No space left on device"))
+        .count()
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn every_failed_directory_creation_is_reported_when_long_paths_would_overfill_a_reply() {
+    // 1,000 new directories below long names, every one of which the
+    // receiver fails to create. A reply carries a request's errors and holds
+    // 8 MiB, less than 1,000 of these: the requests end before their errors
+    // could overfill it, and each directory's failure is reported.
+    let t = Tmp::new();
+    let parent = long_parent();
+    for index in 0..1000 {
+        fs::create_dir_all(
+            t.path("src")
+                .join(&parent)
+                .join(format!("d{index:04}-full")),
+        )
+        .unwrap();
+    }
+    let requests = t.path("requests");
+    // Off a network filesystem, one request creates as many directories as
+    // its 6 MiB holds: about 900 of these.
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["cp", "--no-progress", "--srcs-in", &t.s("src"), "--into"])
+        .arg(t.path("dst"))
+        .env("SYQ_TEST_FAIL_APPLY_ENOSPC", "-full")
+        .env("SYQ_TEST_DIRECTORY_REQUESTS", &requests)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .run()
+        .unwrap();
+    let stderr = stderr_of(&output);
+    let sizes: Vec<usize> = fs::read_to_string(&requests)
+        .unwrap()
+        .lines()
+        .map(|line| line.parse().unwrap())
+        .collect();
+    // A full destination ends the copy once the failures of the requests
+    // already sent are reported: each directory below the long parents.
+    let sent = sizes.iter().sum::<usize>() - 14;
+    assert_eq!(
+        (output.status.code(), full_lines(&output)),
+        // With the line that ends the copy.
+        (Some(1), sent + 1),
+        "{sizes:?}\n{}",
+        stderr.lines().rev().take(3).collect::<Vec<_>>().join("\n")
+    );
+    assert!(
+        sizes.len() > 1 && sizes.iter().all(|&size| size < 400),
+        "{sizes:?}"
+    );
+    assert!(t.path("dst").join(&parent).is_dir());
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn every_failed_removal_is_reported_when_long_paths_would_overfill_a_reply() {
+    // 1,000 files only in the destination, below long names, every one of
+    // which the receiver fails to remove.
+    let t = Tmp::new();
+    let parent = long_parent();
+    fs::create_dir_all(t.path("src").join(&parent)).unwrap();
+    for index in 0..1000 {
+        write(
+            &t.path("dst")
+                .join(&parent)
+                .join(format!("f{index:04}-full")),
+            b"extra",
+        );
+    }
+    let output = compat_command()
+        .args([
+            "-a",
+            "--delete",
+            "--no-progress",
+            &t.s("src/"),
+            &t.s("dst/"),
+        ])
+        .env("SYQ_TEST_FAIL_APPLY_ENOSPC", "-full")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .run()
+        .unwrap();
+    assert_eq!(
+        (output.status.code(), full_lines(&output)),
+        (Some(23), 1000),
+        "{}",
+        stderr_of(&output)
+            .lines()
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert!(t.path("dst").join(&parent).join("f0000-full").exists());
+}

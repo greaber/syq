@@ -123,20 +123,26 @@ impl DirectoryQueue {
 
     /// The next request's directories at `growth`: at most `PER_PARENT *
     /// growth` in one parent, `PER_REQUEST * growth` in all and `growth`
-    /// levels deep (`usize::MAX` for no such limit), within `byte_limit` by
-    /// `sizes` (each directory's share of the request). A deeper level joins
+    /// levels deep (`usize::MAX` for no such limit), within `limits` by
+    /// `sizes`: each directory's share of the request, then the most its
+    /// failures could add to the reply. A deeper level joins
     /// only once the levels above it are all in this or an earlier request,
     /// so a directory is never created before its parent. The request ends
     /// before the first directory that must wait for an earlier request's
     /// reply (`DirectoryQueue`), which stays queued: it is empty when that
     /// is the next one.
-    pub(super) fn next(&mut self, growth: usize, sizes: &[usize], byte_limit: usize) -> Vec<usize> {
+    pub(super) fn next(
+        &mut self,
+        growth: usize,
+        sizes: &[(usize, usize)],
+        limits: (usize, usize),
+    ) -> Vec<usize> {
         self.requests += 1;
         let request = self.requests;
         let total = PER_REQUEST.saturating_mul(growth);
         let per_parent = PER_PARENT.saturating_mul(growth);
         let mut chosen = Vec::new();
-        let mut bytes = 0usize;
+        let (mut bytes, mut reply) = (0usize, 0usize);
         let mut full = false;
         let mut level = self.first;
         while level < self.levels.len() && level < self.first.saturating_add(growth) && !full {
@@ -148,7 +154,9 @@ impl DirectoryQueue {
                         break;
                     };
                     if chosen.len() == total
-                        || (!chosen.is_empty() && bytes.saturating_add(sizes[index]) > byte_limit)
+                        || (!chosen.is_empty()
+                            && (bytes.saturating_add(sizes[index].0) > limits.0
+                                || reply.saturating_add(sizes[index].1) > limits.1))
                         || (self.any_no_replace
                             && waits(&self.parent, &self.no_replace, &self.state, index, request))
                     {
@@ -158,7 +166,8 @@ impl DirectoryQueue {
                     queue.pop_front();
                     chosen.push(index);
                     self.state[index] = Creation::Sent(request);
-                    bytes = bytes.saturating_add(sizes[index]);
+                    bytes = bytes.saturating_add(sizes[index].0);
+                    reply = reply.saturating_add(sizes[index].1);
                     taken += 1;
                     current.remaining -= 1;
                 }
@@ -337,22 +346,34 @@ impl Pacing {
 mod tests {
     use super::*;
 
-    fn queued(paths: &[&str]) -> (DirectoryQueue, Vec<usize>) {
+    const UNLIMITED: (usize, usize) = (usize::MAX, usize::MAX);
+
+    fn queued(paths: &[&str]) -> (DirectoryQueue, Vec<(usize, usize)>) {
         queued_no_replace(paths, &[])
     }
 
     /// The directories of `paths` named in `no_replace` are created only
     /// where nothing is.
-    fn queued_no_replace(paths: &[&str], no_replace: &[&str]) -> (DirectoryQueue, Vec<usize>) {
+    fn queued_no_replace(
+        paths: &[&str],
+        no_replace: &[&str],
+    ) -> (DirectoryQueue, Vec<(usize, usize)>) {
         let flags: Vec<bool> = paths.iter().map(|path| no_replace.contains(path)).collect();
         let paths: Vec<&[u8]> = paths.iter().map(|path| path.as_bytes()).collect();
-        (DirectoryQueue::new(&paths, &flags), vec![100; paths.len()])
+        (
+            DirectoryQueue::new(&paths, &flags),
+            vec![(100, 0); paths.len()],
+        )
     }
 
-    fn drain(queue: &mut DirectoryQueue, sizes: &[usize], growth: usize) -> Vec<Vec<usize>> {
+    fn drain(
+        queue: &mut DirectoryQueue,
+        sizes: &[(usize, usize)],
+        growth: usize,
+    ) -> Vec<Vec<usize>> {
         let mut requests = Vec::new();
         while !queue.is_empty() {
-            let request = queue.next(growth, sizes, usize::MAX);
+            let request = queue.next(growth, sizes, UNLIMITED);
             assert!(!request.is_empty(), "a request creates something");
             requests.push(request);
         }
@@ -419,9 +440,15 @@ mod tests {
             vec![64, 64, 64, 8]
         );
         let (mut queue, sizes) = queued(&paths);
-        assert_eq!(queue.next(1, &sizes, 250).len(), 2);
+        assert_eq!(queue.next(1, &sizes, (250, usize::MAX)).len(), 2);
         // One directory goes alone even past the limit.
-        assert_eq!(queue.next(1, &sizes, 50).len(), 1);
+        assert_eq!(queue.next(1, &sizes, (50, usize::MAX)).len(), 1);
+        // The reply's limit ends a request just as the request's does.
+        let (mut queue, _) = queued(&paths);
+        let sizes = vec![(100, 1000); paths.len()];
+        assert_eq!(queue.next(1, &sizes, (usize::MAX, 2500)).len(), 2);
+        assert_eq!(queue.next(1, &sizes, (usize::MAX, 500)).len(), 1);
+        assert_eq!(queue.next(1, &sizes, (250, 2500)).len(), 2);
     }
 
     #[test]
@@ -435,57 +462,57 @@ mod tests {
         let (mut queue, sizes) = queued_no_replace(&paths, &paths);
         let mut sent = Vec::new();
         for expected in [[0, 1], [2, 3], [4, 5], [6, 7]] {
-            let request = queue.next(1, &sizes, usize::MAX);
+            let request = queue.next(1, &sizes, UNLIMITED);
             assert_eq!(request, expected);
             sent.extend(request);
         }
         // A child waits for its parent's reply.
-        assert!(queue.next(1, &sizes, usize::MAX).is_empty());
+        assert!(queue.next(1, &sizes, UNLIMITED).is_empty());
         queue.answered(&sent);
         // Grown requests span levels, but never take a no-replace directory
         // with its parent: the receiver would create both at once.
-        assert_eq!(queue.next(8, &sizes, usize::MAX), vec![8]);
-        assert!(queue.next(8, &sizes, usize::MAX).is_empty());
+        assert_eq!(queue.next(8, &sizes, UNLIMITED), vec![8]);
+        assert!(queue.next(8, &sizes, UNLIMITED).is_empty());
         queue.answered(&[8]);
-        assert_eq!(queue.next(8, &sizes, usize::MAX), vec![9]);
+        assert_eq!(queue.next(8, &sizes, UNLIMITED), vec![9]);
         assert!(queue.is_empty());
 
         // Nor with a parent created as usual, which the receiver creates
         // after its no-replace creations.
         let (mut queue, sizes) = queued_no_replace(&["/d/a", "/d/a/b"], &["/d/a/b"]);
-        assert_eq!(queue.next(4, &sizes, usize::MAX), vec![0]);
-        assert!(queue.next(4, &sizes, usize::MAX).is_empty());
+        assert_eq!(queue.next(4, &sizes, UNLIMITED), vec![0]);
+        assert!(queue.next(4, &sizes, UNLIMITED).is_empty());
         queue.answered(&[0]);
-        assert_eq!(queue.next(4, &sizes, usize::MAX), vec![1]);
+        assert_eq!(queue.next(4, &sizes, UNLIMITED), vec![1]);
 
         // What is created as usual beneath a no-replace directory may go in
         // its request, where the receiver skips it if that creation fails,
         // but not in a later one before its reply, nor deeper beneath.
         let paths = ["/d/a", "/d/a/x", "/d/a/x/y", "/d/b"];
         let (mut queue, sizes) = queued_no_replace(&paths, &["/d/a"]);
-        assert_eq!(queue.next(2, &sizes, usize::MAX), vec![0, 3, 1]);
-        assert!(queue.next(2, &sizes, usize::MAX).is_empty());
+        assert_eq!(queue.next(2, &sizes, UNLIMITED), vec![0, 3, 1]);
+        assert!(queue.next(2, &sizes, UNLIMITED).is_empty());
         queue.answered(&[0, 3, 1]);
-        assert_eq!(queue.next(2, &sizes, usize::MAX), vec![2]);
+        assert_eq!(queue.next(2, &sizes, UNLIMITED), vec![2]);
         let (mut queue, sizes) = queued_no_replace(&paths, &["/d/a"]);
-        assert_eq!(queue.next(1, &sizes, usize::MAX), vec![0, 3]);
-        assert!(queue.next(1, &sizes, usize::MAX).is_empty());
+        assert_eq!(queue.next(1, &sizes, UNLIMITED), vec![0, 3]);
+        assert!(queue.next(1, &sizes, UNLIMITED).is_empty());
         queue.answered(&[0, 3]);
-        assert_eq!(queue.next(4, &sizes, usize::MAX), vec![1, 2]);
+        assert_eq!(queue.next(4, &sizes, UNLIMITED), vec![1, 2]);
 
         // A directory the scan found between two new ones, say made by
         // another process meanwhile, does not hide the one above it.
         let (mut queue, sizes) =
             queued_no_replace(&["/d/a", "/d/x", "/d/a/b/c"], &["/d/a", "/d/x", "/d/a/b/c"]);
-        assert_eq!(queue.next(2, &sizes, usize::MAX), vec![0, 1]);
-        assert!(queue.next(2, &sizes, usize::MAX).is_empty());
+        assert_eq!(queue.next(2, &sizes, UNLIMITED), vec![0, 1]);
+        assert!(queue.next(2, &sizes, UNLIMITED).is_empty());
         queue.answered(&[0, 1]);
-        assert_eq!(queue.next(2, &sizes, usize::MAX), vec![2]);
+        assert_eq!(queue.next(2, &sizes, UNLIMITED), vec![2]);
 
         // A request ends at the first directory that waits.
         let (mut queue, sizes) =
             queued_no_replace(&["/d/a", "/d/b", "/d/a/x", "/d/b/x"], &["/d/b/x"]);
-        assert_eq!(queue.next(4, &sizes, usize::MAX), vec![0, 1, 2]);
+        assert_eq!(queue.next(4, &sizes, UNLIMITED), vec![0, 1, 2]);
     }
 
     #[test]
@@ -496,19 +523,29 @@ mod tests {
         paths.extend(["/d/0/a".into(), "/d/0/a/b".into()]);
         let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
         let (mut queue, sizes) = queued(&paths);
-        assert_eq!(queue.next(usize::MAX, &sizes, usize::MAX).len(), 302);
+        assert_eq!(queue.next(usize::MAX, &sizes, UNLIMITED).len(), 302);
         assert!(queue.is_empty());
         let (mut queue, sizes) = queued(&paths);
-        assert_eq!(queue.next(usize::MAX, &sizes, 100 * 250).len(), 250);
-        assert_eq!(queue.next(usize::MAX, &sizes, 100 * 250).len(), 52);
+        assert_eq!(
+            queue
+                .next(usize::MAX, &sizes, (100 * 250, usize::MAX))
+                .len(),
+            250
+        );
+        assert_eq!(
+            queue
+                .next(usize::MAX, &sizes, (100 * 250, usize::MAX))
+                .len(),
+            52
+        );
         // Nested no-replace directories still go a level at a time.
         let (mut queue, sizes) = queued_no_replace(&paths, &["/d/0/a", "/d/0/a/b"]);
-        assert_eq!(queue.next(usize::MAX, &sizes, usize::MAX).len(), 300);
-        assert!(queue.next(usize::MAX, &sizes, usize::MAX).is_empty());
+        assert_eq!(queue.next(usize::MAX, &sizes, UNLIMITED).len(), 300);
+        assert!(queue.next(usize::MAX, &sizes, UNLIMITED).is_empty());
         queue.answered(&(0..300).collect::<Vec<_>>());
-        assert_eq!(queue.next(usize::MAX, &sizes, usize::MAX), vec![300]);
+        assert_eq!(queue.next(usize::MAX, &sizes, UNLIMITED), vec![300]);
         queue.answered(&[300]);
-        assert_eq!(queue.next(usize::MAX, &sizes, usize::MAX), vec![301]);
+        assert_eq!(queue.next(usize::MAX, &sizes, UNLIMITED), vec![301]);
     }
 
     #[test]
