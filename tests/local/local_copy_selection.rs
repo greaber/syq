@@ -27,20 +27,22 @@ fn local_batch_boundary_and_scheduler_agree() {
             ])
             .env("SYQ_DEBUG", "1")
             .env("SYQ_TEST_WORKER_EVENTS", t.path("workers"))
+            .env("SYQ_TUNING_HISTORY", t.path("history.sqlite"))
             .env("SYQ_TEST_COPY_LOCAL_EXDEV", "1")
             .env("SYQ_TEST_COPY_LOCAL_FS", "local")
             .run()
             .unwrap();
         assert_output_ok(&out);
+        // Every requested worker starts. One that starts after the others
+        // have finished every file exits without connecting.
+        let (started, _) = started_workers(&t.path("history.sqlite"));
+        assert_eq!(started, connections.parse::<i64>().unwrap());
         let workers = fs::read_to_string(t.path("workers")).unwrap();
-        assert_eq!(
-            workers
-                .lines()
-                .filter(|line| line.starts_with("connected "))
-                .count(),
-            connections.parse::<usize>().unwrap(),
-            "{workers}"
-        );
+        let connected = workers
+            .lines()
+            .filter(|line| line.starts_with("connected "))
+            .count();
+        assert!((1..=started as usize).contains(&connected), "{workers}");
         assert_same_tree(&t.path("src"), &t.path("dst"));
         let observed = tuning_observed(&out);
         assert_eq!(observed["local_whole_files"], 3, "{out:?}");
