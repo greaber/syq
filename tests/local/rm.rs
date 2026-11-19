@@ -743,3 +743,125 @@ fn native_rm_named_directories_are_rejected_before_any_mutation_locally_and_remo
         }
     }
 }
+
+/// A tree nested beyond the longest path a system call takes: `depth`
+/// directories named with 255 bytes, each opened from the one above, and
+/// `files` files in the deepest.
+#[cfg(target_os = "linux")]
+fn deep_tree(top: &Path, depth: usize, files: usize) {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    fs::create_dir(top).unwrap();
+    let name = std::ffi::CString::new(vec![b'a'; 255]).unwrap();
+    let open = |at: i32, name: &std::ffi::CStr| {
+        let fd = unsafe { libc::openat(at, name.as_ptr(), libc::O_DIRECTORY | libc::O_CLOEXEC) };
+        assert!(fd >= 0, "{}", std::io::Error::last_os_error());
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    };
+    let top = std::ffi::CString::new(top.as_os_str().as_bytes()).unwrap();
+    let mut directory = open(libc::AT_FDCWD, &top);
+    for _ in 0..depth {
+        assert_eq!(
+            unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o755) },
+            0
+        );
+        directory = open(directory.as_raw_fd(), &name);
+    }
+    for index in 0..files {
+        let file = std::ffi::CString::new(format!("f{index:04}")).unwrap();
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                file.as_ptr(),
+                libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC,
+                0o644,
+            )
+        };
+        assert!(fd >= 0);
+        drop(unsafe { OwnedFd::from_raw_fd(fd) });
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_remote_removal_reports_each_entry_of_a_tree_nested_beyond_any_path() {
+    // 250 files below 170 directories named with 255 bytes: each result
+    // names a path of about 43 KiB, and the receiver sends at most 200
+    // results together, more than one message holds. Each goes in a
+    // message that holds it, and every entry's removal is reported.
+    let t = Tmp::new();
+    let ssh = fake_ssh(&t);
+    deep_tree(&t.path("deep"), 170, 250);
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["rm", "--cwd", &t.s(""), "--src-dir", "deep", "-q"])
+        .args(["--results", &t.s("results.ndjson")])
+        .args(["--on", "fake", "--syq-path", env!("CARGO_BIN_EXE_syq")])
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", ssh.parent().unwrap().to_string_lossy()),
+        )
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    assert!(!t.path("deep").exists());
+    let records: Vec<serde_json::Value> = String::from_utf8(read(&t.path("results.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let removed = records
+        .iter()
+        .filter(|record| record["type"] == "removal_result" && record["disposition"] == "removed")
+        .count();
+    // The files, the 170 directories and the selected one.
+    assert_eq!(removed, 250 + 171);
+    let result = records.last().unwrap();
+    assert_eq!(
+        (&result["status"], &result["entries_removed"]),
+        (&serde_json::json!("success"), &serde_json::json!(421))
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_remote_removal_reports_selectors_whose_traces_together_exceed_a_message() {
+    // Sixteen missing selectors of about 100,000 DEL characters, which a trace
+    // shows escaped, six bytes for each: about 9.6 MB of traces, more than
+    // one message holds. Each selector's result is reported.
+    let t = Tmp::new();
+    let ssh = fake_ssh(&t);
+    let selectors: Vec<String> = (0..16)
+        .map(|index| {
+            let component = "\u{7f}".repeat(255);
+            format!("missing{index:02}/{}", vec![component; 390].join("/"))
+        })
+        .collect();
+    let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .args(["rm", "--cwd", &t.s(""), "-q"])
+        .args(["--results", &t.s("results.ndjson")])
+        .args(["--on", "fake", "--syq-path", env!("CARGO_BIN_EXE_syq")])
+        .args(&selectors)
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", ssh.parent().unwrap().to_string_lossy()),
+        )
+        .run()
+        .unwrap();
+    let records: Vec<serde_json::Value> = String::from_utf8(read(&t.path("results.ndjson")))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_output_ok(&output);
+    let result = records.last().unwrap();
+    assert_eq!(
+        (&result["status"], &result["selectors_missing"]),
+        (&serde_json::json!("success"), &serde_json::json!(16))
+    );
+}
