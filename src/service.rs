@@ -173,14 +173,16 @@ impl Server {
                 return Err(error).context("wait for the service's next event");
             }
         }
+        let client = result > 0 && descriptors[0].revents != 0;
+        if result <= 0 || descriptors[1].revents == 0 {
+            return Ok(client);
+        }
         loop {
             match self.wake.read(&mut [0; 128]) {
                 Ok(0) => bail!("service wake channel closed"),
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    return Ok(result > 0 && descriptors[0].revents != 0)
-                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(client),
                 Err(error) => return Err(error.into()),
             }
         }
