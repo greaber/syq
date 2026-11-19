@@ -25,9 +25,12 @@
 //! when the source changed while it was read. A destination connection
 //! carries nothing else while a patch is open on it, so a worker streams
 //! its patches one after another, each next one beginning as the last ends.
-//! Pieces are pipelined: up to `STREAM_BUFFER_BYTES` of them are read ahead
-//! from a remote source, and those sent await their acknowledgments within
-//! the destination's reply queue.
+//! Pieces are pipelined. From a remote source, sixteen are read ahead, or
+//! more within `STREAM_READ_AHEAD_BYTES`, and never more than
+//! `STREAM_BUFFER_BYTES`. Those sent await their acknowledgments within the
+//! destination's reply queue and `UNACKNOWLEDGED_PIECE_BYTES`: scattered
+//! changes make pieces of a single block, so a stream needs many of them in
+//! flight to fill a long link.
 //!
 //! A worker streams the first of its batch's patches itself and leaves the
 //! others in the queue (`Sched::share_patches`), for workers that have
@@ -72,6 +75,37 @@ static NEXT_COMPARE_BATCH: AtomicU64 = AtomicU64::new(1);
 /// Most piece data a worker reads ahead of sending it while streaming a
 /// patch: as much as a group's patches hold.
 const STREAM_BUFFER_BYTES: u64 = crate::proto::MAX_DIFFERING_FILE_BYTES;
+/// Most piece data a worker reads ahead from a remote source once sixteen
+/// reads await replies (and never more than `STREAM_BUFFER_BYTES`): enough
+/// for scattered single-block pieces to fill a long link, while what waits
+/// for a stalled destination stays near what sixteen such reads held.
+const STREAM_READ_AHEAD_BYTES: u64 = 2 << 20;
+
+/// Most piece data a worker has sent and the destination not yet
+/// acknowledged while streaming patches: what sixteen full pieces carry.
+/// The worker does not keep the pieces it sent: each is written to its
+/// connection before it reads another, and a receiver decodes only a few
+/// requests ahead of the one it serves. A piece is one whole comparison
+/// block when that is larger, so every piece fits the bound.
+const UNACKNOWLEDGED_PIECE_BYTES: u64 = 16 * PATCH_PIECE_BYTES;
+const _: () = assert!(PATCH_PIECE_BYTES <= UNACKNOWLEDGED_PIECE_BYTES);
+const _: () = assert!(crate::proto::MAX_HASH_BLOCK_BYTES <= UNACKNOWLEDGED_PIECE_BYTES);
+
+/// Replies a stream leaves room for in its connections' reply queues: those
+/// still owed for requests sent before it began, such as a deferred
+/// publication's check or finalize, or the connection's setup.
+const OWED_REPLIES: usize = COMPARE_WINDOW;
+const _: () = assert!(super::publication::DEFERRED_PUBLICATIONS < OWED_REPLIES);
+
+/// Pieces and reads a stream may have awaiting replies on a connection whose
+/// reader queues `queue` replies: the queue less the room for replies still
+/// owed, so that the reader never stops reading replies while the worker
+/// sends, and never fewer than sixteen, or the whole queue if it is smaller.
+fn stream_window(queue: usize) -> usize {
+    queue
+        .saturating_sub(OWED_REPLIES)
+        .max(queue.min(COMPARE_WINDOW))
+}
 
 /// Files and source bytes per group.
 const COMPARE_GROUP_FILES: usize = 256;
@@ -202,6 +236,19 @@ enum StreamStep {
     End(usize),
 }
 
+/// The piece data sent to the destination and not yet acknowledged.
+fn unacknowledged(
+    destination: &std::collections::VecDeque<(StreamStep, std::time::Instant)>,
+) -> u64 {
+    destination
+        .iter()
+        .map(|(step, _)| match step {
+            StreamStep::Ack(_, len) => u64::from(*len),
+            _ => 0,
+        })
+        .sum()
+}
+
 /// What streaming one patch has learned.
 #[derive(Default)]
 struct StreamState {
@@ -214,6 +261,8 @@ struct StreamState {
     failed: bool,
     /// The receiver refused its begin, so no patch is open there to end.
     refused: bool,
+    /// The receiver accepted its begin.
+    opened: bool,
     /// The source changed while it was read, to this or nothing.
     changed: Option<Option<Entry>>,
     /// Bytes of its pieces the receiver acknowledged, counted as progress
@@ -736,15 +785,11 @@ impl Worker {
         use std::collections::VecDeque;
         // An in-process source answers each read as it is sent, and its
         // piece moves on before the next is read. A remote one's reads queue
-        // within its reply queue and the read-ahead buffer.
-        let reads = self
-            .src
-            .reply_queue()
-            .map_or(1, |queue| queue.min(COMPARE_WINDOW));
-        let acknowledgments = self
-            .dst
-            .reply_queue()
-            .map_or(COMPARE_WINDOW, |queue| queue.min(COMPARE_WINDOW));
+        // within its reply queue (`stream_window`) and the read-ahead
+        // buffer. Sent pieces await their acknowledgments within the
+        // destination's reply queue and `UNACKNOWLEDGED_PIECE_BYTES`.
+        let reads = self.src.reply_queue().map_or(1, stream_window);
+        let acknowledgments = self.dst.reply_queue().map_or(COMPARE_WINDOW, stream_window);
         let mut source: VecDeque<(StreamStep, std::time::Instant)> = VecDeque::new();
         let mut destination: VecDeque<(StreamStep, std::time::Instant)> = VecDeque::new();
         // The patch whose reads are being sent, and the piece bytes read
@@ -771,7 +816,11 @@ impl Worker {
                 }
                 let job = &jobs[streams[reading].file];
                 if let Some(&(off, len)) = state.ranges.get(state.next) {
-                    if buffered > 0 && buffered + u64::from(len) > STREAM_BUFFER_BYTES {
+                    let after = buffered + u64::from(len);
+                    if buffered > 0
+                        && (after > STREAM_BUFFER_BYTES
+                            || (after > STREAM_READ_AHEAD_BYTES && source.len() >= COMPARE_WINDOW))
+                    {
                         break;
                     }
                     self.src.send(Request::ReadRange {
@@ -836,7 +885,22 @@ impl Worker {
             // sends no more pieces, and owe no more acknowledgments than the
             // destination's connection queues.
             self.arrived_replies(batch, streams, states, &mut destination, outcomes)?;
-            while destination.len() >= acknowledgments {
+            // A command-restricted receiver records each piece that reaches
+            // it after refusing the patch's begin, so until the begin is
+            // answered, only as many follow it as sixteen requests allow.
+            let (piece, stream) = match step {
+                StreamStep::Piece(index, _, len) => (u64::from(len), Some(index)),
+                _ => (0, None),
+            };
+            let restricted = self.opts.restricted_receiver;
+            let unopened = |states: &[StreamState]| {
+                restricted
+                    && stream.is_some_and(|index| !states[index].opened && !states[index].failed)
+            };
+            while destination.len() >= acknowledgments
+                || unacknowledged(&destination) + piece > UNACKNOWLEDGED_PIECE_BYTES
+                || (unopened(states) && destination.len() >= COMPARE_WINDOW)
+            {
                 let (step, _) = destination.pop_front().expect("pending reply");
                 let reply = self.dst.recv()?;
                 self.streamed_reply(batch, streams, states, step, reply, outcomes)?;
@@ -845,6 +909,12 @@ impl Worker {
                 StreamStep::Piece(index, off, len) => {
                     let state = &mut states[index];
                     buffered -= u64::from(len);
+                    // Its reads may all have been sent before the copy was
+                    // aborted: no further piece is sent, and the patch is
+                    // not published.
+                    if self.sched.is_aborted() {
+                        state.failed = true;
+                    }
                     let piece = match ok(response, "read streamed patch piece") {
                         Ok(Response::Block {
                             off: at,
@@ -1003,6 +1073,7 @@ impl Worker {
                         state.counted += u64::from(*len);
                         self.progress.add_bytes(u64::from(*len));
                     }
+                    (StreamStep::Begin(_), Response::Ok) => state.opened = true,
                     (_, Response::Ok) => {}
                     (StreamStep::Begin(_), Response::Err(_) | Response::EndpointError(_)) => {
                         state.failed = true;
