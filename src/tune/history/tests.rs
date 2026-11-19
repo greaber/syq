@@ -1075,7 +1075,8 @@ fn unfinished_run(path: &Path, key: &ContextKey, points: &[(usize, f64)]) -> Rec
 fn exact_filesystem_starts_survive_other_destinations_and_unfinished_runs() {
     let temp = crate::test_support::tempdir().unwrap();
     let path = temp.path().join("history.sqlite");
-    // Each run's other count is nearly as fast, so an exact match may refine.
+    // Each run's other count is nearly as fast, so an exact match may refine
+    // and starts from the fewer workers.
     measured_run(&path, &key("a"), &[(8, 200.0), (16, 195.0)]);
     measured_run(&path, &key("b"), &[(32, 200.0), (16, 195.0)]);
     let failed = unfinished_run(&path, &key("a"), &[(64, 200.0), (32, 100.0)]);
@@ -1089,7 +1090,7 @@ fn exact_filesystem_starts_survive_other_destinations_and_unfinished_runs() {
     let exact = next.starting_count(&key("a"), false).unwrap();
     assert_eq!((exact.workers, exact.matched.as_str()), (8, "filesystems"));
     assert!(exact.refine);
-    assert_eq!(next.starting_count(&key("b"), false).unwrap().workers, 32);
+    assert_eq!(next.starting_count(&key("b"), false).unwrap().workers, 16);
     // Another filesystem pair falls back to the route only when allowed,
     // and a route-level match never skips the startup doubling.
     assert!(next.starting_count(&key("unknown"), false).is_none());
@@ -1101,20 +1102,20 @@ fn exact_filesystem_starts_survive_other_destinations_and_unfinished_runs() {
     assert!(next.starting_count(&other_mode, true).is_none());
 }
 
-#[test]
-fn repeated_inconclusive_copies_do_not_raise_the_starting_count() {
+/// Starting counts of six copies from an empty history, where each copy
+/// starts as production does and the live tuner's first upward probe measures
+/// `ratio(copy)` times the starting count's rate.
+fn starts_over_copies(ratio: impl Fn(usize) -> f64) -> Vec<usize> {
     use super::super::Policy;
     let temp = crate::test_support::tempdir().unwrap();
     let path = temp.path().join("history.sqlite");
     let context = key("a");
-    let mut start = 8;
+    let mut starts = Vec::new();
     for run in 0..6 {
         let hint = recorder(&path).starting_count(&context, false);
         assert_eq!(hint.is_some(), run > 0);
-        if let Some(hint) = &hint {
-            start = hint.workers;
-        }
-        assert_eq!(start, 8, "run {run}");
+        let start = hint.as_ref().map_or(8, |hint| hint.workers);
+        starts.push(start);
         let mut policy = if hint.is_some_and(|h| h.refine) {
             Policy::refine(start, 1, 256)
         } else {
@@ -1123,13 +1124,37 @@ fn repeated_inconclusive_copies_do_not_raise_the_starting_count() {
         policy.observe(100.0);
         policy.activated();
         let larger = policy.active();
-        policy.observe(97.0);
-        // The live copy keeps the inconclusive increase.
+        let rate = 100.0 * ratio(run);
+        policy.observe(rate);
+        // The live copy keeps an inconclusive increase.
         assert_eq!(policy.settled(), larger);
-        let writer = measured_run(&path, &context, &[(start, 100.0), (larger, 97.0)]);
+        let writer = measured_run(&path, &context, &[(start, 100.0), (larger, rate)]);
         let run = command::read_run(&open(&path).unwrap(), saved(&writer)).unwrap();
         assert_eq!(run["recommendation_eligible"], true);
     }
+    starts
+}
+
+#[test]
+fn repeated_inconclusive_copies_do_not_raise_the_starting_count() {
+    // The larger count measured slower, faster by less than the live
+    // tuner's own threshold for a gain, or each in turn.
+    assert_eq!(starts_over_copies(|_| 0.97), [8; 6]);
+    assert_eq!(starts_over_copies(|_| 1.01), [8; 6]);
+    assert_eq!(starts_over_copies(|_| 1.04), [8; 6]);
+    assert_eq!(
+        starts_over_copies(|run| if run % 2 == 0 { 1.01 } else { 0.99 }),
+        [8; 6]
+    );
+}
+
+#[test]
+fn repeated_clear_gains_keep_raising_the_starting_count() {
+    let starts = starts_over_copies(|_| 1.3);
+    assert!(
+        starts.windows(2).all(|pair| pair[1] > pair[0]),
+        "{starts:?}"
+    );
 }
 
 #[test]

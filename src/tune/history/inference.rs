@@ -14,8 +14,9 @@ pub(super) const MEASUREMENTS: i64 = 4;
 struct Comparison {
     workers: usize,
     refine: bool,
-    // The best count was the highest one measured. This is evidence against
-    // lower counts, not evidence against untested higher counts.
+    // The chosen count was the highest one measured, so it measured clearly
+    // faster than every lower count. This is evidence against lower counts,
+    // not evidence against untested higher counts.
     lower_bound: bool,
 }
 
@@ -248,14 +249,14 @@ impl RunEvidence {
         if best <= 0.0 {
             return None;
         }
-        // A small connection cost breaks flat-rate ties without sacrificing a
-        // meaningful speed gain: 0.1% of throughput per doubling. Otherwise flat
-        // successive runs would ratchet their starting counts upward forever.
-        let minimum = points.first()?.0 as f64;
-        let utility = |n: usize, rate: f64| rate / best - 0.001 * (n as f64 / minimum).log2();
+        // Prefer the fewest workers within the live tuner's own tolerance of the
+        // best rate. A larger count has to measure clearly faster to become the
+        // run's choice, and only then does it bound the start from below. With a
+        // smaller margin, noise that favours the larger count would raise the
+        // next copy's start, which tries a still larger count, and so on.
         let workers = points
             .iter()
-            .max_by(|a, b| utility(a.0, a.1).total_cmp(&utility(b.0, b.1)))?
+            .find(|p| p.1 >= best * (1.0 - crate::tune::NEAR_BEST_TOLERANCE))?
             .0;
         let refine = points
             .iter()

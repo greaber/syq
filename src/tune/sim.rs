@@ -489,7 +489,7 @@ fn report() {
     }
 
     // Repeated medium-length copies that start from the remembered count.
-    println!("\nremembered count across six 40s copies (median, 90th percentile)");
+    println!("\nremembered count across eight 40s copies (median, 90th percentile)");
     for (name, curve, start) in curves() {
         let s = Scenario {
             name,
@@ -501,46 +501,8 @@ fn report() {
             setup_secs: 0.3,
             prepare: true,
         };
-        let mut remembered = vec![Vec::new(); 6];
-        let key = history::tests::key("a");
         // Each copy writes a real history store, so use fewer seeds here.
-        for seed in 0..SEEDS / 10 {
-            let mut rng = Rng(seed);
-            let temp = crate::test_support::tempdir().unwrap();
-            let path = temp.path().join("history.sqlite");
-            for run in remembered.iter_mut() {
-                // Start each copy as production does, from the recorded history.
-                let writer = history::tests::recorder(&path);
-                let next = match writer.starting_count(&key, false) {
-                    Some(hint) if hint.refine => Policy::refine(hint.workers, 1, LIMIT),
-                    Some(hint) => Policy::new(hint.workers, 1, LIMIT),
-                    None => Policy::new(s.start, 1, LIMIT),
-                };
-                let out = copy(&s, next, &mut rng);
-                writer.context(&key);
-                writer.event(
-                    "learning_context",
-                    serde_json::json!({"consistent":true,"automatic":true}),
-                );
-                let mut segment = None;
-                for &(workers, rate) in &out.observations {
-                    if segment != Some(workers) {
-                        writer.event("transition", serde_json::json!({}));
-                        segment = Some(workers);
-                    }
-                    writer.event(
-                        "observation",
-                        serde_json::json!({"active":workers,"seconds":SAMPLE_SECS,
-                            "rate":rate,"usable":true}),
-                    );
-                }
-                writer.complete(true, serde_json::json!({}));
-                let count = writer
-                    .starting_count(&key, false)
-                    .map_or(s.start, |hint| hint.workers);
-                run.push(count as f64);
-            }
-        }
+        let mut remembered = remembered(&s, SEEDS / 10, 8);
         let row: Vec<String> = remembered
             .iter_mut()
             .map(|run| format!("{:>3.0}/{:<3.0}", quantile(run, 0.5), quantile(run, 0.9)))
@@ -552,6 +514,76 @@ fn report() {
             row.join(" ")
         );
     }
+}
+
+/// The count each of `copies` successive copies leaves for the next one, from
+/// an empty history, as production chooses it from a real history store.
+fn remembered(s: &Scenario, seeds: u64, copies: usize) -> Vec<Vec<f64>> {
+    let mut remembered = vec![Vec::new(); copies];
+    let key = history::tests::key("a");
+    for seed in 0..seeds {
+        let mut rng = Rng(seed);
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("history.sqlite");
+        for run in remembered.iter_mut() {
+            // Start each copy as production does, from the recorded history.
+            let writer = history::tests::recorder(&path);
+            let next = match writer.starting_count(&key, false) {
+                Some(hint) if hint.refine => Policy::refine(hint.workers, 1, LIMIT),
+                Some(hint) => Policy::new(hint.workers, 1, LIMIT),
+                None => Policy::new(s.start, 1, LIMIT),
+            };
+            let out = copy(s, next, &mut rng);
+            writer.context(&key);
+            writer.event(
+                "learning_context",
+                serde_json::json!({"consistent":true,"automatic":true}),
+            );
+            let mut segment = None;
+            for &(workers, rate) in &out.observations {
+                if segment != Some(workers) {
+                    writer.event("transition", serde_json::json!({}));
+                    segment = Some(workers);
+                }
+                writer.event(
+                    "observation",
+                    serde_json::json!({"active":workers,"seconds":SAMPLE_SECS,
+                        "rate":rate,"usable":true}),
+                );
+            }
+            writer.complete(true, serde_json::json!({}));
+            let count = writer
+                .starting_count(&key, false)
+                .map_or(s.start, |hint| hint.workers);
+            run.push(count as f64);
+        }
+    }
+    remembered
+}
+
+#[test]
+fn noisy_flat_copies_keep_their_starting_count() {
+    let (name, curve, start) = curves()[2];
+    assert_eq!(name, "flat from 1");
+    let s = Scenario {
+        name,
+        curve,
+        ideal_secs: 40.0,
+        start,
+        sigma: 0.05,
+        rho: 0.5,
+        setup_secs: 0.3,
+        prepare: true,
+    };
+    let mut remembered = remembered(&s, 40, 8);
+    let last = remembered.last_mut().unwrap();
+    let (median, high) = (quantile(last, 0.5), quantile(last, 0.9));
+    // Noise still lets some copies take a step up, but the start must not keep
+    // climbing as it once did (to a median of 35 and a 90th percentile of 64).
+    assert!(
+        median <= 2.0 * start as f64 && high <= 4.0 * start as f64,
+        "{median} {high}"
+    );
 }
 
 #[test]
