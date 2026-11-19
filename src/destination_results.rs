@@ -54,87 +54,6 @@ const MAX_HEADER_BYTES: usize = 1024;
 const SEAL_BYTES: usize = 32 * 1024;
 const SEAL_AFTER: Duration = Duration::from_millis(200);
 pub(crate) const MAX_DIAGNOSTIC_BYTES: usize = 1024;
-/// Signed values new grants keep writing in their unchanged policy field.
-pub(crate) const DEFAULT_MAX_RECORDS: u64 = 4_000_000;
-pub(crate) const DEFAULT_MAX_PLAINTEXT_BYTES: u64 = 512 * 1024 * 1024;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum HpkeSuite {
-    X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum ReceiptDelivery {
-    AttachedEncrypted {
-        suite: HpkeSuite,
-        recipient_public_key: [u8; 32],
-    },
-    DetachedSignedPlaintext,
-}
-
-/// A signed grant's results policy. Grants keep its released encoding byte
-/// for byte (it was the receipt policy); the destination now reads only the
-/// invoking machine's recipient key from it. Its record and byte limits no
-/// longer cap anything.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ReceiptPolicy {
-    pub required: bool,
-    pub hashed: bool,
-    pub max_records: u64,
-    pub max_plaintext_bytes: u64,
-    pub delivery: ReceiptDelivery,
-}
-
-impl ReceiptPolicy {
-    /// The policy a new grant or request carries for this recipient key.
-    pub(crate) fn for_recipient(recipient_public_key: [u8; 32]) -> Self {
-        Self {
-            required: true,
-            hashed: false,
-            max_records: DEFAULT_MAX_RECORDS,
-            max_plaintext_bytes: DEFAULT_MAX_PLAINTEXT_BYTES,
-            delivery: ReceiptDelivery::AttachedEncrypted {
-                suite: HpkeSuite::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
-                recipient_public_key,
-            },
-        }
-    }
-
-    pub(crate) fn validate(&self) -> Result<()> {
-        if !self.required {
-            bail!("receipt policy must require a receipt");
-        }
-        if self.max_records == 0 || self.max_records > DEFAULT_MAX_RECORDS {
-            bail!("receipt record limit is outside the supported range");
-        }
-        if self.max_plaintext_bytes == 0 || self.max_plaintext_bytes > DEFAULT_MAX_PLAINTEXT_BYTES {
-            bail!("receipt byte limit is outside the supported range");
-        }
-        match &self.delivery {
-            ReceiptDelivery::AttachedEncrypted {
-                recipient_public_key,
-                ..
-            } if recipient_public_key.iter().all(|byte| *byte == 0) => {
-                bail!("receipt recipient public key must be nonzero")
-            }
-            ReceiptDelivery::AttachedEncrypted { .. }
-            | ReceiptDelivery::DetachedSignedPlaintext => Ok(()),
-        }
-    }
-
-    fn recipient(&self) -> Result<[u8; 32]> {
-        match &self.delivery {
-            ReceiptDelivery::AttachedEncrypted {
-                suite: HpkeSuite::X25519HkdfSha256HkdfSha256ChaCha20Poly1305,
-                recipient_public_key,
-            } => Ok(*recipient_public_key),
-            ReceiptDelivery::DetachedSignedPlaintext => {
-                bail!("the signed grant names no recipient for the destination's results")
-            }
-        }
-    }
-}
-
 pub(crate) struct RecipientSecret([u8; 32]);
 
 impl std::fmt::Debug for RecipientSecret {
@@ -398,12 +317,12 @@ impl Stream {
     /// Start a stream for the recipient the grant names. The signed header
     /// is the first frame `take_frames` returns.
     pub(crate) fn start(
-        policy: &ReceiptPolicy,
+        recipient: [u8; 32],
         binding: Binding,
         signing_key: &PrivateKey,
         records: bool,
     ) -> Result<Self> {
-        let public = <Kem as hpke::Kem>::PublicKey::from_bytes(&policy.recipient()?)
+        let public = <Kem as hpke::Kem>::PublicKey::from_bytes(&recipient)
             .map_err(|_| anyhow!("invalid HPKE recipient public key in the signed grant"))?;
         let (encapsulated, context) =
             setup_sender::<Aead, Kdf, Kem>(&OpModeS::Base, &public, &hpke_info(&binding)?)
