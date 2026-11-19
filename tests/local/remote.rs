@@ -1650,18 +1650,33 @@ fn automatic_ssh_restores_workers_for_a_single_file_partial() {
         .env("SYQ_TEST_TUNING_NETWORK", "")
         .env("XDG_CONFIG_HOME", t.path("config"))
         .env("XDG_CACHE_HOME", t.path("cache"))
+        .env("SYQ_TUNING_HISTORY", t.path("history.sqlite"))
         .run()
         .unwrap();
     assert_output_ok(&out);
     assert!(!stderr_of(&out).contains("connections remembered for this path"));
     assert_eq!(read(&t.path("dest/file")), content);
     assert_earlier_partial_removed_where_possible(&partial);
+    // The partial makes the copy ask for every remembered worker. Those
+    // still logging in once the first two have copied every block find the
+    // copy over and do not connect, as a loaded machine shows.
+    let restored: Option<i64> = rusqlite::OptionalExtension::optional(
+        rusqlite::Connection::open(t.path("history.sqlite"))
+            .unwrap()
+            .query_row(
+            "SELECT json_extract(data,'$.data.requested') FROM events WHERE json_extract(data,'$.kind')='transition' AND json_extract(data,'$.data.reason')='direct_copy_needs_userspace_transfer'",
+            [],
+            |row| row.get(0),
+        ),
+    )
+    .unwrap();
+    assert_eq!(restored, Some(8), "{out:?}");
     let connected = fs::read_to_string(events)
         .unwrap()
         .lines()
         .filter(|line| line.starts_with("connected "))
         .count();
-    assert_eq!(connected, 8, "{out:?}");
+    assert!((2..=8).contains(&connected), "{out:?}");
     assert!(stderr_of(&out).contains("SSH startup limited to 2 workers"));
 }
 
