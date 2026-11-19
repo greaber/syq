@@ -3460,6 +3460,31 @@ pub(crate) struct NativeEndpoint {
     pub(crate) port: Option<u16>,
 }
 
+impl NativeEndpoint {
+    /// `[user@]host[:port]`, as [`endpoint_label`] spells it.
+    pub(crate) fn label(&self) -> String {
+        endpoint_label(self.user.as_deref(), &self.host, self.port)
+    }
+}
+
+/// `[user@]host[:port]`, with a host that contains `:` (an IPv6 address) in
+/// brackets: the spelling `parse_native_endpoint` reads back.
+pub(crate) fn endpoint_label(user: Option<&str>, host: &str, port: Option<u16>) -> String {
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    let endpoint = match user {
+        Some(user) => format!("{user}@{host}"),
+        None => host,
+    };
+    match port {
+        Some(port) => format!("{endpoint}:{port}"),
+        None => endpoint,
+    }
+}
+
 pub(crate) fn parse_native_endpoint(spec: Option<&str>) -> Result<Option<NativeEndpoint>> {
     let Some(spec) = spec else {
         return Ok(None);

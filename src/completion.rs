@@ -251,7 +251,7 @@ fn run_cache(action: CacheAction) -> Result<()> {
                 crate::output::command_println!("completion endpoint cache is empty");
             } else {
                 for endpoint in cache.endpoints {
-                    crate::output::command_println!("{}", endpoint_label(&endpoint.endpoint()));
+                    crate::output::command_println!("{}", endpoint.endpoint().label());
                 }
             }
         }
@@ -264,9 +264,9 @@ fn run_cache(action: CacheAction) -> Result<()> {
                 before != cache.endpoints.len()
             })?;
             if removed {
-                crate::output::command_println!("forgot {}", endpoint_label(&endpoint));
+                crate::output::command_println!("forgot {}", endpoint.label());
             } else {
-                crate::output::command_println!("{} was not cached", endpoint_label(&endpoint));
+                crate::output::command_println!("{} was not cached", endpoint.label());
             }
         }
         CacheAction::Clear => {
@@ -304,11 +304,7 @@ pub(crate) fn remember_endpoint_best_effort(user: Option<&str>, host: &str, port
 
 fn remember_endpoint(user: Option<&str>, host: &str, port: Option<u16>) -> Result<()> {
     // Reuse the public endpoint validator before putting anything on disk.
-    let label = endpoint_label(&NativeEndpoint {
-        user: user.map(str::to_owned),
-        host: host.to_owned(),
-        port,
-    });
+    let label = crate::cli::endpoint_label(user, host, port);
     let endpoint = parse_native_endpoint(Some(&label))?
         .ok_or_else(|| anyhow!("validated endpoint unexpectedly became local"))?;
     update_cache(|cache| {
@@ -1719,7 +1715,7 @@ fn connect_completion_endpoint(
         Some(Arc::new(SshMultiplexer::approved(cached.control(), None)))
     } else {
         if let AuthFrom::Provider(provider) = auth_from {
-            bail!("no live approved account connection for {} through {provider}; connect first with syq persist connect {} --auth-from {provider}", endpoint_label(&endpoint), endpoint_label(&endpoint));
+            bail!("no live approved account connection for {} through {provider}; connect first with syq persist connect {} --auth-from {provider}", endpoint.label(), endpoint.label());
         }
         let persistent = crate::persistence::scope_for_implicit_ssh(domain.explicit_path())
             .and_then(|scope| {
@@ -2125,23 +2121,8 @@ fn endpoint_candidate_value(
     if matches!(syntax, EndpointSyntax::Rsync) && endpoint.port.is_some() {
         return None;
     }
-    let label = endpoint_label(endpoint);
+    let label = endpoint.label();
     label.starts_with(typed).then_some(label)
-}
-
-fn endpoint_label(endpoint: &NativeEndpoint) -> String {
-    let host = if endpoint.host.contains(':') {
-        format!("[{}]", endpoint.host)
-    } else {
-        endpoint.host.clone()
-    };
-    let authority = endpoint
-        .user
-        .as_ref()
-        .map_or(host.clone(), |user| format!("{user}@{host}"));
-    endpoint
-        .port
-        .map_or(authority.clone(), |port| format!("{authority}:{port}"))
 }
 
 fn ssh_config_endpoints() -> Vec<NativeEndpoint> {
