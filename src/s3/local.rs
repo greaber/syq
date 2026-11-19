@@ -660,8 +660,7 @@ impl CreationPermissions {
 /// receiver cannot vouch for changing its metadata in place
 /// (`fsops::vouch`): the object is then downloaded to replace it. A
 /// `preview` only says which. A kept file is kept through the receiver's
-/// routine (`fsops::keep`), which also requires that its name still lead
-/// to it once its metadata is set.
+/// routine (`fsops::keep`).
 pub(super) fn keep_unchanged_file(
     root: &Root,
     path: &RelativePath,
@@ -697,7 +696,9 @@ pub(super) fn keep_unchanged_file(
     use crate::fsops::keep;
     let keeping = keep::Keeping {
         handle: keep::Handle::Open,
-        recheck_any: true,
+        // The S3 keep does not look the name up again after setting the
+        // metadata: that would cost each kept file a lookup on the rerun path.
+        recheck_any: false,
         setting: None,
     };
     Ok(matches!(
