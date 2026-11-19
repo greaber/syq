@@ -21,8 +21,8 @@ use crate::conn::PendingReply;
 
 /// A batch the scan showed before its turn, with its lookup.
 pub(super) struct EarlyLookup {
-    /// What its lookup asks about, as `Planner::map_batch` is expected to
-    /// map the batch.
+    /// What its lookup asks about, as `Planner::plan_batch` is expected to
+    /// select and map the batch.
     directories: Vec<PathBytes>,
     others: Vec<PathBytes>,
     /// The reply to come, and how many other requests the destination had
@@ -51,8 +51,6 @@ impl Planner<'_> {
     /// leave replies for later.
     pub(super) fn looks_up_early(&self) -> bool {
         self.batch_lookups_configured()
-            // `handle_batch` drops unselected entries before mapping.
-            && self.opts.expressions.selection.is_none()
             && self.dst.requests_sent().is_some()
             && self
                 .dst
@@ -74,12 +72,36 @@ impl Planner<'_> {
 
     /// The scan has `entries` complete, to be planned after the batches
     /// shown before it: look its destinations up now if that is useful.
-    pub(super) fn show_upcoming(&mut self, entries: &[Entry], sub: &[u8], dst_root: &[u8]) {
+    pub(super) fn show_upcoming(
+        &mut self,
+        entries: &[Entry],
+        src_root: &[u8],
+        sub: &[u8],
+        dst_root: &[u8],
+    ) {
         let mut directories = Vec::new();
         let mut others = Vec::new();
         // `map_batch` joins the same three parts, the last two first.
         let base = join(dst_root, sub);
+        // `plan_batch` drops what `--where` leaves out before it maps the
+        // batch, so the lookup leaves the same entries out.
+        let filtered = self.filters_scanned_entries();
+        #[cfg(debug_assertions)]
+        let filtered = filtered && std::env::var_os("SYQ_TEST_EARLY_LOOKUPS_UNFILTERED").is_none();
         for entry in entries {
+            if filtered {
+                match self.selects_scanned_entry(entry, src_root) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    // The batch's turn reports it and ends the copy: ask
+                    // nothing for it.
+                    Err(_) => {
+                        directories.clear();
+                        others.clear();
+                        break;
+                    }
+                }
+            }
             let list = match self.claim_for(entry) {
                 Some(Claim::Dir) => &mut directories,
                 Some(Claim::File { .. } | Claim::Leaf) => &mut others,

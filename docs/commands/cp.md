@@ -256,6 +256,9 @@ If a directory you own lacks the write or search permission a change needs,
 `syq cp` names it and the changes in it fail;
 [`--widen-dirs`](#metadata-and-symlinks) lets syq briefly add the missing
 owner permission and restore it afterwards, as `syq rsync` does by default.
+A [restricted copy](../remote-reference.md#limits-and-unsupported-options)
+with `--if-exists=keep` is the exception: it does not widen the existing
+directories the copy includes, so the changes in them still fail.
 
 ## File descriptors
 
