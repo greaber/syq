@@ -397,6 +397,23 @@ fn interrupted_partial_from(args: &[&str], dir: &Path, cwd: Option<&Path>) -> Pa
         killed == 0 || kill_error.raw_os_error() == Some(libc::ESRCH),
         "stop partial-copy process group: {kill_error}"
     );
+    // The signal reaches the group at once, but its other members, such as a
+    // local receiver writing the partial, exit on their own time: a starved
+    // one keeps the partial open for writing after the leader is reaped, and
+    // a rerun that looks in that time must leave the partial in place.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut next_progress = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while unsafe { libc::kill(-(child.id() as i32), 0) } == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stopped partial copy's process group is still running"
+        );
+        if std::time::Instant::now() >= next_progress {
+            eprintln!("waiting for the stopped partial copy's process group to exit");
+            next_progress += std::time::Duration::from_secs(1);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     assert!(
         stopped_early.is_none(),
         "copy exited before interruption: {stopped_early:?}"
