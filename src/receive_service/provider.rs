@@ -1014,9 +1014,6 @@ fn local_identity() -> Result<ProviderIdentity> {
     }
 }
 
-/// Take the provider's lock, or None when another provider holds it. A
-/// start retries for [`PROBE_GRACE`], so that `is_running` cannot make it
-/// exit.
 fn lock_path(domain: &Domain) -> PathBuf {
     domain.runtime_path().join(LOCK_FILE)
 }
@@ -1024,6 +1021,8 @@ fn lock_path(domain: &Domain) -> PathBuf {
 fn is_running(domain: &Domain) -> Result<bool> {
     crate::service::is_running(&lock_path(domain))
 }
+/// Take the provider's lock, or None when another provider holds it
+/// (`service::lock_for_start`).
 fn acquire_lock(domain: &Domain) -> Result<Option<LockFile>> {
     crate::service::lock_for_start(&lock_path(domain))
 }
