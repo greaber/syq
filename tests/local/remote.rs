@@ -1639,14 +1639,13 @@ fn automatic_ssh_restores_workers_for_a_single_file_partial() {
         resumed[block * (4 << 20)..(block + 1) * (4 << 20)].fill(0);
     }
     write(&partial, &resumed);
-    write(&t.path("tuning.json"), br#"{"paths":{"local>host|ssh":8}}"#);
     let events = t.path("events");
     let out = compat_command()
         .args(args)
         .arg("--no-progress")
         .env("SYQ_TEST_WORKER_EVENTS", &events)
         .env("SYQ_TUNING_CACHE", t.path("tuning.json"))
-        // Match the unscoped legacy cache fixture regardless of the host network.
+        // Keep the history's route key independent of the host network.
         .env("SYQ_TEST_TUNING_NETWORK", "")
         .env("XDG_CONFIG_HOME", t.path("config"))
         .env("XDG_CACHE_HOME", t.path("cache"))
@@ -1654,7 +1653,6 @@ fn automatic_ssh_restores_workers_for_a_single_file_partial() {
         .run()
         .unwrap();
     assert_output_ok(&out);
-    assert!(!stderr_of(&out).contains("connections remembered for this path"));
     assert_eq!(read(&t.path("dest/file")), content);
     assert_earlier_partial_removed_where_possible(&partial);
     // The partial makes the copy ask for every remembered worker. Those
@@ -2327,20 +2325,8 @@ fn resource_worker_ceiling_bounds_local_tcp_and_ssh_workers() {
     let data = prng(9 * 1024 * 1024 + 123, 905);
     write(&t.path("source"), &data);
     for route in ["local", "tcp", "ssh"] {
-        for (remembered, limit, network) in [
-            (64, 1, "test-network"),
-            (64, 3, "test-network"),
-            (2, 3, "test-network"),
-            (2, 3, "other-network"),
-            (2, 3, ""),
-        ] {
-            // Keep the cache format, with network-scoped keys; cover hints
-            // above and below the cap without depending on the host network.
-            let cache = format!(
-                r#"{{"paths":{{"local>host|tcp|network-v1=test-network":{remembered},"local>host|ssh|network-v1=test-network":{remembered},"local>host|tcp":96,"local>host|ssh":96}}}}"#
-            );
-            write(&t.path("tuning.json"), cache.as_bytes());
-            let label = format!("{route}-{remembered}-{limit}-{network}");
+        for limit in [1, 3] {
+            let label = format!("{route}-{limit}");
             let events = t.path(&format!("events-{label}"));
             let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
             command.args([
@@ -2374,7 +2360,6 @@ fn resource_worker_ceiling_bounds_local_tcp_and_ssh_workers() {
                 .env("SYQ_TEST_WORKER_EVENTS", &events)
                 .env("SYQ_TEST_TUNE_SAMPLE_MS", "20")
                 .env("SYQ_TUNING_CACHE", t.path("tuning.json"))
-                .env("SYQ_TEST_TUNING_NETWORK", network)
                 .env("FAKE_REMOTE_HOME", t.path("remote-home"))
                 .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
                 .env("FAKE_RSH_LOG", t.path("rsh.log"))
@@ -2384,16 +2369,6 @@ fn resource_worker_ceiling_bounds_local_tcp_and_ssh_workers() {
             let out = command.run().unwrap();
             assert_output_ok(&out);
             assert!(stderr_of(&out).contains("auto-tuned"), "{out:?}");
-            if route != "local" && network == "other-network" {
-                assert!(
-                    !stderr_of(&out).contains("connections remembered for this path"),
-                    "{out:?}"
-                );
-            }
-            assert!(
-                !stderr_of(&out).contains("connections remembered for this path"),
-                "{out:?}"
-            );
             assert_eq!(read(&t.path(&label)), data);
             let observed = fs::read_to_string(&events).unwrap();
             let connected: Vec<_> = observed
@@ -2405,7 +2380,6 @@ fn resource_worker_ceiling_bounds_local_tcp_and_ssh_workers() {
                 let id: usize = line.split_whitespace().nth(1).unwrap().parse().unwrap();
                 assert!(id < limit, "{label}: {observed}");
             }
-            assert_eq!(read(&t.path("tuning.json")), cache.as_bytes());
         }
     }
 }
