@@ -1416,8 +1416,8 @@ fn serve(
         }
         return;
     }
-    if fault == "parts-unordered" {
-        serve_unordered_parts(&mut socket, method, first, &probes);
+    if fault == "parts-unordered" || fault == "parts-prefix-policy" {
+        serve_unordered_parts(&mut socket, method, first, &probes, fault);
         return;
     }
     if fault.starts_with("parallel-") {
@@ -7002,8 +7002,15 @@ fn parallel_listing_failure_stops_copy_and_removal_before_mutation() {
 
 /// Lists `tree/` in order, but every other listing of keys in reverse: once
 /// a divided listing has handed keys over, it must list the prefix again one
-/// request at a time. `starts` counts the listings of `tree/` begun.
-fn serve_unordered_parts(socket: &mut TcpStream, method: &str, first: &str, starts: &AtomicUsize) {
+/// request at a time. `starts` counts the listings of `tree/` begun. With
+/// `parts-prefix-policy`, a policy refuses every prefix but `tree/` instead.
+fn serve_unordered_parts(
+    socket: &mut TcpStream,
+    method: &str,
+    first: &str,
+    starts: &AtomicUsize,
+    fault: &str,
+) {
     if method == "HEAD" {
         if first.starts_with("HEAD /bucket/tree ") {
             reply(socket, 404, &[], b"", true);
@@ -7022,6 +7029,16 @@ fn serve_unordered_parts(socket: &mut TcpStream, method: &str, first: &str, star
     let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
     let prefix = query["prefix"].as_ref();
     let delimiter = query.contains_key("delimiter");
+    if fault == "parts-prefix-policy" && prefix != "tree/" {
+        reply(
+            socket,
+            403,
+            &[],
+            b"<Error><Code>AccessDenied</Code></Error>",
+            false,
+        );
+        return;
+    }
     // A token counts the items of the listing before the page.
     let start: usize = query
         .get("continuation-token")
@@ -7060,6 +7077,67 @@ fn serve_unordered_parts(socket: &mut TcpStream, method: &str, first: &str, star
             .unwrap_or_default()
     );
     reply(socket, 200, &[], body.as_bytes(), false);
+}
+
+// Release builds cannot divide a listing at a loopback endpoint.
+#[cfg(debug_assertions)]
+#[test]
+fn ls_says_how_to_list_a_prefix_only_its_own_listing_may_list() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let server = Server::start("parts-prefix-policy");
+    let ls = |divide: bool, concurrency: &str| {
+        let process = server.command_for(temp.path(), "cp");
+        let mut command = Command::new(process.get_program());
+        for (name, value) in process.get_envs() {
+            match value {
+                Some(value) => command.env(name, value),
+                None => command.env_remove(name),
+            };
+        }
+        command.current_dir(temp.path());
+        if divide {
+            command.env("SYQ_TEST_S3_DIVIDE_LISTINGS", "1");
+        } else {
+            command.env_remove("SYQ_TEST_S3_DIVIDE_LISTINGS");
+        }
+        command.args([
+            "_ls",
+            "s3://bucket/tree/**",
+            "--s3-region",
+            "us-east-1",
+            "--s3-header",
+            "X-Tigris-Consistent: true",
+            "--s3-endpoint",
+            &server.address,
+            "--concurrency",
+            concurrency,
+        ]);
+        command.capture_output().unwrap()
+    };
+    let hint = "rerun with --concurrency 1";
+    // Divided, a part's listing is refused, and the error says what to do.
+    let output = ls(true, "32");
+    assert!(!output.status.success());
+    assert!(
+        output_text(&output).contains(hint),
+        "{}",
+        output_text(&output)
+    );
+    // That works.
+    let output = ls(true, "1");
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().count(),
+        12_000
+    );
+    // Master's own split is refused as before, and says nothing more.
+    let output = ls(false, "32");
+    assert!(!output.status.success());
+    assert!(
+        !output_text(&output).contains(hint),
+        "{}",
+        output_text(&output)
+    );
 }
 
 // Release builds cannot divide a listing at a loopback endpoint.

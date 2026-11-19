@@ -131,6 +131,16 @@ impl std::fmt::Display for Unordered {
 }
 impl std::error::Error for Unordered {}
 
+/// The context of a failed listing of a narrower prefix that a listing in
+/// parts made: a policy may allow listing only the prefix itself.
+#[derive(Debug)]
+pub(in crate::s3) struct PartFailed;
+impl std::fmt::Display for PartFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("listing part of the prefix by itself failed")
+    }
+}
+
 /// Whether this listing is divided into parts rather than listed as below.
 fn in_parts(store: &impl Store, concurrency: usize) -> bool {
     concurrency > 1 && store.ordered() && store.divides()

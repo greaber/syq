@@ -128,7 +128,13 @@ async fn execute(
             prefix,
             token,
         } => {
-            let page = read(store, &prefix, false, token.as_deref()).await?;
+            let page = read(store, &prefix, false, token.as_deref()).await;
+            // Every listing but a walk's first is of a narrower prefix.
+            let page = if part == 0 {
+                page?
+            } else {
+                page.map_err(|error| error.context(super::PartFailed))?
+            };
             return Ok(Done::Keys { walk, part, page });
         }
         Job::Children {

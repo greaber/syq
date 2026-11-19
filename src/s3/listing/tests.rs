@@ -757,6 +757,8 @@ fn only_aws_general_purpose_endpoints_divide_listings() {
         "https://s3.us-east-1.amazonaws.com/./",
         "https://s3.us-east-1.amazonaws.com//",
         "https://s3.us-east-1.amazonaws.com\\archive",
+        "https:/s3.us-east-1.amazonaws.com/archive/",
+        "https:s3.us-east-1.amazonaws.com/archive/",
     ] {
         assert!(!lists_in_byte_order(Some(endpoint), "bucket"), "{endpoint}");
     }

@@ -108,7 +108,7 @@ pub(crate) fn run(args: &[OsString]) -> Result<i32> {
                 let denied = error
                     .downcast_ref::<super::client::RequestFailure>()
                     .is_some_and(super::client::RequestFailure::denied);
-                if denied && command.concurrency > 1 {
+                if denied && error.downcast_ref::<engine::PartFailed>().is_some() {
                     error.context(
                         "if only the prefix itself may be listed, rerun with --concurrency 1",
                     )
@@ -215,10 +215,11 @@ fn aws_endpoint(endpoint: &str) -> bool {
     };
     // A path would come before the bucket's: another bucket, and a key. The
     // SDK sends the path as given, so check it before any normalization.
-    let path = endpoint.split_once("://").map_or("", |(_, rest)| {
-        rest.find(['/', '\\']).map_or("", |at| &rest[at..])
-    });
-    if !matches!(path, "" | "/") {
+    let Some((_, rest)) = endpoint.split_once("://") else {
+        return false;
+    };
+    let path = rest.find(['/', '\\']).map_or("", |at| &rest[at..]);
+    if !matches!(path, "" | "/") || url.path() != "/" {
         return false;
     }
     let Some(url::Host::Domain(host)) = url.host() else {
