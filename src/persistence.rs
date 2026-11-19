@@ -767,8 +767,9 @@ pub(crate) fn scope_for_implicit_ssh(
     }
 }
 
-/// A scope this command has already checked with [`Domain::ensure_runtime`]:
-/// its directory and marker, and that it was not closing. The command's
+/// A scope this command has already checked, with [`Domain::select`] or
+/// [`Domain::ensure_runtime`]: its directory and marker, and that it was not
+/// closing. The command's
 /// later steps use it rather than checking the same path again.
 pub(crate) struct CheckedScope {
     domain: Domain,
@@ -779,9 +780,7 @@ impl CheckedScope {
     /// Select and check `scope` as an explicit `--pscope` would be.
     #[cfg(test)]
     pub(crate) fn check(scope: &Path) -> Result<Self> {
-        let domain = Domain::select(Some(scope))?;
-        let path = domain.ensure_runtime()?;
-        Ok(Self { domain, path })
+        scope_for_implicit_ssh(Some(scope))?.context("an explicit scope is always used")
     }
 
     pub(crate) fn domain(&self) -> &Domain {
