@@ -3138,10 +3138,9 @@ impl FsOps {
             // selection has already applied the operator-root policy, and no
             // descendant component gains symlink-traversal authority here.
             // Sources this thread has just read, one at a time, are statted
-            // on it too. Every worker rechecks its batches at once, so the
-            // pool's threads would mostly look for work, at several times the
-            // cost of the stats: a file just read usually still has its
-            // attributes cached, on a network filesystem as well.
+            // on it too: a file just read usually still has its attributes
+            // cached, on a network filesystem as well, so each stat costs
+            // less than waking a pool thread for it.
             let minimum = if read_here { usize::MAX } else { PAR_MIN };
             let results = parallel_map_init_from(
                 minimum,
@@ -3784,8 +3783,8 @@ const PAR_MIN: usize = 32;
 const NETWORK_ENTRIES_MAX: usize = 4096;
 
 /// The threads that share out batches of metadata operations with the
-/// thread that asks. A batch is split into at most `PAR_THREADS` shares, so
-/// it keeps that many threads busy, the asking one among them.
+/// thread that asks. A batch keeps at most `PAR_THREADS` threads busy, the
+/// asking one among them.
 fn metadata_pool() -> Option<&'static crate::batch_pool::BatchPool> {
     static POOL: OnceLock<Option<crate::batch_pool::BatchPool>> = OnceLock::new();
     POOL.get_or_init(|| crate::resources::optional_batch_pool("syq-metadata", PAR_THREADS))

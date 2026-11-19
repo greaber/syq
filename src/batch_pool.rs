@@ -218,13 +218,23 @@ impl Batch {
         // still waiting for it and the closure `work` points at is alive.
         let outcome = catch_unwind(AssertUnwindSafe(|| unsafe { (*self.work)() }));
         let mut progress = lock(&self.progress);
-        if let Err(panic) = outcome {
-            progress.panic.get_or_insert(panic);
-        }
+        // Keep the first panic. A later one is dropped only after this
+        // thread has reported: dropping it runs the payload's own code,
+        // which could panic while the lock is held and before `run` learns
+        // that this thread is done.
+        let later = match outcome {
+            Err(panic) if progress.panic.is_none() => {
+                progress.panic = Some(panic);
+                None
+            }
+            outcome => outcome.err(),
+        };
         // `run` may return as soon as the lock is released; nothing after
         // this touches the caller's work.
         progress.finished += 1;
         self.finished.notify_one();
+        drop(progress);
+        drop(later);
     }
 }
 
@@ -396,6 +406,139 @@ mod tests {
                 .sum::<usize>()
         });
         assert_eq!(sums, [36, 66, 96, 126]);
+    }
+
+    #[test]
+    fn a_batch_does_not_wait_for_busy_pool_threads() {
+        let pool = BatchPool::new("syq-test-pool", 2).unwrap();
+        let together = Together::new();
+        let release = (Mutex::new(false), Condvar::new());
+        std::thread::scope(|scope| {
+            // Two other callers hold both pool threads: each batch of two
+            // shares runs on its caller and one pool thread, and all four
+            // wait until released.
+            let hold = || {
+                pool.map(&[(); 2], |()| {
+                    assert!(together.meet(4));
+                    let (released, changed) = &release;
+                    let released = lock(released);
+                    let (_released, waited) = changed
+                        .wait_timeout_while(released, Duration::from_secs(30), |released| {
+                            !*released
+                        })
+                        .unwrap();
+                    assert!(!waited.timed_out());
+                })
+            };
+            let busy = [scope.spawn(hold), scope.spawn(hold)];
+            while *lock(&together.arrived) < 4 {
+                std::thread::yield_now();
+            }
+            // This batch's requests find no thread free: the caller takes
+            // every share, withdraws the requests and returns at once.
+            let caller = std::thread::current().id();
+            let threads = pool.map(&[(); 10], |()| std::thread::current().id());
+            assert!(threads.iter().all(|thread| *thread == caller));
+            assert_eq!(queued(&pool), 0);
+            *lock(&release.0) = true;
+            release.1.notify_all();
+            for busy in busy {
+                busy.join().unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn panics_on_the_caller_and_a_pool_thread_raise_one_of_them() {
+        let pool = BatchPool::new("syq-test-pool", 2).unwrap();
+        let together = Together::new();
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            pool.map(&[(); 2], |()| {
+                assert!(together.meet(2));
+                std::panic::panic_any("both panic");
+            })
+        }))
+        .expect_err("the panic must reach the caller");
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"both panic"));
+        assert_eq!(queued(&pool), 0);
+        assert_eq!(pool.map(&[1, 2, 3], |n| n * 2), [2, 4, 6]);
+    }
+
+    /// Many threads ask at once, with batches of every size around the
+    /// pool's, and some shares panic on the caller or on a pool thread. No
+    /// share may still be running once its batch has returned or unwound.
+    #[test]
+    fn no_share_outlives_its_batch_with_many_callers_and_panics() {
+        const CALLERS: usize = 8;
+        const ROUNDS: usize = 200;
+        let pool = BatchPool::new("syq-test-pool", 4).unwrap();
+        let returned: Vec<AtomicBool> = (0..CALLERS * ROUNDS)
+            .map(|_| AtomicBool::new(false))
+            .collect();
+        let late = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for caller in 0..CALLERS {
+                let (pool, returned, late) = (&pool, &returned, &late);
+                scope.spawn(move || {
+                    for round in 0..ROUNDS {
+                        let batch = caller * ROUNDS + round;
+                        let shares: Vec<usize> = (0..1 + batch % 9).collect();
+                        let panicking = (batch % 5 == 0).then_some(batch % shares.len());
+                        let outcome = catch_unwind(AssertUnwindSafe(|| {
+                            pool.map(&shares, |&share| {
+                                if share % 2 == 1 {
+                                    std::thread::sleep(Duration::from_micros(200));
+                                }
+                                if returned[batch].load(Ordering::SeqCst) {
+                                    late.fetch_add(1, Ordering::SeqCst);
+                                }
+                                if panicking == Some(share) {
+                                    std::panic::panic_any(batch);
+                                }
+                                share * 3
+                            })
+                        }));
+                        returned[batch].store(true, Ordering::SeqCst);
+                        match (outcome, panicking) {
+                            (Ok(tripled), None) => {
+                                assert_eq!(
+                                    tripled,
+                                    shares.iter().map(|share| share * 3).collect::<Vec<_>>()
+                                )
+                            }
+                            (Err(panic), Some(_)) => {
+                                assert_eq!(panic.downcast_ref::<usize>(), Some(&batch))
+                            }
+                            (outcome, _) => {
+                                panic!("batch {batch}: unexpected outcome {:?}", outcome.is_ok())
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        // Shares still running after their batch returned would arrive here
+        // late; wait briefly so that they would be counted.
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(late.load(Ordering::SeqCst), 0);
+        assert_eq!(queued(&pool), 0);
+    }
+
+    #[test]
+    fn dropping_the_pool_stops_its_threads() {
+        let pool = BatchPool::new("syq-test-pool", 3).unwrap();
+        assert_eq!(pool.map(&[1, 2, 3, 4], |n| n + 1), [2, 3, 4, 5]);
+        let shared = Arc::downgrade(&pool.shared);
+        drop(pool);
+        // Each thread holds the shared state until it returns.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while shared.upgrade().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pool threads did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[test]
