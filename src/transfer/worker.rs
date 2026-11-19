@@ -282,7 +282,11 @@ impl Worker {
                     .observation
                     .as_ref()
                     .map(|a| a.span(crate::transfer_observations::Stage::AwaitingWork));
-                self.sched.next()
+                self.sched.try_next().unwrap_or_else(|| {
+                    // A worker waiting for work keeps no range read buffer.
+                    self.src.release_read_buffer();
+                    self.sched.next()
+                })
             };
             if matches!(item, Item::Exit) {
                 return Ok(());
