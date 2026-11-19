@@ -268,7 +268,7 @@ fn every_failed_directory_creation_is_reported_when_long_paths_would_overfill_a_
     }
     let requests = t.path("requests");
     // Off a network filesystem, one request creates as many directories as
-    // its 6 MiB holds: about 900 of these.
+    // its 6 MiB holds: about 1,700 of these, without early metadata.
     let output = Command::new(env!("CARGO_BIN_EXE_syq"))
         .args(["cp", "--no-progress", "--srcs-in", &t.s("src"), "--into"])
         .arg(t.path("dst"))
