@@ -483,7 +483,7 @@ mod tests {
                     for round in 0..ROUNDS {
                         let batch = caller * ROUNDS + round;
                         let shares: Vec<usize> = (0..1 + batch % 9).collect();
-                        let panicking = (batch % 5 == 0).then_some(batch % shares.len());
+                        let panicking = batch.is_multiple_of(5).then_some(batch % shares.len());
                         let outcome = catch_unwind(AssertUnwindSafe(|| {
                             pool.map(&shares, |&share| {
                                 if share % 2 == 1 {
