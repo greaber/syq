@@ -8233,3 +8233,90 @@ fn only_pushes_start_with_a_short_look_ahead() {
         }
     }
 }
+
+/// Widening directories at paths near the longest a system call takes,
+/// none of them UTF-8, where every one fails: each error names its path,
+/// which the receiver shows at three bytes for each byte. The requests end
+/// before their errors could overfill a reply, and every reply fits its
+/// frame.
+#[cfg(target_os = "linux")]
+#[test]
+fn directory_widening_replies_fit_their_frames_when_every_directory_fails() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let mut receiver = crate::fsops::FsOps::rooted_for_test(root);
+    let sizes = Arc::new(Mutex::new(Vec::new()));
+    let mut destination = AnsweringConn {
+        answer: {
+            let sizes = sizes.clone();
+            move |request: Request| {
+                let Request::WidenDirectories { directories, .. } = &request else {
+                    panic!("unexpected request {request:?}");
+                };
+                sizes.lock().unwrap().push(directories.len());
+                let paths: Vec<PathBytes> =
+                    directories.iter().map(|(path, _)| path.clone()).collect();
+                let response = receiver.handle(&request);
+                let Response::WidenedDirectories(results) = &response else {
+                    panic!("unexpected response {response:?}");
+                };
+                // Each error is within what its request allowed for.
+                for (path, result) in paths.iter().zip(results) {
+                    let error = result.as_ref().expect_err("every widening fails");
+                    let encoded = postcard::to_extend(&Some(error), Vec::new()).unwrap();
+                    assert!(
+                        encoded.len() <= crate::proto::failed_path_hint(path),
+                        "{error:?}"
+                    );
+                    assert!(error.message.len() > 3 * 3300, "{error:?}");
+                }
+                assert!(
+                    crate::proto::FrameWriter::new(Vec::new(), false)
+                        .write_msg(&response)
+                        .is_ok(),
+                    "a reply overfills its frame"
+                );
+                response
+            }
+        },
+        replies: Default::default(),
+    };
+    let sched = Arc::new(Sched::new(512, 8192));
+    let unused = Arc::new(Mutex::new(PipelineState::default()));
+    let worker = pipeline_worker(&sched, &unused, &unused, true);
+    let progress = Progress::new(false, false, None);
+    let root_bytes = root.as_os_str().as_encoded_bytes().to_vec();
+    let parent = [root_bytes, vec![vec![0xff; 255]; 13].join(&b'/')].join(&b'/');
+    let on_disk = |path: &[u8]| {
+        use std::os::unix::ffi::OsStrExt;
+        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(path))
+    };
+    let mut directories: Vec<(PathBytes, TargetCondition)> = (0..1000)
+        .map(|index| {
+            let path = [parent.clone(), format!("d{index:04}").into_bytes()].join(&b'/');
+            (path, TargetCondition::Any)
+        })
+        .collect();
+    // Most are missing. A file has taken the first's place, and the second
+    // is not the directory the copy found.
+    std::fs::create_dir_all(on_disk(&directories[1].0)).unwrap();
+    std::fs::write(on_disk(&directories[0].0), b"").unwrap();
+    directories[1].1 = TargetCondition::Matches { dev: 1, ino: 1 };
+    let widened = super::planner::widen_directory_batch(
+        &mut destination,
+        &worker.opts,
+        &progress,
+        &mut Default::default(),
+        directories,
+        0o300,
+    )
+    .unwrap();
+    assert_eq!(widened, 0);
+    let sizes = sizes.lock().unwrap();
+    assert_eq!(sizes.iter().sum::<usize>(), 1000);
+    // About 10 KiB for each error: about 135 in each request.
+    assert!(
+        sizes.len() > 1 && sizes.iter().all(|&size| size < 400),
+        "{sizes:?}"
+    );
+}

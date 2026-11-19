@@ -775,7 +775,8 @@ pub(crate) fn failed_set_meta_hint(path: &[u8], meta: &Meta) -> usize {
 /// or attribute adds to its request's `Applied` reply: the receiver's error,
 /// as text, and its other fields. This holds for setting a directory's
 /// metadata (`failed_set_meta_hint` adds attributes), creating a directory
-/// and removing an entry (`Op::Mkdir`, `Op::Rmdir`, `Op::Unlink`).
+/// and removing an entry (`Op::Mkdir`, `Op::Rmdir`, `Op::Unlink`), and
+/// widening a directory's owner permissions (`Request::WidenDirectories`).
 ///
 /// The text names the path as the receiver displays it, in which each byte
 /// that is not UTF-8 shows as a three-byte replacement character. No error
