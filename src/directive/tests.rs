@@ -442,6 +442,20 @@ fn directives_out_of_bounds_are_refused_before_they_are_signed_or_read() {
     }
 }
 
+/// A directive that names no key for its results gets no rules.
+#[test]
+fn rules_need_a_results_key() {
+    let mut keyless = directive(ROUTE_5);
+    keyless.results_key = [0; 32];
+    let error = destination_rules(&keyless, Path::new(HOME))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("recipient public key must be nonzero"),
+        "{error}"
+    );
+}
+
 #[test]
 fn the_destination_rules_come_from_the_signed_command() {
     let home = Path::new(HOME);

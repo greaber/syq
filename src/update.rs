@@ -669,7 +669,8 @@ fn download_helper(helper: &TrustedCurrentHelper, what: &str) -> Result<Vec<u8>>
         &helper.archive,
         &format!("downloaded {what} archive"),
     )?;
-    let mut binary = Vec::new();
+    // Reserved at the signed size, so the buffer is never copied as it grows.
+    let mut binary = Vec::with_capacity(helper.binary.size as usize + 1);
     GzDecoder::new(archive.as_slice())
         .take(helper.binary.size + 1)
         .read_to_end(&mut binary)
@@ -1016,8 +1017,13 @@ fn install_release(
     // made before the download, so that a directory it cannot be made in
     // fails first.
     let temporary = TempFile::new(parent, ".bin")?;
-    let binary = download_helper(&artifact, SYQ_RELEASE)?;
-    let binary = write_sealed(temporary, &binary, SYQ_RELEASE)?;
+    // The downloaded bytes go once they are written, before the probes and
+    // any wait for the directory lock.
+    let binary = write_sealed(
+        temporary,
+        &download_helper(&artifact, SYQ_RELEASE)?,
+        SYQ_RELEASE,
+    )?;
     // The file that runs and replaces the executable is the one verified.
     verify_file_as(binary.path(), &artifact.binary, "written syq release")?;
     verify_executable(binary.path(), release)?;
@@ -1347,12 +1353,6 @@ fn copy_bounded(source: &mut impl Read, destination: &mut impl Write, limit: u64
 /// digest is checked.
 fn fetch_bytes(url: &str, mode: FetchMode, limit: u64) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    fetch_into(url, &mut bytes, mode, limit)?;
-    Ok(bytes)
-}
-
-/// Download `url` into `bytes`, which each attempt starts over.
-fn fetch_into(url: &str, bytes: &mut Vec<u8>, mode: FetchMode, limit: u64) -> Result<()> {
     #[cfg(any(test, debug_assertions))]
     if let Some(root) = std::env::var_os("SYQ_TEST_FIXTURES").filter(|value| !value.is_empty()) {
         let name = url
@@ -1363,11 +1363,11 @@ fn fetch_into(url: &str, bytes: &mut Vec<u8>, mode: FetchMode, limit: u64) -> Re
         bytes.clear();
         copy_bounded(
             &mut File::open(PathBuf::from(root).join(name))?,
-            bytes,
+            &mut bytes,
             limit,
         )
         .with_context(|| format!("copy test release fixture {name}"))?;
-        return Ok(());
+        return Ok(bytes);
     }
 
     // An interactive download may take as long as the connection needs,
@@ -1403,7 +1403,7 @@ fn fetch_into(url: &str, bytes: &mut Vec<u8>, mode: FetchMode, limit: u64) -> Re
             bytes.clear();
             copy_bounded_watched(
                 response.into_body().into_reader(),
-                &mut *bytes,
+                &mut bytes,
                 limit,
                 DOWNLOAD_STALL,
             )
@@ -1411,7 +1411,7 @@ fn fetch_into(url: &str, bytes: &mut Vec<u8>, mode: FetchMode, limit: u64) -> Re
             Ok(())
         })();
         match result {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(bytes),
             Err(error) => {
                 let retryable = error.downcast_ref::<DownloadTooLarge>().is_none()
                     && !matches!(

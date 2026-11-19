@@ -851,7 +851,6 @@ fn mapping_warning(request: &crate::destination::CopyRequest) -> Option<&'static
 /// "The server ...".
 fn copy_warnings(request: &crate::destination::CopyRequest) -> Vec<String> {
     let options = &request.rules.copy.options;
-    let extra = &request.rules.copy.options;
     if options.dry_run {
         return Vec::new();
     }
@@ -876,13 +875,13 @@ fn copy_warnings(request: &crate::destination::CopyRequest) -> Vec<String> {
             .preserve_group
             .then(|| "can give files to any group you belong to".to_owned()),
         mapping_warning(request).map(str::to_owned),
-        extra
+        options
             .acls
             .then(|| "can give other users access to files".to_owned()),
-        extra
+        options
             .xattrs
             .then(|| "can set extended attributes, which some programs act on".to_owned()),
-        extra
+        options
             .hardlinks
             .then(|| "can link new names to files already in the destination".to_owned()),
         request

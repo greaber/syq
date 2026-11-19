@@ -2950,7 +2950,7 @@ fn test_authority_with_policy(
 
 /// A fresh recipient key for a grant's results, and the recipient's
 /// secret.
-fn results_policy() -> (crate::destination_results::RecipientSecret, [u8; 32]) {
+fn results_recipient() -> (crate::destination_results::RecipientSecret, [u8; 32]) {
     let (secret, public) = crate::destination_results::generate_recipient().unwrap();
     (secret, public)
 }
@@ -3160,7 +3160,7 @@ fn test_authority_with_options(
     options(&mut copy.options);
     let (results_key, results_recipient) = match results {
         Some((key, recipient)) => (key, recipient),
-        None => (generate_results_key(id)?, results_policy().1),
+        None => (generate_results_key(id)?, results_recipient().1),
     };
     RestrictedAuthority::new(
         confined,
@@ -5786,7 +5786,7 @@ fn a_finalize_sent_again_on_another_connection_is_answered_as_published() {
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
     let file = target.join("fresh");
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = existence_authority_with_results(&root, &policy, 60_000);
     let mut reader = start_results(&authority, secret);
     let mut first = authority.test_ops();
@@ -5842,7 +5842,7 @@ fn at_the_entry_limit_a_file_held_without_a_count_is_not_published() {
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
     let (first, held) = (target.join("first"), target.join("held"));
-    let mut authority = existence_authority_with_results(&root, &results_policy().1, 60_000);
+    let mut authority = existence_authority_with_results(&root, &results_recipient().1, 60_000);
     authority.rules.copy.limits.max_entries = 1;
     let mut ops = authority.test_ops();
     publish_written(&authority, &mut ops, &first, b"data");
@@ -5891,7 +5891,7 @@ fn a_preparation_after_its_copy_ended_holds_nothing() {
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
     let file = target.join("late");
-    let authority = existence_authority_with_results(&root, &results_policy().1, 60_000);
+    let authority = existence_authority_with_results(&root, &results_recipient().1, 60_000);
     let mut ops = authority.test_ops();
     let mut request = prepare_request(&file);
     let mut settlement = authority.authorize(&mut request, false).unwrap();
@@ -5971,7 +5971,7 @@ fn a_finalize_sent_again_counts_again() {
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
     let (first, second) = (target.join("first"), target.join("second"));
-    let mut authority = existence_authority_with_results(&root, &results_policy().1, 60_000);
+    let mut authority = existence_authority_with_results(&root, &results_recipient().1, 60_000);
     authority.rules.copy.limits.max_entries = 2;
     let mut ops = authority.test_ops();
     let published = publish_written(&authority, &mut ops, &first, b"data");
@@ -6005,7 +6005,7 @@ fn a_finalize_sent_again_at_the_entry_limit_is_refused() {
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
     let file = target.join("fresh");
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let mut authority = existence_authority_with_results(&root, &policy, 60_000);
     authority.rules.copy.limits.max_entries = 1;
     let mut reader = start_results(&authority, secret);
@@ -6041,7 +6041,7 @@ fn a_finalize_racing_a_newer_preparation_settles_by_what_it_did() {
     fs::create_dir_all(&target).unwrap();
     let file = target.join("fresh");
     let key = (path_bytes(&file), [1; 16]);
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = existence_authority_with_results(&root, &policy, 60_000);
     let mut reader = start_results(&authority, secret);
     let write = |data: &[u8]| Request::WriteRange {
@@ -6130,7 +6130,7 @@ fn a_copy_with_a_dropped_connection_fits_its_files_plus_what_was_in_flight() {
         let files: Vec<_> = (0..FILES)
             .map(|index| target.join(format!("file-{index}")))
             .collect();
-        let mut authority = existence_authority_with_results(&root, &results_policy().1, 60_000);
+        let mut authority = existence_authority_with_results(&root, &results_recipient().1, 60_000);
         authority.rules.copy.limits.max_entries = limit;
         let send = |ops: &mut crate::fsops::FsOps, mut request: Request| {
             let settlement = authority
@@ -6901,7 +6901,7 @@ fn results_report_confirmed_changes_and_end_the_grant() {
     fs::create_dir_all(&target).unwrap();
     fs::write(&kept, b"old").unwrap();
     fs::write(&gone, b"bye").unwrap();
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = existence_authority_with_results(&root, &policy, 60_000);
     let mut reader = start_results(&authority, secret);
 
@@ -6974,7 +6974,7 @@ fn results_report_confirmed_changes_and_end_the_grant() {
     assert!(authority.authorize(&mut observe, false).is_err());
 
     // A request still in flight holds the end back.
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let waiting = existence_authority_with_results(&root, &policy, 200);
     let _reader = start_results(&waiting, secret);
     let settlement = waiting
@@ -6985,7 +6985,7 @@ fn results_report_confirmed_changes_and_end_the_grant() {
 
     // The results list changes in the order they settled: a file published
     // then deleted appears twice.
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let racing = existence_authority_with_results(&root, &policy, 5_000);
     let mut reader = start_results(&racing, secret);
     let vanished = target.join("vanished");
@@ -7014,7 +7014,7 @@ fn results_start_before_any_change_or_not_at_all() {
     fs::create_dir_all(&target).unwrap();
     // A coordinator that changed something first cannot start results that
     // would leave the change out.
-    let (_, policy) = results_policy();
+    let (_, policy) = results_recipient();
     let late = existence_authority_with_results(&root, &policy, 5_000);
     let mut mkdir = apply(Op::Mkdir {
         path: path_bytes(&target.join("early")),
@@ -7042,7 +7042,7 @@ fn results_start_before_any_change_or_not_at_all() {
     assert!(quiet.state.lock().unwrap().file_lifecycles.is_empty());
     assert!(quiet.take_results_frames().is_empty());
     assert!(quiet.finish_results().is_err());
-    let (_, policy) = results_policy();
+    let (_, policy) = results_recipient();
     let twice = existence_authority_with_results(&root, &policy, 5_000);
     twice.start_results(false).unwrap();
     assert!(twice.start_results(false).is_err());
@@ -7065,7 +7065,7 @@ fn observation_only_prepare_releases_absent_reservation_and_skips_lifecycle() {
         RootExistence::Any,
         Some((
             generate_results_key(EnrollmentId::random()).unwrap(),
-            results_policy().1,
+            results_recipient().1,
         )),
     )
     .unwrap();
@@ -7138,7 +7138,7 @@ fn older_observation_does_not_release_newer_real_reservation() {
         RootExistence::Any,
         Some((
             generate_results_key(EnrollmentId::random()).unwrap(),
-            results_policy().1,
+            results_recipient().1,
         )),
     )
     .unwrap();
@@ -7189,7 +7189,7 @@ fn results_count_directories_as_an_ordinary_copy_does() {
     ] {
         let _ = fs::remove_dir_all(root.join("target"));
         let key = generate_results_key(EnrollmentId::random()).unwrap();
-        let (secret, policy) = results_policy();
+        let (secret, policy) = results_recipient();
         let authority = test_authority_with_results(
             &root,
             DeletionPolicy::Forbid,
@@ -7244,7 +7244,7 @@ fn a_small_file_batch_with_links_reports_each_failed_write() {
     let failed = target.join("failed");
     fs::create_dir_all(&target).unwrap();
     let key = generate_results_key(EnrollmentId::random()).unwrap();
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = test_authority_with_results(
         &root,
         DeletionPolicy::Forbid,
@@ -7315,7 +7315,7 @@ fn results_list_each_settled_change_in_ordinary_form() {
     fs::create_dir_all(&target).unwrap();
     fs::write(&removed, b"old").unwrap();
 
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = existence_authority_with_results(&root, &policy, 60_000);
     let mut reader = start_results(&authority, secret);
     let put = |path: &Path| proto::SmallPut {
@@ -7386,7 +7386,7 @@ fn results_report_a_declined_metadata_change_as_the_replacement() {
     fs::create_dir_all(&target).unwrap();
     fs::write(&linked, b"same").unwrap();
     fs::write(&small, b"new").unwrap();
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = existence_authority_with_results(&root, &policy, 60_000);
     let mut reader = start_results(&authority, secret);
     let declined = || proto::WireError {
@@ -7482,7 +7482,7 @@ fn unfinished_in_place_files_are_reported_failed() {
     fs::create_dir_all(&target).unwrap();
     let in_place = |finished: bool| {
         let key = generate_results_key(EnrollmentId::random()).unwrap();
-        let (secret, policy) = results_policy();
+        let (secret, policy) = results_recipient();
         let authority = test_authority_with_results(
             &root,
             DeletionPolicy::Forbid,
@@ -7576,7 +7576,7 @@ fn refused_preparations_leave_nothing_behind() {
     let root = temporary.path().join("root");
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = existence_authority_with_results(&root, &policy, 60_000);
     let mut reader = start_results(&authority, secret);
     // A coordinator can ask for any number of files the grant refuses.
@@ -7615,7 +7615,7 @@ fn a_refused_write_to_an_unfinished_file_lists_it_once() {
     let image = target.join("image");
     fs::create_dir_all(&target).unwrap();
     let key = generate_results_key(EnrollmentId::random()).unwrap();
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = test_authority_with_results(
         &root,
         DeletionPolicy::Forbid,
@@ -9962,7 +9962,7 @@ fn a_stale_patch_holds_no_bytes_and_leaves_its_record_to_the_retry() {
     fs::write(&a, b"same").unwrap();
     fs::hard_link(&a, &b).unwrap();
     let key = generate_results_key(EnrollmentId::random()).unwrap();
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let mut authority = test_authority_with_results(
         &root,
         DeletionPolicy::Forbid,
@@ -10319,7 +10319,7 @@ fn grouped_patch_results_list_published_and_failed_files() {
         fs::write(path, b"old").unwrap();
     }
     let key = generate_results_key(EnrollmentId::random()).unwrap();
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = test_authority_with_results(
         &root,
         DeletionPolicy::Forbid,
@@ -10418,7 +10418,7 @@ fn a_failed_patch_is_listed_unless_the_senders_retry_settles_it() {
         fs::create_dir_all(&target).unwrap();
         fs::write(&file, b"old").unwrap();
         let key = generate_results_key(EnrollmentId::random()).unwrap();
-        let (secret, policy) = results_policy();
+        let (secret, policy) = results_recipient();
         let authority = test_authority_with_results(
             &root,
             DeletionPolicy::Forbid,
@@ -10520,7 +10520,7 @@ fn a_metadata_change_does_not_settle_a_failed_patch() {
         fs::create_dir_all(&target).unwrap();
         fs::write(&file, b"old").unwrap();
         let key = generate_results_key(EnrollmentId::random()).unwrap();
-        let (secret, policy) = results_policy();
+        let (secret, policy) = results_recipient();
         let mut authority = test_authority_with_results(
             &root,
             DeletionPolicy::Forbid,
@@ -10602,7 +10602,7 @@ fn data_corrupted_in_transit_is_listed_as_an_integrity_failure() {
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
     let key = generate_results_key(EnrollmentId::random()).unwrap();
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = test_authority_with_results(
         &root,
         DeletionPolicy::Forbid,
@@ -10752,7 +10752,7 @@ fn streamed_patches_keep_to_the_grant_from_their_begin_to_their_end() {
         fs::write(target.join(name), &old).unwrap();
     }
     let key = generate_results_key(EnrollmentId::random()).unwrap();
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = std::sync::Arc::new(
         test_authority_with_results(
             &root,
@@ -11645,7 +11645,7 @@ fn both_receivers_update_in_place_only_files_they_vouch_for() {
         }
         fs::hard_link(target.join("linked"), root.join("outside")).unwrap();
         let key = generate_results_key(EnrollmentId::random()).unwrap();
-        let (secret, policy) = results_policy();
+        let (secret, policy) = results_recipient();
         let mut receiver =
             ParityReceiver::new(&root, restricted, true, PublicationPolicy::InPlaceUpdate);
         let mut reader = None;
@@ -11822,7 +11822,7 @@ fn both_receivers_settle_each_file_of_an_in_place_batch_alike() {
             .map(|name| fs::metadata(target.join(name)).unwrap().ino())
             .collect();
         let key = generate_results_key(EnrollmentId::random()).unwrap();
-        let (secret, policy) = results_policy();
+        let (secret, policy) = results_recipient();
         let mut receiver =
             ParityReceiver::new(&root, restricted, true, PublicationPolicy::InPlaceUpdate);
         let mut reader = None;
@@ -12026,7 +12026,7 @@ fn both_receivers_hold_leases_on_the_files_they_compared() {
             eprintln!("note: the test filesystem's leases are not trusted");
         }
         let key = generate_results_key(EnrollmentId::random()).unwrap();
-        let (secret, policy) = results_policy();
+        let (secret, policy) = results_recipient();
         let mut receiver =
             ParityReceiver::new(&root, restricted, true, PublicationPolicy::AtomicStaged);
         let mut reader = None;
@@ -13272,7 +13272,7 @@ fn a_refusal_racing_the_results_end_is_still_counted() {
     let root = temporary.path().join("root");
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = std::sync::Arc::new(existence_authority_with_results(&root, &policy, 30_000));
     let mut reader = start_results(&authority, secret);
     let mut ops = vec![Op::Mkdir {
@@ -13496,7 +13496,7 @@ fn files_the_keep_policy_keeps_are_neither_refused_nor_failed() {
     let target = root.join("target");
     fs::create_dir_all(&target).unwrap();
     let key = generate_results_key(EnrollmentId::random()).unwrap();
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let authority = test_authority_with_results(
         &root,
         DeletionPolicy::Forbid,
@@ -13552,7 +13552,7 @@ fn small_copies_publish_through_a_restricted_receiver() {
     fs::create_dir_all(&target).unwrap();
     fs::write(target.join("old"), b"stale contents").unwrap();
     let key = generate_results_key(EnrollmentId::random()).unwrap();
-    let (secret, policy) = results_policy();
+    let (secret, policy) = results_recipient();
     let mut authority = test_authority_with_results(
         &root,
         DeletionPolicy::Forbid,

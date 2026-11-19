@@ -595,11 +595,11 @@ impl Receiver {
         // being written, so they always ask, as does widening the directory
         // the copy goes into, and unencrypted TCP, which `receiving_rules`
         // refuses here before it gets this far.
-        let extra = &request.rules.copy.options;
-        let automatic = !(extra.acls
-            || extra.xattrs
-            || extra.hardlinks
-            || extra.widen_dirs == crate::delegation::DirectoryWidening::All
+        let options = &request.rules.copy.options;
+        let automatic = !(options.acls
+            || options.xattrs
+            || options.hardlinks
+            || options.widen_dirs == crate::delegation::DirectoryWidening::All
             || request.rules.tcp == crate::delegation::TcpPermission::Unencrypted)
             && self.auto_approve_root.as_ref().is_some_and(|root| {
                 destination.starts_with(root)
