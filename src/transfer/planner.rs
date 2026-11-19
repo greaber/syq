@@ -6035,16 +6035,17 @@ fn reply_sized_slices<T>(
 }
 
 /// `reply_sized_slices` for operations to send, moved rather than copied.
-fn reply_sized(mut ops: Vec<Op>, most: usize, hint: impl Fn(&Op) -> usize) -> Vec<Vec<Op>> {
+fn reply_sized(ops: Vec<Op>, most: usize, hint: impl Fn(&Op) -> usize) -> Vec<Vec<Op>> {
     let lengths: Vec<usize> = reply_sized_slices(&ops, most, hint)
         .map(<[Op]>::len)
         .collect();
+    if lengths.len() <= 1 {
+        return (!ops.is_empty()).then_some(ops).into_iter().collect();
+    }
+    let mut ops = ops.into_iter();
     lengths
         .into_iter()
-        .map(|len| {
-            let rest = ops.split_off(len);
-            std::mem::replace(&mut ops, rest)
-        })
+        .map(|len| ops.by_ref().take(len).collect())
         .collect()
 }
 
