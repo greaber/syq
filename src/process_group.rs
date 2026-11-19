@@ -17,6 +17,29 @@ impl ProcessGroup {
             leader: true,
         })
     }
+    /// `child`, which already leads its own group, as one that started a
+    /// session of its own does.
+    #[allow(dead_code)] // Not in every target that includes this file.
+    pub fn leading(child: Child) -> Self {
+        Self {
+            child,
+            status: None,
+            leader: true,
+        }
+    }
+    /// Leave the child running, as a service that outlives this process:
+    /// a thread reaps it once it exits, and nothing ends its group.
+    #[allow(dead_code)] // Not in every target that includes this file.
+    pub fn detach(self) {
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `this` is never used or dropped again.
+        let mut child = unsafe { std::ptr::read(&this.child) };
+        if this.status.is_none() {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+    }
     /// A child that stays in this process's group, for a process whose own
     /// owner ends that group with everything in it, such as the receiving
     /// service's setup child. It cannot take the terminal.

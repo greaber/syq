@@ -231,30 +231,24 @@ fn validate_ticket(ticket: &str) -> Result<()> {
 }
 fn connect(domain: &Domain, control: bool) -> Result<UnixStream> {
     let path = domain.runtime_path().join(SOCKET_FILE);
-    let metadata = fs::symlink_metadata(&path).with_context(|| format!(
-        "SSH authorization provider is unavailable at {}; run syq persist receive on locally on the provider", path.display()))?;
-    anyhow::ensure!(
-        metadata.file_type().is_socket() && metadata.uid() == unsafe { libc::geteuid() },
-        "provider control socket must be owned and private"
-    );
-    if metadata.mode() & 0o077 != 0 {
-        return Err(NotYetPrivate.into());
-    }
-    handshake(UnixStream::connect(&path)?, control)
+    // The provider binds its socket before making it private: never
+    // connect before then (`NotYetPrivate`).
+    let stream = crate::service::connect(&path, HANDSHAKE_TIMEOUT, true).map_err(|error| {
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            error.context(format!(
+                "SSH authorization provider is unavailable at {}; run syq persist receive on locally on the provider",
+                path.display()
+            ))
+        } else {
+            error
+        }
+    })?;
+    handshake(stream, control)
 }
-/// The provider binds its socket before making it private. Never connect to
-/// it before then; while the provider holds its lock, it is still starting.
-#[derive(Debug)]
-struct NotYetPrivate;
-impl std::fmt::Display for NotYetPrivate {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("provider control socket must be owned and private")
-    }
-}
-impl std::error::Error for NotYetPrivate {}
 fn handshake(mut stream: UnixStream, control: bool) -> Result<UnixStream> {
-    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
     exchange_hello(&mut stream, control)?;
     Ok(stream)
 }
@@ -299,23 +293,17 @@ fn running(
     timeout: Duration,
     operation: impl Fn() -> Control,
 ) -> Result<Option<Snapshot>> {
-    let deadline = Instant::now() + timeout;
-    while is_running(domain)? {
-        match query(domain, operation()) {
-            Ok(state) => return Ok(Some(state)),
-            Err(error) if unanswered(&error) || error.is::<NotYetPrivate>() => {
-                if Instant::now() >= deadline {
-                    return Err(error.context(format!(
-                        "SSH authorization provider is running but not answering in {}",
-                        domain.runtime_path().display()
-                    )));
-                }
-                std::thread::sleep(ANSWER_POLL);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(None)
+    crate::service::answer(
+        &lock_path(domain),
+        timeout,
+        || query(domain, operation()),
+        || {
+            format!(
+                "SSH authorization provider is running but not answering in {}",
+                domain.runtime_path().display()
+            )
+        },
+    )
 }
 /// The hidden `persist receive` subcommand a provider runs with a new build
 /// at its path to switch to it (`switch`).
@@ -392,22 +380,19 @@ pub(super) fn switch_outdated(domain: &Domain) -> Result<()> {
 /// Wait for provider process `pid`, which is stopping, to give up the
 /// lock: until it has exited, or another provider answers.
 fn await_exit(domain: &Domain, pid: u32) -> Result<()> {
-    let deadline = Instant::now() + STOP_TIMEOUT;
-    while is_running(domain)? {
-        match query(domain, Control::Status) {
-            Ok(state) if state.pid != pid => return Ok(()),
-            Ok(_) => {}
-            Err(_) if !process_alive(pid) => return Ok(()),
-            Err(_) => {}
-        }
-        anyhow::ensure!(
-            Instant::now() < deadline,
+    ending(domain).await_exit(pid, || Ok(query(domain, Control::Status)?.pid))
+}
+/// How commands wait for the provider to stop.
+fn ending(domain: &Domain) -> crate::service::Ending {
+    crate::service::Ending {
+        lock: lock_path(domain),
+        timeout: STOP_TIMEOUT,
+        stuck: format!(
             "local SSH authorization provider did not stop in {}",
             domain.runtime_path().display()
-        );
-        std::thread::sleep(Duration::from_millis(20));
+        ),
+        progress: Some("waiting for local SSH authorization provider to stop".into()),
     }
-    Ok(())
 }
 
 /// Stop a provider from another build, and report whether there was one.
@@ -1032,12 +1017,15 @@ fn local_identity() -> Result<ProviderIdentity> {
 /// Take the provider's lock, or None when another provider holds it. A
 /// start retries for [`PROBE_GRACE`], so that `is_running` cannot make it
 /// exit.
-fn acquire_lock(domain: &Domain) -> Result<Option<LockFile>> {
-    let lock = LockFile::open(&domain.runtime_path().join(LOCK_FILE), true)?;
-    Ok(lock.try_exclusive_within(PROBE_GRACE)?.then_some(lock))
+fn lock_path(domain: &Domain) -> PathBuf {
+    domain.runtime_path().join(LOCK_FILE)
 }
+#[cfg(test)]
 fn is_running(domain: &Domain) -> Result<bool> {
-    Ok(LockFile::is_held(&domain.runtime_path().join(LOCK_FILE))?)
+    crate::service::is_running(&lock_path(domain))
+}
+fn acquire_lock(domain: &Domain) -> Result<Option<LockFile>> {
+    crate::service::lock_for_start(&lock_path(domain))
 }
 
 /// Called only by explicit local receiving commands, never by an inbound SSH
@@ -1057,8 +1045,6 @@ pub(super) fn ensure(domain: &Domain) -> Result<()> {
 /// serves instead.
 fn start(domain: &Domain) -> Result<()> {
     domain.ensure_runtime()?;
-    let (mut startup, child_output) = crate::process::with_inheritance_guard(UnixStream::pair)?;
-    startup.set_read_timeout(Some(STOP_TIMEOUT))?;
     let mut command = crate::process::self_command()?;
     // Its own switches are not a command's (`switch::STARTED_BY_COMMAND`).
     command
@@ -1068,88 +1054,40 @@ fn start(domain: &Domain) -> Result<()> {
     if let Some(path) = crate::process::started_from() {
         command.arg(path);
     }
-    command
-        .stdin(Stdio::null())
-        .stdout(File::from(std::os::fd::OwnedFd::from(child_output)))
-        .stderr(Stdio::null());
+    command.stdin(Stdio::null()).stderr(Stdio::null());
     crate::destination::ssh::persistent::protect_keeper_inheritance(&mut command)?;
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+    let (provider, mut startup) =
+        crate::process::spawn_detached(command, crate::process::Detach::Session, false)
+            .context("start local SSH authorization provider")?;
+    startup.set_read_timeout(Some(STOP_TIMEOUT))?;
+    let result: Result<std::result::Result<(), String>> =
+        crate::destination::read_message(&mut startup);
+    if let Ok(Ok(())) = result {
+        provider.detach();
+        return Ok(());
     }
-    let (mut child, ready) = launch(command, &mut startup)?;
-    match ready {
-        Ok(Ok(())) => {
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-            Ok(())
-        }
-        result => {
-            // The leader has not been reaped; the process group remains ours.
-            unsafe {
-                libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
-            }
-            let _ = child.wait();
-            // A simultaneous local receive-on may have started the owner, which
-            // can hold the lock before it answers.
-            if running(domain, ANSWER_TIMEOUT, || Control::Status)?
-                .is_some_and(|state| state.build == crate::identity::build())
-            {
-                return refresh(domain);
-            }
-            match result {
-                Ok(Err(error)) => Err(anyhow::Error::msg(error)),
-                Err(error) => Err(error).context("local SSH authorization provider did not start"),
-                Ok(Ok(())) => unreachable!(),
-            }
-        }
+    drop(provider);
+    // A simultaneous local receive-on may have started the owner, which can
+    // hold the lock before it answers.
+    if running(domain, ANSWER_TIMEOUT, || Control::Status)?
+        .is_some_and(|state| state.build == crate::identity::build())
+    {
+        return refresh(domain);
     }
-}
-
-/// Start `command`, the provider, which answers on the other end of
-/// `startup`, and read its answer.
-fn launch(
-    mut command: std::process::Command,
-    startup: &mut UnixStream,
-) -> Result<(std::process::Child, Result<std::result::Result<(), String>>)> {
-    let child = command
-        .spawn_guarded()
-        .context("start local SSH authorization provider")?;
-    // The command holds this process's copy of the provider's end. Close it,
-    // so that a provider that ends without answering ends the read at once
-    // rather than at its time limit.
-    drop(command);
-    Ok((child, crate::destination::read_message(startup)))
+    match result {
+        Ok(Err(error)) => Err(anyhow::Error::msg(error)),
+        Err(error) => Err(error).context("local SSH authorization provider did not start"),
+        Ok(Ok(())) => unreachable!(),
+    }
 }
 
 pub(crate) fn stop(domain: &Domain) -> Result<()> {
-    let deadline = Instant::now() + STOP_TIMEOUT;
-    let mut progress = Instant::now();
-    while is_running(domain)? {
-        let _ = query(domain, Control::Stop);
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "local SSH authorization provider did not stop in {}",
-            domain.runtime_path().display()
-        );
-        if progress.elapsed() >= Duration::from_secs(5) {
-            crate::output::diagnostic!("syq: waiting for local SSH authorization provider to stop");
-            progress = Instant::now();
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    Ok(())
+    ending(domain).stop(|_| query(domain, Control::Stop).map(drop))
 }
 
 struct Runtime {
     _lock: LockFile,
-    _socket: SocketCleanup,
-    listener: UnixListener,
+    server: crate::service::Server,
     service: Arc<Service>,
     follower: Option<super::switch::Follower>,
 }
@@ -1168,29 +1106,10 @@ impl Runtime {
         let follower = started_from
             .filter(|path| path.to_str().is_some())
             .map(super::switch::Follower::new);
-        let path = scope.join(SOCKET_FILE);
-        match fs::symlink_metadata(&path) {
-            Ok(metadata)
-                if metadata.file_type().is_socket()
-                    && metadata.uid() == unsafe { libc::geteuid() } =>
-            {
-                fs::remove_file(&path)?
-            }
-            Ok(_) => bail!("unexpected entry at provider socket {}", path.display()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        let listener = UnixListener::bind(&path)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-        listener.set_nonblocking(true)?;
-        let socket_metadata = fs::symlink_metadata(&path)?;
+        let server = crate::service::Server::bind(&scope.join(SOCKET_FILE))?;
         Ok(Self {
             _lock: lock,
-            _socket: SocketCleanup {
-                path,
-                identity: (socket_metadata.dev(), socket_metadata.ino()),
-            },
-            listener,
+            server,
             service: Arc::new(Service::new(
                 domain,
                 follower
@@ -1202,11 +1121,7 @@ impl Runtime {
         })
     }
     fn run(&mut self) -> Result<()> {
-        let (mut wake, sender) = crate::process::with_inheritance_guard(UnixStream::pair)?;
-        wake.set_nonblocking(true)?;
-        sender.set_nonblocking(true)?;
-        let sender = Arc::new(sender);
-        let _signals = SignalWake::new(self.service.stop.clone(), &sender)?;
+        self.server.stop_on_signals(&self.service.stop)?;
         let (completed, completions) = std::sync::mpsc::channel();
         let mut workers = Vec::<std::thread::JoinHandle<()>>::new();
         let mut switch_args: Vec<OsString> = ["persist", "receive", SWITCH_PROVIDER]
@@ -1219,12 +1134,16 @@ impl Runtime {
         let result = (|| {
             while !self.service.stop.load(Ordering::Acquire) {
                 // With a path to follow, wake when it is next due.
-                let mut wait = -1;
+                let mut wait = None;
                 if let Some(follower) = &mut self.follower {
                     let service = &self.service;
                     follower.tick(&|| service.busy() == 0, &switch_args);
                     *service.switch.lock().unwrap() = follower.report();
-                    wait = follower.due().as_millis().clamp(1, 60_000) as i32;
+                    wait = Some(
+                        follower
+                            .due()
+                            .clamp(Duration::from_millis(1), Duration::from_secs(60)),
+                    );
                 }
                 // Completion is queued before waking poll; join also covers the
                 // short interval between that wake and the thread's return.
@@ -1235,26 +1154,28 @@ impl Runtime {
                         let _ = workers.swap_remove(index).join();
                     }
                 }
-                match self.listener.accept() {
-                    Ok((stream, _)) => {
+                match self.server.accept()? {
+                    Some(stream) => {
                         if workers.len() >= MAX_CLIENTS {
                             continue;
                         }
-                        stream.set_nonblocking(false)?;
                         let stream = self.service.streams.track(stream)?;
                         let service = self.service.clone();
                         let completed = completed.clone();
-                        let sender = sender.clone();
+                        let waker = self.server.waker();
                         workers.push(std::thread::spawn(move || {
                             let _ = service.handle(stream);
                             let _ = completed.send(std::thread::current().id());
-                            let _ = (&*sender).write(&[1]);
+                            waker.wake();
                         }));
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        wait_for_event(&self.listener, &mut wake, wait)?;
+                    // Worker completion, control requests and signals wake
+                    // it. An idle service reads no configuration
+                    // periodically; following its path to a new build, it
+                    // wakes when that is next due.
+                    None => {
+                        self.server.wait(wait)?;
                     }
-                    Err(error) => return Err(error.into()),
                 }
             }
             Ok(())
@@ -1264,58 +1185,6 @@ impl Runtime {
             let _ = worker.join();
         }
         result
-    }
-}
-
-// Worker completion and control requests use the same event channel as signals.
-// An idle service reads no configuration periodically; following its path to
-// a new build, it wakes every `timeout` milliseconds.
-fn wait_for_event(listener: &UnixListener, wake: &mut UnixStream, timeout: i32) -> Result<()> {
-    let mut descriptors = [
-        libc::pollfd {
-            fd: listener.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: wake.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-    ];
-    let result = unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, timeout) };
-    if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    loop {
-        match wake.read(&mut [0; 128]) {
-            Ok(0) => bail!("provider wake channel closed"),
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
-            Err(error) => return Err(error.into()),
-        }
-    }
-}
-struct SignalWake {
-    _registrations: crate::process::signals::Owned<crate::process::signals::Registrations>,
-}
-impl SignalWake {
-    fn new(stop: Arc<AtomicBool>, sender: &UnixStream) -> Result<Self> {
-        let registrations = crate::process::signals::owned(&[libc::SIGINT, libc::SIGTERM], || {
-            let mut registrations = crate::process::signals::Registrations::default();
-            for signal in [libc::SIGINT, libc::SIGTERM] {
-                registrations.push(signal_hook::flag::register(signal, stop.clone())?);
-                registrations.push(signal_hook::low_level::pipe::register(
-                    signal,
-                    sender.try_clone()?,
-                )?);
-            }
-            Ok(registrations)
-        })?;
-        Ok(Self {
-            _registrations: registrations,
-        })
     }
 }
 
@@ -1345,6 +1214,10 @@ pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock_file::PROBE_GRACE;
+    use crate::service::NotYetPrivate;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    use std::os::unix::net::UnixListener;
 
     fn fixture() -> (tempfile::TempDir, Domain, Preferences) {
         let directory = crate::test_support::short_tempdir().unwrap();
@@ -1377,28 +1250,6 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         (client, service.streams.track(server).unwrap())
-    }
-
-    /// A provider that ends without answering is noticed as soon as it ends,
-    /// not at the startup read's time limit.
-    #[test]
-    fn a_provider_that_ends_without_answering_is_noticed_at_once() {
-        let (mut startup, child_output) = UnixStream::pair().unwrap();
-        startup.set_read_timeout(Some(STOP_TIMEOUT)).unwrap();
-        let mut command = std::process::Command::new("true");
-        command
-            .stdin(Stdio::null())
-            .stdout(File::from(std::os::fd::OwnedFd::from(child_output)))
-            .stderr(Stdio::null());
-        let started = Instant::now();
-        let (mut child, ready) = launch(command, &mut startup).unwrap();
-        assert!(ready.is_err());
-        assert!(
-            started.elapsed() < STOP_TIMEOUT / 3,
-            "{:?}",
-            started.elapsed()
-        );
-        child.wait().unwrap();
     }
 
     #[test]

@@ -8,19 +8,18 @@ use crate::destination::forward::DeadlineIo;
 use crate::destination::{read_message, write_message};
 use crate::lock_file::LockFile;
 use crate::persistence::Domain;
-use crate::process::CommandExt as _;
 use crate::receive_service::provider::{self as service, SessionRequest, Ticket};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -566,17 +565,6 @@ fn ensure(domain: &Domain, provider: &Provider) -> Result<Record> {
     existing(domain, provider)?.context("SSH provider ended before it became ready")
 }
 
-struct Starting(Option<Child>);
-impl Drop for Starting {
-    fn drop(&mut self) {
-        if let Some(child) = &mut self.0 {
-            unsafe {
-                libc::kill(-(child.id() as i32), libc::SIGKILL);
-            }
-            let _ = child.wait();
-        }
-    }
-}
 fn launch_keeper(
     domain: &Domain,
     record: &Record,
@@ -584,14 +572,8 @@ fn launch_keeper(
     deadline: Instant,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<()> {
-    let (mut parent, child) = crate::process::with_inheritance_guard(UnixStream::pair)?;
     let mut command = crate::process::self_command()?;
-    command
-        .arg(KEEPER)
-        .process_group(0)
-        .stdin(Stdio::from(File::from(OwnedFd::from(child.try_clone()?))))
-        .stdout(Stdio::from(File::from(OwnedFd::from(child))))
-        .stderr(Stdio::null());
+    command.arg(KEEPER).stderr(Stdio::null());
     persistent::protect_keeper_inheritance(&mut command)?;
     let descriptor = lock.as_raw_fd();
     // Only this owned flock descriptor crosses exec in addition to startup IO.
@@ -604,10 +586,8 @@ fn launch_keeper(
             Ok(())
         });
     }
-    let mut process = Starting(Some(command.spawn_guarded()?));
-    // Close this process's copy of the keeper's end, so a keeper that ends
-    // without replying ends the read below at once.
-    drop(command);
+    let (keeper, mut parent) =
+        crate::process::spawn_detached(command, crate::process::Detach::Group, true)?;
     write_message(
         &mut parent,
         &Startup {
@@ -622,10 +602,7 @@ fn launch_keeper(
         cancelled: Some(cancelled),
     })?;
     reply.map_err(anyhow::Error::msg)?;
-    let mut child = process.0.take().unwrap();
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
+    keeper.detach();
     Ok(())
 }
 fn socket_path(path: &Path) -> Result<()> {
@@ -1088,6 +1065,7 @@ pub(crate) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::CommandExt as _;
     use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::net::UnixListener;
 
