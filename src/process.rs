@@ -391,6 +391,29 @@ pub(crate) fn capture_output_bounded(
     )
 }
 
+/// [`capture_output_bounded`] for a command that stays in this process's
+/// group, so that whatever ends this process with its group, such as the
+/// receiving service ending its setup child, ends the command too, and an
+/// interactive command can read the terminal. At the deadline only the
+/// command itself is killed; anything it started ends with this group.
+pub(crate) fn capture_output_bounded_in_this_group(
+    what: &str,
+    command: &mut Command,
+    deadline: std::time::Instant,
+    cancelled: &dyn Fn() -> bool,
+    max_output_bytes: usize,
+) -> std::io::Result<Output> {
+    capture_output_bounded_spawned(
+        what,
+        command,
+        deadline,
+        cancelled,
+        max_output_bytes,
+        &mut std::thread::sleep,
+        group::ProcessGroup::spawn_in_this_group,
+    )
+}
+
 /// `capture_output_bounded`, waiting with `wait` before each new look for
 /// the exit of a command that has closed its output.
 fn capture_output_bounded_with(
@@ -400,6 +423,26 @@ fn capture_output_bounded_with(
     cancelled: &dyn Fn() -> bool,
     max_output_bytes: usize,
     wait: &mut dyn FnMut(std::time::Duration),
+) -> std::io::Result<Output> {
+    capture_output_bounded_spawned(
+        what,
+        command,
+        deadline,
+        cancelled,
+        max_output_bytes,
+        wait,
+        group::ProcessGroup::spawn,
+    )
+}
+
+fn capture_output_bounded_spawned(
+    what: &str,
+    command: &mut Command,
+    deadline: std::time::Instant,
+    cancelled: &dyn Fn() -> bool,
+    max_output_bytes: usize,
+    wait: &mut dyn FnMut(std::time::Duration),
+    spawn: fn(&mut Command) -> std::io::Result<group::ProcessGroup>,
 ) -> std::io::Result<Output> {
     use std::io::{self, Read};
     use std::os::fd::{AsRawFd, RawFd};
@@ -466,7 +509,7 @@ fn capture_output_bounded_with(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut group = group::ProcessGroup::spawn(command)?;
+    let mut group = spawn(command)?;
     let mut stdout = group.child.stdout.take().unwrap();
     let mut stderr = group.child.stderr.take().unwrap();
     nonblocking(stdout.as_raw_fd())?;

@@ -425,11 +425,9 @@ impl SshEndpoint {
         &self.target
     }
 
-    /// What `ssh -G` needs after its options to resolve this endpoint.
-    pub(crate) fn query_arguments(&self) -> Vec<String> {
-        let mut args = Vec::new();
-        self.append_connection_args(&mut args);
-        args
+    /// The port given explicitly, if any.
+    pub(crate) fn port(&self) -> Option<u16> {
+        self.port
     }
 
     pub(crate) fn label(&self) -> String {
@@ -505,9 +503,8 @@ const BACKGROUND_LOGIN: [&str; 4] = [
 /// Whether `ssh -G` output says `StrictHostKeyChecking ask`, the default:
 /// someone would have to answer about a host key nobody knows.
 pub(crate) fn asks_about_new_host_keys(config: &[u8]) -> bool {
-    String::from_utf8_lossy(config)
-        .lines()
-        .any(|line| line.trim() == "stricthostkeychecking ask")
+    crate::ssh_config::value(&String::from_utf8_lossy(config), "stricthostkeychecking")
+        == Some("ask")
 }
 
 /// Arguments for the trusted local OpenSSH client that enrolls HostB.  A jump
@@ -519,6 +516,17 @@ pub(crate) fn enrollment_ssh_args_raw(
     target: &SshEndpoint,
     route: EnrollmentRoute<'_>,
     remote_command: &str,
+    unattended: Option<Unattended>,
+) -> Vec<String> {
+    let mut args = enrollment_ssh_options(route, unattended);
+    target.append_connection_args(&mut args);
+    args.push(remote_command.to_owned());
+    args
+}
+
+/// [`enrollment_ssh_args_raw`] before the endpoint and command.
+pub(crate) fn enrollment_ssh_options(
+    route: EnrollmentRoute<'_>,
     unattended: Option<Unattended>,
 ) -> Vec<String> {
     // SSH takes the first value of each option, and the command line's
@@ -575,8 +583,6 @@ pub(crate) fn enrollment_ssh_args_raw(
             ));
         }
     }
-    target.append_connection_args(&mut args);
-    args.push(remote_command.to_owned());
     args
 }
 

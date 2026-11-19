@@ -5,7 +5,6 @@ use crate::cli::NativeEndpoint;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
-use std::process::Command;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -58,39 +57,27 @@ impl LocalPlan {
             "ProxyJump configuration contains a cycle or exceeds 16 hops"
         );
         visited.push(requested.clone());
-        let mut command = Command::new("ssh");
-        command.arg("-G").env("LC_ALL", "C");
-        if let Some(user) = &requested.user {
-            command.args(["-l", user]);
-        }
-        if let Some(port) = requested.port {
-            command.args(["-p", &port.to_string()]);
-        }
-        if !forced.is_empty() {
-            command.args([
-                "-J",
-                &forced
+        let jumps = (!forced.is_empty()).then(|| {
+            [
+                "-J".to_owned(),
+                forced
                     .iter()
                     .map(NativeEndpoint::label)
                     .collect::<Vec<_>>()
                     .join(","),
-            ]);
-        }
-        command.args(["--", &requested.host]);
-        let output = crate::process::capture_output_bounded(
-            "SSH configuration lookup",
-            &mut command,
+            ]
+        });
+        let config = crate::ssh_config::SshConfig::query(
+            "ssh",
+            jumps.as_ref().map_or(&[][..], |jumps| &jumps[..]),
+            requested.user.as_deref(),
+            requested.port,
+            &requested.host,
+            crate::ssh_config::Group::Own,
             deadline,
             cancelled,
-            LIMIT,
-        )
-        .context("resolve SSH configuration on the requesting machine")?;
-        anyhow::ensure!(
-            output.status.success(),
-            "could not resolve local SSH configuration: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let mut plan = Self::parse(requested, &output.stdout)?;
+        )?;
+        let mut plan = Self::parse(requested, config.text().as_bytes())?;
         if let Route::Jump(chain) = &plan.route {
             let (last, previous) = chain.split_last().context("empty ProxyJump chain")?;
             let hop = Self::resolve_inner(last, previous, visited, deadline, cancelled)?;
@@ -108,12 +95,7 @@ impl LocalPlan {
 
     fn parse(requested: &NativeEndpoint, output: &[u8]) -> Result<Self> {
         let text = std::str::from_utf8(output).context("local ssh -G output is not UTF-8")?;
-        let value = |name: &str| -> Option<&str> {
-            text.lines().find_map(|line| {
-                line.strip_prefix(name)
-                    .and_then(|rest| rest.strip_prefix(' '))
-            })
-        };
+        let value = |name: &str| crate::ssh_config::value(text, name);
         let endpoint = NativeEndpoint {
             user: Some(value("user").context("local ssh -G omitted User")?.into()),
             host: value("hostname")
@@ -250,6 +232,7 @@ impl LocalPlan {
 mod tests {
     use super::*;
     use crate::process::CommandExt as _;
+    use std::process::Command;
 
     fn requested() -> NativeEndpoint {
         NativeEndpoint {
