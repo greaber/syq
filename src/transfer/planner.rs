@@ -6265,12 +6265,14 @@ mod directory_metadata_tests {
     /// The longest text an error of setting a directory's metadata takes: its
     /// handle could not be opened, which names the directory as the request
     /// does (`shown`) and again beneath the destination root (`beneath`),
-    /// with the system's longest description of an error.
+    /// with the system's longest description of an error and the receiver's
+    /// note on an owned directory's permissions.
     fn longest_error(shown: &[u8], beneath: &[u8]) -> WireError {
         WireError {
             message: format!(
                 "open confined metadata handle {}: open confined metadata handle {}: \
-                 Attempting to link in too many shared libraries (os error 2147483647)",
+                 Attempting to link in too many shared libraries (os error 2147483647); \
+                 an owned destination directory lacks the required owner permissions",
                 String::from_utf8_lossy(shown),
                 String::from_utf8_lossy(beneath)
             ),
@@ -6351,6 +6353,9 @@ mod directory_metadata_tests {
         }
     }
 
+    // Linux only: the directories' names are not UTF-8, which APFS refuses,
+    // and their paths are longer than macOS takes.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_failed_final_metadata_operation_says_no_more_than_its_request_allowed_for() {
         use crate::proto::failed_set_meta_hint;
@@ -6407,11 +6412,25 @@ mod directory_metadata_tests {
              Attempting to link in too many shared libraries (os error 2147483647)",
             [255_u8; 255].as_slice()
         );
-        assert!(
-            attribute.len() <= crate::inode_metadata::InodeMetadata::default().failure_hint(),
-            "{}",
-            attribute.len()
-        );
+        let attributes = |xattrs| crate::inode_metadata::InodeMetadata {
+            xattrs,
+            ..Default::default()
+        };
+        let allowed = attributes(Some(crate::inode_metadata::ExtendedAttributes {
+            privileged: false,
+            values: Vec::new(),
+        }))
+        .failure_hint();
+        assert!(attribute.len() <= allowed, "{}", attribute.len());
+        // Preserved times alone cannot name an attribute.
+        let times = crate::inode_metadata::InodeMetadata {
+            atime: Some(crate::inode_metadata::Timestamp {
+                seconds: 1,
+                nanoseconds: 0,
+            }),
+            ..attributes(None)
+        };
+        assert_eq!(times.failure_hint(), 0);
     }
 
     #[test]
