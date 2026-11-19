@@ -69,7 +69,11 @@ impl LocalPlan {
         if !forced.is_empty() {
             command.args([
                 "-J",
-                &forced.iter().map(jump_label).collect::<Vec<_>>().join(","),
+                &forced
+                    .iter()
+                    .map(NativeEndpoint::label)
+                    .collect::<Vec<_>>()
+                    .join(","),
             ]);
         }
         command.args(["--", &requested.host]);
@@ -240,23 +244,6 @@ impl LocalPlan {
             format!("ProxyCommand={proxy}").into(),
         ])
     }
-}
-
-fn jump_label(endpoint: &NativeEndpoint) -> String {
-    let mut value = endpoint
-        .user
-        .as_ref()
-        .map(|user| format!("{user}@"))
-        .unwrap_or_default();
-    if endpoint.host.contains(':') {
-        value.push_str(&format!("[{}]", endpoint.host));
-    } else {
-        value.push_str(&endpoint.host);
-    }
-    if let Some(port) = endpoint.port {
-        value.push_str(&format!(":{port}"));
-    }
-    value
 }
 
 #[cfg(test)]

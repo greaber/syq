@@ -52,20 +52,7 @@ impl Provider {
     pub(crate) fn label(&self) -> String {
         match self {
             Self::Return(name) => format!("@{name}"),
-            Self::Ssh { endpoint } => {
-                let mut label = if endpoint.host.contains(':') {
-                    format!("[{}]", endpoint.host)
-                } else {
-                    endpoint.host.clone()
-                };
-                if let Some(user) = &endpoint.user {
-                    label = format!("{user}@{label}");
-                }
-                if let Some(port) = endpoint.port {
-                    label.push_str(&format!(":{port}"));
-                }
-                label
-            }
+            Self::Ssh { endpoint } => endpoint.label(),
         }
     }
 }

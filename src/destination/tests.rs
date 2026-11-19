@@ -528,7 +528,7 @@ fn rules(
     options: &[&str],
     destination: &Path,
     (max_entries, max_delete): (u64, u64),
-) -> Result<(crate::delegation::Grant, GrantConstraints)> {
+) -> Result<crate::delegation::DestinationRules> {
     crate::directive::receiving_rules(
         &issued(
             &command(source, options),
@@ -569,7 +569,7 @@ fn a_request_keeps_the_receiving_directory_it_opened() {
 fn named_destination_allows_128_workers_and_preserves_smaller_allowances() {
     let temporary = crate::test_support::tempdir().unwrap();
     for (requested, expected) in [(2, 2), (32, 32), (64, 64), (128, 128), (256, 128)] {
-        let (grant, _) = rules(
+        let grant = rules(
             &temporary.path().join("source"),
             &["--resource-limits", &format!("workers={requested}")],
             temporary.path(),
@@ -1404,7 +1404,7 @@ fn named_copy_accepts_ownership_and_special_files() {
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o640) }, 0);
     let (_broker, _receiver, registration, _) = broker(&root, Approval::Always);
     let options = ["--copy-metadata", "mtime,permissions,ownership,specials"];
-    let (grant, _) = rules(&source, &options, &root, (1000, 0)).unwrap();
+    let grant = rules(&source, &options, &root, (1000, 0)).unwrap();
     let preserved = &grant.copy.options;
     assert!(preserved.preserve_owner && preserved.preserve_group && preserved.preserve_devices);
     let (command, inputs) = requested(&source, &options);
@@ -1428,7 +1428,7 @@ fn named_requests_accept_in_place_new_and_prune_within_the_machines_limit() {
     let temporary = crate::test_support::tempdir().unwrap();
     let source = temporary.path().join("source");
     let derive = |options: &[&str], limits| rules(&source, options, temporary.path(), limits);
-    let (accepted, _) = derive(&["--in-place=new"], (1000, 0)).unwrap();
+    let accepted = derive(&["--in-place=new"], (1000, 0)).unwrap();
     assert_eq!(
         accepted.copy.policy.publication,
         crate::delegation::PublicationPolicy::InPlaceNew
@@ -1442,9 +1442,9 @@ fn named_requests_accept_in_place_new_and_prune_within_the_machines_limit() {
             .contains("pruning needs a positive --max-delete"),
         "{error:#}"
     );
-    let (grant, _) = derive(&["--prune"], (1000, 5)).unwrap();
+    let grant = derive(&["--prune"], (1000, 5)).unwrap();
     assert_eq!(grant.copy.limits.max_deletions, 5);
-    let (grant, _) = derive(&["--prune"], (3, 5)).unwrap();
+    let grant = derive(&["--prune"], (3, 5)).unwrap();
     assert_eq!(grant.copy.limits.max_deletions, 3);
     // The approval carries the ceiling that bounds the rules, for a dry
     // run's read-only rules too, whose own limit is zero.
@@ -1453,10 +1453,10 @@ fn named_requests_accept_in_place_new_and_prune_within_the_machines_limit() {
         max_entries,
         max_delete: 5,
     };
-    let (lower, _) = derive(&["--prune", "--max-delete", "2"], (1000, 5)).unwrap();
+    let lower = derive(&["--prune", "--max-delete", "2"], (1000, 5)).unwrap();
     assert_eq!(lower.copy.limits.max_deletions, 2);
     assert_eq!(caps(1000).deletion_ceiling(&lower.copy), 5);
-    let (preview, _) = derive(&["--prune", "--dry-run"], (3, 5)).unwrap();
+    let preview = derive(&["--prune", "--dry-run"], (3, 5)).unwrap();
     assert_eq!(preview.copy.limits.max_deletions, 0);
     assert_eq!(caps(3).deletion_ceiling(&preview.copy), 3);
 
@@ -2649,14 +2649,14 @@ fn data_hostnames_reject_options_paths_and_config_syntax() {
 #[test]
 fn named_rules_never_follow_the_destination() {
     for follow in ["--follow-dst", "--follow"] {
-        let (_, constraints) = rules(
+        let constraints = rules(
             Path::new("source"),
             &[follow],
             Path::new("/receiving"),
             (1000, 0),
         )
         .unwrap();
-        assert!(!constraints.extra_options.follow_dst, "{follow}");
+        assert!(!constraints.copy.options.follow_dst, "{follow}");
     }
 }
 

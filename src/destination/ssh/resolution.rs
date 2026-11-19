@@ -3,14 +3,13 @@ use super::{local_config::LocalPlan, persistent, SessionRequest};
 use crate::auth_from::Provider;
 use crate::cli::NativeEndpoint;
 use crate::destination::ssh_auth::{self, ResolvedPolicy};
-use crate::lock_file::LockFile;
 use crate::persistence::Domain;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DIRECTORY: &str = "resolution-v1";
 const MAX_FILE: u64 = 256 * 1024;
@@ -51,6 +50,8 @@ struct Entry {
     authorizer: Provider,
     requested: NativeEndpoint,
     selected: Selection,
+    /// When the entry was written. Nothing reads these, but releases up to
+    /// 0.10.1 refuse an entry without them, so they are still written.
     checked: u64,
     attempted: u64,
 }
@@ -325,16 +326,13 @@ pub(super) fn invalidate(
     Ok(())
 }
 
-fn state_paths(domain: &Domain, locks_only: bool) -> Result<Vec<PathBuf>> {
+fn state_paths(domain: &Domain) -> Result<Vec<PathBuf>> {
     let Some(directory) = existing_directory(domain)? else {
         return Ok(Vec::new());
     };
     let mut paths = Vec::new();
     for entry in fs::read_dir(directory)? {
         let path = entry?.path();
-        if locks_only && path.extension().is_none_or(|ext| ext != "lock") {
-            continue;
-        }
         // Cleanup removes a temporary file that a killed writer left.
         if path
             .file_name()
@@ -343,6 +341,7 @@ fn state_paths(domain: &Domain, locks_only: bool) -> Result<Vec<PathBuf>> {
             paths.push(path);
             continue;
         }
+        // Development builds before 0.8.0 left `.lock` files here too.
         anyhow::ensure!(
             path.extension()
                 .is_some_and(|ext| ext == "json" || ext == "lock")
@@ -358,47 +357,8 @@ fn state_paths(domain: &Domain, locks_only: bool) -> Result<Vec<PathBuf>> {
     }
     Ok(paths)
 }
-/// Generation cancellation precedes this wait. Refresh helpers exit even if
-/// the provider is unavailable; no metadata writer can recreate a closed scope.
-pub(super) fn wait(domain: &Domain) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut report = Instant::now();
-    loop {
-        let mut running = 0;
-        for path in state_paths(domain, true)? {
-            if path.extension().is_none_or(|ext| ext != "lock") {
-                continue;
-            }
-            let lock = match LockFile::open(&path, false) {
-                Ok(lock) => lock,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
-            };
-            anyhow::ensure!(
-                lock.file().metadata()?.len() == 0,
-                "SSH resolution metadata must be a bounded owner-only file"
-            );
-            if lock.held()? {
-                running += 1;
-            }
-        }
-        if running == 0 {
-            return Ok(());
-        }
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "SSH resolution refresh did not stop within 10 seconds"
-        );
-        if report.elapsed() >= Duration::from_secs(1) {
-            crate::output::diagnostic!("syq: waiting for SSH resolution refresh to stop");
-            report = Instant::now();
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
 pub(super) fn cleanup(domain: &Domain) -> Result<()> {
-    wait(domain)?;
-    for path in state_paths(domain, false)? {
+    for path in state_paths(domain)? {
         private_file(&path, false, MAX_FILE)?.context("SSH resolution state disappeared")?;
         fs::remove_file(path)?;
     }
@@ -464,6 +424,47 @@ mod tests {
             &entry.selected.provider,
         )
         .unwrap()
+    }
+    /// An entry as releases 0.8.0 to 0.10.1 wrote it, and still write it:
+    /// this build reads it, and writes the fields those releases require.
+    #[test]
+    fn entries_stay_readable_by_this_build_and_released_ones() {
+        const RELEASED: &str = r#"{"version":1,"authorizer":"laptop","requested":{"user":null,"host":"alias","port":null},"selected":{"provider":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","policy":{"endpoint":{"user":"user","host":"resolved.invalid","port":22},"host_algorithms":"ssh-ed25519","known_hosts":"syq-approved-peer ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP0XJDhaoMdbZPt4zWAvodmR/ev3axPFjtcC6sg16fYY\n"}},"checked":1,"attempted":1}"#;
+        let (_root, domain, entry) = fixture();
+        let path = entry_path(&domain, &entry);
+        crate::state_file::write_atomic(
+            &path,
+            RELEASED.as_bytes(),
+            0o600,
+            crate::state_file::Publish::Replace,
+            crate::state_file::Durability::RenameOnly,
+        )
+        .unwrap();
+        let read = read_at(
+            &path,
+            &entry.authorizer,
+            &entry.requested,
+            &entry.selected.provider,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(read.selected, entry.selected);
+        store_at(&path, &entry).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), RELEASED);
+    }
+
+    /// Cleanup removes the cache, and a `.lock` file a development build
+    /// left there, without waiting for anything.
+    #[test]
+    fn cleanup_removes_entries_and_a_stray_lock() {
+        let (_root, domain, entry) = fixture();
+        let path = entry_path(&domain, &entry);
+        store_at(&path, &entry).unwrap();
+        let lock = path.with_extension("lock");
+        let held = crate::lock_file::LockFile::open(&lock, true).unwrap();
+        assert!(held.try_exclusive().unwrap());
+        cleanup(&domain).unwrap();
+        assert!(existing_directory(&domain).unwrap().is_none());
     }
     #[test]
     fn metadata_survives_master_absence_but_is_bound_to_provider_and_endpoint() {
