@@ -24,9 +24,9 @@ pub const MAX_READ_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_HANDSHAKE_FRAME: usize = 1024 * 1024;
 const MAX_METADATA_FRAME: usize = 8 * 1024 * 1024;
 pub(crate) const METADATA_BATCH_BYTES: usize = 6 * 1024 * 1024;
-/// What the failures of one request's metadata operations may add to its
-/// reply, by `failed_set_meta_hint`: half a metadata frame, so that the
-/// reply still fits should an error come to say more than that allows for.
+/// What the failures of one request's operations may add to its reply, by
+/// `failed_path_hint` and `failed_set_meta_hint`: half a metadata frame, so
+/// that the reply still fits should an error come to say more than that allows for.
 pub(crate) const METADATA_REPLY_BYTES: usize = MAX_METADATA_FRAME / 2;
 /// Supported comparison granularity floor, enforced by receivers as well as the CLI.
 /// Smaller blocks increase the number of hashes per file; this is a protocol
@@ -757,24 +757,35 @@ impl Op {
 }
 
 /// The most a failed `Op::SetMeta` of `path` adds to its request's `Applied`
-/// reply: the receiver's error, as text, and its other fields.
-///
-/// The text names the path as the receiver displays it, in which each byte
-/// that is not UTF-8 shows as a three-byte replacement character. No error
-/// of this operation names it more than twice (opening its metadata handle
-/// names it for the request and again beneath the destination root); three
-/// are allowed for. The rest of the text is fixed wording and the system's
-/// description of the error, well under 320 bytes with the error's other
-/// fields. An error of preserved ACLs or extended attributes also names one
-/// attribute, of at most 255 bytes, as a list of numbers
-/// (`InodeMetadata::failure_hint`).
+/// reply: that of any operation on the path (`failed_path_hint`), and an
+/// attribute's name when ACLs or extended attributes are preserved: an
+/// error applying them names one, of at most 255 bytes, as a list of
+/// numbers (`InodeMetadata::failure_hint`). No error of this operation
+/// names the path more than twice: opening its metadata handle names it
+/// for the request and again beneath the destination root.
 pub(crate) fn failed_set_meta_hint(path: &[u8], meta: &Meta) -> usize {
-    3 * String::from_utf8_lossy(path).len()
-        + 320
+    failed_path_hint(path)
         + meta
             .inode_metadata
             .as_ref()
             .map_or(0, |inode| inode.failure_hint())
+}
+
+/// The most the failure of an operation on `path` that names no other path
+/// or attribute adds to its request's `Applied` reply: the receiver's error,
+/// as text, and its other fields. This holds for setting a directory's
+/// metadata (`failed_set_meta_hint` adds attributes), creating a directory
+/// and removing an entry (`Op::Mkdir`, `Op::Rmdir`, `Op::Unlink`).
+///
+/// The text names the path as the receiver displays it, in which each byte
+/// that is not UTF-8 shows as a three-byte replacement character. No error
+/// of these operations names it more than twice (a no-replace creation
+/// whose name was taken names it in that condition and in the creation that
+/// failed); three are allowed for. The rest of the text is fixed wording and
+/// the system's description of the error, well under 320 bytes with the
+/// error's other fields.
+pub(crate) fn failed_path_hint(path: &[u8]) -> usize {
+    3 * String::from_utf8_lossy(path).len() + 320
 }
 
 /// Receiver-observed mode and identity before temporary directory access.
