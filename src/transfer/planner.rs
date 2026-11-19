@@ -3197,7 +3197,9 @@ impl Planner<'_> {
             }
             if stream.queue.is_empty() {
                 // A private root changes group only after this batch's
-                // subdirectories have inherited its starting group.
+                // subdirectories have inherited its starting group. Its one
+                // operation is not in the reply's budget: the other half of
+                // the frame holds its failure.
                 ops.append(&mut stream.last_metadata);
             }
             if ops.is_empty() {
@@ -6032,10 +6034,17 @@ fn reply_sized_slices<T>(
     })
 }
 
-/// `reply_sized_slices` for operations to send.
-fn reply_sized(ops: Vec<Op>, most: usize, hint: impl Fn(&Op) -> usize) -> Vec<Vec<Op>> {
-    reply_sized_slices(&ops, most, hint)
-        .map(<[Op]>::to_vec)
+/// `reply_sized_slices` for operations to send, moved rather than copied.
+fn reply_sized(mut ops: Vec<Op>, most: usize, hint: impl Fn(&Op) -> usize) -> Vec<Vec<Op>> {
+    let lengths: Vec<usize> = reply_sized_slices(&ops, most, hint)
+        .map(<[Op]>::len)
+        .collect();
+    lengths
+        .into_iter()
+        .map(|len| {
+            let rest = ops.split_off(len);
+            std::mem::replace(&mut ops, rest)
+        })
         .collect()
 }
 
@@ -6656,6 +6665,25 @@ mod directory_metadata_tests {
             long[..long.len() - 1].iter().all(|&len| len == 141),
             "{long:?}"
         );
+        // Operations are moved into their requests in order.
+        let ops: Vec<Op> = (0..300_u16)
+            .map(|index| Op::Unlink {
+                path: [vec![0xff; 3250], index.to_be_bytes().to_vec()].concat(),
+            })
+            .collect();
+        let requests = reply_sized(ops.clone(), 1000, |op| {
+            crate::proto::failed_path_hint(apply_path(op))
+        });
+        assert_eq!(
+            requests.iter().map(Vec::len).collect::<Vec<_>>(),
+            [141, 141, 18]
+        );
+        let paths = |ops: &[Op]| {
+            ops.iter()
+                .map(|op| apply_path(op).to_vec())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(paths(&requests.concat()), paths(&ops));
         // One goes alone, however large.
         assert_eq!(
             reply_sized_slices(&[0, 1], 1000, |_| usize::MAX)
