@@ -655,14 +655,10 @@ pub(crate) struct RestrictedAuthority {
     /// they need not list, so the copy's lookups do not list them again.
     pub(super) settled_listings: Vec<proto::PathBytes>,
     pub(super) destination: Vec<u8>,
-    pub(super) copy: CopyOperation,
-    pub(super) filters: FilterPolicy,
+    /// What the copy may do here, as its command states.
+    pub(super) rules: DestinationRules,
     pub(super) filter_matcher: Option<ignore::gitignore::Gitignore>,
     pub(super) filter_roots: Vec<Vec<u8>>,
-    pub(super) root_existence: RootExistence,
-    pub(super) enrollment_id: EnrollmentId,
-    pub(super) request_id: RequestId,
-    pub(super) receipt_policy: crate::destination_results::ReceiptPolicy,
     pub(super) grant_digest: [u8; 32],
     /// Signs the header of this grant's results for the invoking machine.
     pub(super) results_key: PrivateKey,
@@ -684,13 +680,9 @@ pub(crate) struct RestrictedAuthority {
     pub(super) state: Mutex<AuthorityState>,
     /// Signalled whenever an in-flight request settles.
     pub(super) settled: std::sync::Condvar,
-    pub(super) tcp_congestion: Option<String>,
-    /// Whether the signed command lets the data go over TCP, and
-    /// unencrypted.
-    pub(super) tcp: crate::delegation::TcpPermission,
+    /// What the copy's mapping file has admitted so far, when the rules
+    /// authorize one.
     pub(super) mapping: Option<Mutex<crate::mapping::Admission>>,
-    pub(super) hashing: Option<crate::hashing::CopyHashing>,
-    pub(super) extra_options: crate::delegation::ExtraCopyOptions,
     /// The files this receiver created for the grant, shared with every
     /// connection's operations.
     pub(super) owned: std::sync::Arc<crate::fsops::owned::OwnedObjects>,
@@ -757,7 +749,7 @@ impl RestrictedAuthority {
         &self,
     ) -> Option<std::sync::Arc<crate::fsops::owned::OwnedObjects>> {
         (self.creation_policy(false) == ExistingDestinationPolicy::Skip
-            && self.extra_options.hardlinks)
+            && self.rules.copy.options.hardlinks)
             .then(|| self.owned.clone())
     }
 
@@ -767,14 +759,7 @@ impl RestrictedAuthority {
     }
 
     pub(crate) fn hash_policy(&self) -> crate::hashing::HashPolicy {
-        self.hashing.as_ref().map_or(
-            crate::hashing::HashPolicy {
-                algorithm: crate::hashing::HashAlgorithm::Blake3,
-                transfer_integrity: true,
-                transfer_hash_type: None,
-            },
-            |hashing| hashing.policy,
-        )
+        self.rules.hashing.policy
     }
 
     pub(super) fn expected_hash(&self, path: &[u8]) -> Result<Option<crate::hashing::Digest>> {
@@ -785,11 +770,12 @@ impl RestrictedAuthority {
                 .expected_hash(self.mapping_relative(path)?)?
                 .cloned());
         }
-        let selected = match self.copy.policy.placement {
+        let selected = match self.rules.copy.policy.placement {
             DestinationPlacement::ExactPath => path == self.destination,
             _ => {
                 path != self.destination
                     && self
+                        .rules
                         .copy
                         .mutation_scopes
                         .iter()
@@ -797,39 +783,22 @@ impl RestrictedAuthority {
             }
         };
         Ok(selected
-            .then(|| {
-                self.hashing
-                    .as_ref()
-                    .and_then(|hashing| hashing.expected_hash.clone())
-            })
+            .then(|| self.rules.hashing.expected_hash.clone())
             .flatten())
     }
 
     pub(super) fn new(
         confined: ConfinedRoot,
-        grant: Grant,
-        extensions: GrantConstraints,
+        rules: DestinationRules,
         grant_digest: [u8; 32],
         results_key: PrivateKey,
         deadline: Instant,
         protected: &[ReceiverControlPath],
     ) -> Result<Self> {
-        let GrantConstraints {
-            filters,
-            root_existence,
-            receipt_policy,
-            tcp_congestion,
-            tcp,
-            mapping,
-            hashing,
-            extra_options,
-        } = extensions;
-        let enrollment_id = grant.enrollment_id;
-        let request_id = grant.request_id;
-        let copy = grant.copy;
-        reject_control_plane_scopes(&copy, protected)?;
-        let filter_matcher = crate::scan::build_ignore(&filters.ignore)?;
-        let filter_roots = filters.destination_roots.clone();
+        let copy = &rules.copy;
+        reject_control_plane_scopes(copy, protected)?;
+        let filter_matcher = crate::scan::build_ignore(&rules.filters.ignore)?;
+        let filter_roots = rules.filters.destination_roots.clone();
         let root_path = Path::new(std::ffi::OsStr::from_bytes(&confined.named));
         let destination = Path::new(std::ffi::OsStr::from_bytes(&copy.destination));
         let relative = destination.strip_prefix(root_path).with_context(|| {
@@ -846,7 +815,7 @@ impl RestrictedAuthority {
         let relative = relative.as_os_str().as_bytes();
         // Where the destination really is, by name, beside the checks of the
         // names the grant uses and of identities below.
-        let descendants = destination_has_descendants(&copy);
+        let descendants = destination_has_descendants(copy);
         reject_control_plane_scope(
             &crate::fsops::join(&confined.real, relative),
             descendants,
@@ -864,7 +833,7 @@ impl RestrictedAuthority {
         // the copy creates the rest of the destination inside, is the root
         // every connection works beneath, named in requests by the matching
         // part of the signed destination, so nothing reaches past it.
-        let followed = if extra_options.follow_dst
+        let followed = if copy.options.follow_dst
             && copy.policy.placement != DestinationPlacement::ExactPath
         {
             // Resolved from `/`, where an absolute link target names where
@@ -983,15 +952,10 @@ impl RestrictedAuthority {
             )?;
             reject_protected_scope(&root, relative, descendants, &identities, &mut seen)?;
         }
-        receipt_policy.validate()?;
         let mut authority = Self {
-            hashing,
-            extra_options,
             owned: Default::default(),
             stage_scope: crate::fsops::StageScope::new(),
-            tcp_congestion,
-            tcp,
-            mapping: mapping.map(|authorization| {
+            mapping: rules.mapping.clone().map(|authorization| {
                 Mutex::new(crate::mapping::Admission::new(
                     authorization,
                     copy.limits.max_entries,
@@ -1001,14 +965,9 @@ impl RestrictedAuthority {
             root_path: held_path,
             settled_listings,
             destination: copy.destination.clone(),
-            copy,
-            filters,
+            rules,
             filter_matcher,
             filter_roots,
-            root_existence,
-            enrollment_id,
-            request_id,
-            receipt_policy,
             grant_digest,
             results_key,
             results: Mutex::new(None),
@@ -1061,10 +1020,10 @@ impl RestrictedAuthority {
             "destination results have already started"
         );
         *results = Some(crate::destination_results::Stream::start(
-            &self.receipt_policy,
+            self.rules.results_recipient,
             crate::destination_results::Binding {
-                enrollment_id: self.enrollment_id,
-                request_id: self.request_id,
+                enrollment_id: self.rules.enrollment_id,
+                request_id: self.rules.request_id,
                 grant_digest: self.grant_digest,
             },
             &self.results_key,
@@ -1152,12 +1111,12 @@ impl RestrictedAuthority {
     pub(super) fn check_root_existence(&self) -> Result<()> {
         // Either answer will do, so nothing is looked up: the destination
         // may lie in a root only an approved `all` lets the copy search.
-        if self.root_existence == RootExistence::Any {
+        if self.rules.root_existence == RootExistence::Any {
             return Ok(());
         }
         let observed = self.rooted_metadata(&self.destination)?;
         let destination = String::from_utf8_lossy(&self.destination);
-        match (self.root_existence, observed) {
+        match (self.rules.root_existence, observed) {
             (RootExistence::Any, _) => Ok(()),
             (RootExistence::New, Some(_)) => bail!(
                 "signed destination {destination} already exists, but the grant requires a new path"
@@ -1167,7 +1126,7 @@ impl RestrictedAuthority {
                 "signed destination {destination} does not exist, but the grant requires an existing path"
             ),
             (RootExistence::Existing, Some(metadata))
-                if self.copy.policy.placement != DestinationPlacement::ExactPath
+                if self.rules.copy.policy.placement != DestinationPlacement::ExactPath
                     && !metadata.is_dir() =>
             {
                 bail!(
@@ -1183,7 +1142,7 @@ impl RestrictedAuthority {
             bail!("transfer control is closed or expired");
         }
         self.check_deadline()?;
-        if compressed != self.copy.options.compressed_transport {
+        if compressed != self.rules.copy.options.compressed_transport {
             bail!("transport compression does not match the signed grant");
         }
         Ok(())
@@ -1206,7 +1165,7 @@ impl RestrictedAuthority {
         if !self.control_is_open() {
             bail!("transfer control is closed or expired");
         }
-        if state.live_connections >= self.copy.limits.max_connections {
+        if state.live_connections >= self.rules.copy.limits.max_connections {
             bail!("signed grant connection limit exceeded");
         }
         state.live_connections += 1;
@@ -1305,7 +1264,7 @@ impl RestrictedAuthority {
             .reserved_bytes
             .checked_add(effective - previous.unwrap_or(0))
             .context("signed reservation byte counter overflow")?;
-        if total > self.copy.limits.max_total_bytes {
+        if total > self.rules.copy.limits.max_total_bytes {
             bail!("signed grant total-byte limit exceeded by file preparation");
         }
         let hold = if observation_only {
@@ -1402,6 +1361,7 @@ impl RestrictedAuthority {
         Self::validate_request_path(path)?;
         if path != self.destination
             && !self
+                .rules
                 .copy
                 .mutation_scopes
                 .iter()
@@ -1418,7 +1378,7 @@ impl RestrictedAuthority {
     /// the confinement root, so this is the root or a directory inside it, never
     /// one above it.
     fn outer_directory(&self) -> Option<Vec<u8>> {
-        match self.copy.policy.placement {
+        match self.rules.copy.policy.placement {
             DestinationPlacement::DirectoryAsChild => Some(self.destination.clone()),
             DestinationPlacement::ExactPath => {
                 let end = self.destination.iter().rposition(|&byte| byte == b'/')?;
@@ -1466,7 +1426,7 @@ impl RestrictedAuthority {
     /// Whether the grant allows changes at all now: not a read-only one, and
     /// not after its results ended.
     fn check_mutation_allowed(&self) -> Result<()> {
-        if self.copy.options.dry_run {
+        if self.rules.copy.options.dry_run {
             bail!("signed read-only transfer forbids destination mutations");
         }
         if self.state.lock().unwrap().results_closing {
@@ -1479,6 +1439,7 @@ impl RestrictedAuthority {
         self.check_mutation_allowed()?;
         Self::validate_request_path(path)?;
         if !self
+            .rules
             .copy
             .mutation_scopes
             .iter()
@@ -1522,7 +1483,7 @@ impl RestrictedAuthority {
         if change == Change::EnsureDirectory
             && error.is_none()
             && path == self.destination
-            && self.copy.policy.placement != DestinationPlacement::ExactPath
+            && self.rules.copy.policy.placement != DestinationPlacement::ExactPath
         {
             return;
         }
@@ -1931,11 +1892,11 @@ impl RestrictedAuthority {
     ) -> Result<()> {
         let policy = self.creation_policy(directory);
         let root_must_be_new =
-            self.root_existence == RootExistence::New && path == self.destination;
+            self.rules.root_existence == RootExistence::New && path == self.destination;
         let label = String::from_utf8_lossy(path);
         if root_must_be_new
             && !directory
-            && self.copy.policy.placement != DestinationPlacement::ExactPath
+            && self.rules.copy.policy.placement != DestinationPlacement::ExactPath
         {
             bail!(
                 "signed placement puts names inside {label}, so it must be created as a directory"
@@ -1993,7 +1954,7 @@ impl RestrictedAuthority {
         use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
         let label = String::from_utf8_lossy(path);
         let root_must_be_new =
-            self.root_existence == RootExistence::New && path == self.destination;
+            self.rules.root_existence == RootExistence::New && path == self.destination;
         let recorded = match &self.lookups {
             Some(lookups)
                 if self.creation_policy(false) != ExistingDestinationPolicy::Replace
@@ -2083,22 +2044,17 @@ impl RestrictedAuthority {
         }
     }
 
-    /// The existing-object policy a creation is held to: the grant's, or,
-    /// for anything but a directory under `keep_files` (`syq rsync
-    /// --ignore-existing`), `Skip`.
+    /// The existing-object policy a creation is held to: the grant's, with
+    /// `KeepFiles` resolved for a directory or anything else. It is never
+    /// `KeepFiles`.
     fn creation_policy(&self, directory: bool) -> ExistingDestinationPolicy {
-        match self.copy.policy.existing {
-            ExistingDestinationPolicy::Replace if self.extra_options.keep_files && !directory => {
-                ExistingDestinationPolicy::Skip
-            }
-            policy => policy,
-        }
+        self.rules.copy.policy.existing.for_object(directory)
     }
 
     /// Whether the failure of a change at `path` only shows an object its
     /// existing-object policy keeps: the executor found, before changing
     /// anything, that the destination did not meet the change's condition
-    /// (`fsops::condition_not_met`), under `Skip` (or `keep_files` for
+    /// (`fsops::condition_not_met`), under `Skip` (or `KeepFiles` for
     /// anything but a directory) or `MustExist`. Such a change is no
     /// failure: nothing changed, as the policy asks. A root that must be
     /// new, and a name this grant created, are never kept.
@@ -2114,7 +2070,7 @@ impl RestrictedAuthority {
                 self.creation_policy(directory),
                 ExistingDestinationPolicy::Skip | ExistingDestinationPolicy::MustExist
             )
-            && !(self.root_existence == RootExistence::New && path == self.destination)
+            && !(self.rules.root_existence == RootExistence::New && path == self.destination)
             && !state.created.contains(path)
     }
 
@@ -2130,6 +2086,10 @@ impl RestrictedAuthority {
         use proto::TargetCondition::{Absent, Any, Matches, MatchesFingerprint};
         let label = String::from_utf8_lossy(path);
         match policy {
+            // `creation_policy` resolves it for each object.
+            ExistingDestinationPolicy::KeepFiles => {
+                bail!("{label}: the existing-object policy was not resolved")
+            }
             ExistingDestinationPolicy::MustExist => {
                 let metadata = match observed {
                     Some(metadata) if !directory || metadata.is_dir() => metadata,
@@ -2202,7 +2162,7 @@ impl RestrictedAuthority {
     /// Bind mutations at `path` to the signed existing-object policy.
     /// `Skip` protects all pre-existing objects, including directories,
     /// while permitting updates to objects created by this grant.
-    /// `directory` marks a directory's metadata: under `keep_files` only
+    /// `directory` marks a directory's metadata: under `KeepFiles` only
     /// those of existing objects may change.
     pub(super) fn constrain_update(
         &self,
@@ -2236,6 +2196,10 @@ impl RestrictedAuthority {
             // nothing hostA supplies names an inode on its own authority.
             ExistingDestinationPolicy::MustExist => self.pin_update(path, &label, condition),
             ExistingDestinationPolicy::Replace => Ok(()),
+            // `creation_policy` resolves it for each object.
+            ExistingDestinationPolicy::KeepFiles => {
+                bail!("{label}: the existing-object policy was not resolved")
+            }
         }
     }
 
@@ -2352,7 +2316,7 @@ impl RestrictedAuthority {
             );
         }
         let root_must_be_new =
-            self.root_existence == RootExistence::New && path == self.destination;
+            self.rules.root_existence == RootExistence::New && path == self.destination;
         if root_must_be_new && !self.created_by_this_grant(path) {
             bail!(
                 "signed grant only creates {}: it is staged and published without replacing anything, not written in place",
@@ -2368,7 +2332,14 @@ impl RestrictedAuthority {
     /// is replaced through a stage, published under the existing-object
     /// policy as any staged file is. Staged requests are always allowed.
     fn require_publication_mode(&self, inplace: bool, what: &str) -> Result<()> {
-        if inplace && !self.copy.policy.publication.writes_new_files_in_place() {
+        if inplace
+            && !self
+                .rules
+                .copy
+                .policy
+                .publication
+                .writes_new_files_in_place()
+        {
             bail!("{what} does not match the signed publication policy");
         }
         Ok(())
@@ -2409,7 +2380,7 @@ impl RestrictedAuthority {
             | proto::flags::REQUIRE_GROUP;
         // A hard-link representative reports the identity its followers
         // link to; that changes only the reply.
-        let known = if self.extra_options.hardlinks {
+        let known = if self.rules.copy.options.hardlinks {
             known | proto::flags::REPORT_IDENTITY
         } else {
             known
@@ -2426,28 +2397,30 @@ impl RestrictedAuthority {
             bail!("request cannot mix source and receiver-managed mode flags");
         }
         if flags & proto::flags::MODE != 0
-            && !self.copy.options.preserve_permissions
+            && !self.rules.copy.options.preserve_permissions
             && !granted(proto::flags::MODE)
         {
             bail!("request tries to preserve permissions not authorized by the grant");
         }
-        if flags & proto::flags::RECEIVER_MODE != 0 && !self.copy.options.receiver_managed_modes {
+        if flags & proto::flags::RECEIVER_MODE != 0
+            && !self.rules.copy.options.receiver_managed_modes
+        {
             bail!("request tries to apply receiver-managed modes not authorized by the grant");
         }
         if flags & proto::flags::OWNER != 0
-            && !self.copy.options.preserve_owner
+            && !self.rules.copy.options.preserve_owner
             && !granted(proto::flags::OWNER)
         {
             bail!("request tries to preserve ownership not authorized by the grant");
         }
         if flags & proto::flags::GROUP != 0
-            && !self.copy.options.preserve_group
+            && !self.rules.copy.options.preserve_group
             && !granted(proto::flags::GROUP)
         {
             bail!("request tries to preserve group not authorized by the grant");
         }
         if flags & proto::flags::TIMES != 0
-            && !self.copy.options.preserve_times
+            && !self.rules.copy.options.preserve_times
             && !granted(proto::flags::TIMES)
         {
             bail!("request tries to preserve timestamps not authorized by the grant");
@@ -2527,7 +2500,7 @@ impl RestrictedAuthority {
                 open_noatime: false,
             };
             anyhow::ensure!(
-                self.extra_options.allows(requested),
+                self.rules.copy.options.allows(requested),
                 "request applies inode metadata not authorized by the signed grant"
             );
         }
@@ -2568,10 +2541,10 @@ impl RestrictedAuthority {
     }
 
     pub(super) fn check_hash_request(&self, block: u64, len: u64) -> Result<()> {
-        if block != self.copy.limits.hash_block_bytes {
+        if block != self.rules.copy.limits.hash_block_bytes {
             bail!("hash block size does not match the signed grant");
         }
-        if len > self.copy.limits.max_file_bytes {
+        if len > self.rules.copy.limits.max_file_bytes {
             bail!("signed grant per-file byte limit exceeded");
         }
         if !proto::hash_response_fits(block, len) {
@@ -2587,7 +2560,7 @@ impl RestrictedAuthority {
         if !(proto::MIN_HASH_BLOCK_BYTES..=proto::MAX_HASH_BLOCK_BYTES).contains(&block) {
             bail!("comparison block size is outside protocol limits");
         }
-        if len > self.copy.limits.max_file_bytes {
+        if len > self.rules.copy.limits.max_file_bytes {
             bail!("signed grant per-file byte limit exceeded");
         }
         if !proto::hash_response_fits(block, len) {
@@ -2603,7 +2576,7 @@ impl RestrictedAuthority {
         self.check_mutation_path(path, false)?;
         let bytes = u64::try_from(bytes).context("request byte count overflow")?;
         let end = offset.checked_add(bytes).context("file offset overflow")?;
-        if end > self.copy.limits.max_file_bytes {
+        if end > self.rules.copy.limits.max_file_bytes {
             bail!("signed grant per-file byte limit exceeded");
         }
         Ok(())
@@ -2615,12 +2588,12 @@ impl RestrictedAuthority {
         if path == self.destination {
             bail!("the signed destination root itself may not be deleted");
         }
-        if self.filters.delete_excluded {
+        if self.rules.filters.delete_excluded {
             self.check_mutation_authority(path)?;
         } else {
             self.check_mutation_path(path, is_dir)?;
         }
-        if self.copy.policy.deletion == DeletionPolicy::Forbid {
+        if self.rules.copy.policy.deletion == DeletionPolicy::Forbid {
             bail!("deletion is not authorized by the signed grant");
         }
         Ok(())
@@ -2710,7 +2683,7 @@ impl RestrictedAuthority {
         let refund = |counter: &std::sync::atomic::AtomicU64, amount: u64| {
             counter.fetch_sub(amount, Ordering::AcqRel);
         };
-        let limits = &self.copy.limits;
+        let limits = &self.rules.copy.limits;
         if !charge(&self.changes, changes, limits.max_entries) {
             bail!("signed grant entry limit exceeded");
         }
@@ -2836,7 +2809,7 @@ impl RestrictedAuthority {
         outcomes: &mut Vec<PendingOutcome>,
     ) -> Result<()> {
         if self.creation_policy(false) != ExistingDestinationPolicy::Replace
-            || self.root_existence != RootExistence::Any
+            || self.rules.root_existence != RootExistence::Any
         {
             bail!("the small-copy shortcut replaces existing files, which this grant does not");
         }
@@ -2850,8 +2823,8 @@ impl RestrictedAuthority {
                 .map(|slash| path[..slash.max(1)].to_vec())
         };
         let in_destination = request.directory == self.destination
-            && self.copy.policy.placement != DestinationPlacement::ExactPath;
-        let at_destination = self.copy.policy.placement == DestinationPlacement::ExactPath
+            && self.rules.copy.policy.placement != DestinationPlacement::ExactPath;
+        let at_destination = self.rules.copy.policy.placement == DestinationPlacement::ExactPath
             && parent(&self.destination).as_deref() == Some(request.directory.as_slice());
         if !in_destination && !at_destination {
             bail!("small copy writes into a directory other than the signed destination");
@@ -2913,6 +2886,7 @@ impl RestrictedAuthority {
             // which the receiver checks again as it finishes the file.
             if patch.update_in_place {
                 if !self
+                    .rules
                     .copy
                     .policy
                     .publication
@@ -2964,7 +2938,7 @@ impl RestrictedAuthority {
         pending: &mut Vec<PendingCreation>,
         outcomes: &mut Vec<PendingOutcome>,
     ) -> Result<()> {
-        if !self.extra_options.hardlinks {
+        if !self.rules.copy.options.hardlinks {
             bail!("hardlink creation is not authorized by the signed grant");
         }
         if self.expected_hash(path)?.is_some() || self.expected_hash(source)?.is_some() {
@@ -3050,13 +3024,13 @@ impl RestrictedAuthority {
             | Op::SetMeta { path, .. }
             | Op::SetFileMetaIfSame { path, .. } => path,
             Op::Symlink { path, .. } => {
-                if !self.copy.options.preserve_symlinks {
+                if !self.rules.copy.options.preserve_symlinks {
                     bail!("symlink creation is not authorized by the signed grant");
                 }
                 path
             }
             Op::Mknod { path, .. } => {
-                if !self.copy.options.preserve_devices {
+                if !self.rules.copy.options.preserve_devices {
                     bail!("special-file creation is not authorized by the signed grant");
                 }
                 path
@@ -3132,10 +3106,10 @@ impl RestrictedAuthority {
                     } else {
                         self.rooted_metadata(path)?
                     };
-                    let policy = match self.copy.policy.existing {
+                    let policy = match self.creation_policy(true) {
                         ExistingDestinationPolicy::Replace => {
                             if observed.is_some()
-                                && !(self.root_existence == RootExistence::New
+                                && !(self.rules.root_existence == RootExistence::New
                                     && *path == self.destination)
                             {
                                 ExistingDestinationPolicy::MustExist
@@ -3158,7 +3132,7 @@ impl RestrictedAuthority {
                 }
                 // Creation limits the permission bits; without -p the
                 // sender chooses no special bits.
-                if !self.copy.options.preserve_permissions {
+                if !self.rules.copy.options.preserve_permissions {
                     *mode &= 0o777;
                 }
                 outcomes.push(PendingOutcome::Logical {
@@ -3206,7 +3180,7 @@ impl RestrictedAuthority {
                 let file_type = *mode & libc::S_IFMT;
                 #[cfg(not(target_os = "linux"))]
                 let file_type = *mode & libc::S_IFMT as u32;
-                let permitted = if self.copy.options.preserve_permissions {
+                let permitted = if self.rules.copy.options.preserve_permissions {
                     0o7777
                 } else {
                     0o777
@@ -3462,13 +3436,16 @@ impl RestrictedAuthority {
                 if !over_ssh {
                     bail!("TCP listener request is allowed only on the signed control connection");
                 }
-                self.tcp.check_listener(key.as_deref(), token)?;
+                self.rules.tcp.check_listener(key.as_deref(), token)?;
                 if (*port_lo, *port_hi)
-                    != (self.copy.options.tcp_port_lo, self.copy.options.tcp_port_hi)
+                    != (
+                        self.rules.copy.options.tcp_port_lo,
+                        self.rules.copy.options.tcp_port_hi,
+                    )
                 {
                     bail!("TCP listener range does not match the signed grant");
                 }
-                if congestion_control.as_ref() != self.tcp_congestion.as_ref() {
+                if congestion_control.as_ref() != self.rules.tcp_congestion.as_ref() {
                     bail!("TCP congestion override is not authorized by the signed grant");
                 }
                 let mut state = self.state.lock().unwrap();
@@ -3495,10 +3472,10 @@ impl RestrictedAuthority {
                 }
                 self.check_observation_path(root)?;
                 if self.filter_applies(root) {
-                    let expected = if self.filters.delete_excluded {
+                    let expected = if self.rules.filters.delete_excluded {
                         &[][..]
                     } else {
-                        self.filters.ignore.as_slice()
+                        self.rules.filters.ignore.as_slice()
                     };
                     if ignore.as_slice() != expected {
                         bail!("destination scan filters do not match the signed filter policy");
@@ -3582,7 +3559,7 @@ impl RestrictedAuthority {
                 // search, and read too when the copy prunes and so lists
                 // them, never to enter a directory it could not read; `all`
                 // also the directory the copy goes into.
-                let approved = self.extra_options.widen_dirs;
+                let approved = self.rules.copy.options.widen_dirs;
                 match approved {
                     DirectoryWidening::None => {
                         bail!("the approved copy does not widen read-only directories")
@@ -3590,7 +3567,7 @@ impl RestrictedAuthority {
                     DirectoryWidening::Rsync => anyhow::ensure!(
                         *access & !0o300 == 0
                             || *access == 0o700
-                                && self.copy.policy.deletion
+                                && self.rules.copy.policy.deletion
                                     == DeletionPolicy::DeleteDestinationOnly,
                         "the approved copy widens only directories it includes, as rsync does"
                     ),
@@ -3645,7 +3622,7 @@ impl RestrictedAuthority {
                 // walk goes to the signed destination, beneath that root, and
                 // follows no symlink.
                 anyhow::ensure!(
-                    self.extra_options.widen_dirs == DirectoryWidening::All,
+                    self.rules.copy.options.widen_dirs == DirectoryWidening::All,
                     "the approved copy does not widen the directories on the way to its destination"
                 );
                 self.check_mutation_allowed()?;
@@ -3662,7 +3639,7 @@ impl RestrictedAuthority {
             // It restores only what the request above changed.
             Request::RestoreDestinationPath => {}
             Request::Apply { ops } => {
-                let outer = (self.extra_options.widen_dirs == DirectoryWidening::All)
+                let outer = (self.rules.copy.options.widen_dirs == DirectoryWidening::All)
                     .then(|| self.outer_directory())
                     .flatten();
                 for (index, operation) in ops.iter_mut().enumerate() {
@@ -3749,7 +3726,7 @@ impl RestrictedAuthority {
             } => {
                 self.check_hash_request(*block, if bounded_basis { 0 } else { *len })?;
                 self.require_publication_mode(false, "staged basis creation")?;
-                if *len > self.copy.limits.max_file_bytes {
+                if *len > self.rules.copy.limits.max_file_bytes {
                     bail!("signed grant per-file byte limit exceeded");
                 }
                 self.check_mutation_path(path, false)?;
@@ -3805,6 +3782,7 @@ impl RestrictedAuthority {
                 if let Some(update) = update {
                     if !*inplace
                         || !self
+                            .rules
                             .copy
                             .policy
                             .publication
@@ -3815,7 +3793,7 @@ impl RestrictedAuthority {
                     self.check_metadata(path, &update.meta, update.flags)?;
                 }
                 self.check_preparation_flags(path, *mode, *flags)?;
-                if *size > self.copy.limits.max_file_bytes {
+                if *size > self.rules.copy.limits.max_file_bytes {
                     bail!("signed grant per-file byte limit exceeded");
                 }
                 self.check_mutation_path(path, false)?;
@@ -4027,8 +4005,8 @@ impl RestrictedAuthority {
                     bail!("a restricted receiver keeps existing files atomically");
                 }
                 if *narrow_new_directories
-                    || (*sparse && !self.extra_options.sparse)
-                    || !self.extra_options.allows(*selection)
+                    || (*sparse && !self.rules.copy.options.sparse)
+                    || !self.rules.copy.options.allows(*selection)
                 {
                     bail!("inode metadata or read policy is not authorized by the signed grant");
                 }

@@ -288,7 +288,7 @@ mod tests {
         fn start(root: &Path) -> Self {
             std::fs::create_dir(root.join("target")).unwrap();
             let mut authority = super::super::tests::tcp_test_authority(root);
-            authority.copy.options.compressed_transport = false;
+            authority.rules.copy.options.compressed_transport = false;
             let authority = Arc::new(authority);
             let (workers, ticket) =
                 start(crate::restricted::Checker::Destination(authority.clone())).unwrap();
@@ -414,7 +414,7 @@ mod tests {
         let root = crate::test_support::tempdir().unwrap();
         std::fs::create_dir(root.path().join("target")).unwrap();
         let mut authority = super::super::tests::tcp_test_authority(root.path());
-        authority.copy.options.compressed_transport = false;
+        authority.rules.copy.options.compressed_transport = false;
         let authority = Arc::new(authority);
         let (workers, ticket) =
             start(crate::restricted::Checker::Destination(authority.clone())).unwrap();

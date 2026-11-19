@@ -25,7 +25,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use crate::delegation::{CopyOperation, DestinationPlacement, GrantConstraints};
+use crate::delegation::{DestinationPlacement, DestinationRules};
 use crate::lock_file::LockFile;
 use crate::private_broker::{BrokerDirectory, PrivateBroker, PrivateBrokerConfig, TrackedStream};
 
@@ -188,8 +188,7 @@ pub(crate) fn run_command(command: Destinations) -> Result<i32> {
 pub(crate) struct CopyRequest {
     /// The destination as the command names it.
     pub destination: Vec<u8>,
-    pub copy: CopyOperation,
-    pub constraints: GrantConstraints,
+    pub rules: DestinationRules,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
