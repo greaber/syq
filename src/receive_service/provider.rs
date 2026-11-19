@@ -325,14 +325,17 @@ pub(super) fn switch_when_idle(domain: &Domain) -> Result<()> {
         };
         match super::switch::plan(&observed(&state), super::switch::Initiator::Switch) {
             super::switch::Plan::Leave(super::switch::Keep::Current) => return refresh(domain),
-            super::switch::Plan::Leave(_) => {
+            super::switch::Plan::Leave(super::switch::Keep::FollowsOther) => {
                 crate::output::command_human_stdout!(
                     "The SSH authorization provider keeps running syq {}, which follows another installed syq",
                     state.build
                 );
                 return Ok(());
             }
-            _ => {}
+            super::switch::Plan::Leave(why) => {
+                unreachable!("a switch does not leave a provider as {why:?}")
+            }
+            super::switch::Plan::ReplaceWhenIdle | super::switch::Plan::ReplaceNow => {}
         }
         let answer = query(domain, Control::StopIfIdle)?;
         if !answer.stopping {

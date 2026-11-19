@@ -401,7 +401,7 @@ pub(crate) enum Plan {
     /// At once, cutting off whatever is in progress.
     ReplaceNow,
 }
-/// Whether `initiator` may replace the service it `seen` with this build,
+/// Whether `initiator` may replace the service it sees (`seen`) with this build,
 /// and how. Every place that replaces a service from another build asks
 /// this, so that none replaces what another would leave.
 pub(crate) fn plan(seen: &Observed, initiator: Initiator) -> Plan {
@@ -1387,7 +1387,7 @@ mod tests {
     /// Each site that replaces a service from another build decided this
     /// for itself before `plan`. These oracles transcribe what each decided
     /// then; every combination of what it sees must decide the same through
-    /// `plan`, apart from the one change listed.
+    /// `plan`.
     #[test]
     fn every_site_decides_through_plan_as_it_did_on_its_own() {
         #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1472,28 +1472,13 @@ mod tests {
                                         user_at_hand: interactive,
                                     },
                                 ) {
-                                    Plan::Leave(Keep::Busy) => Did::Note,
+                                    // As `switch_outdated_now` says it.
+                                    Plan::Leave(Keep::Busy) if interactive || !login => Did::Note,
                                     Plan::Leave(_) => Did::Skip,
                                     Plan::ReplaceWhenIdle => Did::Replace,
                                     Plan::ReplaceNow => unreachable!(),
                                 };
-                                // The one change: a busy service whose switch
-                                // waits for a login, which a `persist` command
-                                // without a terminal now says is busy rather
-                                // than passing over in silence.
-                                let changed = login
-                                    && !interactive
-                                    && !idle
-                                    && !current
-                                    && follows != Follows::OtherFile;
-                                if changed {
-                                    assert_eq!((old, new), (Did::Skip, Did::Note));
-                                } else {
-                                    assert_eq!(
-                                        old, new,
-                                        "switch_outdated_now {seen:?} {interactive}"
-                                    );
-                                }
+                                assert_eq!(old, new, "switch_outdated_now {seen:?} {interactive}");
                                 if phase.is_none() && idle {
                                     let old = if current || follows != Follows::Nothing {
                                         Did::Skip

@@ -1007,6 +1007,11 @@ pub(crate) fn refresh_outdated(domain: &Domain, quiet: bool) {
             }
             Ok(None) | Err(_) => continue,
         };
+        // `plan` leaves these too; deciding here first skips reading the
+        // switch's report and looking at the path it follows.
+        if state.identity == crate::identity::build() || !state.busy.idle() {
+            continue;
+        }
         let phase = switch_report(&control, &state).map(|report| report.phase);
         let initiator = switch::Initiator::Command {
             user_at_hand: interactive && !quiet,
@@ -1118,16 +1123,22 @@ pub(crate) fn switch_outdated_now(domain: &Domain) {
             }
             Ok(None) | Err(_) => continue,
         };
-        let phase = switch_report(&control, &state).map(|report| report.phase);
         let initiator = switch::Initiator::Command {
             user_at_hand: interactive,
         };
         let fix = connect_command(&state.endpoint, domain.explicit_path());
-        // Whether to leave it, saying so when it is busy.
-        let leave =
-            |state: &Status| match switch::plan(&observed(state, phase.as_deref()), initiator) {
+        // Whether to leave the service whose status is `state`, saying so
+        // when it is busy, and its switch's phase.
+        let leave = |state: &Status| {
+            let phase = switch_report(&control, state).map(|report| report.phase);
+            let plan = switch::plan(&observed(state, phase.as_deref()), initiator);
+            let leave = match plan {
                 switch::Plan::ReplaceWhenIdle => false,
-                switch::Plan::Leave(switch::Keep::Busy) => {
+                // One whose switch waits for a login is left to a command
+                // in a terminal without a word, busy or not.
+                switch::Plan::Leave(switch::Keep::Busy)
+                    if interactive || phase.as_deref() != Some("login") =>
+                {
                     crate::output::diagnostic!(
                         "syq: {}",
                         busy_notice(&state.endpoint, &state.identity, &state.busy, false, &fix)
@@ -1136,7 +1147,10 @@ pub(crate) fn switch_outdated_now(domain: &Domain) {
                 }
                 _ => true,
             };
-        if leave(&state) {
+            (leave, phase)
+        };
+        let (leave_it, phase) = leave(&state);
+        if leave_it {
             continue;
         }
         // One switch at a time per connection, and after one failed, not
@@ -1175,7 +1189,8 @@ pub(crate) fn switch_outdated_now(domain: &Domain) {
         let Ok(Some(state)) = running_status(&control, Retry::No, ANSWER_TIMEOUT) else {
             continue;
         };
-        if leave(&state) {
+        let (leave_it, _) = leave(&state);
+        if leave_it {
             continue;
         }
         crate::output::diagnostic!(
@@ -1771,7 +1786,8 @@ fn replace_other(
         }
         switch::Plan::Leave(switch::Keep::Current) => Ok(Some(Receiving::Running)),
         switch::Plan::Leave(switch::Keep::Busy) => Ok(other(Some(state.busy))),
-        switch::Plan::Leave(_) => Ok(other(None)),
+        switch::Plan::Leave(switch::Keep::FollowsOther) => Ok(other(None)),
+        switch::Plan::Leave(why) => unreachable!("a switch does not leave a service as {why:?}"),
         switch::Plan::ReplaceWhenIdle => {
             // The new service logs in to the server, separately from the
             // control connection this command used, before the old one
