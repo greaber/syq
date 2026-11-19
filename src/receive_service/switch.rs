@@ -351,6 +351,93 @@ pub(crate) fn follows_other_file(started_from: Option<&str>) -> bool {
     follows(started_from) == Follows::OtherFile
 }
 
+/// What a process knows about a running service when it decides whether to
+/// replace it with this build.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Observed<'a> {
+    /// It runs this build.
+    pub(crate) current: bool,
+    pub(crate) follows: Follows,
+    /// Nothing is in progress. The provider decides that itself when asked
+    /// to stop, so it is seen as idle here.
+    pub(crate) idle: bool,
+    /// Its own switch's phase (`Report::phase`), when it has one.
+    pub(crate) phase: Option<&'a str>,
+}
+/// Who asks to replace a service from another build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Initiator {
+    /// A syq command, for services it does not use: in the background
+    /// (`receive_service::refresh_outdated`), or in the foreground for the
+    /// `persist` commands (`switch_outdated_now`). It replaces only a
+    /// service that cannot follow its path by itself, or whose own switch
+    /// failed. `user_at_hand` says whether a login may ask the user, which
+    /// a switch that needed a login is worth trying again only with.
+    Command { user_at_hand: bool },
+    /// A switch to this build that a service or command started
+    /// (`Replace::WhenIdle`), or a provider's switch.
+    Switch,
+    /// `persist connect` run by hand, or a settings change (`Replace::Now`).
+    Hand,
+}
+/// Why a service from another build keeps running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Keep {
+    /// It runs this build.
+    Current,
+    /// It follows another installed syq file, so that two installed copies
+    /// do not take turns replacing each other's services.
+    FollowsOther,
+    /// It follows this command's file and switches by itself.
+    SwitchesItself,
+    /// Something is in progress.
+    Busy,
+    /// Its switch needs a login that may ask the user, who is not at hand.
+    NeedsUser,
+}
+/// Whether to replace a service from another build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Plan {
+    Leave(Keep),
+    /// Once idle, after this build's service has logged in (`successor`).
+    ReplaceWhenIdle,
+    /// At once, cutting off whatever is in progress.
+    ReplaceNow,
+}
+/// Whether `initiator` may replace the service it `seen` with this build,
+/// and how. Every place that replaces a service from another build asks
+/// this, so that none replaces what another would leave.
+pub(crate) fn plan(seen: &Observed, initiator: Initiator) -> Plan {
+    if seen.current {
+        return Plan::Leave(Keep::Current);
+    }
+    if initiator == Initiator::Hand {
+        return Plan::ReplaceNow;
+    }
+    if seen.follows == Follows::OtherFile {
+        return Plan::Leave(Keep::FollowsOther);
+    }
+    let command = matches!(initiator, Initiator::Command { .. });
+    if command
+        && seen.follows == Follows::ThisFile
+        && !matches!(seen.phase, Some("failed" | "login"))
+    {
+        return Plan::Leave(Keep::SwitchesItself);
+    }
+    if !seen.idle {
+        return Plan::Leave(Keep::Busy);
+    }
+    if initiator
+        == (Initiator::Command {
+            user_at_hand: false,
+        })
+        && seen.phase == Some("login")
+    {
+        return Plan::Leave(Keep::NeedsUser);
+    }
+    Plan::ReplaceWhenIdle
+}
+
 /// Refuse to run a file that an arbitrary other account could have put
 /// there, or pointed the path at. Every directory resolving `path` passes
 /// through, including through each symbolic link on the way, must belong to
@@ -1298,5 +1385,162 @@ mod tests {
             follows_with_store(Some(pinned.to_str().unwrap()), Some(&store)),
             Follows::OtherFile
         );
+    }
+
+    /// Each site that replaces a service from another build decided this
+    /// for itself before `plan`. These oracles transcribe what each decided
+    /// then; every combination of what it sees must decide the same through
+    /// `plan`, apart from the one change listed.
+    #[test]
+    fn every_site_decides_through_plan_as_it_did_on_its_own() {
+        #[derive(Debug, PartialEq)]
+        enum Did {
+            /// Left it without a word.
+            Skip,
+            /// Left it, giving its claim back for the next command
+            /// (`refresh_outdated`), or saying it is busy
+            /// (`switch_outdated_now`, `keeps_running` and `replace_other`).
+            Note,
+            /// Replaced it once idle, or (`Replace::Now`) at once.
+            Replace,
+        }
+        let none_or_phases = [
+            None,
+            Some("waiting"),
+            Some("switching"),
+            Some("login"),
+            Some("failed"),
+        ];
+        let mut rows = 0;
+        for current in [false, true] {
+            for follows in [Follows::Nothing, Follows::ThisFile, Follows::OtherFile] {
+                for idle in [false, true] {
+                    for phase in none_or_phases {
+                        for interactive in [false, true] {
+                            for quiet in [false, true] {
+                                rows += 1;
+                                let seen = Observed {
+                                    current,
+                                    follows,
+                                    idle,
+                                    phase,
+                                };
+                                let switched_itself = follows == Follows::ThisFile
+                                    && !matches!(phase, Some("failed" | "login"));
+                                let login = phase == Some("login");
+                                // `refresh_outdated`.
+                                let old = if current
+                                    || !idle
+                                    || follows == Follows::OtherFile
+                                    || switched_itself
+                                {
+                                    Did::Skip
+                                } else if login && (!interactive || quiet) {
+                                    Did::Note
+                                } else {
+                                    Did::Replace
+                                };
+                                let new = match plan(
+                                    &seen,
+                                    Initiator::Command {
+                                        user_at_hand: interactive && !quiet,
+                                    },
+                                ) {
+                                    Plan::Leave(Keep::NeedsUser) => Did::Note,
+                                    Plan::Leave(_) => Did::Skip,
+                                    Plan::ReplaceWhenIdle => Did::Replace,
+                                    Plan::ReplaceNow => unreachable!(),
+                                };
+                                assert_eq!(
+                                    old, new,
+                                    "refresh_outdated {seen:?} {interactive} {quiet}"
+                                );
+                                // `switch_outdated_now`, up to its claim, and
+                                // `provider::switch_outdated`, which sees no
+                                // phase and leaves busy to the provider.
+                                let old = if current
+                                    || follows == Follows::OtherFile
+                                    || switched_itself
+                                    || (login && !interactive)
+                                {
+                                    Did::Skip
+                                } else if !idle {
+                                    Did::Note
+                                } else {
+                                    Did::Replace
+                                };
+                                let new = match plan(
+                                    &seen,
+                                    Initiator::Command {
+                                        user_at_hand: interactive,
+                                    },
+                                ) {
+                                    Plan::Leave(Keep::Busy) => Did::Note,
+                                    Plan::Leave(_) => Did::Skip,
+                                    Plan::ReplaceWhenIdle => Did::Replace,
+                                    Plan::ReplaceNow => unreachable!(),
+                                };
+                                // The one change: a busy service whose switch
+                                // waits for a login, which a `persist` command
+                                // without a terminal now says is busy rather
+                                // than passing over in silence.
+                                if !(login
+                                    && !interactive
+                                    && !idle
+                                    && old == Did::Skip
+                                    && follows != Follows::OtherFile
+                                    && !current)
+                                {
+                                    assert_eq!(
+                                        old, new,
+                                        "switch_outdated_now {seen:?} {interactive}"
+                                    );
+                                } else {
+                                    assert_eq!(new, Did::Note);
+                                }
+                                if phase.is_none() && idle {
+                                    let old = if current || follows != Follows::Nothing {
+                                        Did::Skip
+                                    } else {
+                                        Did::Replace
+                                    };
+                                    assert_eq!(old, new, "provider::switch_outdated {seen:?}");
+                                }
+                                // `keeps_running`, `replace_other` with
+                                // `Replace::WhenIdle` (whose caller has left a
+                                // current one) and the provider's
+                                // `switch_when_idle` (which sees it as idle).
+                                let old = if current {
+                                    Did::Skip
+                                } else if follows == Follows::OtherFile || !idle {
+                                    Did::Note
+                                } else {
+                                    Did::Replace
+                                };
+                                let new = match plan(&seen, Initiator::Switch) {
+                                    Plan::Leave(Keep::Current) => Did::Skip,
+                                    Plan::Leave(Keep::FollowsOther | Keep::Busy) => Did::Note,
+                                    Plan::Leave(_) | Plan::ReplaceNow => unreachable!(),
+                                    Plan::ReplaceWhenIdle => Did::Replace,
+                                };
+                                assert_eq!(old, new, "keeps_running {seen:?}");
+                                // `replace_other` with `Replace::Now`.
+                                let new = match plan(&seen, Initiator::Hand) {
+                                    Plan::Leave(Keep::Current) => Did::Skip,
+                                    Plan::ReplaceNow => Did::Replace,
+                                    _ => unreachable!(),
+                                };
+                                assert_eq!(
+                                    if current { Did::Skip } else { Did::Replace },
+                                    new,
+                                    "replace_other Now {seen:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(rows, 2 * 3 * 2 * 5 * 2 * 2);
     }
 }
