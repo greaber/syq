@@ -60,7 +60,11 @@ impl LocalPlan {
         let jumps = (!forced.is_empty()).then(|| {
             [
                 "-J".to_owned(),
-                forced.iter().map(jump_label).collect::<Vec<_>>().join(","),
+                forced
+                    .iter()
+                    .map(NativeEndpoint::label)
+                    .collect::<Vec<_>>()
+                    .join(","),
             ]
         });
         let config = crate::ssh_config::SshConfig::query(
@@ -222,23 +226,6 @@ impl LocalPlan {
             format!("ProxyCommand={proxy}").into(),
         ])
     }
-}
-
-fn jump_label(endpoint: &NativeEndpoint) -> String {
-    let mut value = endpoint
-        .user
-        .as_ref()
-        .map(|user| format!("{user}@"))
-        .unwrap_or_default();
-    if endpoint.host.contains(':') {
-        value.push_str(&format!("[{}]", endpoint.host));
-    } else {
-        value.push_str(&endpoint.host);
-    }
-    if let Some(port) = endpoint.port {
-        value.push_str(&format!(":{port}"));
-    }
-    value
 }
 
 #[cfg(test)]

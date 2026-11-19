@@ -2310,19 +2310,7 @@ impl RemoteSpec {
         if self.local_process {
             return "local receiver".into();
         }
-        let host = if self.host.contains(':') {
-            format!("[{}]", self.host)
-        } else {
-            self.host.clone()
-        };
-        let endpoint = match &self.user {
-            Some(user) => format!("{user}@{host}"),
-            None => host,
-        };
-        match self.port {
-            Some(port) => format!("{endpoint}:{port}"),
-            None => endpoint,
-        }
+        crate::cli::endpoint_label(self.user.as_deref(), &self.host, self.port)
     }
 
     pub fn diagnostics(&self) -> RemoteDiagnostics {

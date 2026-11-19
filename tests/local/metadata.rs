@@ -2162,11 +2162,11 @@ fn final_metadata_requests(t: &Tmp) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// `count` empty directories `dNNNN` below `root`, each with its own time.
+/// `count` empty directories `dNNNNN` below `root`, each with its own time.
 #[cfg(debug_assertions)]
 fn timed_directories(t: &Tmp, root: &str, count: i64, first_time: i64) {
     for index in 0..count {
-        let directory = t.path(&format!("{root}/d{index:04}"));
+        let directory = t.path(&format!("{root}/d{index:05}"));
         fs::create_dir_all(&directory).unwrap();
         set_mtime(&directory, first_time + index);
     }
@@ -2174,7 +2174,7 @@ fn timed_directories(t: &Tmp, root: &str, count: i64, first_time: i64) {
 
 #[cfg(debug_assertions)]
 fn directory_time(t: &Tmp, root: &str, index: i64) -> i64 {
-    fs::metadata(t.path(&format!("{root}/d{index:04}")))
+    fs::metadata(t.path(&format!("{root}/d{index:05}")))
         .unwrap()
         .mtime()
 }
@@ -2182,13 +2182,13 @@ fn directory_time(t: &Tmp, root: &str, index: i64) -> i64 {
 #[cfg(debug_assertions)]
 #[test]
 fn final_directory_metadata_is_sent_ahead_of_the_replies() {
-    // 4,300 directories and the destination itself take five requests of at
-    // most 1,000 directories. The receiver, a process of its own even for a
+    // 17,000 directories and the destination itself take five requests of at
+    // most 4,096 directories. The receiver, a process of its own even for a
     // local destination, is sent four before the first is answered and the
     // fifth when that reply arrives. Every directory gets its time.
     for remote in [true, false] {
         let t = Tmp::new();
-        timed_directories(&t, "src", 4300, 1_500_000_000);
+        timed_directories(&t, "src", 17_000, 1_500_000_000);
         set_mtime(&t.path("src"), 1_400_000_000);
         let out = copy_recording_final_metadata(&t, "-a", remote)
             .run()
@@ -2196,14 +2196,14 @@ fn final_directory_metadata_is_sent_ahead_of_the_replies() {
         assert_output_ok(&out);
         assert_eq!(
             final_metadata_requests(&t),
-            [(1000, 0), (1000, 1), (1000, 2), (1000, 3), (301, 3)],
+            [(4096, 0), (4096, 1), (4096, 2), (4096, 3), (617, 3)],
             "remote={remote}"
         );
-        for index in 0..4300 {
+        for index in 0..17_000 {
             assert_eq!(
                 directory_time(&t, "dst", index),
                 1_500_000_000 + index,
-                "remote={remote}, d{index:04}"
+                "remote={remote}, d{index:05}"
             );
         }
         assert_eq!(
@@ -2222,10 +2222,10 @@ fn a_full_destination_ends_final_directory_metadata_after_the_requests_already_s
     // the times they were given. The fifth request is not sent.
     for remote in [true, false] {
         let t = Tmp::new();
-        timed_directories(&t, "src", 4300, 1_500_000_000);
-        timed_directories(&t, "dst", 4300, 1_000_000_000);
+        timed_directories(&t, "src", 17_000, 1_500_000_000);
+        timed_directories(&t, "dst", 17_000, 1_000_000_000);
         let out = copy_recording_final_metadata(&t, "-a", remote)
-            .env("SYQ_TEST_FAIL_APPLY_ENOSPC", "/d0000")
+            .env("SYQ_TEST_FAIL_APPLY_ENOSPC", "/d00000")
             .run()
             .unwrap();
         assert!(!out.status.success(), "remote={remote}: {out:?}");
@@ -2236,18 +2236,18 @@ fn a_full_destination_ends_final_directory_metadata_after_the_requests_already_s
         );
         assert_eq!(
             final_metadata_requests(&t),
-            [(1000, 0), (1000, 1), (1000, 2), (1000, 3)],
+            [(4096, 0), (4096, 1), (4096, 2), (4096, 3)],
             "remote={remote}"
         );
         let changed = |index| directory_time(&t, "dst", index) == 1_500_000_000 + index;
         // The first request: the directory that failed, and another.
         assert!(!changed(0), "remote={remote}");
-        assert!(changed(999), "remote={remote}");
+        assert!(changed(4095), "remote={remote}");
         // The requests sent before its reply arrived.
-        assert!(changed(1000), "remote={remote}");
-        assert!(changed(3999), "remote={remote}");
+        assert!(changed(4096), "remote={remote}");
+        assert!(changed(16_383), "remote={remote}");
         // The request never sent.
-        assert!(!changed(4000), "remote={remote}");
+        assert!(!changed(16_384), "remote={remote}");
     }
 }
 
@@ -2259,7 +2259,7 @@ fn a_failure_in_a_later_final_metadata_request_names_its_directory() {
     // matched to their own directories: only that one fails, by name, and
     // the rest, in every request, get their times.
     let t = Tmp::new();
-    timed_directories(&t, "src", 4300, 1_500_000_000);
+    timed_directories(&t, "src", 17_000, 1_500_000_000);
     let ready = t.path("metadata-ready");
     let continuation = t.path("metadata-continue");
     let mut child = copy_recording_final_metadata(&t, "-a", true)
@@ -2270,8 +2270,8 @@ fn a_failure_in_a_later_final_metadata_request_names_its_directory() {
         .start()
         .unwrap();
     wait_for_confinement_marker(&mut child, &ready, "final directory metadata");
-    fs::remove_dir(t.path("dst/d2500")).unwrap();
-    write(&t.path("dst/d2500"), b"planted");
+    fs::remove_dir(t.path("dst/d10000")).unwrap();
+    write(&t.path("dst/d10000"), b"planted");
     release_confinement_barrier(&continuation);
 
     let output = child.wait_with_output().unwrap();
@@ -2283,21 +2283,76 @@ fn a_failure_in_a_later_final_metadata_request_names_its_directory() {
         .collect();
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(
-        errors[0].contains("d2500") && errors[0].contains("no longer a directory"),
+        errors[0].contains("d10000") && errors[0].contains("no longer a directory"),
         "{errors:?}"
     );
     assert_eq!(
         final_metadata_requests(&t),
-        [(1000, 0), (1000, 1), (1000, 2), (1000, 3), (301, 3)]
+        [(4096, 0), (4096, 1), (4096, 2), (4096, 3), (617, 3)]
     );
-    assert_eq!(read(&t.path("dst/d2500")), b"planted");
-    for index in (0..4300).filter(|index| *index != 2500) {
+    assert_eq!(read(&t.path("dst/d10000")), b"planted");
+    for index in (0..17_000).filter(|index| *index != 10_000) {
         assert_eq!(
             directory_time(&t, "dst", index),
             1_500_000_000 + index,
-            "d{index:04}"
+            "d{index:05}"
         );
     }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn every_failure_is_reported_when_the_errors_of_long_paths_would_overfill_a_reply() {
+    use std::os::unix::ffi::OsStrExt;
+    // 1,000 directories below thirteen named with 255 bytes that are not
+    // UTF-8. Each one's error names its path, which the receiver shows at
+    // three bytes for each of those: about 10 KiB. Their destination is
+    // moved away once the copy has filled it, so every one fails. A reply
+    // carries a request's errors and holds 8 MiB, less than 1,000 of these:
+    // the requests end before their errors could overfill it, and each
+    // directory's failure is reported.
+    let t = Tmp::new();
+    let long = std::ffi::OsStr::from_bytes(&[0xff; 255]);
+    let parent = (0..13).fold(PathBuf::new(), |path, _| path.join(long));
+    for index in 0..1000 {
+        fs::create_dir_all(t.path("src").join(&parent).join(format!("d{index:04}"))).unwrap();
+    }
+    let ready = t.path("metadata-ready");
+    let continuation = t.path("metadata-continue");
+    let mut child = copy_recording_final_metadata(&t, "-a", false)
+        .env("SYQ_TEST_DIRECTORY_METADATA_READY_FILE", &ready)
+        .env("SYQ_TEST_DIRECTORY_METADATA_CONTINUE_FILE", &continuation)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .start()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "final directory metadata");
+    fs::rename(t.path("dst").join(long), t.path("moved")).unwrap();
+    release_confinement_barrier(&continuation);
+
+    let output = child.wait_with_output().unwrap();
+    let stderr = stderr_of(&output);
+    let missing = stderr
+        .lines()
+        .filter(|line| line.contains("No such file or directory"))
+        .count();
+    assert_eq!(
+        (output.status.code(), missing),
+        // The 1,000 directories and the thirteen above them.
+        (Some(23), 1013),
+        "{}",
+        stderr.lines().rev().take(3).collect::<Vec<_>>().join("\n")
+    );
+    let requests = final_metadata_requests(&t);
+    // With the destination itself, which is still there.
+    assert_eq!(
+        requests.iter().map(|request| request.0).sum::<usize>(),
+        1014
+    );
+    assert!(
+        requests.len() >= 6 && requests.iter().all(|request| request.0 <= 200),
+        "{requests:?}"
+    );
 }
 
 #[cfg(debug_assertions)]
@@ -2308,11 +2363,11 @@ fn a_directory_loses_search_access_only_once_the_requests_before_it_are_answered
     }
     // Without -p the receiver opens the read-only `closed` to fill it and
     // gives it its mode back at the end. That waits in a request of its own
-    // behind the 1,200 directories inside, which could not be reached after
+    // behind the 4,300 directories inside, which could not be reached after
     // it: the receiver runs the three requests in the order sent, though it
     // has all of them before it answers the first.
     let t = Tmp::new();
-    timed_directories(&t, "src/closed", 1200, 1_500_000_000);
+    timed_directories(&t, "src/closed", 4300, 1_500_000_000);
     fs::create_dir_all(t.path("dst/closed")).unwrap();
     fs::set_permissions(t.path("dst/closed"), fs::Permissions::from_mode(0o400)).unwrap();
     let out = copy_recording_final_metadata(&t, "-rt", true)
@@ -2325,13 +2380,13 @@ fn a_directory_loses_search_access_only_once_the_requests_before_it_are_answered
     assert_eq!(
         final_metadata_requests(&t),
         // `closed` goes with the destination itself, which is above it.
-        [(1000, 0), (200, 1), (2, 2)]
+        [(4096, 0), (204, 1), (2, 2)]
     );
-    for index in 0..1200 {
+    for index in 0..4300 {
         assert_eq!(
             directory_time(&t, "dst/closed", index),
             1_500_000_000 + index,
-            "d{index:04}"
+            "d{index:05}"
         );
     }
 }

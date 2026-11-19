@@ -1,9 +1,8 @@
 //! Enrollments and the receivers that enforce restricted copies.
 
 use crate::delegation::{
-    self, CopyOperation, DeletionPolicy, DestinationPlacement, DirectoryWidening,
-    ExistingDestinationPolicy, FilterPolicy, Grant, GrantConstraints, MutationScope, RequestId,
-    RootExistence,
+    self, CopyOperation, DeletionPolicy, DestinationPlacement, DestinationRules, DirectoryWidening,
+    ExistingDestinationPolicy, MutationScope, RequestId, RootExistence,
 };
 use crate::directive::{CLOCK_SKEW_SECONDS, FINISH_WINDOW_SECONDS};
 use crate::enrollment::{
