@@ -33,6 +33,7 @@ mod comparing;
 mod diagnostics;
 mod directory_stream;
 mod dry_run;
+mod early_lookups;
 mod hardlinks;
 mod planner;
 mod publication;
@@ -239,6 +240,8 @@ pub struct Opts {
     /// Directories already named as needing temporary access; failures
     /// beneath them do not repeat the hint.
     pub access_noted: Mutex<std::collections::HashSet<PathBytes>>,
+    /// A directory was named with `KEEP_BARS_WIDENING` (`Opts::said_once`).
+    pub keep_widening_explained: AtomicBool,
     pub devices: bool,
     pub checksum: bool,
     /// Don't trust matching size and time, but compare only the files block
@@ -326,6 +329,13 @@ impl Opts {
     /// trusting them.
     fn trusts_size_and_time(&self) -> bool {
         !self.checksum && !self.hash_or_copy
+    }
+
+    /// Whether a file at `path` whose size and time match the source's is
+    /// kept without being read. A copy still reads one the mapping gives an
+    /// expected hash for.
+    fn keeps_matching_file(&self, path: &[u8]) -> bool {
+        self.trusts_size_and_time() && (self.dry_run || self.expected_for(path).is_none())
     }
 
     /// Whether a dry run compares an existing file of the same size to
@@ -2364,6 +2374,10 @@ pub(crate) fn mode_hint(
     })
 }
 
+/// Why `--widen-dirs` widens no directory inside the copy
+/// (`Opts::keep_bars_widening`), in place of the hint naming a wider mode.
+const KEEP_BARS_WIDENING: &str = "--if-exists=keep lets the restricted receiver change no existing directory's permissions, so --widen-dirs does not widen it";
+
 /// Add the hint to a failed lookup or creation of the destination path, which
 /// the receiver found blocked by an owned directory lacking owner permission.
 /// Only `all` widens the directories on the way to the destination.
@@ -2436,16 +2450,58 @@ impl Opts {
         self.widen_dirs != WidenDirs::None && !self.dry_run
     }
 
-    /// Only a copy that widens nothing names, ahead of time, the directories
-    /// it would need to widen.
+    /// A restricted receiver whose grant keeps what exists
+    /// (`--if-exists=keep`) changes no directory the copy did not create,
+    /// not even its permissions while the copy runs, and refuses whole a
+    /// request to widen one. So the copy asks it to widen none inside the
+    /// copy, whatever the mode: changes in a directory lacking owner
+    /// permission fail one by one, as they do without `--widen-dirs`. The
+    /// directory the copy goes into is not the grant's to keep, and `all`
+    /// still widens it.
+    pub(super) fn keep_bars_widening(&self) -> bool {
+        self.restricted_receiver && self.preserve_existing_directory_metadata
+    }
+
+    /// Whether existing directories inside the copy are widened.
+    pub(super) fn widens_inside_copy(&self) -> bool {
+        self.may_widen_directory_permissions() && !self.keep_bars_widening()
+    }
+
+    /// Only a copy that widens nothing inside it names, ahead of time, the
+    /// directories it would need to widen.
     fn may_suggest_directory_access(&self) -> bool {
-        self.widen_dirs == WidenDirs::None
+        self.widen_dirs == WidenDirs::None || self.keep_bars_widening()
     }
 
     /// The hint naming `needed`, as this command spells it, when this copy's
-    /// mode is narrower.
+    /// mode is narrower; or, for a directory inside a copy whose grant bars
+    /// widening it, why no mode helps.
     pub(super) fn hint_for(&self, needed: WidenDirs) -> Option<&'static str> {
+        if needed == WidenDirs::Rsync && self.keep_bars_widening() {
+            return Some(KEEP_BARS_WIDENING);
+        }
         mode_hint(self.widen_dirs, needed, self.rsync_creation)
+    }
+
+    /// The hint for a directory inside the copy that only `all` lets the
+    /// copy enter, and no mode where the grant bars widening: a
+    /// destination-only directory pruning could not list, or an existing
+    /// `--as` directory the copy cannot search.
+    pub(super) fn entering_hint(&self) -> Option<&'static str> {
+        if self.keep_bars_widening() {
+            return Some(KEEP_BARS_WIDENING);
+        }
+        self.hint_for(WidenDirs::All)
+    }
+
+    /// `hint` as a message that names a directory carries it: why a grant
+    /// bars widening is said in full once in a copy, and briefly after that.
+    pub(super) fn said_once(&self, hint: &'static str) -> &'static str {
+        if hint == KEEP_BARS_WIDENING && self.keep_widening_explained.swap(true, Relaxed) {
+            "it is not widened either"
+        } else {
+            hint
+        }
     }
 
     /// The hint for a failure inside the copy, which `rsync` widens.
@@ -2494,15 +2550,15 @@ impl Opts {
         };
         self.access_noted.lock().unwrap().insert(parent.clone());
         let missing = !mode & 0o300;
+        let hint = self.said_once(self.hint_for(widens).unwrap_or_default());
         progress.warning(&format!(
-            "{}: you own this directory, but it lacks owner {} permission; {}",
+            "{}: you own this directory, but it lacks owner {} permission; {hint}",
             display(&parent),
             match (missing & 0o200 != 0, missing & 0o100 != 0) {
                 (true, true) => "write and search",
                 (true, false) => "write",
                 _ => "search",
             },
-            self.hint_for(widens).unwrap_or_default()
         ));
     }
 
@@ -2837,6 +2893,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         access_limited: Default::default(),
         outer_directory: Default::default(),
         access_noted: Default::default(),
+        keep_widening_explained: Default::default(),
         devices: args.devices,
         checksum: args.checksum,
         hash_or_copy: args.hash_or_copy && !args.checksum,
@@ -3364,6 +3421,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                         fast_batch_files,
                         batch_budget: WorkBudget::default(),
                         range_budget: None,
+                        setup_latency: None,
                         comparison: Default::default(),
                         setup_elapsed: t0.elapsed(),
                         publications: Default::default(),
@@ -3997,7 +4055,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                     "search destination directory {}: Permission denied (os error 13); \
                      an owned destination directory lacks the required owner permissions; {}",
                     display_plan_target(dst, &dst_root, &args),
-                    opts.hint_for(WidenDirs::All).unwrap_or_default()
+                    opts.entering_hint().unwrap_or_default()
                 );
             }
         }
@@ -4938,6 +4996,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         directory_restorations: Default::default(),
         receiver_uid: None,
         parent_groups: Default::default(),
+        leaf_parents: Vec::new(),
         new_file_owner: None,
         // The destination directory itself when its owner lacks write or
         // search permission. Whatever the placement, an existing directory
@@ -4987,6 +5046,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         },
         active_source: None,
         hardlinks: Default::default(),
+        early_lookups: Default::default(),
     };
 
     let mut scan_err = None;
@@ -6235,43 +6295,93 @@ fn stat_and_canonicalize(
     Ok((entry, canonical))
 }
 
+/// What a source scan gives the planner (`scan_into_planner`).
+enum Scanned<'a> {
+    /// The next batch to plan. `shown` when it was `Upcoming` before.
+    Batch { entries: Vec<Entry>, shown: bool },
+    /// A batch the scan has complete while earlier ones are still to be
+    /// planned (`Conn::scan_ahead`). It comes as a `Batch` in its turn.
+    Upcoming(&'a [Entry]),
+}
+
 /// Run a source scan whose batches feed the planner, and remember whether it
 /// reported any problem — `scan_warned` is what gates --delete, so every
-/// source walk must go through here.
+/// source walk must go through here. With `ahead`, `f` is also shown the
+/// batches to come, when the planner looks destinations up early
+/// (`Planner::looks_up_early`).
 fn scan_into_planner(
     pl: &mut Planner<'_>,
     src: &mut dyn Conn,
     root: &[u8],
     source: Option<&RegisteredPath>,
-    follow_root: bool,
+    (follow_root, ahead): (bool, bool),
     ignore: &[String],
-    mut f: impl FnMut(&mut Planner<'_>, Vec<Entry>) -> Result<()>,
+    f: impl FnMut(&mut Planner<'_>, Scanned<'_>) -> Result<()>,
 ) -> Result<()> {
     let progress = pl.progress;
     let quiet = pl.opts.quiet;
     let warned = std::cell::Cell::new(false);
-    let res = src.scan(
-        root,
-        source,
-        follow_root,
-        ignore,
-        false,
-        &mut |batch| f(pl, batch),
-        &mut |_| Ok(()),
-        &mut |w| {
-            let w = w.to_string();
-            // "skipping …" is a notice (nothing the copy owes is missing);
-            // anything else from the scanner means an entry was lost.
-            if w.starts_with("skipping ") {
-                if !quiet {
-                    progress.eprintln(&format!("syq: {w}"));
-                }
-            } else {
-                warned.set(true);
-                progress.error(&format!("syq: {w}"));
+    let mut warn = |w: crate::proto::ScanWarning| {
+        let w = w.to_string();
+        // "skipping …" is a notice (nothing the copy owes is missing);
+        // anything else from the scanner means an entry was lost.
+        if w.starts_with("skipping ") {
+            if !quiet {
+                progress.eprintln(&format!("syq: {w}"));
             }
-        },
-    );
+        } else {
+            warned.set(true);
+            progress.error(&format!("syq: {w}"));
+        }
+    };
+    let ahead = ahead && pl.looks_up_early();
+    // The planner, `f`, and how many batches were shown and not yet planned.
+    let state = std::cell::RefCell::new((pl, f, 0usize));
+    let mut sink = |entries: Vec<Entry>| {
+        let (pl, f, shown) = &mut *state.borrow_mut();
+        let was_shown = *shown > 0;
+        *shown -= usize::from(was_shown);
+        f(
+            pl,
+            Scanned::Batch {
+                entries,
+                shown: was_shown,
+            },
+        )
+    };
+    let res = if ahead {
+        src.scan_ahead(
+            root,
+            source,
+            follow_root,
+            ignore,
+            false,
+            &mut sink,
+            &mut |entries| {
+                let (pl, f, shown) = &mut *state.borrow_mut();
+                // Only a hint: the batch's own turn reports what goes wrong.
+                if f(pl, Scanned::Upcoming(entries)).is_ok() {
+                    *shown += 1;
+                }
+            },
+            &mut |_| Ok(()),
+            &mut warn,
+        )
+    } else {
+        src.scan(
+            root,
+            source,
+            follow_root,
+            ignore,
+            false,
+            &mut sink,
+            &mut |_| Ok(()),
+            &mut warn,
+        )
+    };
+    let (pl, ..) = state.into_inner();
+    // Batches shown but never planned leave their lookups unanswered.
+    pl.drop_early_lookups();
     if warned.get() {
         pl.scan_warned = true;
     }

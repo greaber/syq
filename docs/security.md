@@ -328,7 +328,9 @@ HostA cannot:
   directory.
 - Overwrite existing files, change their permissions, owner, or other
   metadata, or give them new names with hard links when the signed copy
-  permits only creating new ones, or delete files without permission.
+  permits only creating new ones, or delete files without permission. Such a
+  copy does not briefly widen the existing directories it includes for
+  `--widen-dirs` either.
 - Exceed the signed byte, entry, or deletion limits.
 - Reuse the signed copy for another copy, use the entry key to start a later
   copy without one you newly signed, even if it keeps the key, or use that key

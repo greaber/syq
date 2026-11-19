@@ -1,7 +1,11 @@
 //! Adjust whole-object admission without interrupting requests already in flight.
 use crate::tune::FILE_CREDIT;
 use anyhow::Result;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::time::Instant;
 
 const SAMPLE: Duration = Duration::from_millis(250);
 
@@ -64,6 +68,142 @@ pub(super) struct Concurrency {
     pub maximum: Option<usize>,
     pub initial_probe_up: bool,
     pub requests: Option<Arc<super::tuning::Budget>>,
+    /// Lets objects beyond the transfer limit be checked. `None` keeps
+    /// every object within that limit.
+    pub checking: Option<Checking>,
+}
+
+pub(super) struct Checking {
+    /// The most objects in progress while those beyond the transfer limit
+    /// are only being checked.
+    pub maximum: usize,
+    /// Counts the responses that asked the client to slow down.
+    pub outage: Arc<super::outage::Outage>,
+}
+
+// Finding that an object needs no transfer takes a metadata request and
+// little else, while the transfer limit is sized for moving data. Objects
+// beyond that limit may therefore be checked, but each must claim a slot
+// before it reads, hashes or sends anything. While no object is admitted
+// beyond the transfer limit, every claim succeeds at once.
+struct Gate {
+    state: Mutex<GateState>,
+    changed: tokio::sync::Notify,
+}
+
+struct GateState {
+    limit: usize,
+    active: usize,
+    waiting: usize,
+    /// When objects began waiting for a slot without a pause since.
+    waiting_since: Option<Instant>,
+}
+
+impl Gate {
+    fn set_limit(&self, limit: usize) {
+        let mut state = self.state.lock().unwrap();
+        let raised = limit > state.limit;
+        state.limit = limit;
+        drop(state);
+        if raised {
+            self.changed.notify_waiters();
+        }
+    }
+
+    fn active(&self) -> usize {
+        self.state.lock().unwrap().active
+    }
+
+    /// Whether checked objects have queued for transfer slots for a whole
+    /// sample: transfers, not checks, then set the pace. Restarts the clock.
+    fn transfers_bound(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let bound = state
+            .waiting_since
+            .is_some_and(|since| since.elapsed() >= SAMPLE);
+        if bound {
+            state.waiting_since = Some(Instant::now());
+        }
+        bound
+    }
+}
+
+struct Waiting<'a>(&'a Gate);
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap();
+        state.waiting -= 1;
+        if state.waiting == 0 {
+            state.waiting_since = None;
+        } else if state.active < state.limit {
+            // This waiter may have consumed a wakeup it no longer needs.
+            self.0.changed.notify_one();
+        }
+    }
+}
+
+/// An object's place among the objects transferring.
+pub(super) struct TransferSlot {
+    gate: Arc<Gate>,
+    held: bool,
+}
+
+impl TransferSlot {
+    /// Whether objects beyond the transfer limit are in progress. Their
+    /// number then bounds the requests that check them, where otherwise an
+    /// object's requests are admitted as they always were.
+    pub fn beyond_limit(&self) -> bool {
+        self.gate.state.lock().unwrap().limit != usize::MAX
+    }
+
+    /// Wait for a transfer slot. Call this before reading or hashing file
+    /// contents and before any request that transfers an object or changes
+    /// one; an object that turns out to need none of that never calls it.
+    /// Creating a directory or applying metadata to an unchanged local file
+    /// needs no slot. Claiming again is free.
+    pub async fn claim(&mut self) {
+        if self.held {
+            return;
+        }
+        let mut waiting = None;
+        loop {
+            let ready = self.gate.changed.notified();
+            tokio::pin!(ready);
+            ready.as_mut().enable();
+            {
+                let mut state = self.gate.state.lock().unwrap();
+                // Earlier objects keep their turn.
+                if state.active < state.limit && (waiting.is_some() || state.waiting == 0) {
+                    state.active += 1;
+                    self.held = true;
+                    return;
+                }
+                if waiting.is_none() {
+                    state.waiting += 1;
+                    state.waiting_since.get_or_insert_with(Instant::now);
+                    waiting = Some(Waiting(&self.gate));
+                }
+            }
+            ready.await;
+        }
+    }
+}
+
+impl Drop for TransferSlot {
+    fn drop(&mut self) {
+        if self.held {
+            self.gate.state.lock().unwrap().active -= 1;
+            self.gate.changed.notify_one();
+        }
+    }
+}
+
+/// Completions observed since a controller's last decision.
+#[derive(Default)]
+struct Checked {
+    completed: usize,
+    old: usize,
+    fresh: usize,
 }
 
 struct Probe {
@@ -77,6 +217,10 @@ struct Probe {
 struct Controller {
     limit: usize,
     maximum: usize,
+    /// The limit never goes below this. The checking controller's is the
+    /// transfer limit, which already admits that many objects.
+    minimum: usize,
+    checking: bool,
     sampler: RateWindow,
     probe: Option<Probe>,
     probe_completed: usize,
@@ -101,6 +245,8 @@ impl Controller {
         Self {
             limit: start.clamp(1, maximum),
             maximum,
+            minimum: 1,
+            checking: false,
             sampler,
             probe: None,
             probe_completed: 0,
@@ -117,6 +263,96 @@ impl Controller {
             rate_variation: 0.0,
             growth_baseline: None,
         }
+    }
+
+    /// Search above the transfer limit for the number of objects in progress
+    /// that finds unchanged objects fastest.
+    fn checking(transfers: usize, maximum: usize) -> Self {
+        let mut controller = Self::new(transfers, maximum, true);
+        controller.minimum = controller.limit;
+        controller.checking = true;
+        controller
+    }
+
+    /// The transfer limit moved. Checking that had not grown beyond it, or
+    /// that it overtook, continues from it. What rejected increases taught
+    /// stays: the transfer limit often moves just after one, and that is no
+    /// reason to try again at once.
+    fn follow(&mut self, transfers: usize) {
+        let minimum = transfers.clamp(1, self.maximum);
+        if self.minimum == minimum {
+            return;
+        }
+        let grown = self.limit > self.minimum;
+        let rejected = self.upper <= self.minimum + 1;
+        self.minimum = minimum;
+        if grown && self.limit > minimum {
+            return;
+        }
+        self.limit = minimum;
+        self.upper = if rejected {
+            minimum + 1
+        } else {
+            self.upper.max(minimum + 1)
+        };
+        self.lower = minimum - 1;
+        self.upward = true;
+        self.probe = None;
+        self.probe_completed = 0;
+        self.growth_baseline = None;
+        // Rates measured at another transfer limit say nothing about this one.
+        self.reference = None;
+        self.changed_scores = 0;
+        self.sampler.reset();
+    }
+
+    /// The service asked for fewer requests. Halve the room above the
+    /// transfer limit, at once and for the rest of this batch of objects,
+    /// so that checking settles below the rate the service refuses instead
+    /// of returning to it.
+    fn throttled(&mut self) -> usize {
+        let before = self.limit;
+        if before <= self.minimum {
+            // The transfer limit alone keeps this many objects in progress.
+            // At least add nothing to them for a while.
+            return self.reject();
+        }
+        self.maximum = self.minimum + (before - self.minimum) / 2;
+        self.limit = self.maximum;
+        self.upper = self.maximum + 1;
+        self.lower = self.lower.min(self.limit - 1);
+        self.retreated(before)
+    }
+
+    /// Checked objects queue for transfer slots, so checking more of them
+    /// at once only lengthens that queue. Return to the transfer limit, as
+    /// after a failed increase, and leave the next one to a later revisit.
+    fn reject(&mut self) -> usize {
+        let before = self.limit;
+        let up = usize::from(true);
+        self.failures[up] = (self.failures[up] + 1).min(3);
+        self.revisit_at[up] = self.scores + (8 << self.failures[up]);
+        self.limit = self.minimum;
+        self.upper = self.minimum + 1;
+        self.lower = self.lower.min(self.minimum.saturating_sub(1));
+        self.upward = true;
+        self.retreated(before)
+    }
+
+    /// The limit was lowered on evidence other than the measured rate.
+    fn retreated(&mut self, before: usize) -> usize {
+        self.probe = None;
+        self.probe_completed = 0;
+        self.growth_baseline = None;
+        self.hold = 1;
+        if before != self.limit {
+            // The rate at the lower limit is not a change of conditions.
+            self.reference = None;
+            self.changed_scores = 0;
+            self.sampler.reset();
+            super::diagnostics::object_concurrency(self.checking, before, self.limit, 0.0);
+        }
+        self.limit
     }
 
     #[cfg(test)]
@@ -166,7 +402,18 @@ impl Controller {
                 // Pay for more concurrency only when it improves throughput.
                 // Prefer fewer objects only when measured speed holds: a
                 // tolerated loss per step can accumulate into a large loss.
-                let floor = if probe.upward { 1.02 } else { 1.0 };
+                let floor = if !probe.upward {
+                    1.0
+                } else if self.checking {
+                    // Each object checked at once is a request in flight
+                    // that the service must admit. Keep an increase only
+                    // for a quarter of the gain it would give if the added
+                    // requests were as productive as the others.
+                    let added = self.limit as f64 / probe.from as f64 - 1.0;
+                    (1.0 + 0.25 * added).max(1.02)
+                } else {
+                    1.02
+                };
                 let direction = usize::from(probe.upward);
                 if fresh_score < probe.baseline * floor && score >= probe.baseline * floor {
                     // Old completions could explain the apparent gain. Neither
@@ -258,7 +505,7 @@ impl Controller {
                 if self.limit == self.maximum {
                     self.upward = false;
                 }
-                if self.limit == 1 {
+                if self.limit <= self.minimum {
                     self.upward = true;
                 }
                 let mut candidate = self.candidate();
@@ -293,7 +540,7 @@ impl Controller {
                             let next = if upward {
                                 (self.limit + step).min(self.maximum)
                             } else {
-                                self.limit.saturating_sub(step).max(1)
+                                self.limit.saturating_sub(step).max(self.minimum)
                             };
                             if next != self.limit {
                                 self.nearby[direction] = !nearby;
@@ -323,7 +570,7 @@ impl Controller {
             if self.limit != before {
                 self.probe_completed = 0;
                 self.sampler.reset();
-                super::diagnostics::object_concurrency(before, self.limit, score);
+                super::diagnostics::object_concurrency(self.checking, before, self.limit, score);
             }
         }
         self.limit
@@ -365,7 +612,7 @@ impl Controller {
         } else {
             (self.limit / 2)
                 .max((self.limit + self.lower).div_ceil(2))
-                .max(1)
+                .max(self.minimum)
         }
     }
 }
@@ -379,7 +626,7 @@ pub(super) async fn parallel<T, F, Fut>(
     mut work: F,
 ) -> Result<()>
 where
-    F: FnMut(T) -> Fut,
+    F: FnMut(T, TransferSlot) -> Fut,
     Fut: std::future::Future<Output = Result<Option<u64>>> + Send + 'static,
 {
     let begin = |remaining: usize| {
@@ -434,20 +681,59 @@ where
                     });
                     controller.limit = candidate;
                     controller.sampler.reset();
-                    super::diagnostics::object_concurrency(initial, candidate, rate);
+                    super::diagnostics::object_concurrency(false, initial, candidate, rate);
                 }
             }
         }
         Some(controller)
     };
+    // While the request ramp is in charge, prepare only one job beyond
+    // its current capacity. That waiter signals demand without starting
+    // a queue that must drain if the ramp backs off.
+    let transfer_limit = |controller: &Option<Controller>, limit: usize| {
+        if controller.is_none() && concurrency.maximum.is_some() {
+            concurrency
+                .requests
+                .as_ref()
+                .map_or(limit, |requests| limit.min(requests.preparation_limit()))
+        } else {
+            limit
+        }
+    };
     let mut controller = begin(jobs.len());
     let mut handoff_pending = controller.is_some() && concurrency.requests.is_some();
     let mut limit = controller.as_ref().map_or(concurrency.initial, |c| c.limit);
+    let gate = Arc::new(Gate {
+        state: Mutex::new(GateState {
+            limit: usize::MAX,
+            active: 0,
+            waiting: 0,
+            waiting_since: None,
+        }),
+        changed: tokio::sync::Notify::new(),
+    });
+    let mut checking = concurrency
+        .checking
+        .as_ref()
+        .map(|checking| Controller::checking(transfer_limit(&controller, limit), checking.maximum));
+    let throttled = || {
+        concurrency
+            .checking
+            .as_ref()
+            .map_or(0, |checking| checking.outage.throttled_responses())
+    };
+    let mut seen_throttled = throttled();
+    // Whether objects beyond the transfer limit are in progress, so that
+    // transfers take their slots from the gate.
+    let mut gated = false;
+    let mut checked = Checked::default();
+    let mut checked_since = Instant::now();
+    let mut checking_generation = 0u64;
     let mut tasks = tokio::task::JoinSet::new();
     let mut jobs = jobs.into_iter();
     let mut interval = tokio::time::interval(SAMPLE);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut since = tokio::time::Instant::now();
+    let mut since = Instant::now();
     let mut activity = 0u64;
     let mut completed = 0usize;
     let mut generation = 0u64;
@@ -458,7 +744,9 @@ where
         .maximum
         .and_then(|_| super::diagnostics::ObjectWindows::new());
     loop {
-        if handoff_pending && tasks.len() <= limit {
+        // Only objects holding a transfer slot make data requests.
+        let transferring = if gated { gate.active() } else { tasks.len() };
+        if handoff_pending && transferring <= limit {
             // The old request cap stays in force until queued requests belong
             // to no more than the new number of live object tasks.
             concurrency
@@ -468,21 +756,24 @@ where
                 .finish_objects(concurrency.maximum.unwrap());
             handoff_pending = false;
         }
-        // While the request ramp is in charge, prepare only one job beyond
-        // its current capacity. That waiter signals demand without starting
-        // a queue that must drain if the ramp backs off.
-        let preparation_limit = if controller.is_none() && concurrency.maximum.is_some() {
-            concurrency
-                .requests
-                .as_ref()
-                .map_or(limit, |requests| limit.min(requests.preparation_limit()))
-        } else {
-            limit
-        };
-        while error.is_none() && tasks.len() < preparation_limit {
+        let transfers = transfer_limit(&controller, limit);
+        let admitted = checking.as_mut().map_or(transfers, |checking| {
+            checking.follow(transfers);
+            checking.limit.max(transfers)
+        });
+        // Stay gated until the objects admitted beyond the limit have left.
+        gated = admitted > transfers || (gated && tasks.len() > transfers);
+        gate.set_limit(if gated { transfers } else { usize::MAX });
+        while error.is_none() && tasks.len() < admitted {
             let Some(job) = jobs.next() else { break };
-            let prepared = generation;
-            let future = work(job);
+            let prepared = (generation, checking_generation);
+            let slot = TransferSlot {
+                gate: gate.clone(),
+                held: false,
+            };
+            // A job's future can be tens of kilobytes. Box it once here
+            // rather than move it into the task and again into its allocation.
+            let future = Box::pin(work(job, slot));
             tasks.spawn(async move { (prepared, future.await) });
         }
         if tasks.is_empty() {
@@ -491,14 +782,14 @@ where
         tokio::select! {
             result = tasks.join_next() => {
                 let result = result.unwrap();
-                if let (Some(observations), Ok((prepared, result))) = (&mut observations, &result) {
+                if let (Some(observations), Ok(((prepared, _), result))) = (&mut observations, &result) {
                     observations.completed(*prepared,
                         result.as_ref().ok().and_then(|bytes| *bytes)
                             .map(|bytes| bytes.saturating_add(FILE_CREDIT)));
                 }
                 match result.map_err(anyhow::Error::from)
                     .and_then(|(prepared, result)| result.map(|bytes| (prepared, bytes))) {
-                    Ok((prepared, Some(bytes))) => {
+                    Ok(((prepared, _), Some(bytes))) => {
                         let work = bytes.saturating_add(FILE_CREDIT);
                         if prepared != generation {
                             old_activity = old_activity.saturating_add(work);
@@ -508,11 +799,67 @@ where
                         activity = activity.saturating_add(work);
                         completed += 1;
                     }
-                    Ok((_, None)) => {}, // Skips and failed copies are not transferred work.
+                    // Skips and failed copies are not transferred work.
+                    // They show how fast objects are being checked.
+                    Ok(((_, prepared), None)) => {
+                        checked.completed += 1;
+                        if prepared != checking_generation {
+                            checked.old += 1;
+                        } else {
+                            checked.fresh += 1;
+                        }
+                    }
                     Err(e) => { if error.is_none() { error = Some(e); } },
                 }
             }
-            _ = interval.tick(), if concurrency.maximum.is_some() && error.is_none() => {
+            _ = interval.tick(), if (concurrency.maximum.is_some() || checking.is_some()) && error.is_none() => {
+                if let Some(checking) = &mut checking {
+                    let before = checking.limit;
+                    let elapsed = checked_since.elapsed();
+                    // Checked objects have queued for transfer slots for a
+                    // whole sample: transfers set the pace.
+                    let bound = gate.transfers_bound() && checking.limit > checking.minimum;
+                    // The service asks for fewer requests. Do not add to
+                    // them here, however many objects the transfer limit
+                    // itself keeps in progress.
+                    let responses = throttled();
+                    let slowed = responses != seen_throttled;
+                    seen_throttled = responses;
+                    if slowed {
+                        checking.throttled();
+                    } else if bound {
+                        checking.reject();
+                    } else if checking.probe.is_none()
+                        && gate.active() * 4 > transfer_limit(&controller, limit)
+                    {
+                        // Transfers use a good part of their slots, so the
+                        // objects another increase finds to transfer could
+                        // fill the rest. The transfer limit is then what
+                        // there is to tune, and an increase here would only
+                        // suspend that.
+                        checking.sampler.reset();
+                    } else if !elapsed.is_zero() && checked.completed >= 16 {
+                        checking.probe_completed =
+                            checking.probe_completed.saturating_add(checked.fresh);
+                        let seconds = elapsed.as_secs_f64();
+                        checking.observe_window(
+                            checked.completed as f64 / seconds, tasks.len(), jobs.len(),
+                            (checked.completed as f64 * 4.0 * SAMPLE.as_secs_f64() / seconds).ceil() as usize,
+                            checked.old as f64 / seconds,
+                            elapsed,
+                        );
+                    }
+                    if bound || slowed || checked.completed >= 16 {
+                        checked = Checked::default();
+                        checked_since = Instant::now();
+                    }
+                    if checking.limit != before {
+                        checking_generation += 1;
+                    }
+                }
+                if concurrency.maximum.is_none() {
+                    continue;
+                }
                 if controller.is_none() {
                     // Preserve the existing request ramp before taking over.
                     // Only one controller changes concurrency at a time.
@@ -529,7 +876,18 @@ where
                     completed = 0;
                     old_activity = 0;
                     fresh_completed = 0;
-                    since = tokio::time::Instant::now();
+                    since = Instant::now();
+                    continue;
+                }
+                if gated {
+                    // The transfer limit is not what bounds the objects in
+                    // progress, so their rate says nothing about it.
+                    controller.as_mut().unwrap().sampler.reset();
+                    activity = 0;
+                    completed = 0;
+                    old_activity = 0;
+                    fresh_completed = 0;
+                    since = Instant::now();
                     continue;
                 }
                 let elapsed = since.elapsed();
@@ -569,7 +927,7 @@ where
                     completed = 0;
                     old_activity = 0;
                     fresh_completed = 0;
-                    since = tokio::time::Instant::now();
+                    since = Instant::now();
                 }
             }
         }

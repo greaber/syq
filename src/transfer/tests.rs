@@ -114,6 +114,12 @@ struct PipelineState {
     deferred: std::collections::VecDeque<u64>,
     arrived: std::collections::HashMap<u64, Response>,
     next_deferred: u64,
+    /// Answer `send_timing_ok` as a remote connection does: without
+    /// waiting, and with this round trip once its reply has been read.
+    timed: Option<std::time::Duration>,
+    timed_round_trip: Option<std::time::Duration>,
+    /// An automatic small-file endpoint refuses its hashing configuration.
+    refuse_configuration: bool,
     /// Setting up telemetry on the connection fails.
     fail_observe: bool,
     /// The addresses of the actors telemetry was set up with, in order.
@@ -121,6 +127,9 @@ struct PipelineState {
 }
 
 struct PipelineConn(Arc<Mutex<PipelineState>>);
+
+/// The place in `PipelineState::deferred` of a `send_timing_ok` reply.
+const TIMED_REPLY: u64 = u64::MAX;
 
 impl PipelineConn {
     /// Read the replies of deferred requests, oldest first: all of them, or
@@ -131,6 +140,13 @@ impl PipelineConn {
                 return Ok(());
             };
             let reply = self.receive()?;
+            if id == TIMED_REPLY {
+                crate::conn::ok(reply, "configure hashing")
+                    .map_err(|error| crate::conn::DeferredRequestError(format!("{error:#}")))?;
+                let mut state = self.0.lock().unwrap();
+                state.timed_round_trip = state.timed;
+                continue;
+            }
             self.0.lock().unwrap().arrived.insert(id, reply);
             if until == Some(id) {
                 return Ok(());
@@ -225,6 +241,23 @@ impl Conn for PipelineConn {
         anyhow::ensure!(!state.fail_observe, "injected telemetry failure");
         state.observed_by.push(Arc::as_ptr(actor) as usize);
         Ok(())
+    }
+    fn send_timing_ok(
+        &mut self,
+        request: Request,
+        what: &'static str,
+    ) -> Result<Option<std::time::Duration>> {
+        if self.0.lock().unwrap().timed.is_none() {
+            let sent = std::time::Instant::now();
+            crate::conn::ok(self.call(request)?, what)?;
+            return Ok(Some(sent.elapsed()));
+        }
+        self.send(request)?;
+        self.0.lock().unwrap().deferred.push_back(TIMED_REPLY);
+        Ok(None)
+    }
+    fn take_timed_round_trip(&mut self) -> Option<std::time::Duration> {
+        self.0.lock().unwrap().timed_round_trip.take()
     }
     fn send_pending(&mut self, request: Request) -> Result<crate::conn::PendingReply> {
         if !self.0.lock().unwrap().defers {
@@ -325,7 +358,11 @@ impl Conn for PipelineConn {
                         state.received,
                         "latency check requires drained requests"
                     );
-                    Response::Ok
+                    if state.refuse_configuration {
+                        Response::Err("hash policy differs from the authorized copy".into())
+                    } else {
+                        Response::Ok
+                    }
                 }
                 Request::ReadSmallBatch(reads) => Response::SmallBlocks(
                     reads
@@ -538,6 +575,7 @@ fn pipeline_worker(
         access_limited: Default::default(),
         outer_directory: Default::default(),
         access_noted: Default::default(),
+        keep_widening_explained: Default::default(),
         devices: false,
         checksum: false,
         hash_or_copy: false,
@@ -589,6 +627,7 @@ fn pipeline_worker(
         fast_batch_files: 1,
         batch_budget: WorkBudget::default(),
         range_budget: None,
+        setup_latency: None,
         comparison: Default::default(),
         setup_elapsed: std::time::Duration::ZERO,
         publications: Default::default(),
@@ -1744,6 +1783,174 @@ fn cancelled_range_drains_without_reporting_or_publishing_an_innocent_file() {
         .iter()
         .all(|r| matches!(r, Request::WriteRange { .. })));
     assert_eq!(worker.progress.errors.load(Relaxed), 0);
+}
+
+#[test]
+fn a_worker_does_not_wait_for_its_hashing_configuration() {
+    use std::time::Duration;
+    let timed = |round_trip| {
+        Arc::new(Mutex::new(PipelineState {
+            timed: Some(Duration::from_millis(round_trip)),
+            replies: [Response::Ok].into(),
+            ..Default::default()
+        }))
+    };
+    let (src, dst) = (timed(30), timed(50));
+    let sched = Arc::new(Sched::new(512, 8192));
+    sched.scan_done();
+    let mut worker = pipeline_worker(&sched, &src, &dst, false);
+    worker.run(None).unwrap();
+    for state in [&src, &dst] {
+        let state = state.lock().unwrap();
+        assert!(matches!(state.requests[..], [Request::ConfigureHashing(_)]));
+        assert_eq!(state.received, 0, "the reply was waited for");
+    }
+    let default = worker.batch_budget.latency_target();
+    // A range allowance kept from before the round trips were known.
+    worker.range_budget = Some(WorkBudget::ranges(512, default, None));
+
+    // The allowance comes from both round trips, once both replies have
+    // been read ahead of a later one.
+    for (state, both) in [(&src, false), (&dst, true)] {
+        state.lock().unwrap().replies.push_back(Response::Ok);
+        let conn = if both {
+            &mut worker.dst
+        } else {
+            &mut worker.src
+        };
+        assert!(matches!(conn.recv().unwrap(), Response::Ok));
+        assert_eq!(
+            worker.settle_setup_latency(),
+            both.then_some(Duration::from_millis(80))
+        );
+        if !both {
+            assert_eq!(worker.batch_budget.latency_target(), default);
+        }
+    }
+    let allowance =
+        Duration::from_millis(80) * crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH as u32;
+    assert_eq!(worker.batch_budget.latency_target(), allowance);
+    assert_eq!(
+        worker.range_budget.as_ref().unwrap().latency_target(),
+        allowance
+    );
+    assert_eq!(worker.settle_setup_latency(), None, "settled once");
+}
+
+#[test]
+fn moving_to_its_own_login_keeps_a_setup_round_trip_already_read() {
+    use std::time::Duration;
+    let timed = |round_trip| {
+        Arc::new(Mutex::new(PipelineState {
+            timed: Some(Duration::from_millis(round_trip)),
+            replies: [Response::Ok].into(),
+            ..Default::default()
+        }))
+    };
+    let (source, shared) = (timed(0), timed(100));
+    let sched = Arc::new(Sched::new(512, 8192));
+    sched.scan_done();
+    let mut worker = pipeline_worker(&sched, &source, &shared, false);
+    worker.run(None).unwrap();
+    // The shared session's reply is read by the requests of the file the
+    // worker copies there, which do not take the round trip.
+    for state in [&source, &shared] {
+        state.lock().unwrap().replies.push_back(Response::Ok);
+    }
+    assert!(matches!(worker.src.recv().unwrap(), Response::Ok));
+    assert!(matches!(worker.dst.recv().unwrap(), Response::Ok));
+
+    worker.on_shared_login = true;
+    let own = Arc::new(Mutex::new(PipelineState::default()));
+    worker.own_login = OwnLogin::Unopened(Box::new(move || {
+        Ok((None, Some(Box::new(PipelineConn(own)) as Box<dyn Conn>)))
+    }));
+    worker.open_own_login();
+    wait_for_own_login(&worker);
+    worker.take_own_login_if_ready().unwrap();
+    assert!(!worker.on_shared_login);
+    assert_eq!(
+        worker.batch_budget.latency_target(),
+        Duration::from_millis(100) * crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH as u32,
+        "the round trip went with the shared session"
+    );
+}
+
+#[test]
+fn a_refused_hashing_configuration_fails_the_copy_at_the_first_reply() {
+    let sched = Arc::new(Sched::new(512, 8192));
+    sched.push_file(pipeline_job(b"first", 4096));
+    sched.scan_done();
+    let src = Arc::new(Mutex::new(PipelineState {
+        timed: Some(Default::default()),
+        replies: [Response::Ok].into(),
+        ..Default::default()
+    }));
+    let dst = Arc::new(Mutex::new(PipelineState {
+        timed: Some(Default::default()),
+        replies: [
+            Response::Err("hash policy differs from the authorized copy".into()),
+            // What the receiver answers the preparation sent behind it.
+            Response::Prepared(Preparation::default()),
+        ]
+        .into(),
+        ..Default::default()
+    }));
+    let mut worker = pipeline_worker(&sched, &src, &dst, false);
+    let error = worker.run(None).unwrap_err();
+    assert_eq!(
+        format!("{error:#}"),
+        "configure hashing: hash policy differs from the authorized copy"
+    );
+    assert!(sched.is_aborted(), "the copy goes on without its policy");
+    assert!(!worker.transport_dead());
+    assert_eq!(worker.progress.files_done.load(Relaxed), 0);
+    let destination = dst.lock().unwrap();
+    assert!(
+        !destination
+            .requests
+            .iter()
+            .any(|request| matches!(request, Request::WriteRange { .. })),
+        "data was sent after the refusal"
+    );
+}
+
+#[test]
+fn a_refused_hashing_configuration_fails_the_copy_not_each_small_file() {
+    // Within the test worker's 512-byte requests, so batched.
+    let size = 256;
+    let sched = Arc::new(Sched::new(4 << 20, 32 << 20));
+    for name in [&b"first"[..], b"second", b"third"] {
+        sched.push_file(pipeline_job(name, size));
+    }
+    sched.scan_done();
+    let endpoint = |refuse| {
+        Arc::new(Mutex::new(PipelineState {
+            timed: Some(Default::default()),
+            auto_small_size: Some(size),
+            refuse_configuration: refuse,
+            ..Default::default()
+        }))
+    };
+    let (src, dst) = (endpoint(false), endpoint(true));
+    let mut worker = pipeline_worker(&sched, &src, &dst, false);
+    Arc::get_mut(&mut worker.opts).unwrap().tuning = Default::default();
+    let error = worker.run(None).unwrap_err();
+    assert_eq!(
+        format!("{error:#}"),
+        "configure hashing: hash policy differs from the authorized copy"
+    );
+    assert!(sched.is_aborted());
+    assert_eq!(worker.progress.errors.load(Relaxed), 0, "listed per file");
+    assert_eq!(worker.progress.files_done.load(Relaxed), 0);
+    assert!(
+        dst.lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|request| matches!(request, Request::PutSmallBatch(_))),
+        "the files were not sent as a small batch"
+    );
 }
 
 #[test]
@@ -6720,6 +6927,121 @@ fn restricted_destination(
         },
         replies: Default::default(),
     })
+}
+
+/// A copy whose grant keeps existing objects (`--if-exists=keep`) asks a
+/// restricted receiver to widen no directory inside the copy: the receiver
+/// refuses such a request whole, and the copy with it. Under `all` it still
+/// asks for the directory the copy goes into. In place of naming a wider
+/// mode, it says why none helps.
+#[test]
+fn a_keep_grant_copy_asks_a_restricted_receiver_to_widen_no_directory_inside_it() {
+    use crate::cli::WidenDirs;
+    use crate::delegation::DirectoryWidening;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let bytes = |path: &std::path::Path| path.as_os_str().as_bytes().to_vec();
+    let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().mode() & 0o7777;
+    for approved in [DirectoryWidening::Rsync, DirectoryWidening::All] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        let sub = root.join("target/sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let authority = Arc::new(crate::restricted::tests::keep_test_authority_widening(
+            root, approved,
+        ));
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let mut receiver = restricted_destination(authority, executed.clone(), || {});
+        let asked = Arc::new(Mutex::new(0));
+        let mut destination = AnsweringConn {
+            answer: {
+                let asked = asked.clone();
+                move |request: Request| {
+                    *asked.lock().unwrap() += 1;
+                    receiver.call(request).unwrap()
+                }
+            },
+            replies: Default::default(),
+        };
+        let sched = Arc::new(Sched::new(512, 8192));
+        let unused = Arc::new(Mutex::new(PipelineState::default()));
+        let mut worker = pipeline_worker(&sched, &unused, &unused, true);
+        let opts = Arc::get_mut(&mut worker.opts).unwrap();
+        opts.restricted_receiver = true;
+        opts.widen_dirs = match approved {
+            DirectoryWidening::All => WidenDirs::All,
+            _ => WidenDirs::Rsync,
+        };
+        // The directory an exact target is in.
+        opts.outer_directory.set(bytes(root)).unwrap();
+        let progress = Progress::new(false, false, None);
+        let identity = |path: &std::path::Path| {
+            let metadata = std::fs::metadata(path).unwrap();
+            TargetCondition::Matches {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            }
+        };
+        let mut restorations = Default::default();
+        let mut widen = |opts: &Opts, directories: Vec<&std::path::Path>| {
+            super::planner::widen_directory_batch(
+                &mut destination,
+                opts,
+                &progress,
+                &mut restorations,
+                directories
+                    .into_iter()
+                    .map(|path| (bytes(path), identity(path)))
+                    .collect(),
+                0o300,
+            )
+        };
+
+        // Asked as under any other policy, the receiver refuses.
+        assert_eq!(opts.hint_for(WidenDirs::Rsync), None);
+        let error = widen(opts, vec![&sub]).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("contradicts the signed existing-object policy"),
+            "{error:#}"
+        );
+        assert_eq!(*asked.lock().unwrap(), 1);
+
+        // Knowing its grant keeps what exists, the copy does not ask.
+        opts.preserve_existing_directory_metadata = true;
+        assert!(opts.keep_bars_widening() && !opts.widens_inside_copy());
+        assert_eq!(widen(opts, vec![&sub]).unwrap(), 0);
+        assert_eq!(*asked.lock().unwrap(), 1);
+        assert_eq!(mode(&sub), 0o555);
+        let hint = opts.hint_for(WidenDirs::Rsync).unwrap();
+        assert!(hint.contains("--if-exists=keep"), "{hint}");
+        assert_eq!(
+            opts.hint_for(WidenDirs::All),
+            (approved == DirectoryWidening::Rsync).then_some("--widen-dirs=all may help")
+        );
+        assert_eq!(opts.entering_hint(), Some(hint));
+        // The reason is given in full once, whichever message carries it.
+        assert_eq!(opts.said_once(hint), hint);
+        assert_eq!(opts.said_once(hint), "it is not widened either");
+        let other = "--widen-dirs=all may help";
+        assert_eq!(opts.said_once(other), other);
+
+        // Only the directory the copy goes into is asked for, under `all`.
+        if approved == DirectoryWidening::All {
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o500)).unwrap();
+            assert_eq!(widen(opts, vec![root, &sub]).unwrap(), 1);
+            assert_eq!(*asked.lock().unwrap(), 2);
+            let executed = executed.lock().unwrap();
+            let [Request::WidenDirectories { directories, .. }] = &executed[..] else {
+                panic!("{executed:?}");
+            };
+            assert_eq!(directories.len(), 1);
+            assert_eq!(directories[0].0, bytes(root));
+            assert_eq!((mode(root), mode(&sub)), (0o700, 0o555));
+        }
+    }
 }
 
 /// Run `workers` on threads of their own until the copy ends, and check

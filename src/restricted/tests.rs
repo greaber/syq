@@ -2906,6 +2906,24 @@ pub(crate) fn time_preserving_test_authority_for(
     authority
 }
 
+/// A signed-grant authority over `root/target` that keeps existing objects
+/// (`--if-exists=keep`) and approves the widening `approved`, for other
+/// modules' tests.
+pub(crate) fn keep_test_authority_widening(
+    root: &Path,
+    approved: DirectoryWidening,
+) -> RestrictedAuthority {
+    let mut authority = existence_authority(
+        root,
+        ExistingDestinationPolicy::Skip,
+        DestinationPlacement::ExactPath,
+        RootExistence::Any,
+    )
+    .unwrap();
+    authority.extra_options.widen_dirs = approved;
+    authority
+}
+
 /// A signed-grant authority over `root/target` that lets the copy update
 /// existing files in place (`--in-place=update`), preserving times, for up
 /// to `entries` paths, for other modules' tests.
@@ -4780,6 +4798,149 @@ fn restricted_widening_follows_the_approved_mode() {
         );
         assert_eq!(fs::metadata(&root).unwrap().mode() & 0o777, 0o500);
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
+/// A grant that keeps existing objects (`--if-exists=keep`) widens none of
+/// the copy's existing directories, whatever mode was approved: a request
+/// naming one is refused whole and changes nothing. A directory the grant
+/// created is its own to widen, and under `all` so is the directory the copy
+/// goes into, which the grant does not keep. A copy asks for none of the
+/// refused ones (`transfer::Opts::keep_bars_widening`). The grant's other
+/// protections are as before: nothing replaces an existing directory or
+/// file, or changes its metadata.
+#[test]
+fn a_keep_grant_widens_no_existing_directory_of_the_copy() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let identity = |path: &Path| {
+        let metadata = fs::metadata(path).unwrap();
+        proto::TargetCondition::Matches {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    };
+    let fingerprint = |path: &Path| {
+        let metadata = fs::metadata(path).unwrap();
+        proto::TargetCondition::MatchesFingerprint {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            ctime: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec() as u32,
+        }
+    };
+    let widen = |directories: Vec<(&Path, proto::TargetCondition)>| Request::WidenDirectories {
+        access: 0o300,
+        remember: true,
+        directories: directories
+            .into_iter()
+            .map(|(path, condition)| (path_bytes(path), condition))
+            .collect(),
+    };
+    let mode = |path: &Path| fs::metadata(path).unwrap().mode() & 0o7777;
+    let read_only = |path: &Path| {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o555)).unwrap();
+    };
+    for approved in [DirectoryWidening::Rsync, DirectoryWidening::All] {
+        let temp = crate::test_support::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let target = root.join("target");
+        let sub = target.join("sub");
+        let old = sub.join("old");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(&old, b"existing").unwrap();
+        let mut authority = existence_authority(
+            &root,
+            ExistingDestinationPolicy::Skip,
+            DestinationPlacement::ExactPath,
+            RootExistence::Any,
+        )
+        .unwrap();
+        authority.extra_options.widen_dirs = approved;
+        let mut ops = authority.test_ops();
+        let refused = |request: &mut Request| {
+            let error = authority.authorize(request, false).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("contradicts the signed existing-object policy"),
+                "{approved:?}: {error:#}"
+            );
+        };
+
+        // A directory the copy made is the grant's own.
+        let made = target.join("made");
+        let response = execute_authorized(&authority, &mut ops, apply(mkdir(&made)));
+        assert!(
+            matches!(response, proto::Response::Applied(ref errors) if errors.iter().all(Option::is_none)),
+            "{response:?}"
+        );
+        read_only(&made);
+        let response =
+            execute_authorized(&authority, &mut ops, widen(vec![(&made, identity(&made))]));
+        assert!(
+            matches!(response, proto::Response::WidenedDirectories(ref outcomes)
+                if matches!(outcomes[..], [Ok(Some(_))])),
+            "{response:?}"
+        );
+        assert_eq!(mode(&made), 0o755, "{approved:?}");
+
+        // An existing one, the destination itself included, is not, however
+        // the request names it, and one in a request refuses all of it.
+        read_only(&made);
+        read_only(&sub);
+        for existing in [&sub, &target] {
+            refused(&mut widen(vec![(existing, identity(existing))]));
+            refused(&mut widen(vec![(existing, fingerprint(existing))]));
+        }
+        refused(&mut widen(vec![
+            (&made, identity(&made)),
+            (&sub, identity(&sub)),
+        ]));
+        assert_eq!((mode(&made), mode(&sub)), (0o555, 0o555), "{approved:?}");
+
+        // Only `all` widens the directory the copy goes into.
+        assert_eq!(
+            authority
+                .authorize(
+                    &mut widen(vec![(&root, proto::TargetCondition::Any)]),
+                    false
+                )
+                .is_ok(),
+            approved == DirectoryWidening::All,
+            "{approved:?}"
+        );
+
+        // Nothing replaces what exists, or changes its metadata.
+        refused(&mut apply(Op::Mkdir {
+            path: path_bytes(&sub),
+            mode: 0o755,
+            condition: identity(&sub),
+        }));
+        let mut replace = small_put(&old);
+        let Request::PutSmallBatch(puts) = &mut replace else {
+            unreachable!()
+        };
+        puts[0].condition = identity(&old);
+        puts[0].replaces = true;
+        refused(&mut replace);
+        for existing in [&sub, &old] {
+            let error = authority
+                .authorize(&mut apply(set_meta(existing)), false)
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("may not be modified"),
+                "{approved:?}: {error:#}"
+            );
+        }
+        // A put that names no object leaves the existing file as it was.
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut put = small_put(&old);
+        if let Ok(mut settlement) = authority.authorize(&mut put, false) {
+            let response = settlement.execute(&mut ops, |ops| ops.handle(&put));
+            authority.settle(settlement, &response);
+        }
+        assert_eq!(fs::read(&old).unwrap(), b"existing", "{approved:?}");
+        assert_eq!(mode(&sub), 0o755, "{approved:?}");
     }
 }
 
@@ -14829,6 +14990,198 @@ fn keeping_files_renames_unchecked_beneath_directories_found_empty_or_made() {
         }
     }
     assert_eq!(fs::read(target.join("old/kept")).unwrap(), b"old");
+}
+
+/// Look a batch up for the planner on `ops`, a connection of `authority`,
+/// as one `Request::PlanBatch` does.
+fn look_up_batch(
+    authority: &RestrictedAuthority,
+    ops: &mut crate::fsops::FsOps,
+    directories: &[PathBuf],
+    others: &[PathBuf],
+) -> (Vec<Option<proto::Entry>>, Option<Vec<Option<proto::Entry>>>) {
+    let paths = |paths: &[PathBuf]| paths.iter().map(|path| path_bytes(path)).collect();
+    let mut request = Request::PlanBatch {
+        directories: paths(directories),
+        others: paths(others),
+        strict_metadata: false,
+    };
+    authority.authorize(&mut request, false).unwrap();
+    match ops.handle(&request) {
+        proto::Response::BatchPlan {
+            directories,
+            others,
+        } => (directories, others),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A planner that keeps several batch lookups in flight asks about a batch
+/// before it has applied the batches ahead of it: here, before it created
+/// the directory the batch's files go into. It then drops that reply and
+/// asks again in the batch's turn.
+///
+/// Keeping existing files on a filesystem without a no-replace rename, the
+/// receiver publishes by what it recorded of its own lookups. The early
+/// lookup of a name in a directory that is not there yet records nothing
+/// for it; the directory's creation and the lookup in turn record what an
+/// ordinary copy's would, and the file is renamed into place unchecked.
+#[test]
+fn an_early_batch_lookup_records_nothing_beneath_a_directory_not_yet_made() {
+    use crate::fsops::lookups::Looked;
+    use proto::TargetCondition::{Absent, Any};
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("there"), b"old").unwrap();
+    let mut authority = existence_authority(
+        &root,
+        ExistingDestinationPolicy::Skip,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+    )
+    .unwrap();
+    authority.copy.limits.max_entries = 64;
+    assume_lacking(&authority, true, false);
+    let mut ops = authority.test_ops();
+    let recorded = |name: &str| {
+        authority
+            .lookups
+            .as_ref()
+            .unwrap()
+            .get(format!("target/{name}").as_bytes())
+    };
+    let made = target.join("made");
+    let files = [made.join("first"), made.join("second")];
+
+    // The early lookup, sent before the batch ahead creates the directory.
+    let (_, found) = look_up_batch(&authority, &mut ops, &[], &files);
+    assert!(matches!(found.as_deref(), Some([None, None])));
+    assert_eq!(recorded("made/first"), None);
+    assert_eq!(recorded("made/second"), None);
+    assert_eq!(recorded("made"), None);
+
+    // The batch ahead, in its turn, finds the directory missing and
+    // creates it.
+    let (found, _) = look_up_batch(&authority, &mut ops, std::slice::from_ref(&made), &[]);
+    assert!(matches!(found[..], [None]));
+    assert_eq!(recorded("made"), Some(Looked::Absent));
+    carry_out(&authority, &mut ops, &mut apply(mkdir(&made))).unwrap();
+    assert_eq!(recorded("made"), Some(Looked::Empty));
+
+    // The lookup repeated in the batch's turn finds the names absent in a
+    // directory that is there, and records that.
+    let (_, found) = look_up_batch(&authority, &mut ops, &[], &files);
+    assert!(matches!(found.as_deref(), Some([None, None])));
+    assert_eq!(recorded("made/first"), Some(Looked::Absent));
+    let mut request = small_put_with(&files[0], Absent);
+    carry_out(&authority, &mut ops, &mut request).unwrap();
+    assert_eq!(small_put_condition(&request), Any);
+    assert_eq!(recorded("made/first"), Some(Looked::Claimed));
+    assert_eq!(fs::read(&files[0]).unwrap(), b"new");
+    // An early lookup that a later one repeats unchanged records the same
+    // thing twice: a file found stays kept.
+    for _ in 0..2 {
+        let (_, found) = look_up_batch(&authority, &mut ops, &[], &[target.join("there")]);
+        assert!(matches!(found.as_deref(), Some([Some(_)])));
+        assert!(matches!(recorded("there"), Some(Looked::Present { .. })));
+    }
+    let error = carry_out(
+        &authority,
+        &mut ops,
+        &mut small_put_with(&target.join("there"), Any),
+    )
+    .unwrap_err();
+    assert!(KeptExisting::is(&error), "{error:#}");
+    assert_eq!(fs::read(target.join("there")).unwrap(), b"old");
+}
+
+/// The same, where the batch ahead widens a directory that hides the
+/// batch's files. A copy that keeps existing files widens no directory
+/// that exists, so this arises replacing only existing files, on a
+/// filesystem without an exchange, where the receiver records the files
+/// its lookups find.
+///
+/// The early lookup cannot see into the directory and records nothing, so
+/// a publication on its strength alone is looked at by the receiver. The
+/// lookup in turn records the files that are there, and those alone.
+#[test]
+fn an_early_batch_lookup_records_nothing_in_a_directory_not_yet_widened() {
+    use crate::fsops::lookups::Looked;
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path().join("root");
+    let target = root.join("target");
+    let locked = target.join("locked");
+    fs::create_dir_all(&locked).unwrap();
+    fs::write(locked.join("found"), b"old").unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut authority = existence_authority(
+        &root,
+        ExistingDestinationPolicy::MustExist,
+        DestinationPlacement::DirectoryContents,
+        RootExistence::Any,
+    )
+    .unwrap();
+    authority.copy.limits.max_entries = 64;
+    authority.extra_options.widen_dirs = DirectoryWidening::Rsync;
+    assume_lacking(&authority, false, true);
+    let mut ops = authority.test_ops();
+    let lookups = authority.lookups.clone().unwrap();
+    let files = [locked.join("found"), locked.join("missing")];
+
+    // The early lookup, before the directory is widened.
+    let (_, found) = look_up_batch(&authority, &mut ops, &[], &files);
+    assert!(matches!(found.as_deref(), Some([None, None])));
+    assert_eq!(lookups.len(), 0);
+
+    // The batch ahead widens the directory.
+    let metadata = fs::metadata(&locked).unwrap();
+    let mut widen = Request::WidenDirectories {
+        access: 0o300,
+        remember: true,
+        directories: vec![(
+            path_bytes(&locked),
+            proto::TargetCondition::Matches {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            },
+        )],
+    };
+    let settlement = authority.authorize(&mut widen, false).unwrap();
+    let response = ops.handle(&widen);
+    assert!(
+        matches!(&response, proto::Response::WidenedDirectories(outcomes)
+            if outcomes.len() == 1 && outcomes[0].is_ok()),
+        "{response:?}"
+    );
+    authority.settle(settlement, &response);
+
+    // On the early reply alone nothing was recorded: the receiver looks
+    // for itself, and creates nothing.
+    let Err(error) = authority.authorize(&mut small_put(&locked.join("missing")), false) else {
+        panic!("a file was created under a grant that creates nothing")
+    };
+    assert!(KeptExisting::is(&error), "{error:#}");
+
+    // The lookup repeated in the batch's turn records the file it finds.
+    let (_, found) = look_up_batch(&authority, &mut ops, &[], &files);
+    assert!(matches!(found.as_deref(), Some([Some(_), None])));
+    assert_eq!(lookups.len(), 1);
+    assert!(matches!(
+        lookups.get(b"target/locked/found"),
+        Some(Looked::Present { .. })
+    ));
+    carry_out(&authority, &mut ops, &mut small_put(&locked.join("found"))).unwrap();
+    assert_eq!(fs::read(locked.join("found")).unwrap(), b"new");
+    let Err(error) = authority.authorize(&mut small_put(&locked.join("missing")), false) else {
+        panic!("a file was created under a grant that creates nothing")
+    };
+    assert!(KeptExisting::is(&error), "{error:#}");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 /// A destination reached through links, which the receiver then holds as

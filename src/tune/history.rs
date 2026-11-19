@@ -17,23 +17,56 @@ pub(crate) use command::{command_for_help, run};
 const SCHEMA: i64 = 2;
 const DEFAULT_BUDGET: u64 = 10 << 20;
 const MAX_PENDING: usize = 4096;
+/// A copy writes nothing to the history for this long after opening it, so
+/// that a short copy writes once, when it ends. One killed sooner leaves no
+/// record.
+/// Many copies starting and finishing together then contend for the writer
+/// lock once each, for a single short transaction, instead of several times.
+const FIRST_WRITE: Duration = Duration::from_secs(1);
+/// How often a longer copy then saves what it has recorded, so that it can
+/// be inspected while it runs and leaves its timeline if it is killed.
+const WRITE_INTERVAL: Duration = Duration::from_secs(5);
+/// This many unsaved events are saved at once, whatever the copy's age,
+/// well before `MAX_PENDING` would drop any.
+const WRITE_EVENTS: usize = 1024;
+/// How long a save that found the history locked leaves it alone.
+const WRITE_RETRY: Duration = Duration::from_millis(250);
+/// A finishing copy waits for other copies' writes no longer than it ran
+/// itself, and at most this long. Then it records nothing. The wait is part
+/// of the copy's wall time: a short copy's record is not worth holding the
+/// copy up for, and a long copy, whose measurements later copies start from,
+/// waits the full time unnoticed.
 const FINISH_LOCK_WAIT: Duration = Duration::from_millis(100);
 /// How long opening history waits for another run's lock before this run
-/// goes without history.
+/// goes without history. Reading an existing history takes no lock that a
+/// writer holds; this covers a history being created or recovered.
 const OPEN_LOCK_WAIT: Duration = Duration::from_millis(100);
 /// About how long one copy spends deleting old runs from a history over its
-/// budget, and how many runs one statement deletes.
-const PRUNE_TIME: Duration = Duration::from_millis(20);
-const PRUNE_BATCH: i128 = 256;
+/// budget and returning its free space.
+const PRUNE_TIME: Duration = Duration::from_millis(5);
+/// The fraction of its budget a history over it is pruned below.
+const PRUNE_SLACK: i64 = 32;
+/// The most runs one step deletes, and how many of the oldest runs it reads
+/// to choose them. Both bound a step whatever the history holds.
+const PRUNE_BATCH: usize = 256;
+const PRUNE_WINDOW: i64 = 512;
+/// An incomplete run this close behind the finishing one may belong to a copy
+/// still in progress, and is never deleted.
+const ACTIVE_RUNS: i64 = 256;
 
 #[derive(Clone)]
 pub(crate) struct Recorder(Arc<Mutex<Writer>>);
 
 struct Writer {
     db: Connection,
-    id: i64,
+    /// The run's row, which the first save creates.
+    id: Option<i64>,
+    day: i64,
     start: Instant,
-    last_flush: Instant,
+    /// When the next periodic save is due.
+    next_write: Instant,
+    /// No save is attempted before this, after one found the history locked.
+    retry: Instant,
     sequence: u64,
     pending: Vec<Value>,
     pending_context: Option<ContextKey>,
@@ -237,32 +270,25 @@ impl Recorder {
         budget: u64,
         lock_wait: Duration,
     ) -> Result<Self> {
+        // Starting a copy only reads an existing history: its identity key
+        // here and, later, earlier runs for a starting count. Other copies'
+        // writes do not hold these reads up, and this copy's own run is
+        // written later, off the path to its first byte.
         let db = open_waiting(path, lock_wait)?;
-        let mut generated = [0u8; 32];
-        getrandom::fill(&mut generated).context("create tuning history identity key")?;
-        db.execute(
-            "INSERT OR IGNORE INTO metadata VALUES ('identity_key',?1)",
-            [generated.as_slice()],
-        )?;
-        let salt: Vec<u8> = db.query_row(
-            "SELECT value FROM metadata WHERE key='identity_key'",
-            [],
-            |r| r.get(0),
-        )?;
-        let salt = salt
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("invalid history identity key"))?;
-        db.execute(
-            "INSERT INTO runs(day,updated_day,build) VALUES (?1,?1,?2)",
-            params![day(), crate::identity::build()],
-        )?;
-        let id = db.last_insert_rowid();
+        let salt = identity_key(&db)?;
         db.busy_timeout(Duration::ZERO)?;
+        // The first save is counted from here, not from `start`. A copy's
+        // clock can start well before its history opens, as when choosing
+        // its authorization first connects to a server, and that copy is
+        // still starting.
+        let opened = Instant::now();
         let recorder = Self(Arc::new(Mutex::new(Writer {
             db,
-            id,
+            id: None,
+            day: day(),
             start,
-            last_flush: Instant::now(),
+            next_write: opened + FIRST_WRITE,
+            retry: opened,
             sequence: 0,
             pending: Vec::new(),
             pending_context: None,
@@ -274,7 +300,6 @@ impl Recorder {
             salt,
         })));
         recorder.event("start", details);
-        recorder.flush();
         Ok(recorder)
     }
 
@@ -320,46 +345,28 @@ impl Recorder {
         );
     }
 
-    pub(crate) fn event(&self, kind: &str, mut data: Value) {
+    pub(crate) fn event(&self, kind: &str, data: Value) {
         let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
         if state.finished {
             return;
         }
-        let elapsed_us = state.start.elapsed().as_micros().min(i64::MAX as u128) as u64;
-        let sequence = state.sequence;
-        state.sequence += 1;
-        if matches!(kind, "transition" | "sequential_evidence") {
-            state.measurement_segment = sequence as i64;
-        }
-        if kind == "observation" {
-            data["segment"] = json!(state.measurement_segment);
-        }
-        if state.pending.len() < MAX_PENDING {
-            let event =
-                json!({"sequence":sequence,"elapsed_us":elapsed_us,"kind":kind,"data":data});
-            state.measurements.push(&event);
-            state.pending.push(event);
-        } else {
-            state.lost += 1;
-        }
-        if state.last_flush.elapsed() >= Duration::from_secs(1) || state.pending.len() >= 64 {
-            if let Err(error) = state.flush() {
+        state.record(kind, data);
+        let now = Instant::now();
+        if now >= state.retry && (now >= state.next_write || state.pending.len() >= WRITE_EVENTS) {
+            if let Err(error) = state.save() {
+                // Usually another copy holds the writer lock. Keep the
+                // events for a later save instead of waiting for it.
+                state.retry = now + WRITE_RETRY;
                 diagnostic(&error);
             }
         }
     }
 
-    pub(crate) fn flush(&self) {
-        if let Err(error) = self.0.lock().unwrap_or_else(|p| p.into_inner()).flush() {
-            diagnostic(&error);
-        }
-    }
-
+    /// Set the run's context, which the next save writes with its events.
     pub(crate) fn context(&self, key: &ContextKey) {
         let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        state.pending_context = Some(key.clone());
-        if let Err(error) = state.flush() {
-            diagnostic(&error);
+        if !state.finished {
+            state.pending_context = Some(key.clone());
         }
     }
 
@@ -372,11 +379,11 @@ impl Recorder {
 
     /// Record the outcome and the final summary. Later events are ignored.
     pub(crate) fn complete(&self, success: bool, summary: Value) {
-        self.event("finish", summary.clone());
         let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
         if state.finished {
             return;
         }
+        state.record("finish", summary.clone());
         if let Err(error) = state.finish(success, summary) {
             diagnostic(&error);
         }
@@ -385,104 +392,247 @@ impl Recorder {
 }
 
 impl Writer {
-    fn flush(&mut self) -> Result<()> {
+    /// Keep an event for the next save.
+    fn record(&mut self, kind: &str, mut data: Value) {
+        let elapsed_us = self.start.elapsed().as_micros().min(i64::MAX as u128) as u64;
+        let sequence = self.sequence;
+        self.sequence += 1;
+        if matches!(kind, "transition" | "sequential_evidence") {
+            self.measurement_segment = sequence as i64;
+        }
+        if kind == "observation" {
+            data["segment"] = json!(self.measurement_segment);
+        }
+        if self.pending.len() < MAX_PENDING {
+            let event =
+                json!({"sequence":sequence,"elapsed_us":elapsed_us,"kind":kind,"data":data});
+            self.measurements.push(&event);
+            self.pending.push(event);
+        } else {
+            self.lost += 1;
+        }
+    }
+
+    /// Write what this copy has recorded since its last save, without
+    /// waiting for another copy's write to end.
+    fn save(&mut self) -> Result<()> {
         if self.pending.is_empty() && self.pending_context.is_none() {
             return Ok(());
         }
-        let transaction = self.db.unchecked_transaction()?;
-        self.write_pending(&transaction)?;
-        transaction.commit()?;
-        self.mark_flushed();
-        Ok(())
+        self.commit(Duration::ZERO, None)
     }
 
-    fn write_pending(&self, transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    /// Write the pending context and events, and `outcome` if the copy has
+    /// ended, in one transaction, waiting at most `wait` for the writer lock.
+    /// The first save creates the run's row.
+    fn commit(&mut self, wait: Duration, outcome: Option<&Outcome>) -> Result<()> {
+        // Other copies wait for as long as this one holds the writer lock, so
+        // everything that needs no lock is done before it is taken.
+        //
         // Context revisions (for example, discovering a mixed-filesystem tree)
-        // must survive contention just like samples. Finish flushes this before
-        // recording the outcome under the context.
-        if let Some(key) = &self.pending_context {
-            transaction.execute("UPDATE runs SET context=?1,route=?2,source_fs=?3,destination_fs=?4,mode=?5 WHERE id=?6",
-                params![serde_json::to_string(key)?, key.route, key.source_filesystem, key.destination_filesystem, key.mode, self.id])?;
-        }
-        {
-            let mut insert = transaction.prepare("INSERT INTO events VALUES (?1,?2,?3,?4)")?;
-            let mut measurement =
-                transaction.prepare("INSERT INTO measurements VALUES (?1,?2,?3,?4,?5,?6,?7,?8)")?;
-            for event in &self.pending {
-                if let Some(o) = inference::Observation::from_event(event) {
-                    measurement.execute(params![
-                        self.id,
-                        event["sequence"].as_i64(),
-                        event["elapsed_us"].as_i64(),
-                        o.segment,
-                        o.workers as i64,
-                        o.seconds,
-                        o.rate,
-                        o.usable
-                    ])?;
-                }
-                insert.execute(params![
-                    self.id,
+        // must survive contention just like samples, and the outcome is
+        // recorded under the context that the same save writes.
+        let context = self
+            .pending_context
+            .as_ref()
+            .map(|key| Ok::<_, serde_json::Error>((serde_json::to_string(key)?, key)))
+            .transpose()?;
+        let events = self
+            .pending
+            .iter()
+            .map(|event| {
+                Ok((
                     event["sequence"].as_i64(),
                     event["elapsed_us"].as_i64(),
-                    serde_json::to_string(event)?
+                    serde_json::to_string(event)?,
+                    inference::Observation::from_event(event),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let today = day();
+        let id = {
+            let mut create = self.db.prepare_cached(
+                "INSERT INTO runs(day,updated_day,build,lost,context,route,source_fs,
+                    destination_fs,mode,status,eligible,summary)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            )?;
+            let mut insert = self
+                .db
+                .prepare_cached("INSERT INTO events VALUES (?1,?2,?3,?4)")?;
+            let mut measurement = self
+                .db
+                .prepare_cached("INSERT INTO measurements VALUES (?1,?2,?3,?4,?5,?6,?7,?8)")?;
+            let transaction = begin_within(&self.db, wait)?;
+            let id = if let Some(id) = self.id {
+                let found = transaction.execute(
+                    "UPDATE runs SET lost=?1,updated_day=?3 WHERE id=?2",
+                    params![self.lost, id, today],
+                )?;
+                if found == 0 {
+                    None
+                } else {
+                    if let Some((json, key)) = &context {
+                        transaction.execute("UPDATE runs SET context=?1,route=?2,source_fs=?3,destination_fs=?4,mode=?5 WHERE id=?6",
+                            params![json, key.route, key.source_filesystem, key.destination_filesystem, key.mode, id])?;
+                    }
+                    if let Some(outcome) = outcome {
+                        transaction.execute(
+                            "UPDATE runs SET status=?1,eligible=?2,summary=?3 WHERE id=?4",
+                            params![outcome.status, outcome.eligible, outcome.summary, id],
+                        )?;
+                    }
+                    Some(id)
+                }
+            } else {
+                // A copy that ends before its first periodic save, as most
+                // do, writes its whole row at once.
+                let key = context.as_ref().map(|(_, key)| *key);
+                create.execute(params![
+                    self.day,
+                    today,
+                    crate::identity::build(),
+                    self.lost,
+                    context.as_ref().map_or("{}", |(json, _)| json),
+                    key.map(|key| &key.route),
+                    key.and_then(|key| key.source_filesystem.as_ref()),
+                    key.and_then(|key| key.destination_filesystem.as_ref()),
+                    key.map(|key| &key.mode),
+                    outcome.map_or("incomplete", |outcome| outcome.status),
+                    outcome.map_or(0, |outcome| outcome.eligible),
+                    outcome.map(|outcome| &outcome.summary),
                 ])?;
+                Some(transaction.last_insert_rowid())
+            };
+            if let Some(id) = id {
+                for (sequence, elapsed_us, data, observation) in &events {
+                    if let Some(o) = observation {
+                        measurement.execute(params![
+                            id,
+                            sequence,
+                            elapsed_us,
+                            o.segment,
+                            o.workers as i64,
+                            o.seconds,
+                            o.rate,
+                            o.usable
+                        ])?;
+                    }
+                    insert.execute(params![id, sequence, elapsed_us, data])?;
+                }
+                transaction.commit()?;
             }
-        }
-        transaction.execute(
-            "UPDATE runs SET lost=?1,updated_day=?3 WHERE id=?2",
-            params![self.lost, self.id, day()],
-        )?;
+            id
+        };
+        let Some(id) = id else {
+            // An earlier save's row is gone, and nothing was written.
+            self.abandon();
+            return Ok(());
+        };
+        self.id = Some(id);
+        self.pending.clear();
+        self.pending_context = None;
+        self.next_write = Instant::now() + WRITE_INTERVAL;
         Ok(())
     }
 
-    fn mark_flushed(&mut self) {
+    /// Stop recording a run that is no longer in the history: another copy
+    /// pruned it to keep the history within its budget, or the user cleared
+    /// the history. Its remaining events could only fail, each taking the
+    /// writer lock that other copies wait for.
+    fn abandon(&mut self) {
         self.pending.clear();
         self.pending_context = None;
-        self.last_flush = Instant::now();
+        self.finished = true;
     }
 
     fn finish(&mut self, success: bool, summary: Value) -> Result<()> {
-        let summary = serde_json::to_string(&summary)?;
         // The `workers` column and the older `eligible` values belong to
         // runs from earlier releases; this build leaves `workers` unset.
-        let eligibility = if success && self.lost == 0 && self.measurements.reusable() {
-            inference::MEASUREMENTS
-        } else {
-            0
+        let outcome = Outcome {
+            status: if success { "success" } else { "failed" },
+            eligible: if success && self.lost == 0 && self.measurements.reusable() {
+                inference::MEASUREMENTS
+            } else {
+                0
+            },
+            summary: serde_json::to_string(&summary)?,
         };
-        // Pay at most one small lock wait for the entire final save. Once the
-        // immediate transaction owns the writer lock, samples, context and the
-        // outcome commit together without per-statement busy waits.
-        self.db.busy_timeout(FINISH_LOCK_WAIT)?;
-        let transaction = rusqlite::Transaction::new_unchecked(
-            &self.db,
-            rusqlite::TransactionBehavior::Immediate,
-        );
-        self.db.busy_timeout(Duration::ZERO)?;
-        let transaction = transaction?;
-        self.write_pending(&transaction)?;
-        transaction.execute(
-            "UPDATE runs SET status=?1,eligible=?2,summary=?3,lost=?4 WHERE id=?5",
-            params![
-                if success { "success" } else { "failed" },
-                eligibility,
-                summary,
-                self.lost,
-                self.id
-            ],
-        )?;
-        transaction.commit()?;
-        self.mark_flushed();
+        // Pay at most one lock wait for the entire final save, no longer
+        // than the copy itself took. Once the transaction owns the writer
+        // lock, samples, context and the outcome commit together.
+        self.commit(finish_wait(self.start.elapsed()), Some(&outcome))?;
         // Maintenance is best effort and must not renew the lock-wait budget.
-        prune(&self.db, self.budget, self.id)?;
+        if let Some(id) = self.id.filter(|_| !self.finished) {
+            prune(&self.db, self.budget, id)?;
+        }
         Ok(())
     }
 }
 
+struct Outcome {
+    status: &'static str,
+    eligible: i64,
+    summary: String,
+}
+
+/// How long a copy that ran for `elapsed` waits to save its run.
+fn finish_wait(elapsed: Duration) -> Duration {
+    elapsed.min(FINISH_LOCK_WAIT)
+}
+
+/// Take the writer lock, trying for at most `wait` while other connections
+/// hold it. The connection itself waits for no lock, so this owns the wait
+/// and can bound it more finely than a busy timeout does.
+fn begin_within(db: &Connection, wait: Duration) -> Result<rusqlite::Transaction<'_>> {
+    let deadline = Instant::now() + wait;
+    let mut pause = Duration::from_micros(100);
+    loop {
+        match rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate) {
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::DatabaseBusy && Instant::now() < deadline =>
+            {
+                std::thread::sleep(pause.min(deadline.saturating_duration_since(Instant::now())));
+                pause = (pause * 2).min(Duration::from_millis(2));
+            }
+            result => return Ok(result?),
+        }
+    }
+}
+
+/// The key that makes this history's tokens, created with the history.
+fn identity_key(db: &Connection) -> Result<[u8; 32]> {
+    let read = || {
+        db.query_row(
+            "SELECT value FROM metadata WHERE key='identity_key'",
+            [],
+            |r| r.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+    };
+    let key = match read()? {
+        Some(key) => key,
+        None => {
+            let mut generated = [0u8; 32];
+            getrandom::fill(&mut generated).context("create tuning history identity key")?;
+            // Another copy may be creating it too; all of them use the one
+            // that was stored first.
+            db.execute(
+                "INSERT OR IGNORE INTO metadata VALUES ('identity_key',?1)",
+                [generated.as_slice()],
+            )?;
+            read()?.context("history identity key missing")?
+        }
+    };
+    key.try_into()
+        .map_err(|_| anyhow::anyhow!("invalid history identity key"))
+}
+
 impl Drop for Writer {
     fn drop(&mut self) {
-        let _ = self.flush();
+        // A copy that ended has saved its run or given up on it.
+        if !self.finished {
+            let _ = self.save();
+        }
     }
 }
 
@@ -505,25 +655,33 @@ fn prune_within(db: &Connection, budget: u64, current: i64, time: Duration) -> R
     };
     let (mut size, mut free) = used()?;
     if size > budget {
-        // Delete the oldest runs, keeping the current run and recent
-        // incomplete ones, in batches sized from the estimated excess. A
-        // history far over its budget, as after the budget shrank, then
-        // shrinks over a few copies rather than slowing many.
-        // The estimate is redone after each batch, so batches stay sized
-        // when the oldest runs are smaller than average.
-        let mut runs: i64 = db.query_row("SELECT count(*) FROM runs", [], |r| r.get(0))?;
+        // Delete a little more than the excess, so that the copies which
+        // follow find the history within its budget and only read its size.
+        // A history far over its budget, as after the budget shrank, shrinks
+        // over several copies, each spending about `time`.
+        let target = budget - budget / PRUNE_SLACK;
+        // Nothing here counts or scans the runs: each step sizes the next
+        // from the space it freed, growing at most fourfold in case the
+        // oldest runs are smaller than the ones behind them.
+        let mut batch = 1;
         loop {
-            let excess = i128::from(runs) * i128::from(size - budget) / i128::from(size);
-            let batch = excess.clamp(1, PRUNE_BATCH) as i64;
-            let deleted = db.execute(
-                "DELETE FROM runs WHERE id IN (SELECT id FROM runs WHERE id!=?1 AND (status!='incomplete' OR updated_day<?2) ORDER BY id LIMIT ?3)",
-                params![current, day().saturating_sub(2), batch],
-            )?;
-            runs -= deleted as i64;
-            (size, free) = used()?;
-            if deleted == 0 || size <= budget || Instant::now() >= deadline {
+            let runs = prunable(db, current, batch)?;
+            if runs.is_empty() {
                 break;
             }
+            let before = size;
+            let deleted = delete_runs(db, &runs, deadline)? as i128;
+            (size, free) = used()?;
+            if size <= target || Instant::now() >= deadline {
+                break;
+            }
+            let freed = i128::from(before - size);
+            let needed = if freed > 0 {
+                (deleted * i128::from(size - target) + freed - 1) / freed
+            } else {
+                deleted * 2
+            };
+            batch = needed.clamp(1, (batch * 4).min(PRUNE_BATCH) as i128) as usize;
         }
     }
     if size <= budget && free > budget {
@@ -531,13 +689,70 @@ fn prune_within(db: &Connection, budget: u64, current: i64, time: Duration) -> R
         // the free space, which a gradual reclaim would have to move
         // around. This happens once after a large shrink.
         db.execute_batch("VACUUM;")?;
-    } else if size <= budget {
-        // Each step of this pragma frees one page; run it to completion.
-        let mut vacuum = db.prepare("PRAGMA incremental_vacuum(256)")?;
+    } else if size <= budget && size + free > budget {
+        // Later runs reuse free pages, so return only the ones that keep the
+        // file over the budget. Each step of this pragma moves one page and
+        // commits when the statement is dropped, so the same deadline bounds
+        // it and the copies which follow finish the rest.
+        let pages = (size + free - budget + page_size - 1) / page_size;
+        let mut vacuum = db.prepare(&format!("PRAGMA incremental_vacuum({pages})"))?;
         let mut rows = vacuum.raw_query();
-        while rows.next()?.is_some() {}
+        while Instant::now() < deadline && rows.next()?.is_some() {}
     }
     Ok(())
+}
+
+/// Up to `batch` of the oldest runs to delete, never `current`.
+///
+/// A run that finished, or one left incomplete more than two days ago, can
+/// go. Among the `PRUNE_WINDOW` oldest runs these go first, so an incomplete
+/// run that a long copy may still be recording outlives them. Copies whose
+/// final save found the history locked, and copies that were killed, leave
+/// incomplete runs that never finish. Once such runs are all that the window
+/// holds, the oldest of them go too, except the `ACTIVE_RUNS` started last.
+/// Without that a history filled by them would stay over its budget, and
+/// would cost every copy this search.
+fn prunable(db: &Connection, current: i64, batch: usize) -> Result<Vec<i64>> {
+    let mut oldest = db.prepare_cached(
+        "SELECT id, status='incomplete' AND updated_day>=?2 FROM runs
+         WHERE id!=?1 ORDER BY id LIMIT ?3",
+    )?;
+    let mut rows = oldest.query(params![current, day().saturating_sub(2), PRUNE_WINDOW])?;
+    let settled = current.saturating_sub(ACTIVE_RUNS);
+    let (mut runs, mut recent) = (Vec::new(), Vec::new());
+    while let Some(row) = rows.next()? {
+        let (id, may_be_active): (i64, bool) = (row.get(0)?, row.get(1)?);
+        if !may_be_active {
+            runs.push(id);
+            if runs.len() == batch {
+                break;
+            }
+        } else if id < settled && recent.len() < batch {
+            recent.push(id);
+        }
+    }
+    Ok(if runs.is_empty() { recent } else { runs })
+}
+
+/// Delete `runs` with their events in one transaction, stopping early at
+/// `deadline`. Returns how many were deleted.
+fn delete_runs(db: &Connection, runs: &[i64], deadline: Instant) -> Result<usize> {
+    // Another run holding the writer lock fails this at once, and a later
+    // copy prunes instead.
+    let transaction =
+        rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)?;
+    let mut deleted = 0;
+    {
+        let mut delete = transaction.prepare_cached("DELETE FROM runs WHERE id=?1")?;
+        for run in runs {
+            deleted += delete.execute([run])?;
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+    }
+    transaction.commit()?;
+    Ok(deleted)
 }
 
 fn diagnostic(error: &anyhow::Error) {

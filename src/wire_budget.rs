@@ -11,7 +11,18 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 pub(crate) const MEMORY_LIMIT: usize = 512 << 20;
+/// A message's first reservation: at least a decoded `Request` or
+/// `Response` (a few hundred bytes, in a queue slot allocated with its
+/// channel). A queued acknowledgment, matched range or data block, whose
+/// data is not counted, costs the allowance this rather than a whole
+/// granule. A message counted for more, such as one with two or more
+/// digests or a file's metadata, reserves granules, as before.
+const MESSAGE_RESERVATION: usize = 1 << 10;
+/// Reservations beyond a message's first grow in granules, so that a large
+/// collection updates the shared count once per granule, not per element.
 const RESERVATION_GRANULE: usize = 64 << 10;
+const _: () = assert!(std::mem::size_of::<crate::proto::Request>() <= MESSAGE_RESERVATION);
+const _: () = assert!(std::mem::size_of::<crate::proto::Response>() <= MESSAGE_RESERVATION);
 /// Decompressed bytes beyond the bytes that arrived, across the frames a
 /// server's connections hold. Without it, a peer could make each queued
 /// frame hold up to `MAX_FRAME` for a few bytes sent.
@@ -173,11 +184,14 @@ impl Hold {
         };
         let used = self.used.checked_add(bytes).ok_or_else(exhausted)?;
         if used > self.reserved {
-            let wanted = used
-                .checked_add(RESERVATION_GRANULE - 1)
-                .ok_or_else(exhausted)?
-                / RESERVATION_GRANULE
-                * RESERVATION_GRANULE;
+            let wanted = if used <= MESSAGE_RESERVATION {
+                MESSAGE_RESERVATION
+            } else {
+                used.checked_add(RESERVATION_GRANULE - 1)
+                    .ok_or_else(exhausted)?
+                    / RESERVATION_GRANULE
+                    * RESERVATION_GRANULE
+            };
             let extra = wanted - self.reserved;
             self.budget
                 .used
@@ -635,7 +649,74 @@ mod tests {
         assert!(
             matches!(decoded.value, crate::proto::Response::Block { data, .. } if data.len() == 8 << 20)
         );
-        assert_eq!(shared.used.load(Relaxed), RESERVATION_GRANULE);
+        assert_eq!(shared.used.load(Relaxed), MESSAGE_RESERVATION);
+    }
+
+    #[test]
+    fn every_reply_queue_of_many_workers_fits_the_allowance() {
+        // Each of 64 workers' two connections queues up to 256 replies, such
+        // as a stream's pieces read from its source and their
+        // acknowledgments, or a comparison's matched ranges: 32,768 queued
+        // replies, each holding a few hundred bytes. Each reserves what it
+        // holds, not a 64 KiB granule, which would have used up the
+        // allowance at 8,192.
+        use crate::proto::Response;
+        let replies = [
+            Response::Ok,
+            Response::Block {
+                off: 0,
+                hash: Default::default(),
+                data: vec![7; 16],
+            },
+            Response::RangeMatched {
+                off: 0,
+                len: 1 << 16,
+            },
+        ]
+        .map(|reply| postcard::to_stdvec(&reply).unwrap());
+        let shared = Arc::new(Budget {
+            used: AtomicUsize::new(0),
+            limit: MEMORY_LIMIT,
+        });
+        let queued = 64 * 2 * crate::transfer_tuning::COMPARE_REQUESTS;
+        let held: Vec<_> = (0..queued)
+            .map(|n| decode_with_hold::<Response>(&replies[n % replies.len()], hold(&shared)))
+            .collect::<io::Result<_>>()
+            .unwrap();
+        assert_eq!(shared.used.load(Relaxed), queued * MESSAGE_RESERVATION);
+        drop(held);
+        assert_eq!(shared.used.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn a_reply_counted_for_more_reserves_no_more_than_a_granule() {
+        // A patch's result, a file's metadata or two digests are counted
+        // for more than a first reservation; they reserve no more than one
+        // granule, as before.
+        use crate::proto::{Response, SmallPatched};
+        let shared = Arc::new(Budget {
+            used: AtomicUsize::new(0),
+            limit: MEMORY_LIMIT,
+        });
+        let counted = [
+            Response::PatchedBatch(vec![Ok(SmallPatched {
+                kept: false,
+                identity: None,
+                replaced: None,
+            })]),
+            Response::Stats(vec![None]),
+            Response::Hashes(vec![Default::default(); 2]),
+        ];
+        for reply in counted {
+            let bytes = postcard::to_stdvec(&reply).unwrap();
+            let held = decode_with_hold::<Response>(&bytes, hold(&shared)).unwrap();
+            let reserved = shared.used.load(Relaxed);
+            assert!(
+                held.hold.used > MESSAGE_RESERVATION && reserved <= RESERVATION_GRANULE,
+                "{reply:?}: {reserved}"
+            );
+            drop(held);
+        }
     }
 
     #[test]

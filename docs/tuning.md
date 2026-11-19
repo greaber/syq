@@ -53,7 +53,7 @@ Use these keys for `syq cp` with S3 endpoints:
 
 | Key | Default | Accepted values / meaning |
 |---|---|---|
-| `s3-requests` | Automatic | 1–65536 simultaneous data requests across objects; excludes metadata requests and idle sockets |
+| `s3-requests` | Automatic | 1–65536 simultaneous data requests across objects; excludes idle sockets and metadata requests, apart from each object's own metadata requests in a copy between buckets and the extra checks of unchanged objects described below |
 | `s3-objects` | Automatic | 1–65536 objects in progress, including preparation and finalization |
 | `s3-parts-per-object` | Automatic | 1–1024 simultaneous parts or ranges per object |
 | `s3-part-size` | 16 MiB for uploads, 8 MiB for downloads, 256 MiB for copies between buckets; adjusted for some providers and fast links | 5 MiB–5 GiB per upload part or download range. Larger parts take fewer requests; smaller ones let one object use more requests at once and resend less after a failure |
@@ -71,6 +71,14 @@ fixed, and unused slots can stay idle; to let syq choose counts under these
 ceilings, pass the same keys to `--resource-limits` instead. Part size grows
 when needed to stay within S3's limit of 10,000 parts per upload. For retries,
 see [`--s3-retries`](object-storage.md#retries).
+
+When most objects are already up to date, a copy mostly asks the service
+about each object and transfers little. Syq then checks more objects at once
+than it would transfer, for as long as that finds unchanged objects faster:
+up to 256 of these metadata requests, and fewer once the service asks it to
+slow down. Objects that do need a transfer still wait for their turn under
+the usual limits. Setting `s3-objects` turns this off, and `s3-requests` and
+an `s3-objects` ceiling bound these requests too.
 
 <a id="s3-streams"></a>
 
@@ -111,6 +119,16 @@ records can change between versions and are not part of the
 [automation results](automation.md) contract. Clearing history also resets
 remembered counts. When a server coordinates a copy, the history is on that
 server; S3 copies record none.
+
+A copy saves its timeline when it ends. One that runs for more than a second
+also saves it every few seconds along the way: it is listed as `incomplete`
+until it ends, and stays that way, with what it had saved, if it is
+interrupted. A copy interrupted in its first second leaves no record.
+Recording does not hold a copy up for long: when many copies end at the same
+moment, a copy waits for the others no longer than it ran itself, and never
+more than a tenth of a second. Then it gives up: a copy that had saved nothing
+yet leaves no record, which mostly happens to very short copies, and a longer
+one stays `incomplete`.
 
 The history holds opaque endpoint, filesystem, and network-address
 identifiers, the UTC date, copy settings, progress numbers, and tuning

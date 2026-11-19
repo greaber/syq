@@ -6329,6 +6329,67 @@ fn source_stat_batches_preserve_order_across_sizes() {
 }
 
 #[test]
+fn read_sources_are_rechecked_on_the_reading_thread() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let count = 2 * PAR_MIN;
+    for index in 0..count {
+        fs::write(temporary.path().join(format!("f{index}")), b"data").unwrap();
+    }
+    // The batches the calling thread hands to the pool while `request` runs.
+    let pooled = |request: &dyn Fn(Vec<RegisteredPath>) -> Request| {
+        let (mut worker, selections, _control) = registered_source_worker(&[temporary.path()]);
+        let sources = (0..count)
+            .map(|index| selections[0].join(format!("f{index}").as_bytes()).unwrap())
+            .collect();
+        let before = POOLED_BATCHES.get();
+        let entries: Vec<_> = match worker.handle(&request(sources)) {
+            Response::SmallBlocks(blocks) => blocks
+                .into_iter()
+                .map(|block| {
+                    let block = block.unwrap();
+                    assert_eq!(block.data, b"data");
+                    block.source
+                })
+                .collect(),
+            Response::Stats(entries) => entries,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(entries.len(), count);
+        assert!(entries
+            .iter()
+            .all(|entry| entry.as_ref().is_some_and(|entry| entry.size == 4)));
+        POOLED_BATCHES.get() - before
+    };
+    // The worker read every file itself before statting it again, which
+    // costs less than waking the pool.
+    assert_eq!(
+        pooled(&|sources| {
+            Request::ReadSmallBatch(
+                sources
+                    .into_iter()
+                    .map(|source| SmallRead {
+                        path: b"/display/path/is/not/authority".to_vec(),
+                        source: Some(source),
+                        attempt: 0,
+                        len: 4,
+                    })
+                    .collect(),
+            )
+        }),
+        0
+    );
+    // Sources nothing has read yet, such as a list's, share the pool.
+    assert_eq!(
+        pooled(&|sources| Request::StatMany {
+            paths: vec![b"/display/path/is/not/authority".to_vec(); sources.len()],
+            sources: Some(sources),
+            follow: false,
+        }),
+        1
+    );
+}
+
+#[test]
 fn source_stat_batches_isolate_roots_and_refresh_parents_between_requests() {
     let temporary = crate::test_support::tempdir().unwrap();
     let roots: Vec<_> = ["first", "second"]
@@ -8152,6 +8213,102 @@ fn late_close_is_reported_before_identity_conditioned_publication() {
         assert_eq!(fs::metadata(&target).unwrap().mtime(), before.mtime());
         assert_eq!(fs::read(&target).unwrap(), b"previous good copy");
     }
+}
+
+/// A written file is checked by closing a duplicate of its descriptor
+/// wherever a close can report a write error, and not on a root's own
+/// filesystem when its close reports none. A file on another device, or one
+/// whose device the caller does not know, is checked whatever it is on.
+#[cfg(target_os = "linux")]
+#[test]
+fn written_files_are_checked_at_close_only_where_a_close_reports() {
+    let closes = || super::partial::WRITER_CLOSES.replace(0);
+    let meta = Meta {
+        mode: 0o600,
+        uid: 0,
+        gid: 0,
+        mtime: 1_500_000_000,
+        mtime_nsec: 0,
+        inode_metadata: None,
+    };
+    let data = b"updated contents";
+    for (quiet, expected) in [(true, 0), (false, 1)] {
+        for (small, inplace) in [(true, false), (true, true), (false, false), (false, true)] {
+            let context = format!("quiet={quiet}, small={small}, inplace={inplace}");
+            let directory = crate::test_support::tempdir().unwrap();
+            let mut ops = destination_ops(directory.path());
+            ops.set_hash_policy(crate::hashing::HashPolicy::default());
+            ops.destination_root
+                .as_ref()
+                .unwrap()
+                .assume_quiet_close_for_test(quiet);
+            let copy_id = [84; 16];
+            closes();
+            if small {
+                ops.put_small(&SmallPut {
+                    path: b"target".to_vec(),
+                    copy_id,
+                    data: data.to_vec(),
+                    hash: content_digest(data),
+                    meta: meta.clone(),
+                    flags: flags::TIMES,
+                    inplace,
+                    condition: TargetCondition::Absent,
+                    replaces: false,
+                    scanned: crate::proto::ScannedDestination::Unknown,
+                })
+                .unwrap();
+            } else {
+                let partial = || PartialTarget {
+                    path: b"target",
+                    id: &copy_id,
+                };
+                ops.prepare(
+                    partial(),
+                    PrepareOptions {
+                        size: data.len() as u64,
+                        inplace,
+                        mode: 0o600,
+                        attempt: 0,
+                        create_if_missing: true,
+                        group: None,
+                        update: None,
+                    },
+                )
+                .unwrap();
+                ops.write_range(partial(), inplace, 0, 0, content_digest(data), data)
+                    .unwrap();
+                ops.finalize(
+                    b"target",
+                    inplace,
+                    &copy_id,
+                    &meta,
+                    flags::TIMES,
+                    TargetCondition::Absent,
+                )
+                .unwrap();
+            }
+            assert_eq!(closes(), expected, "{context}");
+            assert_eq!(
+                fs::read(directory.path().join("target")).unwrap(),
+                data,
+                "{context}"
+            );
+        }
+    }
+    let directory = crate::test_support::tempdir().unwrap();
+    let root = Root::open(directory.path()).unwrap();
+    root.assume_quiet_close_for_test(true);
+    let file = File::create(directory.path().join("file")).unwrap();
+    let dev = file.metadata().unwrap().dev();
+    let label = Path::new("file");
+    super::partial::check_written_file(&root, Some(dev), &file, label).unwrap();
+    assert_eq!(closes(), 0);
+    // Another filesystem beneath the root is not known to be the one read.
+    super::partial::check_written_file(&root, Some(dev + 1), &file, label).unwrap();
+    assert_eq!(closes(), 1);
+    super::partial::check_written_file(&root, None, &file, label).unwrap();
+    assert_eq!(closes(), 1);
 }
 
 #[cfg(all(target_os = "linux", debug_assertions))]

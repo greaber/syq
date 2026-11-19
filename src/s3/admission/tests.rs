@@ -126,8 +126,9 @@ async fn tuning_continues_while_an_old_job_is_still_pending() {
                 maximum: Some(16),
                 initial_probe_up: true,
                 requests: None,
+                checking: None,
             },
-            move |job| {
+            move |job, _| {
                 let active = active.clone();
                 let peak = copy_peak.clone();
                 let gate = copy_gate.clone();
@@ -507,8 +508,9 @@ async fn scheduler_learns_when_timer_processing_jitter_shortens_intervals() {
             maximum: Some(16),
             initial_probe_up: true,
             requests: None,
+            checking: None,
         },
-        |_| {
+        |_, _| {
             let active = active.clone();
             let peak = peak.clone();
             async move {
@@ -552,8 +554,9 @@ async fn adaptive_scheduler_grows_without_losing_or_duplicating_jobs() {
             maximum: Some(16),
             initial_probe_up: false,
             requests: None,
+            checking: None,
         },
-        |n| {
+        |n, _| {
             let active = active.clone();
             let peak = peak.clone();
             let seen = seen.clone();
@@ -588,8 +591,9 @@ async fn fixed_limit_and_failure_drain_started_jobs() {
             maximum: None,
             initial_probe_up: false,
             requests: None,
+            checking: None,
         },
-        |n| {
+        |n, _| {
             let started = started.clone();
             let finished = finished.clone();
             async move {
@@ -608,4 +612,396 @@ async fn fixed_limit_and_failure_drain_started_jobs() {
     assert!(error.to_string().contains("fixture failure"));
     assert_eq!(started.load(SeqCst), 2);
     assert_eq!(finished.load(SeqCst), 1);
+}
+
+/// Runs a copy whose objects take `check` to check and, when `transfers`
+/// selects them, claim a slot and take `transfer` more. Returns the peak
+/// number of objects in progress and of objects transferring, each as
+/// (first objects, objects from `late` on).
+async fn checked_copy(
+    jobs: usize,
+    concurrency: Concurrency,
+    late: usize,
+    transfers: impl Fn(usize) -> bool + Copy + Send + 'static,
+) -> ((usize, usize), (usize, usize)) {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let counters: Arc<[AtomicUsize; 6]> = Arc::default();
+    let seen = Arc::new((0..jobs).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>());
+    parallel((0..jobs).collect(), concurrency, |n, mut slot| {
+        let counters = counters.clone();
+        let seen = seen.clone();
+        async move {
+            let [active, transferring, peak, late_peak, transfer_peak, late_transfer_peak] =
+                &*counters;
+            let now = active.fetch_add(1, SeqCst) + 1;
+            if n >= late { late_peak } else { peak }.fetch_max(now, SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            seen[n].fetch_add(1, SeqCst);
+            let result = if transfers(n) {
+                slot.claim().await;
+                let now = transferring.fetch_add(1, SeqCst) + 1;
+                if n >= late {
+                    late_transfer_peak
+                } else {
+                    transfer_peak
+                }
+                .fetch_max(now, SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                transferring.fetch_sub(1, SeqCst);
+                Some(1024)
+            } else {
+                None
+            };
+            active.fetch_sub(1, SeqCst);
+            Ok(result)
+        }
+    })
+    .await
+    .unwrap();
+    assert!(seen.iter().all(|count| count.load(SeqCst) == 1));
+    let [active, transferring, peak, late_peak, transfer_peak, late_transfer_peak] = &*counters;
+    assert_eq!((active.load(SeqCst), transferring.load(SeqCst)), (0, 0));
+    (
+        (peak.load(SeqCst), late_peak.load(SeqCst)),
+        (transfer_peak.load(SeqCst), late_transfer_peak.load(SeqCst)),
+    )
+}
+
+fn checked(initial: usize, maximum: Option<usize>, checking: Option<usize>) -> Concurrency {
+    Concurrency {
+        initial,
+        maximum,
+        initial_probe_up: false,
+        requests: None,
+        checking: checking.map(|maximum| Checking {
+            maximum,
+            outage: Arc::default(),
+        }),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn unchanged_objects_are_checked_beyond_the_transfer_limit() {
+    // With or without a transfer controller, which unchanged objects give
+    // no samples.
+    for maximum in [None, Some(16)] {
+        let ((peak, _), _) =
+            checked_copy(20_000, checked(4, maximum, Some(64)), 20_000, |_| false).await;
+        assert!((33..=64).contains(&peak), "peak {peak}");
+    }
+    // Without a checking ceiling the transfer limit bounds them, as before.
+    let ((peak, _), _) = checked_copy(2_000, checked(4, None, None), 2_000, |_| false).await;
+    assert_eq!(peak, 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn transfers_keep_their_limit_while_more_objects_are_checked() {
+    // One object in 64 transfers: far fewer than the four slots can carry.
+    let ((peak, _), (transferring, _)) =
+        checked_copy(20_000, checked(4, None, Some(64)), 20_000, |n| n % 64 == 0).await;
+    assert!((33..=64).contains(&peak), "peak {peak}");
+    assert!(
+        (1..=4).contains(&transferring),
+        "transferring {transferring}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_copy_that_transfers_every_object_admits_none_beyond_the_limit() {
+    let ((peak, _), (transferring, _)) =
+        checked_copy(2_000, checked(4, None, Some(64)), 2_000, |_| true).await;
+    assert_eq!((peak, transferring), (4, 4));
+}
+
+#[tokio::test(start_paused = true)]
+async fn checking_returns_to_the_transfer_limit_once_objects_need_transfers() {
+    // Unchanged objects raise the number in progress; the changed ones
+    // that follow then queue for the four transfer slots.
+    let ((peak, late_peak), (_, transferring)) = checked_copy(
+        12_000,
+        checked(4, None, Some(64)),
+        // Leave the queue of checked objects time to drain.
+        9_000,
+        |n| n >= 8_000,
+    )
+    .await;
+    assert!((33..=64).contains(&peak), "peak {peak}");
+    assert_eq!((late_peak, transferring), (4, 4));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_transfer_limit_is_tuned_again_after_checking_falls_back() {
+    let ((peak, _), (_, transferring)) =
+        checked_copy(40_000, checked(4, Some(16), Some(64)), 8_000, |n| {
+            n >= 8_000
+        })
+        .await;
+    assert!((33..=64).contains(&peak), "peak {peak}");
+    // The controller raises the limit once transfers are what it measures.
+    assert!(
+        (5..=16).contains(&transferring),
+        "transferring {transferring}"
+    );
+}
+
+#[test]
+fn checking_searches_only_above_the_transfer_limit() {
+    for optimum in [1, 8, 32, 100, 256] {
+        let mut controller = Controller::checking(32, 256);
+        for _ in 0..500 {
+            let active = controller.limit;
+            assert!((32..=256).contains(&active));
+            let rate = if active <= optimum {
+                active as f64
+            } else {
+                (optimum * optimum) as f64 / active as f64
+            };
+            controller.observe(rate, active, 10000, 16, 0.0);
+        }
+        let settled = controller
+            .probe
+            .as_ref()
+            .map_or(controller.limit, |probe| probe.from);
+        let expected = optimum.max(32);
+        assert!(
+            settled.abs_diff(expected) <= expected / 10,
+            "optimum {optimum}, settled {settled}"
+        );
+    }
+    // A ceiling at or below the transfer limit leaves nothing to search.
+    let mut controller = Controller::checking(32, 16);
+    for _ in 0..100 {
+        assert_eq!(controller.observe(16.0, 16, 10000, 16, 0.0), 16);
+    }
+}
+
+#[test]
+fn a_checking_increase_must_earn_a_quarter_of_its_share() {
+    // Checking 64 objects at once instead of 32 is kept for 28% more
+    // unchanged objects found, not for 22%; transfers keep a 2% gain.
+    for (rate_at_64, checking, kept) in
+        [(41.0, true, true), (39.0, true, false), (39.0, false, true)]
+    {
+        let mut controller = if checking {
+            Controller::checking(32, 256)
+        } else {
+            Controller::new(32, 256, true)
+        };
+        for _ in 0..200 {
+            let active = controller.limit;
+            let rate = 32.0 + (rate_at_64 - 32.0) * (active.min(64) as f64 - 32.0) / 32.0;
+            controller.observe(rate, active, 10000, 16, 0.0);
+        }
+        let settled = controller
+            .probe
+            .as_ref()
+            .map_or(controller.limit, |probe| probe.from);
+        assert_eq!(
+            settled >= 60,
+            kept,
+            "rate {rate_at_64}, checking {checking}: settled {settled}"
+        );
+    }
+}
+
+#[test]
+fn checking_follows_the_transfer_limit_until_it_has_grown() {
+    let mut controller = Controller::checking(32, 256);
+    controller.follow(64);
+    assert_eq!((controller.limit, controller.minimum), (64, 64));
+    controller.follow(16);
+    assert_eq!((controller.limit, controller.minimum), (16, 16));
+    // Grown beyond the transfer limit, it keeps its own limit while that
+    // limit moves beneath it, and starts again where it is overtaken.
+    exercise(&mut controller, 128);
+    let grown = controller.limit;
+    assert!(grown > 100);
+    controller.follow(32);
+    assert_eq!((controller.limit, controller.minimum), (grown, 32));
+    controller.follow(200);
+    assert_eq!((controller.limit, controller.minimum), (200, 200));
+    assert!(controller.probe.is_none());
+    // Above the ceiling there is nothing for it to add.
+    controller.follow(1000);
+    assert_eq!(controller.limit, 256);
+    controller.follow(1000);
+    assert_eq!(controller.limit, 256);
+}
+
+#[test]
+fn a_moving_transfer_limit_does_not_bring_a_rejected_increase_back() {
+    for transfers in [40, 24] {
+        let mut controller = Controller::checking(32, 256);
+        exercise(&mut controller, 256);
+        assert_eq!(controller.reject(), 32);
+        controller.follow(transfers);
+        assert_eq!(
+            (controller.limit, controller.minimum),
+            (transfers, transfers)
+        );
+        let mut waited = 0;
+        while controller.observe(transfers as f64, transfers, 10000, 16, 0.0) == transfers {
+            waited += 1;
+            assert!(waited < 200, "checking never retried");
+        }
+        assert!(waited >= 16, "retried after {waited} samples");
+    }
+}
+
+#[test]
+fn rejected_checking_returns_to_the_transfer_limit_and_retries_later() {
+    let mut controller = Controller::checking(32, 256);
+    exercise(&mut controller, 256);
+    assert!(controller.limit > 200);
+    assert_eq!(controller.reject(), 32);
+    assert!(controller.probe.is_none());
+    // The same conditions do not bring the increase back at once...
+    let mut waited = 0;
+    while controller.observe(32.0, 32, 10000, 16, 0.0) == 32 {
+        waited += 1;
+        assert!(waited < 200, "checking never retried");
+    }
+    assert!(waited >= 16, "retried after {waited} samples");
+    // ...and a retry that is rejected again waits longer.
+    assert_eq!(controller.reject(), 32);
+    let mut waited_again = 0;
+    while controller.observe(32.0, 32, 10000, 16, 0.0) == 32 {
+        waited_again += 1;
+        assert!(waited_again < 400, "checking never retried");
+    }
+    assert!(waited_again > waited, "{waited_again} after {waited}");
+    // Rejected at the transfer limit, it still puts the next increase off.
+    let mut idle = Controller::checking(32, 256);
+    assert_eq!(idle.reject(), 32);
+    for _ in 0..16 {
+        assert_eq!(idle.observe(32.0, 32, 10000, 16, 0.0), 32);
+    }
+}
+
+#[test]
+fn throttling_halves_the_room_checking_may_use() {
+    let mut controller = Controller::checking(32, 256);
+    exercise(&mut controller, 256);
+    let reached = controller.limit;
+    assert!(reached > 200);
+    // It continues from halfway, and never again goes higher.
+    let halved = 32 + (reached - 32) / 2;
+    assert_eq!(controller.throttled(), halved);
+    assert_eq!(controller.maximum, halved);
+    assert!(controller.probe.is_none());
+    for _ in 0..500 {
+        let active = controller.limit;
+        assert!((32..=halved).contains(&active));
+        controller.observe(active as f64, active, 10000, 16, 0.0);
+    }
+    assert!(controller.limit > halved * 9 / 10, "{}", controller.limit);
+    // Repeated throttling brings it down to the transfer limit, where it
+    // has no room left to give up.
+    for _ in 0..8 {
+        controller.throttled();
+    }
+    assert_eq!((controller.limit, controller.maximum), (32, 32));
+    for _ in 0..100 {
+        assert_eq!(controller.observe(32.0, 32, 10000, 16, 0.0), 32);
+    }
+    // Throttled before it has grown, it keeps its room and waits.
+    let mut idle = Controller::checking(32, 256);
+    assert_eq!(idle.throttled(), 32);
+    assert_eq!(idle.maximum, 256);
+    for _ in 0..16 {
+        assert_eq!(idle.observe(32.0, 32, 10000, 16, 0.0), 32);
+    }
+}
+
+#[test]
+fn a_waiter_that_gives_up_passes_its_transfer_slot_on() {
+    use std::{future::Future, task::Context};
+    let gate = Arc::new(Gate {
+        state: Mutex::new(GateState {
+            limit: 1,
+            active: 0,
+            waiting: 0,
+            waiting_since: None,
+        }),
+        changed: tokio::sync::Notify::new(),
+    });
+    let slot = || TransferSlot {
+        gate: gate.clone(),
+        held: false,
+    };
+    let waker = futures_util::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut holder = slot();
+    assert!(Box::pin(holder.claim()).as_mut().poll(&mut cx).is_ready());
+    // Claiming again neither waits nor takes a second slot.
+    assert!(Box::pin(holder.claim()).as_mut().poll(&mut cx).is_ready());
+    assert_eq!(gate.active(), 1);
+    // A limit is in force only while objects beyond it are in progress.
+    assert!(holder.beyond_limit());
+    gate.set_limit(usize::MAX);
+    assert!(!holder.beyond_limit());
+    gate.set_limit(1);
+    let (mut cancelled, mut next, mut last) = (slot(), slot(), slot());
+    {
+        let mut cancelled = Box::pin(cancelled.claim());
+        let mut next = Box::pin(next.claim());
+        assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+        assert!(next.as_mut().poll(&mut cx).is_pending());
+        drop(holder);
+        // The released slot woke the first waiter, which is dropped unpolled.
+        drop(cancelled);
+        assert!(next.as_mut().poll(&mut cx).is_ready());
+    }
+    assert_eq!(gate.active(), 1);
+    // A later object does not overtake one already waiting.
+    {
+        let mut last = Box::pin(last.claim());
+        assert!(last.as_mut().poll(&mut cx).is_pending());
+        gate.set_limit(2);
+        let mut overtaking = slot();
+        let mut overtaking = Box::pin(overtaking.claim());
+        assert!(overtaking.as_mut().poll(&mut cx).is_pending());
+        assert!(last.as_mut().poll(&mut cx).is_ready());
+    }
+    drop((next, last));
+    assert_eq!(gate.active(), 0);
+    assert_eq!(gate.state.lock().unwrap().waiting, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn throttling_responses_stop_checking_from_adding_requests() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    // (objects in progress above which the service throttles, expected peak)
+    for (threshold, expected) in [(0, 4..=4), (16, 17..=32)] {
+        let outage = Arc::new(crate::s3::outage::Outage::default());
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut concurrency = checked(4, None, Some(64));
+        concurrency.checking.as_mut().unwrap().outage = outage.clone();
+        parallel((0..40_000).collect(), concurrency, |_: usize, _| {
+            let (outage, active, peak) = (outage.clone(), active.clone(), peak.clone());
+            async move {
+                let now = active.fetch_add(1, SeqCst) + 1;
+                peak.fetch_max(now, SeqCst);
+                if now > threshold {
+                    outage.throttled();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                active.fetch_sub(1, SeqCst);
+                Ok(None)
+            }
+        })
+        .await
+        .unwrap();
+        let peak = peak.load(SeqCst);
+        assert!(
+            expected.contains(&peak),
+            "threshold {threshold}: peak {peak}"
+        );
+        if threshold != 0 {
+            // Each sample above the threshold halves how far checking goes.
+            let throttled = outage.throttled_responses();
+            assert!((1..1_000).contains(&throttled), "throttled {throttled}");
+        }
+    }
 }

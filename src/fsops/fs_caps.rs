@@ -22,6 +22,10 @@
 //! type, mount options, and on macOS the capabilities a volume advertises.
 //! It is read when a publication first needs it and cached per mount or
 //! volume. Nothing is probed.
+//!
+//! Whether a close can report a write error (`TypeFacts::quiet_close`) is
+//! kept out of the profile: a wrong answer there hides a failed write, so
+//! each destination root reads it from its own filesystem.
 
 use std::fs::File;
 use std::io;
@@ -237,6 +241,19 @@ pub(crate) struct TypeFacts {
     pub(crate) direct_io_tested: bool,
     /// Replacing files is bounded per filesystem (`Root::replacement_turn`).
     pub(crate) bounds_replacement: bool,
+    /// Closing a descriptor reports no write error here, so a written file
+    /// need not be checked by closing a duplicate of its descriptor
+    /// (`Root::close_reports_writes_on`). `close` returns only what the
+    /// filesystem's `flush` file operation returns (`filp_flush` in
+    /// fs/open.c). NFS, SMB, FUSE and OrangeFS write out there and report
+    /// what failed, and overlayfs and eCryptfs pass on what the filesystem
+    /// below them reports. This is set only for local types whose file
+    /// operations have no `flush`, read in Linux 4.19, 5.4, 6.12 and 7.2
+    /// where each exists and in OpenZFS 2.4 (`zpl_file_operations`), and
+    /// for f2fs, whose `f2fs_file_flush` only rolls back an exiting
+    /// process's atomic write and returns 0. Set it for each type by name,
+    /// never through a shared base: overlayfs shares one with them.
+    pub(crate) quiet_close: bool,
 }
 
 /// A filesystem type syq knows nothing about.
@@ -255,6 +272,7 @@ pub(crate) const UNKNOWN_TYPE: TypeFacts = TypeFacts {
     measured_local_source: false,
     direct_io_tested: false,
     bounds_replacement: true,
+    quiet_close: false,
 };
 
 /// A filesystem whose rename handler refuses the flags it lacks, with
@@ -345,6 +363,7 @@ const KNOWN_TYPES: [TypeFacts; 31] = [
         local_userspace_copy: true,
         measured_local_source: true,
         direct_io_tested: true,
+        quiet_close: true,
         ..LOCAL_TYPE
     },
     // xfs_vn_rename. XFS frees inodes per allocation group and replaces
@@ -356,12 +375,14 @@ const KNOWN_TYPES: [TypeFacts; 31] = [
         measured_local_source: true,
         direct_io_tested: true,
         bounds_replacement: false,
+        quiet_close: true,
         ..LOCAL_TYPE
     },
     // btrfs_rename2
     TypeFacts {
         magic: BTRFS_SUPER_MAGIC,
         kind: "btrfs",
+        quiet_close: true,
         ..LOCAL_TYPE
     },
     // shmem_rename2
@@ -369,6 +390,7 @@ const KNOWN_TYPES: [TypeFacts; 31] = [
         magic: TMPFS_MAGIC,
         kind: "tmpfs",
         local_userspace_copy: true,
+        quiet_close: true,
         ..LOCAL_TYPE
     },
     // ovl_rename_start
@@ -383,12 +405,14 @@ const KNOWN_TYPES: [TypeFacts; 31] = [
         magic: ZFS_SUPER_MAGIC,
         kind: "zfs",
         serialized_writes: false,
+        quiet_close: true,
         ..LOCAL_TYPE
     },
     TypeFacts {
         magic: F2FS_SUPER_MAGIC,
         kind: "f2fs",
         leases_show_writers: false,
+        quiet_close: true,
         ..LOCAL_TYPE
     },
     TypeFacts {
@@ -396,6 +420,7 @@ const KNOWN_TYPES: [TypeFacts; 31] = [
         kind: "ntfs3",
         owners: Owners::Fixed,
         links: Links::Trusted,
+        quiet_close: true,
         ..REFUSES_RENAME_FLAGS
     },
     TypeFacts {
@@ -403,6 +428,7 @@ const KNOWN_TYPES: [TypeFacts; 31] = [
         kind: "exfat",
         owners: Owners::Fixed,
         links: Links::OneNameEach,
+        quiet_close: true,
         ..REFUSES_RENAME_FLAGS
     },
     // vfat_rename2, msdos_rename. FAT keeps modification times in
@@ -413,6 +439,7 @@ const KNOWN_TYPES: [TypeFacts; 31] = [
         kind: FAT_KIND,
         owners: Owners::Fixed,
         links: Links::OneNameEach,
+        quiet_close: true,
         ..REFUSES_RENAME_FLAGS
     },
     of_type(0x4244, REFUSES_RENAME_FLAGS),      // HFS
@@ -1176,7 +1203,8 @@ mod tests {
     /// replaced gave it. Columns: type, reported kind; network, leases show
     /// writers, owners reported faithfully, owners fixed, owners decided
     /// by the mount; userspace copy ranges, measured local source, direct
-    /// I/O tested, replacement bounded; then the profile on a mount without
+    /// I/O tested, replacement bounded, a close that reports no write
+    /// error; then the profile on a mount without
     /// `nocto` or `ino32`: exchange, atomic no-replace rename, hard links,
     /// link counts trusted, symlink times, two-second times, audited,
     /// serialized writes.
@@ -1193,47 +1221,48 @@ mod tests {
         u8,
         u8,
         u8,
+        u8,
         [u8; 8],
     );
 
     #[cfg(target_os = "linux")]
     #[rustfmt::skip]
     const PINNED: [PinnedRow; 35] = [
-    (0x0000ef53, "ext", 0, 1, 1, 0, 0, 1, 1, 1, 1, [1, 1, 1, 1, 1, 0, 1, 1]),
-    (0x58465342, "xfs", 0, 1, 1, 0, 0, 1, 1, 1, 0, [1, 1, 1, 1, 1, 0, 1, 1]),
-    (0x9123683e, "btrfs", 0, 1, 1, 0, 0, 0, 0, 0, 1, [1, 1, 1, 1, 1, 0, 1, 1]),
-    (0x01021994, "tmpfs", 0, 1, 1, 0, 0, 1, 0, 0, 1, [1, 1, 1, 1, 1, 0, 1, 1]),
-    (0x794c7630, "overlay", 0, 0, 1, 0, 0, 0, 0, 0, 1, [1, 1, 1, 1, 1, 0, 1, 1]),
-    (0x2fc12fc1, "zfs", 0, 1, 1, 0, 0, 0, 0, 0, 1, [1, 1, 1, 1, 1, 0, 1, 0]),
-    (0xf2f52010, "f2fs", 0, 0, 1, 0, 0, 0, 0, 0, 1, [1, 1, 1, 1, 1, 0, 1, 1]),
-    (0x7366746e, "ntfs3", 0, 0, 0, 1, 0, 0, 0, 0, 1, [1, 1, 1, 1, 1, 0, 1, 1]),
-    (0x2011bab0, "exfat", 0, 0, 0, 1, 0, 0, 0, 0, 1, [1, 1, 0, 1, 0, 0, 1, 1]),
-    (0x00004d44, "fat", 0, 0, 0, 1, 0, 0, 0, 0, 1, [1, 1, 0, 1, 0, 1, 1, 1]),
-    (0x00004244, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, [1, 1, 1, 0, 0, 0, 1, 1]),
-    (0x0000482b, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, [1, 1, 1, 0, 0, 0, 1, 1]),
-    (0x3153464a, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, [1, 1, 1, 0, 0, 0, 1, 1]),
-    (0x00003434, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, [1, 1, 1, 0, 0, 0, 1, 1]),
-    (0x15013346, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, [1, 1, 1, 0, 0, 0, 1, 1]),
-    (0x00011954, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, [1, 1, 1, 0, 0, 0, 1, 1]),
-    (0x7461636f, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, [0, 0, 1, 0, 0, 0, 1, 1]),
-    (0x01161970, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, [1, 0, 1, 0, 0, 0, 1, 1]),
-    (0x00c36400, "ceph", 1, 0, 0, 0, 0, 0, 0, 0, 1, [0, 0, 1, 1, 1, 0, 1, 1]),
-    (0x00006969, "nfs", 1, 0, 0, 0, 0, 0, 0, 0, 1, [0, 0, 1, 1, 1, 0, 1, 1]),
-    (0xff534d42, "other", 1, 0, 0, 1, 0, 0, 0, 0, 1, [1, 0, 1, 0, 0, 0, 1, 1]),
-    (0xfe534d42, "other", 1, 0, 0, 1, 0, 0, 0, 0, 1, [1, 0, 1, 0, 0, 0, 1, 1]),
-    (0x01021997, "other", 0, 0, 0, 0, 1, 0, 0, 0, 1, [0, 0, 1, 0, 0, 0, 1, 1]),
-    (0x6b414653, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, [1, 1, 1, 0, 0, 0, 1, 1]),
-    (0x5346414f, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, [1, 1, 1, 0, 0, 0, 1, 1]),
-    (0x24051905, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, [1, 1, 1, 0, 0, 0, 1, 1]),
-    (0x000072b6, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, [1, 1, 1, 0, 0, 0, 1, 1]),
-    (0x73757245, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, [0, 0, 1, 0, 0, 0, 1, 1]),
-    (0x786f4256, "other", 0, 0, 0, 1, 0, 0, 0, 0, 1, [0, 0, 1, 0, 0, 0, 1, 1]),
-    (0x65735546, "other", 1, 0, 0, 0, 1, 0, 0, 0, 1, [0, 0, 1, 0, 0, 0, 0, 1]),
-    (0x0000517b, "other", 1, 0, 0, 1, 0, 0, 0, 0, 1, [0, 0, 1, 0, 0, 0, 0, 1]),
-    (0x00009fa0, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, [0, 0, 1, 0, 0, 0, 0, 1]),
-    (0x5346544e, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, [0, 0, 1, 0, 0, 0, 0, 1]),
-    (0xca451a4e, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, [0, 0, 1, 0, 0, 0, 0, 1]),
-    (0x12345678, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, [0, 0, 1, 0, 0, 0, 0, 1]),
+    (0x0000ef53, "ext", 0, 1, 1, 0, 0, 1, 1, 1, 1, 1, [1, 1, 1, 1, 1, 0, 1, 1]),
+    (0x58465342, "xfs", 0, 1, 1, 0, 0, 1, 1, 1, 0, 1, [1, 1, 1, 1, 1, 0, 1, 1]),
+    (0x9123683e, "btrfs", 0, 1, 1, 0, 0, 0, 0, 0, 1, 1, [1, 1, 1, 1, 1, 0, 1, 1]),
+    (0x01021994, "tmpfs", 0, 1, 1, 0, 0, 1, 0, 0, 1, 1, [1, 1, 1, 1, 1, 0, 1, 1]),
+    (0x794c7630, "overlay", 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, [1, 1, 1, 1, 1, 0, 1, 1]),
+    (0x2fc12fc1, "zfs", 0, 1, 1, 0, 0, 0, 0, 0, 1, 1, [1, 1, 1, 1, 1, 0, 1, 0]),
+    (0xf2f52010, "f2fs", 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, [1, 1, 1, 1, 1, 0, 1, 1]),
+    (0x7366746e, "ntfs3", 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, [1, 1, 1, 1, 1, 0, 1, 1]),
+    (0x2011bab0, "exfat", 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, [1, 1, 0, 1, 0, 0, 1, 1]),
+    (0x00004d44, "fat", 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, [1, 1, 0, 1, 0, 1, 1, 1]),
+    (0x00004244, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [1, 1, 1, 0, 0, 0, 1, 1]),
+    (0x0000482b, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [1, 1, 1, 0, 0, 0, 1, 1]),
+    (0x3153464a, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [1, 1, 1, 0, 0, 0, 1, 1]),
+    (0x00003434, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [1, 1, 1, 0, 0, 0, 1, 1]),
+    (0x15013346, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [1, 1, 1, 0, 0, 0, 1, 1]),
+    (0x00011954, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [1, 1, 1, 0, 0, 0, 1, 1]),
+    (0x7461636f, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [0, 0, 1, 0, 0, 0, 1, 1]),
+    (0x01161970, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [1, 0, 1, 0, 0, 0, 1, 1]),
+    (0x00c36400, "ceph", 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, [0, 0, 1, 1, 1, 0, 1, 1]),
+    (0x00006969, "nfs", 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, [0, 0, 1, 1, 1, 0, 1, 1]),
+    (0xff534d42, "other", 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, [1, 0, 1, 0, 0, 0, 1, 1]),
+    (0xfe534d42, "other", 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, [1, 0, 1, 0, 0, 0, 1, 1]),
+    (0x01021997, "other", 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, [0, 0, 1, 0, 0, 0, 1, 1]),
+    (0x6b414653, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [1, 1, 1, 0, 0, 0, 1, 1]),
+    (0x5346414f, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [1, 1, 1, 0, 0, 0, 1, 1]),
+    (0x24051905, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [1, 1, 1, 0, 0, 0, 1, 1]),
+    (0x000072b6, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [1, 1, 1, 0, 0, 0, 1, 1]),
+    (0x73757245, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [0, 0, 1, 0, 0, 0, 1, 1]),
+    (0x786f4256, "other", 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, [0, 0, 1, 0, 0, 0, 1, 1]),
+    (0x65735546, "other", 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, [0, 0, 1, 0, 0, 0, 0, 1]),
+    (0x0000517b, "other", 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, [0, 0, 1, 0, 0, 0, 0, 1]),
+    (0x00009fa0, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [0, 0, 1, 0, 0, 0, 0, 1]),
+    (0x5346544e, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [0, 0, 1, 0, 0, 0, 0, 1]),
+    (0xca451a4e, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [0, 0, 1, 0, 0, 0, 0, 1]),
+    (0x12345678, "other", 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, [0, 0, 1, 0, 0, 0, 0, 1]),
     ];
 
     #[cfg(target_os = "linux")]
@@ -1251,6 +1280,7 @@ mod tests {
             measured,
             direct,
             bounds,
+            quiet,
             profile,
         ) in PINNED
         {
@@ -1269,6 +1299,7 @@ mod tests {
                     bit(facts.measured_local_source),
                     bit(facts.direct_io_tested),
                     bit(facts.bounds_replacement),
+                    bit(facts.quiet_close),
                     [
                         bit(read.exchange),
                         bit(read.atomic_no_replace_rename),
@@ -1282,7 +1313,7 @@ mod tests {
                 ),
                 (
                     kind, network, leases, faithful, fixed, by_mount, userspace, measured, direct,
-                    bounds, profile
+                    bounds, quiet, profile
                 ),
                 "{magic:#x}"
             );
@@ -1416,6 +1447,48 @@ mod tests {
             assert_eq!(Profile::from_bits(bits).to_bits(), bits);
         }
         assert_eq!(Profile::from_bits(Profile::LOCAL.to_bits()), Profile::LOCAL);
+    }
+
+    /// A close is trusted to report nothing on exactly the local types
+    /// audited for it. Every filesystem that flushes at close, or sits on
+    /// one that may, and every type not listed keeps the check of its
+    /// writes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_close_is_quiet_only_on_the_audited_local_types() {
+        let mut quiet: Vec<u32> = KNOWN_TYPES
+            .iter()
+            .filter(|facts| facts.quiet_close)
+            .map(|facts| facts.magic)
+            .collect();
+        quiet.sort_unstable();
+        let mut audited = [
+            EXT_SUPER_MAGIC,
+            XFS_SUPER_MAGIC,
+            BTRFS_SUPER_MAGIC,
+            TMPFS_MAGIC,
+            ZFS_SUPER_MAGIC,
+            F2FS_SUPER_MAGIC,
+            NTFS3_SUPER_MAGIC,
+            EXFAT_SUPER_MAGIC,
+            FAT_SUPER_MAGIC,
+        ];
+        audited.sort_unstable();
+        assert_eq!(quiet, audited);
+        for checked in [
+            NFS_SUPER_MAGIC,
+            FUSE_SUPER_MAGIC,
+            CIFS_SUPER_MAGIC,
+            SMB2_SUPER_MAGIC,
+            OVERLAYFS_SUPER_MAGIC,
+            CEPH_SUPER_MAGIC,
+            V9FS_MAGIC,
+            libc::ECRYPTFS_SUPER_MAGIC as u32,
+            0x2011_3221, // OrangeFS
+            0x1234_5678,
+        ] {
+            assert!(!type_facts(checked).quiet_close, "{checked:#x}");
+        }
     }
 
     /// A macOS volume's rename flags are tried only on volume types where
