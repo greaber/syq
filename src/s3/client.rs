@@ -279,6 +279,9 @@ impl RequestFailure {
     pub(super) fn region_mismatch(&self) -> bool {
         self.status == Some(301) && self.region.is_some()
     }
+    pub(super) fn denied(&self) -> bool {
+        self.status == Some(403)
+    }
 }
 impl std::fmt::Display for RequestFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

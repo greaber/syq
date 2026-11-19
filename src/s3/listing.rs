@@ -102,6 +102,20 @@ pub(crate) fn run(args: &[OsString]) -> Result<i32> {
                 },
             )
             .await
+            .map_err(|error| {
+                // A policy may allow listing only the prefix itself, and the
+                // listings of narrower prefixes that divide it are refused.
+                let denied = error
+                    .downcast_ref::<super::client::RequestFailure>()
+                    .is_some_and(super::client::RequestFailure::denied);
+                if denied && command.concurrency > 1 {
+                    error.context(
+                        "if only the prefix itself may be listed, rerun with --concurrency 1",
+                    )
+                } else {
+                    error
+                }
+            })
         })?;
     Ok(0)
 }
@@ -125,8 +139,8 @@ pub(super) fn lists_in_key_order(bucket: &str) -> bool {
 /// returns keys in UTF-8 byte order. `None` is the AWS endpoint the SDK
 /// chooses.
 ///
-/// Only AWS documents it: "List results are always returned in UTF-8 binary
-/// order" (https://docs.aws.amazon.com/AmazonS3/latest/userguide/ListingKeysUsingAPIs.html),
+/// Of the providers checked, only AWS documents it: "List results are always
+/// returned in UTF-8 binary order" (https://docs.aws.amazon.com/AmazonS3/latest/userguide/ListingKeysUsingAPIs.html),
 /// for general purpose buckets. Directory buckets are not in lexicographic
 /// order (https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html),
 /// and Object Lambda access points can return a LIST response of their own
@@ -199,8 +213,12 @@ fn aws_endpoint(endpoint: &str) -> bool {
     let Ok(url) = url::Url::parse(endpoint) else {
         return false;
     };
-    // A path would come before the bucket's: another bucket, and a key.
-    if url.path() != "/" {
+    // A path would come before the bucket's: another bucket, and a key. The
+    // SDK sends the path as given, so check it before any normalization.
+    let path = endpoint.split_once("://").map_or("", |(_, rest)| {
+        rest.find(['/', '\\']).map_or("", |at| &rest[at..])
+    });
+    if !matches!(path, "" | "/") {
         return false;
     }
     let Some(url::Host::Domain(host)) = url.host() else {

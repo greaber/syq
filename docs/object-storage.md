@@ -49,9 +49,10 @@ hold many objects, syq may list each subdirectory by itself, at a request
 each, however few objects the others hold.
 
 Dividing a listing is safe only when the service returns keys in byte
-order, and only AWS documents that it does. With `--s3-endpoint`, syq divides
-listings only when the URL is an AWS S3 endpoint: regional, dual-stack, FIPS,
-or the bucket address of a VPC endpoint. For other services, including MinIO
+order, which AWS documents for general purpose buckets, so syq divides
+listings only there. With `--s3-endpoint`, that means the URL is an AWS S3
+endpoint: regional, dual-stack, FIPS, or the bucket address of a VPC
+endpoint. For other services, including MinIO
 and other servers you run yourself, syq mostly lists one page at a time.
 
 ## Upload and download

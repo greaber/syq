@@ -538,8 +538,10 @@ impl Walk {
     /// when the request for it failed.
     fn children(&mut self, at: usize, directory: &str, page: Option<Page>) -> Result<()> {
         let part = &mut self.parts[at];
-        let current =
-            !part.done && part.directory == directory && matches!(part.children, Children::Asked);
+        // The page answers the part's request, unless the part has since
+        // given up on its children; it is of use only while the part lists.
+        let outstanding = part.directory == directory && matches!(part.children, Children::Asked);
+        let current = outstanding && !part.done;
         let Some(page) = page else {
             if current {
                 part.children = Children::Closed;
@@ -549,7 +551,7 @@ impl Walk {
         // Children and objects come in separate lists, each in order and all
         // after those of the page before. A page that arrives too late to be
         // used is still evidence of the store's order.
-        let after = if current {
+        let after = if outstanding {
             part.children_end.as_str()
         } else {
             ""
@@ -618,10 +620,15 @@ impl Walk {
     /// whether it applies. As in the split it keeps, a listing must be known
     /// to need a third page: a burst costs a request for each child.
     fn decide_burst(&mut self) {
+        let root = &self.parts[0];
+        if root.done || (root.pages > 0 && !root.dense) {
+            // No burst can follow; a pattern can leave many walks behind.
+            self.sample = None;
+            return;
+        }
         let (Some(sample), Some(narrow)) = (&self.sample, self.narrow) else {
             return;
         };
-        let root = &self.parts[0];
         if !root.done && root.pages < 2 {
             return;
         }

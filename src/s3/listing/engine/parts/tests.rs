@@ -1072,4 +1072,40 @@ fn a_late_children_page_out_of_order_fails_a_divided_walk() {
     assert!(walk()
         .children(1, "t/", Some(page(["t/zx", "t/zy"])))
         .is_ok());
+    // A continuation that starts before the page it continues, after the
+    // part has finished.
+    let mut late = walk();
+    late.parts[1].directory = "t/".to_owned();
+    late.parts[1].children = Children::Asked;
+    late.parts[1].children_end = "t/zz".to_owned();
+    let error = late
+        .children(1, "t/", Some(page(["t/zm", "t/zn"])))
+        .unwrap_err();
+    assert!(error.is::<Unordered>());
+}
+
+#[test]
+fn walks_that_cannot_burst_keep_no_sample() {
+    let page = |keys: std::ops::Range<usize>, next: Option<&str>| Page {
+        entries: keys
+            .map(|i| Entry {
+                key: format!("t/d{i:04}/only"),
+                size: 1,
+                last_modified: None,
+                etag: None,
+            })
+            .collect(),
+        prefixes: Vec::new(),
+        next: next.map(str::to_owned),
+    };
+    let mut walk = Walk::new("t/".to_owned(), true, true);
+    // A sparse first page rules the burst out.
+    walk.keys(0, 0, page(0..1000, Some("next"))).unwrap();
+    walk.decide_burst();
+    assert!(walk.sample.is_none());
+    // So does the end of the listing.
+    let mut walk = Walk::new("t/".to_owned(), true, true);
+    walk.keys(0, 0, page(0..10, None)).unwrap();
+    walk.decide_burst();
+    assert!(walk.sample.is_none());
 }
