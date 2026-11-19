@@ -53,6 +53,11 @@ fn b_runs_after_timeout() {
             env.pop("NEXTEST_PROFILE", None)
             subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=root,
                            env=env, check=True)
+            # Build first: the bound below is on running the tests, which a
+            # loaded machine's compile would otherwise use up.
+            subprocess.run(["cargo", "nextest", "run", "--locked", "--offline", "--no-run"],
+                           cwd=root, env=env, check=True, stdout=subprocess.DEVNULL,
+                           timeout=600)
             process = subprocess.Popen(
                 ["cargo", "nextest", "run", "--locked", "--offline", "--test-threads", "1"],
                 cwd=root, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
