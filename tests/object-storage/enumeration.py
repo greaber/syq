@@ -64,13 +64,14 @@ def check_parts():
     divide too, and the same checks run without it.
     """
     prefix = c.PREFIX + '/wide'
+    # Over 64 directories, so that parts cover several directories each.
     objects = {f'{prefix}/shard {shard:03}/f{i:03}': b'x'
-               for shard in range(120) for i in range(100)}
-    objects.update({f'{prefix}/zz ignored/f{i:04}': b'x' for i in range(1500)})
+               for shard in range(70) for i in range(200)}
+    objects.update({f'{prefix}/zz ignored/f{i:04}': b'x' for i in range(300)})
     # MinIO cannot hold an object and a directory of the same name; the
     # in-memory fixture of the unit tests covers that.
     objects.update({key: b'beside' for key in (
-        prefix + '/shard 050.txt', prefix + '/shard 1', prefix + '/shard 119+',
+        prefix + '/shard 050.txt', prefix + '/shard 1', prefix + '/shard 069+',
         prefix + '/zz', prefix + '/文')})
     objects.update({prefix + '/shard 010/': b'', prefix + '/zz ignored/': b''})
     remote = 's3://' + c.BUCKET
