@@ -1514,6 +1514,14 @@ fn serve(
         serve_latency_pages(&mut socket, first);
         return;
     }
+    if fault == "copy-pages" {
+        serve_copy_pages(&mut socket, first, &probes);
+        return;
+    }
+    if fault.starts_with("upload-pages") {
+        serve_upload_pages(&mut socket, first, &probes, fault == "upload-pages-fail");
+        return;
+    }
     if fault.starts_with("wrong-region") {
         // A prefix is looked up with a HEAD and a listing at once. Hold one of
         // them back so each gets a turn at being the first failure.
@@ -1649,6 +1657,7 @@ fn serve(
         if method == "HEAD"
             && (url.path() == "/bucket/data"
                 || fault.starts_with("listing-budget")
+                || fault == "listing-present"
                 || fault == "listing-complete")
         {
             reply(&mut socket, 404, &[], b"", true);
@@ -1702,16 +1711,20 @@ fn serve(
                     assert_eq!(query.get("max-keys").map(|s| s.as_ref()), Some("1"));
                     (object("data/other"), true)
                 }
-                "listing-budget-many" => (
-                    object("data/other"),
-                    !query.contains_key("continuation-token"),
-                ),
-                "listing-budget" => {
+                "listing-budget" | "listing-budget-many" => {
                     assert!(
                         !query.contains_key("continuation-token"),
                         "upload enumerated a large destination"
                     );
                     (object("data/other"), true)
+                }
+                "listing-present" => {
+                    assert_eq!(
+                        query.get("start-after").map(|s| s.as_ref()),
+                        Some("data/ond"),
+                        "the listing starts at the first planned key"
+                    );
+                    (object("data/one"), false)
                 }
                 "listing-complete" => (String::new(), false),
                 "listing-adaptive" | "listing-all-ignored" | "listing-wide" => {
@@ -4799,8 +4812,12 @@ fn s3_listing_costs_are_bounded_without_changing_selection() {
 fn s3_upload_destination_discovery_is_bounded() {
     for (fault, placement, success, expected_requests) in [
         ("listing-exists", "--into-new", false, 2),
-        ("listing-budget", "--into", true, 3),
-        ("listing-budget-many", "--into", true, 2),
+        // One page shows `one` absent and ends before the other keys. Too
+        // few remain to be worth another page, so each gets a HEAD.
+        ("listing-budget", "--into", true, 2),
+        ("listing-budget-many", "--into", true, 3),
+        // Only the listed key gets a HEAD.
+        ("listing-present", "--into", true, 2),
         ("listing-complete", "--into", true, 1),
     ] {
         let server = Server::start(fault);
@@ -5291,6 +5308,276 @@ fn serve_latency_pages(socket: &mut TcpStream, first: &str) {
         ),
     ];
     reply(socket, 200, &fields, b"data", false);
+}
+
+/// A destination of 3,000 keys, `data/f0000` to `data/f2999`, listed in key
+/// order a thousand at a time. `probes` counts the LIST requests; with
+/// `fail`, the third is refused.
+fn serve_upload_pages(socket: &mut TcpStream, first: &str, probes: &AtomicUsize, fail: bool) {
+    if first.starts_with("HEAD ") {
+        reply(socket, 404, &[], b"", true);
+        return;
+    }
+    let target = first.split_whitespace().nth(1).unwrap();
+    let url = url::Url::parse(&format!("http://fixture{target}")).unwrap();
+    let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+    assert!(first.starts_with("GET ") && query.contains_key("list-type"));
+    assert_eq!(query["prefix"], "data/");
+    if probes.fetch_add(1, Ordering::Relaxed) == 2 && fail {
+        reply(
+            socket,
+            500,
+            &[],
+            b"<Error><Code>InternalError</Code></Error>",
+            false,
+        );
+        return;
+    }
+    if query.get("max-keys").map(|n| n.as_ref()) == Some("1") {
+        // The one request a copy sends when it will not rely on a listing.
+        reply(
+            socket,
+            200,
+            &[],
+            b"<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>data/f0000</NextContinuationToken><Contents><Key>data/f0000</Key><Size>1</Size></Contents></ListBucketResult>",
+            false,
+        );
+        return;
+    }
+    let after = match query.get("continuation-token") {
+        Some(token) => token.to_string(),
+        None => {
+            // Only the first request starts a listing, just below the
+            // first planned key.
+            assert_eq!(query["start-after"], "data/f000/");
+            query["start-after"].to_string()
+        }
+    };
+    let keys: Vec<_> = (0..3000)
+        .map(|n| format!("data/f{n:04}"))
+        .filter(|key| *key > after)
+        .collect();
+    let page = &keys[..keys.len().min(1000)];
+    let next = if keys.len() > page.len() {
+        format!(
+            "<IsTruncated>true</IsTruncated><NextContinuationToken>{}</NextContinuationToken>",
+            page.last().unwrap()
+        )
+    } else {
+        "<IsTruncated>false</IsTruncated>".into()
+    };
+    let objects: String = page
+        .iter()
+        .map(|key| format!("<Contents><Key>{key}</Key><Size>1</Size></Contents>"))
+        .collect();
+    let xml = format!("<ListBucketResult>{next}{objects}</ListBucketResult>");
+    reply(socket, 200, &[], xml.as_bytes(), false);
+}
+
+/// Bucket to bucket: the source holds `data/k00` to `data/k19` and the
+/// directory marker `data/sub/`; the destination holds the even ones under
+/// `out/`. `probes` counts the destination's HEADs.
+fn serve_copy_pages(socket: &mut TcpStream, first: &str, probes: &AtomicUsize) {
+    let method = first.split_whitespace().next().unwrap();
+    let target = first.split_whitespace().nth(1).unwrap();
+    let url = url::Url::parse(&format!("http://fixture{target}")).unwrap();
+    let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+    let object = |key: &str, size: usize| {
+        format!("<Contents><Key>{key}</Key><Size>{size}</Size></Contents>")
+    };
+    let page = |objects: String| {
+        format!("<ListBucketResult><IsTruncated>false</IsTruncated>{objects}</ListBucketResult>")
+    };
+    match (method, url.path()) {
+        ("GET", "/source/") => {
+            assert_eq!(query["prefix"], "data/");
+            let mut objects: String = (0..20)
+                .map(|n| object(&format!("data/k{n:02}"), 4))
+                .collect();
+            objects.push_str(&object("data/sub/", 0));
+            reply(socket, 200, &[], page(objects).as_bytes(), false);
+        }
+        ("GET", "/destination/") => {
+            // The listing starts just below the first destination key.
+            assert_eq!(query["prefix"], "out/");
+            assert_eq!(query["start-after"], "out/k0/");
+            let objects = (0..20)
+                .step_by(2)
+                .map(|n| object(&format!("out/k{n:02}"), 4))
+                .collect();
+            reply(socket, 200, &[], page(objects).as_bytes(), false);
+        }
+        ("HEAD", "/source/data") => reply(socket, 404, &[], b"", true),
+        ("HEAD", path) if path.starts_with("/source/data/") => {
+            let length = if path.ends_with('/') { "0" } else { "4" };
+            reply(
+                socket,
+                200,
+                &[
+                    ("Content-Length".into(), length.into()),
+                    ("ETag".into(), "\"source\"".into()),
+                    (
+                        "Last-Modified".into(),
+                        "Wed, 01 Jan 2020 00:00:00 GMT".into(),
+                    ),
+                ],
+                b"",
+                true,
+            );
+        }
+        ("HEAD", path) if path.starts_with("/destination/out/k") => {
+            // Only keys the listing showed present are asked about.
+            let number: usize = path["/destination/out/k".len()..].parse().unwrap();
+            assert_eq!(number % 2, 0, "HEAD for a key the listing showed absent");
+            probes.fetch_add(1, Ordering::Relaxed);
+            reply(socket, 404, &[], b"", true);
+        }
+        _ => panic!("unexpected copy-pages request: {first}"),
+    }
+}
+
+#[test]
+fn s3_bucket_copy_asks_only_about_destination_keys_its_listing_shows() {
+    let server = Server::start("copy-pages");
+    let temp = crate::test_support::tempdir().unwrap();
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--from",
+            "s3://source",
+            "--srcs-in",
+            "data",
+            "--to",
+            "s3://destination",
+            "--into",
+            "out",
+            "--dry-run",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    // Ten destination keys exist. The other ten and the directory marker
+    // `out/sub/` are absent from the listing and get no HEAD.
+    assert_eq!(server.probes.load(Ordering::Relaxed), 10);
+}
+
+#[test]
+fn s3_upload_pages_through_a_large_destination_while_copying() {
+    let server = Server::start("upload-pages");
+    let temp = crate::test_support::tempdir().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    // Every tenth destination key, and five keys the destination lacks.
+    for n in (0..3000).step_by(10) {
+        std::fs::write(data.join(format!("f{n:04}")), b"x").unwrap();
+    }
+    for n in 0..5 {
+        std::fs::write(data.join(format!("zz{n}")), b"x").unwrap();
+    }
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--srcs-in",
+            "data",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "data",
+            "--dry-run",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    // The copy starts after two pages; the third arrives while it runs and
+    // shows the five new keys absent. Listed keys get a HEAD, new ones none.
+    assert_eq!(server.probes.load(Ordering::Relaxed), 3);
+    assert_eq!(server.requests.load(Ordering::Relaxed), 3 + 300);
+}
+
+#[test]
+fn s3_upload_asks_about_every_key_where_a_wrong_absence_would_change_the_result() {
+    for flags in [
+        &["--if-exists=update-if-older"][..],
+        &["--if-exists=error-if-different"][..],
+        // This fixture's copies are dry runs, which send no conditional write.
+        &["--if-exists=error"][..],
+        &["--copy-if", "not dst.exists or src.size != dst.size"][..],
+    ] {
+        let server = Server::start("upload-pages");
+        let temp = crate::test_support::tempdir().unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        for n in (0..3000).step_by(10) {
+            std::fs::write(data.join(format!("f{n:04}")), b"x").unwrap();
+        }
+        for n in 0..5 {
+            std::fs::write(data.join(format!("zz{n}")), b"x").unwrap();
+        }
+        let mut args = vec![
+            "--srcs-in",
+            "data",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "data",
+            "--dry-run",
+        ];
+        args.extend(flags);
+        let output = server.cp(temp.path(), &args);
+        assert!(
+            output.status.success(),
+            "{flags:?}: {}",
+            output_text(&output)
+        );
+        // No listing decides that a key is absent: all 305 keys get a HEAD,
+        // including the five new ones the default policy leaves to the
+        // listing. The one LIST asks for a single key.
+        assert_eq!(server.probes.load(Ordering::Relaxed), 1, "{flags:?}");
+        assert_eq!(
+            server.requests.load(Ordering::Relaxed),
+            1 + 305,
+            "{flags:?}"
+        );
+    }
+}
+
+#[test]
+fn s3_upload_continues_with_head_when_a_later_listing_page_fails() {
+    let server = Server::start("upload-pages-fail");
+    let temp = crate::test_support::tempdir().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    for n in (0..3000).step_by(10) {
+        std::fs::write(data.join(format!("f{n:04}")), b"x").unwrap();
+    }
+    for n in 0..5 {
+        std::fs::write(data.join(format!("zz{n}")), b"x").unwrap();
+    }
+    let output = server.cp(
+        temp.path(),
+        &[
+            "--srcs-in",
+            "data",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "data",
+            "--dry-run",
+        ],
+    );
+    // The copy is complete without the listing, so it succeeds and says once
+    // what happened.
+    assert!(output.status.success(), "{}", output_text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .matches("warning: S3 destination listing stopped")
+            .count(),
+        1,
+        "{stderr}"
+    );
+    // Two pages show 200 planned keys present. The 105 keys the failed page
+    // would have covered get a HEAD as well.
+    assert_eq!(server.probes.load(Ordering::Relaxed), 3);
+    assert_eq!(server.requests.load(Ordering::Relaxed), 3 + 200 + 105);
 }
 
 #[test]

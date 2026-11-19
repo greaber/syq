@@ -111,10 +111,14 @@ pub(super) struct S3<'a> {
     pub(super) client: aws_sdk_s3::Client,
     pub(super) bucket: &'a str,
 }
+/// Directory buckets do not promise lexicographic LIST order.
+pub(super) fn lists_in_key_order(bucket: &str) -> bool {
+    !bucket.ends_with("--x-s3")
+}
+
 impl Store for S3<'_> {
     fn ordered(&self) -> bool {
-        // Directory buckets do not promise lexicographic LIST order.
-        !self.bucket.ends_with("--x-s3")
+        lists_in_key_order(self.bucket)
     }
 
     async fn page(

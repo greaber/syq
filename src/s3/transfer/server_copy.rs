@@ -93,11 +93,11 @@ fn same_contents(
     source.etag == old.etag || quick_check
 }
 
-fn copy_destination_key(job: &Download) -> String {
+fn copy_destination_key(job: &Download) -> std::borrow::Cow<'_, str> {
     if client::is_directory_marker(&job.key, job.size) {
-        format!("{}/", job.path)
+        format!("{}/", job.path).into()
     } else {
-        job.path.clone()
+        job.path.as_str().into()
     }
 }
 
@@ -258,7 +258,7 @@ impl Engine {
     async fn server_copy_inner(self: Arc<Self>) -> Result<()> {
         let target = local::key_path(&self.args.locations.last().unwrap().path)?;
         let DownloadPlan {
-            jobs: plan,
+            jobs: mut plan,
             mut prune,
             ..
         } = self.download_plan(&target).await?;
@@ -267,8 +267,7 @@ impl Engine {
                 .map(|job| job.path == target && !job.key.ends_with('/')),
         )
         .await?;
-        let keys: Vec<_> = plan.iter().map(copy_destination_key).collect();
-        self.discover_destination(keys.iter().map(String::as_str).collect())
+        self.discover_destination(&mut plan, copy_destination_key)
             .await?;
         let workers = self.object_workers(plan.iter().map(|p| p.size))?;
         self.progress.files_total.store(plan.len() as u64, Relaxed);
@@ -278,11 +277,13 @@ impl Engine {
         self.progress.scan_done.store(true, Relaxed);
         if self.authorization.is_some() {
             let prepared = Arc::new(Mutex::new(Vec::with_capacity(plan.len())));
+            let mut position = 0..;
             parallel(plan, workers, |mut job, mut slot| {
+                let listed = self.listed(position.next().unwrap(), &copy_destination_key(&job));
                 let engine = self.clone();
                 let prepared = prepared.clone();
                 async move {
-                    match engine.prepare_copy(&mut job, &mut slot).await {
+                    match engine.prepare_copy(&mut job, listed.await, &mut slot).await {
                         Ok(work) => prepared.lock().await.push((job, work)),
                         Err(error) => engine.settle(
                             job.key.as_bytes(),
@@ -331,12 +332,17 @@ impl Engine {
             if self.args.prune_before {
                 self.prune(std::mem::take(&mut prune), None).await?;
             }
+            let mut position = 0..;
             parallel(plan, workers, |mut job, mut slot| {
+                let listed = self.listed(position.next().unwrap(), &copy_destination_key(&job));
                 let engine = self.clone();
                 async move {
+                    // Checked after the wait, which can outlast a
+                    // cancellation by one listing request.
+                    let listed = listed.await;
                     engine.check_cancelled()?;
                     let result = engine
-                        .copy_object(&mut job, &mut slot)
+                        .copy_object(&mut job, listed, &mut slot)
                         .await
                         .map_err(|error| engine.copy_error(error));
                     engine.settle(job.key.as_bytes(), &job.path, job.kind, &result, None);
@@ -355,19 +361,23 @@ impl Engine {
     async fn prepare_copy(
         &self,
         job: &mut Download,
+        listed: Listed,
         slot: &mut TransferSlot,
     ) -> Result<CopyPreparation> {
         let source_bucket = self.options.route.source_bucket().unwrap();
-        let key = copy_destination_key(job);
+        let key = copy_destination_key(job).into_owned();
         local::key_path(key.trim_end_matches('/').as_bytes())?;
         anyhow::ensure!(key.len() <= 1024, "S3 key exceeds 1024 bytes");
         // Provider checksums can matter only against an existing destination
         // of the same size that is not kept regardless.
-        let listed = self.upload_keys.get().map(|keys| keys.get(&key).copied());
-        let comparable =
-            !self.args.ignore_existing && listed.is_none_or(|size| size == Some(job.size));
+        let comparable = !self.args.ignore_existing
+            && match listed {
+                Listed::Unknown => true,
+                Listed::Absent => false,
+                Listed::Present(size) => size == job.size,
+            };
         let destination = async {
-            if listed == Some(None) {
+            if listed == Listed::Absent {
                 Ok(None)
             } else {
                 self.object_head(&self.options.bucket, &key, comparable, slot)
@@ -722,9 +732,10 @@ impl Engine {
     async fn copy_object(
         &self,
         job: &mut Download,
+        listed: Listed,
         slot: &mut TransferSlot,
     ) -> Result<Option<u64>> {
-        let work = self.prepare_copy(job, slot).await?;
+        let work = self.prepare_copy(job, listed, slot).await?;
         self.execute_copy(work, slot).await
     }
 
