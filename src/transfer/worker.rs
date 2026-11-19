@@ -1176,8 +1176,12 @@ impl Worker {
         let mut start = 0;
         let mut bytes = 0u64;
         let mut path_bytes = 0usize;
+        // What the files' failures could add to the reply: each names its
+        // destination, so a group of long paths holds fewer files.
+        let mut reply_bytes = 0usize;
         for (i, job) in jobs.iter().enumerate() {
             let source_bytes = source_request_bytes(&job.src, Some(&job.source));
+            let failure_bytes = crate::proto::failed_small_file_hint(&job.dst);
             let file_bytes = job.entry.size.saturating_add(
                 job.entry
                     .inode_metadata
@@ -1195,15 +1199,19 @@ impl Worker {
                         .min(crate::proto::MAX_READ_BYTES)
                         .min(first_limit.bytes)
                     || path_bytes.saturating_add(source_bytes) > SOURCE_BATCH_PATH_BYTES
+                    || reply_bytes.saturating_add(failure_bytes)
+                        > crate::proto::METADATA_REPLY_BYTES
                     || i - start >= group_files.min(first_limit.files))
             {
                 groups.push(start..i);
                 start = i;
                 bytes = 0;
                 path_bytes = 0;
+                reply_bytes = 0;
             }
             bytes += file_bytes;
             path_bytes = path_bytes.saturating_add(source_bytes);
+            reply_bytes = reply_bytes.saturating_add(failure_bytes);
         }
         if start < jobs.len() {
             groups.push(start..jobs.len());

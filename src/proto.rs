@@ -788,6 +788,15 @@ pub(crate) fn failed_path_hint(path: &[u8]) -> usize {
     3 * String::from_utf8_lossy(path).len() + 320
 }
 
+/// The most the failure of a small file's publication (a `SmallPut` or a
+/// `SmallPatch`) adds to its batch's reply: that of an operation on its
+/// path (`failed_path_hint`), where an error may name instead the staged
+/// file beside it, whose name is up to 26 bytes longer
+/// (`fsops::partial_path_with_name_max`).
+pub(crate) fn failed_small_file_hint(path: &[u8]) -> usize {
+    failed_path_hint(path) + 3 * 32
+}
+
 /// Receiver-observed mode and identity before temporary directory access.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct DirectoryMode {
