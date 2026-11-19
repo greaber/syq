@@ -1109,16 +1109,19 @@ impl Runtime {
             .filter(|path| path.to_str().is_some())
             .map(super::switch::Follower::new);
         let server = crate::service::Server::bind(&scope.join(SOCKET_FILE))?;
+        // A local, so that a failure here also drops the socket before the
+        // lock.
+        let service = Arc::new(Service::new(
+            domain,
+            follower
+                .as_ref()
+                .and_then(|follower| follower.path().to_str())
+                .map(str::to_owned),
+        )?);
         Ok(Self {
             server,
             _lock: lock,
-            service: Arc::new(Service::new(
-                domain,
-                follower
-                    .as_ref()
-                    .and_then(|follower| follower.path().to_str())
-                    .map(str::to_owned),
-            )?),
+            service,
             follower,
         })
     }
