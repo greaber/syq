@@ -403,9 +403,7 @@ fn agent_socket_from_config(
     environment: impl Fn(&str) -> Option<OsString>,
 ) -> Result<Option<PathBuf>> {
     let config = std::str::from_utf8(config).context("SSH configuration is not UTF-8")?;
-    let selection = config
-        .lines()
-        .find_map(|line| line.strip_prefix("identityagent "));
+    let selection = crate::ssh_config::value(config, "identityagent");
     let socket = match selection {
         Some("none") => None,
         None | Some("SSH_AUTH_SOCK") => environment("SSH_AUTH_SOCK"),
@@ -501,58 +499,27 @@ fn inspect_ssh_configuration_at(
     deadline: Instant,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<SshConfigurationInspection> {
-    let mut command = Command::new(ssh_program);
-    command.args(["-G", "-vvv"]);
-    if compiled_defaults_only {
-        command.args(["-F", "/dev/null"]);
-    }
-    if let Some(user) = explicit_user {
-        command.args(["-l", user]);
-    }
-    if let Some(port) = explicit_port {
-        command.args(["-p", &port.to_string()]);
-    }
-    command.args(["--", host]).env("LC_ALL", "C");
-    let output = crate::process::capture_output_bounded(
-        "SSH policy inspection",
-        &mut command,
+    let options: &[&str] = if compiled_defaults_only {
+        &["-vvv", "-F", "/dev/null"]
+    } else {
+        &["-vvv"]
+    };
+    let config = crate::ssh_config::SshConfig::query(
+        ssh_program,
+        options,
+        explicit_user,
+        explicit_port,
+        host,
         deadline,
         cancelled,
-        MAX_POLICY_OUTPUT_BYTES,
-    )
-    .with_context(|| format!("inspect SSH configuration for {host}"))?;
-    if !output.status.success() {
-        // Keep the raw debug stream for successful provenance checks below;
-        // users need the SSH error, not the configuration traversal trace.
-        let detail = String::from_utf8_lossy(&output.stderr)
-            .lines()
-            .filter(|line| {
-                let version_banner = line.starts_with("OpenSSH_")
-                    && crate::conn::parse_openssh_version(line.as_bytes()).is_some();
-                let debug_trace = ["debug1:", "debug2:", "debug3:"]
-                    .iter()
-                    .any(|prefix| line.starts_with(prefix));
-                !(version_banner || debug_trace)
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let detail = detail.trim();
-        bail!(
-            "could not inspect SSH configuration for {host}{}",
-            if detail.is_empty() {
-                String::new()
-            } else {
-                format!(": {detail}")
-            }
-        );
-    }
+    )?;
     // OpenSSH does not retain filename quoting in `ssh -G` output. Its debug
     // stream identifies the configuration files that contributed to this
     // query, which lets us distinguish compiled defaults from an explicitly
     // configured value that happens to render identically. Requiring the
     // controlled query to name /dev/null also validates that this OpenSSH's
     // debug format is one we can use as provenance.
-    let configuration_paths = ssh_configuration_paths(&output.stderr)?;
+    let configuration_paths = ssh_configuration_paths(config.trace())?;
     let known_hosts_configured = if compiled_defaults_only {
         if configuration_paths != [PathBuf::from("/dev/null")] {
             bail!(
@@ -564,7 +531,7 @@ fn inspect_ssh_configuration_at(
         configured_known_hosts_directives(&configuration_paths)?
     };
     Ok(SshConfigurationInspection {
-        output: output.stdout,
+        output: config.into_text().into_bytes(),
         known_hosts_configured,
     })
 }
@@ -818,10 +785,7 @@ fn parse_ssh_config_with_defaults(
     let mut host_key_algorithms = None;
     let mut required_rsa_size = None;
     let mut unsupported = None;
-    for line in output.lines() {
-        let Some((name, value)) = line.split_once(' ') else {
-            continue;
-        };
+    for (name, value) in crate::ssh_config::entries(output) {
         let value = value.trim();
         match name {
             "user" => user = Some(value.to_string()),
@@ -902,10 +866,7 @@ fn known_hosts_values(output: &[u8]) -> Result<(String, String)> {
     let output = std::str::from_utf8(output).context("SSH configuration was not UTF-8")?;
     let mut user = None;
     let mut global = None;
-    for line in output.lines() {
-        let Some((name, value)) = line.split_once(' ') else {
-            continue;
-        };
+    for (name, value) in crate::ssh_config::entries(output) {
         match name {
             "userknownhostsfile" => user = Some(value.trim().to_owned()),
             "globalknownhostsfile" => global = Some(value.trim().to_owned()),

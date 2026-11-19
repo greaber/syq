@@ -72,6 +72,7 @@ mod sched;
 mod server;
 mod session_pool;
 mod sparse;
+mod ssh_config;
 mod state_file;
 mod stream_mapping;
 mod streaming;

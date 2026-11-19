@@ -1,7 +1,6 @@
 //! The enrolling machine's side of enrollment: one enrollment per server
 //! account, set up and refreshed over the user's own login.
 use super::*;
-use crate::process::CommandExt as _;
 use std::io::BufRead as _;
 
 pub(super) fn local_state_base() -> Result<PathBuf> {
@@ -937,40 +936,42 @@ pub(super) fn configured_agent(
     route: EnrollmentRoute<'_>,
     unattended: Option<enrollment::Unattended>,
 ) -> Result<(Option<PathBuf>, bool)> {
-    let output = Command::new("ssh")
-        .arg("-G")
-        .args(enrollment::enrollment_ssh_args_raw(
-            target, route, "", unattended,
-        ))
-        .capture_output()
-        .context("inspect the SSH configuration for the enrollment's login")?;
-    if !output.status.success() {
-        bail!(
-            "could not read the SSH configuration for {}",
-            target.label()
-        );
-    }
+    let config = configuration(
+        target,
+        &enrollment::enrollment_ssh_options(route, unattended),
+    )?;
     Ok((
-        crate::agent_broker::configured_agent_socket(&output.stdout)?,
-        enrollment::asks_about_new_host_keys(&output.stdout),
+        crate::agent_broker::configured_agent_socket(config.text().as_bytes())?,
+        enrollment::asks_about_new_host_keys(config.text().as_bytes()),
     ))
 }
 
 /// Whether the configuration would ask about a host key of `endpoint`
 /// that nobody knows.
 fn asks_about_new_host_keys(endpoint: &SshEndpoint) -> Result<bool> {
-    let output = Command::new("ssh")
-        .arg("-G")
-        .args(endpoint.query_arguments())
-        .capture_output()
-        .context("inspect the SSH configuration for the enrollment's jump")?;
-    if !output.status.success() {
-        bail!(
-            "could not read the SSH configuration for {}",
-            endpoint.label()
-        );
-    }
-    Ok(enrollment::asks_about_new_host_keys(&output.stdout))
+    let config = configuration(endpoint, &[] as &[&str])?;
+    Ok(enrollment::asks_about_new_host_keys(
+        config.text().as_bytes(),
+    ))
+}
+
+/// This machine's SSH configuration for `endpoint`. Nothing here has a
+/// deadline of its own: the receiving service ends a setup child at its
+/// deadline, and someone enrolling at a terminal can interrupt it. Allow
+/// what the other lookups made in the foreground allow.
+fn configuration(
+    endpoint: &SshEndpoint,
+    options: &[impl AsRef<std::ffi::OsStr>],
+) -> Result<crate::ssh_config::SshConfig> {
+    crate::ssh_config::SshConfig::query(
+        "ssh",
+        options,
+        None,
+        endpoint.port(),
+        endpoint.as_str(),
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+        &|| false,
+    )
 }
 
 /// What one enrollment session sets up: a new enrollment, a retry of one

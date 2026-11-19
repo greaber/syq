@@ -3634,6 +3634,39 @@ fn route_probes_give_up_on_a_silent_address_after_their_bound() {
     drop(listener);
 }
 
+/// A resolver that does not answer for the SSH target's name holds the
+/// probes no longer than their wait, and the advertised literal is still
+/// probed and found.
+#[test]
+fn a_silent_resolver_does_not_hold_up_route_probes() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let candidate = |address: &str, source| TcpCandidate {
+        address: address.into(),
+        speed_mbps: 0,
+        source,
+        reachable: None,
+        selected: false,
+        same_as_ssh_target: false,
+    };
+    let mut candidates = vec![
+        candidate("127.0.0.1", DataAddressSource::RemoteInterface),
+        candidate("ssh-target.invalid", DataAddressSource::SshTarget),
+    ];
+    let wait = std::time::Duration::from_millis(200);
+    let started = std::time::Instant::now();
+    probe_reachable_with(&mut candidates, port, wait, |name, _| {
+        assert_eq!(name, "ssh-target.invalid");
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        Vec::new()
+    })
+    .unwrap();
+    let elapsed = started.elapsed();
+    assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    assert_eq!(candidates[0].reachable, Some(true));
+    assert_ne!(candidates[1].reachable, Some(true));
+}
+
 #[test]
 fn a_kept_reply_reports_when_it_arrived_rather_than_when_it_was_taken() {
     let mut conn = connection_replaying(&[Response::Ok, Response::Err("later".into())]);
