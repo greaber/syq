@@ -53,6 +53,19 @@ fn b_runs_after_timeout() {
             env.pop("NEXTEST_PROFILE", None)
             subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=root,
                            env=env, check=True)
+            # Build first: the bound below is on running the tests, which a
+            # loaded machine's compile would otherwise use up.
+            build = subprocess.Popen(
+                ["cargo", "nextest", "run", "--locked", "--offline", "--no-run"],
+                cwd=root, env=env, stdout=subprocess.DEVNULL, start_new_session=True)
+            try:
+                self.assertEqual(build.wait(timeout=600), 0)
+            finally:
+                # A compiler left running would write into the directory
+                # while it is removed.
+                if build.poll() is None:
+                    os.killpg(build.pid, signal.SIGKILL)
+                    build.wait()
             process = subprocess.Popen(
                 ["cargo", "nextest", "run", "--locked", "--offline", "--test-threads", "1"],
                 cwd=root, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

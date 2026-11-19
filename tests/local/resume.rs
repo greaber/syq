@@ -753,14 +753,22 @@ fn small_inplace_files_use_batched_workers() {
         let lines: Vec<&str> = events.lines().collect();
         // Three small files start one automatic worker, and at most one per
         // file even when more are requested. A started worker that finds every
-        // file already done exits without connecting.
+        // file already done exits without connecting. The automatic tuner may
+        // still add its startup spare when it looks before the first worker
+        // has taken the files, as a starved copy does; that spare then finds
+        // them taken.
         let (started, _) = started_workers(&t.path("history.sqlite"));
         assert_eq!(started, if workers.is_some() { 3 } else { 1 });
-        if workers.is_none() {
-            assert_eq!(lines, ["connected 0 0", "batch 0 3"]);
-        }
+        let spare = usize::from(workers.is_none());
         let connected = lines.iter().filter(|l| l.starts_with("connected ")).count();
-        assert!((1..=started as usize).contains(&connected), "{events}");
+        assert!(
+            (1..=started as usize + spare).contains(&connected),
+            "{events}"
+        );
+        if workers.is_none() {
+            let batches: Vec<_> = lines.iter().filter(|l| l.starts_with("batch ")).collect();
+            assert!(batches.len() == 1 && batches[0].ends_with(" 3"), "{events}");
+        }
         let batched: usize = lines
             .iter()
             .filter_map(|l| l.strip_prefix("batch "))

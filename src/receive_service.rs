@@ -504,9 +504,12 @@ fn ensure_current_settings(domain: &Domain) -> Result<Preferences> {
 fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let mut bytes = serde_json::to_vec(value)?;
     bytes.push(b'\n');
+    write_json_bytes(path, &bytes)
+}
+fn write_json_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     crate::state_file::write_atomic(
         path,
-        &bytes,
+        bytes,
         0o600,
         crate::state_file::Publish::Replace,
         crate::state_file::Durability::FileSynced,
@@ -1940,7 +1943,7 @@ fn ensure_inner(
     replace: Replace,
 ) -> Result<Receiving> {
     let scope = control.parent().context("persistence scope missing")?;
-    crate::persistence::validate_scope(scope)?;
+    // Selecting the domain validates the scope.
     anyhow::ensure!(
         Domain::select(Some(scope))? == *domain,
         "receiving control belongs to a different scope"
@@ -1993,7 +1996,19 @@ fn ensure_inner(
     let spec = service_spec(remote);
     // Keep the connected endpoint even when no profile currently allows it:
     // a later preference change can start receiving without another connect.
-    atomic_json(&suffixed(control, RECORD), &spec)?;
+    // While receiving stays off this runs on every command, so a record that
+    // already holds exactly these bytes is left alone rather than rewritten
+    // and synced.
+    let record = suffixed(control, RECORD);
+    let mut bytes = serde_json::to_vec(&spec)?;
+    bytes.push(b'\n');
+    if crate::delegation::read_private_regular(&record, "background receiving endpoint", 64 * 1024)
+        .ok()
+        .as_deref()
+        != Some(&bytes[..])
+    {
+        write_json_bytes(&record, &bytes)?;
+    }
     if !allowed {
         return Ok(Receiving::Off);
     }

@@ -397,6 +397,23 @@ fn interrupted_partial_from(args: &[&str], dir: &Path, cwd: Option<&Path>) -> Pa
         killed == 0 || kill_error.raw_os_error() == Some(libc::ESRCH),
         "stop partial-copy process group: {kill_error}"
     );
+    // The signal reaches the group at once, but its other members, such as a
+    // local receiver writing the partial, exit on their own time: a starved
+    // one keeps the partial open for writing after the leader is reaped, and
+    // a rerun that looks in that time must leave the partial in place.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut next_progress = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while let Some(running) = live_group_members(child.id() as i32) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stopped partial copy's process group is still running: {running}"
+        );
+        if std::time::Instant::now() >= next_progress {
+            eprintln!("waiting for the stopped partial copy's process group to exit: {running}");
+            next_progress += std::time::Duration::from_secs(1);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     assert!(
         stopped_early.is_none(),
         "copy exited before interruption: {stopped_early:?}"
@@ -405,6 +422,50 @@ fn interrupted_partial_from(args: &[&str], dir: &Path, cwd: Option<&Path>) -> Pa
     let mut partials = partial_files(dir);
     assert_eq!(partials.len(), 1, "expected one prepared partial");
     partials.pop().unwrap()
+}
+
+/// The members of process group `group` that have not exited, by PID and
+/// state, or None when there are none. An exited member that nobody has
+/// reaped yet, as a container's PID 1 may leave it, holds no files; one whose
+/// main thread has exited holds them until its last thread has.
+#[cfg(debug_assertions)]
+fn live_group_members(group: i32) -> Option<String> {
+    if unsafe { libc::kill(-group, 0) } != 0 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // After the command name: state, parent and process group.
+        let fields = |stat: &Path| -> Option<(String, String)> {
+            let stat = fs::read_to_string(stat).ok()?;
+            let mut fields = stat.rsplit_once(") ")?.1.split_whitespace();
+            let state = fields.next()?.to_owned();
+            Some((state, fields.nth(1)?.to_owned()))
+        };
+        let group = group.to_string();
+        let mut live = Vec::new();
+        for entry in fs::read_dir("/proc").unwrap().flatten() {
+            let Some((state, member_group)) = fields(&entry.path().join("stat")) else {
+                continue;
+            };
+            if member_group != group {
+                continue;
+            }
+            let threads = fs::read_dir(entry.path().join("task"))
+                .into_iter()
+                .flatten();
+            if threads
+                .flatten()
+                .filter_map(|thread| fields(&thread.path().join("stat")))
+                .any(|(state, _)| state != "Z")
+            {
+                live.push(format!("{} {state}", entry.file_name().to_string_lossy()));
+            }
+        }
+        (!live.is_empty()).then(|| live.join(", "))
+    }
+    #[cfg(not(target_os = "linux"))]
+    Some(format!("group {group}"))
 }
 
 /// Whether a rerun that publishes a file removes the partials earlier copies
