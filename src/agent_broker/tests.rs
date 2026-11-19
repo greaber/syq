@@ -627,7 +627,7 @@ fn policy_deadline_interrupts_real_openssh_match_exec() {
     std::fs::write(
         &config,
         format!(
-            "Match exec \"touch {}; sleep 30\"\n  User backup\n",
+            "Match exec \"touch {}; sleep 60\"\n  User backup\n",
             shell_words::quote(marker.to_str().unwrap()),
         ),
     )
@@ -640,13 +640,15 @@ fn policy_deadline_interrupts_real_openssh_match_exec() {
         ),
         0o700,
     );
+    // The deadline must fall after OpenSSH has started the Match exec: on a
+    // starved CPU it took up to 1.8 s to get there.
     let started = Instant::now();
     let error = resolve_host_policy_at_bounded(
         ssh.to_str().unwrap(),
         None,
         "unused.example",
         None,
-        started + Duration::from_millis(300),
+        started + Duration::from_secs(5),
         &|| false,
     )
     .unwrap_err();
@@ -655,7 +657,8 @@ fn policy_deadline_interrupts_real_openssh_match_exec() {
         std::io::ErrorKind::TimedOut
     );
     assert!(marker.exists(), "OpenSSH did not reach Match exec");
-    assert!(started.elapsed() < Duration::from_secs(3));
+    // Well before the Match exec's own end.
+    assert!(started.elapsed() < Duration::from_secs(20));
 }
 
 #[test]
