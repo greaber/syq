@@ -415,14 +415,14 @@ impl SshMultiplexer {
     /// sessions with plain `ssh` and syq's own options, so they serve only
     /// connections without them.
     pub(crate) fn persistent(
-        scope: &std::path::Path,
+        scope: &crate::persistence::CheckedScope,
         user: Option<&str>,
         host: &str,
         port: Option<u16>,
         ssh: Option<&crate::persistence::SshOptions>,
     ) -> Result<Self> {
-        let path = crate::persistence::prepare_endpoint(scope, user, host, port, ssh)?;
-        let domain = crate::persistence::Domain::select(Some(scope))?;
+        let path = scope.prepare_endpoint(user, host, port, ssh)?;
+        let domain = scope.domain().clone();
         let global = domain.is_default();
         Ok(Self {
             _directory: None,

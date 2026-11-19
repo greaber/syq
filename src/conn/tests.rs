@@ -2394,6 +2394,7 @@ fn a_pool_appearing_after_priming_is_not_queried_during_connect() {
     let directory = crate::test_support::short_tempdir().unwrap();
     let scope = directory.path().join("scope");
     crate::persistence::initialize_scope(&scope).unwrap();
+    let scope = crate::persistence::CheckedScope::check(&scope).unwrap();
     let multiplexer = SshMultiplexer::persistent(&scope, None, "example", None, None).unwrap();
     let socket = crate::session_pool::socket_path(&multiplexer.path);
     let mut spec = RemoteSpec::local_receiver(true);
@@ -2419,14 +2420,16 @@ fn persistent_reuse_uses_auto_master_and_never_shares_with_workers() {
     let directory = crate::test_support::short_tempdir().unwrap();
     let base = directory.path().join("scope");
     crate::persistence::initialize_scope(&base).unwrap();
+    let checked = crate::persistence::CheckedScope::check(&base).unwrap();
     // The socket name is stable per endpoint, and a dead leftover at the
     // path is cleared so a fresh master can bind.
-    let probe = SshMultiplexer::persistent(&base, Some("u"), "example", None, None).unwrap();
+    let probe = SshMultiplexer::persistent(&checked, Some("u"), "example", None, None).unwrap();
     std::fs::write(&probe.path, b"stale").unwrap();
-    let multiplexer = SshMultiplexer::persistent(&base, Some("u"), "example", None, None).unwrap();
+    let multiplexer =
+        SshMultiplexer::persistent(&checked, Some("u"), "example", None, None).unwrap();
     assert_eq!(probe.path, multiplexer.path);
     let alternate_port =
-        SshMultiplexer::persistent(&base, Some("u"), "example", Some(2222), None).unwrap();
+        SshMultiplexer::persistent(&checked, Some("u"), "example", Some(2222), None).unwrap();
     assert_ne!(multiplexer.path, alternate_port.path);
     assert!(!multiplexer.path.exists());
     assert_eq!(
@@ -3205,6 +3208,7 @@ fn only_connections_kept_after_the_command_forward_nothing() {
     let directory = crate::test_support::short_tempdir().unwrap();
     let base = directory.path().join("scope");
     crate::persistence::initialize_scope(&base).unwrap();
+    let checked = crate::persistence::CheckedScope::check(&base).unwrap();
     let spec = |multiplexer: Option<SshMultiplexer>| {
         let mut spec = RemoteSpec::local_receiver(false);
         spec.local_process = false;
@@ -3226,7 +3230,7 @@ fn only_connections_kept_after_the_command_forward_nothing() {
     // The master that persistence keeps, and a session that joins it: a
     // forwarded agent would stay usable on the server until `persist off`.
     let persistent = spec(Some(
-        SshMultiplexer::persistent(&base, None, "example", None, None).unwrap(),
+        SshMultiplexer::persistent(&checked, None, "example", None, None).unwrap(),
     ));
     let control = args(&persistent, SshConnection::Control);
     assert!(control.iter().any(|arg| arg == "ControlPersist=300"));
