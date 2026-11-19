@@ -1416,6 +1416,10 @@ fn serve(
         }
         return;
     }
+    if fault == "parts-unordered" || fault == "parts-prefix-policy" {
+        serve_unordered_parts(&mut socket, method, first, &probes, fault);
+        return;
+    }
     if fault.starts_with("parallel-") {
         if method == "HEAD" {
             if first.starts_with("HEAD /bucket/tree ") {
@@ -6993,6 +6997,212 @@ fn parallel_listing_failure_stops_copy_and_removal_before_mutation() {
             output_text(&output)
         );
         assert!(!temp.path().join("out/a/file").exists());
+    }
+}
+
+/// Lists `tree/` in order, but every other listing of keys in reverse: once
+/// a divided listing has handed keys over, it must list the prefix again one
+/// request at a time. `starts` counts the listings of `tree/` begun. With
+/// `parts-prefix-policy`, a policy refuses every prefix but `tree/` instead.
+fn serve_unordered_parts(
+    socket: &mut TcpStream,
+    method: &str,
+    first: &str,
+    starts: &AtomicUsize,
+    fault: &str,
+) {
+    if method == "HEAD" {
+        if first.starts_with("HEAD /bucket/tree ") {
+            reply(socket, 404, &[], b"", true);
+        } else {
+            let fields = [
+                ("Content-Length".into(), "1".into()),
+                ("ETag".into(), "\"source\"".into()),
+            ];
+            reply(socket, 200, &fields, b"", true);
+        }
+        return;
+    }
+    assert!(first.contains("list-type=2"), "{first}");
+    let target = first.split_whitespace().nth(1).unwrap();
+    let url = url::Url::parse(&format!("http://fixture{target}")).unwrap();
+    let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+    let prefix = query["prefix"].as_ref();
+    let delimiter = query.contains_key("delimiter");
+    if fault == "parts-prefix-policy" && prefix != "tree/" {
+        reply(
+            socket,
+            403,
+            &[],
+            b"<Error><Code>AccessDenied</Code></Error>",
+            false,
+        );
+        return;
+    }
+    // A token counts the items of the listing before the page.
+    let start: usize = query
+        .get("continuation-token")
+        .map_or(0, |token| token.parse().unwrap());
+    let mut items: Vec<String> = (0..40)
+        .flat_map(|d| (0..300).map(move |i| format!("tree/d{d:02}/{i:04}")))
+        .filter(|key| key.starts_with(prefix))
+        .map(|key| match key[prefix.len()..].find('/') {
+            Some(slash) if delimiter => key[..prefix.len() + slash + 1].to_owned(),
+            _ => key,
+        })
+        .collect();
+    items.dedup();
+    let next = (items.len() > start + 1000).then_some(start + 1000);
+    let mut page: Vec<_> = items.iter().skip(start).take(1000).collect();
+    if prefix == "tree/" && !delimiter && start == 0 {
+        starts.fetch_add(1, Ordering::Relaxed);
+    }
+    if prefix != "tree/" && !delimiter {
+        page.reverse();
+    }
+    let body = page
+        .iter()
+        .map(|item| {
+            if item.ends_with('/') {
+                format!("<CommonPrefixes><Prefix>{item}</Prefix></CommonPrefixes>")
+            } else {
+                format!("<Contents><Key>{item}</Key><Size>1</Size></Contents>")
+            }
+        })
+        .collect::<String>();
+    let body = format!(
+        "<ListBucketResult><IsTruncated>{}</IsTruncated>{}{body}</ListBucketResult>",
+        next.is_some(),
+        next.map(|token| format!("<NextContinuationToken>{token}</NextContinuationToken>"))
+            .unwrap_or_default()
+    );
+    reply(socket, 200, &[], body.as_bytes(), false);
+}
+
+// Release builds cannot divide a listing at a loopback endpoint.
+#[cfg(debug_assertions)]
+#[test]
+fn ls_says_how_to_list_a_prefix_only_its_own_listing_may_list() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let server = Server::start("parts-prefix-policy");
+    let ls = |divide: bool, concurrency: &str| {
+        let process = server.command_for(temp.path(), "cp");
+        let mut command = Command::new(process.get_program());
+        for (name, value) in process.get_envs() {
+            match value {
+                Some(value) => command.env(name, value),
+                None => command.env_remove(name),
+            };
+        }
+        command.current_dir(temp.path());
+        if divide {
+            command.env("SYQ_TEST_S3_DIVIDE_LISTINGS", "1");
+        } else {
+            command.env_remove("SYQ_TEST_S3_DIVIDE_LISTINGS");
+        }
+        command.args([
+            "_ls",
+            "s3://bucket/tree/**",
+            "--s3-region",
+            "us-east-1",
+            "--s3-header",
+            "X-Tigris-Consistent: true",
+            "--s3-endpoint",
+            &server.address,
+            "--concurrency",
+            concurrency,
+        ]);
+        command.capture_output().unwrap()
+    };
+    let hint = "rerun with --concurrency 1";
+    // Divided, a part's listing is refused, and the error says what to do.
+    let output = ls(true, "32");
+    assert!(!output.status.success());
+    assert!(
+        output_text(&output).contains(hint),
+        "{}",
+        output_text(&output)
+    );
+    // That works.
+    let output = ls(true, "1");
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().count(),
+        12_000
+    );
+    // Master's own split is refused as before, and says nothing more.
+    let output = ls(false, "32");
+    assert!(!output.status.success());
+    assert!(
+        !output_text(&output).contains(hint),
+        "{}",
+        output_text(&output)
+    );
+}
+
+// Release builds cannot divide a listing at a loopback endpoint.
+#[cfg(debug_assertions)]
+#[test]
+fn a_divided_listing_out_of_order_is_listed_again_whole() {
+    for command in ["cp", "rm"] {
+        let temp = crate::test_support::tempdir().unwrap();
+        let server = Server::start("parts-unordered");
+        let mut process = server.command_for(temp.path(), command);
+        // The test server is not AWS; debug builds let it divide.
+        process.env("SYQ_TEST_S3_DIVIDE_LISTINGS", "1");
+        process.args([
+            "--s3-endpoint",
+            &server.address,
+            "--dry-run",
+            "--results",
+            "results.ndjson",
+        ]);
+        if command == "cp" {
+            process.args([
+                "--from",
+                "s3://bucket",
+                "--srcs-in",
+                "tree",
+                "--into",
+                "out",
+            ]);
+        } else {
+            process.args(["--on", "s3://bucket", "--srcs-in", "tree"]);
+        }
+        let output = process.capture_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{command}: {}",
+            output_text(&output)
+        );
+        // Divided first, then listed again whole.
+        assert_eq!(
+            server.probes.load(Ordering::Relaxed),
+            2,
+            "{command}: listings of tree/"
+        );
+        let (key, kind) = if command == "cp" {
+            ("src", "trace")
+        } else {
+            ("path", "removal_trace")
+        };
+        let actual: std::collections::BTreeSet<String> =
+            std::fs::read_to_string(temp.path().join("results.ndjson"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|record| record["type"] == kind)
+                .map(|record| record[key]["value"].as_str().unwrap().to_owned())
+                .collect();
+        let expected: std::collections::BTreeSet<_> = (0..40)
+            .flat_map(|d| (0..300).map(move |i| format!("tree/d{d:02}/{i:04}")))
+            .collect();
+        assert!(
+            actual == expected,
+            "{command}: {} of {} objects",
+            actual.len(),
+            expected.len()
+        );
     }
 }
 

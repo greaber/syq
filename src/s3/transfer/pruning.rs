@@ -269,6 +269,7 @@ impl Engine {
                         .collect(),
                     None => client::list(
                         &self.client,
+                        self.options.endpoint.as_deref(),
                         &self.options.bucket,
                         &prefix,
                         self.options.concurrency,
@@ -354,6 +355,7 @@ impl Engine {
                 keys.extend(
                     client::list(
                         &self.client,
+                        self.options.endpoint.as_deref(),
                         &self.options.bucket,
                         &prefix,
                         self.options.concurrency,

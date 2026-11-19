@@ -72,7 +72,7 @@ async fn latency_uses_individual_control_responses_and_ignores_errors_and_data()
         .is_err());
     assert_eq!(control.load(Ordering::Relaxed), 80_000_000);
     assert_eq!(
-        list(&client, "bucket", "data/", 32)
+        list(&client, None, "bucket", "data/", 32)
             .await
             .unwrap()
             .into_objects()

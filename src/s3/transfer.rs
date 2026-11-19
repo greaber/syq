@@ -928,6 +928,7 @@ impl Engine {
         // planner.
         let listing = client::list(
             &self.client,
+            self.options.endpoint.as_deref(),
             &self.options.bucket,
             &prefix,
             self.options.concurrency,
@@ -2077,6 +2078,7 @@ impl Engine {
                     exact,
                     client::list_with_times(
                         &self.client,
+                        self.options.endpoint.as_deref(),
                         source_bucket,
                         &prefix,
                         matcher.as_ref(),
@@ -2128,6 +2130,7 @@ impl Engine {
                         None => {
                             client::list_with_times(
                                 &self.client,
+                                self.options.endpoint.as_deref(),
                                 source_bucket,
                                 &prefix,
                                 matcher.as_ref(),

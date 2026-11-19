@@ -314,9 +314,11 @@ impl Discovery {
             passed: String::new(),
             token: None,
         };
+        // This listing reads pages one by one; it never divides.
         let store = listing::S3 {
             client: client.clone(),
             bucket,
+            divides: false,
         };
         let mut more = store.ordered();
         if more {
@@ -339,6 +341,7 @@ impl Discovery {
                 let store = listing::S3 {
                     client,
                     bucket: &bucket,
+                    divides: false,
                 };
                 let mut more = true;
                 while more && !cancelled.load(Relaxed) {

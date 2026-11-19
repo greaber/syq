@@ -279,6 +279,9 @@ impl RequestFailure {
     pub(super) fn region_mismatch(&self) -> bool {
         self.status == Some(301) && self.region.is_some()
     }
+    pub(super) fn denied(&self) -> bool {
+        self.status == Some(403)
+    }
 }
 impl std::fmt::Display for RequestFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -953,13 +956,16 @@ impl Listing {
 }
 
 /// List every object under a literal prefix with the bounded parallel engine.
+/// `endpoint` is the custom endpoint the client uses, if any: it decides
+/// whether a listing may be divided (`listing::lists_in_byte_order`).
 pub(super) async fn list(
     client: &Client,
+    endpoint: Option<&str>,
     bucket: &str,
     prefix: &str,
     concurrency: usize,
 ) -> Result<Listing> {
-    list_with_times(client, bucket, prefix, None, concurrency, false).await
+    list_with_times(client, endpoint, bucket, prefix, None, concurrency, false).await
 }
 
 /// Delimiter requests a filtered listing may spend looking past a first page
@@ -974,6 +980,7 @@ const LOOKAHEAD_PROBES: usize = 4;
 /// them.
 pub(super) async fn list_with_times(
     client: &Client,
+    endpoint: Option<&str>,
     bucket: &str,
     prefix: &str,
     matcher: Option<&ignore::gitignore::Gitignore>,
@@ -1001,6 +1008,9 @@ pub(super) async fn list_with_times(
         fn ordered(&self) -> bool {
             self.inner.ordered()
         }
+        fn divides(&self) -> bool {
+            self.inner.divides()
+        }
         async fn page(
             &self,
             prefix: &str,
@@ -1022,6 +1032,7 @@ pub(super) async fn list_with_times(
         inner: listing::S3 {
             client: client.clone(),
             bucket,
+            divides: listing::lists_in_byte_order(endpoint, bucket),
         },
         root: prefix,
         discovery_denied: AtomicBool::new(false),
@@ -1087,6 +1098,11 @@ pub(super) async fn list_with_times(
             // denying discovery or child prefixes. No caller has consumed the
             // plan yet.
             Err(error) if !fallback && store.discovery_denied.load(Relaxed) && denied(&error) => {
+                fallback = true;
+            }
+            // The engine relies on key order only when it lists a prefix in
+            // parts. List it whole instead.
+            Err(error) if !fallback && error.is::<engine::Unordered>() => {
                 fallback = true;
             }
             Err(error) => return Err(error),
