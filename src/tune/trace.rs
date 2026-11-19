@@ -161,9 +161,6 @@ impl Trace {
         self.event("policy_end",json!({"active":policy.active(),"requested":policy.n,
             "last_accepted":policy.settled(),"completed_comparison":policy.measured(),
             "pending_comparison":matches!(policy.state,State::Explore{..}),"aborted":aborted,"policy":snapshot(policy)}));
-        if let Some(recorder) = &self.recorder {
-            recorder.flush();
-        }
     }
 }
 

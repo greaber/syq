@@ -865,7 +865,7 @@ mod tests {
         misleading.context(&key);
         misleading.complete(true, json!({}));
         // A row as earlier releases saved their recommendation.
-        let id = misleading.0.lock().unwrap().id;
+        let id = super::super::tests::saved(&misleading);
         Connection::open(&path)
             .unwrap()
             .execute(
