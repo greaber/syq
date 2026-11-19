@@ -76,6 +76,9 @@ struct Writer {
     measurements: inference::Eligibility,
     measurement_segment: i64,
     salt: [u8; 32],
+    /// The local network's fingerprint, read once for the copy's starting
+    /// keys. `None` until a remote key first needs it.
+    network: Option<Option<String>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -298,6 +301,7 @@ impl Recorder {
             measurements: Default::default(),
             measurement_segment: 0,
             salt,
+            network: None,
         })));
         recorder.event("start", details);
         Ok(recorder)
@@ -368,6 +372,22 @@ impl Recorder {
         if !state.finished {
             state.pending_context = Some(key.clone());
         }
+    }
+
+    /// The network fingerprint this copy's starting keys share, read when the
+    /// first of them needs it.
+    fn network(&self) -> Option<String> {
+        if let Some(network) = &self.0.lock().unwrap_or_else(|p| p.into_inner()).network {
+            return network.clone();
+        }
+        // Read without the lock, which every recorded event takes.
+        let network = super::network::fingerprint();
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .network
+            .get_or_insert(network)
+            .clone()
     }
 
     pub(crate) fn starting_count(&self, key: &ContextKey, allow_route: bool) -> Option<Hint> {
@@ -771,6 +791,7 @@ pub(crate) fn activity_mode(mut mode: String, transport: bool) -> String {
     mode
 }
 
+/// A copy's context key, with the network it started on.
 pub(crate) fn context_key(
     recorder: &Recorder,
     src: &crate::conn::Endpoint,
@@ -778,6 +799,41 @@ pub(crate) fn context_key(
     source: Option<&str>,
     destination: Option<&str>,
     mode: String,
+) -> ContextKey {
+    key_on(recorder, src, dst, source, destination, mode, || {
+        recorder.network()
+    })
+}
+
+/// `context_key` with the network as it is now, to tell whether a copy's
+/// network changed while it ran.
+pub(crate) fn current_context_key(
+    recorder: &Recorder,
+    src: &crate::conn::Endpoint,
+    dst: &crate::conn::Endpoint,
+    source: Option<&str>,
+    destination: Option<&str>,
+    mode: String,
+) -> ContextKey {
+    key_on(
+        recorder,
+        src,
+        dst,
+        source,
+        destination,
+        mode,
+        super::network::fingerprint,
+    )
+}
+
+fn key_on(
+    recorder: &Recorder,
+    src: &crate::conn::Endpoint,
+    dst: &crate::conn::Endpoint,
+    source: Option<&str>,
+    destination: Option<&str>,
+    mode: String,
+    network: impl FnOnce() -> Option<String>,
 ) -> ContextKey {
     let transport = |endpoint: &crate::conn::Endpoint| match endpoint {
         crate::conn::Endpoint::Remote(spec) if !spec.local_process => {
@@ -795,7 +851,7 @@ pub(crate) fn context_key(
         destination_transport
     );
     let remote = source_transport != "Local" || destination_transport != "Local";
-    let network = remote.then(super::network::fingerprint).flatten();
+    let network = remote.then(network).flatten();
     let route = if remote {
         super::network_key(&route, network.as_deref())
     } else {

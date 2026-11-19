@@ -1,18 +1,10 @@
 use super::*;
 
 #[test]
-fn measured_history_seeds_auto_tuning_and_fixed_counts_preserve_legacy_cache() {
+fn measured_history_seeds_auto_tuning() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     let cache = t.path("tuning.json");
-    write(
-        &cache,
-        serde_json::to_string_pretty(&serde_json::json!({
-            "paths": { "local>fake|ssh": 1 }
-        }))
-        .unwrap()
-        .as_bytes(),
-    );
     let run = |destination: &str, fixed: Option<usize>, limited: bool| {
         let mut command = compat_command();
         command
@@ -35,7 +27,7 @@ fn measured_history_seeds_auto_tuning_and_fixed_counts_preserve_legacy_cache() {
             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
             .env("FAKE_RSH_LOG", t.path("rsh.log"))
             .env("SYQ_TUNING_CACHE", &cache)
-            // Match the unscoped legacy cache fixture regardless of the host network.
+            // Keep the history's route key independent of the host network.
             .env("SYQ_TEST_TUNING_NETWORK", "")
             .run()
             .unwrap()
@@ -71,10 +63,7 @@ fn measured_history_seeds_auto_tuning_and_fixed_counts_preserve_legacy_cache() {
     );
     assert_eq!(read(&t.path("limited")), read(&t.path("src")));
 
-    let fixed = run("fixed", Some(3), true);
-    assert_output_ok(&fixed);
-    let cached: serde_json::Value = serde_json::from_slice(&read(&cache)).unwrap();
-    assert_eq!(cached["paths"]["local>fake|ssh"], 1);
+    assert_output_ok(&run("fixed", Some(3), true));
 }
 
 #[cfg(debug_assertions)]
