@@ -7062,6 +7062,8 @@ fn serve_unordered_parts(socket: &mut TcpStream, method: &str, first: &str, star
     reply(socket, 200, &[], body.as_bytes(), false);
 }
 
+// Release builds cannot divide a listing at a loopback endpoint.
+#[cfg(debug_assertions)]
 #[test]
 fn a_divided_listing_out_of_order_is_listed_again_whole() {
     for command in ["cp", "rm"] {

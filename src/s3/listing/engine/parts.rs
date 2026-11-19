@@ -538,40 +538,47 @@ impl Walk {
     /// when the request for it failed.
     fn children(&mut self, at: usize, directory: &str, page: Option<Page>) -> Result<()> {
         let part = &mut self.parts[at];
-        if part.done || part.directory != directory || !matches!(part.children, Children::Asked) {
-            return Ok(());
-        }
+        let current =
+            !part.done && part.directory == directory && matches!(part.children, Children::Asked);
         let Some(page) = page else {
-            part.children = Children::Closed;
+            if current {
+                part.children = Children::Closed;
+            }
             return Ok(());
         };
         // Children and objects come in separate lists, each in order and all
-        // after those of the page before.
-        let ascending = |mut items: std::slice::Iter<'_, &str>| {
-            let mut before = part.children_end.as_str();
+        // after those of the page before. A page that arrives too late to be
+        // used is still evidence of the store's order.
+        let after = if current {
+            part.children_end.as_str()
+        } else {
+            ""
+        };
+        fn ascending<'a>(mut before: &'a str, mut items: impl Iterator<Item = &'a str>) -> bool {
             items.all(|item| {
-                let ordered = *item > before;
+                let ordered = item > before;
                 before = item;
                 ordered
             })
-        };
-        let prefixes: Vec<&str> = page.prefixes.iter().map(String::as_str).collect();
-        let objects: Vec<&str> = page
-            .entries
-            .iter()
-            .map(|entry| entry.key.as_str())
-            .collect();
-        let ordered = ascending(prefixes.iter()) && ascending(objects.iter());
-        let end = prefixes
-            .last()
-            .max(objects.last())
-            .map(|end| (*end).to_owned());
-        if let Some(end) = end {
-            part.children_end = end;
         }
+        let ordered = ascending(after, page.prefixes.iter().map(String::as_str))
+            && ascending(after, page.entries.iter().map(|entry| entry.key.as_str()));
         if !ordered {
-            self.parts[at].children = Children::Closed;
+            if current {
+                part.children = Children::Closed;
+            }
             return self.out_of_order();
+        }
+        if !current {
+            return Ok(());
+        }
+        let end = page
+            .prefixes
+            .last()
+            .map(String::as_str)
+            .max(page.entries.last().map(|entry| entry.key.as_str()));
+        if let Some(end) = end {
+            part.children_end = end.to_owned();
         }
         if at == 0 && self.narrow.is_none() {
             self.narrow =

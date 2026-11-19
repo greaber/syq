@@ -1041,3 +1041,35 @@ async fn the_burst_needs_a_dense_first_page() {
         );
     }
 }
+
+#[test]
+fn a_late_children_page_out_of_order_fails_a_divided_walk() {
+    let object = |key: &str| Entry {
+        key: key.to_owned(),
+        size: 1,
+        last_modified: None,
+        etag: None,
+    };
+    // The first listing stopped where it handed `t/z` over; that part has
+    // finished when the children it asked for arrive.
+    let walk = || {
+        let mut walk = Walk::new("t/".to_owned(), true, false);
+        walk.parts[0].stop = Some("t/z".to_owned());
+        let mut part = Part::new("t/z".to_owned(), Some(2));
+        part.done = true;
+        walk.parts.push(part);
+        walk
+    };
+    let page = |keys: [&str; 2]| Page {
+        entries: keys.map(object).into(),
+        prefixes: Vec::new(),
+        next: None,
+    };
+    let error = walk()
+        .children(1, "t/", Some(page(["t/zy", "t/zx"])))
+        .unwrap_err();
+    assert!(error.is::<Unordered>());
+    assert!(walk()
+        .children(1, "t/", Some(page(["t/zx", "t/zy"])))
+        .is_ok());
+}
