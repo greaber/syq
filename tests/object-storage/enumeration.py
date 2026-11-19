@@ -77,26 +77,27 @@ def check_parts():
     with ThreadPoolExecutor(max_workers=32) as pool:
         list(pool.map(lambda item: c.request('PUT', item[0], item[1]), objects.items()))
     assert set(c.listing(prefix + '/')) == set(objects), 'independent listing must see the fixture'
-    for divide in ('1', None):
+    for divide in (True, False):
         env = {key: value for key, value in os.environ.items()
                if key != 'SYQ_TEST_S3_DIVIDE_LISTINGS'}
         if divide:
-            env['SYQ_TEST_S3_DIVIDE_LISTINGS'] = divide
+            env['SYQ_TEST_S3_DIVIDE_LISTINGS'] = '1'
         listed = subprocess.run([c.SYQ, '_ls', f'{remote}/{prefix}/**', '--s3-region', c.REGION],
                                 capture_output=True, text=True, timeout=120, env=env)
         assert listed.returncode == 0, listed.stderr
+        assert ('listing divided into parts' in listed.stderr) == divide, listed.stderr
         keys = [json.loads(line)['key'] for line in listed.stdout.splitlines()]
         assert len(keys) == len(objects) and set(keys) == set(objects)
-        with tempfile.TemporaryDirectory(prefix='syq-enumeration-') as temp:
-            destination = Path(temp).resolve() / 'download'
-            c.run(['--from', remote, '--srcs-in', prefix, '--into', destination,
-                   '--ignore', 'zz ignored/'], env=env)
-            expected = {key[len(prefix) + 1:] for key in objects
-                        if not key.endswith('/') and '/zz ignored/' not in key}
-            actual = {str(path.relative_to(destination))
-                      for path in destination.rglob('*') if path.is_file()}
-            assert actual == expected
-
+    # check() above copies without the hook; this copy lists in parts.
+    with tempfile.TemporaryDirectory(prefix='syq-enumeration-') as temp:
+        destination = Path(temp).resolve() / 'download'
+        c.run(['--from', remote, '--srcs-in', prefix, '--into', destination,
+               '--ignore', 'zz ignored/'], env=env | {'SYQ_TEST_S3_DIVIDE_LISTINGS': '1'})
+        expected = {key[len(prefix) + 1:] for key in objects
+                    if not key.endswith('/') and '/zz ignored/' not in key}
+        actual = {str(path.relative_to(destination))
+                  for path in destination.rglob('*') if path.is_file()}
+        assert actual == expected
 
 if __name__ == '__main__':
     try:

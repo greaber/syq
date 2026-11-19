@@ -41,16 +41,17 @@ service is back.
 
 Before it copies or removes a prefix, and for `--prune`, syq lists the
 objects under it. In general purpose buckets on AWS, syq divides a large
-listing with subdirectories into parts that it lists at the same time. That
-can make a listing of hundreds of thousands of objects several times faster,
-for at most two list requests more plus one for every four pages of 1,000
-objects.
+listing with subdirectories into parts that it lists at the same time, so
+the listing can finish sooner when each request takes a while. This costs a
+few more list requests, up to about a quarter more on large listings. When a
+prefix has a few dozen subdirectories that each hold many objects, syq may
+list each of them by itself.
 
 Dividing a listing is safe only when the service returns keys in byte
-order, which AWS documents and other services do not. With `--s3-endpoint`,
-syq divides listings only when the URL names an AWS S3 endpoint (regional,
-dual-stack, FIPS or VPC). For other services, including MinIO and other
-servers you run yourself, syq mostly lists one page at a time.
+order, and only AWS documents that it does. With `--s3-endpoint`, syq divides
+listings only when the URL is an AWS S3 endpoint: regional, dual-stack, FIPS,
+or the bucket address of a VPC endpoint. For other services, including MinIO
+and other servers you run yourself, syq mostly lists one page at a time.
 
 ## Upload and download
 

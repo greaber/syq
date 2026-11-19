@@ -1029,7 +1029,7 @@ pub(super) async fn list_with_times(
         inner: listing::S3 {
             client: client.clone(),
             bucket,
-            divides: listing::lists_in_byte_order(endpoint),
+            divides: listing::lists_in_byte_order(endpoint, bucket),
         },
         root: prefix,
         discovery_denied: AtomicBool::new(false),

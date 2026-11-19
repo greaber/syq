@@ -93,7 +93,7 @@ enum Done {
         walk: usize,
         part: usize,
         directory: String,
-        page: Page,
+        page: Option<Page>,
     },
 }
 
@@ -137,7 +137,10 @@ async fn execute(
             directory,
             token,
         } => {
-            let page = read(store, &directory, true, token.as_deref()).await?;
+            // Only the choice of parts needs the children. A listing whose
+            // request for them fails, perhaps refused by a policy that allows
+            // listing the prefix alone, goes on by itself.
+            let page = read(store, &directory, true, token.as_deref()).await.ok();
             return Ok(Done::Children {
                 walk,
                 part,
@@ -459,20 +462,16 @@ impl Walk {
     /// Take a page of a part's keys. Returns the keys that belong to it and
     /// the request for its next page.
     fn keys(&mut self, id: usize, at: usize, mut page: Page) -> Result<(Vec<Entry>, Option<Job>)> {
-        let part = &mut self.parts[at];
-        let mut before = part.last.as_str();
+        let mut before = self.parts[at].last.as_str();
         let mut ordered = true;
         for entry in &page.entries {
             ordered &= entry.key.as_str() > before;
             before = &entry.key;
         }
         if !ordered {
-            if part.stop.is_some() {
-                return Err(Unordered.into());
-            }
-            // Nothing depends on the order yet, and nothing will.
-            self.dividing = false;
+            self.out_of_order()?;
         }
+        let part = &mut self.parts[at];
         let mut finished = page.next.is_none();
         if let Some(stop) = &part.stop {
             let within = page.entries.partition_point(|entry| entry.key < *stop);
@@ -487,7 +486,7 @@ impl Walk {
             directories(&part.prefix, &page, &mut counts);
             part.dense = counts.values().any(|keys| *keys >= DENSE_DIRECTORY);
         }
-        if at == 0 {
+        if at == 0 && part.pages < BURST_PAGES {
             if let Some(sample) = &mut self.sample {
                 let mut counts = HashMap::new();
                 directories(&part.prefix, &page, &mut counts);
@@ -521,12 +520,28 @@ impl Walk {
         Ok((page.entries, Some(job)))
     }
 
-    /// Take a page of the children of the directory a part is in.
-    fn children(&mut self, at: usize, directory: &str, page: Page) {
+    /// The store returned something out of order. Once any listing of the
+    /// walk has stopped at a key handed over, it may have stopped early;
+    /// before that, nothing depends on the order, and nothing will.
+    fn out_of_order(&mut self) -> Result<()> {
+        if self.parts.iter().any(|part| part.stop.is_some()) {
+            return Err(Unordered.into());
+        }
+        self.dividing = false;
+        Ok(())
+    }
+
+    /// Take a page of the children of the directory a part is in, or `None`
+    /// when the request for it failed.
+    fn children(&mut self, at: usize, directory: &str, page: Option<Page>) -> Result<()> {
         let part = &mut self.parts[at];
         if part.done || part.directory != directory || !matches!(part.children, Children::Asked) {
-            return;
+            return Ok(());
         }
+        let Some(page) = page else {
+            part.children = Children::Closed;
+            return Ok(());
+        };
         let mut before = part.listed.as_str();
         let mut ordered = true;
         for child in &page.prefixes {
@@ -534,10 +549,8 @@ impl Walk {
             before = child;
         }
         if !ordered {
-            // The children are of no use out of order. Parts already handed
-            // over do not depend on them.
-            part.children = Children::Closed;
-            return;
+            self.parts[at].children = Children::Closed;
+            return self.out_of_order();
         }
         if at == 0 && self.narrow.is_none() {
             self.narrow =
@@ -562,6 +575,7 @@ impl Walk {
             Some(token) => Children::More(token),
             None => Children::Complete,
         };
+        Ok(())
     }
 
     fn allowance(&self) -> usize {
@@ -573,20 +587,27 @@ impl Walk {
     }
 
     /// Grant the burst once the first pages and the prefix's children say
-    /// whether it applies.
+    /// whether it applies. As in the split it keeps, a listing must be known
+    /// to need a third page: a burst costs a request for each child.
     fn decide_burst(&mut self) {
         let (Some(sample), Some(narrow)) = (&self.sample, self.narrow) else {
             return;
         };
+        let root = &self.parts[0];
+        if !root.done && root.pages < 2 {
+            return;
+        }
         let dense = sample
             .values()
             .filter(|keys| **keys >= DENSE_DIRECTORY)
             .count();
-        if narrow && dense >= 2 {
-            self.burst = self.parts[0].ahead.len();
-            self.parts[0].burst = true;
-        } else if narrow && self.parts[0].pages < BURST_PAGES {
-            return;
+        if narrow && !root.done {
+            if dense >= 2 {
+                self.burst = root.ahead.len();
+                self.parts[0].burst = true;
+            } else if root.pages < BURST_PAGES {
+                return;
+            }
         }
         self.sample = None;
     }
@@ -829,6 +850,11 @@ async fn enumerate_jobs(
             active.push(execute(&store, pattern, prune, job, split));
         }
         let Some(done) = active.next().await else {
+            // The MinIO check confirms through this that the walk divided.
+            #[cfg(debug_assertions)]
+            if crate::s3::listing::test_divides() && walks.iter().any(|walk| walk.parts.len() > 1) {
+                crate::output::diagnostic!("syq: test hook: listing divided into parts");
+            }
             return Ok(pruned);
         };
         let (mut entries, walk) = match done? {
@@ -856,7 +882,7 @@ async fn enumerate_jobs(
                 directory,
                 page,
             } => {
-                walks[walk].children(part, &directory, page);
+                walks[walk].children(part, &directory, page)?;
                 (Vec::new(), Some(walk))
             }
         };

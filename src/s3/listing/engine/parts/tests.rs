@@ -15,6 +15,8 @@ struct Memory {
     ended: RefCell<BTreeSet<String>>,
     active: Cell<usize>,
     peak: Cell<usize>,
+    /// Milliseconds a page of keys takes; a page of children takes one.
+    key_delay: Cell<u64>,
 }
 impl Memory {
     fn new(keys: impl IntoIterator<Item = String>) -> Self {
@@ -24,6 +26,7 @@ impl Memory {
             ended: RefCell::default(),
             active: Cell::new(0),
             peak: Cell::new(0),
+            key_delay: Cell::new(1),
         }
     }
     /// The requests a listing of everything under `prefix` makes one page
@@ -59,7 +62,8 @@ impl Store for Memory {
         self.calls.borrow_mut().push((prefix.into(), delimiter));
         self.active.set(self.active.get() + 1);
         self.peak.set(self.peak.get().max(self.active.get()));
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        let delay = if delimiter { 1 } else { self.key_delay.get() };
+        tokio::time::sleep(Duration::from_millis(delay)).await;
         self.active.set(self.active.get() - 1);
         // A token names its query and where the next page starts: after a
         // key, or at the first key past a directory.
@@ -890,4 +894,93 @@ async fn a_part_never_covers_a_pruned_directory_that_starts_like_it() {
     assert!(keys.iter().all(|key| !key.starts_with("t/build/")));
     assert_eq!(keys.len(), 12_900);
     assert!(store.calls.borrow().len() <= allowance(13));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_two_page_listing_never_bursts_whichever_reply_comes_first() {
+    // Two dense directories and 62 others of one key: two pages.
+    let keys: Vec<_> = tree(2, 500)
+        .chain((2..64).map(|d| format!("t/e{d:02}/file")))
+        .collect();
+    for key_delay in [1, 5] {
+        let store = Memory::new(keys.clone());
+        store.key_delay.set(key_delay);
+        let (requests, _) = walked(&store, "t/", 32, None).await;
+        // A page, then the children and the second page together, and when
+        // the children come first, one part for the directories after the
+        // dense ones; not a listing for each of the 62.
+        assert!(
+            requests <= 4,
+            "{requests} requests, pages taking {key_delay} ms"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn keys_out_of_order_in_any_part_fail_a_divided_listing() {
+    /// Returns the keys of every listing but the first in reverse.
+    struct Reversed(Memory);
+    impl Store for Reversed {
+        fn divides(&self) -> bool {
+            true
+        }
+        async fn page(
+            &self,
+            prefix: &str,
+            delimiter: bool,
+            token: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<Page> {
+            let mut page = self.0.page(prefix, delimiter, token, None).await?;
+            if prefix != "t/" && !delimiter {
+                page.entries.reverse();
+            }
+            Ok(page)
+        }
+    }
+    let store = Reversed(Memory::new(tree(100, 300)));
+    let outcome = engine::enumerate_prefix(&store, "t/", 32, None, |_| Ok(())).await;
+    // The first listing stopped where it handed keys over, so a part out of
+    // order may hide keys the first listing would have reached.
+    assert!(outcome.unwrap_err().is::<engine::Unordered>());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_request_for_children_leaves_the_listing_whole() {
+    /// Refuses every request with a delimiter.
+    struct Refusing(Memory);
+    impl Store for Refusing {
+        fn divides(&self) -> bool {
+            true
+        }
+        async fn page(
+            &self,
+            prefix: &str,
+            delimiter: bool,
+            token: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<Page> {
+            let page = self.0.page(prefix, delimiter, token, None).await?;
+            anyhow::ensure!(!delimiter, "access denied");
+            Ok(page)
+        }
+    }
+    let flat = (0..3001).map(|i| format!("t/f{i:04}"));
+    for keys in [flat.collect::<Vec<_>>(), tree(100, 300).collect()] {
+        let store = Refusing(Memory::new(keys));
+        let mut listed = BTreeSet::new();
+        engine::enumerate_prefix(&store, "t/", 32, None, |entry| {
+            assert!(listed.insert(entry.key));
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(listed == store.0.keys);
+        let calls = store.0.calls.borrow();
+        assert!(calls.iter().filter(|(_, delimiter)| *delimiter).count() <= 1);
+        assert_eq!(
+            calls.iter().filter(|(_, delimiter)| !delimiter).count(),
+            store.0.pages("t/")
+        );
+    }
 }
