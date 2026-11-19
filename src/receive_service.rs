@@ -2567,13 +2567,16 @@ fn serve(
         .map(switch::Follower::new);
     let switch_args = switch_command(domain, &spec.endpoint.label());
     let preferences_path = config_path(domain)?;
-    // The default scope's persistence switch, which an explicit scope does
-    // not have: persistence ends there with the scope itself.
+    // The file that says whether persistence is on: the default scope's
+    // switch, or an explicit scope's marker. `Domain::enabled` looks again
+    // whenever it changes.
     let switch_path = if domain.is_default() {
         crate::persistence::config_path()
     } else {
-        None
+        Some(scope.join(crate::persistence::SCOPE_MARKER))
     };
+    let closing = scope.join(CLOSING);
+    let uid = unsafe { libc::geteuid() };
     // A file as last read: read it again only once it changed.
     let seen = |path: &Path| {
         fs::symlink_metadata(path).ok().map(|m| {
@@ -2586,8 +2589,8 @@ fn serve(
     let result = (|| {
         let mut read = seen(&preferences_path);
         let mut config = preferences(domain)?;
-        // Read the switch on the first tick, as it may have changed since
-        // the start looked.
+        // Look at the switch or marker on the first tick, as it may have
+        // changed since the start looked.
         let mut switch_read = None;
         let mut next_tick = Instant::now();
         while !shutdown.load(Ordering::Acquire) {
@@ -2598,10 +2601,8 @@ fn serve(
                 // The scope must still be the private directory it started
                 // in, and not closing.
                 if !fs::metadata(scope).is_ok_and(|m| {
-                    (m.dev(), m.ino()) == scope_identity
-                        && m.uid() == unsafe { libc::geteuid() }
-                        && m.mode() & 0o077 == 0
-                }) || scope.join(CLOSING).exists()
+                    (m.dev(), m.ino()) == scope_identity && m.uid() == uid && m.mode() & 0o077 == 0
+                }) || closing.exists()
                 {
                     break;
                 }

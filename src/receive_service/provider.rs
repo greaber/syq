@@ -1086,8 +1086,10 @@ pub(crate) fn stop(domain: &Domain) -> Result<()> {
 }
 
 struct Runtime {
-    _lock: LockFile,
+    /// Dropped before the lock, so that the socket is gone before another
+    /// provider can take the lock and bind its own.
     server: crate::service::Server,
+    _lock: LockFile,
     service: Arc<Service>,
     follower: Option<super::switch::Follower>,
 }
@@ -1108,8 +1110,8 @@ impl Runtime {
             .map(super::switch::Follower::new);
         let server = crate::service::Server::bind(&scope.join(SOCKET_FILE))?;
         Ok(Self {
-            _lock: lock,
             server,
+            _lock: lock,
             service: Arc::new(Service::new(
                 domain,
                 follower

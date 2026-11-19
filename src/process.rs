@@ -671,9 +671,14 @@ mod group_tests {
             assert_eq!(unsafe { libc::getsid(pid) } == pid, own_session);
             drop(child);
             let deadline = Instant::now() + Duration::from_secs(10);
-            // The sleeper is not this process's child: once killed, init
-            // reaps it.
-            while unsafe { libc::kill(sleeper, 0) } == 0 {
+            // The sleeper is not this process's child, and the process that
+            // adopts it may never reap it: a zombie counts as ended.
+            while unsafe { libc::kill(sleeper, 0) } == 0
+                && !std::fs::read_to_string(format!("/proc/{sleeper}/stat")).is_ok_and(|stat| {
+                    stat.rsplit_once(") ")
+                        .is_some_and(|(_, fields)| fields.starts_with('Z'))
+                })
+            {
                 assert!(Instant::now() < deadline, "the group outlived its owner");
                 std::thread::sleep(Duration::from_millis(10));
             }

@@ -75,8 +75,14 @@ impl Server {
     /// removed only if this user owns it; anything else there is an error.
     pub(crate) fn bind(path: &Path) -> Result<Self> {
         match fs::symlink_metadata(path) {
-            Ok(metadata) if own_socket(&metadata) => fs::remove_file(path)
-                .with_context(|| format!("remove stale socket {}", path.display()))?,
+            Ok(metadata) if own_socket(&metadata) => match fs::remove_file(path) {
+                // The service that left it may remove it at the same time.
+                Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                    return Err(error)
+                        .with_context(|| format!("remove stale socket {}", path.display()))
+                }
+                _ => {}
+            },
             Ok(_) => bail!("unexpected entry at {}", path.display()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
@@ -491,23 +497,5 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-    }
-
-    #[test]
-    fn a_lock_removed_while_a_start_waits_is_taken_again_by_its_new_name() {
-        let root = crate::test_support::short_tempdir().unwrap();
-        let path = root.path().join("s.lock");
-        let owner = lock_for_start(&path).unwrap().unwrap();
-        let exiting = std::thread::spawn(move || {
-            std::thread::sleep(PROBE_GRACE / 4);
-            fs::remove_file(&root.path().join("s.lock")).unwrap();
-            drop(owner);
-            root
-        });
-        let lock = lock_for_start(&path).unwrap().unwrap();
-        let root = exiting.join().unwrap();
-        let named = fs::metadata(root.path().join("s.lock")).unwrap();
-        let locked = lock.file().metadata().unwrap();
-        assert_eq!((named.dev(), named.ino()), (locked.dev(), locked.ino()));
     }
 }

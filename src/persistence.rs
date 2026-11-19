@@ -25,7 +25,7 @@ pub(crate) use domain::Domain;
 mod ssh_config;
 
 const CONFIG_FILE: &str = "persistence.json";
-const SCOPE_MARKER: &str = ".syq-persistence";
+pub(crate) const SCOPE_MARKER: &str = ".syq-persistence";
 const SCOPE_MARKER_CONTENT: &[u8] = b"syq persistence scope\n";
 
 #[derive(Parser, Debug)]
