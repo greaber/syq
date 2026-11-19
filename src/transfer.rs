@@ -3329,7 +3329,10 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 let mut ahead_took = None;
                 let mut ahead = match ahead.and_then(|ahead| ahead.recv().ok()) {
                     Some(opened) if opened.opened.elapsed() <= AHEAD_CONNECTION_USABLE => {
-                        ahead_took = Some(opened.took);
+                        // An attempt that opened nothing is not part of the
+                        // setup of the connection made here instead.
+                        let (src, dst) = &opened.connections;
+                        ahead_took = (src.is_some() || dst.is_some()).then_some(opened.took);
                         opened.connections
                     }
                     Some(stale) => {
