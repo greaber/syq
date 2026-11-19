@@ -410,6 +410,80 @@ fn rsh_ssh_options_keep_separate_persistent_connections() {
     assert!(!scope.exists());
 }
 
+/// Commands repeated with nothing new to record leave persistence state
+/// alone: the endpoint record and the record of an endpoint that is not
+/// receiving are only read, and `persist on` keeps a configuration that
+/// already says so. Rewriting them meant a sync on every command.
+#[test]
+fn repeated_commands_leave_unchanged_persistence_state_alone() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    let ssh = fake_ssh(&t);
+    write(&t.path("src"), b"shared");
+    let on = || assert_output_ok(&persistence_command(&t, &["on"]).run().unwrap());
+    on();
+    let _off = PersistenceOff(&t);
+    assert_output_ok(&persistence_command(&t, &["receive", "off"]).run().unwrap());
+    let copy = || {
+        let out = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .args(["cp", "--no-progress", "--no-tcp", "--syq-path"])
+            .arg(env!("CARGO_BIN_EXE_syq"))
+            .arg(t.path("src"))
+            .args(["--to", "fake", "--as"])
+            .arg(t.path("dst"))
+            .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+            .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+            .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
+            )
+            .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_RUNTIME_DIR", t.runtime())
+            .run()
+            .unwrap();
+        assert_output_ok(&out);
+    };
+    let config = t.path("config/syq/persistence.json");
+    let written = fs::metadata(&config).unwrap().ino();
+    on();
+    assert_eq!(fs::metadata(&config).unwrap().ino(), written);
+
+    copy();
+    let parent = fs::read_dir(t.runtime())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("syq-persist-")
+        })
+        .unwrap();
+    let records = || {
+        let mut records: Vec<(String, u64)> = fs::read_dir(parent.join("global"))
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.ends_with(".json") || name.ends_with(".recv-json")
+            })
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    entry.metadata().unwrap().ino(),
+                )
+            })
+            .collect();
+        records.sort();
+        records
+    };
+    let first = records();
+    assert_eq!(first.len(), 2, "{first:?}");
+    copy();
+    assert_eq!(records(), first);
+}
+
 #[test]
 fn local_copy_does_not_read_the_global_persistence_configuration() {
     let t = Tmp::new();
