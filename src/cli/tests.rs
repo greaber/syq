@@ -773,6 +773,46 @@ fn native_endpoints_are_separate_from_paths() {
     assert!(parse_native_endpoint(Some("host/path")).is_err());
 }
 
+/// An endpoint's label is the spelling that parses back to it, which the
+/// completion cache relies on.
+#[test]
+fn endpoint_labels_parse_back_to_their_endpoint() {
+    for host in [
+        "example.test",
+        "alias",
+        "192.0.2.7",
+        "2001:db8::1",
+        "::1",
+        "fe80::1%eth0",
+    ] {
+        for user in [None, Some("alice"), Some("a.b-c_d")] {
+            for port in [None, Some(1), Some(22), Some(2222), Some(65535)] {
+                let endpoint = super::NativeEndpoint {
+                    user: user.map(str::to_owned),
+                    host: host.to_owned(),
+                    port,
+                };
+                let label = endpoint.label();
+                assert_eq!(
+                    label,
+                    super::endpoint_label(user, host, port),
+                    "{endpoint:?}"
+                );
+                assert_eq!(
+                    parse_native_endpoint(Some(&label)).unwrap(),
+                    Some(endpoint),
+                    "{label}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        super::endpoint_label(Some("alice"), "2001:db8::1", Some(2200)),
+        "alice@[2001:db8::1]:2200"
+    );
+    assert_eq!(super::endpoint_label(None, "host", None), "host");
+}
+
 #[test]
 fn native_source_arguments_must_precede_destination_arguments() {
     for (argv, source_argument) in [

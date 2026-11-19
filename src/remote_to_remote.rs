@@ -1555,19 +1555,7 @@ pub(crate) fn endpoint_arg(
 ) -> String {
     let host =
         connection_host.unwrap_or_else(|| location.host.as_deref().expect("remote endpoint"));
-    let host = if host.contains(':') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    };
-    let endpoint = match login_user.or(location.user.as_deref()) {
-        Some(user) => format!("{user}@{host}"),
-        None => host,
-    };
-    match location.port {
-        Some(port) => format!("{endpoint}:{port}"),
-        None => endpoint,
-    }
+    crate::cli::endpoint_label(login_user.or(location.user.as_deref()), host, location.port)
 }
 
 fn endpoint_display(location: &Location) -> String {

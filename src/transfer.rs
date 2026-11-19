@@ -6533,19 +6533,8 @@ fn display_location(loc: &Location, path: &[u8]) -> String {
     let Some(host) = &loc.host else {
         return path;
     };
-    let host = if host.contains(':') {
-        format!("[{host}]")
-    } else {
-        host.clone()
-    };
-    let endpoint = match &loc.user {
-        Some(user) => format!("{user}@{host}"),
-        None => host,
-    };
-    match loc.port {
-        Some(port) => format!("{endpoint}:{port}:{path}"),
-        None => format!("{endpoint}:{path}"),
-    }
+    let endpoint = crate::cli::endpoint_label(loc.user.as_deref(), host, loc.port);
+    format!("{endpoint}:{path}")
 }
 
 fn display_plan_source(loc: &Location, args: &Args) -> String {
