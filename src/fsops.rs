@@ -3275,6 +3275,16 @@ impl FsOps {
         )
     }
 
+    /// A receiver whose destination root is the existing directory `root`,
+    /// reached by that spelling. Its methods take paths relative to `root`.
+    #[cfg(test)]
+    pub(crate) fn rooted_for_test(root: &Path) -> Self {
+        let mut ops = Self::new();
+        ops.destination_root = Some(Arc::new(Root::open(root).unwrap()));
+        ops.destination_prefix = Some(path_bytes(root));
+        ops
+    }
+
     /// Ops within a batch run in parallel, except that a creation waits for
     /// its parent's Mkdir in the same batch. Creations in a wave share each
     /// directory between at most two threads. A short phase runs on this
