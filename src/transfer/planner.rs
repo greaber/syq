@@ -1440,8 +1440,12 @@ impl Planner<'_> {
         if self.mapping_mode && !self.opts.dry_run {
             let deferred: std::collections::HashSet<_> =
                 self.deferred.iter().map(|(path, ..)| path).collect();
-            self.src_overrides
-                .retain(|dst, _| deferred.contains(&join(&self.dst_root, dst)));
+            // A representative the planner kept may still go to a worker
+            // (`recheck_kept_representatives`), which names its source.
+            let kept = self.hardlinks.kept_destinations();
+            self.src_overrides.retain(|dst, _| {
+                deferred.contains(&join(&self.dst_root, dst)) || kept.contains(dst)
+            });
             self.implicit_dirs.retain(|path| deferred.contains(path));
             self.src_overrides.shrink_to_fit();
             self.implicit_dirs.shrink_to_fit();
@@ -2227,6 +2231,8 @@ impl Planner<'_> {
                     contested,
                 },
                 dst_entry,
+                target_condition,
+                leaf_ops,
             );
             return;
         }
@@ -2289,6 +2295,7 @@ impl Planner<'_> {
                             entry: e,
                             destination: d.clone(),
                         })),
+                        hardlink_group: None,
                     });
                     return;
                 }
@@ -3668,20 +3675,98 @@ impl Planner<'_> {
         if meta_fixes.is_empty() {
             return Ok(());
         }
-        let (ops, entries): (Vec<_>, Vec<_>) = meta_fixes
-            .into_iter()
-            .map(|fix| (fix.op, (fix.dst_rel, fix.kind, fix.replacement)))
-            .unzip();
-        let errors = self.apply(ops)?;
+        let unzip = |fixes: Vec<MetaFix>| -> (Vec<Op>, Vec<_>) {
+            fixes
+                .into_iter()
+                .map(|fix| {
+                    (
+                        fix.op,
+                        (fix.dst_rel, fix.kind, fix.replacement, fix.hardlink_group),
+                    )
+                })
+                .unzip()
+        };
+        let (errors, refused_whole, entries) =
+            if !meta_fixes.iter().any(|fix| fix.hardlink_group.is_some()) {
+                let (ops, entries) = unzip(meta_fixes);
+                let errors = self.apply(ops)?;
+                let refused_whole = vec![false; errors.len()];
+                (errors, refused_whole, entries)
+            } else {
+                let (representatives, ordinary): (Vec<_>, Vec<_>) = meta_fixes
+                    .into_iter()
+                    .partition(|fix| fix.hardlink_group.is_some());
+                // Hard-link representatives' checks, many operations that each
+                // used to go alone, are sized by their replies, and the batch's
+                // requests sent ahead of their replies. A restricted receiver
+                // refuses a request whole, and a representative refused with
+                // others goes to a worker, which asks again by itself, where an
+                // ordinary file would fail: there they go in requests of their
+                // own.
+                let (mut ops, mut entries) = unzip(ordinary);
+                let (representative_ops, representative_entries) = unzip(representatives);
+                let requests = if self.opts.restricted_receiver {
+                    let mut requests = if ops.is_empty() {
+                        Vec::new()
+                    } else {
+                        request_sized(ops)
+                    };
+                    requests.extend(metadata_requests(representative_ops));
+                    requests
+                } else {
+                    ops.extend(representative_ops);
+                    metadata_requests(ops)
+                };
+                entries.extend(representative_entries);
+                let (errors, refused_whole) = self.apply_requests(requests)?;
+                (errors, refused_whole, entries)
+            };
         let capacity_error = first_capacity_error(&errors);
         // The files to replace are queued together, after the reply.
         let _burst = self.sched.file_burst();
-        for ((dst, kind, replacement), error) in entries.into_iter().zip(errors) {
-            match (error, replacement) {
-                (None, _) => {}
+        for (((dst, kind, replacement, hardlink_group), error), whole) in
+            entries.into_iter().zip(errors).zip(refused_whole)
+        {
+            match (error, replacement, hardlink_group) {
+                (None, _, Some(group)) => self.representative_kept(group),
+                (None, _, None) => {}
+                // A hard-link representative the receiver will not change in
+                // place goes to a worker to be replaced, and one refused with
+                // its whole request by a restricted receiver goes to a worker
+                // to be asked about again by itself, unless a full
+                // destination ends the copy after this batch.
+                (Some(error), _, Some(group))
+                    if capacity_error.is_none()
+                        && (whole || crate::fsops::vouch::is_replace_required_wire(&error)) =>
+                {
+                    self.representative_to_worker(
+                        group,
+                        crate::fsops::vouch::replace_reason_wire(&error),
+                    )
+                }
+                // Any other outcome is settled now, as a worker settles it:
+                // skipped when its existing-file policy keeps the
+                // destination, and otherwise reported. A later batch's full
+                // destination could end the copy before a worker reported it.
+                (Some(error), _, Some(group)) => {
+                    let skipped = self.representative_skipped_by_policy(group, &error);
+                    self.representative_failed(group);
+                    if skipped {
+                        self.progress.files_excluded.fetch_add(1, Relaxed);
+                        if !self.opts.quiet {
+                            self.progress.eprintln(&format!(
+                                "syq: {}: {}",
+                                display(&dst),
+                                self.opts.kept_note()
+                            ));
+                        }
+                    } else {
+                        self.report_metadata_failure(Some(&dst), kind, &error);
+                    }
+                }
                 // The receiver will not change this file's metadata in
                 // place: it is copied as a changed file and replaced.
-                (Some(error), Some(replacement))
+                (Some(error), Some(replacement), None)
                     if crate::fsops::vouch::is_replace_required_wire(&error) =>
                 {
                     let reason = crate::fsops::vouch::replace_reason_wire(&error);
@@ -3698,9 +3783,17 @@ impl Planner<'_> {
                     self.progress
                         .bytes_in_unchanged_files
                         .fetch_sub(entry.size, Relaxed);
-                    self.enqueue_with(source, dst, rel, dst_rel, entry, Some(destination), reason);
+                    self.enqueue_with(
+                        source,
+                        dst,
+                        rel,
+                        dst_rel,
+                        entry,
+                        Some(destination),
+                        (reason, false, false),
+                    );
                 }
-                (Some(error), _) => self.report_metadata_failure(Some(&dst), kind, &error),
+                (Some(error), _, None) => self.report_metadata_failure(Some(&dst), kind, &error),
             }
         }
         if let Some(error) = capacity_error {
@@ -4190,12 +4283,25 @@ impl Planner<'_> {
         entry: Entry,
         dst_entry: Option<Entry>,
     ) -> usize {
-        self.enqueue_with(source_path, dst, rel, rel_bytes, entry, dst_entry, None)
+        self.enqueue_with(
+            source_path,
+            dst,
+            rel,
+            rel_bytes,
+            entry,
+            dst_entry,
+            (None, false, false),
+        )
     }
 
     /// `enqueue`, replacing an existing destination file whatever its
     /// contents when `refused` says why, as when the receiver refused to
-    /// change its metadata in place.
+    /// change its metadata in place. With `copy_whole`, the file is known
+    /// to differ from its destination, as one whose source changed, after
+    /// its size and time were found to match, in a way they do not show: it
+    /// is copied whole, where it is when `--in-place=update` allows, without
+    /// a comparison. `retry` queues it as a worker queues a file whose
+    /// source changed: as its second attempt.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn enqueue_with(
         &mut self,
@@ -4205,7 +4311,7 @@ impl Planner<'_> {
         rel_bytes: PathBytes,
         entry: Entry,
         dst_entry: Option<Entry>,
-        refused: Option<crate::proto::ReplaceReason>,
+        (refused, copy_whole, retry): (Option<crate::proto::ReplaceReason>, bool, bool),
     ) -> usize {
         let (src, source) = source_path;
         let target_condition = self.leaf_condition_for(&dst, dst_entry.as_ref());
@@ -4247,7 +4353,7 @@ impl Planner<'_> {
             data: FileJobData {
                 compare_ranges: false,
                 compare_final: false,
-                compared: false,
+                compared: copy_whole,
                 resume_partial: false,
                 replace,
                 recompared: 0,
@@ -4259,7 +4365,7 @@ impl Planner<'_> {
                 entry,
                 policy_condition,
                 target_condition,
-                attempt: 0,
+                attempt: u32::from(retry),
                 done: Arc::new(AtomicU64::new(0)),
                 inplace,
                 in_place_refusal,
@@ -5175,6 +5281,74 @@ impl Planner<'_> {
         Ok(results)
     }
 
+    /// The outcomes of `requests`' operations, in order, each with whether a
+    /// restricted receiver refused its whole request (`applied`). Several
+    /// requests are sent ahead of their replies, as many as the connection
+    /// lets wait (`directory_stream::REQUESTS_IN_FLIGHT`): the receiver runs
+    /// them in the order sent. After a failure nothing more is sent, and the
+    /// replies to those already sent are taken.
+    fn apply_requests(
+        &mut self,
+        requests: Vec<Vec<Op>>,
+    ) -> Result<(Vec<Option<WireError>>, Vec<bool>)> {
+        let unanswered = self.dst.reply_queue().map_or(1, |replies| {
+            replies.min(super::directory_stream::REQUESTS_IN_FLIGHT)
+        });
+        let mut results = Vec::new();
+        let mut refused_whole = Vec::new();
+        let refused = |response: &Response| {
+            self.opts.restricted_receiver && matches!(response, Response::Err(_))
+        };
+        if requests.len() <= 1 || unanswered == 1 {
+            for ops in requests {
+                let count = ops.len();
+                let response = self.dst.call(Request::Apply { ops })?;
+                refused_whole.extend(std::iter::repeat_n(refused(&response), count));
+                results.extend(self.applied(response, count)?);
+            }
+            return Ok((results, refused_whole));
+        }
+        // Lookups sent early would not see these changes: their replies
+        // are taken first, as the batch would drop them anyway
+        // (`early_lookups`), and so that all fit what the connection lets
+        // wait.
+        self.withdraw_early_lookups();
+        let mut requests = requests.into_iter();
+        let mut in_flight = std::collections::VecDeque::new();
+        let mut failure = None;
+        loop {
+            while failure.is_none() && in_flight.len() < unanswered {
+                let Some(ops) = requests.next() else {
+                    break;
+                };
+                let count = ops.len();
+                match self.dst.send_pending(Request::Apply { ops }) {
+                    Ok(reply) => in_flight.push_back((reply, count)),
+                    Err(error) => failure = Some(error),
+                }
+            }
+            let Some((reply, count)) = in_flight.pop_front() else {
+                break;
+            };
+            let response = match self.dst.take_reply(reply) {
+                Ok(response) => response,
+                Err(error) => return Err(failure.unwrap_or(error)),
+            };
+            if failure.is_some() {
+                continue;
+            }
+            let whole = refused(&response);
+            match self.applied(response, count) {
+                Ok(errors) => {
+                    refused_whole.extend(std::iter::repeat_n(whole, count));
+                    results.extend(errors);
+                }
+                Err(error) => failure = Some(error),
+            }
+        }
+        failure.map_or(Ok((results, refused_whole)), Err)
+    }
+
     pub(super) fn apply(&mut self, ops: Vec<Op>) -> Result<Vec<Option<WireError>>> {
         let mut results = Vec::with_capacity(ops.len());
         for ops in request_sized(ops) {
@@ -5186,7 +5360,11 @@ impl Planner<'_> {
     }
 
     /// The outcome of each of an `Apply` request's `count` operations.
-    fn applied(&self, response: Response, count: usize) -> Result<Vec<Option<WireError>>> {
+    pub(super) fn applied(
+        &self,
+        response: Response,
+        count: usize,
+    ) -> Result<Vec<Option<WireError>>> {
         match response {
             // A restricted receiver refuses a request whole when it would
             // break the grant, a limit say, and lists that refusal itself:
@@ -5196,7 +5374,10 @@ impl Planner<'_> {
                 Ok(vec![Some(WireError::from(error)); count])
             }
             response => match ok(response, "apply")? {
-                Response::Applied(v) => Ok(v),
+                Response::Applied(v) if v.len() == count => Ok(v),
+                Response::Applied(v) => {
+                    bail!("receiver returned {} results for {count} changes", v.len())
+                }
                 other => bail!("unexpected response {other:?}"),
             },
         }
@@ -5998,11 +6179,17 @@ fn merge_directory_metadata(
 /// set (`flags`), its depth, and the directory it must still be.
 type DirectoryMetadata = (PathBytes, Meta, u8, usize, TargetCondition);
 
-/// The most the failure of an early or final directory metadata operation
-/// adds to its reply (`proto::failed_set_meta_hint`).
+/// The most the failure of a directory metadata, file metadata or link
+/// operation adds to its reply (`proto::failed_set_meta_hint`): a link's
+/// error may name the name it links to as well as its own.
 fn failed_metadata_hint(op: &Op) -> usize {
     match op {
-        Op::SetMeta { path, meta, .. } => crate::proto::failed_set_meta_hint(path, meta),
+        Op::SetMeta { path, meta, .. } | Op::SetFileMetaIfSame { path, meta, .. } => {
+            crate::proto::failed_set_meta_hint(path, meta)
+        }
+        Op::Hardlink { path, source, .. } => {
+            crate::proto::failed_path_hint(path) + crate::proto::failed_path_hint(source)
+        }
         op => crate::proto::failed_path_hint(apply_path(op)),
     }
 }
@@ -6061,6 +6248,18 @@ fn request_sized(mut ops: Vec<Op>) -> Vec<Vec<Op>> {
         return parts;
     }
     vec![ops]
+}
+
+/// Metadata or link operations of a kind that each used to go in a request
+/// of its own, such as hard-link representatives' checks and links, as the
+/// requests they go in: each small enough that the failures of all its
+/// operations would fit its reply (`reply_sized`), and its request its
+/// frame (`request_sized`).
+pub(super) fn metadata_requests(ops: Vec<Op>) -> Vec<Vec<Op>> {
+    reply_sized(ops, usize::MAX, failed_metadata_hint)
+        .into_iter()
+        .flat_map(request_sized)
+        .collect()
 }
 
 /// The final directory metadata still to send, deepest first, as the
@@ -6169,26 +6368,29 @@ pub(super) fn implicit_dir_entry(path: PathBytes) -> Entry {
 /// Each entry of `names` owns two consecutive entries of `ops`: the creation
 /// and then its metadata.
 #[derive(Default)]
-struct LeafOps {
+pub(super) struct LeafOps {
     ops: Vec<Op>,
     names: Vec<QueuedLeafOp>,
     // Metadata-only operations retain the same retry identity as content copies.
-    meta_fixes: Vec<MetaFix>,
+    pub(super) meta_fixes: Vec<MetaFix>,
 }
 
 /// A metadata-only change to an existing destination entry.
-struct MetaFix {
-    op: Op,
-    dst_rel: PathBytes,
-    kind: DeclaredKind,
+pub(super) struct MetaFix {
+    pub(super) op: Op,
+    pub(super) dst_rel: PathBytes,
+    pub(super) kind: DeclaredKind,
     /// How to copy a file the receiver will not change in place instead.
-    replacement: Option<Box<Replacement>>,
+    pub(super) replacement: Option<Box<Replacement>>,
+    /// The hard-link group whose representative this is, kept by the
+    /// planner (`Planner::keeps_representative`).
+    pub(super) hardlink_group: Option<usize>,
 }
 
 /// A planned file copy, kept for a file planned to keep its contents in case
 /// the receiver will not change its metadata in place: it is then copied and
 /// replaced (`fsops::vouch`).
-struct Replacement {
+pub(super) struct Replacement {
     source: (PathBytes, RegisteredPath),
     dst: PathBytes,
     rel: String,
@@ -6424,6 +6626,62 @@ mod directory_metadata_tests {
             io_kind: Some(crate::proto::WireIoKind::OwnedDirectoryPermissions),
             raw_os_error: Some(i32::MAX),
             condition_not_met: true,
+        }
+    }
+
+    #[test]
+    fn file_metadata_and_link_requests_and_their_replies_fit_their_frames_when_every_file_fails() {
+        use crate::proto::{METADATA_BATCH_BYTES, METADATA_REPLY_BYTES};
+        // Kept hard-link representatives whose files vanished, and links to
+        // them, with the longest paths of non-UTF-8 bytes: the requests'
+        // replies, not the requests, decide how many go together
+        // (`metadata_requests`).
+        let tree = crate::test_support::tempdir().unwrap();
+        let mut receiver = crate::fsops::FsOps::rooted_for_test(tree.path());
+        let beneath = |index: usize| {
+            let mut path = vec![vec![0xff; 255]; 15].join(&b'/');
+            path.push(b'/');
+            path.extend_from_slice(&[0xff; 247]);
+            path.extend_from_slice(format!("{index:08}").as_bytes());
+            path
+        };
+        let meta = timed(Vec::new(), 0).1;
+        let checks: Vec<Op> = (0..400)
+            .map(|index| Op::SetFileMetaIfSame {
+                path: beneath(index),
+                condition: TargetCondition::Matches { dev: 1, ino: 1 },
+                meta: meta.clone(),
+                flags: flags::TIMES | flags::REPORT_IDENTITY,
+            })
+            .collect();
+        let links: Vec<Op> = (0..400)
+            .map(|index| Op::Hardlink {
+                path: beneath(index),
+                source: beneath(index + 400),
+                dev: 1,
+                ino: 1,
+                condition: TargetCondition::Any,
+            })
+            .collect();
+        for ops in [checks, links] {
+            let total = ops.len();
+            // Sized by their requests alone, all would go in one.
+            assert_eq!(request_sized(ops.clone()).len(), 1);
+            let requests = metadata_requests(ops);
+            assert!(requests.len() > 1);
+            let mut sent = 0;
+            for ops in requests {
+                let request = Request::Apply { ops: ops.clone() };
+                assert!(encoded_len(&request) < METADATA_BATCH_BYTES);
+                assert!(fits_its_frame(&request));
+                let errors = receiver.apply(&ops);
+                assert!(errors.iter().all(Option::is_some), "{errors:?}");
+                let reply = Response::Applied(errors);
+                assert!(encoded_len(&reply) <= METADATA_REPLY_BYTES);
+                assert!(fits_its_frame(&reply));
+                sent += ops.len();
+            }
+            assert_eq!(sent, total);
         }
     }
 

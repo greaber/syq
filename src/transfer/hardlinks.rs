@@ -8,10 +8,87 @@ pub(super) struct Hardlinks {
     groups: Vec<Group>,
 }
 
+impl Hardlinks {
+    /// The destination paths, below the root, of the representatives the
+    /// planner kept.
+    pub(super) fn kept_destinations(&self) -> std::collections::HashSet<&PathBytes> {
+        self.groups
+            .iter()
+            .filter_map(|group| group.kept.as_ref().map(|kept| &kept.leaf.dst_rel))
+            .collect()
+    }
+
+    /// The representative of `group` the planner kept.
+    fn kept_leaf(&self, group: usize) -> &Planned {
+        &self.groups[group].kept.as_ref().expect("a kept group").leaf
+    }
+}
+
 struct Group {
     representative: usize,
     preview: Option<Box<(Planned, Option<Entry>)>>,
+    /// A representative kept without a worker (`Planner::keeps_representative`).
+    kept: Option<Box<Kept>>,
     followers: Vec<Follower>,
+}
+
+/// An existing representative whose size and time match its source: its
+/// metadata and owner are checked with its batch's other metadata fixes
+/// (`Planner::flush_meta_fixes`), as a worker would check them one file at
+/// a time. One the receiver will not keep is copied by a worker instead.
+struct Kept {
+    leaf: Planned,
+    /// The existing file, as the lookup found it.
+    destination: Entry,
+    /// Its identity once the receiver has accepted it: what the group's
+    /// other names are linked to.
+    identity: Option<(u64, u64)>,
+}
+
+/// The name a group's other names are linked to: a worker's job, shared
+/// with the scheduler, or a representative the planner kept.
+enum Linked {
+    Job(WorkerJob),
+    Kept(Box<Kept>),
+}
+
+impl Linked {
+    fn src(&self) -> &PathBytes {
+        match self {
+            Self::Job(job) => &job.src,
+            Self::Kept(kept) => &kept.leaf.src,
+        }
+    }
+
+    fn source(&self) -> &RegisteredPath {
+        match self {
+            Self::Job(job) => &job.source,
+            Self::Kept(kept) => &kept.leaf.source,
+        }
+    }
+
+    fn dst(&self) -> &PathBytes {
+        match self {
+            Self::Job(job) => &job.dst,
+            Self::Kept(kept) => &kept.leaf.dst,
+        }
+    }
+
+    /// Its path below the destination root.
+    fn rel(&self) -> &PathBytes {
+        match self {
+            Self::Job(job) => &job.rel_bytes,
+            Self::Kept(kept) => &kept.leaf.dst_rel,
+        }
+    }
+
+    /// The source file as the scan found it.
+    fn entry(&self) -> &Entry {
+        match self {
+            Self::Job(job) => &job.entry,
+            Self::Kept(kept) => &kept.leaf.e,
+        }
+    }
 }
 
 struct Follower {
@@ -28,7 +105,7 @@ struct Follower {
 }
 
 struct ReadyGroup {
-    job: WorkerJob,
+    representative: Linked,
     published: Option<(u64, u64)>,
     followers: Vec<Follower>,
 }
@@ -61,7 +138,13 @@ pub(super) fn validate_macos_acls<'a>(entries: impl Iterator<Item = &'a Planned>
 }
 
 impl Planner<'_> {
-    pub(super) fn plan_hardlinked_file(&mut self, leaf: Planned, destination: Option<Entry>) {
+    pub(super) fn plan_hardlinked_file(
+        &mut self,
+        leaf: Planned,
+        destination: Option<Entry>,
+        target_condition: TargetCondition,
+        leaf_ops: &mut LeafOps,
+    ) {
         let identity = (leaf.e.dev, leaf.e.ino);
         let condition = self.leaf_condition_for(&leaf.dst, destination.as_ref());
         if let Some(&index) = self.hardlinks.by_inode.get(&identity) {
@@ -70,6 +153,8 @@ impl Planner<'_> {
             let (entry, rel) = if let Some(preview) = &group.preview {
                 let (leaf, _) = &**preview;
                 (&leaf.e, &leaf.dst_rel)
+            } else if let Some(kept) = &group.kept {
+                (&kept.leaf.e, &kept.leaf.dst_rel)
             } else {
                 let representative = &jobs[group.representative];
                 (&representative.entry, &representative.rel_bytes)
@@ -114,6 +199,7 @@ impl Planner<'_> {
             self.hardlinks.groups.push(Group {
                 representative: 0,
                 preview: Some(Box::new((leaf, destination))),
+                kept: None,
                 followers: Vec::new(),
             });
         } else if self.opts.dry_run
@@ -175,6 +261,52 @@ impl Planner<'_> {
             self.hardlinks.groups.push(Group {
                 representative: 0,
                 preview: Some(Box::new((leaf, destination.filter(|_| matched)))),
+                kept: None,
+                followers: Vec::new(),
+            });
+        } else if destination
+            .as_ref()
+            .is_some_and(|d| self.keeps_representative(&leaf, d))
+        {
+            let destination = destination.expect("checked above");
+            self.progress.files_unchanged.fetch_add(1, Relaxed);
+            self.progress
+                .bytes_unchanged
+                .fetch_add(leaf.e.size, Relaxed);
+            self.progress.add_unchanged_file_bytes(leaf.e.size);
+            let group = self.hardlinks.groups.len();
+            // As `Worker::try_expected_match` asks of a representative: its
+            // metadata reconciled, the inode the lookup found, and an owner
+            // the receiver accepts for a file to get new names (`vouch`).
+            leaf_ops.meta_fixes.push(MetaFix {
+                op: Op::SetFileMetaIfSame {
+                    path: leaf.dst.clone(),
+                    condition: match target_condition {
+                        TargetCondition::Any => target_identity(&destination),
+                        condition => condition,
+                    },
+                    meta: self.opts.metadata_for(&leaf.dst_rel, &leaf.e),
+                    flags: self
+                        .opts
+                        .metadata_fix_flags(&leaf.dst_rel, &leaf.e, &destination)
+                        | self.opts.ownership_flags(&leaf.dst_rel)
+                        | flags::REPORT_IDENTITY,
+                },
+                dst_rel: leaf.dst_rel.clone(),
+                kind: DeclaredKind::File,
+                // Kept with the group instead (`representative_to_worker`).
+                replacement: None,
+                hardlink_group: Some(group),
+            });
+            self.hardlinks.by_inode.insert(identity, group);
+            self.hardlinks.groups.push(Group {
+                representative: 0,
+                preview: None,
+                kept: Some(Box::new(Kept {
+                    leaf,
+                    destination,
+                    identity: None,
+                })),
                 followers: Vec::new(),
             });
         } else {
@@ -203,9 +335,261 @@ impl Planner<'_> {
             self.hardlinks.groups.push(Group {
                 representative,
                 preview: None,
+                kept: None,
                 followers: Vec::new(),
             });
         }
+    }
+
+    /// Whether the planner keeps the existing representative `destination`
+    /// of `leaf` without a worker: a worker would keep it on its size and
+    /// time alone (`Worker::try_expected_match`), and the scan does not
+    /// predict that the receiver will refuse it (`must_replace`). Not where
+    /// a mapping gives names their own metadata: a later alias may request
+    /// other metadata for the group, which refuses the copy before any name
+    /// of the group is changed, and the planner would already have changed
+    /// this one.
+    fn keeps_representative(&mut self, leaf: &Planned, destination: &Entry) -> bool {
+        // A preview changes nothing.
+        !self.opts.dry_run
+            && self.opts.mapping_metadata.is_empty()
+            && destination.kind == Kind::File
+            && self.opts.keeps_matching_file(&leaf.dst_rel)
+            && !self.opts.protects_existing_contents()
+            && self
+                .opts
+                .metadata_matches(&leaf.dst_rel, &leaf.e, destination)
+            && !self.must_replace((&leaf.dst, &leaf.dst_rel), &leaf.e, destination)
+    }
+
+    /// The receiver accepted the representative of `group` kept by the
+    /// planner.
+    pub(super) fn representative_kept(&mut self, group: usize) {
+        if let Some(kept) = &mut self.hardlinks.groups[group].kept {
+            kept.identity = Some((kept.destination.dev, kept.destination.ino));
+        }
+        #[cfg(debug_assertions)]
+        let _ = crate::fsops::record_test_event("SYQ_TEST_HARDLINK_EVENTS", format_args!("kept"));
+    }
+
+    /// Give the representative of `group`, which the planner did not keep
+    /// after all, to a worker: to be replaced, when the receiver refused to
+    /// change it in place for `refused`, or else to be checked and copied
+    /// as it would have been without the planner.
+    pub(super) fn representative_to_worker(
+        &mut self,
+        group: usize,
+        refused: Option<crate::proto::ReplaceReason>,
+    ) {
+        self.requeue_representative(group, refused, None);
+    }
+
+    /// `representative_to_worker`, or, with `changed`, what its source is
+    /// now, to be copied from it as a worker copies a file whose source
+    /// changed: as its second attempt, and whole when its size and time do
+    /// not show the change, since they were already found to match.
+    fn requeue_representative(
+        &mut self,
+        group: usize,
+        refused: Option<crate::proto::ReplaceReason>,
+        changed: Option<Entry>,
+    ) {
+        let Some(kept) = self.hardlinks.groups[group].kept.take() else {
+            return;
+        };
+        let Kept {
+            leaf, destination, ..
+        } = *kept;
+        // It was counted unchanged when it was planned.
+        self.progress.files_unchanged.fetch_sub(1, Relaxed);
+        self.progress
+            .bytes_unchanged
+            .fetch_sub(leaf.e.size, Relaxed);
+        self.progress
+            .bytes_in_unchanged_files
+            .fetch_sub(leaf.e.size, Relaxed);
+        let retry = changed.is_some();
+        let (entry, copy_whole) = match changed {
+            Some(now) => {
+                if !self.opts.quiet {
+                    self.progress.eprintln(&format!(
+                        "syq: {}: changed during transfer, retrying",
+                        leaf.rel
+                    ));
+                }
+                let copy_whole = self
+                    .opts
+                    .metadata_matches(&leaf.dst_rel, &now, &destination);
+                (
+                    Entry {
+                        path: leaf.e.path,
+                        ..now
+                    },
+                    copy_whole,
+                )
+            }
+            None => (leaf.e, false),
+        };
+        // The destination as the scan found it: the job is held to it, as
+        // the existing-file policies require (`leaf_condition_for`).
+        let job = self.enqueue_with(
+            (leaf.src, leaf.source),
+            leaf.dst,
+            leaf.rel,
+            leaf.dst_rel,
+            entry,
+            Some(destination),
+            (refused, copy_whole, retry),
+        );
+        self.hardlinks.groups[group].representative = job;
+        #[cfg(debug_assertions)]
+        let _ = crate::fsops::record_test_event(
+            "SYQ_TEST_HARDLINK_EVENTS",
+            format_args!(
+                "{}",
+                match (refused, retry, copy_whole) {
+                    (Some(_), ..) => "replaced",
+                    (None, true, true) => "copied",
+                    (None, true, false) => "retried",
+                    (None, false, _) => "worker",
+                }
+            ),
+        );
+    }
+
+    /// Whether `error`, from the receiver's check of the representative of
+    /// `group` the planner kept, only shows a destination its existing-file
+    /// policy keeps, as for a worker (`Worker::kept_by_policy`).
+    pub(super) fn representative_skipped_by_policy(&self, group: usize, error: &WireError) -> bool {
+        let Some(kept) = &self.hardlinks.groups[group].kept else {
+            return false;
+        };
+        let condition = self.leaf_condition_for(&kept.leaf.dst, Some(&kept.destination));
+        crate::fsops::is_condition_not_met_wire(error)
+            && self.policy_condition(&kept.leaf.dst, condition)
+    }
+
+    /// The representative of `group`, which the planner kept, failed, and
+    /// is reported: no name is linked to it.
+    pub(super) fn representative_failed(&mut self, group: usize) {
+        let Some(kept) = &mut self.hardlinks.groups[group].kept else {
+            return;
+        };
+        kept.identity = None;
+        let size = kept.leaf.e.size;
+        self.progress.files_unchanged.fetch_sub(1, Relaxed);
+        self.progress.bytes_unchanged.fetch_sub(size, Relaxed);
+        self.progress
+            .bytes_in_unchanged_files
+            .fetch_sub(size, Relaxed);
+    }
+
+    /// The source of the representative of `group`, which the planner kept,
+    /// changed, and it is not copied again: it fails, as a file a worker
+    /// cannot retry does, and no name is linked to it.
+    fn representative_source_changed(&mut self, group: usize) {
+        let Some(kept) = &self.hardlinks.groups[group].kept else {
+            return;
+        };
+        let rel = kept.leaf.dst_rel.clone();
+        self.representative_failed(group);
+        let message = "source changed during transfer (or vanished)";
+        self.progress.entry_error_classified(
+            &format!("syq: {}: {message}", display(&rel)),
+            Some("io"),
+            None,
+            Some((&rel, crate::results::ReceiverListing::Unlisted)),
+        );
+        self.emit_entry_failed(
+            FailedEntry {
+                dst: &rel,
+                src: self.mapping_source_rel(&rel).as_deref(),
+                kind: Some(DeclaredKind::File),
+            },
+            "yes",
+            "io",
+            None,
+            message,
+            crate::results::ReceiverListing::Unlisted,
+        );
+        #[cfg(debug_assertions)]
+        let _ = crate::fsops::record_test_event("SYQ_TEST_HARDLINK_EVENTS", format_args!("failed"));
+    }
+
+    /// Before the workers finish, check the sources of the representatives
+    /// the planner kept as a worker checks a file's source before
+    /// publishing it (`source_changed`). One that changed is copied whole
+    /// by a worker from what its source is now. One whose source vanished,
+    /// or cannot be read, goes to a worker, which reports it. A change this
+    /// does not see, or one after it, is found before linking
+    /// (`same_source`).
+    pub(super) fn recheck_kept_representatives(&mut self, source: &mut dyn Conn) -> Result<()> {
+        #[cfg(debug_assertions)]
+        crate::fsops::test_race_barrier(
+            "SYQ_TEST_HARDLINK_RECHECK_READY_FILE",
+            "SYQ_TEST_HARDLINK_RECHECK_CONTINUE_FILE",
+            "hard-link representative recheck",
+        )?;
+        let kept: Vec<usize> = (0..self.hardlinks.groups.len())
+            .filter(|&group| {
+                self.hardlinks.groups[group]
+                    .kept
+                    .as_ref()
+                    .is_some_and(|kept| kept.identity.is_some())
+            })
+            .collect();
+        // The files to copy again are queued together.
+        let _burst = self.sched.file_burst();
+        for groups in kept.chunks(4096) {
+            self.recheck_representatives(source, groups)?;
+        }
+        Ok(())
+    }
+
+    /// `recheck_kept_representatives` for `groups`, in one request. If it
+    /// fails for one of them, as for a named source that vanished, each
+    /// half is asked again, so that only that one goes to a worker.
+    fn recheck_representatives(&mut self, source: &mut dyn Conn, groups: &[usize]) -> Result<()> {
+        let (paths, references): (Vec<_>, Vec<_>) = groups
+            .iter()
+            .map(|&group| {
+                let leaf = self.hardlinks.kept_leaf(group);
+                (leaf.src.clone(), leaf.source.clone())
+            })
+            .unzip();
+        let current = match stat_many_registered(source, paths, Some(references), false) {
+            Ok(current) if current.len() == groups.len() => current,
+            Ok(_) => bail!("source returned an incomplete stat batch"),
+            Err(error) if source.is_dead() => return Err(error),
+            Err(_) if groups.len() > 1 => {
+                let (first, second) = groups.split_at(groups.len() / 2);
+                self.recheck_representatives(source, first)?;
+                return self.recheck_representatives(source, second);
+            }
+            Err(_) => {
+                self.representative_to_worker(groups[0], None);
+                return Ok(());
+            }
+        };
+        for (&group, now) in groups.iter().zip(current) {
+            if !source_changed(&self.hardlinks.kept_leaf(group).e, now.as_ref()) {
+                continue;
+            }
+            let kept = self.hardlinks.groups[group].kept.as_ref().unwrap();
+            let held = self.leaf_condition_for(&kept.leaf.dst, Some(&kept.destination))
+                != TargetCondition::Any;
+            match now.filter(|now| now.kind == Kind::File) {
+                // A copy is published over whatever its name holds by then
+                // (`leaf_condition_for`), so one held to the file the scan
+                // found, as under `--existing`, is not copied again once
+                // that file has been kept, as a worker does not either.
+                Some(_) if held => self.representative_source_changed(group),
+                Some(now) => self.requeue_representative(group, None, Some(now)),
+                // A source that vanished is reported by the worker.
+                None => self.representative_to_worker(group, None),
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn finish_hardlink_planning(&mut self) -> Result<()> {
@@ -282,14 +666,29 @@ impl Planner<'_> {
                 }
                 continue;
             }
-            let completed = self
-                .opts
-                .hardlink_completions
-                .lock()
-                .unwrap()
-                .remove(&group.representative);
-            let Some(published) = completed.filter(|_| !self.sched.is_failed(group.representative))
-            else {
+            let completed = if let Some(kept) = group.kept {
+                kept.identity
+                    .map(|identity| (Linked::Kept(kept), Some(identity)))
+            } else {
+                let completed = self
+                    .opts
+                    .hardlink_completions
+                    .lock()
+                    .unwrap()
+                    .remove(&group.representative);
+                completed
+                    .filter(|_| !self.sched.is_failed(group.representative))
+                    .map(|published| {
+                        let job = self
+                            .sched
+                            .jobs
+                            .lock()
+                            .unwrap()
+                            .snapshot(group.representative);
+                        (Linked::Job(job), published)
+                    })
+            };
+            let Some((representative, published)) = completed else {
                 for follower in group.followers {
                     self.hardlink_failure(
                         &follower,
@@ -300,12 +699,7 @@ impl Planner<'_> {
                 continue;
             };
             ready.push(ReadyGroup {
-                job: self
-                    .sched
-                    .jobs
-                    .lock()
-                    .unwrap()
-                    .snapshot(group.representative),
+                representative,
                 published,
                 followers: group.followers,
             });
@@ -314,27 +708,91 @@ impl Planner<'_> {
             .iter()
             .flat_map(|group| group.followers.iter().map(move |f| (group, f)))
             .peekable();
-        while links.peek().is_some() {
-            let mut batch = Vec::new();
-            let mut bytes = 0usize;
-            while let Some((group, follower)) = links.peek() {
-                let size = group
-                    .job
-                    .dst
-                    .len()
-                    .saturating_add(follower.dst.len())
-                    .saturating_add(64);
-                if !batch.is_empty()
-                    && (batch.len() >= 256 || bytes.saturating_add(size) > SOURCE_BATCH_PATH_BYTES)
-                {
-                    break;
+        // The receiver runs a connection's requests in the order sent, and
+        // each link names a follower no other request names, so several link
+        // requests can await their replies, as final directory metadata does
+        // (`apply_deferred`). Checking a follower's contents first asks the
+        // destination itself, so those copies wait for each reply.
+        let unanswered = if self.opts.protects_existing_contents() {
+            1
+        } else {
+            self.dst.reply_queue().map_or(1, |replies| {
+                replies.min(super::directory_stream::REQUESTS_IN_FLIGHT)
+            })
+        };
+        let mut prepared = std::collections::VecDeque::new();
+        let mut in_flight = std::collections::VecDeque::new();
+        let mut root_checked = false;
+        // What ends the links early. Nothing more is sent, and the requests
+        // already sent are still answered: they have changed the names they
+        // link.
+        let mut failure = None;
+        loop {
+            while failure.is_none() && in_flight.len() < unanswered {
+                if prepared.is_empty() {
+                    let mut batch = Vec::new();
+                    let mut bytes = 0usize;
+                    while let Some((group, follower)) = links.peek() {
+                        let size = group
+                            .representative
+                            .dst()
+                            .len()
+                            .saturating_add(follower.dst.len())
+                            .saturating_add(64);
+                        if !batch.is_empty()
+                            && (batch.len() >= 256
+                                || bytes.saturating_add(size) > SOURCE_BATCH_PATH_BYTES)
+                        {
+                            break;
+                        }
+                        bytes = bytes.saturating_add(size);
+                        batch.push(links.next().unwrap());
+                    }
+                    if batch.is_empty() {
+                        break;
+                    }
+                    match self.prepare_link_batch(source, &batch) {
+                        Ok(requests) => prepared.extend(requests),
+                        Err(error) => failure = Some(error),
+                    }
+                    continue;
                 }
-                bytes = bytes.saturating_add(size);
-                batch.push(links.next().unwrap());
+                // The destination root is checked once, before the first
+                // link, as before the final directory metadata.
+                if !root_checked {
+                    root_checked = true;
+                    if let Err(error) = self.assert_mutation_root() {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+                let (ops, links): (Vec<Op>, Vec<_>) = prepared.pop_front().unwrap();
+                // Tests count each request's links and the requests still
+                // unanswered when it is sent.
+                #[cfg(debug_assertions)]
+                let _ = crate::fsops::record_test_event(
+                    "SYQ_TEST_HARDLINK_EVENTS",
+                    format_args!("link {} {}", ops.len(), in_flight.len()),
+                );
+                match self.dst.send_pending(Request::Apply { ops }) {
+                    Ok(reply) => in_flight.push_back((reply, links)),
+                    Err(error) => failure = Some(error),
+                }
             }
-            self.complete_link_batch(source, &batch)?;
+            let Some((reply, links)) = in_flight.pop_front() else {
+                break;
+            };
+            let response = match self.dst.take_reply(reply) {
+                Ok(response) => response,
+                // No usable reply came: the connection is lost or out of
+                // step, so the replies after it are not waited for.
+                Err(error) => return Err(failure.unwrap_or(error)),
+            };
+            if let Err(error) = self.settle_link_request(response, &links) {
+                failure.get_or_insert(error);
+            }
         }
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 
     fn check_hardlink_contents(
@@ -374,21 +832,25 @@ impl Planner<'_> {
         Ok(same)
     }
 
-    fn complete_link_batch(
+    /// The link requests for `links`, after checking each follower's
+    /// source is still the representative's: each request with the links
+    /// it makes. A preview reports them instead.
+    #[allow(clippy::type_complexity)]
+    fn prepare_link_batch<'a>(
         &mut self,
         source: &mut dyn Conn,
-        links: &[(&ReadyGroup, &Follower)],
-    ) -> Result<()> {
+        links: &[(&'a ReadyGroup, &'a Follower)],
+    ) -> Result<Vec<(Vec<Op>, Vec<(&'a ReadyGroup, &'a Follower)>)>> {
         let current = if self.opts.dry_run {
             Vec::new()
         } else {
             let paths = links
                 .iter()
-                .flat_map(|(g, f)| [g.job.src.clone(), f.src.clone()])
+                .flat_map(|(g, f)| [g.representative.src().clone(), f.src.clone()])
                 .collect();
             let references = links
                 .iter()
-                .flat_map(|(g, f)| [g.job.source.clone(), f.source.clone()])
+                .flat_map(|(g, f)| [g.representative.source().clone(), f.source.clone()])
                 .collect();
             stat_many_registered(source, paths, Some(references), false)?
         };
@@ -399,11 +861,14 @@ impl Planner<'_> {
                 continue;
             }
             if self.opts.dry_run {
-                self.preview_hardlink(follower, &group.job.dst, group.published);
+                self.preview_hardlink(follower, group.representative.dst(), group.published);
                 continue;
             }
-            if !same_source(current[2 * index].as_ref(), &group.job.entry)
-                || !same_source(current[2 * index + 1].as_ref(), &group.job.entry)
+            if !same_source(current[2 * index].as_ref(), group.representative.entry())
+                || !same_source(
+                    current[2 * index + 1].as_ref(),
+                    group.representative.entry(),
+                )
             {
                 self.hardlink_failure(
                     follower,
@@ -422,7 +887,7 @@ impl Planner<'_> {
             }
             operations.push(Op::Hardlink {
                 path: follower.dst.clone(),
-                source: group.job.dst.clone(),
+                source: group.representative.dst().clone(),
                 dev,
                 ino,
                 condition: follower.condition,
@@ -430,24 +895,39 @@ impl Planner<'_> {
             pending.push((group, follower));
         }
         if operations.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
-        self.assert_mutation_root()?;
-        let paths: Vec<PathBytes> = pending
+        let mut pending = pending.into_iter();
+        Ok(metadata_requests(operations)
+            .into_iter()
+            .map(|ops| {
+                let links = pending.by_ref().take(ops.len()).collect();
+                (ops, links)
+            })
+            .collect())
+    }
+
+    /// Report the outcome of a link request from the receiver's `response`.
+    fn settle_link_request(
+        &mut self,
+        response: Response,
+        links: &[(&ReadyGroup, &Follower)],
+    ) -> Result<()> {
+        let errors = self.applied(response, links.len())?;
+        anyhow::ensure!(
+            errors.len() == links.len(),
+            "hardlink receiver returned an incomplete result batch"
+        );
+        let paths: Vec<PathBytes> = links
             .iter()
             .map(|(_, follower)| follower.dst.clone())
             .collect();
-        let conditions: Vec<TargetCondition> = pending
+        let conditions: Vec<TargetCondition> = links
             .iter()
             .map(|(_, follower)| follower.condition)
             .collect();
-        let errors = self.apply(operations)?;
-        anyhow::ensure!(
-            errors.len() == pending.len(),
-            "hardlink receiver returned an incomplete result batch"
-        );
         let kept = self.kept_by_policy(&paths, &conditions, &errors);
-        for (((group, follower), error), kept) in pending.into_iter().zip(errors).zip(kept) {
+        for ((&(group, follower), error), kept) in links.iter().zip(errors).zip(kept) {
             if kept {
                 self.progress.files_excluded.fetch_add(1, Relaxed);
                 if !self.opts.quiet {
@@ -486,7 +966,7 @@ impl Planner<'_> {
                     self.progress.println(&format!(
                         "{} => {}",
                         display(&follower.rel),
-                        display(&group.job.rel_bytes)
+                        display(group.representative.rel())
                     ));
                 }
             }

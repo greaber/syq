@@ -573,3 +573,700 @@ fn hardlink_mixed_hashes_cross_transports_and_recover_lost_publication_reply() {
         }
     }
 }
+
+/// `syq rsync -aH OPTIONS src/ dst/` to a local destination, or to the same
+/// one through a remote shell, recording what hard-link completion does
+/// (`hardlink_events`).
+#[cfg(debug_assertions)]
+fn copy_recording_hardlinks(t: &Tmp, options: &[&str], remote: bool) -> Command {
+    let (src, dst) = (t.s("src/"), t.s("dst/"));
+    let mut command = if remote {
+        let host_dst = format!("host:{dst}");
+        let mut args = vec!["-aH", "--rsync-path", env!("CARGO_BIN_EXE_syq")];
+        args.extend(options);
+        args.extend([src.as_str(), host_dst.as_str()]);
+        remote_syq_command(t, &fake_rsh(t), &args)
+    } else {
+        let mut command = compat_command();
+        command
+            .args(["-aH", "--no-progress"])
+            .args(options)
+            .args([&src, &dst]);
+        command
+    };
+    let _ = fs::remove_file(t.path("hardlink-events"));
+    command.env("SYQ_TEST_HARDLINK_EVENTS", t.path("hardlink-events"));
+    command
+}
+
+/// What the last recorded copy did: how many representatives the planner
+/// kept, and gave to a worker to replace, and for each link request in order, how many links
+/// it makes and how many earlier requests were still unanswered when it
+/// was sent.
+#[cfg(debug_assertions)]
+fn hardlink_events(t: &Tmp) -> (usize, usize, Vec<(usize, usize)>) {
+    let (mut kept, mut replaced, mut requests) = (0, 0, Vec::new());
+    for line in fs::read_to_string(t.path("hardlink-events"))
+        .unwrap_or_default()
+        .lines()
+    {
+        let mut words = line.split(' ');
+        match words.next().unwrap() {
+            "kept" => kept += 1,
+            "replaced" => replaced += 1,
+            // Counted by the tests that expect them.
+            "worker" | "copied" | "retried" | "failed" => {}
+            "link" => requests.push((
+                words.next().unwrap().parse().unwrap(),
+                words.next().unwrap().parse().unwrap(),
+            )),
+            other => panic!("unexpected event {other}"),
+        }
+    }
+    (kept, replaced, requests)
+}
+
+/// The destination identity of every name in a tree of `groups` two-name
+/// groups `dNNN/a` and `dNNN/b`, checking that each pair shares one file
+/// that is not the source's.
+#[cfg(debug_assertions)]
+fn linked_pairs(t: &Tmp, groups: usize) -> Vec<(u64, u64)> {
+    (0..groups)
+        .map(|index| {
+            let a = identity(&t.path(&format!("dst/d{index:03}/a")));
+            assert_eq!(a, identity(&t.path(&format!("dst/d{index:03}/b"))));
+            assert_ne!(a, identity(&t.path(&format!("src/d{index:03}/a"))));
+            assert_eq!(
+                read(&t.path(&format!("dst/d{index:03}/b"))),
+                format!("group {index}").as_bytes()
+            );
+            a
+        })
+        .collect()
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn hardlink_reruns_keep_representatives_in_the_planner_and_send_links_ahead() {
+    // 600 two-name groups take three link requests of at most 256 links.
+    // The receiver, a process of its own even for a local destination, is
+    // sent all three before the first is answered. An unchanged rerun
+    // keeps every representative without a worker, and links again what a
+    // name lost.
+    for remote in [true, false] {
+        let t = Tmp::new();
+        for index in 0..600 {
+            write(
+                &t.path(&format!("src/d{index:03}/a")),
+                format!("group {index}").as_bytes(),
+            );
+            fs::hard_link(
+                t.path(&format!("src/d{index:03}/a")),
+                t.path(&format!("src/d{index:03}/b")),
+            )
+            .unwrap();
+        }
+        let expected = vec![(256, 0), (256, 1), (88, 2)];
+        assert_output_ok(&copy_recording_hardlinks(&t, &[], remote).run().unwrap());
+        assert_eq!(
+            hardlink_events(&t),
+            (0, 0, expected.clone()),
+            "remote={remote}"
+        );
+        let first = linked_pairs(&t, 600);
+
+        assert_output_ok(&copy_recording_hardlinks(&t, &[], remote).run().unwrap());
+        assert_eq!(
+            hardlink_events(&t),
+            (600, 0, expected.clone()),
+            "remote={remote}"
+        );
+        assert_eq!(linked_pairs(&t, 600), first);
+
+        // A name that lost its link, and a representative whose mode
+        // differs, are repaired around the kept file.
+        fs::remove_file(t.path("dst/d007/b")).unwrap();
+        write(&t.path("dst/d300/b.new"), b"group 300");
+        fs::rename(t.path("dst/d300/b.new"), t.path("dst/d300/b")).unwrap();
+        fs::remove_file(t.path("dst/d500/b")).unwrap();
+        fs::set_permissions(t.path("dst/d500/a"), fs::Permissions::from_mode(0o600)).unwrap();
+        assert_output_ok(&copy_recording_hardlinks(&t, &[], remote).run().unwrap());
+        assert_eq!(hardlink_events(&t), (600, 0, expected), "remote={remote}");
+        assert_eq!(linked_pairs(&t, 600), first);
+        assert_eq!(
+            fs::metadata(t.path("dst/d500/a")).unwrap().mode() & 0o777,
+            fs::metadata(t.path("src/d500/a")).unwrap().mode() & 0o777
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_kept_representative_the_receiver_then_refuses_is_copied_and_linked() {
+    // The scan finds the representative with one name, so the planner
+    // keeps it and only corrects its mode. Before the receiver does, the
+    // file gains another name, which the copy must not change: the
+    // receiver refuses, and a worker copies the file again for the group.
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"payload");
+    fs::hard_link(t.path("src/a"), t.path("src/b")).unwrap();
+    run_ok(&["-aH", &t.s("src/"), &t.s("dst/")]);
+    fs::remove_file(t.path("dst/b")).unwrap();
+    fs::set_permissions(t.path("dst/a"), fs::Permissions::from_mode(0o600)).unwrap();
+    let ready = t.path("ready");
+    let continuation = t.path("continue");
+    let mut child = copy_recording_hardlinks(&t, &[], false)
+        .env("SYQ_TEST_QUICK_META_READY_FILE", &ready)
+        .env("SYQ_TEST_QUICK_META_CONTINUE_FILE", &continuation)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "representative metadata check");
+    fs::hard_link(t.path("dst/a"), t.path("outside")).unwrap();
+    release_confinement_barrier(&continuation);
+    let output = child.wait_with_output().unwrap();
+    assert_output_ok(&output);
+    assert_eq!(hardlink_events(&t), (0, 1, vec![(1, 0)]));
+    assert_eq!(identity(&t.path("dst/a")), identity(&t.path("dst/b")));
+    assert_ne!(identity(&t.path("dst/a")), identity(&t.path("outside")));
+    assert_eq!(read(&t.path("dst/b")), b"payload");
+    assert_eq!(
+        fs::metadata(t.path("dst/a")).unwrap().mode() & 0o777,
+        fs::metadata(t.path("src/a")).unwrap().mode() & 0o777
+    );
+    assert_eq!(
+        fs::metadata(t.path("outside")).unwrap().mode() & 0o777,
+        0o600
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_kept_representative_whose_source_changes_is_copied_again() {
+    // Both representatives are kept by the planner. While the receiver
+    // holds their metadata checks, both sources change: one is a group of
+    // two selected names, the other a single selected name whose other
+    // name is outside the copy. Before the workers finish, both are found
+    // changed and copied again, as a worker retries a file whose source
+    // changed, and the group is linked to the new file.
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"first");
+    fs::hard_link(t.path("src/a"), t.path("src/b")).unwrap();
+    write(&t.path("src/single"), b"first");
+    fs::hard_link(t.path("src/single"), t.path("outside")).unwrap();
+    for name in ["src/a", "src/single"] {
+        set_mtime(&t.path(name), 1_600_000_000);
+    }
+    run_ok(&["-aH", &t.s("src/"), &t.s("dst/")]);
+    let ready = t.path("ready");
+    let continuation = t.path("continue");
+    let mut child = copy_recording_hardlinks(&t, &[], false)
+        .env("SYQ_TEST_QUICK_META_READY_FILE", &ready)
+        .env("SYQ_TEST_QUICK_META_CONTINUE_FILE", &continuation)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "representative metadata check");
+    for name in ["src/a", "src/single"] {
+        write(&t.path(name), b"second, longer");
+    }
+    release_confinement_barrier(&continuation);
+    let output = child.wait_with_output().unwrap();
+    assert_output_ok(&output);
+    let (kept, replaced, requests) = hardlink_events(&t);
+    assert_eq!((kept, replaced, requests), (2, 0, vec![(1, 0)]));
+    let events = fs::read_to_string(t.path("hardlink-events")).unwrap();
+    assert_eq!(events.matches("retried").count(), 2, "{events}");
+    assert_eq!(
+        stderr_of(&output)
+            .matches("changed during transfer, retrying")
+            .count(),
+        2,
+        "{}",
+        stderr_of(&output)
+    );
+    for name in ["dst/a", "dst/b", "dst/single"] {
+        assert_eq!(read(&t.path(name)), b"second, longer");
+    }
+    assert_eq!(identity(&t.path("dst/a")), identity(&t.path("dst/b")));
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_kept_representative_the_existing_policy_skips_is_skipped() {
+    // `--existing` holds the copy to the file the scan found. The planner
+    // keeps the representative, but before the receiver checks it, another
+    // program puts a different file at its name: the representative is
+    // skipped, as a worker skips it, and the copy succeeds.
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"payload");
+    fs::hard_link(t.path("src/a"), t.path("outside")).unwrap();
+    run_ok(&["-aH", &t.s("src/"), &t.s("dst/")]);
+    let ready = t.path("ready");
+    let continuation = t.path("continue");
+    let mut child = copy_recording_hardlinks(&t, &["--existing"], false)
+        .env("SYQ_TEST_QUICK_META_READY_FILE", &ready)
+        .env("SYQ_TEST_QUICK_META_CONTINUE_FILE", &continuation)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "representative metadata check");
+    write(&t.path("dst/a.new"), b"another");
+    fs::rename(t.path("dst/a.new"), t.path("dst/a")).unwrap();
+    release_confinement_barrier(&continuation);
+    let output = child.wait_with_output().unwrap();
+    assert_output_ok(&output);
+    assert!(
+        stderr_of(&output).contains("replaced or removed during the copy; skipping it"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(!fs::read_to_string(t.path("hardlink-events"))
+        .unwrap_or_default()
+        .contains("kept"));
+    assert_eq!(read(&t.path("dst/a")), b"another");
+}
+
+/// Start `syq` with `args` in `dir`, held at the receiver's first quick
+/// metadata check, and wait until it is held; the returned path releases it
+/// (`release_confinement_barrier`).
+#[cfg(debug_assertions)]
+fn held_at_metadata_check(
+    t: &Tmp,
+    mut command: Command,
+) -> (std::process::Child, std::path::PathBuf) {
+    let ready = t.path("ready");
+    let continuation = t.path("continue");
+    let mut child = command
+        .env("SYQ_TEST_QUICK_META_READY_FILE", &ready)
+        .env("SYQ_TEST_QUICK_META_CONTINUE_FILE", &continuation)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "representative metadata check");
+    (child, continuation)
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_kept_representative_rewritten_in_its_time_still_fails_its_links() {
+    // Same size and time, other contents: no worker would copy it on size
+    // and time, so the source's change is found only before linking, which
+    // refuses the group's other names, as it did before the planner kept
+    // representatives.
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"first");
+    fs::hard_link(t.path("src/a"), t.path("src/b")).unwrap();
+    set_mtime(&t.path("src/a"), 1_600_000_000);
+    run_ok(&["-aH", &t.s("src/"), &t.s("dst/")]);
+    fs::remove_file(t.path("dst/b")).unwrap();
+    let (child, continuation) =
+        held_at_metadata_check(&t, copy_recording_hardlinks(&t, &[], false));
+    write(&t.path("src/a"), b"other");
+    set_mtime(&t.path("src/a"), 1_600_000_000);
+    release_confinement_barrier(&continuation);
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        stderr_of(&output).contains("source hardlink group changed during the copy"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(!t.path("dst/b").exists());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_kept_representative_whose_named_source_vanishes_fails_alone() {
+    // Two named sources: a kept representative, and a new file. The
+    // representative's source is removed while the receiver checks it; it
+    // fails, and the new file is still copied.
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"payload");
+    fs::hard_link(t.path("src/a"), t.path("outside")).unwrap();
+    run_ok(&["-aH", &t.s("src/a"), &t.s("dst/")]);
+    write(&t.path("src/new"), b"new file");
+    let mut command = compat_command();
+    command.args([
+        "-aH",
+        "--no-progress",
+        &t.s("src/a"),
+        &t.s("src/new"),
+        &t.s("dst/"),
+    ]);
+    let (child, continuation) = held_at_metadata_check(&t, command);
+    fs::remove_file(t.path("src/a")).unwrap();
+    release_confinement_barrier(&continuation);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    assert_eq!(read(&t.path("dst/new")), b"new file");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_mapped_representative_given_to_a_worker_keeps_its_source_name() {
+    // A mapping copies `alpha` to `stored`. The kept representative's
+    // source vanishes during the copy, so a worker reports it, naming the
+    // manifest's source.
+    let t = Tmp::new();
+    write(&t.path("src/alpha"), b"payload");
+    fs::hard_link(t.path("src/alpha"), t.path("outside")).unwrap();
+    let manifest = serde_json::json!({
+        "src": {"encoding": "utf-8", "value": "alpha"},
+        "dst": {"encoding": "utf-8", "value": "stored"},
+    })
+    .to_string();
+    write(&t.path("manifest.jsonl"), manifest.as_bytes());
+    let mapped = |results: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.current_dir(t.path("")).args([
+            "cp",
+            "--no-progress",
+            "--copy-metadata=hardlinks",
+            "--mapping",
+            "manifest.jsonl",
+            "-C",
+            "src",
+            "--into",
+            "dst",
+            "--results",
+            results,
+        ]);
+        command
+    };
+    assert_output_ok(&mapped("first.ndjson").run().unwrap());
+    assert_eq!(read(&t.path("dst/stored")), b"payload");
+    let (child, continuation) = held_at_metadata_check(&t, mapped("results.ndjson"));
+    fs::remove_file(t.path("src/alpha")).unwrap();
+    release_confinement_barrier(&continuation);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    let failed: Vec<serde_json::Value> = fs::read_to_string(t.path("results.ndjson"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|record| record["type"] == "operation_result" && record["disposition"] == "failed")
+        .collect();
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0]["dst"]["value"], "stored");
+    assert_eq!(failed[0]["src"]["value"], "alpha");
+}
+
+/// Start `command`, held before the planner rechecks the representatives
+/// it kept, and wait until it is held.
+#[cfg(debug_assertions)]
+fn held_at_recheck(t: &Tmp, mut command: Command) -> (std::process::Child, std::path::PathBuf) {
+    let ready = t.path("recheck-ready");
+    let continuation = t.path("recheck-continue");
+    let mut child = command
+        .env("SYQ_TEST_HARDLINK_RECHECK_READY_FILE", &ready)
+        .env("SYQ_TEST_HARDLINK_RECHECK_CONTINUE_FILE", &continuation)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_confinement_marker(&mut child, &ready, "representative recheck");
+    (child, continuation)
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_kept_representative_rewritten_within_its_second_is_copied_whole() {
+    // The source's contents change and its time moves by a millisecond,
+    // within the same second, before the planner rechecks it. The change
+    // is seen, and the file is copied whole rather than matched on size
+    // and time again, so the name the group gains gets the new contents.
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"first");
+    fs::hard_link(t.path("src/a"), t.path("src/b")).unwrap();
+    set_mtime(&t.path("src/a"), 1_600_000_000);
+    run_ok(&["-aH", &t.s("src/"), &t.s("dst/")]);
+    fs::remove_file(t.path("dst/b")).unwrap();
+    let (child, continuation) = held_at_recheck(&t, copy_recording_hardlinks(&t, &[], false));
+    write(&t.path("src/a"), b"other");
+    let file = fs::File::options()
+        .write(true)
+        .open(t.path("src/a"))
+        .unwrap();
+    file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_600_000_000_001))
+        .unwrap();
+    drop(file);
+    release_confinement_barrier(&continuation);
+    let output = child.wait_with_output().unwrap();
+    assert_output_ok(&output);
+    let events = fs::read_to_string(t.path("hardlink-events")).unwrap();
+    assert!(events.contains("copied"), "{events}");
+    assert_eq!(read(&t.path("dst/a")), b"other");
+    assert_eq!(read(&t.path("dst/b")), b"other");
+    assert_eq!(identity(&t.path("dst/a")), identity(&t.path("dst/b")));
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_changed_kept_representative_whose_destination_went_is_not_created_under_existing() {
+    // `--existing` creates no file. After the receiver accepted the
+    // representative, its source grows and its destination is removed. A
+    // copy would be published at the name whatever it holds, so the
+    // representative is not copied again: it fails, as a worker that had
+    // kept it fails it, and the name stays absent.
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"payload");
+    fs::hard_link(t.path("src/a"), t.path("outside")).unwrap();
+    run_ok(&["-aH", &t.s("src/"), &t.s("dst/")]);
+    let (child, continuation) =
+        held_at_recheck(&t, copy_recording_hardlinks(&t, &["--existing"], false));
+    write(&t.path("src/a"), b"a longer payload");
+    fs::remove_file(t.path("dst/a")).unwrap();
+    release_confinement_barrier(&continuation);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    assert!(
+        stderr_of(&output).contains("source changed during transfer"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert!(!t.path("dst/a").exists());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_kept_representative_on_a_full_destination_is_reported() {
+    // The destination is full when the receiver checks the representative
+    // the planner kept: the copy ends, and the representative is reported
+    // with the capacity error, as a worker reported it.
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"payload");
+    fs::hard_link(t.path("src/a"), t.path("outside")).unwrap();
+    let copy = |results: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args([
+            "cp",
+            "--no-progress",
+            "--copy-metadata=hardlinks",
+            "--results",
+            &t.s(results),
+            "--srcs-in",
+            &t.s("src"),
+            "--into",
+            &t.s("dst"),
+        ]);
+        command
+    };
+    assert_output_ok(&copy("first.ndjson").run().unwrap());
+    let output = copy("results.ndjson")
+        .env("SYQ_TEST_FAIL_APPLY_ENOSPC", "/a")
+        .run()
+        .unwrap();
+    assert!(!output.status.success(), "{}", stderr_of(&output));
+    let records: Vec<serde_json::Value> = fs::read_to_string(t.path("results.ndjson"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        records
+            .iter()
+            .any(|record| record["type"] == "operation_result"
+                && record["action"] == "transfer_file"
+                && record["disposition"] == "failed"
+                && record["dst"]["value"] == "a"
+                && record["os_kind"] == "no_space"),
+        "{records:?}"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_kept_representative_rewritten_within_its_second_is_updated_in_place() {
+    // As above, under `--in-place=update`, with a destination the receiver
+    // may write in place (one name, owned by the receiving account): the
+    // new contents are written into it, rather than replacing it.
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"first");
+    fs::hard_link(t.path("src/a"), t.path("src/b")).unwrap();
+    set_mtime(&t.path("src/a"), 1_600_000_000);
+    let copy = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args([
+            "cp",
+            "--no-progress",
+            "--copy-metadata=mtime,hardlinks",
+            "--in-place=update",
+            "--srcs-in",
+            &t.s("src"),
+            "--into",
+            &t.s("dst"),
+        ]);
+        command
+    };
+    assert_output_ok(&copy().run().unwrap());
+    fs::remove_file(t.path("dst/b")).unwrap();
+    let before = identity(&t.path("dst/a"));
+    let (child, continuation) = held_at_recheck(&t, copy());
+    write(&t.path("src/a"), b"other");
+    let file = fs::File::options()
+        .write(true)
+        .open(t.path("src/a"))
+        .unwrap();
+    file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_600_000_000_001))
+        .unwrap();
+    drop(file);
+    release_confinement_barrier(&continuation);
+    let output = child.wait_with_output().unwrap();
+    assert_output_ok(&output);
+    assert_eq!(identity(&t.path("dst/a")), before);
+    assert_eq!(identity(&t.path("dst/b")), before);
+    assert_eq!(read(&t.path("dst/a")), b"other");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn every_kept_representative_in_a_batch_that_fills_the_destination_is_reported() {
+    // In one batch, one representative's check fails and another's finds
+    // the destination full: the copy ends, and both are reported.
+    let t = Tmp::new();
+    for name in ["a-meta", "z-full"] {
+        write(&t.path(&format!("src/{name}")), b"payload");
+        fs::hard_link(
+            t.path(&format!("src/{name}")),
+            t.path(&format!("outside-{name}")),
+        )
+        .unwrap();
+    }
+    let copy = |results: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args([
+            "cp",
+            "--no-progress",
+            "--copy-metadata=hardlinks",
+            "--results",
+            &t.s(results),
+            "--srcs-in",
+            &t.s("src"),
+            "--into",
+            &t.s("dst"),
+        ]);
+        command
+    };
+    assert_output_ok(&copy("first.ndjson").run().unwrap());
+    let output = copy("results.ndjson")
+        .env("SYQ_TEST_FAIL_SETMETA", "/a-meta")
+        .env("SYQ_TEST_FAIL_APPLY_ENOSPC", "/z-full")
+        .run()
+        .unwrap();
+    assert!(!output.status.success(), "{}", stderr_of(&output));
+    let failed: Vec<String> = fs::read_to_string(t.path("results.ndjson"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|record| record["type"] == "operation_result" && record["disposition"] == "failed")
+        .map(|record| record["dst"]["value"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(failed.contains(&"a-meta".to_owned()), "{failed:?}");
+    assert!(failed.contains(&"z-full".to_owned()), "{failed:?}");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_kept_representative_that_failed_is_reported_when_a_later_batch_fills_the_destination() {
+    // Two named sources go in successive batches: the first one's check
+    // fails, and the second one's finds the destination full. The copy
+    // ends, and both are reported.
+    let t = Tmp::new();
+    for name in ["a-meta", "z-full"] {
+        write(&t.path(&format!("src/{name}")), b"payload");
+        fs::hard_link(
+            t.path(&format!("src/{name}")),
+            t.path(&format!("outside-{name}")),
+        )
+        .unwrap();
+    }
+    let copy = |results: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_syq"));
+        command.args([
+            "cp",
+            "--no-progress",
+            "--performance-tuning=workers=1",
+            "--copy-metadata=mtime,hardlinks",
+            "--results",
+            &t.s(results),
+            &t.s("src/a-meta"),
+            &t.s("src/z-full"),
+            "--into",
+            &t.s("dst"),
+        ]);
+        command
+    };
+    assert_output_ok(&copy("first.ndjson").run().unwrap());
+    let output = copy("results.ndjson")
+        .env("SYQ_TEST_FAIL_SETMETA", "/a-meta")
+        .env("SYQ_TEST_FAIL_APPLY_ENOSPC", "/z-full")
+        .run()
+        .unwrap();
+    assert!(!output.status.success(), "{}", stderr_of(&output));
+    let failed: Vec<String> = fs::read_to_string(t.path("results.ndjson"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|record| record["type"] == "operation_result" && record["disposition"] == "failed")
+        .map(|record| record["dst"]["value"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(failed.contains(&"a-meta".to_owned()), "{failed:?}");
+    assert!(failed.contains(&"z-full".to_owned()), "{failed:?}");
+}
+
+#[test]
+fn a_mapping_with_conflicting_metadata_leaves_an_existing_representative_alone() {
+    // The destination already holds the representative, with matching
+    // contents and time. A later alias asks for other metadata, so the copy
+    // is refused, and refused before it changed anything: the existing
+    // file keeps its mode, wherever the conflicting alias comes.
+    for padding in [0, 4500] {
+        let t = Tmp::new();
+        write(&t.path("src/a"), b"payload");
+        fs::hard_link(t.path("src/a"), t.path("src/b")).unwrap();
+        set_mtime(&t.path("src/a"), 1_600_000_000);
+        write(&t.path("dst/a"), b"payload");
+        set_mtime(&t.path("dst/a"), 1_600_000_000);
+        fs::set_permissions(t.path("dst/a"), fs::Permissions::from_mode(0o640)).unwrap();
+        let entry = |source: &str, destination: &str, mode: u32| {
+            serde_json::json!({"src":{"encoding":"utf-8","value":source},"dst":{"encoding":"utf-8","value":destination},"metadata":{"mode":mode}}).to_string()
+        };
+        let mut entries = vec![entry("a", "a", 0o600)];
+        for index in 0..padding {
+            entries.push(entry("a", &format!("padding-{index:04}"), 0o600));
+        }
+        entries.push(entry("b", "b", 0o644));
+        let manifest = entries.join("\n");
+        let output = syq_cp_in(
+            &t.path(""),
+            &[
+                "--copy-metadata=mtime,hardlinks",
+                "--if-exists=update",
+                "--mapping",
+                "-",
+                "-C",
+                "src",
+                "--into",
+                "dst",
+            ],
+            Some(manifest.as_bytes()),
+        );
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("conflicting destination metadata"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::metadata(t.path("dst/a")).unwrap().mode() & 0o777,
+            0o640,
+            "padding {padding}"
+        );
+        assert!(!t.path("dst/b").exists());
+    }
+}
