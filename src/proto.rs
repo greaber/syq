@@ -319,6 +319,47 @@ pub struct NativeRemoveOutcome {
     pub failure: Option<NativeRemoveFailure>,
 }
 
+impl NativeRemoveOutcome {
+    pub(crate) fn size_hint(&self) -> usize {
+        self.path.len()
+            + self
+                .failure
+                .as_ref()
+                .map_or(0, |failure| failure.error.message.len())
+            + 48
+    }
+}
+
+/// A removal's results or traces as the messages that carry them, in order:
+/// each message ends before its items (by `size`) pass half a metadata
+/// frame, and holds at least one item. An empty batch is one empty message:
+/// the receiver's sign of life while a removal finds nothing to report.
+/// A result names its path, which has no
+/// length limit: a removal descends from directory to directory, so a tree
+/// can nest far beyond the longest path a system call takes. A trace quotes
+/// its selector, escaping what is not printable.
+pub(crate) fn native_remove_messages<T>(
+    mut items: Vec<T>,
+    size: impl Fn(&T) -> usize,
+) -> Vec<Vec<T>> {
+    let mut messages = Vec::new();
+    loop {
+        let mut bytes = 0usize;
+        let len = items
+            .iter()
+            .position(|item| {
+                bytes = bytes.saturating_add(size(item));
+                bytes > MAX_METADATA_FRAME / 2
+            })
+            .map_or(items.len(), |index| index.max(1));
+        let rest = items.split_off(len);
+        messages.push(std::mem::replace(&mut items, rest));
+        if items.is_empty() {
+            return messages;
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeRemoveDisposition {
     Resolved,
@@ -2316,17 +2357,7 @@ impl SizeHint for Response {
             Response::ScanBatch(v) => v.iter().map(Entry::size_hint).sum::<usize>() + 16,
             Response::NativeMapData(data) => data.len() + 16,
             Response::NativeRemoveBatch(v) => {
-                v.iter()
-                    .map(|outcome| {
-                        outcome.path.len()
-                            + outcome
-                                .failure
-                                .as_ref()
-                                .map_or(0, |failure| failure.error.message.len())
-                            + 48
-                    })
-                    .sum::<usize>()
-                    + 16
+                v.iter().map(NativeRemoveOutcome::size_hint).sum::<usize>() + 16
             }
             Response::DirectoryEntries { entries, .. } => {
                 entries
