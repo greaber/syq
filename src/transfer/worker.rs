@@ -3052,6 +3052,7 @@ impl Worker {
             }
             Ok(())
         })();
+        self.src.release_read_buffer();
         if result
             .as_ref()
             .is_err_and(|error| error.is::<RangeReplyMismatch>())
@@ -3065,7 +3066,6 @@ impl Worker {
         // error. No following file can consume this one's data or late errors.
         let (source_end, destination_end, _destination_wait) =
             crate::streaming::finish_range(&mut *self.src, &mut *self.dst, sent);
-        self.src.release_read_buffer();
         let source_end = source_end.map(|discarded| {
             self.benchmark.stream_discarded_bytes += discarded;
         });

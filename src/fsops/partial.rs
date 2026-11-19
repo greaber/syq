@@ -2801,13 +2801,15 @@ impl FsOps {
             bail!("read length {len} exceeds the {MAX_READ_BYTES}-byte protocol limit");
         }
         let len = len as usize;
-        let mut data = self.read_buffer.take().unwrap_or_default();
-        if data.len() < len {
-            // Exact, so a slightly longer range does not double the buffer.
-            data.reserve_exact(len - data.len());
-            data.resize(len, 0);
-        }
-        data.truncate(len);
+        let mut data = match self.read_buffer.take() {
+            Some(mut data) => {
+                // Exact, so a slightly longer range does not double the buffer.
+                data.reserve_exact(len.saturating_sub(data.len()));
+                data.resize(len, 0);
+                data
+            }
+            None => vec![0u8; len],
+        };
         if let Err(error) = self.read_source_into(path, source, attempt, off, &mut data) {
             self.read_buffer = Some(data);
             return Err(error);

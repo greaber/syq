@@ -293,10 +293,12 @@ fn range_reads_reuse_a_returned_buffer_after_short_reads_and_errors() {
     let oversized = Vec::with_capacity(crate::proto::MAX_READ_BYTES as usize + 1);
     let oversized_storage = oversized.as_ptr();
     operations.reuse_read_buffer(oversized);
-    assert_ne!(read(&mut operations, 0, 4).as_ptr(), oversized_storage);
+    let fresh = read(&mut operations, 0, 4);
+    assert_ne!(fresh.as_ptr(), oversized_storage);
     operations.reuse_read_buffer(after_error);
-    operations.reuse_read_buffer(vec![0; 4]);
-    assert_eq!(read(&mut operations, 0, 4).as_ptr(), storage);
+    operations.reuse_read_buffer(fresh);
+    let kept = read(&mut operations, 0, 4);
+    assert_eq!(kept.as_ptr(), storage);
 }
 
 #[test]
