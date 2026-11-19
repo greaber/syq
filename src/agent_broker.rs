@@ -510,6 +510,7 @@ fn inspect_ssh_configuration_at(
         explicit_user,
         explicit_port,
         host,
+        crate::ssh_config::Group::Own,
         deadline,
         cancelled,
     )?;

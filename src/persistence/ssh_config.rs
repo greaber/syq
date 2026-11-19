@@ -104,6 +104,7 @@ fn expanded_control(pattern: &str, endpoint: &NativeEndpoint) -> Result<PathBuf>
         endpoint.user.as_deref(),
         Some(endpoint.port.unwrap_or(22)),
         &endpoint.host,
+        crate::ssh_config::Group::Callers,
         std::time::Instant::now() + std::time::Duration::from_secs(30),
         &|| false,
     )?;

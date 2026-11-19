@@ -956,9 +956,10 @@ fn asks_about_new_host_keys(endpoint: &SshEndpoint) -> Result<bool> {
 }
 
 /// This machine's SSH configuration for `endpoint`. Nothing here has a
-/// deadline of its own: the receiving service ends a setup child at its
-/// deadline, and someone enrolling at a terminal can interrupt it. Allow
-/// what the other lookups made in the foreground allow.
+/// deadline of its own: the receiving service ends a setup child's group
+/// at its deadline, and someone enrolling at a terminal can interrupt it,
+/// so the lookup stays in this process's group. Allow what the other
+/// lookups made in the foreground allow.
 fn configuration(
     endpoint: &SshEndpoint,
     options: &[impl AsRef<std::ffi::OsStr>],
@@ -969,6 +970,7 @@ fn configuration(
         None,
         endpoint.port(),
         endpoint.as_str(),
+        crate::ssh_config::Group::Callers,
         std::time::Instant::now() + std::time::Duration::from_secs(30),
         &|| false,
     )

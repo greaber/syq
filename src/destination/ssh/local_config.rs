@@ -69,6 +69,7 @@ impl LocalPlan {
             requested.user.as_deref(),
             requested.port,
             &requested.host,
+            crate::ssh_config::Group::Own,
             deadline,
             cancelled,
         )?;

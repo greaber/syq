@@ -10,6 +10,18 @@ use std::time::Instant;
 /// read can be longer.
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
+/// Which process group a lookup runs in.
+#[derive(Clone, Copy)]
+pub(crate) enum Group {
+    /// Its own: a timeout or cancellation ends everything the lookup
+    /// started, such as `Match exec` commands.
+    Own,
+    /// This process's: whatever ends this process with its group ends the
+    /// lookup too, and an interactive `Match exec` can read the terminal.
+    /// A timeout ends only ssh; what it started ends with this group.
+    Callers,
+}
+
 /// What `ssh -G` printed for one host.
 pub(crate) struct SshConfig {
     text: String,
@@ -20,12 +32,14 @@ impl SshConfig {
     /// Run `program -G options [-l user] [-p port] -- host` within
     /// `deadline`. `ssh -G` contacts no server, but it runs the
     /// configuration's `Match exec` commands, which can take any time.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn query(
         program: impl AsRef<OsStr>,
         options: &[impl AsRef<OsStr>],
         user: Option<&str>,
         port: Option<u16>,
         host: &str,
+        group: Group,
         deadline: Instant,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Self> {
@@ -43,7 +57,11 @@ impl SshConfig {
             .stdin(Stdio::null());
         // A timeout or cancellation names the lookup itself, and keeps its
         // kind for callers that tell a timeout apart.
-        let output = match crate::process::capture_output_bounded(
+        let capture = match group {
+            Group::Own => crate::process::capture_output_bounded,
+            Group::Callers => crate::process::capture_output_bounded_in_this_group,
+        };
+        let output = match capture(
             &format!("the SSH configuration lookup for {host}"),
             &mut command,
             deadline,
@@ -165,6 +183,7 @@ mod tests {
             Some("alice"),
             Some(2200),
             "backup",
+            Group::Own,
             Instant::now() + Duration::from_secs(10),
             &|| false,
         )
@@ -179,26 +198,55 @@ mod tests {
     /// A `Match exec` command that never finishes cannot hold syq.
     #[test]
     fn a_hanging_lookup_times_out_naming_the_host() {
-        let (_root, ssh) = fake_ssh("#!/bin/sh\nsleep 30\n");
-        let started = Instant::now();
-        let error = SshConfig::query(
-            &ssh,
-            &[] as &[&str],
-            None,
-            None,
-            "backup",
-            Instant::now() + Duration::from_millis(100),
-            &|| false,
-        )
-        .err()
-        .unwrap();
-        assert!(started.elapsed() < Duration::from_secs(10));
-        assert_eq!(
-            error.to_string(),
-            "the SSH configuration lookup for backup timed out"
-        );
-        assert!(error
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut));
+        let (_root, ssh) = fake_ssh("#!/bin/sh\nexec sleep 30\n");
+        for group in [Group::Own, Group::Callers] {
+            let started = Instant::now();
+            let error = SshConfig::query(
+                &ssh,
+                &[] as &[&str],
+                None,
+                None,
+                "backup",
+                group,
+                Instant::now() + Duration::from_millis(100),
+                &|| false,
+            )
+            .err()
+            .unwrap();
+            assert!(started.elapsed() < Duration::from_secs(10));
+            assert_eq!(
+                error.to_string(),
+                "the SSH configuration lookup for backup timed out"
+            );
+            assert!(error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut));
+        }
+    }
+
+    /// A lookup in the caller's group ends with it, as when the receiving
+    /// service ends a setup child's group; one in its own group does not.
+    #[test]
+    fn a_lookup_runs_in_the_group_asked_for() {
+        let (_root, ssh) = fake_ssh("#!/bin/sh\nprintf 'group %s\\n' $(ps -o pgid= -p $$)\n");
+        let ours = unsafe { libc::getpgrp() }.to_string();
+        let group = |group| {
+            SshConfig::query(
+                &ssh,
+                &[] as &[&str],
+                None,
+                None,
+                "backup",
+                group,
+                Instant::now() + Duration::from_secs(10),
+                &|| false,
+            )
+            .unwrap()
+            .value("group")
+            .unwrap()
+            .to_owned()
+        };
+        assert_eq!(group(Group::Callers), ours);
+        assert_ne!(group(Group::Own), ours);
     }
 }

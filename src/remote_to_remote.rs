@@ -868,6 +868,7 @@ impl ReceiverConnection {
             user,
             port,
             host,
+            crate::ssh_config::Group::Own,
             std::time::Instant::now() + std::time::Duration::from_secs(30),
             &|| false,
         )?;
@@ -908,7 +909,7 @@ impl ReceiverConnection {
     }
 
     pub(crate) fn parse(output: &str) -> Result<Self> {
-        let value = |name: &str| crate::ssh_config::value(output, name);
+        let value = |name: &str| crate::ssh_config::value(output, name).map(str::trim);
         let hostname = value("hostname").context("`ssh -G` reported no hostname")?;
         let port: u16 = value("port")
             .context("`ssh -G` reported no port")?

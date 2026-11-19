@@ -3423,7 +3423,10 @@ impl RemoteSpec {
         // A lookup that outlasts the copy's own login, which has just read
         // the same configuration, is stuck, as on a `Match exec` command
         // that does not finish: probe the name as given instead.
-        let config = match self.ssh_config(std::time::Instant::now() + SSH_DESTINATION_LOOKUP) {
+        let config = match self.ssh_config(
+            crate::ssh_config::Group::Callers,
+            std::time::Instant::now() + SSH_DESTINATION_LOOKUP,
+        ) {
             Ok(config) => config,
             Err(error) => {
                 if crate::output::debug() {
@@ -3439,6 +3442,7 @@ impl RemoteSpec {
     /// opening a connection.
     pub(crate) fn ssh_config(
         &self,
+        group: crate::ssh_config::Group,
         deadline: std::time::Instant,
     ) -> Result<crate::ssh_config::SshConfig> {
         crate::ssh_config::SshConfig::query(
@@ -3447,6 +3451,7 @@ impl RemoteSpec {
             self.user.as_deref(),
             self.port,
             &self.host,
+            group,
             deadline,
             &|| false,
         )
@@ -3763,7 +3768,7 @@ const SSH_DESTINATION_LOOKUP: std::time::Duration = std::time::Duration::from_se
 
 /// The destination `ssh -G` output describes.
 fn parse_ssh_destination(output: &str) -> Option<SshDestination> {
-    let value = |name: &str| crate::ssh_config::value(output, name);
+    let value = |name: &str| crate::ssh_config::value(output, name).map(str::trim);
     let proxied = ["proxyjump", "proxycommand"]
         .into_iter()
         .any(|name| value(name).is_some_and(|value| value != "none"));
@@ -3828,12 +3833,12 @@ fn probe_reachable_with(
         bail!("too many TCP probe candidates");
     }
     // Advertised addresses are literals. A name, such as the SSH target,
-    // is looked up in parallel within the probes' wait: a resolver that
-    // does not answer must not hold up the probes of the literals. More
-    // importantly, probe every resolved socket address in parallel too: a
-    // dual-stack name must not spend the whole candidate budget timing out
-    // on IPv6 before trying IPv4.
-    let looked_up = std::time::Instant::now() + wait;
+    // is looked up in parallel, for no longer than the longest probe wait:
+    // a resolver that does not answer holds up the probes that far and no
+    // further. More importantly, probe every resolved socket address in
+    // parallel too: a dual-stack name must not spend the whole candidate
+    // budget timing out on IPv6 before trying IPv4.
+    let looked_up = std::time::Instant::now() + wait.max(TCP_PROBE_CEILING);
     let mut resolved: Vec<Vec<SocketAddr>> = vec![Vec::new(); candidates.len()];
     let (resolved_tx, resolved_rx) = std::sync::mpsc::channel();
     let mut lookups = 0;

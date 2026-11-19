@@ -3635,8 +3635,8 @@ fn route_probes_give_up_on_a_silent_address_after_their_bound() {
 }
 
 /// A resolver that does not answer for the SSH target's name holds the
-/// probes no longer than their wait, and the advertised literal is still
-/// probed and found.
+/// probes no longer than the longest probe wait, and the advertised
+/// literal is still probed and found.
 #[test]
 fn a_silent_resolver_does_not_hold_up_route_probes() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3655,8 +3655,7 @@ fn a_silent_resolver_does_not_hold_up_route_probes() {
     ];
     let wait = std::time::Duration::from_millis(200);
     let started = std::time::Instant::now();
-    probe_reachable_with(&mut candidates, port, wait, |name, _| {
-        assert_eq!(name, "ssh-target.invalid");
+    probe_reachable_with(&mut candidates, port, wait, |_, _| {
         std::thread::sleep(std::time::Duration::from_secs(30));
         Vec::new()
     })

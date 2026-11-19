@@ -259,7 +259,10 @@ enum Credentials {
 
 fn credentials(spec: &crate::conn::RemoteSpec) -> Credentials {
     // ssh's own view of the destination: its agent and identity files.
-    let Ok(config) = spec.ssh_config(Instant::now() + Duration::from_secs(5)) else {
+    let Ok(config) = spec.ssh_config(
+        crate::ssh_config::Group::Own,
+        Instant::now() + Duration::from_secs(5),
+    ) else {
         return Credentials::Present;
     };
     let Ok(agent) = crate::agent_broker::configured_agent_socket(config.text().as_bytes()) else {

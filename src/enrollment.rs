@@ -425,7 +425,7 @@ impl SshEndpoint {
         &self.target
     }
 
-    /// What `ssh -G` needs after its options to resolve this endpoint.
+    /// The port given explicitly, if any.
     pub(crate) fn port(&self) -> Option<u16> {
         self.port
     }
