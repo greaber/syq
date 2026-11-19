@@ -1007,29 +1007,25 @@ pub(crate) fn refresh_outdated(domain: &Domain, quiet: bool) {
             }
             Ok(None) | Err(_) => continue,
         };
-        if state.identity == crate::identity::build() || !state.busy.idle() {
-            continue;
-        }
         let phase = switch_report(&control, &state).map(|report| report.phase);
-        match switch::follows(state.started_from.as_deref()) {
-            switch::Follows::OtherFile => continue,
-            // It switches by itself, unless its switch failed.
-            switch::Follows::ThisFile if !matches!(phase.as_deref(), Some("failed" | "login")) => {
-                continue
+        let initiator = switch::Initiator::Command {
+            user_at_hand: interactive && !quiet,
+        };
+        match switch::plan(&observed(&state, phase.as_deref()), initiator) {
+            switch::Plan::ReplaceWhenIdle => {}
+            // Leave the next attempt to a command run in a terminal, however
+            // soon it comes.
+            switch::Plan::Leave(switch::Keep::NeedsUser) => {
+                crate::persistence::defer_switch_attempts(&control, Duration::ZERO);
+                continue;
             }
-            _ => {}
+            _ => continue,
         }
         // Logging in again after a login that needed the user is worth it
         // only with the user at hand, and no more than every ten minutes:
         // each attempt that fails is a failed login on the server.
         let login = phase.as_deref() == Some("login");
         if login {
-            if !interactive || quiet {
-                // Leave the next attempt to a command run in a terminal,
-                // however soon it comes.
-                crate::persistence::defer_switch_attempts(&control, Duration::ZERO);
-                continue;
-            }
             crate::persistence::defer_switch_attempts(&control, switch::LOGIN_RETRY);
         }
         match start_switch(domain, &state.endpoint) {
@@ -1122,29 +1118,25 @@ pub(crate) fn switch_outdated_now(domain: &Domain) {
             }
             Ok(None) | Err(_) => continue,
         };
-        if state.identity == crate::identity::build() {
-            continue;
-        }
         let phase = switch_report(&control, &state).map(|report| report.phase);
-        match switch::follows(state.started_from.as_deref()) {
-            switch::Follows::OtherFile => continue,
-            // It switches by itself, unless its switch failed.
-            switch::Follows::ThisFile if !matches!(phase.as_deref(), Some("failed" | "login")) => {
-                continue
-            }
-            _ => {}
-        }
-        // A login that needed the user is worth trying again only with the
-        // user at hand.
-        if phase.as_deref() == Some("login") && !interactive {
-            continue;
-        }
+        let initiator = switch::Initiator::Command {
+            user_at_hand: interactive,
+        };
         let fix = connect_command(&state.endpoint, domain.explicit_path());
-        if !state.busy.idle() {
-            crate::output::diagnostic!(
-                "syq: {}",
-                busy_notice(&state.endpoint, &state.identity, &state.busy, false, &fix)
-            );
+        // Whether to leave it, saying so when it is busy.
+        let leave =
+            |state: &Status| match switch::plan(&observed(state, phase.as_deref()), initiator) {
+                switch::Plan::ReplaceWhenIdle => false,
+                switch::Plan::Leave(switch::Keep::Busy) => {
+                    crate::output::diagnostic!(
+                        "syq: {}",
+                        busy_notice(&state.endpoint, &state.identity, &state.busy, false, &fix)
+                    );
+                    true
+                }
+                _ => true,
+            };
+        if leave(&state) {
             continue;
         }
         // One switch at a time per connection, and after one failed, not
@@ -1183,14 +1175,7 @@ pub(crate) fn switch_outdated_now(domain: &Domain) {
         let Ok(Some(state)) = running_status(&control, Retry::No, ANSWER_TIMEOUT) else {
             continue;
         };
-        if state.identity == crate::identity::build() {
-            continue;
-        }
-        if !state.busy.idle() {
-            crate::output::diagnostic!(
-                "syq: {}",
-                busy_notice(&state.endpoint, &state.identity, &state.busy, false, &fix)
-            );
+        if leave(&state) {
             continue;
         }
         crate::output::diagnostic!(
@@ -1202,7 +1187,7 @@ pub(crate) fn switch_outdated_now(domain: &Domain) {
             // background, with its bounds on logging in and on its time
             // (`switch`), and its records; that takes the claim itself.
             drop(claim);
-            match run_switch(switch_command(domain, &state.endpoint)) {
+            match run_switch(switch_command(domain, &state.endpoint, Replace::WhenIdle)) {
                 Ok(status) if status.success() => {}
                 Ok(status) => {
                     if status.code() != Some(switch::LOGIN_NEEDED_EXIT) {
@@ -1231,7 +1216,7 @@ pub(crate) fn switch_outdated_now(domain: &Domain) {
             None,
             false,
             Duration::from_secs(30),
-            Replace::IfIdle,
+            Replace::WhenIdle,
             crate::persistence::Login::Bounded,
         );
         let switched = running_status(&control, Retry::No, ANSWER_TIMEOUT)
@@ -1402,6 +1387,16 @@ fn last_attempt(control: &Path) -> Option<Attempt> {
         .ok()
         .filter(|attempt| attempt.version == ATTEMPT_VERSION)
 }
+/// What `switch::plan` needs to know about the service whose status is
+/// `state`, with its switch in `phase` (`switch_report`).
+fn observed<'a>(state: &Status, phase: Option<&'a str>) -> switch::Observed<'a> {
+    switch::Observed {
+        current: state.identity == crate::identity::build(),
+        follows: switch::follows(state.started_from.as_deref()),
+        idle: state.busy.idle(),
+        phase,
+    }
+}
 /// How a service's switch to another build is going: what it reports, or
 /// for one that cannot say, the last switch a command started for it.
 fn switch_report(control: &Path, state: &Status) -> Option<switch::Report> {
@@ -1434,7 +1429,7 @@ const SWITCH_ATTEMPT_INTERVAL: Duration = Duration::from_secs(60);
 /// detached and without prompts: it reports a login that needs the user in
 /// its status rather than asking.
 fn start_switch(domain: &Domain, endpoint: &str) -> Result<()> {
-    let mut command = switch_process(switch_command(domain, endpoint))?;
+    let mut command = switch_process(switch_command(domain, endpoint, Replace::WhenIdle))?;
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1484,21 +1479,16 @@ fn switch_process(args: Vec<OsString>) -> Result<std::process::Command> {
 /// server; the service itself decides again when asked to stop.
 pub(crate) fn keeps_running(control: &Path) -> Option<Ready> {
     let state = running_status(control, Retry::No, ANSWER_TIMEOUT).ok()??;
-    if state.identity == crate::identity::build() {
-        return None;
-    }
-    if switch::follows_other_file(state.started_from.as_deref()) {
-        return Some(Ready::Other {
-            build: state.identity,
-            busy: None,
-            follows_this_file: false,
-        });
-    }
-    (!state.busy.idle()).then(|| Ready::Other {
-        follows_this_file: switch::follows(state.started_from.as_deref())
-            == switch::Follows::ThisFile,
+    let seen = observed(&state, None);
+    let busy = match switch::plan(&seen, switch::Initiator::Switch) {
+        switch::Plan::Leave(switch::Keep::FollowsOther) => None,
+        switch::Plan::Leave(switch::Keep::Busy) => Some(state.busy),
+        _ => return None,
+    };
+    Some(Ready::Other {
+        follows_this_file: seen.follows == switch::Follows::ThisFile,
         build: state.identity,
-        busy: Some(state.busy),
+        busy,
     })
 }
 /// What `persist connect` found.
@@ -1719,7 +1709,7 @@ enum Receiving {
     Started,
     /// A service from another build keeps running: `busy` with requests in
     /// progress, or (None) following another installed syq file
-    /// (`switch::follows_other_file`). `follows_this_file` says whether it
+    /// (`switch::Keep::FollowsOther`). `follows_this_file` says whether it
     /// switches to this build by itself once idle.
     Other {
         build: String,
@@ -1728,29 +1718,21 @@ enum Receiving {
     },
 }
 
-/// Whether to replace a running receiving service from another build.
+/// Whether to replace a running receiving service from another build
+/// (`switch::plan`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Replace {
     /// For commands: never. The service switches by itself, or a switch a
     /// command starts in the background replaces it (`refresh_outdated`),
     /// once the new service has logged in (`successor`).
     Leave,
-    /// For the switches services and commands start: only once nothing is
-    /// in progress, never one that follows another installed syq file by
-    /// itself, so that two installed copies do not take turns replacing each
-    /// other's services, and only once the new service could log in
-    /// (`switch`).
+    /// For a switch to this build, which services and commands start, and
+    /// which the `persist` commands the user types make in the foreground
+    /// (`switch_outdated_now`): as `switch::Initiator::Switch`.
     WhenIdle,
-    /// For the `persist` commands the user types (`switch_outdated_now`): as
-    /// `WhenIdle`, but in the foreground, without the switch's own process
-    /// and records.
-    IfIdle,
-    /// For `persist connect` run by hand: at once, saying what that cuts off.
+    /// For `persist connect` run by hand and settings changes: at once,
+    /// saying what that cuts off.
     Now,
-    /// For a settings change without a terminal: as `Now`, but run as a
-    /// switch is, one at a time, within its bounds on logging in and on its
-    /// time (`run_switch`).
-    NowBounded,
 }
 
 /// Stop a service from another build as `replace` allows, or say why it
@@ -1761,17 +1743,21 @@ fn replace_other(
     replace: Replace,
     remote: &crate::conn::RemoteSpec,
 ) -> Result<Option<Receiving>> {
-    let follows_this_file =
-        switch::follows(state.started_from.as_deref()) == switch::Follows::ThisFile;
+    let seen = observed(state, None);
     let other = |busy| {
         Some(Receiving::Other {
             build: state.identity.clone(),
             busy,
-            follows_this_file,
+            follows_this_file: seen.follows == switch::Follows::ThisFile,
         })
     };
-    match replace {
-        Replace::Now | Replace::NowBounded => {
+    let initiator = match replace {
+        Replace::Leave => return Ok(other((!state.busy.idle()).then_some(state.busy))),
+        Replace::WhenIdle => switch::Initiator::Switch,
+        Replace::Now => switch::Initiator::Hand,
+    };
+    match switch::plan(&seen, initiator) {
+        switch::Plan::ReplaceNow => {
             if !state.busy.idle() {
                 crate::output::diagnostic!(
                     "syq: replacing receiving through {}, which runs syq {}, cuts off {}",
@@ -1783,14 +1769,10 @@ fn replace_other(
             stop_inner(control, false)?;
             Ok(None)
         }
-        Replace::Leave => Ok(other((!state.busy.idle()).then_some(state.busy))),
-        Replace::IfIdle | Replace::WhenIdle => {
-            if switch::follows_other_file(state.started_from.as_deref()) {
-                return Ok(other(None));
-            }
-            if !state.busy.idle() {
-                return Ok(other(Some(state.busy)));
-            }
+        switch::Plan::Leave(switch::Keep::Current) => Ok(Some(Receiving::Running)),
+        switch::Plan::Leave(switch::Keep::Busy) => Ok(other(Some(state.busy))),
+        switch::Plan::Leave(_) => Ok(other(None)),
+        switch::Plan::ReplaceWhenIdle => {
             // The new service logs in to the server, separately from the
             // control connection this command used, before the old one
             // stops, and keeps that login: a failure leaves the old service
@@ -1798,16 +1780,17 @@ fn replace_other(
             let spec = service_spec(remote);
             let mut successor = successor::Successor::start(control, &spec, &remote.label())?;
             // That took a while: decide on what the service says now, such
-            // as a request that began waiting for approval meanwhile.
+            // as a request that began waiting for approval meanwhile. The
+            // service itself decides whether it is idle as it is asked to
+            // stop.
             let Some(state) = running_status(control, Retry::No, ANSWER_TIMEOUT)? else {
                 successor.take_over()?;
                 return Ok(Some(Receiving::Started));
             };
-            if state.identity == crate::identity::build() {
-                return Ok(Some(Receiving::Running));
-            }
-            if switch::follows_other_file(state.started_from.as_deref()) {
-                return Ok(other(None));
+            match switch::plan(&observed(&state, None), initiator) {
+                switch::Plan::Leave(switch::Keep::Current) => return Ok(Some(Receiving::Running)),
+                switch::Plan::Leave(switch::Keep::FollowsOther) => return Ok(other(None)),
+                _ => {}
             }
             // A connection it lost meanwhile leaves the old one receiving.
             successor.still_logged_in(control, &remote.label())?;
@@ -1910,7 +1893,7 @@ fn ensure_inner(
                 // One from before syq followed updates cannot say whether
                 // it is idle: only a replacement run by hand stops it.
                 Err(error) => match error.downcast_ref::<OlderService>() {
-                    Some(older) if matches!(replace, Replace::Now | Replace::NowBounded) => {
+                    Some(older) if replace == Replace::Now => {
                         crate::output::diagnostic!(
                             "syq: replacing receiving through {}, which runs syq {}, cuts off any copy in progress through it",
                             older.endpoint,
@@ -2440,7 +2423,7 @@ fn reconnect_with_this_build(domain: &Domain, control: &Path, endpoint: &str) ->
             crate::persistence::Login::Bounded,
         );
     }
-    let (status, pid) = run_switch_process(replace_now_command(domain, endpoint))?;
+    let (status, pid) = run_switch_process(switch_command(domain, endpoint, Replace::Now))?;
     // One from before syq followed updates still runs, as when the switch
     // could not log in: what the switch recorded says why.
     let now = match running_status(control, Retry::No, ANSWER_TIMEOUT) {
@@ -2499,27 +2482,17 @@ fn read_control_request(client: &mut UnixStream) -> Result<LocalRequest> {
 /// switch to it (`switch`): the new build's own `persist connect`, which
 /// installs its helper on the server and replaces this service once idle.
 /// `--auth-from ssh` keeps a saved authorization default from choosing
-/// anything but this machine's own SSH login.
-fn switch_command(domain: &Domain, endpoint: &str) -> Vec<OsString> {
+/// anything but this machine's own SSH login. With `Replace::Now` it
+/// replaces the service at once even when busy, as a settings change does.
+fn switch_command(domain: &Domain, endpoint: &str, replace: Replace) -> Vec<OsString> {
     let mut args: Vec<OsString> = ["persist", "connect", endpoint, "--auth-from", "ssh"]
         .into_iter()
         .map(OsString::from)
         .collect();
     args.push(WHEN_IDLE.into());
-    if let Some(scope) = domain.explicit_path() {
-        args.extend([OsString::from("--pscope"), scope.into()]);
+    if replace == Replace::Now {
+        args.push("--replace-now".into());
     }
-    args
-}
-/// As `switch_command`, replacing the service at once even when busy
-/// (`Replace::NowBounded`).
-fn replace_now_command(domain: &Domain, endpoint: &str) -> Vec<OsString> {
-    let mut args: Vec<OsString> = ["persist", "connect", endpoint, "--auth-from", "ssh"]
-        .into_iter()
-        .map(OsString::from)
-        .collect();
-    args.push(WHEN_IDLE.into());
-    args.push("--replace-now".into());
     if let Some(scope) = domain.explicit_path() {
         args.extend([OsString::from("--pscope"), scope.into()]);
     }
@@ -2580,7 +2553,7 @@ fn serve(
     let mut follower = started_from
         .filter(|path| path.to_str().is_some())
         .map(switch::Follower::new);
-    let switch_args = switch_command(domain, &spec.endpoint.label());
+    let switch_args = switch_command(domain, &spec.endpoint.label(), Replace::WhenIdle);
     let preferences_path = config_path(domain)?;
     // The file that says whether persistence is on: the default scope's
     // switch, or an explicit scope's marker. `Domain::enabled` looks again

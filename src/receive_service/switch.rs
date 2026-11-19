@@ -347,9 +347,6 @@ fn in_store(path: &Path, store: &Path) -> bool {
         || std::fs::canonicalize(store)
             .is_ok_and(|store| resolved().is_some_and(|path| path.starts_with(store)))
 }
-pub(crate) fn follows_other_file(started_from: Option<&str>) -> bool {
-    follows(started_from) == Follows::OtherFile
-}
 
 /// What a process knows about a running service when it decides whether to
 /// replace it with this build.
@@ -1393,7 +1390,7 @@ mod tests {
     /// `plan`, apart from the one change listed.
     #[test]
     fn every_site_decides_through_plan_as_it_did_on_its_own() {
-        #[derive(Debug, PartialEq)]
+        #[derive(Clone, Copy, Debug, PartialEq)]
         enum Did {
             /// Left it without a word.
             Skip,
@@ -1484,19 +1481,18 @@ mod tests {
                                 // waits for a login, which a `persist` command
                                 // without a terminal now says is busy rather
                                 // than passing over in silence.
-                                if !(login
+                                let changed = login
                                     && !interactive
                                     && !idle
-                                    && old == Did::Skip
-                                    && follows != Follows::OtherFile
-                                    && !current)
-                                {
+                                    && !current
+                                    && follows != Follows::OtherFile;
+                                if changed {
+                                    assert_eq!((old, new), (Did::Skip, Did::Note));
+                                } else {
                                     assert_eq!(
                                         old, new,
                                         "switch_outdated_now {seen:?} {interactive}"
                                     );
-                                } else {
-                                    assert_eq!(new, Did::Note);
                                 }
                                 if phase.is_none() && idle {
                                     let old = if current || follows != Follows::Nothing {

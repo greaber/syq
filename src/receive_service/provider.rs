@@ -311,7 +311,7 @@ pub(crate) const SWITCH_PROVIDER: &str = "switch-provider";
 
 /// Replace a provider from another build with one from this build once it
 /// is idle, as a provider's switch to a new build asks. Leave one that
-/// follows another installed syq file, as `Replace::WhenIdle` does.
+/// follows another installed syq file (`switch::plan`).
 ///
 /// A provider that agreed to stop is only waited for, never sent a stop:
 /// another may start meanwhile, and is looked at in turn.
@@ -323,15 +323,16 @@ pub(super) fn switch_when_idle(domain: &Domain) -> Result<()> {
         let Some(state) = running(domain, ANSWER_TIMEOUT, || Control::Status)? else {
             return start(domain);
         };
-        if state.build == crate::identity::build() {
-            return refresh(domain);
-        }
-        if super::switch::follows_other_file(state.started_from.as_deref()) {
-            crate::output::command_human_stdout!(
-                "The SSH authorization provider keeps running syq {}, which follows another installed syq",
-                state.build
-            );
-            return Ok(());
+        match super::switch::plan(&observed(&state), super::switch::Initiator::Switch) {
+            super::switch::Plan::Leave(super::switch::Keep::Current) => return refresh(domain),
+            super::switch::Plan::Leave(_) => {
+                crate::output::command_human_stdout!(
+                    "The SSH authorization provider keeps running syq {}, which follows another installed syq",
+                    state.build
+                );
+                return Ok(());
+            }
+            _ => {}
         }
         let answer = query(domain, Control::StopIfIdle)?;
         if !answer.stopping {
@@ -369,12 +370,24 @@ pub(super) fn switch_outdated(domain: &Domain) -> Result<()> {
     let Some(state) = running(domain, ANSWER_TIMEOUT, || Control::Status)? else {
         return Ok(());
     };
-    if state.build == crate::identity::build()
-        || super::switch::follows(state.started_from.as_deref()) != super::switch::Follows::Nothing
-    {
-        return Ok(());
+    let initiator = super::switch::Initiator::Command {
+        user_at_hand: std::io::IsTerminal::is_terminal(&std::io::stderr()),
+    };
+    match super::switch::plan(&observed(&state), initiator) {
+        super::switch::Plan::Leave(_) => Ok(()),
+        _ => switch_when_idle(domain),
     }
-    switch_when_idle(domain)
+}
+/// What `switch::plan` needs to know about the provider whose status is
+/// `state`. It has no switch phase to report, and decides itself whether it
+/// is idle when asked to stop (`Control::StopIfIdle`).
+fn observed(state: &Snapshot) -> super::switch::Observed<'static> {
+    super::switch::Observed {
+        current: state.build == crate::identity::build(),
+        follows: super::switch::follows(state.started_from.as_deref()),
+        idle: true,
+        phase: None,
+    }
 }
 
 /// Wait for provider process `pid`, which is stopping, to give up the

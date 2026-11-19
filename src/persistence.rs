@@ -72,7 +72,7 @@ enum PersistAction {
         #[arg(long, hide = true)]
         when_idle: bool,
         /// With --when-idle: replace it at once, even when busy, as a
-        /// settings change does (`receive_service::Replace::NowBounded`)
+        /// settings change does without a terminal (`receive_service::Replace::Now`)
         #[arg(long, hide = true, requires = "when_idle")]
         replace_now: bool,
     },
@@ -243,10 +243,10 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                     syq_path,
                     no_bootstrap,
                     Duration::from_secs(timeout),
-                    match (when_idle, replace_now) {
-                        (true, true) => crate::receive_service::Replace::NowBounded,
-                        (true, false) => crate::receive_service::Replace::WhenIdle,
-                        (false, _) => crate::receive_service::Replace::Now,
+                    if when_idle && !replace_now {
+                        crate::receive_service::Replace::WhenIdle
+                    } else {
+                        crate::receive_service::Replace::Now
                     },
                     if when_idle {
                         Login::Unattended
@@ -385,13 +385,14 @@ pub(crate) enum Login {
     /// terminal on the way.
     Bounded,
     /// Never asking: a login that needs the user fails as
-    /// `switch::LoginNeeded`, as for a switch without a terminal.
+    /// `switch::LoginNeeded`, as for a switch without a terminal. It runs
+    /// as a switch does: one at a time per connection, within the switch's
+    /// time, and recorded for status.
     Unattended,
 }
 /// `replace` says what to do with a receiving service from another build:
 /// replace it at once, as when the user runs `persist connect`, or only
-/// once idle, as a switch to a new build does. A switch to a new build
-/// (`Replace::WhenIdle`) always logs in `Login::Unattended`.
+/// once idle, as a switch to a new build does.
 pub(crate) fn connect_domain(
     domain: &Domain,
     host: &str,
@@ -405,9 +406,9 @@ pub(crate) fn connect_domain(
         crate::cli::parse_native_endpoint(Some(host))?.context("SSH endpoint missing")?;
     reject_receiving_name(&endpoint.host)?;
     let was_enabled = domain.enabled()?;
-    let when_idle = replace == crate::receive_service::Replace::WhenIdle;
     // Run as a switch to a new build is: one at a time, bounded, recorded.
-    let switching = when_idle || replace == crate::receive_service::Replace::NowBounded;
+    let switching = login == Login::Unattended;
+    let when_idle = switching && replace == crate::receive_service::Replace::WhenIdle;
     // A switch to a new build never turns persistence back on.
     if switching && !was_enabled {
         return Ok(());
@@ -490,7 +491,7 @@ pub(crate) fn connect_domain(
         no_bootstrap,
         timeout,
         replace,
-        Login::Unattended,
+        login,
     );
     match &result {
         Ok(()) => crate::receive_service::clear_attempt(&control),
@@ -568,7 +569,7 @@ fn connect_receiving(
     };
     // Tests stand for work after the login that takes too long.
     #[cfg(debug_assertions)]
-    if let Some(millis) = (replace == crate::receive_service::Replace::WhenIdle)
+    if let Some(millis) = (unattended && replace == crate::receive_service::Replace::WhenIdle)
         .then(|| std::env::var("SYQ_TEST_SWITCH_STALL_MS").ok())
         .flatten()
         .and_then(|millis| millis.parse().ok())
