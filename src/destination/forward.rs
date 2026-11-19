@@ -462,27 +462,16 @@ pub(super) fn apply_upload(
     Ok(())
 }
 
-/// The login this machine's SSH configuration gives `target`.
-fn ssh_login(target: &str, deadline: Instant, cancelled: &dyn Fn() -> bool) -> Result<String> {
-    let output = read_ssh_configuration(
-        target_spec(target)?.ssh_hostname_command(),
-        deadline,
-        cancelled,
-    )?;
-    output
-        .lines()
-        .find_map(|line| line.strip_prefix("user ")?.trim().to_owned().into())
-        .filter(|user: &String| !user.is_empty())
-        .with_context(|| format!("the SSH configuration for {target:?} did not report its user"))
-}
-
 /// An account this machine reaches with its own SSH, and what its records
 /// say about the account's enrollment.
 pub(super) struct Account {
     endpoint: crate::cli::NativeEndpoint,
     /// The account as the command names it.
     pub(super) target: String,
-    login: String,
+    /// The login this machine's SSH configuration gives the account, and
+    /// what this machine knows about its host key, which the server dialing
+    /// it adds to what it knows.
+    pub(super) policy: crate::agent_broker::HostPolicy,
     pub(super) enrollment: crate::restricted::EnrollmentState,
 }
 
@@ -490,7 +479,7 @@ impl Account {
     /// Whether this machine's SSH configuration logs in to the account as
     /// root.
     pub(super) fn is_root(&self) -> bool {
-        self.login == "root"
+        self.policy.login_user == "root"
     }
 
     pub(super) fn host(&self) -> &str {
@@ -498,20 +487,30 @@ impl Account {
     }
 
     pub(super) fn label(&self) -> String {
-        format!("{}@{}", self.login, self.endpoint.host)
+        format!("{}@{}", self.policy.login_user, self.endpoint.host)
     }
 
-    /// The login this machine's SSH configuration gives `target`, and its
-    /// enrollment. Reading the configuration contacts no server.
+    /// What this machine's SSH configuration and known_hosts files say
+    /// about `target`, and its enrollment. Reading them contacts no server.
     pub(super) fn find(target: &str, cancelled: &dyn Fn() -> bool) -> Result<Self> {
         let endpoint = target_endpoint(target)?;
-        let login = ssh_login(target, Instant::now() + SETUP_TIMEOUT, cancelled)?;
-        let enrollment =
-            crate::restricted::local_enrollment_state(&endpoint.host, endpoint.port, &login)?;
+        let policy = crate::agent_broker::resolve_known_policy_at_bounded(
+            "ssh",
+            endpoint.user.as_deref(),
+            &endpoint.host,
+            endpoint.port,
+            Instant::now() + SETUP_TIMEOUT,
+            cancelled,
+        )?;
+        let enrollment = crate::restricted::local_enrollment_state(
+            &endpoint.host,
+            endpoint.port,
+            &policy.login_user,
+        )?;
         Ok(Self {
             endpoint,
             target: target.to_owned(),
-            login,
+            policy,
             enrollment,
         })
     }
@@ -545,35 +544,12 @@ impl Account {
         }
     }
 
-    /// The login enrollment uses and what this machine knows about the
-    /// account's host key, which the server dialing it adds to what it
-    /// knows.
-    pub(super) fn policy(
-        &self,
-        cancelled: &dyn Fn() -> bool,
-    ) -> Result<crate::agent_broker::HostPolicy> {
-        let policy = crate::agent_broker::resolve_known_policy_at_bounded(
-            "ssh",
-            self.endpoint.user.as_deref(),
-            &self.endpoint.host,
-            self.endpoint.port,
-            Instant::now() + SETUP_TIMEOUT,
-            &cancelled,
-        )?;
-        anyhow::ensure!(
-            policy.login_user == self.login,
-            "the SSH configuration for {:?} changed during approval",
-            self.target
-        );
-        Ok(policy)
-    }
-
-    pub(super) fn setup(&self, policy: &crate::agent_broker::HostPolicy) -> SetupAccount {
+    pub(super) fn setup(&self) -> SetupAccount {
         SetupAccount {
             host: self.endpoint.host.clone(),
             port: self.endpoint.port,
-            login: self.login.clone(),
-            agent: policy.agent_socket().map(Path::to_path_buf),
+            login: self.policy.login_user.clone(),
+            agent: self.policy.agent_socket().map(Path::to_path_buf),
         }
     }
 }
@@ -868,48 +844,6 @@ pub(super) struct ForwardChild {
     closed: bool,
 }
 impl ForwardChild {
-    pub(super) fn wait_for_exit(
-        &mut self,
-        deadline: Instant,
-        cancelled: &impl Fn() -> bool,
-    ) -> Result<std::process::ExitStatus> {
-        loop {
-            // Observe without reaping, so cleanup can still kill descendants
-            // without allowing the leader's PID to be reused for another group.
-            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            let result = unsafe {
-                libc::waitid(
-                    libc::P_PID,
-                    self.child.id(),
-                    &mut info,
-                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-                )
-            };
-            if result < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error.into());
-            }
-            if info.si_signo != 0 {
-                return Ok(self.close()?);
-            }
-            if cancelled() {
-                let _ = self.close();
-                bail!("return helper cancelled while waiting for its exit status");
-            }
-            if Instant::now() >= deadline {
-                let _ = self.close();
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "return helper deadline expired while waiting for its exit status",
-                )
-                .into());
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
     pub(super) fn spawn_command(mut command: Command) -> Result<Self> {
         let mut child = command
             .stdin(Stdio::piped())
@@ -996,61 +930,6 @@ impl<T: Write + AsRawFd> Write for DeadlineIo<'_, T> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
     }
-}
-
-/// The SSH route this machine's configuration gives `target`, for reading
-/// that configuration without contacting the server.
-pub(super) fn target_spec(target: &str) -> Result<crate::conn::RemoteSpec> {
-    let endpoint = target_endpoint(target)?;
-    // A return connection needs its explicit remote forwarding. This
-    // outbound copy needs no forwarding and must not ask about host keys
-    // from the background service. RemoteSpec disables multiplexing.
-    let rsh = std::iter::once("ssh")
-        .chain(RETURN_SSH_OPTIONS.iter().copied())
-        .chain([
-            "-o",
-            "ClearAllForwardings=yes",
-            "-o",
-            "StrictHostKeyChecking=yes",
-        ])
-        .map(str::to_owned)
-        .collect();
-    Ok(crate::conn::RemoteSpec {
-        bootstrap_helper: true,
-        quiet: true,
-        ..crate::conn::RemoteSpec::new(endpoint.user, endpoint.host, endpoint.port, rsh)
-    })
-}
-
-/// What `ssh -G` prints for a target, within the setup's deadline.
-fn read_ssh_configuration(
-    command: Command,
-    deadline: Instant,
-    cancelled: &dyn Fn() -> bool,
-) -> Result<String> {
-    // Reuse helper process-group ownership, bounded stderr capture, and the
-    // setup's absolute deadline. A local Match exec must not outlive revocation.
-    let mut child = ForwardChild::spawn_command(command)?;
-    drop(child.child.stdin.take());
-    let mut output = Vec::new();
-    DeadlineIo {
-        inner: child.child.stdout.as_mut().unwrap(),
-        deadline,
-        cancelled: Some(cancelled),
-    }
-    .take(MAX_MESSAGE as u64 + 1)
-    .read_to_end(&mut output)?;
-    anyhow::ensure!(
-        output.len() <= MAX_MESSAGE,
-        "SSH configuration output is too large"
-    );
-    let status = child.wait_for_exit(deadline, &cancelled)?;
-    anyhow::ensure!(
-        status.success(),
-        "resolve the SSH configuration: {}",
-        child.errors()
-    );
-    String::from_utf8(output).context("SSH configuration is not UTF-8")
 }
 
 pub(super) fn dispatch(argv: &[OsString]) -> Option<Result<i32>> {
@@ -1216,38 +1095,6 @@ mod tests {
         assert_eq!(issue(&named).unwrap(), "alice@server:2222");
         named.via = Some((None, "-oProxyCommand=evil".into(), None));
         assert!(issue(&named).is_err());
-    }
-
-    #[test]
-    fn helper_exit_status_and_stderr_survive_group_cleanup() {
-        let mut command = Command::new("sh");
-        // A descendant keeps stderr open after the launcher has exited.
-        command.args(["-c", "sleep 30 & printf missing >&2; exit 125"]);
-        let mut child = ForwardChild::spawn_command(command).unwrap();
-        let status = child
-            .wait_for_exit(Instant::now() + Duration::from_secs(2), &|| false)
-            .unwrap();
-        assert_eq!(
-            status.code(),
-            Some(crate::remote_helper::HELPER_MISSING_EXIT)
-        );
-        assert_eq!(child.errors(), "\"missing\"");
-        assert_eq!(child.close().unwrap(), status);
-    }
-
-    #[test]
-    fn helper_exit_wait_remains_bounded_and_cancellable() {
-        for cancel in [false, true] {
-            let mut command = Command::new("sh");
-            command.args(["-c", "sleep 30"]);
-            let mut child = ForwardChild::spawn_command(command).unwrap();
-            let started = Instant::now();
-            assert!(child
-                .wait_for_exit(started + Duration::from_millis(20), &|| cancel)
-                .is_err());
-            assert!(started.elapsed() < Duration::from_secs(2));
-            assert!(child.child.try_wait().unwrap().is_some());
-        }
     }
 
     #[test]

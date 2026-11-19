@@ -388,9 +388,8 @@ impl<'a> Approver<'a> {
         // The destination's known hosts go to the server that dials it: the
         // source, in its signed directive, or the server that asked.
         let reach = |account: forward::Account| -> Result<_> {
-            let policy = account.policy(&cancelled)?;
-            let known_hosts = policy.known_hosts_for_others()?;
-            Ok((account, policy, known_hosts))
+            let known_hosts = account.policy.known_hosts_for_others()?;
+            Ok((account, known_hosts))
         };
         let destination = destination.map(reach).transpose()?;
         let source = source.map(reach).transpose()?;
@@ -404,12 +403,10 @@ impl<'a> Approver<'a> {
                 inputs: asked.inputs,
                 caps,
                 accounts: forward::Accounts {
-                    source: source
+                    source: source.as_ref().map(|(account, _)| account.setup()),
+                    destination: destination
                         .as_ref()
-                        .map(|(account, policy, _)| account.setup(policy)),
-                    destination: destination.as_ref().map(|(account, policy, known_hosts)| {
-                        (account.setup(policy), known_hosts.clone())
-                    }),
+                        .map(|(account, known_hosts)| (account.setup(), known_hosts.clone())),
                 },
                 results_key: asked.results_key,
                 via: receiver.map(|receiver| {
@@ -431,8 +428,8 @@ impl<'a> Approver<'a> {
         anyhow::ensure!(!cancelled(), disconnected);
         Ok(Reply::Signed(Box::new(forward::Issued::new(
             signed,
-            source.map(|(_, policy, known_hosts)| (policy, known_hosts)),
-            destination.map(|(_, policy, known_hosts)| (policy, known_hosts)),
+            source.map(|(account, known_hosts)| (account.policy, known_hosts)),
+            destination.map(|(account, known_hosts)| (account.policy, known_hosts)),
             max_delete,
         )?)))
     }
