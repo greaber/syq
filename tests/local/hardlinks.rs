@@ -1159,10 +1159,10 @@ fn every_kept_representative_in_a_batch_that_fills_the_destination_is_reported()
 
 #[cfg(debug_assertions)]
 #[test]
-fn a_kept_representative_that_failed_is_reported_when_a_later_batch_fills_the_destination() {
-    // Two named sources go in successive batches: the first one's check
-    // fails, and the second one's finds the destination full. The copy
-    // ends, and both are reported.
+fn failed_kept_representatives_of_named_sources_are_reported_when_the_destination_fills() {
+    // Two named sources, planned in batches of their own: one's check
+    // fails, and the other's finds the destination full. The copy ends,
+    // and both are reported.
     let t = Tmp::new();
     for name in ["a-meta", "z-full"] {
         write(&t.path(&format!("src/{name}")), b"payload");

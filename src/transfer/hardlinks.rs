@@ -22,6 +22,33 @@ impl Hardlinks {
     fn kept_leaf(&self, group: usize) -> &Planned {
         &self.groups[group].kept.as_ref().expect("a kept group").leaf
     }
+
+    /// `groups`, kept representatives, in consecutive parts of at most
+    /// `most`, each also ending once the scanned entries it holds pass
+    /// `SOURCE_BATCH_PATH_BYTES`: they carry any ACLs and extended
+    /// attributes copied, which each part's requests and replies repeat.
+    /// Each part holds at least one.
+    fn kept_parts<'g>(&self, mut groups: &'g [usize], most: usize) -> Vec<&'g [usize]> {
+        let mut parts = Vec::new();
+        while !groups.is_empty() {
+            let mut bytes = 0usize;
+            let len = groups
+                .iter()
+                .take(most)
+                .position(|&group| {
+                    let leaf = self.kept_leaf(group);
+                    bytes = bytes
+                        .saturating_add(source_request_bytes(&leaf.src, Some(&leaf.source)))
+                        .saturating_add(leaf.e.size_hint());
+                    bytes > SOURCE_BATCH_PATH_BYTES
+                })
+                .map_or(groups.len().min(most), |index| index.max(1));
+            let (part, rest) = groups.split_at(len);
+            parts.push(part);
+            groups = rest;
+        }
+        parts
+    }
 }
 
 struct Group {
@@ -328,11 +355,10 @@ impl Planner<'_> {
     /// of `leaf` without a worker: a worker would keep it on its size and
     /// time alone (`Worker::try_expected_match`), and the scan does not
     /// predict that the receiver will refuse it (`must_replace`), and its
-    /// check would change nothing. A later alias may find the group's
-    /// metadata in conflict (a mapping's, or the source's changing between
-    /// the scans of its names), which refuses the copy before any name of
-    /// the group is changed: a representative whose metadata needs changing
-    /// is left to a worker, which runs only once the group is validated.
+    /// check would change nothing. A representative whose metadata needs
+    /// changing is left to a worker, as before: the planner's checks change
+    /// no file, and a representative they hand on still has the metadata
+    /// the scan found (`requeue_representative`).
     fn keeps_representative(&mut self, leaf: &Planned, destination: &Entry) -> bool {
         // A preview changes nothing.
         !self.opts.dry_run
@@ -559,7 +585,7 @@ impl Planner<'_> {
         self.assert_mutation_root()?;
         // The files to replace are queued together.
         let _burst = self.sched.file_burst();
-        for groups in kept.chunks(8192) {
+        for groups in self.hardlinks.kept_parts(&kept, 8192) {
             let ops = groups
                 .iter()
                 .map(|&group| {
@@ -630,22 +656,7 @@ impl Planner<'_> {
             .collect();
         // The files to copy again are queued together.
         let _burst = self.sched.file_burst();
-        let mut rest = &kept[..];
-        while !rest.is_empty() {
-            let mut bytes = 0usize;
-            let len = rest
-                .iter()
-                .take(4096)
-                .position(|&group| {
-                    let leaf = self.hardlinks.kept_leaf(group);
-                    bytes = bytes
-                        .saturating_add(source_request_bytes(&leaf.src, Some(&leaf.source)))
-                        .saturating_add(leaf.e.size_hint());
-                    bytes > SOURCE_BATCH_PATH_BYTES
-                })
-                .map_or(rest.len().min(4096), |index| index.max(1));
-            let (groups, later) = rest.split_at(len);
-            rest = later;
+        for groups in self.hardlinks.kept_parts(&kept, 4096) {
             self.recheck_representatives(source, groups)?;
         }
         Ok(())
