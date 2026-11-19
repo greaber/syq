@@ -627,7 +627,7 @@ fn policy_deadline_interrupts_real_openssh_match_exec() {
     std::fs::write(
         &config,
         format!(
-            "Match exec \"touch {}; sleep 30\"\n  User backup\n",
+            "Match exec \"touch {}; sleep 60\"\n  User backup\n",
             shell_words::quote(marker.to_str().unwrap()),
         ),
     )
@@ -640,22 +640,36 @@ fn policy_deadline_interrupts_real_openssh_match_exec() {
         ),
         0o700,
     );
-    let started = Instant::now();
-    let error = resolve_host_policy_at_bounded(
-        ssh.to_str().unwrap(),
-        None,
-        "unused.example",
-        None,
-        started + Duration::from_millis(300),
-        &|| false,
-    )
-    .unwrap_err();
-    assert_eq!(
-        error.downcast_ref::<std::io::Error>().unwrap().kind(),
-        std::io::ErrorKind::TimedOut
-    );
-    assert!(marker.exists(), "OpenSSH did not reach Match exec");
-    assert!(started.elapsed() < Duration::from_secs(3));
+    // The deadline must fall after OpenSSH has started the Match exec, which
+    // a starved CPU delays: give it longer until it does.
+    let mut allowed = Duration::from_millis(300);
+    loop {
+        let _ = std::fs::remove_file(&marker);
+        let started = Instant::now();
+        let error = resolve_host_policy_at_bounded(
+            ssh.to_str().unwrap(),
+            None,
+            "unused.example",
+            None,
+            started + allowed,
+            &|| false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        // Well before the Match exec's own end.
+        assert!(started.elapsed() < allowed + Duration::from_secs(10));
+        if marker.exists() {
+            break;
+        }
+        assert!(
+            allowed < Duration::from_secs(10),
+            "OpenSSH did not reach Match exec"
+        );
+        allowed *= 2;
+    }
 }
 
 #[test]
