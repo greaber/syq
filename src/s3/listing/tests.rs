@@ -559,7 +559,9 @@ async fn small_sparse_and_flat_trees_cost_at_most_two_more_requests() {
         ("eleven sparse pages", tree(256, 40).collect(), 2),
         ("two dense pages", tree(1, 1001).collect(), 1),
         ("three sparse pages", tree(30, 90).collect(), 0),
-        ("three pages in one directory", tree(1, 2500).collect(), 1),
+        // One more request when the children of `t/` arrive before the
+        // second page, which then asks for those of `t/d0000/`.
+        ("three pages in one directory", tree(1, 2500).collect(), 2),
         ("four pages in two directories", tree(2, 1700).collect(), 1),
         ("one flat directory", tree(1, 30_000).collect(), 2),
         ("two keys a directory", tree(30_000, 2).collect(), 2),
