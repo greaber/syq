@@ -558,6 +558,9 @@ async fn small_sparse_and_flat_trees_cost_at_most_two_more_requests() {
         ("two sparse pages", tree(256, 4).collect(), 0),
         ("eleven sparse pages", tree(256, 40).collect(), 2),
         ("two dense pages", tree(1, 1001).collect(), 1),
+        ("three sparse pages", tree(30, 90).collect(), 0),
+        ("three pages in one directory", tree(1, 2500).collect(), 1),
+        ("four pages in two directories", tree(2, 1700).collect(), 1),
         ("one flat directory", tree(1, 30_000).collect(), 2),
         ("two keys a directory", tree(30_000, 2).collect(), 2),
         (
@@ -835,4 +838,31 @@ async fn filtered_listings_leave_out_pruned_directories_at_the_end() {
         .collect();
     assert!(keys == expected);
     assert!(store.calls.borrow().len() <= allowance(25));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_part_never_covers_a_pruned_directory_that_starts_like_it() {
+    // `t/build/` is left out; the part for the directories before it must
+    // not be `t/b`, which would list it whole.
+    let ignored = |key: &str, _directory: bool| key.starts_with("t/build/").then_some(7);
+    let prune = engine::Prune {
+        subtree: &ignored,
+        probes: 4.into(),
+    };
+    let keys = (0..12_000)
+        .map(|i| format!("t/a/f{i:05}"))
+        .chain((0..3).flat_map(|d| (0..300).map(move |i| format!("t/b{d:02}/f{i:03}"))))
+        .chain((0..20_000).map(|i| format!("t/build/f{i:05}")));
+    let store = Memory::new(keys);
+    let mut keys = Vec::new();
+    let pruned = engine::enumerate_prefix(&store, "t/", 32, Some(&prune), |entry| {
+        keys.push(entry.key);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(pruned, ["t/build/"]);
+    assert!(keys.iter().all(|key| !key.starts_with("t/build/")));
+    assert_eq!(keys.len(), 12_900);
+    assert!(store.calls.borrow().len() <= allowance(13));
 }

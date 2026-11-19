@@ -24,8 +24,12 @@ const PAGE: usize = 1000;
 // costs more than a fixed share over its sequential pages.
 const EXTRA_REQUESTS: usize = 2;
 const PAGES_PER_EXTRA: usize = 4;
-// A first page with this many keys in one directory asks for the children a
-// page sooner: such a directory is unlikely to be the listing's last.
+// A listing asks for the children of its prefix once it is known to need a
+// page past this many. A shorter listing rarely has directories large enough
+// to hand over, so the request would only add to its cost.
+const SPARSE_PAGES: usize = 3;
+// A first page with this many keys in one directory asks for the children at
+// once: such a directory is unlikely to be the listing's last.
 const DENSE_DIRECTORY: usize = 256;
 // Directories are handed to another listing only while those not yet handed
 // over are expected to hold twice this many pages.
@@ -428,6 +432,9 @@ async fn recursive(store: &impl Store, prune: Option<&Prune<'_>>, prefix: String
 /// Where a part stands with the children of the directory it is in.
 enum Children {
     Unlisted,
+    /// The listing went into this child of the directory before. Ask for
+    /// its children if the listing is still in it after another page.
+    Entered,
     /// A page is on its way.
     Asked,
     /// Pages so far end at a continuation token.
@@ -793,7 +800,14 @@ impl Walk {
             })
         };
         match std::mem::replace(&mut part.children, Children::Closed) {
-            Children::Unlisted if part.dense || part.pages >= 2 => children(part, None),
+            Children::Unlisted if part.dense || part.pages >= SPARSE_PAGES => children(part, None),
+            // A listing that has already left the child has nothing to hand
+            // over from it.
+            Children::Entered if part.pages >= 2 => part
+                .last
+                .starts_with(&part.directory)
+                .then(|| children(part, None))
+                .flatten(),
             Children::More(token) => children(part, Some(token)),
             Children::Complete => {
                 part.children = Children::Complete;
@@ -812,7 +826,8 @@ impl Walk {
                     part.reached = 1;
                     part.burst = false;
                     part.listed.clear();
-                    return children(part, None);
+                    part.children = Children::Entered;
+                    return None;
                 };
                 // Small directories are not worth a request each. Leave them
                 // to the listing unless enough of them remain.
@@ -822,7 +837,17 @@ impl Walk {
                 let prefix = if part.burst {
                     name.clone()
                 } else {
-                    block(&inside, name)
+                    // Nor may it cover the part's stop: a pruned directory
+                    // left out after `name` can start the same way.
+                    let mut prefix = block(&inside, name);
+                    if let Some(stop) = part
+                        .stop
+                        .as_deref()
+                        .filter(|stop| stop.starts_with(&prefix))
+                    {
+                        prefix = block(stop, name);
+                    }
+                    prefix
                 };
                 let from = part
                     .ahead
