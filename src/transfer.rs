@@ -331,6 +331,13 @@ impl Opts {
         !self.checksum && !self.hash_or_copy
     }
 
+    /// Whether a file at `path` whose size and time match the source's is
+    /// kept without being read. A copy still reads one the mapping gives an
+    /// expected hash for.
+    fn keeps_matching_file(&self, path: &[u8]) -> bool {
+        self.trusts_size_and_time() && (self.dry_run || self.expected_for(path).is_none())
+    }
+
     /// Whether a dry run compares an existing file of the same size to
     /// learn whether the copy would change it, because the copy would
     /// compare it too.
@@ -4989,6 +4996,7 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         directory_restorations: Default::default(),
         receiver_uid: None,
         parent_groups: Default::default(),
+        leaf_parents: Vec::new(),
         new_file_owner: None,
         // The destination directory itself when its owner lacks write or
         // search permission. Whatever the placement, an existing directory
