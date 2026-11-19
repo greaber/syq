@@ -70,8 +70,10 @@ mod scan;
 mod sched;
 #[cfg_attr(all(target_os = "macos", not(test)), deny(clippy::disallowed_methods))]
 mod server;
+mod service;
 mod session_pool;
 mod sparse;
+mod ssh_config;
 mod state_file;
 mod stream_mapping;
 mod streaming;

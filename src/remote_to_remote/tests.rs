@@ -562,13 +562,7 @@ fn destination(
         request_id: crate::delegation::RequestId::fresh(1_900_000_000).unwrap(),
         grant_digest: [17; 32],
     };
-    let stream = crate::destination_results::Stream::start(
-        &crate::destination_results::ReceiptPolicy::for_recipient(public),
-        binding,
-        &key,
-        records,
-    )
-    .unwrap();
+    let stream = crate::destination_results::Stream::start(public, binding, &key, records).unwrap();
     (
         stream,
         crate::destination_results::Expectation {

@@ -310,6 +310,66 @@ pub(crate) fn restore_self_started_name() {
     }
 }
 
+/// Start `command` in a session of its own, away from this process's
+/// terminal, so that a Ctrl-C or hangup meant for this process never
+/// reaches it. It leads its own process group.
+pub(crate) fn new_session(command: &mut Command) -> &mut Command {
+    use std::os::unix::process::CommandExt as _;
+    // SAFETY: setsid takes no arguments, touches no memory, and is safe to
+    // call between fork and exec.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        })
+    }
+}
+
+/// How a detached child is kept apart from this process.
+pub(crate) enum Detach {
+    /// A session of its own (`new_session`), for a service that outlives
+    /// this process and its terminal.
+    Session,
+    /// A process group of its own, still in this process's session.
+    Group,
+}
+
+/// Start `command`, this build in an internal mode, detached as `detach`
+/// says, with the other end of the returned socket pair as its standard
+/// output and, with `input`, its standard input: the child reads what it
+/// is to do there and answers when it is ready. Reads from it wait up to
+/// `read_timeout`, set before the child starts: macOS refuses to set a
+/// timeout on a socket whose other end has closed, as it has once a child
+/// that failed has exited. Dropping the group kills it;
+/// `ProcessGroup::detach` leaves it running once it is ready.
+pub(crate) fn spawn_detached(
+    mut command: Command,
+    detach: Detach,
+    input: bool,
+    read_timeout: Option<std::time::Duration>,
+) -> std::io::Result<(group::ProcessGroup, std::os::unix::net::UnixStream)> {
+    use std::os::fd::OwnedFd;
+    let (parent, child) = with_inheritance_guard(std::os::unix::net::UnixStream::pair)?;
+    parent.set_read_timeout(read_timeout)?;
+    if input {
+        command.stdin(Stdio::from(OwnedFd::from(child.try_clone()?)));
+    }
+    command.stdout(Stdio::from(OwnedFd::from(child)));
+    let group = match detach {
+        Detach::Session => new_session(&mut command)
+            .spawn_guarded()
+            .map(group::ProcessGroup::leading),
+        Detach::Group => group::ProcessGroup::spawn(&mut command),
+    };
+    // The command holds this process's copy of the child's end. Close it,
+    // so that a child that ends without answering ends the parent's read
+    // at once rather than at its time limit.
+    drop(command);
+    Ok((group?, parent))
+}
+
 /// Run an inspection command under one deadline, including descendants that
 /// retain its output pipes. Neither output nor cancellation needs a reader
 /// thread whose lifetime can outlast the command's process group. `what`
@@ -331,6 +391,29 @@ pub(crate) fn capture_output_bounded(
     )
 }
 
+/// [`capture_output_bounded`] for a command that stays in this process's
+/// group, so that whatever ends this process with its group, such as the
+/// receiving service ending its setup child, ends the command too, and an
+/// interactive command can read the terminal. At the deadline only the
+/// command itself is killed; anything it started ends with this group.
+pub(crate) fn capture_output_bounded_in_this_group(
+    what: &str,
+    command: &mut Command,
+    deadline: std::time::Instant,
+    cancelled: &dyn Fn() -> bool,
+    max_output_bytes: usize,
+) -> std::io::Result<Output> {
+    capture_output_bounded_spawned(
+        what,
+        command,
+        deadline,
+        cancelled,
+        max_output_bytes,
+        &mut std::thread::sleep,
+        group::ProcessGroup::spawn_in_this_group,
+    )
+}
+
 /// `capture_output_bounded`, waiting with `wait` before each new look for
 /// the exit of a command that has closed its output.
 fn capture_output_bounded_with(
@@ -340,6 +423,26 @@ fn capture_output_bounded_with(
     cancelled: &dyn Fn() -> bool,
     max_output_bytes: usize,
     wait: &mut dyn FnMut(std::time::Duration),
+) -> std::io::Result<Output> {
+    capture_output_bounded_spawned(
+        what,
+        command,
+        deadline,
+        cancelled,
+        max_output_bytes,
+        wait,
+        group::ProcessGroup::spawn,
+    )
+}
+
+fn capture_output_bounded_spawned(
+    what: &str,
+    command: &mut Command,
+    deadline: std::time::Instant,
+    cancelled: &dyn Fn() -> bool,
+    max_output_bytes: usize,
+    wait: &mut dyn FnMut(std::time::Duration),
+    spawn: fn(&mut Command) -> std::io::Result<group::ProcessGroup>,
 ) -> std::io::Result<Output> {
     use std::io::{self, Read};
     use std::os::fd::{AsRawFd, RawFd};
@@ -406,7 +509,7 @@ fn capture_output_bounded_with(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut group = group::ProcessGroup::spawn(command)?;
+    let mut group = spawn(command)?;
     let mut stdout = group.child.stdout.take().unwrap();
     let mut stderr = group.child.stderr.take().unwrap();
     nonblocking(stdout.as_raw_fd())?;
@@ -574,6 +677,85 @@ mod group_tests {
         let status = child.close().unwrap();
         assert_eq!(status.signal(), Some(libc::SIGKILL));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A detached child that ends without answering is noticed as soon as
+    /// it ends, not at the parent's read limit: the parent keeps no copy of
+    /// the child's end.
+    #[test]
+    fn a_detached_child_that_ends_without_answering_is_noticed_at_once() {
+        for detach in [super::Detach::Session, super::Detach::Group] {
+            let started = Instant::now();
+            // The read limit is set before the child can have exited.
+            let (mut child, mut channel) = super::spawn_detached(
+                Command::new("true"),
+                detach,
+                true,
+                Some(Duration::from_secs(30)),
+            )
+            .unwrap();
+            let mut byte = [0u8];
+            assert_eq!(std::io::Read::read(&mut channel, &mut byte).unwrap(), 0);
+            assert!(started.elapsed() < Duration::from_secs(10));
+            assert!(child.wait().unwrap().success());
+        }
+    }
+
+    /// A child in a session of its own leads its group and session; one in
+    /// a group of its own stays in this session. Either way dropping it
+    /// before it is detached kills its whole group.
+    #[test]
+    fn a_detached_child_is_apart_and_dropping_it_kills_its_group() {
+        for (detach, own_session) in [
+            (super::Detach::Session, true),
+            (super::Detach::Group, false),
+        ] {
+            let mut command = Command::new("sh");
+            command.args(["-c", "sleep 600 & echo $!; wait"]);
+            let (child, channel) = super::spawn_detached(command, detach, false, None).unwrap();
+            let pid = child.child.id() as libc::pid_t;
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut std::io::BufReader::new(&channel), &mut line).unwrap();
+            let sleeper: libc::pid_t = line.trim().parse().unwrap();
+            assert_eq!(unsafe { libc::getpgid(pid) }, pid);
+            assert_eq!(unsafe { libc::getpgid(sleeper) }, pid);
+            assert_eq!(unsafe { libc::getsid(pid) } == pid, own_session);
+            drop(child);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            // The sleeper is not this process's child, and the process that
+            // adopts it may never reap it: a zombie counts as ended.
+            while unsafe { libc::kill(sleeper, 0) } == 0
+                && !std::fs::read_to_string(format!("/proc/{sleeper}/stat")).is_ok_and(|stat| {
+                    stat.rsplit_once(") ")
+                        .is_some_and(|(_, fields)| fields.starts_with('Z'))
+                })
+            {
+                assert!(Instant::now() < deadline, "the group outlived its owner");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    /// A detached child keeps running, and its reaper leaves no zombie.
+    #[test]
+    fn a_detached_child_keeps_running_and_is_reaped() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "read line; exit 0"]);
+        let (child, mut channel) =
+            super::spawn_detached(command, super::Detach::Group, true, None).unwrap();
+        let pid = child.child.id() as libc::pid_t;
+        child.detach();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+        std::io::Write::write_all(&mut channel, b"go\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        // Once reaped, the process is gone: kill fails with ESRCH.
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the detached child was not reaped"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 

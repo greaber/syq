@@ -1,12 +1,10 @@
 //! A snapshot for native SSH tools, bound to one approved account's live socket.
 use crate::cli::{AuthFrom, NativeEndpoint};
-use crate::process::CommandExt as _;
 use anyhow::{bail, ensure, Context, Result};
 use clap::Args;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 #[derive(Args, Debug)]
 pub(crate) struct ExportCommand {
@@ -90,31 +88,28 @@ fn alias_pattern(scope: &Path) -> Result<String> {
 }
 
 fn expanded_control(pattern: &str, endpoint: &NativeEndpoint) -> Result<PathBuf> {
-    let mut command = Command::new("ssh");
-    command
-        .args(["-G", "-T", "-F", "/dev/null", "-o", "ProxyJump=none"])
-        .args(["-S", pattern]);
-    if let Some(user) = &endpoint.user {
-        command.args(["-l", user]);
-    }
-    command.args([
-        "-p",
-        &endpoint.port.unwrap_or(22).to_string(),
-        "--",
+    // With no configuration file, the lookup runs no configured commands;
+    // allow it what the other foreground lookups allow.
+    let config = crate::ssh_config::SshConfig::query(
+        "ssh",
+        &[
+            "-T",
+            "-F",
+            "/dev/null",
+            "-o",
+            "ProxyJump=none",
+            "-S",
+            pattern,
+        ],
+        endpoint.user.as_deref(),
+        Some(endpoint.port.unwrap_or(22)),
         &endpoint.host,
-    ]);
-    let output = command
-        .capture_output()
-        .context("inspect native OpenSSH control path")?;
-    ensure!(
-        output.status.success(),
-        "native OpenSSH could not expand the exported control path: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    let text = std::str::from_utf8(&output.stdout).context("OpenSSH configuration is not UTF-8")?;
-    let value = text
-        .lines()
-        .find_map(|line| line.strip_prefix("controlpath "))
+        crate::ssh_config::Group::Callers,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+        &|| false,
+    )?;
+    let value = config
+        .value("controlpath")
         .context("native OpenSSH did not return a control path")?;
     Ok(PathBuf::from(value))
 }
@@ -166,6 +161,8 @@ fn render(requested: &NativeEndpoint, endpoint: &NativeEndpoint, pattern: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::CommandExt as _;
+    use std::process::Command;
 
     fn endpoint() -> NativeEndpoint {
         NativeEndpoint {

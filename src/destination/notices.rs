@@ -259,24 +259,17 @@ enum Credentials {
 
 fn credentials(spec: &crate::conn::RemoteSpec) -> Credentials {
     // ssh's own view of the destination: its agent and identity files.
-    let Ok(output) = crate::process::capture_output_bounded(
-        "SSH credential check",
-        &mut spec.ssh_hostname_command(),
+    let Ok(config) = spec.ssh_config(
+        crate::ssh_config::Group::Own,
         Instant::now() + Duration::from_secs(5),
-        &|| false,
-        MAX_MESSAGE,
     ) else {
         return Credentials::Present;
     };
-    if !output.status.success() {
-        return Credentials::Present;
-    }
-    let Ok(agent) = crate::agent_broker::configured_agent_socket(&output.stdout) else {
+    let Ok(agent) = crate::agent_broker::configured_agent_socket(config.text().as_bytes()) else {
         return Credentials::Present;
     };
-    let config = String::from_utf8_lossy(&output.stdout);
     classify(
-        &config,
+        config.text(),
         agent.map(|socket| {
             let answer =
                 crate::agent_socket::inspect(&socket, Instant::now() + Duration::from_secs(2));
@@ -294,9 +287,7 @@ fn classify(
     match agent {
         Some((socket, Agent::Dead)) => {
             let environment = matches!(
-                config
-                    .lines()
-                    .find_map(|line| line.strip_prefix("identityagent ")),
+                crate::ssh_config::value(config, "identityagent"),
                 None | Some("SSH_AUTH_SOCK")
             );
             return Credentials::DeadAgent {
@@ -311,29 +302,23 @@ fn classify(
         Some((_, Agent::Identities(_))) => return Credentials::Present,
     }
     // A PKCS#11 provider holds keys that neither the agent nor files show.
-    if config
-        .lines()
-        .any(|line| line.starts_with("pkcs11provider ") && line != "pkcs11provider none")
-    {
+    if crate::ssh_config::values(config, "pkcs11provider").any(|provider| provider != "none") {
         return Credentials::Present;
     }
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let key_files = config
-        .lines()
-        .filter_map(|line| line.strip_prefix("identityfile "))
-        .any(|file| {
-            // `ssh -G` leaves `~` and tokens in identity files unexpanded.
-            // A file whose name syq cannot work out may exist.
-            if file.contains('%') || file.contains("${") {
-                return true;
-            }
-            let path = match (file.strip_prefix("~/"), &home) {
-                (Some(rest), Some(home)) => home.join(rest),
-                (None, _) if !file.starts_with('~') => PathBuf::from(file),
-                _ => return true,
-            };
-            exists(&path)
-        });
+    let key_files = crate::ssh_config::values(config, "identityfile").any(|file| {
+        // `ssh -G` leaves `~` and tokens in identity files unexpanded.
+        // A file whose name syq cannot work out may exist.
+        if file.contains('%') || file.contains("${") {
+            return true;
+        }
+        let path = match (file.strip_prefix("~/"), &home) {
+            (Some(rest), Some(home)) => home.join(rest),
+            (None, _) if !file.starts_with('~') => PathBuf::from(file),
+            _ => return true,
+        };
+        exists(&path)
+    });
     if key_files {
         Credentials::Present
     } else {

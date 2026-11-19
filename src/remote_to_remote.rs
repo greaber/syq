@@ -862,29 +862,17 @@ impl ReceiverConnection {
         let (program, options) = command
             .split_first()
             .context("receiver SSH command is empty")?;
-        let mut query = std::process::Command::new(program);
-        query.args(options).arg("-G");
-        if let Some(user) = user {
-            query.args(["-l", user]);
-        }
-        if let Some(port) = port {
-            query.args(["-p", &port.to_string()]);
-        }
-        query.args(["--", host]).stdin(std::process::Stdio::null());
-        let output = crate::process::capture_output_bounded(
-            "SSH configuration lookup",
-            &mut query,
+        let config = crate::ssh_config::SshConfig::query(
+            program,
+            options,
+            user,
+            port,
+            host,
+            crate::ssh_config::Group::Own,
             std::time::Instant::now() + std::time::Duration::from_secs(30),
             &|| false,
-            1 << 20,
-        )
-        .context("read this machine's SSH configuration for the destination")?;
-        anyhow::ensure!(
-            output.status.success(),
-            "could not read this machine's SSH configuration for {host}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        Self::parse(std::str::from_utf8(&output.stdout).context("SSH configuration is not UTF-8")?)
+        )?;
+        Self::parse(config.text())
     }
 
     /// How the approving machine's entries can join this machine's.
@@ -921,12 +909,7 @@ impl ReceiverConnection {
     }
 
     pub(crate) fn parse(output: &str) -> Result<Self> {
-        let value = |name: &str| {
-            output
-                .lines()
-                .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
-                .map(str::trim)
-        };
+        let value = |name: &str| crate::ssh_config::value(output, name).map(str::trim);
         let hostname = value("hostname").context("`ssh -G` reported no hostname")?;
         let port: u16 = value("port")
             .context("`ssh -G` reported no port")?
@@ -1555,19 +1538,7 @@ pub(crate) fn endpoint_arg(
 ) -> String {
     let host =
         connection_host.unwrap_or_else(|| location.host.as_deref().expect("remote endpoint"));
-    let host = if host.contains(':') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    };
-    let endpoint = match login_user.or(location.user.as_deref()) {
-        Some(user) => format!("{user}@{host}"),
-        None => host,
-    };
-    match location.port {
-        Some(port) => format!("{endpoint}:{port}"),
-        None => endpoint,
-    }
+    crate::cli::endpoint_label(login_user.or(location.user.as_deref()), host, location.port)
 }
 
 fn endpoint_display(location: &Location) -> String {

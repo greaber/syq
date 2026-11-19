@@ -2310,19 +2310,7 @@ impl RemoteSpec {
         if self.local_process {
             return "local receiver".into();
         }
-        let host = if self.host.contains(':') {
-            format!("[{}]", self.host)
-        } else {
-            self.host.clone()
-        };
-        let endpoint = match &self.user {
-            Some(user) => format!("{user}@{host}"),
-            None => host,
-        };
-        match self.port {
-            Some(port) => format!("{endpoint}:{port}"),
-            None => endpoint,
-        }
+        crate::cli::endpoint_label(self.user.as_deref(), &self.host, self.port)
     }
 
     pub fn diagnostics(&self) -> RemoteDiagnostics {
@@ -3413,43 +3401,48 @@ impl RemoteSpec {
                 direct: !receiver.proxied,
             });
         }
+        let reached_as_named = SshDestination {
+            hostname: self.host.clone(),
+            direct: true,
+        };
         if !self.rsh[0].ends_with("ssh") {
-            return Some(SshDestination {
-                hostname: self.host.clone(),
-                direct: true,
-            });
+            return Some(reached_as_named);
         }
-        let out = self.ssh_hostname_command().capture_output().ok()?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        parse_ssh_destination(&text).or_else(|| {
-            Some(SshDestination {
-                hostname: self.host.clone(),
-                direct: true,
-            })
-        })
+        // A lookup that outlasts the copy's own login, which has just read
+        // the same configuration, is stuck, as on a `Match exec` command
+        // that does not finish: probe the name as given instead.
+        let config = match self.ssh_config(
+            crate::ssh_config::Group::Callers,
+            std::time::Instant::now() + SSH_DESTINATION_LOOKUP,
+        ) {
+            Ok(config) => config,
+            Err(error) => {
+                if crate::output::debug() {
+                    crate::output::diagnostic!("syq: {}: {error:#}", self.label());
+                }
+                return Some(reached_as_named);
+            }
+        };
+        parse_ssh_destination(config.text()).or(Some(reached_as_named))
     }
 
-    /// Read the effective SSH configuration without opening a connection.
-    /// Callers that own a setup deadline can supervise this command themselves.
-    pub(crate) fn ssh_hostname_command(&self) -> Command {
-        let mut command = Command::new(&self.rsh[0]);
-        command
-            .args(&self.rsh[1..])
-            .arg("-G")
-            .args(
-                self.user
-                    .as_ref()
-                    .map(|user| vec!["-l".to_owned(), user.clone()])
-                    .unwrap_or_default(),
-            )
-            .args(
-                self.port
-                    .map(|port| vec!["-p".to_owned(), port.to_string()])
-                    .unwrap_or_default(),
-            )
-            .arg("--")
-            .arg(&self.host);
-        command
+    /// This machine's SSH configuration for the endpoint, read without
+    /// opening a connection.
+    pub(crate) fn ssh_config(
+        &self,
+        group: crate::ssh_config::Group,
+        deadline: std::time::Instant,
+    ) -> Result<crate::ssh_config::SshConfig> {
+        crate::ssh_config::SshConfig::query(
+            &self.rsh[0],
+            &self.rsh[1..],
+            self.user.as_deref(),
+            self.port,
+            &self.host,
+            group,
+            deadline,
+            &|| false,
+        )
     }
 
     /// Open one data connection, spreading successive connections across the
@@ -3757,14 +3750,13 @@ struct SshDestination {
     direct: bool,
 }
 
+/// How long route probing waits for `ssh -G` to say where SSH reaches the
+/// host.
+const SSH_DESTINATION_LOOKUP: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The destination `ssh -G` output describes.
 fn parse_ssh_destination(output: &str) -> Option<SshDestination> {
-    let value = |name: &str| {
-        output
-            .lines()
-            .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
-            .map(str::trim)
-    };
+    let value = |name: &str| crate::ssh_config::value(output, name).map(str::trim);
     let proxied = ["proxyjump", "proxycommand"]
         .into_iter()
         .any(|name| value(name).is_some_and(|value| value != "none"));
@@ -3809,40 +3801,60 @@ fn probe_reachable(
     port: u16,
     wait: std::time::Duration,
 ) -> Result<bool> {
+    probe_reachable_with(candidates, port, wait, |name, port| {
+        (name, port)
+            .to_socket_addrs()
+            .map(|addresses| addresses.take(MAX_RESOLVED_TCP_ADDRESSES + 1).collect())
+            .unwrap_or_default()
+    })
+}
+
+/// [`probe_reachable`], looking names up with `resolve`.
+fn probe_reachable_with(
+    candidates: &mut [TcpCandidate],
+    port: u16,
+    wait: std::time::Duration,
+    resolve: fn(&str, u16) -> Vec<SocketAddr>,
+) -> Result<bool> {
     // One extra candidate is the coordinator's SSH target.
     if candidates.len() > MAX_ADVERTISED_TCP_ADDRESSES + 1 {
         bail!("too many TCP probe candidates");
     }
-    // Resolve candidate names in parallel. More importantly, probe every
-    // resolved socket address in parallel too: a dual-stack name must not
-    // spend the whole candidate budget timing out on IPv6 before trying IPv4.
+    // Advertised addresses are literals. A name, such as the SSH target,
+    // is looked up in parallel, for no longer than the longest probe wait:
+    // a resolver that does not answer holds up the probes that far and no
+    // further. More importantly, probe every resolved socket address in
+    // parallel too: a dual-stack name must not spend the whole candidate
+    // budget timing out on IPv6 before trying IPv4.
+    let looked_up = std::time::Instant::now() + wait.max(TCP_PROBE_CEILING);
+    let mut resolved: Vec<Vec<SocketAddr>> = vec![Vec::new(); candidates.len()];
     let (resolved_tx, resolved_rx) = std::sync::mpsc::channel();
+    let mut lookups = 0;
     for (i, candidate) in candidates.iter().enumerate() {
+        if let Ok(ip) = candidate.address.parse::<std::net::IpAddr>() {
+            resolved[i] = vec![SocketAddr::new(ip, port)];
+            continue;
+        }
         let tx = resolved_tx.clone();
         let address = candidate.address.clone();
         std::thread::Builder::new()
             .spawn(move || {
-                let addrs = (address.as_str(), port)
-                    .to_socket_addrs()
-                    .map(|addresses| addresses.take(MAX_RESOLVED_TCP_ADDRESSES + 1).collect())
-                    .unwrap_or_default();
-                let _ = tx.send((i, addrs));
+                let _ = tx.send((i, resolve(&address, port)));
             })
             .map_err(crate::resources::allocation_error)
             .context("start TCP address resolver")?;
+        lookups += 1;
     }
     drop(resolved_tx);
-    let mut resolved: Vec<Vec<SocketAddr>> = vec![Vec::new(); candidates.len()];
-    for _ in 0..candidates.len() {
-        let Ok((i, addrs)) = resolved_rx.recv() else {
+    for _ in 0..lookups {
+        let remaining = looked_up.saturating_duration_since(std::time::Instant::now());
+        let Ok((i, addrs)) = resolved_rx.recv_timeout(remaining) else {
             break;
         };
         resolved[i] = addrs;
-        if resolved.iter().map(Vec::len).sum::<usize>() > MAX_RESOLVED_TCP_ADDRESSES {
-            bail!(
-                "TCP candidates resolved to too many addresses (limit {MAX_RESOLVED_TCP_ADDRESSES})"
-            );
-        }
+    }
+    if resolved.iter().map(Vec::len).sum::<usize>() > MAX_RESOLVED_TCP_ADDRESSES {
+        bail!("TCP candidates resolved to too many addresses (limit {MAX_RESOLVED_TCP_ADDRESSES})");
     }
 
     mark_ssh_target_addresses(candidates, &resolved);

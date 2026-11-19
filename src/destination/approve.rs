@@ -388,9 +388,8 @@ impl<'a> Approver<'a> {
         // The destination's known hosts go to the server that dials it: the
         // source, in its signed directive, or the server that asked.
         let reach = |account: forward::Account| -> Result<_> {
-            let policy = account.policy(&cancelled)?;
-            let known_hosts = policy.known_hosts_for_others()?;
-            Ok((account, policy, known_hosts))
+            let known_hosts = account.policy.known_hosts_for_others()?;
+            Ok((account, known_hosts))
         };
         let destination = destination.map(reach).transpose()?;
         let source = source.map(reach).transpose()?;
@@ -404,12 +403,10 @@ impl<'a> Approver<'a> {
                 inputs: asked.inputs,
                 caps,
                 accounts: forward::Accounts {
-                    source: source
+                    source: source.as_ref().map(|(account, _)| account.setup()),
+                    destination: destination
                         .as_ref()
-                        .map(|(account, policy, _)| account.setup(policy)),
-                    destination: destination.as_ref().map(|(account, policy, known_hosts)| {
-                        (account.setup(policy), known_hosts.clone())
-                    }),
+                        .map(|(account, known_hosts)| (account.setup(), known_hosts.clone())),
                 },
                 results_key: asked.results_key,
                 via: receiver.map(|receiver| {
@@ -431,8 +428,8 @@ impl<'a> Approver<'a> {
         anyhow::ensure!(!cancelled(), disconnected);
         Ok(Reply::Signed(Box::new(forward::Issued::new(
             signed,
-            source.map(|(_, policy, known_hosts)| (policy, known_hosts)),
-            destination.map(|(_, policy, known_hosts)| (policy, known_hosts)),
+            source.map(|(account, known_hosts)| (account.policy, known_hosts)),
+            destination.map(|(account, known_hosts)| (account.policy, known_hosts)),
             max_delete,
         )?)))
     }
@@ -465,7 +462,7 @@ impl Preview {
             }
         };
         let preview = preview_directive(crate::directive::Role::Destination, asked.parts(), caps)?;
-        let (rules, constraints) = crate::directive::destination_rules(&preview, root)?;
+        let rules = crate::directive::destination_rules(&preview, root)?;
         let max_delete = caps.deletion_ceiling(&rules.copy);
         Ok(Preview::Write {
             source,
@@ -477,8 +474,7 @@ impl Preview {
                     .context("copy destination missing")?
                     .path
                     .clone(),
-                copy: rules.copy,
-                constraints,
+                rules,
             }),
             max_delete,
         })
@@ -518,10 +514,7 @@ impl Receiver {
         destination: &Path,
     ) -> Result<(
         crate::directive::Directive,
-        (
-            crate::delegation::Grant,
-            crate::delegation::GrantConstraints,
-        ),
+        crate::delegation::DestinationRules,
     )> {
         let directive = crate::directive::issue_here(
             crate::directive::Binding {
@@ -585,8 +578,7 @@ impl Receiver {
             self.issue_here((command, cwd, inputs), caps, results_key, &destination)?;
         let request = CopyRequest {
             destination: named,
-            copy: rules.0.copy.clone(),
-            constraints: rules.1.clone(),
+            rules: rules.clone(),
         };
         // The most deletions the copy may make here: this machine's own
         // --max-delete, within the copy's entry limit. A pruning copy's rules
@@ -594,22 +586,22 @@ impl Receiver {
         // carries it to the sender, which refuses every deletion when it plans
         // more. A dry run deletes nothing, but its reply carries this too, so
         // the dry run plans against what a real run would get.
-        let max_delete = caps.deletion_ceiling(&request.copy);
+        let max_delete = caps.deletion_ceiling(&request.rules.copy);
         self.check_session_room()?;
         // ACLs, extended attributes and hard links reach beyond the files
         // being written, so they always ask, as does widening the directory
         // the copy goes into, and unencrypted TCP, which `receiving_rules`
         // refuses here before it gets this far.
-        let extra = &request.constraints.extra_options;
-        let automatic = !(extra.acls
-            || extra.xattrs
-            || extra.hardlinks
-            || extra.widen_dirs == crate::delegation::DirectoryWidening::All
-            || request.constraints.tcp == crate::delegation::TcpPermission::Unencrypted)
+        let options = &request.rules.copy.options;
+        let automatic = !(options.acls
+            || options.xattrs
+            || options.hardlinks
+            || options.widen_dirs == crate::delegation::DirectoryWidening::All
+            || request.rules.tcp == crate::delegation::TcpPermission::Unencrypted)
             && self.auto_approve_root.as_ref().is_some_and(|root| {
                 destination.starts_with(root)
                     && !(destination == *root
-                        && request.copy.policy.placement == DestinationPlacement::ExactPath)
+                        && request.rules.copy.policy.placement == DestinationPlacement::ExactPath)
             });
         if automatic {
             // Anchor the filesystem executor above the automatic root. Its
@@ -644,7 +636,7 @@ impl Receiver {
             authority,
             Approved {
                 token: String::new(),
-                destination: request.copy.destination,
+                destination: request.rules.copy.destination,
                 max_delete: Some(max_delete),
             },
         ))

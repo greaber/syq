@@ -39,7 +39,6 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read, Seek};
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -168,33 +167,6 @@ pub(crate) fn end_own_group() {
     }
 }
 
-/// Wait for `child`, which leads its own process group, then end what it
-/// left in that group before reaping it, so that its group ID cannot have
-/// been reused by then.
-pub(crate) fn wait_and_end_group(
-    child: &mut std::process::Child,
-) -> std::io::Result<std::process::ExitStatus> {
-    loop {
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let result = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                child.id() as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOWAIT,
-            )
-        };
-        if result == 0 {
-            break;
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
-    unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
-    child.wait()
-}
 /// How long a receiving connection must have had no request before it
 /// counts as idle: one copy's steps, such as identifying the receiver,
 /// asking for approval and opening the copy, arrive as separate requests a
@@ -781,21 +753,15 @@ fn start(
         .stdin(Stdio::null())
         .stdout(output.try_clone()?)
         .stderr(output.try_clone()?);
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = command
-        .spawn_guarded()
-        .with_context(|| format!("start {}", path.display()))?;
-    let group = child.id() as libc::pid_t;
+    let mut switch = crate::process::group::ProcessGroup::leading(
+        crate::process::new_session(&mut command)
+            .spawn_guarded()
+            .with_context(|| format!("start {}", path.display()))?,
+    );
+    let group = switch.child.id() as libc::pid_t;
     let (sender, done) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = match wait_and_end_group(&mut child) {
+        let result = match switch.wait() {
             Ok(status) if status.success() => Ok(()),
             Ok(status) => Err(Ended {
                 error: last_line(&mut output).unwrap_or_else(|| status.to_string()),
@@ -868,7 +834,8 @@ mod tests {
             .read_to_string(&mut pid)
             .unwrap();
         let pid: libc::pid_t = pid.trim().parse().unwrap();
-        assert!(wait_and_end_group(&mut child).unwrap().success());
+        let mut switch = crate::process::group::ProcessGroup::leading(child);
+        assert!(switch.wait().unwrap().success());
         let deadline = Instant::now() + Duration::from_secs(5);
         while unsafe { libc::kill(pid, 0) } == 0
             && !std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {

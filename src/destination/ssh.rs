@@ -154,8 +154,7 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
         crate::persistence::scope_for_implicit_ssh(domain.explicit_path()).and_then(|scope| {
             scope
                 .map(|scope| {
-                    crate::persistence::prepare_endpoint(
-                        &scope,
+                    scope.prepare_endpoint(
                         request.destination.user.as_deref(),
                         &request.destination.host,
                         request.destination.port,
