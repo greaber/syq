@@ -753,7 +753,14 @@ pub(crate) fn scope_for_implicit_ssh(
 ) -> Result<Option<CheckedScope>> {
     let domain = Domain::select(explicit_scope)?;
     if !domain.is_default() || domain.enabled()? {
-        let path = domain.ensure_runtime()?;
+        let path = match domain.explicit_path() {
+            // Selecting an explicit scope has just validated it.
+            Some(path) if path.join(crate::receive_service::CLOSING).exists() => {
+                return Err(closing_scope_error(path))
+            }
+            Some(path) => path.to_path_buf(),
+            None => domain.ensure_runtime()?,
+        };
         Ok(Some(CheckedScope { domain, path }))
     } else {
         Ok(None)
@@ -764,8 +771,8 @@ pub(crate) fn scope_for_implicit_ssh(
 /// its directory and marker, and that it was not closing. The command's
 /// later steps use it rather than checking the same path again.
 pub(crate) struct CheckedScope {
-    pub(super) domain: Domain,
-    pub(super) path: PathBuf,
+    domain: Domain,
+    path: PathBuf,
 }
 
 impl CheckedScope {

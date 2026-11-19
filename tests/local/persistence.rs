@@ -439,6 +439,7 @@ fn repeated_commands_leave_unchanged_persistence_state_alone() {
                 format!("{}:/usr/bin:/bin", ssh.parent().unwrap().display()),
             )
             .env("XDG_CONFIG_HOME", t.path("config"))
+            .env("XDG_CACHE_HOME", t.path("cache"))
             .env("XDG_RUNTIME_DIR", t.runtime())
             .run()
             .unwrap();
