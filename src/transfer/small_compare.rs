@@ -75,10 +75,10 @@ static NEXT_COMPARE_BATCH: AtomicU64 = AtomicU64::new(1);
 /// Most piece data a worker reads ahead of sending it while streaming a
 /// patch: as much as a group's patches hold.
 const STREAM_BUFFER_BYTES: u64 = crate::proto::MAX_DIFFERING_FILE_BYTES;
-/// Piece data a worker may read ahead from a remote source beyond sixteen
-/// reads, within `STREAM_BUFFER_BYTES`: enough for scattered single-block
-/// pieces to fill a long link, while what waits for a stalled destination
-/// stays near what sixteen such reads held.
+/// Most piece data a worker reads ahead from a remote source once sixteen
+/// reads await replies (and never more than `STREAM_BUFFER_BYTES`): enough
+/// for scattered single-block pieces to fill a long link, while what waits
+/// for a stalled destination stays near what sixteen such reads held.
 const STREAM_READ_AHEAD_BYTES: u64 = 2 << 20;
 
 /// Most piece data a worker has sent and the destination not yet
@@ -100,7 +100,7 @@ const _: () = assert!(super::publication::DEFERRED_PUBLICATIONS < OWED_REPLIES);
 /// Pieces and reads a stream may have awaiting replies on a connection whose
 /// reader queues `queue` replies: the queue less the room for replies still
 /// owed, so that the reader never stops reading replies while the worker
-/// sends, and never fewer than sixteen.
+/// sends, and never fewer than sixteen, or the whole queue if it is smaller.
 fn stream_window(queue: usize) -> usize {
     queue
         .saturating_sub(OWED_REPLIES)

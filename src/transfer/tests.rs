@@ -6633,12 +6633,13 @@ fn a_streamed_patchs_unacknowledged_pieces_stay_within_their_byte_bound() {
 
 #[test]
 fn an_aborted_copy_takes_every_reply_of_a_wide_patch_stream() {
-    // The copy is aborted, as by a fatal error elsewhere, once a hundred
+    // The copy is aborted, as by a fatal error elsewhere, once some of 320
     // single-block pieces were sent: no further piece is sent, every reply
     // in flight is taken, and the patch is not published. A remote source
-    // has further pieces read by then, which are not sent.
-    for remote_source in [false, true] {
-        let case = format!("remote_source={remote_source}");
+    // has further pieces read by then, which are not sent; after 300 pieces
+    // it has been sent every read and the recheck.
+    for (remote_source, abort_at) in [(false, 100), (true, 100), (true, 300)] {
+        let case = format!("remote_source={remote_source} abort_at={abort_at}");
         let temporary = crate::test_support::tempdir().unwrap();
         let root = temporary.path();
         let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
@@ -6647,15 +6648,15 @@ fn an_aborted_copy_takes_every_reply_of_a_wide_patch_stream() {
             ..Holding::default()
         };
         let (sched, mut worker, held) =
-            stream_into_holding_destination(root, &files, how, |sched, pieces| {
-                if pieces == 100 {
+            stream_into_holding_destination(root, &files, how, move |sched, pieces| {
+                if pieces == abort_at {
                     sched.abort();
                 }
             });
         assert!(sched.is_aborted());
-        assert_eq!(held.sent, 100, "{case}");
+        assert_eq!(held.sent, abort_at, "{case}");
         if !remote_source {
-            assert_eq!(held.pieces, 100, "{case}");
+            assert_eq!(held.pieces, abort_at, "{case}");
         }
         assert!(
             worker.dst.recv().is_err(),
