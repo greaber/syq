@@ -3866,6 +3866,9 @@ fn source_read_ahead_runs_for_tcp_and_ssh_ranges_and_streams() {
                     .args(["--as", &destination])
                     .env("SYQ_DEBUG", "1")
                     .env("SYQ_TEST_LOCAL_READ_AHEAD", "1")
+                    // The helper advises before the reader moves on, so the
+                    // samples see it even when it is starved.
+                    .env("SYQ_TEST_READ_AHEAD_FIRST_ADVICE", "1")
                     .env("FAKE_REMOTE_HOME", t.path("remote-home"))
                     .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
                     .env("FAKE_RSH_LOG", t.path("rsh.log"))
