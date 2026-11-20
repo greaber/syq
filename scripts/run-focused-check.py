@@ -77,7 +77,12 @@ def main():
         raise ValueError(f"dispatch did not return a run ID: {response}")
     print(f"https://github.com/{repo}/actions/runs/{run_id}", flush=True)
     print(f"To cancel: gh run cancel {run_id} --repo {repo}", flush=True)
-    return subprocess.call(["gh", "run", "watch", str(run_id), "--repo", repo, "--exit-status"])
+    # Every agent on the account shares one GitHub API quota, and focused
+    # checks take minutes, so check the run twice a minute, not every 3 s.
+    return subprocess.call([
+        "gh", "run", "watch", str(run_id), "--repo", repo, "--exit-status",
+        "--interval", "30",
+    ])
 
 
 if __name__ == "__main__":
