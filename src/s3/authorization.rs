@@ -661,8 +661,8 @@ struct State {
     /// in order, so batches finish in order.
     signed_through: u64,
     /// Later batches whose requests were all signed by an earlier exchange
-    /// by the time an exchange took them. Their callers succeed whatever
-    /// happens to that exchange.
+    /// by the time an exchange took them or the session failed. Their
+    /// callers succeed whatever happens to later exchanges.
     satisfied: BTreeSet<u64>,
     /// The number of requests in the exchange under way, if any.
     in_flight: usize,
@@ -676,10 +676,19 @@ impl State {
             None => Ok(()),
         }
     }
+    /// Ends the session. Queued batches that earlier exchanges have signed
+    /// in full stay complete; the rest fail.
     fn fail(&mut self, failure: String) {
         self.connection = None;
         self.failure = Some(failure);
-        self.queued.clear();
+        for (number, batch) in std::mem::take(&mut self.queued) {
+            if batch
+                .iter()
+                .all(|request| self.requests.contains_key(request))
+            {
+                self.satisfied.insert(number);
+            }
+        }
     }
 }
 pub(crate) struct Authorization {

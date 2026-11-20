@@ -1081,6 +1081,36 @@ fn a_request_signed_while_queued_survives_a_later_refusal() {
     }
 }
 
+/// The same holds for a batch the failed exchange did not reach because
+/// the batches before it filled the exchange.
+#[test]
+fn a_request_signed_while_queued_beyond_a_full_exchange_survives_its_refusal() {
+    let (authorization, authorizer, first, release) = held_session();
+    let leader = sign_in_thread(&authorization, get("0"));
+    first.recv_timeout(Duration::from_secs(30)).unwrap();
+    let full = {
+        let authorization = authorization.clone();
+        let requests = (0..EXCHANGE_REQUESTS)
+            .map(|i| get(&format!("refused/{i}")))
+            .collect();
+        std::thread::spawn(move || authorization.authorize(requests))
+    };
+    queued_reaches(&authorization, EXCHANGE_REQUESTS);
+    let unsigned = sign_in_thread(&authorization, get("1"));
+    queued_reaches(&authorization, EXCHANGE_REQUESTS + 1);
+    let duplicate = sign_in_thread(&authorization, get("0"));
+    queued_reaches(&authorization, EXCHANGE_REQUESTS + 2);
+    release.send(None).unwrap();
+    leader.join().unwrap().unwrap();
+    assert!(full.join().unwrap().is_err());
+    assert!(unsigned.join().unwrap().is_err());
+    let url = duplicate.join().unwrap().unwrap();
+    assert!(url.contains("/fixture/allowed/0?"), "{url}");
+    let messages = authorizer.join().unwrap();
+    assert_eq!(messages, [(1, 1), (128, EXCHANGE_REQUESTS)]);
+    assert!(authorization.finish_preparation().is_err());
+}
+
 #[test]
 fn a_failed_exchange_fails_every_waiting_request() {
     let (authorization, authorizer, first, release) = held_session();
