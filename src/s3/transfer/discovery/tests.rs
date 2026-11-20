@@ -1096,18 +1096,15 @@ async fn in_another_order_only_a_short_complete_listing_decides() {
 #[tokio::test]
 async fn in_another_order_no_key_waits_for_the_listing() {
     // The complete listing runs alongside the copy; a key it has not decided
-    // gets a HEAD at once.
-    let (sender, reach) = watch::channel(Reach {
+    // gets a HEAD at once, and one it has decided is relied on at once, before
+    // the listing of later prefixes ends.
+    let (_sender, reach) = watch::channel(Reach {
         decided: 0,
         finished: false,
     });
-    let decisions = Arc::new(Decisions::new(2));
-    for index in 0..2 {
-        decisions.store(index, ABSENT);
-    }
     let discovery = Discovery {
         listed: vec![(0..2, 0)],
-        decisions,
+        decisions: Arc::new(Decisions::new(2)),
         reach: vec![reach],
         waits: false,
         tasks: Vec::new(),
@@ -1115,11 +1112,11 @@ async fn in_another_order_no_key_waits_for_the_listing() {
     let lookup = discovery.lookup(1);
     let listed = tokio::time::timeout(std::time::Duration::from_secs(5), lookup).await;
     assert_eq!(listed.unwrap(), Listed::Unknown);
-    sender.send_replace(Reach {
-        decided: 2,
-        finished: true,
-    });
+    assert_eq!(discovery.known(1), None);
+    // The first prefix's listing completed and showed the key absent.
+    discovery.decisions.store(1, ABSENT);
     assert_eq!(discovery.lookup(1).await, Listed::Absent);
+    assert_eq!(discovery.known(1), Some(Listed::Absent));
 }
 
 #[test]

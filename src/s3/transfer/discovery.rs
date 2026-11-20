@@ -187,8 +187,9 @@ impl Segment {
 /// The copy sends one listing request whether or not it lists anything, to
 /// size its concurrency from. So when no prefix has that many planned keys,
 /// the one with the most is listed, if it has at least two: that request then
-/// decides them too. Like a plan of one key, a single key under a prefix is
-/// always checked with HEAD.
+/// decides them too (where the order is unknown, only when the prefix holds
+/// at most one object). Like a plan of one key, a single key under a prefix
+/// is always checked with HEAD.
 pub(super) fn segments(keys: &Keys, prefixes: &[String]) -> Vec<Segment> {
     let mut prefixes: Vec<&String> = prefixes.iter().collect();
     prefixes.sort_unstable();
@@ -229,14 +230,18 @@ pub(super) fn segments(keys: &Keys, prefixes: &[String]) -> Vec<Segment> {
     most.into_iter().collect()
 }
 
-/// The first request the listing sends for each of `segments`, as its prefix
-/// and where it starts: the pages that do not depend on an earlier response.
-/// A copy whose requests another machine signs has these signed together
-/// before the listing starts, rather than one round trip to that machine as
-/// the listing reaches each segment. The listing sends them as [`Walk`]
-/// enters each segment, or as [`Walk::whole`] lists it in a bucket that does
-/// not list in key order. A segment whose planned keys are all too long for
-/// S3 is not listed.
+/// The requests the listing sends that do not depend on an earlier response:
+/// the first page of each of `segments` it lists, and where the store is in
+/// key order but not known to be in byte order (`divides`), the short request
+/// that comes first ([`Discovery::start_unordered`]). A copy whose requests
+/// another machine signs has these signed together before the listing
+/// starts, rather than one round trip to that machine as the listing reaches
+/// each segment. The listing sends the pages as [`Walk`] enters each segment,
+/// or as [`Walk::whole`] lists it where a key's place in a page shows
+/// nothing: in a bucket not in key order, and alongside the copy for a
+/// segment of at least [`BACKGROUND_KEYS`] planned keys where the order is
+/// unknown. A segment whose planned keys are all too long for S3 is not
+/// listed.
 pub(super) fn first_pages<'a>(
     segments: &'a [Segment],
     keys: &'a Keys,
@@ -615,7 +620,8 @@ impl Discovery {
                 Walk::new(segments.cloned().collect(), keys.clone(), decisions.clone())
             })
             .collect();
-        // These listings read pages one by one; they never divide.
+        // These listings read pages one by one; `divides` says that they may
+        // rely on byte order.
         let store = listing::S3 {
             client: client.clone(),
             bucket,
@@ -754,7 +760,8 @@ impl Discovery {
     }
 
     /// What the listing says about the key at plan position `index`, once the
-    /// listing has passed it or ended.
+    /// listing has passed it or ended; where the order is unknown, at once
+    /// (`waits`).
     pub(super) fn lookup(&self, index: usize) -> impl Future<Output = Listed> + Send + 'static {
         let reach = self.reach(index).cloned();
         let decisions = self.decisions.clone();
@@ -765,12 +772,10 @@ impl Discovery {
                 return Listed::Unknown;
             };
             if !waits {
-                let decided = reach.borrow().decided > index;
-                return if decided {
-                    decisions.get(index)
-                } else {
-                    Listed::Unknown
-                };
+                // A complete listing of a prefix records its absences only
+                // once complete, and a listed key is present: what is
+                // recorded holds before the other prefixes are listed.
+                return decisions.get(index);
             }
             // A listing that ended early or was dropped leaves the rest to HEAD.
             let decided = reach
@@ -791,6 +796,12 @@ impl Discovery {
         let Some(reach) = self.reach(index) else {
             return Some(Listed::Unknown);
         };
+        if !self.waits {
+            let listed = self.decisions.get(index);
+            if listed != Listed::Unknown {
+                return Some(listed);
+            }
+        }
         let reach = *reach.borrow();
         if reach.decided > index {
             Some(self.decisions.get(index))
