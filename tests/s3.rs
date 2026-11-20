@@ -1490,14 +1490,8 @@ fn serve(
             "<IsTruncated>false</IsTruncated><CommonPrefixes><Prefix>tree/a/</Prefix></CommonPrefixes><CommonPrefixes><Prefix>tree/b/</Prefix></CommonPrefixes>".to_owned()
         } else {
             let (range, next) = match (prefix, token) {
-                ("tree/" | "tree/a/", None) => (0..1000, Some("next")),
+                ("tree/", None) => (0..1000, Some("next")),
                 ("tree/", Some("next")) => (1000..2000, Some("last")),
-                ("tree/a/", Some("next")) => (1000..2000, None),
-                ("tree/b/", None)
-                    if query.get("start-after").map(|s| s.as_ref()) == Some("tree/b/2999") =>
-                {
-                    (3000..4000, None)
-                }
                 ("tree/", Some("last")) | ("tree/b/", None) => (2000..3000, Some("tail")),
                 ("tree/" | "tree/b/", Some("tail")) => (3000..4000, None),
                 other => panic!("unexpected listing {other:?}"),
@@ -7147,13 +7141,12 @@ fn ls_says_how_to_list_a_prefix_only_its_own_listing_may_list() {
         String::from_utf8_lossy(&output.stdout).lines().count(),
         12_000
     );
-    // Master's own split is refused as before, and says nothing more.
+    // Not divided, the listing asks only for the prefix itself.
     let output = ls(false, "32");
-    assert!(!output.status.success());
-    assert!(
-        !output_text(&output).contains(hint),
-        "{}",
-        output_text(&output)
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().count(),
+        12_000
     );
 }
 

@@ -52,8 +52,8 @@ Dividing a listing is safe only when the service returns keys in byte
 order, which AWS documents for general purpose buckets, so syq divides
 listings only there. With `--s3-endpoint`, that means the URL is an AWS S3
 endpoint: regional, dual-stack, FIPS, or the bucket address of a VPC
-endpoint. For other services, including MinIO
-and other servers you run yourself, syq mostly lists one page at a time.
+endpoint. For other services, including Cloudflare R2, MinIO and other
+servers you run yourself, syq lists one page after another.
 
 ## Upload and download
 
