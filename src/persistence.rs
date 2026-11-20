@@ -2146,6 +2146,39 @@ mod tests {
         }
     }
 
+    /// Commands racing to create the same scope all succeed: none reads the
+    /// marker before its contents are there.
+    #[test]
+    fn commands_racing_to_create_a_scope_all_succeed() {
+        let temporary = crate::test_support::short_tempdir().unwrap();
+        for round in 0..5000 {
+            let scope = temporary.path().join(format!("s{round}"));
+            let barrier = std::sync::Barrier::new(8);
+            std::thread::scope(|threads| {
+                let racers: Vec<_> = (0..8)
+                    .map(|_| {
+                        threads.spawn(|| {
+                            barrier.wait();
+                            initialize_scope(&scope)
+                        })
+                    })
+                    .collect();
+                for racer in racers {
+                    if let Err(error) = racer.join().unwrap() {
+                        panic!("round {round}: {error:#}");
+                    }
+                }
+            });
+            let marker = scope.join(SCOPE_MARKER);
+            assert_eq!(std::fs::read(&marker).unwrap(), SCOPE_MARKER_CONTENT);
+            assert_eq!(
+                std::fs::metadata(&marker).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            close_scope(&scope).unwrap();
+        }
+    }
+
     #[test]
     fn closing_scope_removes_temporary_files_a_killed_writer_left() {
         let temporary = crate::test_support::short_tempdir().unwrap();

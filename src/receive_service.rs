@@ -4020,6 +4020,30 @@ mod tests {
         })
     }
 
+    /// A service that does not answer whether it is idle in time is named,
+    /// with what to do, rather than reported as a bare read timeout.
+    #[test]
+    fn a_service_that_does_not_answer_whether_it_is_idle_is_named() {
+        let (_root, control, _lock) = locked_control();
+        let listener = UnixListener::bind(suffixed(&control, SOCKET)).unwrap();
+        let service = std::thread::spawn(move || {
+            let (mut client, _) = listener.accept().unwrap();
+            let request = read_control_request(&mut client).unwrap();
+            assert!(request.stop_if_idle);
+            // Hold the connection, unanswered, past the client's timeout.
+            let _ = client.read(&mut [0; 1]);
+        });
+        let error = format!("{:#}", stop_when_idle(&control).unwrap_err());
+        service.join().unwrap();
+        assert!(
+            error.starts_with(&format!(
+                "receiving service is running but did not answer at {} whether it is idle",
+                suffixed(&control, SOCKET).display()
+            )),
+            "{error}"
+        );
+    }
+
     /// An approved account connection is reported as what it is, not as a
     /// copy in progress, with what to run to switch now: it does not end by
     /// itself.
