@@ -3664,6 +3664,46 @@ fn a_receiving_service_switches_to_a_new_build_at_its_path_once_idle() {
     );
 }
 
+/// A service asked to stop once idle stops only when the one asking is still
+/// there for the answer. One that gave up waiting has logged its replacement
+/// out again, so the service keeps receiving.
+#[test]
+fn a_service_asked_to_stop_by_a_client_that_gave_up_keeps_receiving() {
+    use std::os::unix::net::UnixStream;
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let status = || installed.request(serde_json::json!({"version": 2, "stop": false}));
+    let pid = status()["pid"].clone();
+    let socket = PathBuf::from(format!("{}.recv", installed.control().display()));
+    // Clients that send nothing hold the service for its read timeout each,
+    // so it reads the request after them only once its sender is gone.
+    let silent: Vec<_> = (0..5)
+        .map(|_| UnixStream::connect(&socket).unwrap())
+        .collect();
+    let mut asking = UnixStream::connect(&socket).unwrap();
+    write_provider_frame(
+        &mut asking,
+        serde_json::json!({"version": 2, "stop": false, "stop_if_idle": true}),
+    );
+    drop(asking);
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    drop(silent);
+    let state = status();
+    assert_eq!(state["pid"], pid, "{state}");
+    assert!(state.get("stopping").is_none(), "{state}");
+    // It still stops once idle for a client that waits for the answer.
+    let answer =
+        installed.request(serde_json::json!({"version": 2, "stop": false, "stop_if_idle": true}));
+    assert_eq!(answer["stopping"], true, "{answer}");
+    wait_for(
+        "the service to stop",
+        std::time::Duration::from_secs(15),
+        || !socket.exists(),
+    );
+}
+
 /// Replace the fixture's receiving service with a stand-in for one an
 /// older syq left running that cannot follow its path: its record names the
 /// older build, and it answers with `pending` requests, saying what it has

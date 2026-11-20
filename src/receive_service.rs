@@ -4019,7 +4019,8 @@ mod tests {
                 let request = read_control_request(&mut client).unwrap();
                 requests.push(serde_json::to_string(&request).unwrap());
                 let answer = reply(&request);
-                write_status(&mut client, &answer).unwrap();
+                // As a service does, whether or not the client still waits.
+                let _ = write_status(&mut client, &answer);
                 if request.stop || answer.stopping {
                     fs::remove_file(&socket).unwrap();
                     then(lock);
@@ -4051,6 +4052,45 @@ mod tests {
             )),
             "{error}"
         );
+    }
+
+    /// A service answers requests one at a time, so it may decide whether to
+    /// stop once idle only after the switch stopped waiting for the answer.
+    /// The switch still learns what it decided: a service that stopped is
+    /// taken over, and one that kept running keeps receiving.
+    #[test]
+    fn a_late_answer_to_stop_once_idle_is_still_followed() {
+        let late = |stops: bool| {
+            move |request: &LocalRequest| {
+                if request.stop_if_idle {
+                    std::thread::sleep(Duration::from_millis(1500));
+                }
+                answer("other", Busy::default(), stops && request.stop_if_idle)
+            }
+        };
+        let (_root, control, lock) = locked_control();
+        let service = stand_in(&control, lock, late(true));
+        assert!(stop_when_idle(&control).unwrap());
+        assert!(!is_running(&control));
+        service.join().unwrap();
+
+        let (_root, control, lock) = locked_control();
+        let service = stand_in(&control, lock, late(false));
+        assert!(!stop_when_idle(&control).unwrap());
+        assert!(is_running(&control));
+        send(
+            &control,
+            &LocalRequest {
+                version: VERSION,
+                stop: true,
+                decision: None,
+                retry: false,
+                restart: false,
+                stop_if_idle: false,
+            },
+        )
+        .unwrap();
+        service.join().unwrap();
     }
 
     /// An approved account connection is reported as what it is, not as a
