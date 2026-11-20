@@ -91,6 +91,8 @@ impl Tuning {
     pub fn report(&self, workers: usize) {
         super::diagnostics::planning(self.control_latency(), workers, self.request_limit());
     }
+    /// Whether the endpoint answers within 3 ms, as on the same machine or a
+    /// fast LAN, where downloads use a few large ranges per object.
     pub fn local_latency(&self) -> bool {
         self.control_ns.load(Relaxed) < 3_000_000
     }
@@ -102,9 +104,9 @@ impl Tuning {
 /// connection, so it takes about two round trips over HTTP and three over
 /// HTTPS (TCP, then TLS), and an upload into an empty prefix has no other
 /// sample. At 20 ms, an HTTPS endpoint counts as far from about a 6 ms round
-/// trip on a first request, and any endpoint from 20 ms on a reused
-/// connection; many small objects copied faster that way at every round trip
-/// measured from 5 to 60 ms.
+/// trip on a first request, a plain-HTTP one from about 10 ms, and any
+/// endpoint from 20 ms on a reused connection: distances at which many small
+/// objects finish sooner starting wide than ramping from 64.
 pub(super) const HIGH_LATENCY: Duration = Duration::from_millis(20);
 /// Path latency is the fastest single control response. The time to plan a copy
 /// grows with the number of listing pages, so it says little about the path.

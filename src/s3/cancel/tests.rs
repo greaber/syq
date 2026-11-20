@@ -64,7 +64,7 @@ async fn cancellation_retires_buffered_and_file_uploads_and_rejects_new_requests
                 }
             });
             let cancellation = Arc::new(Cancellation::default());
-            let fallback = aws_smithy_http_client::Builder::new()
+            let transport = aws_smithy_http_client::Builder::new()
                 .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
                     aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
                 ))
@@ -82,7 +82,7 @@ async fn cancellation_retires_buffered_and_file_uploads_and_rejects_new_requests
                     )
                     .endpoint_url(endpoint)
                     .force_path_style(true)
-                    .http_client(client(fallback, cancellation.clone()))
+                    .http_client(client(transport, cancellation.clone()))
                     .request_checksum_calculation(
                         aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
                     )
@@ -151,7 +151,7 @@ async fn cancellation_retires_download_and_control_response_bodies() {
             assert!(matches!(socket.read(&mut buffer).await, Ok(0) | Err(_)));
         });
         let cancellation = Arc::new(Cancellation::default());
-        let fallback = aws_smithy_http_client::Builder::new()
+        let transport = aws_smithy_http_client::Builder::new()
             .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
                 aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
             ))
@@ -170,7 +170,7 @@ async fn cancellation_retires_download_and_control_response_bodies() {
                 .stalled_stream_protection(
                     aws_sdk_s3::config::StalledStreamProtectionConfig::disabled(),
                 )
-                .http_client(client(fallback, cancellation.clone()))
+                .http_client(client(transport, cancellation.clone()))
                 .build(),
         );
         let worker = tokio::spawn(async move {
@@ -262,7 +262,7 @@ async fn multipart_aborts_still_go_out_for_a_while_after_cancellation() {
         }
     });
     let cancellation = Arc::new(Cancellation::default());
-    let fallback = aws_smithy_http_client::Builder::new()
+    let transport = aws_smithy_http_client::Builder::new()
         .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
             aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
         ))
@@ -289,7 +289,7 @@ async fn multipart_aborts_still_go_out_for_a_while_after_cancellation() {
                 .stalled_stream_protection(
                     aws_sdk_s3::config::StalledStreamProtectionConfig::disabled(),
                 )
-                .http_client(client(fallback, cancellation.clone()))
+                .http_client(client(transport, cancellation.clone()))
                 .build(),
         );
     let abort = |key: &'static str| {
