@@ -4600,6 +4600,36 @@ fn received_batch_feedback_sizes_the_next_source_request() {
     }
 }
 
+/// A worker pacing under a low `--bwlimit`, as one sending a comparison
+/// group's patches does, stops as soon as the copy fails elsewhere rather
+/// than sleeping out bytes it will no longer send; once the copy has
+/// failed, it does not pace at all.
+#[test]
+fn an_abort_ends_bandwidth_pacing_at_once() {
+    let sched = Arc::new(Sched::new(4 << 20, 32 << 20));
+    let state = Arc::new(Mutex::new(PipelineState::default()));
+    let mut worker = pipeline_worker(&sched, &state, &state, false);
+    // 16 KiB at 1 KiB/s pace for about sixteen seconds.
+    worker.bwlimit = Some(Arc::new(BandwidthLimit::new(1024)));
+    let started = std::time::Instant::now();
+    let failing = {
+        let sched = sched.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            sched.abort();
+        })
+    };
+    worker.limit(16 << 10);
+    let elapsed = started.elapsed();
+    failing.join().unwrap();
+    assert!(elapsed < std::time::Duration::from_secs(3), "{elapsed:?}");
+
+    let started = std::time::Instant::now();
+    worker.limit(16 << 10);
+    let elapsed = started.elapsed();
+    assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
+}
+
 #[test]
 fn aborted_batches_stop_claiming_groups_and_drain_issued_requests() {
     let sched = Arc::new(Sched::new(4 << 20, 32 << 20));
