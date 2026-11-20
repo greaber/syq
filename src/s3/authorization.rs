@@ -742,35 +742,39 @@ impl Authorization {
                 state = self.exchanged.wait(state).unwrap();
                 continue;
             }
+            // Nothing is in flight and this caller's batch is unsigned, so it
+            // is queued and preparation has not finished.
+            if state.connection.is_none() || state.queued.is_empty() {
+                state.fail("storage authorization lost its connection".into());
+                self.exchanged.notify_all();
+                return state.ended();
+            }
             // The first queued batch, and the batches after it while the
             // exchange stays within the limit.
-            let mut exchange = Vec::new();
-            let mut through = state.signed_through;
-            while let Some((number, requests)) = state.queued.front() {
-                if !exchange.is_empty() && exchange.len() + requests.len() > EXCHANGE_REQUESTS {
+            let (mut through, mut exchange) = state.queued.pop_front().unwrap();
+            let mut combined = false;
+            while let Some((number, requests)) = state.queued.pop_front() {
+                if exchange.len() + requests.len() > EXCHANGE_REQUESTS {
+                    state.queued.push_front((number, requests));
                     break;
                 }
-                through = *number;
-                let (_, requests) = state.queued.pop_front().unwrap();
+                through = number;
                 exchange.extend(requests);
+                combined = true;
             }
-            // A request signed since its batch was queued, or asked for twice,
-            // is signed once.
+            // A request signed since its batch was queued, or asked for by
+            // two of the combined callers, is signed once.
             exchange.retain(|request| !state.requests.contains_key(request));
-            exchange.sort_unstable();
-            exchange.dedup();
+            if combined {
+                exchange.sort_unstable();
+                exchange.dedup();
+            }
             if exchange.is_empty() {
                 state.signed_through = through;
                 self.exchanged.notify_all();
                 continue;
             }
-            // Nothing is in flight and this batch is unsigned, so it is
-            // queued and preparation has not finished.
-            let Some(mut stream) = state.connection.take() else {
-                state.fail("storage authorization lost its connection".into());
-                self.exchanged.notify_all();
-                return state.ended();
-            };
+            let mut stream = state.connection.take().unwrap();
             state.in_flight = exchange.len();
             drop(state);
             let mut exchanging = Exchanging(Some(self));
