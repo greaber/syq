@@ -52,8 +52,8 @@ Dividing a listing is safe only when the service returns keys in byte
 order, which AWS documents for general purpose buckets, so syq divides
 listings only there. With `--s3-endpoint`, that means the URL is an AWS S3
 endpoint: regional, dual-stack, FIPS, or the bucket address of a VPC
-endpoint. For other services, including MinIO
-and other servers you run yourself, syq mostly lists one page at a time.
+endpoint. For other services, including Cloudflare R2, MinIO and other
+servers you run yourself, syq lists one page after another.
 
 ## Upload and download
 
@@ -98,8 +98,7 @@ objects.
   service's consistency allows, but not a whole prefix.
   `--if-exists=update-if-older` compares stored file times, falling back to S3
   Last-Modified, which is the upload time rather than the file's age.
-  `--in-place` is unsupported, and so are copies between S3 and an SSH host;
-  run syq on the machine that has the files.
+  `--in-place` is unsupported.
 - **Recovery:** A rerun can resume interrupted uploads and downloads. A resumed
   download needs room for a second copy of its `.syq-s3-*.partial` file; to
   start over instead, remove the partial or run
@@ -146,6 +145,77 @@ and expected hashes are unsupported here. It compares objects by their
 metadata, and `--if-exists=error-if-different` rejects copies whose contents
 can't be shown to match that way.
 
+## Copy between a server and a bucket
+
+Name an SSH server as the other end to copy between its files and a bucket
+without logging in to it:
+
+```sh
+syq cp --from server --srcs-in dataset --to s3://bucket --into dataset
+syq cp --from s3://bucket --srcs-in dataset --to server --into dataset
+```
+
+The copy runs on the server, and file data travels directly between the
+server and the storage service, never through the machine where you typed the
+command. That machine supplies the credentials: `--s3-profile`,
+`--s3-endpoint`, `--s3-region` and the AWS environment variables are read
+there, and it signs each storage request the server needs, so the server needs
+no credentials and never receives yours. Typing the command is the approval;
+there is no prompt. It signs only for the bucket, paths and operations the
+command implies: for a source you name, such as `project` with
+`--into backups`, that is `backups/project` and what lies under it. See
+[Storage authorization](security.md#storage-authorization) for the limits and
+for what this trusts the server with.
+
+When the storage credentials are on a third machine, add `--auth-from @NAME`
+to have that [receiving machine](receive.md#set-up-receiving) approve the copy
+and sign instead:
+
+```sh
+syq cp --from server project --to s3://bucket --into backups \
+  --auth-from @laptop --s3-profile storage
+```
+
+You approve the request on NAME, as for
+[any storage authorization](#authorize-from-your-laptop), and
+`--s3-profile` selects a profile there. The machine where you typed the
+command only passes signing requests and signed URLs between the server and
+NAME; it needs no storage credentials, and it still logs in to the server
+with its own SSH access. Once syq reports **storage authorization ready**,
+NAME may disconnect.
+
+The server needs:
+
+- network access to the storage service, and for HTTPS the usual
+  [CA certificates](security.md#https-certificates);
+- a clock that is roughly right;
+- the same syq build as your machine, which syq installs for you as for any
+  copy to a server.
+
+`--dry-run`, `--results`, `-v`, progress and exit codes work as they do for a
+copy run on the server itself. Keep the command running: if it ends or loses
+its connection, the copy on the server stops. Run it again to continue; the
+server keeps the records of interrupted uploads and downloads, and your
+machine signs again.
+
+Requests are signed before data starts moving and stay valid for seven days,
+as for any storage authorization, or until the signing credentials expire if
+that is sooner, as temporary credentials often do within an hour; syq then
+says when. A copy that runs longer fails its remaining files; run it again to
+continue.
+
+Headers you add with `--s3-header` and `--s3-write-header` are sent to the
+server, which makes the requests. A customer-provided encryption key would be
+sent with them, so these copies refuse the
+`x-amz-server-side-encryption-customer-*` headers; to copy with such a key,
+run syq on the server.
+
+These copies do not support `--detach`, `--mapping`,
+`--stream-mapping-fd` or the options for copies between two servers
+(`--coordinate-at`, `--peer-auth` and the TCP options). `syq rm`, copies between two buckets and
+copies that also name a second server or a receiving machine (`@NAME`) cannot
+run through a server this way.
+
 ## Authorize from your laptop
 
 Add `--auth-from @NAME` to an S3 `cp` or `rm` command to use credentials on a
@@ -158,7 +228,9 @@ syq cp results --to s3://my-bucket --into runs \
 ```
 
 Approve on your laptop, then wait for **storage authorization ready** before
-disconnecting. Data travels directly between the server and storage.
+disconnecting. The prompt lists the paths the command covers: for a source
+you name, its own name inside the destination, and otherwise the whole
+destination path. Data travels directly between the server and storage.
 Authorization lasts up to seven days, subject to credentials and provider
 policies; restarting requires fresh approval. Both machines need the same syq
 build. See [Storage authorization](security.md#storage-authorization) for the

@@ -282,6 +282,14 @@ impl RequestFailure {
     pub(super) fn denied(&self) -> bool {
         self.status == Some(403)
     }
+    #[cfg(test)]
+    pub(super) fn refused_for_test(operation: &str) -> Self {
+        Self {
+            operation: operation.into(),
+            status: Some(403),
+            region: None,
+        }
+    }
 }
 impl std::fmt::Display for RequestFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
