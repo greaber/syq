@@ -38,6 +38,9 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(15);
 /// bind a starting service only reads its preferences and endpoint record;
 /// a stopping one leaves at most one 1-second query unanswered.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(2);
+/// When a switch says it still waits for an old service's answer to a
+/// request to stop once idle.
+const SLOW_ANSWER_NOTE: Duration = Duration::from_secs(2);
 /// How often the service looks at its scope, its preferences and the file
 /// it follows, which bounds how long a change takes to be noticed.
 const TICK: Duration = Duration::from_millis(200);
@@ -763,13 +766,10 @@ fn query_retry(
     )
 }
 fn send(control: &Path, request: &LocalRequest) -> Result<Status> {
-    send_within(control, request, Duration::from_secs(1))
-}
-/// [`send`], giving the service `timeout` for each read and write.
-fn send_within(control: &Path, request: &LocalRequest, timeout: Duration) -> Result<Status> {
     // Older builds and released stand-ins may leave the socket's mode as
     // bound, so only its owner is checked.
-    let mut socket = crate::service::connect(&suffixed(control, SOCKET), timeout, false)?;
+    let mut socket =
+        crate::service::connect(&suffixed(control, SOCKET), Duration::from_secs(1), false)?;
     crate::destination::write_message(&mut socket, request)?;
     decode_status(control, read_status(&mut socket)?)
 }
@@ -1813,7 +1813,7 @@ fn replace_other(
             }
             // A connection it lost meanwhile leaves the old one receiving.
             successor.still_logged_in(control, &remote.label())?;
-            if stop_when_idle(control)? {
+            if stop_when_idle(control, &remote.label())? {
                 successor.take_over()?;
                 return Ok(Some(Receiving::Started));
             }
@@ -1839,22 +1839,35 @@ fn replace_other(
 /// the caller looks again at whoever owns the control.
 ///
 /// The service answers requests one at a time, so others may come first:
-/// wait for its answer as long as for it to stop. A service of an earlier
-/// build stops once it decides, even when nobody waits for the answer any
-/// more, so giving up sooner could leave nothing receiving.
-fn stop_when_idle(control: &Path) -> Result<bool> {
-    let answer = match send_within(
-        control,
-        &LocalRequest {
-            version: VERSION,
-            stop: false,
-            decision: None,
-            retry: false,
-            restart: false,
-            stop_if_idle: true,
-        },
-        STOP_TIMEOUT,
-    ) {
+/// wait for its answer as long as for it to stop, saying so once after
+/// [`SLOW_ANSWER_NOTE`]. A service of an earlier build stops once it
+/// decides, even when nobody waits for the answer any more, so giving up
+/// sooner could leave nothing receiving. `endpoint` is its server.
+fn stop_when_idle(control: &Path, endpoint: &str) -> Result<bool> {
+    let request = LocalRequest {
+        version: VERSION,
+        stop: false,
+        decision: None,
+        retry: false,
+        restart: false,
+        stop_if_idle: true,
+    };
+    let exchange = || {
+        // Only the owner of the socket is checked, as in `send`.
+        let mut socket = crate::service::connect(
+            &suffixed(control, SOCKET),
+            STOP_TIMEOUT - SLOW_ANSWER_NOTE,
+            false,
+        )?;
+        crate::destination::write_message(&mut socket, &request)?;
+        if !crate::sys::readable_within(socket.as_raw_fd(), SLOW_ANSWER_NOTE) {
+            crate::output::diagnostic!(
+                "syq: waiting for the old receiving service through {endpoint} to answer whether it is idle"
+            );
+        }
+        decode_status(control, read_status(&mut socket)?)
+    };
+    let answer = match exchange() {
         Ok(answer) => answer,
         // Without an answer: a service that has gone has stopped.
         Err(error) if crate::service::unanswered(&error) => {
@@ -4074,7 +4087,7 @@ mod tests {
             // Hold the connection, unanswered, past the client's timeout.
             let _ = client.read(&mut [0; 1]);
         });
-        let error = format!("{:#}", stop_when_idle(&control).unwrap_err());
+        let error = format!("{:#}", stop_when_idle(&control, "example").unwrap_err());
         service.join().unwrap();
         assert!(
             error.starts_with(&format!(
@@ -4101,13 +4114,13 @@ mod tests {
         };
         let (_root, control, lock) = locked_control();
         let service = stand_in(&control, lock, late(true));
-        assert!(stop_when_idle(&control).unwrap());
+        assert!(stop_when_idle(&control, "example").unwrap());
         assert!(!is_running(&control));
         service.join().unwrap();
 
         let (_root, control, lock) = locked_control();
         let service = stand_in(&control, lock, late(false));
-        assert!(!stop_when_idle(&control).unwrap());
+        assert!(!stop_when_idle(&control, "example").unwrap());
         assert!(is_running(&control));
         send(
             &control,
@@ -4126,7 +4139,7 @@ mod tests {
         // One that has already gone has stopped: its replacement takes over.
         let (_root, control, lock) = locked_control();
         drop(lock);
-        assert!(stop_when_idle(&control).unwrap());
+        assert!(stop_when_idle(&control, "example").unwrap());
     }
 
     /// An approved account connection is reported as what it is, not as a
@@ -4284,7 +4297,7 @@ mod tests {
             accounts_in_use: 0,
         };
         let service = stand_in(&control, lock, move |_| answer("other", busy, false));
-        assert!(!stop_when_idle(&control).unwrap());
+        assert!(!stop_when_idle(&control, "example").unwrap());
         assert!(is_running(&control));
         // The busy one was asked once and kept running.
         send(
@@ -4314,7 +4327,7 @@ mod tests {
         });
         // Its answer to stop_if_idle says it stops, and nothing else is
         // sent while it goes.
-        assert!(stop_when_idle(&control).unwrap());
+        assert!(stop_when_idle(&control, "example").unwrap());
         assert!(!is_running(&control));
         assert_eq!(
             service.join().unwrap(),
@@ -4376,7 +4389,7 @@ mod tests {
                 }));
             },
         );
-        assert!(stop_when_idle(&control).unwrap());
+        assert!(stop_when_idle(&control, "example").unwrap());
         old.join().unwrap();
         // The next owner still runs, and was only asked for its status.
         assert!(is_running(&control));

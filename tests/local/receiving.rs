@@ -3768,6 +3768,17 @@ fn other_service(
     pending: serde_json::Value,
     busy: Option<serde_json::Value>,
 ) -> std::thread::JoinHandle<Vec<serde_json::Value>> {
+    other_service_answering_after(installed, pending, busy, std::time::Duration::ZERO)
+}
+
+/// As `other_service`, answering a request to stop once idle only after
+/// `delay`, as a service with other requests to answer first does.
+fn other_service_answering_after(
+    installed: &Installed,
+    pending: serde_json::Value,
+    busy: Option<serde_json::Value>,
+    delay: std::time::Duration,
+) -> std::thread::JoinHandle<Vec<serde_json::Value>> {
     let (socket, lock) = retire_service(installed);
     // It receives as the fixture's profile, where the scope keeps one.
     let name = fs::read(installed.scope.join("receive.json"))
@@ -3816,6 +3827,9 @@ fn other_service(
             if let Some(busy) = &busy {
                 answer["busy"] = busy.clone();
                 answer["stopping"] = stop.into();
+            }
+            if request["stop_if_idle"] == true {
+                std::thread::sleep(delay);
             }
             requests.push(request);
             write_provider_frame(&mut stream, answer);
@@ -4023,6 +4037,46 @@ fn a_switch_that_cannot_log_in_leaves_the_old_service_receiving() {
             .all(|request| request == &serde_json::json!({"version": 2, "stop": false})),
         "{requests:?}"
     );
+}
+
+/// A switch waits for an old service that is slow to answer whether it is
+/// idle, saying once that it does, and takes over when it stops.
+#[test]
+fn a_switch_says_once_that_it_waits_for_a_slow_old_service() {
+    let t = Tmp::new();
+    let installed = Installed::new(&t);
+    let _off = ScopeOff(&t, installed.scope.clone());
+    installed.connect();
+    let old = other_service_answering_after(
+        &installed,
+        serde_json::json!([]),
+        Some(serde_json::json!({"requests": 0, "pending": 0})),
+        std::time::Duration::from_secs(3),
+    );
+    let switched = installed.persist(
+        Path::new(env!("CARGO_BIN_EXE_syq")),
+        &[
+            "connect",
+            "test-server",
+            "--auth-from",
+            "ssh",
+            "--when-idle",
+        ],
+    );
+    assert_output_ok(&switched);
+    let stderr = String::from_utf8_lossy(&switched.stderr);
+    assert_eq!(
+        stderr
+            .matches(
+                "syq: waiting for the old receiving service through test-server to answer whether it is idle"
+            )
+            .count(),
+        1,
+        "{stderr}"
+    );
+    assert_eq!(old.join().unwrap().last().unwrap()["stop_if_idle"], true);
+    let state = installed.request(serde_json::json!({"version": 2, "stop": false}));
+    assert_eq!(state["identity"], this_build(), "{state}");
 }
 
 /// A switch logs in to the server once, while the old service still
