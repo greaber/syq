@@ -2,20 +2,21 @@
 """Check how an S3-compatible service orders and pages ListObjectsV2.
 
 syq divides a listing into parts, and decides a key absent from where it
-would fall in a page, only where the service lists keys in UTF-8 byte order.
-For a service that does not document its order, run this before relying on
-it, and again later to notice a change. It runs against a real service by
-hand and is not part of CI.
+would fall in a page, only where it takes a service to list keys in UTF-8
+byte order. This checks whether a service's listings behave as those
+assumptions require, and can be rerun to notice a change. It runs against a
+real service by hand and is not part of CI.
 
 usage: scripts/s3-order-probe.py --endpoint URL [--region REGION] s3://BUCKET[/PREFIX]
 
 Credentials come from AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and, if set,
-AWS_SESSION_TOKEN. The bucket must allow writing: the probe uploads about 150
+AWS_SESSION_TOKEN. The bucket must allow writing: the probe uploads about 100
 one-byte objects under a new prefix `syq-order-probe-<random>/` below PREFIX,
-lists them, and deletes them again, also when it fails. It addresses buckets
-path-style. Keys a service refuses to store, such as a key and a "directory"
-of the same name on MinIO, are reported under not_stored and left out of the
-checks.
+lists them, and deletes them again, also when it fails. In a bucket with
+versioning, the deleted objects' versions remain. It addresses buckets
+path-style. Keys a service refuses to store (`refused`, with the status and
+error code), or acknowledges but cannot find again (`not_stored`), are left
+out of the checks.
 
 It checks:
   flat-order       flat listings at several page sizes return every key once,
@@ -30,7 +31,7 @@ It checks:
 
 It prints a JSON report on stdout, one line per check on stderr, and exits 0
 when every check passes, 1 when one fails, and 2 when the probe could not run
-or clean up.
+or clean up (the report is printed if the checks ran).
 """
 import argparse
 import datetime
@@ -50,6 +51,7 @@ from concurrent.futures import ThreadPoolExecutor
 NFC_E = unicodedata.normalize("NFC", "é")
 NFD_E = unicodedata.normalize("NFD", "é")
 PAGE_SIZES = (1, 3, 7, 1000)
+DELIMITER_PAGE_SIZES = (1, 2, 3, 4, 5, 6, 1000)
 
 
 def keys():
@@ -67,13 +69,18 @@ def keys():
         "%", "%25", "a%2Fb", "+", "a+b", " x", "x ",
     ]
     out = ["o/" + name for name in names]
-    # Delimiter pages: directories followed by a key that extends their name
-    # with '0', at every page boundary for small page sizes.
-    for stem in ("x", "y", "q", "q0", "r"):
-        out += [f"d/{stem}/a", f"d/{stem}0", f"d/{stem}1/a"]
-    out += [f"d/f{i:02d}" for i in range(12)]
-    out += [f"d/q00", "d/q01/a"]
+    for size in DELIMITER_PAGE_SIZES[:-1]:
+        out += delimiter_keys(size)
     return sorted(set(out), key=lambda key: key.encode())
+
+
+def delimiter_keys(size):
+    """Keys under `d<size>/` whose delimiter listing, `size` items a page in
+    byte order, ends its first two pages with a directory `P/` that the key
+    `P0` follows."""
+    fill = lambda name, n: [f"d{size}/{name}{i}" for i in range(n)]
+    return (fill("a", size - 1) + [f"d{size}/b/x", f"d{size}/b0"] + fill("c", max(size - 2, 0))
+            + [f"d{size}/e/x", f"d{size}/e0", f"d{size}/z"])
 
 
 class Client:
@@ -160,14 +167,24 @@ def expected_items(stored, prefix):
 
 def run(client, root, stored):
     report = {"prefix": root, "checks": {}}
+
+    def put(key):
+        try:
+            client.request("PUT", key, data=b"x")
+        except urllib.error.HTTPError as error:
+            code = ET.fromstring(error.read() or b"<Error/>").findtext("Code") if error.code else None
+            return {"key": key, "status": error.code, "code": code}
+        return None
+
     with ThreadPoolExecutor(16) as pool:
-        list(pool.map(lambda key: client.request("PUT", key, data=b"x"), stored))
+        refused = [result for result in pool.map(put, stored) if result]
+    report["refused"] = refused
     forms = {root + "o/e" + NFC_E, root + "o/e" + NFD_E}
     # What the service holds. Some cannot store a key and a "directory" of
     # the same name; a key acknowledged but never listed is checked by HEAD.
     present = set(key for kind, key in client.listing(root, 1000))
     unlisted, unstored = [], []
-    for key in sorted(set(stored) - present - forms):
+    for key in sorted(set(stored) - present - forms - {r["key"] for r in refused}):
         try:
             client.request("HEAD", key)
             unlisted.append(key)
@@ -201,11 +218,16 @@ def run(client, root, stored):
             wrong.append({"start_after": before, "expected": after, "got": got})
     report["checks"]["start-after"] = {"pass": not wrong, "wrong": wrong[:10]}
 
-    # Delimiter pages at sizes that put a common prefix last on some page.
-    expected = expected_items(present, root + "d/")
+    # Delimiter pages: under `d<size>/`, pages of `size` items end with a
+    # common prefix `P/` that the key `P0` follows; at 1,000, all at once.
     pages = []
-    for size in (1, 2, 3, 4, 5, 6, 1000):
-        got = client.listing(root + "d/", size, delimiter=True)
+    for size in DELIMITER_PAGE_SIZES:
+        prefixes = ([root + f"d{size}/"] if size in DELIMITER_PAGE_SIZES[:-1]
+                    else [root + f"d{n}/" for n in DELIMITER_PAGE_SIZES[:-1]])
+        got, expected = [], set()
+        for prefix in prefixes:
+            got += client.listing(prefix, size, delimiter=True)
+            expected |= expected_items(present, prefix)
         pages.append({"page_size": size,
                       "missing": sorted(item for _, item in expected - set(got))[:10],
                       "extra": sorted(item for _, item in set(got) - expected)[:10],
@@ -219,12 +241,17 @@ def run(client, root, stored):
 
 
 def clean(client, root, stored):
+    def delete(key):
+        try:
+            client.request("DELETE", key)
+        except urllib.error.HTTPError:
+            pass  # The listing below says whether anything is left.
+
     with ThreadPoolExecutor(16) as pool:
-        list(pool.map(lambda key: client.request("DELETE", key), stored))
+        list(pool.map(delete, stored))
     # Delete whatever else is there, such as a merged spelling.
-    left = [key for _, key in client.listing(root, 1000)]
-    for key in left:
-        client.request("DELETE", key)
+    for _, key in client.listing(root, 1000):
+        delete(key)
     return [key for _, key in client.listing(root, 1000)]
 
 
@@ -249,8 +276,8 @@ def main():
     report = None
     try:
         report = run(client, root, stored)
-    except (urllib.error.URLError, ET.ParseError, OSError) as error:
-        print(f"s3-order-probe: {error}", file=sys.stderr)
+    except Exception as error:  # Any failure still cleans up and exits 2.
+        print(f"s3-order-probe: {type(error).__name__}: {error}", file=sys.stderr)
     finally:
         cleaned = False
         try:
@@ -258,14 +285,18 @@ def main():
             cleaned = not left
             if left:
                 print(f"s3-order-probe: {len(left)} objects left under {root}", file=sys.stderr)
-        except (urllib.error.URLError, ET.ParseError, OSError) as error:
-            print(f"s3-order-probe: cleaning up {root}: {error}", file=sys.stderr)
+        except Exception as error:
+            print(f"s3-order-probe: cleaning up {root}: {type(error).__name__}: {error}",
+                  file=sys.stderr)
+    if report is not None:
+        json.dump(report, sys.stdout, indent=1, ensure_ascii=False)
+        print()
+        for name, check in report["checks"].items():
+            print(f"{name}: {'pass' if check['pass'] else 'FAIL'}", file=sys.stderr)
+        for refusal in report["refused"]:
+            print(f"refused: {refusal}", file=sys.stderr)
     if report is None or not cleaned:
         return 2
-    json.dump(report, sys.stdout, indent=1, ensure_ascii=False)
-    print()
-    for name, check in report["checks"].items():
-        print(f"{name}: {'pass' if check['pass'] else 'FAIL'}", file=sys.stderr)
     return 0 if all(check["pass"] for check in report["checks"].values()) else 1
 
 

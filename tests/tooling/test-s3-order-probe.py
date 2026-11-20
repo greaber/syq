@@ -2,6 +2,8 @@
 """The provider order probe tells byte order from other orders and skipped keys."""
 from support import SCRIPTS
 
+import importlib.util
+
 import http.server
 import json
 import os
@@ -9,13 +11,21 @@ import subprocess
 import sys
 import threading
 import unittest
+import unicodedata
 import urllib.parse
+
+
+spec = importlib.util.spec_from_file_location("probe", SCRIPTS / "s3-order-probe.py")
+probe = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(probe)
 
 
 class Store:
     """Objects, listed in byte order, in Cloudflare R2's measured order
     (`r2`), or in byte order with Tigris's skip after a common prefix
-    (`skip`)."""
+    (`skip`); hiding from listings a key below another stored key, as MinIO
+    does (`hide`); storing the NFD spelling of a name as NFC (`merge`); or
+    refusing keys that hold an emoji (`refuse`)."""
 
     def __init__(self, mode):
         self.mode = mode
@@ -25,9 +35,15 @@ class Store:
         data = key.encode()
         return data + b"9\xff" if self.mode == "r2" else data
 
+    def listed(self):
+        if self.mode != "hide":
+            return self.objects
+        return {key for key in self.objects
+                if not any(key.startswith(other + "/") for other in self.objects)}
+
     def items(self, prefix, delimiter):
         out = []
-        for key in sorted((k for k in self.objects if k.startswith(prefix)), key=self.position):
+        for key in sorted((k for k in self.listed() if k.startswith(prefix)), key=self.position):
             rest = key[len(prefix):]
             item = ("prefix", prefix + rest[:rest.index("/") + 1]) if delimiter and "/" in rest else ("key", key)
             if item not in out:
@@ -82,7 +98,12 @@ def serve(store):
 
         def do_PUT(self):
             self.rfile.read(int(self.headers.get("Content-Length", "0")))
-            store.objects.add(self.key())
+            key = self.key()
+            if store.mode == "refuse" and "\U0001f600" in key:
+                return self.reply(400, b"<Error><Code>InvalidObjectName</Code></Error>")
+            if store.mode == "merge":
+                key = unicodedata.normalize("NFC", key)
+            store.objects.add(key)
             self.reply(200)
 
         def do_DELETE(self):
@@ -117,8 +138,10 @@ class ProbeTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
         self.assertEqual(store.objects, set(), "the probe deletes what it stored")
+        self.assertTrue(result.stdout, result.stderr)
         report = json.loads(result.stdout)
         self.assertTrue(report["prefix"].startswith("base/syq-order-probe-"))
+        self.report = report
         return result.returncode, {name: check["pass"] for name, check in report["checks"].items()}
 
     def test_byte_order_passes(self):
@@ -137,6 +160,33 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(checks, {"flat-order": True, "start-after": True,
                                   "delimiter-pages": False, "distinct-forms": True})
+
+    def test_a_key_stored_but_never_listed_fails_flat_order(self):
+        code, checks = self.probe("hide")
+        self.assertEqual(code, 1)
+        self.assertFalse(checks["flat-order"])
+        hidden = self.report["checks"]["flat-order"]["stored_but_never_listed"]
+        self.assertTrue(hidden and all("/o/" in key for key in hidden), hidden)
+
+    def test_merged_spellings_fail_distinct_forms(self):
+        self.assertEqual(self.probe("merge"), (1, {
+            "flat-order": True, "start-after": True, "delimiter-pages": True,
+            "distinct-forms": False}))
+
+    def test_refused_keys_are_reported_and_left_out(self):
+        code, checks = self.probe("refuse")
+        self.assertEqual(code, 0, checks)
+        refused = self.report["refused"]
+        self.assertTrue(refused)
+        self.assertTrue(all(r["status"] == 400 and r["code"] == "InvalidObjectName" for r in refused))
+
+    def test_every_small_page_size_ends_a_page_before_a_skippable_key(self):
+        for size in probe.DELIMITER_PAGE_SIZES[:-1]:
+            keys = set(probe.delimiter_keys(size))
+            items = sorted(probe.expected_items(keys, f"d{size}/"), key=lambda item: item[1].encode())
+            ends = [items[i] for i in range(size - 1, len(items) - 1, size)
+                    if items[i][0] == "prefix" and items[i + 1] == ("key", items[i][1][:-1] + "0")]
+            self.assertGreaterEqual(len(ends), 2, size)
 
 
 if __name__ == "__main__":
