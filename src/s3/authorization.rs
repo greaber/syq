@@ -653,7 +653,8 @@ struct State {
     /// every later request it has not prepared fails for the same reason.
     failure: Option<String>,
     /// Callers' batches waiting for the next exchange, in the order they
-    /// arrived, each numbered one more than the batch before it.
+    /// arrived and in number order. An exchange a caller left to others is
+    /// one entry with the number of the last batch it holds.
     queued: VecDeque<(u64, Vec<Unsigned>)>,
     /// The number given to the last batch queued.
     last_queued: u64,
@@ -801,9 +802,9 @@ impl Authorization {
             if exchange.is_empty() {
                 continue;
             }
-            // If this caller's own batch is among them, a waiting caller
-            // sends the exchange instead, as one batch numbered after the
-            // last it includes.
+            // If this caller's batch turned out complete, it leaves the
+            // exchange to a waiting caller, queued again as one entry with
+            // the number of the last batch it holds.
             if state.signed_through >= batch || state.satisfied.remove(&batch) {
                 state.queued.push_front((through, exchange));
                 return Ok(());
