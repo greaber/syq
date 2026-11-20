@@ -4630,6 +4630,38 @@ fn an_abort_ends_bandwidth_pacing_at_once() {
     assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
 }
 
+/// A small-file batch whose pacing the copy's failure ended does not send
+/// its group's read: from a remote source the data would come back at the
+/// capped rate. The group stays unissued, to be requeued.
+#[test]
+fn a_batch_aborted_while_pacing_sends_no_read() {
+    let jobs: Vec<_> = (0..8)
+        .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), 1024)))
+        .collect();
+    let src = Arc::new(Mutex::new(PipelineState::default()));
+    let dst = Arc::new(Mutex::new(PipelineState::default()));
+    let sched = Arc::new(Sched::new(512, 8192));
+    let mut worker = pipeline_worker(&sched, &src, &dst, false);
+    // Eight 1 KiB files at 1 KiB/s pace for about eight seconds.
+    worker.bwlimit = Some(Arc::new(BandwidthLimit::new(1024)));
+    let failing = {
+        let sched = sched.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            sched.abort();
+        })
+    };
+    let started = std::time::Instant::now();
+    let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();
+    let mut groups = Some(0..8);
+    let _ = worker.transfer_small_batches(&jobs, move |_| groups.take(), &mut results);
+    let elapsed = started.elapsed();
+    failing.join().unwrap();
+    assert!(elapsed < std::time::Duration::from_secs(3), "{elapsed:?}");
+    assert!(src.lock().unwrap().requests.is_empty(), "no read was sent");
+    assert!(results.iter().all(Option::is_none), "{results:?}");
+}
+
 #[test]
 fn aborted_batches_stop_claiming_groups_and_drain_issued_requests() {
     let sched = Arc::new(Sched::new(4 << 20, 32 << 20));

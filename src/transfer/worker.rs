@@ -971,6 +971,11 @@ impl Worker {
                             len: job.entry.size as u32,
                         });
                     }
+                    // A failure that ended the pacing leaves the group
+                    // unissued: a remote source would send it at the cap.
+                    if self.sched.is_aborted() {
+                        break;
+                    }
                     let count = requests.len();
                     if count > 0 {
                         if let Err(error) = self.src.send(Request::ReadSmallBatch(requests)) {
@@ -3106,19 +3111,22 @@ impl Worker {
             .request_size(self.opts.block, self.bwlimit.as_deref())
     }
 
-    /// Pace `bytes` under `--bwlimit`. A copy that has failed sends nothing
-    /// more, so it neither starts nor finishes pacing.
+    /// Pace `bytes` under `--bwlimit`, as `BandwidthLimit::wait` does, but
+    /// stop waiting once the copy has failed.
     pub(super) fn limit(&self, bytes: u64) {
         if let Some(limit) = &self.bwlimit {
-            if bytes == 0 || self.sched.is_aborted() {
+            if bytes == 0 {
                 return;
             }
             let _pacing = self
                 .observation
                 .as_ref()
                 .map(|a| a.span(crate::transfer_observations::Stage::Pacing));
-            self.sched
-                .sleep_unless_aborted(limit.reserve(std::time::Instant::now(), bytes));
+            let now = std::time::Instant::now();
+            let at = limit.reserve(now, bytes);
+            if at > now {
+                self.sched.sleep_unless_aborted(at);
+            }
         }
     }
 
