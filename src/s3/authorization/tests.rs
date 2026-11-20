@@ -17,6 +17,7 @@ fn approval() -> Request {
         create_only: true,
         lifetime: DEFAULT_LIFETIME,
         headers: Default::default(),
+        max_delete: None,
     }
 }
 #[test]
@@ -85,6 +86,7 @@ fn upload_authorization_signs_object_lock_and_retention_bypass_only_when_the_com
     )
     .unwrap();
     let mut signer = Signer {
+        deletions: Default::default(),
         request: approval,
         configuration: Configuration {
             endpoint: "https://storage.example".into(),
@@ -308,6 +310,7 @@ fn sealed_authorization_reuses_requests_but_cannot_acquire_more() {
 #[test]
 fn presigns_bind_the_payload_marker_and_write_condition() {
     let signer = Signer {
+        deletions: Default::default(),
         request: approval(),
         configuration: Configuration {
             endpoint: "https://storage.example".into(),
@@ -482,6 +485,7 @@ fn stream_capabilities_accept_late_checksums_but_preserve_part_and_condition() {
 #[test]
 fn literal_object_keys_keep_their_scope_through_signing_and_transport() {
     let signer = Signer {
+        deletions: Default::default(),
         request: approval(),
         configuration: Configuration {
             endpoint: "https://storage.example/base".into(),
@@ -522,6 +526,7 @@ fn literal_object_keys_keep_their_scope_through_signing_and_transport() {
 #[test]
 fn signer_rejects_caller_supplied_host() {
     let signer = Signer {
+        deletions: Default::default(),
         request: approval(),
         configuration: Configuration {
             endpoint: "https://storage.example".into(),
@@ -727,6 +732,7 @@ fn session(stop_after: Option<usize>) -> (Authorization, std::thread::JoinHandle
             let seen = messages.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             stop_after.is_some_and(|limit| seen >= limit)
         })
+        .map(drop)
     });
     (
         Authorization::new("fixture".into(), configuration, client),
@@ -873,4 +879,14 @@ fn later_requests_report_an_earlier_refusal() {
     let finish = authorization.finish_preparation().unwrap_err();
     assert_eq!(format!("{finish:#}"), earlier);
     authorizer.join().unwrap();
+    // The machine that started a copy signs without an approval to renew.
+    let mut authorization = authorization;
+    authorization.started_elsewhere = true;
+    let later = authorization
+        .signed(Unsigned::new("GET", "allowed/c"))
+        .unwrap_err();
+    assert_eq!(
+        format!("{later:#}"),
+        "storage signing ended after an earlier request failed (authorizing machine: outside approved paths); run the copy again"
+    );
 }

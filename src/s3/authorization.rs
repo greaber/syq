@@ -9,6 +9,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+pub(crate) mod started;
 mod transport;
 pub(super) use transport::{http_client, signed_header};
 
@@ -86,6 +87,9 @@ pub(crate) struct Request {
     /// signed headers must be ones syq sends itself.
     #[serde(default)]
     pub headers: std::collections::BTreeSet<(String, String)>,
+    /// The command's --max-delete: the most object deletions signed.
+    #[serde(default)]
+    pub max_delete: Option<u64>,
 }
 impl Request {
     pub(crate) fn validate(&self) -> Result<()> {
@@ -416,7 +420,7 @@ impl Unsigned {
                 .map(String::as_str),
         )
     }
-    pub(super) fn new(method: &str, key: &str) -> Self {
+    pub(crate) fn new(method: &str, key: &str) -> Self {
         Self {
             bucket: None,
             method: method.into(),
@@ -425,15 +429,15 @@ impl Unsigned {
             headers: BTreeMap::new(),
         }
     }
-    pub(super) fn bucket(mut self, bucket: &str, default: &str) -> Self {
+    pub(crate) fn bucket(mut self, bucket: &str, default: &str) -> Self {
         self.bucket = (bucket != default).then(|| bucket.to_owned());
         self
     }
-    pub(super) fn query(mut self, key: &str, value: &str) -> Self {
+    pub(crate) fn query(mut self, key: &str, value: &str) -> Self {
         self.query.insert(key.into(), value.into());
         self
     }
-    pub(super) fn header(mut self, key: &str, value: &str) -> Self {
+    pub(crate) fn header(mut self, key: &str, value: &str) -> Self {
         self.headers.insert(key.into(), value.into());
         self
     }
@@ -470,6 +474,8 @@ pub(crate) struct Signer {
     request: Request,
     pub configuration: Configuration,
     credentials: aws_sdk_s3::config::Credentials,
+    /// Object deletions signed so far, counted against --max-delete.
+    deletions: std::sync::atomic::AtomicU64,
 }
 impl Signer {
     pub(crate) async fn new(request: Request) -> Result<Self> {
@@ -531,6 +537,7 @@ impl Signer {
             },
             request,
             credentials,
+            deletions: Default::default(),
         })
     }
 
@@ -552,7 +559,29 @@ impl Signer {
                 None,
                 "test",
             ),
+            deletions: Default::default(),
         }
+    }
+
+    /// Refuses an object deletion beyond the command's --max-delete. The
+    /// copy asks for all of its deletions together, and for none when it
+    /// plans more than the limit, so only a server that ignores the limit
+    /// reaches this. Each signature counts, whatever key it names.
+    fn count_deletion(&self, request: &Unsigned) -> Result<()> {
+        let Some(limit) = self.request.max_delete else {
+            return Ok(());
+        };
+        if request.method != "DELETE" || request.query.contains_key("uploadId") {
+            return Ok(());
+        }
+        let signed = self
+            .deletions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        anyhow::ensure!(
+            signed < limit,
+            "storage authorization permits no more than {limit} object deletions (--max-delete)"
+        );
+        Ok(())
     }
 
     pub(crate) fn sign(&self, request: &Unsigned) -> Result<String> {
@@ -561,6 +590,7 @@ impl Signer {
             SigningSettings, UriPathNormalizationMode,
         };
         self.request.permits(request)?;
+        self.count_deletion(request)?;
         let remaining = self
             .configuration
             .expires_at
@@ -650,8 +680,11 @@ struct State {
     failure: Option<String>,
 }
 impl State {
-    fn ended(&self) -> Result<()> {
+    fn ended(&self, started_elsewhere: bool) -> Result<()> {
         match &self.failure {
+            Some(failure) if started_elsewhere => anyhow::bail!(
+                "storage signing ended after an earlier request failed ({failure}); run the copy again"
+            ),
             Some(failure) => anyhow::bail!(
                 "storage authorization ended after an earlier request failed ({failure}); rerun the copy for fresh approval"
             ),
@@ -663,6 +696,13 @@ pub(crate) struct Authorization {
     pub configuration: Configuration,
     pub bucket: String,
     state: Mutex<State>,
+    /// The machine that started this copy over SSH signs for it, rather
+    /// than a receiving machine that approved it.
+    started_elsewhere: bool,
+    /// Whether the storage service has answered a request, and whether one
+    /// sent to it got no answer.
+    answered: std::sync::atomic::AtomicBool,
+    unanswered: std::sync::atomic::AtomicBool,
 }
 impl std::fmt::Debug for Authorization {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -685,9 +725,48 @@ impl Authorization {
                 requests: BTreeMap::new(),
                 failure: None,
             }),
+            started_elsewhere: false,
+            answered: Default::default(),
+            unanswered: Default::default(),
         }
     }
-    pub(super) fn authorize(&self, requests: Vec<Unsigned>) -> Result<()> {
+    /// Whether the machine that started this copy signs for it.
+    pub(crate) fn started_elsewhere(&self) -> bool {
+        self.started_elsewhere
+    }
+    fn signer(&self) -> &'static str {
+        if self.started_elsewhere {
+            "the machine that started this copy"
+        } else {
+            "authorizing machine"
+        }
+    }
+    fn expired(&self) -> anyhow::Error {
+        if self.started_elsewhere {
+            anyhow::anyhow!(
+                "the signed storage URLs for this copy expired at {}; they last {}, or until the credentials that signed them expire if that is sooner. Run the copy again to continue it",
+                started::time(self.configuration.expires_at),
+                started::duration(self.configuration.requested_lifetime)
+            )
+        } else {
+            anyhow::anyhow!("storage authorization expired; rerun the copy for fresh approval")
+        }
+    }
+    pub(super) fn record_answer(&self, answered: bool) {
+        let flag = if answered {
+            &self.answered
+        } else {
+            &self.unanswered
+        };
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// Whether requests were sent to the storage service and none of them
+    /// was ever answered.
+    pub(crate) fn never_answered(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.unanswered.load(Relaxed) && !self.answered.load(Relaxed)
+    }
+    pub(crate) fn authorize(&self, requests: Vec<Unsigned>) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         let missing: Vec<_> = requests
             .into_iter()
@@ -696,15 +775,25 @@ impl Authorization {
         if missing.is_empty() {
             return Ok(());
         }
-        state.ended()?;
-        let stream = state.connection.as_mut().with_context(|| format!("request {request:?} was not prepared before storage authorization disconnected; rerun for fresh approval", request = missing[0]))?;
-        let signed = crate::destination::storage::sign(stream, &missing).and_then(|signed| {
-            anyhow::ensure!(
-                signed.len() == missing.len(),
-                "incomplete storage authorization response"
-            );
-            Ok(signed)
-        });
+        state.ended(self.started_elsewhere)?;
+        let signer = self.signer();
+        let started_elsewhere = self.started_elsewhere;
+        let stream = state.connection.as_mut().with_context(|| {
+            let request = &missing[0];
+            if started_elsewhere {
+                format!("request {request:?} was not signed before the copy started moving data; run the copy again")
+            } else {
+                format!("request {request:?} was not prepared before storage authorization disconnected; rerun for fresh approval")
+            }
+        })?;
+        let signed =
+            crate::destination::storage::sign(stream, &missing, signer).and_then(|signed| {
+                anyhow::ensure!(
+                    signed.len() == missing.len(),
+                    "incomplete storage authorization response"
+                );
+                Ok(signed)
+            });
         match signed {
             Ok(signed) => {
                 state.requests.extend(missing.into_iter().zip(signed));
@@ -717,11 +806,10 @@ impl Authorization {
             }
         }
     }
-    pub(super) fn signed(&self, request: Unsigned) -> Result<String> {
-        anyhow::ensure!(
-            now()? < self.configuration.expires_at,
-            "storage authorization expired; rerun the copy for fresh approval"
-        );
+    pub(crate) fn signed(&self, request: Unsigned) -> Result<String> {
+        if now()? >= self.configuration.expires_at {
+            return Err(self.expired());
+        }
         if request.method == "PUT" {
             let mut streaming = request.clone();
             streaming.headers.remove("content-md5");
@@ -738,13 +826,18 @@ impl Authorization {
             .fmt(aws_smithy_types::date_time::Format::DateTime)?;
         let authorization = self.clone();
         tokio::task::spawn_blocking(move || authorization.finish_preparation()).await??;
+        if self.started_elsewhere {
+            // That machine stays connected for the whole copy, and losing it
+            // stops the copy, so there is nothing to tell anyone.
+            return Ok(());
+        }
         crate::output::diagnostic!("syq: storage authorization ready; the authorizing machine may disconnect. Authorization expires at {deadline}; provider policies or credential revocation may shorten it.");
         Ok(())
     }
-    pub(super) fn finish_preparation(&self) -> Result<()> {
+    pub(crate) fn finish_preparation(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         // Preparation that failed must not count as finished.
-        state.ended()?;
+        state.ended(self.started_elsewhere)?;
         if let Some(mut stream) = state.connection.take() {
             crate::destination::storage::finish(&mut stream)?;
         }
@@ -814,16 +907,13 @@ pub(crate) fn request_for(args: &crate::cli::Args, options: &super::Options) -> 
             })
             .collect::<Result<Vec<_>>>()?
     } else if upload {
-        vec![Scope {
-            key: super::local::key_path(
-                &args
-                    .locations
-                    .last()
-                    .context("storage destination missing")?
-                    .path,
-            )?,
-            descendants: true,
-        }]
+        upload_roots(args, options)?
+            .into_iter()
+            .map(|key| Scope {
+                key,
+                descendants: true,
+            })
+            .collect()
     } else {
         source_scopes()?
     };
@@ -859,8 +949,57 @@ pub(crate) fn request_for(args: &crate::cli::Args, options: &super::Options) -> 
         create_only: args.ignore_existing || args.target_existence == crate::cli::Existence::New,
         lifetime: DEFAULT_LIFETIME,
         headers: command_headers(options),
+        max_delete: args
+            .max_delete
+            .filter(|_| upload && args.delete && !args.dry_run),
     };
     Ok(request)
+}
+
+/// The most upload roots a request names one by one.
+const NAMED_ROOTS: usize = 1024;
+
+/// The keys under which an upload reads, writes and lists: each is a key and
+/// everything below it. Where the command names its sources, each lands at
+/// its own name inside the destination directory, and those names are the
+/// roots: nothing else in the directory is the copy's business. The whole
+/// destination is the root when the command does not say which names the
+/// copy produces (`--srcs-in`, a mapping, a copy between buckets), when it
+/// tests the destination directory itself (the `-existing` and `-new`
+/// placements), and when it names more sources than a request lists. (A
+/// copy between a server and a bucket never does: like a copy between two
+/// servers, it refuses more named sources than that before it signs
+/// anything.)
+///
+/// The machine that signs derives the signed paths from this, and the copy
+/// lists the destination under the same roots, so the two cannot disagree.
+pub(crate) fn upload_roots(
+    args: &crate::cli::Args,
+    options: &super::Options,
+) -> Result<Vec<String>> {
+    let (target, sources) = args
+        .locations
+        .split_last()
+        .context("storage destination missing")?;
+    let target = super::local::key_path(&target.path)?;
+    let named = options.route == super::Route::Upload
+        && args.native_mapping.is_none()
+        && args.target_existence == crate::cli::Existence::Any;
+    if !named {
+        return Ok(vec![target]);
+    }
+    let mut roots = std::collections::BTreeSet::new();
+    for source in sources {
+        let root = super::local::upload_destination(args, &target, source)?;
+        if root == target || roots.len() == NAMED_ROOTS {
+            return Ok(vec![target]);
+        }
+        roots.insert(root);
+    }
+    if roots.is_empty() {
+        return Ok(vec![target]);
+    }
+    Ok(roots.into_iter().collect())
 }
 
 pub(super) fn acl_headers(options: &super::Options) -> BTreeMap<String, String> {

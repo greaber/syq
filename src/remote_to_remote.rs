@@ -78,6 +78,10 @@ const MAX_RELAYED_LINE_BYTES: usize = 1024 * 1024;
 struct Relay {
     coordinator_prefix: Vec<u8>,
     destination_prefix: Vec<u8>,
+    /// Marks what a copy between a server and storage sends on its signing
+    /// session, and where those bytes go: this machine's signer.
+    storage_prefix: Vec<u8>,
+    storage: Option<std::os::unix::net::UnixStream>,
     results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
     /// The restricted destination's stream, which also supplies the
     /// operation records for its changes.
@@ -102,6 +106,8 @@ impl Relay {
                 .into_bytes(),
             destination_prefix: crate::destination_results::relay::destination_prefix(token)
                 .into_bytes(),
+            storage_prefix: crate::s3::authorization::started::line_prefix(token).into_bytes(),
+            storage: None,
             results,
             destination: destination.map(crate::destination_results::Reader::new),
             coordinator_terminal: None,
@@ -113,10 +119,22 @@ impl Relay {
 
     /// Whether a line is one of ours.
     fn marked(&self, line: &[u8]) -> bool {
-        line.starts_with(&self.coordinator_prefix) || line.starts_with(&self.destination_prefix)
+        line.starts_with(&self.coordinator_prefix)
+            || line.starts_with(&self.destination_prefix)
+            || line.starts_with(&self.storage_prefix)
     }
 
     fn line(&mut self, line: &[u8]) {
+        // Signing requests go to the signer whatever became of the results:
+        // the server waits for an answer to each. If they cannot be passed
+        // on, the session ends, which stops the server's copy.
+        if let Some(bytes) = line.strip_prefix(self.storage_prefix.as_slice()) {
+            if let Err(error) = self.storage_bytes(bytes) {
+                self.storage = None;
+                self.failure.get_or_insert(error);
+            }
+            return;
+        }
         if self.failure.is_some() {
             return;
         }
@@ -204,6 +222,20 @@ impl Relay {
         Ok(())
     }
 
+    /// Hand the server's signing requests to this machine's signer.
+    fn storage_bytes(&mut self, line: &[u8]) -> Result<()> {
+        let signer = self
+            .storage
+            .as_mut()
+            .context("the server sent storage signing requests that this copy does not use")?;
+        let bytes = base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(line.trim_ascii())
+            .context("decode the server's storage signing requests")?;
+        // A signer that already ended, as after a refusal, takes no more.
+        let _ = signer.write_all(&bytes);
+        Ok(())
+    }
+
     fn error(&mut self, message: &str, class: &'static str) {
         if let Some(writer) = &self.results {
             writer.emit_value(serde_json::json!({
@@ -248,7 +280,8 @@ fn relay_output(
     let prefix_len = relay
         .coordinator_prefix
         .len()
-        .max(relay.destination_prefix.len());
+        .max(relay.destination_prefix.len())
+        .max(relay.storage_prefix.len());
     let mut reader = std::io::BufReader::with_capacity(64 * 1024, stdout);
     // A failed human-output sink must not discard results; keep relaying
     // marked lines after the first write error.
@@ -1602,6 +1635,9 @@ pub(crate) struct CoordinatorCommand<'a> {
     /// The named sources start the coordinator's input, in this many bytes
     /// of [`input_sources`], rather than being on its command line.
     pub sources_on_input: Option<usize>,
+    /// The other endpoint is this bucket rather than a second server: the
+    /// coordinator runs an ordinary copy between its files and the bucket.
+    pub storage: Option<&'a crate::s3::Options>,
 }
 
 /// The arguments of the delegated `syq cp` that coordinates a copy between
@@ -1759,25 +1795,33 @@ pub(crate) fn coordinator_arguments(
     // Helper selection applies to ordinary remote syq processes. The local
     // launcher already used it for this coordinator; an enrolled destination
     // is selected by its forced authorized_keys command instead.
-    append_delegated_helper_selection(
-        &mut remote,
-        args.syq_path.as_deref(),
-        args.no_bootstrap,
-        command.destination_path.is_some(),
-    );
-    if args.no_tcp {
-        remote.push("--no-tcp".into());
-    }
-    if args.no_tcp_encryption {
-        remote.push("--no-tcp-encryption".into());
-    }
-    if let Some(algorithm) = &args.tcp_congestion {
-        remote.push(format!("--tcp-congestion={algorithm}"));
-    }
-    remote.push(format!("--tcp-ports={}", args.tcp_ports));
-    if let Some(remote_shell) = command.remote_shell {
-        remote.push("--rsh".into());
-        remote.push(remote_shell);
+    if let Some(storage) = command.storage {
+        // The coordinator starts no syq on another host, so it takes no
+        // helper, SSH or TCP options. This machine's endpoint, region,
+        // profile and headers stay here: its signer applies them, and the
+        // headers reach the coordinator on the signing session.
+        remote.push(format!("--s3-retries={}", storage.retries));
+    } else {
+        append_delegated_helper_selection(
+            &mut remote,
+            args.syq_path.as_deref(),
+            args.no_bootstrap,
+            command.destination_path.is_some(),
+        );
+        if args.no_tcp {
+            remote.push("--no-tcp".into());
+        }
+        if args.no_tcp_encryption {
+            remote.push("--no-tcp-encryption".into());
+        }
+        if let Some(algorithm) = &args.tcp_congestion {
+            remote.push(format!("--tcp-congestion={algorithm}"));
+        }
+        remote.push(format!("--tcp-ports={}", args.tcp_ports));
+        if let Some(remote_shell) = command.remote_shell {
+            remote.push("--rsh".into());
+            remote.push(remote_shell);
+        }
     }
     if args.no_progress || args.quiet {
         remote.push("--no-progress".into());
@@ -1785,13 +1829,19 @@ pub(crate) fn coordinator_arguments(
         remote.push("--progress".into());
     }
 
+    let bucket = command
+        .storage
+        .map(|_| peer.host.clone().context("storage endpoint missing"))
+        .transpose()?;
     if coordinator_at_dst && !same_host {
         remote.push("--from".into());
-        remote.push(endpoint_arg(
-            &srcs[0],
-            command.peer_login_user,
-            command.peer_connection_host,
-        ));
+        remote.push(bucket.clone().unwrap_or_else(|| {
+            endpoint_arg(
+                &srcs[0],
+                command.peer_login_user,
+                command.peer_connection_host,
+            )
+        }));
     }
     if let Some(path) = &args.native_source_root {
         remote.push("--root".into());
@@ -1811,11 +1861,9 @@ pub(crate) fn coordinator_arguments(
     }
     if !coordinator_at_dst && !same_host {
         remote.push("--to".into());
-        remote.push(endpoint_arg(
-            peer,
-            command.peer_login_user,
-            command.peer_connection_host,
-        ));
+        remote.push(bucket.unwrap_or_else(|| {
+            endpoint_arg(peer, command.peer_login_user, command.peer_connection_host)
+        }));
     }
     remote.push(native_placement_arg(args)?.into());
     remote.push(delegated_operand(
@@ -1851,6 +1899,30 @@ pub fn coordinate_at_dst(
         );
     }
     run_remote(args, srcs, dst, true, results)
+}
+
+/// Run a copy between an SSH server and a bucket on that server. This
+/// machine starts the copy the way it starts one between two servers, and
+/// signs the server's storage requests over the same SSH session, so its
+/// storage credentials never leave it and file data never passes through it.
+pub(crate) fn run_storage(
+    args: &Args,
+    results: Option<std::sync::Arc<crate::results::ResultsWriter>>,
+) -> Result<i32> {
+    let (dst, srcs) = args
+        .locations
+        .split_last()
+        .context("storage copy has no destination")?;
+    let server_is_destination = dst.is_ssh_server();
+    anyhow::ensure!(
+        args.s3.is_some()
+            && args.interface == Interface::NativeCp
+            && srcs
+                .iter()
+                .all(|source| source.is_ssh_server() != server_is_destination),
+        "a copy between an SSH server and S3 needs one server and one bucket"
+    );
+    run_remote(args, srcs, dst, server_is_destination, results)
 }
 
 /// Set to `1` in the environment of a coordinator of this build that this
@@ -1895,6 +1967,27 @@ fn run_remote(
     let rsh = parse_rsh(&args.rsh)?;
     let coordinator_host = coordinator.host.clone().unwrap();
     let same_host = srcs[0].same_host(dst);
+    // A copy between the coordinator and a bucket: it reaches no other
+    // server, and this machine signs its storage requests.
+    let storage = args.s3.as_ref();
+    // What the command lets the server ask for signatures of, settled
+    // before anything is started there, and who signs it, prepared while
+    // the SSH session starts: this machine, or the receiving machine the
+    // command names with --auth-from, once it has approved the request.
+    let signer = storage
+        .map(|_| {
+            let request = crate::s3::authorization::started::request(args)?;
+            let name =
+                crate::s3::authorization::started::receiving_machine(args).map(str::to_owned);
+            let signer = std::sync::Arc::new(StorageSigner::default());
+            let prepared = signer.clone();
+            std::thread::Builder::new()
+                .name("storage-signer".into())
+                .spawn(move || prepared.prepare(request, name))
+                .context("start the storage signer")?;
+            anyhow::Ok(signer)
+        })
+        .transpose()?;
 
     let mut broker_guard = None;
     let mut entry_key = None;
@@ -1910,7 +2003,7 @@ fn run_remote(
     let mut destination_results = None;
     let default_ssh_agent_policy = if args.rsh.is_some() {
         None
-    } else if same_host || args.peer_auth == PeerAuth::OwnCredentials {
+    } else if same_host || storage.is_some() || args.peer_auth == PeerAuth::OwnCredentials {
         Some(AgentForwarding::Disabled)
     } else if args.peer_auth == PeerAuth::FullAgent {
         Some(AgentForwarding::Unrestricted)
@@ -2100,7 +2193,9 @@ fn run_remote(
 
     // With an entry key, the coordinator reaches the receiver with the entry
     // key alone; otherwise the forwarding policy decides.
-    let remote_shell = if entry_key.is_some() {
+    let remote_shell = if storage.is_some() {
+        None
+    } else if entry_key.is_some() {
         constrained_rsh.clone()
     } else {
         destination_rsh(
@@ -2119,6 +2214,7 @@ fn run_remote(
         destination_path: restricted_destination_path.as_deref(),
         mapping: args.mapping_contents.is_some(),
         sources_on_input: None,
+        storage,
     };
     // A detached launcher returns before the background syq execs, so a
     // missing helper could otherwise look like a successful start.  Validate
@@ -2138,6 +2234,19 @@ fn run_remote(
     // share it.
     let follow_requester =
         !args.detach && (args.mapping_contents.is_none() || spec.runs_this_build());
+    if storage.is_some() {
+        // The signing session follows the marker on the coordinator's input.
+        anyhow::ensure!(
+            follow_requester && args.mapping_contents.is_none(),
+            "a copy between an SSH server and S3 stays attached and takes no mapping"
+        );
+        // The coordinator refuses the session unless it is this build, before
+        // it reads or sends any of it.
+        internal_environment.push((
+            crate::s3::authorization::started::SIGNING_ENV,
+            crate::identity::build().to_owned(),
+        ));
+    }
     if follow_requester {
         internal_environment.push((
             REQUESTER_STDIN,
@@ -2189,7 +2298,7 @@ fn run_remote(
     }
     // Results come back as lines on the coordinator's output, marked with a
     // token file names printed there cannot guess.
-    let results_token = (results.is_some() || destination_results.is_some())
+    let results_token = (results.is_some() || destination_results.is_some() || storage.is_some())
         .then(crate::destination_results::relay::new_token)
         .transpose()?;
     if let Some(token) = &results_token {
@@ -2383,7 +2492,18 @@ fn run_remote(
         return Ok(0);
     }
     if !args.quiet {
-        crate::output::diagnostic!("syq: remote-to-remote: running on {coordinator_host}");
+        if storage.is_some() {
+            crate::output::diagnostic!(
+                "syq: running on {coordinator_host}, which exchanges file data with {} directly; {} signs its storage requests",
+                peer.host.as_deref().unwrap_or("storage"),
+                match crate::s3::authorization::started::receiving_machine(args) {
+                    Some(name) => format!("@{name}"),
+                    None => "this machine".into(),
+                }
+            );
+        } else {
+            crate::output::diagnostic!("syq: remote-to-remote: running on {coordinator_host}");
+        }
     }
     let relay = results_token.as_deref().map(|token| {
         Relay::new(
@@ -2393,7 +2513,30 @@ fn run_remote(
             (args.dry_run, args.delete),
         )
     });
-    let run = |relay: Option<Relay>| {
+    let run = |mut relay: Option<Relay>| {
+        // Set once this attempt's SSH command has ended.
+        let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The signing session of this attempt: the relay hands the server's
+        // requests to the signer, which answers on the server's input.
+        let signing = signer
+            .as_ref()
+            .map(|signer| -> Result<_> {
+                let (requests, to_signer) = std::os::unix::net::UnixStream::pair()
+                    .context("create the storage signing channel")?;
+                relay
+                    .as_mut()
+                    .context("a storage copy relays its signing requests")?
+                    .storage = Some(to_signer);
+                let options = storage.expect("a signer serves a storage copy");
+                Ok((
+                    signer.clone(),
+                    ended.clone(),
+                    requests,
+                    crate::s3::authorization::started::header_pairs(&options.headers),
+                    crate::s3::authorization::started::header_pairs(&options.write_headers),
+                ))
+            })
+            .transpose()?;
         let mut cmd = make_command();
         cmd.stdin(
             if follow_requester
@@ -2422,6 +2565,7 @@ fn run_remote(
             let entry_key = entry_key.clone();
             let directive = directive.clone();
             let sources = sources_input.clone();
+            let quiet = args.quiet;
             std::thread::spawn(move || {
                 // Named sources first, which the coordinator reads before it
                 // parses its arguments, then the entry key and the
@@ -2443,16 +2587,99 @@ fn run_remote(
                 // Without the marker the coordinator only stops following;
                 // failing to write it must not fail the copy.
                 let _ = stdin.write_all(&[REQUESTER_MARKER]);
-                Ok::<_, std::io::Error>(Some(stdin))
+                let Some((signer, ended, requests, headers, write_headers)) = signing else {
+                    return Ok::<_, std::io::Error>(Some(stdin));
+                };
+                // An SSH command that has already ended needs no signer:
+                // stop waiting for credentials that may take a while.
+                let Some(Ok(signer)) = signer.wait(&ended) else {
+                    // Closing the coordinator's input stops it; this machine
+                    // reports why once it has.
+                    return Ok(None);
+                };
+                let mut session = SigningSession {
+                    requests,
+                    replies: stdin,
+                };
+                let served = match signer {
+                    StorageAuthority::Here(signer) => {
+                        if !quiet {
+                            if let Some(notice) =
+                                crate::s3::authorization::started::early_expiry_notice(
+                                    &signer.configuration,
+                                )
+                            {
+                                crate::output::diagnostic!("syq: {notice}");
+                            }
+                        }
+                        crate::destination::storage::serve_started_copy(
+                            &mut session,
+                            signer,
+                            headers,
+                            write_headers,
+                        )
+                        .map(|refusal| {
+                            refusal.map(|refusal| format!("refused to sign a storage request from the server: {refusal}"))
+                        })
+                    }
+                    // The receiving machine checks and signs; this machine
+                    // only passes the signing messages on.
+                    StorageAuthority::Named {
+                        name,
+                        connection,
+                        configuration,
+                    } => {
+                        let ended = crate::destination::storage::relay_started_copy(
+                            &session.requests,
+                            &mut session.replies,
+                            connection,
+                            name,
+                            &crate::destination::storage::Opening {
+                                configuration: configuration.clone(),
+                                headers,
+                                write_headers,
+                            },
+                        );
+                        if matches!(ended, Ok(None)) && !quiet {
+                            crate::output::diagnostic!(
+                                "syq: storage authorization ready; @{name} may disconnect. Authorization expires at {}; provider policies or credential revocation may shorten it.",
+                                crate::s3::authorization::started::time(configuration.expires_at)
+                            );
+                        }
+                        ended.map(|ended| {
+                            ended.map(|ended| format!("storage signing by @{name} ended: {ended}"))
+                        })
+                    }
+                };
+                match served {
+                    // This machine's own word on a refusal, whatever the
+                    // server goes on to print.
+                    Ok(Some(ended)) => crate::output::diagnostic!("syq: {ended}"),
+                    Ok(None) => {}
+                    // The session ended without an answer the server could
+                    // act on. Closing its input stops a copy still waiting
+                    // for one; a copy that already ended is unaffected.
+                    Err(error) => {
+                        if crate::output::debug() {
+                            crate::output::diagnostic!("syq: storage signing ended: {error:#}");
+                        }
+                        return Ok(None);
+                    }
+                }
+                Ok(Some(session.replies))
             })
         });
         let relayed = match (child.stdout.take(), relay) {
-            (Some(stdout), Some(relay)) => relay_stdout(stdout, relay).map(Some),
+            (Some(stdout), Some(relay)) => relay_stdout(stdout, relay).map(|mut relay| {
+                // The coordinator's output ended: so do its signing requests.
+                relay.storage = None;
+                Some(relay)
+            }),
             (_, relay) => Ok(relay),
         };
-        let status = child
-            .wait()
-            .with_context(|| format!("wait for {:?}", rsh[0]))?;
+        let status = child.wait();
+        ended.store(true, std::sync::atomic::Ordering::Release);
+        let status = status.with_context(|| format!("wait for {:?}", rsh[0]))?;
         let written = input
             .map(|writer| {
                 writer
@@ -2461,6 +2688,9 @@ fn run_remote(
                     .and_then(|written| written.map_err(anyhow::Error::from))
             })
             .transpose();
+        if let Some(Err(error)) = signer.as_ref().and_then(|signer| signer.ready()) {
+            bail!("{error}");
+        }
         if status.success() {
             written.context("send the remote coordinator its input")?;
         }
@@ -2498,6 +2728,9 @@ fn run_remote(
         Some(c) => {
             if args.rsh.is_none() && args.peer_auth == PeerAuth::Broker && !same_host {
                 bail!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); constrained authentication permits only {}@{} and requires OpenSSH session-bind/host-bound authentication. Use --peer-auth own-credentials with coordinator-host credentials, or explicitly accept full agent exposure with --peer-auth full-agent", peer_login_user.as_deref().unwrap_or("the peer user"), peer.host.as_deref().unwrap_or("the peer"))
+            }
+            if storage.is_some() {
+                bail!("the copy on {coordinator_host} failed (exit {c})")
             }
             bail!("remote-to-remote transfer on {coordinator_host} failed (exit {c}); {coordinator_host} may not be able to reach the peer endpoint")
         }
@@ -2745,6 +2978,7 @@ pub(crate) fn coordination_command(
             // The receiver starts the coordinator itself, with each source
             // a separate argument.
             sources_on_input: None,
+            storage: None,
         },
     )?;
     let mut environment = vec![
@@ -2866,6 +3100,25 @@ const REQUESTER_LOSS_KILL_AFTER: std::time::Duration = std::time::Duration::from
 /// if it had been interrupted: it does not finish the copy, and its
 /// receivers see a lost connection rather than a completed copy.
 pub(crate) fn follow_requester(args: &mut Args) -> Result<()> {
+    follow(args, None)
+}
+
+/// As [`follow_requester`], for a copy whose requester signs its storage
+/// requests: what the requester writes after the marker is its side of the
+/// signing session, and goes to `session`. Losing the requester also ends
+/// the session, so a copy waiting for a signature stops too.
+pub(crate) fn follow_requester_signing(
+    args: &mut Args,
+    session: std::os::unix::net::UnixStream,
+) -> Result<()> {
+    anyhow::ensure!(
+        args.delegated && args.requester_stdin == Some(0),
+        "storage signing needs the attached syq that started this copy"
+    );
+    follow(args, Some(session))
+}
+
+fn follow(args: &mut Args, session: Option<std::os::unix::net::UnixStream>) -> Result<()> {
     use std::os::fd::{AsFd, AsRawFd};
     let Some(manifest_bytes) = args.requester_stdin.filter(|_| args.delegated) else {
         return Ok(());
@@ -2903,8 +3156,16 @@ pub(crate) fn follow_requester(args: &mut Args) -> Result<()> {
     std::thread::Builder::new()
         .name("requester".into())
         .spawn(move || {
-            if wait_for_requester_loss(&mut input) {
+            let lost = wait_for_requester_loss(&mut input, session.as_ref());
+            if lost {
                 unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+            }
+            if let Some(session) = &session {
+                // Whether or not the requester was ever there, nothing more
+                // will be signed: release a copy waiting for a signature.
+                let _ = session.shutdown(std::net::Shutdown::Both);
+            }
+            if lost {
                 std::thread::sleep(REQUESTER_LOSS_KILL_AFTER);
                 unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
             }
@@ -2916,16 +3177,132 @@ pub(crate) fn follow_requester(args: &mut Args) -> Result<()> {
 /// Wait for the end of the requester's input. Returns whether it ended after
 /// the marker: input that ends first never came from the requester, as with
 /// `ssh -n` or `StdinNull`, so it says nothing about the requester.
-fn wait_for_requester_loss(input: &mut impl Read) -> bool {
+///
+/// With `session`, the bytes after the marker are the requester's side of a
+/// storage signing session and are passed on to it.
+fn wait_for_requester_loss(
+    input: &mut impl Read,
+    mut session: Option<&std::os::unix::net::UnixStream>,
+) -> bool {
     let mut marked = false;
-    let mut buffer = [0u8; 64];
+    let mut buffer = vec![0u8; if session.is_some() { 64 * 1024 } else { 64 }];
     loop {
         match input.read(&mut buffer) {
             Ok(0) => return marked,
-            Ok(_) => marked = true,
+            Ok(length) => {
+                let replies = &buffer[usize::from(!marked)..length];
+                marked = true;
+                if let Some(mut stream) = session.filter(|_| !replies.is_empty()) {
+                    // A session the copy has finished with takes no more.
+                    if stream.write_all(replies).is_err() {
+                        session = None;
+                    }
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => return marked,
         }
+    }
+}
+
+/// Who signs the storage requests of a copy this machine started on a
+/// server.
+enum StorageAuthority {
+    /// This machine, with its own credentials. The command typed here is
+    /// the approval.
+    Here(Box<crate::s3::authorization::Signer>),
+    /// The receiving machine `name`, which approved the request over
+    /// `connection` and holds the credentials. This machine passes the
+    /// server's signing messages to it.
+    Named {
+        name: String,
+        connection: std::os::unix::net::UnixStream,
+        configuration: crate::s3::authorization::Configuration,
+    },
+}
+
+/// The signer for a copy this machine started on a server, prepared once:
+/// loading credentials and finding the bucket's region, or waiting for a
+/// receiving machine's approval, takes a while, so that starts while the
+/// SSH session does.
+#[derive(Default)]
+struct StorageSigner {
+    signer: std::sync::OnceLock<Result<StorageAuthority, String>>,
+    prepared: (std::sync::Mutex<()>, std::sync::Condvar),
+}
+
+impl StorageSigner {
+    /// Prepare the signer for `request`, or record why this machine cannot
+    /// sign, and wake whoever waits for it.
+    fn prepare(&self, request: crate::s3::authorization::Request, name: Option<String>) {
+        let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match name {
+                None => crate::s3::authorization::started::signer(request)
+                    .map(|signer| StorageAuthority::Here(Box::new(signer))),
+                Some(name) => crate::destination::storage::connect(&name, request).map(
+                    |(connection, configuration)| StorageAuthority::Named {
+                        name,
+                        connection,
+                        configuration,
+                    },
+                ),
+            }
+            .map_err(|error| format!("{error:#}"))
+        }))
+        .unwrap_or_else(|_| Err("preparing to sign storage requests failed".into()));
+        let _ = self.signer.set(prepared);
+        let _waiters = self.prepared.0.lock().unwrap();
+        self.prepared.1.notify_all();
+    }
+
+    /// The signer, or why this machine cannot sign, if that is known yet.
+    fn ready(&self) -> Option<&Result<StorageAuthority, String>> {
+        self.signer.get()
+    }
+
+    /// Wait until `ready`, or return `None` once `ended` is set.
+    fn wait(
+        &self,
+        ended: &std::sync::atomic::AtomicBool,
+    ) -> Option<&Result<StorageAuthority, String>> {
+        let mut waiting = self.prepared.0.lock().unwrap();
+        loop {
+            if let Some(signer) = self.ready() {
+                return Some(signer);
+            }
+            if ended.load(std::sync::atomic::Ordering::Acquire) {
+                return None;
+            }
+            // `ended` has no notification of its own.
+            (waiting, _) = self
+                .prepared
+                .1
+                .wait_timeout(waiting, std::time::Duration::from_millis(50))
+                .unwrap();
+        }
+    }
+}
+
+/// This machine's end of a storage signing session with a copy it started
+/// on a server: the server's requests arrive through the relay of its
+/// output, and replies go to its input.
+struct SigningSession<W> {
+    requests: std::os::unix::net::UnixStream,
+    replies: W,
+}
+
+impl<W> Read for SigningSession<W> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.requests.read(buffer)
+    }
+}
+
+impl<W: Write> Write for SigningSession<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.replies.write(buffer)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.replies.flush()
     }
 }
 

@@ -105,8 +105,9 @@ pub(super) struct Engine {
     client: Client,
     progress: Arc<Progress>,
     bandwidth: Option<crate::bwlimit::BandwidthLimit>,
-    /// Every destination key, when pruning listed them all before the copy.
-    upload_keys: OnceLock<HashMap<String, u64>>,
+    /// The destination keys under each listed prefix, when pruning listed
+    /// them before the copy.
+    upload_keys: OnceLock<DestinationListing>,
     /// Otherwise, the planned keys the destination listing has reached.
     discovery: OnceLock<Discovery>,
     copy_checksum_unsupported: std::sync::atomic::AtomicBool,
@@ -234,7 +235,50 @@ struct DownloadState {
     hash_algorithm: HashAlgorithm,
 }
 
+/// What listing an upload's destination found, and under which prefixes it
+/// looked. A key outside those prefixes was not looked for.
+#[derive(Default)]
+pub(super) struct DestinationListing {
+    prefixes: Vec<String>,
+    keys: HashMap<String, u64>,
+}
+impl DestinationListing {
+    fn covers(&self, key: &str) -> bool {
+        self.prefixes.iter().any(|prefix| key.starts_with(prefix))
+    }
+    /// The size of `key` when the listing found it, `Some(None)` when the
+    /// listing shows that it does not exist, and `None` when the listing
+    /// does not say.
+    fn size(&self, key: &str) -> Option<Option<u64>> {
+        match self.keys.get(key) {
+            Some(size) => Some(Some(*size)),
+            None => self.covers(key).then_some(None),
+        }
+    }
+}
+
 impl Engine {
+    /// The prefixes under which an upload's destination keys lie. A copy
+    /// another machine signs for lists only what that machine's signatures
+    /// cover (`authorization::upload_roots`); a named file there has no
+    /// prefix of its own and is checked with a request for its key.
+    fn destination_prefixes(&self) -> Result<Vec<String>> {
+        let roots = if self.authorization.is_some() {
+            super::authorization::upload_roots(&self.args, &self.options)?
+        } else {
+            vec![local::key_path(&self.args.locations.last().unwrap().path)?]
+        };
+        Ok(roots
+            .into_iter()
+            .map(|root| {
+                if root.is_empty() {
+                    root
+                } else {
+                    format!("{root}/")
+                }
+            })
+            .collect())
+    }
     fn expression_destination_path<'a>(&self, path: &'a str) -> &'a [u8] {
         let path = path.trim_end_matches('/');
         let root = self
@@ -370,8 +414,10 @@ impl Engine {
             }
             self.check_upload_placement(plan.first().map(|s| s.kind() != ObjectKind::Dir))
                 .await?;
-            self.discover_destination(&mut plan, |source| source.key.as_str().into())
-                .await?;
+            self.discover_destination(&mut plan, &prune.scopes, |source| {
+                source.key.as_str().into()
+            })
+            .await?;
             let workers = self.object_workers(plan.iter().map(|s| s.meta.len))?;
             self.progress.files_total.store(plan.len() as u64, Relaxed);
             self.progress.bytes_total.store(
@@ -891,75 +937,130 @@ impl Engine {
         .into_bytes()
     }
     /// Learn which planned destination keys exist, so that new ones need no
-    /// HEAD. Pruning lists the whole destination first. Otherwise, where the
-    /// copy lists its destination, this puts `plan` in key order, the order
-    /// that listing follows.
+    /// HEAD. Pruning lists the destination first, everything under `pruned`
+    /// included. Otherwise, where the copy lists its destination, this puts
+    /// `plan` in key order, the order that listing follows.
+    ///
+    /// Both list under `destination_prefixes`: the destination, or for a
+    /// copy another machine signs for, each prefix its signatures cover.
     async fn discover_destination<T>(
         &self,
         plan: &mut [T],
+        pruned: &[Vec<u8>],
         key: impl for<'a> Fn(&'a T) -> std::borrow::Cow<'a, str>,
     ) -> Result<()> {
         if plan.len() < 2 || self.args.existing || self.args.ignore_existing {
             return Ok(());
         }
-        let target = local::key_path(&self.args.locations.last().unwrap().path)?;
-        let prefix = if target.is_empty() {
-            String::new()
-        } else {
-            format!("{target}/")
-        };
+        let prefixes = self.destination_prefixes()?;
         if !self.args.delete {
-            if !discovery::lists_destination(&self.args, &self.options.bucket) {
-                // Every key gets its HEAD, so a listing would save nothing.
-                // One request still goes first: the copy sizes its
-                // concurrency from a response seen before it starts, and a
-                // destination that cannot be listed fails here, as it does
-                // for the copies that list.
-                client::list_one(&self.client, &self.options.bucket, &prefix).await?;
-                return Ok(());
+            let lists = discovery::lists_destination(&self.args, &self.options.bucket);
+            if self.authorization.is_none() {
+                if !lists {
+                    // Every key gets its HEAD, so a listing would save
+                    // nothing. One request still goes first: the copy sizes
+                    // its concurrency from a response seen before it starts,
+                    // and a destination that cannot be listed fails here, as
+                    // it does for the copies that list.
+                    client::list_one(&self.client, &self.options.bucket, &prefixes[0]).await?;
+                    return Ok(());
+                }
+                plan.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
+                let keys = discovery::Keys::new(plan.iter().map(&key));
+                let whole = discovery::Segment::whole(prefixes[0].clone(), &keys);
+                return self.start_discovery(vec![whole], keys).await;
             }
-            plan.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
-            let discovery = Discovery::start(
-                self.client.clone(),
-                &self.options.bucket,
-                prefix,
-                discovery::Keys::new(plan.iter().map(key)),
-                self.cancelled.clone(),
-                self.progress.clone(),
-            )
-            .await?;
-            let _ = self.discovery.set(discovery);
+            // Under signatures, each signed prefix is listed for the planned
+            // keys beneath it.
+            if lists {
+                plan.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
+                let keys = discovery::Keys::new(plan.iter().map(&key));
+                let segments = discovery::segments(&keys, &prefixes);
+                if !segments.is_empty() {
+                    return self.start_discovery(segments, keys).await;
+                }
+            }
+            // Nothing to list: still send the request the copy sizes its
+            // concurrency from, under a signed prefix with planned keys
+            // beneath it if there is one.
+            let probe = plan
+                .iter()
+                .find_map(|t| {
+                    let key = key(t);
+                    prefixes
+                        .iter()
+                        .find(|prefix| key.starts_with(prefix.as_str()))
+                })
+                .unwrap_or(&prefixes[0]);
+            client::list_one(&self.client, &self.options.bucket, probe).await?;
             return Ok(());
         }
         // Pruning needs every destination key, including keys absent from
         // the plan. Only this complete cache is reusable by the deletion
         // planner.
-        let listing = client::list(
-            &self.client,
-            self.options.endpoint.as_deref(),
-            &self.options.bucket,
-            &prefix,
-            self.options.concurrency,
-        )
-        .await;
-        match listing {
-            Ok(listing) => {
-                let _ = self
-                    .upload_keys
-                    .set(listing.into_objects().into_iter().collect());
-            }
-            Err(error)
-                if error
-                    .downcast_ref::<client::RequestFailure>()
-                    .is_some_and(|failure| failure.region_mismatch()) =>
+        let mut found = DestinationListing::default();
+        // A named file has nothing beneath its key for pruning to look
+        // through, so an upload another machine signs for does not list
+        // there. Every pruned directory stays covered.
+        let named = self.authorization.is_some() && self.options.route == Route::Upload;
+        for prefix in prefixes {
+            if named
+                && !pruned.iter().any(|scope| {
+                    scope.is_empty()
+                        || [scope.as_slice(), b"/"]
+                            .concat()
+                            .starts_with(prefix.as_bytes())
+                })
             {
-                return Err(error);
+                continue;
             }
-            Err(error) => {
-                self.progress
-                    .error(&format!("list S3 destination: {error:#}"));
+            let listing = client::list(
+                &self.client,
+                self.options.endpoint.as_deref(),
+                &self.options.bucket,
+                &prefix,
+                self.options.concurrency,
+            )
+            .await;
+            match listing {
+                Ok(listing) => {
+                    found.keys.extend(listing.into_objects());
+                    found.prefixes.push(prefix);
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<client::RequestFailure>()
+                        .is_some_and(|failure| failure.region_mismatch()) =>
+                {
+                    return Err(error);
+                }
+                Err(error) => {
+                    self.progress
+                        .error(&format!("list S3 destination: {error:#}"));
+                    return Ok(());
+                }
             }
         }
+        if !found.prefixes.is_empty() {
+            let _ = self.upload_keys.set(found);
+        }
+        Ok(())
+    }
+    async fn start_discovery(
+        &self,
+        segments: Vec<discovery::Segment>,
+        keys: discovery::Keys,
+    ) -> Result<()> {
+        let discovery = Discovery::start(
+            self.client.clone(),
+            &self.options.bucket,
+            segments,
+            keys,
+            self.cancelled.clone(),
+            self.progress.clone(),
+        )
+        .await?;
+        let _ = self.discovery.set(discovery);
         Ok(())
     }
     /// What a destination listing says about `key`, the plan's `position`th,
