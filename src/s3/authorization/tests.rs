@@ -1058,7 +1058,7 @@ fn a_request_signed_while_queued_survives_a_later_refusal() {
         let (authorization, authorizer, first, release) = held_session();
         let leader = sign_in_thread(&authorization, get("0"));
         first.recv_timeout(Duration::from_secs(30)).unwrap();
-        let mut queue = |key: &str, queued: usize| {
+        let queue = |key: &str, queued: usize| {
             let caller = sign_in_thread(&authorization, get(key));
             queued_reaches(&authorization, queued);
             caller
