@@ -4085,10 +4085,10 @@ mod tests {
         );
     }
 
-    /// A service answers requests one at a time, so it may decide whether to
-    /// stop once idle only after the switch stopped waiting for the answer.
-    /// The switch still learns what it decided: a service that stopped is
-    /// taken over, and one that kept running keeps receiving.
+    /// A service answers requests one at a time, so it may answer a request
+    /// to stop once idle only after others. The switch waits for that answer
+    /// and follows it: a service that stopped is taken over, and one that
+    /// kept running keeps receiving.
     #[test]
     fn a_late_answer_to_stop_once_idle_is_still_followed() {
         let late = |stops: bool| {
@@ -4122,6 +4122,11 @@ mod tests {
         )
         .unwrap();
         service.join().unwrap();
+
+        // One that has already gone has stopped: its replacement takes over.
+        let (_root, control, lock) = locked_control();
+        drop(lock);
+        assert!(stop_when_idle(&control).unwrap());
     }
 
     /// An approved account connection is reported as what it is, not as a
