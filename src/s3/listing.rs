@@ -136,8 +136,7 @@ pub(super) fn lists_in_key_order(bucket: &str) -> bool {
 
 /// Whether listings of `bucket` at `endpoint` may be divided into parts
 /// (`engine::Store::divides`): ListObjectsV2 must return keys in UTF-8 byte
-/// order, and StartAfter must follow it. `None` is the AWS endpoint the SDK
-/// chooses.
+/// order. `None` is the AWS endpoint the SDK chooses.
 ///
 /// Of the providers checked, only AWS documents it: "List results are always
 /// returned in UTF-8 binary order" (https://docs.aws.amazon.com/AmazonS3/latest/userguide/ListingKeysUsingAPIs.html),
@@ -147,14 +146,17 @@ pub(super) fn lists_in_key_order(bucket: &str) -> bool {
 /// (https://docs.aws.amazon.com/AmazonS3/latest/userguide/olap-writing-lambda.html),
 /// so only names of general purpose buckets divide.
 ///
-/// Tigris states no order (https://www.tigrisdata.com/docs/api/s3/), but
-/// tests against it at `e7cc1893` found byte order throughout. About 5,000
+/// Tigris states no order (https://www.tigrisdata.com/docs/api/s3/), but ad
+/// hoc runs of syq at `e7cc1893` against its own buckets in November 2026,
+/// kept outside this repository, found byte order throughout. About 5,000
 /// keys built to expose other orders (keys that extend others, case,
 /// punctuation around '/', NFC and NFD, CJK, emoji, percent signs) came back
-/// in byte order at page sizes from 1 to 1,000. StartAfter resumed in byte
-/// order, and both a divided listing and one page after another returned
-/// every key. Its delimiter listings skip the key after a page that ends with
-/// a common prefix, which `engine::Gaps` makes up for.
+/// in byte order at page sizes from 1 to 1,000. StartAfter without a
+/// delimiter resumed in byte order, and both a divided listing and one page
+/// after another returned every key. A delimiter listing skips the key `P0`
+/// after a page that ends with the common prefix `P/`, which `engine::Gap`
+/// makes up for. Buckets that read through to another provider's bucket
+/// (Tigris's shadow buckets) were not tested.
 ///
 /// Left out: Cloudflare R2, which states no order and in the same tests
 /// sorted as if every key ended in a byte just above '9' (`a0` and `a/b`
@@ -167,8 +169,7 @@ pub(super) fn lists_in_key_order(bucket: &str) -> bool {
 pub(super) fn lists_in_byte_order(endpoint: Option<&str>, bucket: &str) -> bool {
     general_purpose_bucket(bucket)
         && endpoint.is_none_or(|endpoint| {
-            aws_endpoint(endpoint)
-                || tigris_endpoint(endpoint)
+            base_host(endpoint).is_some_and(|host| aws_host(&host) || super::tigris_host(&host))
                 || (test_divides() && loopback(endpoint))
         })
 }
@@ -212,18 +213,16 @@ fn general_purpose_bucket(bucket: &str) -> bool {
         .any(|suffix| bucket.ends_with(suffix))
 }
 
-/// Whether `endpoint` is the base URL of an AWS S3 endpoint for general
-/// purpose buckets, which the client addresses path-style: global, regional,
+/// Whether `host`, of an endpoint URL with no path (`base_host`), is an AWS
+/// S3 endpoint for general purpose buckets, which the client addresses
+/// path-style: global, regional,
 /// legacy dash-regional, dual-stack and FIPS endpoints in the AWS and China
 /// partitions (https://docs.aws.amazon.com/general/latest/gr/s3.html), and
 /// the bucket role of a VPC interface endpoint
 /// (https://docs.aws.amazon.com/AmazonS3/latest/userguide/privatelink-interface-endpoints.html).
 /// Hosts that already name a bucket, access points, Object Lambda, Outposts,
 /// directory buckets (`s3express`) and multi-Region access points are not.
-fn aws_endpoint(endpoint: &str) -> bool {
-    let Some(host) = base_host(endpoint) else {
-        return false;
-    };
+fn aws_host(host: &str) -> bool {
     let labels: Vec<&str> = host.split('.').collect();
     let rest = match labels.as_slice() {
         [rest @ .., "amazonaws", "com"] | [rest @ .., "amazonaws", "com", "cn"] => rest,
@@ -248,17 +247,6 @@ fn aws_endpoint(endpoint: &str) -> bool {
         [legacy] => legacy.strip_prefix("s3-").is_some_and(region),
         _ => false,
     }
-}
-
-/// Whether `endpoint` is the base URL of a Tigris endpoint, recognized as
-/// `Options::is_tigris` does: `t3.storage.dev`, or a host under `tigris.dev`.
-fn tigris_endpoint(endpoint: &str) -> bool {
-    base_host(endpoint).is_some_and(|host| {
-        host == "t3.storage.dev"
-            || host
-                .strip_suffix(".tigris.dev")
-                .is_some_and(|name| !name.is_empty())
-    })
 }
 
 /// The domain of an endpoint URL with no path, in lowercase. A path would

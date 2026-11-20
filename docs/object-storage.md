@@ -42,9 +42,9 @@ service is back.
 Before it copies or removes a prefix, and for `--prune`, syq lists the
 objects under it. In general purpose buckets on AWS, and on Tigris, syq
 divides a large listing with subdirectories into parts that it lists at the
-same time, so
-the listing can finish sooner when each request takes a while. This costs
-more list requests: usually up to about a quarter more on large listings.
+same time, so the listing can finish sooner when each request takes a
+while. This costs more list requests: usually up to about a quarter more on
+large listings.
 When a prefix has no more than a few dozen subdirectories and the first ones
 hold many objects, syq may list each subdirectory by itself, at a request
 each, however few objects the others hold.

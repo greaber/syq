@@ -71,13 +71,14 @@ pub(in crate::s3) trait Store {
     }
 
     /// Whether a listing may rely on the store returning keys in UTF-8 byte
-    /// order. Only stores whose provider documents that order divide: a
-    /// listing with more than one request slot is then divided into parts
-    /// that run at the same time (`parts`), and an exact key is looked for on
-    /// the first page only. Every part but the last stops at the first key
-    /// handed over, so a key that the store returns out of order after that
-    /// point would be missed without an error. Other stores are listed one
-    /// page after another, which does not depend on the order.
+    /// order. Only stores whose provider documents that order, or was found
+    /// to follow it, divide: a listing with more than one request slot is
+    /// then divided into parts that run at the same time (`parts`), and an
+    /// exact key is looked for on the first page only. Every part but the
+    /// last stops at the first key handed over, so a key that the store
+    /// returns out of order after that point would be missed without an
+    /// error. Other stores are listed one page after another, which does not
+    /// depend on the order.
     fn divides(&self) -> bool {
         false
     }
