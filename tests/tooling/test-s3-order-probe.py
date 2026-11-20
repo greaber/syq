@@ -99,6 +99,8 @@ def serve(store):
         def do_PUT(self):
             self.rfile.read(int(self.headers.get("Content-Length", "0")))
             key = self.key()
+            if store.mode == "forbid":
+                return self.reply(403, b"<Error><Code>AccessDenied</Code></Error>")
             if store.mode == "refuse" and "\U0001f600" in key:
                 return self.reply(400, b"<Error><Code>InvalidObjectName</Code></Error>")
             if store.mode == "merge":
@@ -179,6 +181,21 @@ class ProbeTests(unittest.TestCase):
         refused = self.report["refused"]
         self.assertTrue(refused)
         self.assertTrue(all(r["status"] == 400 and r["code"] == "InvalidObjectName" for r in refused))
+
+    def test_a_failed_write_ends_the_probe(self):
+        store = Store("forbid")
+        server = serve(store)
+        try:
+            env = dict(os.environ, AWS_ACCESS_KEY_ID="id", AWS_SECRET_ACCESS_KEY="secret")
+            result = subprocess.run(
+                [sys.executable, str(SCRIPTS / "s3-order-probe.py"), "--endpoint",
+                 f"http://127.0.0.1:{server.server_address[1]}", "s3://bucket"],
+                env=env, capture_output=True, text=True, timeout=120)
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
 
     def test_every_small_page_size_ends_a_page_before_a_skippable_key(self):
         for size in probe.DELIMITER_PAGE_SIZES[:-1]:

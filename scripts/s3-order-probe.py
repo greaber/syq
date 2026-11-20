@@ -2,8 +2,8 @@
 """Check how an S3-compatible service orders and pages ListObjectsV2.
 
 syq divides a listing into parts, and decides a key absent from where it
-would fall in a page, only where it takes a service to list keys in UTF-8
-byte order. This checks whether a service's listings behave as those
+would fall in a page, only for services it assumes list keys in UTF-8 byte
+order. This checks whether a service's listings behave as those
 assumptions require, and can be rerun to notice a change. It runs against a
 real service by hand and is not part of CI.
 
@@ -52,6 +52,8 @@ NFC_E = unicodedata.normalize("NFC", "é")
 NFD_E = unicodedata.normalize("NFD", "é")
 PAGE_SIZES = (1, 3, 7, 1000)
 DELIMITER_PAGE_SIZES = (1, 2, 3, 4, 5, 6, 1000)
+# PUT statuses that reject a key's name or size.
+REFUSES_KEY = (400, 409, 413, 414)
 
 
 def keys():
@@ -172,7 +174,14 @@ def run(client, root, stored):
         try:
             client.request("PUT", key, data=b"x")
         except urllib.error.HTTPError as error:
-            code = ET.fromstring(error.read() or b"<Error/>").findtext("Code") if error.code else None
+            # Only these reject the key itself; any other failure, such as
+            # missing permission or an unavailable service, ends the probe.
+            if error.code not in REFUSES_KEY:
+                raise
+            try:
+                code = ET.fromstring(error.read()).findtext("Code")
+            except ET.ParseError:
+                code = None
             return {"key": key, "status": error.code, "code": code}
         return None
 
@@ -183,6 +192,8 @@ def run(client, root, stored):
     # What the service holds. Some cannot store a key and a "directory" of
     # the same name; a key acknowledged but never listed is checked by HEAD.
     present = set(key for kind, key in client.listing(root, 1000))
+    if not present:
+        raise RuntimeError("nothing stored was listed")
     unlisted, unstored = [], []
     for key in sorted(set(stored) - present - forms - {r["key"] for r in refused}):
         try:
