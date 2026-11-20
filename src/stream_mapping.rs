@@ -12,7 +12,7 @@ use crate::{
 use anyhow::{bail, ensure, Context, Result};
 use futures_util::{stream, StreamExt};
 use manifest::{Endpoint, Entry};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::{
     io::Read,
     sync::{
@@ -21,33 +21,27 @@ use std::{
     },
 };
 
-struct Totals(Value);
+/// The run's totals: its pathname phase's, then each callback entry's.
+struct Totals(results::ResultRecord);
 impl Totals {
     fn new(dry_run: bool) -> Self {
-        Self(
-            json!({"type":"result", "status":"success", "exit_code":0, "dry_run":dry_run,
-            "files_transferred":0,"files_unchanged":0,"files_excluded":0,"directories_created":0,
-            "symlinks_created":0,"specials_created":0,"errors":0,"bytes_transferred":0,
-            "bytes_unchanged":0,"timings":{"total_ms":0}}),
-        )
+        Self(results::ResultRecord::new(
+            results::Status::Success,
+            0,
+            dry_run,
+        ))
     }
-    fn add(&mut self, name: &str, value: u64) {
-        self.0[name] = (self.0[name].as_u64().unwrap_or(0) + value).into();
-    }
-    fn phase(&mut self, value: &Value) {
-        for name in [
-            "files_transferred",
-            "files_unchanged",
-            "files_excluded",
-            "directories_created",
-            "symlinks_created",
-            "specials_created",
-            "errors",
-            "bytes_transferred",
-            "bytes_unchanged",
-        ] {
-            self.add(name, value[name].as_u64().unwrap_or(0));
-        }
+    fn phase(&mut self, record: &results::ResultRecord) {
+        let totals = &mut self.0;
+        totals.files_transferred += record.files_transferred;
+        totals.files_unchanged += record.files_unchanged;
+        totals.files_excluded += record.files_excluded;
+        totals.directories_created += record.directories_created;
+        totals.symlinks_created += record.symlinks_created;
+        totals.specials_created += record.specials_created;
+        totals.errors += record.errors;
+        totals.bytes_transferred += record.bytes_transferred;
+        totals.bytes_unchanged += record.bytes_unchanged;
     }
 }
 
@@ -67,50 +61,29 @@ pub(crate) fn run(args: Args) -> Result<i32> {
     let code = if let Err(error) = &outcome {
         writer.emit_error_classified(&format!("{error:#}"), None, None);
         crate::output::diagnostic!("syq: {error:#}");
-        totals.add("errors", 1);
+        totals.0.errors += 1;
         1
-    } else if totals.0["errors"].as_u64().unwrap_or(0) != 0 {
+    } else if totals.0.errors != 0 {
         23
     } else {
         0
     };
-    totals.0["status"] = (if code == 0 {
-        "success"
-    } else if code == 23 {
-        "partial"
-    } else {
-        "failed"
-    })
+    totals.0.status = match code {
+        0 => results::Status::Success,
+        23 => results::Status::Partial,
+        _ => results::Status::Failed,
+    }
     .into();
-    totals.0["exit_code"] = code.into();
-    totals.0["timings"]["total_ms"] = (started.elapsed().as_millis() as u64).into();
-    writer.emit_terminal_value(totals.0);
+    totals.0.exit_code = code;
+    totals.0.timings.total_ms = started.elapsed().as_millis() as u64;
+    writer.emit_result(&totals.0);
     Ok(if writer.is_dead() { 1 } else { code })
 }
 
 fn run_inner(args: &Args, writer: Arc<ResultsWriter>, totals: &mut Totals) -> Result<()> {
     let channel = Arc::new(channel::Channel::connect(args.stream_mapping_fd.unwrap())?);
     let outcome = (|| {
-        let mut contents = Vec::new();
-        let path = args
-            .native_mapping
-            .as_deref()
-            .context("missing stream mapping manifest")?;
-        if path == b"-" {
-            std::io::stdin().read_to_end(&mut contents)?;
-        } else {
-            crate::fsops::open_operator_file_read(
-                path,
-                if args.native_follow {
-                    crate::proto::OperatorSymlinkPolicy::FollowAll
-                } else {
-                    crate::proto::OperatorSymlinkPolicy::Refuse
-                },
-            )?
-            .read_to_end(&mut contents)?;
-        }
-        let manifest = manifest::parse(&contents)?;
-        validate(args, &manifest)?;
+        let manifest = read_manifest(args)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
@@ -132,130 +105,237 @@ fn run_inner(args: &Args, writer: Arc<ResultsWriter>, totals: &mut Totals) -> Re
                 if let Some(authorization) = &args.storage_authorization {
                     runtime.block_on(authorization.finish())?;
                 }
+            } else {
+                let callback_paths = manifest.callbacks.iter().any(|e| e.dst.path().is_some());
+                run_pathname_phase(args, manifest.paths, callback_paths, &writer, totals)?;
             }
-            if !manifest.paths.entries.is_empty() {
-                let mut ordinary = args.clone();
-                ordinary.stream_mapping_fd = None;
-                if manifest.callbacks.iter().any(|e| e.dst.path().is_some()) {
-                    ordinary.target_existence = Existence::Any;
-                }
-                ordinary.parsed_mapping = Some(Arc::new(manifest.paths));
-                let phase = ResultsWriter::phase(writer.clone());
-                ordinary.results_override = Some(phase.clone());
-                ordinary.suppress_summary = true;
-                let result = if ordinary.s3.is_some() {
-                    crate::s3::run(ordinary)
-                } else {
-                    crate::transfer::run(ordinary)
-                };
-                if let Some(record) = phase.take_phase_result() {
-                    totals.phase(&record);
-                }
-                let code = result?;
-                ensure!(
-                    code == 0 || code == 23,
-                    "pathname phase failed with exit status {code}"
-                );
-            }
-            let mut progress = crate::progress::Progress::new(
-                !args.quiet && !args.no_progress,
-                args.progress,
-                None,
-            );
-            Arc::get_mut(&mut progress).unwrap().stream = true;
-            progress.set_results(writer.clone());
-            progress
-                .bytes_done
-                .store(totals.0["bytes_transferred"].as_u64().unwrap(), Relaxed);
-            progress
-                .files_total
-                .store(manifest.callbacks.len() as u64, Relaxed);
-            let ordinary_done = totals.0["files_transferred"].as_u64().unwrap();
-            let ordinary_unchanged = totals.0["files_unchanged"].as_u64().unwrap();
-            let ordinary_excluded = totals.0["files_excluded"].as_u64().unwrap();
-            progress.files_total.fetch_add(
-                ordinary_done + ordinary_unchanged + ordinary_excluded,
-                Relaxed,
-            );
-            progress.files_done.store(ordinary_done, Relaxed);
-            progress.files_unchanged.store(ordinary_unchanged, Relaxed);
-            progress.files_excluded.store(ordinary_excluded, Relaxed);
-            progress
-                .bytes_total
-                .store(totals.0["bytes_transferred"].as_u64().unwrap(), Relaxed);
-            progress
-                .bytes_unchanged
-                .store(totals.0["bytes_unchanged"].as_u64().unwrap(), Relaxed);
-            let ticker = progress.spawn_ticker();
-            let result = runtime.block_on(async {
-            let cancelled = Arc::new(AtomicBool::new(false));
-            let mut signals = crate::process::signals::interrupt_and_terminate()?;
-        let (sigint, term) = &mut *signals;
-            let entries = stream::iter(manifest.callbacks).map(|entry| {
-                let cancelled = cancelled.clone();
-                let channel = channel.clone();
-                let progress = progress.clone();
-                let writer = writer.clone();
-                let resources = resources.clone();
-                let sessions = &sessions;
-                async move {
-                    let mut controls = entry_controls(args, &entry, Some(writer));
-                    controls.parent_progress = Some(progress);
-                    controls.share_bandwidth(resources.bandwidth());
-                    let controls = Arc::new(controls);
-                    let payload = Arc::new(Payload::new(channel, entry.id));
-                    let local_cancel = Arc::new(AtomicBool::new(false));
-                    let result = if cancelled.load(Relaxed) { Err(anyhow::anyhow!("stream mapping cancelled before callback admission")) } else {
-                        let operation = sessions.execute(args, entry, controls.clone(), payload.clone(), local_cancel.clone(), resources.budget.clone());
-                        tokio::pin!(operation);
-                        tokio::select! {
-                            result = &mut operation => result,
-                            _ = async { while !cancelled.load(Relaxed) { tokio::time::sleep(std::time::Duration::from_millis(50)).await; } } => {
-                                local_cancel.store(true, Relaxed);
-                                operation.await
-                            }
-                        }
-                    };
-                    let result = result.and_then(|()| payload.transferred(None));
-                    if let Err(error) = &result { let _ = payload.transferred(Some(error)); }
-                    controls.finish(result.as_ref().err());
-                    (controls, result.is_ok())
-                }
-            }).buffer_unordered(args.stream_concurrency);
-            tokio::pin!(entries);
-            let signal = async { tokio::select! { _ = sigint.recv() => {}, _ = term.recv() => {} } };
-            tokio::pin!(signal);
-            loop {
-                let next = tokio::select! {
-                    next = entries.next() => next,
-                    _ = &mut signal, if !cancelled.load(Relaxed) => { cancelled.store(true, Relaxed); continue; }
-                };
-                let Some((controls, success)) = next else { break; };
-                let skipped = success && controls.report.skipped();
-                totals.add("files_transferred", u64::from(success && !skipped));
-                totals.add("files_excluded", u64::from(skipped));
-                totals.add("errors", u64::from(!success));
-                totals.add("bytes_transferred", controls.progress.bytes_done.load(Relaxed));
-                progress.files_done.fetch_add(u64::from(success && !skipped), Relaxed);
-                progress.files_excluded.fetch_add(u64::from(skipped), Relaxed);
-                progress.errors.fetch_add(u64::from(!success), Relaxed);
-            }
-            Ok::<_, anyhow::Error>(())
-        });
-            progress.stop();
-            if let Some(ticker) = ticker {
-                let _ = ticker.join();
-            }
-            if args.stats && !args.quiet {
-                crate::output::diagnostic!("mapping complete: {} bytes transferred, {} unchanged files, {} excluded files, {} errors", totals.0["bytes_transferred"], totals.0["files_unchanged"], totals.0["files_excluded"], totals.0["errors"]);
-            }
-            result
+            let callbacks = Callbacks {
+                channel: &channel,
+                sessions: &sessions,
+                resources: &resources,
+                writer: &writer,
+            };
+            run_callback_phase(args, &runtime, manifest.callbacks, callbacks, totals)
         })();
         runtime.block_on(sessions.cleanup_storage(args));
         result
     })();
     let ended = channel.send(channel::Message::End, &[]);
     outcome.and(ended)
+}
+
+fn read_manifest(args: &Args) -> Result<manifest::Manifest> {
+    let mut contents = Vec::new();
+    let path = args
+        .native_mapping
+        .as_deref()
+        .context("missing stream mapping manifest")?;
+    if path == b"-" {
+        std::io::stdin().read_to_end(&mut contents)?;
+    } else {
+        crate::fsops::open_operator_file_read(
+            path,
+            if args.native_follow {
+                crate::proto::OperatorSymlinkPolicy::FollowAll
+            } else {
+                crate::proto::OperatorSymlinkPolicy::Refuse
+            },
+        )?
+        .read_to_end(&mut contents)?;
+    }
+    let manifest = manifest::parse(&contents)?;
+    validate(args, &manifest)?;
+    Ok(manifest)
+}
+
+/// Copy the manifest's pathname entries as one ordinary copy, whose records
+/// join this stream and whose totals start the run's. `callback_paths` says
+/// whether callback entries also write under the destination.
+fn run_pathname_phase(
+    args: &Args,
+    paths: crate::mapping::ParsedManifest,
+    callback_paths: bool,
+    writer: &Arc<ResultsWriter>,
+    totals: &mut Totals,
+) -> Result<()> {
+    let mut ordinary = args.clone();
+    ordinary.stream_mapping_fd = None;
+    if callback_paths {
+        ordinary.target_existence = Existence::Any;
+    }
+    ordinary.parsed_mapping = Some(Arc::new(paths));
+    let phase = ResultsWriter::phase(writer.clone());
+    ordinary.results_override = Some(phase.clone());
+    ordinary.suppress_summary = true;
+    let result = if ordinary.s3.is_some() {
+        crate::s3::run(ordinary)
+    } else {
+        crate::transfer::run(ordinary)
+    };
+    if let Some(record) = phase.take_phase_result() {
+        totals.phase(&record);
+    }
+    let code = result?;
+    ensure!(
+        code == 0 || code == 23,
+        "pathname phase failed with exit status {code}"
+    );
+    Ok(())
+}
+
+/// What the callback entries share.
+struct Callbacks<'a> {
+    channel: &'a Arc<channel::Channel>,
+    sessions: &'a Sessions,
+    resources: &'a Arc<copy::session::Resources>,
+    writer: &'a Arc<ResultsWriter>,
+}
+
+/// Run the callback entries concurrently over the shared sessions, adding
+/// each one's outcome to `totals`. A signal cancels the entries running and
+/// fails those not yet admitted.
+fn run_callback_phase(
+    args: &Args,
+    runtime: &tokio::runtime::Runtime,
+    entries: Vec<Entry>,
+    shared: Callbacks<'_>,
+    totals: &mut Totals,
+) -> Result<()> {
+    let mut progress =
+        crate::progress::Progress::new(!args.quiet && !args.no_progress, args.progress, None);
+    Arc::get_mut(&mut progress).unwrap().stream = true;
+    progress.set_results(shared.writer.clone());
+    let ordinary = &totals.0;
+    progress.files_total.store(entries.len() as u64, Relaxed);
+    progress.files_total.fetch_add(
+        ordinary.files_transferred + ordinary.files_unchanged + ordinary.files_excluded,
+        Relaxed,
+    );
+    progress
+        .files_done
+        .store(ordinary.files_transferred, Relaxed);
+    progress
+        .files_unchanged
+        .store(ordinary.files_unchanged, Relaxed);
+    progress
+        .files_excluded
+        .store(ordinary.files_excluded, Relaxed);
+    progress
+        .bytes_done
+        .store(ordinary.bytes_transferred, Relaxed);
+    progress
+        .bytes_total
+        .store(ordinary.bytes_transferred, Relaxed);
+    progress
+        .bytes_unchanged
+        .store(ordinary.bytes_unchanged, Relaxed);
+    let ticker = progress.spawn_ticker();
+    let result = runtime.block_on(async {
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        let mut signals = crate::process::signals::interrupt_and_terminate()?;
+        let (sigint, term) = &mut *signals;
+        let entries = stream::iter(entries)
+            .map(|entry| run_callback(args, entry, &shared, &progress, cancelled.clone()))
+            .buffer_unordered(args.stream_concurrency);
+        tokio::pin!(entries);
+        let signal = async {
+            tokio::select! {
+                _ = sigint.recv() => {},
+                _ = term.recv() => {},
+            }
+        };
+        tokio::pin!(signal);
+        loop {
+            let next = tokio::select! {
+                next = entries.next() => next,
+                _ = &mut signal, if !*cancel.borrow() => {
+                    cancel.send_replace(true);
+                    continue;
+                }
+            };
+            let Some((controls, success)) = next else {
+                break;
+            };
+            let skipped = success && controls.report.skipped();
+            let totals = &mut totals.0;
+            totals.files_transferred += u64::from(success && !skipped);
+            totals.files_excluded += u64::from(skipped);
+            totals.errors += u64::from(!success);
+            totals.bytes_transferred += controls.progress.bytes_done.load(Relaxed);
+            progress
+                .files_done
+                .fetch_add(u64::from(success && !skipped), Relaxed);
+            progress
+                .files_excluded
+                .fetch_add(u64::from(skipped), Relaxed);
+            progress.errors.fetch_add(u64::from(!success), Relaxed);
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+    progress.stop();
+    if let Some(ticker) = ticker {
+        let _ = ticker.join();
+    }
+    if args.stats && !args.quiet {
+        let totals = &totals.0;
+        crate::output::diagnostic!(
+            "mapping complete: {} bytes transferred, {} unchanged files, {} excluded files, {} errors",
+            totals.bytes_transferred,
+            totals.files_unchanged,
+            totals.files_excluded,
+            totals.errors
+        );
+    }
+    result
+}
+
+/// One callback entry, which a cancellation before its admission fails and
+/// one after it stops.
+async fn run_callback(
+    args: &Args,
+    entry: Entry,
+    shared: &Callbacks<'_>,
+    progress: &Arc<crate::progress::Progress>,
+    mut cancelled: tokio::sync::watch::Receiver<bool>,
+) -> (Arc<Controls>, bool) {
+    let mut controls = entry_controls(args, &entry, Some(shared.writer.clone()));
+    controls.parent_progress = Some(progress.clone());
+    controls.share_bandwidth(shared.resources.bandwidth());
+    let controls = Arc::new(controls);
+    let payload = Arc::new(Payload::new(shared.channel.clone(), entry.id));
+    let local_cancel = Arc::new(AtomicBool::new(false));
+    let result = if *cancelled.borrow() {
+        Err(anyhow::anyhow!(
+            "stream mapping cancelled before callback admission"
+        ))
+    } else {
+        let operation = shared.sessions.execute(
+            args,
+            entry,
+            controls.clone(),
+            payload.clone(),
+            local_cancel.clone(),
+            shared.resources.budget.clone(),
+        );
+        tokio::pin!(operation);
+        tokio::select! {
+            result = &mut operation => result,
+            // The sender outlives every entry, so this ends only on a
+            // cancellation.
+            // Drop the borrow wait_for returns at once: it holds the
+            // channel's read lock.
+            _ = async { drop(cancelled.wait_for(|cancelled| *cancelled).await) } => {
+                local_cancel.store(true, Relaxed);
+                operation.await
+            }
+        }
+    };
+    let result = result.and_then(|()| payload.transferred(None));
+    if let Err(error) = &result {
+        let _ = payload.transferred(Some(error));
+    }
+    controls.finish(result.as_ref().err());
+    (controls, result.is_ok())
 }
 
 fn entry_controls(args: &Args, entry: &Entry, writer: Option<Arc<ResultsWriter>>) -> Controls {

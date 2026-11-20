@@ -11,11 +11,10 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -755,9 +754,6 @@ pub(crate) fn stop_all(domain: &Domain) -> Result<()> {
         }
         std::thread::sleep(POLL);
     }
-    if let Err(error) = resolution::wait(domain) {
-        errors.push(format!("{error:#}"));
-    }
     if let Err(error) = cleanup::wait_for_keepers(domain) {
         errors.push(format!("{error:#}"));
     }
@@ -841,16 +837,6 @@ pub(super) fn command(
     endpoint.host = request.destination.host.clone();
     command.args(request.ssh_arguments(&endpoint)?);
     Ok(Some(command))
-}
-
-struct Starting(Option<Child>);
-impl Drop for Starting {
-    fn drop(&mut self) {
-        if let Some(child) = &mut self.0 {
-            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
-            let _ = child.wait();
-        }
-    }
 }
 
 pub(crate) fn connect(domain: &Domain, request: SessionRequest) -> Result<()> {
@@ -963,21 +949,13 @@ fn start(domain: &Domain, request: SessionRequest, plan: resolution::Plan) -> Re
         },
     };
     let signals = foreground::Signals::new()?;
-    let (mut parent, child) = crate::process::with_inheritance_guard(UnixStream::pair)?;
     let mut command = crate::process::self_command()?;
-    use std::os::unix::process::CommandExt as _;
-    command
-        .arg(INTERNAL)
-        .process_group(0)
-        .stdin(Stdio::from(File::from(OwnedFd::from(child.try_clone()?))))
-        .stdout(Stdio::from(File::from(OwnedFd::from(child))))
-        .stderr(Stdio::null());
+    command.arg(INTERNAL).stderr(Stdio::null());
     protect_keeper_inheritance(&mut command)?;
-    let mut process = Starting(Some(command.spawn_guarded()?));
-    // The command holds this process's copy of the keeper's end. Close it so
-    // the reader below sees the keeper's end close when the keeper is
-    // stopped; otherwise an interrupted wait never returns.
-    drop(command);
+    // The reader below sees the keeper's end close when the keeper is
+    // stopped, which ends an interrupted wait.
+    let (keeper, mut parent) =
+        crate::process::spawn_detached(command, crate::process::Detach::Group, true, None)?;
     super::super::write_message(&mut parent, &startup)?;
     let (sender, receiver) = std::sync::mpsc::sync_channel(2);
     let reader = std::thread::spawn(move || loop {
@@ -1027,12 +1005,10 @@ fn start(domain: &Domain, request: SessionRequest, plan: resolution::Plan) -> Re
         }
     };
     if result.as_ref().is_ok_and(|reply| reply.is_ok()) {
-        let mut child = process.0.take().unwrap();
-        std::thread::spawn(move || {
-            let _ = child.wait();
-        });
+        keeper.detach();
+    } else {
+        drop(keeper);
     }
-    drop(process);
     // A reader with messages nobody receives must not block on the channel.
     drop(receiver);
     let _ = reader.join();
@@ -1929,7 +1905,7 @@ mod tests {
 
     #[test]
     fn keeper_does_not_inherit_caller_payload_descriptors() {
-        use std::os::fd::FromRawFd;
+        use std::os::fd::{FromRawFd, OwnedFd};
         let root = crate::test_support::tempdir().unwrap();
         let file = File::create(root.path().join("caller-output")).unwrap();
         // F_DUPFD deliberately creates a caller-style inheritable descriptor.

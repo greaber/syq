@@ -91,6 +91,7 @@ mod paths;
 mod receiver_mode;
 mod sidecars;
 mod small_batch;
+mod source_selection;
 mod stages;
 pub(crate) mod vouch;
 
@@ -113,6 +114,7 @@ pub(crate) use sidecars::{
 };
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use small_batch::with_coarse_change_times;
+pub(crate) use source_selection::{PinnedSource, SourceSelector};
 
 /// Whether this receiver trusts read leases on the filesystem of `file`
 /// (`leases`), for tests outside these modules.
@@ -2026,7 +2028,7 @@ impl FsOps {
             relative: partial,
             label,
             file,
-            ..
+            opened,
         } = self.open_stage(
             &rooted,
             copy_id,
@@ -2034,7 +2036,7 @@ impl FsOps {
         )?;
         observed_write(&self.operation, &file, data, 0, false)
             .with_context(|| format!("write {}", label.display()))?;
-        check_destination_writes(&file, &label)?;
+        check_written_file(&rooted.root, opened.dev(), &file, &label)?;
         set_meta_file(&file, meta, flags)
             .with_context(|| format!("set metadata {}", label.display()))?;
         // `publish_partial_rooted` re-checks the staged name against the open
@@ -2112,140 +2114,26 @@ impl FsOps {
                 Ok(resolve(&selection.path))
             })
             .collect::<Result<Vec<_>>>()?;
-        let needs_base = base.confined || paths.iter().any(|path| !path.is_absolute());
-        let relative_resolver = if needs_base {
-            let base_path = resolve(base.path.as_deref().unwrap_or(b"."));
-            let mut base_hops = Vec::new();
-            let directory = |pinned: Result<PinnedPath>| -> Result<_> {
-                match pinned
-                    .with_context(|| format!("resolve source base {}", base_path.display()))?
-                {
-                    PinnedPath::Directory(directory) => Ok(directory.into_parts().0),
-                    PinnedPath::Leaf(_) | PinnedPath::OpenFile(_) => {
-                        bail!("source base {} is not a directory", base_path.display())
-                    }
-                    PinnedPath::Missing(_) => {
-                        unreachable!("source base resolution requires an existing directory")
-                    }
-                }
-            };
-            let base_directory = match &self.source_outer_root {
-                None => directory(OperatorResolver::resolve_process(
-                    base_path.as_os_str().as_bytes(),
-                    symlink_policy,
-                    OperatorFinalComponent::Directory,
-                    false,
-                    &mut base_hops,
-                ))?,
-                Some(outer) => {
-                    let outer = Path::new(OsStr::from_bytes(outer));
-                    let inside = base_path.strip_prefix(outer).with_context(|| {
-                        format!("source base {} is outside its root", base_path.display())
-                    })?;
-                    let outer_directory = directory(OperatorResolver::resolve_process(
-                        outer.as_os_str().as_bytes(),
-                        OperatorSymlinkPolicy::Refuse,
-                        OperatorFinalComponent::Directory,
-                        false,
-                        &mut Vec::new(),
-                    ))?;
-                    if inside.as_os_str().is_empty() {
-                        outer_directory
-                    } else {
-                        directory(
-                            OperatorResolver::beneath(&outer_directory, true, symlink_policy)?
-                                .resolve(
-                                    inside.as_os_str().as_bytes(),
-                                    OperatorFinalComponent::Directory,
-                                    false,
-                                    &mut base_hops,
-                                ),
-                        )?
-                    }
-                }
-            };
-            Some(OperatorResolver::beneath(
-                &base_directory,
-                base.confined,
-                symlink_policy,
-            )?)
-        } else {
-            None
-        };
+        let needs_base = paths.iter().any(|path| !path.is_absolute());
+        let selector = SourceSelector::new(
+            "source base",
+            base,
+            self.source_outer_root.as_deref(),
+            symlink_policy,
+            needs_base,
+        )?;
         let mut resolved = Vec::with_capacity(selections.len());
         for (selection, path) in selections.iter().zip(paths) {
-            let mut hops = Vec::new();
-            let pinned = if path.is_absolute() {
-                if base.confined {
-                    bail!(
-                        "source selector {} beneath --root must be relative",
-                        path.display()
-                    );
-                }
-                OperatorResolver::resolve_process(
-                    path.as_os_str().as_bytes(),
-                    symlink_policy,
-                    OperatorFinalComponent::Entry {
-                        follow_symlink: selection.follow_root,
-                    },
-                    false,
-                    &mut hops,
-                )
-            } else {
-                relative_resolver
-                    .as_ref()
-                    .expect("relative source selection requires a pinned base")
-                    .resolve(
-                        path.as_os_str().as_bytes(),
-                        OperatorFinalComponent::Entry {
-                            follow_symlink: selection.follow_root,
-                        },
-                        false,
-                        &mut hops,
-                    )
-            };
-            let pinned =
-                pinned.with_context(|| format!("resolve source selection {}", path.display()))?;
-            match pinned {
-                PinnedPath::Directory(directory) => {
-                    let (directory, _) = directory.into_parts();
-                    resolved.push((directory, Vec::new(), None, None));
-                }
-                PinnedPath::Leaf(leaf) => {
-                    let (parent, name, metadata, object) = leaf.into_parts();
-                    if object.is_none() && !metadata.is_fifo() {
-                        bail!("this platform cannot retain the selected source leaf safely");
-                    }
-                    let symlink_target = if metadata.is_symlink() {
-                        Some(
-                            read_open_symlink(object.as_ref().expect("symlink object was checked"))?
-                                .context("this platform cannot snapshot a selected source symlink through its pinned object (macOS 13 or newer is required on Darwin)")?,
-                        )
-                    } else {
-                        None
-                    };
-                    resolved.push((
-                        parent,
-                        name.as_bytes().to_vec(),
-                        Some(SourceLeafIdentity {
-                            dev: metadata.dev,
-                            ino: metadata.ino,
-                            file_type: metadata.file_type(),
-                            symlink_atime: (metadata.is_symlink()
-                                && self.inode_preservation.atimes)
-                                .then_some(metadata.atime),
-                            symlink_target,
-                        }),
-                        object,
-                    ));
-                }
-                PinnedPath::Missing(_) => {
-                    unreachable!("source resolution did not allow a missing suffix")
-                }
-                PinnedPath::OpenFile(_) => {
-                    unreachable!("source resolution never opens a procfs control input")
-                }
-            }
+            let pinned = selector.resolve(&path, selection.follow_root, || {
+                format!("resolve source selection {}", path.display())
+            })?;
+            let source = PinnedSource::new(pinned, self.inode_preservation.atimes)?;
+            resolved.push((
+                source.directory,
+                source.relative,
+                source.expected_leaf,
+                source.object,
+            ));
         }
 
         let registrations: Vec<_> = resolved
@@ -3220,6 +3108,7 @@ impl FsOps {
         paths: &[PathBytes],
         sources: Option<&[RegisteredPath]>,
         follow: bool,
+        read_here: bool,
     ) -> Result<Vec<Option<Entry>>> {
         if let Some(sources) = sources {
             if self.destination_root.is_some() {
@@ -3248,7 +3137,14 @@ impl FsOps {
             // `follow` describes the legacy pathname request. A registered
             // selection has already applied the operator-root policy, and no
             // descendant component gains symlink-traversal authority here.
-            let results = parallel_map_init(
+            // Sources this thread has just read, one at a time, are statted
+            // on it too. Every worker rechecks its batches at once, so the
+            // pool's threads would mostly look for work, at several times the
+            // cost of the stats: a file just read usually still has its
+            // attributes cached, on a network filesystem as well.
+            let minimum = if read_here { usize::MAX } else { PAR_MIN };
+            let results = parallel_map_init_from(
+                minimum,
                 &targets,
                 || None,
                 |parent, (_, _, source, target)| {
@@ -3377,6 +3273,16 @@ impl FsOps {
         parallel_minimum(
             short && self.destination_on_network_file_system(&paths.collect::<Vec<_>>()),
         )
+    }
+
+    /// A receiver whose destination root is the existing directory `root`,
+    /// reached by that spelling. Its methods take paths relative to `root`.
+    #[cfg(test)]
+    pub(crate) fn rooted_for_test(root: &Path) -> Self {
+        let mut ops = Self::new();
+        ops.destination_root = Some(Arc::new(Root::open(root).unwrap()));
+        ops.destination_prefix = Some(path_bytes(root));
+        ops
     }
 
     /// Ops within a batch run in parallel, except that a creation waits for
@@ -4044,17 +3950,15 @@ fn parallel_by_directory<R: Send>(
         .collect()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Batches the current thread has handed to the metadata pool.
+    static POOLED_BATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 // State belongs to one bounded input chunk and is discarded before returning.
 // Metadata lookups can reuse a held parent for adjacent siblings, while later
 // requests resolve the namespace afresh. No state is shared between workers.
-fn parallel_map_init<T: Sync, R: Send, S>(
-    items: &[T],
-    init: impl Fn() -> S + Sync,
-    f: impl Fn(&mut S, &T) -> R + Sync,
-) -> Vec<R> {
-    parallel_map_init_from(PAR_MIN, items, init, f)
-}
-
 fn parallel_map_init_from<T: Sync, R: Send, S>(
     minimum: usize,
     items: &[T],
@@ -4069,6 +3973,8 @@ fn parallel_map_init_from<T: Sync, R: Send, S>(
         let mut state = init();
         return items.iter().map(|item| f(&mut state, item)).collect();
     };
+    #[cfg(test)]
+    POOLED_BATCHES.with(|batches| batches.set(batches.get() + 1));
     let chunk = items.len().div_ceil(PAR_THREADS).max(1);
     use rayon::prelude::*;
     pool.install(|| {

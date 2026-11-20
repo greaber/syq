@@ -25,7 +25,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use crate::delegation::{CopyOperation, DestinationPlacement, GrantConstraints};
+use crate::delegation::{DestinationPlacement, DestinationRules};
 use crate::lock_file::LockFile;
 use crate::private_broker::{BrokerDirectory, PrivateBroker, PrivateBrokerConfig, TrackedStream};
 
@@ -34,10 +34,11 @@ pub(crate) mod approve;
 pub(crate) mod exec;
 pub(crate) mod forward;
 pub(crate) mod notices;
-pub(crate) use forward::{DeadlineIo, HandshakeInput};
+pub(crate) use forward::DeadlineIo;
 pub(crate) mod handoff;
 mod identity;
 pub(crate) mod pull;
+mod request;
 pub(crate) mod send;
 pub(crate) mod ssh;
 pub(crate) mod ssh_auth;
@@ -187,8 +188,7 @@ pub(crate) fn run_command(command: Destinations) -> Result<i32> {
 pub(crate) struct CopyRequest {
     /// The destination as the command names it.
     pub destination: Vec<u8>,
-    pub copy: CopyOperation,
-    pub constraints: GrantConstraints,
+    pub rules: DestinationRules,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -247,27 +247,12 @@ enum Message {
         cwd: String,
         request: Box<crate::s3::authorization::Request>,
     },
-    /// A copy from the requesting server to this machine. This machine
-    /// derives what the copy may do from its command.
-    Request {
-        command: Vec<Vec<u8>>,
-        #[serde(default)]
-        cwd: String,
-        inputs: crate::directive::Inputs,
-    },
-    /// A copy from another server to the requesting server, which this
-    /// machine approves with a directive for the source's enrolled receiver.
-    Pull(Box<pull::ReadRequest>),
-    /// A copy of files on this machine to the requesting server. This
-    /// machine derives what the copy may read from its command.
-    Send {
-        command: Vec<Vec<u8>>,
-        cwd: String,
-    },
-    /// A copy from the requesting server to another server, or between two
-    /// other servers, which this machine approves with directives for their
-    /// enrolled receivers.
-    Forward(Box<forward::ForwardRequest>),
+    /// A copy another machine approves: to or from this machine, or
+    /// between the requesting server and another, or two other servers,
+    /// which this machine approves with directives for their enrolled
+    /// receivers. This machine classifies the route and derives what the
+    /// copy may do from its command.
+    Copy(Box<approve::Asked>),
     Open {
         token: String,
         control: bool,
@@ -276,8 +261,7 @@ enum Message {
 #[derive(Serialize, Deserialize)]
 enum Reply {
     RetryableError(String),
-    Directive(Box<forward::Issued>),
-    SourceDirective(Box<pull::Issued>),
+    Signed(Box<forward::Issued>),
     TcpProbed(Vec<crate::conn::TcpCandidate>),
     TcpCongestionRejected(String),
     Ready,
@@ -984,17 +968,6 @@ pub(crate) fn home_directory() -> Option<(PathBuf, PathBuf)> {
     named.is_absolute().then_some((named, real))
 }
 
-/// The SSH destination a copy through the receiving machine's access would use.
-pub(crate) fn forward_target(args: &crate::cli::Args) -> Result<String> {
-    forward::eligible_target(args)
-}
-
-/// The source and destination of a copy between two servers that a
-/// receiving machine could approve.
-pub(crate) fn coordinated_targets(args: &crate::cli::Args) -> Result<(String, String)> {
-    forward::eligible_peer(args)
-}
-
 /// Plan deletions against the approving machine's own --max-delete, or the
 /// command's if lower, so that pruning stays all or nothing, and note when
 /// the machine's limit is the one in effect.
@@ -1114,7 +1087,6 @@ fn select_copy(
         name,
         registration,
         handoff::Kind::Copy,
-        None,
     )))
 }
 
@@ -1123,54 +1095,67 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
         Some(selection) => selection,
         None => select_copy(args, None)?,
     };
-    let Some(selection) = selection else {
+    let approving = match selection {
+        Some(selection) => {
+            handoff::check_selection(&selection)?;
+            request::Approving::Return {
+                name: selection.name,
+                registration: selection.registration,
+            }
+        }
         // An SSH authorization provider approves a copy between two
         // servers that the command selected it for; other copies without a
         // receiving machine use SSH access, their own or approved.
-        return forward::prepare_through_provider(args);
+        None => match forward::approving_provider(args) {
+            Some(provider) => request::Approving::Provider(provider),
+            None => return Ok(()),
+        },
     };
-    handoff::check_selection(&selection)?;
-    if selection.kind == handoff::Kind::Pull {
-        return pull::prepare(args, selection);
-    }
-    if selection.kind == handoff::Kind::Send {
-        return send::prepare(args, selection);
-    }
-    if selection.kind == handoff::Kind::Forward {
-        return forward::prepare(args, selection);
-    }
-    let handoff::Selection {
-        name, registration, ..
-    } = selection;
-    // Refuse here, before asking, what the receiving machine would refuse
-    // in the command alone, such as an out-of-range limit or too many
-    // sources: it derives the copy's rules the same way.
-    let (_, sources) = args
-        .locations
-        .split_last()
-        .context("copy endpoints missing")?;
-    crate::directive::copy_operation(args, sources, &request_path(b".")?)?;
-    let command = crate::approval_command::copy_command(args)?;
-    let inputs = crate::directive::Inputs {
-        ignore: args.ignore_lines.clone(),
-        mapping: crate::directive::mapping_authorization(args)?,
-    };
-    notices::waiting(&format!("@{name}"), "this copy");
-    let cwd = crate::approval_command::current_directory();
+    request::prepare(args, approving)
+}
+
+/// Write to the receiving machine `name`, as it approved.
+fn apply_to_named(
+    args: &mut crate::cli::Args,
+    name: &str,
+    registration: Registration,
+    approved: Approved,
+) -> Result<()> {
+    apply_deletion_limit(args, approved.max_delete);
+    let destination = args.locations.last_mut().unwrap();
+    destination.path = approved.destination;
+    destination.host = Some(format!("@{name}"));
+    args.restricted_grant = Some(format!(
+        "{PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&Route {
+            registration,
+            token: approved.token,
+        })?)
+    ));
+    Ok(())
+}
+
+/// Send `asked` to the receiving machine `name`, registered here as
+/// `registration`, and read its reply within `timeout`. Return the
+/// registration that answered.
+fn ask_named(
+    name: &str,
+    registration: Registration,
+    asked: &approve::Asked,
+    timeout: Duration,
+) -> Result<(Registration, Reply)> {
     let ask = |registration: &Registration| {
         exchange(
             registration,
-            Message::Request {
-                command: command.clone(),
-                cwd: cwd.clone(),
-                inputs: inputs.clone(),
-            },
-            REQUEST_TIMEOUT + Duration::from_secs(10),
+            Message::Copy(Box::new(asked.clone())),
+            timeout,
             None,
         )
+        // The copy needs nothing more from this connection.
+        .map(|(_, reply)| reply)
     };
-    let (registration, reply) = match ask(&registration) {
-        Ok((_, reply)) => (registration, reply),
+    match ask(&registration) {
+        Ok(reply) => Ok((registration, reply)),
         // The receiving machine may have switched its connection to another
         // syq build since this command chose it, as after an update, while
         // the command read its input: the connection it chose is gone or
@@ -1188,7 +1173,7 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
                     Duration::ZERO
                 };
             let current = loop {
-                match load_registration(&name) {
+                match load_registration(name) {
                     Ok(current)
                         if (&current.socket, &current.secret)
                             != (&registration.socket, &registration.secret) =>
@@ -1204,25 +1189,11 @@ pub(crate) fn prepare(args: &mut crate::cli::Args) -> Result<()> {
                 "@{name} switched to syq {} while this command was starting; run the command again",
                 current.identity
             );
-            let (_, reply) = ask(&current)?;
-            (current, reply)
+            let reply = ask(&current)?;
+            Ok((current, reply))
         }
-        Err(error) => return Err(error),
-    };
-    let Reply::Approved(approved) = reply else {
-        bail!("unexpected named destination response");
-    };
-    apply_deletion_limit(args, approved.max_delete);
-    args.locations.last_mut().unwrap().path = approved.destination.clone();
-    args.locations.last_mut().unwrap().host = Some(format!("@{name}"));
-    args.restricted_grant = Some(format!(
-        "{PREFIX}{}",
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&Route {
-            registration,
-            token: approved.token,
-        })?)
-    ));
-    Ok(())
+        Err(error) => Err(error),
+    }
 }
 
 /// How long a copy refused by a receiving connection stopping for a switch
@@ -1271,61 +1242,10 @@ fn decode_route(grant: &str) -> Result<Route> {
     )?)
 }
 
-/// What an approved copy may do here: write files it sends, or read files
-/// this machine sends.
-#[derive(Clone)]
-enum SessionAuthority {
-    Receive(Arc<crate::restricted::RestrictedAuthority>),
-    Send {
-        authority: Arc<crate::restricted::source::SourceAuthority>,
-        /// Shared by the copy's control and workers: workers can use only
-        /// the roots its control registered.
-        descriptors: crate::descriptor_broker::DescriptorSessionSlot,
-    },
-}
-/// What one open channel of a copy holds against its approved connections.
-#[allow(dead_code)]
-enum ChannelPermit {
-    Receive(crate::server::ConnectionPermit),
-    Send(crate::restricted::source::ChannelPermit),
-}
-
-impl SessionAuthority {
-    /// Count one channel against the approved connections before its hello.
-    /// A copy's own control does not count against a receiver's workers.
-    fn permit(&self, control: bool) -> Result<Option<ChannelPermit>> {
-        Ok(match self {
-            Self::Receive(_) if control => None,
-            Self::Receive(authority) => Some(ChannelPermit::Receive(
-                crate::server::ConnectionPermit::acquire(Arc::clone(authority))?,
-            )),
-            Self::Send { authority, .. } => Some(ChannelPermit::Send(authority.open_channel()?)),
-        })
-    }
-    #[cfg(test)]
-    fn receiving(&self) -> Arc<crate::restricted::RestrictedAuthority> {
-        match self {
-            Self::Receive(authority) => Arc::clone(authority),
-            Self::Send { .. } => panic!("not a receiving session"),
-        }
-    }
-    fn close(&self) {
-        match self {
-            Self::Receive(authority) => authority.close_control(),
-            Self::Send { authority, .. } => authority.close(),
-        }
-    }
-    fn is_open(&self) -> bool {
-        match self {
-            Self::Receive(authority) => authority.control_is_open(),
-            Self::Send { authority, .. } => authority.is_open(),
-        }
-    }
-}
-
 struct Session {
     tcp: Option<crate::conn::TcpInfo>,
-    authority: SessionAuthority,
+    /// What the approved copy may do here.
+    authority: crate::restricted::Checker,
     issued: Instant,
     opened: bool,
     channels: Arc<crate::private_broker::ConnectionRegistry>,
@@ -1459,46 +1379,7 @@ impl Receiver {
                 let proof = identity::prove(&self.identity_key, &name, &challenge, &self.secret)?;
                 write_message(&mut stream, &Reply::Identity(proof))
             }
-            Message::Pull(request) => {
-                let pull::ReadRequest {
-                    target,
-                    command,
-                    cwd,
-                    inputs,
-                } = *request;
-                self.approve(
-                    approve::Asked {
-                        command,
-                        cwd,
-                        inputs,
-                        ask: approve::Ask::Pull { target },
-                    },
-                    stream,
-                )
-            }
-            Message::Send { command, cwd } => self.approve(
-                approve::Asked {
-                    command,
-                    cwd,
-                    inputs: Default::default(),
-                    ask: approve::Ask::Send,
-                },
-                stream,
-            ),
-            Message::Forward(request) => self.approve((*request).into(), stream),
-            Message::Request {
-                command,
-                cwd,
-                inputs,
-            } => self.approve(
-                approve::Asked {
-                    command,
-                    cwd,
-                    inputs,
-                    ask: approve::Ask::Write,
-                },
-                stream,
-            ),
+            Message::Copy(asked) => self.approve(*asked, stream),
             Message::Open { token, control } => self.open(token, control, stream),
         }
     }
@@ -1538,21 +1419,7 @@ impl Receiver {
             // Keep the bounded Hello deadline until the server has
             // validated its complete handshake. Pending workers already
             // consume their per-transfer connection allowance.
-            match &authority {
-                SessionAuthority::Receive(authority) => {
-                    crate::server::run_named(stream, writer, Arc::clone(authority), control)
-                }
-                SessionAuthority::Send {
-                    authority,
-                    descriptors,
-                } => crate::server::run_named_source(
-                    stream,
-                    writer,
-                    Arc::clone(authority),
-                    descriptors.clone(),
-                    control,
-                ),
-            }
+            crate::server::run_named(stream, writer, authority.clone(), control)
         })();
         if control {
             // Opening consumes the token even if the reply fails. Do

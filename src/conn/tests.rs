@@ -2394,6 +2394,7 @@ fn a_pool_appearing_after_priming_is_not_queried_during_connect() {
     let directory = crate::test_support::short_tempdir().unwrap();
     let scope = directory.path().join("scope");
     crate::persistence::initialize_scope(&scope).unwrap();
+    let scope = crate::persistence::CheckedScope::check(&scope).unwrap();
     let multiplexer = SshMultiplexer::persistent(&scope, None, "example", None, None).unwrap();
     let socket = crate::session_pool::socket_path(&multiplexer.path);
     let mut spec = RemoteSpec::local_receiver(true);
@@ -2419,14 +2420,16 @@ fn persistent_reuse_uses_auto_master_and_never_shares_with_workers() {
     let directory = crate::test_support::short_tempdir().unwrap();
     let base = directory.path().join("scope");
     crate::persistence::initialize_scope(&base).unwrap();
+    let checked = crate::persistence::CheckedScope::check(&base).unwrap();
     // The socket name is stable per endpoint, and a dead leftover at the
     // path is cleared so a fresh master can bind.
-    let probe = SshMultiplexer::persistent(&base, Some("u"), "example", None, None).unwrap();
+    let probe = SshMultiplexer::persistent(&checked, Some("u"), "example", None, None).unwrap();
     std::fs::write(&probe.path, b"stale").unwrap();
-    let multiplexer = SshMultiplexer::persistent(&base, Some("u"), "example", None, None).unwrap();
+    let multiplexer =
+        SshMultiplexer::persistent(&checked, Some("u"), "example", None, None).unwrap();
     assert_eq!(probe.path, multiplexer.path);
     let alternate_port =
-        SshMultiplexer::persistent(&base, Some("u"), "example", Some(2222), None).unwrap();
+        SshMultiplexer::persistent(&checked, Some("u"), "example", Some(2222), None).unwrap();
     assert_ne!(multiplexer.path, alternate_port.path);
     assert!(!multiplexer.path.exists());
     assert_eq!(
@@ -3205,6 +3208,7 @@ fn only_connections_kept_after_the_command_forward_nothing() {
     let directory = crate::test_support::short_tempdir().unwrap();
     let base = directory.path().join("scope");
     crate::persistence::initialize_scope(&base).unwrap();
+    let checked = crate::persistence::CheckedScope::check(&base).unwrap();
     let spec = |multiplexer: Option<SshMultiplexer>| {
         let mut spec = RemoteSpec::local_receiver(false);
         spec.local_process = false;
@@ -3226,7 +3230,7 @@ fn only_connections_kept_after_the_command_forward_nothing() {
     // The master that persistence keeps, and a session that joins it: a
     // forwarded agent would stay usable on the server until `persist off`.
     let persistent = spec(Some(
-        SshMultiplexer::persistent(&base, None, "example", None, None).unwrap(),
+        SshMultiplexer::persistent(&checked, None, "example", None, None).unwrap(),
     ));
     let control = args(&persistent, SshConnection::Control);
     assert!(control.iter().any(|arg| arg == "ControlPersist=300"));
@@ -3634,6 +3638,38 @@ fn route_probes_give_up_on_a_silent_address_after_their_bound() {
     drop(listener);
 }
 
+/// A resolver that does not answer for the SSH target's name holds the
+/// probes no longer than the longest probe wait, and the advertised
+/// literal is still probed and found.
+#[test]
+fn a_silent_resolver_does_not_hold_up_route_probes() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let candidate = |address: &str, source| TcpCandidate {
+        address: address.into(),
+        speed_mbps: 0,
+        source,
+        reachable: None,
+        selected: false,
+        same_as_ssh_target: false,
+    };
+    let mut candidates = vec![
+        candidate("127.0.0.1", DataAddressSource::RemoteInterface),
+        candidate("ssh-target.invalid", DataAddressSource::SshTarget),
+    ];
+    let wait = std::time::Duration::from_millis(200);
+    let started = std::time::Instant::now();
+    probe_reachable_with(&mut candidates, port, wait, |_, _| {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        Vec::new()
+    })
+    .unwrap();
+    let elapsed = started.elapsed();
+    assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    assert_eq!(candidates[0].reachable, Some(true));
+    assert_ne!(candidates[1].reachable, Some(true));
+}
+
 #[test]
 fn a_kept_reply_reports_when_it_arrived_rather_than_when_it_was_taken() {
     let mut conn = connection_replaying(&[Response::Ok, Response::Err("later".into())]);
@@ -3735,4 +3771,184 @@ fn a_local_scan_without_a_registered_source_is_refused() {
         "{error:#}"
     );
     assert_eq!(entries, 0);
+}
+
+/// A connection over a socket pair whose peer the test plays: the replies
+/// it writes and the requests it reads.
+fn connection_with_peer() -> (
+    RemoteConn,
+    FrameWriter<std::os::unix::net::UnixStream>,
+    FrameReader<std::os::unix::net::UnixStream>,
+) {
+    let (client, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    let (rx, reader, batch_receipts) = spawn_observed_reader(
+        Box::new(client.try_clone().unwrap()),
+        4,
+        Some(1 << 20),
+        Default::default(),
+    )
+    .unwrap();
+    let mut replies = FrameWriter::new(peer.try_clone().unwrap(), false);
+    replies.write_msg(&hello_ok()).unwrap();
+    let conn = RemoteConn {
+        batch_receipts,
+        deferred: Default::default(),
+        transport_stop: None,
+        rpc_observation: None,
+        observation: Default::default(),
+        child: None,
+        approved_login: None,
+        worker_setup: None,
+        w: FrameWriter::new(Box::new(client.try_clone().unwrap()), false),
+        rx: Some(rx),
+        replies: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
+        reader: Some(reader),
+        label: "peer test".into(),
+        dead: false,
+        peer: None,
+        tcp_socket: None,
+        named_socket: Some(client),
+        multiplexed_ssh: false,
+        detached: false,
+        write_stream: None,
+    };
+    let conn = receive_hello(conn, true).unwrap();
+    (conn, replies, FrameReader::new(peer))
+}
+
+#[test]
+fn a_timed_request_is_not_waited_for_and_reports_its_round_trip_once_read() {
+    let configure = || Request::ConfigureHashing(crate::hashing::HashPolicy::default());
+    let (mut conn, mut replies, mut requests) = connection_with_peer();
+    // Nothing answers yet: sending must not wait, and no time is known.
+    let before_send = std::time::Instant::now();
+    assert_eq!(conn.send_timing_ok(configure(), "configure").unwrap(), None);
+    assert!(matches!(
+        requests.read_msg::<Request>().unwrap(),
+        Request::ConfigureHashing(_)
+    ));
+    assert_eq!(conn.take_timed_round_trip(), None);
+    let wait = std::time::Duration::from_millis(40);
+    std::thread::sleep(wait);
+    replies.write_msg(&Response::Ok).unwrap();
+    // A reply with file data behind it shows, without reading either, when
+    // the reader has taken both.
+    let data = vec![42; 16];
+    replies
+        .write_msg(&Response::Block {
+            off: 0,
+            hash: crate::fsops::content_digest(&data),
+            data,
+        })
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while conn.rx.as_ref().unwrap().queued_bytes() == 0 {
+        assert!(std::time::Instant::now() < deadline, "the reply never came");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let arrived_within = before_send.elapsed();
+    // The time ends when the reply arrives, however much later it is read.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let round_trip = conn
+        .take_timed_round_trip()
+        .expect("the arrived reply is read without a later one");
+    assert!(round_trip >= wait, "{round_trip:?}");
+    assert!(
+        round_trip <= arrived_within,
+        "{round_trip:?} includes the time until the reply was read"
+    );
+    assert_eq!(conn.take_timed_round_trip(), None, "reported once");
+    assert!(matches!(conn.recv().unwrap(), Response::Block { .. }));
+
+    // A later reply is read behind it as usual.
+    assert_eq!(conn.send_timing_ok(configure(), "configure").unwrap(), None);
+    replies.write_msg(&Response::Ok).unwrap();
+    replies.write_msg(&Response::Stats(vec![])).unwrap();
+    assert!(matches!(
+        conn.call(Request::Shutdown).unwrap(),
+        Response::Stats(_)
+    ));
+    assert!(conn.take_timed_round_trip().is_some());
+}
+
+#[test]
+fn taking_a_round_trip_reads_no_reply_behind_the_timed_one() {
+    let configure = || Request::ConfigureHashing(crate::hashing::HashPolicy::default());
+    let (mut conn, mut replies, _requests) = connection_with_peer();
+    conn.send_timing_ok(configure(), "configure").unwrap();
+    let later = conn.send_pending(Request::Shutdown).unwrap();
+    replies.write_msg(&Response::Ok).unwrap();
+    replies.write_msg(&Response::Stats(vec![])).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while conn.take_timed_round_trip().is_none() {
+        assert!(std::time::Instant::now() < deadline, "the reply never came");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    // Its caller takes the later reply, with any error it carries.
+    assert!(!conn.reply_arrived(&later));
+    assert_eq!(conn.take_timed_round_trip(), None);
+    assert!(!conn.reply_arrived(&later));
+    assert!(matches!(
+        conn.take_reply(later).unwrap(),
+        Response::Stats(_)
+    ));
+}
+
+#[test]
+fn a_refused_timed_request_fails_the_next_reply_read() {
+    let configure = || Request::ConfigureHashing(crate::hashing::HashPolicy::default());
+    let (mut conn, mut replies, _requests) = connection_with_peer();
+    conn.send_timing_ok(configure(), "configure hashing")
+        .unwrap();
+    replies
+        .write_msg(&Response::Err("hash policy differs".into()))
+        .unwrap();
+    replies.write_msg(&Response::Stats(vec![])).unwrap();
+    for _ in 0..2 {
+        let error = conn.call(Request::Shutdown).unwrap_err();
+        assert!(is_deferred_request_error(&error));
+        assert_eq!(
+            format!("{error:#}"),
+            "configure hashing: hash policy differs"
+        );
+    }
+}
+
+#[test]
+fn small_batches_start_without_waiting_for_a_configuration_reply() {
+    use crate::tune::Meter;
+    let configure = || Request::ConfigureHashing(crate::hashing::HashPolicy::default());
+    let (mut conn, mut replies, mut requests) = connection_with_peer();
+    conn.send_timing_ok(configure(), "configure").unwrap();
+    let progress = crate::progress::Progress::new(false, false, None);
+    // The configuration is unanswered: tracking must not wait for it.
+    let scope = conn.track_small_batches(progress.clone()).unwrap().unwrap();
+    conn.send(batch_progress::test_request(&[16])).unwrap();
+    assert!(matches!(
+        requests.read_msg::<Request>().unwrap(),
+        Request::ConfigureHashing(_)
+    ));
+    assert!(matches!(
+        requests.read_msg::<Request>().unwrap(),
+        Request::PutSmallBatch(_)
+    ));
+    // Its `Ok` is not the batch's receipt.
+    replies.write_msg(&Response::Ok).unwrap();
+    replies
+        .write_msg(&Response::PublishedBatch(vec![Ok(None)]))
+        .unwrap();
+    assert!(matches!(conn.recv().unwrap(), Response::PublishedBatch(_)));
+    assert_eq!(scope.received_count(), 1);
+    assert_eq!(Meter::bytes(&*progress), 16);
+    scope.consume().unwrap();
+    assert!(conn.take_timed_round_trip().is_some());
+
+    // A reply the caller will take is still read before batches start.
+    let (mut conn, mut replies, _requests) = connection_with_peer();
+    let pending = conn.send_pending(Request::Shutdown).unwrap();
+    replies.write_msg(&Response::Stats(vec![])).unwrap();
+    let _scope = conn.track_small_batches(progress).unwrap().unwrap();
+    assert!(conn.reply_arrived(&pending));
 }

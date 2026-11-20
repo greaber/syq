@@ -1023,3 +1023,74 @@ fn an_admission_goes_once_before_the_preamble() {
         .unwrap();
     assert!(plain_writer.starts_with(WIRE_PREAMBLE_MAGIC));
 }
+
+#[test]
+fn removal_results_go_in_messages_that_hold_them() {
+    let half = MAX_METADATA_FRAME / 2;
+    let messages =
+        |sizes: Vec<usize>| -> Vec<Vec<usize>> { native_remove_messages(sizes, |size| *size) };
+    // An empty batch is still sent: it shows the receiver is alive.
+    assert_eq!(messages(Vec::new()), [Vec::<usize>::new()]);
+    assert_eq!(messages(vec![1, 2, 3]), [vec![1, 2, 3]]);
+    // A message ends before the item that would pass half a frame.
+    assert_eq!(
+        messages(vec![half / 2, half / 2, 1, half]),
+        [vec![half / 2, half / 2], vec![1], vec![half]]
+    );
+    // An item larger than that goes alone.
+    assert_eq!(
+        messages(vec![1, half + 1, 2]),
+        [vec![1], vec![half + 1], vec![2]]
+    );
+}
+
+#[test]
+fn small_file_groups_end_where_their_failures_could_overfill_a_reply() {
+    // Where each group of `paths` ends: by `SmallFileReplies`, and by adding
+    // each path's exact budget.
+    let cuts = |paths: &[Vec<u8>]| {
+        let mut replies = SmallFileReplies::default();
+        let (mut start, mut cuts) = (0, Vec::new());
+        for (i, path) in paths.iter().enumerate() {
+            if i > start && !replies.fits(paths[start..i].iter().map(Vec::as_slice), path) {
+                cuts.push(i);
+                start = i;
+                replies.start();
+            }
+            replies.add(path);
+        }
+        cuts
+    };
+    let exact_cuts = |paths: &[Vec<u8>]| {
+        let (mut start, mut bytes, mut cuts) = (0, 0usize, Vec::new());
+        for (i, path) in paths.iter().enumerate() {
+            let hint = failed_small_file_hint(path);
+            if i > start && bytes + hint > METADATA_REPLY_BYTES {
+                cuts.push(i);
+                (start, bytes) = (i, 0);
+            }
+            bytes += hint;
+        }
+        cuts
+    };
+    let path = |len: usize, byte: u8| vec![byte; len];
+    // Ordinary paths: 2,048 go together up to 544 displayed bytes each.
+    assert!(cuts(&vec![path(544, b'a'); 2048]).is_empty());
+    let longer = vec![path(545, b'a'); 2048];
+    assert_eq!(cuts(&longer), [2045]);
+    assert_eq!(cuts(&longer), exact_cuts(&longer));
+    // Paths that are not UTF-8 show three bytes for each.
+    assert!(cuts(&vec![path(181, 0xff); 2048]).is_empty());
+    let longer = vec![path(182, 0xff); 2048];
+    assert!(!cuts(&longer).is_empty());
+    assert_eq!(cuts(&longer), exact_cuts(&longer));
+    // Mixed lengths and encodings cut where exact budgets would.
+    let mixed: Vec<Vec<u8>> = (0..6000)
+        .map(|index| {
+            let len = 20 + (index * 7919) % 4000;
+            path(len, if index % 3 == 0 { 0xff } else { b'a' })
+        })
+        .collect();
+    assert_eq!(cuts(&mixed), exact_cuts(&mixed));
+    assert!(!cuts(&mixed).is_empty());
+}

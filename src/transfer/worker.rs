@@ -41,6 +41,9 @@ pub(super) struct Worker {
     pub(super) fast_batch_files: usize,
     pub(super) batch_budget: WorkBudget,
     pub(super) range_budget: Option<WorkBudget>,
+    /// The round trips of the hashing configuration sent when the worker
+    /// started, until both replies have been read (`settle_setup_latency`).
+    pub(super) setup_latency: Option<SetupLatency>,
     /// Comparison sizes this worker has learned during the copy.
     pub(super) comparison: super::comparing::ComparisonSizing,
     pub(super) setup_elapsed: std::time::Duration,
@@ -129,6 +132,15 @@ impl Drop for PendingLogin {
     }
 }
 
+/// Each side's round trip for the hashing configuration a worker sends when
+/// it starts, once that side's reply has been read. A remote connection's
+/// reply is not waited for: it is read ahead of the first file's replies.
+#[derive(Default)]
+pub(super) struct SetupLatency {
+    src: Option<std::time::Duration>,
+    dst: Option<std::time::Duration>,
+}
+
 pub(super) struct BlockDiff {
     pub(super) ranges: Vec<(u64, u64)>,
     pub(super) held_len: Option<u64>,
@@ -147,10 +159,16 @@ impl Worker {
 
     pub(super) fn run(&mut self, setup: Option<crate::progress::Measuring<'_>>) -> Result<()> {
         let r = (|| {
-            let configure_start = std::time::Instant::now();
-            configure_hashing(&mut *self.src, self.opts.hash_policy)?;
-            configure_hashing(&mut *self.dst, self.opts.hash_policy)?;
-            self.batch_budget.set_latency(configure_start.elapsed());
+            // Neither reply is waited for on a remote connection: the first
+            // file's requests travel right behind, and a refusal fails the
+            // first reply read from that connection.
+            let configure = Request::ConfigureHashing(self.opts.hash_policy);
+            let src = self
+                .src
+                .send_timing_ok(configure.clone(), "configure hashing")?;
+            let dst = self.dst.send_timing_ok(configure, "configure hashing")?;
+            self.setup_latency = Some(SetupLatency { src, dst });
+            self.settle_setup_latency();
             if self.progress.observations.enabled.load(Relaxed) {
                 let actor = self.progress.observations.workers.actor("worker");
                 self.src
@@ -159,7 +177,7 @@ impl Worker {
                     .observe(&self.progress.observations, &actor, false, self.id)?;
                 self.observation = Some(actor);
             }
-            // A prepared connection must finish helper configuration before
+            // A prepared connection has sent its helper configuration before
             // the tuner can activate it or use its setup time as a forecast.
             self.gate.mark_ready(self.id);
             drop(setup);
@@ -180,6 +198,32 @@ impl Worker {
             self.abandon_publications(error);
         }
         r
+    }
+
+    /// Take the first latency allowance from the hashing configuration's
+    /// round trips, once the replies of both sides have been read: the sum,
+    /// as when each was waited for in turn. Returns it that once.
+    pub(super) fn settle_setup_latency(&mut self) -> Option<std::time::Duration> {
+        let setup = self.setup_latency.as_mut()?;
+        if setup.src.is_none() {
+            setup.src = self.src.take_timed_round_trip();
+        }
+        if setup.dst.is_none() {
+            setup.dst = self.dst.take_timed_round_trip();
+        }
+        let round_trip = setup.src? + setup.dst?;
+        self.setup_latency = None;
+        self.apply_setup_latency(round_trip);
+        Some(round_trip)
+    }
+
+    /// Start the latency allowance from `round_trip`: for small-file
+    /// batches, and for a range allowance kept from before it was known.
+    fn apply_setup_latency(&mut self, round_trip: std::time::Duration) {
+        self.batch_budget.set_latency(round_trip);
+        if let Some(budget) = &mut self.range_budget {
+            budget.set_latency(round_trip);
+        }
     }
 
     pub(super) fn transport_dead(&self) -> bool {
@@ -357,12 +401,21 @@ impl Worker {
             }
             return self.leave_shared_login(format_args!("{error:#}"));
         }
+        // The shared sessions hold the setup round trips read on them until
+        // the worker takes them: take them before those sessions close.
+        self.settle_setup_latency();
         self.on_shared_login = false;
         for (source, new) in [(true, src), (false, dst)] {
             if let Some(new) = new {
                 let old = if source { &mut self.src } else { &mut self.dst };
                 std::mem::replace(old, new).detach();
             }
+        }
+        // A session that closed before its setup reply was read gives no
+        // round trip. The allowance then starts from the other side's alone
+        // and is checked again like any that proves too small.
+        if let Some(setup) = self.setup_latency.take() {
+            self.apply_setup_latency(setup.src.unwrap_or_default() + setup.dst.unwrap_or_default());
         }
         // The shared sessions are closed. A worker that leaves gives its
         // share back once the worker loop has closed them (`Worker` drop).
@@ -516,6 +569,10 @@ impl Worker {
                             for &i in &slow {
                                 self.sched.requeue_probed(i);
                             }
+                            return Err(e);
+                        }
+                        // Not these files' failure (`file_error`).
+                        if crate::conn::is_deferred_request_error(&e) {
                             return Err(e);
                         }
                         let hint = self.opts.failure_hint().filter(|_| {
@@ -775,6 +832,7 @@ impl Worker {
             None => std::time::Instant::now(),
         };
         let valid = Self::record_small_batch_reply(&sent, response, results);
+        self.settle_setup_latency();
         if self.adaptive_batches()
             && valid
             && sent.iter().all(|&i| matches!(results[i], Some(Ok(_))))
@@ -966,6 +1024,7 @@ impl Worker {
                         }
                     }
                 };
+                self.settle_setup_latency();
                 let read_stall_budget = if adaptive {
                     read_stall_budget.max(self.batch_budget.latency_target())
                 } else {
@@ -1117,6 +1176,9 @@ impl Worker {
         let mut start = 0;
         let mut bytes = 0u64;
         let mut path_bytes = 0usize;
+        // What the files' failures could add to the reply: each names its
+        // destination, so a group of long paths holds fewer files.
+        let mut replies = crate::proto::SmallFileReplies::default();
         for (i, job) in jobs.iter().enumerate() {
             let source_bytes = source_request_bytes(&job.src, Some(&job.source));
             let file_bytes = job.entry.size.saturating_add(
@@ -1136,15 +1198,21 @@ impl Worker {
                         .min(crate::proto::MAX_READ_BYTES)
                         .min(first_limit.bytes)
                     || path_bytes.saturating_add(source_bytes) > SOURCE_BATCH_PATH_BYTES
-                    || i - start >= group_files.min(first_limit.files))
+                    || i - start >= group_files.min(first_limit.files)
+                    || !replies.fits(
+                        jobs[start..i].iter().map(|job| job.dst.as_slice()),
+                        &job.dst,
+                    ))
             {
                 groups.push(start..i);
                 start = i;
                 bytes = 0;
                 path_bytes = 0;
+                replies.start();
             }
             bytes += file_bytes;
             path_bytes = path_bytes.saturating_add(source_bytes);
+            replies.add(&job.dst);
         }
         if start < jobs.len() {
             groups.push(start..jobs.len());
@@ -1305,7 +1373,13 @@ impl Worker {
         // Range validation can leave pipelined source replies and destination
         // acknowledgments unread. End this worker and abort the copy; neither
         // connection may serve another job or enter transport recovery.
-        if e.is::<RangeReplyMismatch>() || self.transport_dead() {
+        // A refused setup request fails every later reply on its connection,
+        // whatever file they are for: it is the copy's failure, as when the
+        // worker waited for that reply before taking work.
+        if e.is::<RangeReplyMismatch>()
+            || self.transport_dead()
+            || crate::conn::is_deferred_request_error(&e)
+        {
             return Err(e);
         }
         let job = self.job(idx);
@@ -2585,6 +2659,10 @@ impl Worker {
         let slow = if adaptive {
             let (response, arrived) = received.unwrap_or_else(|| self.dst.recv_with_arrival())?;
             change_ok(response, "write")?;
+            // A range that started before both setup replies were read.
+            if let Some(round_trip) = self.settle_setup_latency() {
+                budget.set_latency(round_trip);
+            }
             let elapsed = arrived.saturating_duration_since(started);
             let slow = elapsed > budget.latency_target();
             budget.observe(WorkSize { bytes: n, files: 0 }, elapsed);
@@ -2632,6 +2710,7 @@ impl Worker {
             .tuning
             .ordinary_range_limit(self.opts.same_host, block);
         let adaptive = self.opts.adaptive_ranges();
+        self.settle_setup_latency();
         let mut budget = self.range_budget.take().unwrap_or_else(|| {
             // Only a new worker needs its donor's hint. An existing worker
             // keeps its own measurements, which may describe a faster link.
@@ -3016,11 +3095,7 @@ impl Worker {
                 .observation
                 .as_ref()
                 .map(|a| a.span(crate::transfer_observations::Stage::Pacing));
-            if self.opts.tuning.bw_pacing == Some(crate::transfer_tuning::BwPacing::Average) {
-                limit.wait_prepaid(bytes);
-            } else {
-                limit.wait(bytes);
-            }
+            limit.wait(bytes);
         }
     }
 

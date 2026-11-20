@@ -174,6 +174,24 @@ impl Worker {
         wake.notify_one();
     }
 
+    /// Wait until the helper has advised the window that `begin` opened at
+    /// `copied`, or has given it up. Tests that observe the helper use this:
+    /// otherwise a starved helper may first run once the reader has passed
+    /// the whole range.
+    #[cfg(debug_assertions)]
+    fn wait_for_first_advice(&self, copied: u64) {
+        let (lock, wake) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while state.in_flight
+            || state
+                .window
+                .as_ref()
+                .is_some_and(|window| window.offset == copied)
+        {
+            state = wake.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
     fn finish(&self) {
         let (lock, wake) = &*self.shared;
         let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -385,6 +403,10 @@ impl PreparedRange<'_> {
             return;
         };
         worker.begin(source, copied, self.range.end);
+        #[cfg(debug_assertions)]
+        if std::env::var_os("SYQ_TEST_READ_AHEAD_FIRST_ADVICE").is_some() {
+            worker.wait_for_first_advice(copied);
+        }
         self.active = true;
         if crate::output::debug() {
             crate::output::diagnostic!(

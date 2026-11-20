@@ -325,12 +325,12 @@ impl Summary {
     ) -> Result<Self> {
         let mut id = [0; 16];
         getrandom::fill(&mut id).map_err(|e| anyhow::anyhow!("approval ID: {e}"))?;
-        let permission = if request.copy.options.dry_run {
+        let permission = if request.rules.copy.options.dry_run {
             "Preview only; no filesystem changes"
         } else {
             use crate::delegation::ExistingDestinationPolicy::*;
-            match request.copy.policy.existing {
-                Replace => "May create and overwrite matching entries",
+            match request.rules.copy.policy.existing {
+                Replace | KeepFiles => "May create and overwrite matching entries",
                 Skip => "May create new entries; keep existing entries",
                 MustExist => "May change existing entries only",
             }
@@ -343,7 +343,7 @@ impl Summary {
             None => (
                 format!(
                     "{:?}",
-                    std::ffi::OsStr::from_bytes(&request.copy.destination)
+                    std::ffi::OsStr::from_bytes(&request.rules.copy.destination)
                 ),
                 permission.to_owned(),
             ),
@@ -437,7 +437,7 @@ impl Summary {
         }
         let prunes = parsed.as_ref().is_some_and(|args| args.delete);
         let target = match remote {
-            None => local_path(&request.copy.destination),
+            None => local_path(&request.rules.copy.destination),
             Some(Remote { target, .. }) => crate::approval_command::display_arg(
                 &[
                     target.as_bytes(),
@@ -467,15 +467,15 @@ impl Summary {
             details: Details::Copy {
                 destination,
                 permission,
-                max_bytes: request.copy.limits.max_total_bytes,
-                max_entries: request.copy.limits.max_entries,
-                max_delete: request.copy.limits.max_deletions,
-                preserve_permissions: request.copy.options.preserve_permissions,
+                max_bytes: request.rules.copy.limits.max_total_bytes,
+                max_entries: request.rules.copy.limits.max_entries,
+                max_delete: request.rules.copy.limits.max_deletions,
+                preserve_permissions: request.rules.copy.options.preserve_permissions,
                 // Plain copies keep the released shape. Without the field, a
                 // request that preserves permissions reads as one stored by an
                 // earlier release, so it records even an empty list.
                 warnings: Some(copy_warnings(request)).filter(|warnings| {
-                    !warnings.is_empty() || request.copy.options.preserve_permissions
+                    !warnings.is_empty() || request.rules.copy.options.preserve_permissions
                 }),
             },
             expires_at: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
@@ -795,17 +795,17 @@ fn remote_path(path: &[u8]) -> Vec<u8> {
 /// receiving machine's credentials before approval.
 fn copy_notes(request: &crate::destination::CopyRequest, remote: bool) -> Vec<String> {
     use crate::delegation::{ExistingDestinationPolicy, RootExistence};
-    let options = &request.copy.options;
+    let options = &request.rules.copy.options;
     let mut notes = Vec::new();
     if options.dry_run {
         notes.push("preview only".to_owned());
     } else {
-        match request.copy.policy.existing {
+        match request.rules.copy.policy.existing {
             ExistingDestinationPolicy::Skip => notes.push("keeps existing files".to_owned()),
             ExistingDestinationPolicy::MustExist => {
                 notes.push("changes existing files only".to_owned())
             }
-            _ if remote || request.constraints.root_existence == RootExistence::New => {}
+            _ if remote || request.rules.root_existence == RootExistence::New => {}
             _ => match destination_exists(request) {
                 Some(true) => notes.push("replaces existing files".to_owned()),
                 Some(false) => {}
@@ -836,8 +836,8 @@ const UPDATE_IN_PLACE_WARNING: &str = "can write new contents into your existing
 /// copies are never written as root, and every copy that can carry a mapping
 /// already sets modification times from the source, which the server supplies.
 fn mapping_warning(request: &crate::destination::CopyRequest) -> Option<&'static str> {
-    request.constraints.mapping.as_ref()?;
-    let options = &request.copy.options;
+    request.rules.mapping.as_ref()?;
+    let options = &request.rules.copy.options;
     match (options.preserve_permissions, options.preserve_group) {
         (false, false) => Some("can use its mapping file to make the files it lists readable or writable by others, create programs that run as you, or give them to any group you belong to"),
         (false, true) => Some("can use its mapping file to make the files it lists readable or writable by others or create programs that run as you"),
@@ -850,20 +850,20 @@ fn mapping_warning(request: &crate::destination::CopyRequest) -> Option<&'static
 /// that lets the server do more than copy plain files, each completing
 /// "The server ...".
 fn copy_warnings(request: &crate::destination::CopyRequest) -> Vec<String> {
-    let options = &request.copy.options;
-    let extra = &request.constraints.extra_options;
+    let options = &request.rules.copy.options;
     if options.dry_run {
         return Vec::new();
     }
-    let deletions = request.copy.limits.max_deletions;
+    let deletions = request.rules.copy.limits.max_deletions;
     [
         request
+            .rules
             .copy
             .policy
             .publication
             .updates_existing_files_in_place()
             .then(|| UPDATE_IN_PLACE_WARNING.to_owned()),
-        (request.constraints.tcp == crate::delegation::TcpPermission::Unencrypted)
+        (request.rules.tcp == crate::delegation::TcpPermission::Unencrypted)
             .then(|| UNENCRYPTED_TCP_WARNING.to_owned()),
         (deletions > 0).then(|| {
             format!("can delete up to {deletions} files or folders anywhere in the destination")
@@ -875,16 +875,17 @@ fn copy_warnings(request: &crate::destination::CopyRequest) -> Vec<String> {
             .preserve_group
             .then(|| "can give files to any group you belong to".to_owned()),
         mapping_warning(request).map(str::to_owned),
-        extra
+        options
             .acls
             .then(|| "can give other users access to files".to_owned()),
-        extra
+        options
             .xattrs
             .then(|| "can set extended attributes, which some programs act on".to_owned()),
-        extra
+        options
             .hardlinks
             .then(|| "can link new names to files already in the destination".to_owned()),
         request
+            .rules
             .copy
             .policy
             .publication
@@ -892,7 +893,7 @@ fn copy_warnings(request: &crate::destination::CopyRequest) -> Vec<String> {
             .then(|| {
                 "can show new files under their final names before they are complete".to_owned()
             }),
-        (extra.widen_dirs != crate::delegation::DirectoryWidening::None)
+        widens_existing_folders(request)
             // Under `all`, or `rsync` with deletion, it can add read too,
             // which shows the names inside, and through comparisons more.
             .then(|| "can temporarily open folders you own to read or change them".to_owned()),
@@ -901,12 +902,28 @@ fn copy_warnings(request: &crate::destination::CopyRequest) -> Vec<String> {
     .flatten()
     .collect()
 }
+/// Whether the copy can widen a folder that is already there. A copy that
+/// keeps existing files (`--if-exists=keep`) widens none of the folders it
+/// includes, so `rsync` then widens nothing; `all` still widens the folder
+/// the copy goes into and the one that holds the destination
+/// (`RestrictedAuthority`'s `WidenDirectories` and `PrepareDestinationPath`).
+fn widens_existing_folders(request: &crate::destination::CopyRequest) -> bool {
+    use crate::delegation::{DirectoryWidening, ExistingDestinationPolicy};
+    match request.rules.copy.options.widen_dirs {
+        DirectoryWidening::None => false,
+        DirectoryWidening::Rsync => {
+            request.rules.copy.policy.existing != ExistingDestinationPolicy::Skip
+        }
+        DirectoryWidening::All => true,
+    }
+}
+
 /// Whether any named mutation root exists on this machine, or `None` when
 /// that cannot be told cheaply. Existing directory scopes need no recursive
 /// inspection: merging into them can overwrite children whose names are not
 /// yet known.
 fn destination_exists(request: &crate::destination::CopyRequest) -> Option<bool> {
-    let scopes = &request.copy.mutation_scopes;
+    let scopes = &request.rules.copy.mutation_scopes;
     if scopes.is_empty() || scopes.len() > 32 {
         return None;
     }
@@ -1372,7 +1389,7 @@ impl Queue {
         command: &[Vec<u8>],
         cwd: &str,
         (target, enrollment, as_root): (&str, crate::restricted::EnrollmentState, bool),
-        request: &crate::destination::pull::PullRequest,
+        request: &crate::restricted::source::SourcePolicy,
         notifications: Notifications,
         cancelled: impl Fn() -> bool,
     ) -> Result<()> {
@@ -2041,7 +2058,7 @@ mod tests {
         let path = path.as_os_str().as_bytes().to_vec();
         crate::destination::CopyRequest {
             destination: path.clone(),
-            copy: CopyOperation {
+            rules: DestinationRules::for_test(CopyOperation {
                 destination: path.clone(),
                 mutation_scopes: vec![MutationScope {
                     path,
@@ -2062,11 +2079,19 @@ mod tests {
                     preserve_owner: false,
                     preserve_group: false,
                     preserve_devices: false,
-                    compare_existing_by_content: false,
                     dry_run: false,
                     compressed_transport: true,
                     tcp_port_lo: 47600,
                     tcp_port_hi: 47699,
+                    hardlinks: false,
+                    acls: false,
+                    xattrs: false,
+                    atimes: false,
+                    crtimes: false,
+                    sparse: false,
+                    open_noatime: false,
+                    widen_dirs: DirectoryWidening::None,
+                    follow_dst: false,
                 },
                 limits: CopyLimits {
                     max_entries: 100,
@@ -2076,8 +2101,7 @@ mod tests {
                     max_connections: 1,
                     max_deletions: 0,
                 },
-            },
-            constraints: GrantConstraints::default(),
+            }),
         }
     }
 
@@ -2141,15 +2165,15 @@ mod tests {
         assert!(!plain
             .description(&crate::persistence::Domain::default(), str::to_owned)
             .contains("The server can"));
-        request.copy.options.preserve_permissions = true;
-        request.copy.options.receiver_managed_modes = false;
-        request.copy.options.preserve_group = true;
-        request.copy.limits.max_deletions = 4;
-        request.constraints.extra_options.acls = true;
-        request.constraints.extra_options.hardlinks = true;
-        request.constraints.extra_options.xattrs = true;
-        request.constraints.extra_options.widen_dirs = crate::delegation::DirectoryWidening::All;
-        request.copy.policy.publication = crate::delegation::PublicationPolicy::InPlaceNew;
+        request.rules.copy.options.preserve_permissions = true;
+        request.rules.copy.options.receiver_managed_modes = false;
+        request.rules.copy.options.preserve_group = true;
+        request.rules.copy.limits.max_deletions = 4;
+        request.rules.copy.options.acls = true;
+        request.rules.copy.options.hardlinks = true;
+        request.rules.copy.options.xattrs = true;
+        request.rules.copy.options.widen_dirs = crate::delegation::DirectoryWidening::All;
+        request.rules.copy.policy.publication = crate::delegation::PublicationPolicy::InPlaceNew;
         let warnings = [
             "can delete up to 4 files or folders anywhere in the destination",
             "can make files readable or writable by others or create programs that run as you",
@@ -2178,7 +2202,7 @@ mod tests {
             details
         );
         // A preview changes nothing, so it warns of nothing.
-        request.copy.options.dry_run = true;
+        request.rules.copy.options.dry_run = true;
         let preview = Summary::new(&requester(), &[], "~", &request, TIMEOUT, None).unwrap();
         assert!(!preview
             .description(&crate::persistence::Domain::default(), str::to_owned)
@@ -2197,12 +2221,12 @@ mod tests {
         let temp = crate::test_support::tempdir().unwrap();
         let path = temp.path().canonicalize().unwrap().join("data");
         let mut request = copy_request(&path);
-        request.copy.limits.max_deletions = 4;
-        request.copy.policy.publication = crate::delegation::PublicationPolicy::InPlaceNew;
+        request.rules.copy.limits.max_deletions = 4;
+        request.rules.copy.policy.publication = crate::delegation::PublicationPolicy::InPlaceNew;
         let new = Summary::new(&requester(), &[], "~", &request, TIMEOUT, None).unwrap();
         let details = new.description(&crate::persistence::Domain::default(), str::to_owned);
         assert!(!details.contains(UPDATE_IN_PLACE_WARNING), "{details}");
-        request.copy.policy.publication = crate::delegation::PublicationPolicy::InPlaceUpdate;
+        request.rules.copy.policy.publication = crate::delegation::PublicationPolicy::InPlaceUpdate;
         let update = Summary::new(&requester(), &[], "~", &request, TIMEOUT, None).unwrap();
         let details = update.description(&crate::persistence::Domain::default(), str::to_owned);
         let warnings: Vec<&str> = details
@@ -2256,13 +2280,76 @@ mod tests {
         let temp = crate::test_support::tempdir().unwrap();
         let path = temp.path().canonicalize().unwrap().join("data");
         let mut request = copy_request(&path);
-        request.constraints.tcp = crate::delegation::TcpPermission::Unencrypted;
+        request.rules.tcp = crate::delegation::TcpPermission::Unencrypted;
         let warnings = |request: &crate::destination::CopyRequest| {
             shown_warnings(&Summary::new(&requester(), &[], "~", request, TIMEOUT, None).unwrap())
         };
         assert_eq!(warnings(&request), [UNENCRYPTED_TCP_WARNING]);
-        request.copy.options.dry_run = true;
+        request.rules.copy.options.dry_run = true;
         assert!(warnings(&request).is_empty());
+    }
+
+    /// `syq rsync --ignore-existing` keeps existing files but still changes
+    /// existing folders, and its approval says what a replacing copy's does.
+    #[test]
+    fn keeping_files_is_approved_as_a_replacing_copy() {
+        use crate::delegation::ExistingDestinationPolicy;
+        let temp = crate::test_support::tempdir().unwrap();
+        let file = temp.path().canonicalize().unwrap().join("file");
+        std::fs::write(&file, b"keep").unwrap();
+        let replace = copy_request(&file);
+        let mut keep = replace.clone();
+        keep.rules.copy.policy.existing = ExistingDestinationPolicy::KeepFiles;
+        let shown = |request| {
+            let mut summary = serde_json::to_value(
+                Summary::new(&requester(), &[], "~", request, TIMEOUT, None).unwrap(),
+            )
+            .unwrap();
+            summary.as_object_mut().unwrap().remove("id");
+            summary.as_object_mut().unwrap().remove("expires_at");
+            summary
+        };
+        assert_eq!(shown(&keep), shown(&replace));
+        for remote in [false, true] {
+            assert_eq!(copy_notes(&keep, remote), copy_notes(&replace, remote));
+        }
+        assert_eq!(copy_notes(&keep, false), ["replaces existing files"]);
+    }
+
+    /// A copy that keeps existing files widens none of the folders it
+    /// includes, so approving `rsync` widening for it warns of nothing; `all`
+    /// still widens the folder the copy goes into, and warns.
+    #[test]
+    fn copy_approvals_warn_of_widening_only_where_a_folder_can_be_widened() {
+        use crate::delegation::{DirectoryWidening, ExistingDestinationPolicy};
+        const WIDENING: &str = "can temporarily open folders you own to read or change them";
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().canonicalize().unwrap().join("data");
+        let mut request = copy_request(&path);
+        let mut warnings = |existing, widen_dirs| {
+            request.rules.copy.policy.existing = existing;
+            request.rules.copy.options.widen_dirs = widen_dirs;
+            shown_warnings(&Summary::new(&requester(), &[], "~", &request, TIMEOUT, None).unwrap())
+        };
+        for existing in [
+            ExistingDestinationPolicy::Replace,
+            ExistingDestinationPolicy::MustExist,
+            ExistingDestinationPolicy::Skip,
+            ExistingDestinationPolicy::KeepFiles,
+        ] {
+            let keeps = existing == ExistingDestinationPolicy::Skip;
+            assert!(warnings(existing, DirectoryWidening::None).is_empty());
+            assert_eq!(
+                warnings(existing, DirectoryWidening::Rsync),
+                if keeps { vec![] } else { vec![WIDENING] },
+                "{existing:?}"
+            );
+            assert_eq!(
+                warnings(existing, DirectoryWidening::All),
+                [WIDENING],
+                "{existing:?}"
+            );
+        }
     }
 
     const MAPPING_WARNING: &str = "can use its mapping file to make the files it lists readable or writable by others, create programs that run as you, or give them to any group you belong to";
@@ -2286,14 +2373,14 @@ mod tests {
             format!("{entry}}}\n"),
             format!("{entry},\"metadata\":{{\"mode\":{}}}}}\n", 0o4755),
         ] {
-            request.constraints.mapping = Some(crate::mapping::Authorization::from_contents(
+            request.rules.mapping = Some(crate::mapping::Authorization::from_contents(
                 contents.as_bytes(),
             ));
             assert_eq!(warnings(&request), [MAPPING_WARNING]);
         }
         // What the options already allow is said once, without the mapping.
-        request.copy.options.preserve_permissions = true;
-        request.copy.options.receiver_managed_modes = false;
+        request.rules.copy.options.preserve_permissions = true;
+        request.rules.copy.options.receiver_managed_modes = false;
         assert_eq!(
             warnings(&request),
             [
@@ -2301,7 +2388,7 @@ mod tests {
                 "can use its mapping file to give the files it lists to any group you belong to",
             ]
         );
-        request.copy.options.preserve_group = true;
+        request.rules.copy.options.preserve_group = true;
         assert_eq!(
             warnings(&request),
             [
@@ -2309,8 +2396,8 @@ mod tests {
                 "can give files to any group you belong to"
             ]
         );
-        request.copy.options.preserve_permissions = false;
-        request.copy.options.receiver_managed_modes = true;
+        request.rules.copy.options.preserve_permissions = false;
+        request.rules.copy.options.receiver_managed_modes = true;
         assert_eq!(
             warnings(&request),
             [
@@ -2319,11 +2406,11 @@ mod tests {
             ]
         );
         // A preview changes nothing.
-        request.copy.options.dry_run = true;
+        request.rules.copy.options.dry_run = true;
         assert_eq!(warnings(&request), none);
         // One that copies permissions lists none, rather than leaving out the
         // list and reading as a request stored before warnings existed.
-        request.copy.options.preserve_permissions = true;
+        request.rules.copy.options.preserve_permissions = true;
         let preview = Summary::new(&requester(), &[], "~", &request, TIMEOUT, None).unwrap();
         assert_eq!(
             serde_json::to_value(&preview).unwrap()["warnings"],
@@ -2401,12 +2488,10 @@ mod tests {
             Duration::from_secs(60),
         )
         .unwrap();
-        let (rules, constraints) =
-            crate::directive::receiving_rules(&issued, b"/home/me/runs").unwrap();
+        let rules = crate::directive::receiving_rules(&issued, b"/home/me/runs").unwrap();
         let request = crate::destination::CopyRequest {
             destination: b"runs".to_vec(),
-            copy: rules.copy,
-            constraints,
+            rules,
         };
         let summary = Summary::new(&requester(), &to_laptop, "~", &request, TIMEOUT, None).unwrap();
         assert_eq!(shown_warnings(&summary), [MAPPING_WARNING]);
@@ -2433,13 +2518,12 @@ mod tests {
             [1; 32],
         )
         .unwrap();
-        let (rules, constraints) =
+        let rules =
             crate::directive::destination_rules(&preview, std::path::Path::new("/home/backup"))
                 .unwrap();
         let forwarded = crate::destination::CopyRequest {
             destination: b"runs".to_vec(),
-            copy: rules.copy,
-            constraints,
+            rules,
         };
         let summary = Summary::new(
             &requester(),
@@ -2521,7 +2605,7 @@ mod tests {
         // Another host is never inspected; the destination keeps its host and
         // the requested path, not the placeholder that host later resolves.
         let mut forwarded = request.clone();
-        forwarded.copy.destination = b"/SYQ-RECEIVE".to_vec();
+        forwarded.rules.copy.destination = b"/SYQ-RECEIVE".to_vec();
         let remote = Summary::new(
             &requester(),
             &command,
@@ -2792,7 +2876,7 @@ mod tests {
         let temp = crate::test_support::tempdir().unwrap();
         let path = temp.path().canonicalize().unwrap();
         let mut request = copy_request(&path);
-        request.copy.limits.max_deletions = 2;
+        request.rules.copy.limits.max_deletions = 2;
         let mut command: Vec<Vec<u8>> = ["cp", "report.pdf", "to", "~/Downloads"]
             .iter()
             .map(|arg| arg.as_bytes().to_vec())
@@ -3331,25 +3415,25 @@ mod tests {
         assert_eq!(std::fs::read(&file).unwrap(), b"keep");
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
         let mut many = copy_request(&missing);
-        many.copy.mutation_scopes = vec![many.copy.mutation_scopes[0].clone(); 33];
+        many.rules.copy.mutation_scopes = vec![many.rules.copy.mutation_scopes[0].clone(); 33];
         assert_eq!(copy_notes(&many, false), ["may replace existing files"]);
         // Another server is never inspected, so nothing is claimed about it.
         assert_eq!(copy_notes(&copy_request(&file), true), none);
 
         let mut request = copy_request(&file);
-        request.copy.options.dry_run = true;
+        request.rules.copy.options.dry_run = true;
         assert_eq!(copy_notes(&request, false), ["preview only"]);
-        request.copy.options.dry_run = false;
-        request.copy.policy.existing = ExistingDestinationPolicy::Skip;
+        request.rules.copy.options.dry_run = false;
+        request.rules.copy.policy.existing = ExistingDestinationPolicy::Skip;
         assert_eq!(copy_notes(&request, false), ["keeps existing files"]);
         assert_eq!(copy_notes(&request, true), ["keeps existing files"]);
-        request.copy.policy.existing = ExistingDestinationPolicy::MustExist;
+        request.rules.copy.policy.existing = ExistingDestinationPolicy::MustExist;
         assert_eq!(copy_notes(&request, false), ["changes existing files only"]);
-        request.copy.policy.existing = ExistingDestinationPolicy::Replace;
-        request.constraints.root_existence = RootExistence::New;
+        request.rules.copy.policy.existing = ExistingDestinationPolicy::Replace;
+        request.rules.root_existence = RootExistence::New;
         assert_eq!(copy_notes(&request, false), none);
-        request.constraints.root_existence = RootExistence::Any;
-        request.copy.limits.max_deletions = 3;
+        request.rules.root_existence = RootExistence::Any;
+        request.rules.copy.limits.max_deletions = 3;
         assert_eq!(
             copy_notes(&request, false),
             [

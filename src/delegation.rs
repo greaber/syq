@@ -113,7 +113,7 @@ impl RequestId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CopyOperation {
     /// Canonically spelled absolute target path. This is only a name;
     /// receiver authorization resolves it beneath the confinement root handle.
@@ -126,13 +126,13 @@ pub(crate) struct CopyOperation {
     pub limits: CopyLimits,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MutationScope {
     pub path: Vec<u8>,
     pub descendants: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CopyPolicy {
     pub placement: DestinationPlacement,
     pub existing: ExistingDestinationPolicy,
@@ -140,28 +140,44 @@ pub(crate) struct CopyPolicy {
     pub publication: PublicationPolicy,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DestinationPlacement {
     ExactPath,
     DirectoryContents,
     DirectoryAsChild,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExistingDestinationPolicy {
     Replace,
     /// Create missing entries without modifying pre-existing entries.
     Skip,
     MustExist,
+    /// `syq rsync --ignore-existing`: new files, links and special files are
+    /// created without replacing anything, as under `Skip`, while existing
+    /// directories still take the copy's metadata, as under `Replace`.
+    KeepFiles,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+impl ExistingDestinationPolicy {
+    /// The policy a change to one object is held to: `KeepFiles` is
+    /// `Replace` for a directory and `Skip` for anything else.
+    pub(crate) fn for_object(self, directory: bool) -> Self {
+        match self {
+            Self::KeepFiles if directory => Self::Replace,
+            Self::KeepFiles => Self::Skip,
+            policy => policy,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeletionPolicy {
     Forbid,
     DeleteDestinationOnly,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PublicationPolicy {
     AtomicStaged,
     /// `--in-place=new`: new files may be written directly at their final
@@ -185,7 +201,7 @@ impl PublicationPolicy {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CopyOptions {
     pub recursive: bool,
     pub preserve_symlinks: bool,
@@ -195,14 +211,24 @@ pub(crate) struct CopyOptions {
     pub preserve_owner: bool,
     pub preserve_group: bool,
     pub preserve_devices: bool,
-    pub compare_existing_by_content: bool,
     pub dry_run: bool,
     pub compressed_transport: bool,
     pub tcp_port_lo: u16,
     pub tcp_port_hi: u16,
+    pub hardlinks: bool,
+    pub acls: bool,
+    pub xattrs: bool,
+    pub atimes: bool,
+    pub crtimes: bool,
+    pub sparse: bool,
+    pub open_noatime: bool,
+    pub widen_dirs: DirectoryWidening,
+    /// `--follow-dst` with `--into`: when the destination is a symlink, the
+    /// copy goes into the directory it resolves to inside the confinement root.
+    pub follow_dst: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CopyLimits {
     pub max_entries: u64,
     pub max_total_bytes: u64,
@@ -213,12 +239,50 @@ pub(crate) struct CopyLimits {
 }
 
 /// What one approved copy may do at its destination: the rules derived from
-/// its command, and the approval they came from.
+/// its command (`directive::rules_at`), and the approval they came from.
+/// They are derived where they are enforced or shown, and never sent,
+/// signed or stored.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Grant {
+pub(crate) struct DestinationRules {
     pub enrollment_id: EnrollmentId,
     pub request_id: RequestId,
     pub copy: CopyOperation,
+    pub filters: FilterPolicy,
+    pub root_existence: RootExistence,
+    /// The invoking machine's key for this copy's results.
+    pub results_recipient: [u8; 32],
+    pub tcp_congestion: Option<String>,
+    /// Whether the copy's data may go over TCP, and unencrypted.
+    pub tcp: TcpPermission,
+    pub mapping: Option<crate::mapping::Authorization>,
+    pub hashing: crate::hashing::CopyHashing,
+}
+
+#[cfg(test)]
+impl DestinationRules {
+    /// The rules of `copy` for a test, approved by no one, with the
+    /// defaults of a command that states nothing more.
+    pub(crate) fn for_test(copy: CopyOperation) -> Self {
+        Self {
+            enrollment_id: EnrollmentId::random(),
+            request_id: RequestId::fresh(1_900_000_000).unwrap(),
+            copy,
+            filters: FilterPolicy::default(),
+            root_existence: RootExistence::Any,
+            results_recipient: [1; 32],
+            tcp_congestion: None,
+            tcp: TcpPermission::Encrypted,
+            mapping: None,
+            hashing: crate::hashing::CopyHashing {
+                policy: crate::hashing::HashPolicy {
+                    algorithm: crate::hashing::HashAlgorithm::Blake3,
+                    transfer_integrity: true,
+                    transfer_hash_type: None,
+                },
+                expected_hash: None,
+            },
+        }
+    }
 }
 
 impl CopyOperation {
@@ -279,7 +343,7 @@ impl CopyOperation {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FilterPolicy {
     /// Ordered gitignore-style rules, anchored independently at every source
     /// root mapped into the signed destination scopes.
@@ -352,7 +416,7 @@ impl FilterPolicy {
 /// against the confinement root when the copy starts, and `New`
 /// additionally forces no-replace creation of that root, so a remote source
 /// coordinator cannot turn `--into-new` into an update of an existing tree.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum RootExistence {
     #[default]
     Any,
@@ -363,31 +427,11 @@ pub(crate) enum RootExistence {
     Existing,
 }
 
-/// Copy options beyond `CopyOptions`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ExtraCopyOptions {
-    pub hardlinks: bool,
-    pub acls: bool,
-    pub xattrs: bool,
-    pub atimes: bool,
-    pub crtimes: bool,
-    pub sparse: bool,
-    pub open_noatime: bool,
-    pub widen_dirs: DirectoryWidening,
-    /// `syq rsync --ignore-existing`: new files, links and special files are
-    /// created without replacing anything, as under the `Skip` policy, while
-    /// existing directories still take the copy's metadata.
-    pub keep_files: bool,
-    /// `--follow-dst` with `--into`: when the destination is a symlink, the
-    /// copy goes into the directory it resolves to inside the confinement root.
-    pub follow_dst: bool,
-}
-
 /// Which existing destination directories the receiver may briefly give the
 /// owner permission the copy needs, as `--widen-dirs` names them: none, the
 /// ones the copy includes, or also the directory the copy goes into. Never
 /// one above the confinement root.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum DirectoryWidening {
     #[default]
     None,
@@ -405,7 +449,7 @@ impl From<crate::cli::WidenDirs> for DirectoryWidening {
     }
 }
 
-impl ExtraCopyOptions {
+impl CopyOptions {
     /// The inode metadata these options let a request apply or select.
     pub(crate) fn allows(&self, selection: crate::inode_metadata::Selection) -> bool {
         (!selection.acls || self.acls)
@@ -419,42 +463,27 @@ impl ExtraCopyOptions {
 /// Check the rules derived for a destination before a receiver uses them:
 /// bounded, consistent, and with filter roots sorted as the receiver matches
 /// them.
-pub(crate) fn validate_rules(
-    copy: &CopyOperation,
-    constraints: &mut GrantConstraints,
-) -> Result<()> {
+pub(crate) fn validate_rules(rules: &mut DestinationRules) -> Result<()> {
+    let copy = &rules.copy;
     copy.validate()?;
-    constraints.filters.normalize();
-    constraints.filters.validate(copy)?;
-    constraints.receipt_policy.validate()?;
-    if let Some(algorithm) = &constraints.tcp_congestion {
+    rules.filters.normalize();
+    rules.filters.validate(copy)?;
+    if rules.results_recipient.iter().all(|byte| *byte == 0) {
+        bail!("receipt recipient public key must be nonzero");
+    }
+    if let Some(algorithm) = &rules.tcp_congestion {
         crate::cli::parse_tcp_congestion(algorithm).map_err(anyhow::Error::msg)?;
     }
-    if let Some(expected) = constraints
-        .hashing
-        .as_ref()
-        .and_then(|hashing| hashing.expected_hash.as_ref())
-    {
+    if let Some(expected) = &rules.hashing.expected_hash {
         expected.validate()?;
     }
-    if constraints.mapping.is_some() && copy.policy.deletion != DeletionPolicy::Forbid {
+    if rules.mapping.is_some() && copy.policy.deletion != DeletionPolicy::Forbid {
         bail!("mapping authorization does not permit pruning");
     }
-    if constraints.extra_options.acls && !copy.options.preserve_permissions {
+    if copy.options.acls && !copy.options.preserve_permissions {
         bail!("ACL preservation requires permission preservation");
     }
     Ok(())
-}
-
-#[cfg(test)]
-fn test_receipt_policy() -> crate::destination_results::ReceiptPolicy {
-    crate::destination_results::ReceiptPolicy {
-        required: true,
-        hashed: false,
-        max_records: crate::destination_results::DEFAULT_MAX_RECORDS,
-        max_plaintext_bytes: crate::destination_results::DEFAULT_MAX_PLAINTEXT_BYTES,
-        delivery: crate::destination_results::ReceiptDelivery::DetachedSignedPlaintext,
-    }
 }
 
 /// Check an account name: bounded, without control characters or `/`.
@@ -946,37 +975,6 @@ impl TcpPermission {
             "TCP data connections must be encrypted and authenticated unless the approved command passes --no-tcp-encryption"
         );
         Ok(())
-    }
-}
-
-/// The destination's rules beyond the copy operation, derived where they
-/// are enforced and never sent.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct GrantConstraints {
-    pub filters: FilterPolicy,
-    pub root_existence: RootExistence,
-    pub receipt_policy: crate::destination_results::ReceiptPolicy,
-    pub tcp_congestion: Option<String>,
-    /// Whether the copy's data may go over TCP, and unencrypted.
-    pub tcp: TcpPermission,
-    pub mapping: Option<crate::mapping::Authorization>,
-    pub hashing: Option<crate::hashing::CopyHashing>,
-    pub extra_options: ExtraCopyOptions,
-}
-
-#[cfg(test)]
-impl Default for GrantConstraints {
-    fn default() -> Self {
-        Self {
-            filters: FilterPolicy::default(),
-            root_existence: RootExistence::Any,
-            receipt_policy: test_receipt_policy(),
-            tcp_congestion: None,
-            tcp: TcpPermission::Encrypted,
-            mapping: None,
-            hashing: None,
-            extra_options: ExtraCopyOptions::default(),
-        }
     }
 }
 

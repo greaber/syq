@@ -87,7 +87,6 @@ fn network_cap_is_aggregate_and_keeps_small_file_batches() {
             .run()
             .unwrap();
         assert_output_ok(&out);
-        assert!(!stderr_of(&out).contains("bw-pacing has no effect"));
         assert_same_tree(&t.path("src"), &t.path("dst"));
         if mode == 2 {
             let stderr = stderr_of(&out);
@@ -122,16 +121,11 @@ fn network_compression_is_charged_after_compressing() {
         let t = Tmp::new();
         write(&t.path("src"), &vec![b'x'; 4 << 20]);
         let mut cmd = command(&t, mode, pull, "1M");
-        cmd.arg("--performance-tuning=bw-pacing=average")
-            .args(paths(&t, pull, false))
+        cmd.args(paths(&t, pull, false))
             .env("SYQ_TEST_PACED_BYTES", t.path("paced"));
         let out = cmd.run().unwrap();
         assert_output_ok(&out);
         assert_eq!(read(&t.path("dst")), read(&t.path("src")));
-        assert_eq!(
-            stderr_of(&out).matches("bw-pacing has no effect").count(),
-            1
-        );
         // Measure what the budget charged, independently of process startup
         // and scheduler delays. Include TCP, SSH, and partial-TCP fallback.
         #[cfg(debug_assertions)]

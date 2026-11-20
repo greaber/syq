@@ -73,6 +73,10 @@ impl Tuning {
     pub fn tigris(&self) -> bool {
         self.tigris
     }
+    /// Whether the user set the request count, as a value or as a ceiling.
+    pub fn requests_set(&self) -> bool {
+        self.fixed_requests.is_some() || self.requests.ceiling.is_some()
+    }
     pub fn request_capacity(&self) -> usize {
         self.fixed_requests
             .unwrap_or_else(|| self.requests.state.lock().unwrap().max)

@@ -61,7 +61,11 @@ pub fn run(mut args: Args) -> Result<i32> {
     match outcome {
         Ok(()) => {
             let exit_code = if summary.entries_failed > 0 { 23 } else { 0 };
-            let status = if exit_code == 0 { "success" } else { "partial" };
+            let status = if exit_code == 0 {
+                crate::results::Status::Success
+            } else {
+                crate::results::Status::Partial
+            };
             progress.finish(exit_code == 0);
             emit_terminal(
                 results.as_deref(),
@@ -90,7 +94,7 @@ pub fn run(mut args: Args) -> Result<i32> {
                 &summary,
                 selectors_total,
                 args.dry_run,
-                "failed",
+                crate::results::Status::Failed,
                 1,
             );
             Err(error)
@@ -329,7 +333,7 @@ fn emit_terminal(
     summary: &RemovalSummary,
     selectors_total: u64,
     dry_run: bool,
-    status: &'static str,
+    status: crate::results::Status,
     exit_code: i32,
 ) {
     if let Some(writer) = writer.filter(|writer| !writer.is_dead()) {

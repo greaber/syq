@@ -24,6 +24,10 @@ pub const MAX_READ_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_HANDSHAKE_FRAME: usize = 1024 * 1024;
 const MAX_METADATA_FRAME: usize = 8 * 1024 * 1024;
 pub(crate) const METADATA_BATCH_BYTES: usize = 6 * 1024 * 1024;
+/// What the failures of one request's operations may add to its reply, by
+/// `failed_path_hint`, `failed_set_meta_hint` and `failed_small_file_hint`:
+/// half a metadata frame, so that the reply still fits should an error come to say more than that allows for.
+pub(crate) const METADATA_REPLY_BYTES: usize = MAX_METADATA_FRAME / 2;
 /// Supported comparison granularity floor, enforced by receivers as well as the CLI.
 /// Smaller blocks increase the number of hashes per file; this is a protocol
 /// policy, not a minimum input size imposed by the hash algorithm.
@@ -313,6 +317,47 @@ pub struct NativeRemoveOutcome {
     /// and dry-run records have no attempts.
     pub attempts: Option<u64>,
     pub failure: Option<NativeRemoveFailure>,
+}
+
+impl NativeRemoveOutcome {
+    pub(crate) fn size_hint(&self) -> usize {
+        self.path.len()
+            + self
+                .failure
+                .as_ref()
+                .map_or(0, |failure| failure.error.message.len())
+            + 48
+    }
+}
+
+/// A removal's results or traces as the messages that carry them, in order:
+/// each message ends before its items (by `size`) pass half a metadata
+/// frame, and holds at least one item. An empty batch is one empty message:
+/// the receiver's sign of life while a removal finds nothing to report.
+/// A result names its path, which has no
+/// length limit: a removal descends from directory to directory, so a tree
+/// can nest far beyond the longest path a system call takes. A trace quotes
+/// its selector, escaping what is not printable.
+pub(crate) fn native_remove_messages<T>(
+    mut items: Vec<T>,
+    size: impl Fn(&T) -> usize,
+) -> Vec<Vec<T>> {
+    let mut messages = Vec::new();
+    loop {
+        let mut bytes = 0usize;
+        let len = items
+            .iter()
+            .position(|item| {
+                bytes = bytes.saturating_add(size(item));
+                bytes > MAX_METADATA_FRAME / 2
+            })
+            .map_or(items.len(), |index| index.max(1));
+        let rest = items.split_off(len);
+        messages.push(std::mem::replace(&mut items, rest));
+        if items.is_empty() {
+            return messages;
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Eq, PartialEq)]
@@ -728,11 +773,16 @@ pub enum Op {
     Unlink { path: PathBytes },
 }
 
+/// An `Op::SetMeta`'s share of its request (`Op::size_hint`).
+pub(crate) fn set_meta_size_hint(path: &[u8], meta: &Meta) -> usize {
+    path.len() + meta.size_hint() + 64
+}
+
 impl Op {
     pub(crate) fn size_hint(&self) -> usize {
         match self {
             Self::SetMeta { path, meta, .. } | Self::SetFileMetaIfSame { path, meta, .. } => {
-                path.len() + meta.size_hint() + 64
+                set_meta_size_hint(path, meta)
             }
             Self::Hardlink { path, source, .. } => path.len() + source.len() + 64,
             Self::Symlink {
@@ -744,6 +794,102 @@ impl Op {
             | Self::Unlink { path }
             | Self::Rmdir { path } => path.len() + 96,
         }
+    }
+}
+
+/// The most a failed `Op::SetMeta` of `path` adds to its request's `Applied`
+/// reply: that of any operation on the path (`failed_path_hint`), and an
+/// attribute's name when ACLs or extended attributes are preserved: an
+/// error applying them names one, of at most 255 bytes, as a list of
+/// numbers (`InodeMetadata::failure_hint`). No error of this operation
+/// names the path more than twice: opening its metadata handle names it
+/// for the request and again beneath the destination root.
+pub(crate) fn failed_set_meta_hint(path: &[u8], meta: &Meta) -> usize {
+    failed_path_hint(path)
+        + meta
+            .inode_metadata
+            .as_ref()
+            .map_or(0, |inode| inode.failure_hint())
+}
+
+/// The most the failure of an operation on `path` that names no other path
+/// or attribute adds to its request's `Applied` reply: the receiver's error,
+/// as text, and its other fields. This holds for setting a directory's
+/// metadata (`failed_set_meta_hint` adds attributes), creating a directory
+/// and removing an entry (`Op::Mkdir`, `Op::Rmdir`, `Op::Unlink`), and
+/// widening a directory's owner permissions (`Request::WidenDirectories`).
+///
+/// The text names the path as the receiver displays it, in which each byte
+/// that is not UTF-8 shows as a three-byte replacement character. No error
+/// of these operations names it more than twice (a no-replace creation
+/// whose name was taken names it in that condition and in the creation that
+/// failed); three are allowed for. The rest of the text is fixed wording and
+/// the system's description of the error, well under 320 bytes with the
+/// error's other fields.
+pub(crate) fn failed_path_hint(path: &[u8]) -> usize {
+    3 * String::from_utf8_lossy(path).len() + 320
+}
+
+/// What the failure of a small file's publication (a `SmallPut` or a
+/// `SmallPatch`) adds to its batch's reply: that of an operation on its
+/// path (`failed_path_hint`), where an error may name instead the staged
+/// file beside it, whose name is up to 26 bytes longer
+/// (`fsops::partial_path_with_name_max`).
+///
+/// An error applying preserved extended attributes also names one, of at
+/// most 255 bytes, escaped: about 1,020 bytes this leaves out, so that
+/// copies preserving attributes form the groups of ordinary copies. The
+/// other half of the reply's frame holds it: a group holds at most 4,096
+/// files, and with every one of them naming such an attribute the reply
+/// stays under about 7 MB.
+pub(crate) fn failed_small_file_hint(path: &[u8]) -> usize {
+    failed_path_hint(path) + 3 * 32
+}
+
+/// What the failures of a group of small files, added in order, could add
+/// to its reply (`failed_small_file_hint`), for ending the group before it
+/// passes `METADATA_REPLY_BYTES`. Its paths are read only when a group
+/// could come near that: until then a path's length alone bounds what it
+/// shows (three bytes for each), as it does for every group of ordinary
+/// paths, which a small-file copy forms for each of its files.
+#[derive(Default)]
+pub(crate) struct SmallFileReplies {
+    bytes: usize,
+    /// `bytes` counts each path as shown, not by its length alone.
+    exact: bool,
+}
+
+impl SmallFileReplies {
+    fn bound(path: &[u8]) -> usize {
+        3 * (3 * path.len() + 32) + 320
+    }
+
+    /// Whether the failure of `path` still fits after those of `group`, the
+    /// paths already added since the last `start`.
+    pub(crate) fn fits<'a>(&mut self, group: impl Iterator<Item = &'a [u8]>, path: &[u8]) -> bool {
+        if !self.exact {
+            if self.bytes.saturating_add(Self::bound(path)) <= METADATA_REPLY_BYTES {
+                return true;
+            }
+            self.bytes = group.map(failed_small_file_hint).sum();
+            self.exact = true;
+        }
+        self.bytes.saturating_add(failed_small_file_hint(path)) <= METADATA_REPLY_BYTES
+    }
+
+    /// Add `path`'s failure, which `fits` allowed or which starts a group.
+    pub(crate) fn add(&mut self, path: &[u8]) {
+        let bytes = if self.exact {
+            failed_small_file_hint(path)
+        } else {
+            Self::bound(path)
+        };
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    /// Start a new group.
+    pub(crate) fn start(&mut self) {
+        *self = Self::default();
     }
 }
 
@@ -2275,17 +2421,7 @@ impl SizeHint for Response {
             Response::ScanBatch(v) => v.iter().map(Entry::size_hint).sum::<usize>() + 16,
             Response::NativeMapData(data) => data.len() + 16,
             Response::NativeRemoveBatch(v) => {
-                v.iter()
-                    .map(|outcome| {
-                        outcome.path.len()
-                            + outcome
-                                .failure
-                                .as_ref()
-                                .map_or(0, |failure| failure.error.message.len())
-                            + 48
-                    })
-                    .sum::<usize>()
-                    + 16
+                v.iter().map(NativeRemoveOutcome::size_hint).sum::<usize>() + 16
             }
             Response::DirectoryEntries { entries, .. } => {
                 entries

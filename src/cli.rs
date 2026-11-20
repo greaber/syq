@@ -439,7 +439,7 @@ pub struct Args {
     #[arg(long, visible_alias = "no-W", overrides_with_all = ["whole_file", "no_whole_file"])]
     pub no_whole_file: bool,
     /// Override transfer internals for performance troubleshooting (normally automatic)
-    #[arg(long = "performance-tuning", value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::RSYNC_HELP, help_heading = "Advanced controls")]
+    #[arg(long = "performance-tuning", value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::help(true), help_heading = "Advanced controls")]
     pub performance_tuning: Vec<String>,
     #[arg(skip)]
     pub tuning_options: Option<crate::transfer_tuning::TransferTuning>,
@@ -942,25 +942,15 @@ impl Args {
         }
 
         if let Some(tuning) = self.tuning_options {
-            if self.s3.is_none() && tuning.has_s3_controls() {
-                bail!("S3 performance tuning requires an S3 endpoint");
-            }
-            if self.rm {
-                let allowed = if self.s3.is_some() {
-                    crate::transfer_tuning::TransferTuning {
-                        s3_requests: tuning.s3_requests,
-                        ..Default::default()
-                    }
-                } else {
-                    crate::transfer_tuning::TransferTuning {
-                        workers: tuning.workers,
-                        ..Default::default()
-                    }
-                };
-                if tuning != allowed {
-                    bail!("removal supports only performance-tuning workers for filesystems or s3-requests for S3");
-                }
-            }
+            // Streams narrow the filesystem keys further once the copy
+            // knows it copies streams (`descriptor_copy::validate_controls`).
+            use crate::transfer_tuning::TuningRoute;
+            tuning.check_route(match (self.rm, self.s3.is_some()) {
+                (false, false) => TuningRoute::Copy,
+                (false, true) => TuningRoute::S3Copy,
+                (true, false) => TuningRoute::Removal,
+                (true, true) => TuningRoute::S3Removal,
+            })?;
             if let Some(block) = tuning.comparison_block_size {
                 self.block_size = block;
             }
@@ -1524,7 +1514,7 @@ struct NativeOperationalArgs {
     #[arg(short = 'q', long)]
     quiet: bool,
     /// Override performance settings (normally automatic)
-    #[arg(long = "performance-tuning", value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::HELP, help_heading = "Advanced controls")]
+    #[arg(long = "performance-tuning", value_name = "KEY=VALUE,...", long_help = crate::transfer_tuning::help(false), help_heading = "Advanced controls")]
     performance_tuning: Vec<String>,
     /// Show progress even when stderr is not a terminal
     #[arg(long, overrides_with = "no_progress")]
@@ -3484,6 +3474,31 @@ pub(crate) struct NativeEndpoint {
     pub(crate) user: Option<String>,
     pub(crate) host: String,
     pub(crate) port: Option<u16>,
+}
+
+impl NativeEndpoint {
+    /// `[user@]host[:port]`, as [`endpoint_label`] spells it.
+    pub(crate) fn label(&self) -> String {
+        endpoint_label(self.user.as_deref(), &self.host, self.port)
+    }
+}
+
+/// `[user@]host[:port]`, with a host that contains `:` (an IPv6 address) in
+/// brackets: the spelling `parse_native_endpoint` reads back.
+pub(crate) fn endpoint_label(user: Option<&str>, host: &str, port: Option<u16>) -> String {
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    let endpoint = match user {
+        Some(user) => format!("{user}@{host}"),
+        None => host,
+    };
+    match port {
+        Some(port) => format!("{endpoint}:{port}"),
+        None => endpoint,
+    }
 }
 
 pub(crate) fn parse_native_endpoint(spec: Option<&str>) -> Result<Option<NativeEndpoint>> {

@@ -567,11 +567,10 @@ pub(crate) fn is_sessions_full(error: &anyhow::Error) -> bool {
 
 /// What a session the forced command started may go on to do.
 pub(crate) enum Session {
-    /// Serve a copy a verified directive allows.
-    Copy(std::sync::Arc<RestrictedAuthority>),
-    /// Serve the reads a verified directive for this account as a copy's
-    /// source allows, to the server that started the copy.
-    Source(std::sync::Arc<super::source::SourceAuthority>),
+    /// Serve a copy a verified directive allows: its writes as the copy's
+    /// destination, or, as its source, the reads it allows to the server
+    /// that started the copy.
+    Serve(super::Checker),
     /// This session's input and output were handed to the running copy its
     /// worker ticket names, which has served them.
     Worker,
@@ -726,8 +725,8 @@ pub(super) fn verify_coordination(
 
 /// What a verified directive for one end of a copy allows.
 pub(super) enum Rules {
-    Destination(Box<(Grant, GrantConstraints)>),
-    Source(Box<crate::destination::pull::PullRequest>),
+    Destination(Box<DestinationRules>),
+    Source(Box<crate::restricted::source::SourcePolicy>),
 }
 
 impl Rules {
@@ -803,33 +802,32 @@ pub(super) fn session_for(
     (home, canonical_home): (&Path, &Path),
     protected: &[ReceiverControlPath],
 ) -> Result<Session> {
-    let (grant, constraints) = match rules {
+    let rules = match rules {
         Rules::Destination(rules) => *rules,
         // Reads follow the signed command, as the account's own would: the
         // approving machine's prompt showed what it names.
         Rules::Source(reads) => {
-            return Ok(Session::Source(super::source::SourceAuthority::new(
-                reads.policy(verified.execution_deadline),
-            )?));
+            return Ok(Session::Serve(super::Checker::source(
+                super::source::SourceAuthority::new(*reads, verified.execution_deadline)?,
+            )));
         }
     };
     let results_key = load_results_key(state)?;
     let root = ConfinedRoot::resolve(
-        &grant.copy.destination,
+        &rules.copy.destination,
         protected,
-        constraints.extra_options.follow_dst,
+        rules.copy.options.follow_dst,
         Some((home, canonical_home)),
     )?;
-    Ok(Session::Copy(std::sync::Arc::new(
-        RestrictedAuthority::new(
+    Ok(Session::Serve(super::Checker::Destination(
+        std::sync::Arc::new(RestrictedAuthority::new(
             root,
-            grant,
-            constraints,
+            rules,
             verified.digest,
             results_key,
             verified.execution_deadline,
             protected,
-        )?,
+        )?),
     )))
 }
 
@@ -873,7 +871,7 @@ pub(super) fn verify(
     (generation, build): (u64, &str),
     directive: &[u8],
     home: &Path,
-) -> Result<((Grant, GrantConstraints), delegation::VerifiedDirective)> {
+) -> Result<(DestinationRules, delegation::VerifiedDirective)> {
     verify_with(state, config, (generation, build), directive, |directive| {
         crate::directive::destination_rules(directive, home)
     })

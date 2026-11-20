@@ -82,6 +82,10 @@ pub(super) struct Planner<'a> {
     /// The group and mode of destination directories, as `must_replace`
     /// read them for a root receiver; None for one that does not exist.
     pub(super) parent_groups: std::collections::HashMap<PathBytes, Option<(u32, u32)>>,
+    /// The directories the leaves being planned may ask about
+    /// (`group_question_parents`): the first question reads them all, in
+    /// one request, rather than each wait for its own reply.
+    pub(super) leaf_parents: Vec<PathBytes>,
     /// Who a file the receiver creates in the destination belongs to, once
     /// asked (`Request::NewFileOwner`).
     pub(super) new_file_owner: Option<crate::proto::NewFileOwner>,
@@ -130,6 +134,8 @@ pub(super) struct Planner<'a> {
     /// planner batches. Buffered jobs retain their own derived path.
     pub(super) active_source: Option<RegisteredPath>,
     pub(super) hardlinks: super::hardlinks::Hardlinks,
+    /// Lookups sent for batches the scan showed before their turn.
+    pub(super) early_lookups: super::early_lookups::EarlyLookups,
 }
 
 /// What a source entry asserts about its destination path. Two dirs merge;
@@ -393,8 +399,9 @@ struct DirectoryStream {
     /// Early metadata for directories that already exist, sent with the
     /// last request.
     last_metadata: Vec<Op>,
-    /// Each directory's share of its request, with its early metadata.
-    sizes: Vec<usize>,
+    /// Each directory's share of its request, with its early metadata, and
+    /// the most their failures could add to its reply.
+    sizes: Vec<(usize, usize)>,
     in_flight: std::collections::VecDeque<SentDirectories>,
     /// Send nothing more: the copy was cancelled or a request failed.
     stopped: bool,
@@ -693,12 +700,21 @@ impl Planner<'_> {
             src,
             src_root,
             Some(&source),
-            follow_root,
+            (follow_root, true),
             &ignore,
-            |pl, batch| {
+            |pl, scanned| {
                 if skip_all {
                     return Ok(());
                 }
+                let (batch, shown) = match scanned {
+                    Scanned::Batch { entries, shown } => (entries, shown),
+                    Scanned::Upcoming(entries) => {
+                        // Only after the first batch, which settles `sub`.
+                        anyhow::ensure!(!first, "a scan showed its first batch early");
+                        pl.show_upcoming(entries, src_root, &sub, dst_root);
+                        return Ok(());
+                    }
+                };
                 if first {
                     first = false;
                     if let Some(root) = batch.first() {
@@ -765,7 +781,7 @@ impl Planner<'_> {
                     }
                 }
                 pl.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
-                pl.handle_batch(batch, src_root, &sub, dst_root)
+                pl.handle_scanned_batch(batch, src_root, &sub, dst_root, shown)
             },
         )?;
         mapping.ok_or_else(|| anyhow::anyhow!("source scan returned no root entry"))
@@ -1243,9 +1259,12 @@ impl Planner<'_> {
             src,
             &join(src_root, rel),
             Some(&source),
-            false,
+            (false, false),
             &[],
-            |pl, batch| {
+            |pl, scanned| {
+                let Scanned::Batch { entries: batch, .. } = scanned else {
+                    return Ok(());
+                };
                 let batch: Vec<Entry> = batch
                     .into_iter()
                     .filter(|e| !e.path.is_empty())
@@ -1275,27 +1294,42 @@ impl Planner<'_> {
         sub: &[u8],
         dst_root: &[u8],
     ) -> Result<()> {
-        let batch = if self.opts.expressions.selection.is_some() && !self.mapping_mode {
+        self.handle_scanned_batch(batch, src_root, sub, dst_root, false)
+    }
+
+    /// `handle_batch` for a batch from a scan, `shown` when the scan showed
+    /// it earlier (`show_upcoming`).
+    pub(super) fn handle_scanned_batch(
+        &mut self,
+        batch: Vec<Entry>,
+        src_root: &[u8],
+        sub: &[u8],
+        dst_root: &[u8],
+        shown: bool,
+    ) -> Result<()> {
+        let mut early = shown.then(|| self.next_early_lookup()).flatten();
+        let before = self.other_requests();
+        let planned = self.plan_batch(batch, src_root, sub, dst_root, &mut early);
+        if let Some(unused) = early {
+            self.discard_early_lookup(unused);
+        }
+        planned?;
+        self.batch_planned(before);
+        Ok(())
+    }
+
+    fn plan_batch(
+        &mut self,
+        batch: Vec<Entry>,
+        src_root: &[u8],
+        sub: &[u8],
+        dst_root: &[u8],
+        early: &mut Option<super::early_lookups::EarlyLookup>,
+    ) -> Result<()> {
+        let batch = if self.filters_scanned_entries() {
             let mut selected = Vec::with_capacity(batch.len());
             for entry in batch {
-                // Directories bypass --where: they are created and receive
-                // metadata as in an unfiltered copy.
-                if entry.kind == Kind::Dir {
-                    selected.push(entry);
-                    continue;
-                }
-                let relative = self
-                    .src_overrides
-                    .get(&entry.path)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&entry.path);
-                let path = crate::expression::source_path(src_root, relative);
-                let included = self
-                    .opts
-                    .expressions
-                    .selects(&crate::expression::File::from_entry(&entry), path)
-                    .with_context(|| format!("source {}", display(path)))?;
-                if !included {
+                if !self.selects_scanned_entry(&entry, src_root)? {
                     // Selection never makes a source counterpart extraneous.
                     if self.opts.delete {
                         let dst = join(dst_root, &join(sub, &entry.path));
@@ -1370,7 +1404,7 @@ impl Planner<'_> {
                     .map(|planned| planned.dst.clone()),
             );
         }
-        self.inspect_destination_batch(&mut mapped)?;
+        self.inspect_destination_batch(&mut mapped, early.take())?;
         match &mut self.buffer {
             Some(buf) => buf.push(mapped),
             None => self.apply_mapped(mapped)?,
@@ -1418,7 +1452,59 @@ impl Planner<'_> {
         }
     }
 
+    /// Whether `plan_batch` drops the scanned entries `--where` leaves out.
+    /// A mapping's entries are filtered as they are read instead.
+    pub(super) fn filters_scanned_entries(&self) -> bool {
+        self.opts.expressions.selection.is_some() && !self.mapping_mode
+    }
+
+    /// Whether `--where` selects a scanned entry. It sees only the entry,
+    /// its source path and the time the command started, so it gives the
+    /// same answer whenever it is asked.
+    pub(super) fn selects_scanned_entry(&self, entry: &Entry, src_root: &[u8]) -> Result<bool> {
+        // Directories bypass --where: they are created and receive metadata
+        // as in an unfiltered copy.
+        if entry.kind == Kind::Dir {
+            return Ok(true);
+        }
+        let relative = self
+            .src_overrides
+            .get(&entry.path)
+            .map(Vec::as_slice)
+            .unwrap_or(&entry.path);
+        let path = crate::expression::source_path(src_root, relative);
+        self.opts
+            .expressions
+            .selects(&crate::expression::File::from_entry(entry), path)
+            .with_context(|| format!("source {}", display(path)))
+    }
+
     /// The mapping loop: decide and claim everything about each entry.
+    /// What a scanned entry claims at its destination; None for a directory
+    /// this copy does not take.
+    pub(super) fn claim_for(&self, e: &Entry) -> Option<Claim> {
+        let opts = self.opts;
+        Some(match e.kind {
+            Kind::Dir if !opts.recursive && !self.keep_dirs => return None,
+            Kind::Dir => Claim::Dir,
+            Kind::File => Claim::File {
+                dev: e.dev,
+                ino: e.ino,
+            },
+            Kind::Symlink if opts.links => Claim::Leaf,
+            Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev
+                if opts.devices
+                    && special_creation_supported(
+                        self.destination_supports_confined_socket_nodes,
+                        e.kind,
+                    ) =>
+            {
+                Claim::Leaf
+            }
+            _ => Claim::Weak,
+        })
+    }
+
     pub(super) fn map_batch(
         &mut self,
         batch: Vec<Entry>,
@@ -1431,9 +1517,9 @@ impl Planner<'_> {
         let mut others: Vec<Planned> = Vec::new();
         let mut directory_expression_sources = std::collections::HashMap::new();
         for e in batch {
-            if e.kind == Kind::Dir && !opts.recursive && !self.keep_dirs {
+            let Some(claim) = self.claim_for(&e) else {
                 continue;
-            }
+            };
             let dst_rel = join(sub, &e.path);
             if opts.expected_for(&dst_rel).is_some()
                 && e.kind != Kind::File
@@ -1463,24 +1549,6 @@ impl Planner<'_> {
             // path, and it is what makes --delete safe — whatever happens
             // below (skip, filter, unsupported type), a path the source has is
             // never an extra.
-            let claim = match e.kind {
-                Kind::Dir => Claim::Dir,
-                Kind::File => Claim::File {
-                    dev: e.dev,
-                    ino: e.ino,
-                },
-                Kind::Symlink if opts.links => Claim::Leaf,
-                Kind::Fifo | Kind::Socket | Kind::CharDev | Kind::BlockDev
-                    if opts.devices
-                        && special_creation_supported(
-                            self.destination_supports_confined_socket_nodes,
-                            e.kind,
-                        ) =>
-                {
-                    Claim::Leaf
-                }
-                _ => Claim::Weak,
-            };
             // A later real claim can replace a weak claim from an entry that
             // is not copied. In that case it is the first capacity-relevant
             // object at this path even though the namespace was already seen.
@@ -1802,7 +1870,7 @@ impl Planner<'_> {
                 self.stat_directories_with_dry_run_overlay(&dirs, dst_root)?
             };
             let fill = self.fill_access();
-            if opts.may_widen_directory_permissions()
+            if opts.widens_inside_copy()
                 && stats
                     .iter()
                     .flatten()
@@ -1861,9 +1929,7 @@ impl Planner<'_> {
 
         let leaves = self.leaf_entries(others, other_stats, root_entry.as_ref(), dst_root)?;
         let mut leaf_ops = LeafOps::default();
-        for (p, dst_entry) in leaves {
-            self.plan_leaf(p, dst_entry, dst_root, &mut leaf_ops)?;
-        }
+        self.plan_leaves(leaves, dst_root, &mut leaf_ops)?;
         self.flush_meta_fixes(leaf_ops.meta_fixes)?;
         self.flush_leaf_ops(leaf_ops.ops, &leaf_ops.names)
     }
@@ -1901,6 +1967,71 @@ impl Planner<'_> {
             )?
         };
         Ok(others.into_iter().zip(stats).collect())
+    }
+
+    /// Plan leaves whose directories exist, queuing their files as one
+    /// burst, so that the workers waiting for work are woken once for all
+    /// of them (`Sched::file_burst`). Planning a leaf waits on nothing but
+    /// a few questions about ownership, which announce the queued files
+    /// first (`announce_before_asking`); anything else that waits here must
+    /// do the same.
+    fn plan_leaves(
+        &mut self,
+        leaves: Vec<(Planned, Option<Entry>)>,
+        dst_root: &[u8],
+        leaf_ops: &mut LeafOps,
+    ) -> Result<()> {
+        let _burst = self.sched.file_burst();
+        self.leaf_parents = self.group_question_parents(
+            leaves
+                .iter()
+                .map(|(leaf, destination)| (leaf, destination.as_ref())),
+        );
+        let planned = leaves
+            .into_iter()
+            .try_for_each(|(leaf, entry)| self.plan_leaf(leaf, entry, dst_root, leaf_ops));
+        self.leaf_parents = Vec::new();
+        planned
+    }
+
+    /// The directories whose group planning `leaves` may ask a root
+    /// receiver (`new_file_group_may_differ`) and has not read: those of the
+    /// existing files the copy would write in place or link new names to,
+    /// where it does not copy the group. Only a file the copy does not
+    /// keep by its size and time is written in place (`plan_file`); one
+    /// missed here is asked by itself.
+    pub(super) fn group_question_parents<'l>(
+        &self,
+        leaves: impl Iterator<Item = (&'l Planned, Option<&'l Entry>)>,
+    ) -> Vec<PathBytes> {
+        let opts = self.opts;
+        if !(opts.inplace_update || opts.hardlinks) || self.receiver_uid.is_some_and(|uid| uid != 0)
+        {
+            return Vec::new();
+        }
+        let mut parents: Vec<PathBytes> = Vec::new();
+        for (leaf, destination) in leaves {
+            let Some(destination) = destination.filter(|d| d.kind == Kind::File) else {
+                continue;
+            };
+            let asks = leaf.e.kind == Kind::File
+                && opts.flags_for(&leaf.dst_rel) & flags::GROUP == 0
+                && ((opts.hardlinks && leaf.e.nlink > 1)
+                    || (opts.inplace_update
+                        && !(opts.keeps_matching_file(&leaf.dst_rel)
+                            && opts.metadata_matches(&leaf.dst_rel, &leaf.e, destination))));
+            let Some(parent) = super::directory_stream::parent_of(&leaf.dst).filter(|_| asks)
+            else {
+                continue;
+            };
+            // A directory's files are planned together.
+            if parents.last().is_none_or(|last| last != parent)
+                && !self.parent_groups.contains_key(parent)
+            {
+                parents.push(parent.to_vec());
+            }
+        }
+        parents
     }
 
     /// Decide what one mapped leaf needs, given what its destination holds.
@@ -2102,9 +2233,7 @@ impl Planner<'_> {
         // Content is up to date, but its metadata differs, and the receiver
         // cannot change it in place: the file is replaced as a changed file
         // is (`must_replace`).
-        let quick = same
-            && opts.trusts_size_and_time()
-            && (opts.dry_run || opts.expected_for(&dst_rel).is_none());
+        let quick = same && opts.keeps_matching_file(&dst_rel);
         let replace = quick
             && dst_entry.as_ref().is_some_and(|d| {
                 (opts.metadata_fix_flags(&dst_rel, &e, d) != 0
@@ -2900,16 +3029,18 @@ impl Planner<'_> {
             }
         }
         if !ready.is_empty() {
-            for (leaf, entry) in ready {
-                self.plan_leaf(leaf, entry, dst_root, leaf_ops)?;
-            }
+            self.plan_leaves(ready, dst_root, leaf_ops)?;
             (self.start_streaming)((!mkdirs.is_empty()).then_some(pending));
         }
-        let sizes: Vec<usize> = mkdirs
+        let sizes: Vec<(usize, usize)> = mkdirs
             .iter()
             .zip(&own_metadata)
             .map(|(op, metadata)| {
-                op.size_hint() + metadata.iter().map(Op::size_hint).sum::<usize>()
+                (
+                    op.size_hint() + metadata.iter().map(Op::size_hint).sum::<usize>(),
+                    crate::proto::failed_path_hint(apply_path(op))
+                        + metadata.iter().map(failed_metadata_hint).sum::<usize>(),
+                )
             })
             .collect();
         let queue = {
@@ -2942,6 +3073,11 @@ impl Planner<'_> {
             // Nothing to create: a private root's metadata goes by itself.
             self.apply(std::mem::take(&mut stream.last_metadata))?;
         }
+        if !stream.queue.is_empty() {
+            // The creations make them stale, and their replies would take
+            // the room the creations' replies need (`REQUESTS_IN_FLIGHT`).
+            self.withdraw_early_lookups();
+        }
         let outcome =
             self.run_directory_stream(&mut stream, &mut waiting, &mut pending, dst_root, leaf_ops);
         // However the stream ended, record what the requests already sent did.
@@ -2968,9 +3104,7 @@ impl Planner<'_> {
             self.open_private_root(proposed)?;
         }
         if !last.is_empty() {
-            for (leaf, entry) in last {
-                self.plan_leaf(leaf, entry, dst_root, leaf_ops)?;
-            }
+            self.plan_leaves(last, dst_root, leaf_ops)?;
             (self.start_streaming)(None);
         }
         Ok(true)
@@ -2997,10 +3131,14 @@ impl Planner<'_> {
             } else {
                 usize::MAX
             };
-            let chosen =
-                stream
-                    .queue
-                    .next(growth, &stream.sizes, crate::proto::METADATA_BATCH_BYTES);
+            let chosen = stream.queue.next(
+                growth,
+                &stream.sizes,
+                (
+                    crate::proto::METADATA_BATCH_BYTES,
+                    crate::proto::METADATA_REPLY_BYTES,
+                ),
+            );
             if chosen.is_empty() {
                 // What is left waits for a request in flight. Without one it
                 // would never be sent, and its files never copied.
@@ -3059,7 +3197,9 @@ impl Planner<'_> {
             }
             if stream.queue.is_empty() {
                 // A private root changes group only after this batch's
-                // subdirectories have inherited its starting group.
+                // subdirectories have inherited its starting group. Its one
+                // operation is not in the reply's budget: the other half of
+                // the frame holds its failure.
                 ops.append(&mut stream.last_metadata);
             }
             if ops.is_empty() {
@@ -3158,16 +3298,17 @@ impl Planner<'_> {
         if chosen.is_empty() || self.sched.is_aborted() {
             return Ok(());
         }
-        let mut released = false;
-        for i in chosen {
-            for (leaf, entry) in std::mem::take(&mut waiting[i]) {
-                if leaf.e.kind == Kind::File {
-                    pending.remove(leaf.e.size);
-                }
-                self.plan_leaf(leaf, entry, dst_root, leaf_ops)?;
-                released = true;
+        let leaves: Vec<_> = chosen
+            .into_iter()
+            .flat_map(|i| std::mem::take(&mut waiting[i]))
+            .collect();
+        let released = !leaves.is_empty();
+        for (leaf, _) in &leaves {
+            if leaf.e.kind == Kind::File {
+                pending.remove(leaf.e.size);
             }
         }
+        self.plan_leaves(leaves, dst_root, leaf_ops)?;
         if released {
             pending.trickling = !self.directory_pacing.link_bound();
             (self.start_streaming)(Some(*pending));
@@ -3193,8 +3334,12 @@ impl Planner<'_> {
         }
         let mut early = self.early_directory_metadata(planned)?;
         // Narrow existing directories before publishing anything inside them.
-        if !early.existing.is_empty() {
-            self.apply(std::mem::take(&mut early.existing))?;
+        for ops in reply_sized(
+            std::mem::take(&mut early.existing),
+            usize::MAX,
+            failed_metadata_hint,
+        ) {
+            self.apply(ops)?;
         }
         let mut new_dirs: Vec<Op> = planned
             .iter()
@@ -3529,6 +3674,8 @@ impl Planner<'_> {
             .unzip();
         let errors = self.apply(ops)?;
         let capacity_error = first_capacity_error(&errors);
+        // The files to replace are queued together, after the reply.
+        let _burst = self.sched.file_burst();
         for ((dst, kind, replacement), error) in entries.into_iter().zip(errors) {
             match (error, replacement) {
                 (None, _) => {}
@@ -3696,40 +3843,65 @@ impl Planner<'_> {
             .collect()
     }
 
-    fn inspect_destination_batch(&mut self, mapped: &mut Mapped) -> Result<()> {
+    /// Whether this copy looks each batch's destinations up in one request
+    /// as the batch arrives (`inspect_destination_batch`).
+    pub(super) fn batch_lookups_configured(&self) -> bool {
+        !self.opts.inode_preservation.any()
+            && self.opts.dst_remote
+            && self.buffer.is_none()
+            && !self.opts.dry_run
+            && !self.destination_children_known_missing
+    }
+
+    /// `batch_lookups_configured`, once the directory the copy goes into is
+    /// accessible.
+    pub(super) fn looks_up_batches(&self) -> bool {
+        self.batch_lookups_configured() && self.container_access.is_none()
+    }
+
+    /// Look the batch's destinations up in one request, or take the reply
+    /// to `early`, the same request sent before the batch's turn.
+    fn inspect_destination_batch(
+        &mut self,
+        mapped: &mut Mapped,
+        early: Option<super::early_lookups::EarlyLookup>,
+    ) -> Result<()> {
         // Keep the remote receiver's combined metadata lookup, but wait for
         // container access first: an inaccessible child must not be cached as
         // absent before apply_mapped makes its container searchable.
-        if self.opts.inode_preservation.any()
-            || !self.opts.dst_remote
-            || self.buffer.is_some()
-            || self.opts.dry_run
-            || self.container_access.is_some()
-            || self.destination_children_known_missing
-        {
+        if !self.looks_up_batches() {
+            if let Some(early) = early {
+                self.discard_early_lookup(early);
+            }
             return Ok(());
         }
-        let directories: Vec<_> = mapped
-            .dirs
-            .iter()
-            .map(|(path, _, _)| path.clone())
-            .collect();
-        let others: Vec<_> = mapped
-            .others
-            .iter()
-            .map(|planned| planned.dst.clone())
-            .collect();
-        if directories.is_empty() && others.is_empty() {
-            return Ok(());
-        }
-        match ok(
-            self.dst.call(Request::PlanBatch {
-                directories: directories.clone(),
-                others: others.clone(),
-                strict_metadata: self.opts.expressions.update.is_some(),
-            })?,
-            "plan destination batch",
-        )? {
+        let (directories, others, response) =
+            match early.and_then(|early| self.early_reply(early, mapped)) {
+                Some(answered) => answered,
+                None => {
+                    let directories: Vec<_> = mapped
+                        .dirs
+                        .iter()
+                        .map(|(path, _, _)| path.clone())
+                        .collect();
+                    let others: Vec<_> = mapped
+                        .others
+                        .iter()
+                        .map(|planned| planned.dst.clone())
+                        .collect();
+                    if directories.is_empty() && others.is_empty() {
+                        return Ok(());
+                    }
+                    self.count_batch_lookup();
+                    let response = self.dst.call(Request::PlanBatch {
+                        directories: directories.clone(),
+                        others: others.clone(),
+                        strict_metadata: self.opts.expressions.update.is_some(),
+                    })?;
+                    (directories, others, response)
+                }
+            };
+        match ok(response, "plan destination batch")? {
             Response::BatchPlan {
                 directories: dir_stats,
                 others: other_stats,
@@ -4218,7 +4390,7 @@ impl Planner<'_> {
             // patterns apply from the root, so with those the whole root is
             // walked again instead.
             let enter = self.opts.widen_dirs == crate::cli::WidenDirs::All
-                && self.opts.may_widen_directory_permissions();
+                && self.opts.widens_inside_copy();
             let subtrees = ignore
                 .iter()
                 .all(|pattern| ignore_pattern_is_unanchored(pattern));
@@ -4322,17 +4494,16 @@ impl Planner<'_> {
             }
             // Only `all` enters a destination-only directory pruning cannot
             // read, so one the receiving account owns names that mode.
-            let unlisted: std::collections::HashMap<&[u8], &Entry> = if warnings.is_empty()
-                || self.opts.hint_for(crate::cli::WidenDirs::All).is_none()
-            {
-                Default::default()
-            } else {
-                walk.entries
-                    .iter()
-                    .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o500 != 0o500)
-                    .map(|entry| (entry.path.as_slice(), entry))
-                    .collect()
-            };
+            let unlisted: std::collections::HashMap<&[u8], &Entry> =
+                if warnings.is_empty() || self.opts.entering_hint().is_none() {
+                    Default::default()
+                } else {
+                    walk.entries
+                        .iter()
+                        .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o500 != 0o500)
+                        .map(|entry| (entry.path.as_slice(), entry))
+                        .collect()
+                };
             for (base, warning) in warnings {
                 self.delete_walk_failed = true;
                 let directory = warning.path.as_ref().map(|path| join(&base, path));
@@ -4343,12 +4514,8 @@ impl Planner<'_> {
                     Some(entry) => receiver_owns(&mut *self.dst, &mut self.receiver_uid, entry)?,
                     None => false,
                 };
-                let hint = match self
-                    .opts
-                    .hint_for(crate::cli::WidenDirs::All)
-                    .filter(|_| owned)
-                {
-                    Some(hint) => format!("; {hint}"),
+                let hint = match self.opts.entering_hint().filter(|_| owned) {
+                    Some(hint) => format!("; {}", self.opts.said_once(hint)),
                     None => String::new(),
                 };
                 // A preview names the directory it could not inspect.
@@ -4385,7 +4552,7 @@ impl Planner<'_> {
             // already widened to be entered has a new change time, so only
             // its identity is required.
             let unwritable: std::collections::HashMap<PathBytes, TargetCondition> =
-                if self.opts.may_widen_directory_permissions() {
+                if self.opts.widens_inside_copy() {
                     walk.entries
                         .iter()
                         .filter(|entry| entry.kind == Kind::Dir && entry.mode & 0o300 != 0o300)
@@ -4655,7 +4822,9 @@ impl Planner<'_> {
             for (path, ..) in items {
                 me.note_directory_change(path, true);
             }
-            for chunk in items.chunks(1000) {
+            for chunk in reply_sized_slices(items, 1000, |(path, ..)| {
+                crate::proto::failed_path_hint(path)
+            }) {
                 if opts.dry_run {
                     for (p, rel, kind) in chunk {
                         n += 1;
@@ -5006,18 +5175,14 @@ impl Planner<'_> {
         Ok(results)
     }
 
-    pub(super) fn apply(&mut self, mut ops: Vec<Op>) -> Result<Vec<Option<WireError>>> {
-        if ops.len() > 1
-            && ops.iter().map(Op::size_hint).sum::<usize>() > crate::proto::METADATA_BATCH_BYTES
-        {
-            let tail = ops.split_off(ops.len() / 2);
-            let mut results = self.apply(ops)?;
-            results.extend(self.apply(tail)?);
-            return Ok(results);
+    pub(super) fn apply(&mut self, ops: Vec<Op>) -> Result<Vec<Option<WireError>>> {
+        let mut results = Vec::with_capacity(ops.len());
+        for ops in request_sized(ops) {
+            let count = ops.len();
+            let response = self.dst.call(Request::Apply { ops })?;
+            results.extend(self.applied(response, count)?);
         }
-        let count = ops.len();
-        let response = self.dst.call(Request::Apply { ops })?;
-        self.applied(response, count)
+        Ok(results)
     }
 
     /// The outcome of each of an `Apply` request's `count` operations.
@@ -5046,7 +5211,18 @@ impl Planner<'_> {
 
     /// The receiving account's user ID, asked once.
     fn receiver_uid(&mut self) -> Result<u32> {
+        self.announce_before_asking(self.receiver_uid.is_none());
         receiver_uid(&mut *self.dst, &mut self.receiver_uid)
+    }
+
+    /// Deciding about a leaf is about to wait for the destination's answer,
+    /// when `asking`. That can happen while the leaf's files are queued as a
+    /// burst (`plan_leaves`): the files queued so far get their workers
+    /// first, rather than wait for the reply too.
+    fn announce_before_asking(&self, asking: bool) {
+        if asking {
+            self.sched.announce_queued_files();
+        }
     }
 
     /// Whether the existing file `destination` must be replaced rather than
@@ -5270,6 +5446,7 @@ impl Planner<'_> {
     /// letting the receiver create anything anyone could see.
     fn new_file_owner(&mut self, dst: &[u8]) -> Option<crate::proto::NewFileOwner> {
         if self.new_file_owner.is_none() {
+            self.announce_before_asking(true);
             let directory = dst
                 .iter()
                 .rposition(|&c| c == b'/')
@@ -5296,24 +5473,14 @@ impl Planner<'_> {
         group: u32,
         new_file: crate::proto::NewFileOwner,
     ) -> bool {
-        let Some(parent) = dst
-            .iter()
-            .rposition(|&c| c == b'/')
-            .map(|i| dst[..i.max(1)].to_vec())
-        else {
+        let Some(parent) = super::directory_stream::parent_of(dst) else {
             return true;
         };
-        let directory = match self.parent_groups.get(&parent) {
+        let directory = match self.parent_groups.get(parent) {
             Some(directory) => *directory,
             None => {
-                let directory = self
-                    .stat_many(vec![parent.clone()])
-                    .ok()
-                    .and_then(|mut stats| stats.pop().flatten())
-                    .filter(|entry| entry.kind == Kind::Dir)
-                    .map(|entry| (entry.gid, entry.mode));
-                self.parent_groups.insert(parent, directory);
-                directory
+                self.announce_before_asking(true);
+                self.read_parent_groups(parent.to_vec())
             }
         };
         match directory {
@@ -5323,6 +5490,34 @@ impl Planner<'_> {
                 parent_group != group || (parent_mode & 0o2000 == 0 && new_file.group != group)
             }
         }
+    }
+
+    /// Read the group and mode of the directory `parent` into
+    /// `parent_groups`, and with it, in the same request, those of the
+    /// other directories the leaves being planned may ask about
+    /// (`leaf_parents`): a tree of small directories otherwise waits a
+    /// round trip for each. A directory that cannot be read counts as
+    /// missing, so a file there is replaced. This is a plain lookup, not
+    /// the planner's own (`Planner::stat_many`): that one fails as a whole
+    /// when a `--copy-if` copy sees an entry change between its two reads,
+    /// as these directories do while workers publish into them.
+    fn read_parent_groups(&mut self, parent: PathBytes) -> Option<(u32, u32)> {
+        let mut parents = std::mem::take(&mut self.leaf_parents);
+        parents.push(parent.clone());
+        parents.sort_unstable();
+        parents.dedup();
+        let mut stats = stat_many(self.dst, parents.clone(), false)
+            .unwrap_or_default()
+            .into_iter();
+        for path in parents {
+            let directory = stats
+                .next()
+                .flatten()
+                .filter(|entry| entry.kind == Kind::Dir)
+                .map(|entry| (entry.gid, entry.mode));
+            self.parent_groups.insert(path, directory);
+        }
+        self.parent_groups.get(&parent).copied().flatten()
     }
 
     /// Sort existing directories whose owner lacks write or search
@@ -5360,7 +5555,7 @@ impl Planner<'_> {
                         "syq: {}: not inspected: you own this directory, but it lacks owner search permission{}",
                         display(&path),
                         match self.opts.hint_for(needed).filter(|_| hint) {
-                            Some(hint) => format!("; {hint}"),
+                            Some(hint) => format!("; {}", self.opts.said_once(hint)),
                             None => String::new(),
                         }
                     ),
@@ -5368,7 +5563,8 @@ impl Planner<'_> {
                     Some("permission_denied"),
                 );
                 uninspected.push(path);
-            } else if hint {
+            } else if hint && self.opts.hint_for(needed).is_some() {
+                // A mode that already widens `needed` leaves nothing to name.
                 self.opts
                     .access_limited
                     .lock()
@@ -5404,7 +5600,7 @@ impl Planner<'_> {
     }
 
     fn prepare_existing_directories(&mut self, mut paths: Vec<PathBytes>) -> Result<()> {
-        if !self.opts.may_widen_directory_permissions() {
+        if !self.opts.widens_inside_copy() {
             return Ok(());
         }
         let fill = self.fill_access();
@@ -5529,23 +5725,67 @@ impl Planner<'_> {
                 "final directory metadata",
             )?;
         }
-        let mut pending = d.as_slice();
-        while !pending.is_empty() {
-            let (chunk, rest) = pending.split_at(directory_metadata_batch_len(pending));
-            pending = rest;
-            let ops: Vec<Op> = chunk
-                .iter()
-                .map(|(p, m, f, _, condition)| Op::SetMeta {
-                    path: p.clone(),
-                    meta: m.clone(),
-                    flags: *f,
-                    condition: *condition,
-                    directory: true,
-                })
-                .collect();
-            let errors = self.apply(ops)?;
+        // A scan takes the replies to the lookups it sent early when it
+        // ends. One that panicked leaves them unanswered, and this pass then
+        // runs as the planner is dropped: their replies are taken first, as
+        // with these requests they would be more than the connection lets
+        // wait.
+        self.withdraw_early_lookups();
+        // The receiver runs requests in the order sent, so several can await
+        // their replies without a later one's changes overtaking an earlier
+        // one's (`directory_metadata_batch_len`).
+        let unanswered = self.dst.reply_queue().map_or(1, |replies| {
+            replies.min(super::directory_stream::REQUESTS_IN_FLIGHT)
+        });
+        let mut requests = DirectoryMetadataRequests::new(&d);
+        let mut in_flight = std::collections::VecDeque::new();
+        // What ends the pass early. Nothing more is sent, and the requests
+        // already sent are still answered: they have changed the directories
+        // they name.
+        let mut failure = None;
+        // A reply was no `Apply` result, so the replies after it may not be
+        // their requests'. They are taken, to leave the connection as it
+        // was, and not read.
+        let mut unmatched = false;
+        loop {
+            while failure.is_none() && in_flight.len() < unanswered {
+                let Some((directories, ops)) = requests.next() else {
+                    break;
+                };
+                // Tests count each request's directories and the requests
+                // still unanswered when it is sent.
+                #[cfg(debug_assertions)]
+                let _ = crate::fsops::record_test_event(
+                    "SYQ_TEST_DIRECTORY_METADATA_REQUESTS",
+                    format_args!("{} {}", ops.len(), in_flight.len()),
+                );
+                match self.dst.send_pending(Request::Apply { ops }) {
+                    Ok(reply) => in_flight.push_back((reply, directories)),
+                    Err(error) => failure = Some(error),
+                }
+            }
+            let Some((reply, directories)) = in_flight.pop_front() else {
+                break;
+            };
+            let response = match self.dst.take_reply(reply) {
+                Ok(response) => response,
+                // No usable reply came: the connection is lost or out of
+                // step, so the replies after it are not waited for.
+                Err(error) => return Err(failure.unwrap_or(error)),
+            };
+            if unmatched {
+                continue;
+            }
+            let errors = match self.applied(response, directories.len()) {
+                Ok(errors) => errors,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    unmatched = true;
+                    continue;
+                }
+            };
             let capacity_error = first_capacity_error(&errors);
-            for ((path, ..), error) in chunk.iter().zip(errors) {
+            for ((path, ..), error) in directories.iter().zip(errors) {
                 if let Some(error) = error {
                     if quiet {
                         continue;
@@ -5559,10 +5799,12 @@ impl Planner<'_> {
                 }
             }
             if let Some(error) = capacity_error {
-                return Err(endpoint_error(error)).context("apply destination changes");
+                failure.get_or_insert_with(|| {
+                    endpoint_error(error).context("apply destination changes")
+                });
             }
         }
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 }
 
@@ -5646,7 +5888,7 @@ fn receiver_uid(dst: &mut dyn Conn, cache: &mut Option<u32>) -> Result<u32> {
 /// Temporarily add owner access to `directories` and remember the original
 /// modes of those actually changed; returns how many changed. The receiver
 /// widens only owned directories, never as root.
-fn widen_directory_batch(
+pub(super) fn widen_directory_batch(
     dst: &mut dyn Conn,
     opts: &Opts,
     progress: &Progress,
@@ -5655,9 +5897,19 @@ fn widen_directory_batch(
     access: u32,
 ) -> Result<usize> {
     let mut widened = 0;
-    let mut directories = directories.into_iter().peekable();
-    while directories.peek().is_some() {
-        let batch: Vec<_> = directories.by_ref().take(1000).collect();
+    // A grant that bars widening the copy's directories leaves only the
+    // directory the copy goes into to ask for: the receiver would refuse the
+    // whole request for another, and the copy with it.
+    let barred = opts.keep_bars_widening();
+    let directories: Vec<_> = directories
+        .into_iter()
+        .filter(|(path, _)| !barred || opts.outer_directory.get() == Some(path))
+        .collect();
+    // At most 1,000 go together, fewer when their failures, each naming its
+    // directory, could overfill the reply.
+    for batch in reply_sized(directories, 1000, |(path, _)| {
+        crate::proto::failed_path_hint(path)
+    }) {
         let names: Vec<_> = batch.iter().map(|(path, _)| path.clone()).collect();
         let response = ok(
             dst.call(Request::WidenDirectories {
@@ -5745,19 +5997,148 @@ fn merge_directory_metadata(
     }
 }
 
-/// Keep ordinary metadata in full batches, even across directory depths. Only
-/// a mode that removes search access needs to wait for deeper operations.
-fn directory_metadata_batch_len(
-    entries: &[(PathBytes, Meta, u8, usize, TargetCondition)],
-) -> usize {
-    let maximum = entries.len().min(1000);
+/// A directory's final metadata: its path, the metadata and which of it to
+/// set (`flags`), its depth, and the directory it must still be.
+type DirectoryMetadata = (PathBytes, Meta, u8, usize, TargetCondition);
+
+/// The most the failure of an early or final directory metadata operation
+/// adds to its reply (`proto::failed_set_meta_hint`).
+fn failed_metadata_hint(op: &Op) -> usize {
+    match op {
+        Op::SetMeta { path, meta, .. } => crate::proto::failed_set_meta_hint(path, meta),
+        op => crate::proto::failed_path_hint(apply_path(op)),
+    }
+}
+
+/// `items` in order, as consecutive parts of at most `most`, each ending
+/// before the failures of all its operations (by `hint`) could overfill a
+/// reply (`proto::METADATA_REPLY_BYTES`). Each part holds at least one.
+fn reply_sized_slices<T>(
+    mut items: &[T],
+    most: usize,
+    hint: impl Fn(&T) -> usize,
+) -> impl Iterator<Item = &[T]> {
+    std::iter::from_fn(move || {
+        if items.is_empty() {
+            return None;
+        }
+        let mut reply = 0usize;
+        let len = items
+            .iter()
+            .take(most)
+            .position(|item| {
+                reply = reply.saturating_add(hint(item));
+                reply > crate::proto::METADATA_REPLY_BYTES
+            })
+            .map_or(items.len().min(most), |index| index.max(1));
+        let (part, rest) = items.split_at(len);
+        items = rest;
+        Some(part)
+    })
+}
+
+/// `reply_sized_slices` for items to send, moved rather than copied.
+fn reply_sized<T>(items: Vec<T>, most: usize, hint: impl Fn(&T) -> usize) -> Vec<Vec<T>> {
+    let lengths: Vec<usize> = reply_sized_slices(&items, most, hint)
+        .map(<[T]>::len)
+        .collect();
+    if lengths.len() <= 1 {
+        return (!items.is_empty()).then_some(items).into_iter().collect();
+    }
+    let mut items = items.into_iter();
+    lengths
+        .into_iter()
+        .map(|len| items.by_ref().take(len).collect())
+        .collect()
+}
+
+/// Split `ops` in halves until each part's request fits the metadata frame
+/// budget, keeping their order.
+fn request_sized(mut ops: Vec<Op>) -> Vec<Vec<Op>> {
+    if ops.len() > 1
+        && ops.iter().map(Op::size_hint).sum::<usize>() > crate::proto::METADATA_BATCH_BYTES
+    {
+        let tail = ops.split_off(ops.len() / 2);
+        let mut parts = request_sized(ops);
+        parts.extend(request_sized(tail));
+        return parts;
+    }
+    vec![ops]
+}
+
+/// The final directory metadata still to send, deepest first, as the
+/// requests it goes in: each with the directories it changes. Only the
+/// metadata of the request being sent is copied.
+struct DirectoryMetadataRequests<'a> {
+    pending: &'a [DirectoryMetadata],
+}
+
+impl<'a> DirectoryMetadataRequests<'a> {
+    fn new(pending: &'a [DirectoryMetadata]) -> Self {
+        Self { pending }
+    }
+}
+
+impl<'a> Iterator for DirectoryMetadataRequests<'a> {
+    type Item = (&'a [DirectoryMetadata], Vec<Op>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let (batch, rest) = self
+            .pending
+            .split_at(directory_metadata_batch_len(self.pending));
+        self.pending = rest;
+        let ops = batch
+            .iter()
+            .map(|(path, meta, flags, _, condition)| Op::SetMeta {
+                path: path.clone(),
+                meta: meta.clone(),
+                flags: *flags,
+                condition: *condition,
+                directory: true,
+            })
+            .collect();
+        Some((batch, ops))
+    }
+}
+
+/// Directories whose final metadata goes in one request: as many as one
+/// request creates at its largest on a network filesystem
+/// (`directory_stream`).
+const DIRECTORIES_PER_REQUEST: usize = 4096;
+
+/// How many of `entries`, deepest first, go in the next request.
+///
+/// Ordinary metadata fills a request, even across directory depths. Only a
+/// mode that removes search access needs to wait for deeper operations: it
+/// goes in a later request, which the receiver runs once the earlier ones
+/// are done.
+///
+/// A request also ends before its operations pass the request budget
+/// (`proto::METADATA_BATCH_BYTES`), which preserved attribute values can
+/// fill, and before the failures of all of them could overfill its reply
+/// (`proto::METADATA_REPLY_BYTES`). Each failure's error names its
+/// directory, so a request of very long paths holds fewer.
+fn directory_metadata_batch_len(entries: &[DirectoryMetadata]) -> usize {
+    let maximum = entries.len().min(DIRECTORIES_PER_REQUEST);
     let deepest = entries[0].3;
+    let (mut request, mut reply) = (0, 0);
     entries[..maximum]
         .iter()
-        .position(|(_, meta, flags, depth, _)| {
-            *depth < deepest
-                && flags & (flags::MODE | flags::RECEIVER_MODE) != 0
-                && meta.mode & 0o100 == 0
+        .enumerate()
+        .position(|(index, (path, meta, flags, depth, _))| {
+            request += crate::proto::set_meta_size_hint(path, meta);
+            reply += crate::proto::failed_set_meta_hint(path, meta);
+            // The first always goes: it is as deep as itself, and a request
+            // carries at least one operation.
+            (index > 0
+                && (request > crate::proto::METADATA_BATCH_BYTES
+                    || reply > crate::proto::METADATA_REPLY_BYTES))
+                || (*depth < deepest
+                    && flags & (flags::MODE | flags::RECEIVER_MODE) != 0
+                    && meta.mode & 0o100 == 0)
         })
         .unwrap_or(maximum)
 }
@@ -5911,6 +6292,409 @@ mod directory_metadata_tests {
         assert_eq!(directory_metadata_batch_len(&entries), 12);
         entries[7].2 = flags::RECEIVER_MODE;
         assert_eq!(directory_metadata_batch_len(&entries), 7);
+    }
+
+    #[test]
+    fn final_metadata_too_large_for_one_request_fills_requests_with_its_directories() {
+        // Nine directories whose extended attributes together exceed the
+        // frame budget, then one at a shallower depth that removes search
+        // access.
+        let long = crate::proto::METADATA_BATCH_BYTES / 4;
+        let entry = |name: u8, len: usize, mode, depth| {
+            let attributes = crate::inode_metadata::ExtendedAttributes {
+                privileged: false,
+                values: vec![(b"user.large".to_vec(), vec![0; len])],
+            };
+            (
+                vec![name],
+                Meta {
+                    mode,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                    mtime_nsec: 0,
+                    inode_metadata: Some(Box::new(crate::inode_metadata::InodeMetadata {
+                        xattrs: Some(attributes),
+                        ..Default::default()
+                    })),
+                },
+                flags::MODE,
+                depth,
+                TargetCondition::Any,
+            )
+        };
+        let mut entries: Vec<DirectoryMetadata> =
+            (0..9).map(|name| entry(name, long, 0o755, 2)).collect();
+        entries.push(entry(9, 1, 0o600, 1));
+        let requests: Vec<_> = DirectoryMetadataRequests::new(&entries).collect();
+        let names: Vec<Vec<u8>> = requests
+            .iter()
+            .map(|(directories, ops)| {
+                let paths: Vec<_> = directories.iter().map(|(path, ..)| path).collect();
+                let sent: Vec<_> = ops
+                    .iter()
+                    .map(|op| match op {
+                        Op::SetMeta {
+                            path,
+                            directory: true,
+                            ..
+                        } => path,
+                        other => panic!("unexpected operation {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(paths, sent);
+                let request = Request::Apply { ops: ops.clone() };
+                assert!(encoded_len(&request) <= crate::proto::METADATA_BATCH_BYTES);
+                assert!(fits_its_frame(&request));
+                paths.iter().map(|path| path[0]).collect()
+            })
+            .collect();
+        // Three of these directories fill a request's budget. The narrowed
+        // directory waits for all of them.
+        assert_eq!(
+            names,
+            [vec![0, 1, 2], vec![3, 4, 5], vec![6, 7, 8], vec![9]]
+        );
+    }
+
+    fn timed(path: Vec<u8>, depth: usize) -> DirectoryMetadata {
+        (
+            path,
+            Meta {
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                mtime: 1_500_000_000,
+                mtime_nsec: 0,
+                inode_metadata: None,
+            },
+            flags::TIMES,
+            depth,
+            TargetCondition::Any,
+        )
+    }
+
+    fn encoded_len<T: serde::Serialize>(message: &T) -> usize {
+        postcard::to_extend(message, Vec::new()).unwrap().len()
+    }
+
+    /// Whether a connection would send `message`: it is within its frame.
+    fn fits_its_frame<T: serde::Serialize + crate::proto::SizeHint>(message: &T) -> bool {
+        crate::proto::FrameWriter::new(Vec::new(), false)
+            .write_msg(message)
+            .is_ok()
+    }
+
+    #[test]
+    fn a_final_metadata_request_holds_4096_directories_of_ordinary_paths() {
+        let mut entries: Vec<DirectoryMetadata> = (0..10_000)
+            .map(|index| {
+                let path = format!("/destination/tree/g{:03}/d{index:06}", index / 1000);
+                timed(path.into_bytes(), 4)
+            })
+            .collect();
+        let lengths = |entries: &[DirectoryMetadata]| -> Vec<usize> {
+            DirectoryMetadataRequests::new(entries)
+                .map(|(directories, ops)| {
+                    assert_eq!(directories.len(), ops.len());
+                    ops.len()
+                })
+                .collect()
+        };
+        assert_eq!(lengths(&entries), [4096, 4096, 1808]);
+        // A shallower directory that loses search access still starts a
+        // request of its own, wherever in a request it would have fallen.
+        entries[5000] = timed(b"/destination/tree/closed".to_vec(), 3);
+        entries[5000].1.mode = 0o600;
+        entries[5000].2 = flags::MODE | flags::TIMES;
+        assert_eq!(lengths(&entries), [4096, 904, 4096, 904]);
+    }
+
+    /// The longest text an error of setting a directory's metadata takes: its
+    /// handle could not be opened, which names the directory as the request
+    /// does (`shown`) and again beneath the destination root (`beneath`),
+    /// with the system's longest description of an error and the receiver's
+    /// note on an owned directory's permissions.
+    fn longest_error(shown: &[u8], beneath: &[u8]) -> WireError {
+        WireError {
+            message: format!(
+                "open confined metadata handle {}: open confined metadata handle {}: \
+                 Attempting to link in too many shared libraries (os error 2147483647); \
+                 an owned destination directory lacks the required owner permissions",
+                String::from_utf8_lossy(shown),
+                String::from_utf8_lossy(beneath)
+            ),
+            io_kind: Some(crate::proto::WireIoKind::OwnedDirectoryPermissions),
+            raw_os_error: Some(i32::MAX),
+            condition_not_met: true,
+        }
+    }
+
+    #[test]
+    fn final_metadata_requests_and_their_replies_fit_their_frames_when_every_directory_fails() {
+        use crate::proto::{failed_set_meta_hint, METADATA_BATCH_BYTES, METADATA_REPLY_BYTES};
+        // The worst case for a reply: paths as long as a system call takes
+        // (4,095 bytes below the destination), none of them UTF-8, so that
+        // the receiver shows each byte as three, and every operation fails.
+        let tree = crate::test_support::tempdir().unwrap();
+        let root = tree.path().as_os_str().as_encoded_bytes().to_vec();
+        let mut receiver = crate::fsops::FsOps::rooted_for_test(tree.path());
+        let beneath = |index: usize| {
+            let mut path = vec![vec![0xff; 255]; 15].join(&b'/');
+            path.push(b'/');
+            path.extend_from_slice(&[0xff; 247]);
+            path.extend_from_slice(format!("{index:08}").as_bytes());
+            assert_eq!(path.len(), 4095);
+            path
+        };
+        let entries: Vec<DirectoryMetadata> = (0..400)
+            .map(|index| timed(join(&root, &beneath(index)), 17))
+            .collect();
+        let mut sent = 0;
+        let mut one_failure = None;
+        for (directories, ops) in DirectoryMetadataRequests::new(&entries) {
+            // Far fewer than 4,096 go together: about 110, and what is left.
+            assert!(ops.len() <= 120, "{}", ops.len());
+            assert!(sent > 0 || ops.len() >= 100, "{}", ops.len());
+            let request = Request::Apply { ops: ops.clone() };
+            assert!(encoded_len(&request) < METADATA_BATCH_BYTES);
+            assert!(fits_its_frame(&request));
+            // The receiver takes each path beneath its root, as its server
+            // maps a request's paths.
+            let relative: Vec<Op> = (sent..sent + ops.len())
+                .map(|index| Op::SetMeta {
+                    path: beneath(index),
+                    meta: entries[index].1.clone(),
+                    flags: flags::TIMES,
+                    condition: TargetCondition::Any,
+                    directory: true,
+                })
+                .collect();
+            let errors = receiver.apply(&relative);
+            assert_eq!(errors.len(), ops.len());
+            let mut longest = Vec::new();
+            for (index, ((path, meta, ..), error)) in directories.iter().zip(&errors).enumerate() {
+                let allowed = failed_set_meta_hint(path, meta);
+                let error = error.as_ref().expect("no such directory exists");
+                // What the receiver said, and the most it could have said.
+                assert!(encoded_len(&Some(error)) <= allowed, "{error:?}");
+                assert!(error.message.len() > 3 * 4095, "{error:?}");
+                let worst = longest_error(path, &beneath(sent + index));
+                assert!(encoded_len(&Some(&worst)) <= allowed);
+                longest.push(Some(worst));
+            }
+            one_failure = errors[0].clone();
+            for reply in [Response::Applied(errors), Response::Applied(longest)] {
+                assert!(encoded_len(&reply) <= METADATA_REPLY_BYTES);
+                assert!(fits_its_frame(&reply));
+            }
+            sent += ops.len();
+        }
+        assert_eq!(sent, entries.len());
+        // The number of directories alone would not have kept these replies
+        // within their frame: not 4,096 of these failures, nor 1,000.
+        for count in [4096, 1000] {
+            assert!(!fits_its_frame(&Response::Applied(vec![
+                one_failure.clone();
+                count
+            ])));
+        }
+    }
+
+    // Linux only: the directories' names are not UTF-8, which APFS refuses,
+    // and their paths are longer than macOS takes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_final_metadata_operation_says_no_more_than_its_request_allowed_for() {
+        use crate::proto::failed_set_meta_hint;
+        // Directories that exist, at paths near the longest a system call
+        // takes, fail in the other ways open to a test: a file has taken
+        // the directory's place, or it is not the directory the copy found.
+        let tree = crate::test_support::tempdir().unwrap();
+        let root = tree.path().as_os_str().as_encoded_bytes().to_vec();
+        let mut receiver = crate::fsops::FsOps::rooted_for_test(tree.path());
+        let parent = vec![vec![0xff; 255]; 13].join(&b'/');
+        let on_disk = |path: &[u8]| {
+            use std::os::unix::ffi::OsStrExt;
+            tree.path().join(std::ffi::OsStr::from_bytes(path))
+        };
+        std::fs::create_dir_all(on_disk(&parent)).unwrap();
+        let (file, other) = (join(&parent, b"file"), join(&parent, b"other"));
+        std::fs::write(on_disk(&file), b"").unwrap();
+        std::fs::create_dir(on_disk(&other)).unwrap();
+        let meta = timed(Vec::new(), 0).1;
+        let op = |path: &[u8], condition| Op::SetMeta {
+            path: path.to_vec(),
+            meta: meta.clone(),
+            flags: flags::TIMES,
+            condition,
+            directory: true,
+        };
+        let elsewhere = TargetCondition::Matches { dev: 1, ino: 1 };
+        let errors = receiver.apply(&[
+            op(&file, TargetCondition::Any),
+            op(&other, elsewhere),
+            op(&join(&parent, b"missing"), TargetCondition::Any),
+        ]);
+        let paths = [&file[..], &other[..], &join(&parent, b"missing")[..]].map(<[u8]>::to_vec);
+        let said: Vec<&str> = errors
+            .iter()
+            .zip(&paths)
+            .map(|(error, path)| {
+                let error = error.as_ref().expect("each operation fails");
+                let allowed = failed_set_meta_hint(&join(&root, path), &meta);
+                assert!(encoded_len(&Some(error)) <= allowed, "{error:?}");
+                error.message.as_str()
+            })
+            .collect();
+        assert!(said[0].contains("is no longer a directory"), "{said:?}");
+        assert!(
+            said[1].contains("changed before metadata update"),
+            "{said:?}"
+        );
+        assert!(said[2].contains("No such file or directory"), "{said:?}");
+        // An error of preserved attributes names one attribute, of at most
+        // 255 bytes, as a list of numbers.
+        let attribute = format!(
+            "reconcile attribute {:?}: restore permissions after extended attributes: \
+             Attempting to link in too many shared libraries (os error 2147483647)",
+            [255_u8; 255].as_slice()
+        );
+        let attributes = |xattrs| crate::inode_metadata::InodeMetadata {
+            xattrs,
+            ..Default::default()
+        };
+        let allowed = attributes(Some(crate::inode_metadata::ExtendedAttributes {
+            privileged: false,
+            values: Vec::new(),
+        }))
+        .failure_hint();
+        assert!(attribute.len() <= allowed, "{}", attribute.len());
+        // Preserved times alone cannot name an attribute.
+        let times = crate::inode_metadata::InodeMetadata {
+            atime: Some(crate::inode_metadata::Timestamp {
+                seconds: 1,
+                nanoseconds: 0,
+            }),
+            ..attributes(None)
+        };
+        assert_eq!(times.failure_hint(), 0);
+    }
+
+    // Linux only, as the test above: names that are not UTF-8, at paths
+    // longer than macOS takes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_creation_or_removal_says_no_more_than_its_request_allowed_for() {
+        use crate::proto::failed_path_hint;
+        // Entries at paths near the longest a system call takes fail to be
+        // created or removed in each way a test can bring about.
+        let tree = crate::test_support::tempdir().unwrap();
+        let root = tree.path().as_os_str().as_encoded_bytes().to_vec();
+        let mut receiver = crate::fsops::FsOps::rooted_for_test(tree.path());
+        let parent = vec![vec![0xff; 255]; 13].join(&b'/');
+        let on_disk = |path: &[u8]| {
+            use std::os::unix::ffi::OsStrExt;
+            tree.path().join(std::ffi::OsStr::from_bytes(path))
+        };
+        std::fs::create_dir_all(on_disk(&join(&parent, b"full/inside"))).unwrap();
+        std::fs::write(on_disk(&join(&parent, b"file")), b"").unwrap();
+        let mkdir = |name: &[u8], condition| Op::Mkdir {
+            path: join(&parent, name),
+            mode: 0o755,
+            condition,
+        };
+        let ops = [
+            // Another directory holds the name of a no-replace creation:
+            // its error names the path twice.
+            mkdir(b"full", TargetCondition::Absent),
+            // A file holds the name.
+            mkdir(b"file", TargetCondition::Any),
+            // The parent is a file.
+            mkdir(b"file/new", TargetCondition::Any),
+            // A directory is not empty.
+            Op::Rmdir {
+                path: join(&parent, b"full"),
+            },
+            // A directory has taken a file's place.
+            Op::Unlink {
+                path: join(&parent, b"full"),
+            },
+            // The parent is a file.
+            Op::Rmdir {
+                path: join(&parent, b"file/old"),
+            },
+        ];
+        let expected = [
+            "appeared before no-replace creation",
+            "cannot replace non-directory",
+            "Not a directory",
+            "Directory not empty",
+            "is now a directory",
+            "Not a directory",
+        ];
+        for (op, expected) in ops.iter().zip(expected) {
+            let error = receiver.apply(std::slice::from_ref(op)).remove(0);
+            let error = error.unwrap_or_else(|| panic!("{expected}: the operation succeeded"));
+            assert!(error.message.contains(expected), "{error:?}");
+            let allowed = failed_path_hint(&join(&root, apply_path(op)));
+            assert!(encoded_len(&Some(&error)) <= allowed, "{error:?}");
+            assert!(error.message.len() > 3 * 3300, "{error:?}");
+        }
+        // The no-replace creation's error names the path twice.
+        let twice = receiver.apply(&ops[..1]).remove(0).unwrap();
+        assert!(twice.message.len() > 2 * 3 * 3300, "{twice:?}");
+    }
+
+    #[test]
+    fn removals_go_1000_at_a_time_or_fewer_when_their_failures_could_overfill_a_reply() {
+        let lengths = |path_len: usize| -> Vec<usize> {
+            let paths: Vec<PathBytes> = (0..2500)
+                .map(|index| {
+                    let mut path = vec![0xff; path_len];
+                    path.extend_from_slice(format!("{index:05}").as_bytes());
+                    path
+                })
+                .collect();
+            reply_sized_slices(&paths, 1000, |path| crate::proto::failed_path_hint(path))
+                .map(<[PathBytes]>::len)
+                .collect()
+        };
+        assert_eq!(lengths(50), [1000, 1000, 500]);
+        // Three copies of about 9.8 KiB each when the receiver shows them:
+        // 141 in 4 MiB.
+        let long = lengths(3250);
+        assert_eq!(long.iter().sum::<usize>(), 2500);
+        assert!(
+            long[..long.len() - 1].iter().all(|&len| len == 141),
+            "{long:?}"
+        );
+        // Operations are moved into their requests in order.
+        let ops: Vec<Op> = (0..300_u16)
+            .map(|index| Op::Unlink {
+                path: [vec![0xff; 3250], index.to_be_bytes().to_vec()].concat(),
+            })
+            .collect();
+        let requests = reply_sized(ops.clone(), 1000, |op| {
+            crate::proto::failed_path_hint(apply_path(op))
+        });
+        assert_eq!(
+            requests.iter().map(Vec::len).collect::<Vec<_>>(),
+            [141, 141, 18]
+        );
+        let paths = |ops: &[Op]| {
+            ops.iter()
+                .map(|op| apply_path(op).to_vec())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(paths(&requests.concat()), paths(&ops));
+        // One goes alone, however large.
+        assert_eq!(
+            reply_sized_slices(&[0, 1], 1000, |_| usize::MAX)
+                .map(<[i32]>::len)
+                .collect::<Vec<_>>(),
+            [1, 1]
+        );
     }
 
     #[test]

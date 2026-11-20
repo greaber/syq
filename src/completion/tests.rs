@@ -394,7 +394,7 @@ fn rsync_endpoint_suggestions_never_treat_a_native_port_as_a_path() {
         host: "example".into(),
         port: Some(2222),
     };
-    assert_eq!(endpoint_label(&endpoint), "alice@example:2222");
+    assert_eq!(endpoint.label(), "alice@example:2222");
     assert!(endpoint_candidate_value(&endpoint, "alice", EndpointSyntax::Rsync).is_none());
     assert_eq!(
         endpoint_candidate_value(&endpoint, "alice", EndpointSyntax::Native).as_deref(),

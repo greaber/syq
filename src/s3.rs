@@ -337,20 +337,6 @@ impl Options {
                 "S3 endpoints must be s3://BUCKET; select keys with source and placement options"
             );
         }
-        if tuning.comparison_block_size.is_some()
-            || tuning.workers.is_some()
-            || tuning.request_size.is_some()
-            || tuning.pipeline_depth.is_some()
-            || tuning.copy_path.is_some()
-            || tuning.batch_files.is_some()
-            || tuning.batch_bytes.is_some()
-            || tuning.split_min_size.is_some()
-            || tuning.bw_pacing.is_some()
-        {
-            bail!(
-                "filesystem performance tuning is not supported for S3 {operation}; use the s3-* keys"
-            );
-        }
         let concurrency = tuning.s3_part_workers.unwrap_or(64);
         let part_size = tuning.s3_part_size.unwrap_or(16 << 20);
         if let Some(endpoint) = &flags.s3_endpoint {
@@ -480,36 +466,13 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
             .map_err(|_| anyhow::anyhow!("progress thread panicked"))?;
     }
     if let Some(writer) = progress.results_writer() {
-        writer.emit_result(&crate::results::ResultRecord {
-            status: match code {
-                0 => "success",
-                23 => "partial",
-                25 => "refused",
-                _ => "failed",
-            },
-            exit_code: code,
-            dry_run: args.dry_run,
-            files_transferred: progress.files_done.load(Relaxed),
-            files_unchanged: progress.files_unchanged.load(Relaxed),
-            files_excluded: progress.excluded(),
-            directories_created: progress.directories_created.load(Relaxed),
-            symlinks_created: progress.symlinks_created.load(Relaxed),
-            specials_created: 0,
-            errors,
-            bytes_transferred: progress.bytes_done.load(Relaxed),
-            bytes_unchanged: progress.bytes_unchanged.load(Relaxed),
-            timings: progress.timings(),
-            deletions_planned: args
-                .delete
-                .then(|| progress.deletions_planned.load(Relaxed)),
-            deletions_completed: args
-                .delete
-                .then(|| progress.deletions_completed.load(Relaxed)),
-            deletions_blocked: args
-                .delete
-                .then(|| progress.deletions_blocked.load(Relaxed)),
-            replaced_not_in_place: None,
-        });
+        let status = match code {
+            0 => crate::results::Status::Success,
+            23 => crate::results::Status::Partial,
+            25 => crate::results::Status::Refused,
+            _ => crate::results::Status::Failed,
+        };
+        writer.emit_result(&progress.result_record(status, code, args.dry_run, args.delete, false));
         if writer.is_dead() {
             bail!("S3 result stream could not be completed");
         }
@@ -572,23 +535,12 @@ fn run_on_server(mut args: Args) -> Result<i32> {
         // the stream; one that already settled it ignores these records.
         writer.emit_error_classified(&format!("syq: {error:#}"), None, None);
         writer.emit_result(&crate::results::ResultRecord {
-            status: "failed",
-            exit_code: 1,
-            dry_run: args.dry_run,
-            files_transferred: 0,
-            files_unchanged: 0,
-            files_excluded: 0,
-            directories_created: 0,
-            symlinks_created: 0,
-            specials_created: 0,
             errors: 1,
-            bytes_transferred: 0,
-            bytes_unchanged: 0,
             timings: clock.timings(),
             deletions_planned: args.delete.then_some(0),
             deletions_completed: args.delete.then_some(0),
             deletions_blocked: args.delete.then_some(0),
-            replaced_not_in_place: None,
+            ..crate::results::ResultRecord::new(crate::results::Status::Failed, 1, args.dry_run)
         });
     }
     outcome

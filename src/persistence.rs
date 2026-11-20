@@ -25,7 +25,7 @@ pub(crate) use domain::Domain;
 mod ssh_config;
 
 const CONFIG_FILE: &str = "persistence.json";
-const SCOPE_MARKER: &str = ".syq-persistence";
+pub(crate) const SCOPE_MARKER: &str = ".syq-persistence";
 const SCOPE_MARKER_CONTENT: &[u8] = b"syq persistence scope\n";
 
 #[derive(Parser, Debug)]
@@ -72,7 +72,7 @@ enum PersistAction {
         #[arg(long, hide = true)]
         when_idle: bool,
         /// With --when-idle: replace it at once, even when busy, as a
-        /// settings change does (`receive_service::Replace::NowBounded`)
+        /// settings change does without a terminal (`receive_service::Replace::Now`)
         #[arg(long, hide = true, requires = "when_idle")]
         replace_now: bool,
     },
@@ -143,19 +143,7 @@ impl EndpointRecord {
     }
 
     pub(crate) fn label(&self) -> String {
-        let host = if self.host.contains(':') {
-            format!("[{}]", self.host)
-        } else {
-            self.host.clone()
-        };
-        let endpoint = match &self.user {
-            Some(user) => format!("{user}@{host}"),
-            None => host,
-        };
-        match self.port {
-            Some(port) => format!("{endpoint}:{port}"),
-            None => endpoint,
-        }
+        crate::cli::endpoint_label(self.user.as_deref(), &self.host, self.port)
     }
 }
 
@@ -255,10 +243,10 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
                     syq_path,
                     no_bootstrap,
                     Duration::from_secs(timeout),
-                    match (when_idle, replace_now) {
-                        (true, true) => crate::receive_service::Replace::NowBounded,
-                        (true, false) => crate::receive_service::Replace::WhenIdle,
-                        (false, _) => crate::receive_service::Replace::Now,
+                    if when_idle && !replace_now {
+                        crate::receive_service::Replace::WhenIdle
+                    } else {
+                        crate::receive_service::Replace::Now
                     },
                     if when_idle {
                         Login::Unattended
@@ -296,11 +284,11 @@ pub(crate) fn run(argv: &[OsString]) -> Result<i32> {
         PersistAction::On { ephemeral: false } => {
             let scope = domain.enable()?;
             crate::output::command_human_stdout!("SSH connection persistence is on");
-            crate::output::command_human_stdout!("scope: {}", scope.display());
+            crate::output::command_human_stdout!("scope: {}", scope.path().display());
             crate::receive_service::switch_outdated_now(&domain);
         }
         PersistAction::Off {} => {
-            if domain.is_default() {
+            if domain.is_default() && !global_config_is(false) {
                 write_global_config(false)?;
             }
             let scope = domain.runtime_path();
@@ -397,13 +385,14 @@ pub(crate) enum Login {
     /// terminal on the way.
     Bounded,
     /// Never asking: a login that needs the user fails as
-    /// `switch::LoginNeeded`, as for a switch without a terminal.
+    /// `switch::LoginNeeded`, as for a switch without a terminal. It runs
+    /// as a switch does: one at a time per connection, within the switch's
+    /// time, and recorded for status.
     Unattended,
 }
 /// `replace` says what to do with a receiving service from another build:
 /// replace it at once, as when the user runs `persist connect`, or only
-/// once idle, as a switch to a new build does. A switch to a new build
-/// (`Replace::WhenIdle`) always logs in `Login::Unattended`.
+/// once idle, as a switch to a new build does.
 pub(crate) fn connect_domain(
     domain: &Domain,
     host: &str,
@@ -417,9 +406,9 @@ pub(crate) fn connect_domain(
         crate::cli::parse_native_endpoint(Some(host))?.context("SSH endpoint missing")?;
     reject_receiving_name(&endpoint.host)?;
     let was_enabled = domain.enabled()?;
-    let when_idle = replace == crate::receive_service::Replace::WhenIdle;
     // Run as a switch to a new build is: one at a time, bounded, recorded.
-    let switching = when_idle || replace == crate::receive_service::Replace::NowBounded;
+    let switching = login == Login::Unattended;
+    let when_idle = switching && replace == crate::receive_service::Replace::WhenIdle;
     // A switch to a new build never turns persistence back on.
     if switching && !was_enabled {
         return Ok(());
@@ -473,7 +462,7 @@ pub(crate) fn connect_domain(
             .then(|| crate::receive_service::keeps_running(multiplexer.control_path()))
             .flatten()
         {
-            report_ready(domain, &endpoint_label(&endpoint), ready);
+            report_ready(domain, &endpoint.label(), ready);
             return Ok(());
         }
     }
@@ -502,7 +491,7 @@ pub(crate) fn connect_domain(
         no_bootstrap,
         timeout,
         replace,
-        Login::Unattended,
+        login,
     );
     match &result {
         Ok(()) => crate::receive_service::clear_attempt(&control),
@@ -580,7 +569,7 @@ fn connect_receiving(
     };
     // Tests stand for work after the login that takes too long.
     #[cfg(debug_assertions)]
-    if let Some(millis) = (replace == crate::receive_service::Replace::WhenIdle)
+    if let Some(millis) = (unattended && replace == crate::receive_service::Replace::WhenIdle)
         .then(|| std::env::var("SYQ_TEST_SWITCH_STALL_MS").ok())
         .flatten()
         .and_then(|millis| millis.parse().ok())
@@ -597,16 +586,6 @@ fn connect_receiving(
     drop(connection);
     report_ready(domain, &remote.label(), receiving);
     Ok(())
-}
-
-fn endpoint_label(endpoint: &crate::cli::NativeEndpoint) -> String {
-    EndpointRecord::new(
-        endpoint.user.as_deref(),
-        &endpoint.host,
-        endpoint.port,
-        None,
-    )
-    .label()
 }
 
 fn report_ready(domain: &Domain, label: &str, ready: crate::receive_service::Ready) {
@@ -748,12 +727,58 @@ pub(crate) fn mark_explicit_scope(args: &mut Args) -> Result<()> {
 /// Resolve persistence only for an implicit local SSH edge. Explicit scopes
 /// are validated here, and the durable policy is read here. Local commands and
 /// transports that do not use managed SSH avoid an unrelated state dependency.
-pub(crate) fn scope_for_implicit_ssh(explicit_scope: Option<&Path>) -> Result<Option<PathBuf>> {
+pub(crate) fn scope_for_implicit_ssh(
+    explicit_scope: Option<&Path>,
+) -> Result<Option<CheckedScope>> {
     let domain = Domain::select(explicit_scope)?;
     if !domain.is_default() || domain.enabled()? {
-        Ok(Some(domain.ensure_runtime()?))
+        let path = match domain.explicit_path() {
+            // Selecting an explicit scope has just validated it.
+            Some(path) if path.join(crate::receive_service::CLOSING).exists() => {
+                return Err(closing_scope_error(path))
+            }
+            Some(path) => path.to_path_buf(),
+            None => domain.ensure_runtime()?,
+        };
+        Ok(Some(CheckedScope { domain, path }))
     } else {
         Ok(None)
+    }
+}
+
+/// A scope this command has already checked, with [`Domain::select`] or
+/// [`Domain::ensure_runtime`]: its directory and marker, and that it was not
+/// closing. The command's
+/// later steps use it rather than checking the same path again.
+pub(crate) struct CheckedScope {
+    domain: Domain,
+    path: PathBuf,
+}
+
+impl CheckedScope {
+    /// Select and check `scope` as an explicit `--pscope` would be.
+    #[cfg(test)]
+    pub(crate) fn check(scope: &Path) -> Result<Self> {
+        scope_for_implicit_ssh(Some(scope))?.context("an explicit scope is always used")
+    }
+
+    pub(crate) fn domain(&self) -> &Domain {
+        &self.domain
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// [`prepare_endpoint`] without checking the scope a second time.
+    pub(crate) fn prepare_endpoint(
+        &self,
+        user: Option<&str>,
+        host: &str,
+        port: Option<u16>,
+        ssh: Option<&SshOptions>,
+    ) -> Result<PathBuf> {
+        prepare_checked_endpoint(&self.path, user, host, port, ssh)
     }
 }
 
@@ -838,29 +863,49 @@ pub(crate) fn prepare_endpoint(
     if scope.join(crate::receive_service::CLOSING).exists() {
         return Err(closing_scope_error(scope));
     }
+    prepare_checked_endpoint(scope, user, host, port, ssh)
+}
+
+fn prepare_checked_endpoint(
+    scope: &Path,
+    user: Option<&str>,
+    host: &str,
+    port: Option<u16>,
+    ssh: Option<&SshOptions>,
+) -> Result<PathBuf> {
     let key = endpoint_key(user, host, port, ssh);
     let socket = scope.join(&key);
     validate_openssh_socket_path(&socket)?;
     let record_path = scope.join(format!("{key}.json"));
     let expected = EndpointRecord::new(user, host, port, ssh);
-    let mut record_bytes = serde_json::to_vec(&expected)?;
-    record_bytes.push(b'\n');
-    let created = crate::state_file::write_atomic(
-        &record_path,
-        &record_bytes,
-        0o600,
-        crate::state_file::Publish::NoClobber,
-        crate::state_file::Durability::RenameOnly,
-    )
-    .with_context(|| format!("create endpoint record {}", record_path.display()))?;
-    if !created {
-        let actual = read_endpoint_record(&record_path)?;
-        if actual != expected {
-            bail!(
-                "persistence scope endpoint-key collision at {}",
-                record_path.display()
-            );
+    // The record outlives the command, so after the first command to an
+    // endpoint it is only read. Creation never replaces a record: a command
+    // racing to create the same one reads the winner's.
+    let actual = match read_endpoint_record_if_present(&record_path)? {
+        Some(actual) => actual,
+        None => {
+            let mut record_bytes = serde_json::to_vec(&expected)?;
+            record_bytes.push(b'\n');
+            let created = crate::state_file::write_atomic(
+                &record_path,
+                &record_bytes,
+                0o600,
+                crate::state_file::Publish::NoClobber,
+                crate::state_file::Durability::RenameOnly,
+            )
+            .with_context(|| format!("create endpoint record {}", record_path.display()))?;
+            if created {
+                expected.clone()
+            } else {
+                read_endpoint_record(&record_path)?
+            }
         }
+    };
+    if actual != expected {
+        bail!(
+            "persistence scope endpoint-key collision at {}",
+            record_path.display()
+        );
     }
 
     if let Ok(metadata) = socket.symlink_metadata() {
@@ -913,14 +958,35 @@ pub(crate) fn global_enabled() -> Result<bool> {
     Ok(read_global_config()?.is_some_and(|config| config.enabled))
 }
 
+fn global_config_bytes(enabled: bool) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(&PersistenceConfig { enabled })?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Whether the configuration already holds exactly what
+/// [`write_global_config`] would write, with the mode it would set, so
+/// rewriting and syncing it would change nothing.
+fn global_config_is(enabled: bool) -> bool {
+    let (Some(path), Ok(expected)) = (config_path(), global_config_bytes(enabled)) else {
+        return false;
+    };
+    crate::state_file::read_private(
+        &path,
+        "persistence configuration",
+        MAX_CONFIG_BYTES,
+        crate::state_file::FileRule::Exact0600,
+    )
+    .is_ok_and(|bytes| bytes.as_deref() == Some(&expected[..]))
+}
+
 fn write_global_config(enabled: bool) -> Result<()> {
     let path = config_path()
         .context("cannot change persistence: no home directory or absolute XDG_CONFIG_HOME")?;
     let parent = path.parent().expect("configuration path has a parent");
     std::fs::create_dir_all(parent)
         .with_context(|| format!("create configuration directory {}", parent.display()))?;
-    let mut bytes = serde_json::to_vec_pretty(&PersistenceConfig { enabled })?;
-    bytes.push(b'\n');
+    let bytes = global_config_bytes(enabled)?;
     crate::state_file::write_atomic(
         &path,
         &bytes,
@@ -1008,10 +1074,22 @@ fn create_ephemeral_scope() -> Result<PathBuf> {
 }
 
 pub(crate) fn initialize_scope(scope: &Path) -> Result<()> {
+    // The socket path check covers `validate_openssh_control_path(scope)`,
+    // and the tightened directory passes `validate_scope`'s directory rule,
+    // so only the marker is left to check.
     validate_openssh_socket_path(&scope.join(endpoint_key(None, "", None, None)))?;
     secure_directory(scope, true, true)?;
-    create_marker(scope)?;
-    validate_scope(scope)
+    match open_marker(scope) {
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            create_marker(scope)?;
+            validate_marker(open_marker(scope)?, scope)
+        }
+        marker => validate_marker(marker?, scope),
+    }
 }
 
 fn create_marker(scope: &Path) -> Result<()> {
@@ -1035,8 +1113,12 @@ fn create_marker(scope: &Path) -> Result<()> {
 pub(crate) fn validate_scope(scope: &Path) -> Result<()> {
     validate_openssh_control_path(scope)?;
     secure_directory(scope, false, false)?;
+    validate_marker(open_marker(scope)?, scope)
+}
+
+fn open_marker(scope: &Path) -> Result<File> {
     let marker_path = scope.join(SCOPE_MARKER);
-    let mut marker = OpenOptions::new()
+    OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&marker_path)
@@ -1045,7 +1127,11 @@ pub(crate) fn validate_scope(scope: &Path) -> Result<()> {
                 "open persistence scope marker {} (is this a path printed by `syq persist on --ephemeral`?)",
                 marker_path.display()
             )
-        })?;
+        })
+}
+
+fn validate_marker(mut marker: File, scope: &Path) -> Result<()> {
+    let marker_path = scope.join(SCOPE_MARKER);
     let metadata = marker.metadata()?;
     if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
         bail!(
@@ -1122,6 +1208,20 @@ fn endpoint_key(
 fn read_endpoint_record(path: &Path) -> Result<EndpointRecord> {
     let file = crate::state_file::open_private(path)
         .with_context(|| format!("open endpoint record {}", path.display()))?;
+    parse_endpoint_record(path, file)
+}
+
+fn read_endpoint_record_if_present(path: &Path) -> Result<Option<EndpointRecord>> {
+    match crate::state_file::open_private(path) {
+        Ok(file) => parse_endpoint_record(path, file).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("open endpoint record {}", path.display()))
+        }
+    }
+}
+
+fn parse_endpoint_record(path: &Path, file: File) -> Result<EndpointRecord> {
     let bytes = crate::state_file::read_open(
         file,
         &format_args!("endpoint record {}", path.display()),
@@ -1991,6 +2091,59 @@ mod tests {
         assert_eq!(scope_records(&scope).unwrap().len(), 2);
         close_scope(&scope).unwrap();
         assert!(!scope.exists());
+    }
+
+    /// After the first command to an endpoint, a command only reads the
+    /// scope: it creates no file there, not even a temporary one.
+    #[test]
+    fn a_repeated_command_writes_nothing_in_the_scope() {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = crate::test_support::short_tempdir().unwrap();
+        let scope = temporary.path().join("scope");
+        initialize_scope(&scope).unwrap();
+        let first = CheckedScope::check(&scope)
+            .unwrap()
+            .prepare_endpoint(Some("alice"), "example", None, None)
+            .unwrap();
+        let read_only =
+            |mode| std::fs::set_permissions(&scope, std::fs::Permissions::from_mode(mode)).unwrap();
+        read_only(0o500);
+        let repeated = CheckedScope::check(&scope)
+            .and_then(|checked| checked.prepare_endpoint(Some("alice"), "example", None, None));
+        let unchecked = prepare_endpoint(&scope, Some("alice"), "example", None, None);
+        read_only(0o700);
+        assert_eq!(repeated.unwrap(), first);
+        assert_eq!(unchecked.unwrap(), first);
+    }
+
+    /// Commands racing to create the same endpoint record all succeed, and
+    /// the record they leave is the one each would have written.
+    #[test]
+    fn commands_racing_to_create_an_endpoint_record_all_succeed() {
+        let temporary = crate::test_support::short_tempdir().unwrap();
+        for round in 0..20 {
+            let scope = temporary.path().join(format!("s{round}"));
+            initialize_scope(&scope).unwrap();
+            let barrier = std::sync::Barrier::new(4);
+            let sockets: Vec<PathBuf> = std::thread::scope(|threads| {
+                let racers: Vec<_> = (0..4)
+                    .map(|_| {
+                        threads.spawn(|| {
+                            barrier.wait();
+                            prepare_endpoint(&scope, Some("alice"), "example", None, None)
+                        })
+                    })
+                    .collect();
+                racers
+                    .into_iter()
+                    .map(|racer| racer.join().unwrap().unwrap())
+                    .collect()
+            });
+            assert!(sockets.windows(2).all(|pair| pair[0] == pair[1]));
+            assert_eq!(scope_records(&scope).unwrap().len(), 1);
+            // Nothing is left behind for `persist off` to refuse.
+            close_scope(&scope).unwrap();
+        }
     }
 
     #[test]

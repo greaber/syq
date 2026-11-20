@@ -1,6 +1,6 @@
 //! Stop a batch when S3 stops answering, instead of spending every object's
 //! retries on a service that is down.
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 
 /// Requests that fail after their retries without an answer from the service,
 /// with none answered in between, before a batch stops. A partial outage or
@@ -12,6 +12,7 @@ pub(crate) struct Outage {
     failures: AtomicU32,
     stopped: AtomicBool,
     notify: tokio::sync::Notify,
+    throttled: AtomicU64,
 }
 
 impl Outage {
@@ -37,6 +38,17 @@ impl Outage {
             // The batch has one waiter; a stored permit covers a later wait.
             self.notify.notify_one();
         }
+    }
+
+    /// A response asked the client to slow down, whether or not the request
+    /// was then retried.
+    pub(crate) fn throttled(&self) {
+        self.throttled.fetch_add(1, Relaxed);
+    }
+
+    /// How many responses have asked that so far.
+    pub(crate) fn throttled_responses(&self) -> u64 {
+        self.throttled.load(Relaxed)
     }
 
     /// Completes once the batch should stop.

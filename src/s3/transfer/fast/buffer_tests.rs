@@ -43,6 +43,60 @@ fn resource_ceilings_bound_initial_and_adaptive_s3_concurrency() {
 }
 
 #[test]
+fn objects_checked_beyond_the_transfer_limit_stay_within_set_limits() {
+    let copy = || Route::ServerCopy {
+        source_bucket: "source".into(),
+    };
+    let checking = |flags: &[&str], route: Route| {
+        let mut engine = planning_engine(flags);
+        engine.options.route = route;
+        engine
+            .object_workers(std::iter::repeat_n(8u64 << 20, 1024))
+            .unwrap()
+            .checking
+            .map(|checking| checking.maximum)
+    };
+    assert_eq!(checking(&[], Route::Upload), Some(256));
+    assert_eq!(checking(&[], Route::Download), Some(256));
+    // A copy between buckets asks about the source and the destination.
+    assert_eq!(checking(&[], copy()), Some(128));
+    for (flag, route, expected) in [
+        ("--resource-limits=s3-objects=40", Route::Upload, Some(40)),
+        ("--resource-limits=s3-objects=40", copy(), Some(40)),
+        (
+            "--resource-limits=s3-requests=40",
+            Route::Download,
+            Some(40),
+        ),
+        ("--resource-limits=s3-requests=40", copy(), Some(20)),
+        (
+            "--performance-tuning=s3-requests=16",
+            Route::Upload,
+            Some(16),
+        ),
+        ("--performance-tuning=s3-requests=1", copy(), Some(1)),
+        // A fixed object count is the number of objects in progress.
+        ("--performance-tuning=s3-objects=7", Route::Upload, None),
+    ] {
+        assert_eq!(checking(&[flag], route), expected, "{flag}");
+    }
+    // Between buckets a request count the user set also admits each
+    // object's own metadata requests, as before.
+    for (flags, set) in [
+        (&[][..], false),
+        (&["--performance-tuning=s3-requests=16"][..], true),
+        (&["--resource-limits=s3-requests=16"][..], true),
+        (&["--resource-limits=s3-objects=16"][..], false),
+    ] {
+        assert_eq!(
+            planning_engine(flags).tuning.requests_set(),
+            set,
+            "{flags:?}"
+        );
+    }
+}
+
+#[test]
 fn server_copy_threshold_tracks_single_request_scheduling() {
     let mut engine = planning_engine(&[]);
     engine.options.route = Route::ServerCopy {
@@ -294,8 +348,9 @@ pub(super) fn planning_engine(extra: &[&str]) -> Engine {
         tuning,
         client: Client::from_conf(config),
         progress: Progress::new(false, false, None),
-        pace: Mutex::new(tokio::time::Instant::now()),
+        bandwidth: None,
         upload_keys: OnceLock::new(),
+        discovery: OnceLock::new(),
         authorization: None,
         copy_checksum_unsupported: Default::default(),
         content_md5: Default::default(),

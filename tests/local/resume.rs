@@ -1,18 +1,10 @@
 use super::*;
 
 #[test]
-fn measured_history_seeds_auto_tuning_and_fixed_counts_preserve_legacy_cache() {
+fn measured_history_seeds_auto_tuning() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     let cache = t.path("tuning.json");
-    write(
-        &cache,
-        serde_json::to_string_pretty(&serde_json::json!({
-            "paths": { "local>fake|ssh": 1 }
-        }))
-        .unwrap()
-        .as_bytes(),
-    );
     let run = |destination: &str, fixed: Option<usize>, limited: bool| {
         let mut command = compat_command();
         command
@@ -35,7 +27,7 @@ fn measured_history_seeds_auto_tuning_and_fixed_counts_preserve_legacy_cache() {
             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
             .env("FAKE_RSH_LOG", t.path("rsh.log"))
             .env("SYQ_TUNING_CACHE", &cache)
-            // Match the unscoped legacy cache fixture regardless of the host network.
+            // Keep the history's route key independent of the host network.
             .env("SYQ_TEST_TUNING_NETWORK", "")
             .run()
             .unwrap()
@@ -71,10 +63,14 @@ fn measured_history_seeds_auto_tuning_and_fixed_counts_preserve_legacy_cache() {
     );
     assert_eq!(read(&t.path("limited")), read(&t.path("src")));
 
+    // A fixed count does not start from the history.
     let fixed = run("fixed", Some(3), true);
     assert_output_ok(&fixed);
-    let cached: serde_json::Value = serde_json::from_slice(&read(&cache)).unwrap();
-    assert_eq!(cached["paths"]["local>fake|ssh"], 1);
+    assert!(
+        !String::from_utf8_lossy(&fixed.stderr).contains("auto-tuning: starting with"),
+        "{}",
+        String::from_utf8_lossy(&fixed.stderr)
+    );
 }
 
 #[cfg(debug_assertions)]
@@ -617,7 +613,7 @@ fn streaming_and_default_copies_share_resume_partials() {
             "-a",
             "--block-size=1M",
             "--resource-limits=bandwidth=1G",
-            &format!("--performance-tuning=copy-path={after},request-size=128K,bw-pacing=average"),
+            &format!("--performance-tuning=copy-path={after},request-size=128K"),
             &src,
             &dst,
         ]);
@@ -656,7 +652,7 @@ fn tuning_options_preserve_partial_identity_and_reused_hash_blocks() {
         "--whole-file",
         "--block-size=1M",
         "--resource-limits=bandwidth=1G",
-        "--performance-tuning=request-size=128K,pipeline-depth=8,copy-path=ranges,split-min-size=2M,bw-pacing=average",
+        "--performance-tuning=request-size=128K,pipeline-depth=8,copy-path=ranges,split-min-size=2M",
         &src,
         &dst,
     ]);
@@ -753,14 +749,22 @@ fn small_inplace_files_use_batched_workers() {
         let lines: Vec<&str> = events.lines().collect();
         // Three small files start one automatic worker, and at most one per
         // file even when more are requested. A started worker that finds every
-        // file already done exits without connecting.
+        // file already done exits without connecting. The automatic tuner may
+        // still add its startup spare when it looks before the first worker
+        // has taken the files, as a starved copy does; that spare then finds
+        // them taken.
         let (started, _) = started_workers(&t.path("history.sqlite"));
         assert_eq!(started, if workers.is_some() { 3 } else { 1 });
-        if workers.is_none() {
-            assert_eq!(lines, ["connected 0 0", "batch 0 3"]);
-        }
+        let spare = usize::from(workers.is_none());
         let connected = lines.iter().filter(|l| l.starts_with("connected ")).count();
-        assert!((1..=started as usize).contains(&connected), "{events}");
+        assert!(
+            (1..=started as usize + spare).contains(&connected),
+            "{events}"
+        );
+        if workers.is_none() {
+            let batches: Vec<_> = lines.iter().filter(|l| l.starts_with("batch ")).collect();
+            assert!(batches.len() == 1 && batches[0].ends_with(" 3"), "{events}");
+        }
         let batched: usize = lines
             .iter()
             .filter_map(|l| l.strip_prefix("batch "))
