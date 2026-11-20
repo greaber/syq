@@ -263,7 +263,6 @@ fn base_host(endpoint: &str) -> Option<String> {
         url::Host::Domain(host) => Some(host.to_owned()),
         _ => None,
     }
-    }
 }
 
 /// The request [`S3::first_key`] sends, as storage signing names it.
