@@ -347,9 +347,10 @@ async fn execute(
     }
     let page = read(store, &query, true, None).await?;
     if component + 1 == pattern.components.len() {
-        if page.next.is_some() && !byte_ordered(store) {
-            // Making sure of a key a page may leave out (`Gap`) relies on
-            // byte order. List everything under the prefix instead.
+        if page.next.is_some() && !byte_ordered(store) && part.may_end_with('0') {
+            // Making sure of a key a page may leave out (`Gap`), which ends
+            // in '0', relies on byte order. List everything under the prefix
+            // instead.
             let flat = read(store, &query, false, None).await?;
             return Ok(scan_batch(query, false, flat, Gap::default()));
         }

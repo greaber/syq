@@ -1213,4 +1213,35 @@ async fn a_key_the_glob_cannot_match_needs_no_check() {
     assert!(
         format!("{error:#}").contains("\"edge/p0\" to check for a key the store may have skipped")
     );
+    // Where the order is unknown, `edge/*` is listed flat after the first
+    // page, but `edge/*.jpg` needs no more than its delimiter listing, which
+    // a policy may require.
+    struct DelimiterOnly(Memory);
+    impl Store for DelimiterOnly {
+        async fn page(
+            &self,
+            prefix: &str,
+            delimiter: bool,
+            token: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<Page> {
+            anyhow::ensure!(delimiter, "refused");
+            self.0.page(prefix, delimiter, token, None).await
+        }
+    }
+    let store = DelimiterOnly(Memory::new(store.0.keys.iter().cloned()));
+    store.0.skips.set(true);
+    let mut keys = Vec::new();
+    let pattern = Pattern::parse("s3://bucket/edge/*.jpg").unwrap();
+    engine::enumerate(&store, &pattern, 1, |entry| {
+        keys.push(entry.key);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(keys.len(), 1000);
+    let pattern = Pattern::parse("s3://bucket/edge/*").unwrap();
+    assert!(engine::enumerate(&store, &pattern, 1, |_| Ok(()))
+        .await
+        .is_err());
 }
