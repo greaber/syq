@@ -110,14 +110,22 @@ async fn latency_uses_individual_control_responses_and_ignores_errors_and_data()
     assert_eq!(control.load(Ordering::Relaxed), 1_000_000);
 }
 
+/// How long the fake storage service takes to answer, and how long the fake
+/// authorizing machine takes to sign. The gap leaves room for a loaded runner.
+const STORAGE: Duration = Duration::from_millis(50);
+const SIGNING: Duration = Duration::from_millis(2000);
+
 #[derive(Debug, Clone)]
 struct Found;
 impl HttpConnector for Found {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
         assert!(request.uri().contains("X-Amz-Signature="));
-        let mut response = HttpResponse::new(200.try_into().unwrap(), SdkBody::empty());
-        response.headers_mut().insert("content-length", "0");
-        HttpConnectorFuture::ready(Ok(response))
+        HttpConnectorFuture::new(async {
+            tokio::time::sleep(STORAGE).await;
+            let mut response = HttpResponse::new(200.try_into().unwrap(), SdkBody::empty());
+            response.headers_mut().insert("content-length", "0");
+            Ok(response)
+        })
     }
 }
 
@@ -131,7 +139,7 @@ async fn latency_leaves_out_the_wait_for_a_signature() {
     let authorizer = std::thread::spawn(move || {
         let message: serde_json::Value = read_message(&mut peer).unwrap();
         let key = message["Sign"][0]["key"].as_str().unwrap().to_owned();
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(SIGNING);
         let url = format!("https://storage.example/fixture/{key}?X-Amz-Signature=fake");
         write_message(&mut peer, &serde_json::json!({ "Signed": [url] })).unwrap();
     });
@@ -176,8 +184,9 @@ async fn latency_leaves_out_the_wait_for_a_signature() {
         .send()
         .await
         .unwrap();
-    assert!(start.elapsed() >= Duration::from_millis(200));
+    assert!(start.elapsed() >= SIGNING + STORAGE);
+    // The storage service's own time stays in the sample.
     let sample = Duration::from_nanos(control.load(Ordering::Relaxed));
-    assert!(sample < Duration::from_millis(100), "{sample:?}");
+    assert!(sample >= STORAGE && sample < SIGNING / 2, "{sample:?}");
     authorizer.join().unwrap();
 }
