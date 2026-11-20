@@ -710,6 +710,42 @@ mod tests {
         assert_eq!(std::fs::read_dir(directory).unwrap().count(), 0);
     }
 
+    /// An empty upload is refused as empty, and nothing is installed.
+    #[test]
+    fn an_empty_upload_is_refused() {
+        use std::process::{Command, Stdio};
+
+        let root = crate::test_support::tempdir().unwrap();
+        let result = Command::new("sh")
+            .args([
+                "-c",
+                &upload_script(Target {
+                    key: "self",
+                    asset: "",
+                }),
+            ])
+            .env("HOME", root.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_guarded()
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(INSTALL_FAILED_EXIT));
+        let error = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            error.contains("syq: the uploaded remote helper is empty"),
+            "{error}"
+        );
+        let directory = root
+            .path()
+            .join(".local/lib/syq")
+            .join(helper_identity())
+            .join("self");
+        assert_eq!(std::fs::read_dir(directory).unwrap().count(), 0);
+    }
+
     #[test]
     fn upload_needs_no_download_verification_or_decompression_tools() {
         let target = Target::from_uname("Linux", "x86_64").unwrap();

@@ -2671,6 +2671,15 @@ fn management_stage_is_scoped_to_one_shell_session() {
     );
     assert_eq!(output.status.code(), Some(23));
     assert!(!store.join(".syq-stage-test").exists());
+
+    // An empty upload, as when the enrolling machine could not get the
+    // build, is refused rather than run as an empty script.
+    let output = invoke(temporary.path(), b"", b"empty request");
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("syq: the uploaded syq is empty"), "{error}");
+    assert!(output.stdout.ends_with(b"upload\n"), "{:?}", output.stdout);
+    assert!(!store.join(".syq-stage-test").exists());
 }
 
 /// The greeting's `authorized_keys` byte count and the bytes after it come
