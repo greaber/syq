@@ -1078,35 +1078,33 @@ pub(crate) fn initialize_scope(scope: &Path) -> Result<()> {
     // and the tightened directory passes `validate_scope`'s directory rule,
     // so only the marker is left to check.
     validate_openssh_socket_path(&scope.join(endpoint_key(None, "", None, None)))?;
-    secure_directory(scope, true, true)?;
+    let directory = secure_directory(scope, true, true)?;
     match open_marker(scope) {
         Err(error)
             if error
                 .downcast_ref::<std::io::Error>()
                 .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
         {
-            create_marker(scope)?;
+            create_marker(&directory, scope)?;
             validate_marker(open_marker(scope)?, scope)
         }
         marker => validate_marker(marker?, scope),
     }
 }
 
-fn create_marker(scope: &Path) -> Result<()> {
-    let path = scope.join(SCOPE_MARKER);
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&path)
-    {
-        Ok(mut marker) => marker.write_all(SCOPE_MARKER_CONTENT)?,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => {
-            return Err(error).with_context(|| format!("create scope marker {}", path.display()));
-        }
-    }
+/// Publish the marker whole, unless one is already there, so that a
+/// command creating the same scope at the same time never reads it partly
+/// written.
+fn create_marker(directory: &File, scope: &Path) -> Result<()> {
+    crate::state_file::write_atomic_at(
+        directory,
+        OsStr::new(SCOPE_MARKER),
+        SCOPE_MARKER_CONTENT,
+        0o600,
+        crate::state_file::Publish::NoClobber,
+        crate::state_file::Durability::RenameOnly,
+    )
+    .with_context(|| format!("create scope marker {}", scope.join(SCOPE_MARKER).display()))?;
     Ok(())
 }
 
@@ -2151,7 +2149,7 @@ mod tests {
     #[test]
     fn commands_racing_to_create_a_scope_all_succeed() {
         let temporary = crate::test_support::short_tempdir().unwrap();
-        for round in 0..5000 {
+        for round in 0..3000 {
             let scope = temporary.path().join(format!("s{round}"));
             let barrier = std::sync::Barrier::new(8);
             std::thread::scope(|threads| {

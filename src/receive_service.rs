@@ -1845,7 +1845,16 @@ fn stop_when_idle(control: &Path) -> Result<bool> {
             restart: false,
             stop_if_idle: true,
         },
-    )?;
+    )
+    .map_err(|error| {
+        if !crate::service::unanswered(&error) {
+            return error;
+        }
+        error.context(format!(
+            "receiving service is running but did not answer at {} whether it is idle; run the command again, or check syq persist status",
+            suffixed(control, SOCKET).display()
+        ))
+    })?;
     if !answer.stopping {
         return Ok(false);
     }

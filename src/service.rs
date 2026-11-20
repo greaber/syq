@@ -248,9 +248,17 @@ pub(crate) fn connect(path: &Path, timeout: Duration, private: bool) -> Result<U
     Ok(stream)
 }
 
+/// A service that stops just after a client connects drops the connection,
+/// and macOS then refuses to set its timeouts with EINVAL: report that as
+/// the reset connection it is, so that callers wait for the service.
 fn set_timeouts(stream: &UnixStream, timeout: Duration) -> io::Result<()> {
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))
+    stream
+        .set_read_timeout(Some(timeout))
+        .and_then(|()| stream.set_write_timeout(Some(timeout)))
+        .map_err(|error| match error.raw_os_error() {
+            Some(libc::EINVAL) => io::Error::from(io::ErrorKind::ConnectionReset),
+            _ => error,
+        })
 }
 
 /// Whether nothing answered on a control socket, as while a locked service
