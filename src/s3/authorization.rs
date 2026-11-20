@@ -4,13 +4,13 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::{Arc, Condvar, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 mod transport;
-pub(super) use transport::{http_client, signed_header};
+pub(super) use transport::{http_client, signed_header, SigningWait};
 
 pub(crate) const DEFAULT_LIFETIME: u64 = 7 * 24 * 60 * 60;
 
@@ -643,11 +643,20 @@ fn now() -> Result<u64> {
 }
 
 struct State {
+    /// The connection to the authorizing machine. It is out of the state
+    /// while an exchange uses it, and gone once preparation finishes or fails.
     connection: Option<std::os::unix::net::UnixStream>,
     requests: BTreeMap<Unsigned, String>,
     /// Why signing failed. A failed exchange ends the signing session, so
     /// every later request it has not prepared fails for the same reason.
     failure: Option<String>,
+    /// Requests waiting for the next exchange, in the order they arrived.
+    queued: VecDeque<Unsigned>,
+    /// The queued requests and those in the exchange under way, so callers
+    /// asking for the same request at once share its signature.
+    waiting: BTreeSet<Unsigned>,
+    /// Whether a caller is exchanging with the authorizing machine.
+    exchanging: bool,
 }
 impl State {
     fn ended(&self) -> Result<()> {
@@ -658,11 +667,19 @@ impl State {
             None => Ok(()),
         }
     }
+    fn fail(&mut self, failure: String) {
+        self.connection = None;
+        self.failure = Some(failure);
+        self.queued.clear();
+        self.waiting.clear();
+    }
 }
 pub(crate) struct Authorization {
     pub configuration: Configuration,
     pub bucket: String,
     state: Mutex<State>,
+    /// Signals the end of each exchange.
+    exchanged: Condvar,
 }
 impl std::fmt::Debug for Authorization {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -684,9 +701,17 @@ impl Authorization {
                 connection: Some(connection),
                 requests: BTreeMap::new(),
                 failure: None,
+                queued: VecDeque::new(),
+                waiting: BTreeSet::new(),
+                exchanging: false,
             }),
+            exchanged: Condvar::new(),
         }
     }
+    /// Signs the requests not yet prepared. Requests that arrive while an
+    /// exchange is under way go together in the next one, so callers that
+    /// sign as they send share round trips to the authorizing machine
+    /// instead of waiting for one each.
     pub(super) fn authorize(&self, requests: Vec<Unsigned>) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         let missing: Vec<_> = requests
@@ -697,23 +722,62 @@ impl Authorization {
             return Ok(());
         }
         state.ended()?;
-        let stream = state.connection.as_mut().with_context(|| format!("request {request:?} was not prepared before storage authorization disconnected; rerun for fresh approval", request = missing[0]))?;
-        let signed = crate::destination::storage::sign(stream, &missing).and_then(|signed| {
-            anyhow::ensure!(
-                signed.len() == missing.len(),
-                "incomplete storage authorization response"
-            );
-            Ok(signed)
-        });
-        match signed {
-            Ok(signed) => {
-                state.requests.extend(missing.into_iter().zip(signed));
-                Ok(())
+        if state.connection.is_none() && !state.exchanging {
+            anyhow::bail!("request {request:?} was not prepared before storage authorization disconnected; rerun for fresh approval", request = missing[0]);
+        }
+        for request in &missing {
+            if state.waiting.insert(request.clone()) {
+                state.queued.push_back(request.clone());
             }
-            Err(error) => {
-                state.connection = None;
-                state.failure = Some(format!("{error:#}"));
-                Err(error)
+        }
+        loop {
+            if missing
+                .iter()
+                .all(|request| state.requests.contains_key(request))
+            {
+                return Ok(());
+            }
+            state.ended()?;
+            if state.exchanging {
+                state = self.exchanged.wait(state).unwrap();
+                continue;
+            }
+            // Nothing is in flight and some of these requests are unsigned,
+            // so they are queued and preparation has not finished.
+            let Some(mut stream) = state.connection.take() else {
+                state.fail("storage authorization lost its connection".into());
+                self.exchanged.notify_all();
+                return state.ended();
+            };
+            let count = state.queued.len().min(EXCHANGE_REQUESTS);
+            let exchange: Vec<_> = state.queued.drain(..count).collect();
+            state.exchanging = true;
+            drop(state);
+            let mut exchanging = Exchanging(Some(self));
+            let signed =
+                crate::destination::storage::sign(&mut stream, &exchange).and_then(|signed| {
+                    anyhow::ensure!(
+                        signed.len() == exchange.len(),
+                        "incomplete storage authorization response"
+                    );
+                    Ok(signed)
+                });
+            exchanging.0 = None;
+            state = self.state.lock().unwrap();
+            state.exchanging = false;
+            self.exchanged.notify_all();
+            match signed {
+                Ok(signed) => {
+                    state.connection = Some(stream);
+                    for request in &exchange {
+                        state.waiting.remove(request);
+                    }
+                    state.requests.extend(exchange.into_iter().zip(signed));
+                }
+                Err(error) => {
+                    state.fail(format!("{error:#}"));
+                    return Err(error);
+                }
             }
         }
     }
@@ -742,13 +806,37 @@ impl Authorization {
         Ok(())
     }
     pub(super) fn finish_preparation(&self) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        // Requests already asked for are signed first, as they would be had
+        // their callers taken the connection before this one.
+        let mut state = self
+            .exchanged
+            .wait_while(self.state.lock().unwrap(), |state| {
+                state.failure.is_none() && (state.exchanging || !state.queued.is_empty())
+            })
+            .unwrap();
         // Preparation that failed must not count as finished.
         state.ended()?;
         if let Some(mut stream) = state.connection.take() {
             crate::destination::storage::finish(&mut stream)?;
         }
         Ok(())
+    }
+}
+
+/// Ends an exchange that stopped without a result, so its waiting callers
+/// fail instead of waiting for it forever.
+struct Exchanging<'a>(Option<&'a Authorization>);
+impl Drop for Exchanging<'_> {
+    fn drop(&mut self) {
+        if let Some(authorization) = self.0 {
+            let mut state = authorization
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.exchanging = false;
+            state.fail("storage signing stopped unexpectedly".into());
+            authorization.exchanged.notify_all();
+        }
     }
 }
 

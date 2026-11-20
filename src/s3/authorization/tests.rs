@@ -874,3 +874,185 @@ fn later_requests_report_an_earlier_refusal() {
     assert_eq!(format!("{finish:#}"), earlier);
     authorizer.join().unwrap();
 }
+
+/// What the fake authorizing machine saw in each signing message: how many
+/// requests it carried, and how many were in the exchange under way.
+type Messages = Vec<(usize, usize)>;
+
+/// A signing session with an authorizing machine that answers each request
+/// with a URL naming its key. It holds its reply to the first message until
+/// the test releases it, with `Some(error)` to refuse that message instead.
+#[allow(clippy::type_complexity)]
+fn held_session() -> (
+    Arc<Authorization>,
+    std::thread::JoinHandle<Messages>,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<Option<String>>,
+) {
+    use crate::destination::{read_message, write_message};
+    let (client, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    for socket in [&client, &peer] {
+        socket
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+    }
+    let authorization = Arc::new(Authorization::new(
+        "fixture".into(),
+        Signer::fixture(approval()).configuration,
+        client,
+    ));
+    let (arrived, first) = std::sync::mpsc::channel();
+    let (release, held) = std::sync::mpsc::channel::<Option<String>>();
+    let shared = authorization.clone();
+    let authorizer = std::thread::spawn(move || {
+        let mut messages = Messages::new();
+        loop {
+            let Ok(message) = read_message::<serde_json::Value>(&mut peer) else {
+                return messages;
+            };
+            let Some(batch) = message.get("Sign").and_then(|b| b.as_array()) else {
+                assert_eq!(message, "Finish");
+                write_message(&mut peer, &"Finished").unwrap();
+                return messages;
+            };
+            let in_flight = {
+                let state = shared.state.lock().unwrap();
+                state.waiting.len() - state.queued.len()
+            };
+            messages.push((batch.len(), in_flight));
+            if messages.len() == 1 {
+                arrived.send(()).unwrap();
+                if let Some(error) = held.recv_timeout(Duration::from_secs(30)).unwrap() {
+                    write_message(&mut peer, &serde_json::json!({ "Error": error })).unwrap();
+                    return messages;
+                }
+            }
+            let urls: Vec<_> = batch
+                .iter()
+                .map(|request| {
+                    format!(
+                        "https://storage.example/fixture/{}?X-Amz-Signature=fake",
+                        request["key"].as_str().unwrap()
+                    )
+                })
+                .collect();
+            write_message(&mut peer, &serde_json::json!({ "Signed": urls })).unwrap();
+        }
+    });
+    (authorization, authorizer, first, release)
+}
+fn queued_reaches(authorization: &Authorization, count: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let queued = authorization.state.lock().unwrap().queued.len();
+        if queued == count {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{queued} of {count} requests queued"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+fn get(key: &str) -> Unsigned {
+    Unsigned::new("GET", &format!("allowed/{key}"))
+}
+fn sign_in_thread(
+    authorization: &Arc<Authorization>,
+    request: Unsigned,
+) -> std::thread::JoinHandle<Result<String>> {
+    let authorization = authorization.clone();
+    std::thread::spawn(move || authorization.signed(request))
+}
+
+#[test]
+fn requests_arriving_during_an_exchange_share_the_next_one() {
+    let (authorization, authorizer, first, release) = held_session();
+    let leader = sign_in_thread(&authorization, get("0"));
+    first.recv_timeout(Duration::from_secs(30)).unwrap();
+    // While that exchange is under way, more callers each ask for one
+    // request, one of them for the request already in flight.
+    let keys: Vec<String> = (1..63).map(|i| i.to_string()).chain(["0".into()]).collect();
+    let callers: Vec<_> = keys
+        .iter()
+        .map(|key| sign_in_thread(&authorization, get(key)))
+        .collect();
+    queued_reaches(&authorization, 62);
+    release.send(None).unwrap();
+    for (key, caller) in std::iter::once("0")
+        .zip([leader])
+        .chain(keys.iter().map(String::as_str).zip(callers))
+    {
+        let url = caller.join().unwrap().unwrap();
+        assert!(
+            url.contains(&format!("/fixture/allowed/{key}?")),
+            "{key}: {url}"
+        );
+    }
+    authorization.finish_preparation().unwrap();
+    // Two round trips instead of 63, and the shared request was signed once.
+    assert_eq!(authorizer.join().unwrap(), [(1, 1), (62, 62)]);
+}
+
+#[test]
+fn combined_exchanges_keep_the_request_limit() {
+    let (authorization, authorizer, first, release) = held_session();
+    let leader = sign_in_thread(&authorization, get("0"));
+    first.recv_timeout(Duration::from_secs(30)).unwrap();
+    let callers: Vec<_> = ["a", "b"]
+        .into_iter()
+        .map(|prefix| {
+            let authorization = authorization.clone();
+            std::thread::spawn(move || {
+                authorization
+                    .authorize((0..10_000).map(|i| get(&format!("{prefix}/{i}"))).collect())
+            })
+        })
+        .collect();
+    queued_reaches(&authorization, 20_000);
+    release.send(None).unwrap();
+    leader.join().unwrap().unwrap();
+    for caller in callers {
+        caller.join().unwrap().unwrap();
+    }
+    assert_eq!(prepared(&authorization), 20_001);
+    authorization.finish_preparation().unwrap();
+    let messages = authorizer.join().unwrap();
+    assert!(messages.iter().all(|&(count, _)| count <= 128));
+    assert_eq!(messages.iter().map(|m| m.0).sum::<usize>(), 20_001);
+    // The queue drains in exchanges of at most the limit.
+    let exchanges: BTreeSet<_> = messages.iter().map(|m| m.1).collect();
+    assert_eq!(
+        exchanges,
+        BTreeSet::from([1, EXCHANGE_REQUESTS, 20_000 - EXCHANGE_REQUESTS])
+    );
+}
+
+#[test]
+fn a_failed_exchange_fails_every_waiting_request() {
+    let (authorization, authorizer, first, release) = held_session();
+    let leader = sign_in_thread(&authorization, get("0"));
+    first.recv_timeout(Duration::from_secs(30)).unwrap();
+    let callers: Vec<_> = (1..=20)
+        .map(|i| sign_in_thread(&authorization, get(&i.to_string())))
+        .collect();
+    queued_reaches(&authorization, 20);
+    release.send(Some("outside approved paths".into())).unwrap();
+    let error = leader.join().unwrap().unwrap_err();
+    assert_eq!(
+        format!("{error:#}"),
+        "authorizing machine: outside approved paths"
+    );
+    for caller in callers {
+        let error = caller.join().unwrap().unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "storage authorization ended after an earlier request failed (authorizing machine: outside approved paths); rerun the copy for fresh approval"
+        );
+    }
+    // The waiting requests never reached the authorizing machine.
+    assert_eq!(authorizer.join().unwrap(), [(1, 1)]);
+    assert_eq!(prepared(&authorization), 0);
+    assert!(authorization.finish_preparation().is_err());
+}
