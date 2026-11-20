@@ -1,0 +1,7 @@
+[env]
+# Seed aws-lc's random generator from the operating system (getrandom)
+# instead of CPU-jitter entropy, which costs about 30 ms of CPU before each
+# command's first HTTPS connection. The release build in flake.nix sets the
+# same variable, since Nix builds do not read this file. An explicitly set
+# environment variable still takes precedence.
+AWS_LC_SYS_NO_JITTER_ENTROPY = "1"
