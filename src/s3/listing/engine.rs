@@ -207,10 +207,11 @@ fn scan_batch(prefix: String, delimiter: bool, page: Page, gap: Gap) -> Batch {
 /// exists, is missing from the next page. In byte order nothing else can come
 /// between the two, and a listing of `P0` itself shows the key first. So the
 /// next page is read together with that listing, and the key is added if the
-/// page left it out. That relies on byte order: a delimiter listing goes on
-/// past its first page only where the store's order is known
-/// (`byte_ordered`). Every such store is checked, since the same mistake is
-/// easy to make elsewhere.
+/// page left it out. That check relies on byte order, so it is made only
+/// where the store's order is known (`byte_ordered`); every such store is
+/// checked, since the same mistake is easy to make elsewhere. Elsewhere a
+/// delimiter listing goes on past its first page only when the pattern
+/// cannot match the key.
 #[derive(Clone, Default)]
 pub(super) struct Gap(Option<String>);
 
@@ -347,10 +348,12 @@ async fn execute(
     }
     let page = read(store, &query, true, None).await?;
     if component + 1 == pattern.components.len() {
-        if page.next.is_some() && !byte_ordered(store) && part.may_end_with('0') {
-            // Making sure of a key a page may leave out (`Gap`), which ends
-            // in '0', relies on byte order. List everything under the prefix
-            // instead.
+        if page.next.is_some() && !byte_ordered(store) && !part.literal() && part.may_end_with('0')
+        {
+            // Making sure of a key a page may leave out (`Gap`) relies on
+            // byte order. List everything under the prefix instead, unless
+            // the pattern cannot match that key: it ends in '0' and is
+            // longer than the prefix, so a literal name is never it.
             let flat = read(store, &query, false, None).await?;
             return Ok(scan_batch(query, false, flat, Gap::default()));
         }

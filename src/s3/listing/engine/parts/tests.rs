@@ -1244,4 +1244,19 @@ async fn a_key_the_glob_cannot_match_needs_no_check() {
     assert!(engine::enumerate(&store, &pattern, 1, |_| Ok(()))
         .await
         .is_err());
+    // Nor can a literal name be the key, which is longer than the prefix.
+    let store = DelimiterOnly(Memory::new(
+        std::iter::once("runs/day/f0".to_owned())
+            .chain((0..1000).map(|i| format!("runs/day/f0{i:03}/x"))),
+    ));
+    store.0.skips.set(true);
+    let mut keys = Vec::new();
+    let pattern = Pattern::parse("s3://bucket/runs/*/f0").unwrap();
+    engine::enumerate(&store, &pattern, 8, |entry| {
+        keys.push(entry.key);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(keys, ["runs/day/f0"]);
 }
