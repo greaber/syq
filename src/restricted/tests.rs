@@ -15598,3 +15598,23 @@ fn requests_creating_a_state_directory_at_once_all_use_it() {
         assert!(directory.is_dir());
     }
 }
+
+/// A symlink or a file where a state directory belongs is refused, even a
+/// symlink to a real directory.
+#[test]
+fn a_state_directory_must_be_a_real_directory() {
+    let root = crate::test_support::tempdir().unwrap();
+    let real = root.path().join("real");
+    fs::create_dir(&real).unwrap();
+    let link = root.path().join("link");
+    symlink(&real, &link).unwrap();
+    let file = root.path().join("file");
+    fs::write(&file, b"").unwrap();
+    for path in [&link, &file] {
+        let error = ensure_directory(path, 0o700).unwrap_err();
+        assert!(
+            format!("{error:#}").ends_with("is not a real directory"),
+            "{error:#}"
+        );
+    }
+}
