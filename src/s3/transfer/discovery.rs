@@ -30,7 +30,7 @@ use tokio::sync::watch;
 /// Whether a planned key that the listing shows absent may go without its
 /// HEAD. The listing concludes absence from where a key would fall in a page
 /// only where the store lists in byte order, and otherwise only from a
-/// complete listing (`Walk::before_copy`): elsewhere an existing object could
+/// complete listing (`Discovery::start`): elsewhere an existing object could
 /// look absent, and an upload in its place would drop metadata only the
 /// destination has. Even so, relying on it must not change what the copy
 /// does, so these copies ask about every key.
@@ -340,20 +340,29 @@ impl Walk {
             self.whole(store, usize::MAX).await?;
             return Ok(false);
         }
-        if !store.divides() {
-            // A key's place in a page shows it absent only in byte order
-            // (`trusts_absence`); in another order only a complete listing
-            // does. List each prefix whole if that takes no more pages than
-            // the copy waits for anyway, and leave the rest to HEAD.
-            self.whole(store, PAGES_BEFORE_COPY).await?;
-            return Ok(false);
-        }
         for _ in 0..PAGES_BEFORE_COPY {
             if !self.page(store).await? {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    /// Decide the only segment from a complete listing of it, which shows at
+    /// most `object` and its size if given.
+    fn settle(&mut self, object: Option<(&str, Option<u64>)>) {
+        let Segment { prefix, range } = &self.segments[0];
+        for index in range.clone() {
+            let key = self.keys.get(index);
+            let size = match object {
+                Some((listed, Some(size))) if listed == key => size,
+                Some((listed, None)) if listed == key => UNKNOWN,
+                _ if key.starts_with(prefix.as_str()) => ABSENT,
+                _ => UNKNOWN,
+            };
+            self.sizes[index].store(size, Relaxed);
+        }
+        self.decided = self.keys.len();
     }
 
     /// Directory buckets list in no particular order and cannot start after a
@@ -418,6 +427,9 @@ fn in_key_order(page: &Page, after: &str) -> bool {
 pub(super) struct Discovery {
     /// The plan positions some listing decides; the others are unknown.
     listed: Vec<Range<usize>>,
+    /// Whether a key waits for the listing to reach it. Otherwise a key the
+    /// listing has not decided yet is unknown.
+    waits: bool,
     sizes: Arc<[AtomicU64]>,
     reach: watch::Receiver<Reach>,
     task: Option<tokio::task::AbortHandle>,
@@ -451,7 +463,30 @@ impl Discovery {
             bucket,
             divides,
         };
-        let more = walk.before_copy(&store).await?;
+        // A key's place in a page shows it absent only in byte order
+        // (`trusts_absence`); in another order only a complete listing does.
+        // There each prefix is listed whole, within the pages the copy would
+        // otherwise wait for, while the copy goes on: a key the listing has
+        // not decided by the time the copy reaches it gets a HEAD.
+        let waits = !store.ordered() || divides;
+        let more = if waits {
+            walk.before_copy(&store).await?
+        } else {
+            // A destination that cannot be listed still fails the copy here,
+            // from one short request. When the prefix holds at most one
+            // object, that request lists it completely.
+            let first =
+                super::super::client::list_one(&client, bucket, &walk.segments[0].prefix).await?;
+            let complete = walk.segments.len() == 1 && first.is_truncated() != Some(true);
+            if complete {
+                let object = first.contents().first().map(|object| {
+                    let size = object.size().and_then(|size| u64::try_from(size).ok());
+                    (object.key().unwrap_or_default().to_owned(), size)
+                });
+                walk.settle(object.as_ref().map(|(key, size)| (key.as_str(), *size)));
+            }
+            !complete
+        };
         let (sender, reach) = watch::channel(Reach {
             decided: walk.decided,
             finished: !more,
@@ -464,6 +499,18 @@ impl Discovery {
                     bucket: &bucket,
                     divides,
                 };
+                if !waits {
+                    if let Err(error) = walk.whole(&store, PAGES_BEFORE_COPY).await {
+                        progress.warning(&format!(
+                            "S3 destination listing stopped; each remaining destination key is checked with its own request: {error:#}"
+                        ));
+                    }
+                    sender.send_replace(Reach {
+                        decided: walk.decided,
+                        finished: true,
+                    });
+                    return;
+                }
                 let mut more = true;
                 while more && !cancelled.load(Relaxed) {
                     more = walk.page(&store).await.unwrap_or_else(|error| {
@@ -490,6 +537,7 @@ impl Discovery {
             listed,
             sizes,
             reach,
+            waits,
             task,
         })
     }
@@ -509,9 +557,18 @@ impl Discovery {
         let listed = self.lists(index);
         let sizes = self.sizes.clone();
         let mut reach = self.reach.clone();
+        let waits = self.waits;
         async move {
             if !listed {
                 return Listed::Unknown;
+            }
+            if !waits {
+                let decided = reach.borrow().decided > index;
+                return if decided {
+                    decision(&sizes, index)
+                } else {
+                    Listed::Unknown
+                };
             }
             // A listing that ended early or was dropped leaves the rest to HEAD.
             let decided = reach

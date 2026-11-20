@@ -125,7 +125,10 @@ async fn discover_segments(bucket: &impl Store, segments: Vec<Segment>, keys: Ke
     if walk.segments.is_empty() {
         return plan.map(|_| Listed::Unknown).collect();
     }
-    if walk.before_copy(bucket).await.unwrap() {
+    // As `Discovery::start` does, without the copy going on meanwhile.
+    if bucket.ordered() && !bucket.divides() {
+        walk.whole(bucket, PAGES_BEFORE_COPY).await.unwrap();
+    } else if walk.before_copy(bucket).await.unwrap() {
         while walk.page(bucket).await.unwrap() {}
     }
     plan.map(|index| match walk.sizes[index].load(Relaxed) {
@@ -157,6 +160,7 @@ async fn at_copy_start(bucket: &Bucket, prefix: &str, plan: &[String]) -> Discov
         listed: std::iter::once(0..plan.len()).collect(),
         sizes: walk.sizes,
         reach,
+        waits: true,
         task: None,
     }
 }
@@ -293,6 +297,7 @@ async fn keys_outside_every_named_prefix_are_decided_at_once() {
         listed,
         sizes,
         reach,
+        waits: true,
         task: None,
     };
     let at = |key: &str| plan.iter().position(|planned| planned == key).unwrap();
@@ -336,6 +341,7 @@ async fn keys_the_listing_has_not_decided_are_presigned() {
         listed: discovery.listed.clone(),
         sizes: discovery.sizes.clone(),
         reach,
+        waits: true,
         task: None,
     };
     assert_eq!(
@@ -911,4 +917,44 @@ async fn in_another_order_only_a_short_complete_listing_decides() {
     let listed = discover(&bucket, "big/", &plan).await;
     assert!(listed.iter().all(|listed| *listed == Listed::Unknown));
     assert_eq!(bucket.requests.borrow().len(), PAGES_BEFORE_COPY);
+}
+
+#[tokio::test]
+async fn in_another_order_no_key_waits_for_the_listing() {
+    // The complete listing runs alongside the copy; a key it has not decided
+    // gets a HEAD at once.
+    let (sender, reach) = watch::channel(Reach {
+        decided: 0,
+        finished: false,
+    });
+    let discovery = Discovery {
+        listed: std::iter::once(0..2).collect(),
+        sizes: (0..2).map(|_| AtomicU64::new(ABSENT)).collect(),
+        reach,
+        waits: false,
+        task: None,
+    };
+    let lookup = discovery.lookup(1);
+    let listed = tokio::time::timeout(std::time::Duration::from_secs(5), lookup).await;
+    assert_eq!(listed.unwrap(), Listed::Unknown);
+    sender.send_replace(Reach {
+        decided: 2,
+        finished: true,
+    });
+    assert_eq!(discovery.lookup(1).await, Listed::Absent);
+}
+
+#[test]
+fn a_listing_of_at_most_one_object_settles_every_key() {
+    let plan = ["d/a".to_owned(), "d/b".to_owned()];
+    for (object, expected) in [
+        (None, [Listed::Absent, Listed::Absent]),
+        (Some(("d/a", Some(3))), [Listed::Present(3), Listed::Absent]),
+        (Some(("d/a", None)), [Listed::Unknown, Listed::Absent]),
+    ] {
+        let mut walk = walk("d/", &plan);
+        walk.settle(object);
+        assert_eq!(walk.decided, 2);
+        assert_eq!([0, 1].map(|index| decision(&walk.sizes, index)), expected);
+    }
 }
