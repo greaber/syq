@@ -828,7 +828,9 @@ fn opening_existing_history_needs_no_writer_lock() {
 /// While the history opens it holds no descriptor of its own on the file,
 /// only SQLite's, even while it waits for another run's lock: a copy counts
 /// its open descriptors as the history opens in the background
-/// (`require_source_descriptor_capacity`).
+/// (`require_source_descriptor_capacity`). Linux only: it tells which file a
+/// descriptor is on through `/proc/self/fd`, which macOS's `/dev/fd` does not.
+#[cfg(target_os = "linux")]
 #[test]
 fn opening_the_history_holds_only_sqlite_descriptors_while_it_waits() {
     use std::os::unix::fs::MetadataExt;
@@ -837,11 +839,7 @@ fn opening_the_history_holds_only_sqlite_descriptors_while_it_waits() {
     let holder = open(&path).unwrap();
     let file = std::fs::metadata(&path).unwrap();
     let on_file = || {
-        let directory = ["/proc/self/fd", "/dev/fd"]
-            .into_iter()
-            .find(|directory| Path::new(directory).is_dir())
-            .unwrap();
-        std::fs::read_dir(directory)
+        std::fs::read_dir("/proc/self/fd")
             .unwrap()
             .flatten()
             .filter(|entry| {
