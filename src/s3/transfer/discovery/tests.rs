@@ -85,15 +85,7 @@ impl Store for Bucket {
 /// Run the listing to its end, as `Discovery::start` and its task do, and
 /// return what it decided about each planned key.
 async fn discover(bucket: &Bucket, prefix: &str, plan: &[String]) -> Vec<Listed> {
-    let mut walk = Walk {
-        prefix: prefix.to_owned(),
-        keys: Keys::new(plan.iter().map(|key| key.as_str().into())),
-        sizes: (0..plan.len()).map(|_| AtomicU64::new(UNKNOWN)).collect(),
-        decided: 0,
-        shortfall: 0,
-        passed: String::new(),
-        token: None,
-    };
+    let mut walk = walk(prefix, plan);
     if bucket.ordered {
         while walk.page(bucket).await.unwrap() {}
     } else {
@@ -107,6 +99,166 @@ async fn discover(bucket: &Bucket, prefix: &str, plan: &[String]) -> Vec<Listed>
             size => Listed::Present(size),
         })
         .collect()
+}
+
+fn walk(prefix: &str, plan: &[String]) -> Walk {
+    Walk {
+        prefix: prefix.to_owned(),
+        keys: Keys::new(plan.iter().map(|key| key.as_str().into())),
+        sizes: (0..plan.len()).map(|_| AtomicU64::new(UNKNOWN)).collect(),
+        decided: 0,
+        shortfall: 0,
+        passed: String::new(),
+        token: None,
+    }
+}
+
+/// The listing as the copy finds it when preparation starts, as
+/// `Discovery::start` leaves it, without the later pages.
+async fn at_copy_start(bucket: &Bucket, prefix: &str, plan: &[String]) -> Discovery {
+    let mut walk = walk(prefix, plan);
+    let more = walk.before_copy(bucket).await.unwrap();
+    let (_, reach) = watch::channel(Reach {
+        decided: walk.decided,
+        finished: !more,
+    });
+    Discovery {
+        sizes: walk.sizes,
+        reach,
+        task: None,
+    }
+}
+
+fn cp(flags: &[&str]) -> Args {
+    let argv: Vec<_> = ["cp", "tree", "--to", "s3://bucket", "--into", "data"]
+        .iter()
+        .chain(flags)
+        .map(std::ffi::OsString::from)
+        .collect();
+    Args::parse_args(&argv).unwrap()
+}
+
+/// The keys whose existence checks an authorized upload signs before
+/// preparation. Checks that every key decided by then is decided as
+/// preparation will see it.
+async fn presigned(
+    args: &Args,
+    complete: Option<&HashMap<String, u64>>,
+    discovery: Option<&Discovery>,
+    plan: &[String],
+) -> Vec<String> {
+    for (position, key) in plan.iter().enumerate() {
+        if let Some(known) = known(args, complete, discovery, position, key) {
+            let listed = listed(args, complete, discovery, position, key).await;
+            assert_eq!(known, listed, "{key}");
+        }
+    }
+    super::super::authorization::upload_checks(plan.iter().map(String::as_str), |position, key| {
+        known(args, complete, discovery, position, key)
+    })
+    .map(|check| {
+        assert_eq!(check.method, "HEAD");
+        check.key
+    })
+    .collect()
+}
+
+#[tokio::test]
+async fn new_upload_presigns_no_existence_checks() {
+    // A new directory in a large prefix, and new files in an empty one.
+    for (bucket, plan) in [
+        (
+            Bucket::new(large()),
+            (0..500).map(|f| format!("big/m-new/f{f:03}")).collect(),
+        ),
+        (
+            Bucket::new([]),
+            (0..20).map(|f| format!("big/f{f:02}")).collect::<Vec<_>>(),
+        ),
+    ] {
+        let discovery = at_copy_start(&bucket, "big/", &plan).await;
+        for flags in [&[][..], &["--dry-run"], &["--if-exists=error"]] {
+            let args = cp(flags);
+            assert!(lists_destination(&args, "bucket"));
+            assert_eq!(
+                presigned(&args, None, Some(&discovery), &plan).await,
+                Vec::<String>::new(),
+                "{flags:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn existing_keys_and_untrusted_absences_keep_their_checks() {
+    let existing: Vec<_> = (0..300).map(|f| format!("data/f{f:03}")).collect();
+    let bucket = Bucket::new(existing.iter().cloned());
+    let mut plan = existing.clone();
+    plan.extend((0..300).map(|f| format!("data/g{f:03}")));
+    plan.push("data/new/".to_owned());
+    plan.sort();
+    let discovery = at_copy_start(&bucket, "data/", &plan).await;
+    assert_eq!(
+        presigned(&cp(&[]), None, Some(&discovery), &plan).await,
+        existing
+    );
+    // A directory marker that exists is accepted here, so only a HEAD may
+    // say it is absent.
+    let mut checked = existing.clone();
+    checked.push("data/new/".to_owned());
+    checked.sort();
+    assert_eq!(
+        presigned(&cp(&["--if-exists=error"]), None, Some(&discovery), &plan).await,
+        checked
+    );
+    // Pruning lists the whole destination first.
+    let complete: HashMap<_, _> = existing.iter().map(|key| (key.clone(), 1)).collect();
+    assert_eq!(
+        presigned(&cp(&[]), Some(&complete), None, &plan).await,
+        existing
+    );
+}
+
+#[tokio::test]
+async fn keys_the_listing_has_not_decided_are_presigned() {
+    let existing: Vec<_> = (0..5000).map(|f| format!("data/f{f:04}")).collect();
+    let bucket = Bucket::new(existing.iter().cloned());
+    let mut plan = existing.clone();
+    plan.extend((0..5000).map(|f| format!("data/f{f:04}n")));
+    plan.sort();
+    let discovery = at_copy_start(&bucket, "data/", &plan).await;
+    let decided = discovery.reach.borrow().decided;
+    assert!((1000..plan.len() / 2).contains(&decided), "{decided}");
+    let checked = presigned(&cp(&[]), None, Some(&discovery), &plan).await;
+    let expected: Vec<_> = plan
+        .iter()
+        .enumerate()
+        .filter(|(position, key)| *position >= decided || !key.ends_with('n'))
+        .map(|(_, key)| key.clone())
+        .collect();
+    assert_eq!(checked, expected);
+    // A listing that ended early leaves the rest to their checks too.
+    let (_, reach) = watch::channel(Reach {
+        decided,
+        finished: true,
+    });
+    let ended = Discovery {
+        sizes: discovery.sizes.clone(),
+        reach,
+        task: None,
+    };
+    assert_eq!(
+        presigned(&cp(&[]), None, Some(&ended), &plan).await,
+        expected
+    );
+}
+
+#[tokio::test]
+async fn copies_that_do_not_list_presign_every_check() {
+    let plan: Vec<_> = (0..20).map(|f| format!("data/f{f:02}")).collect();
+    let args = cp(&["--if-exists=error", "--dry-run"]);
+    assert!(!lists_destination(&args, "bucket"));
+    assert_eq!(presigned(&args, None, None, &plan).await, plan);
 }
 
 /// Every decision must be what a HEAD would have found.

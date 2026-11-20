@@ -383,9 +383,11 @@ impl Engine {
             );
             self.progress.scan_done.store(true, Relaxed);
             if self.authorization.is_some() {
-                // Preparation checks and hashes every file without asking the
-                // authorizing machine: the checks' requests are signed together
-                // first and the uploads' requests together afterwards.
+                // Preparation checks and hashes each file without asking the
+                // authorizing machine about it: the checks' requests are signed
+                // together first and the uploads' requests together afterwards.
+                // Destination listing pages that arrive during preparation are
+                // still signed one at a time.
                 self.authorize_upload_checks(&plan).await?;
                 let prepared = Arc::new(Mutex::new(Vec::with_capacity(plan.len())));
                 let mut position = 0..;
@@ -967,25 +969,24 @@ impl Engine {
         position: usize,
         key: &str,
     ) -> impl std::future::Future<Output = Listed> + Send + 'static {
-        let complete = self.upload_keys.get().map(|keys| {
-            keys.get(key)
-                .map_or(Listed::Absent, |size| Listed::Present(*size))
-        });
-        let reached = self
-            .discovery
-            .get()
-            .map(|discovery| discovery.lookup(position));
-        let trusted = discovery::trusts_absence_of(&self.args, key);
-        async move {
-            match (complete, reached) {
-                (Some(listed), _) => listed,
-                (None, Some(reached)) => match reached.await {
-                    Listed::Absent if !trusted => Listed::Unknown,
-                    listed => listed,
-                },
-                (None, None) => Listed::Unknown,
-            }
-        }
+        discovery::listed(
+            &self.args,
+            self.upload_keys.get(),
+            self.discovery.get(),
+            position,
+            key,
+        )
+    }
+    /// What `listed` will say about `key`, if the listings have already
+    /// decided it.
+    fn known(&self, position: usize, key: &str) -> Option<Listed> {
+        discovery::known(
+            &self.args,
+            self.upload_keys.get(),
+            self.discovery.get(),
+            position,
+            key,
+        )
     }
     async fn check_upload_placement(&self, single_object: Option<bool>) -> Result<()> {
         if self.args.target_existence == Existence::Any {

@@ -1,6 +1,17 @@
 use super::*;
 use crate::s3::authorization::Unsigned;
 
+/// An existence check for each of `keys`, the plan in order, except those
+/// `known` already reports absent.
+pub(super) fn upload_checks<'a>(
+    keys: impl Iterator<Item = &'a str> + 'a,
+    known: impl Fn(usize, &str) -> Option<Listed> + 'a,
+) -> impl Iterator<Item = Unsigned> + 'a {
+    keys.enumerate()
+        .filter(move |(position, key)| known(*position, key) != Some(Listed::Absent))
+        .map(|(_, key)| Unsigned::new("HEAD", key))
+}
+
 impl Engine {
     pub(super) async fn authorize_requests(&self, mut requests: Vec<Unsigned>) -> Result<()> {
         let Some(authorization) = &self.authorization else {
@@ -47,15 +58,14 @@ impl Engine {
         }
         Ok(())
     }
-    /// The existence checks `prepare_upload` will send, signed together
-    /// before preparation starts.
+    /// The existence checks `prepare_upload` may send, signed together
+    /// before preparation starts. A key the destination listing has already
+    /// shown absent gets none; one it has yet to reach is signed in case.
     pub(super) async fn authorize_upload_checks(&self, plan: &[Source]) -> Result<()> {
-        let listed = self.upload_keys.get();
-        self.authorize_all(
-            plan.iter()
-                .filter(|source| listed.is_none_or(|keys| keys.contains_key(&source.key)))
-                .map(|source| Unsigned::new("HEAD", &source.key)),
-        )
+        self.authorize_all(upload_checks(
+            plan.iter().map(|source| source.key.as_str()),
+            |position, key| self.known(position, key),
+        ))
         .await
     }
     /// Every request the prepared uploads will send, signed together after
