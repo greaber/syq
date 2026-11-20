@@ -693,9 +693,11 @@ pub struct Sched {
     inner: Mutex<Inner>,
     cv: Condvar,
     tune_cv: Condvar,
-    /// Wakes only workers pacing under `--bwlimit` (`sleep_unless_aborted`),
-    /// and only on `abort`: `cv` wakes for every queued file.
-    abort_cv: Condvar,
+    /// Whether the copy is aborted, for workers pacing under `--bwlimit`
+    /// (`sleep_unless_aborted`), with what wakes them on `abort`. Its own
+    /// lock keeps paced sleeps off `inner`, which every worker takes, and
+    /// `cv` wakes for every queued file.
+    paced_abort: (Mutex<bool>, Condvar),
     direct_fallback_workers: AtomicUsize,
     initial_range_workers: AtomicUsize,
     tune_request: AtomicUsize,
@@ -758,7 +760,7 @@ impl Sched {
             }),
             cv: Condvar::new(),
             tune_cv: Condvar::new(),
-            abort_cv: Condvar::new(),
+            paced_abort: Default::default(),
             direct_fallback_workers: AtomicUsize::new(0),
             initial_range_workers: AtomicUsize::new(0),
             tune_request: AtomicUsize::new(0),
@@ -1009,7 +1011,8 @@ impl Sched {
     pub fn abort(&self) {
         self.inner.lock().unwrap().abort = true;
         self.cv.notify_all();
-        self.abort_cv.notify_all();
+        *self.paced_abort.0.lock().unwrap() = true;
+        self.paced_abort.1.notify_all();
         self.tune_cv.notify_one();
         self.worker_setups.cancel();
     }
@@ -1020,13 +1023,14 @@ impl Sched {
 
     /// Sleep until `until`, or until the copy is aborted.
     pub fn sleep_unless_aborted(&self, until: Instant) {
-        let mut inner = self.inner.lock().unwrap();
+        let (aborted, woken) = &self.paced_abort;
+        let mut aborted = aborted.lock().unwrap();
         loop {
             let now = Instant::now();
-            if inner.abort || now >= until {
+            if *aborted || now >= until {
                 return;
             }
-            inner = self.abort_cv.wait_timeout(inner, until - now).unwrap().0;
+            aborted = woken.wait_timeout(aborted, until - now).unwrap().0;
         }
     }
 
