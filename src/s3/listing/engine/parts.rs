@@ -3,7 +3,7 @@
 //! Every part but the last is a listing that stops at the first key it has
 //! handed over, so a key the store returns out of byte order after that point
 //! would be missed. Only stores that document UTF-8 byte order use this
-//! (`Store::divides`); the others are listed as on `master`.
+//! (`Store::divides`); the others are listed one page after another.
 use super::{
     read, Entry, LimitedStore, Page, Prune, Store, Unordered, MAX_CHILDREN, SPLIT_QUEUE_LIMIT,
 };
