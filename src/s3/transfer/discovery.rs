@@ -176,6 +176,12 @@ impl Segment {
 /// which is the order of `keys`. A prefix inside another adds nothing to it.
 /// Fewer planned keys than a listing costs in HEAD requests are each checked
 /// with HEAD instead, which costs less and needs no wait for a listing.
+///
+/// The copy sends one listing request whether or not it lists anything, to
+/// size its concurrency from. So when no prefix has that many planned keys,
+/// the one with the most is listed, if it has at least two: that request then
+/// decides them too. Like a plan of one key, a single key under a prefix is
+/// always checked with HEAD.
 pub(super) fn segments(keys: &Keys, prefixes: &[String]) -> Vec<Segment> {
     let mut prefixes: Vec<&String> = prefixes.iter().collect();
     prefixes.sort_unstable();
@@ -191,14 +197,29 @@ pub(super) fn segments(keys: &Keys, prefixes: &[String]) -> Vec<Segment> {
         let start = keys.partition_point(|key| key < prefix.as_str());
         let end =
             keys.partition_point(|key| key < prefix.as_str() || key.starts_with(prefix.as_str()));
-        if end - start >= LIST_COST {
+        if end - start >= 2 {
             segments.push(Segment {
                 prefix: prefix.clone(),
                 range: start..end,
             });
         }
     }
-    segments
+    if segments
+        .iter()
+        .any(|segment| segment.range.len() >= LIST_COST)
+    {
+        segments.retain(|segment| segment.range.len() >= LIST_COST);
+        return segments;
+    }
+    // The first of those with the most keys.
+    let most = segments.into_iter().reduce(|most, next| {
+        if next.range.len() > most.range.len() {
+            next
+        } else {
+            most
+        }
+    });
+    most.into_iter().collect()
 }
 
 /// The first request the listing sends for each of `segments`, as its prefix
@@ -245,7 +266,7 @@ fn predecessor(key: &str) -> String {
 
 #[derive(Clone, Copy)]
 struct Reach {
-    /// Plan positions below this are decided.
+    /// Plan positions below this, in the listing's own segments, are decided.
     decided: usize,
     finished: bool,
 }

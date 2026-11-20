@@ -839,10 +839,13 @@ async fn sparse_named_prefix_stops_only_its_own_listing() {
 async fn named_prefixes_with_fewer_keys_than_a_listing_costs_are_not_listed() {
     let prefixes: Vec<String> = (0..300).map(|d| format!("big/d{d:03}/")).collect();
     for keys in [1, 4, LIST_COST - 1, LIST_COST] {
-        let plan: Vec<String> = prefixes
+        let mut plan: Vec<String> = prefixes
             .iter()
             .flat_map(|prefix| (0..keys).map(move |f| format!("{prefix}new{f:02}")))
             .collect();
+        // One prefix with a key more than the others.
+        plan.push(format!("big/d150/new{keys:02}"));
+        plan.sort();
         let bucket = Bucket::new(large());
         let found = segments(
             &Keys::new(plan.iter().map(|key| key.as_str().into())),
@@ -850,17 +853,51 @@ async fn named_prefixes_with_fewer_keys_than_a_listing_costs_are_not_listed() {
         );
         let prefixes: Vec<&str> = prefixes.iter().map(String::as_str).collect();
         let listed = discover_under(&bucket, &prefixes, &plan).await;
+        let decided = listed.iter().filter(|listed| **listed != Listed::Unknown);
+        let requests = bucket.requests.borrow().len();
         if keys < LIST_COST {
             // Their HEAD requests cost less than a listing of each prefix.
-            assert!(found.is_empty(), "{keys}");
-            assert!(listed.iter().all(|listed| *listed == Listed::Unknown));
-            assert!(bucket.requests.borrow().is_empty());
+            // The copy's one listing request lists the prefix with the most
+            // keys instead, if it has at least two.
+            let most: Vec<_> = found
+                .iter()
+                .map(|segment| segment.prefix.as_str())
+                .collect();
+            assert_eq!(most, ["big/d150/"], "{keys}");
+            assert_eq!((decided.count(), requests), (keys + 1, 1), "{keys}");
         } else {
             assert_eq!(found.len(), 300);
-            assert!(listed.iter().all(|listed| *listed == Listed::Absent));
-            assert_eq!(bucket.requests.borrow().len(), 300);
+            assert_eq!((decided.count(), requests), (plan.len(), 300));
         }
     }
+    // Each single key is checked with HEAD.
+    let plan: Vec<String> = prefixes
+        .iter()
+        .map(|prefix| format!("{prefix}new"))
+        .collect();
+    let found = segments(
+        &Keys::new(plan.iter().map(|key| key.as_str().into())),
+        &prefixes,
+    );
+    assert!(found.is_empty());
+}
+
+#[test]
+fn the_first_prefix_with_the_most_keys_is_listed_when_none_is_worth_a_listing() {
+    let plan: Vec<String> = [
+        "a/1", "a/2", "b/1", "b/2", "b/3", "c/1", "c/2", "c/3", "d/1",
+    ]
+    .map(str::to_owned)
+    .into();
+    let keys = Keys::new(plan.iter().map(|key| key.as_str().into()));
+    let prefixes: Vec<String> = ["a/", "b/", "c/", "d/"].map(str::to_owned).into();
+    assert_eq!(
+        segments(&keys, &prefixes),
+        [Segment {
+            prefix: "b/".into(),
+            range: 2..5,
+        }]
+    );
 }
 
 #[tokio::test]
@@ -1157,6 +1194,56 @@ mod signed {
             assert_eq!(authorization.exchanges_so_far(), 3);
             assert_eq!(served.requests.lock().unwrap().len(), 5);
         }
+    }
+
+    #[tokio::test]
+    async fn one_small_named_directory_is_listed_with_the_copy_s_one_listing_request() {
+        // Named directories of 4 and 3 keys: neither is worth a listing, but
+        // the copy sends one listing request anyway.
+        let argv = &[
+            "cp",
+            "/src/a",
+            "/src/c",
+            "--to",
+            "s3://fixture",
+            "--into",
+            "dst",
+        ];
+        let served = served();
+        let (engine, authorization) = engine(argv, &served, true);
+        let authorization = authorization.unwrap();
+        let mut plan: Vec<String> = ["dst/a/", "dst/a/01", "dst/a/02", "dst/a/03"]
+            .into_iter()
+            .chain(["dst/c/01", "dst/c/02", "dst/c/03"])
+            .map(str::to_owned)
+            .collect();
+        plan.sort();
+        engine
+            .discover_destination(&mut plan, &[], |key: &String| key.as_str().into())
+            .await
+            .unwrap();
+        let listed = decisions(&engine, &plan).await;
+        // That request lists `a` and decides its keys; `c`'s keys are left
+        // to their HEAD requests.
+        let in_a = plan.iter().map(|key| key.starts_with("dst/a/"));
+        for ((key, listed), in_a) in plan.iter().zip(&listed).zip(in_a) {
+            let expected = if in_a {
+                expected(std::slice::from_ref(key), &served)[0]
+            } else {
+                Listed::Unknown
+            };
+            assert_eq!(*listed, expected, "{key}");
+        }
+        let requests = served.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["prefix"], "dst/a/");
+        assert_eq!(requests[0].get("start-after"), Some(&predecessor("dst/a/")));
+        // Its page was signed with the first pages, before it was sent.
+        assert_eq!(
+            signed_listings(&authorization),
+            [("dst/a/".to_owned(), Some(predecessor("dst/a/")), false)]
+        );
+        assert_eq!(authorization.exchanges_so_far(), 1);
     }
 
     #[tokio::test]
