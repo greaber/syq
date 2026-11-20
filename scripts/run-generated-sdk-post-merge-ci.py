@@ -15,8 +15,10 @@ from tooling import ToolError, json_output, output, report_errors
 
 def watch(run_id, repository):
     sys.stdout.flush()
+    # A full ci.yml run takes many minutes; polling every 3 s (the default)
+    # spends the account's shared API quota for nothing.
     return subprocess.run(["gh", "run", "watch", str(run_id), "--repo", repository,
-                           "--exit-status"]).returncode
+                           "--exit-status", "--interval", "30"]).returncode
 
 
 def dispatch_run(repository, branch, merge_sha):
