@@ -108,6 +108,12 @@ impl Tuning {
 /// endpoint from 20 ms on a reused connection: distances at which many small
 /// objects finish sooner starting wide than ramping from 64.
 pub(super) const HIGH_LATENCY: Duration = Duration::from_millis(20);
+/// Below this fastest control response, a far endpoint's uploads of small
+/// files start with at most 2,048 objects in flight instead of 4,096. The
+/// response takes at least one round trip, so the endpoint is closer than
+/// this, and at up to 30 ms 2,048 objects finish as soon as 4,096 in about
+/// 40% less memory. From 60 ms they finish later.
+pub(super) const NEAR_FAR_LATENCY: Duration = Duration::from_millis(32);
 /// Path latency is the fastest single control response. The time to plan a copy
 /// grows with the number of listing pages, so it says little about the path.
 pub(super) fn observe_control(control_ns: &AtomicU64, elapsed: Duration) {

@@ -313,6 +313,24 @@ async fn pending_read_exact_keeps_consumed_bytes_across_observations() {
     assert_eq!(&bytes, b"abcd");
 }
 
+#[test]
+fn far_small_uploads_start_with_at_most_2048_objects_below_32_ms() {
+    let start = |ms| {
+        let mut engine = planning_engine(&[]);
+        engine.options.route = Route::Upload;
+        engine.tuning.observe_control(Duration::from_millis(ms));
+        let workers = engine
+            .object_workers(std::iter::repeat_n(1024, 10_000))
+            .unwrap();
+        assert_eq!(engine.tuning.request_limit(), workers.initial, "{ms} ms");
+        workers.initial
+    };
+    let capacity = start(100);
+    assert_eq!(start(32), capacity);
+    assert_eq!(start(20), capacity.min(2048));
+    assert_eq!(start(31), capacity.min(2048));
+}
+
 pub(super) fn planning_engine(extra: &[&str]) -> Engine {
     let argv = [
         "cp",
