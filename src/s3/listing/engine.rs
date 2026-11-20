@@ -442,7 +442,7 @@ async fn execute(
                     static SAID: std::sync::Once = std::sync::Once::new();
                     SAID.call_once(|| {
                         crate::output::diagnostic!(
-                            "syq _ls: listing every key under {query:?} (and any other directory the pattern's last part reaches) without a delimiter, which can take much longer: this store may not list keys in byte order, and its later delimiter pages could leave a key out"
+                            "syq _ls: listing every key under {query:?} without a delimiter, which can take much longer; other prefixes the pattern's last part reaches are listed the same way when their listings need more than one page: this store may not list keys in byte order, and its later delimiter pages could leave a key out"
                         );
                     });
                     return Ok(scan_batch(query, false, flat, Gap::default()));
