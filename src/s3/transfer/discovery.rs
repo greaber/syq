@@ -9,6 +9,7 @@
 //! The listing reads one prefix, the destination, unless the copy may list
 //! only some prefixes inside it: then it reads each of those for the planned
 //! keys beneath it ([`segments`]), several at once ([`LISTINGS`]).
+use super::super::authorization::Unsigned;
 use super::super::listing::{
     self,
     engine::{Page, Store},
@@ -28,10 +29,12 @@ use std::{
 use tokio::sync::watch;
 
 /// Whether a planned key that the listing shows absent may go without its
-/// HEAD. The listing concludes absence from where a key would fall in a page,
-/// so a provider that orders keys differently could show an existing object
-/// as absent. That may cost an upload the comparison would have skipped. It
-/// must not change what the copy does, so these copies ask about every key.
+/// HEAD. The listing concludes absence from where a key would fall in a page
+/// only where the store lists in byte order, and otherwise only from a
+/// complete listing (`Discovery::start`): elsewhere an existing object could
+/// look absent, and an upload in its place would drop metadata only the
+/// destination has. Even so, relying on it must not change what the copy
+/// does, so these copies ask about every key.
 pub(super) fn trusts_absence(args: &Args) -> bool {
     // The object would be skipped by --only-existing, refused instead of kept
     // by keep, overwritten though newer by update-if-older, and judged by
@@ -82,6 +85,10 @@ const LIST_COST: usize = 12;
 /// about [`LIST_COST`] times a HEAD, and a worker waiting for the page could
 /// have sent its own HEAD instead.
 const KEYS_PER_PAGE: usize = 64;
+/// Planned keys beneath a prefix worth its complete listing alongside the
+/// copy where the order is unknown. A smaller plan has its keys checked
+/// before a page could come back.
+const BACKGROUND_KEYS: usize = KEYS_PER_PAGE;
 
 /// Prefixes listed at once. A copy whose requests another machine signs lists
 /// each named prefix on its own, and listing them one after another would
@@ -181,8 +188,9 @@ impl Segment {
 /// The copy sends one listing request whether or not it lists anything, to
 /// size its concurrency from. So when no prefix has that many planned keys,
 /// the one with the most is listed, if it has at least two: that request then
-/// decides them too. Like a plan of one key, a single key under a prefix is
-/// always checked with HEAD.
+/// decides them too (where the order is unknown, only when the prefix holds
+/// at most one object). Like a plan of one key, a single key under a prefix
+/// is always checked with HEAD.
 pub(super) fn segments(keys: &Keys, prefixes: &[String]) -> Vec<Segment> {
     let mut prefixes: Vec<&String> = prefixes.iter().collect();
     prefixes.sort_unstable();
@@ -223,32 +231,49 @@ pub(super) fn segments(keys: &Keys, prefixes: &[String]) -> Vec<Segment> {
     most.into_iter().collect()
 }
 
-/// The first request the listing sends for each of `segments`, as its prefix
-/// and where it starts: the pages that do not depend on an earlier response.
-/// A copy whose requests another machine signs has these signed together
-/// before the listing starts, rather than one round trip to that machine as
-/// the listing reaches each segment. The listing sends them as [`Walk`]
-/// enters each segment, or as [`Walk::whole`] lists it in a bucket that does
-/// not list in key order. A segment whose planned keys are all too long for
-/// S3 is not listed.
+/// The requests the listing sends that do not depend on an earlier response:
+/// the first page of each of `segments` it lists, and where the store is in
+/// key order but not known to be in byte order (`divides`), the short request
+/// that comes first ([`Discovery::start_unordered`]). A copy whose requests
+/// another machine signs has these signed together before the listing
+/// starts, rather than one round trip to that machine as the listing reaches
+/// each segment. The listing sends the pages as [`Walk`] enters each segment,
+/// or as [`Walk::whole`] lists it where a key's place in a page shows
+/// nothing: in a bucket not in key order, and alongside the copy for a
+/// segment of at least [`BACKGROUND_KEYS`] planned keys where the order is
+/// unknown. A segment whose planned keys are all too long for S3 is not
+/// listed.
 pub(super) fn first_pages<'a>(
     segments: &'a [Segment],
     keys: &'a Keys,
     ordered: bool,
-) -> impl Iterator<Item = (&'a str, Option<String>)> + 'a {
-    segments
-        .iter()
-        .filter_map(move |Segment { prefix, range }| {
-            if !ordered {
-                // `Walk::whole` spends fewer requests than the segment's keys.
-                return (range.len() >= 2).then_some((prefix.as_str(), None));
-            }
-            let start = range
-                .clone()
-                .map(|index| keys.get(index))
-                .find(|key| key.len() <= MAX_KEY)?;
-            Some((prefix.as_str(), Some(predecessor(start))))
-        })
+    divides: bool,
+) -> impl Iterator<Item = Unsigned> + 'a {
+    let probe = segments
+        .first()
+        .filter(|_| ordered && !divides)
+        .map(|first| listing::first_key_request(&first.prefix));
+    probe.into_iter().chain(
+        segments
+            .iter()
+            .filter_map(move |Segment { prefix, range }| {
+                if !ordered || !divides {
+                    // `Walk::whole` spends fewer requests than the segment's
+                    // keys, and alongside the copy lists only larger plans.
+                    let least = if ordered { BACKGROUND_KEYS } else { 2 };
+                    return (range.len() >= least)
+                        .then(|| listing::first_page_request(prefix, None));
+                }
+                let start = range
+                    .clone()
+                    .map(|index| keys.get(index))
+                    .find(|key| key.len() <= MAX_KEY)?;
+                Some(listing::first_page_request(
+                    prefix,
+                    Some(&predecessor(start)),
+                ))
+            }),
+    )
 }
 
 /// A key just below `key`: a listing that starts after it begins at `key`.
@@ -351,6 +376,7 @@ impl Walk {
     /// Request the next page and record what it decides. Returns whether
     /// another page is worth requesting.
     async fn page(&mut self, store: &impl Store) -> Result<bool> {
+        debug_assert!(store.divides(), "absence from a page needs byte order");
         if self.decisions.withdrawn.load(Relaxed) {
             return Ok(false);
         }
@@ -427,7 +453,7 @@ impl Walk {
     /// is worth requesting.
     async fn before_copy(&mut self, store: &impl Store) -> Result<bool> {
         if !store.ordered() {
-            self.whole(store).await?;
+            self.whole(store, usize::MAX, 0).await?;
             return Ok(false);
         }
         for _ in 0..PAGES_BEFORE_COPY {
@@ -438,14 +464,36 @@ impl Walk {
         Ok(true)
     }
 
+    /// Decide the only segment from a complete listing of it, which shows at
+    /// most `object` and its size.
+    fn settle(&mut self, object: Option<(&str, u64)>) {
+        let Segment { prefix, range } = &self.segments[0];
+        for index in range.clone() {
+            let key = self.keys.get(index);
+            let size = match object {
+                Some((listed, size)) if listed == key => size,
+                _ if key.starts_with(prefix.as_str()) => ABSENT,
+                _ => UNKNOWN,
+            };
+            self.decisions.store(index, size);
+        }
+        self.decided = self.keys.len();
+    }
+
     /// Directory buckets list in no particular order and cannot start after a
-    /// key, so only a complete listing decides anything.
-    async fn whole(&mut self, store: &impl Store) -> Result<()> {
+    /// key, and other stores may list in an order other than bytes, so only a
+    /// complete listing of a prefix shows a key absent. At most `pages`
+    /// requests go to each prefix, and none to a prefix with fewer than
+    /// `least` planned keys.
+    async fn whole(&mut self, store: &impl Store, pages: usize, least: usize) -> Result<()> {
         for Segment { prefix, range } in &self.segments {
+            if range.len() < least {
+                continue;
+            }
             let mut token: Option<String> = None;
             let mut found = 0;
             // Never spend as many LIST requests as checking each key with HEAD.
-            for _ in 0..range.len().saturating_sub(1) {
+            for _ in 0..range.len().saturating_sub(1).min(pages) {
                 let page = store.page(prefix, false, token.as_deref(), None).await?;
                 for entry in &page.entries {
                     ensure!(
@@ -534,6 +582,9 @@ pub(super) struct Discovery {
     decisions: Arc<Decisions>,
     /// How far each listing has come.
     reach: Vec<watch::Receiver<Reach>>,
+    /// Whether a key waits for the listing to reach it. Otherwise a key the
+    /// listing has not decided yet is unknown.
+    waits: bool,
     tasks: Vec<tokio::task::AbortHandle>,
 }
 impl Discovery {
@@ -543,6 +594,7 @@ impl Discovery {
     /// while the copy runs.
     pub(super) async fn start(
         client: aws_sdk_s3::Client,
+        endpoint: Option<&str>,
         bucket: &str,
         segments: Vec<Segment>,
         keys: Keys,
@@ -550,6 +602,11 @@ impl Discovery {
         progress: Arc<Progress>,
     ) -> Result<Self> {
         ensure!(!segments.is_empty(), "no destination prefix to list");
+        // `divides` says only whether these listings may rely on byte order.
+        let divides = listing::lists_in_byte_order(endpoint, bucket);
+        if listing::lists_in_key_order(bucket) && !divides {
+            return Self::start_unordered(client, bucket, segments, keys, progress).await;
+        }
         let decisions = Arc::new(Decisions::new(keys.len()));
         let listings = segments.len().min(LISTINGS);
         let listed = segments
@@ -564,11 +621,11 @@ impl Discovery {
                 Walk::new(segments.cloned().collect(), keys.clone(), decisions.clone())
             })
             .collect();
-        // These listings read pages one by one; they never divide.
+        // These listings read pages one by one.
         let store = listing::S3 {
             client: client.clone(),
             bucket,
-            divides: false,
+            divides,
         };
         let more = futures_util::future::try_join_all(
             walks.iter_mut().map(|walk| walk.before_copy(&store)),
@@ -593,7 +650,7 @@ impl Discovery {
                 let store = listing::S3 {
                     client,
                     bucket: &bucket,
-                    divides: false,
+                    divides,
                 };
                 walk.rest(&store, &cancelled, &stopped, &progress, &sender)
                     .await;
@@ -604,6 +661,92 @@ impl Discovery {
             listed,
             decisions,
             reach,
+            waits: true,
+            tasks,
+        })
+    }
+
+    /// `start` where the store lists in key order, but not known to be byte
+    /// order. A key's place in a page shows it absent only in byte order
+    /// (`trusts_absence`); in another order only a complete listing does.
+    /// So each prefix is listed whole, within the pages the copy would
+    /// otherwise wait for, while the copy goes on: a key the listing has not
+    /// decided by the time the copy reaches it gets a HEAD.
+    async fn start_unordered(
+        client: aws_sdk_s3::Client,
+        bucket: &str,
+        segments: Vec<Segment>,
+        keys: Keys,
+        progress: Arc<Progress>,
+    ) -> Result<Self> {
+        let decisions = Arc::new(Decisions::new(keys.len()));
+        let listed = segments
+            .iter()
+            .map(|segment| (segment.range.clone(), 0))
+            .collect();
+        let mut walk = Walk::new(segments, Arc::new(keys), decisions.clone());
+        let store = listing::S3 {
+            client: client.clone(),
+            bucket,
+            divides: false,
+        };
+        // A destination that cannot be listed still fails the copy here, from
+        // one short request. When the prefix holds at most one object, that
+        // request lists it completely.
+        let prefix = walk.segments[0].prefix.clone();
+        let first = store.first_key(&prefix).await?;
+        for entry in &first.entries {
+            ensure!(
+                entry.key.starts_with(prefix.as_str()),
+                "S3 listing returned a key outside the requested prefix"
+            );
+        }
+        // A service that returns more than asked for settles nothing.
+        let complete = walk.segments.len() == 1 && first.next.is_none() && first.entries.len() <= 1;
+        if complete {
+            walk.settle(
+                first
+                    .entries
+                    .first()
+                    .map(|entry| (entry.key.as_str(), entry.size)),
+            );
+        }
+        // A small plan reaches its keys before a page could come back.
+        let more = !complete
+            && walk
+                .segments
+                .iter()
+                .any(|segment| segment.range.len() >= BACKGROUND_KEYS);
+        let (sender, reach) = watch::channel(Reach {
+            decided: walk.decided,
+            finished: !more,
+        });
+        let mut tasks = Vec::new();
+        if more {
+            let bucket = bucket.to_owned();
+            let task = tokio::spawn(async move {
+                let store = listing::S3 {
+                    client,
+                    bucket: &bucket,
+                    divides: false,
+                };
+                if let Err(error) = walk.whole(&store, PAGES_BEFORE_COPY, BACKGROUND_KEYS).await {
+                    progress.warning(&format!(
+                        "S3 destination listing stopped; each destination key it did not reach is checked with its own request: {error:#}"
+                    ));
+                }
+                sender.send_replace(Reach {
+                    decided: walk.decided,
+                    finished: true,
+                });
+            });
+            tasks.push(task.abort_handle());
+        }
+        Ok(Self {
+            listed,
+            decisions,
+            reach: vec![reach],
+            waits: false,
             tasks,
         })
     }
@@ -617,15 +760,23 @@ impl Discovery {
     }
 
     /// What the listing says about the key at plan position `index`, once the
-    /// listing has passed it or ended.
+    /// listing has passed it or ended; where the order is unknown, at once
+    /// (`waits`).
     pub(super) fn lookup(&self, index: usize) -> impl Future<Output = Listed> + Send + 'static {
         let reach = self.reach(index).cloned();
         let decisions = self.decisions.clone();
+        let waits = self.waits;
         async move {
             // A key no listing reaches need not wait for one.
             let Some(mut reach) = reach else {
                 return Listed::Unknown;
             };
+            if !waits {
+                // A complete listing of a prefix records its absences only
+                // once complete, and a listed key is present: what is
+                // recorded holds before the other prefixes are listed.
+                return decisions.get(index);
+            }
             // A listing that ended early or was dropped leaves the rest to HEAD.
             let decided = reach
                 .wait_for(|reach| reach.decided > index || reach.finished)
@@ -645,6 +796,12 @@ impl Discovery {
         let Some(reach) = self.reach(index) else {
             return Some(Listed::Unknown);
         };
+        if !self.waits {
+            let listed = self.decisions.get(index);
+            if listed != Listed::Unknown {
+                return Some(listed);
+            }
+        }
         let reach = *reach.borrow();
         if reach.decided > index {
             Some(self.decisions.get(index))

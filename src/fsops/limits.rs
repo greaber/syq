@@ -150,15 +150,28 @@ pub(super) fn source_descriptor_requirement(
         .context("source descriptor requirement overflow")
 }
 
-/// Count a snapshot of the process's live descriptors. Reading an fd directory keeps
-/// the common Linux and Darwin paths proportional to the number of open
-/// descriptors. Its directory descriptor is visible in the listing, which is
-/// a harmless conservative overcount. The portable fallback scans the finite
-/// descriptor range and treats unexpected `fcntl` errors as open.
+/// Count a snapshot of the process's live descriptors that take up the
+/// slots below `soft_limit`. A new descriptor gets the lowest free number,
+/// which must be below the limit; one already open above it, such as a
+/// descriptor the parent left at a high number, takes none of them.
+/// Reading an fd directory keeps the common Linux and Darwin paths
+/// proportional to the number of open descriptors. Its directory descriptor
+/// is visible in the listing, which is a harmless conservative overcount.
+/// The portable fallback scans the same range and treats unexpected `fcntl`
+/// errors as open.
 pub(crate) fn current_open_descriptor_count(soft_limit: libc::rlim_t) -> Result<usize> {
     for fd_directory in ["/proc/self/fd", "/dev/fd"] {
         if let Ok(entries) = fs::read_dir(fd_directory) {
-            return Ok(entries.count());
+            return Ok(entries
+                .filter(|entry| {
+                    // A name that is not a number is counted, conservatively.
+                    entry
+                        .as_ref()
+                        .ok()
+                        .and_then(|entry| entry.file_name().to_str()?.parse::<libc::rlim_t>().ok())
+                        .is_none_or(|fd| fd < soft_limit)
+                })
+                .count());
         }
     }
 
