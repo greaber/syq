@@ -314,25 +314,37 @@ async fn pending_read_exact_keeps_consumed_bytes_across_observations() {
 }
 
 #[test]
-fn far_small_uploads_start_with_at_most_2048_objects_below_32_ms() {
-    let start = |ms| {
-        let mut engine = planning_engine(&[]);
-        engine.options.route = Route::Upload;
-        engine.tuning.observe_control(Duration::from_millis(ms));
-        let workers = engine
-            .object_workers(std::iter::repeat_n(1024, 10_000))
-            .unwrap();
-        assert_eq!(engine.tuning.request_limit(), workers.initial, "{ms} ms");
-        workers.initial
-    };
+fn far_small_copies_start_with_at_most_2048_objects_below_32_ms() {
     // Only a capacity above 2,048 shows the lower start; raise the soft
     // descriptor limit as the binary does at startup.
     crate::raise_nofile();
-    let capacity = start(100);
-    assert!(capacity > 2048, "small-object capacity {capacity}");
-    assert_eq!(start(32), capacity);
-    assert_eq!(start(20), capacity.min(2048));
-    assert_eq!(start(31), capacity.min(2048));
+    for route in [Route::Upload, Route::Download] {
+        let plan = |ms| {
+            let mut engine = planning_engine(&[]);
+            engine.options.route = route.clone();
+            engine.tuning.observe_control(Duration::from_millis(ms));
+            let workers = engine
+                .object_workers(std::iter::repeat_n(1024, 10_000))
+                .unwrap();
+            (workers.initial, engine.tuning.request_limit())
+        };
+        // A far start admits as many requests as objects.
+        let start = |ms| {
+            let (objects, requests) = plan(ms);
+            assert_eq!(requests, objects, "{route:?}, {ms} ms");
+            objects
+        };
+        let capacity = start(100);
+        assert!(
+            capacity > 2048,
+            "{route:?}: small-object capacity {capacity}"
+        );
+        assert_eq!(start(32), capacity, "{route:?}");
+        assert_eq!(start(20), capacity.min(2048), "{route:?}");
+        assert_eq!(start(31), capacity.min(2048), "{route:?}");
+        // A near endpoint starts with 256 objects and ramps requests from 64.
+        assert_eq!(plan(19), (256, 64), "{route:?}");
+    }
 }
 
 pub(super) fn planning_engine(extra: &[&str]) -> Engine {
@@ -427,8 +439,9 @@ async fn small_download_search_preserves_seeds_mixed_batches_and_overrides() {
         .unwrap();
     let maximum = concurrency.maximum.unwrap();
     assert!((1..=4096).contains(&maximum));
-    assert_eq!(concurrency.initial, maximum.min(256));
-    assert_eq!(engine.tuning.request_limit(), 256);
+    // A far endpoint starts with every object the budget allows in flight.
+    assert_eq!(concurrency.initial, maximum);
+    assert_eq!(engine.tuning.request_limit(), maximum);
 
     // An average below 1 MiB does not make every object small. Keep the
     // existing target when even one larger object needs streaming buffers.

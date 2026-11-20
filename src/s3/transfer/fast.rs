@@ -45,27 +45,31 @@ impl Engine {
             .unwrap_or(usize::MAX);
         let ramp_whole_objects = single_request && !tiny && fixed_workers.is_none();
         let small_upload = self.options.route == Route::Upload && largest <= 1024 * 1024;
-        let capacity = if small_upload {
+        // Many small objects to or from a far endpoint start with as many
+        // objects in flight as the payload and descriptor budget allows.
+        let far_small = tiny
+            && fixed_workers.is_none()
+            && self.tuning.high_latency()
+            && (small_upload || self.options.route == Route::Download && largest < 1024 * 1024);
+        let capacity = if small_upload || far_small {
             super::super::tuning::small_object_capacity(largest)?
         } else {
             256
         };
         let workers = if let Some(fixed) = fixed_workers {
             fixed
-        } else if tiny {
-            if small_upload && self.tuning.high_latency() {
-                if self
-                    .tuning
-                    .control_latency()
-                    .is_some_and(|latency| latency < super::super::tuning::NEAR_FAR_LATENCY)
-                {
-                    capacity.min(2048)
-                } else {
-                    capacity
-                }
+        } else if far_small {
+            if self
+                .tuning
+                .control_latency()
+                .is_some_and(|latency| latency < super::super::tuning::NEAR_FAR_LATENCY)
+            {
+                capacity.min(2048)
             } else {
-                256
+                capacity
             }
+        } else if tiny {
+            256
         } else if single_request {
             // Taper the object seed instead of dropping eightfold at 1 MiB.
             ((256 * 1024 * 1024) / average.max(1)).clamp(32, 256) as usize
@@ -88,7 +92,11 @@ impl Engine {
         // preparation follows the same request budget.
         self.tuning.configure(
             tiny,
-            if small_upload { workers } else { 256 },
+            if small_upload || far_small {
+                workers
+            } else {
+                256
+            },
             if ramp_whole_objects { 32 } else { 64 },
         );
         let starting = if ramp_whole_objects {
