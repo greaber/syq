@@ -353,8 +353,15 @@ async fn execute(
             // Making sure of a key a page may leave out (`Gap`) relies on
             // byte order. List everything under the prefix instead, unless
             // the pattern cannot match that key: it ends in '0' and is
-            // longer than the prefix, so a literal name is never it.
-            let flat = read(store, &query, false, None).await?;
+            // longer than the prefix, so a literal name is never it. That
+            // assumes a store in another order would leave out only that
+            // key, as Tigris does in byte order; none is known to leave out
+            // any.
+            let flat = read(store, &query, false, None)
+                .await
+                .with_context(|| {
+                    format!("listing {query:?} without a delimiter, since a later delimiter page could leave out a key")
+                })?;
             return Ok(scan_batch(query, false, flat, Gap::default()));
         }
         let gap = Gap::after(&page, |key| pattern.matches(key));
