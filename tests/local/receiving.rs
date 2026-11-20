@@ -2943,14 +2943,17 @@ fn write_provider_frame(stream: &mut std::os::unix::net::UnixStream, message: se
 /// a reload, as a provider that cannot read newer settings does. It returns
 /// the requests it received once it has been stopped.
 fn replace_with_other_build_provider(t: &Tmp) -> std::thread::JoinHandle<Vec<String>> {
-    replace_with_other_build_provider_following(t, None)
+    replace_with_other_build_provider_following(t, None, Some(std::time::Duration::ZERO))
 }
 
 /// `replace_with_other_build_provider`, with one that says it follows the
-/// file at `started_from`.
+/// file at `started_from`, and answers a request to stop if idle only after
+/// `delay`, as one slow to end its idle account connections does; without
+/// a delay, it stops without answering.
 fn replace_with_other_build_provider_following(
     t: &Tmp,
     started_from: Option<&Path>,
+    delay: Option<std::time::Duration>,
 ) -> std::thread::JoinHandle<Vec<String>> {
     let started_from = started_from.map(|path| path.to_str().unwrap().to_owned());
     let pid = local_provider(t)["pid"].as_u64().unwrap();
@@ -3015,6 +3018,14 @@ fn replace_with_other_build_provider_following(
             requests.push(request.clone());
             if !["Status", "Stop", "StopIfIdle"].contains(&request.as_str()) {
                 continue;
+            }
+            if request == "StopIfIdle" {
+                let Some(delay) = delay else {
+                    fs::remove_file(&socket).unwrap();
+                    drop(lock);
+                    return requests;
+                };
+                std::thread::sleep(delay);
             }
             write_provider_frame(
                 &mut stream,
@@ -3081,7 +3092,8 @@ fn settings_commands_replace_a_provider_from_another_build() {
 
 /// A command run with `--use-version` starts the provider from the selected
 /// release in the binary store, which never changes. The installed syq's
-/// persist commands, and `--self-update` through them, replace it.
+/// persist commands, and `--self-update` through them, replace it. One slow
+/// to answer whether it is idle is waited for, saying so once.
 #[test]
 fn persist_commands_replace_a_provider_that_follows_a_stored_release() {
     let t = Tmp::new();
@@ -3095,14 +3107,57 @@ fn persist_commands_replace_a_provider_that_follows_a_stored_release() {
     let stored = t.path(".local/lib/syq/v0.0.1/linux-x86_64/syq");
     fs::create_dir_all(stored.parent().unwrap()).unwrap();
     fs::write(&stored, b"a stored release").unwrap();
-    let old = replace_with_other_build_provider_following(&t, Some(&stored));
-    assert_output_ok(&receive_command(&t, &["status"]));
+    let old = replace_with_other_build_provider_following(
+        &t,
+        Some(&stored),
+        Some(std::time::Duration::from_secs(3)),
+    );
+    let status = receive_command(&t, &["status"]);
+    assert_output_ok(&status);
+    let stderr = String::from_utf8_lossy(&status.stderr);
+    assert_eq!(
+        stderr
+            .matches(
+                "syq: waiting for the old local SSH authorization provider to answer whether it is idle"
+            )
+            .count(),
+        1,
+        "{stderr}"
+    );
     let requests = old.join().unwrap();
     assert_eq!(
         requests.last().map(String::as_str),
         Some("StopIfIdle"),
         "{requests:?}"
     );
+    let build = Command::new(env!("CARGO_BIN_EXE_syq"))
+        .arg("--build-identity")
+        .capture_output()
+        .unwrap();
+    assert_eq!(
+        local_provider(&t)["build"],
+        String::from_utf8(build.stdout).unwrap().trim()
+    );
+}
+
+/// A provider of another build that stops without answering whether it is
+/// idle is replaced all the same: the switch finds it gone.
+#[test]
+fn a_provider_that_stops_without_answering_is_replaced() {
+    let t = Tmp::new();
+    fs::create_dir(t.runtime()).unwrap();
+    let _persistence = PersistenceOff(&t);
+    fs::create_dir_all(t.path("root")).unwrap();
+    assert_output_ok(&receive_command(
+        &t,
+        &["on", "--name", "first", "--root", "root", "--notify", "off"],
+    ));
+    let stored = t.path(".local/lib/syq/v0.0.1/linux-x86_64/syq");
+    fs::create_dir_all(stored.parent().unwrap()).unwrap();
+    fs::write(&stored, b"a stored release").unwrap();
+    let old = replace_with_other_build_provider_following(&t, Some(&stored), None);
+    assert_output_ok(&receive_command(&t, &["status"]));
+    assert_eq!(old.join().unwrap().last().unwrap(), "StopIfIdle");
     let build = Command::new(env!("CARGO_BIN_EXE_syq"))
         .arg("--build-identity")
         .capture_output()

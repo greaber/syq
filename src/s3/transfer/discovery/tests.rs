@@ -118,11 +118,7 @@ async fn discover_under(bucket: &Bucket, prefixes: &[&str], plan: &[String]) -> 
 
 async fn discover_segments(bucket: &Bucket, segments: Vec<Segment>, keys: Keys) -> Vec<Listed> {
     let len = keys.len();
-    let mut walk = Walk::new(
-        segments,
-        keys,
-        (0..len).map(|_| AtomicU64::new(UNKNOWN)).collect(),
-    );
+    let mut walk = Walk::new(segments, Arc::new(keys), Arc::new(Decisions::new(len)));
     let plan = 0..len;
     if walk.segments.is_empty() {
         return plan.map(|_| Listed::Unknown).collect();
@@ -132,11 +128,12 @@ async fn discover_segments(bucket: &Bucket, segments: Vec<Segment>, keys: Keys) 
     } else {
         walk.whole(bucket).await.unwrap();
     }
-    plan.map(|index| match walk.sizes[index].load(Relaxed) {
-        _ if index >= walk.decided => Listed::Unknown,
-        UNKNOWN => Listed::Unknown,
-        ABSENT => Listed::Absent,
-        size => Listed::Present(size),
+    plan.map(|index| {
+        if index >= walk.decided {
+            Listed::Unknown
+        } else {
+            walk.decisions.get(index)
+        }
     })
     .collect()
 }
@@ -144,8 +141,8 @@ async fn discover_segments(bucket: &Bucket, segments: Vec<Segment>, keys: Keys) 
 fn walk(prefix: &str, plan: &[String]) -> Walk {
     let keys = Keys::new(plan.iter().map(|key| key.as_str().into()));
     let whole = Segment::whole(prefix.to_owned(), &keys);
-    let sizes = (0..plan.len()).map(|_| AtomicU64::new(UNKNOWN)).collect();
-    Walk::new(vec![whole], keys, sizes)
+    let decisions = Arc::new(Decisions::new(plan.len()));
+    Walk::new(vec![whole], Arc::new(keys), decisions)
 }
 
 /// The listing as the copy finds it when preparation starts, as
@@ -158,10 +155,10 @@ async fn at_copy_start(bucket: &Bucket, prefix: &str, plan: &[String]) -> Discov
         finished: !more,
     });
     Discovery {
-        listed: std::iter::once(0..plan.len()).collect(),
-        sizes: walk.sizes,
-        reach,
-        task: None,
+        listed: vec![(0..plan.len(), 0)],
+        decisions: walk.decisions,
+        reach: vec![reach],
+        tasks: Vec::new(),
     }
 }
 
@@ -285,9 +282,12 @@ async fn keys_outside_every_named_prefix_are_decided_at_once() {
     let keys = Keys::new(plan.iter().map(|key| key.as_str().into()));
     let prefixes: Vec<String> = NAMED.map(str::to_owned).into();
     let found = segments(&keys, &prefixes);
-    let listed: Vec<_> = found.iter().map(|segment| segment.range.clone()).collect();
-    let sizes: Arc<[AtomicU64]> = (0..plan.len()).map(|_| AtomicU64::new(UNKNOWN)).collect();
-    let mut walk = Walk::new(found, keys, sizes.clone());
+    let listed: Vec<_> = found
+        .iter()
+        .map(|segment| (segment.range.clone(), 0))
+        .collect();
+    let decisions = Arc::new(Decisions::new(plan.len()));
+    let mut walk = Walk::new(found, Arc::new(keys), decisions.clone());
     // Before any page: the walk has not reached the named directories.
     let (sender, reach) = watch::channel(Reach {
         decided: walk.decided,
@@ -295,9 +295,9 @@ async fn keys_outside_every_named_prefix_are_decided_at_once() {
     });
     let discovery = Discovery {
         listed,
-        sizes,
-        reach,
-        task: None,
+        decisions,
+        reach: vec![reach],
+        tasks: Vec::new(),
     };
     let at = |key: &str| plan.iter().position(|planned| planned == key).unwrap();
     // A named file and a lone key are checked with HEAD, whatever the walk.
@@ -321,7 +321,7 @@ async fn keys_the_listing_has_not_decided_are_presigned() {
     plan.extend((0..5000).map(|f| format!("data/f{f:04}n")));
     plan.sort();
     let discovery = at_copy_start(&bucket, "data/", &plan).await;
-    let decided = discovery.reach.borrow().decided;
+    let decided = discovery.reach[0].borrow().decided;
     assert!((1000..plan.len() / 2).contains(&decided), "{decided}");
     let checked = presigned(&cp(&[]), None, Some(&discovery), &plan).await;
     let expected: Vec<_> = plan
@@ -338,9 +338,9 @@ async fn keys_the_listing_has_not_decided_are_presigned() {
     });
     let ended = Discovery {
         listed: discovery.listed.clone(),
-        sizes: discovery.sizes.clone(),
-        reach,
-        task: None,
+        decisions: discovery.decisions.clone(),
+        reach: vec![reach],
+        tasks: Vec::new(),
     };
     assert_eq!(
         presigned(&cp(&[]), None, Some(&ended), &plan).await,
@@ -483,6 +483,44 @@ async fn page_out_of_order_withdraws_every_decision() {
     // listing's order cannot be relied on.
     assert!(listed.iter().all(|listed| *listed == Listed::Unknown));
     assert_eq!(bucket.requests.borrow().len(), 3);
+}
+
+#[tokio::test]
+async fn page_out_of_order_withdraws_the_other_listings_decisions() {
+    let existing: Vec<_> = (0..5000).map(|f| format!("data/f{f:04}")).collect();
+    let mut bucket = Bucket::new(existing.iter().cloned().chain(["more/f1".to_owned()]));
+    let mut plan = existing.clone();
+    plan.extend((0..20).map(|f| format!("more/f{f}")));
+    plan.sort();
+    let keys = Arc::new(Keys::new(plan.iter().map(|key| key.as_str().into())));
+    let found = segments(&keys, &["data/".to_owned(), "more/".to_owned()]);
+    let decisions = Arc::new(Decisions::new(plan.len()));
+    let mut walks = found
+        .into_iter()
+        .map(|segment| Walk::new(vec![segment], keys.clone(), decisions.clone()));
+    let (mut data, mut more) = (walks.next().unwrap(), walks.next().unwrap());
+    // `more/` is listed in full and `data/` in part before a page of
+    // `data/` shows that this listing's order cannot be relied on.
+    assert!(!more.page(&bucket).await.unwrap());
+    assert!(data.page(&bucket).await.unwrap());
+    let decided = |decisions: &Decisions| {
+        (0..plan.len())
+            .filter(|index| decisions.get(*index) != Listed::Unknown)
+            .count()
+    };
+    assert_eq!(decided(&decisions), 1020);
+    bucket.disordered = Some(3);
+    assert!(!data.page(&bucket).await.unwrap());
+    assert_eq!(decided(&decisions), 0);
+    // A listing still running requests nothing more.
+    let mut again = Walk::new(
+        segments(&keys, &["more/".to_owned()]),
+        keys.clone(),
+        decisions.clone(),
+    );
+    let sent = bucket.requests.borrow().len();
+    assert!(!again.page(&bucket).await.unwrap());
+    assert_eq!(bucket.requests.borrow().len(), sent);
 }
 
 #[tokio::test]
@@ -670,7 +708,8 @@ fn keys_are_found_by_position_and_by_name() {
 
 /// Named sources at the destination `dst/`: directories `a`, `a-b` and `c`
 /// and the file `a.txt`. `a.txt` and every `a-b/` key sort between `a` and
-/// its contents.
+/// its contents. `a` and `a-b` hold enough keys to be worth a listing each,
+/// and `c` one key.
 fn named_plan() -> Vec<String> {
     let mut plan: Vec<String> = [
         "dst/a/",
@@ -684,6 +723,8 @@ fn named_plan() -> Vec<String> {
     ]
     .map(str::to_owned)
     .into();
+    plan.extend((0..10).map(|f| format!("dst/a/f{f}")));
+    plan.extend((0..10).map(|f| format!("dst/a-b/z{f}")));
     plan.sort();
     plan
 }
@@ -702,11 +743,11 @@ fn keys_beneath_each_prefix_form_one_segment() {
         [
             Segment {
                 prefix: "dst/a-b/".into(),
-                range: at("dst/a-b/x")..at("dst/a-b/y") + 1,
+                range: at("dst/a-b/x")..at("dst/a-b/z9") + 1,
             },
             Segment {
                 prefix: "dst/a/".into(),
-                range: at("dst/a/")..at("dst/a/3") + 1,
+                range: at("dst/a/")..at("dst/a/f9") + 1,
             },
         ]
     );
@@ -771,7 +812,10 @@ async fn unordered_bucket_lists_each_named_prefix_whole() {
     let listed = discover_under(&bucket, &NAMED, &plan).await;
     assert_true(&bucket, &plan, &listed);
     let decided = listed.iter().filter(|listed| **listed != Listed::Unknown);
-    assert_eq!(decided.count(), 6);
+    let beneath = plan
+        .iter()
+        .filter(|key| key.starts_with("dst/a/") || key.starts_with("dst/a-b/"));
+    assert_eq!(decided.count(), beneath.count());
     assert_eq!(*bucket.prefixes.borrow(), ["dst/a-b/", "dst/a/"]);
 }
 
@@ -779,26 +823,81 @@ async fn unordered_bucket_lists_each_named_prefix_whole() {
 async fn sparse_named_prefix_stops_only_its_own_listing() {
     // A sparse plan under "big/" stops listing there, as for the whole
     // destination; the next prefix is still listed.
-    let bucket = Bucket::new(large().into_iter().chain(["more/f1".to_owned()]));
+    let bucket = Bucket::new(large().into_iter().chain(["more/f00".to_owned()]));
     let mut plan: Vec<_> = (0..300).map(|d| format!("big/d{d:03}/f050")).collect();
-    plan.extend(["more/f1".to_owned(), "more/f2".to_owned()]);
+    plan.extend((0..LIST_COST).map(|f| format!("more/f{f:02}")));
     let listed = discover_under(&bucket, &["big/", "more/"], &plan).await;
     assert_true(&bucket, &plan, &listed);
     assert_eq!(bucket.requests.borrow().len(), SLACK_PAGES + 2);
     assert_eq!(listed[299], Listed::Unknown);
-    assert_eq!(&listed[300..], [Listed::Present(30001), Listed::Absent]);
+    assert_eq!(listed[300], Listed::Present(30001));
+    assert!(listed[301..].iter().all(|listed| *listed == Listed::Absent));
     assert_eq!(bucket.prefixes.borrow().last().unwrap(), "more/");
 }
 
 #[tokio::test]
-async fn named_prefixes_each_holding_one_planned_key_are_not_listed() {
-    let plan: Vec<String> = (0..300).map(|d| format!("big/d{d:03}/new")).collect();
+async fn named_prefixes_with_fewer_keys_than_a_listing_costs_are_not_listed() {
     let prefixes: Vec<String> = (0..300).map(|d| format!("big/d{d:03}/")).collect();
-    let prefixes: Vec<&str> = prefixes.iter().map(String::as_str).collect();
-    let bucket = Bucket::new(large());
-    let listed = discover_under(&bucket, &prefixes, &plan).await;
-    assert!(listed.iter().all(|listed| *listed == Listed::Unknown));
-    assert!(bucket.requests.borrow().is_empty());
+    for keys in [1, 4, LIST_COST - 1, LIST_COST] {
+        let mut plan: Vec<String> = prefixes
+            .iter()
+            .flat_map(|prefix| (0..keys).map(move |f| format!("{prefix}new{f:02}")))
+            .collect();
+        // One prefix with a key more than the others.
+        plan.push(format!("big/d150/new{keys:02}"));
+        plan.sort();
+        let bucket = Bucket::new(large());
+        let found = segments(
+            &Keys::new(plan.iter().map(|key| key.as_str().into())),
+            &prefixes,
+        );
+        let prefixes: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+        let listed = discover_under(&bucket, &prefixes, &plan).await;
+        let decided = listed.iter().filter(|listed| **listed != Listed::Unknown);
+        let requests = bucket.requests.borrow().len();
+        if keys < LIST_COST {
+            // Their HEAD requests cost less than a listing of each prefix.
+            // The copy's one listing request lists the prefix with the most
+            // keys instead, if it has at least two.
+            let most: Vec<_> = found
+                .iter()
+                .map(|segment| segment.prefix.as_str())
+                .collect();
+            assert_eq!(most, ["big/d150/"], "{keys}");
+            assert_eq!((decided.count(), requests), (keys + 1, 1), "{keys}");
+        } else {
+            assert_eq!(found.len(), 300);
+            assert_eq!((decided.count(), requests), (plan.len(), 300));
+        }
+    }
+    // Each single key is checked with HEAD.
+    let plan: Vec<String> = prefixes
+        .iter()
+        .map(|prefix| format!("{prefix}new"))
+        .collect();
+    let found = segments(
+        &Keys::new(plan.iter().map(|key| key.as_str().into())),
+        &prefixes,
+    );
+    assert!(found.is_empty());
+}
+
+#[test]
+fn the_first_prefix_with_the_most_keys_is_listed_when_none_is_worth_a_listing() {
+    let plan: Vec<String> = [
+        "a/1", "a/2", "b/1", "b/2", "b/3", "c/1", "c/2", "c/3", "d/1",
+    ]
+    .map(str::to_owned)
+    .into();
+    let keys = Keys::new(plan.iter().map(|key| key.as_str().into()));
+    let prefixes: Vec<String> = ["a/", "b/", "c/", "d/"].map(str::to_owned).into();
+    assert_eq!(
+        segments(&keys, &prefixes),
+        [Segment {
+            prefix: "b/".into(),
+            range: 2..5,
+        }]
+    );
 }
 
 #[tokio::test]
@@ -808,13 +907,9 @@ async fn first_pages_are_where_each_prefix_listing_starts() {
     let mut plan = named_plan();
     // The listing of `l` starts after its long first key; every key of `m` is
     // too long to start a listing at.
-    plan.extend([
-        long("l"),
-        "dst/l/b".into(),
-        "dst/l/c".into(),
-        long("m"),
-        format!("{}y", long("m")),
-    ]);
+    plan.extend([long("l"), "dst/l/b".into(), "dst/l/c".into(), long("m")]);
+    plan.extend((0..10).map(|f| format!("dst/l/d{f}")));
+    plan.extend((0..11).map(|f| format!("{}y{f}", long("m"))));
     plan.sort();
     let first_of_l = plan.iter().find(|key| key.starts_with("dst/l/"));
     assert_eq!(first_of_l, Some(&long("l")));
@@ -866,7 +961,10 @@ mod signed {
         http::{http_client_fn, HttpConnector, HttpConnectorFuture, SharedHttpConnector},
         orchestrator::{HttpRequest, HttpResponse},
     };
-    use std::sync::Mutex;
+    use std::{
+        sync::{atomic::AtomicUsize, Mutex},
+        time::Duration,
+    };
 
     /// The destination bucket `fixture`, answering ListObjectsV2 requests
     /// 1000 keys at a time. A continuation token names the last key returned.
@@ -875,6 +973,11 @@ mod signed {
         objects: Arc<BTreeMap<String, u64>>,
         /// Each request's query, without the signature.
         requests: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
+        /// How long each answer takes.
+        delay: Duration,
+        /// Requests under way, and the most there have been at once.
+        in_flight: Arc<AtomicUsize>,
+        most: Arc<AtomicUsize>,
     }
     impl HttpConnector for Served {
         fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
@@ -912,32 +1015,50 @@ mod signed {
                 ));
             }
             xml.push_str("</ListBucketResult>");
-            HttpConnectorFuture::ready(Ok(HttpResponse::new(
-                200.try_into().unwrap(),
-                aws_smithy_types::body::SdkBody::from(xml),
-            )))
+            let now = self.in_flight.fetch_add(1, Relaxed) + 1;
+            self.most.fetch_max(now, Relaxed);
+            let (delay, in_flight) = (self.delay, self.in_flight.clone());
+            HttpConnectorFuture::new(async move {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                in_flight.fetch_sub(1, Relaxed);
+                Ok(HttpResponse::new(
+                    200.try_into().unwrap(),
+                    aws_smithy_types::body::SdkBody::from(xml),
+                ))
+            })
         }
     }
 
-    /// Named directories `a`, `b` and `c` uploaded into `dst`. `b` holds
-    /// more existing keys than one page lists.
+    /// Named directories `a`, `b` and `c` uploaded into `dst`, each holding
+    /// enough keys to be worth a listing. `b` holds more existing keys than
+    /// two pages list.
     fn plan() -> Vec<String> {
-        let mut plan: Vec<String> = ["dst/a/1", "dst/a/2", "dst/c/1", "dst/c/2", "dst/c/3"]
-            .map(str::to_owned)
-            .into();
-        plan.extend((0..1500).map(|f| format!("dst/b/{f:04}")));
+        let mut plan: Vec<String> = ["a", "c"]
+            .iter()
+            .flat_map(|d| (1..=LIST_COST).map(move |f| format!("dst/{d}/{f:02}")))
+            .collect();
+        plan.extend((0..2500).map(|f| format!("dst/b/{f:04}")));
         plan.sort();
         plan
     }
     fn served() -> Served {
-        let mut objects: BTreeMap<String, u64> =
-            [("dst/a-a", 1), ("dst/a/1", 2), ("dst/c/2", 3), ("dst/z", 4)]
-                .map(|(key, size)| (key.to_owned(), size))
-                .into();
-        objects.extend((0..1500).map(|f| (format!("dst/b/{f:04}"), 5)));
+        let mut objects: BTreeMap<String, u64> = [
+            ("dst/a-a", 1),
+            ("dst/a/01", 2),
+            ("dst/c/02", 3),
+            ("dst/z", 4),
+        ]
+        .map(|(key, size)| (key.to_owned(), size))
+        .into();
+        objects.extend((0..2500).map(|f| (format!("dst/b/{f:04}"), 5)));
         Served {
             objects: Arc::new(objects),
             requests: Arc::default(),
+            delay: Duration::ZERO,
+            in_flight: Arc::default(),
+            most: Arc::default(),
         }
     }
     const ARGV: &[&str] = &[
@@ -1039,31 +1160,124 @@ mod signed {
                 .discover_destination(&mut plan, &[], |key: &String| key.as_str().into())
                 .await
                 .unwrap();
-            // The listing has sent its first two pages; the rest of it has
-            // yet to run. Every prefix's first page is already signed, and
-            // nothing else: not the destination directory itself.
+            // Each prefix's listing has sent the pages the copy waits for:
+            // `a` and `c` their only one, `b` two. Every prefix's first page
+            // was signed in one exchange, and nothing else: not the
+            // destination directory itself. `b`'s second page continues from
+            // its first response, so it needed an exchange of its own.
             let first =
                 |prefix: &str, key: &str| (prefix.to_owned(), Some(predecessor(key)), false);
             let presigned = vec![
-                first("dst/a/", "dst/a/1"),
+                first("dst/a/", "dst/a/01"),
                 first("dst/b/", "dst/b/0000"),
-                first("dst/c/", "dst/c/1"),
+                first("dst/c/", "dst/c/01"),
             ];
-            assert_eq!(signed_listings(&authorization), presigned);
-            assert_eq!(served.requests.lock().unwrap().len(), 2);
-
-            assert_eq!(decisions(&engine, &plan).await, expected(&plan, &served));
-            // `b`'s second page continues from its first response, so it was
-            // signed only when the listing reached it. The pages sent are the
-            // ones signed: the descriptions match what the SDK sends.
+            let continued = ("dst/b/".to_owned(), None, true);
             let mut signed = signed_listings(&authorization);
             signed.sort();
             let mut all = presigned.clone();
-            all.push(("dst/b/".into(), None, true));
+            all.push(continued.clone());
             all.sort();
             assert_eq!(signed, all);
+            assert_eq!(authorization.exchanges_so_far(), 2);
             assert_eq!(served.requests.lock().unwrap().len(), 4);
+
+            assert_eq!(decisions(&engine, &plan).await, expected(&plan, &served));
+            // `b`'s third page was signed only when the listing reached it.
+            // The pages sent are the ones signed: the descriptions match what
+            // the SDK sends.
+            let mut signed = signed_listings(&authorization);
+            signed.sort();
+            all.push(continued);
+            all.sort();
+            assert_eq!(signed, all);
+            assert_eq!(authorization.exchanges_so_far(), 3);
+            assert_eq!(served.requests.lock().unwrap().len(), 5);
         }
+    }
+
+    #[tokio::test]
+    async fn one_small_named_directory_is_listed_with_the_copy_s_one_listing_request() {
+        // Named directories of 4 and 3 keys: neither is worth a listing, but
+        // the copy sends one listing request anyway.
+        let argv = &[
+            "cp",
+            "/src/a",
+            "/src/c",
+            "--to",
+            "s3://fixture",
+            "--into",
+            "dst",
+        ];
+        let served = served();
+        let (engine, authorization) = engine(argv, &served, true);
+        let authorization = authorization.unwrap();
+        let mut plan: Vec<String> = ["dst/a/", "dst/a/01", "dst/a/02", "dst/a/03"]
+            .into_iter()
+            .chain(["dst/c/01", "dst/c/02", "dst/c/03"])
+            .map(str::to_owned)
+            .collect();
+        plan.sort();
+        engine
+            .discover_destination(&mut plan, &[], |key: &String| key.as_str().into())
+            .await
+            .unwrap();
+        let listed = decisions(&engine, &plan).await;
+        // That request lists `a` and decides its keys; `c`'s keys are left
+        // to their HEAD requests.
+        let in_a = plan.iter().map(|key| key.starts_with("dst/a/"));
+        for ((key, listed), in_a) in plan.iter().zip(&listed).zip(in_a) {
+            let expected = if in_a {
+                expected(std::slice::from_ref(key), &served)[0]
+            } else {
+                Listed::Unknown
+            };
+            assert_eq!(*listed, expected, "{key}");
+        }
+        let requests = served.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["prefix"], "dst/a/");
+        assert_eq!(requests[0].get("start-after"), Some(&predecessor("dst/a/")));
+        // Its page was signed with the first pages, before it was sent.
+        assert_eq!(
+            signed_listings(&authorization),
+            [("dst/a/".to_owned(), Some(predecessor("dst/a/")), false)]
+        );
+        assert_eq!(authorization.exchanges_so_far(), 1);
+    }
+
+    #[tokio::test]
+    async fn named_prefixes_are_listed_at_once_up_to_a_bound() {
+        let sources: Vec<String> = (0..40).map(|d| format!("/src/d{d:02}")).collect();
+        let mut argv = vec!["cp"];
+        argv.extend(sources.iter().map(String::as_str));
+        argv.extend(["--to", "s3://fixture", "--into", "dst"]);
+        let mut served = served();
+        served.delay = Duration::from_millis(100);
+        let (engine, _) = engine(&argv, &served, true);
+        let mut plan: Vec<String> = (0..40)
+            .flat_map(|d| (0..LIST_COST).map(move |f| format!("dst/d{d:02}/{f:02}")))
+            .collect();
+        plan.sort();
+        let started = std::time::Instant::now();
+        engine
+            .discover_destination(&mut plan, &[], |key: &String| key.as_str().into())
+            .await
+            .unwrap();
+        assert_eq!(decisions(&engine, &plan).await, expected(&plan, &served));
+        // Far sooner than one prefix after another.
+        assert!(
+            started.elapsed() < served.delay * 20,
+            "{:?}",
+            started.elapsed()
+        );
+        // One request for each prefix, as many at once as allowed.
+        let requests = served.requests.lock().unwrap();
+        let mut prefixes: Vec<_> = requests.iter().map(|query| &query["prefix"]).collect();
+        prefixes.sort();
+        prefixes.dedup();
+        assert_eq!((requests.len(), prefixes.len()), (40, 40));
+        assert_eq!(served.most.load(Relaxed), LISTINGS);
     }
 
     #[test]
@@ -1096,7 +1310,7 @@ mod signed {
         assert!(requests.iter().all(|query| query["prefix"] == "dst/"));
         assert_eq!(
             requests[0].get("start-after"),
-            Some(&predecessor("dst/a/1"))
+            Some(&predecessor("dst/a/01"))
         );
     }
 }

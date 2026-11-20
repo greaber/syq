@@ -285,6 +285,9 @@ impl Store for S3<'_> {
         token: Option<&str>,
         start_after: Option<&str>,
     ) -> Result<Page> {
+        // Tigris returns nothing for a delimiter listing that starts after a
+        // key ending in '/'; syq never sends StartAfter with a delimiter.
+        debug_assert!(!(delimiter && start_after.is_some()));
         let response = self
             .client
             .list_objects_v2()
