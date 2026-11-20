@@ -51,7 +51,7 @@ impl Tuning {
         // Tigris uploads keep their conservative seed. Downloads still need
         // enough requests in flight to cover a long round trip, regardless of
         // provider; short copies cannot recover time spent ramping from 64.
-        (!self.tigris || !self.upload) && ns != u64::MAX && ns >= 50_000_000
+        (!self.tigris || !self.upload) && ns != u64::MAX && ns >= HIGH_LATENCY.as_nanos() as u64
     }
     pub fn configure(&self, tiny: bool, request_cap: usize, seed: usize) {
         let request_cap = request_cap
@@ -95,6 +95,17 @@ impl Tuning {
         self.control_ns.load(Relaxed) < 3_000_000
     }
 }
+/// The fastest control response at which an endpoint counts as far away, so
+/// that copies of many small objects start with every request in flight and
+/// probe upward instead of ramping from a low seed. A response on a reused
+/// connection takes one round trip. A copy's first request also opens the
+/// connection, so it takes about two round trips over HTTP and three over
+/// HTTPS (TCP, then TLS), and an upload into an empty prefix has no other
+/// sample. At 20 ms, an HTTPS endpoint counts as far from about a 6 ms round
+/// trip on a first request, and any endpoint from 20 ms on a reused
+/// connection; many small objects copied faster that way at every round trip
+/// measured from 5 to 60 ms.
+pub(super) const HIGH_LATENCY: Duration = Duration::from_millis(20);
 /// Path latency is the fastest single control response. The time to plan a copy
 /// grows with the number of listing pages, so it says little about the path.
 pub(super) fn observe_control(control_ns: &AtomicU64, elapsed: Duration) {
