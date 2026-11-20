@@ -348,8 +348,8 @@ impl Engine {
     /// signer has their first pages signed together beforehand rather than
     /// one exchange with the signing machine as each listing starts. The
     /// listings' requests together stay within what one listing sends at a
-    /// time. An error is the first, in the order of `prefixes`, of the
-    /// listings that failed.
+    /// time. A listing that takes long holds up only its own prefix. An
+    /// error is that of the first listing to fail.
     pub(super) async fn list_completely(
         &self,
         prefixes: Vec<String>,
@@ -374,7 +374,7 @@ impl Engine {
                     &slots,
                 )
             })
-            .buffered(discovery::LISTINGS);
+            .buffer_unordered(discovery::LISTINGS);
         let mut found = DestinationListing::default();
         while let Some(listing) = listings.next().await {
             found.keys.extend(listing?.into_objects());

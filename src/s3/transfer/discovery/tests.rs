@@ -1611,4 +1611,28 @@ mod signed {
         assert!(!requests[0].contains_key("start-after"));
         assert_eq!(engine.upload_keys.get().unwrap().keys.len(), 2504);
     }
+
+    #[tokio::test]
+    async fn a_long_pruning_listing_does_not_hold_up_the_others() {
+        // `d00` holds eleven pages of keys; the other directories one each.
+        let argv = pruning_argv(&[]);
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let mut served = pruning_served();
+        let mut objects = (*served.objects).clone();
+        objects.extend((0..10_000).map(|f| (format!("dst/d00/k{f:05}"), 1)));
+        served.objects = Arc::new(objects);
+        served.delay = Duration::from_millis(20);
+        let (engine, _) = engine(&argv, &served, true);
+        let (mut plan, prune) = pruning_plan();
+        engine
+            .discover_destination(&mut plan, &prune.scopes, |key: &String| key.as_str().into())
+            .await
+            .unwrap();
+        // Every other directory was listed before `d00`'s last page.
+        let requests = served.requests.lock().unwrap();
+        let prefixes: Vec<&str> = requests.iter().map(|q| q["prefix"].as_str()).collect();
+        assert_eq!(prefixes.len(), 50);
+        assert_eq!(prefixes.last(), Some(&"dst/d00/"));
+        assert_eq!(engine.upload_keys.get().unwrap().keys.len(), 10_060);
+    }
 }
