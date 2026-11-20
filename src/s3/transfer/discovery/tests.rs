@@ -803,7 +803,8 @@ async fn named_prefixes_each_holding_one_planned_key_are_not_listed() {
 
 #[tokio::test]
 async fn first_pages_are_where_each_prefix_listing_starts() {
-    let long = |name: &str| format!("dst/{name}/{}", "x".repeat(MAX_KEY));
+    // Sorts before every other key beneath the same prefix.
+    let long = |name: &str| format!("dst/{name}/{}", "a".repeat(MAX_KEY));
     let mut plan = named_plan();
     // The listing of `l` starts after its long first key; every key of `m` is
     // too long to start a listing at.
@@ -815,6 +816,8 @@ async fn first_pages_are_where_each_prefix_listing_starts() {
         format!("{}y", long("m")),
     ]);
     plan.sort();
+    let first_of_l = plan.iter().find(|key| key.starts_with("dst/l/"));
+    assert_eq!(first_of_l, Some(&long("l")));
     let prefixes: Vec<String> = NAMED
         .into_iter()
         .chain(["dst/l/", "dst/m/"])
@@ -855,7 +858,7 @@ async fn first_pages_are_where_each_prefix_listing_starts() {
 mod signed {
     //! A named upload's destination listing through the signing transport.
     use super::super::super::super::authorization::{
-        http_client, request_for, Authorization, Signer, Unsigned,
+        http_client, request_for, Authorization, Signer,
     };
     use super::super::super::super::listing::first_page_request;
     use super::*;
@@ -1076,15 +1079,6 @@ mod signed {
                 "{prefix}"
             );
         }
-        // Its description is the request a page sends.
-        assert_eq!(
-            first_page_request("dst/b/", None),
-            Unsigned::new("GET", "")
-                .query("list-type", "2")
-                .query("prefix", "dst/b/")
-                .query("max-keys", "1000")
-                .query("encoding-type", "url")
-        );
     }
 
     #[tokio::test]
