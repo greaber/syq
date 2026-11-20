@@ -251,7 +251,7 @@ fn run_cache(action: CacheAction) -> Result<()> {
                 crate::output::command_println!("completion endpoint cache is empty");
             } else {
                 for endpoint in cache.endpoints {
-                    crate::output::command_println!("{}", endpoint_label(&endpoint.endpoint()));
+                    crate::output::command_println!("{}", endpoint.endpoint().label());
                 }
             }
         }
@@ -264,9 +264,9 @@ fn run_cache(action: CacheAction) -> Result<()> {
                 before != cache.endpoints.len()
             })?;
             if removed {
-                crate::output::command_println!("forgot {}", endpoint_label(&endpoint));
+                crate::output::command_println!("forgot {}", endpoint.label());
             } else {
-                crate::output::command_println!("{} was not cached", endpoint_label(&endpoint));
+                crate::output::command_println!("{} was not cached", endpoint.label());
             }
         }
         CacheAction::Clear => {
@@ -304,11 +304,7 @@ pub(crate) fn remember_endpoint_best_effort(user: Option<&str>, host: &str, port
 
 fn remember_endpoint(user: Option<&str>, host: &str, port: Option<u16>) -> Result<()> {
     // Reuse the public endpoint validator before putting anything on disk.
-    let label = endpoint_label(&NativeEndpoint {
-        user: user.map(str::to_owned),
-        host: host.to_owned(),
-        port,
-    });
+    let label = crate::cli::endpoint_label(user, host, port);
     let endpoint = parse_native_endpoint(Some(&label))?
         .ok_or_else(|| anyhow!("validated endpoint unexpectedly became local"))?;
     update_cache(|cache| {
@@ -1008,6 +1004,9 @@ impl<'a> CompletionContext<'a> {
                 context.present.insert(arg.get_id().to_string());
                 if let Some(value) = value {
                     context.value(arg, value, 1);
+                    // Like clap, an attached value is the option's only one,
+                    // so the next word is not another value.
+                    context.pending = None;
                 } else if arg.get_action().takes_values() {
                     context.pending = Some((arg, 0));
                 } else {
@@ -1151,7 +1150,7 @@ fn filesystem_command_candidates(
     }
     match command {
         "cp" | "rm" | "clean-partials" | "map" if context.sources_allowed(command) => {
-            complete_path_for(command, &context.options, current, true)
+            complete_path_for(command, &context.options, current, true, false)
         }
         "rsync" => complete_rsync_operand(&context.options, current),
         _ => Ok(Vec::new()),
@@ -1187,8 +1186,10 @@ fn complete_argument(
     }
     let name = option_name(arg);
     let kind = value_completion(command, &name, meta).unwrap_or(ValueCompletion::None);
-    let mut values = complete_value(command, &context.options, current, kind)?;
-    if directories_only_id(arg.get_id().as_str()) {
+    let directories_only = directories_only_id(arg.get_id().as_str());
+    let mut values = complete_value(command, &context.options, current, kind, directories_only)?;
+    if directories_only {
+        // A remote listing has no type filter.
         values.retain(|candidate| candidate.value.ends_with(b"/"));
     }
     Ok(values)
@@ -1341,6 +1342,7 @@ fn complete_value(
     args: &[Vec<u8>],
     current: &[u8],
     kind: ValueCompletion,
+    directories_only: bool,
 ) -> Result<Vec<Candidate>> {
     match kind {
         ValueCompletion::ReceivingProfile => Ok(crate::receive_service::profile_names(
@@ -1371,12 +1373,17 @@ fn complete_value(
             pscope_from_args(command, args),
         )),
         ValueCompletion::SourcePath { apply_base } => {
-            complete_source_path(command, args, current, apply_base)
+            complete_source_path(command, args, current, apply_base, directories_only)
         }
-        ValueCompletion::DestinationPath => complete_path_for(command, args, current, false),
-        ValueCompletion::LocalPath { directories_only } => {
-            Ok(local_path_candidates(current, directories_only))
+        ValueCompletion::DestinationPath => {
+            complete_path_for(command, args, current, false, directories_only)
         }
+        ValueCompletion::LocalPath {
+            directories_only: kind_directories_only,
+        } => Ok(local_path_candidates(
+            current,
+            kind_directories_only || directories_only,
+        )),
         ValueCompletion::None => Ok(Vec::new()),
     }
 }
@@ -1451,14 +1458,15 @@ fn complete_path_for(
     args: &[Vec<u8>],
     current: &[u8],
     source: bool,
+    directories_only: bool,
 ) -> Result<Vec<Candidate>> {
     if source {
-        return complete_source_path(command, args, current, true);
+        return complete_source_path(command, args, current, true, directories_only);
     }
     let Some(endpoint_text) = find_option_value(args, b"--to") else {
         return Ok(local_path_candidates_at(
             current,
-            false,
+            directories_only,
             None,
             path_policy(command, args, false, true),
         ));
@@ -1471,7 +1479,7 @@ fn complete_path_for(
     let Some(endpoint) = parse_native_endpoint(Some(endpoint_text))? else {
         return Ok(local_path_candidates_at(
             current,
-            false,
+            directories_only,
             None,
             path_policy(command, args, false, true),
         ));
@@ -1495,6 +1503,7 @@ fn complete_source_path(
     args: &[Vec<u8>],
     current: &[u8],
     apply_base: bool,
+    directories_only: bool,
 ) -> Result<Vec<Candidate>> {
     // Removal follows parent paths when requested, but selects the final link
     // itself. --cwd and --root still resolve their complete directory paths.
@@ -1513,7 +1522,12 @@ fn complete_source_path(
             b"--from"
         },
     ) else {
-        return Ok(local_path_candidates_at(current, false, base, policy));
+        return Ok(local_path_candidates_at(
+            current,
+            directories_only,
+            base,
+            policy,
+        ));
     };
     if endpoint_text.starts_with("s3://") {
         // S3 keys are not SSH paths. Tab must not open an SSH connection or
@@ -1521,7 +1535,12 @@ fn complete_source_path(
         return Ok(Vec::new());
     }
     let Some(endpoint) = parse_native_endpoint(Some(endpoint_text))? else {
-        return Ok(local_path_candidates_at(current, false, base, policy));
+        return Ok(local_path_candidates_at(
+            current,
+            directories_only,
+            base,
+            policy,
+        ));
     };
     remote_path_candidates(command, args, endpoint, current, Vec::new(), base, policy)
 }
@@ -1719,7 +1738,7 @@ fn connect_completion_endpoint(
         Some(Arc::new(SshMultiplexer::approved(cached.control(), None)))
     } else {
         if let AuthFrom::Provider(provider) = auth_from {
-            bail!("no live approved account connection for {} through {provider}; connect first with syq persist connect {} --auth-from {provider}", endpoint_label(&endpoint), endpoint_label(&endpoint));
+            bail!("no live approved account connection for {} through {provider}; connect first with syq persist connect {} --auth-from {provider}", endpoint.label(), endpoint.label());
         }
         let persistent = crate::persistence::scope_for_implicit_ssh(domain.explicit_path())
             .and_then(|scope| {
@@ -2125,23 +2144,8 @@ fn endpoint_candidate_value(
     if matches!(syntax, EndpointSyntax::Rsync) && endpoint.port.is_some() {
         return None;
     }
-    let label = endpoint_label(endpoint);
+    let label = endpoint.label();
     label.starts_with(typed).then_some(label)
-}
-
-fn endpoint_label(endpoint: &NativeEndpoint) -> String {
-    let host = if endpoint.host.contains(':') {
-        format!("[{}]", endpoint.host)
-    } else {
-        endpoint.host.clone()
-    };
-    let authority = endpoint
-        .user
-        .as_ref()
-        .map_or(host.clone(), |user| format!("{user}@{host}"));
-    endpoint
-        .port
-        .map_or(authority.clone(), |port| format!("{authority}:{port}"))
 }
 
 fn ssh_config_endpoints() -> Vec<NativeEndpoint> {

@@ -21,7 +21,7 @@ enum DestinationStatus {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SettlementOutcome {
-    results_status: &'static str,
+    results_status: crate::results::Status,
     exit_code: i32,
     /// The destination's results contradict the coordinator's exit status.
     rejects: bool,
@@ -39,35 +39,29 @@ fn settlement_outcome(
         refusals > 0 || (destination != DestinationStatus::Clean && coordinator_exit_code == 0);
     // Status first, then the exit code the automation contract pairs with
     // it — the two can never disagree.
+    use crate::results::Status;
     let results_status = if coordinator_exit_code == 1 {
         // A coordinator-fatal run may hold unsettled entries; the
         // destination's records still describe what did land.
-        "failed"
+        Status::Failed
     } else if refusals > 0 || coordinator_exit_code == 25 {
-        "refused"
+        Status::Refused
     } else if destination != DestinationStatus::Clean || coordinator_exit_code == 23 {
-        "partial"
+        Status::Partial
     } else {
-        "success"
+        Status::Success
     };
     let exit_code = match results_status {
-        "success" => 0,
-        "partial" => 23,
-        "refused" => 25,
-        _ => 1,
+        Status::Success => 0,
+        Status::Partial => 23,
+        Status::Refused => 25,
+        Status::Aborted | Status::Failed => 1,
     };
     SettlementOutcome {
         results_status,
         exit_code,
         rejects,
     }
-}
-
-/// An error record the final result counts: not one that only explains a
-/// failure another record counts.
-fn counted_error(record: &serde_json::Value) -> bool {
-    record.get("type").and_then(serde_json::Value::as_str) == Some("error")
-        && record.get(crate::results::DIAGNOSTIC_FOR).is_none()
 }
 
 /// The longest relayed results line: a coordinator record, or a base64
@@ -88,12 +82,10 @@ struct Relay {
     /// The restricted destination's stream, which also supplies the
     /// operation records for its changes.
     destination: Option<crate::destination_results::Reader>,
-    coordinator_terminal: Option<serde_json::Value>,
+    coordinator_terminal: Option<crate::results::ResultRecord>,
     /// The run's shape, for a final result this machine writes itself.
     dry_run: bool,
     prune: bool,
-    /// Counted error records written to the results so far.
-    errors: u64,
     /// The first problem with what arrived; later lines are drained unread.
     failure: Option<anyhow::Error>,
 }
@@ -115,7 +107,6 @@ impl Relay {
             coordinator_terminal: None,
             dry_run,
             prune,
-            errors: 0,
             failure: None,
         }
     }
@@ -173,7 +164,8 @@ impl Relay {
                     self.coordinator_terminal.is_none(),
                     "the coordinating server sent two final results"
                 );
-                self.coordinator_terminal = Some(record);
+                self.coordinator_terminal =
+                    Some(crate::results::ResultRecord::from_record(record)?);
             }
             // The destination reports the changes it made.
             "operation_result"
@@ -187,9 +179,6 @@ impl Relay {
                     self.coordinator_terminal.is_none(),
                     "the coordinating server sent results after its final result"
                 );
-                if counted_error(&record) {
-                    self.errors += 1;
-                }
                 writer.emit_value(record);
             }
         }
@@ -208,10 +197,6 @@ impl Relay {
             records.push(record);
             Ok(())
         })?;
-        self.errors += records
-            .iter()
-            .filter(|record| counted_error(record))
-            .count() as u64;
         // A frame's records are written together.
         if let Some(writer) = &self.results {
             writer.emit_values(records);
@@ -226,8 +211,14 @@ impl Relay {
                 "class": class,
                 "message": message,
             }));
-            self.errors += 1;
         }
+    }
+
+    /// Counted error records written to the results so far.
+    fn errors(&self) -> u64 {
+        self.results
+            .as_ref()
+            .map_or(0, |writer| writer.relayed_errors())
     }
 }
 
@@ -387,7 +378,7 @@ fn settle(mut relay: Relay, settlement: Settlement<'_>) -> Result<i32> {
         // An ordinary coordinator's own final result is the run's.
         if let Some(writer) = &relay.results {
             match relay.coordinator_terminal.take() {
-                Some(terminal) => writer.emit_terminal_value(terminal),
+                Some(terminal) => writer.emit_result(&terminal),
                 None => {
                     relay.error(
                         &format!("the coordinating server on {src_host} sent no final result"),
@@ -447,7 +438,7 @@ fn settle(mut relay: Relay, settlement: Settlement<'_>) -> Result<i32> {
         if !quiet && !relay.dry_run {
             print_summary(&terminal);
         }
-        writer.emit_terminal_value(terminal);
+        writer.emit_result(&terminal);
         // A stream was settled: the process exits with the code it
         // advertises.
         if let Some(message) = settlement_error {
@@ -500,86 +491,52 @@ fn compose_terminal(
     totals: &crate::destination_results::Totals,
     outcome: SettlementOutcome,
     elapsed_ms: u64,
-) -> serde_json::Value {
+) -> crate::results::ResultRecord {
     let mut terminal = relay
         .coordinator_terminal
         .clone()
         .unwrap_or_else(|| empty_terminal(relay, elapsed_ms));
-    let object = terminal
-        .as_object_mut()
-        .expect("a final result is an object");
-    object.insert("status".into(), outcome.results_status.into());
-    object.insert("exit_code".into(), outcome.exit_code.into());
-    object.insert("errors".into(), relay.errors.into());
+    terminal.status = outcome.results_status.into();
+    terminal.exit_code = outcome.exit_code;
+    terminal.errors = relay.errors();
+    terminal.settle(&["status", "exit_code", "errors"]);
     // A dry run changes nothing: its plan is the coordinator's.
     if !relay.dry_run {
-        for (key, value) in [
-            ("files_transferred", totals.files_transferred),
-            ("bytes_transferred", totals.bytes_transferred),
-            ("directories_created", totals.directories_created),
-            ("symlinks_created", totals.symlinks_created),
-            ("specials_created", totals.specials_created),
-        ] {
-            object.insert(key.into(), value.into());
-        }
-        if object.contains_key("deletions_completed") {
-            object.insert(
-                "deletions_completed".into(),
-                totals.deletions_completed.into(),
-            );
+        terminal.files_transferred = totals.files_transferred;
+        terminal.bytes_transferred = totals.bytes_transferred;
+        terminal.directories_created = totals.directories_created;
+        terminal.symlinks_created = totals.symlinks_created;
+        terminal.specials_created = totals.specials_created;
+        terminal.settle(&[
+            "files_transferred",
+            "bytes_transferred",
+            "directories_created",
+            "symlinks_created",
+            "specials_created",
+        ]);
+        // Only a pruning copy's record has it, in whatever type.
+        if terminal.deletions_completed.is_some()
+            || terminal.extra.contains_key("deletions_completed")
+        {
+            terminal.deletions_completed = Some(totals.deletions_completed);
+            terminal.settle(&["deletions_completed"]);
         }
     }
     terminal
 }
 
-fn print_summary(terminal: &serde_json::Value) {
-    let count = |key: &str| terminal.get(key).and_then(serde_json::Value::as_u64);
-    let value = |key: &str| count(key).unwrap_or(0);
-    let deletions = match (count("deletions_blocked"), count("deletions_completed")) {
+fn print_summary(terminal: &crate::results::ResultRecord) {
+    let deletions = match (terminal.deletions_blocked, terminal.deletions_completed) {
         (Some(blocked), _) if blocked > 0 => format!(
             ", {} planned for deletion (blocked)",
-            value("deletions_planned")
+            terminal.deletions_planned.unwrap_or(0)
         ),
         (_, Some(deleted)) => format!(", {deleted} deleted"),
         _ => String::new(),
     };
-    let timings = &terminal["timings"];
-    let elapsed_ms = timings["transfer_ms"]
-        .as_u64()
-        .or_else(|| timings["total_ms"].as_u64())
-        .unwrap_or(0);
+    let elapsed_ms = summary_elapsed_ms(terminal);
     crate::transfer::print_transfer_summary(
-        &crate::results::ResultRecord {
-            status: "",
-            exit_code: 0,
-            dry_run: false,
-            files_transferred: value("files_transferred"),
-            files_unchanged: value("files_unchanged"),
-            files_excluded: value("files_excluded"),
-            directories_created: value("directories_created"),
-            symlinks_created: value("symlinks_created"),
-            specials_created: value("specials_created"),
-            errors: value("errors"),
-            bytes_transferred: value("bytes_transferred"),
-            bytes_unchanged: value("bytes_unchanged"),
-            timings: Default::default(),
-            deletions_planned: None,
-            deletions_completed: None,
-            deletions_blocked: None,
-            replaced_not_in_place: terminal
-                .get("replaced_not_in_place")
-                .and_then(serde_json::Value::as_object)
-                .map(|counts| {
-                    crate::proto::ReplaceReason::ALL
-                        .iter()
-                        .map(|reason| {
-                            let count =
-                                counts.get(reason.key()).and_then(serde_json::Value::as_u64);
-                            (*reason, count.unwrap_or(0))
-                        })
-                        .collect()
-                }),
-        },
+        terminal,
         // The coordinator's results do not separate data reused inside
         // transferred files from unchanged files.
         None,
@@ -589,36 +546,32 @@ fn print_summary(terminal: &serde_json::Value) {
     );
 }
 
+/// The copying time the summary shows. Timings relayed as sent, which this
+/// build could not read whole, are read measurement by measurement.
+fn summary_elapsed_ms(terminal: &crate::results::ResultRecord) -> u64 {
+    match terminal.extra.get("timings") {
+        Some(timings) => timings["transfer_ms"]
+            .as_u64()
+            .or_else(|| timings["total_ms"].as_u64())
+            .unwrap_or(0),
+        None => terminal
+            .timings
+            .transfer_ms
+            .unwrap_or(terminal.timings.total_ms),
+    }
+}
+
 /// A final result with every count zero, for a run without the
 /// coordinator's own.
-fn empty_terminal(relay: &Relay, elapsed_ms: u64) -> serde_json::Value {
-    let mut terminal = serde_json::json!({
-        "type": "result",
-        "status": "failed",
-        "exit_code": 1,
-        "dry_run": relay.dry_run,
-        "files_transferred": 0,
-        "files_unchanged": 0,
-        "files_excluded": 0,
-        "directories_created": 0,
-        "symlinks_created": 0,
-        "specials_created": 0,
-        "errors": relay.errors,
-        "bytes_transferred": 0,
-        "bytes_unchanged": 0,
-        "timings": {"total_ms": elapsed_ms},
-    });
+fn empty_terminal(relay: &Relay, elapsed_ms: u64) -> crate::results::ResultRecord {
+    let mut terminal =
+        crate::results::ResultRecord::new(crate::results::Status::Failed, 1, relay.dry_run);
+    terminal.errors = relay.errors();
+    terminal.timings.total_ms = elapsed_ms;
     if relay.prune {
-        let object = terminal
-            .as_object_mut()
-            .expect("a final result is an object");
-        for key in [
-            "deletions_planned",
-            "deletions_completed",
-            "deletions_blocked",
-        ] {
-            object.insert(key.into(), 0.into());
-        }
+        terminal.deletions_planned = Some(0);
+        terminal.deletions_completed = Some(0);
+        terminal.deletions_blocked = Some(0);
     }
     terminal
 }
@@ -627,7 +580,7 @@ fn empty_terminal(relay: &Relay, elapsed_ms: u64) -> serde_json::Value {
 /// result keeps the counts nothing vouches for at zero.
 fn fail_results(relay: &Relay, elapsed_ms: u64) {
     if let Some(writer) = &relay.results {
-        writer.emit_terminal_value(empty_terminal(relay, elapsed_ms));
+        writer.emit_result(&empty_terminal(relay, elapsed_ms));
     }
 }
 
@@ -909,29 +862,17 @@ impl ReceiverConnection {
         let (program, options) = command
             .split_first()
             .context("receiver SSH command is empty")?;
-        let mut query = std::process::Command::new(program);
-        query.args(options).arg("-G");
-        if let Some(user) = user {
-            query.args(["-l", user]);
-        }
-        if let Some(port) = port {
-            query.args(["-p", &port.to_string()]);
-        }
-        query.args(["--", host]).stdin(std::process::Stdio::null());
-        let output = crate::process::capture_output_bounded(
-            "SSH configuration lookup",
-            &mut query,
+        let config = crate::ssh_config::SshConfig::query(
+            program,
+            options,
+            user,
+            port,
+            host,
+            crate::ssh_config::Group::Own,
             std::time::Instant::now() + std::time::Duration::from_secs(30),
             &|| false,
-            1 << 20,
-        )
-        .context("read this machine's SSH configuration for the destination")?;
-        anyhow::ensure!(
-            output.status.success(),
-            "could not read this machine's SSH configuration for {host}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        Self::parse(std::str::from_utf8(&output.stdout).context("SSH configuration is not UTF-8")?)
+        )?;
+        Self::parse(config.text())
     }
 
     /// How the approving machine's entries can join this machine's.
@@ -968,12 +909,7 @@ impl ReceiverConnection {
     }
 
     pub(crate) fn parse(output: &str) -> Result<Self> {
-        let value = |name: &str| {
-            output
-                .lines()
-                .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
-                .map(str::trim)
-        };
+        let value = |name: &str| crate::ssh_config::value(output, name).map(str::trim);
         let hostname = value("hostname").context("`ssh -G` reported no hostname")?;
         let port: u16 = value("port")
             .context("`ssh -G` reported no port")?
@@ -1602,19 +1538,7 @@ pub(crate) fn endpoint_arg(
 ) -> String {
     let host =
         connection_host.unwrap_or_else(|| location.host.as_deref().expect("remote endpoint"));
-    let host = if host.contains(':') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    };
-    let endpoint = match login_user.or(location.user.as_deref()) {
-        Some(user) => format!("{user}@{host}"),
-        None => host,
-    };
-    match location.port {
-        Some(port) => format!("{endpoint}:{port}"),
-        None => endpoint,
-    }
+    crate::cli::endpoint_label(login_user.or(location.user.as_deref()), host, location.port)
 }
 
 fn endpoint_display(location: &Location) -> String {

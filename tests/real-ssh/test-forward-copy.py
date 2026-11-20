@@ -332,29 +332,42 @@ assert remote("sha256sum './~/syq-real-ssh-forward-home/literal'").split()[0] ==
 remote("test ! -e ~/syq-real-ssh-forward-home/literal")
 
 print("case: an approved copy's slow SSH setup does not block the next approval", flush=True)
-def deny_during_setup():
-    command = "exec timeout 15 syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as during-forward-setup"
-    process = subprocess.Popen(["ssh", "source", command], start_new_session=True)
-    try:
-        pending = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "3"))
-        assert len(pending) == 1 and "during-forward-setup" in pending[0]["destination"], pending
-        run("syq", "persist", "receive", "deny", pending[0]["id"])
-        assert process.wait(timeout=5) not in (0, 124)
-    finally:
-        if process.poll() is None:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=3)
+# Setting restricted copying up again holds the enrolling login after the
+# approval; keep that window open long enough to exercise another request
+# on the same return connection.
+hold = Path("/tmp/syq-real-ssh-hold-enrollment")
+waiting = Path("/tmp/syq-real-ssh-hold-enrollment.waiting")
 
-# Reading the destination's SSH configuration after approval is slow here;
-# keep that window open long enough to exercise another request on the same
-# return connection.
-Path("/tmp/syq-real-ssh-slow-config").touch()
+
+def deny_during_setup():
+    try:
+        wait_until("the enrolling login", lambda: (waiting.exists(), setup_processes()))
+        command = "exec timeout 15 syq cp /tmp/syq-real-ssh/return-source/message.txt --to @laptop --as during-forward-setup"
+        process = subprocess.Popen(["ssh", "source", command], start_new_session=True)
+        try:
+            pending = json.loads(run("syq", "persist", "receive", "pending", "--json", "--wait", "--timeout", "3"))
+            assert len(pending) == 1 and "during-forward-setup" in pending[0]["destination"], pending
+            run("syq", "persist", "receive", "deny", pending[0]["id"])
+            assert process.wait(timeout=5) not in (0, 124)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=3)
+    finally:
+        hold.unlink(missing_ok=True)
+
+
+for enrollment in destination_enrollments():
+    run("syq", "receiver", "revoke", enrollment)
+waiting.unlink(missing_ok=True)
+hold.touch()
 try:
     run("syq", "persist", "receive", "on", "--no-auto-approve-root", "--notify", "off")
     run("syq", "persist", "receive", "wait", "source", "--timeout", "30")
     copy("/tmp/syq-real-ssh/forward/slow-setup", after_approval=deny_during_setup)
 finally:
-    Path("/tmp/syq-real-ssh-slow-config").unlink()
+    hold.unlink(missing_ok=True)
+    waiting.unlink(missing_ok=True)
 
 print("case: previews and protected paths remain restricted", flush=True)
 copy("/tmp/syq-real-ssh/forward/preview", extra=("--dry-run",))

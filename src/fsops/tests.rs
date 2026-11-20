@@ -794,10 +794,7 @@ fn test_dir() -> PathBuf {
 /// A worker whose destination root is the existing directory `root`,
 /// reached by that spelling. Its methods take paths relative to `root`.
 fn destination_ops(root: &Path) -> FsOps {
-    let mut ops = FsOps::new();
-    ops.destination_root = Some(Arc::new(Root::open(root).unwrap()));
-    ops.destination_prefix = Some(path_bytes(root));
-    ops
+    FsOps::rooted_for_test(root)
 }
 
 fn make_fifo(path: &Path, mode: libc::mode_t) {
@@ -6329,6 +6326,67 @@ fn source_stat_batches_preserve_order_across_sizes() {
 }
 
 #[test]
+fn read_sources_are_rechecked_on_the_reading_thread() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let count = 2 * PAR_MIN;
+    for index in 0..count {
+        fs::write(temporary.path().join(format!("f{index}")), b"data").unwrap();
+    }
+    // The batches the calling thread hands to the pool while `request` runs.
+    let pooled = |request: &dyn Fn(Vec<RegisteredPath>) -> Request| {
+        let (mut worker, selections, _control) = registered_source_worker(&[temporary.path()]);
+        let sources = (0..count)
+            .map(|index| selections[0].join(format!("f{index}").as_bytes()).unwrap())
+            .collect();
+        let before = POOLED_BATCHES.get();
+        let entries: Vec<_> = match worker.handle(&request(sources)) {
+            Response::SmallBlocks(blocks) => blocks
+                .into_iter()
+                .map(|block| {
+                    let block = block.unwrap();
+                    assert_eq!(block.data, b"data");
+                    block.source
+                })
+                .collect(),
+            Response::Stats(entries) => entries,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(entries.len(), count);
+        assert!(entries
+            .iter()
+            .all(|entry| entry.as_ref().is_some_and(|entry| entry.size == 4)));
+        POOLED_BATCHES.get() - before
+    };
+    // The worker read every file itself before statting it again, which
+    // costs less than waking the pool.
+    assert_eq!(
+        pooled(&|sources| {
+            Request::ReadSmallBatch(
+                sources
+                    .into_iter()
+                    .map(|source| SmallRead {
+                        path: b"/display/path/is/not/authority".to_vec(),
+                        source: Some(source),
+                        attempt: 0,
+                        len: 4,
+                    })
+                    .collect(),
+            )
+        }),
+        0
+    );
+    // Sources nothing has read yet, such as a list's, share the pool.
+    assert_eq!(
+        pooled(&|sources| Request::StatMany {
+            paths: vec![b"/display/path/is/not/authority".to_vec(); sources.len()],
+            sources: Some(sources),
+            follow: false,
+        }),
+        1
+    );
+}
+
+#[test]
 fn source_stat_batches_isolate_roots_and_refresh_parents_between_requests() {
     let temporary = crate::test_support::tempdir().unwrap();
     let roots: Vec<_> = ["first", "second"]
@@ -8154,6 +8212,102 @@ fn late_close_is_reported_before_identity_conditioned_publication() {
     }
 }
 
+/// A written file is checked by closing a duplicate of its descriptor
+/// wherever a close can report a write error, and not on a root's own
+/// filesystem when its close reports none. A file on another device, or one
+/// whose device the caller does not know, is checked whatever it is on.
+#[cfg(target_os = "linux")]
+#[test]
+fn written_files_are_checked_at_close_only_where_a_close_reports() {
+    let closes = || super::partial::WRITER_CLOSES.replace(0);
+    let meta = Meta {
+        mode: 0o600,
+        uid: 0,
+        gid: 0,
+        mtime: 1_500_000_000,
+        mtime_nsec: 0,
+        inode_metadata: None,
+    };
+    let data = b"updated contents";
+    for (quiet, expected) in [(true, 0), (false, 1)] {
+        for (small, inplace) in [(true, false), (true, true), (false, false), (false, true)] {
+            let context = format!("quiet={quiet}, small={small}, inplace={inplace}");
+            let directory = crate::test_support::tempdir().unwrap();
+            let mut ops = destination_ops(directory.path());
+            ops.set_hash_policy(crate::hashing::HashPolicy::default());
+            ops.destination_root
+                .as_ref()
+                .unwrap()
+                .assume_quiet_close_for_test(quiet);
+            let copy_id = [84; 16];
+            closes();
+            if small {
+                ops.put_small(&SmallPut {
+                    path: b"target".to_vec(),
+                    copy_id,
+                    data: data.to_vec(),
+                    hash: content_digest(data),
+                    meta: meta.clone(),
+                    flags: flags::TIMES,
+                    inplace,
+                    condition: TargetCondition::Absent,
+                    replaces: false,
+                    scanned: crate::proto::ScannedDestination::Unknown,
+                })
+                .unwrap();
+            } else {
+                let partial = || PartialTarget {
+                    path: b"target",
+                    id: &copy_id,
+                };
+                ops.prepare(
+                    partial(),
+                    PrepareOptions {
+                        size: data.len() as u64,
+                        inplace,
+                        mode: 0o600,
+                        attempt: 0,
+                        create_if_missing: true,
+                        group: None,
+                        update: None,
+                    },
+                )
+                .unwrap();
+                ops.write_range(partial(), inplace, 0, 0, content_digest(data), data)
+                    .unwrap();
+                ops.finalize(
+                    b"target",
+                    inplace,
+                    &copy_id,
+                    &meta,
+                    flags::TIMES,
+                    TargetCondition::Absent,
+                )
+                .unwrap();
+            }
+            assert_eq!(closes(), expected, "{context}");
+            assert_eq!(
+                fs::read(directory.path().join("target")).unwrap(),
+                data,
+                "{context}"
+            );
+        }
+    }
+    let directory = crate::test_support::tempdir().unwrap();
+    let root = Root::open(directory.path()).unwrap();
+    root.assume_quiet_close_for_test(true);
+    let file = File::create(directory.path().join("file")).unwrap();
+    let dev = file.metadata().unwrap().dev();
+    let label = Path::new("file");
+    super::partial::check_written_file(&root, Some(dev), &file, label).unwrap();
+    assert_eq!(closes(), 0);
+    // Another filesystem beneath the root is not known to be the one read.
+    super::partial::check_written_file(&root, Some(dev + 1), &file, label).unwrap();
+    assert_eq!(closes(), 1);
+    super::partial::check_written_file(&root, None, &file, label).unwrap();
+    assert_eq!(closes(), 1);
+}
+
 #[cfg(all(target_os = "linux", debug_assertions))]
 #[test]
 fn native_copy_reports_original_writer_close_error() {
@@ -9562,5 +9716,91 @@ fn an_unchecked_keep_renames_where_no_replace_would_cost_a_link() {
             assert!(errors[0].is_none(), "{errors:?}");
             assert_eq!(contents, b"ours");
         }
+    }
+}
+
+/// Small files at paths near the longest a system call takes, none of them
+/// UTF-8, fail to be published for want of their directory. Each result is
+/// within what its batch's reply allows for (attribute errors aside, which
+/// `failed_small_file_hint` leaves to the frame's other half).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_small_file_says_no_more_than_its_batch_allowed_for() {
+    use crate::proto::{failed_small_file_hint, SmallPatch};
+    let dir = crate::test_support::tempdir().unwrap();
+    let mut rooted = FsOps::rooted_for_test(dir.path());
+    let root = path_bytes(dir.path());
+    let parent = [root, vec![vec![0xff; 255]; 13].join(&b'/')].join(&b'/');
+    let meta = Meta {
+        inode_metadata: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        mtime: 0,
+        mtime_nsec: 0,
+    };
+    let path = |name: &str| [parent.clone(), name.as_bytes().to_vec()].join(&b'/');
+    let put = |name: &str| SmallPut {
+        path: path(name),
+        copy_id: [7; 16],
+        data: b"new".to_vec(),
+        hash: content_digest(b"new"),
+        meta: meta.clone(),
+        flags: 0,
+        inplace: false,
+        condition: TargetCondition::Any,
+        replaces: false,
+        scanned: crate::proto::ScannedDestination::Unknown,
+    };
+    let patch = |name: &str, update_in_place| SmallPatch {
+        path: path(name),
+        copy_id: [7; 16],
+        len: 3,
+        block: 65536,
+        reuse: vec![None],
+        data: b"new".to_vec(),
+        hash: content_digest(b"new"),
+        basis: None,
+        meta: meta.clone(),
+        flags: 0,
+        unchanged_flags: 0,
+        condition: TargetCondition::Any,
+        update_in_place,
+    };
+    // Each result as its reply carries it.
+    let check = |path: &[u8], encoded: usize, error: &WireError, copies: usize| {
+        assert!(encoded <= failed_small_file_hint(path), "{error:?}");
+        assert!(error.message.len() > copies * 3 * 3300, "{error:?}");
+    };
+    // The directory is missing.
+    let Response::Applied(errors) = rooted.handle(&Request::PutSmallBatch(vec![put("missing")]))
+    else {
+        panic!("unexpected response");
+    };
+    let encoded = postcard::to_extend(&errors[0], Vec::new()).unwrap().len();
+    check(&path("missing"), encoded, errors[0].as_ref().unwrap(), 1);
+    // A file has taken the directory's place: errors name the path twice.
+    let parent_path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&parent));
+    fs::create_dir_all(parent_path.parent().unwrap()).unwrap();
+    fs::write(&parent_path, b"").unwrap();
+    let Response::Applied(errors) = rooted.handle(&Request::PutSmallBatch(vec![put("blocked")]))
+    else {
+        panic!("unexpected response");
+    };
+    let encoded = postcard::to_extend(&errors[0], Vec::new()).unwrap().len();
+    check(&path("blocked"), encoded, errors[0].as_ref().unwrap(), 2);
+    for update in [false, true] {
+        let Response::PatchedBatch(results) =
+            rooted.handle(&Request::PatchSmallBatch(vec![patch("blocked", update)]))
+        else {
+            panic!("unexpected response");
+        };
+        let encoded = postcard::to_extend(&results[0], Vec::new()).unwrap().len();
+        check(
+            &path("blocked"),
+            encoded,
+            &results[0].as_ref().unwrap_err().error,
+            2,
+        );
     }
 }

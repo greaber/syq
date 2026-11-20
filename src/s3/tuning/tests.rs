@@ -378,8 +378,9 @@ async fn request_ramp_bounds_preparation_and_refills_after_growth() {
                 maximum: Some(16),
                 initial_probe_up: true,
                 requests: Some(copy_budget.clone()),
+                checking: None,
             },
-            move |job| {
+            move |job, _| {
                 let budget = copy_budget.clone();
                 let gate = copy_gate.clone();
                 let prepared = prepared.clone();
@@ -458,8 +459,9 @@ async fn measured_handoff_can_probe_before_more_completions() {
                     maximum: Some(maximum),
                     initial_probe_up: upward,
                     requests: Some(budget.clone()),
+                    checking: None,
                 },
-                move |job| {
+                move |job, _| {
                     let budget = budget.clone();
                     let gate = copy_gate.clone();
                     let prepared = prepared.clone();
@@ -558,8 +560,9 @@ async fn check_handoff_direction(probe_bytes: u64, expected_peak: usize, expecte
                 maximum: Some(256),
                 initial_probe_up: true,
                 requests: Some(copy_budget.clone()),
+                checking: None,
             },
-            move |_| {
+            move |_, _| {
                 let budget = copy_budget.clone();
                 let peak = copy_peak.clone();
                 async move {
@@ -598,8 +601,9 @@ async fn object_handoff_drains_waiting_jobs_before_opening_request_capacity() {
                 maximum: Some(16),
                 initial_probe_up: true,
                 requests: Some(copy_budget.clone()),
+                checking: None,
             },
-            move |job| {
+            move |job, _| {
                 let budget = copy_budget.clone();
                 let gate = copy_gate.clone();
                 let started = started.clone();

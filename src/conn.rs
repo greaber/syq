@@ -144,6 +144,24 @@ pub trait Conn: Send {
     fn send_expecting_ok(&mut self, req: Request, what: &'static str) -> Result<()> {
         ok(self.call(req)?, what).map(|_| ())
     }
+    /// `send_expecting_ok` for a request whose round trip is a latency
+    /// sample. A connection that waits for the reply here returns how long
+    /// that took. One that does not returns `None`, and
+    /// `take_timed_round_trip` gives the time once the reply has been read.
+    fn send_timing_ok(
+        &mut self,
+        req: Request,
+        what: &'static str,
+    ) -> Result<Option<std::time::Duration>> {
+        let sent = std::time::Instant::now();
+        ok(self.call(req)?, what)?;
+        Ok(Some(sent.elapsed()))
+    }
+    /// The round trip of a request sent with `send_timing_ok` whose reply
+    /// was read since, from sending it to when the reply began to arrive.
+    fn take_timed_round_trip(&mut self) -> Option<std::time::Duration> {
+        None
+    }
     fn call(&mut self, req: Request) -> Result<Response> {
         let expected = reply_shape(&req);
         self.send(req)?;
@@ -205,6 +223,13 @@ pub trait Conn: Send {
     fn reply_queue(&self) -> Option<usize> {
         None
     }
+    /// How many requests this connection has sent, when `send_pending` can
+    /// leave a reply for later. A caller that sent a request early compares
+    /// counts to learn whether anything was sent after it. None when each
+    /// request is answered as it is sent.
+    fn requests_sent(&self) -> Option<u64> {
+        None
+    }
     /// Current kernel RTT estimate for a TCP data connection. This is a
     /// local socket query and never sends a protocol request.
     fn tcp_rtt_us(&self) -> Option<u64> {
@@ -230,6 +255,35 @@ pub trait Conn: Send {
         ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
         warn: &mut dyn FnMut(crate::proto::ScanWarning),
     ) -> Result<u64>;
+    /// `scan`, which also shows `upcoming` each batch after the first as
+    /// soon as the scan has it, while `sink` may still have earlier batches
+    /// to take: at most `scan::AHEAD` wait at once. `sink` then gets those
+    /// batches in the same order. A connection that cannot hold batches
+    /// back never calls `upcoming`.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_ahead(
+        &mut self,
+        root: &[u8],
+        source: Option<&RegisteredPath>,
+        follow_root: bool,
+        ignore: &[String],
+        report_ignored: bool,
+        sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        _upcoming: &mut dyn FnMut(&[Entry]),
+        ignored: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
+        warn: &mut dyn FnMut(crate::proto::ScanWarning),
+    ) -> Result<u64> {
+        self.scan(
+            root,
+            source,
+            follow_root,
+            ignore,
+            report_ignored,
+            sink,
+            ignored,
+            warn,
+        )
+    }
     /// Stream descendants of disjoint selections relative to one registered base.
     /// Return false without invoking callbacks when this endpoint needs the
     /// ordinary per-selection scan path. Selected roots are already planned.
@@ -392,7 +446,7 @@ pub(crate) enum PendingReply {
 /// A request sent without waiting for its reply failed. Requests sent after
 /// it assumed it succeeded, so the connection refuses every later reply.
 #[derive(Debug)]
-pub(crate) struct DeferredRequestError(String);
+pub(crate) struct DeferredRequestError(pub(crate) String);
 
 impl std::fmt::Display for DeferredRequestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -410,8 +464,12 @@ pub(crate) fn is_deferred_request_error(error: &anyhow::Error) -> bool {
 
 /// A request sent without waiting for its reply.
 enum Deferred {
-    /// Its reply must be `Ok`.
-    Ok(&'static str),
+    /// Its reply must be `Ok`. `timed` is when a request whose round trip
+    /// is wanted was sent (`Conn::send_timing_ok`).
+    Ok {
+        what: &'static str,
+        timed: Option<std::time::Instant>,
+    },
     /// Its reply is kept until the caller takes it.
     Reply {
         id: u64,
@@ -429,6 +487,11 @@ struct DeferredReplies {
     arrived: std::collections::HashMap<u64, (Response, std::time::Instant)>,
     next: u64,
     failed: Option<String>,
+    /// Every request sent, deferred or not (`Conn::requests_sent`).
+    sent: u64,
+    /// The round trip of the last timed request whose reply was read, until
+    /// taken.
+    round_trip: Option<std::time::Duration>,
 }
 
 pub(crate) fn tcp_congestion_fallback_note(requested: Option<&str>) -> String {
@@ -1196,12 +1259,7 @@ impl RemoteConn {
                 break;
             };
             match deferred {
-                Deferred::Ok(what) => {
-                    if let Err(error) = ok(first.into_inner(), what) {
-                        self.deferred.pending.clear();
-                        self.deferred.failed = Some(format!("{error:#}"));
-                    }
-                }
+                Deferred::Ok { what, timed } => self.check_deferred_ok(what, timed, first),
                 Deferred::Reply { id, expected } => {
                     let arrival = first.started_at;
                     let reply = assemble_reply(expected, first.into_inner(), || {
@@ -1218,6 +1276,33 @@ impl RemoteConn {
             Some(failure) => Err(DeferredRequestError(failure.clone()).into()),
             None => Ok(all),
         }
+    }
+
+    /// Check the reply to a request whose reply must be `Ok`, and time its
+    /// round trip if that was asked for.
+    fn check_deferred_ok(
+        &mut self,
+        what: &'static str,
+        timed: Option<std::time::Instant>,
+        reply: ReceivedResponse,
+    ) {
+        if let Some(sent) = timed {
+            self.deferred.round_trip = Some(reply.started_at.saturating_duration_since(sent));
+        }
+        if let Err(error) = ok(reply.into_inner(), what) {
+            self.deferred.pending.clear();
+            self.deferred.failed = Some(format!("{error:#}"));
+        }
+    }
+
+    /// Whether the next replies owed are all ones that must be `Ok`, up to
+    /// one whose round trip is timed.
+    fn timed_reply_is_next(&self) -> bool {
+        self.deferred
+            .pending
+            .iter()
+            .take_while(|deferred| matches!(deferred, Deferred::Ok { .. }))
+            .any(|deferred| matches!(deferred, Deferred::Ok { timed: Some(_), .. }))
     }
 
     /// The next reply, if it has arrived, without waiting for it.
@@ -1388,6 +1473,7 @@ impl Conn for RemoteConn {
             "only writes and their fence are valid during streaming writes"
         );
         self.batch_receipts.request(&req)?;
+        self.deferred.sent += 1;
         // The peer may have to send replies before it reads this request.
         let _sending = self.rx.as_ref().and_then(Replies::sending);
         if let Request::WriteRange { .. } = &req {
@@ -1403,8 +1489,49 @@ impl Conn for RemoteConn {
     }
     fn send_expecting_ok(&mut self, req: Request, what: &'static str) -> Result<()> {
         self.send(req)?;
-        self.deferred.pending.push_back(Deferred::Ok(what));
+        self.deferred
+            .pending
+            .push_back(Deferred::Ok { what, timed: None });
         Ok(())
+    }
+    fn send_timing_ok(
+        &mut self,
+        req: Request,
+        what: &'static str,
+    ) -> Result<Option<std::time::Duration>> {
+        let sent = std::time::Instant::now();
+        self.send(req)?;
+        self.deferred.pending.push_back(Deferred::Ok {
+            what,
+            timed: Some(sent),
+        });
+        Ok(None)
+    }
+    fn take_timed_round_trip(&mut self) -> Option<std::time::Duration> {
+        // Read the timed reply if it has arrived, without waiting for it,
+        // and nothing behind it. A failure is kept for the next reply that
+        // is read.
+        while self.deferred.round_trip.is_none()
+            && self.deferred.failed.is_none()
+            && self.rx.is_some()
+            && self.timed_reply_is_next()
+        {
+            match self.try_receive_next_response() {
+                Ok(Some(reply)) => {
+                    let Some(Deferred::Ok { what, timed }) = self.deferred.pending.pop_front()
+                    else {
+                        unreachable!("a reply that must be Ok is next");
+                    };
+                    self.check_deferred_ok(what, timed, reply);
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    self.deferred.pending.clear();
+                    self.deferred.failed = Some(format!("{error:#}"));
+                }
+            }
+        }
+        self.deferred.round_trip.take()
     }
     fn send_pending(&mut self, req: Request) -> Result<PendingReply> {
         let expected = reply_shape(&req);
@@ -1474,7 +1601,17 @@ impl Conn for RemoteConn {
             self.write_stream.is_none(),
             "streaming writes are already active"
         );
-        self.receive_deferred(None)?;
+        // A reply that must be `Ok` need not be waited for: the receipts
+        // tell it from a batch's reply, which never is one. Any other reply
+        // still owed is read first.
+        if self
+            .deferred
+            .pending
+            .iter()
+            .any(|deferred| matches!(deferred, Deferred::Reply { .. }))
+        {
+            self.receive_deferred(None)?;
+        }
         self.batch_receipts.begin(progress).map(Some)
     }
     fn recv_with_wait(&mut self) -> Result<(Response, std::time::Duration)> {
@@ -1488,6 +1625,9 @@ impl Conn for RemoteConn {
     }
     fn reply_queue(&self) -> Option<usize> {
         Some(self.replies)
+    }
+    fn requests_sent(&self) -> Option<u64> {
+        Some(self.deferred.sent)
     }
     fn detach(&mut self) {
         self.detached = true;
@@ -2170,19 +2310,7 @@ impl RemoteSpec {
         if self.local_process {
             return "local receiver".into();
         }
-        let host = if self.host.contains(':') {
-            format!("[{}]", self.host)
-        } else {
-            self.host.clone()
-        };
-        let endpoint = match &self.user {
-            Some(user) => format!("{user}@{host}"),
-            None => host,
-        };
-        match self.port {
-            Some(port) => format!("{endpoint}:{port}"),
-            None => endpoint,
-        }
+        crate::cli::endpoint_label(self.user.as_deref(), &self.host, self.port)
     }
 
     pub fn diagnostics(&self) -> RemoteDiagnostics {
@@ -3273,43 +3401,48 @@ impl RemoteSpec {
                 direct: !receiver.proxied,
             });
         }
+        let reached_as_named = SshDestination {
+            hostname: self.host.clone(),
+            direct: true,
+        };
         if !self.rsh[0].ends_with("ssh") {
-            return Some(SshDestination {
-                hostname: self.host.clone(),
-                direct: true,
-            });
+            return Some(reached_as_named);
         }
-        let out = self.ssh_hostname_command().capture_output().ok()?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        parse_ssh_destination(&text).or_else(|| {
-            Some(SshDestination {
-                hostname: self.host.clone(),
-                direct: true,
-            })
-        })
+        // A lookup that outlasts the copy's own login, which has just read
+        // the same configuration, is stuck, as on a `Match exec` command
+        // that does not finish: probe the name as given instead.
+        let config = match self.ssh_config(
+            crate::ssh_config::Group::Callers,
+            std::time::Instant::now() + SSH_DESTINATION_LOOKUP,
+        ) {
+            Ok(config) => config,
+            Err(error) => {
+                if crate::output::debug() {
+                    crate::output::diagnostic!("syq: {}: {error:#}", self.label());
+                }
+                return Some(reached_as_named);
+            }
+        };
+        parse_ssh_destination(config.text()).or(Some(reached_as_named))
     }
 
-    /// Read the effective SSH configuration without opening a connection.
-    /// Callers that own a setup deadline can supervise this command themselves.
-    pub(crate) fn ssh_hostname_command(&self) -> Command {
-        let mut command = Command::new(&self.rsh[0]);
-        command
-            .args(&self.rsh[1..])
-            .arg("-G")
-            .args(
-                self.user
-                    .as_ref()
-                    .map(|user| vec!["-l".to_owned(), user.clone()])
-                    .unwrap_or_default(),
-            )
-            .args(
-                self.port
-                    .map(|port| vec!["-p".to_owned(), port.to_string()])
-                    .unwrap_or_default(),
-            )
-            .arg("--")
-            .arg(&self.host);
-        command
+    /// This machine's SSH configuration for the endpoint, read without
+    /// opening a connection.
+    pub(crate) fn ssh_config(
+        &self,
+        group: crate::ssh_config::Group,
+        deadline: std::time::Instant,
+    ) -> Result<crate::ssh_config::SshConfig> {
+        crate::ssh_config::SshConfig::query(
+            &self.rsh[0],
+            &self.rsh[1..],
+            self.user.as_deref(),
+            self.port,
+            &self.host,
+            group,
+            deadline,
+            &|| false,
+        )
     }
 
     /// Open one data connection, spreading successive connections across the
@@ -3617,14 +3750,13 @@ struct SshDestination {
     direct: bool,
 }
 
+/// How long route probing waits for `ssh -G` to say where SSH reaches the
+/// host.
+const SSH_DESTINATION_LOOKUP: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The destination `ssh -G` output describes.
 fn parse_ssh_destination(output: &str) -> Option<SshDestination> {
-    let value = |name: &str| {
-        output
-            .lines()
-            .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
-            .map(str::trim)
-    };
+    let value = |name: &str| crate::ssh_config::value(output, name).map(str::trim);
     let proxied = ["proxyjump", "proxycommand"]
         .into_iter()
         .any(|name| value(name).is_some_and(|value| value != "none"));
@@ -3669,40 +3801,60 @@ fn probe_reachable(
     port: u16,
     wait: std::time::Duration,
 ) -> Result<bool> {
+    probe_reachable_with(candidates, port, wait, |name, port| {
+        (name, port)
+            .to_socket_addrs()
+            .map(|addresses| addresses.take(MAX_RESOLVED_TCP_ADDRESSES + 1).collect())
+            .unwrap_or_default()
+    })
+}
+
+/// [`probe_reachable`], looking names up with `resolve`.
+fn probe_reachable_with(
+    candidates: &mut [TcpCandidate],
+    port: u16,
+    wait: std::time::Duration,
+    resolve: fn(&str, u16) -> Vec<SocketAddr>,
+) -> Result<bool> {
     // One extra candidate is the coordinator's SSH target.
     if candidates.len() > MAX_ADVERTISED_TCP_ADDRESSES + 1 {
         bail!("too many TCP probe candidates");
     }
-    // Resolve candidate names in parallel. More importantly, probe every
-    // resolved socket address in parallel too: a dual-stack name must not
-    // spend the whole candidate budget timing out on IPv6 before trying IPv4.
+    // Advertised addresses are literals. A name, such as the SSH target,
+    // is looked up in parallel, for no longer than the longest probe wait:
+    // a resolver that does not answer holds up the probes that far and no
+    // further. More importantly, probe every resolved socket address in
+    // parallel too: a dual-stack name must not spend the whole candidate
+    // budget timing out on IPv6 before trying IPv4.
+    let looked_up = std::time::Instant::now() + wait.max(TCP_PROBE_CEILING);
+    let mut resolved: Vec<Vec<SocketAddr>> = vec![Vec::new(); candidates.len()];
     let (resolved_tx, resolved_rx) = std::sync::mpsc::channel();
+    let mut lookups = 0;
     for (i, candidate) in candidates.iter().enumerate() {
+        if let Ok(ip) = candidate.address.parse::<std::net::IpAddr>() {
+            resolved[i] = vec![SocketAddr::new(ip, port)];
+            continue;
+        }
         let tx = resolved_tx.clone();
         let address = candidate.address.clone();
         std::thread::Builder::new()
             .spawn(move || {
-                let addrs = (address.as_str(), port)
-                    .to_socket_addrs()
-                    .map(|addresses| addresses.take(MAX_RESOLVED_TCP_ADDRESSES + 1).collect())
-                    .unwrap_or_default();
-                let _ = tx.send((i, addrs));
+                let _ = tx.send((i, resolve(&address, port)));
             })
             .map_err(crate::resources::allocation_error)
             .context("start TCP address resolver")?;
+        lookups += 1;
     }
     drop(resolved_tx);
-    let mut resolved: Vec<Vec<SocketAddr>> = vec![Vec::new(); candidates.len()];
-    for _ in 0..candidates.len() {
-        let Ok((i, addrs)) = resolved_rx.recv() else {
+    for _ in 0..lookups {
+        let remaining = looked_up.saturating_duration_since(std::time::Instant::now());
+        let Ok((i, addrs)) = resolved_rx.recv_timeout(remaining) else {
             break;
         };
         resolved[i] = addrs;
-        if resolved.iter().map(Vec::len).sum::<usize>() > MAX_RESOLVED_TCP_ADDRESSES {
-            bail!(
-                "TCP candidates resolved to too many addresses (limit {MAX_RESOLVED_TCP_ADDRESSES})"
-            );
-        }
+    }
+    if resolved.iter().map(Vec::len).sum::<usize>() > MAX_RESOLVED_TCP_ADDRESSES {
+        bail!("TCP candidates resolved to too many addresses (limit {MAX_RESOLVED_TCP_ADDRESSES})");
     }
 
     mark_ssh_target_addresses(candidates, &resolved);

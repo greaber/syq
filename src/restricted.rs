@@ -1,9 +1,8 @@
 //! Enrollments and the receivers that enforce restricted copies.
 
 use crate::delegation::{
-    self, CopyOperation, DeletionPolicy, DestinationPlacement, DirectoryWidening,
-    ExistingDestinationPolicy, FilterPolicy, Grant, GrantConstraints, MutationScope, RequestId,
-    RootExistence,
+    self, CopyOperation, DeletionPolicy, DestinationPlacement, DestinationRules, DirectoryWidening,
+    ExistingDestinationPolicy, MutationScope, RequestId, RootExistence,
 };
 use crate::directive::{CLOCK_SKEW_SECONDS, FINISH_WINDOW_SECONDS};
 use crate::enrollment::{
@@ -33,6 +32,7 @@ use std::time::Instant;
 
 mod active;
 mod authority;
+mod checker;
 mod enroll;
 mod install;
 mod issue;
@@ -46,13 +46,14 @@ mod statefs;
 pub(crate) use keys::parse_entry_key;
 
 pub(crate) use authority::*;
+pub(crate) use checker::Checker;
 use enroll::*;
 pub(crate) use install::*;
 pub(crate) use issue::*;
 use keys::*;
 pub(crate) use privilege::{refuse_privileged_approved_receiver, refuse_privileged_receiver};
 pub(crate) use receiver::*;
-pub(crate) use ssh::{start as start_ssh_workers, start_source as start_source_ssh_workers};
+pub(crate) use ssh::start as start_ssh_workers;
 use statefs::*;
 
 /// The effective account's login name, for messages; `None` if unknown.

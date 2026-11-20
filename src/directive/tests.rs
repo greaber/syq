@@ -442,10 +442,24 @@ fn directives_out_of_bounds_are_refused_before_they_are_signed_or_read() {
     }
 }
 
+/// A directive that names no key for its results gets no rules.
+#[test]
+fn rules_need_a_results_key() {
+    let mut keyless = directive(ROUTE_5);
+    keyless.results_key = [0; 32];
+    let error = destination_rules(&keyless, Path::new(HOME))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("recipient public key must be nonzero"),
+        "{error}"
+    );
+}
+
 #[test]
 fn the_destination_rules_come_from_the_signed_command() {
     let home = Path::new(HOME);
-    let (grant, constraints) = destination_rules(&directive(ROUTE_5), home).unwrap();
+    let grant = destination_rules(&directive(ROUTE_5), home).unwrap();
     assert_eq!(grant.enrollment_id, EnrollmentId::test_v4(7));
     assert_eq!(grant.copy.destination, b"/home/backup/backup");
     // Named sources: the directory itself, and each source's name in it.
@@ -462,16 +476,19 @@ fn the_destination_rules_come_from_the_signed_command() {
             (b"/home/backup/backup/data".to_vec(), true),
         ]
     );
-    assert_eq!(
-        constraints.receipt_policy,
-        crate::destination_results::ReceiptPolicy::for_recipient([4; 32])
-    );
+    assert_eq!(grant.results_recipient, [4; 32]);
     // A bandwidth limit is the sender's preference, not part of the rules.
     let mut limited = ROUTE_5.to_vec();
     limited.extend(["--resource-limits", "bandwidth=4M"]);
-    let (limited_grant, limited) = destination_rules(&directive(&limited), home).unwrap();
-    assert_eq!(limited_grant.copy, grant.copy);
-    assert_eq!(limited, constraints);
+    let limited = destination_rules(&directive(&limited), home).unwrap();
+    assert_eq!(
+        crate::delegation::DestinationRules {
+            enrollment_id: grant.enrollment_id,
+            request_id: grant.request_id,
+            ..limited
+        },
+        grant
+    );
     // `~`, and an absolute destination, as on the server.
     for (destination, expected) in [
         ("~", HOME),
@@ -480,7 +497,7 @@ fn the_destination_rules_come_from_the_signed_command() {
     ] {
         let mut args = ROUTE_5.to_vec();
         *args.last_mut().unwrap() = destination;
-        let (grant, _) = destination_rules(&directive(&args), home).unwrap();
+        let grant = destination_rules(&directive(&args), home).unwrap();
         assert_eq!(grant.copy.destination, expected.as_bytes(), "{destination}");
     }
 
@@ -499,10 +516,10 @@ fn the_destination_rules_come_from_the_signed_command() {
         "/unreadable/rules",
     ]);
     ignoring.inputs.ignore = vec!["*.tmp".into()];
-    let (_, constraints) = destination_rules(&ignoring, home).unwrap();
-    assert_eq!(constraints.filters.ignore, ["*.tmp"]);
+    let grant = destination_rules(&ignoring, home).unwrap();
+    assert_eq!(grant.filters.ignore, ["*.tmp"]);
     assert_eq!(
-        constraints.filters.destination_roots,
+        grant.filters.destination_roots,
         [b"/home/backup/backup/data".to_vec()]
     );
     // A mapping's digest comes with exactly the commands that name one.
@@ -523,8 +540,8 @@ fn the_destination_rules_come_from_the_signed_command() {
         bytes: 3,
         digest: [1; 32],
     });
-    let (_, constraints) = destination_rules(&mapped, home).unwrap();
-    assert_eq!(constraints.mapping, mapped.inputs.mapping);
+    let grant = destination_rules(&mapped, home).unwrap();
+    assert_eq!(grant.mapping, mapped.inputs.mapping);
     let mut unmapped = directive(ROUTE_5);
     unmapped.inputs.mapping = mapped.inputs.mapping.clone();
     assert!(destination_rules(&unmapped, home).is_err());
@@ -585,7 +602,7 @@ fn an_approval_lists_as_many_sources_as_a_copy_takes_with_their_destination() {
         args.extend(["--to", "host-b", "--into", "backup"]);
         directive(&args)
     };
-    let (grant, _) = destination_rules(&command(1024), home).unwrap();
+    let grant = destination_rules(&command(1024), home).unwrap();
     assert_eq!(grant.copy.mutation_scopes.len(), 1025);
     let error = destination_rules(&command(1025), home).unwrap_err();
     let message = format!("{error:#}");
@@ -605,8 +622,8 @@ fn derivation_does_not_depend_on_the_environment() {
     let rules = || {
         let mut args = ROUTE_5.to_vec();
         args.extend(["--if-exists", "keep", "--ignore", "*.o"]);
-        let (grant, constraints) = destination_rules(&directive(&args), Path::new(HOME)).unwrap();
-        format!("{grant:?}\n{constraints:?}")
+        let rules = destination_rules(&directive(&args), Path::new(HOME)).unwrap();
+        format!("{rules:?}")
     };
     if std::env::var_os(CHILD).is_some() {
         println!("rules<<{}>>", rules());
@@ -652,7 +669,7 @@ fn the_approving_machines_limits_lower_the_commands() {
         directive.caps = Some(caps);
         destination_rules(&directive, home)
     };
-    let (grant, _) = capped(Caps {
+    let grant = capped(Caps {
         max_bytes: 1 << 20,
         max_entries: 10,
         max_delete: 3,
@@ -663,7 +680,7 @@ fn the_approving_machines_limits_lower_the_commands() {
     assert_eq!(grant.copy.limits.max_entries, 10);
     assert_eq!(grant.copy.limits.max_deletions, 3);
     // Limits above the command's leave it as it is.
-    let (grant, _) = capped(Caps {
+    let grant = capped(Caps {
         max_bytes: u64::MAX,
         max_entries: u64::MAX,
         max_delete: u64::MAX,
@@ -781,9 +798,7 @@ fn a_sources_reads_come_from_the_signed_command() {
         .contains("mapping does not match"));
     // SSH data is not a reason to refuse it, and then the source starts no
     // TCP listener either.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    let permission =
-        |reads: &crate::destination::pull::PullRequest| reads.policy(deadline).tcp.permission;
+    let permission = |reads: &crate::restricted::source::SourcePolicy| reads.tcp.permission;
     assert_eq!(permission(&reads), delegation::TcpPermission::Encrypted);
     let ssh_only =
         source_rules(&source_directive(&[ROUTE_4, &["--no-tcp"]].concat()), home).unwrap();
@@ -802,9 +817,9 @@ fn a_sources_reads_come_from_the_signed_command() {
 #[test]
 fn unencrypted_tcp_comes_only_from_the_command() {
     let home = Path::new(HOME);
-    let (_, encrypted) = destination_rules(&directive(ROUTE_5), home).unwrap();
+    let encrypted = destination_rules(&directive(ROUTE_5), home).unwrap();
     assert_eq!(encrypted.tcp, delegation::TcpPermission::Encrypted);
-    let (_, plain) = destination_rules(
+    let plain = destination_rules(
         &directive(&[ROUTE_5, &["--no-tcp-encryption"]].concat()),
         home,
     )

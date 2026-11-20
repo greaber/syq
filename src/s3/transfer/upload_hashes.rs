@@ -76,7 +76,7 @@ where
             || -> Result<()> {
                 if !whole_hashes.is_empty() {
                     let mut read = open(size)?;
-                    let mut buffer = vec![0; 1024 * 1024];
+                    let mut buffer = crate::s3::file_body::scratch();
                     let mut offset = 0;
                     while offset < size {
                         let length = (size - offset).min(buffer.len() as u64) as usize;
@@ -97,8 +97,17 @@ where
         let mut read = open(size)?;
         let mut parts = Vec::new();
         // Most files are far smaller than the read size, and preparation
-        // hashes many at once: a full buffer each costs far more memory.
-        let mut buffer = vec![0; size.min(1024 * 1024) as usize];
+        // hashes many at once: a whole pooled buffer each costs far more
+        // memory than one the file's size.
+        let mut small;
+        let mut pooled;
+        let buffer: &mut [u8] = if size < 1024 * 1024 {
+            small = vec![0; size as usize];
+            &mut small
+        } else {
+            pooled = crate::s3::file_body::scratch();
+            &mut pooled
+        };
         for index in 0..size.div_ceil(part_size).max(1) {
             let mut hash = native.hasher();
             let mut offset = index * part_size;
@@ -174,7 +183,9 @@ where
             let mut read = open(end)?;
             let mut native = native.hasher();
             let mut subtrees = Vec::new();
-            let mut buffer = vec![0; part_size.min(1024 * 1024) as usize];
+            let mut buffer = crate::s3::file_body::scratch();
+            let length = buffer.len().min(part_size as usize);
+            let buffer = &mut buffer[..length];
             let mut offset = start;
             while offset < end {
                 let subtree_start = offset;

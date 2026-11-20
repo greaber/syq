@@ -353,6 +353,61 @@ fn completion_respects_conflicts_selection_modes_and_source_order() {
 }
 
 #[test]
+fn completion_attached_value_ends_a_variadic_option() {
+    // As in clap, `--src-dirs=tree` takes one value, so the next word is a
+    // source; `--src-dirs tree` keeps taking directories.
+    let t = Tmp::new();
+    fs::create_dir_all(t.path("tree")).unwrap();
+    fs::create_dir_all(t.path("fdir")).unwrap();
+    write(&t.path("fab"), b"x");
+    for command in ["cp", "map", "rm"] {
+        assert_completion_candidates(
+            &t,
+            &["syq", command, "--src-dirs=tree", "f"],
+            &["fab", "fdir/"],
+        );
+        assert_completion_candidates(&t, &["syq", command, "--src-dirs", "tree", "f"], &["fdir/"]);
+    }
+}
+
+#[test]
+fn directory_values_describe_only_the_directories_they_offer() {
+    // Detail rows are padded to the rows shown, so a directory-only value
+    // that describes files it then drops would pad its rows differently.
+    let t = Tmp::new();
+    fs::write(t.path("alpha"), vec![0; 2048]).unwrap();
+    fs::create_dir(t.path("alpine")).unwrap();
+    let detail = |option: &str| {
+        let output = completion_command(
+            &t,
+            &["__complete", "zsh", "3", "--", "syq", "cp", option, "al"],
+        )
+        .env("SYQ_COMPLETION_DETAILS", "1")
+        .current_dir(t.path(""))
+        .run()
+        .unwrap();
+        assert_output_ok(&output);
+        let records: Vec<_> = output
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|r| !r.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect();
+        assert_eq!(records.len(), 2, "{option}: {output:?}");
+        assert_eq!(records[0], b"palpine/", "{option}");
+        records[1].clone()
+    };
+    let expected = detail("--pscope");
+    for option in ["--src-dir", "--src-dirs", "--into-existing", "--root"] {
+        assert_eq!(
+            String::from_utf8_lossy(&detail(option)),
+            String::from_utf8_lossy(&expected),
+            "{option}"
+        );
+    }
+}
+
+#[test]
 fn completion_bash_repeated_tabs_accept_option_fragments() {
     let t = Tmp::new();
     write(&t.path("--help"), b"literal filename");

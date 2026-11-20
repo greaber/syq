@@ -683,3 +683,100 @@ async fn directory_markers_do_not_stop_pruning_an_ignored_first_page() {
         );
     }
 }
+
+#[test]
+fn only_aws_general_purpose_endpoints_divide_listings() {
+    if std::env::var_os("SYQ_TEST_S3_DIVIDE_LISTINGS").is_some() {
+        return;
+    }
+    // The AWS endpoint the SDK chooses, and the base URLs of it a user can
+    // name; the client addresses buckets path-style.
+    assert!(lists_in_byte_order(None, "bucket"));
+    for endpoint in [
+        "https://s3.amazonaws.com",
+        "http://s3.amazonaws.com:80",
+        "https://s3.us-west-2.amazonaws.com",
+        "https://S3.EU-CENTRAL-1.AMAZONAWS.COM/",
+        "https://s3-us-west-2.amazonaws.com",
+        "https://s3-external-1.amazonaws.com",
+        "https://s3.dualstack.eu-central-1.amazonaws.com",
+        "https://s3-fips.us-gov-west-1.amazonaws.com",
+        "https://s3-fips.dualstack.us-east-1.amazonaws.com",
+        "https://s3.cn-north-1.amazonaws.com.cn",
+        "https://s3.dualstack.cn-northwest-1.amazonaws.com.cn",
+        "https://bucket.vpce-1a2b3c4d-5e6f.s3.us-east-1.vpce.amazonaws.com",
+    ] {
+        assert!(lists_in_byte_order(Some(endpoint), "bucket"), "{endpoint}");
+    }
+    for endpoint in [
+        // Providers that do not document byte order, and look-alikes.
+        "https://account.r2.cloudflarestorage.com",
+        "https://r2.cloudflarestorage.com.example.org",
+        "https://storage.googleapis.com",
+        "https://s3.us-west-002.backblazeb2.com",
+        "https://t3.storage.dev",
+        "https://fly.storage.tigris.dev",
+        "https://s3.amazonaws.com.example.org",
+        "https://s3.us-east-1.amazonaws.com.example.org",
+        "https://s3.amazonaws.com.",
+        "https://s3.us-east-1.amazonaws.co",
+        "https://evils3.us-east-1.amazonaws.com",
+        "https://s3.notaregion.amazonaws.com",
+        "https://s3-fips.amazonaws.com",
+        // Hosts that already name a bucket: path-style requests to them do
+        // not list that bucket.
+        "https://bucket.s3.us-east-1.amazonaws.com",
+        "https://my.dotted.bucket.s3.amazonaws.com",
+        // VPC interface endpoint roles other than buckets.
+        "https://vpce-1a2b3c4d-5e6f.s3.us-east-1.vpce.amazonaws.com",
+        "https://accesspoint.vpce-1a2b3c4d-5e6f.s3.us-east-1.vpce.amazonaws.com",
+        "https://control.vpce-1a2b3c4d-5e6f.s3.us-east-1.vpce.amazonaws.com",
+        "https://s3.us-east-1.vpce.amazonaws.com",
+        "https://bucket.vpce-1a2b3c4d-5e6f.vpce-svc-0123.us-east-1.vpce.amazonaws.com",
+        // AWS hosts that are not general purpose bucket endpoints.
+        "https://bucket--usw2-az1--x-s3.s3express-usw2-az1.us-west-2.amazonaws.com",
+        "https://s3express-control.us-west-2.amazonaws.com",
+        "https://ap-123456789012.s3-accesspoint.us-east-1.amazonaws.com",
+        "https://s3-outposts.us-east-1.amazonaws.com",
+        "https://s3-object-lambda.us-east-1.amazonaws.com",
+        "https://alias.accesspoint.s3-global.amazonaws.com",
+        "https://s3-website-us-east-1.amazonaws.com",
+        "https://s3-website.us-east-1.amazonaws.com",
+        "https://s3-123456.us-east-1.elb.amazonaws.com",
+        "https://s3.us-east-1.elb.amazonaws.com",
+        // Self-hosted and local endpoints.
+        "http://127.0.0.1:9000",
+        "http://[::1]:9000",
+        "http://localhost:9000",
+        "https://minio.example.internal",
+        "not a url",
+        // A path names another bucket on the way.
+        "https://s3.us-east-1.amazonaws.com/archive/",
+        "https://s3.us-east-1.amazonaws.com/archive",
+        "https://s3.us-east-1.amazonaws.com/archive/../",
+        "https://s3.us-east-1.amazonaws.com/./",
+        "https://s3.us-east-1.amazonaws.com//",
+        "https://s3.us-east-1.amazonaws.com\\archive",
+        "https:/s3.us-east-1.amazonaws.com/archive/",
+        "https:s3.us-east-1.amazonaws.com/archive/",
+    ] {
+        assert!(!lists_in_byte_order(Some(endpoint), "bucket"), "{endpoint}");
+    }
+    // Names that are not general purpose buckets, at any endpoint.
+    for bucket in [
+        "dir--usw2-az1--x-s3",
+        "point--usw2-az1--xa-s3",
+        "banner-123456789012--ol-s3",
+        "outpost-alias--op-s3",
+        "point-abcdefghij-s3alias",
+        "mfzwi23gnjvgw.mrap",
+        "tables--table-s3",
+        "arn:aws:s3:us-east-1:123456789012:accesspoint/point",
+    ] {
+        assert!(!lists_in_byte_order(None, bucket), "{bucket}");
+        assert!(
+            !lists_in_byte_order(Some("https://s3.us-east-1.amazonaws.com"), bucket),
+            "{bucket}"
+        );
+    }
+}

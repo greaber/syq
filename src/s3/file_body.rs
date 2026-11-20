@@ -60,6 +60,28 @@ impl Pool {
     }
 }
 
+/// A whole pooled chunk to read a file through, for a pass that hashes it
+/// rather than sending it: dropping it returns the buffer to the pool that
+/// upload bodies use, so hashing reuses their buffers rather than
+/// allocating and zeroing a new one for every file or part.
+pub(super) struct Scratch(Buffer);
+
+/// A [`Scratch`] buffer of 1 MiB.
+pub(super) fn scratch() -> Scratch {
+    Scratch(POOL.take())
+}
+impl std::ops::Deref for Scratch {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0.buffer
+    }
+}
+impl std::ops::DerefMut for Scratch {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.0.buffer
+    }
+}
+
 /// A chunk's bytes. Dropping it, wherever that happens, returns a pooled
 /// buffer to its pool.
 struct Buffer {
@@ -92,7 +114,8 @@ struct Opened {
 /// come from `source.open()`. Each copy the SDK makes of the body starts
 /// again at `offset`. A body fails rather than finish once the source no
 /// longer matches what was selected: a short read, or a changed size or
-/// timestamp when the last chunk has been read.
+/// timestamp when the last chunk has been read. That failure is marked
+/// [`super::retry::Permanent`], so the upload is not retried.
 pub(super) fn body(source: Source, file: File, offset: u64, length: u64) -> SdkBody {
     let opened = Arc::new(Opened { file, source });
     SdkBody::retryable(move || {
@@ -134,13 +157,24 @@ impl Chunks {
                 },
             };
             let read = opened.file.read_exact_at(&mut buffer.buffer[..n], offset);
-            // A short read means the file shrank; name that, not the EOF.
-            if read.is_err() || last {
-                opened
-                    .source
-                    .check(&opened.file)
-                    .map_err(std::io::Error::other)?;
-            }
+            // A short read shows that the file shrank, even before its
+            // metadata does; name that, not the EOF. A confirmed change is
+            // final, but an error reading the metadata may pass.
+            let short = matches!(&read, Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof);
+            let changed = if short {
+                Err(opened.source.changed())
+            } else if read.is_err() || last {
+                opened.source.check(&opened.file)
+            } else {
+                Ok(())
+            };
+            changed.map_err(|e| {
+                if e.is::<super::local::SourceChanged>() {
+                    std::io::Error::other(super::retry::Permanent::new(e))
+                } else {
+                    std::io::Error::other(e)
+                }
+            })?;
             read?;
             buffer.len = n;
             Ok(buffer)

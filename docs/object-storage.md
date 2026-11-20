@@ -37,6 +37,24 @@ With the default of 10, one request can keep retrying for a minute or more.
 If 8 requests in a row still fail, syq stops; rerun the command once the
 service is back.
 
+### Listing large prefixes
+
+Before it copies or removes a prefix, and for `--prune`, syq lists the
+objects under it. In general purpose buckets on AWS, syq divides a large
+listing with subdirectories into parts that it lists at the same time, so
+the listing can finish sooner when each request takes a while. This costs
+more list requests: usually up to about a quarter more on large listings.
+When a prefix has no more than a few dozen subdirectories and the first ones
+hold many objects, syq may list each subdirectory by itself, at a request
+each, however few objects the others hold.
+
+Dividing a listing is safe only when the service returns keys in byte
+order, which AWS documents for general purpose buckets, so syq divides
+listings only there. With `--s3-endpoint`, that means the URL is an AWS S3
+endpoint: regional, dual-stack, FIPS, or the bucket address of a VPC
+endpoint. For other services, including MinIO
+and other servers you run yourself, syq mostly lists one page at a time.
+
 ## Upload and download
 
 ```sh

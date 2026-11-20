@@ -224,6 +224,7 @@ pub(super) fn selector_key(base: &str, location: &Location, exact_version: bool)
 async fn plan(
     args: &Args,
     client: &Client,
+    endpoint: Option<&str>,
     progress: &Progress,
     summary: &mut RmResultRecord,
 ) -> Result<Vec<Entry>> {
@@ -282,6 +283,7 @@ async fn plan(
             if !use_versions {
                 listed = client::list(
                     client,
+                    endpoint,
                     bucket,
                     &prefix,
                     args.s3.as_ref().unwrap().concurrency,
@@ -432,7 +434,7 @@ pub(super) fn run(args: Args) -> Result<i32> {
         progress.set_results(writer);
     }
     let mut summary = RmResultRecord {
-        status: "success",
+        status: crate::results::Status::Success,
         exit_code: 0,
         dry_run: args.dry_run,
         selectors_total: args.locations.len() as u64,
@@ -463,7 +465,14 @@ pub(super) fn run(args: Args) -> Result<i32> {
             if let Some(note) = note.filter(|_| args.verbose > 0 && !args.quiet) {
                 progress.println(&note);
             }
-            let entries = plan(&args, &client, &progress, &mut summary).await?;
+            let entries = plan(
+                &args,
+                &client,
+                options.endpoint.as_deref(),
+                &progress,
+                &mut summary,
+            )
+            .await?;
             if let Some(authorization) = &authorization {
                 if !args.dry_run {
                     let mut requests = Vec::with_capacity(entries.len());
@@ -576,10 +585,10 @@ pub(super) fn run(args: Args) -> Result<i32> {
         progress.error(&format!("syq: {error:#}"));
         summary.errors += 1;
         summary.exit_code = 1;
-        summary.status = "failed";
+        summary.status = crate::results::Status::Failed;
     } else if summary.entries_failed != 0 {
         summary.exit_code = 23;
-        summary.status = "partial";
+        summary.status = crate::results::Status::Partial;
     }
     summary.elapsed_ms = progress.start.elapsed().as_millis() as u64;
     progress.scan_done.store(true, Relaxed);

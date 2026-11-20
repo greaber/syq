@@ -39,7 +39,6 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read, Seek};
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -168,33 +167,6 @@ pub(crate) fn end_own_group() {
     }
 }
 
-/// Wait for `child`, which leads its own process group, then end what it
-/// left in that group before reaping it, so that its group ID cannot have
-/// been reused by then.
-pub(crate) fn wait_and_end_group(
-    child: &mut std::process::Child,
-) -> std::io::Result<std::process::ExitStatus> {
-    loop {
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let result = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                child.id() as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOWAIT,
-            )
-        };
-        if result == 0 {
-            break;
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
-    unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
-    child.wait()
-}
 /// How long a receiving connection must have had no request before it
 /// counts as idle: one copy's steps, such as identifying the receiver,
 /// asking for approval and opening the copy, arrive as separate requests a
@@ -375,8 +347,92 @@ fn in_store(path: &Path, store: &Path) -> bool {
         || std::fs::canonicalize(store)
             .is_ok_and(|store| resolved().is_some_and(|path| path.starts_with(store)))
 }
-pub(crate) fn follows_other_file(started_from: Option<&str>) -> bool {
-    follows(started_from) == Follows::OtherFile
+
+/// What a process knows about a running service when it decides whether to
+/// replace it with this build.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Observed<'a> {
+    /// It runs this build.
+    pub(crate) current: bool,
+    pub(crate) follows: Follows,
+    /// Nothing is in progress. The provider decides that itself when asked
+    /// to stop, so it is seen as idle here.
+    pub(crate) idle: bool,
+    /// Its own switch's phase (`Report::phase`), when it has one.
+    pub(crate) phase: Option<&'a str>,
+}
+/// Who asks to replace a service from another build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Initiator {
+    /// A syq command, for services it does not use: in the background
+    /// (`receive_service::refresh_outdated`), or in the foreground for the
+    /// `persist` commands (`switch_outdated_now`). It replaces only a
+    /// service that cannot follow its path by itself, or whose own switch
+    /// failed. `user_at_hand` says whether a login may ask the user, which
+    /// a switch that needed a login is worth trying again only with.
+    Command { user_at_hand: bool },
+    /// A switch to this build that a service or command started
+    /// (`Replace::WhenIdle`), or a provider's switch.
+    Switch,
+    /// `persist connect` run by hand, or a settings change (`Replace::Now`).
+    Hand,
+}
+/// Why a service from another build keeps running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Keep {
+    /// It runs this build.
+    Current,
+    /// It follows another installed syq file, so that two installed copies
+    /// do not take turns replacing each other's services.
+    FollowsOther,
+    /// It follows this command's file and switches by itself.
+    SwitchesItself,
+    /// Something is in progress.
+    Busy,
+    /// Its switch needs a login that may ask the user, who is not at hand.
+    NeedsUser,
+}
+/// Whether to replace a service from another build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Plan {
+    Leave(Keep),
+    /// Once idle, after this build's service has logged in (`successor`).
+    ReplaceWhenIdle,
+    /// At once, cutting off whatever is in progress.
+    ReplaceNow,
+}
+/// Whether `initiator` may replace the service it sees (`seen`) with this build,
+/// and how. Every place that replaces a service from another build asks
+/// this, so that none replaces what another would leave.
+pub(crate) fn plan(seen: &Observed, initiator: Initiator) -> Plan {
+    if seen.current {
+        return Plan::Leave(Keep::Current);
+    }
+    if initiator == Initiator::Hand {
+        return Plan::ReplaceNow;
+    }
+    if seen.follows == Follows::OtherFile {
+        return Plan::Leave(Keep::FollowsOther);
+    }
+    let command = matches!(initiator, Initiator::Command { .. });
+    if command
+        && seen.follows == Follows::ThisFile
+        && !matches!(seen.phase, Some("failed" | "login"))
+    {
+        return Plan::Leave(Keep::SwitchesItself);
+    }
+    if !seen.idle {
+        return Plan::Leave(Keep::Busy);
+    }
+    if initiator
+        == (Initiator::Command {
+            user_at_hand: false,
+        })
+        && seen.phase == Some("login")
+    {
+        return Plan::Leave(Keep::NeedsUser);
+    }
+    Plan::ReplaceWhenIdle
 }
 
 /// Refuse to run a file that an arbitrary other account could have put
@@ -781,21 +837,15 @@ fn start(
         .stdin(Stdio::null())
         .stdout(output.try_clone()?)
         .stderr(output.try_clone()?);
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = command
-        .spawn_guarded()
-        .with_context(|| format!("start {}", path.display()))?;
-    let group = child.id() as libc::pid_t;
+    let mut switch = crate::process::group::ProcessGroup::leading(
+        crate::process::new_session(&mut command)
+            .spawn_guarded()
+            .with_context(|| format!("start {}", path.display()))?,
+    );
+    let group = switch.child.id() as libc::pid_t;
     let (sender, done) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = match wait_and_end_group(&mut child) {
+        let result = match switch.wait() {
             Ok(status) if status.success() => Ok(()),
             Ok(status) => Err(Ended {
                 error: last_line(&mut output).unwrap_or_else(|| status.to_string()),
@@ -868,7 +918,8 @@ mod tests {
             .read_to_string(&mut pid)
             .unwrap();
         let pid: libc::pid_t = pid.trim().parse().unwrap();
-        assert!(wait_and_end_group(&mut child).unwrap().success());
+        let mut switch = crate::process::group::ProcessGroup::leading(child);
+        assert!(switch.wait().unwrap().success());
         let deadline = Instant::now() + Duration::from_secs(5);
         while unsafe { libc::kill(pid, 0) } == 0
             && !std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
@@ -1331,5 +1382,146 @@ mod tests {
             follows_with_store(Some(pinned.to_str().unwrap()), Some(&store)),
             Follows::OtherFile
         );
+    }
+
+    /// Each site that replaces a service from another build decided this
+    /// for itself before `plan`. These oracles transcribe what each decided
+    /// then; every combination of what it sees must decide the same through
+    /// `plan`.
+    #[test]
+    fn every_site_decides_through_plan_as_it_did_on_its_own() {
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Did {
+            /// Left it without a word.
+            Skip,
+            /// Left it, giving its claim back for the next command
+            /// (`refresh_outdated`), or saying it is busy
+            /// (`switch_outdated_now`, `keeps_running` and `replace_other`).
+            Note,
+            /// Replaced it once idle, or (`Replace::Now`) at once.
+            Replace,
+        }
+        let none_or_phases = [
+            None,
+            Some("waiting"),
+            Some("switching"),
+            Some("login"),
+            Some("failed"),
+        ];
+        let mut rows = 0;
+        for current in [false, true] {
+            for follows in [Follows::Nothing, Follows::ThisFile, Follows::OtherFile] {
+                for idle in [false, true] {
+                    for phase in none_or_phases {
+                        for interactive in [false, true] {
+                            for quiet in [false, true] {
+                                rows += 1;
+                                let seen = Observed {
+                                    current,
+                                    follows,
+                                    idle,
+                                    phase,
+                                };
+                                let switched_itself = follows == Follows::ThisFile
+                                    && !matches!(phase, Some("failed" | "login"));
+                                let login = phase == Some("login");
+                                // `refresh_outdated`.
+                                let old = if current
+                                    || !idle
+                                    || follows == Follows::OtherFile
+                                    || switched_itself
+                                {
+                                    Did::Skip
+                                } else if login && (!interactive || quiet) {
+                                    Did::Note
+                                } else {
+                                    Did::Replace
+                                };
+                                let new = match plan(
+                                    &seen,
+                                    Initiator::Command {
+                                        user_at_hand: interactive && !quiet,
+                                    },
+                                ) {
+                                    Plan::Leave(Keep::NeedsUser) => Did::Note,
+                                    Plan::Leave(_) => Did::Skip,
+                                    Plan::ReplaceWhenIdle => Did::Replace,
+                                    Plan::ReplaceNow => unreachable!(),
+                                };
+                                assert_eq!(
+                                    old, new,
+                                    "refresh_outdated {seen:?} {interactive} {quiet}"
+                                );
+                                // `switch_outdated_now`, up to its claim, and
+                                // `provider::switch_outdated`, which sees no
+                                // phase and leaves busy to the provider.
+                                let old = if current
+                                    || follows == Follows::OtherFile
+                                    || switched_itself
+                                    || (login && !interactive)
+                                {
+                                    Did::Skip
+                                } else if !idle {
+                                    Did::Note
+                                } else {
+                                    Did::Replace
+                                };
+                                let new = match plan(
+                                    &seen,
+                                    Initiator::Command {
+                                        user_at_hand: interactive,
+                                    },
+                                ) {
+                                    // As `switch_outdated_now` says it.
+                                    Plan::Leave(Keep::Busy) if interactive || !login => Did::Note,
+                                    Plan::Leave(_) => Did::Skip,
+                                    Plan::ReplaceWhenIdle => Did::Replace,
+                                    Plan::ReplaceNow => unreachable!(),
+                                };
+                                assert_eq!(old, new, "switch_outdated_now {seen:?} {interactive}");
+                                if phase.is_none() && idle {
+                                    let old = if current || follows != Follows::Nothing {
+                                        Did::Skip
+                                    } else {
+                                        Did::Replace
+                                    };
+                                    assert_eq!(old, new, "provider::switch_outdated {seen:?}");
+                                }
+                                // `keeps_running`, `replace_other` with
+                                // `Replace::WhenIdle` (whose caller has left a
+                                // current one) and the provider's
+                                // `switch_when_idle` (which sees it as idle).
+                                let old = if current {
+                                    Did::Skip
+                                } else if follows == Follows::OtherFile || !idle {
+                                    Did::Note
+                                } else {
+                                    Did::Replace
+                                };
+                                let new = match plan(&seen, Initiator::Switch) {
+                                    Plan::Leave(Keep::Current) => Did::Skip,
+                                    Plan::Leave(Keep::FollowsOther | Keep::Busy) => Did::Note,
+                                    Plan::Leave(_) | Plan::ReplaceNow => unreachable!(),
+                                    Plan::ReplaceWhenIdle => Did::Replace,
+                                };
+                                assert_eq!(old, new, "keeps_running {seen:?}");
+                                // `replace_other` with `Replace::Now`.
+                                let new = match plan(&seen, Initiator::Hand) {
+                                    Plan::Leave(Keep::Current) => Did::Skip,
+                                    Plan::ReplaceNow => Did::Replace,
+                                    _ => unreachable!(),
+                                };
+                                assert_eq!(
+                                    if current { Did::Skip } else { Did::Replace },
+                                    new,
+                                    "replace_other Now {seen:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(rows, 2 * 3 * 2 * 5 * 2 * 2);
     }
 }

@@ -2,7 +2,7 @@
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Debug, Default, serde::Serialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Timings {
     pub total_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -15,6 +15,9 @@ pub struct Timings {
     pub finalization_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub helper_install_ms: Option<u64>,
+    /// Measurements in a relayed record that this build does not know.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Only coarse coordinator work uses these guards. File work shares one start

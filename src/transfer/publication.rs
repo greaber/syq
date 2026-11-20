@@ -29,7 +29,7 @@ use crate::conn::PendingReply;
 /// check, then a remote destination's `Finalize`) overlap the next file's
 /// work in each, and keep at most three files per worker unfinished at the
 /// destination (`fsops::stages`).
-const DEFERRED_PUBLICATIONS: usize = 2;
+pub(super) const DEFERRED_PUBLICATIONS: usize = 2;
 
 /// A file whose publication is in flight.
 pub(super) struct Publication {

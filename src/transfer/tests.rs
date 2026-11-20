@@ -114,6 +114,12 @@ struct PipelineState {
     deferred: std::collections::VecDeque<u64>,
     arrived: std::collections::HashMap<u64, Response>,
     next_deferred: u64,
+    /// Answer `send_timing_ok` as a remote connection does: without
+    /// waiting, and with this round trip once its reply has been read.
+    timed: Option<std::time::Duration>,
+    timed_round_trip: Option<std::time::Duration>,
+    /// An automatic small-file endpoint refuses its hashing configuration.
+    refuse_configuration: bool,
     /// Setting up telemetry on the connection fails.
     fail_observe: bool,
     /// The addresses of the actors telemetry was set up with, in order.
@@ -121,6 +127,9 @@ struct PipelineState {
 }
 
 struct PipelineConn(Arc<Mutex<PipelineState>>);
+
+/// The place in `PipelineState::deferred` of a `send_timing_ok` reply.
+const TIMED_REPLY: u64 = u64::MAX;
 
 impl PipelineConn {
     /// Read the replies of deferred requests, oldest first: all of them, or
@@ -131,6 +140,13 @@ impl PipelineConn {
                 return Ok(());
             };
             let reply = self.receive()?;
+            if id == TIMED_REPLY {
+                crate::conn::ok(reply, "configure hashing")
+                    .map_err(|error| crate::conn::DeferredRequestError(format!("{error:#}")))?;
+                let mut state = self.0.lock().unwrap();
+                state.timed_round_trip = state.timed;
+                continue;
+            }
             self.0.lock().unwrap().arrived.insert(id, reply);
             if until == Some(id) {
                 return Ok(());
@@ -225,6 +241,23 @@ impl Conn for PipelineConn {
         anyhow::ensure!(!state.fail_observe, "injected telemetry failure");
         state.observed_by.push(Arc::as_ptr(actor) as usize);
         Ok(())
+    }
+    fn send_timing_ok(
+        &mut self,
+        request: Request,
+        what: &'static str,
+    ) -> Result<Option<std::time::Duration>> {
+        if self.0.lock().unwrap().timed.is_none() {
+            let sent = std::time::Instant::now();
+            crate::conn::ok(self.call(request)?, what)?;
+            return Ok(Some(sent.elapsed()));
+        }
+        self.send(request)?;
+        self.0.lock().unwrap().deferred.push_back(TIMED_REPLY);
+        Ok(None)
+    }
+    fn take_timed_round_trip(&mut self) -> Option<std::time::Duration> {
+        self.0.lock().unwrap().timed_round_trip.take()
     }
     fn send_pending(&mut self, request: Request) -> Result<crate::conn::PendingReply> {
         if !self.0.lock().unwrap().defers {
@@ -325,7 +358,11 @@ impl Conn for PipelineConn {
                         state.received,
                         "latency check requires drained requests"
                     );
-                    Response::Ok
+                    if state.refuse_configuration {
+                        Response::Err("hash policy differs from the authorized copy".into())
+                    } else {
+                        Response::Ok
+                    }
                 }
                 Request::ReadSmallBatch(reads) => Response::SmallBlocks(
                     reads
@@ -538,6 +575,7 @@ fn pipeline_worker(
         access_limited: Default::default(),
         outer_directory: Default::default(),
         access_noted: Default::default(),
+        keep_widening_explained: Default::default(),
         devices: false,
         checksum: false,
         hash_or_copy: false,
@@ -589,6 +627,7 @@ fn pipeline_worker(
         fast_batch_files: 1,
         batch_budget: WorkBudget::default(),
         range_budget: None,
+        setup_latency: None,
         comparison: Default::default(),
         setup_elapsed: std::time::Duration::ZERO,
         publications: Default::default(),
@@ -1744,6 +1783,174 @@ fn cancelled_range_drains_without_reporting_or_publishing_an_innocent_file() {
         .iter()
         .all(|r| matches!(r, Request::WriteRange { .. })));
     assert_eq!(worker.progress.errors.load(Relaxed), 0);
+}
+
+#[test]
+fn a_worker_does_not_wait_for_its_hashing_configuration() {
+    use std::time::Duration;
+    let timed = |round_trip| {
+        Arc::new(Mutex::new(PipelineState {
+            timed: Some(Duration::from_millis(round_trip)),
+            replies: [Response::Ok].into(),
+            ..Default::default()
+        }))
+    };
+    let (src, dst) = (timed(30), timed(50));
+    let sched = Arc::new(Sched::new(512, 8192));
+    sched.scan_done();
+    let mut worker = pipeline_worker(&sched, &src, &dst, false);
+    worker.run(None).unwrap();
+    for state in [&src, &dst] {
+        let state = state.lock().unwrap();
+        assert!(matches!(state.requests[..], [Request::ConfigureHashing(_)]));
+        assert_eq!(state.received, 0, "the reply was waited for");
+    }
+    let default = worker.batch_budget.latency_target();
+    // A range allowance kept from before the round trips were known.
+    worker.range_budget = Some(WorkBudget::ranges(512, default, None));
+
+    // The allowance comes from both round trips, once both replies have
+    // been read ahead of a later one.
+    for (state, both) in [(&src, false), (&dst, true)] {
+        state.lock().unwrap().replies.push_back(Response::Ok);
+        let conn = if both {
+            &mut worker.dst
+        } else {
+            &mut worker.src
+        };
+        assert!(matches!(conn.recv().unwrap(), Response::Ok));
+        assert_eq!(
+            worker.settle_setup_latency(),
+            both.then_some(Duration::from_millis(80))
+        );
+        if !both {
+            assert_eq!(worker.batch_budget.latency_target(), default);
+        }
+    }
+    let allowance =
+        Duration::from_millis(80) * crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH as u32;
+    assert_eq!(worker.batch_budget.latency_target(), allowance);
+    assert_eq!(
+        worker.range_budget.as_ref().unwrap().latency_target(),
+        allowance
+    );
+    assert_eq!(worker.settle_setup_latency(), None, "settled once");
+}
+
+#[test]
+fn moving_to_its_own_login_keeps_a_setup_round_trip_already_read() {
+    use std::time::Duration;
+    let timed = |round_trip| {
+        Arc::new(Mutex::new(PipelineState {
+            timed: Some(Duration::from_millis(round_trip)),
+            replies: [Response::Ok].into(),
+            ..Default::default()
+        }))
+    };
+    let (source, shared) = (timed(0), timed(100));
+    let sched = Arc::new(Sched::new(512, 8192));
+    sched.scan_done();
+    let mut worker = pipeline_worker(&sched, &source, &shared, false);
+    worker.run(None).unwrap();
+    // The shared session's reply is read by the requests of the file the
+    // worker copies there, which do not take the round trip.
+    for state in [&source, &shared] {
+        state.lock().unwrap().replies.push_back(Response::Ok);
+    }
+    assert!(matches!(worker.src.recv().unwrap(), Response::Ok));
+    assert!(matches!(worker.dst.recv().unwrap(), Response::Ok));
+
+    worker.on_shared_login = true;
+    let own = Arc::new(Mutex::new(PipelineState::default()));
+    worker.own_login = OwnLogin::Unopened(Box::new(move || {
+        Ok((None, Some(Box::new(PipelineConn(own)) as Box<dyn Conn>)))
+    }));
+    worker.open_own_login();
+    wait_for_own_login(&worker);
+    worker.take_own_login_if_ready().unwrap();
+    assert!(!worker.on_shared_login);
+    assert_eq!(
+        worker.batch_budget.latency_target(),
+        Duration::from_millis(100) * crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH as u32,
+        "the round trip went with the shared session"
+    );
+}
+
+#[test]
+fn a_refused_hashing_configuration_fails_the_copy_at_the_first_reply() {
+    let sched = Arc::new(Sched::new(512, 8192));
+    sched.push_file(pipeline_job(b"first", 4096));
+    sched.scan_done();
+    let src = Arc::new(Mutex::new(PipelineState {
+        timed: Some(Default::default()),
+        replies: [Response::Ok].into(),
+        ..Default::default()
+    }));
+    let dst = Arc::new(Mutex::new(PipelineState {
+        timed: Some(Default::default()),
+        replies: [
+            Response::Err("hash policy differs from the authorized copy".into()),
+            // What the receiver answers the preparation sent behind it.
+            Response::Prepared(Preparation::default()),
+        ]
+        .into(),
+        ..Default::default()
+    }));
+    let mut worker = pipeline_worker(&sched, &src, &dst, false);
+    let error = worker.run(None).unwrap_err();
+    assert_eq!(
+        format!("{error:#}"),
+        "configure hashing: hash policy differs from the authorized copy"
+    );
+    assert!(sched.is_aborted(), "the copy goes on without its policy");
+    assert!(!worker.transport_dead());
+    assert_eq!(worker.progress.files_done.load(Relaxed), 0);
+    let destination = dst.lock().unwrap();
+    assert!(
+        !destination
+            .requests
+            .iter()
+            .any(|request| matches!(request, Request::WriteRange { .. })),
+        "data was sent after the refusal"
+    );
+}
+
+#[test]
+fn a_refused_hashing_configuration_fails_the_copy_not_each_small_file() {
+    // Within the test worker's 512-byte requests, so batched.
+    let size = 256;
+    let sched = Arc::new(Sched::new(4 << 20, 32 << 20));
+    for name in [&b"first"[..], b"second", b"third"] {
+        sched.push_file(pipeline_job(name, size));
+    }
+    sched.scan_done();
+    let endpoint = |refuse| {
+        Arc::new(Mutex::new(PipelineState {
+            timed: Some(Default::default()),
+            auto_small_size: Some(size),
+            refuse_configuration: refuse,
+            ..Default::default()
+        }))
+    };
+    let (src, dst) = (endpoint(false), endpoint(true));
+    let mut worker = pipeline_worker(&sched, &src, &dst, false);
+    Arc::get_mut(&mut worker.opts).unwrap().tuning = Default::default();
+    let error = worker.run(None).unwrap_err();
+    assert_eq!(
+        format!("{error:#}"),
+        "configure hashing: hash policy differs from the authorized copy"
+    );
+    assert!(sched.is_aborted());
+    assert_eq!(worker.progress.errors.load(Relaxed), 0, "listed per file");
+    assert_eq!(worker.progress.files_done.load(Relaxed), 0);
+    assert!(
+        dst.lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|request| matches!(request, Request::PutSmallBatch(_))),
+        "the files were not sent as a small batch"
+    );
 }
 
 #[test]
@@ -3538,11 +3745,11 @@ fn bandwidth_limited_remote_sources_compare_before_pacing_only_differing_reads()
             let opts = Arc::get_mut(&mut worker.opts).unwrap();
             opts.src_remote = true;
             opts.dst_remote = relay;
-            opts.tuning.bw_pacing = Some(crate::transfer_tuning::BwPacing::Average);
             if basis == "candidate-reuse-off" {
                 opts.transfer_strategy = crate::cli::TransferStrategy::WholeFile;
             }
-            worker.bwlimit = Some(Arc::new(BandwidthLimit::new(5120)));
+            // 512 bytes cost 500 ms, beyond the 125 ms of idle credit.
+            worker.bwlimit = Some(Arc::new(BandwidthLimit::new(1024)));
             worker.progress.bytes_total.store(1536, Relaxed);
             worker.progress.files_total.store(1, Relaxed);
             worker.handle_file(0).unwrap();
@@ -5392,6 +5599,18 @@ fn differing_jobs(
     root: &std::path::Path,
     files: &[(&str, usize, std::ops::Range<usize>)],
 ) -> Arc<Sched> {
+    let files: Vec<_> = files
+        .iter()
+        .map(|(name, len, changed)| (*name, *len, vec![changed.clone()]))
+        .collect();
+    edited_jobs(root, &files)
+}
+
+/// `differing_jobs` for sources that rewrite several ranges.
+fn edited_jobs(
+    root: &std::path::Path,
+    files: &[(&str, usize, Vec<std::ops::Range<usize>>)],
+) -> Arc<Sched> {
     use std::os::unix::fs::MetadataExt;
     for directory in ["source", "target"] {
         std::fs::create_dir_all(root.join(directory)).unwrap();
@@ -5400,7 +5619,9 @@ fn differing_jobs(
     for (n, (name, len, changed)) in files.iter().enumerate() {
         let old: Vec<u8> = (0..*len).map(|i| ((i * 7 + n) % 251) as u8).collect();
         let mut new = old.clone();
-        new[changed.clone()].fill(n as u8 + 1);
+        for changed in changed {
+            new[changed.clone()].fill(n as u8 + 1);
+        }
         let (source, target) = (
             root.join("source").join(name),
             root.join("target").join(name),
@@ -6044,6 +6265,501 @@ fn an_aborted_copy_sends_nothing_further_for_groups_in_flight() {
     assert_eq!(worker.progress.files_done.load(Relaxed), 1);
 }
 
+/// A destination that serves each request as it is sent but, as a remote
+/// one, holds its replies until they are asked for, within a reply queue of
+/// `queue`. It records the most streamed patch pieces, and piece bytes, that
+/// awaited acknowledgment at once, and calls `sent` with each piece's count.
+struct HoldingDestination<F> {
+    ops: crate::fsops::FsOps,
+    queue: usize,
+    replies: std::collections::VecDeque<(Response, usize)>,
+    most: Arc<Mutex<(usize, usize)>>,
+    pieces: usize,
+    sent: F,
+    /// Refuse every streamed begin, as a receiver's grant can.
+    refuse_begin: bool,
+    /// Replies still owed when a stream begins, for requests sent before,
+    /// as a deferred publication's are: they wait ahead of the begin's
+    /// reply, and are taken before the next reply, as a connection takes
+    /// them.
+    owed_at_begin: usize,
+    owed: usize,
+}
+
+impl<F: FnMut(usize) + Send> Conn for HoldingDestination<F> {
+    fn send(&mut self, request: Request) -> Result<()> {
+        let piece = match &request {
+            Request::PatchData { data, .. } => data.len(),
+            _ => 0,
+        };
+        if let Request::PatchBegin { .. } = request {
+            let owed = std::mem::take(&mut self.owed_at_begin);
+            self.replies.extend((0..owed).map(|_| (Response::Ok, 0)));
+            self.owed += owed;
+        }
+        let reply = match request {
+            Request::PatchBegin { .. } if self.refuse_begin => {
+                Response::Err("refused by the grant".into())
+            }
+            request => self.ops.handle(&request),
+        };
+        self.replies.push_back((reply, piece));
+        assert!(self.replies.len() <= self.queue, "reply queue overrun");
+        let pieces = self.replies.iter().filter(|(_, len)| *len > 0).count();
+        let bytes = self.replies.iter().map(|(_, len)| len).sum();
+        let mut most = self.most.lock().unwrap();
+        *most = (most.0.max(pieces), most.1.max(bytes));
+        drop(most);
+        if piece > 0 {
+            self.pieces += 1;
+            (self.sent)(self.pieces);
+        }
+        Ok(())
+    }
+    fn recv(&mut self) -> Result<Response> {
+        for _ in 0..std::mem::take(&mut self.owed) {
+            self.replies.pop_front();
+        }
+        self.replies
+            .pop_front()
+            .map(|(reply, _)| reply)
+            .ok_or_else(|| anyhow::anyhow!("missing reply"))
+    }
+    fn reply_queue(&self) -> Option<usize> {
+        Some(self.queue)
+    }
+    fn scan(
+        &mut self,
+        _: &[u8],
+        _: Option<&RegisteredPath>,
+        _: bool,
+        _: &[String],
+        _: bool,
+        _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
+        _: &mut dyn FnMut(crate::proto::ScanWarning),
+    ) -> Result<u64> {
+        unreachable!()
+    }
+    fn native_remove(
+        &mut self,
+        _: Option<&[u8]>,
+        _: Option<&[u8]>,
+        _: &[NativeRemoveSelection],
+        _: bool,
+        _: bool,
+        _: usize,
+        _: &mut dyn FnMut(Vec<String>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
+    ) -> Result<()> {
+        unreachable!()
+    }
+}
+
+/// A remote source, which queues its replies within a reply queue of
+/// `COMPARE_REQUESTS`, as a worker connection's does.
+struct WideSource(QueuingSource);
+
+impl Conn for WideSource {
+    fn send(&mut self, request: Request) -> Result<()> {
+        self.0.send(request)
+    }
+    fn recv(&mut self) -> Result<Response> {
+        self.0.recv()
+    }
+    fn reply_queue(&self) -> Option<usize> {
+        Some(crate::transfer_tuning::COMPARE_REQUESTS)
+    }
+    fn scan(
+        &mut self,
+        _: &[u8],
+        _: Option<&RegisteredPath>,
+        _: bool,
+        _: &[String],
+        _: bool,
+        _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
+        _: &mut dyn FnMut(crate::proto::ScanWarning),
+    ) -> Result<u64> {
+        unreachable!()
+    }
+    fn native_remove(
+        &mut self,
+        _: Option<&[u8]>,
+        _: Option<&[u8]>,
+        _: &[NativeRemoveSelection],
+        _: bool,
+        _: bool,
+        _: usize,
+        _: &mut dyn FnMut(Vec<String>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
+    ) -> Result<()> {
+        unreachable!()
+    }
+}
+
+/// A remote source whose reader, as a connection's does, holds room in the
+/// process's decoded-message allowance for each reply from when it arrives
+/// until it is taken. A reply that does not fit fails, and so does every
+/// later one, as the reader stops.
+struct BudgetedSource {
+    inner: QueuingSource,
+    holds: std::collections::VecDeque<std::io::Result<crate::wire_budget::Budgeted<Response>>>,
+    failed: bool,
+}
+
+impl Conn for BudgetedSource {
+    fn send(&mut self, request: Request) -> Result<()> {
+        self.inner.send(request)?;
+        let reply = postcard::to_stdvec(self.inner.replies.back().expect("a reply")).unwrap();
+        self.holds
+            .push_back(crate::wire_budget::decode::<Response>(&reply));
+        Ok(())
+    }
+    fn recv(&mut self) -> Result<Response> {
+        let hold = self.holds.pop_front().context("missing reply")?;
+        anyhow::ensure!(!self.failed, "the reader stopped");
+        if let Err(error) = hold {
+            self.failed = true;
+            return Err(error.into());
+        }
+        self.inner.recv()
+    }
+    fn reply_queue(&self) -> Option<usize> {
+        Some(crate::transfer_tuning::COMPARE_REQUESTS)
+    }
+    fn is_dead(&self) -> bool {
+        self.failed
+    }
+    fn scan(
+        &mut self,
+        _: &[u8],
+        _: Option<&RegisteredPath>,
+        _: bool,
+        _: &[String],
+        _: bool,
+        _: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<PathBytes>) -> Result<()>,
+        _: &mut dyn FnMut(crate::proto::ScanWarning),
+    ) -> Result<u64> {
+        unreachable!()
+    }
+    fn native_remove(
+        &mut self,
+        _: Option<&[u8]>,
+        _: Option<&[u8]>,
+        _: &[NativeRemoveSelection],
+        _: bool,
+        _: bool,
+        _: usize,
+        _: &mut dyn FnMut(Vec<String>) -> Result<()>,
+        _: &mut dyn FnMut(Vec<NativeRemoveOutcome>) -> Result<()>,
+    ) -> Result<()> {
+        unreachable!()
+    }
+}
+
+/// How `stream_into_holding_destination` streams.
+#[derive(Clone, Copy, Default)]
+struct Holding {
+    /// Read from a remote source (`WideSource`) rather than an in-process
+    /// one.
+    remote_source: bool,
+    /// Read from a remote source whose replies hold room in the
+    /// decoded-message allowance (`BudgetedSource`).
+    budgeted_source: bool,
+    /// Stream to a command-restricted receiver.
+    restricted: bool,
+    /// The receiver refuses every streamed begin.
+    refuse_begin: bool,
+    /// Replies the destination still owes for requests sent before the
+    /// stream began.
+    owed: usize,
+}
+
+/// What `stream_into_holding_destination` observed: the most pieces and
+/// piece bytes that awaited acknowledgment at once, the most source reads
+/// and read data that awaited the worker at once, and the pieces sent.
+struct Held {
+    pieces: usize,
+    bytes: usize,
+    reads: usize,
+    read_data: usize,
+    sent: usize,
+}
+
+/// Stream `files`' patches into a destination that holds its replies in a
+/// queue of `COMPARE_REQUESTS`, calling `sent` with each piece's count.
+fn stream_into_holding_destination(
+    root: &std::path::Path,
+    files: &[(&str, usize, Vec<std::ops::Range<usize>>)],
+    how: Holding,
+    sent: impl FnMut(&Sched, usize) + Send + 'static,
+) -> (Arc<Sched>, Worker, Held) {
+    let sched = edited_jobs(root, files);
+    let unused = Arc::new(Mutex::new(PipelineState::default()));
+    let mut worker = pipeline_worker(&sched, &unused, &unused, true);
+    let reads = Arc::new(Mutex::new((0, 0)));
+    let source = QueuingSource {
+        ops: crate::fsops::FsOps::new(),
+        replies: Default::default(),
+        in_process: !(how.remote_source || how.budgeted_source),
+        most: reads.clone(),
+    };
+    worker.src = if how.budgeted_source {
+        Box::new(BudgetedSource {
+            inner: source,
+            holds: Default::default(),
+            failed: false,
+        })
+    } else if how.remote_source {
+        Box::new(WideSource(source))
+    } else {
+        Box::new(source)
+    };
+    let most = Arc::new(Mutex::new((0, 0)));
+    let pieces = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut sent = sent;
+    let (aborting, counted) = (sched.clone(), pieces.clone());
+    worker.dst = Box::new(HoldingDestination {
+        ops: crate::fsops::FsOps::test_destination(&root.join("target")),
+        queue: crate::transfer_tuning::COMPARE_REQUESTS,
+        replies: Default::default(),
+        most: most.clone(),
+        pieces: 0,
+        sent: move |pieces| {
+            counted.store(pieces, Relaxed);
+            sent(&aborting, pieces)
+        },
+        refuse_begin: how.refuse_begin,
+        owed_at_begin: how.owed,
+        owed: 0,
+    });
+    worker.fast_batch_files = files.len();
+    let opts = Arc::get_mut(&mut worker.opts).unwrap();
+    opts.block = 1 << 20;
+    opts.restricted_receiver = how.restricted;
+    worker.process_item(sched.next()).unwrap();
+    let (most, reads) = (*most.lock().unwrap(), *reads.lock().unwrap());
+    let held = Held {
+        pieces: most.0,
+        bytes: most.1,
+        reads: reads.0,
+        read_data: reads.1,
+        sent: pieces.load(Relaxed),
+    };
+    (sched, worker, held)
+}
+
+/// Every other 64 KiB block of the first `len` bytes.
+fn scattered_blocks(len: usize) -> Vec<std::ops::Range<usize>> {
+    (0..len)
+        .step_by(128 << 10)
+        .map(|start| start..start + (64 << 10))
+        .collect()
+}
+
+#[test]
+fn a_streamed_patch_of_single_block_pieces_keeps_its_reply_queue_of_them_in_flight() {
+    // 20 MiB of scattered blocks differ, which streams as 320 pieces of one
+    // block each. The destination's reply queue, less room for replies
+    // still owed, and not a count of sixteen, limits the pieces awaiting
+    // acknowledgment, and a remote source's
+    // reply queue and the read-ahead buffer the reads awaiting the worker.
+    for remote_source in [false, true] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
+        let how = Holding {
+            remote_source,
+            ..Holding::default()
+        };
+        let (sched, worker, held) = stream_into_holding_destination(root, &files, how, |_, _| {});
+        let case = format!("remote_source={remote_source}");
+        assert!(!sched.is_aborted());
+        assert_eq!(
+            read(root, "source/file"),
+            read(root, "target/file"),
+            "{case}"
+        );
+        assert_eq!(worker.progress.files_done.load(Relaxed), 1, "{case}");
+        assert_eq!(worker.progress.bytes_done.load(Relaxed), 20 << 20, "{case}");
+        if remote_source {
+            // Pieces follow the source's reads.
+            assert!(held.pieces > 16, "{case}: {} pieces", held.pieces);
+            // Reads beyond sixteen within 2 MiB of read-ahead, and one
+            // piece more.
+            assert!(held.reads > 16, "{case}: {} reads", held.reads);
+            assert!(
+                held.read_data <= (2 << 20) + (64 << 10),
+                "{case}: {} bytes",
+                held.read_data
+            );
+        } else {
+            // The reply queue less the room it keeps for replies still owed.
+            assert_eq!((held.pieces, held.bytes), (240, 15 << 20), "{case}");
+            assert_eq!(held.reads, 1, "{case}");
+        }
+    }
+}
+
+#[test]
+fn a_streamed_patchs_unacknowledged_pieces_stay_within_their_byte_bound() {
+    // Two rewritten files of 40 MiB, streamed one after another in 4 MiB
+    // pieces: 80 MiB, more than may await acknowledgment at once, although
+    // the reply queue would take all twenty pieces.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let rewritten = vec![std::ops::Range {
+        start: 0,
+        end: 40 << 20,
+    }];
+    let files = [
+        ("first", 40 << 20, rewritten.clone()),
+        ("second", 40 << 20, rewritten),
+    ];
+    let (_, worker, held) =
+        stream_into_holding_destination(root, &files, Holding::default(), |_, _| {});
+    for (name, ..) in &files {
+        assert_eq!(
+            read(root, &format!("source/{name}")),
+            read(root, &format!("target/{name}")),
+            "{name}"
+        );
+    }
+    assert_eq!(worker.progress.files_done.load(Relaxed), 2);
+    assert_eq!((held.pieces, held.bytes), (16, 64 << 20));
+}
+
+#[test]
+fn an_aborted_copy_takes_every_reply_of_a_wide_patch_stream() {
+    // The copy is aborted, as by a fatal error elsewhere, once some of 320
+    // single-block pieces were sent: no further piece is sent, every reply
+    // in flight is taken, and the patch is not published. A remote source
+    // has further pieces read by then, which are not sent; after 300 pieces
+    // it has been sent every read and the recheck.
+    for (remote_source, abort_at) in [(false, 100), (true, 100), (true, 300)] {
+        let case = format!("remote_source={remote_source} abort_at={abort_at}");
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
+        let how = Holding {
+            remote_source,
+            ..Holding::default()
+        };
+        let (sched, mut worker, held) =
+            stream_into_holding_destination(root, &files, how, move |sched, pieces| {
+                if pieces == abort_at {
+                    sched.abort();
+                }
+            });
+        assert!(sched.is_aborted());
+        assert_eq!(held.sent, abort_at, "{case}");
+        if !remote_source {
+            assert_eq!(held.pieces, abort_at, "{case}");
+        }
+        assert!(
+            worker.dst.recv().is_err(),
+            "{case}: a reply was left unread"
+        );
+        assert!(worker.src.recv().is_err(), "{case}: a read was left unread");
+        assert_ne!(
+            read(root, "source/file"),
+            read(root, "target/file"),
+            "{case}"
+        );
+        assert_eq!(worker.progress.files_done.load(Relaxed), 0, "{case}");
+        assert_eq!(worker.progress.bytes_done.load(Relaxed), 0, "{case}");
+    }
+}
+
+// Holds the process's own allowance: run in a process of its own, as nextest
+// does.
+#[test]
+fn a_wide_patch_stream_cannot_use_up_the_decoded_message_allowance() {
+    // A stream of 320 single-block pieces from a remote source has more
+    // than sixteen of its reads' replies queued at once. Other connections'
+    // messages hold all but 1 MiB of the process's decoded-message
+    // allowance, as those of many workers can. Each queued reply holds what
+    // it is counted for, about 1 KiB, so the stream stays wide and the copy
+    // completes; at 64 KiB a reply, 16 of them would have used up what is
+    // left.
+    let others = postcard::to_stdvec(&vec![
+        0u64;
+        (crate::wire_budget::MEMORY_LIMIT - (1 << 20)) / 64 - 1
+    ])
+    .unwrap();
+    let _others = crate::wire_budget::decode::<Vec<u64>>(&others).unwrap();
+    let how = Holding {
+        budgeted_source: true,
+        ..Holding::default()
+    };
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
+    let (_, worker, held) = stream_into_holding_destination(root, &files, how, |_, _| {});
+    assert_eq!(read(root, "source/file"), read(root, "target/file"));
+    assert_eq!(worker.progress.files_done.load(Relaxed), 1);
+    assert!(held.reads > 16, "{} reads", held.reads);
+}
+
+#[test]
+fn a_patch_stream_leaves_room_for_replies_still_owed() {
+    // A worker can begin a stream with replies still owed on its
+    // connection, as for its deferred publications and its setup. The
+    // stream's pieces and those replies together never fill more than the
+    // destination's reply queue.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
+    let how = Holding {
+        owed: super::publication::DEFERRED_PUBLICATIONS + 1,
+        ..Holding::default()
+    };
+    let (_, worker, held) = stream_into_holding_destination(root, &files, how, |_, _| {});
+    assert_eq!(read(root, "source/file"), read(root, "target/file"));
+    assert_eq!(worker.progress.files_done.load(Relaxed), 1);
+    assert!(
+        held.pieces > crate::transfer_tuning::COMPARE_WINDOW,
+        "{} pieces",
+        held.pieces
+    );
+}
+
+#[test]
+fn a_restricted_receiver_gets_few_pieces_before_it_answers_a_streamed_begin() {
+    // A command-restricted receiver records each piece that reaches it after
+    // it refused the patch's begin. Until the begin is answered, at most
+    // fifteen pieces follow it; once it is accepted, the window widens.
+    for refuse_begin in [true, false] {
+        let case = format!("refuse_begin={refuse_begin}");
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
+        let how = Holding {
+            restricted: true,
+            refuse_begin,
+            ..Holding::default()
+        };
+        let (_, worker, held) = stream_into_holding_destination(root, &files, how, |_, _| {});
+        if refuse_begin {
+            assert_eq!(
+                held.sent,
+                crate::transfer_tuning::COMPARE_WINDOW - 1,
+                "{case}"
+            );
+            assert_eq!(worker.progress.files_done.load(Relaxed), 0, "{case}");
+        } else {
+            assert_eq!(held.pieces, 240, "{case}");
+            assert_eq!(
+                read(root, "source/file"),
+                read(root, "target/file"),
+                "{case}"
+            );
+        }
+    }
+}
+
 /// A connection that fails, and stays dead, as a dropped one does: at its
 /// `fail_recv`-th reply, as it sends its `fail_patch`-th patch batch, or as
 /// it sends its `fail_piece`-th streamed patch piece.
@@ -6264,6 +6980,121 @@ fn restricted_destination(
         },
         replies: Default::default(),
     })
+}
+
+/// A copy whose grant keeps existing objects (`--if-exists=keep`) asks a
+/// restricted receiver to widen no directory inside the copy: the receiver
+/// refuses such a request whole, and the copy with it. Under `all` it still
+/// asks for the directory the copy goes into. In place of naming a wider
+/// mode, it says why none helps.
+#[test]
+fn a_keep_grant_copy_asks_a_restricted_receiver_to_widen_no_directory_inside_it() {
+    use crate::cli::WidenDirs;
+    use crate::delegation::DirectoryWidening;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let bytes = |path: &std::path::Path| path.as_os_str().as_bytes().to_vec();
+    let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().mode() & 0o7777;
+    for approved in [DirectoryWidening::Rsync, DirectoryWidening::All] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        let sub = root.join("target/sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let authority = Arc::new(crate::restricted::tests::keep_test_authority_widening(
+            root, approved,
+        ));
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let mut receiver = restricted_destination(authority, executed.clone(), || {});
+        let asked = Arc::new(Mutex::new(0));
+        let mut destination = AnsweringConn {
+            answer: {
+                let asked = asked.clone();
+                move |request: Request| {
+                    *asked.lock().unwrap() += 1;
+                    receiver.call(request).unwrap()
+                }
+            },
+            replies: Default::default(),
+        };
+        let sched = Arc::new(Sched::new(512, 8192));
+        let unused = Arc::new(Mutex::new(PipelineState::default()));
+        let mut worker = pipeline_worker(&sched, &unused, &unused, true);
+        let opts = Arc::get_mut(&mut worker.opts).unwrap();
+        opts.restricted_receiver = true;
+        opts.widen_dirs = match approved {
+            DirectoryWidening::All => WidenDirs::All,
+            _ => WidenDirs::Rsync,
+        };
+        // The directory an exact target is in.
+        opts.outer_directory.set(bytes(root)).unwrap();
+        let progress = Progress::new(false, false, None);
+        let identity = |path: &std::path::Path| {
+            let metadata = std::fs::metadata(path).unwrap();
+            TargetCondition::Matches {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            }
+        };
+        let mut restorations = Default::default();
+        let mut widen = |opts: &Opts, directories: Vec<&std::path::Path>| {
+            super::planner::widen_directory_batch(
+                &mut destination,
+                opts,
+                &progress,
+                &mut restorations,
+                directories
+                    .into_iter()
+                    .map(|path| (bytes(path), identity(path)))
+                    .collect(),
+                0o300,
+            )
+        };
+
+        // Asked as under any other policy, the receiver refuses.
+        assert_eq!(opts.hint_for(WidenDirs::Rsync), None);
+        let error = widen(opts, vec![&sub]).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("contradicts the signed existing-object policy"),
+            "{error:#}"
+        );
+        assert_eq!(*asked.lock().unwrap(), 1);
+
+        // Knowing its grant keeps what exists, the copy does not ask.
+        opts.preserve_existing_directory_metadata = true;
+        assert!(opts.keep_bars_widening() && !opts.widens_inside_copy());
+        assert_eq!(widen(opts, vec![&sub]).unwrap(), 0);
+        assert_eq!(*asked.lock().unwrap(), 1);
+        assert_eq!(mode(&sub), 0o555);
+        let hint = opts.hint_for(WidenDirs::Rsync).unwrap();
+        assert!(hint.contains("--if-exists=keep"), "{hint}");
+        assert_eq!(
+            opts.hint_for(WidenDirs::All),
+            (approved == DirectoryWidening::Rsync).then_some("--widen-dirs=all may help")
+        );
+        assert_eq!(opts.entering_hint(), Some(hint));
+        // The reason is given in full once, whichever message carries it.
+        assert_eq!(opts.said_once(hint), hint);
+        assert_eq!(opts.said_once(hint), "it is not widened either");
+        let other = "--widen-dirs=all may help";
+        assert_eq!(opts.said_once(other), other);
+
+        // Only the directory the copy goes into is asked for, under `all`.
+        if approved == DirectoryWidening::All {
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o500)).unwrap();
+            assert_eq!(widen(opts, vec![root, &sub]).unwrap(), 1);
+            assert_eq!(*asked.lock().unwrap(), 2);
+            let executed = executed.lock().unwrap();
+            let [Request::WidenDirectories { directories, .. }] = &executed[..] else {
+                panic!("{executed:?}");
+            };
+            assert_eq!(directories.len(), 1);
+            assert_eq!(directories[0].0, bytes(root));
+            assert_eq!((mode(root), mode(&sub)), (0o700, 0o555));
+        }
+    }
 }
 
 /// Run `workers` on threads of their own until the copy ends, and check
@@ -7315,9 +8146,9 @@ fn a_restricted_receivers_listed_failures_are_left_to_it() {
 }
 
 /// No receiver paces file data, restricted receivers included: the sender
-/// paces, so a bandwidth limit never bounds a copy's requests by one burst.
+/// paces, so only the sender's own request budget sizes requests.
 #[test]
-fn a_bandwidth_limit_leaves_requests_to_a_restricted_receiver_their_size() {
+fn a_bandwidth_limit_sizes_requests_to_a_restricted_receiver_by_the_sender_budget() {
     let sched = Arc::new(Sched::new(512, 8192));
     let unused = Arc::new(Mutex::new(PipelineState::default()));
     let mut worker = pipeline_worker(&sched, &unused, &unused, false);
@@ -7325,11 +8156,9 @@ fn a_bandwidth_limit_leaves_requests_to_a_restricted_receiver_their_size() {
     let opts = Arc::get_mut(&mut worker.opts).unwrap();
     opts.block = 4 << 20;
     opts.restricted_receiver = true;
-    // Average pacing sizes requests for the bandwidth limit no further.
-    opts.tuning.bw_pacing = Some(crate::transfer_tuning::BwPacing::Average);
     assert_eq!(
         fast_file_size_limit(opts, Some(&limit)),
-        fast_file_size_limit(opts, None)
+        limit.request_bytes()
     );
 }
 
@@ -7361,6 +8190,48 @@ fn kept_small_files_are_listed_by_whoever_saw_them_fail() {
     }
 }
 
+/// A remote coordinator's error records reach this machine's stream as they
+/// arrive. When the copy then fails here before the relay settles the
+/// stream, as when a coordinator refuses to run for another build, the
+/// final record counts them with this machine's own.
+#[test]
+fn a_fatal_failure_counts_the_errors_relayed_before_it() {
+    use std::io::{Read, Seek};
+    let file = tempfile::tempfile().unwrap();
+    let writer = Arc::new(crate::results::ResultsWriter::new(Box::new(
+        file.try_clone().unwrap(),
+    )));
+    let progress = Progress::new(false, false, None);
+    progress.set_results(writer.clone());
+    // Relayed: a counted error, and one that only explains another record.
+    writer.emit_value(serde_json::json!({"type": "error", "message": "coordinator"}));
+    writer.emit_value(serde_json::json!({"type": "error", "message": "why",
+        crate::results::DIAGNOSTIC_FOR: {"encoding": "utf-8", "value": "a"}}));
+    record_failure(
+        &progress,
+        Some(&anyhow::anyhow!("run the copy again")),
+        (false, false, false),
+    );
+    let mut text = String::new();
+    let mut file = file;
+    file.rewind().unwrap();
+    file.read_to_string(&mut text).unwrap();
+    let records: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let counted = records
+        .iter()
+        .filter(|record| {
+            record["type"] == "error" && record.get(crate::results::DIAGNOSTIC_FOR).is_none()
+        })
+        .count();
+    let terminal = records.last().unwrap();
+    assert_eq!(terminal["type"], "result");
+    assert_eq!(counted, 2);
+    assert_eq!(terminal["errors"], 2, "{text}");
+}
+
 fn summary_record(
     files_transferred: u64,
     bytes_transferred: u64,
@@ -7368,23 +8239,11 @@ fn summary_record(
     bytes_unchanged: u64,
 ) -> crate::results::ResultRecord {
     crate::results::ResultRecord {
-        status: "success",
-        exit_code: 0,
-        dry_run: false,
         files_transferred,
         files_unchanged,
-        files_excluded: 0,
-        directories_created: 0,
-        symlinks_created: 0,
-        specials_created: 0,
-        errors: 0,
         bytes_transferred,
         bytes_unchanged,
-        timings: Default::default(),
-        deletions_planned: None,
-        deletions_completed: None,
-        deletions_blocked: None,
-        replaced_not_in_place: None,
+        ..crate::results::ResultRecord::new(crate::results::Status::Success, 0, false)
     }
 }
 
@@ -7882,4 +8741,91 @@ fn only_pushes_start_with_a_short_look_ahead() {
             assert_eq!(worker.comparison.ahead(), ahead);
         }
     }
+}
+
+/// Widening directories at paths near the longest a system call takes,
+/// none of them UTF-8, where every one fails: each error names its path,
+/// which the receiver shows at three bytes for each byte. The requests end
+/// before their errors could overfill a reply, and every reply fits its
+/// frame.
+#[cfg(target_os = "linux")]
+#[test]
+fn directory_widening_replies_fit_their_frames_when_every_directory_fails() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let mut receiver = crate::fsops::FsOps::rooted_for_test(root);
+    let sizes = Arc::new(Mutex::new(Vec::new()));
+    let mut destination = AnsweringConn {
+        answer: {
+            let sizes = sizes.clone();
+            move |request: Request| {
+                let Request::WidenDirectories { directories, .. } = &request else {
+                    panic!("unexpected request {request:?}");
+                };
+                sizes.lock().unwrap().push(directories.len());
+                let paths: Vec<PathBytes> =
+                    directories.iter().map(|(path, _)| path.clone()).collect();
+                let response = receiver.handle(&request);
+                let Response::WidenedDirectories(results) = &response else {
+                    panic!("unexpected response {response:?}");
+                };
+                // Each error is within what its request allowed for.
+                for (path, result) in paths.iter().zip(results) {
+                    let error = result.as_ref().expect_err("every widening fails");
+                    let encoded = postcard::to_extend(&Some(error), Vec::new()).unwrap();
+                    assert!(
+                        encoded.len() <= crate::proto::failed_path_hint(path),
+                        "{error:?}"
+                    );
+                    assert!(error.message.len() > 3 * 3300, "{error:?}");
+                }
+                assert!(
+                    crate::proto::FrameWriter::new(Vec::new(), false)
+                        .write_msg(&response)
+                        .is_ok(),
+                    "a reply overfills its frame"
+                );
+                response
+            }
+        },
+        replies: Default::default(),
+    };
+    let sched = Arc::new(Sched::new(512, 8192));
+    let unused = Arc::new(Mutex::new(PipelineState::default()));
+    let worker = pipeline_worker(&sched, &unused, &unused, true);
+    let progress = Progress::new(false, false, None);
+    let root_bytes = root.as_os_str().as_encoded_bytes().to_vec();
+    let parent = [root_bytes, vec![vec![0xff; 255]; 13].join(&b'/')].join(&b'/');
+    let on_disk = |path: &[u8]| {
+        use std::os::unix::ffi::OsStrExt;
+        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(path))
+    };
+    let mut directories: Vec<(PathBytes, TargetCondition)> = (0..1000)
+        .map(|index| {
+            let path = [parent.clone(), format!("d{index:04}").into_bytes()].join(&b'/');
+            (path, TargetCondition::Any)
+        })
+        .collect();
+    // Most are missing. A file has taken the first's place, and the second
+    // is not the directory the copy found.
+    std::fs::create_dir_all(on_disk(&directories[1].0)).unwrap();
+    std::fs::write(on_disk(&directories[0].0), b"").unwrap();
+    directories[1].1 = TargetCondition::Matches { dev: 1, ino: 1 };
+    let widened = super::planner::widen_directory_batch(
+        &mut destination,
+        &worker.opts,
+        &progress,
+        &mut Default::default(),
+        directories,
+        0o300,
+    )
+    .unwrap();
+    assert_eq!(widened, 0);
+    let sizes = sizes.lock().unwrap();
+    assert_eq!(sizes.iter().sum::<usize>(), 1000);
+    // About 10 KiB for each error: about 135 in each request.
+    assert!(
+        sizes.len() > 1 && sizes.iter().all(|&size| size < 400),
+        "{sizes:?}"
+    );
 }

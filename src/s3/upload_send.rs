@@ -237,14 +237,15 @@ pub(super) mod tests {
     where
         F: Future<Output = Result<O, Error>>,
     {
-        let (attempts, waited, error, _) = failed_upload_stopping(put).await;
+        let (attempts, waited, error, _) = failed_upload_stopping(8, put).await;
         (attempts, waited, error)
     }
 
-    /// As [`failed_upload`], after seven requests that ran out of retries
-    /// without an answer. Also returns whether this failure, as the eighth,
-    /// stopped the batch for an outage.
-    async fn failed_upload_stopping<F, O>(
+    /// As [`failed_upload`] with up to `retries` retries, after seven
+    /// requests that ran out of retries without an answer. Also returns
+    /// whether this failure, as the eighth, stopped the batch for an outage.
+    pub(in crate::s3) async fn failed_upload_stopping<F, O>(
+        retries: u32,
         mut put: impl FnMut() -> F,
     ) -> (usize, std::time::Duration, anyhow::Error, bool)
     where
@@ -256,7 +257,7 @@ pub(super) mod tests {
             outage.exhausted();
         }
         let upload = Upload {
-            retries: 8,
+            retries,
             ..upload(&flag, &outage)
         };
         let mut attempts = 0;
@@ -373,7 +374,7 @@ pub(super) mod tests {
         ];
         for (client, message) in cases {
             let (attempts, waited, error, stopped) =
-                failed_upload_stopping(|| put(&client, bytes::Bytes::from_static(b"x").into()))
+                failed_upload_stopping(8, || put(&client, bytes::Bytes::from_static(b"x").into()))
                     .await;
             assert_eq!(
                 (attempts, waited, stopped),
@@ -383,7 +384,7 @@ pub(super) mod tests {
             assert!(format!("{error:#}").contains(message), "{error:#}");
         }
         let client = client(unreachable, static_credentials());
-        let (attempts, waited, error, stopped) = failed_upload_stopping(|| {
+        let (attempts, waited, error, stopped) = failed_upload_stopping(8, || {
             client
                 .put_object()
                 .bucket("b")
@@ -499,7 +500,7 @@ pub(super) mod tests {
             client(unavailable, static_credentials()),
         ] {
             let (attempts, waited, error, stopped) =
-                failed_upload_stopping(|| put(&client, bytes::Bytes::from_static(b"x").into()))
+                failed_upload_stopping(8, || put(&client, bytes::Bytes::from_static(b"x").into()))
                     .await;
             assert_eq!((attempts, stopped), (9, true), "{error:#}");
             assert!(waited >= std::time::Duration::from_secs(20), "{waited:?}");

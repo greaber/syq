@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Verify existing commands across parallel S3 listing branches and pages."""
 from concurrent.futures import ThreadPoolExecutor
+import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -49,8 +51,56 @@ def check():
                        check=True, timeout=120)
         assert c.listing(prefix + '/') == [prefix + '/']
         assert c.request('GET', outside)[1] == b'outside'
-    print('Parallel S3 enumeration passed: download bytes, server copy, prune, removal, literal selectors', flush=True)
+    check_parts()
+    print('Parallel S3 enumeration passed: download bytes, server copy, prune, removal, literal selectors, listing in parts', flush=True)
 
+
+def check_parts():
+    """A prefix wide enough that its listing is handed to several listings.
+
+    Objects sit beside the directories, start with their names, and need URL
+    encoding, and the last directory is ignored. Only endpoints that document
+    key order divide a listing; a test hook of debug builds lets this server
+    divide too, and the same checks run without it.
+    """
+    prefix = c.PREFIX + '/wide'
+    # Over 64 directories, so that parts cover several directories each.
+    objects = {f'{prefix}/shard {shard:03}/f{i:03}': b'x'
+               for shard in range(70) for i in range(200)}
+    objects.update({f'{prefix}/zz ignored/f{i:04}': b'x' for i in range(300)})
+    # MinIO cannot hold an object and a directory of the same name; the
+    # in-memory fixture of the unit tests covers that.
+    objects.update({key: b'beside' for key in (
+        prefix + '/shard 050.txt', prefix + '/shard 1', prefix + '/shard 069+',
+        prefix + '/zz', prefix + '/文')})
+    objects.update({prefix + '/shard 010/': b'', prefix + '/zz ignored/': b''})
+    remote = 's3://' + c.BUCKET
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        list(pool.map(lambda item: c.request('PUT', item[0], item[1]), objects.items()))
+    assert set(c.listing(prefix + '/')) == set(objects), 'independent listing must see the fixture'
+    for divide in (True, False):
+        env = {key: value for key, value in os.environ.items()
+               if key != 'SYQ_TEST_S3_DIVIDE_LISTINGS'}
+        if divide:
+            env['SYQ_TEST_S3_DIVIDE_LISTINGS'] = '1'
+        listed = subprocess.run([c.SYQ, '_ls', f'{remote}/{prefix}/**', '--s3-region', c.REGION],
+                                capture_output=True, text=True, timeout=120, env=env)
+        assert listed.returncode == 0, listed.stderr
+        assert ('listing divided into parts' in listed.stderr) == divide, listed.stderr
+        keys = [json.loads(line)['key'] for line in listed.stdout.splitlines()]
+        assert len(keys) == len(objects) and set(keys) == set(objects)
+    # check() above copies without the hook; this copy lists in parts.
+    with tempfile.TemporaryDirectory(prefix='syq-enumeration-') as temp:
+        destination = Path(temp).resolve() / 'download'
+        copied = c.run(['--from', remote, '--srcs-in', prefix, '--into', destination,
+                        '--ignore', 'zz ignored/'],
+                       env=env | {'SYQ_TEST_S3_DIVIDE_LISTINGS': '1'}, capture=True)
+        assert 'listing divided into parts' in copied.stderr, copied.stderr
+        expected = {key[len(prefix) + 1:] for key in objects
+                    if not key.endswith('/') and '/zz ignored/' not in key}
+        actual = {str(path.relative_to(destination))
+                  for path in destination.rglob('*') if path.is_file()}
+        assert actual == expected
 
 if __name__ == '__main__':
     try:

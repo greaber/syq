@@ -289,3 +289,156 @@ async fn the_sdk_sends_the_body_that_matches_its_request_checksum() {
     assert_eq!(header.as_deref(), Some(checksum.as_str()));
     assert!(received == data, "the body differs from the file");
 }
+
+/// An SDK client whose uploads go to a local server that reads each request
+/// and answers 200.
+async fn sdk() -> (aws_sdk_s3::Client, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    let Ok(byte) = socket.read_u8().await else {
+                        return;
+                    };
+                    head.push(byte);
+                }
+                let length: u64 = String::from_utf8(head)
+                    .unwrap()
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                    .map(|(_, value)| value.trim().parse().unwrap())
+                    .unwrap();
+                let mut body = (&mut socket).take(length);
+                if tokio::io::copy(&mut body, &mut tokio::io::sink())
+                    .await
+                    .ok()
+                    == Some(length)
+                {
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nETag: \"x\"\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                }
+            });
+        }
+    });
+    let http = aws_smithy_http_client::Builder::new()
+        .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
+            aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
+        ))
+        .build_https();
+    let client =
+        aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::config::Builder::new()
+                .behavior_version_latest()
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    "test", "test", None, None, "fixture",
+                ))
+                .stalled_stream_protection(
+                    aws_sdk_s3::config::StalledStreamProtectionConfig::disabled(),
+                )
+                .endpoint_url(endpoint)
+                .force_path_style(true)
+                .http_client(http)
+                .request_checksum_calculation(
+                    aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+                )
+                .build(),
+        );
+    (client, server)
+}
+
+/// Upload `length` bytes of `file`, opened for `source`, through the upload
+/// retry loop with up to `retries` retries.
+async fn sdk_upload(
+    source: &Source,
+    file: &File,
+    length: u64,
+    retries: u32,
+) -> (usize, Duration, anyhow::Error, bool) {
+    let (client, server) = sdk().await;
+    let result = crate::s3::upload_send::tests::failed_upload_stopping(retries, || {
+        client
+            .put_object()
+            .bucket("bucket")
+            .key("object")
+            .body(aws_sdk_s3::primitives::ByteStream::new(body(
+                source.clone(),
+                file.try_clone().unwrap(),
+                0,
+                length,
+            )))
+            .content_length(length as i64)
+            .customize()
+            .config_override(crate::s3::client::without_sdk_retries())
+            .disable_payload_signing()
+            .send()
+    })
+    .await;
+    server.abort();
+    result
+}
+
+/// A source that changes in place, shrinks or is removed during an upload
+/// fails it after one attempt, without backoff, and is not taken for an
+/// outage.
+#[tokio::test]
+async fn a_changed_source_fails_the_upload_without_retries() {
+    use std::os::unix::fs::FileExt as _;
+    for change in ["in place", "shrunk", "removed"] {
+        let temp = crate::test_support::tempdir().unwrap();
+        let length = 2 * CHUNK + 11;
+        let opened = opened(temp.path(), &patterned(length));
+        let path = temp.path().join("source");
+        match change {
+            "in place" => std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .write_all_at(b"changed", 0)
+                .unwrap(),
+            "shrunk" => std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(CHUNK as u64 + 10)
+                .unwrap(),
+            _ => std::fs::remove_file(&path).unwrap(),
+        }
+        let (attempts, _, error, stopped) =
+            sdk_upload(&opened.source, &opened.file, length as u64, 8).await;
+        assert_eq!((attempts, stopped), (1, false), "{change}: {error:#}");
+        assert!(
+            format!("{error:#}").contains("source changed during S3 copy"),
+            "{change}: {error:#}"
+        );
+    }
+}
+
+/// An error reading an unchanged source may pass, so the upload retries it
+/// with backoff, and running out of retries counts toward the outage stop.
+#[tokio::test]
+async fn a_read_error_is_retried() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let length = 2 * CHUNK + 11;
+    let opened = opened(temp.path(), &patterned(length));
+    // Reading a write-only handle fails, while its metadata still matches.
+    let write_only = std::fs::File::options()
+        .write(true)
+        .open(temp.path().join("source"))
+        .unwrap();
+    let (attempts, waited, error, stopped) =
+        sdk_upload(&opened.source, &write_only, length as u64, 2).await;
+    assert_eq!((attempts, stopped), (3, true), "{error:#}");
+    assert!(waited >= Duration::from_millis(300), "{waited:?}");
+    assert!(
+        !format!("{error:#}").contains("source changed"),
+        "{error:#}"
+    );
+}

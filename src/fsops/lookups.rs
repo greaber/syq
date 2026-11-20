@@ -211,6 +211,14 @@ impl PlanningLookups {
     /// receiver. The name is then `Claimed`; one that cannot be recorded is
     /// not given.
     pub(crate) fn claim(&self, relative: &[u8]) -> Claim {
+        let claim = self.claim_name(relative);
+        // Tests count what the record gave each publication.
+        #[cfg(debug_assertions)]
+        let _ = record_test_event("SYQ_TEST_PUBLICATION_CLAIMS", format_args!("{claim:?}"));
+        claim
+    }
+
+    fn claim_name(&self, relative: &[u8]) -> Claim {
         let key = self.key(relative);
         let mut names = self.names.lock().unwrap();
         match names.get(&key).copied() {

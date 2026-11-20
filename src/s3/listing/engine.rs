@@ -12,6 +12,8 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+mod parts;
+
 const MAX_CHILDREN: usize = 256;
 // Recursive discovery has no selective pattern to amortize empty/small child
 // requests. Require evidence of substantial child prefixes and bound speculative fanout.
@@ -72,6 +74,15 @@ pub(in crate::s3) trait Store {
         true
     }
 
+    /// Whether a listing with more than one request slot may be divided into
+    /// parts that run at the same time (`parts`). Every part but the last
+    /// stops at the first key handed over, so a key that the store returns
+    /// out of UTF-8 byte order after that point would be missed without an
+    /// error. Only stores whose provider documents that order divide.
+    fn divides(&self) -> bool {
+        false
+    }
+
     fn page(
         &self,
         prefix: &str,
@@ -91,6 +102,9 @@ impl<S: Store> Store for LimitedStore<'_, S> {
     fn ordered(&self) -> bool {
         self.inner.ordered()
     }
+    fn divides(&self) -> bool {
+        self.inner.divides()
+    }
     async fn page(
         &self,
         prefix: &str,
@@ -101,6 +115,35 @@ impl<S: Store> Store for LimitedStore<'_, S> {
         let _permit = self.slots.acquire().await?;
         self.inner.page(prefix, delimiter, token, start_after).await
     }
+}
+
+/// Keys arrived out of order after part of a listing was handed to other
+/// listings, so the listing may have stopped before its last key. A listing
+/// that is not divided does not depend on the order.
+#[derive(Debug)]
+pub(in crate::s3) struct Unordered;
+impl std::fmt::Display for Unordered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "S3 listing returned keys out of order; a listing with a concurrency of 1 does not rely on the order",
+        )
+    }
+}
+impl std::error::Error for Unordered {}
+
+/// The context of a failed listing of a narrower prefix that a listing in
+/// parts made: a policy may allow listing only the prefix itself.
+#[derive(Debug)]
+pub(in crate::s3) struct PartFailed;
+impl std::fmt::Display for PartFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("listing part of the prefix by itself failed")
+    }
+}
+
+/// Whether this listing is divided into parts rather than listed as below.
+fn in_parts(store: &impl Store, concurrency: usize) -> bool {
+    concurrency > 1 && store.ordered() && store.divides()
 }
 
 #[derive(Clone)]
@@ -500,6 +543,9 @@ pub(super) async fn enumerate(
         }
         return Ok(());
     }
+    if in_parts(store, concurrency) {
+        return parts::enumerate(store, pattern, concurrency, &mut emit).await;
+    }
     enumerate_jobs(
         store,
         Some(pattern),
@@ -520,10 +566,15 @@ pub(super) async fn enumerate(
 /// This only changes request scheduling; callers still validate and interpret
 /// object metadata, source types and destination mappings.
 ///
-/// With `prune`, the listing stays flat apart from the lookahead, and
-/// directories it names may be skipped: their common prefixes are returned
-/// instead of being listed. Objects in pruned directories may still be
-/// emitted, so callers must classify every entry themselves.
+/// With `prune`, directories it names may be skipped: their common prefixes
+/// are returned instead of being listed. Objects in pruned directories may
+/// still be emitted, so callers must classify every entry themselves. Unless
+/// the listing is divided into parts, it stays flat with `prune` apart from
+/// the lookahead.
+///
+/// A listing in parts fails with [`Unordered`] when keys arrive out of order
+/// after part of it was handed to others; with a concurrency of one, or a
+/// store that does not divide, it is never in parts.
 pub(in crate::s3) async fn enumerate_prefix(
     store: &impl Store,
     prefix: &str,
@@ -531,6 +582,13 @@ pub(in crate::s3) async fn enumerate_prefix(
     prune: Option<&Prune<'_>>,
     mut emit: impl FnMut(Entry) -> Result<()>,
 ) -> Result<Vec<String>> {
+    ensure!(
+        (1..=256).contains(&concurrency),
+        "concurrency must be between 1 and 256"
+    );
+    if in_parts(store, concurrency) {
+        return parts::enumerate_prefix(store, prefix, concurrency, prune, &mut emit).await;
+    }
     enumerate_jobs(
         store,
         None,

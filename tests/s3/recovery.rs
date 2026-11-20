@@ -30,8 +30,11 @@ pub(super) fn serve_upload(
                 .unwrap();
             let _ = std::io::copy(&mut socket.take(length as u64), &mut std::io::sink());
         } else {
+            // Another part's body can see this change and stop early.
             let mut body = vec![0; length];
-            socket.read_exact(&mut body).unwrap();
+            if socket.read_exact(&mut body).is_err() {
+                return;
+            }
             (&file).write_all(b"more").unwrap();
             reply(
                 socket,

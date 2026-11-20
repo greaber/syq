@@ -62,14 +62,6 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
     let remote = format!("fake:{}", t.s("dst"));
     let marker = t.path("drop-after-samples");
     let cache = t.path("tuning.json");
-    write(
-        &cache,
-        serde_json::to_string_pretty(&serde_json::json!({
-            "paths": { "local>fake|ssh": 2 }
-        }))
-        .unwrap()
-        .as_bytes(),
-    );
 
     let mut command = compat_command();
     command
@@ -92,7 +84,7 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("XDG_CONFIG_HOME", t.path("config"))
         .env("SYQ_TUNING_CACHE", &cache)
-        // Match the unscoped legacy cache fixture regardless of the host network.
+        // Keep the history's route key independent of the host network.
         .env("SYQ_TEST_TUNING_NETWORK", "")
         .env("SYQ_DEBUG", "1")
         .env("SYQ_TEST_TUNE_SAMPLE_MS", "50");
@@ -508,7 +500,6 @@ fn one_worker_hint_prepares_spare_before_slow_connection_is_ready() {
     write(&t.path("src/one"), &data);
     write(&t.path("src/two"), &data);
     let cache = t.path("tuning.json");
-    write(&cache, br#"{"paths":{"local>fake|ssh":1}}"#);
     let remote = format!("fake:{}", t.s("dst"));
     let mut command = compat_command();
     command
@@ -529,7 +520,7 @@ fn one_worker_hint_prepares_spare_before_slow_connection_is_ready() {
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("XDG_CONFIG_HOME", t.path("config"))
         .env("SYQ_TUNING_CACHE", &cache)
-        // Match the unscoped legacy cache fixture regardless of the host network.
+        // Keep the history's route key independent of the host network.
         .env("SYQ_TEST_TUNING_NETWORK", "")
         .env("SYQ_DEBUG", "1")
         .env("SYQ_TEST_TUNE_SAMPLE_MS", "50");
