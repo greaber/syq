@@ -572,16 +572,80 @@ permissions, approval trusts the server to choose uploaded contents and object
 settings, such as tags or Object Lock retention, because some services accept
 request headers that a signature does not cover. Anyone with the URLs can
 reuse them until they expire; stopping receiving does not revoke them. The
-protections for filesystem copies do not apply: receiving roots, per-copy
-byte, entry, and deletion limits, and single-use signed copies.
+protections for filesystem copies do not apply: receiving roots, the
+receiving machine's own byte, entry, and deletion limits, and single-use
+signed copies.
+
+The machine that signs works out what to allow from the command alone, and
+signs nothing else:
+
+- **The bucket** the command names.
+- **The paths.** A download covers each source path and everything under it.
+  An upload whose sources the command names covers each source's own name
+  inside the destination and everything under it: `syq cp project --to
+  s3://bucket --into backups` covers `backups/project`, not the rest of
+  `backups`, and with no placement option it covers `project`, not the rest
+  of the bucket. The prompt lists these paths. An upload covers the whole
+  destination path instead when the command does not fix the names: with
+  `--srcs-in`, whose names come from the directory's contents, with
+  `--mapping`, with `--into-existing` or `--into-new`, which look at the
+  destination directory itself, and with more than 1024 named sources (a copy
+  between a server and a bucket refuses that many instead). A copy between
+  two buckets covers each source in the source bucket and the whole
+  destination path.
+- **The operations.** A download can only read. An upload can also write. It
+  can delete only with `--prune` or `--prune-before`, and then no more objects
+  than `--max-delete` allows: the signing machine counts the deletions it
+  signs and refuses the rest. With `--dry-run` it can only read.
+
+Some things the signing machine cannot check, because it does not see the
+files being copied. `--where`, `--ignore` and `--copy-if` choose among the
+server's files, so they shape what an honest server does and do not narrow
+what is signed: a compromised server can read, replace or, with pruning,
+delete any object under the covered paths, up to the deletion limit. It also
+chooses the contents it uploads. Name a destination used for nothing else
+when that matters.
 
 Upload approval is not a write-only grant. It includes reading object
-contents and metadata within the approved destination paths, to compare with
-existing files. When updates are allowed, it also permits reading destination
+contents and metadata within the covered paths, to compare with existing
+files. When updates are allowed, it also permits reading destination
 tags, updating tags on the current destination object, and copying an object
 onto itself to update metadata. It does not authorize tag changes on older
 versions or copying a different destination object as the source;
 bucket-to-bucket copies need a separately approved source.
+
+A [copy between a server and a bucket](object-storage.md#copy-between-a-server-and-a-bucket)
+that you start from another machine gives the server signed URLs in the same
+way, within the same limits. Who signs depends on the command:
+
+- **Without `--auth-from`, the machine where you type the command signs, and
+  there is no prompt.** Typing the command is the approval. That machine works
+  out the limits above before it contacts the server, and refuses any request
+  outside them, which ends the copy. syq says so when that machine's
+  credentials expire before the URLs would.
+- **With `--auth-from @NAME`, the receiving machine NAME signs, after you
+  approve its prompt.** It checks the command and shows the same request as
+  for any storage authorization. The
+  machine where you typed the command holds no storage credentials: it passes
+  the server's signing requests to NAME and the signed URLs back, so it sees
+  those URLs as the server does, and passes nothing else. The option chooses who signs for storage only;
+  the login to the server uses the typing machine's own SSH access.
+
+Either way, the URLs last seven days, or until the signing credentials
+expire if that is sooner, and file data travels only between the server and
+the storage service. Values given with `--s3-header` and `--s3-write-header`
+are sent to the server, because it makes the requests. A customer-provided
+encryption key (the `x-amz-server-side-encryption-customer-*` headers) would
+be sent with them, so syq refuses such a copy; run syq on the server to copy
+with that key.
+
+A compromised server, or anyone who gets the URLs from it, can use them until
+they expire for anything inside the limits. Ending the command stops the copy
+but does not revoke URLs already signed; nothing can, short of revoking the
+credentials that signed them. The secret access key never leaves the machine
+that signs. This is narrower than forwarding credentials to the server, which
+would let it do anything those credentials allow, anywhere, for as long as
+they last.
 
 ## SSH account access
 

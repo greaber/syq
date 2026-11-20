@@ -1,6 +1,11 @@
 use super::super::super::listing::engine::Entry;
+use super::super::DestinationListing;
 use super::*;
-use std::{cell::RefCell, collections::BTreeMap, ops::Bound};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashMap},
+    ops::Bound,
+};
 
 /// A bucket in key order. A continuation token names the last key returned.
 struct Bucket {
@@ -13,6 +18,8 @@ struct Bucket {
     repeated: Option<String>,
     /// Each request's lower bound, and whether it continued the last one.
     requests: RefCell<Vec<(String, bool)>>,
+    /// Each request's prefix.
+    prefixes: RefCell<Vec<String>>,
 }
 impl Bucket {
     fn new(keys: impl IntoIterator<Item = String>) -> Self {
@@ -23,6 +30,7 @@ impl Bucket {
             disordered: None,
             repeated: None,
             requests: RefCell::default(),
+            prefixes: RefCell::default(),
         }
     }
 }
@@ -39,6 +47,7 @@ impl Store for Bucket {
     ) -> Result<Page> {
         assert!(!delimiter);
         assert!(token.is_none() || start_after.is_none());
+        self.prefixes.borrow_mut().push(prefix.to_owned());
         let after = token.or(start_after.filter(|_| self.honors_start));
         self.requests
             .borrow_mut()
@@ -85,32 +94,50 @@ impl Store for Bucket {
 /// Run the listing to its end, as `Discovery::start` and its task do, and
 /// return what it decided about each planned key.
 async fn discover(bucket: &Bucket, prefix: &str, plan: &[String]) -> Vec<Listed> {
-    let mut walk = walk(prefix, plan);
+    let keys = Keys::new(plan.iter().map(|key| key.as_str().into()));
+    let whole = Segment::whole(prefix.to_owned(), &keys);
+    discover_segments(bucket, vec![whole], keys).await
+}
+
+/// Like `discover`, listing each of `prefixes` for the planned keys beneath
+/// it, as a copy that may list only those does.
+async fn discover_under(bucket: &Bucket, prefixes: &[&str], plan: &[String]) -> Vec<Listed> {
+    let keys = Keys::new(plan.iter().map(|key| key.as_str().into()));
+    let prefixes: Vec<String> = prefixes.iter().map(|prefix| (*prefix).to_owned()).collect();
+    let segments = segments(&keys, &prefixes);
+    discover_segments(bucket, segments, keys).await
+}
+
+async fn discover_segments(bucket: &Bucket, segments: Vec<Segment>, keys: Keys) -> Vec<Listed> {
+    let len = keys.len();
+    let mut walk = Walk::new(
+        segments,
+        keys,
+        (0..len).map(|_| AtomicU64::new(UNKNOWN)).collect(),
+    );
+    let plan = 0..len;
+    if walk.segments.is_empty() {
+        return plan.map(|_| Listed::Unknown).collect();
+    }
     if bucket.ordered {
         while walk.page(bucket).await.unwrap() {}
     } else {
         walk.whole(bucket).await.unwrap();
     }
-    (0..plan.len())
-        .map(|index| match walk.sizes[index].load(Relaxed) {
-            _ if index >= walk.decided => Listed::Unknown,
-            UNKNOWN => Listed::Unknown,
-            ABSENT => Listed::Absent,
-            size => Listed::Present(size),
-        })
-        .collect()
+    plan.map(|index| match walk.sizes[index].load(Relaxed) {
+        _ if index >= walk.decided => Listed::Unknown,
+        UNKNOWN => Listed::Unknown,
+        ABSENT => Listed::Absent,
+        size => Listed::Present(size),
+    })
+    .collect()
 }
 
 fn walk(prefix: &str, plan: &[String]) -> Walk {
-    Walk {
-        prefix: prefix.to_owned(),
-        keys: Keys::new(plan.iter().map(|key| key.as_str().into())),
-        sizes: (0..plan.len()).map(|_| AtomicU64::new(UNKNOWN)).collect(),
-        decided: 0,
-        shortfall: 0,
-        passed: String::new(),
-        token: None,
-    }
+    let keys = Keys::new(plan.iter().map(|key| key.as_str().into()));
+    let whole = Segment::whole(prefix.to_owned(), &keys);
+    let sizes = (0..plan.len()).map(|_| AtomicU64::new(UNKNOWN)).collect();
+    Walk::new(vec![whole], keys, sizes)
 }
 
 /// The listing as the copy finds it when preparation starts, as
@@ -123,6 +150,7 @@ async fn at_copy_start(bucket: &Bucket, prefix: &str, plan: &[String]) -> Discov
         finished: !more,
     });
     Discovery {
+        listed: std::iter::once(0..plan.len()).collect(),
         sizes: walk.sizes,
         reach,
         task: None,
@@ -143,7 +171,7 @@ fn cp(flags: &[&str]) -> Args {
 /// preparation will see it.
 async fn presigned(
     args: &Args,
-    complete: Option<&HashMap<String, u64>>,
+    complete: Option<&DestinationListing>,
     discovery: Option<&Discovery>,
     plan: &[String],
 ) -> Vec<String> {
@@ -212,11 +240,69 @@ async fn existing_keys_and_untrusted_absences_keep_their_checks() {
         checked
     );
     // Pruning lists the whole destination first.
-    let complete: HashMap<_, _> = existing.iter().map(|key| (key.clone(), 1)).collect();
+    let complete = DestinationListing {
+        prefixes: vec!["data/".to_owned()],
+        keys: existing.iter().map(|key| (key.clone(), 1)).collect(),
+    };
     assert_eq!(
         presigned(&cp(&[]), Some(&complete), None, &plan).await,
         existing
     );
+}
+
+#[tokio::test]
+async fn keys_outside_a_complete_listing_keep_their_checks() {
+    // Pruning under signatures for named sources lists only the named
+    // directory; the named file beside it exists, and the listing cannot say.
+    let plan = ["data/dir/new".to_owned(), "data/file".to_owned()];
+    let complete = DestinationListing {
+        prefixes: vec!["data/dir/".to_owned()],
+        keys: HashMap::new(),
+    };
+    let args = cp(&["--prune"]);
+    assert_eq!(
+        listed(&args, Some(&complete), None, 1, "data/file").await,
+        Listed::Unknown
+    );
+    assert_eq!(
+        presigned(&args, Some(&complete), None, &plan).await,
+        ["data/file"]
+    );
+}
+
+#[tokio::test]
+async fn keys_outside_every_named_prefix_are_decided_at_once() {
+    let plan = named_plan();
+    let bucket = Bucket::new(["dst/a/1".to_owned(), "dst/a.txt".to_owned()]);
+    let keys = Keys::new(plan.iter().map(|key| key.as_str().into()));
+    let prefixes: Vec<String> = NAMED.map(str::to_owned).into();
+    let found = segments(&keys, &prefixes);
+    let listed: Vec<_> = found.iter().map(|segment| segment.range.clone()).collect();
+    let sizes: Arc<[AtomicU64]> = (0..plan.len()).map(|_| AtomicU64::new(UNKNOWN)).collect();
+    let mut walk = Walk::new(found, keys, sizes.clone());
+    // Before any page: the walk has not reached the named directories.
+    let (sender, reach) = watch::channel(Reach {
+        decided: walk.decided,
+        finished: false,
+    });
+    let discovery = Discovery {
+        listed,
+        sizes,
+        reach,
+        task: None,
+    };
+    let at = |key: &str| plan.iter().position(|planned| planned == key).unwrap();
+    // A named file and a lone key are checked with HEAD, whatever the walk.
+    assert_eq!(discovery.known(at("dst/a.txt")), Some(Listed::Unknown));
+    assert_eq!(discovery.lookup(at("dst/c/q")).await, Listed::Unknown);
+    assert_eq!(discovery.known(at("dst/a/2")), None);
+    while walk.page(&bucket).await.unwrap() {}
+    sender.send_replace(Reach {
+        decided: walk.decided,
+        finished: true,
+    });
+    assert_eq!(discovery.known(at("dst/a/2")), Some(Listed::Absent));
+    assert_eq!(discovery.lookup(at("dst/a/1")).await, Listed::Present(1));
 }
 
 #[tokio::test]
@@ -243,6 +329,7 @@ async fn keys_the_listing_has_not_decided_are_presigned() {
         finished: true,
     });
     let ended = Discovery {
+        listed: discovery.listed.clone(),
         sizes: discovery.sizes.clone(),
         reach,
         task: None,
@@ -571,4 +658,137 @@ fn keys_are_found_by_position_and_by_name() {
     assert_eq!((keys.get(0), keys.get(1), keys.get(2)), ("a", "b/", "b/c"));
     assert_eq!(keys.find("b/c"), Some(2));
     assert_eq!(keys.find("b"), None);
+}
+
+/// Named sources at the destination `dst/`: directories `a`, `a-b` and `c`
+/// and the file `a.txt`. `a.txt` and every `a-b/` key sort between `a` and
+/// its contents.
+fn named_plan() -> Vec<String> {
+    let mut plan: Vec<String> = [
+        "dst/a/",
+        "dst/a/1",
+        "dst/a/2",
+        "dst/a/3",
+        "dst/a-b/x",
+        "dst/a-b/y",
+        "dst/a.txt",
+        "dst/c/q",
+    ]
+    .map(str::to_owned)
+    .into();
+    plan.sort();
+    plan
+}
+const NAMED: [&str; 4] = ["dst/a/", "dst/a-b/", "dst/a.txt/", "dst/c/"];
+
+#[test]
+fn keys_beneath_each_prefix_form_one_segment() {
+    let plan = named_plan();
+    let keys = Keys::new(plan.iter().map(|key| key.as_str().into()));
+    let prefixes: Vec<String> = NAMED.map(str::to_owned).into();
+    let found = segments(&keys, &prefixes);
+    let at = |key: &str| plan.iter().position(|planned| planned == key).unwrap();
+    // `a.txt` has nothing beneath it and `c` one key, which HEAD checks.
+    assert_eq!(
+        found,
+        [
+            Segment {
+                prefix: "dst/a-b/".into(),
+                range: at("dst/a-b/x")..at("dst/a-b/y") + 1,
+            },
+            Segment {
+                prefix: "dst/a/".into(),
+                range: at("dst/a/")..at("dst/a/3") + 1,
+            },
+        ]
+    );
+    // A prefix inside another is listed with it, not again.
+    let nested: Vec<String> = ["dst/a/", "dst/a/1/"].map(str::to_owned).into();
+    assert_eq!(segments(&keys, &nested).len(), 1);
+    // The whole destination is one segment.
+    assert_eq!(
+        segments(&keys, &["dst/".to_owned()]),
+        [Segment::whole("dst/".into(), &keys)]
+    );
+}
+
+#[tokio::test]
+async fn named_prefixes_are_listed_each_for_its_own_keys() {
+    let plan = named_plan();
+    // Siblings outside every named prefix, also between them in key order.
+    let bucket = Bucket::new(
+        [
+            "dst/a-a",
+            "dst/a-b/x",
+            "dst/a.txt",
+            "dst/a/1",
+            "dst/a/3",
+            "dst/b",
+            "dst/c/q",
+        ]
+        .map(str::to_owned),
+    );
+    let listed = discover_under(&bucket, &NAMED, &plan).await;
+    assert_true(&bucket, &plan, &listed);
+    let by_key: BTreeMap<_, _> = plan.iter().map(String::as_str).zip(listed).collect();
+    assert_eq!(by_key["dst/a-b/x"], Listed::Present(2));
+    assert_eq!(by_key["dst/a-b/y"], Listed::Absent);
+    assert_eq!(by_key["dst/a/"], Listed::Absent);
+    assert_eq!(by_key["dst/a/1"], Listed::Present(4));
+    assert_eq!(by_key["dst/a/2"], Listed::Absent);
+    assert_eq!(by_key["dst/a/3"], Listed::Present(5));
+    // Checked with HEAD: a named file, and a lone key.
+    assert_eq!(by_key["dst/a.txt"], Listed::Unknown);
+    assert_eq!(by_key["dst/c/q"], Listed::Unknown);
+    // One request per listed prefix, and none outside them.
+    assert_eq!(*bucket.prefixes.borrow(), ["dst/a-b/", "dst/a/"]);
+}
+
+#[tokio::test]
+async fn unordered_bucket_lists_each_named_prefix_whole() {
+    let plan = named_plan();
+    let mut bucket = Bucket::new(
+        [
+            "dst/a-a",
+            "dst/a-b/x",
+            "dst/a.txt",
+            "dst/a/1",
+            "dst/a/3",
+            "dst/b",
+            "dst/c/q",
+        ]
+        .map(str::to_owned),
+    );
+    bucket.ordered = false;
+    let listed = discover_under(&bucket, &NAMED, &plan).await;
+    assert_true(&bucket, &plan, &listed);
+    let decided = listed.iter().filter(|listed| **listed != Listed::Unknown);
+    assert_eq!(decided.count(), 6);
+    assert_eq!(*bucket.prefixes.borrow(), ["dst/a-b/", "dst/a/"]);
+}
+
+#[tokio::test]
+async fn sparse_named_prefix_stops_only_its_own_listing() {
+    // A sparse plan under "big/" stops listing there, as for the whole
+    // destination; the next prefix is still listed.
+    let bucket = Bucket::new(large().into_iter().chain(["more/f1".to_owned()]));
+    let mut plan: Vec<_> = (0..300).map(|d| format!("big/d{d:03}/f050")).collect();
+    plan.extend(["more/f1".to_owned(), "more/f2".to_owned()]);
+    let listed = discover_under(&bucket, &["big/", "more/"], &plan).await;
+    assert_true(&bucket, &plan, &listed);
+    assert_eq!(bucket.requests.borrow().len(), SLACK_PAGES + 2);
+    assert_eq!(listed[299], Listed::Unknown);
+    assert_eq!(&listed[300..], [Listed::Present(30001), Listed::Absent]);
+    assert_eq!(bucket.prefixes.borrow().last().unwrap(), "more/");
+}
+
+#[tokio::test]
+async fn named_prefixes_each_holding_one_planned_key_are_not_listed() {
+    let plan: Vec<String> = (0..300).map(|d| format!("big/d{d:03}/new")).collect();
+    let prefixes: Vec<String> = (0..300).map(|d| format!("big/d{d:03}/")).collect();
+    let prefixes: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+    let bucket = Bucket::new(large());
+    let listed = discover_under(&bucket, &prefixes, &plan).await;
+    assert!(listed.iter().all(|listed| *listed == Listed::Unknown));
+    assert!(bucket.requests.borrow().is_empty());
 }

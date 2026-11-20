@@ -85,6 +85,7 @@ COPY --from=storage-fixture /usr/bin/silo /usr/local/libexec/syq-test-s3-server
 COPY tests/object-storage/check.py /usr/local/libexec/syq-storage-check.py
 COPY tests/real-ssh/test-storage-authorization.py /usr/local/libexec/syq-test-storage-authorization.py
 COPY tests/real-ssh/storage-streams.py /usr/local/libexec/syq-storage-streams.py
+COPY tests/real-ssh/test-server-storage.py /usr/local/libexec/syq-test-server-storage.py
 
 COPY --from=builder /opt/openssh-8.8 /opt/openssh-8.8
 COPY --from=builder /tmp/syq-test-sk.so /usr/local/lib/syq-test-sk.so
