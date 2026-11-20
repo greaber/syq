@@ -825,6 +825,56 @@ fn opening_existing_history_needs_no_writer_lock() {
     );
 }
 
+/// While the history opens it holds no descriptor of its own on the file,
+/// only SQLite's, even while it waits for another run's lock: a copy counts
+/// its open descriptors as the history opens in the background
+/// (`require_source_descriptor_capacity`).
+#[test]
+fn opening_the_history_holds_only_sqlite_descriptors_while_it_waits() {
+    use std::os::unix::fs::MetadataExt;
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let holder = open(&path).unwrap();
+    let file = std::fs::metadata(&path).unwrap();
+    let on_file = || {
+        let directory = ["/proc/self/fd", "/dev/fd"]
+            .into_iter()
+            .find(|directory| Path::new(directory).is_dir())
+            .unwrap();
+        std::fs::read_dir(directory)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                std::fs::metadata(entry.path())
+                    .is_ok_and(|m| (m.dev(), m.ino()) == (file.dev(), file.ino()))
+            })
+            .count()
+    };
+    // Another run holds the history, so the opening waits for it.
+    holder
+        .execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;")
+        .unwrap();
+    let before = on_file();
+    std::thread::scope(|scope| {
+        let opening = scope.spawn(|| open_waiting(&path, Duration::from_secs(30)));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while on_file() == before {
+            assert!(Instant::now() < deadline, "the history never opened");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut most = 0;
+        let sampled = Instant::now();
+        while sampled.elapsed() < Duration::from_millis(300) {
+            most = most.max(on_file() - before);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Closing the other run's connection lets the opening through.
+        drop(holder);
+        opening.join().unwrap().unwrap();
+        assert_eq!(most, 1, "descriptors on the history while it opened");
+    });
+}
+
 #[test]
 fn concurrent_initialization_shares_one_identity_key() {
     let temp = crate::test_support::tempdir().unwrap();
