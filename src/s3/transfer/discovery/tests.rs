@@ -11,6 +11,8 @@ use std::{
 struct Bucket {
     objects: BTreeMap<String, u64>,
     ordered: bool,
+    /// Whether the listing may rely on byte order (`Store::divides`).
+    divides: bool,
     honors_start: bool,
     /// The request, counted from one, whose page comes back out of order.
     disordered: Option<usize>,
@@ -28,6 +30,7 @@ impl Bucket {
         Self {
             objects: keys.into_iter().zip(1..).collect(),
             ordered: true,
+            divides: true,
             honors_start: true,
             disordered: None,
             repeated: None,
@@ -40,6 +43,9 @@ impl Bucket {
 impl Store for Bucket {
     fn ordered(&self) -> bool {
         self.ordered
+    }
+    fn divides(&self) -> bool {
+        self.divides
     }
     async fn page(
         &self,
@@ -116,17 +122,22 @@ async fn discover_under(bucket: &Bucket, prefixes: &[&str], plan: &[String]) -> 
     discover_segments(bucket, segments, keys).await
 }
 
-async fn discover_segments(bucket: &Bucket, segments: Vec<Segment>, keys: Keys) -> Vec<Listed> {
+async fn discover_segments(bucket: &impl Store, segments: Vec<Segment>, keys: Keys) -> Vec<Listed> {
     let len = keys.len();
     let mut walk = Walk::new(segments, Arc::new(keys), Arc::new(Decisions::new(len)));
     let plan = 0..len;
     if walk.segments.is_empty() {
         return plan.map(|_| Listed::Unknown).collect();
     }
-    if bucket.ordered {
-        while walk.page(bucket).await.unwrap() {}
+    // As `Discovery::start` does, without the copy going on meanwhile.
+    if !bucket.ordered() {
+        walk.whole(bucket, usize::MAX, 0).await.unwrap();
+    } else if !bucket.divides() {
+        walk.whole(bucket, PAGES_BEFORE_COPY, BACKGROUND_KEYS)
+            .await
+            .unwrap();
     } else {
-        walk.whole(bucket).await.unwrap();
+        while walk.page(bucket).await.unwrap() {}
     }
     plan.map(|index| {
         if index >= walk.decided {
@@ -158,6 +169,7 @@ async fn at_copy_start(bucket: &Bucket, prefix: &str, plan: &[String]) -> Discov
         listed: vec![(0..plan.len(), 0)],
         decisions: walk.decisions,
         reach: vec![reach],
+        waits: true,
         tasks: Vec::new(),
     }
 }
@@ -297,6 +309,7 @@ async fn keys_outside_every_named_prefix_are_decided_at_once() {
         listed,
         decisions,
         reach: vec![reach],
+        waits: true,
         tasks: Vec::new(),
     };
     let at = |key: &str| plan.iter().position(|planned| planned == key).unwrap();
@@ -340,6 +353,7 @@ async fn keys_the_listing_has_not_decided_are_presigned() {
         listed: discovery.listed.clone(),
         decisions: discovery.decisions.clone(),
         reach: vec![reach],
+        waits: true,
         tasks: Vec::new(),
     };
     assert_eq!(
@@ -923,8 +937,13 @@ async fn first_pages_are_where_each_prefix_listing_starts() {
         bucket.ordered = ordered;
         let keys = Keys::new(plan.iter().map(|key| key.as_str().into()));
         let segments = segments(&keys, &prefixes);
-        let first: Vec<_> = first_pages(&segments, &keys, ordered)
-            .map(|(prefix, after)| (prefix.to_owned(), after))
+        let first: Vec<_> = first_pages(&segments, &keys, ordered, true)
+            .map(|request| {
+                (
+                    request.query["prefix"].clone(),
+                    request.query.get("start-after").cloned(),
+                )
+            })
             .collect();
         let expected_prefixes: &[&str] = if ordered {
             &["dst/a-b/", "dst/a/", "dst/l/"]
@@ -947,6 +966,170 @@ async fn first_pages_are_where_each_prefix_listing_starts() {
         if ordered {
             assert_eq!(first[2].1.as_deref(), Some(predecessor("dst/l/b").as_str()));
         }
+    }
+}
+
+/// Lists in the order measured on Cloudflare R2: as if every key ended in a
+/// byte just above `9`, so `a0000` comes before `a`. StartAfter follows the
+/// same order, and a continuation token names the last key returned.
+struct R2Order {
+    objects: Vec<(String, u64)>,
+    divides: bool,
+}
+impl R2Order {
+    fn position(key: &str) -> Vec<u8> {
+        let mut position = key.as_bytes().to_vec();
+        position.extend([b'9', 0xff]);
+        position
+    }
+    fn new(keys: impl IntoIterator<Item = String>) -> Self {
+        let mut objects: Vec<_> = keys.into_iter().zip(1..).collect();
+        objects.sort_by_key(|(key, _)| Self::position(key));
+        Self {
+            objects,
+            divides: false,
+        }
+    }
+}
+impl Store for R2Order {
+    fn divides(&self) -> bool {
+        self.divides
+    }
+    async fn page(
+        &self,
+        prefix: &str,
+        _: bool,
+        token: Option<&str>,
+        start_after: Option<&str>,
+    ) -> Result<Page> {
+        let after = token.or(start_after).map(Self::position);
+        let mut matching = self.objects.iter().filter(|(key, _)| {
+            key.starts_with(prefix)
+                && after
+                    .as_ref()
+                    .is_none_or(|after| Self::position(key) > *after)
+        });
+        let entries: Vec<_> = matching
+            .by_ref()
+            .take(1000)
+            .map(|(key, size)| Entry {
+                key: key.clone(),
+                size: *size,
+                last_modified: None,
+                etag: None,
+            })
+            .collect();
+        let next = matching.next().map(|_| entries.last().unwrap().key.clone());
+        Ok(Page {
+            next,
+            entries,
+            prefixes: Vec::new(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn absence_is_concluded_only_where_the_store_lists_in_byte_order() {
+    // The destination holds `d/a` after a thousand longer keys in R2's
+    // order; a page of them looks ordered and passes `d/a` and `d/a-`.
+    let destination = || {
+        (0..1000)
+            .map(|i| format!("d/a{i:04}"))
+            .chain(["d/a".to_owned()])
+    };
+    let plan = ["d/a".to_owned(), "d/a-".to_owned()];
+    let keys = || Keys::new(plan.iter().map(|key| key.as_str().into()));
+    let decide =
+        |store| discover_segments(store, vec![Segment::whole("d/".into(), &keys())], keys());
+    // Taken to be in byte order, the listing would call the existing `d/a`
+    // absent, and an upload would replace it, dropping metadata only the
+    // destination has.
+    let mut store = R2Order::new(destination());
+    store.divides = true;
+    assert_eq!(decide(&store).await, [Listed::Absent, Listed::Absent]);
+    // Where the order is not known, the incomplete listing decides nothing:
+    // both get a HEAD.
+    let store = R2Order::new(destination());
+    assert_eq!(decide(&store).await, [Listed::Unknown, Listed::Unknown]);
+    // A listing that completes shows absence in any order, for a plan large
+    // enough to list for.
+    let plan: Vec<String> = ["d/a".to_owned(), "d/a-".to_owned()]
+        .into_iter()
+        .chain((0..BACKGROUND_KEYS).map(|i| format!("d/n{i:03}")))
+        .collect();
+    let keys = Keys::new(plan.iter().map(|key| key.as_str().into()));
+    let store = R2Order::new(
+        (0..10)
+            .map(|i| format!("d/a{i:04}"))
+            .chain(["d/a".to_owned()]),
+    );
+    let listed = discover_segments(&store, vec![Segment::whole("d/".into(), &keys)], keys).await;
+    assert_eq!(listed[..2], [Listed::Present(11), Listed::Absent]);
+    assert!(listed[2..].iter().all(|listed| *listed == Listed::Absent));
+}
+
+#[tokio::test]
+async fn in_another_order_only_a_short_complete_listing_decides() {
+    // A small prefix: one complete page decides every key.
+    let plan: Vec<String> = (0..300)
+        .map(|i| format!("d/f{i:03}"))
+        .chain(["d/new".to_owned()])
+        .collect();
+    let mut bucket = Bucket::new(plan.iter().filter(|key| *key != "d/new").cloned());
+    bucket.divides = false;
+    let listed = discover(&bucket, "d/", &plan).await;
+    assert!(listed[..300]
+        .iter()
+        .all(|listed| matches!(listed, Listed::Present(_))));
+    assert_eq!(listed[300], Listed::Absent);
+    assert_eq!(bucket.requests.borrow().len(), 1);
+    // A large prefix costs the pages the copy waits for, then every key
+    // gets a HEAD.
+    let mut bucket = Bucket::new(large());
+    bucket.divides = false;
+    let plan: Vec<String> = (0..200).map(|i| format!("big/zz/new{i:03}")).collect();
+    let listed = discover(&bucket, "big/", &plan).await;
+    assert!(listed.iter().all(|listed| *listed == Listed::Unknown));
+    assert_eq!(bucket.requests.borrow().len(), PAGES_BEFORE_COPY);
+}
+
+#[tokio::test]
+async fn in_another_order_no_key_waits_for_the_listing() {
+    // The complete listing runs alongside the copy; a key it has not decided
+    // gets a HEAD at once, and one it has decided is relied on at once, before
+    // the listing of later prefixes ends.
+    let (_sender, reach) = watch::channel(Reach {
+        decided: 0,
+        finished: false,
+    });
+    let discovery = Discovery {
+        listed: vec![(0..2, 0)],
+        decisions: Arc::new(Decisions::new(2)),
+        reach: vec![reach],
+        waits: false,
+        tasks: Vec::new(),
+    };
+    let lookup = discovery.lookup(1);
+    let listed = tokio::time::timeout(std::time::Duration::from_secs(5), lookup).await;
+    assert_eq!(listed.unwrap(), Listed::Unknown);
+    assert_eq!(discovery.known(1), None);
+    // The first prefix's listing completed and showed the key absent.
+    discovery.decisions.store(1, ABSENT);
+    assert_eq!(discovery.lookup(1).await, Listed::Absent);
+    assert_eq!(discovery.known(1), Some(Listed::Absent));
+}
+
+#[test]
+fn a_listing_of_at_most_one_object_settles_every_key() {
+    let plan = ["d/a".to_owned(), "d/b".to_owned()];
+    for (object, expected) in [
+        (None, [Listed::Absent, Listed::Absent]),
+        (Some(("d/a", 3)), [Listed::Present(3), Listed::Absent]),
+    ] {
+        let mut walk = walk("d/", &plan);
+        walk.settle(object);
+        assert_eq!(walk.decided, 2);
+        assert_eq!([0, 1].map(|index| walk.decisions.get(index)), expected);
     }
 }
 
@@ -978,6 +1161,8 @@ mod signed {
         /// Requests under way, and the most there have been at once.
         in_flight: Arc<AtomicUsize>,
         most: Arc<AtomicUsize>,
+        /// Answer every listing with every key, whatever its prefix.
+        ignores_prefix: bool,
     }
     impl HttpConnector for Served {
         fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
@@ -996,7 +1181,7 @@ mod signed {
             let mut matching = self
                 .objects
                 .range::<str, _>((lower, Bound::Unbounded))
-                .filter(|(key, _)| key.starts_with(prefix.as_str()));
+                .filter(|(key, _)| self.ignores_prefix || key.starts_with(prefix.as_str()));
             let entries: Vec<_> = matching.by_ref().take(1000).collect();
             let next = matching.next().map(|_| entries.last().unwrap().0);
             let mut xml = format!(
@@ -1059,6 +1244,7 @@ mod signed {
             delay: Duration::ZERO,
             in_flight: Arc::default(),
             most: Arc::default(),
+            ignores_prefix: false,
         }
     }
     const ARGV: &[&str] = &[
@@ -1278,6 +1464,134 @@ mod signed {
         prefixes.dedup();
         assert_eq!((requests.len(), prefixes.len()), (40, 40));
         assert_eq!(served.most.load(Relaxed), LISTINGS);
+    }
+
+    #[tokio::test]
+    async fn where_order_is_unknown_the_requests_sent_are_the_ones_signed() {
+        let served = served();
+        let (mut engine, authorization) = engine(ARGV, &served, true);
+        let authorization = authorization.unwrap();
+        // Not known to list in byte order.
+        engine.options.endpoint = Some("https://account.r2.cloudflarestorage.com".into());
+        let mut plan = plan();
+        engine
+            .discover_destination(&mut plan, &[], |key: &String| key.as_str().into())
+            .await
+            .unwrap();
+        // The short request first, then each prefix's first page without a
+        // start: all signed up front.
+        let mut presigned: Vec<_> = authorization
+            .signed_so_far()
+            .into_iter()
+            .filter(|request| request.query.contains_key("list-type"))
+            .map(|request| {
+                (
+                    request.query["prefix"].clone(),
+                    request.query["max-keys"].clone(),
+                )
+            })
+            .collect();
+        presigned.sort();
+        // Only `b` plans enough keys to list for.
+        let expected_pages = [("dst/a/", "1"), ("dst/b/", "1000")];
+        assert_eq!(
+            presigned,
+            expected_pages.map(|(prefix, size)| (prefix.to_owned(), size.to_owned()))
+        );
+        let discovery = engine.discovery.get().unwrap();
+        discovery.reach[0]
+            .clone()
+            .wait_for(|reach| reach.finished)
+            .await
+            .unwrap();
+        // `a` and `c` are left to HEAD. `b`'s two pages show the keys they
+        // list present, and nothing absent: the listing did not complete.
+        let listed = decisions(&engine, &plan).await;
+        for (listed, key) in listed.iter().zip(&plan) {
+            if key.starts_with("dst/b/") {
+                assert!(
+                    matches!(listed, Listed::Present(5) | Listed::Unknown),
+                    "{key}"
+                );
+            } else {
+                assert_eq!(*listed, Listed::Unknown, "{key}");
+            }
+        }
+        let shown = listed
+            .iter()
+            .filter(|listed| matches!(listed, Listed::Present(_)))
+            .count();
+        assert_eq!(shown, 2000);
+        // Only `b`'s second page, which continues from its first response,
+        // was signed later; nothing started after a key.
+        let listings = signed_listings(&authorization);
+        assert!(listings.iter().all(|(_, after, _)| after.is_none()));
+        assert_eq!(
+            listings
+                .iter()
+                .filter(|(_, _, continued)| *continued)
+                .count(),
+            1
+        );
+        assert_eq!(served.requests.lock().unwrap().len(), listings.len());
+    }
+
+    #[tokio::test]
+    async fn a_short_listing_that_returns_more_than_asked_settles_nothing() {
+        // `Served` ignores `max-keys`: the short request returns both keys.
+        let served = Served {
+            objects: Arc::new(
+                [("dst/a/1", 1), ("dst/a/2", 2)]
+                    .map(|(key, size)| (key.to_owned(), size))
+                    .into(),
+            ),
+            requests: Arc::default(),
+            delay: Duration::ZERO,
+            in_flight: Arc::default(),
+            most: Arc::default(),
+            ignores_prefix: false,
+        };
+        let (mut engine, _) = engine(
+            &["cp", "/src/a", "--to", "s3://fixture", "--into", "dst"],
+            &served,
+            false,
+        );
+        engine.options.endpoint = Some("https://account.r2.cloudflarestorage.com".into());
+        let mut plan = vec!["dst/a/1".to_owned(), "dst/a/2".to_owned()];
+        engine
+            .discover_destination(&mut plan, &[], |key: &String| key.as_str().into())
+            .await
+            .unwrap();
+        // Both get a HEAD; neither is taken to be absent.
+        assert_eq!(
+            decisions(&engine, &plan).await,
+            [Listed::Unknown, Listed::Unknown]
+        );
+        assert_eq!(served.requests.lock().unwrap()[0]["max-keys"], "1");
+    }
+
+    #[tokio::test]
+    async fn a_short_listing_outside_its_prefix_fails_the_copy() {
+        let served = Served {
+            objects: Arc::new([("unrelated/a".to_owned(), 1)].into()),
+            requests: Arc::default(),
+            delay: Duration::ZERO,
+            in_flight: Arc::default(),
+            most: Arc::default(),
+            ignores_prefix: true,
+        };
+        let (mut engine, _) = engine(
+            &["cp", "/src/a", "--to", "s3://fixture", "--into", "dst"],
+            &served,
+            false,
+        );
+        engine.options.endpoint = Some("https://account.r2.cloudflarestorage.com".into());
+        let mut plan = vec!["dst/a/1".to_owned(), "dst/a/2".to_owned()];
+        let error = engine
+            .discover_destination(&mut plan, &[], |key: &String| key.as_str().into())
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("outside the requested prefix"));
     }
 
     #[test]

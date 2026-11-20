@@ -983,12 +983,12 @@ impl Engine {
                     // together saves a round trip to the signing machine
                     // for each prefix the listing reaches.
                     let ordered = super::listing::lists_in_key_order(&self.options.bucket);
-                    self.authorize_all(discovery::first_pages(&segments, &keys, ordered).map(
-                        |(prefix, after)| {
-                            super::listing::first_page_request(prefix, after.as_deref())
-                        },
-                    ))
-                    .await?;
+                    let divides = super::listing::lists_in_byte_order(
+                        self.options.endpoint.as_deref(),
+                        &self.options.bucket,
+                    );
+                    self.authorize_all(discovery::first_pages(&segments, &keys, ordered, divides))
+                        .await?;
                     return self.start_discovery(segments, keys).await;
                 }
             }
@@ -1065,6 +1065,7 @@ impl Engine {
     ) -> Result<()> {
         let discovery = Discovery::start(
             self.client.clone(),
+            self.options.endpoint.as_deref(),
             &self.options.bucket,
             segments,
             keys,
