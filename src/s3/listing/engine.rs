@@ -382,22 +382,36 @@ pub(super) async fn enumerate(
         (1..=256).contains(&concurrency),
         "concurrency must be between 1 and 256"
     );
-    if byte_ordered(store) && pattern.components.iter().all(|part| part.literal()) {
-        // In byte order the exact prefix itself, if present, precedes every
-        // longer key. Keep LIST permissions (no HEAD).
+    if pattern.components.iter().all(|part| part.literal()) {
         let key = pattern
             .components
             .iter()
             .map(|part| part.literal_prefix())
             .collect::<Vec<_>>()
             .join("/");
+        // Keep LIST permissions (no HEAD). In byte order the exact key, if
+        // present, precedes every longer key on the first page.
         let page = read(store, &key, false, None).await?;
-        for entry in page.entries {
-            if entry.key == key {
-                emit(entry)?;
-            }
+        let truncated = page.next.is_some();
+        if let Some(entry) = page.entries.into_iter().find(|entry| entry.key == key) {
+            return emit(entry);
         }
-        return Ok(());
+        if byte_ordered(store) || !truncated {
+            return Ok(());
+        }
+        // In another order it can come after longer keys. A delimiter
+        // listing leaves out the deeper ones; stop at the key.
+        let mut token = None;
+        loop {
+            let page = read(store, &key, true, token.as_deref()).await?;
+            if let Some(entry) = page.entries.into_iter().find(|entry| entry.key == key) {
+                return emit(entry);
+            }
+            let Some(next) = page.next else {
+                return Ok(());
+            };
+            token = Some(next);
+        }
     }
     if in_parts(store, concurrency) {
         return parts::enumerate(store, pattern, concurrency, &mut emit).await;

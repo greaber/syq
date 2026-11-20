@@ -37,7 +37,7 @@ const DENSE_DIRECTORY: usize = 256;
 const PART_PAGES: usize = 4;
 // A listing that shows two dense directories within three pages, under a
 // prefix with at most this many children, lists every remaining child at
-// once. Unfiltered listings did so before parts existed and keep that start.
+// once; filtered listings do not.
 const BURST_CHILDREN: usize = 64;
 const BURST_PAGES: usize = 3;
 
@@ -623,8 +623,8 @@ impl Walk {
     }
 
     /// Grant the burst once the first pages and the prefix's children say
-    /// whether it applies. As in the split it keeps, a listing must be known
-    /// to need a third page: a burst costs a request for each child.
+    /// whether it applies. A listing must be known to need a third page: a
+    /// burst costs a request for each child.
     fn decide_burst(&mut self) {
         let root = &self.parts[0];
         if root.done || (root.pages > 0 && !root.dense) {
@@ -642,7 +642,7 @@ impl Walk {
             .values()
             .filter(|keys| **keys >= DENSE_DIRECTORY)
             .count();
-        // Master's split also needs a dense directory on the first page.
+        // A burst also needs a dense directory on the first page.
         if narrow && !root.done && root.dense {
             if dense >= 2 {
                 self.burst = root.ahead.len();

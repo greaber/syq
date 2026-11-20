@@ -296,7 +296,7 @@ async fn literal_prefix_enumeration_preserves_metacharacters_and_overlap() {
 }
 
 #[tokio::test]
-async fn sparse_trees_stay_flat_and_exact_keys_stop_after_one_page() {
+async fn sparse_trees_stay_flat_and_exact_keys_stop_after_one_page_in_byte_order() {
     for per_directory in [4, 40] {
         let store =
             Memory::new((0..256).flat_map(|d| {
@@ -339,10 +339,37 @@ async fn sparse_trees_stay_flat_and_exact_keys_stop_after_one_page() {
     .unwrap();
     assert_eq!(found, ["exact"]);
     assert_eq!(store.0.calls.borrow().len(), 1);
-    // Without that order, every key that starts with it is listed.
-    let store = Memory::new(keys());
-    assert_eq!(listed(&store, "exact", 32).await, ["exact"]);
-    assert_eq!(store.calls.borrow().len(), 4);
+    // Without that order, a key found on the first page needs no more, and
+    // that page is the same request: a policy that refuses delimiters allows
+    // it.
+    struct NoDelimiter(Memory);
+    impl Store for NoDelimiter {
+        async fn page(
+            &self,
+            prefix: &str,
+            delimiter: bool,
+            token: Option<&str>,
+            start_after: Option<&str>,
+        ) -> Result<Page> {
+            anyhow::ensure!(!delimiter, "refused");
+            self.0.page(prefix, delimiter, token, start_after).await
+        }
+    }
+    let store = NoDelimiter(Memory::new(keys()));
+    let mut found = Vec::new();
+    engine::enumerate(
+        &store,
+        &Pattern::parse("s3://bucket/exact").unwrap(),
+        32,
+        |entry| {
+            found.push(entry.key);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(found, ["exact"]);
+    assert_eq!(*store.0.calls.borrow(), [("exact".to_owned(), false)]);
 }
 
 #[tokio::test]
@@ -707,7 +734,8 @@ async fn listings_from_a_store_not_in_byte_order_miss_no_key() {
         assert!(missing.is_empty(), "concurrency {concurrency}: {missing:?}");
         assert_eq!(keys.len(), expected.len());
     }
-    // A whole page of longer keys comes before the exact key.
+    // A whole page of longer keys comes before the exact key; deeper ones
+    // are left out once the first page shows that.
     let store = R2Order(Memory::new((0..1000).map(|i| format!("a/{i:04}")).chain([
         "a".into(),
         "a0".into(),
@@ -727,5 +755,9 @@ async fn listings_from_a_store_not_in_byte_order_miss_no_key() {
         .await
         .unwrap();
         assert_eq!(keys, ["a"], "concurrency {concurrency}");
+        assert_eq!(
+            store.0.calls.borrow_mut().split_off(0),
+            [("a".into(), false), ("a".into(), true)]
+        );
     }
 }
