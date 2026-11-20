@@ -1266,6 +1266,34 @@ async fn a_key_the_glob_cannot_match_needs_no_check() {
     .await
     .unwrap();
     assert_eq!(keys.len(), 1001);
+    // Nor after a common prefix whose key the glob cannot match.
+    let store = DelimiterOnly(Memory::new(
+        (0..999)
+            .map(|i| format!("edge/x{i:03}-2020"))
+            .chain(["edge/p/a", "edge/z-2020"].map(String::from)),
+    ));
+    let mut keys = Vec::new();
+    let suffixed = Pattern::parse("s3://bucket/edge/*-2020").unwrap();
+    engine::enumerate(&store, &suffixed, 1, |entry| {
+        keys.push(entry.key);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(keys.len(), 1000);
+    // A later page that holds a common prefix fails the listing with the
+    // refusal, though earlier pages were listed.
+    let store = DelimiterOnly(Memory::new(
+        (0..1000)
+            .map(|i| format!("edge/a{i:04}"))
+            .chain((0..999).map(|i| format!("edge/b{i:03}")))
+            .chain(["edge/q/x", "edge/q0", "edge/zz"].map(String::from)),
+    ));
+    store.0.skips.set(true);
+    let error = engine::enumerate(&store, &pattern, 1, |_| Ok(()))
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("without a delimiter"));
     // Nor can a literal name be the key, which is longer than the prefix.
     let store = DelimiterOnly(Memory::new(
         std::iter::once("runs/day/f0".to_owned())
@@ -1354,6 +1382,20 @@ async fn an_empty_page_settles_nothing_about_a_skipped_key() {
             (("edge/p0", None), Err(())),
         ],
     ];
+    // Nor does an empty first page of an exact key's listing.
+    let store = Scripted(HashMap::from([
+        (("edge/p0", None), page(&[], &[], Some("x"))),
+        (("edge/p0", Some("x")), page(&["edge/p0"], &[], None)),
+    ]));
+    let mut keys = Vec::new();
+    let exact = Pattern::parse("s3://bucket/edge/p0").unwrap();
+    engine::enumerate(&store, &exact, 1, |entry| {
+        keys.push(entry.key);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(keys, ["edge/p0"]);
     for case in cases {
         let mut pages: HashMap<_, _> = case.into_iter().collect();
         pages.insert(("edge/", None), page(&first, &["edge/p/"], Some("1")));

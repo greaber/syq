@@ -147,6 +147,18 @@ fn refused(error: &anyhow::Error) -> bool {
         .is_some_and(crate::s3::client::RequestFailure::denied)
 }
 
+/// Whether a key the pattern wants could be missing from the page after
+/// `page`, in a store that skips only the key `P0` after a common prefix `P/`
+/// in whatever order it lists.
+fn may_hide(page: &Page, wanted: impl Fn(&str) -> bool) -> bool {
+    page.next.is_some()
+        && page.prefixes.iter().any(|prefix| {
+            prefix
+                .strip_suffix('/')
+                .is_some_and(|stem| wanted(&format!("{stem}0")))
+        })
+}
+
 /// Whether the store's listings may rely on UTF-8 byte order.
 fn byte_ordered(store: &impl Store) -> bool {
     store.ordered() && store.divides()
@@ -280,7 +292,7 @@ impl Gap {
             }
         };
         if let Some(refused) = &refused {
-            ensure!(page.next.is_none() || page.prefixes.is_empty(), "{refused}");
+            ensure!(!may_hide(&page, &wanted), "{refused}");
         }
         let mut next = Gap::after(&page, wanted);
         next.refused = refused;
@@ -406,9 +418,9 @@ async fn execute(
             };
             match read(store, &query, false, None).await {
                 Ok(flat) => return Ok(scan_batch(query, false, flat, Gap::default())),
-                // A policy may require a delimiter. A page of nothing but
-                // objects leaves nothing out after it; go on while they are.
-                Err(error) if refused(&error) && page.prefixes.is_empty() => {
+                // A policy may require a delimiter. Go on with it while no
+                // page could be followed by a wanted key left out.
+                Err(error) if refused(&error) && !may_hide(&page, |key| pattern.matches(key)) => {
                     let gap = Gap {
                         key: None,
                         refused: Some(format!("{:#}", error.context(why()))),
@@ -548,10 +560,12 @@ pub(super) async fn enumerate(
         // present, precedes every longer key on the first page.
         let page = read(store, &key, false, None).await?;
         let flat = page.next;
+        let first_empty = page.entries.is_empty();
         if let Some(entry) = page.entries.into_iter().find(|entry| entry.key == key) {
             return emit(entry);
         }
-        if byte_ordered(store) || flat.is_none() {
+        // An empty first page that goes on settles nothing.
+        if flat.is_none() || (byte_ordered(store) && !first_empty) {
             return Ok(());
         }
         // In another order it can come after longer keys. A delimiter
