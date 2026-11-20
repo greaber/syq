@@ -384,32 +384,51 @@ pub(super) fn switch_when_idle(domain: &Domain) -> Result<()> {
 fn ask_stop_if_idle(domain: &Domain) -> Result<Snapshot> {
     let mut stream = connect(domain, true)?;
     crate::destination::write_message(&mut stream, &Control::StopIfIdle)?;
-    let asked = Instant::now();
-    let mut noted = false;
-    loop {
-        let until = asked
-            + if noted {
-                STOP_TIMEOUT
-            } else {
-                SLOW_ANSWER_NOTE
-            };
-        if crate::sys::readable_within(
-            stream.as_raw_fd(),
-            until.saturating_duration_since(Instant::now()),
-        ) {
-            break;
-        }
-        if asked.elapsed() >= STOP_TIMEOUT {
-            return Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
-        }
-        if !noted && asked.elapsed() >= SLOW_ANSWER_NOTE {
-            crate::output::diagnostic!(
-                "syq: waiting for the old local SSH authorization provider to answer whether it is idle"
-            );
-            noted = true;
+    crate::destination::read_framed(
+        &mut SlowAnswer {
+            socket: &stream,
+            asked: Instant::now(),
+            noted: false,
+        },
+        MAX_STATUS,
+        "provider status",
+    )
+}
+/// Reads an answer to `StopIfIdle`, every part of it, until `STOP_TIMEOUT`
+/// after it was asked, saying once after `SLOW_ANSWER_NOTE` that it waits.
+/// It waits by `poll`, as macOS refuses to change a socket's timeouts once
+/// the other end has closed it.
+struct SlowAnswer<'a> {
+    socket: &'a UnixStream,
+    asked: Instant,
+    noted: bool,
+}
+impl Read for SlowAnswer<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let until = self.asked
+                + if self.noted {
+                    STOP_TIMEOUT
+                } else {
+                    SLOW_ANSWER_NOTE
+                };
+            if crate::sys::readable_within(
+                self.socket.as_raw_fd(),
+                until.saturating_duration_since(Instant::now()),
+            ) {
+                return self.socket.read(bytes);
+            }
+            if self.asked.elapsed() >= STOP_TIMEOUT {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            if !self.noted && self.asked.elapsed() >= SLOW_ANSWER_NOTE {
+                crate::output::diagnostic!(
+                    "syq: waiting for the old local SSH authorization provider to answer whether it is idle"
+                );
+                self.noted = true;
+            }
         }
     }
-    crate::destination::read_framed(&mut stream, MAX_STATUS, "provider status")
 }
 
 /// Replace a provider from another build that cannot follow updates by
@@ -534,11 +553,11 @@ struct Service {
     /// Of those, the ones that say whether anything uses them.
     account_links: ssh_auth::AccountLinks,
     /// Refusing new requests while it ends idle account connections to
-    /// switch builds (`stop_if_idle`).
+    /// switch builds (`stop_if_idle_answering`).
     switching: AtomicBool,
-    /// Held by the one `stop_if_idle` running.
+    /// Held by the one `stop_if_idle_answering` running.
     stop_attempt: Mutex<()>,
-    /// Notified when `stop_if_idle` decides; `admit` waits for that.
+    /// Notified when `stop_if_idle_answering` decides; `admit` waits for that.
     switch_decided: (Mutex<()>, std::sync::Condvar),
     /// The path the provider follows, and its switch to a new build.
     started_from: Option<String>,
@@ -654,10 +673,7 @@ impl Service {
                 .map(|profile| profile.approvals.snapshots().len())
                 .sum::<usize>()
     }
-    /// Stop if nothing is in progress (`busy`), after ending the account
-    /// connections nothing uses; whether it did. One attempt runs at a
-    /// time; another meanwhile does not stop it. New requests wait from
-    /// before the decision, and are admitted if it does not stop.
+    /// [`Service::stop_if_idle_answering`] with nobody to answer.
     #[cfg(test)]
     fn stop_if_idle(&self) -> bool {
         self.stop_if_idle_answering(|_| true)
@@ -675,9 +691,14 @@ impl Service {
         });
         written
     }
-    /// [`Service::stop_if_idle`], stopping only if `answer`, given whether
-    /// it would stop, says the one asking heard it: a switch that has
-    /// stopped waiting keeps the provider it meant to replace.
+    /// Stop if nothing is in progress (`busy`), after ending the account
+    /// connections nothing uses; whether it did. One attempt runs at a
+    /// time; another meanwhile does not stop it. New requests wait from
+    /// before the decision, and are admitted if it does not stop.
+    ///
+    /// `answer`, given whether it would stop, answers the one asking and
+    /// says whether it could: a switch that has stopped waiting keeps the
+    /// provider it meant to replace, so it stops only once answered.
     fn stop_if_idle_answering(&self, answer: impl FnOnce(bool) -> bool) -> bool {
         let Ok(_attempt) = self.stop_attempt.try_lock() else {
             answer(false);
@@ -2394,8 +2415,9 @@ mod tests {
     ) -> std::thread::JoinHandle<Vec<&'static str>> {
         stand_in_provider_answering_after(domain, lock, build, pid, busy, Duration::ZERO, then)
     }
-    /// As `stand_in_provider`, deciding whether to stop if idle only after
-    /// `delay`, as a provider slow to end its idle account connections does.
+    /// As `stand_in_provider`, finishing its answer to stop if idle only
+    /// `delay` after its first bytes, as a provider descheduled between
+    /// writing a frame's length and its contents does.
     fn stand_in_provider_answering_after(
         domain: &Domain,
         lock: LockFile,
@@ -2432,6 +2454,7 @@ mod tests {
                     },
                 )
                 .unwrap();
+                let mut answer_delay = Duration::ZERO;
                 let stopping = match crate::destination::read_message(&mut stream).unwrap() {
                     Control::Status => {
                         seen.push("status");
@@ -2443,7 +2466,7 @@ mod tests {
                     }
                     Control::StopIfIdle => {
                         seen.push("stop if idle");
-                        std::thread::sleep(delay);
+                        answer_delay = delay;
                         busy == 0
                     }
                     Control::Refresh | Control::Decide(_) => panic!("unexpected request"),
@@ -2460,13 +2483,16 @@ mod tests {
                     switch: None,
                     stopping,
                 };
-                // As a provider does, whether or not the client still waits.
-                let _ = crate::destination::write_framed(
-                    &mut stream,
-                    &reply,
-                    MAX_STATUS,
-                    "provider status",
-                );
+                // As a provider does, whether or not the client still waits,
+                // and in two writes: the length, then after any `delay`
+                // left, the status.
+                let reply = serde_json::to_vec(&reply).unwrap();
+                let _ = stream
+                    .write_all(&(reply.len() as u32).to_be_bytes())
+                    .and_then(|()| {
+                        std::thread::sleep(answer_delay);
+                        stream.write_all(&reply)
+                    });
                 if stopping {
                     // Like a provider, remove the socket before the lock.
                     fs::remove_file(&path).unwrap();
@@ -2511,10 +2537,10 @@ mod tests {
         assert_eq!(seen.last(), Some(&"stop"));
     }
 
-    /// A provider may decide whether it is idle only after the switch's
-    /// usual two seconds, while it ends idle account connections. The
-    /// switch waits for that answer and follows it, here to a provider that
-    /// agreed to stop and the busy one that took over after it.
+    /// A provider may finish answering whether it is idle only after the
+    /// switch's usual two seconds. The switch waits for the whole answer and
+    /// follows it, here to a provider that agreed to stop and the busy one
+    /// that took over after it.
     #[test]
     fn a_switch_follows_a_late_answer_to_stop_if_idle() {
         let (_directory, domain, _) = fixture();
@@ -2565,7 +2591,6 @@ mod tests {
         let _: HelloReply = crate::destination::read_message(&mut client).unwrap();
         crate::destination::write_message(&mut client, &Control::StopIfIdle).unwrap();
         drop(client);
-        std::thread::sleep(Duration::from_millis(200));
         drop(held);
         let _ = worker.join().unwrap();
         assert!(!service.stop.load(Ordering::SeqCst));
