@@ -1851,7 +1851,7 @@ fn stop_when_idle(control: &Path) -> Result<bool> {
             return error;
         }
         error.context(format!(
-            "receiving service is running but did not answer at {} whether it is idle; run the command again, or check syq persist status",
+            "receiving service did not answer at {} whether it is idle",
             suffixed(control, SOCKET).display()
         ))
     })?;
@@ -4029,8 +4029,8 @@ mod tests {
         })
     }
 
-    /// A service that does not answer whether it is idle in time is named,
-    /// with what to do, rather than reported as a bare read timeout.
+    /// A service that does not answer in time whether it is idle is named,
+    /// rather than reported as a bare read timeout; callers say what to do.
     #[test]
     fn a_service_that_does_not_answer_whether_it_is_idle_is_named() {
         let (_root, control, _lock) = locked_control();
@@ -4046,7 +4046,7 @@ mod tests {
         service.join().unwrap();
         assert!(
             error.starts_with(&format!(
-                "receiving service is running but did not answer at {} whether it is idle",
+                "receiving service did not answer at {} whether it is idle",
                 suffixed(&control, SOCKET).display()
             )),
             "{error}"
