@@ -15,8 +15,8 @@ from tooling import ToolError, json_output, output, report_errors
 
 def watch(run_id, repository):
     sys.stdout.flush()
-    # A full ci.yml run takes many minutes; polling every 3 s (the default)
-    # spends the account's shared API quota for nothing.
+    # This runs in a workflow, whose token allows about 1,000 API requests an
+    # hour; polling a long ci.yml run every 3 s (the default) could use them up.
     return subprocess.run(["gh", "run", "watch", str(run_id), "--repo", repository,
                            "--exit-status", "--interval", "30"]).returncode
 
