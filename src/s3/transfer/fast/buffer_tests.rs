@@ -322,46 +322,7 @@ pub(super) fn planning_engine(extra: &[&str]) -> Engine {
         "--as",
         "destination",
     ];
-    let args = Arc::new(
-        Args::parse_args(
-            &argv
-                .iter()
-                .chain(extra)
-                .map(std::ffi::OsString::from)
-                .collect::<Vec<_>>(),
-        )
-        .unwrap(),
-    );
-    let options = args.s3.clone().unwrap();
-    let tuning = crate::s3::tuning::Tuning::new(
-        &options,
-        &args,
-        Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
-    );
-    let config = aws_sdk_s3::config::Builder::new()
-        .behavior_version_latest()
-        .region(aws_sdk_s3::config::Region::new("us-east-1"))
-        .build();
-    Engine {
-        args,
-        options,
-        tuning,
-        client: Client::from_conf(config),
-        progress: Progress::new(false, false, None),
-        bandwidth: None,
-        upload_keys: OnceLock::new(),
-        discovery: OnceLock::new(),
-        authorization: None,
-        copy_checksum_unsupported: Default::default(),
-        content_md5: Default::default(),
-        file_permissions: Default::default(),
-        metadata_replacements: Default::default(),
-        copy_tagging_unsupported: Default::default(),
-        outage: Default::default(),
-        cancelled: Default::default(),
-        cancel_wake: Default::default(),
-        uploads: Default::default(),
-    }
+    super::super::tests::engine(&[&argv, extra].concat())
 }
 
 #[test]

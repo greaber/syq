@@ -926,6 +926,17 @@ impl Authorization {
             }
         }
     }
+    /// Every request signed so far.
+    #[cfg(test)]
+    pub(crate) fn signed_so_far(&self) -> Vec<Unsigned> {
+        self.state
+            .lock()
+            .unwrap()
+            .requests
+            .keys()
+            .cloned()
+            .collect()
+    }
     pub(crate) fn signed(&self, request: Unsigned) -> Result<String> {
         if now()? >= self.configuration.expires_at {
             return Err(self.expired());
