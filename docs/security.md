@@ -589,8 +589,9 @@ signs nothing else:
   destination path instead when the command does not fix the names: with
   `--srcs-in`, whose names come from the directory's contents, with
   `--mapping`, with `--into-existing` or `--into-new`, which look at the
-  destination directory itself, and with more than 1024 named sources. A copy
-  between two buckets covers each source in the source bucket and the whole
+  destination directory itself, and with more than 1024 named sources (a copy
+  between a server and a bucket refuses that many instead). A copy between
+  two buckets covers each source in the source bucket and the whole
   destination path.
 - **The operations.** A download can only read. An upload can also write. It
   can delete only with `--prune` or `--prune-before`, and then no more objects
@@ -620,21 +621,23 @@ way, within the same limits. Who signs depends on the command:
 - **Without `--auth-from`, the machine where you type the command signs, and
   there is no prompt.** Typing the command is the approval. That machine works
   out the limits above before it contacts the server, and refuses any request
-  outside them, which ends the copy. The URLs last 24 hours, or until its
-  credentials expire if that is sooner; syq says so when the credentials
-  expire first.
+  outside them, which ends the copy. syq says so when that machine's
+  credentials expire before the URLs would.
 - **With `--auth-from @NAME`, the receiving machine NAME signs, after you
   approve its prompt.** It checks the command and shows the same request as
-  for any storage authorization, and its URLs last up to seven days. The
+  for any storage authorization. The
   machine where you typed the command holds no storage credentials: it passes
   the server's signing requests to NAME and the signed URLs back, so it sees
   those URLs as the server does, and passes nothing else. The option chooses who signs for storage only;
   the login to the server uses the typing machine's own SSH access.
 
-Either way, file data travels only between the server and the storage
-service, and values given with `--s3-header` and `--s3-write-header`, such as
-a customer-provided encryption key, are sent to the server because it makes
-the requests.
+Either way, the URLs last seven days, or until the signing credentials
+expire if that is sooner, and file data travels only between the server and
+the storage service. Values given with `--s3-header` and `--s3-write-header`
+are sent to the server, because it makes the requests. A customer-provided
+encryption key (the `x-amz-server-side-encryption-customer-*` headers) would
+be sent with them, so syq refuses such a copy; run syq on the server to copy
+with that key.
 
 A compromised server, or anyone who gets the URLs from it, can use them until
 they expire for anything inside the limits. Ending the command stops the copy

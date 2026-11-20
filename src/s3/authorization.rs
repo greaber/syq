@@ -741,9 +741,9 @@ impl Authorization {
     fn expired(&self) -> anyhow::Error {
         if self.started_elsewhere {
             anyhow::anyhow!(
-                "the signed storage URLs for this copy expired at {}; they last {} hours, or until the credentials that signed them expire if that is sooner. Run the copy again to continue it",
+                "the signed storage URLs for this copy expired at {}; they last {}, or until the credentials that signed them expire if that is sooner. Run the copy again to continue it",
                 started::time(self.configuration.expires_at),
-                self.configuration.requested_lifetime / 3600
+                started::duration(self.configuration.requested_lifetime)
             )
         } else {
             anyhow::anyhow!("storage authorization expired; rerun the copy for fresh approval")
@@ -963,7 +963,10 @@ const NAMED_ROOTS: usize = 1024;
 /// destination is the root when the command does not say which names the
 /// copy produces (`--srcs-in`, a mapping, a copy between buckets), when it
 /// tests the destination directory itself (the `-existing` and `-new`
-/// placements), and when it names more sources than a request lists.
+/// placements), and when it names more sources than a request lists. (A
+/// copy between a server and a bucket never does: like a copy between two
+/// servers, it refuses more named sources than that before it signs
+/// anything.)
 ///
 /// The machine that signs derives the signed paths from this, and the copy
 /// lists the destination under the same roots, so the two cannot disagree.

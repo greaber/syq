@@ -198,11 +198,17 @@ its connection, the copy on the server stops. Run it again to continue; the
 server keeps the records of interrupted uploads and downloads, and your
 machine signs again.
 
-Requests are signed before data starts moving and stay valid for 24 hours, or
-until your credentials expire if that is sooner, as temporary credentials
-often do within an hour; syq then says when. With `--auth-from @NAME` they
-stay valid for up to seven days. A copy that runs longer fails its remaining
-files; run it again to continue.
+Requests are signed before data starts moving and stay valid for seven days,
+as for any storage authorization, or until the signing credentials expire if
+that is sooner, as temporary credentials often do within an hour; syq then
+says when. A copy that runs longer fails its remaining files; run it again to
+continue.
+
+Headers you add with `--s3-header` and `--s3-write-header` are sent to the
+server, which makes the requests. A customer-provided encryption key would be
+sent with them, so these copies refuse the
+`x-amz-server-side-encryption-customer-*` headers; to copy with such a key,
+run syq on the server.
 
 These copies do not support `--detach`, `--mapping`,
 `--stream-mapping-fd` or the options for copies between two servers

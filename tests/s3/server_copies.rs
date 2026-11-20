@@ -21,14 +21,28 @@ pub(super) fn serve(
     let (case, directory) = fault.split_once(':').unwrap();
     let directory = Path::new(directory);
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let field = |name: &str| {
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+    };
     {
         let mut log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(directory.join("request-log"))
             .unwrap();
+        // A listing's line ends with the prefix it lists.
+        let prefix = field("list-type")
+            .map(|_| {
+                format!(
+                    " prefix={}",
+                    field("prefix").unwrap_or("").replace("%2F", "/")
+                )
+            })
+            .unwrap_or_default();
         // One write, so that concurrent requests keep their own lines.
-        log.write_all(format!("{method} {path}\n").as_bytes())
+        log.write_all(format!("{method} {path}{prefix}\n").as_bytes())
             .unwrap();
     }
     // The server holds no credentials: it can only send what was signed.
@@ -36,18 +50,14 @@ pub(super) fn serve(
         !headers.contains_key("authorization"),
         "{method} {target}: the server signed a request itself"
     );
-    let field = |name: &str| {
-        query
-            .split('&')
-            .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
-    };
     assert!(
         field("X-Amz-Signature").is_some(),
         "{method} {target}: not a signed URL"
     );
     let expires: u64 = field("X-Amz-Expires").unwrap().parse().unwrap();
+    // As long as the URLs any --auth-from copy gets.
     assert!(
-        (23 * 60 * 60..=24 * 60 * 60).contains(&expires),
+        (7 * 24 * 60 * 60 - 3600..=7 * 24 * 60 * 60).contains(&expires),
         "signed for {expires} seconds"
     );
     // The command's header reached the server over the signing session.
@@ -233,15 +243,29 @@ fn a_server_uploads_with_urls_this_machine_signed() {
 
 /// Named sources are signed for at their own names in the destination
 /// directory and nowhere else in it, so the copy must look only there:
-/// a request for the directory itself would end it.
+/// a request for the directory itself would end it. `dataset-b` and
+/// `dataset.txt` sort between `dataset` and its contents.
 #[test]
 fn named_sources_upload_within_the_paths_their_names_produce() {
     let lab = Lab::start("ok");
     std::fs::write(lab.path("server-home/note.txt"), b"note\n").unwrap();
+    std::fs::write(lab.path("server-home/dataset.txt"), b"text\n").unwrap();
+    std::fs::create_dir(lab.path("server-home/dataset-b")).unwrap();
+    for name in ["c", "d"] {
+        std::fs::write(lab.path("server-home/dataset-b").join(name), b"b\n").unwrap();
+    }
     for options in [&[][..], &["--prune", "--max-delete=0"]] {
+        std::fs::remove_file(lab.path("stored-by-fixture/request-log")).ok();
         let output = lab.run(
             &[
-                &["--from", "server", "dataset", "note.txt"],
+                &[
+                    "--from",
+                    "server",
+                    "dataset",
+                    "note.txt",
+                    "dataset-b",
+                    "dataset.txt",
+                ][..],
                 &["--to", "s3://bucket", "--into", "backup"],
                 options,
             ]
@@ -261,9 +285,24 @@ fn named_sources_upload_within_the_paths_their_names_produce() {
             "PUT /bucket/backup/dataset/a",
             "PUT /bucket/backup/dataset/sub/b",
             "PUT /bucket/backup/note.txt",
+            "PUT /bucket/backup/dataset.txt",
+            "PUT /bucket/backup/dataset-b/c",
         ] {
             assert!(requests.contains(request), "{options:?}: {requests}");
         }
+        // Each named directory is listed under its own prefix; named files
+        // are checked one by one.
+        let mut listed: Vec<_> = requests
+            .lines()
+            .filter_map(|line| line.split_once(" prefix=").map(|(_, prefix)| prefix))
+            .collect();
+        listed.sort();
+        listed.dedup();
+        assert_eq!(
+            listed,
+            ["backup/dataset-b/", "backup/dataset/"],
+            "{options:?}: {requests}"
+        );
     }
 }
 
@@ -523,6 +562,49 @@ fn options_these_copies_cannot_honor_are_refused() {
             output_text(&output).contains(message),
             "{}",
             output_text(&output)
+        );
+    }
+    // More named sources than signatures name one by one, whoever signs.
+    let names: Vec<String> = (0..1025).map(|index| format!("f{index}")).collect();
+    for signer in [&[][..], &["--auth-from", "@laptop"]] {
+        let mut words = vec!["--from", "server"];
+        words.extend(names.iter().map(String::as_str));
+        words.extend(["--to", "s3://bucket", "--into", "backup"]);
+        words.extend(signer);
+        let output = lab.run(&words);
+        let text = output_text(&output);
+        assert!(!output.status.success(), "{signer:?}: {text}");
+        assert!(
+            text.contains("this copy names 1025 sources, more than the 1024 one copy accepts")
+                && text.contains("--srcs-in"),
+            "{signer:?}: {text}"
+        );
+        assert!(!text.contains("laptop"), "{signer:?}: {text}");
+        assert!(
+            !lab.path("server-home/copy.pid").exists(),
+            "{signer:?}: the server was contacted"
+        );
+    }
+    // A customer-provided encryption key would go to the server.
+    for flag in ["--s3-header", "--s3-write-header"] {
+        let output = lab.run(
+            &[
+                UPLOAD,
+                &[flag, "X-Amz-Server-Side-Encryption-Customer-Key: a2V5"],
+            ]
+            .concat(),
+        );
+        assert!(!output.status.success(), "{flag}: {}", output_text(&output));
+        assert!(
+            output_text(&output).contains(
+                "the customer-provided encryption key would be sent to it. Run syq on the server"
+            ),
+            "{flag}: {}",
+            output_text(&output)
+        );
+        assert!(
+            !lab.path("server-home/copy.pid").exists(),
+            "{flag}: the server was contacted"
         );
     }
     assert_eq!(lab.requests(), "");

@@ -11,20 +11,14 @@ use std::os::unix::net::UnixStream;
 /// copy whose storage requests the machine that started it signs.
 pub(crate) const SIGNING_ENV: &str = "SYQ_INTERNAL_NATIVE_STORAGE_SIGNING";
 
-/// How long the URLs signed for a started copy stay valid: long enough for a
-/// copy that runs all day, and well short of the week a signature may last.
-/// Every URL is signed before data moves, so a copy still running at this
-/// age fails its remaining requests; running it again signs afresh and
-/// resumes.
-pub(crate) const LIFETIME: u64 = 24 * 60 * 60;
-
 /// The most signing bytes carried on one line of the copy's output, well
 /// inside what the starting machine accepts as one line once encoded.
 const LINE_BYTES: usize = 48 * 1024;
 
 /// What the command typed on this machine lets the server's copy ask for:
 /// its bucket, the keys under its S3 source or destination, and only the
-/// operations it implies. The server supplies none of this.
+/// operations it implies. The server supplies none of this. Its URLs last as
+/// long as those signed for any `--auth-from` copy ([`DEFAULT_LIFETIME`]).
 pub(crate) fn request(args: &crate::cli::Args) -> Result<Request> {
     let mut options = args
         .s3
@@ -34,22 +28,43 @@ pub(crate) fn request(args: &crate::cli::Args) -> Result<Request> {
         !args.rm && !options.route.is_server_copy() && args.descriptor_copy.is_none(),
         "this machine signs storage requests only for a file or tree copy between a server and a bucket"
     );
+    refuse_customer_keys(&options)?;
     // As for a copy run here, this machine's environment may name the endpoint.
     options.endpoint = options
         .endpoint
         .or_else(|| std::env::var("AWS_ENDPOINT_URL_S3").ok())
         .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok());
-    let mut request = request_for(args, &options)?;
-    if receiving_machine(args).is_none() {
-        request.lifetime = LIFETIME;
+    request_for(args, &options)
+}
+
+/// Refuse headers that carry a customer-provided encryption key (SSE-C):
+/// the server makes the storage requests, so the key would go to it.
+fn refuse_customer_keys(options: &crate::s3::Options) -> Result<()> {
+    let customer_key = options
+        .headers
+        .iter()
+        .map(|header| ("--s3-header", header))
+        .chain(
+            options
+                .write_headers
+                .iter()
+                .map(|header| ("--s3-write-header", header)),
+        )
+        .find(|(_, crate::s3::Header(name, _))| {
+            name.to_ascii_lowercase()
+                .contains("server-side-encryption-customer-")
+        });
+    if let Some((flag, crate::s3::Header(name, _))) = customer_key {
+        anyhow::bail!(
+            "{flag} {name} is not supported for a copy between an SSH server and S3 started on another machine: the server makes the storage requests, so the customer-provided encryption key would be sent to it. Run syq on the server to copy with that key"
+        );
     }
-    Ok(request)
+    Ok(())
 }
 
 /// The receiving machine the command names with `--auth-from @NAME` to
 /// approve the copy and sign for it, instead of this machine. It derives
-/// the same request from the command, with the lifetime it gives any
-/// storage request it approves.
+/// the same request from the command.
 pub(crate) fn receiving_machine(args: &crate::cli::Args) -> Option<&str> {
     match &args.auth_from {
         crate::cli::AuthFrom::Provider(crate::auth_from::Provider::Return(name)) => Some(name),
@@ -71,6 +86,17 @@ pub(crate) fn time(seconds: u64) -> String {
     aws_smithy_types::DateTime::from_secs(seconds as i64)
         .fmt(aws_smithy_types::date_time::Format::DateTime)
         .unwrap_or_else(|_| format!("{seconds} seconds after 1970"))
+}
+
+/// A lifetime as messages show it, in whole days or hours where it has them.
+pub(crate) fn duration(seconds: u64) -> String {
+    let unit =
+        |count: u64, name: &str| format!("{count} {name}{}", if count == 1 { "" } else { "s" });
+    match seconds {
+        _ if seconds.is_multiple_of(86400) => unit(seconds / 86400, "day"),
+        _ if seconds.is_multiple_of(3600) => unit(seconds / 3600, "hour"),
+        _ => unit(seconds, "second"),
+    }
 }
 
 /// What the starting machine says once when its credentials expire, and its
@@ -257,7 +283,7 @@ mod tests {
     fn an_upload_signs_writes_under_its_destination_only() {
         let request = request(&command(UPLOAD)).unwrap();
         assert_eq!(request.bucket, "bucket");
-        assert_eq!(request.lifetime, 24 * 60 * 60);
+        assert_eq!(request.lifetime, DEFAULT_LIFETIME);
         assert!(request.upload && !request.delete && !request.create_only);
         assert!(request.source.is_none() && request.removal.is_none());
         for allowed in [
@@ -409,12 +435,80 @@ mod tests {
         assert_eq!(keys(&existing), ["backups"]);
         assert!(permits(&existing, Unsigned::new("HEAD", "backups")));
         assert!(permits(&existing, list("backups/")));
-        // More sources than a request lists one by one.
+        // More sources than a request lists one by one, as a receiving
+        // machine's prompt shows for an upload typed where the files are.
+        // A copy between a server and a bucket refuses them first.
         let names: Vec<String> = (0..1025).map(|index| format!("file-{index}")).collect();
         let mut words = vec!["cp", "--from", "server"];
         words.extend(names.iter().map(String::as_str));
         words.extend(["--to", "s3://bucket", "--into", "backups"]);
         assert_eq!(keys(&request(&command(&words)).unwrap()), ["backups"]);
+    }
+
+    #[test]
+    fn customer_encryption_keys_are_not_sent_to_the_server() {
+        for name in [
+            "x-amz-server-side-encryption-customer-key",
+            "X-Amz-Server-Side-Encryption-Customer-Algorithm",
+            "x-amz-server-side-encryption-customer-key-MD5",
+        ] {
+            for flag in ["--s3-header", "--s3-write-header"] {
+                let header = format!("{name}: value");
+                for auth in [&[][..], &["--auth-from", "@laptop"][..]] {
+                    let mut words: Vec<&str> = UPLOAD.to_vec();
+                    words.extend([flag, header.as_str()]);
+                    words.extend(auth);
+                    let error = request(&command(&words)).unwrap_err().to_string();
+                    assert!(
+                        error.contains(&format!("{flag} {}", name.to_ascii_lowercase()))
+                            && error.contains("customer-provided encryption key")
+                            && error.contains("Run syq on the server"),
+                        "{error}"
+                    );
+                }
+            }
+        }
+        // A download sends the key to the server as well.
+        let download = command(&[
+            "cp",
+            "--from",
+            "s3://bucket",
+            "--srcs-in",
+            "dataset",
+            "--to",
+            "server",
+            "--into",
+            "dataset",
+            "--s3-header",
+            "x-amz-server-side-encryption-customer-key: value",
+        ]);
+        let error = request(&download).unwrap_err().to_string();
+        assert!(error.contains("customer-provided"), "{error}");
+        // Other headers, including server-side encryption with a key the
+        // storage service holds, still travel.
+        let other = request(&command(&with(
+            UPLOAD,
+            &[
+                "--s3-header",
+                "x-amz-server-side-encryption: aws:kms",
+                "--s3-write-header",
+                "x-amz-storage-class: STANDARD_IA",
+            ],
+        )))
+        .unwrap();
+        assert_eq!(other.headers.len(), 2);
+    }
+
+    #[test]
+    fn signed_urls_last_as_long_as_for_any_auth_from_copy() {
+        assert_eq!(DEFAULT_LIFETIME, 7 * 24 * 60 * 60);
+        assert_eq!(
+            request(&command(UPLOAD)).unwrap().lifetime,
+            DEFAULT_LIFETIME
+        );
+        assert_eq!(duration(DEFAULT_LIFETIME), "7 days");
+        assert_eq!(duration(3600), "1 hour");
+        assert_eq!(duration(90), "90 seconds");
     }
 
     #[test]
@@ -449,11 +543,16 @@ mod tests {
     }
 
     #[test]
-    fn a_receiving_machine_named_by_the_command_signs_with_its_own_lifetime() {
+    fn a_receiving_machine_named_by_the_command_signs_the_same_request() {
         let named = command(&with(UPLOAD, &["--auth-from", "@laptop"]));
         assert_eq!(receiving_machine(&named), Some("laptop"));
         let request = request(&named).unwrap();
-        // What the receiving machine derives from the same command.
+        // What the receiving machine derives from the same command, which
+        // is also what this machine would sign.
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::to_value(super::request(&command(UPLOAD)).unwrap()).unwrap()
+        );
         assert_eq!(request.lifetime, DEFAULT_LIFETIME);
         crate::approval_command::check_storage(
             &named_words(&with(UPLOAD, &["--auth-from", "@laptop"])),
@@ -611,8 +710,8 @@ mod tests {
     #[test]
     fn credentials_that_expire_early_are_announced_and_named_at_expiry() {
         let mut signer = Signer::fixture(request(&command(UPLOAD)).unwrap());
-        signer.configuration.requested_lifetime = LIFETIME;
-        signer.configuration.expires_at = now().unwrap() + LIFETIME;
+        signer.configuration.requested_lifetime = DEFAULT_LIFETIME;
+        signer.configuration.expires_at = now().unwrap() + DEFAULT_LIFETIME;
         assert_eq!(early_expiry_notice(&signer.configuration), None);
         signer.configuration.expires_at = now().unwrap() + 3600;
         let notice = early_expiry_notice(&signer.configuration).unwrap();
