@@ -150,7 +150,7 @@ async fn at_copy_start(bucket: &Bucket, prefix: &str, plan: &[String]) -> Discov
         finished: !more,
     });
     Discovery {
-        listed: vec![0..plan.len()],
+        listed: std::iter::once(0..plan.len()).collect(),
         sizes: walk.sizes,
         reach,
         task: None,

@@ -879,4 +879,14 @@ fn later_requests_report_an_earlier_refusal() {
     let finish = authorization.finish_preparation().unwrap_err();
     assert_eq!(format!("{finish:#}"), earlier);
     authorizer.join().unwrap();
+    // The machine that started a copy signs without an approval to renew.
+    let mut authorization = authorization;
+    authorization.started_elsewhere = true;
+    let later = authorization
+        .signed(Unsigned::new("GET", "allowed/c"))
+        .unwrap_err();
+    assert_eq!(
+        format!("{later:#}"),
+        "storage signing ended after an earlier request failed (authorizing machine: outside approved paths); run the copy again"
+    );
 }

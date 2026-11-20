@@ -306,6 +306,38 @@ fn named_sources_upload_within_the_paths_their_names_produce() {
     }
 }
 
+/// With nothing to list under the signed paths, the copy still sends the
+/// one listing request it sizes its concurrency from, inside those paths.
+#[test]
+fn named_files_alone_are_checked_one_by_one() {
+    let lab = Lab::start("ok");
+    std::fs::write(lab.path("server-home/note.txt"), b"note\n").unwrap();
+    std::fs::write(lab.path("server-home/dataset.txt"), b"text\n").unwrap();
+    let output = lab.run(&[
+        "--from",
+        "server",
+        "note.txt",
+        "dataset.txt",
+        "--to",
+        "s3://bucket",
+        "--into",
+        "backup",
+    ]);
+    assert!(output.status.success(), "{}", output_text(&output));
+    let requests = lab.requests();
+    let listed: Vec<_> = requests
+        .lines()
+        .filter_map(|line| line.split_once(" prefix=").map(|(_, prefix)| prefix))
+        .collect();
+    assert_eq!(listed, ["backup/dataset.txt/"], "{requests}");
+    for request in [
+        "HEAD /bucket/backup/note.txt",
+        "PUT /bucket/backup/dataset.txt",
+    ] {
+        assert!(requests.contains(request), "{requests}");
+    }
+}
+
 #[test]
 fn a_server_downloads_with_urls_this_machine_signed() {
     let lab = Lab::start("ok");

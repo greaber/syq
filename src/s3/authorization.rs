@@ -680,8 +680,11 @@ struct State {
     failure: Option<String>,
 }
 impl State {
-    fn ended(&self) -> Result<()> {
+    fn ended(&self, started_elsewhere: bool) -> Result<()> {
         match &self.failure {
+            Some(failure) if started_elsewhere => anyhow::bail!(
+                "storage signing ended after an earlier request failed ({failure}); run the copy again"
+            ),
             Some(failure) => anyhow::bail!(
                 "storage authorization ended after an earlier request failed ({failure}); rerun the copy for fresh approval"
             ),
@@ -772,7 +775,7 @@ impl Authorization {
         if missing.is_empty() {
             return Ok(());
         }
-        state.ended()?;
+        state.ended(self.started_elsewhere)?;
         let signer = self.signer();
         let started_elsewhere = self.started_elsewhere;
         let stream = state.connection.as_mut().with_context(|| {
@@ -834,7 +837,7 @@ impl Authorization {
     pub(crate) fn finish_preparation(&self) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         // Preparation that failed must not count as finished.
-        state.ended()?;
+        state.ended(self.started_elsewhere)?;
         if let Some(mut stream) = state.connection.take() {
             crate::destination::storage::finish(&mut stream)?;
         }

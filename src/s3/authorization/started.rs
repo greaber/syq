@@ -56,7 +56,7 @@ fn refuse_customer_keys(options: &crate::s3::Options) -> Result<()> {
         });
     if let Some((flag, crate::s3::Header(name, _))) = customer_key {
         anyhow::bail!(
-            "{flag} {name} is not supported for a copy between an SSH server and S3 started on another machine: the server makes the storage requests, so the customer-provided encryption key would be sent to it. Run syq on the server to copy with that key"
+            "{flag} {name} is not supported when this machine starts a copy between an SSH server and S3: the server makes the storage requests, so the customer-provided encryption key would be sent to it. Run syq on the server to copy with that key"
         );
     }
     Ok(())

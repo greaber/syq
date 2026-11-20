@@ -954,44 +954,47 @@ impl Engine {
         }
         let prefixes = self.destination_prefixes()?;
         if !self.args.delete {
-            // Under signatures for named prefixes, the planned keys beneath
-            // each; otherwise the destination prefix for every planned key.
-            let named = self.authorization.is_some();
-            if !discovery::lists_destination(&self.args, &self.options.bucket) {
-                // Every key gets its HEAD, so a listing would save nothing.
-                // One request still goes first: the copy sizes its
-                // concurrency from a response seen before it starts, and a
-                // destination that cannot be listed fails here, as it does
-                // for the copies that list. Signatures for named prefixes
-                // cover a listing only beneath one with planned keys.
-                let probe = prefixes.iter().find(|prefix| {
-                    !named || plan.iter().any(|t| key(t).starts_with(prefix.as_str()))
-                });
-                if let Some(prefix) = probe {
-                    client::list_one(&self.client, &self.options.bucket, prefix).await?;
+            let lists = discovery::lists_destination(&self.args, &self.options.bucket);
+            if self.authorization.is_none() {
+                if !lists {
+                    // Every key gets its HEAD, so a listing would save
+                    // nothing. One request still goes first: the copy sizes
+                    // its concurrency from a response seen before it starts,
+                    // and a destination that cannot be listed fails here, as
+                    // it does for the copies that list.
+                    client::list_one(&self.client, &self.options.bucket, &prefixes[0]).await?;
+                    return Ok(());
                 }
-                return Ok(());
+                plan.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
+                let keys = discovery::Keys::new(plan.iter().map(&key));
+                let whole = discovery::Segment::whole(prefixes[0].clone(), &keys);
+                return self.start_discovery(vec![whole], keys).await;
             }
-            plan.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
-            let keys = discovery::Keys::new(plan.iter().map(&key));
-            let segments = if named {
-                discovery::segments(&keys, &prefixes)
-            } else {
-                vec![discovery::Segment::whole(prefixes[0].clone(), &keys)]
-            };
-            if segments.is_empty() {
-                return Ok(());
+            // Under signatures, each signed prefix is listed for the planned
+            // keys beneath it.
+            if lists {
+                plan.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
+                let keys = discovery::Keys::new(plan.iter().map(&key));
+                let segments = discovery::segments(&keys, &prefixes);
+                if !segments.is_empty() {
+                    return self.start_discovery(segments, keys).await;
+                }
             }
-            let discovery = Discovery::start(
-                self.client.clone(),
-                &self.options.bucket,
-                segments,
-                keys,
-                self.cancelled.clone(),
-                self.progress.clone(),
-            )
-            .await?;
-            let _ = self.discovery.set(discovery);
+            // Nothing to list: still send the request the copy sizes its
+            // concurrency from, under a signed prefix with planned keys
+            // beneath it if there is one.
+            let mut sorted: Vec<_> = plan.iter().map(&key).collect();
+            sorted.sort_unstable();
+            let probe = prefixes
+                .iter()
+                .find(|prefix| {
+                    let at = sorted.partition_point(|key| key.as_ref() < prefix.as_str());
+                    sorted
+                        .get(at)
+                        .is_some_and(|key| key.starts_with(prefix.as_str()))
+                })
+                .unwrap_or(&prefixes[0]);
+            client::list_one(&self.client, &self.options.bucket, probe).await?;
             return Ok(());
         }
         // Pruning needs every destination key, including keys absent from
@@ -1043,6 +1046,23 @@ impl Engine {
         if !found.prefixes.is_empty() {
             let _ = self.upload_keys.set(found);
         }
+        Ok(())
+    }
+    async fn start_discovery(
+        &self,
+        segments: Vec<discovery::Segment>,
+        keys: discovery::Keys,
+    ) -> Result<()> {
+        let discovery = Discovery::start(
+            self.client.clone(),
+            &self.options.bucket,
+            segments,
+            keys,
+            self.cancelled.clone(),
+            self.progress.clone(),
+        )
+        .await?;
+        let _ = self.discovery.set(discovery);
         Ok(())
     }
     /// What a destination listing says about `key`, the plan's `position`th,
