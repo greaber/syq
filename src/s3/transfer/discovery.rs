@@ -526,6 +526,12 @@ impl Discovery {
             // from one short request. When the prefix holds at most one
             // object, that request lists it completely.
             let first = store.first_key(&walk.segments[0].prefix).await?;
+            for entry in &first.entries {
+                ensure!(
+                    entry.key.starts_with(walk.segments[0].prefix.as_str()),
+                    "S3 listing returned a key outside the requested prefix"
+                );
+            }
             // A service that returns more than asked for settles nothing.
             let complete =
                 walk.segments.len() == 1 && first.next.is_none() && first.entries.len() <= 1;

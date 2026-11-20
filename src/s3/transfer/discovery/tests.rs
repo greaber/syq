@@ -1055,6 +1055,8 @@ mod signed {
         objects: Arc<BTreeMap<String, u64>>,
         /// Each request's query, without the signature.
         requests: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
+        /// Answer every listing with every key, whatever its prefix.
+        ignores_prefix: bool,
     }
     impl HttpConnector for Served {
         fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
@@ -1073,7 +1075,7 @@ mod signed {
             let mut matching = self
                 .objects
                 .range::<str, _>((lower, Bound::Unbounded))
-                .filter(|(key, _)| key.starts_with(prefix.as_str()));
+                .filter(|(key, _)| self.ignores_prefix || key.starts_with(prefix.as_str()));
             let entries: Vec<_> = matching.by_ref().take(1000).collect();
             let next = matching.next().map(|_| entries.last().unwrap().0);
             let mut xml = format!(
@@ -1118,6 +1120,7 @@ mod signed {
         Served {
             objects: Arc::new(objects),
             requests: Arc::default(),
+            ignores_prefix: false,
         }
     }
     const ARGV: &[&str] = &[
@@ -1321,6 +1324,7 @@ mod signed {
                     .into(),
             ),
             requests: Arc::default(),
+            ignores_prefix: false,
         };
         let (mut engine, _) = engine(
             &["cp", "/src/a", "--to", "s3://fixture", "--into", "dst"],
@@ -1339,6 +1343,27 @@ mod signed {
             [Listed::Unknown, Listed::Unknown]
         );
         assert_eq!(served.requests.lock().unwrap()[0]["max-keys"], "1");
+    }
+
+    #[tokio::test]
+    async fn a_short_listing_outside_its_prefix_fails_the_copy() {
+        let served = Served {
+            objects: Arc::new([("unrelated/a".to_owned(), 1)].into()),
+            requests: Arc::default(),
+            ignores_prefix: true,
+        };
+        let (mut engine, _) = engine(
+            &["cp", "/src/a", "--to", "s3://fixture", "--into", "dst"],
+            &served,
+            false,
+        );
+        engine.options.endpoint = Some("https://account.r2.cloudflarestorage.com".into());
+        let mut plan = vec!["dst/a/1".to_owned(), "dst/a/2".to_owned()];
+        let error = engine
+            .discover_destination(&mut plan, &[], |key: &String| key.as_str().into())
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("outside the requested prefix"));
     }
 
     #[test]
