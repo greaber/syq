@@ -4334,15 +4334,14 @@ mod tests {
         let root = crate::test_support::short_tempdir().unwrap();
         let control = root.path().join("cm-test");
         // A status check holds the lock as the service starts, then ends.
-        let probe = LockFile::open(&suffixed(&control, LOCK), true).unwrap();
-        assert!(probe.try_shared().unwrap());
-        let probing = std::thread::spawn(move || {
-            std::thread::sleep(PROBE_GRACE / 10);
-            drop(probe);
-        });
-        let lock = try_lock(&control).unwrap();
-        probing.join().unwrap();
-        assert!(lock.is_some());
+        let _lock = crate::lock_file::start_beside_a_brief_holder(
+            || {
+                let probe = LockFile::open(&suffixed(&control, LOCK), true).unwrap();
+                assert!(probe.try_shared().unwrap());
+                probe
+            },
+            || try_lock(&control).unwrap(),
+        );
     }
 
     #[test]

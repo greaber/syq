@@ -154,6 +154,42 @@ pub(crate) fn flock(file: &impl AsRawFd, operation: libc::c_int) -> io::Result<(
     crate::sys::retry_zero(|| unsafe { libc::flock(fd, operation) })
 }
 
+/// For tests of a service's start: run `start`, which takes a lock and
+/// retries for [`PROBE_GRACE`], while the lock that `hold` returns is held
+/// and is let go a tenth of the grace later, as a probe or an exiting
+/// service lets it go. Returns the lock `start` took. A loaded machine can
+/// deschedule the holder past the grace, and then `start` rightly gives up,
+/// so that attempt is made again; one in which the holder let go within the
+/// grace must take the lock.
+#[cfg(test)]
+pub(crate) fn start_beside_a_brief_holder<H: Send + 'static>(
+    hold: impl Fn() -> H,
+    start: impl Fn() -> Option<LockFile>,
+) -> LockFile {
+    const ATTEMPTS: usize = 20;
+    for _ in 0..ATTEMPTS {
+        let held = hold();
+        let started = Instant::now();
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(PROBE_GRACE / 10);
+            drop(held);
+            Instant::now()
+        });
+        let taken = start();
+        // The holder let go no later than this.
+        let released = holder.join().unwrap();
+        if let Some(lock) = taken {
+            return lock;
+        }
+        assert!(
+            released >= started + PROBE_GRACE,
+            "the start gave up although the holder let go {:?} into the {PROBE_GRACE:?} grace",
+            released - started
+        );
+    }
+    panic!("in {ATTEMPTS} attempts the holder never let go within the grace");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
