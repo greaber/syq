@@ -94,7 +94,8 @@ const BACKGROUND_KEYS: usize = KEYS_PER_PAGE;
 /// each named prefix on its own, and listing them one after another would
 /// cost a round trip to the storage service each. The listings that run at
 /// once share the prefixes in turn, so earlier ones are decided first.
-const LISTINGS: usize = 16;
+/// Pruning's complete listings of those prefixes use the same bound.
+pub(super) const LISTINGS: usize = 16;
 
 /// Pages' worth of shortfall allowed before the listing stops, so one sparse
 /// stretch does not end a listing that pays for itself overall.
