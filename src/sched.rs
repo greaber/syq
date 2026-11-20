@@ -7,7 +7,7 @@ use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::ops::{Deref, DerefMut, Index, IndexMut};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The values used by the tuner's remaining-work gate. No paths or file identities.
 #[derive(Clone, Copy, Debug, serde::Serialize)]
@@ -1011,6 +1011,19 @@ impl Sched {
 
     pub fn is_aborted(&self) -> bool {
         self.inner.lock().unwrap().abort
+    }
+
+    /// Sleep until `until`, or until the copy is aborted: `abort` wakes
+    /// waiting workers.
+    pub fn sleep_unless_aborted(&self, until: Instant) {
+        let mut inner = self.inner.lock().unwrap();
+        loop {
+            let now = Instant::now();
+            if inner.abort || now >= until {
+                return;
+            }
+            inner = self.cv.wait_timeout(inner, until - now).unwrap().0;
+        }
     }
 
     /// A command-restricted receiver now holds this file unfinished.

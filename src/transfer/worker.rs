@@ -3106,13 +3106,19 @@ impl Worker {
             .request_size(self.opts.block, self.bwlimit.as_deref())
     }
 
+    /// Pace `bytes` under `--bwlimit`. A copy that has failed sends nothing
+    /// more, so it neither starts nor finishes pacing.
     pub(super) fn limit(&self, bytes: u64) {
         if let Some(limit) = &self.bwlimit {
+            if bytes == 0 || self.sched.is_aborted() {
+                return;
+            }
             let _pacing = self
                 .observation
                 .as_ref()
                 .map(|a| a.span(crate::transfer_observations::Stage::Pacing));
-            limit.wait(bytes);
+            self.sched
+                .sleep_unless_aborted(limit.reserve(std::time::Instant::now(), bytes));
         }
     }
 
