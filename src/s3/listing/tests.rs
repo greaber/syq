@@ -793,3 +793,43 @@ async fn listings_from_a_store_not_in_byte_order_miss_no_key() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_glob_that_needs_more_than_a_page_lists_flat_where_order_is_unknown() {
+    // In R2's order the first page of `edge/` ends with `p/`, `p0` and `p`.
+    // Whether a later page of a delimiter listing leaves a key out, or a
+    // check for it finds one already listed, depends on the order; a flat
+    // listing does not.
+    let store = R2Order(Memory::new(
+        (0..997)
+            .map(|i| format!("edge/f{i:03}"))
+            .chain(["edge/p/x", "edge/p0", "edge/p", "edge/z"].map(String::from)),
+    ));
+    let pattern = Pattern::parse("s3://bucket/edge/*").unwrap();
+    for concurrency in [1, 8] {
+        let mut keys = Vec::new();
+        engine::enumerate(&store, &pattern, concurrency, |entry| {
+            keys.push(entry.key);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        keys.sort();
+        let expected: Vec<_> = store
+            .0
+            .keys
+            .iter()
+            .filter(|key| pattern.matches(key))
+            .cloned()
+            .collect();
+        assert_eq!(keys, expected);
+        assert_eq!(
+            store.0.calls.borrow_mut().split_off(0),
+            [
+                ("edge/".to_owned(), true),
+                ("edge/".to_owned(), false),
+                ("edge/".to_owned(), false)
+            ]
+        );
+    }
+}

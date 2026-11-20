@@ -1074,11 +1074,11 @@ fn a_late_children_page_out_of_order_fails_a_divided_walk() {
         next: None,
     };
     let error = walk()
-        .children(1, "t/", Some((page(["t/zy", "t/zx"]), Gaps::default())))
+        .children(1, "t/", Some(page(["t/zy", "t/zx"])))
         .unwrap_err();
     assert!(error.is::<Unordered>());
     assert!(walk()
-        .children(1, "t/", Some((page(["t/zx", "t/zy"]), Gaps::default())))
+        .children(1, "t/", Some(page(["t/zx", "t/zy"])))
         .is_ok());
     // A continuation that starts before the page it continues, after the
     // part has finished.
@@ -1087,7 +1087,7 @@ fn a_late_children_page_out_of_order_fails_a_divided_walk() {
     late.parts[1].children = Children::Asked;
     late.parts[1].children_end = "t/zz".to_owned();
     let error = late
-        .children(1, "t/", Some((page(["t/zm", "t/zn"]), Gaps::default())))
+        .children(1, "t/", Some(page(["t/zm", "t/zn"])))
         .unwrap_err();
     assert!(error.is::<Unordered>());
 }
@@ -1162,4 +1162,52 @@ async fn keys_a_store_skips_after_a_common_prefix_are_listed() {
             walked(&store, "tree/", concurrency, None).await;
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_key_the_glob_cannot_match_needs_no_check() {
+    /// Refuses listings of every prefix but `edge/`, as a policy can.
+    struct OnlyEdge(Memory);
+    impl Store for OnlyEdge {
+        fn divides(&self) -> bool {
+            true
+        }
+        async fn page(
+            &self,
+            prefix: &str,
+            delimiter: bool,
+            token: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<Page> {
+            anyhow::ensure!(prefix == "edge/", "refused");
+            self.0.page(prefix, delimiter, token, None).await
+        }
+    }
+    // The first page of `edge/` ends with `p/`.
+    let store = OnlyEdge(Memory::new(
+        (0..999)
+            .map(|i| format!("edge/i{i:03}.jpg"))
+            .chain(["edge/p/x", "edge/zz.jpg"].map(String::from)),
+    ));
+    let mut keys = Vec::new();
+    let pattern = Pattern::parse("s3://bucket/edge/*.jpg").unwrap();
+    engine::enumerate(&store, &pattern, 1, |entry| {
+        keys.push(entry.key);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(keys.len(), 1000);
+    assert!(store
+        .0
+        .calls
+        .borrow()
+        .iter()
+        .all(|(prefix, _)| prefix == "edge/"));
+    // `edge/p0` would match `edge/*`: the check is made, and its refusal
+    // fails the listing rather than leave a key out unnoticed.
+    let pattern = Pattern::parse("s3://bucket/edge/*").unwrap();
+    assert!(engine::enumerate(&store, &pattern, 1, |_| Ok(()))
+        .await
+        .is_err());
 }
