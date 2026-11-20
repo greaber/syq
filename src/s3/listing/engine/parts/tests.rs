@@ -1396,6 +1396,19 @@ async fn an_empty_page_settles_nothing_about_a_skipped_key() {
     .await
     .unwrap();
     assert_eq!(keys, ["edge/p0"]);
+    // In byte order the first page that holds anything settles it: an
+    // absent key does not cost a request per page of longer keys.
+    let store = Scripted(HashMap::from([
+        (("edge/log", None), page(&[], &[], Some("x"))),
+        (
+            ("edge/log", Some("x")),
+            page(&["edge/log-0000"], &[], Some("y")),
+        ),
+    ]));
+    let exact = Pattern::parse("s3://bucket/edge/log").unwrap();
+    engine::enumerate(&store, &exact, 1, |_| panic!("listed an absent key"))
+        .await
+        .unwrap();
     for case in cases {
         let mut pages: HashMap<_, _> = case.into_iter().collect();
         pages.insert(("edge/", None), page(&first, &["edge/p/"], Some("1")));

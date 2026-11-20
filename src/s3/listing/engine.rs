@@ -222,16 +222,16 @@ fn scan_batch(prefix: String, delimiter: bool, page: Page, gap: Gap) -> Batch {
 /// page left it out. That check relies on byte order, so it is made only
 /// where the store's order is known (`byte_ordered`); every such store is
 /// checked, since the same mistake is easy to make elsewhere. Elsewhere a
-/// delimiter listing goes on past its first page only when the pattern
-/// cannot match the key, or when nothing but objects comes before the last
-/// page.
+/// delimiter listing goes on past its first page only while no page that
+/// goes on holds a common prefix whose skipped key the pattern could match
+/// (`may_hide`).
 #[derive(Clone, Default)]
 pub(super) struct Gap {
     /// The key to make sure of on the next page.
     key: Option<String>,
     /// Where the order is unknown, a policy refused the listing without a
     /// delimiter that was to replace this one. Reported if a page that goes
-    /// on holds a common prefix, after which a key could be missing.
+    /// on holds a common prefix whose skipped key the pattern could match.
     refused: Option<String>,
 }
 
@@ -557,15 +557,22 @@ pub(super) async fn enumerate(
             .collect::<Vec<_>>()
             .join("/");
         // Keep LIST permissions (no HEAD). In byte order the exact key, if
-        // present, precedes every longer key on the first page.
-        let page = read(store, &key, false, None).await?;
+        // present, precedes every longer key on the first page that holds
+        // anything; an empty page that goes on settles nothing.
+        let mut page = read(store, &key, false, None).await?;
+        if byte_ordered(store) {
+            while page.entries.is_empty() {
+                let Some(token) = page.next else {
+                    break;
+                };
+                page = read(store, &key, false, Some(&token)).await?;
+            }
+        }
         let flat = page.next;
-        let first_empty = page.entries.is_empty();
         if let Some(entry) = page.entries.into_iter().find(|entry| entry.key == key) {
             return emit(entry);
         }
-        // An empty first page that goes on settles nothing.
-        if flat.is_none() || (byte_ordered(store) && !first_empty) {
+        if flat.is_none() || byte_ordered(store) {
             return Ok(());
         }
         // In another order it can come after longer keys. A delimiter
