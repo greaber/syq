@@ -883,6 +883,7 @@ type Messages = Vec<(usize, usize)>;
 /// A signing session with an authorizing machine that answers each request
 /// with a URL naming its key. It holds its reply to the first message until
 /// the test releases it, with `Some(error)` to refuse that message instead.
+/// It refuses any later message with a key under `allowed/refused`.
 #[allow(clippy::type_complexity)]
 fn held_session() -> (
     Arc<Authorization>,
@@ -924,6 +925,15 @@ fn held_session() -> (
                     write_message(&mut peer, &serde_json::json!({ "Error": error })).unwrap();
                     return messages;
                 }
+            }
+            if batch.iter().any(|request| {
+                request["key"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("allowed/refused")
+            }) {
+                write_message(&mut peer, &serde_json::json!({ "Error": "refused" })).unwrap();
+                return messages;
             }
             let urls: Vec<_> = batch
                 .iter()
@@ -1038,6 +1048,37 @@ fn combined_exchanges_keep_the_request_limit_without_splitting_a_batch() {
         .into_iter()
         .collect();
     assert_eq!(exchanges, [1, 6_000, 12_000, EXCHANGE_REQUESTS + 4_000]);
+}
+
+/// A caller whose request an earlier exchange signed while it waited keeps
+/// that signature, even if the exchange its batch was queued for fails.
+#[test]
+fn a_request_signed_while_queued_survives_a_later_refusal() {
+    for refused_first in [true, false] {
+        let (authorization, authorizer, first, release) = held_session();
+        let leader = sign_in_thread(&authorization, get("0"));
+        first.recv_timeout(Duration::from_secs(30)).unwrap();
+        let mut queue = |key: &str, queued: usize| {
+            let caller = sign_in_thread(&authorization, get(key));
+            queued_reaches(&authorization, queued);
+            caller
+        };
+        let (duplicate, refused) = if refused_first {
+            let refused = queue("refused", 1);
+            (queue("0", 2), refused)
+        } else {
+            let duplicate = queue("0", 1);
+            (duplicate, queue("refused", 2))
+        };
+        release.send(None).unwrap();
+        leader.join().unwrap().unwrap();
+        let url = duplicate.join().unwrap().unwrap();
+        assert!(url.contains("/fixture/allowed/0?"), "{url}");
+        let error = refused.join().unwrap().unwrap_err();
+        assert!(format!("{error:#}").contains("refused"), "{error:#}");
+        assert_eq!(authorizer.join().unwrap(), [(1, 1), (1, 1)]);
+        assert!(authorization.finish_preparation().is_err());
+    }
 }
 
 #[test]

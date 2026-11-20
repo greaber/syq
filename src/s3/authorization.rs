@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, Condvar, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -660,6 +660,10 @@ struct State {
     /// Every batch numbered up to this one is signed. Exchanges take batches
     /// in order, so batches finish in order.
     signed_through: u64,
+    /// Later batches whose requests were all signed by an earlier exchange
+    /// by the time an exchange took them. Their callers succeed whatever
+    /// happens to that exchange.
+    satisfied: BTreeSet<u64>,
     /// The number of requests in the exchange under way, if any.
     in_flight: usize,
 }
@@ -708,6 +712,7 @@ impl Authorization {
                 queued: VecDeque::new(),
                 last_queued: 0,
                 signed_through: 0,
+                satisfied: BTreeSet::new(),
                 in_flight: 0,
             }),
             exchanged: Condvar::new(),
@@ -734,7 +739,7 @@ impl Authorization {
         let batch = state.last_queued;
         state.queued.push_back((batch, missing));
         loop {
-            if state.signed_through >= batch {
+            if state.signed_through >= batch || state.satisfied.remove(&batch) {
                 return Ok(());
             }
             state.ended()?;
@@ -750,29 +755,42 @@ impl Authorization {
                 return state.ended();
             }
             // The first queued batch, and the batches after it while the
-            // exchange stays within the limit.
-            let (mut through, mut exchange) = state.queued.pop_front().unwrap();
+            // exchange stays within the limit. A batch an earlier exchange
+            // has signed since it was queued is complete already.
+            let mut exchange = Vec::new();
+            let mut through = state.signed_through;
             let mut combined = false;
-            while let Some((number, requests)) = state.queued.pop_front() {
-                if exchange.len() + requests.len() > EXCHANGE_REQUESTS {
+            while let Some((number, mut requests)) = state.queued.pop_front() {
+                requests.retain(|request| !state.requests.contains_key(request));
+                if requests.is_empty() {
+                    if exchange.is_empty() {
+                        state.signed_through = number;
+                    } else {
+                        state.satisfied.insert(number);
+                    }
+                    continue;
+                }
+                if !exchange.is_empty() && exchange.len() + requests.len() > EXCHANGE_REQUESTS {
                     state.queued.push_front((number, requests));
                     break;
                 }
                 through = number;
-                exchange.extend(requests);
-                combined = true;
+                if exchange.is_empty() {
+                    exchange = requests;
+                } else {
+                    exchange.extend(requests);
+                    combined = true;
+                }
             }
-            // A request signed since its batch was queued, or asked for by
-            // two of the combined callers, is signed once.
-            exchange.retain(|request| !state.requests.contains_key(request));
+            // Callers whose batches are complete need not wait for this exchange.
+            self.exchanged.notify_all();
+            if exchange.is_empty() {
+                continue;
+            }
+            // Two combined callers may ask for the same request.
             if combined {
                 exchange.sort_unstable();
                 exchange.dedup();
-            }
-            if exchange.is_empty() {
-                state.signed_through = through;
-                self.exchanged.notify_all();
-                continue;
             }
             let mut stream = state.connection.take().unwrap();
             state.in_flight = exchange.len();
@@ -795,9 +813,14 @@ impl Authorization {
                     state.connection = Some(stream);
                     state.requests.extend(exchange.into_iter().zip(signed));
                     state.signed_through = through;
+                    state.satisfied.retain(|&number| number > through);
                 }
                 Err(error) => {
                     state.fail(format!("{error:#}"));
+                    // This caller may have led the exchange for others.
+                    if state.signed_through >= batch || state.satisfied.remove(&batch) {
+                        return Ok(());
+                    }
                     return Err(error);
                 }
             }
