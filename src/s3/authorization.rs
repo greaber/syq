@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     sync::{Arc, Condvar, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -18,6 +18,8 @@ pub(crate) const DEFAULT_LIFETIME: u64 = 7 * 24 * 60 * 60;
 /// pipelines its bounded wire messages, so it costs about one round trip to
 /// the authorizing machine however many requests it carries. The limit bounds
 /// the descriptions and signed URLs held outside the prepared set at once.
+/// Batches from other callers join an exchange only while it stays within
+/// this limit; a caller's own batch is never split.
 pub(super) const EXCHANGE_REQUESTS: usize = 128 * 128;
 
 /// Groups requests into signing exchanges of at most `limit` requests each,
@@ -650,13 +652,16 @@ struct State {
     /// Why signing failed. A failed exchange ends the signing session, so
     /// every later request it has not prepared fails for the same reason.
     failure: Option<String>,
-    /// Requests waiting for the next exchange, in the order they arrived.
-    queued: VecDeque<Unsigned>,
-    /// The queued requests and those in the exchange under way, so callers
-    /// asking for the same request at once share its signature.
-    waiting: BTreeSet<Unsigned>,
-    /// Whether a caller is exchanging with the authorizing machine.
-    exchanging: bool,
+    /// Callers' batches waiting for the next exchange, in the order they
+    /// arrived, each numbered one more than the batch before it.
+    queued: VecDeque<(u64, Vec<Unsigned>)>,
+    /// The number given to the last batch queued.
+    last_queued: u64,
+    /// Every batch numbered up to this one is signed. Exchanges take batches
+    /// in order, so batches finish in order.
+    signed_through: u64,
+    /// The number of requests in the exchange under way, if any.
+    in_flight: usize,
 }
 impl State {
     fn ended(&self) -> Result<()> {
@@ -671,7 +676,6 @@ impl State {
         self.connection = None;
         self.failure = Some(failure);
         self.queued.clear();
-        self.waiting.clear();
     }
 }
 pub(crate) struct Authorization {
@@ -702,13 +706,14 @@ impl Authorization {
                 requests: BTreeMap::new(),
                 failure: None,
                 queued: VecDeque::new(),
-                waiting: BTreeSet::new(),
-                exchanging: false,
+                last_queued: 0,
+                signed_through: 0,
+                in_flight: 0,
             }),
             exchanged: Condvar::new(),
         }
     }
-    /// Signs the requests not yet prepared. Requests that arrive while an
+    /// Signs the requests not yet prepared. Batches that arrive while an
     /// exchange is under way go together in the next one, so callers that
     /// sign as they send share round trips to the authorizing machine
     /// instead of waiting for one each.
@@ -722,36 +727,51 @@ impl Authorization {
             return Ok(());
         }
         state.ended()?;
-        if state.connection.is_none() && !state.exchanging {
+        if state.connection.is_none() && state.in_flight == 0 {
             anyhow::bail!("request {request:?} was not prepared before storage authorization disconnected; rerun for fresh approval", request = missing[0]);
         }
-        for request in &missing {
-            if state.waiting.insert(request.clone()) {
-                state.queued.push_back(request.clone());
-            }
-        }
+        state.last_queued += 1;
+        let batch = state.last_queued;
+        state.queued.push_back((batch, missing));
         loop {
-            if missing
-                .iter()
-                .all(|request| state.requests.contains_key(request))
-            {
+            if state.signed_through >= batch {
                 return Ok(());
             }
             state.ended()?;
-            if state.exchanging {
+            if state.in_flight > 0 {
                 state = self.exchanged.wait(state).unwrap();
                 continue;
             }
-            // Nothing is in flight and some of these requests are unsigned,
-            // so they are queued and preparation has not finished.
+            // The first queued batch, and the batches after it while the
+            // exchange stays within the limit.
+            let mut exchange = Vec::new();
+            let mut through = state.signed_through;
+            while let Some((number, requests)) = state.queued.front() {
+                if !exchange.is_empty() && exchange.len() + requests.len() > EXCHANGE_REQUESTS {
+                    break;
+                }
+                through = *number;
+                let (_, requests) = state.queued.pop_front().unwrap();
+                exchange.extend(requests);
+            }
+            // A request signed since its batch was queued, or asked for twice,
+            // is signed once.
+            exchange.retain(|request| !state.requests.contains_key(request));
+            exchange.sort_unstable();
+            exchange.dedup();
+            if exchange.is_empty() {
+                state.signed_through = through;
+                self.exchanged.notify_all();
+                continue;
+            }
+            // Nothing is in flight and this batch is unsigned, so it is
+            // queued and preparation has not finished.
             let Some(mut stream) = state.connection.take() else {
                 state.fail("storage authorization lost its connection".into());
                 self.exchanged.notify_all();
                 return state.ended();
             };
-            let count = state.queued.len().min(EXCHANGE_REQUESTS);
-            let exchange: Vec<_> = state.queued.drain(..count).collect();
-            state.exchanging = true;
+            state.in_flight = exchange.len();
             drop(state);
             let mut exchanging = Exchanging(Some(self));
             let signed =
@@ -764,15 +784,13 @@ impl Authorization {
                 });
             exchanging.0 = None;
             state = self.state.lock().unwrap();
-            state.exchanging = false;
+            state.in_flight = 0;
             self.exchanged.notify_all();
             match signed {
                 Ok(signed) => {
                     state.connection = Some(stream);
-                    for request in &exchange {
-                        state.waiting.remove(request);
-                    }
                     state.requests.extend(exchange.into_iter().zip(signed));
+                    state.signed_through = through;
                 }
                 Err(error) => {
                     state.fail(format!("{error:#}"));
@@ -811,7 +829,7 @@ impl Authorization {
         let mut state = self
             .exchanged
             .wait_while(self.state.lock().unwrap(), |state| {
-                state.failure.is_none() && (state.exchanging || !state.queued.is_empty())
+                state.failure.is_none() && (state.in_flight > 0 || !state.queued.is_empty())
             })
             .unwrap();
         // Preparation that failed must not count as finished.
@@ -833,7 +851,7 @@ impl Drop for Exchanging<'_> {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.exchanging = false;
+            state.in_flight = 0;
             state.fail("storage signing stopped unexpectedly".into());
             authorization.exchanged.notify_all();
         }

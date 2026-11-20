@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeSet;
 fn approval() -> Request {
     Request {
         bucket: "fixture".into(),
@@ -915,10 +916,7 @@ fn held_session() -> (
                 write_message(&mut peer, &"Finished").unwrap();
                 return messages;
             };
-            let in_flight = {
-                let state = shared.state.lock().unwrap();
-                state.waiting.len() - state.queued.len()
-            };
+            let in_flight = shared.state.lock().unwrap().in_flight;
             messages.push((batch.len(), in_flight));
             if messages.len() == 1 {
                 arrived.send(()).unwrap();
@@ -944,7 +942,9 @@ fn held_session() -> (
 fn queued_reaches(authorization: &Authorization, count: usize) {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
-        let queued = authorization.state.lock().unwrap().queued.len();
+        let queued: usize = (authorization.state.lock().unwrap().queued.iter())
+            .map(|(_, batch)| batch.len())
+            .sum();
         if queued == count {
             return;
         }
@@ -972,13 +972,13 @@ fn requests_arriving_during_an_exchange_share_the_next_one() {
     let leader = sign_in_thread(&authorization, get("0"));
     first.recv_timeout(Duration::from_secs(30)).unwrap();
     // While that exchange is under way, more callers each ask for one
-    // request, one of them for the request already in flight.
+    // request, the last for the request already in flight.
     let keys: Vec<String> = (1..63).map(|i| i.to_string()).chain(["0".into()]).collect();
     let callers: Vec<_> = keys
         .iter()
         .map(|key| sign_in_thread(&authorization, get(key)))
         .collect();
-    queued_reaches(&authorization, 62);
+    queued_reaches(&authorization, 63);
     release.send(None).unwrap();
     for (key, caller) in std::iter::once("0")
         .zip([leader])
@@ -996,37 +996,48 @@ fn requests_arriving_during_an_exchange_share_the_next_one() {
 }
 
 #[test]
-fn combined_exchanges_keep_the_request_limit() {
+fn combined_exchanges_keep_the_request_limit_without_splitting_a_batch() {
     let (authorization, authorizer, first, release) = held_session();
     let leader = sign_in_thread(&authorization, get("0"));
     first.recv_timeout(Duration::from_secs(30)).unwrap();
-    let callers: Vec<_> = ["a", "b"]
+    let batch = |prefix: &str, count: usize| -> Vec<Unsigned> {
+        (0..count).map(|i| get(&format!("{prefix}/{i}"))).collect()
+    };
+    let callers: Vec<_> = ["a", "b", "c"]
         .into_iter()
         .map(|prefix| {
             let authorization = authorization.clone();
-            std::thread::spawn(move || {
-                authorization
-                    .authorize((0..10_000).map(|i| get(&format!("{prefix}/{i}"))).collect())
-            })
+            let requests = batch(prefix, 6_000);
+            std::thread::spawn(move || authorization.authorize(requests))
         })
         .collect();
-    queued_reaches(&authorization, 20_000);
+    queued_reaches(&authorization, 18_000);
     release.send(None).unwrap();
     leader.join().unwrap().unwrap();
     for caller in callers {
         caller.join().unwrap().unwrap();
     }
-    assert_eq!(prepared(&authorization), 20_001);
+    // One caller's batch above the limit still goes in one exchange.
+    authorization
+        .authorize(batch("d", EXCHANGE_REQUESTS + 4_000))
+        .unwrap();
+    assert_eq!(prepared(&authorization), 18_001 + EXCHANGE_REQUESTS + 4_000);
     authorization.finish_preparation().unwrap();
     let messages = authorizer.join().unwrap();
     assert!(messages.iter().all(|&(count, _)| count <= 128));
-    assert_eq!(messages.iter().map(|m| m.0).sum::<usize>(), 20_001);
-    // The queue drains in exchanges of at most the limit.
-    let exchanges: BTreeSet<_> = messages.iter().map(|m| m.1).collect();
     assert_eq!(
-        exchanges,
-        BTreeSet::from([1, EXCHANGE_REQUESTS, 20_000 - EXCHANGE_REQUESTS])
+        messages.iter().map(|m| m.0).sum::<usize>(),
+        prepared(&authorization)
     );
+    // Two 6,000-request batches fit together within the limit; a third does
+    // not, so it waits for the next exchange.
+    let exchanges: Vec<_> = messages
+        .iter()
+        .map(|m| m.1)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    assert_eq!(exchanges, [1, 6_000, 12_000, EXCHANGE_REQUESTS + 4_000]);
 }
 
 #[test]
