@@ -620,8 +620,7 @@ impl Discovery {
                 Walk::new(segments.cloned().collect(), keys.clone(), decisions.clone())
             })
             .collect();
-        // These listings read pages one by one; `divides` says that they may
-        // rely on byte order.
+        // These listings read pages one by one.
         let store = listing::S3 {
             client: client.clone(),
             bucket,
