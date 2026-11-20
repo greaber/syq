@@ -81,6 +81,10 @@ pub(super) enum Listed {
 /// about twelve times a HEAD, and a worker waiting for the page could have
 /// sent its own HEAD instead.
 const KEYS_PER_PAGE: usize = 64;
+/// Planned keys beneath a prefix worth its complete listing alongside the
+/// copy where the order is unknown. A smaller plan has its keys checked
+/// before a page could come back.
+const BACKGROUND_KEYS: usize = KEYS_PER_PAGE;
 /// Pages' worth of shortfall allowed before the listing stops, so one sparse
 /// stretch does not end a listing that pays for itself overall.
 const SLACK_PAGES: usize = 2;
@@ -218,8 +222,10 @@ pub(super) fn first_pages<'a>(
             .filter_map(move |Segment { prefix, range }| {
                 if !ordered || !divides {
                     // `Walk::whole` spends fewer requests than the segment's
-                    // keys.
-                    return (range.len() >= 2).then(|| listing::first_page_request(prefix, None));
+                    // keys, and alongside the copy lists only larger plans.
+                    let least = if ordered { BACKGROUND_KEYS } else { 2 };
+                    return (range.len() >= least)
+                        .then(|| listing::first_page_request(prefix, None));
                 }
                 let start = range
                     .clone()
@@ -378,7 +384,7 @@ impl Walk {
     /// is worth requesting.
     async fn before_copy(&mut self, store: &impl Store) -> Result<bool> {
         if !store.ordered() {
-            self.whole(store, usize::MAX).await?;
+            self.whole(store, usize::MAX, 0).await?;
             return Ok(false);
         }
         for _ in 0..PAGES_BEFORE_COPY {
@@ -408,9 +414,13 @@ impl Walk {
     /// Directory buckets list in no particular order and cannot start after a
     /// key, and other stores may list in an order other than bytes, so only a
     /// complete listing of a prefix shows a key absent. At most `pages`
-    /// requests go to each prefix.
-    async fn whole(&mut self, store: &impl Store, pages: usize) -> Result<()> {
+    /// requests go to each prefix, and none to a prefix with fewer than
+    /// `least` planned keys.
+    async fn whole(&mut self, store: &impl Store, pages: usize, least: usize) -> Result<()> {
         for Segment { prefix, range } in &self.segments {
+            if range.len() < least {
+                continue;
+            }
             let mut token: Option<String> = None;
             let mut found = 0;
             // Never spend as many LIST requests as checking each key with HEAD.
@@ -527,7 +537,12 @@ impl Discovery {
                         .map(|entry| (entry.key.as_str(), entry.size)),
                 );
             }
+            // A small plan reaches its keys before a page could come back.
             !complete
+                && walk
+                    .segments
+                    .iter()
+                    .any(|segment| segment.range.len() >= BACKGROUND_KEYS)
         };
         let (sender, reach) = watch::channel(Reach {
             decided: walk.decided,
@@ -542,7 +557,7 @@ impl Discovery {
                     divides,
                 };
                 if !waits {
-                    if let Err(error) = walk.whole(&store, PAGES_BEFORE_COPY).await {
+                    if let Err(error) = walk.whole(&store, PAGES_BEFORE_COPY, BACKGROUND_KEYS).await {
                         progress.warning(&format!(
                             "S3 destination listing stopped; each remaining destination key is checked with its own request: {error:#}"
                         ));

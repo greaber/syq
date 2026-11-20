@@ -135,7 +135,9 @@ async fn discover_segments(bucket: &impl Store, segments: Vec<Segment>, keys: Ke
     }
     // As `Discovery::start` does, without the copy going on meanwhile.
     if bucket.ordered() && !bucket.divides() {
-        walk.whole(bucket, PAGES_BEFORE_COPY).await.unwrap();
+        walk.whole(bucket, PAGES_BEFORE_COPY, BACKGROUND_KEYS)
+            .await
+            .unwrap();
     } else if walk.before_copy(bucket).await.unwrap() {
         while walk.page(bucket).await.unwrap() {}
     }
@@ -893,13 +895,21 @@ async fn absence_is_concluded_only_where_the_store_lists_in_byte_order() {
     // both get a HEAD.
     let store = R2Order::new(destination());
     assert_eq!(decide(&store).await, [Listed::Unknown, Listed::Unknown]);
-    // A listing that completes shows absence in any order.
+    // A listing that completes shows absence in any order, for a plan large
+    // enough to list for.
+    let plan: Vec<String> = ["d/a".to_owned(), "d/a-".to_owned()]
+        .into_iter()
+        .chain((0..BACKGROUND_KEYS).map(|i| format!("d/n{i:03}")))
+        .collect();
+    let keys = Keys::new(plan.iter().map(|key| key.as_str().into()));
     let store = R2Order::new(
         (0..10)
             .map(|i| format!("d/a{i:04}"))
             .chain(["d/a".to_owned()]),
     );
-    assert_eq!(decide(&store).await, [Listed::Present(11), Listed::Absent]);
+    let listed = discover_segments(&store, vec![Segment::whole("d/".into(), &keys)], keys).await;
+    assert_eq!(listed[..2], [Listed::Present(11), Listed::Absent]);
+    assert!(listed[2..].iter().all(|listed| *listed == Listed::Absent));
 }
 
 #[tokio::test]
@@ -1262,12 +1272,8 @@ mod signed {
             })
             .collect();
         presigned.sort();
-        let expected_pages = [
-            ("dst/a/", "1"),
-            ("dst/a/", "1000"),
-            ("dst/b/", "1000"),
-            ("dst/c/", "1000"),
-        ];
+        // Only `b` plans enough keys to list for.
+        let expected_pages = [("dst/a/", "1"), ("dst/b/", "1000")];
         assert_eq!(
             presigned,
             expected_pages.map(|(prefix, size)| (prefix.to_owned(), size.to_owned()))
@@ -1279,7 +1285,18 @@ mod signed {
             .wait_for(|reach| reach.finished)
             .await
             .unwrap();
-        assert_eq!(decisions(&engine, &plan).await, expected(&plan, &served));
+        let unknown_outside_b = expected(&plan, &served)
+            .into_iter()
+            .zip(&plan)
+            .map(|(listed, key)| {
+                if key.starts_with("dst/b/") {
+                    listed
+                } else {
+                    Listed::Unknown
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(decisions(&engine, &plan).await, unknown_outside_b);
         // Only `b`'s second page, which continues from its first response,
         // was signed later; nothing started after a key.
         let listings = signed_listings(&authorization);
@@ -1292,6 +1309,36 @@ mod signed {
             1
         );
         assert_eq!(served.requests.lock().unwrap().len(), listings.len());
+    }
+
+    #[tokio::test]
+    async fn a_short_listing_that_returns_more_than_asked_settles_nothing() {
+        // `Served` ignores `max-keys`: the short request returns both keys.
+        let served = Served {
+            objects: Arc::new(
+                [("dst/a/1", 1), ("dst/a/2", 2)]
+                    .map(|(key, size)| (key.to_owned(), size))
+                    .into(),
+            ),
+            requests: Arc::default(),
+        };
+        let (mut engine, _) = engine(
+            &["cp", "/src/a", "--to", "s3://fixture", "--into", "dst"],
+            &served,
+            false,
+        );
+        engine.options.endpoint = Some("https://account.r2.cloudflarestorage.com".into());
+        let mut plan = vec!["dst/a/1".to_owned(), "dst/a/2".to_owned()];
+        engine
+            .discover_destination(&mut plan, &[], |key: &String| key.as_str().into())
+            .await
+            .unwrap();
+        // Both get a HEAD; neither is taken to be absent.
+        assert_eq!(
+            decisions(&engine, &plan).await,
+            [Listed::Unknown, Listed::Unknown]
+        );
+        assert_eq!(served.requests.lock().unwrap()[0]["max-keys"], "1");
     }
 
     #[test]

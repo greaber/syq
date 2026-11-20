@@ -290,17 +290,21 @@ fn named_sources_upload_within_the_paths_their_names_produce() {
         ] {
             assert!(requests.contains(request), "{options:?}: {requests}");
         }
-        // Each named directory is listed under its own prefix; named files
-        // are checked one by one.
+        // Listings stay under the named directories' own prefixes; named
+        // files are checked one by one. This server is not known to list in
+        // byte order, so a directory of a few files is checked key by key
+        // after one short request.
         let mut listed: Vec<_> = requests
             .lines()
             .filter_map(|line| line.split_once(" prefix=").map(|(_, prefix)| prefix))
             .collect();
         listed.sort();
         listed.dedup();
-        assert_eq!(
-            listed,
-            ["backup/dataset-b/", "backup/dataset/"],
+        assert!(!listed.is_empty(), "{options:?}: {requests}");
+        assert!(
+            listed
+                .iter()
+                .all(|prefix| ["backup/dataset-b/", "backup/dataset/"].contains(prefix)),
             "{options:?}: {requests}"
         );
     }
