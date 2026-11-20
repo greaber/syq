@@ -1453,7 +1453,11 @@ pub(super) fn install_remote_command(stage: &str, action: ManagementAction) -> S
         "for f in \"$s\"/*/syq; do t=${f%/syq}; t=${t##*/}; if stored \"$t\"; then printf '%s ' \"$t\"; fi; done".to_owned(),
         "printf '\\n'".to_owned(),
         match action {
-            ManagementAction::Install => "if test -f \"$HOME/.ssh/authorized_keys\"; then wc -c <\"$HOME/.ssh/authorized_keys\"; cat \"$HOME/.ssh/authorized_keys\"; else printf '0\\n'; fi",
+            // One read of the file gives both the count and the bytes, so a
+            // file rewritten meanwhile cannot make them disagree. The `x`
+            // keeps trailing newlines, which `$(...)` drops, and a failed
+            // `cat` still stops the script.
+            ManagementAction::Install => "if test -f \"$HOME/.ssh/authorized_keys\"; then k=$(cat \"$HOME/.ssh/authorized_keys\" && printf x); k=${k%x}; printf '%s' \"$k\" | wc -c; printf '%s' \"$k\"; else printf '0\\n'; fi",
             // Revoking finds no login key, and the revoker reads the file
             // itself, under its lock.
             ManagementAction::Revoke => "printf '0\\n'",
