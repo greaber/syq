@@ -2325,6 +2325,19 @@ mod tests {
         busy: usize,
         then: impl FnOnce(LockFile) + Send + 'static,
     ) -> std::thread::JoinHandle<Vec<&'static str>> {
+        stand_in_provider_answering_after(domain, lock, build, pid, busy, Duration::ZERO, then)
+    }
+    /// As `stand_in_provider`, deciding whether to stop if idle only after
+    /// `delay`, as a provider slow to end its idle account connections does.
+    fn stand_in_provider_answering_after(
+        domain: &Domain,
+        lock: LockFile,
+        build: &'static str,
+        pid: u32,
+        busy: usize,
+        delay: Duration,
+        then: impl FnOnce(LockFile) + Send + 'static,
+    ) -> std::thread::JoinHandle<Vec<&'static str>> {
         let path = domain.runtime_path().join(SOCKET_FILE);
         let listener = UnixListener::bind(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -2363,6 +2376,7 @@ mod tests {
                     }
                     Control::StopIfIdle => {
                         seen.push("stop if idle");
+                        std::thread::sleep(delay);
                         busy == 0
                     }
                     Control::Refresh | Control::Decide(_) => panic!("unexpected request"),
@@ -2379,13 +2393,13 @@ mod tests {
                     switch: None,
                     stopping,
                 };
-                crate::destination::write_framed(
+                // As a provider does, whether or not the client still waits.
+                let _ = crate::destination::write_framed(
                     &mut stream,
                     &reply,
                     MAX_STATUS,
                     "provider status",
-                )
-                .unwrap();
+                );
                 if stopping {
                     // Like a provider, remove the socket before the lock.
                     fs::remove_file(&path).unwrap();
@@ -2428,6 +2442,69 @@ mod tests {
         let seen = next.join().unwrap();
         assert!(!seen[..seen.len() - 1].contains(&"stop"), "{seen:?}");
         assert_eq!(seen.last(), Some(&"stop"));
+    }
+
+    /// A provider may decide whether it is idle only after the switch's
+    /// usual two seconds, while it ends idle account connections. The
+    /// switch waits for that answer and follows it, here to a provider that
+    /// agreed to stop and the busy one that took over after it.
+    #[test]
+    fn a_switch_follows_a_late_answer_to_stop_if_idle() {
+        let (_directory, domain, _) = fixture();
+        let successor = Arc::new(Mutex::new(None));
+        let (started, next) = (successor.clone(), domain.clone());
+        let lock = acquire_lock(&domain).unwrap().unwrap();
+        let first = stand_in_provider_answering_after(
+            &domain,
+            lock,
+            "v0.0.1+first",
+            std::process::id(),
+            0,
+            HANDSHAKE_TIMEOUT + Duration::from_secs(1),
+            move |lock| {
+                *started.lock().unwrap() =
+                    Some(stand_in_provider(&next, lock, "v0.0.1+next", 2222, 1, drop));
+            },
+        );
+        switch_when_idle(&domain).unwrap();
+        assert_eq!(first.join().unwrap(), ["status", "stop if idle"]);
+        let next = successor.lock().unwrap().take().unwrap();
+        query(&domain, Control::Stop).unwrap();
+        next.join().unwrap();
+    }
+
+    /// A provider asked to stop if idle by a switch that has stopped waiting
+    /// for the answer keeps running: that switch has given up replacing it.
+    #[test]
+    fn a_provider_whose_stop_answer_cannot_be_delivered_keeps_running() {
+        let (_directory, domain, _) = fixture();
+        let service = Arc::new(Service::new(domain, None).unwrap());
+        let (mut client, server) = pair(&service);
+        // Keep it from deciding until the client has gone.
+        let held = service.inner.lock().unwrap();
+        let worker = {
+            let service = service.clone();
+            std::thread::spawn(move || service.handle(server))
+        };
+        crate::destination::write_message(
+            &mut client,
+            &Hello {
+                version: PROTOCOL,
+                build: crate::identity::build().into(),
+                control: true,
+            },
+        )
+        .unwrap();
+        let _: HelloReply = crate::destination::read_message(&mut client).unwrap();
+        crate::destination::write_message(&mut client, &Control::StopIfIdle).unwrap();
+        drop(client);
+        std::thread::sleep(Duration::from_millis(200));
+        drop(held);
+        let _ = worker.join().unwrap();
+        assert!(!service.stop.load(Ordering::SeqCst));
+        // New requests are admitted again, and it still stops once idle.
+        service.admit().unwrap();
+        assert!(service.stop_if_idle());
     }
 
     /// A provider from an older build: it answers status and stop, and rejects
