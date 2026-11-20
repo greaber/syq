@@ -191,6 +191,18 @@ impl Server {
             .capture_output()
             .unwrap()
     }
+    /// Like `cp`, at a server taken to list in byte order, as this one does:
+    /// only there may a destination listing show a key absent. Release
+    /// builds cannot take a loopback endpoint to.
+    #[cfg(debug_assertions)]
+    fn cp_in_byte_order(&self, temp: &Path, args: &[&str]) -> Output {
+        self.command(temp)
+            .env("SYQ_TEST_S3_DIVIDE_LISTINGS", "1")
+            .args(["--s3-endpoint", &self.address])
+            .args(args)
+            .capture_output()
+            .unwrap()
+    }
 }
 impl Drop for Server {
     fn drop(&mut self) {
@@ -4452,6 +4464,16 @@ fn copies_stop_when_requests_keep_failing_after_their_retries() {
         command
             .args(["--s3-endpoint", &server.address])
             .args(["--performance-tuning", "s3-objects=1"]);
+        if fault.starts_with("unavailable-") {
+            // Only writes fail. The destination listing shows the keys
+            // absent, so no HEAD between them succeeds, at a server taken to
+            // list in byte order, which release builds cannot take a
+            // loopback endpoint to be.
+            if !cfg!(debug_assertions) {
+                continue;
+            }
+            command.env("SYQ_TEST_S3_DIVIDE_LISTINGS", "1");
+        }
         let output = match fault {
             "unavailable-copy" => command.args([
                 "--from",
@@ -4818,6 +4840,7 @@ fn s3_listing_costs_are_bounded_without_changing_selection() {
     }
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn s3_upload_destination_discovery_is_bounded() {
     for (fault, placement, success, expected_requests) in [
@@ -4847,7 +4870,7 @@ fn s3_upload_destination_discovery_is_bounded() {
             std::fs::write(temp.path().join("three"), b"three").unwrap();
             args.insert(0, "three");
         }
-        let output = server.cp(temp.path(), &args);
+        let output = server.cp_in_byte_order(temp.path(), &args);
         assert_eq!(
             output.status.success(),
             success,
@@ -5446,11 +5469,12 @@ fn serve_copy_pages(socket: &mut TcpStream, first: &str, probes: &AtomicUsize) {
     }
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn s3_bucket_copy_asks_only_about_destination_keys_its_listing_shows() {
     let server = Server::start("copy-pages");
     let temp = crate::test_support::tempdir().unwrap();
-    let output = server.cp(
+    let output = server.cp_in_byte_order(
         temp.path(),
         &[
             "--from",
@@ -5470,6 +5494,7 @@ fn s3_bucket_copy_asks_only_about_destination_keys_its_listing_shows() {
     assert_eq!(server.probes.load(Ordering::Relaxed), 10);
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn s3_upload_pages_through_a_large_destination_while_copying() {
     let server = Server::start("upload-pages");
@@ -5483,18 +5508,16 @@ fn s3_upload_pages_through_a_large_destination_while_copying() {
     for n in 0..5 {
         std::fs::write(data.join(format!("zz{n}")), b"x").unwrap();
     }
-    let output = server.cp(
-        temp.path(),
-        &[
-            "--srcs-in",
-            "data",
-            "--to",
-            "s3://bucket",
-            "--into",
-            "data",
-            "--dry-run",
-        ],
-    );
+    let args = [
+        "--srcs-in",
+        "data",
+        "--to",
+        "s3://bucket",
+        "--into",
+        "data",
+        "--dry-run",
+    ];
+    let output = server.cp_in_byte_order(temp.path(), &args);
     assert!(output.status.success(), "{}", output_text(&output));
     // The copy starts after two pages; the third arrives while it runs and
     // shows the five new keys absent. Listed keys get a HEAD, new ones none.
@@ -5549,6 +5572,7 @@ fn s3_upload_asks_about_every_key_where_a_wrong_absence_would_change_the_result(
     }
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn s3_upload_continues_with_head_when_a_later_listing_page_fails() {
     let server = Server::start("upload-pages-fail");
@@ -5561,7 +5585,7 @@ fn s3_upload_continues_with_head_when_a_later_listing_page_fails() {
     for n in 0..5 {
         std::fs::write(data.join(format!("zz{n}")), b"x").unwrap();
     }
-    let output = server.cp(
+    let output = server.cp_in_byte_order(
         temp.path(),
         &[
             "--srcs-in",
@@ -5972,6 +5996,7 @@ fn server_copy_only_new_uses_a_conditional_write() {
     assert!(output.status.success(), "{}", output_text(&output));
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn server_copy_reuses_destination_discovery_and_prunes_beneath_file_keys() {
     for (fault, extra, requests) in [
@@ -5986,7 +6011,7 @@ fn server_copy_reuses_destination_discovery_and_prunes_beneath_file_keys() {
     ] {
         let server = Server::start(fault);
         let temp = crate::test_support::tempdir().unwrap();
-        let output = server.cp(
+        let output = server.cp_in_byte_order(
             temp.path(),
             &[
                 "--from",

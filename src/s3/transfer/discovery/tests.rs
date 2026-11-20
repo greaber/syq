@@ -11,6 +11,8 @@ use std::{
 struct Bucket {
     objects: BTreeMap<String, u64>,
     ordered: bool,
+    /// Whether the listing may rely on byte order (`Store::divides`).
+    divides: bool,
     honors_start: bool,
     /// The request, counted from one, whose page comes back out of order.
     disordered: Option<usize>,
@@ -26,6 +28,7 @@ impl Bucket {
         Self {
             objects: keys.into_iter().zip(1..).collect(),
             ordered: true,
+            divides: true,
             honors_start: true,
             disordered: None,
             repeated: None,
@@ -37,6 +40,9 @@ impl Bucket {
 impl Store for Bucket {
     fn ordered(&self) -> bool {
         self.ordered
+    }
+    fn divides(&self) -> bool {
+        self.divides
     }
     async fn page(
         &self,
@@ -108,7 +114,7 @@ async fn discover_under(bucket: &Bucket, prefixes: &[&str], plan: &[String]) -> 
     discover_segments(bucket, segments, keys).await
 }
 
-async fn discover_segments(bucket: &Bucket, segments: Vec<Segment>, keys: Keys) -> Vec<Listed> {
+async fn discover_segments(bucket: &impl Store, segments: Vec<Segment>, keys: Keys) -> Vec<Listed> {
     let len = keys.len();
     let mut walk = Walk::new(
         segments,
@@ -119,10 +125,8 @@ async fn discover_segments(bucket: &Bucket, segments: Vec<Segment>, keys: Keys) 
     if walk.segments.is_empty() {
         return plan.map(|_| Listed::Unknown).collect();
     }
-    if bucket.ordered {
+    if walk.before_copy(bucket).await.unwrap() {
         while walk.page(bucket).await.unwrap() {}
-    } else {
-        walk.whole(bucket).await.unwrap();
     }
     plan.map(|index| match walk.sizes[index].load(Relaxed) {
         _ if index >= walk.decided => Listed::Unknown,
@@ -791,4 +795,120 @@ async fn named_prefixes_each_holding_one_planned_key_are_not_listed() {
     let listed = discover_under(&bucket, &prefixes, &plan).await;
     assert!(listed.iter().all(|listed| *listed == Listed::Unknown));
     assert!(bucket.requests.borrow().is_empty());
+}
+
+/// Lists in the order measured on Cloudflare R2: as if every key ended in a
+/// byte just above `9`, so `a0000` comes before `a`. StartAfter follows the
+/// same order, and a continuation token names the last key returned.
+struct R2Order {
+    objects: Vec<(String, u64)>,
+    divides: bool,
+}
+impl R2Order {
+    fn position(key: &str) -> Vec<u8> {
+        let mut position = key.as_bytes().to_vec();
+        position.extend([b'9', 0xff]);
+        position
+    }
+    fn new(keys: impl IntoIterator<Item = String>) -> Self {
+        let mut objects: Vec<_> = keys.into_iter().zip(1..).collect();
+        objects.sort_by_key(|(key, _)| Self::position(key));
+        Self {
+            objects,
+            divides: false,
+        }
+    }
+}
+impl Store for R2Order {
+    fn divides(&self) -> bool {
+        self.divides
+    }
+    async fn page(
+        &self,
+        prefix: &str,
+        _: bool,
+        token: Option<&str>,
+        start_after: Option<&str>,
+    ) -> Result<Page> {
+        let after = token.or(start_after).map(Self::position);
+        let mut matching = self.objects.iter().filter(|(key, _)| {
+            key.starts_with(prefix)
+                && after
+                    .as_ref()
+                    .is_none_or(|after| Self::position(key) > *after)
+        });
+        let entries: Vec<_> = matching
+            .by_ref()
+            .take(1000)
+            .map(|(key, size)| Entry {
+                key: key.clone(),
+                size: *size,
+                last_modified: None,
+                etag: None,
+            })
+            .collect();
+        let next = matching.next().map(|_| entries.last().unwrap().key.clone());
+        Ok(Page {
+            next,
+            entries,
+            prefixes: Vec::new(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn absence_is_concluded_only_where_the_store_lists_in_byte_order() {
+    // The destination holds `d/a` after a thousand longer keys in R2's
+    // order; a page of them looks ordered and passes `d/a` and `d/a-`.
+    let destination = || {
+        (0..1000)
+            .map(|i| format!("d/a{i:04}"))
+            .chain(["d/a".to_owned()])
+    };
+    let plan = ["d/a".to_owned(), "d/a-".to_owned()];
+    let keys = || Keys::new(plan.iter().map(|key| key.as_str().into()));
+    let decide =
+        |store| discover_segments(store, vec![Segment::whole("d/".into(), &keys())], keys());
+    // Taken to be in byte order, the listing would call the existing `d/a`
+    // absent, and an upload would replace it, dropping metadata only the
+    // destination has.
+    let mut store = R2Order::new(destination());
+    store.divides = true;
+    assert_eq!(decide(&store).await, [Listed::Absent, Listed::Absent]);
+    // Where the order is not known, the incomplete listing decides nothing:
+    // both get a HEAD.
+    let store = R2Order::new(destination());
+    assert_eq!(decide(&store).await, [Listed::Unknown, Listed::Unknown]);
+    // A listing that completes shows absence in any order.
+    let store = R2Order::new(
+        (0..10)
+            .map(|i| format!("d/a{i:04}"))
+            .chain(["d/a".to_owned()]),
+    );
+    assert_eq!(decide(&store).await, [Listed::Present(11), Listed::Absent]);
+}
+
+#[tokio::test]
+async fn in_another_order_only_a_short_complete_listing_decides() {
+    // A small prefix: one complete page decides every key.
+    let plan: Vec<String> = (0..300)
+        .map(|i| format!("d/f{i:03}"))
+        .chain(["d/new".to_owned()])
+        .collect();
+    let mut bucket = Bucket::new(plan.iter().filter(|key| *key != "d/new").cloned());
+    bucket.divides = false;
+    let listed = discover(&bucket, "d/", &plan).await;
+    assert!(listed[..300]
+        .iter()
+        .all(|listed| matches!(listed, Listed::Present(_))));
+    assert_eq!(listed[300], Listed::Absent);
+    assert_eq!(bucket.requests.borrow().len(), 1);
+    // A large prefix costs the pages the copy waits for, then every key
+    // gets a HEAD.
+    let mut bucket = Bucket::new(large());
+    bucket.divides = false;
+    let plan: Vec<String> = (0..200).map(|i| format!("big/zz/new{i:03}")).collect();
+    let listed = discover(&bucket, "big/", &plan).await;
+    assert!(listed.iter().all(|listed| *listed == Listed::Unknown));
+    assert_eq!(bucket.requests.borrow().len(), PAGES_BEFORE_COPY);
 }

@@ -1053,6 +1053,7 @@ impl Engine {
     ) -> Result<()> {
         let discovery = Discovery::start(
             self.client.clone(),
+            self.options.endpoint.as_deref(),
             &self.options.bucket,
             segments,
             keys,

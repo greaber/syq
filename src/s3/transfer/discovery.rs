@@ -28,10 +28,12 @@ use std::{
 use tokio::sync::watch;
 
 /// Whether a planned key that the listing shows absent may go without its
-/// HEAD. The listing concludes absence from where a key would fall in a page,
-/// so a provider that orders keys differently could show an existing object
-/// as absent. That may cost an upload the comparison would have skipped. It
-/// must not change what the copy does, so these copies ask about every key.
+/// HEAD. The listing concludes absence from where a key would fall in a page
+/// only where the store lists in byte order, and otherwise only from a
+/// complete listing (`Walk::before_copy`): elsewhere an existing object could
+/// look absent, and an upload in its place would drop metadata only the
+/// destination has. Even so, relying on it must not change what the copy
+/// does, so these copies ask about every key.
 pub(super) fn trusts_absence(args: &Args) -> bool {
     // The object would be skipped by --only-existing, refused instead of kept
     // by keep, overwritten though newer by update-if-older, and judged by
@@ -255,8 +257,9 @@ impl Walk {
         true
     }
     /// Request the next page and record what it decides. Returns whether
-    /// another page is worth requesting.
+    /// another page is worth requesting. Only for a store in byte order.
     async fn page(&mut self, store: &impl Store) -> Result<bool> {
+        debug_assert!(store.divides(), "absence from a page needs byte order");
         let start;
         let (token, after) = match &self.token {
             Some(token) => (Some(token.as_str()), self.passed.as_str()),
@@ -334,7 +337,15 @@ impl Walk {
     /// is worth requesting.
     async fn before_copy(&mut self, store: &impl Store) -> Result<bool> {
         if !store.ordered() {
-            self.whole(store).await?;
+            self.whole(store, usize::MAX).await?;
+            return Ok(false);
+        }
+        if !store.divides() {
+            // A key's place in a page shows it absent only in byte order
+            // (`trusts_absence`); in another order only a complete listing
+            // does. List each prefix whole if that takes no more pages than
+            // the copy waits for anyway, and leave the rest to HEAD.
+            self.whole(store, PAGES_BEFORE_COPY).await?;
             return Ok(false);
         }
         for _ in 0..PAGES_BEFORE_COPY {
@@ -346,13 +357,15 @@ impl Walk {
     }
 
     /// Directory buckets list in no particular order and cannot start after a
-    /// key, so only a complete listing decides anything.
-    async fn whole(&mut self, store: &impl Store) -> Result<()> {
+    /// key, and other stores may list in an order other than bytes, so only a
+    /// complete listing of a prefix shows a key absent. At most `pages`
+    /// requests go to each prefix.
+    async fn whole(&mut self, store: &impl Store, pages: usize) -> Result<()> {
         for Segment { prefix, range } in &self.segments {
             let mut token: Option<String> = None;
             let mut found = 0;
             // Never spend as many LIST requests as checking each key with HEAD.
-            for _ in 0..range.len().saturating_sub(1) {
+            for _ in 0..range.len().saturating_sub(1).min(pages) {
                 let page = store.page(prefix, false, token.as_deref(), None).await?;
                 for entry in &page.entries {
                     ensure!(
@@ -416,6 +429,7 @@ impl Discovery {
     /// while the copy runs.
     pub(super) async fn start(
         client: aws_sdk_s3::Client,
+        endpoint: Option<&str>,
         bucket: &str,
         segments: Vec<Segment>,
         keys: Keys,
@@ -429,11 +443,13 @@ impl Discovery {
             .map(|segment| segment.range.clone())
             .collect();
         let mut walk = Walk::new(segments, keys, sizes.clone());
-        // This listing reads pages one by one; it never divides.
+        // This listing reads pages one by one; `divides` says only whether
+        // it may rely on byte order.
+        let divides = listing::lists_in_byte_order(endpoint, bucket);
         let store = listing::S3 {
             client: client.clone(),
             bucket,
-            divides: false,
+            divides,
         };
         let more = walk.before_copy(&store).await?;
         let (sender, reach) = watch::channel(Reach {
@@ -446,7 +462,7 @@ impl Discovery {
                 let store = listing::S3 {
                     client,
                     bucket: &bucket,
-                    divides: false,
+                    divides,
                 };
                 let mut more = true;
                 while more && !cancelled.load(Relaxed) {
