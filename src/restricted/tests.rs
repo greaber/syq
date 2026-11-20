@@ -15577,3 +15577,24 @@ fn paths_lie_beneath_a_prefix_only_across_a_slash() {
     assert!(RestrictedAuthority::scope_allows(&scope(true), b"/a/b/c"));
     assert!(!RestrictedAuthority::scope_allows(&scope(true), b"/a/bc"));
 }
+
+/// Requests that each find a state directory missing create it at once, as
+/// two approvals arriving together do for the enrollments directory: those
+/// that lose the race use the directory the winner made.
+#[test]
+fn requests_creating_a_state_directory_at_once_all_use_it() {
+    for _ in 0..20 {
+        let root = crate::test_support::tempdir().unwrap();
+        let directory = root.path().join("enrollments");
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    start.wait();
+                    ensure_directory(&directory, 0o700).unwrap();
+                });
+            }
+        });
+        assert!(directory.is_dir());
+    }
+}
