@@ -2713,7 +2713,7 @@ fn the_greetings_authorized_keys_count_matches_the_keys_sent() {
         let tools = temporary.path().join("tools");
         crate::test_support::write_executable(
             &tools.join("wc"),
-            &format!(
+            format!(
                 "#!/bin/sh\n{wc} \"$@\"; status=$?\nprintf '%s' '{changed}' > \"$HOME/.ssh/authorized_keys\"\nexit $status\n",
                 wc = real_wc.display(),
             ),
