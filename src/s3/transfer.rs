@@ -433,8 +433,9 @@ impl Engine {
                 // authorizing machine about it: the checks' requests are signed
                 // together first and the uploads' requests together afterwards.
                 // Each listed prefix's first page was signed before the
-                // listing started; a prefix's later pages, which continue
-                // from an earlier response, are signed one at a time.
+                // listings started; a prefix's later pages, which continue
+                // from an earlier response, are signed as the listings reach
+                // them.
                 self.authorize_upload_checks(&plan).await?;
                 let prepared = Arc::new(Mutex::new(Vec::with_capacity(plan.len())));
                 let mut position = 0..;
