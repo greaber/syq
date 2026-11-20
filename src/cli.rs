@@ -2122,6 +2122,9 @@ fn reject_detached_dash_native_values(argv: &[OsString]) -> Result<()> {
         }
     }
 
+    // A variadic option takes the words after it until the next option, but
+    // only when its first value is detached: an attached value
+    // (`--srcs=foo`) ends it, as in clap, so a `-` after it is positional.
     let mut variadic_option = None;
     for argument in arguments {
         let argument = argument.as_bytes();
@@ -2130,10 +2133,7 @@ fn reject_detached_dash_native_values(argv: &[OsString]) -> Result<()> {
                 reject_detached_dash(option)?;
             }
         } else if argument.starts_with(b"-") {
-            variadic_option = variadic_value_options().find(|option| {
-                argument == *option
-                    || (argument.starts_with(option) && argument.get(option.len()) == Some(&b'='))
-            });
+            variadic_option = variadic_value_options().find(|option| argument == *option);
         }
     }
     Ok(())
