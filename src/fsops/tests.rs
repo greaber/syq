@@ -7168,6 +7168,33 @@ fn descriptor_capacity_reservation_preserves_descriptors_and_limits() {
     assert_eq!(descriptors(), before);
 }
 
+/// A descriptor at or above the limit, as a parent can leave one at a high
+/// number before lowering the limit, takes none of the slots below it, so
+/// the snapshot does not count it.
+#[test]
+fn live_descriptor_snapshot_leaves_out_descriptors_above_the_limit() {
+    let limits = nofile_limits().unwrap();
+    let threshold = limits.rlim_cur.min(4096);
+    let file = std::fs::File::open("/dev/null").unwrap();
+    let high = unsafe {
+        libc::fcntl(
+            std::os::fd::AsRawFd::as_raw_fd(&file),
+            libc::F_DUPFD_CLOEXEC,
+            (threshold - 1) as libc::c_int,
+        )
+    };
+    assert_eq!(
+        high,
+        (threshold - 1) as libc::c_int,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+    let below = current_open_descriptor_count(threshold - 1).unwrap();
+    let including = current_open_descriptor_count(threshold).unwrap();
+    unsafe { libc::close(high) };
+    assert_eq!(including, below + 1);
+}
+
 #[test]
 fn live_descriptor_snapshot_includes_this_process() {
     let limits = nofile_limits().unwrap();

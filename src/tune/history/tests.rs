@@ -858,11 +858,12 @@ fn opening_the_history_holds_only_sqlite_descriptors_while_it_waits() {
     std::thread::scope(|scope| {
         let opening = scope.spawn(|| open_waiting(&path, Duration::from_secs(30)));
         let deadline = Instant::now() + Duration::from_secs(30);
-        while on_file() == before {
+        let mut most = 0;
+        while most == 0 {
             assert!(Instant::now() < deadline, "the history never opened");
             std::thread::sleep(Duration::from_millis(1));
+            most = on_file() - before;
         }
-        let mut most = 0;
         let sampled = Instant::now();
         while sampled.elapsed() < Duration::from_millis(300) {
             most = most.max(on_file() - before);
