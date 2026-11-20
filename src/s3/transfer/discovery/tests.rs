@@ -978,6 +978,8 @@ mod signed {
         /// Requests under way, and the most there have been at once.
         in_flight: Arc<AtomicUsize>,
         most: Arc<AtomicUsize>,
+        /// A prefix whose pages come back in reverse key order.
+        reversed: Option<String>,
     }
     impl HttpConnector for Served {
         fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
@@ -997,8 +999,11 @@ mod signed {
                 .objects
                 .range::<str, _>((lower, Bound::Unbounded))
                 .filter(|(key, _)| key.starts_with(prefix.as_str()));
-            let entries: Vec<_> = matching.by_ref().take(1000).collect();
+            let mut entries: Vec<_> = matching.by_ref().take(1000).collect();
             let next = matching.next().map(|_| entries.last().unwrap().0);
+            if self.reversed.as_ref() == Some(prefix) {
+                entries.reverse();
+            }
             let mut xml = format!(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>fixture</Name><Prefix>{prefix}</Prefix><KeyCount>{}</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>{}</IsTruncated>",
                 entries.len(),
@@ -1059,6 +1064,7 @@ mod signed {
             delay: Duration::ZERO,
             in_flight: Arc::default(),
             most: Arc::default(),
+            reversed: None,
         }
     }
     const ARGV: &[&str] = &[
@@ -1312,5 +1318,297 @@ mod signed {
             requests[0].get("start-after"),
             Some(&predecessor("dst/a/01"))
         );
+    }
+
+    /// Named directories `d00`…`d39` uploaded into `dst` with `--prune`, and
+    /// `extra` options. The endpoint is not AWS, so listings are not divided.
+    fn pruning_argv(extra: &[&str]) -> Vec<String> {
+        let mut argv = vec!["cp".to_owned()];
+        argv.extend((0..40).map(|d| format!("/src/d{d:02}")));
+        argv.extend(
+            [
+                "--to",
+                "s3://fixture",
+                "--into",
+                "dst",
+                "--prune",
+                "--s3-endpoint",
+                "https://storage.example",
+            ]
+            .into_iter()
+            .chain(extra.iter().copied())
+            .map(str::to_owned),
+        );
+        argv
+    }
+
+    /// Each named directory's new file `02` and existing file `01`, in key
+    /// order, and the pruning plan for them.
+    fn pruning_plan() -> (Vec<String>, crate::s3::prune::Plan) {
+        let mut plan: Vec<String> = (0..40)
+            .flat_map(|d| ["01", "02"].map(|f| format!("dst/d{d:02}/{f}")))
+            .collect();
+        plan.sort();
+        let mut prune = crate::s3::prune::Plan::default();
+        for d in 0..40 {
+            prune.scope(format!("dst/d{d:02}").as_bytes());
+        }
+        for key in &plan {
+            prune.claim_file(key.as_bytes());
+        }
+        (plan, prune)
+    }
+
+    /// Each named directory's `01`, and an object to prune in every even
+    /// one. Others lie beside the named directories, and one in a directory
+    /// whose name extends a named one's.
+    fn pruning_served() -> Served {
+        let mut objects: BTreeMap<String, u64> = BTreeMap::new();
+        for d in 0..40 {
+            objects.insert(format!("dst/d{d:02}/01"), 1);
+            if d % 2 == 0 {
+                objects.insert(format!("dst/d{d:02}/zz"), 2);
+            }
+        }
+        for key in [
+            "dst/a",
+            "dst/d00-x/zz",
+            "dst/d40/zz",
+            "dst/z",
+            "other/d00/zz",
+        ] {
+            objects.insert(key.to_owned(), 3);
+        }
+        Served {
+            objects: Arc::new(objects),
+            ..served()
+        }
+    }
+
+    /// The keys pruning would delete, from the signed DELETE requests.
+    fn signed_deletions(authorization: &Authorization) -> Vec<String> {
+        let mut keys: Vec<String> = authorization
+            .signed_so_far()
+            .into_iter()
+            .filter(|request| request.method == "DELETE")
+            .map(|request| request.key)
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    #[tokio::test]
+    async fn pruned_prefixes_are_listed_at_once_after_their_first_pages_are_signed_together() {
+        // A copy that keeps existing objects leaves the listing to preparing
+        // the deletions.
+        for extra in [&[][..], &["--if-exists=keep"], &["--dry-run"]] {
+            let argv = pruning_argv(extra);
+            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let mut served = pruning_served();
+            served.delay = Duration::from_millis(100);
+            let (engine, authorization) = engine(&argv, &served, true);
+            let authorization = authorization.unwrap();
+            let (mut plan, prune) = pruning_plan();
+            let started = std::time::Instant::now();
+            engine
+                .discover_destination(&mut plan, &prune.scopes, |key: &String| key.as_str().into())
+                .await
+                .unwrap();
+            engine.prepare_pruning(&prune).await.unwrap();
+            // Far sooner than one prefix after another.
+            assert!(
+                started.elapsed() < served.delay * 10,
+                "{extra:?}: {:?}",
+                started.elapsed()
+            );
+            // One request for each pruned directory, as many at once as the
+            // destination listing allows, each first signed in one exchange.
+            let requests = served.requests.lock().unwrap().clone();
+            let mut prefixes: Vec<&str> = requests.iter().map(|q| q["prefix"].as_str()).collect();
+            prefixes.sort();
+            let expected: Vec<String> = (0..40).map(|d| format!("dst/d{d:02}/")).collect();
+            assert_eq!(prefixes, expected, "{extra:?}");
+            assert!(requests
+                .iter()
+                .all(|q| !q.contains_key("start-after") && !q.contains_key("continuation-token")));
+            assert_eq!(served.most.load(Relaxed), LISTINGS, "{extra:?}");
+            let mut signed = signed_listings(&authorization);
+            signed.sort();
+            let first_pages: Vec<_> = expected.iter().map(|p| (p.clone(), None, false)).collect();
+            assert_eq!(signed, first_pages, "{extra:?}");
+            // The DELETE requests are signed in one more exchange, except in
+            // a dry run, which signs none.
+            let dry_run = extra.contains(&"--dry-run");
+            assert_eq!(
+                authorization.exchanges_so_far(),
+                if dry_run { 1 } else { 2 },
+                "{extra:?}"
+            );
+            let deleted: Vec<String> = if dry_run {
+                Vec::new()
+            } else {
+                (0..40)
+                    .step_by(2)
+                    .map(|d| format!("dst/d{d:02}/zz"))
+                    .collect()
+            };
+            assert_eq!(signed_deletions(&authorization), deleted, "{extra:?}");
+            // The listing is complete for each planned key.
+            let listed = engine.upload_keys.get().unwrap();
+            for key in &plan {
+                let size = served.objects.get(key).copied();
+                assert_eq!(listed.size(key), Some(size), "{key}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pruning_lists_nothing_and_deletes_nothing_outside_the_pruned_directories() {
+        // `d00` and `d01` are pruned, `d02` is named but not pruned: as a
+        // file, its key is checked on its own.
+        let argv = &[
+            "cp",
+            "/src/d00",
+            "/src/d01",
+            "/src/d02",
+            "--to",
+            "s3://fixture",
+            "--into",
+            "dst",
+            "--prune",
+            "--s3-endpoint",
+            "https://storage.example",
+        ];
+        let served = pruning_served();
+        let (engine, authorization) = engine(argv, &served, true);
+        let authorization = authorization.unwrap();
+        let mut plan: Vec<String> = ["dst/d00/01", "dst/d01/01", "dst/d02"]
+            .map(str::to_owned)
+            .into();
+        let mut prune = crate::s3::prune::Plan::default();
+        prune.scope(b"dst/d00");
+        prune.scope(b"dst/d01");
+        for key in &plan {
+            prune.claim_file(key.as_bytes());
+        }
+        engine
+            .discover_destination(&mut plan, &prune.scopes, |key: &String| key.as_str().into())
+            .await
+            .unwrap();
+        engine.prepare_pruning(&prune).await.unwrap();
+        let mut prefixes: Vec<String> = served
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|q| q["prefix"].clone())
+            .collect();
+        prefixes.sort();
+        assert_eq!(prefixes, ["dst/d00/", "dst/d01/"]);
+        assert_eq!(signed_deletions(&authorization), ["dst/d00/zz"]);
+    }
+
+    #[tokio::test]
+    async fn a_pruning_listing_out_of_key_order_is_still_complete() {
+        // A complete listing finds every key wherever the page puts it, so
+        // its order decides nothing, for that prefix or the others.
+        let argv = pruning_argv(&[]);
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let mut served = pruning_served();
+        served.reversed = Some("dst/d04/".to_owned());
+        let (engine, authorization) = engine(&argv, &served, true);
+        let authorization = authorization.unwrap();
+        let (mut plan, prune) = pruning_plan();
+        engine
+            .discover_destination(&mut plan, &prune.scopes, |key: &String| key.as_str().into())
+            .await
+            .unwrap();
+        engine.prepare_pruning(&prune).await.unwrap();
+        let listed = engine.upload_keys.get().unwrap();
+        for key in &plan {
+            assert_eq!(listed.size(key), Some(served.objects.get(key).copied()));
+        }
+        let deleted: Vec<String> = (0..40)
+            .step_by(2)
+            .map(|d| format!("dst/d{d:02}/zz"))
+            .collect();
+        assert_eq!(signed_deletions(&authorization), deleted);
+        assert_eq!(engine.progress.errors.load(Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn pruning_listings_at_once_send_no_more_requests_than_the_copy_s_concurrency() {
+        let argv = pruning_argv(&[]);
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let mut served = pruning_served();
+        served.delay = Duration::from_millis(20);
+        let (mut engine, _) = engine(&argv, &served, true);
+        engine.options.concurrency = 4;
+        let (mut plan, prune) = pruning_plan();
+        engine
+            .discover_destination(&mut plan, &prune.scopes, |key: &String| key.as_str().into())
+            .await
+            .unwrap();
+        assert_eq!(served.requests.lock().unwrap().len(), 40);
+        assert_eq!(served.most.load(Relaxed), 4);
+    }
+
+    #[tokio::test]
+    async fn a_pruned_prefix_s_later_pages_are_signed_as_its_listing_reaches_them() {
+        // `b` holds 2500 keys: three pages, the first signed with `a`'s and
+        // `c`'s, each later one continuing from the page before.
+        let argv: Vec<&str> = ARGV
+            .iter()
+            .copied()
+            .chain(["--prune", "--s3-endpoint", "https://storage.example"])
+            .collect();
+        let served = served();
+        let (engine, authorization) = engine(&argv, &served, true);
+        let authorization = authorization.unwrap();
+        let mut plan = plan();
+        let scopes = [b"dst/a".to_vec(), b"dst/b".to_vec(), b"dst/c".to_vec()];
+        engine
+            .discover_destination(&mut plan, &scopes, |key: &String| key.as_str().into())
+            .await
+            .unwrap();
+        let mut signed = signed_listings(&authorization);
+        signed.sort();
+        let continued = ("dst/b/".to_owned(), None, true);
+        assert_eq!(
+            signed,
+            [
+                ("dst/a/".to_owned(), None, false),
+                ("dst/b/".to_owned(), None, false),
+                continued.clone(),
+                continued,
+                ("dst/c/".to_owned(), None, false),
+            ]
+        );
+        assert_eq!(authorization.exchanges_so_far(), 3);
+        assert_eq!(served.requests.lock().unwrap().len(), 5);
+        assert_eq!(engine.upload_keys.get().unwrap().keys.len(), 2502);
+    }
+
+    #[tokio::test]
+    async fn without_a_signer_pruning_lists_the_destination_as_before() {
+        let argv: Vec<&str> = ARGV
+            .iter()
+            .copied()
+            .chain(["--prune", "--s3-endpoint", "https://storage.example"])
+            .collect();
+        let served = served();
+        let (engine, _) = engine(&argv, &served, false);
+        let mut plan = plan();
+        let scopes = [b"dst/a".to_vec(), b"dst/b".to_vec(), b"dst/c".to_vec()];
+        engine
+            .discover_destination(&mut plan, &scopes, |key: &String| key.as_str().into())
+            .await
+            .unwrap();
+        // One listing of the whole destination, page after page.
+        let requests = served.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|query| query["prefix"] == "dst/"));
+        assert!(!requests[0].contains_key("start-after"));
+        assert_eq!(engine.upload_keys.get().unwrap().keys.len(), 2504);
     }
 }
