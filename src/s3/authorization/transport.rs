@@ -47,10 +47,12 @@ impl HttpConnector for Connector {
             }
             let unsigned = describe(&mut request, &authorization).map_err(Permanent::connector)?;
             let payload = unsigned.payload_sha256().map_err(Permanent::connector)?;
+            let signing = tokio::time::Instant::now();
             let signed = tokio::task::spawn_blocking(move || authorization.signed(unsigned))
                 .await
                 .map_err(|_| failure("storage authorization task failed"))?
                 .map_err(Permanent::connector)?;
+            let signing = SigningWait(signing.elapsed());
             *request.uri_mut() = signed
                 .parse()
                 .map_err(|_| failure("invalid authorized storage URL"))?;
@@ -63,7 +65,7 @@ impl HttpConnector for Connector {
                 http::HeaderValue::from_str(payload.as_deref().unwrap_or("UNSIGNED-PAYLOAD"))
                     .map_err(|_| failure("invalid storage payload checksum"))?,
             );
-            inner
+            let mut response = inner
                 .call(
                     HttpRequest::try_from(request)
                         .map_err(|_| failure("invalid authorized storage request"))?,
@@ -71,10 +73,18 @@ impl HttpConnector for Connector {
                 .await
                 .inspect(|_| authorization_for_answer.record_answer(true))
                 .inspect_err(|_| authorization_for_answer.record_answer(false))
-                .map_err(redaction::connector_error)
+                .map_err(redaction::connector_error)?;
+            response.add_extension(signing);
+            Ok(response)
         })
     }
 }
+
+/// How long a storage request waited for its signature before it was sent.
+/// Latency measured around the request leaves this out: it describes the
+/// authorizing machine, not the storage service.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::s3) struct SigningWait(pub Duration);
 fn failure(message: &'static str) -> ConnectorError {
     Permanent::connector(anyhow::anyhow!(message))
 }

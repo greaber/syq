@@ -4464,16 +4464,6 @@ fn copies_stop_when_requests_keep_failing_after_their_retries() {
         command
             .args(["--s3-endpoint", &server.address])
             .args(["--performance-tuning", "s3-objects=1"]);
-        if fault.starts_with("unavailable-") {
-            // Only writes fail. The destination listing shows the keys
-            // absent, so no HEAD between them succeeds, at a server taken to
-            // list in byte order, which release builds cannot take a
-            // loopback endpoint to be.
-            if !cfg!(debug_assertions) {
-                continue;
-            }
-            command.env("SYQ_TEST_S3_DIVIDE_LISTINGS", "1");
-        }
         let output = match fault {
             "unavailable-copy" => command.args([
                 "--from",

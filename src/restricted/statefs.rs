@@ -37,21 +37,26 @@ pub(super) fn current_account() -> Result<(String, PathBuf)> {
 }
 
 pub(super) fn ensure_directory(path: &Path, mode: u32) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                bail!("{} is not a real directory", path.display());
+    let metadata = match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match fs::DirBuilder::new().mode(mode).create(path) {
+                Ok(()) => return Ok(()),
+                // Another request created it since: check what is there, as
+                // for one that already existed.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    fs::symlink_metadata(path)
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("create private directory {}", path.display()))
+                }
             }
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::DirBuilder::new()
-                .mode(mode)
-                .create(path)
-                .with_context(|| format!("create private directory {}", path.display()))?;
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("inspect directory {}", path.display()))
-        }
+        found => found,
+    }
+    .with_context(|| format!("inspect directory {}", path.display()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        bail!("{} is not a real directory", path.display());
     }
     Ok(())
 }

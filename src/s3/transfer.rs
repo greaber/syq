@@ -361,7 +361,7 @@ impl Engine {
         self.cancelled.store(true, Relaxed);
         self.cancel_wake.notify_waiters();
         self.uploads.cancel();
-        // Drain started requests, including synchronous file bodies, before exit.
+        // Drain started requests before exit.
         let _ = work.await;
         match interrupted {
             Some(interrupted) => bail!("S3 copy {interrupted}; rerun the command to continue"),
@@ -432,8 +432,9 @@ impl Engine {
                 // Preparation checks and hashes each file without asking the
                 // authorizing machine about it: the checks' requests are signed
                 // together first and the uploads' requests together afterwards.
-                // Destination listing pages that arrive during preparation are
-                // still signed one at a time.
+                // Each listed prefix's first page was signed before the
+                // listing started; a prefix's later pages, which continue
+                // from an earlier response, are signed one at a time.
                 self.authorize_upload_checks(&plan).await?;
                 let prepared = Arc::new(Mutex::new(Vec::with_capacity(plan.len())));
                 let mut position = 0..;
@@ -977,6 +978,16 @@ impl Engine {
                 let keys = discovery::Keys::new(plan.iter().map(&key));
                 let segments = discovery::segments(&keys, &prefixes);
                 if !segments.is_empty() {
+                    // Each prefix's first page is known now. Signing them
+                    // together saves a round trip to the signing machine
+                    // for each prefix the listing reaches.
+                    let ordered = super::listing::lists_in_key_order(&self.options.bucket);
+                    let divides = super::listing::lists_in_byte_order(
+                        self.options.endpoint.as_deref(),
+                        &self.options.bucket,
+                    );
+                    self.authorize_all(discovery::first_pages(&segments, &keys, ordered, divides))
+                        .await?;
                     return self.start_discovery(segments, keys).await;
                 }
             }
@@ -1569,27 +1580,20 @@ impl Engine {
         if size <= part_size || small.is_some() {
             let checksum = checksums.first().map(String::as_str);
             let _slot = self.tuning.requests.acquire().await;
-            let synchronous =
-                source.kind() == ObjectKind::File && small.is_none() && self.tuning.local_latency();
-            let sync_file =
-                synchronous.then(|| crate::s3::upload_http::FileBody::new(source.clone(), 0, size));
             self.upload_request(&source.key, None, algorithm, checksum)
                 .send(
                     content_md5(&source, small.as_ref(), 0, size),
                     |content_md5| {
-                        let (source, small, sync_file, metadata) =
-                            (&source, &small, &sync_file, &metadata);
+                        let (source, small, metadata) = (&source, &small, &metadata);
                         async move {
                             self.check_cancelled()?;
                             let body = if let Some(bytes) = &small {
                                 ByteStream::from(bytes.clone())
-                            } else if synchronous {
-                                crate::s3::upload_http::body(size)
                             } else {
                                 file_body(source, 0, size).await?
                             };
                             self.pace(size).await?;
-                            let request = self
+                            let result = self
                                 .client
                                 .put_object()
                                 .bucket(&self.options.bucket)
@@ -1602,16 +1606,9 @@ impl Engine {
                                 .set_if_none_match(must_be_new.then(|| "*".into()))
                                 .customize()
                                 .config_override(super::client::without_sdk_retries())
-                                .disable_payload_signing();
-                            let request = if let Some(file) = &sync_file {
-                                request.interceptor(file.clone())
-                            } else {
-                                request
-                            };
-                            let result = request.send().await;
-                            if let Some(file) = &sync_file {
-                                file.drain().await;
-                            }
+                                .disable_payload_signing()
+                                .send()
+                                .await;
                             Ok(result)
                         }
                     },
@@ -1698,26 +1695,15 @@ impl Engine {
                                 }
                             }
                             let _slot = self.tuning.requests.acquire().await;
-                            let sync_file = self.tuning.local_latency().then(|| {
-                                crate::s3::upload_http::FileBody::new(
-                                    source.clone(),
-                                    offset,
-                                    length,
-                                )
-                            });
                             let output = self
                                 .upload_request(&source.key, Some(number), algorithm, checksum)
-                                .send(content_md5(source, None, offset, length), |content_md5| {
-                                    let sync_file = &sync_file;
-                                    async move {
+                                .send(
+                                    content_md5(source, None, offset, length),
+                                    |content_md5| async move {
                                         self.check_cancelled()?;
-                                        let body = if sync_file.is_some() {
-                                            crate::s3::upload_http::body(length)
-                                        } else {
-                                            file_body(source, offset, length).await?
-                                        };
+                                        let body = file_body(source, offset, length).await?;
                                         self.pace(length).await?;
-                                        let request = self
+                                        let result = self
                                             .client
                                             .upload_part()
                                             .bucket(&self.options.bucket)
@@ -1732,19 +1718,12 @@ impl Engine {
                                             .set_content_md5(content_md5)
                                             .customize()
                                             .config_override(super::client::without_sdk_retries())
-                                            .disable_payload_signing();
-                                        let request = if let Some(file) = &sync_file {
-                                            request.interceptor(file.clone())
-                                        } else {
-                                            request
-                                        };
-                                        let result = request.send().await;
-                                        if let Some(file) = &sync_file {
-                                            file.drain().await;
-                                        }
+                                            .disable_payload_signing()
+                                            .send()
+                                            .await;
                                         Ok(result)
-                                    }
-                                })
+                                    },
+                                )
                                 .await?
                                 .map_err(|e| e.into_service_error())
                                 .context("upload part; rerun the command to resume")?;
@@ -3962,6 +3941,49 @@ fn symlink_metadata_differs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An engine for `argv`, a `syq` command line, that sends nothing.
+    pub(super) fn engine(argv: &[&str]) -> Engine {
+        let args = Arc::new(
+            Args::parse_args(
+                &argv
+                    .iter()
+                    .map(std::ffi::OsString::from)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        );
+        let options = args.s3.clone().unwrap();
+        let tuning = crate::s3::tuning::Tuning::new(
+            &options,
+            &args,
+            Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+        );
+        let config = aws_sdk_s3::config::Builder::new()
+            .behavior_version_latest()
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .build();
+        Engine {
+            args,
+            options,
+            tuning,
+            client: Client::from_conf(config),
+            progress: Progress::new(false, false, None),
+            bandwidth: None,
+            upload_keys: OnceLock::new(),
+            discovery: OnceLock::new(),
+            authorization: None,
+            copy_checksum_unsupported: Default::default(),
+            content_md5: Default::default(),
+            file_permissions: Default::default(),
+            metadata_replacements: Default::default(),
+            copy_tagging_unsupported: Default::default(),
+            outage: Default::default(),
+            cancelled: Default::default(),
+            cancel_wake: Default::default(),
+            uploads: Default::default(),
+        }
+    }
 
     #[test]
     fn native_upload_identity_binds_parts_algorithm_and_boundaries() {

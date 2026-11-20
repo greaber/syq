@@ -9,6 +9,7 @@
 //! The listing reads one prefix, the destination, unless the copy may list
 //! only some prefixes inside it: then it reads each of those in turn, for the
 //! planned keys beneath it ([`segments`]).
+use super::super::authorization::Unsigned;
 use super::super::listing::{
     self,
     engine::{Page, Store},
@@ -192,6 +193,46 @@ pub(super) fn segments(keys: &Keys, prefixes: &[String]) -> Vec<Segment> {
     segments
 }
 
+/// The requests the listing sends that do not depend on an earlier response:
+/// the first page of each of `segments`, and where the store is in key order
+/// but not known to be in byte order (`divides`), the short request that
+/// comes first ([`Discovery::start`]). A copy whose requests another machine
+/// signs has these signed together before the listing starts, rather than
+/// one round trip to that machine as the listing reaches each segment. The
+/// listing sends the pages as [`Walk`] enters each segment, or as
+/// [`Walk::whole`] lists it where a key's place in a page shows nothing. A
+/// segment whose planned keys are all too long for S3 is not listed.
+pub(super) fn first_pages<'a>(
+    segments: &'a [Segment],
+    keys: &'a Keys,
+    ordered: bool,
+    divides: bool,
+) -> impl Iterator<Item = Unsigned> + 'a {
+    let probe = segments
+        .first()
+        .filter(|_| ordered && !divides)
+        .map(|first| listing::first_key_request(&first.prefix));
+    probe.into_iter().chain(
+        segments
+            .iter()
+            .filter_map(move |Segment { prefix, range }| {
+                if !ordered || !divides {
+                    // `Walk::whole` spends fewer requests than the segment's
+                    // keys.
+                    return (range.len() >= 2).then(|| listing::first_page_request(prefix, None));
+                }
+                let start = range
+                    .clone()
+                    .map(|index| keys.get(index))
+                    .find(|key| key.len() <= MAX_KEY)?;
+                Some(listing::first_page_request(
+                    prefix,
+                    Some(&predecessor(start)),
+                ))
+            }),
+    )
+}
+
 /// A key just below `key`: a listing that starts after it begins at `key`.
 /// Keys between the two are listed needlessly, so stay close without
 /// inventing characters a provider might reject in a request.
@@ -349,14 +390,13 @@ impl Walk {
     }
 
     /// Decide the only segment from a complete listing of it, which shows at
-    /// most `object` and its size if given.
-    fn settle(&mut self, object: Option<(&str, Option<u64>)>) {
+    /// most `object` and its size.
+    fn settle(&mut self, object: Option<(&str, u64)>) {
         let Segment { prefix, range } = &self.segments[0];
         for index in range.clone() {
             let key = self.keys.get(index);
             let size = match object {
-                Some((listed, Some(size))) if listed == key => size,
-                Some((listed, None)) if listed == key => UNKNOWN,
+                Some((listed, size)) if listed == key => size,
                 _ if key.starts_with(prefix.as_str()) => ABSENT,
                 _ => UNKNOWN,
             };
@@ -475,15 +515,17 @@ impl Discovery {
             // A destination that cannot be listed still fails the copy here,
             // from one short request. When the prefix holds at most one
             // object, that request lists it completely.
-            let first =
-                super::super::client::list_one(&client, bucket, &walk.segments[0].prefix).await?;
-            let complete = walk.segments.len() == 1 && first.is_truncated() != Some(true);
+            let first = store.first_key(&walk.segments[0].prefix).await?;
+            // A service that returns more than asked for settles nothing.
+            let complete =
+                walk.segments.len() == 1 && first.next.is_none() && first.entries.len() <= 1;
             if complete {
-                let object = first.contents().first().map(|object| {
-                    let size = object.size().and_then(|size| u64::try_from(size).ok());
-                    (object.key().unwrap_or_default().to_owned(), size)
-                });
-                walk.settle(object.as_ref().map(|(key, size)| (key.as_str(), *size)));
+                walk.settle(
+                    first
+                        .entries
+                        .first()
+                        .map(|entry| (entry.key.as_str(), entry.size)),
+                );
             }
             !complete
         };

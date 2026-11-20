@@ -752,6 +752,8 @@ fn initial_request_budget_accounts_for_direction_latency_and_overrides() {
         (true, true, Some(100), true, None, 64),
         (false, false, Some(100), true, None, 256),
         (true, false, Some(100), true, None, 256),
+        (true, false, Some(20), true, None, 256),
+        (true, false, Some(19), true, None, 64),
         (false, true, Some(1), true, None, 64),
         (false, true, None, true, None, 64),
         (false, true, Some(100), false, None, 64),
