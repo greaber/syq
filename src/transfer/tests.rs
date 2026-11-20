@@ -6294,6 +6294,8 @@ fn a_copy_aborted_while_a_group_is_read_sends_no_patch() {
             answer: move |mut request: Request| {
                 if let Request::ReadDifferingBatch { reads, .. } = &mut request {
                     sched.abort();
+                    // Its files are read by path, as no source roots are
+                    // registered.
                     for read in reads {
                         read.source = None;
                     }
@@ -6327,6 +6329,8 @@ fn a_copy_aborted_while_a_group_is_read_sends_no_patch() {
         read(root, "source/file") != read(root, "target/file"),
         "the patch was published"
     );
+    // The file is left unfinished, not failed.
+    assert_eq!(worker.progress.errors.load(Relaxed), 0);
     assert_eq!(worker.progress.files_done.load(Relaxed), 0);
     assert_eq!(worker.progress.bytes_done.load(Relaxed), 0);
 }
