@@ -1721,8 +1721,8 @@ fn selector_and_placement_tables_match_the_parser() {
 }
 
 /// An attached value ends a variadic option, as in clap, so a `-` after it
-/// is the next positional argument (standard input or output); after a
-/// detached value it would be another value, and is refused as before.
+/// is the next positional argument, a path named `-`; after a detached
+/// value it would be another value, and is refused as before.
 #[test]
 fn a_dash_after_an_attached_variadic_value_is_positional() {
     let argv = |words: &[&str]| words.iter().map(OsString::from).collect::<Vec<_>>();
