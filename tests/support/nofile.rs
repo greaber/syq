@@ -2,7 +2,12 @@
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
+/// Limit the child to `requested` descriptors, starting it with only the
+/// standard ones (`inherit_only_standard_descriptors`), so that whether syq
+/// fits the limit does not depend on what the test runner leaves open: the
+/// GitHub Linux runners leave two pipes open in every process they start.
 pub fn set_child_nofile_limit(command: &mut Command, requested: libc::rlim_t) {
+    inherit_only_standard_descriptors(command);
     let mut inherited = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
