@@ -96,7 +96,18 @@ where
     } else {
         let mut read = open(size)?;
         let mut parts = Vec::new();
-        let mut buffer = crate::s3::file_body::scratch();
+        // Most files are far smaller than the read size, and preparation
+        // hashes many at once: a whole pooled buffer each costs far more
+        // memory than one the file's size.
+        let mut small;
+        let mut pooled;
+        let buffer: &mut [u8] = if size < 1024 * 1024 {
+            small = vec![0; size as usize];
+            &mut small
+        } else {
+            pooled = crate::s3::file_body::scratch();
+            &mut pooled
+        };
         for index in 0..size.div_ceil(part_size).max(1) {
             let mut hash = native.hasher();
             let mut offset = index * part_size;

@@ -1,6 +1,17 @@
 use super::*;
 use crate::s3::authorization::Unsigned;
 
+/// An existence check for each of `keys`, the plan in order, except those
+/// `known` already reports absent.
+pub(super) fn upload_checks<'a>(
+    keys: impl Iterator<Item = &'a str> + 'a,
+    known: impl Fn(usize, &str) -> Option<Listed> + 'a,
+) -> impl Iterator<Item = Unsigned> + 'a {
+    keys.enumerate()
+        .filter(move |(position, key)| known(*position, key) != Some(Listed::Absent))
+        .map(|(_, key)| Unsigned::new("HEAD", key))
+}
+
 impl Engine {
     pub(super) async fn authorize_requests(&self, mut requests: Vec<Unsigned>) -> Result<()> {
         let Some(authorization) = &self.authorization else {
@@ -31,12 +42,64 @@ impl Engine {
         };
         authorization.finish().await
     }
-    pub(super) async fn authorize_upload(&self, prepared: &PreparedUpload) -> Result<()> {
+    /// Signs many requests in a few exchanges with the authorizing machine,
+    /// so preparation does not wait for one round trip per file.
+    pub(super) async fn authorize_all(
+        &self,
+        requests: impl Iterator<Item = Unsigned>,
+    ) -> Result<()> {
         if self.authorization.is_none() {
             return Ok(());
         }
+        let limit = crate::s3::authorization::EXCHANGE_REQUESTS;
+        for exchange in crate::s3::authorization::exchanges(requests, limit) {
+            self.check_cancelled()?;
+            self.authorize_requests(exchange).await?;
+        }
+        Ok(())
+    }
+    /// The existence checks `prepare_upload` may send, signed together
+    /// before preparation starts. A key the destination listing has already
+    /// shown absent gets none; one it has yet to reach is signed in case.
+    pub(super) async fn authorize_upload_checks(&self, plan: &[Source]) -> Result<()> {
+        self.authorize_all(upload_checks(
+            plan.iter().map(|source| source.key.as_str()),
+            |position, key| self.known(position, key),
+        ))
+        .await
+    }
+    /// Every request the prepared uploads will send, signed together after
+    /// hashing and before any data moves.
+    pub(super) async fn authorize_uploads<'a>(
+        &self,
+        prepared: impl Iterator<Item = &'a UploadPreparation> + Clone,
+    ) -> Result<()> {
+        let ready = prepared.filter_map(|work| match work {
+            UploadPreparation::Ready(work) => Some(&**work),
+            UploadPreparation::Skipped | UploadPreparation::Preview(_) => None,
+        });
+        // First the requests that abandon uploads no recovery record keeps,
+        // so a failure while signing the rest can still clean those up.
+        self.authorize_all(ready.clone().flat_map(Self::abandon_requests))
+            .await?;
+        self.authorize_all(ready.flat_map(Self::upload_requests))
+            .await
+    }
+    /// The requests that abort a prepared upload which nothing would resume.
+    fn abandon_requests(prepared: &PreparedUpload) -> Vec<Unsigned> {
+        let unrecorded = prepared.metadata_update.is_some()
+            || prepared.multipart.as_ref().is_some_and(|m| !m.recorded);
+        let mut requests = if unrecorded {
+            Self::upload_requests(prepared)
+        } else {
+            Vec::new()
+        };
+        requests.retain(|r| r.method == "DELETE" && r.query.contains_key("uploadId"));
+        requests
+    }
+    fn upload_requests(prepared: &PreparedUpload) -> Vec<Unsigned> {
         if let Some(update) = &prepared.metadata_update {
-            return self.authorize_requests(update.requests()).await;
+            return update.requests();
         }
         let key = &prepared.source.key;
         let mut requests = vec![Unsigned::new("HEAD", key)];
@@ -82,7 +145,7 @@ impl Engine {
             }
             requests.push(request);
         }
-        self.authorize_requests(requests).await
+        requests
     }
     pub(super) async fn authorize_downloads(&self, jobs: &mut [Download]) -> Result<()> {
         if self.authorization.is_none() {

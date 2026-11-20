@@ -4,15 +4,37 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::{Arc, Condvar, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+pub(crate) mod started;
 mod transport;
-pub(super) use transport::{http_client, signed_header};
+pub(super) use transport::{http_client, signed_header, SigningWait};
 
 pub(crate) const DEFAULT_LIFETIME: u64 = 7 * 24 * 60 * 60;
+
+/// The most requests a caller hands to one signing exchange. An exchange
+/// pipelines its bounded wire messages, so it costs about one round trip to
+/// the authorizing machine however many requests it carries. The limit bounds
+/// the descriptions and signed URLs held outside the prepared set at once.
+/// Batches from other callers join an exchange only while it stays within
+/// this limit; a caller's own batch is never split.
+pub(super) const EXCHANGE_REQUESTS: usize = 128 * 128;
+
+/// Groups requests into signing exchanges of at most `limit` requests each,
+/// without first collecting every request.
+pub(super) fn exchanges(
+    requests: impl Iterator<Item = Unsigned>,
+    limit: usize,
+) -> impl Iterator<Item = Vec<Unsigned>> {
+    let mut requests = requests.fuse();
+    std::iter::from_fn(move || {
+        let exchange: Vec<_> = requests.by_ref().take(limit).collect();
+        (!exchange.is_empty()).then_some(exchange)
+    })
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,6 +89,9 @@ pub(crate) struct Request {
     /// signed headers must be ones syq sends itself.
     #[serde(default)]
     pub headers: std::collections::BTreeSet<(String, String)>,
+    /// The command's --max-delete: the most object deletions signed.
+    #[serde(default)]
+    pub max_delete: Option<u64>,
 }
 impl Request {
     pub(crate) fn validate(&self) -> Result<()> {
@@ -397,7 +422,7 @@ impl Unsigned {
                 .map(String::as_str),
         )
     }
-    pub(super) fn new(method: &str, key: &str) -> Self {
+    pub(crate) fn new(method: &str, key: &str) -> Self {
         Self {
             bucket: None,
             method: method.into(),
@@ -406,15 +431,15 @@ impl Unsigned {
             headers: BTreeMap::new(),
         }
     }
-    pub(super) fn bucket(mut self, bucket: &str, default: &str) -> Self {
+    pub(crate) fn bucket(mut self, bucket: &str, default: &str) -> Self {
         self.bucket = (bucket != default).then(|| bucket.to_owned());
         self
     }
-    pub(super) fn query(mut self, key: &str, value: &str) -> Self {
+    pub(crate) fn query(mut self, key: &str, value: &str) -> Self {
         self.query.insert(key.into(), value.into());
         self
     }
-    pub(super) fn header(mut self, key: &str, value: &str) -> Self {
+    pub(crate) fn header(mut self, key: &str, value: &str) -> Self {
         self.headers.insert(key.into(), value.into());
         self
     }
@@ -451,6 +476,8 @@ pub(crate) struct Signer {
     request: Request,
     pub configuration: Configuration,
     credentials: aws_sdk_s3::config::Credentials,
+    /// Object deletions signed so far, counted against --max-delete.
+    deletions: std::sync::atomic::AtomicU64,
 }
 impl Signer {
     pub(crate) async fn new(request: Request) -> Result<Self> {
@@ -512,7 +539,51 @@ impl Signer {
             },
             request,
             credentials,
+            deletions: Default::default(),
         })
+    }
+
+    /// A signer for an already approved request, with fixture credentials.
+    #[cfg(test)]
+    pub(crate) fn fixture(request: Request) -> Self {
+        Self {
+            request,
+            configuration: Configuration {
+                endpoint: "https://storage.example".into(),
+                region: "auto".into(),
+                expires_at: now().unwrap() + DEFAULT_LIFETIME,
+                requested_lifetime: DEFAULT_LIFETIME,
+            },
+            credentials: aws_sdk_s3::config::Credentials::new(
+                "fixture-key",
+                "fixture-secret",
+                None,
+                None,
+                "test",
+            ),
+            deletions: Default::default(),
+        }
+    }
+
+    /// Refuses an object deletion beyond the command's --max-delete. The
+    /// copy asks for all of its deletions together, and for none when it
+    /// plans more than the limit, so only a server that ignores the limit
+    /// reaches this. Each signature counts, whatever key it names.
+    fn count_deletion(&self, request: &Unsigned) -> Result<()> {
+        let Some(limit) = self.request.max_delete else {
+            return Ok(());
+        };
+        if request.method != "DELETE" || request.query.contains_key("uploadId") {
+            return Ok(());
+        }
+        let signed = self
+            .deletions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        anyhow::ensure!(
+            signed < limit,
+            "storage authorization permits no more than {limit} object deletions (--max-delete)"
+        );
+        Ok(())
     }
 
     pub(crate) fn sign(&self, request: &Unsigned) -> Result<String> {
@@ -521,6 +592,7 @@ impl Signer {
             SigningSettings, UriPathNormalizationMode,
         };
         self.request.permits(request)?;
+        self.count_deletion(request)?;
         let remaining = self
             .configuration
             .expires_at
@@ -603,19 +675,53 @@ fn now() -> Result<u64> {
 }
 
 struct State {
+    /// The connection to the authorizing machine. It is out of the state
+    /// while an exchange uses it, and gone once preparation finishes or fails.
     connection: Option<std::os::unix::net::UnixStream>,
     requests: BTreeMap<Unsigned, String>,
     /// Why signing failed. A failed exchange ends the signing session, so
     /// every later request it has not prepared fails for the same reason.
     failure: Option<String>,
+    /// Callers' batches waiting for the next exchange, in the order they
+    /// arrived and in number order. An exchange a caller left to others is
+    /// one entry with the number of the last batch it holds.
+    queued: VecDeque<(u64, Vec<Unsigned>)>,
+    /// The number given to the last batch queued.
+    last_queued: u64,
+    /// Every batch numbered up to this one is signed. Exchanges take batches
+    /// in order, so batches finish in order.
+    signed_through: u64,
+    /// Later batches whose requests were all signed by an earlier exchange
+    /// by the time an exchange took them or the session failed. Their
+    /// callers succeed whatever happens to later exchanges.
+    satisfied: BTreeSet<u64>,
+    /// The number of requests in the exchange under way, if any.
+    in_flight: usize,
 }
 impl State {
-    fn ended(&self) -> Result<()> {
+    fn ended(&self, started_elsewhere: bool) -> Result<()> {
         match &self.failure {
+            Some(failure) if started_elsewhere => anyhow::bail!(
+                "storage signing ended after an earlier request failed ({failure}); run the copy again"
+            ),
             Some(failure) => anyhow::bail!(
                 "storage authorization ended after an earlier request failed ({failure}); rerun the copy for fresh approval"
             ),
             None => Ok(()),
+        }
+    }
+    /// Ends the session. Queued batches that earlier exchanges have signed
+    /// in full stay complete; the rest fail.
+    fn fail(&mut self, failure: String) {
+        self.connection = None;
+        self.failure = Some(failure);
+        for (number, batch) in std::mem::take(&mut self.queued) {
+            if batch
+                .iter()
+                .all(|request| self.requests.contains_key(request))
+            {
+                self.satisfied.insert(number);
+            }
         }
     }
 }
@@ -623,6 +729,15 @@ pub(crate) struct Authorization {
     pub configuration: Configuration,
     pub bucket: String,
     state: Mutex<State>,
+    /// Signals the end of each exchange.
+    exchanged: Condvar,
+    /// The machine that started this copy over SSH signs for it, rather
+    /// than a receiving machine that approved it.
+    started_elsewhere: bool,
+    /// Whether the storage service has answered a request, and whether one
+    /// sent to it got no answer.
+    answered: std::sync::atomic::AtomicBool,
+    unanswered: std::sync::atomic::AtomicBool,
 }
 impl std::fmt::Debug for Authorization {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -644,10 +759,59 @@ impl Authorization {
                 connection: Some(connection),
                 requests: BTreeMap::new(),
                 failure: None,
+                queued: VecDeque::new(),
+                last_queued: 0,
+                signed_through: 0,
+                satisfied: BTreeSet::new(),
+                in_flight: 0,
             }),
+            exchanged: Condvar::new(),
+            started_elsewhere: false,
+            answered: Default::default(),
+            unanswered: Default::default(),
         }
     }
-    pub(super) fn authorize(&self, requests: Vec<Unsigned>) -> Result<()> {
+    /// Whether the machine that started this copy signs for it.
+    pub(crate) fn started_elsewhere(&self) -> bool {
+        self.started_elsewhere
+    }
+    fn signer(&self) -> &'static str {
+        if self.started_elsewhere {
+            "the machine that started this copy"
+        } else {
+            "authorizing machine"
+        }
+    }
+    fn expired(&self) -> anyhow::Error {
+        if self.started_elsewhere {
+            anyhow::anyhow!(
+                "the signed storage URLs for this copy expired at {}; they last {}, or until the credentials that signed them expire if that is sooner. Run the copy again to continue it",
+                started::time(self.configuration.expires_at),
+                started::duration(self.configuration.requested_lifetime)
+            )
+        } else {
+            anyhow::anyhow!("storage authorization expired; rerun the copy for fresh approval")
+        }
+    }
+    pub(super) fn record_answer(&self, answered: bool) {
+        let flag = if answered {
+            &self.answered
+        } else {
+            &self.unanswered
+        };
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// Whether requests were sent to the storage service and none of them
+    /// was ever answered.
+    pub(crate) fn never_answered(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.unanswered.load(Relaxed) && !self.answered.load(Relaxed)
+    }
+    /// Signs the requests not yet prepared. Batches that arrive while an
+    /// exchange is under way go together in the next one, so callers that
+    /// sign as they send share round trips to the authorizing machine
+    /// instead of waiting for one each.
+    pub(crate) fn authorize(&self, requests: Vec<Unsigned>) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         let missing: Vec<_> = requests
             .into_iter()
@@ -656,32 +820,127 @@ impl Authorization {
         if missing.is_empty() {
             return Ok(());
         }
-        state.ended()?;
-        let stream = state.connection.as_mut().with_context(|| format!("request {request:?} was not prepared before storage authorization disconnected; rerun for fresh approval", request = missing[0]))?;
-        let signed = crate::destination::storage::sign(stream, &missing).and_then(|signed| {
-            anyhow::ensure!(
-                signed.len() == missing.len(),
-                "incomplete storage authorization response"
-            );
-            Ok(signed)
-        });
-        match signed {
-            Ok(signed) => {
-                state.requests.extend(missing.into_iter().zip(signed));
-                Ok(())
+        state.ended(self.started_elsewhere)?;
+        if state.connection.is_none() && state.in_flight == 0 {
+            let request = &missing[0];
+            if self.started_elsewhere {
+                anyhow::bail!("request {request:?} was not signed before the copy started moving data; run the copy again");
             }
-            Err(error) => {
-                state.connection = None;
-                state.failure = Some(format!("{error:#}"));
-                Err(error)
+            anyhow::bail!("request {request:?} was not prepared before storage authorization disconnected; rerun for fresh approval");
+        }
+        state.last_queued += 1;
+        let batch = state.last_queued;
+        state.queued.push_back((batch, missing));
+        loop {
+            if state.signed_through >= batch || state.satisfied.remove(&batch) {
+                return Ok(());
+            }
+            state.ended(self.started_elsewhere)?;
+            if state.in_flight > 0 {
+                state = self.exchanged.wait(state).unwrap();
+                continue;
+            }
+            // Nothing is in flight and this caller's batch is unsigned, so it
+            // is queued and preparation has not finished.
+            if state.connection.is_none() || state.queued.is_empty() {
+                state.fail("storage authorization lost its connection".into());
+                self.exchanged.notify_all();
+                return state.ended(self.started_elsewhere);
+            }
+            // The first queued batch, and the batches after it while the
+            // exchange stays within the limit. A batch an earlier exchange
+            // has signed since it was queued is complete already.
+            let mut exchange = Vec::new();
+            let mut through = state.signed_through;
+            let mut combined = false;
+            while let Some((number, mut requests)) = state.queued.pop_front() {
+                requests.retain(|request| !state.requests.contains_key(request));
+                if requests.is_empty() {
+                    if exchange.is_empty() {
+                        state.signed_through = number;
+                    } else {
+                        state.satisfied.insert(number);
+                    }
+                    continue;
+                }
+                if !exchange.is_empty() && exchange.len() + requests.len() > EXCHANGE_REQUESTS {
+                    state.queued.push_front((number, requests));
+                    break;
+                }
+                through = number;
+                if exchange.is_empty() {
+                    exchange = requests;
+                } else {
+                    exchange.extend(requests);
+                    combined = true;
+                }
+            }
+            // Two combined callers may ask for the same request.
+            if combined {
+                exchange.sort_unstable();
+                exchange.dedup();
+            }
+            // Callers whose batches are complete need not wait for this exchange.
+            self.exchanged.notify_all();
+            if exchange.is_empty() {
+                continue;
+            }
+            // If this caller's batch turned out complete, it leaves the
+            // exchange to a waiting caller, queued again as one entry with
+            // the number of the last batch it holds.
+            if state.signed_through >= batch || state.satisfied.remove(&batch) {
+                state.queued.push_front((through, exchange));
+                return Ok(());
+            }
+            let mut stream = state.connection.take().unwrap();
+            state.in_flight = exchange.len();
+            drop(state);
+            let mut exchanging = Exchanging(Some(self));
+            let signed = crate::destination::storage::sign(&mut stream, &exchange, self.signer())
+                .and_then(|signed| {
+                    anyhow::ensure!(
+                        signed.len() == exchange.len(),
+                        "incomplete storage authorization response"
+                    );
+                    Ok(signed)
+                });
+            exchanging.0 = None;
+            state = self.state.lock().unwrap();
+            state.in_flight = 0;
+            self.exchanged.notify_all();
+            match signed {
+                Ok(signed) => {
+                    state.connection = Some(stream);
+                    state.requests.extend(exchange.into_iter().zip(signed));
+                    state.signed_through = through;
+                    state.satisfied.retain(|&number| number > through);
+                }
+                Err(error) => {
+                    state.fail(format!("{error:#}"));
+                    // This caller may have led the exchange for others.
+                    if state.signed_through >= batch || state.satisfied.remove(&batch) {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
             }
         }
     }
-    pub(super) fn signed(&self, request: Unsigned) -> Result<String> {
-        anyhow::ensure!(
-            now()? < self.configuration.expires_at,
-            "storage authorization expired; rerun the copy for fresh approval"
-        );
+    /// Every request signed so far.
+    #[cfg(test)]
+    pub(crate) fn signed_so_far(&self) -> Vec<Unsigned> {
+        self.state
+            .lock()
+            .unwrap()
+            .requests
+            .keys()
+            .cloned()
+            .collect()
+    }
+    pub(crate) fn signed(&self, request: Unsigned) -> Result<String> {
+        if now()? >= self.configuration.expires_at {
+            return Err(self.expired());
+        }
         if request.method == "PUT" {
             let mut streaming = request.clone();
             streaming.headers.remove("content-md5");
@@ -698,17 +957,46 @@ impl Authorization {
             .fmt(aws_smithy_types::date_time::Format::DateTime)?;
         let authorization = self.clone();
         tokio::task::spawn_blocking(move || authorization.finish_preparation()).await??;
+        if self.started_elsewhere {
+            // That machine stays connected for the whole copy, and losing it
+            // stops the copy, so there is nothing to tell anyone.
+            return Ok(());
+        }
         crate::output::diagnostic!("syq: storage authorization ready; the authorizing machine may disconnect. Authorization expires at {deadline}; provider policies or credential revocation may shorten it.");
         Ok(())
     }
-    pub(super) fn finish_preparation(&self) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+    pub(crate) fn finish_preparation(&self) -> Result<()> {
+        // Requests already asked for are signed first, as they would be had
+        // their callers taken the connection before this one.
+        let mut state = self
+            .exchanged
+            .wait_while(self.state.lock().unwrap(), |state| {
+                state.failure.is_none() && (state.in_flight > 0 || !state.queued.is_empty())
+            })
+            .unwrap();
         // Preparation that failed must not count as finished.
-        state.ended()?;
+        state.ended(self.started_elsewhere)?;
         if let Some(mut stream) = state.connection.take() {
             crate::destination::storage::finish(&mut stream)?;
         }
         Ok(())
+    }
+}
+
+/// Ends an exchange that stopped without a result, so its waiting callers
+/// fail instead of waiting for it forever.
+struct Exchanging<'a>(Option<&'a Authorization>);
+impl Drop for Exchanging<'_> {
+    fn drop(&mut self) {
+        if let Some(authorization) = self.0 {
+            let mut state = authorization
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.in_flight = 0;
+            state.fail("storage signing stopped unexpectedly".into());
+            authorization.exchanged.notify_all();
+        }
     }
 }
 
@@ -774,16 +1062,13 @@ pub(crate) fn request_for(args: &crate::cli::Args, options: &super::Options) -> 
             })
             .collect::<Result<Vec<_>>>()?
     } else if upload {
-        vec![Scope {
-            key: super::local::key_path(
-                &args
-                    .locations
-                    .last()
-                    .context("storage destination missing")?
-                    .path,
-            )?,
-            descendants: true,
-        }]
+        upload_roots(args, options)?
+            .into_iter()
+            .map(|key| Scope {
+                key,
+                descendants: true,
+            })
+            .collect()
     } else {
         source_scopes()?
     };
@@ -819,8 +1104,57 @@ pub(crate) fn request_for(args: &crate::cli::Args, options: &super::Options) -> 
         create_only: args.ignore_existing || args.target_existence == crate::cli::Existence::New,
         lifetime: DEFAULT_LIFETIME,
         headers: command_headers(options),
+        max_delete: args
+            .max_delete
+            .filter(|_| upload && args.delete && !args.dry_run),
     };
     Ok(request)
+}
+
+/// The most upload roots a request names one by one.
+const NAMED_ROOTS: usize = 1024;
+
+/// The keys under which an upload reads, writes and lists: each is a key and
+/// everything below it. Where the command names its sources, each lands at
+/// its own name inside the destination directory, and those names are the
+/// roots: nothing else in the directory is the copy's business. The whole
+/// destination is the root when the command does not say which names the
+/// copy produces (`--srcs-in`, a mapping, a copy between buckets), when it
+/// tests the destination directory itself (the `-existing` and `-new`
+/// placements), and when it names more sources than a request lists. (A
+/// copy between a server and a bucket never does: like a copy between two
+/// servers, it refuses more named sources than that before it signs
+/// anything.)
+///
+/// The machine that signs derives the signed paths from this, and the copy
+/// lists the destination under the same roots, so the two cannot disagree.
+pub(crate) fn upload_roots(
+    args: &crate::cli::Args,
+    options: &super::Options,
+) -> Result<Vec<String>> {
+    let (target, sources) = args
+        .locations
+        .split_last()
+        .context("storage destination missing")?;
+    let target = super::local::key_path(&target.path)?;
+    let named = options.route == super::Route::Upload
+        && args.native_mapping.is_none()
+        && args.target_existence == crate::cli::Existence::Any;
+    if !named {
+        return Ok(vec![target]);
+    }
+    let mut roots = std::collections::BTreeSet::new();
+    for source in sources {
+        let root = super::local::upload_destination(args, &target, source)?;
+        if root == target || roots.len() == NAMED_ROOTS {
+            return Ok(vec![target]);
+        }
+        roots.insert(root);
+    }
+    if roots.is_empty() {
+        return Ok(vec![target]);
+    }
+    Ok(roots.into_iter().collect())
 }
 
 pub(super) fn acl_headers(options: &super::Options) -> BTreeMap<String, String> {

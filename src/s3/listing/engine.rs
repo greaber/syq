@@ -154,9 +154,11 @@ fn refused(error: &anyhow::Error) -> bool {
 fn may_hide(page: &Page, wanted: impl Fn(&str) -> bool) -> bool {
     page.next.is_some()
         && page.prefixes.iter().any(|prefix| {
-            prefix
-                .strip_suffix('/')
-                .is_some_and(|stem| wanted(&format!("{stem}0")))
+            prefix.strip_suffix('/').is_some_and(|stem| {
+                let key = format!("{stem}0");
+                // A key the page already holds is not missing.
+                wanted(&key) && page.entries.iter().all(|entry| entry.key != key)
+            })
         })
 }
 
@@ -268,23 +270,36 @@ impl Gap {
             None => read(store, prefix, delimiter, Some(token)).await?,
             Some(key) => {
                 debug_assert!(byte_ordered(store), "checks rely on byte order");
-                let (page, check) = tokio::join!(
-                    read(store, prefix, delimiter, Some(token)),
-                    read(store, &key, true, None)
-                );
-                let mut page = page?;
+                // The check runs while the page is read, and is dropped
+                // unfinished if the page settles the question.
+                let main = read(store, prefix, delimiter, Some(token));
+                let check = read(store, &key, true, None);
+                tokio::pin!(main, check);
+                let mut checked = None;
+                let mut page = loop {
+                    tokio::select! {
+                        // With one request slot free, the page goes first.
+                        biased;
+                        page = &mut main => break page?,
+                        result = &mut check, if checked.is_none() => checked = Some(result),
+                    }
+                };
                 if page.entries.is_empty() && page.prefixes.is_empty() && page.next.is_some() {
                     // An empty page shows nothing; the next one starts at
                     // the key or past it.
                     return Ok((
                         page,
                         Gap {
-                            key: Some(key),
+                            key: Some(key.clone()),
                             refused,
                         },
                     ));
                 }
                 if page.entries.first().is_none_or(|entry| entry.key != key) {
+                    let check = match checked {
+                        Some(check) => check,
+                        None => check.await,
+                    };
                     if let Some(entry) = Self::find(store, &key, check).await? {
                         page.entries.insert(0, entry);
                     }
@@ -295,8 +310,14 @@ impl Gap {
         if let Some(refused) = &refused {
             ensure!(!may_hide(&page, &wanted), "{refused}");
         }
-        let mut next = Gap::after(&page, wanted);
-        next.refused = refused;
+        // Where the order is unknown, nothing is checked (`may_hide` above).
+        let next = match refused {
+            Some(refused) => Gap {
+                key: None,
+                refused: Some(refused),
+            },
+            None => Gap::after(&page, wanted),
+        };
         Ok((page, next))
     }
 
@@ -418,7 +439,15 @@ async fn execute(
                 format!("listing {query:?} without a delimiter, since a later delimiter page could leave out a key")
             };
             match read(store, &query, false, None).await {
-                Ok(flat) => return Ok(scan_batch(query, false, flat, Gap::default())),
+                Ok(flat) => {
+                    static SAID: std::sync::Once = std::sync::Once::new();
+                    SAID.call_once(|| {
+                        crate::output::diagnostic!(
+                            "syq _ls: listing every key under {query:?} without a delimiter, which can take much longer; other prefixes the pattern's last part reaches are listed the same way when their listings need more than one page: this store may not list keys in byte order, and its later delimiter pages could leave a key out"
+                        );
+                    });
+                    return Ok(scan_batch(query, false, flat, Gap::default()));
+                }
                 // A policy may require a delimiter. Go on with it while no
                 // page could be followed by a wanted key left out.
                 Err(error) if refused(&error) && !may_hide(&page, |key| pattern.matches(key)) => {

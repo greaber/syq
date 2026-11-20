@@ -265,6 +265,24 @@ fn base_host(endpoint: &str) -> Option<String> {
     }
 }
 
+/// The request [`S3::page`] sends for a page of `prefix` without a delimiter
+/// or continuation token, as storage signing names it, so that a copy can have
+/// it signed before sending it.
+pub(super) fn first_page_request(
+    prefix: &str,
+    start_after: Option<&str>,
+) -> super::authorization::Unsigned {
+    let request = super::authorization::Unsigned::new("GET", "")
+        .query("list-type", "2")
+        .query("prefix", prefix)
+        .query("max-keys", "1000")
+        .query("encoding-type", "url");
+    match start_after {
+        Some(after) => request.query("start-after", after),
+        None => request,
+    }
+}
+
 impl Store for S3<'_> {
     fn ordered(&self) -> bool {
         lists_in_key_order(self.bucket)

@@ -24,7 +24,6 @@ mod state;
 pub(crate) mod stream;
 mod transfer;
 mod tuning;
-mod upload_http;
 mod upload_send;
 mod writer;
 
@@ -198,6 +197,18 @@ impl Options {
         to: Option<&str>,
         matches: &clap::ArgMatches,
     ) -> Result<Option<Self>> {
+        Self::parse_between(flags, from, to, matches, false)
+    }
+
+    /// As `parse`. With `server`, the copy's other endpoint is an SSH server,
+    /// which runs the copy while this machine signs its storage requests.
+    pub fn parse_between(
+        flags: Flags,
+        from: Option<&str>,
+        to: Option<&str>,
+        matches: &clap::ArgMatches,
+        server: bool,
+    ) -> Result<Option<Self>> {
         let tuning = matches
             .try_get_many::<String>("performance_tuning")
             .ok()
@@ -239,6 +250,13 @@ impl Options {
             }
             return Ok(None);
         }
+        if server && explicit("detach") {
+            bail!("--detach is not supported for copies between an SSH server and S3: the machine that starts the copy passes on or signs the server's storage requests and must stay connected");
+        }
+        // A copy that the machine at the other end of the SSH session started
+        // and signs for arrives as a delegated command.
+        let started_elsewhere =
+            std::env::var_os(authorization::started::SIGNING_ENV).is_some() && !removal;
         if explicit("auth_from")
             && !matches!(
                 matches.get_one::<crate::cli::AuthFrom>("auth_from"),
@@ -270,7 +288,13 @@ impl Options {
             "suppress_summary",
             "relay_results",
         ] {
-            if explicit(id) {
+            let allowed = match id {
+                // How this machine reaches the server.
+                "rsh" | "syq_path" | "no_bootstrap" | "pscope" => server,
+                "delegated_operands_b64" | "relay_results" => started_elsewhere,
+                _ => false,
+            };
+            if explicit(id) && !allowed {
                 bail!(
                     "--{} is not supported for S3 {operation}",
                     id.replace('_', "-")
@@ -370,6 +394,13 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
     if args.rm {
         return remove::run(args);
     }
+    if args
+        .locations
+        .iter()
+        .any(crate::cli::Location::is_ssh_server)
+    {
+        return run_on_server(args);
+    }
     let writer = crate::results::start(
         &args,
         crate::results::RunMode::Cp {
@@ -384,6 +415,9 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
     let ticker = progress.spawn_ticker();
     let result = (|| {
         args.read_copy_inputs()?;
+        // A copy another machine started here takes its storage signatures
+        // from that machine.
+        authorization::started::attach(&mut args)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(
@@ -398,6 +432,11 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
         })
     })();
     diagnostics::finish();
+    let unreachable = args
+        .storage_authorization
+        .as_deref()
+        .and_then(authorization::started::unreachable_hint)
+        .filter(|_| result.is_err() || progress.errors.load(Relaxed) != 0);
     let limited = result
         .as_ref()
         .err()
@@ -409,6 +448,9 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
         } else {
             progress.error(&format!("syq: {error:#}"));
         }
+    }
+    if let Some(hint) = unreachable {
+        progress.eprintln(&hint);
     }
     progress.scan_done.store(true, Relaxed);
     let errors = progress.errors.load(Relaxed);
@@ -470,6 +512,42 @@ pub(crate) fn run(mut args: Args) -> Result<i32> {
         ));
     }
     Ok(code)
+}
+
+/// A copy between an SSH server and a bucket, typed on this machine: the
+/// server runs it, and this machine signs its storage requests and relays
+/// its output and results.
+fn run_on_server(mut args: Args) -> Result<i32> {
+    // As for a copy run here, an unreadable input is an argument error and
+    // opens no results stream.
+    if let Err(error) = args.read_copy_inputs() {
+        crate::output::diagnostic!("syq: {error:#}");
+        return Ok(2);
+    }
+    // Only for the elapsed time of a failed run's final result.
+    let clock = Progress::new(false, false, None);
+    let writer = crate::results::start(
+        &args,
+        crate::results::RunMode::Cp {
+            prune: args.delete,
+            mapping: false,
+        },
+    )?;
+    let outcome = crate::remote_to_remote::run_storage(&args, writer.clone());
+    if let (Err(error), Some(writer)) = (&outcome, &writer) {
+        // A failure before or outside the server's own results still settles
+        // the stream; one that already settled it ignores these records.
+        writer.emit_error_classified(&format!("syq: {error:#}"), None, None);
+        writer.emit_result(&crate::results::ResultRecord {
+            errors: 1,
+            timings: clock.timings(),
+            deletions_planned: args.delete.then_some(0),
+            deletions_completed: args.delete.then_some(0),
+            deletions_blocked: args.delete.then_some(0),
+            ..crate::results::ResultRecord::new(crate::results::Status::Failed, 1, args.dry_run)
+        });
+    }
+    outcome
 }
 
 pub(super) async fn backoff(attempt: u32) {

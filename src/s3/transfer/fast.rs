@@ -161,7 +161,7 @@ impl Engine {
             initial_probe_up: self
                 .tuning
                 .control_latency()
-                .is_some_and(|latency| latency >= Duration::from_millis(50)),
+                .is_some_and(|latency| latency >= super::super::tuning::HIGH_LATENCY),
         })
     }
 

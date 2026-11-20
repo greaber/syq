@@ -1,5 +1,5 @@
-//! HTTPS trust shared by the synchronous clients. The AWS SDK uses the same
-//! system certificate loader for its asynchronous clients.
+//! HTTPS trust for release downloads. The AWS SDK uses the same system
+//! certificate loader for S3.
 
 use std::sync::{Arc, LazyLock};
 use ureq::tls::{Certificate, RootCerts, TlsConfig};
@@ -9,8 +9,8 @@ struct Trust {
     empty_store: Option<String>,
 }
 
-// Load roots for the first release download or synchronous file upload, then
-// reuse them for the lifetime of this process. Other S3 requests use the SDK.
+// Load roots for the first release download, then reuse them for the lifetime
+// of this process.
 static TRUST: LazyLock<Trust> = LazyLock::new(|| {
     let loaded = rustls_native_certs::load_native_certs();
     let empty_store = loaded.certs.is_empty().then(|| {

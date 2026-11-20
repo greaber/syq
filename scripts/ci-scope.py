@@ -376,7 +376,8 @@ def classify(paths, preparation_only):
         elif matches(path, "scripts/generate-installer.py", "tests/tooling/test-installer.py"):
             path_tooling_checks.append("installer")
         elif matches(path, "scripts/try-benchmark*", "tests/tooling/test-try-benchmark.py",
-                     "scripts/benchmark-concurrency.py", "tests/tooling/test-benchmark-concurrency.py"):
+                     "scripts/benchmark-concurrency.py", "tests/tooling/test-benchmark-concurrency.py",
+                     "scripts/s3-order-probe.py", "tests/tooling/test-s3-order-probe.py"):
             path_tooling_checks.append("benchmark")
         elif matches(path, "scripts/run-focused-check.py", "tests/tooling/test-run-focused-check.py"):
             path_tooling_checks.append("focused")

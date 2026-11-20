@@ -715,7 +715,7 @@ fn read_request(stream: &mut UnixStream) -> Option<ClientRequest> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lock_file::PROBE_GRACE;
+    use crate::lock_file::start_beside_a_brief_holder;
     use std::os::unix::net::UnixListener;
 
     fn startup_scope() -> tempfile::TempDir {
@@ -844,30 +844,26 @@ mod tests {
         let temporary = crate::test_support::tempdir().unwrap();
         let control = temporary.path().join("cm-00112233aabbccdd");
         // A concurrent `is_running` holds the lock while the pool starts.
-        let probe = LockFile::open(&lock_path(&control), true).unwrap();
-        assert!(probe.try_shared().unwrap());
-        let probing = std::thread::spawn(move || {
-            std::thread::sleep(PROBE_GRACE / 10);
-            drop(probe);
-        });
-        let lock = lock_for_start(&control).unwrap();
-        probing.join().unwrap();
-        assert!(lock.is_some(), "a probe made a starting pool exit");
+        let _lock = start_beside_a_brief_holder(
+            || {
+                let probe = LockFile::open(&lock_path(&control), true).unwrap();
+                assert!(probe.try_shared().unwrap());
+                probe
+            },
+            || lock_for_start(&control).unwrap(),
+        );
     }
 
     #[test]
     fn a_start_that_waited_for_an_exiting_pool_locks_the_file_now_named() {
         let temporary = crate::test_support::tempdir().unwrap();
         let control = temporary.path().join("cm-00112233aabbccdd");
-        let exiting = PoolLock::new(&control, lock_for_start(&control).unwrap().unwrap()).unwrap();
-        let exit = std::thread::spawn(move || {
-            std::thread::sleep(PROBE_GRACE / 10);
-            // Removes the file, then releases the lock on it.
-            drop(exiting);
-        });
-        let lock = lock_for_start(&control).unwrap();
-        exit.join().unwrap();
-        let lock = lock.expect("the exiting pool's lock was not taken over");
+        let lock = start_beside_a_brief_holder(
+            // Dropping the exiting pool's lock removes the file, then
+            // releases the lock on it.
+            || PoolLock::new(&control, lock_for_start(&control).unwrap().unwrap()).unwrap(),
+            || lock_for_start(&control).unwrap(),
+        );
         let named = fs::symlink_metadata(lock_path(&control)).unwrap();
         let locked = lock.file().metadata().unwrap();
         assert_eq!((named.dev(), named.ino()), (locked.dev(), locked.ino()));

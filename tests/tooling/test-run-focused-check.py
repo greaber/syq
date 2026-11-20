@@ -67,7 +67,8 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(self.payload["inputs"]["revision"], SHA)
         self.assertEqual(self.payload["ref"], "task/example")
         self.watch.assert_called_once_with(
-            ["gh", "run", "watch", "123", "--repo", "example/syq", "--exit-status"]
+            ["gh", "run", "watch", "123", "--repo", "example/syq", "--exit-status",
+             "--interval", "30"]
         )
 
     def test_script_preserves_multiline_shell_and_failure_status(self):

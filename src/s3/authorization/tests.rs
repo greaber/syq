@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeSet;
 fn approval() -> Request {
     Request {
         bucket: "fixture".into(),
@@ -17,6 +18,7 @@ fn approval() -> Request {
         create_only: true,
         lifetime: DEFAULT_LIFETIME,
         headers: Default::default(),
+        max_delete: None,
     }
 }
 #[test]
@@ -85,6 +87,7 @@ fn upload_authorization_signs_object_lock_and_retention_bypass_only_when_the_com
     )
     .unwrap();
     let mut signer = Signer {
+        deletions: Default::default(),
         request: approval,
         configuration: Configuration {
             endpoint: "https://storage.example".into(),
@@ -308,6 +311,7 @@ fn sealed_authorization_reuses_requests_but_cannot_acquire_more() {
 #[test]
 fn presigns_bind_the_payload_marker_and_write_condition() {
     let signer = Signer {
+        deletions: Default::default(),
         request: approval(),
         configuration: Configuration {
             endpoint: "https://storage.example".into(),
@@ -482,6 +486,7 @@ fn stream_capabilities_accept_late_checksums_but_preserve_part_and_condition() {
 #[test]
 fn literal_object_keys_keep_their_scope_through_signing_and_transport() {
     let signer = Signer {
+        deletions: Default::default(),
         request: approval(),
         configuration: Configuration {
             endpoint: "https://storage.example/base".into(),
@@ -522,6 +527,7 @@ fn literal_object_keys_keep_their_scope_through_signing_and_transport() {
 #[test]
 fn signer_rejects_caller_supplied_host() {
     let signer = Signer {
+        deletions: Default::default(),
         request: approval(),
         configuration: Configuration {
             endpoint: "https://storage.example".into(),
@@ -707,6 +713,120 @@ fn validation_rejects_bad_buckets_and_scope_counts_on_both_sides() {
     request.validate().unwrap();
 }
 
+/// A signing session against the authorizing machine's own signing loop.
+/// `stop_after` makes that machine stop receiving after so many messages.
+fn session(stop_after: Option<usize>) -> (Authorization, std::thread::JoinHandle<Result<()>>) {
+    let (client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+    for socket in [&client, &server] {
+        socket
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+    }
+    let signer = Signer::fixture(approval());
+    let configuration = signer.configuration.clone();
+    let served = std::thread::spawn(move || {
+        let messages = std::sync::atomic::AtomicUsize::new(0);
+        crate::destination::storage::serve_signing(&mut server, &signer, || {
+            let seen = messages.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            stop_after.is_some_and(|limit| seen >= limit)
+        })
+        .map(drop)
+    });
+    (
+        Authorization::new("fixture".into(), configuration, client),
+        served,
+    )
+}
+fn upload(index: usize) -> Unsigned {
+    Unsigned::new("PUT", &format!("allowed/{index}")).header("if-none-match", "*")
+}
+fn prepared(authorization: &Authorization) -> usize {
+    authorization.state.lock().unwrap().requests.len()
+}
+
+#[test]
+fn exchanges_carry_at_most_the_request_limit() {
+    let sizes = |count: usize| -> Vec<usize> {
+        exchanges((0..count).map(upload), EXCHANGE_REQUESTS)
+            .map(|exchange| exchange.len())
+            .collect()
+    };
+    assert_eq!(sizes(0), Vec::<usize>::new());
+    assert_eq!(sizes(1), [1]);
+    assert_eq!(sizes(EXCHANGE_REQUESTS), [EXCHANGE_REQUESTS]);
+    assert_eq!(sizes(EXCHANGE_REQUESTS + 1), [EXCHANGE_REQUESTS, 1]);
+    assert_eq!(
+        sizes(2 * EXCHANGE_REQUESTS),
+        [EXCHANGE_REQUESTS, EXCHANGE_REQUESTS]
+    );
+}
+
+#[test]
+fn requests_over_one_exchange_are_all_signed_before_preparation_finishes() {
+    let (authorization, served) = session(None);
+    let count = EXCHANGE_REQUESTS + 1;
+    for exchange in exchanges((0..count).map(upload), EXCHANGE_REQUESTS) {
+        authorization.authorize(exchange).unwrap();
+    }
+    assert_eq!(prepared(&authorization), count);
+    authorization.finish_preparation().unwrap();
+    served.join().unwrap().unwrap();
+    // The last request crossed into a second exchange and is still usable
+    // after the authorizing machine has gone.
+    for index in [0, EXCHANGE_REQUESTS - 1, EXCHANGE_REQUESTS] {
+        let url = authorization.signed(upload(index)).unwrap();
+        assert!(
+            url.contains(&format!("/fixture/allowed/{index}?")) && url.contains("X-Amz-Signature="),
+            "{index}"
+        );
+    }
+}
+
+#[test]
+fn a_refusal_inside_a_batch_fails_preparation_and_issues_nothing_from_it() {
+    let (authorization, served) = session(None);
+    // An earlier exchange that succeeded stays prepared.
+    authorization.authorize(vec![upload(0)]).unwrap();
+    let mut requests: Vec<_> = (1..=1000).map(upload).collect();
+    requests[500] = Unsigned::new("PUT", "sibling/file").header("if-none-match", "*");
+    let error = authorization.authorize(requests).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("storage request is outside the approved paths"),
+        "{error:#}"
+    );
+    // The authorizing machine ended the session at the refusal.
+    served.join().unwrap().unwrap();
+    // Requests signed earlier in the refused exchange are not kept, so none
+    // of its uploads can run, and the session signs nothing further.
+    assert_eq!(prepared(&authorization), 1);
+    for index in [1, 400, 600] {
+        assert!(authorization.signed(upload(index)).is_err(), "{index}");
+    }
+    assert!(authorization.authorize(vec![upload(2000)]).is_err());
+    // Preparation cannot finish, so the copy never reaches its data phase.
+    assert!(authorization.finish_preparation().is_err());
+}
+
+#[test]
+fn losing_the_authorizing_machine_inside_a_batch_fails_preparation() {
+    // It signs two messages of a larger exchange and then stops receiving.
+    let (authorization, served) = session(Some(2));
+    let error = authorization
+        .authorize((0..1000).map(upload).collect())
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("authorizing machine disconnected during preparation"),
+        "{error:#}"
+    );
+    assert!(served.join().unwrap().is_err());
+    assert_eq!(prepared(&authorization), 0);
+    assert!(authorization.signed(upload(0)).is_err());
+    assert!(authorization.finish_preparation().is_err());
+}
+
 /// A refusal ends the signing session; later requests it has not prepared
 /// report that refusal, not a disconnection, and preparation cannot finish.
 #[test]
@@ -760,4 +880,330 @@ fn later_requests_report_an_earlier_refusal() {
     let finish = authorization.finish_preparation().unwrap_err();
     assert_eq!(format!("{finish:#}"), earlier);
     authorizer.join().unwrap();
+    // The machine that started a copy signs without an approval to renew.
+    let mut authorization = authorization;
+    authorization.started_elsewhere = true;
+    let later = authorization
+        .signed(Unsigned::new("GET", "allowed/c"))
+        .unwrap_err();
+    assert_eq!(
+        format!("{later:#}"),
+        "storage signing ended after an earlier request failed (authorizing machine: outside approved paths); run the copy again"
+    );
+}
+
+/// What the fake authorizing machine saw in each signing message: how many
+/// requests it carried, and how many were in the exchange under way.
+type Messages = Vec<(usize, usize)>;
+
+/// A signing session with an authorizing machine that answers each request
+/// with a URL naming its key. It holds its reply to the first message until
+/// the test releases it, with `Some(error)` to refuse that message instead.
+/// It holds any later message with a key under `allowed/held` the same way,
+/// and refuses any later message with a key under `allowed/refused`.
+#[allow(clippy::type_complexity)]
+fn held_session() -> (
+    Arc<Authorization>,
+    std::thread::JoinHandle<Messages>,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<Option<String>>,
+) {
+    use crate::destination::{read_message, write_message};
+    let (client, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    for socket in [&client, &peer] {
+        socket
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+    }
+    let authorization = Arc::new(Authorization::new(
+        "fixture".into(),
+        Signer::fixture(approval()).configuration,
+        client,
+    ));
+    let (arrived, first) = std::sync::mpsc::channel();
+    let (release, held) = std::sync::mpsc::channel::<Option<String>>();
+    let shared = authorization.clone();
+    let authorizer = std::thread::spawn(move || {
+        let mut messages = Messages::new();
+        loop {
+            let Ok(message) = read_message::<serde_json::Value>(&mut peer) else {
+                return messages;
+            };
+            let Some(batch) = message.get("Sign").and_then(|b| b.as_array()) else {
+                assert_eq!(message, "Finish");
+                write_message(&mut peer, &"Finished").unwrap();
+                return messages;
+            };
+            let in_flight = shared.state.lock().unwrap().in_flight;
+            messages.push((batch.len(), in_flight));
+            let held_key = batch
+                .iter()
+                .any(|request| request["key"].as_str().unwrap().starts_with("allowed/held"));
+            if messages.len() == 1 || held_key {
+                let _ = arrived.send(());
+                if let Some(error) = held.recv_timeout(Duration::from_secs(30)).unwrap() {
+                    write_message(&mut peer, &serde_json::json!({ "Error": error })).unwrap();
+                    return messages;
+                }
+            }
+            if batch.iter().any(|request| {
+                request["key"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("allowed/refused")
+            }) {
+                write_message(&mut peer, &serde_json::json!({ "Error": "refused" })).unwrap();
+                return messages;
+            }
+            let urls: Vec<_> = batch
+                .iter()
+                .map(|request| {
+                    format!(
+                        "https://storage.example/fixture/{}?X-Amz-Signature=fake",
+                        request["key"].as_str().unwrap()
+                    )
+                })
+                .collect();
+            write_message(&mut peer, &serde_json::json!({ "Signed": urls })).unwrap();
+        }
+    });
+    (authorization, authorizer, first, release)
+}
+fn queued_reaches(authorization: &Authorization, count: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let queued: usize = (authorization.state.lock().unwrap().queued.iter())
+            .map(|(_, batch)| batch.len())
+            .sum();
+        if queued == count {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{queued} of {count} requests queued"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+fn get(key: &str) -> Unsigned {
+    Unsigned::new("GET", &format!("allowed/{key}"))
+}
+fn sign_in_thread(
+    authorization: &Arc<Authorization>,
+    request: Unsigned,
+) -> std::thread::JoinHandle<Result<String>> {
+    let authorization = authorization.clone();
+    std::thread::spawn(move || authorization.signed(request))
+}
+
+#[test]
+fn requests_arriving_during_an_exchange_share_the_next_one() {
+    let (authorization, authorizer, first, release) = held_session();
+    let leader = sign_in_thread(&authorization, get("0"));
+    first.recv_timeout(Duration::from_secs(30)).unwrap();
+    // While that exchange is under way, more callers each ask for one
+    // request, the last for the request already in flight.
+    let keys: Vec<String> = (1..63).map(|i| i.to_string()).chain(["0".into()]).collect();
+    let callers: Vec<_> = keys
+        .iter()
+        .map(|key| sign_in_thread(&authorization, get(key)))
+        .collect();
+    queued_reaches(&authorization, 63);
+    release.send(None).unwrap();
+    for (key, caller) in std::iter::once("0")
+        .zip([leader])
+        .chain(keys.iter().map(String::as_str).zip(callers))
+    {
+        let url = caller.join().unwrap().unwrap();
+        assert!(
+            url.contains(&format!("/fixture/allowed/{key}?")),
+            "{key}: {url}"
+        );
+    }
+    authorization.finish_preparation().unwrap();
+    // Two round trips instead of 63, and the shared request was signed once.
+    assert_eq!(authorizer.join().unwrap(), [(1, 1), (62, 62)]);
+}
+
+#[test]
+fn combined_exchanges_keep_the_request_limit_without_splitting_a_batch() {
+    let (authorization, authorizer, first, release) = held_session();
+    let leader = sign_in_thread(&authorization, get("0"));
+    first.recv_timeout(Duration::from_secs(30)).unwrap();
+    let batch = |prefix: &str, count: usize| -> Vec<Unsigned> {
+        (0..count).map(|i| get(&format!("{prefix}/{i}"))).collect()
+    };
+    let callers: Vec<_> = ["a", "b", "c"]
+        .into_iter()
+        .map(|prefix| {
+            let authorization = authorization.clone();
+            let requests = batch(prefix, 6_000);
+            std::thread::spawn(move || authorization.authorize(requests))
+        })
+        .collect();
+    queued_reaches(&authorization, 18_000);
+    release.send(None).unwrap();
+    leader.join().unwrap().unwrap();
+    for caller in callers {
+        caller.join().unwrap().unwrap();
+    }
+    // One caller's batch above the limit still goes in one exchange.
+    authorization
+        .authorize(batch("d", EXCHANGE_REQUESTS + 4_000))
+        .unwrap();
+    assert_eq!(prepared(&authorization), 18_001 + EXCHANGE_REQUESTS + 4_000);
+    authorization.finish_preparation().unwrap();
+    let messages = authorizer.join().unwrap();
+    assert!(messages.iter().all(|&(count, _)| count <= 128));
+    assert_eq!(
+        messages.iter().map(|m| m.0).sum::<usize>(),
+        prepared(&authorization)
+    );
+    // Two 6,000-request batches fit together within the limit; a third does
+    // not, so it waits for the next exchange.
+    let exchanges: Vec<_> = messages
+        .iter()
+        .map(|m| m.1)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    assert_eq!(exchanges, [1, 6_000, 12_000, EXCHANGE_REQUESTS + 4_000]);
+}
+
+/// A caller whose request an earlier exchange signed while it waited keeps
+/// that signature, even if the exchange its batch was queued for fails.
+#[test]
+fn a_request_signed_while_queued_survives_a_later_refusal() {
+    for refused_first in [true, false] {
+        let (authorization, authorizer, first, release) = held_session();
+        let leader = sign_in_thread(&authorization, get("0"));
+        first.recv_timeout(Duration::from_secs(30)).unwrap();
+        let queue = |key: &str, queued: usize| {
+            let caller = sign_in_thread(&authorization, get(key));
+            queued_reaches(&authorization, queued);
+            caller
+        };
+        let (duplicate, refused) = if refused_first {
+            let refused = queue("refused", 1);
+            (queue("0", 2), refused)
+        } else {
+            let duplicate = queue("0", 1);
+            (duplicate, queue("refused", 2))
+        };
+        release.send(None).unwrap();
+        leader.join().unwrap().unwrap();
+        let url = duplicate.join().unwrap().unwrap();
+        assert!(url.contains("/fixture/allowed/0?"), "{url}");
+        let error = refused.join().unwrap().unwrap_err();
+        assert!(format!("{error:#}").contains("refused"), "{error:#}");
+        assert_eq!(authorizer.join().unwrap(), [(1, 1), (1, 1)]);
+        assert!(authorization.finish_preparation().is_err());
+    }
+}
+
+/// The same holds for a batch the failed exchange did not reach because
+/// the batches before it filled the exchange.
+#[test]
+fn a_request_signed_while_queued_beyond_a_full_exchange_survives_its_refusal() {
+    let (authorization, authorizer, first, release) = held_session();
+    let leader = sign_in_thread(&authorization, get("0"));
+    first.recv_timeout(Duration::from_secs(30)).unwrap();
+    let full = {
+        let authorization = authorization.clone();
+        let requests = (0..EXCHANGE_REQUESTS)
+            .map(|i| get(&format!("refused/{i}")))
+            .collect();
+        std::thread::spawn(move || authorization.authorize(requests))
+    };
+    queued_reaches(&authorization, EXCHANGE_REQUESTS);
+    let unsigned = sign_in_thread(&authorization, get("1"));
+    queued_reaches(&authorization, EXCHANGE_REQUESTS + 1);
+    let duplicate = sign_in_thread(&authorization, get("0"));
+    queued_reaches(&authorization, EXCHANGE_REQUESTS + 2);
+    release.send(None).unwrap();
+    leader.join().unwrap().unwrap();
+    assert!(full.join().unwrap().is_err());
+    assert!(unsigned.join().unwrap().is_err());
+    let url = duplicate.join().unwrap().unwrap();
+    assert!(url.contains("/fixture/allowed/0?"), "{url}");
+    let messages = authorizer.join().unwrap();
+    assert_eq!(messages, [(1, 1), (128, EXCHANGE_REQUESTS)]);
+    assert!(authorization.finish_preparation().is_err());
+}
+
+/// Preparation finishes only after the exchange under way, so no request is
+/// signed after the copy says the authorizing machine may disconnect.
+#[test]
+fn finishing_waits_for_the_exchange_under_way() {
+    let (authorization, authorizer, first, release) = held_session();
+    let leader = sign_in_thread(&authorization, get("0"));
+    first.recv_timeout(Duration::from_secs(30)).unwrap();
+    let finishing = {
+        let authorization = authorization.clone();
+        std::thread::spawn(move || authorization.finish_preparation())
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!finishing.is_finished());
+    release.send(None).unwrap();
+    leader.join().unwrap().unwrap();
+    finishing.join().unwrap().unwrap();
+    // The authorizing machine saw the signing message, then the finish.
+    assert_eq!(authorizer.join().unwrap(), [(1, 1)]);
+    let error = authorization.authorize(vec![get("1")]).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("was not prepared before storage authorization disconnected"),
+        "{error:#}"
+    );
+}
+
+/// A caller whose request an earlier exchange signed while it waited returns
+/// without waiting for an exchange of other callers' requests.
+#[test]
+fn a_request_signed_while_queued_returns_before_the_next_exchange() {
+    let (authorization, authorizer, first, release) = held_session();
+    let leader = sign_in_thread(&authorization, get("0"));
+    first.recv_timeout(Duration::from_secs(30)).unwrap();
+    let duplicate = sign_in_thread(&authorization, get("0"));
+    queued_reaches(&authorization, 1);
+    let held = sign_in_thread(&authorization, get("held"));
+    queued_reaches(&authorization, 2);
+    release.send(None).unwrap();
+    leader.join().unwrap().unwrap();
+    // The second exchange is held, yet the duplicate has its signature.
+    first.recv_timeout(Duration::from_secs(30)).unwrap();
+    let url = duplicate.join().unwrap().unwrap();
+    assert!(url.contains("/fixture/allowed/0?"), "{url}");
+    assert!(!held.is_finished());
+    release.send(None).unwrap();
+    held.join().unwrap().unwrap();
+    authorization.finish_preparation().unwrap();
+    assert_eq!(authorizer.join().unwrap(), [(1, 1), (1, 1)]);
+}
+
+#[test]
+fn a_failed_exchange_fails_every_waiting_request() {
+    let (authorization, authorizer, first, release) = held_session();
+    let leader = sign_in_thread(&authorization, get("0"));
+    first.recv_timeout(Duration::from_secs(30)).unwrap();
+    let callers: Vec<_> = (1..=20)
+        .map(|i| sign_in_thread(&authorization, get(&i.to_string())))
+        .collect();
+    queued_reaches(&authorization, 20);
+    release.send(Some("outside approved paths".into())).unwrap();
+    let error = leader.join().unwrap().unwrap_err();
+    assert_eq!(
+        format!("{error:#}"),
+        "authorizing machine: outside approved paths"
+    );
+    for caller in callers {
+        let error = caller.join().unwrap().unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "storage authorization ended after an earlier request failed (authorizing machine: outside approved paths); rerun the copy for fresh approval"
+        );
+    }
+    // The waiting requests never reached the authorizing machine.
+    assert_eq!(authorizer.join().unwrap(), [(1, 1)]);
+    assert_eq!(prepared(&authorization), 0);
+    assert!(authorization.finish_preparation().is_err());
 }

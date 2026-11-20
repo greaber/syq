@@ -843,3 +843,50 @@ async fn a_glob_that_needs_more_than_a_page_lists_flat_where_order_is_unknown() 
         );
     }
 }
+
+#[tokio::test]
+async fn a_delimiter_listing_in_another_order_checks_no_key() {
+    /// Refuses listings without a delimiter, as a policy can.
+    struct FlatRefused(R2Order);
+    impl Store for FlatRefused {
+        async fn page(
+            &self,
+            prefix: &str,
+            delimiter: bool,
+            token: Option<&str>,
+            start_after: Option<&str>,
+        ) -> Result<Page> {
+            if !delimiter {
+                return Err(anyhow::Error::msg("AccessDenied").context(
+                    crate::s3::client::RequestFailure::refused_for_test("S3 listing"),
+                ));
+            }
+            self.0.page(prefix, delimiter, token, start_after).await
+        }
+    }
+    // In R2's order the second page ends with `p/`, `p0` and `p`: it holds
+    // the key that could be missing, and nothing is checked after it.
+    let store = FlatRefused(R2Order(Memory::new(
+        (0..1000)
+            .map(|i| format!("edge/a{i:04}"))
+            .chain((0..997).map(|i| format!("edge/f{i:03}")))
+            .chain(["edge/p/x", "edge/p0", "edge/p", "edge/z"].map(String::from)),
+    )));
+    let pattern = Pattern::parse("s3://bucket/edge/*").unwrap();
+    let mut keys = Vec::new();
+    engine::enumerate(&store, &pattern, 1, |entry| {
+        keys.push(entry.key);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let unique: BTreeSet<_> = keys.iter().collect();
+    assert_eq!((keys.len(), unique.len()), (2000, 2000));
+    assert!(store
+        .0
+         .0
+        .calls
+        .borrow()
+        .iter()
+        .all(|(prefix, _)| prefix == "edge/"));
+}
