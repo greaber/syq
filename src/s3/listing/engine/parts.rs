@@ -5,7 +5,7 @@
 //! would be missed. Only stores that document UTF-8 byte order use this
 //! (`Store::divides`); the others are listed one page after another.
 use super::{
-    read, Entry, LimitedStore, Page, Prune, Store, Unordered, MAX_CHILDREN, SPLIT_QUEUE_LIMIT,
+    read, Entry, Gap, LimitedStore, Page, Prune, Store, Unordered, MAX_CHILDREN, SPLIT_QUEUE_LIMIT,
 };
 use crate::s3::listing::pattern::Pattern;
 use anyhow::{ensure, Result};
@@ -22,7 +22,9 @@ const PAGE: usize = 1000;
 // to choose them from, can be a request the sequential listing would not have
 // made. It may make this many once it is known to need a third page, and one
 // more for every `PAGES_PER_EXTRA` pages of keys listed, so a listing never
-// costs more than a fixed share over its sequential pages.
+// costs more than a fixed share over its sequential pages. A later page of
+// children can take one more request with it, to check for a key the store
+// may have left out (`Gap`).
 const EXTRA_REQUESTS: usize = 2;
 const PAGES_PER_EXTRA: usize = 4;
 // A listing asks for the children of its prefix once it is known to need a
@@ -50,7 +52,8 @@ enum Job {
     Scan {
         prefix: String,
         delimiter: bool,
-        token: Option<String>,
+        token: String,
+        gap: Gap,
     },
     /// The first page of everything under a prefix.
     Recursive {
@@ -68,7 +71,7 @@ enum Job {
         walk: usize,
         part: usize,
         directory: String,
-        token: Option<String>,
+        token: Option<(String, Gap)>,
     },
 }
 
@@ -93,11 +96,11 @@ enum Done {
         walk: usize,
         part: usize,
         directory: String,
-        page: Option<Page>,
+        page: Option<(Page, Gap)>,
     },
 }
 
-fn scan_batch(prefix: String, delimiter: bool, page: Page) -> Done {
+fn scan_batch(prefix: String, delimiter: bool, page: Page, gap: Gap) -> Done {
     Done::Batch(Batch {
         entries: page.entries,
         jobs: page
@@ -105,7 +108,8 @@ fn scan_batch(prefix: String, delimiter: bool, page: Page) -> Done {
             .map(|token| Job::Scan {
                 prefix,
                 delimiter,
-                token: Some(token),
+                token,
+                gap,
             })
             .into_iter()
             .collect(),
@@ -146,7 +150,15 @@ async fn execute(
             // Only the choice of parts needs the children. A listing whose
             // request for them fails, perhaps refused by a policy that allows
             // listing the prefix alone, goes on by itself.
-            let page = read(store, &directory, true, token.as_deref()).await.ok();
+            // Parts list every key, so any key a page leaves out is wanted.
+            let page = match token {
+                Some((token, gap)) => gap.read(store, &directory, true, &token, |_| true).await,
+                None => read(store, &directory, true, None).await.map(|page| {
+                    let gap = Gap::after(&page, |_| true);
+                    (page, gap)
+                }),
+            }
+            .ok();
             return Ok(Done::Children {
                 walk,
                 part,
@@ -158,9 +170,15 @@ async fn execute(
             prefix,
             delimiter,
             token,
+            gap,
         } => {
-            let page = read(store, &prefix, delimiter, token.as_deref()).await?;
-            return Ok(scan_batch(prefix, delimiter, page));
+            // Only the last component of a pattern pages with a delimiter.
+            let (page, gap) = gap
+                .read(store, &prefix, delimiter, &token, |key| {
+                    pattern.is_none_or(|pattern| pattern.matches(key))
+                })
+                .await?;
+            return Ok(scan_batch(prefix, delimiter, page, gap));
         }
         Job::Discover { prefix, component } => (prefix, component),
     };
@@ -182,15 +200,17 @@ async fn execute(
     }
     if !split && component + 1 < pattern.components.len() {
         let page = read(store, &query, false, None).await?;
-        return Ok(scan_batch(query, false, page));
+        return Ok(scan_batch(query, false, page, Gap::default()));
     }
     let page = read(store, &query, true, None).await?;
     if component + 1 == pattern.components.len() {
-        return Ok(scan_batch(query, true, page));
+        // Parts run only where the store lists in byte order.
+        let gap = Gap::after(&page, |key| pattern.matches(key));
+        return Ok(scan_batch(query, true, page, gap));
     }
     if page.next.is_some() || page.prefixes.len() > MAX_CHILDREN {
         let flat = read(store, &query, false, None).await?;
-        return Ok(scan_batch(query, false, flat));
+        return Ok(scan_batch(query, false, flat, Gap::default()));
     }
     Ok(Done::Batch(Batch {
         entries: page.entries,
@@ -312,7 +332,7 @@ enum Children {
     /// A page is on its way.
     Asked,
     /// Pages so far end at a continuation token.
-    More(String),
+    More((String, Gap)),
     Complete,
     /// Nothing further to hand over from this part.
     Closed,
@@ -542,13 +562,13 @@ impl Walk {
 
     /// Take a page of the children of the directory a part is in, or `None`
     /// when the request for it failed.
-    fn children(&mut self, at: usize, directory: &str, page: Option<Page>) -> Result<()> {
+    fn children(&mut self, at: usize, directory: &str, page: Option<(Page, Gap)>) -> Result<()> {
         let part = &mut self.parts[at];
         // The page answers the part's request, unless the part has since
         // given up on its children; it is of use only while the part lists.
         let outstanding = part.directory == directory && matches!(part.children, Children::Asked);
         let current = outstanding && !part.done;
-        let Some(page) = page else {
+        let Some((page, gap)) = page else {
             if current {
                 part.children = Children::Closed;
             }
@@ -608,7 +628,7 @@ impl Walk {
             // Children the listing has already passed are too small to be
             // worth a request for every thousand of them.
             Some(_) if part.ahead.is_empty() && part.listed < part.last => Children::Closed,
-            Some(token) => Children::More(token),
+            Some(token) => Children::More((token, gap)),
             None => Children::Complete,
         };
         Ok(())

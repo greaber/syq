@@ -793,3 +793,90 @@ async fn listings_from_a_store_not_in_byte_order_miss_no_key() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_glob_that_needs_more_than_a_page_lists_flat_where_order_is_unknown() {
+    // In R2's order the first page of `edge/` ends with `p/`, `p0` and `p`.
+    // Whether a later page of a delimiter listing leaves a key out, or a
+    // check for it finds one already listed, depends on the order; a flat
+    // listing does not.
+    let store = R2Order(Memory::new(
+        (0..997)
+            .map(|i| format!("edge/f{i:03}"))
+            .chain(["edge/p/x", "edge/p0", "edge/p", "edge/z"].map(String::from)),
+    ));
+    let pattern = Pattern::parse("s3://bucket/edge/*").unwrap();
+    for concurrency in [1, 8] {
+        let mut keys = Vec::new();
+        engine::enumerate(&store, &pattern, concurrency, |entry| {
+            keys.push(entry.key);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        keys.sort();
+        let expected: Vec<_> = store
+            .0
+            .keys
+            .iter()
+            .filter(|key| pattern.matches(key))
+            .cloned()
+            .collect();
+        assert_eq!(keys, expected);
+        assert_eq!(
+            store.0.calls.borrow_mut().split_off(0),
+            [
+                ("edge/".to_owned(), true),
+                ("edge/".to_owned(), false),
+                ("edge/".to_owned(), false)
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_delimiter_listing_in_another_order_checks_no_key() {
+    /// Refuses listings without a delimiter, as a policy can.
+    struct FlatRefused(R2Order);
+    impl Store for FlatRefused {
+        async fn page(
+            &self,
+            prefix: &str,
+            delimiter: bool,
+            token: Option<&str>,
+            start_after: Option<&str>,
+        ) -> Result<Page> {
+            if !delimiter {
+                return Err(anyhow::Error::msg("AccessDenied").context(
+                    crate::s3::client::RequestFailure::refused_for_test("S3 listing"),
+                ));
+            }
+            self.0.page(prefix, delimiter, token, start_after).await
+        }
+    }
+    // In R2's order the second page ends with `p/`, `p0` and `p`: it holds
+    // the key that could be missing, and nothing is checked after it.
+    let store = FlatRefused(R2Order(Memory::new(
+        (0..1000)
+            .map(|i| format!("edge/a{i:04}"))
+            .chain((0..997).map(|i| format!("edge/f{i:03}")))
+            .chain(["edge/p/x", "edge/p0", "edge/p", "edge/z"].map(String::from)),
+    )));
+    let pattern = Pattern::parse("s3://bucket/edge/*").unwrap();
+    let mut keys = Vec::new();
+    engine::enumerate(&store, &pattern, 1, |entry| {
+        keys.push(entry.key);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let unique: BTreeSet<_> = keys.iter().collect();
+    assert_eq!((keys.len(), unique.len()), (2000, 2000));
+    assert!(store
+        .0
+         .0
+        .calls
+        .borrow()
+        .iter()
+        .all(|(prefix, _)| prefix == "edge/"));
+}
