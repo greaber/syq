@@ -190,6 +190,34 @@ pub(super) fn segments(keys: &Keys, prefixes: &[String]) -> Vec<Segment> {
     segments
 }
 
+/// The first request the listing sends for each of `segments`, as its prefix
+/// and where it starts: the pages that do not depend on an earlier response.
+/// A copy whose requests another machine signs has these signed together
+/// before the listing starts, rather than one round trip to that machine as
+/// the listing reaches each segment. The listing sends them as [`Walk`]
+/// enters each segment, or as [`Walk::whole`] lists it in a bucket that does
+/// not list in key order. A segment whose planned keys are all too long for
+/// S3 is not listed.
+pub(super) fn first_pages<'a>(
+    segments: &'a [Segment],
+    keys: &'a Keys,
+    ordered: bool,
+) -> impl Iterator<Item = (&'a str, Option<String>)> + 'a {
+    segments
+        .iter()
+        .filter_map(move |Segment { prefix, range }| {
+            if !ordered {
+                // `Walk::whole` spends fewer requests than the segment's keys.
+                return (range.len() >= 2).then_some((prefix.as_str(), None));
+            }
+            let start = range
+                .clone()
+                .map(|index| keys.get(index))
+                .find(|key| key.len() <= MAX_KEY)?;
+            Some((prefix.as_str(), Some(predecessor(start))))
+        })
+}
+
 /// A key just below `key`: a listing that starts after it begins at `key`.
 /// Keys between the two are listed needlessly, so stay close without
 /// inventing characters a provider might reject in a request.

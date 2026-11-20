@@ -432,8 +432,9 @@ impl Engine {
                 // Preparation checks and hashes each file without asking the
                 // authorizing machine about it: the checks' requests are signed
                 // together first and the uploads' requests together afterwards.
-                // Destination listing pages that arrive during preparation are
-                // still signed one at a time.
+                // Each listed prefix's first page was signed before the
+                // listing started; a prefix's later pages, which continue
+                // from an earlier response, are signed one at a time.
                 self.authorize_upload_checks(&plan).await?;
                 let prepared = Arc::new(Mutex::new(Vec::with_capacity(plan.len())));
                 let mut position = 0..;
@@ -977,6 +978,16 @@ impl Engine {
                 let keys = discovery::Keys::new(plan.iter().map(&key));
                 let segments = discovery::segments(&keys, &prefixes);
                 if !segments.is_empty() {
+                    // Each prefix's first page is known now. Signing them
+                    // together saves a round trip to the signing machine
+                    // for each prefix the listing reaches.
+                    let ordered = super::listing::lists_in_key_order(&self.options.bucket);
+                    self.authorize_all(discovery::first_pages(&segments, &keys, ordered).map(
+                        |(prefix, after)| {
+                            super::listing::first_page_request(prefix, after.as_deref())
+                        },
+                    ))
+                    .await?;
                     return self.start_discovery(segments, keys).await;
                 }
             }
@@ -3961,6 +3972,49 @@ fn symlink_metadata_differs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An engine for `argv`, a `syq` command line, that sends nothing.
+    pub(super) fn engine(argv: &[&str]) -> Engine {
+        let args = Arc::new(
+            Args::parse_args(
+                &argv
+                    .iter()
+                    .map(std::ffi::OsString::from)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        );
+        let options = args.s3.clone().unwrap();
+        let tuning = crate::s3::tuning::Tuning::new(
+            &options,
+            &args,
+            Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+        );
+        let config = aws_sdk_s3::config::Builder::new()
+            .behavior_version_latest()
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .build();
+        Engine {
+            args,
+            options,
+            tuning,
+            client: Client::from_conf(config),
+            progress: Progress::new(false, false, None),
+            bandwidth: None,
+            upload_keys: OnceLock::new(),
+            discovery: OnceLock::new(),
+            authorization: None,
+            copy_checksum_unsupported: Default::default(),
+            content_md5: Default::default(),
+            file_permissions: Default::default(),
+            metadata_replacements: Default::default(),
+            copy_tagging_unsupported: Default::default(),
+            outage: Default::default(),
+            cancelled: Default::default(),
+            cancel_wake: Default::default(),
+            uploads: Default::default(),
+        }
+    }
 
     #[test]
     fn native_upload_identity_binds_parts_algorithm_and_boundaries() {

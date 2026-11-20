@@ -20,6 +20,8 @@ struct Bucket {
     requests: RefCell<Vec<(String, bool)>>,
     /// Each request's prefix.
     prefixes: RefCell<Vec<String>>,
+    /// Each request without a continuation token: its prefix and start.
+    starts: RefCell<Vec<(String, Option<String>)>>,
 }
 impl Bucket {
     fn new(keys: impl IntoIterator<Item = String>) -> Self {
@@ -31,6 +33,7 @@ impl Bucket {
             repeated: None,
             requests: RefCell::default(),
             prefixes: RefCell::default(),
+            starts: RefCell::default(),
         }
     }
 }
@@ -48,6 +51,11 @@ impl Store for Bucket {
         assert!(!delimiter);
         assert!(token.is_none() || start_after.is_none());
         self.prefixes.borrow_mut().push(prefix.to_owned());
+        if token.is_none() {
+            self.starts
+                .borrow_mut()
+                .push((prefix.to_owned(), start_after.map(str::to_owned)));
+        }
         let after = token.or(start_after.filter(|_| self.honors_start));
         self.requests
             .borrow_mut()
@@ -791,4 +799,310 @@ async fn named_prefixes_each_holding_one_planned_key_are_not_listed() {
     let listed = discover_under(&bucket, &prefixes, &plan).await;
     assert!(listed.iter().all(|listed| *listed == Listed::Unknown));
     assert!(bucket.requests.borrow().is_empty());
+}
+
+#[tokio::test]
+async fn first_pages_are_where_each_prefix_listing_starts() {
+    let long = |name: &str| format!("dst/{name}/{}", "x".repeat(MAX_KEY));
+    let mut plan = named_plan();
+    // The listing of `l` starts after its long first key; every key of `m` is
+    // too long to start a listing at.
+    plan.extend([
+        long("l"),
+        "dst/l/b".into(),
+        "dst/l/c".into(),
+        long("m"),
+        format!("{}y", long("m")),
+    ]);
+    plan.sort();
+    let prefixes: Vec<String> = NAMED
+        .into_iter()
+        .chain(["dst/l/", "dst/m/"])
+        .map(str::to_owned)
+        .collect();
+    for ordered in [true, false] {
+        let mut bucket = Bucket::new(["dst/a-b/x", "dst/a/1", "dst/l/c"].map(str::to_owned));
+        bucket.ordered = ordered;
+        let keys = Keys::new(plan.iter().map(|key| key.as_str().into()));
+        let segments = segments(&keys, &prefixes);
+        let first: Vec<_> = first_pages(&segments, &keys, ordered)
+            .map(|(prefix, after)| (prefix.to_owned(), after))
+            .collect();
+        let expected_prefixes: &[&str] = if ordered {
+            &["dst/a-b/", "dst/a/", "dst/l/"]
+        } else {
+            &["dst/a-b/", "dst/a/", "dst/l/", "dst/m/"]
+        };
+        assert_eq!(
+            first.iter().map(|(prefix, _)| prefix).collect::<Vec<_>>(),
+            expected_prefixes
+        );
+        discover_segments(&bucket, segments.clone(), keys).await;
+        // The first request under each prefix, in the order sent.
+        let mut sent: Vec<(String, Option<String>)> = Vec::new();
+        for (prefix, after) in bucket.starts.borrow().iter() {
+            if !sent.iter().any(|(listed, _)| listed == prefix) {
+                sent.push((prefix.clone(), after.clone()));
+            }
+        }
+        assert_eq!(sent, first, "ordered: {ordered}");
+        if ordered {
+            assert_eq!(first[2].1.as_deref(), Some(predecessor("dst/l/b").as_str()));
+        }
+    }
+}
+
+mod signed {
+    //! A named upload's destination listing through the signing transport.
+    use super::super::super::super::authorization::{
+        http_client, request_for, Authorization, Signer, Unsigned,
+    };
+    use super::super::super::super::listing::first_page_request;
+    use super::*;
+    use aws_smithy_runtime_api::client::{
+        http::{http_client_fn, HttpConnector, HttpConnectorFuture, SharedHttpConnector},
+        orchestrator::{HttpRequest, HttpResponse},
+    };
+    use std::sync::Mutex;
+
+    /// The destination bucket `fixture`, answering ListObjectsV2 requests
+    /// 1000 keys at a time. A continuation token names the last key returned.
+    #[derive(Clone, Debug)]
+    struct Served {
+        objects: Arc<BTreeMap<String, u64>>,
+        /// Each request's query, without the signature.
+        requests: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
+    }
+    impl HttpConnector for Served {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            let url = url::Url::parse(request.uri()).unwrap();
+            let query: BTreeMap<String, String> = url
+                .query_pairs()
+                .filter(|(name, _)| !name.starts_with("X-Amz-") && name != "x-id")
+                .map(|(name, value)| (name.into_owned(), value.into_owned()))
+                .collect();
+            self.requests.lock().unwrap().push(query.clone());
+            let prefix = &query["prefix"];
+            let lower = query
+                .get("continuation-token")
+                .or(query.get("start-after"))
+                .map_or(Bound::Unbounded, |after| Bound::Excluded(after.as_str()));
+            let mut matching = self
+                .objects
+                .range::<str, _>((lower, Bound::Unbounded))
+                .filter(|(key, _)| key.starts_with(prefix.as_str()));
+            let entries: Vec<_> = matching.by_ref().take(1000).collect();
+            let next = matching.next().map(|_| entries.last().unwrap().0);
+            let mut xml = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>fixture</Name><Prefix>{prefix}</Prefix><KeyCount>{}</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>{}</IsTruncated>",
+                entries.len(),
+                next.is_some()
+            );
+            for (key, size) in &entries {
+                xml.push_str(&format!(
+                    "<Contents><Key>{key}</Key><Size>{size}</Size></Contents>"
+                ));
+            }
+            if let Some(next) = next {
+                xml.push_str(&format!(
+                    "<NextContinuationToken>{next}</NextContinuationToken>"
+                ));
+            }
+            xml.push_str("</ListBucketResult>");
+            HttpConnectorFuture::ready(Ok(HttpResponse::new(
+                200.try_into().unwrap(),
+                aws_smithy_types::body::SdkBody::from(xml),
+            )))
+        }
+    }
+
+    /// Named directories `a`, `b` and `c` uploaded into `dst`. `b` holds
+    /// more existing keys than one page lists.
+    fn plan() -> Vec<String> {
+        let mut plan: Vec<String> = ["dst/a/1", "dst/a/2", "dst/c/1", "dst/c/2", "dst/c/3"]
+            .map(str::to_owned)
+            .into();
+        plan.extend((0..1500).map(|f| format!("dst/b/{f:04}")));
+        plan.sort();
+        plan
+    }
+    fn served() -> Served {
+        let mut objects: BTreeMap<String, u64> =
+            [("dst/a-a", 1), ("dst/a/1", 2), ("dst/c/2", 3), ("dst/z", 4)]
+                .map(|(key, size)| (key.to_owned(), size))
+                .into();
+        objects.extend((0..1500).map(|f| (format!("dst/b/{f:04}"), 5)));
+        Served {
+            objects: Arc::new(objects),
+            requests: Arc::default(),
+        }
+    }
+    const ARGV: &[&str] = &[
+        "cp",
+        "/src/a",
+        "/src/b",
+        "/src/c",
+        "--to",
+        "s3://fixture",
+        "--into",
+        "dst",
+    ];
+
+    /// An engine for `argv` whose requests `served` answers, signed by a
+    /// signing machine that holds the authorization the command implies
+    /// when `signs`.
+    fn engine(
+        argv: &[&str],
+        served: &Served,
+        signs: bool,
+    ) -> (super::super::super::Engine, Option<Arc<Authorization>>) {
+        use aws_sdk_s3::config::{Builder, Credentials, Region};
+        let mut engine = super::super::super::tests::engine(argv);
+        let authorization = signs.then(|| {
+            let signer = Signer::fixture(request_for(&engine.args, &engine.options).unwrap());
+            let (local, mut remote) = std::os::unix::net::UnixStream::pair().unwrap();
+            let configuration = signer.configuration.clone();
+            std::thread::spawn(move || {
+                crate::destination::storage::serve_signing(&mut remote, &signer, || false)
+            });
+            Arc::new(Authorization::new("fixture".into(), configuration, local))
+        });
+        let inner = served.clone();
+        let inner = http_client_fn(move |_, _| SharedHttpConnector::new(inner.clone()));
+        let config = Builder::new()
+            .behavior_version_latest()
+            .region(Region::new("auto"))
+            .endpoint_url("https://storage.example")
+            .force_path_style(true)
+            .credentials_provider(Credentials::new("fixture", "fixture", None, None, "test"));
+        let config = match &authorization {
+            Some(authorization) => config.http_client(http_client(inner, authorization.clone())),
+            None => config.http_client(inner),
+        };
+        engine.client = aws_sdk_s3::Client::from_conf(config.build());
+        engine.authorization = authorization.clone();
+        (engine, authorization)
+    }
+
+    /// The listing requests signed so far, as `(prefix, start, continued)`.
+    fn signed_listings(authorization: &Authorization) -> Vec<(String, Option<String>, bool)> {
+        authorization
+            .signed_so_far()
+            .into_iter()
+            .filter(|request| request.query.contains_key("list-type"))
+            .map(|request| {
+                (
+                    request.query["prefix"].clone(),
+                    request.query.get("start-after").cloned(),
+                    request.query.contains_key("continuation-token"),
+                )
+            })
+            .collect()
+    }
+
+    async fn decisions(engine: &super::super::super::Engine, plan: &[String]) -> Vec<Listed> {
+        let discovery = engine.discovery.get().unwrap();
+        let mut listed = Vec::new();
+        for index in 0..plan.len() {
+            listed.push(discovery.lookup(index).await);
+        }
+        listed
+    }
+
+    fn expected(plan: &[String], served: &Served) -> Vec<Listed> {
+        plan.iter()
+            .map(|key| {
+                served
+                    .objects
+                    .get(key)
+                    .map_or(Listed::Absent, |size| Listed::Present(*size))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn each_named_prefix_first_page_is_signed_before_the_listing_starts() {
+        for dry_run in [false, true] {
+            let argv: Vec<&str> = ARGV
+                .iter()
+                .copied()
+                .chain(dry_run.then_some("--dry-run"))
+                .collect();
+            let served = served();
+            let (engine, authorization) = engine(&argv, &served, true);
+            let authorization = authorization.unwrap();
+            let mut plan = plan();
+            engine
+                .discover_destination(&mut plan, &[], |key: &String| key.as_str().into())
+                .await
+                .unwrap();
+            // The listing has sent its first two pages; the rest of it has
+            // yet to run. Every prefix's first page is already signed, and
+            // nothing else: not the destination directory itself.
+            let first =
+                |prefix: &str, key: &str| (prefix.to_owned(), Some(predecessor(key)), false);
+            let presigned = vec![
+                first("dst/a/", "dst/a/1"),
+                first("dst/b/", "dst/b/0000"),
+                first("dst/c/", "dst/c/1"),
+            ];
+            assert_eq!(signed_listings(&authorization), presigned);
+            assert_eq!(served.requests.lock().unwrap().len(), 2);
+
+            assert_eq!(decisions(&engine, &plan).await, expected(&plan, &served));
+            // `b`'s second page continues from its first response, so it was
+            // signed only when the listing reached it. The pages sent are the
+            // ones signed: the descriptions match what the SDK sends.
+            let mut signed = signed_listings(&authorization);
+            signed.sort();
+            let mut all = presigned.clone();
+            all.push(("dst/b/".into(), None, true));
+            all.sort();
+            assert_eq!(signed, all);
+            assert_eq!(served.requests.lock().unwrap().len(), 4);
+        }
+    }
+
+    #[test]
+    fn a_first_page_outside_the_named_prefixes_is_refused() {
+        let engine = super::super::super::tests::engine(ARGV);
+        let signer = Signer::fixture(request_for(&engine.args, &engine.options).unwrap());
+        assert!(signer
+            .sign(&first_page_request("dst/b/", Some("dst/b/0")))
+            .is_ok());
+        for prefix in ["dst/", "dst/a", "dst/d/", ""] {
+            assert!(
+                signer.sign(&first_page_request(prefix, None)).is_err(),
+                "{prefix}"
+            );
+        }
+        // Its description is the request a page sends.
+        assert_eq!(
+            first_page_request("dst/b/", None),
+            Unsigned::new("GET", "")
+                .query("list-type", "2")
+                .query("prefix", "dst/b/")
+                .query("max-keys", "1000")
+                .query("encoding-type", "url")
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_signer_the_destination_is_listed_as_before() {
+        let served = served();
+        let (engine, _) = engine(ARGV, &served, false);
+        let mut plan = plan();
+        engine
+            .discover_destination(&mut plan, &[], |key: &String| key.as_str().into())
+            .await
+            .unwrap();
+        assert_eq!(decisions(&engine, &plan).await, expected(&plan, &served));
+        // One listing of the whole destination.
+        let requests = served.requests.lock().unwrap();
+        assert!(requests.iter().all(|query| query["prefix"] == "dst/"));
+        assert_eq!(
+            requests[0].get("start-after"),
+            Some(&predecessor("dst/a/1"))
+        );
+    }
 }
