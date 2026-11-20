@@ -17,6 +17,11 @@ struct Memory {
     peak: Cell<usize>,
     /// Milliseconds a page of keys takes; a page of children takes one.
     key_delay: Cell<u64>,
+    /// Whether the store is taken to list in byte order (`Store::divides`).
+    divides: Cell<bool>,
+    /// Make Tigris's mistake: after a page of children that ends with the
+    /// common prefix `P/`, start the next page past the key `P0`.
+    skips: Cell<bool>,
 }
 impl Memory {
     fn new(keys: impl IntoIterator<Item = String>) -> Self {
@@ -27,6 +32,8 @@ impl Memory {
             active: Cell::new(0),
             peak: Cell::new(0),
             key_delay: Cell::new(1),
+            divides: Cell::new(true),
+            skips: Cell::new(false),
         }
     }
     /// The requests a listing of everything under `prefix` makes one page
@@ -50,7 +57,7 @@ impl Memory {
 }
 impl Store for Memory {
     fn divides(&self) -> bool {
-        true
+        self.divides.get()
     }
     async fn page(
         &self,
@@ -90,6 +97,7 @@ impl Store for Memory {
             }
             if page.entries.len() + page.prefixes.len() == 1000 {
                 page.next = Some(match &cursor {
+                    Bound::Included(at) if self.skips.get() => format!("{marker}-{at}"),
                     Bound::Included(at) => format!("{marker}+{at}"),
                     Bound::Excluded(after) => format!("{marker}-{after}"),
                     Bound::Unbounded => unreachable!(),
@@ -1066,11 +1074,11 @@ fn a_late_children_page_out_of_order_fails_a_divided_walk() {
         next: None,
     };
     let error = walk()
-        .children(1, "t/", Some(page(["t/zy", "t/zx"])))
+        .children(1, "t/", Some((page(["t/zy", "t/zx"]), Gaps::default())))
         .unwrap_err();
     assert!(error.is::<Unordered>());
     assert!(walk()
-        .children(1, "t/", Some(page(["t/zx", "t/zy"])))
+        .children(1, "t/", Some((page(["t/zx", "t/zy"]), Gaps::default())))
         .is_ok());
     // A continuation that starts before the page it continues, after the
     // part has finished.
@@ -1079,7 +1087,7 @@ fn a_late_children_page_out_of_order_fails_a_divided_walk() {
     late.parts[1].children = Children::Asked;
     late.parts[1].children_end = "t/zz".to_owned();
     let error = late
-        .children(1, "t/", Some(page(["t/zm", "t/zn"])))
+        .children(1, "t/", Some((page(["t/zm", "t/zn"]), Gaps::default())))
         .unwrap_err();
     assert!(error.is::<Unordered>());
 }
@@ -1108,4 +1116,50 @@ fn walks_that_cannot_burst_keep_no_sample() {
     walk.keys(0, 0, page(0..10, None)).unwrap();
     walk.decide_burst();
     assert!(walk.sample.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn keys_a_store_skips_after_a_common_prefix_are_listed() {
+    let dir = |name: &str| {
+        (0..300)
+            .map(|i| format!("tree/{name}/{i:03}"))
+            .collect::<Vec<_>>()
+    };
+    // `edge/`: the first page of children ends with `edge/z/`. `tree/`: a
+    // dense directory, 40 more, and objects, so that the first page of
+    // children ends with `tree/g/`. The object `tree/g0` and the directory
+    // `tree/g1/` follow, and a part handed `tree/g` leaves its objects to
+    // the children.
+    let store = Memory::new(
+        (0..999)
+            .map(|i| format!("edge/k{i:03}"))
+            .chain(["edge/z/a", "edge/z0", "edge/z1/a"].map(String::from))
+            .chain(dir("a"))
+            .chain((0..40).flat_map(|d| dir(&format!("d{d:02}"))))
+            .chain((0..958).map(|i| format!("tree/e{i:03}")))
+            .chain(dir("g"))
+            .chain(["tree/g0".to_owned()])
+            .chain(dir("g1")),
+    );
+    store.skips.set(true);
+    for divides in [false, true] {
+        store.divides.set(divides);
+        for concurrency in [1, 8] {
+            for input in ["edge/*", "tree/*", "*/*"] {
+                let pattern = Pattern::parse(&format!("s3://bucket/{input}")).unwrap();
+                let expected: Vec<_> = store
+                    .keys
+                    .iter()
+                    .filter(|key| pattern.matches(key))
+                    .cloned()
+                    .collect();
+                assert_eq!(
+                    listed(&store, input, concurrency).await,
+                    expected,
+                    "{input} divides={divides} concurrency={concurrency}"
+                );
+            }
+            walked(&store, "tree/", concurrency, None).await;
+        }
+    }
 }

@@ -5,7 +5,7 @@
 //! would be missed. Only stores that document UTF-8 byte order use this
 //! (`Store::divides`); the others are listed one page after another.
 use super::{
-    read, Entry, LimitedStore, Page, Prune, Store, Unordered, MAX_CHILDREN, SPLIT_QUEUE_LIMIT,
+    read, Entry, Gaps, LimitedStore, Page, Prune, Store, Unordered, MAX_CHILDREN, SPLIT_QUEUE_LIMIT,
 };
 use crate::s3::listing::pattern::Pattern;
 use anyhow::{ensure, Result};
@@ -50,7 +50,8 @@ enum Job {
     Scan {
         prefix: String,
         delimiter: bool,
-        token: Option<String>,
+        token: String,
+        gaps: Gaps,
     },
     /// The first page of everything under a prefix.
     Recursive {
@@ -68,7 +69,7 @@ enum Job {
         walk: usize,
         part: usize,
         directory: String,
-        token: Option<String>,
+        token: Option<(String, Gaps)>,
     },
 }
 
@@ -93,11 +94,12 @@ enum Done {
         walk: usize,
         part: usize,
         directory: String,
-        page: Option<Page>,
+        page: Option<(Page, Gaps)>,
     },
 }
 
-fn scan_batch(prefix: String, delimiter: bool, page: Page) -> Done {
+fn scan_batch(prefix: String, delimiter: bool, page: Page, gaps: Gaps) -> Done {
+    let gaps = gaps.after(delimiter, &page);
     Done::Batch(Batch {
         entries: page.entries,
         jobs: page
@@ -105,7 +107,8 @@ fn scan_batch(prefix: String, delimiter: bool, page: Page) -> Done {
             .map(|token| Job::Scan {
                 prefix,
                 delimiter,
-                token: Some(token),
+                token,
+                gaps,
             })
             .into_iter()
             .collect(),
@@ -146,7 +149,16 @@ async fn execute(
             // Only the choice of parts needs the children. A listing whose
             // request for them fails, perhaps refused by a policy that allows
             // listing the prefix alone, goes on by itself.
-            let page = read(store, &directory, true, token.as_deref()).await.ok();
+            let page = match token {
+                Some((token, mut gaps)) => gaps
+                    .read(store, &directory, true, &token)
+                    .await
+                    .map(|page| (page, gaps)),
+                None => read(store, &directory, true, None)
+                    .await
+                    .map(|page| (page, Gaps::default())),
+            }
+            .ok();
             return Ok(Done::Children {
                 walk,
                 part,
@@ -158,9 +170,10 @@ async fn execute(
             prefix,
             delimiter,
             token,
+            mut gaps,
         } => {
-            let page = read(store, &prefix, delimiter, token.as_deref()).await?;
-            return Ok(scan_batch(prefix, delimiter, page));
+            let page = gaps.read(store, &prefix, delimiter, &token).await?;
+            return Ok(scan_batch(prefix, delimiter, page, gaps));
         }
         Job::Discover { prefix, component } => (prefix, component),
     };
@@ -182,15 +195,15 @@ async fn execute(
     }
     if !split && component + 1 < pattern.components.len() {
         let page = read(store, &query, false, None).await?;
-        return Ok(scan_batch(query, false, page));
+        return Ok(scan_batch(query, false, page, Gaps::default()));
     }
     let page = read(store, &query, true, None).await?;
     if component + 1 == pattern.components.len() {
-        return Ok(scan_batch(query, true, page));
+        return Ok(scan_batch(query, true, page, Gaps::default()));
     }
     if page.next.is_some() || page.prefixes.len() > MAX_CHILDREN {
         let flat = read(store, &query, false, None).await?;
-        return Ok(scan_batch(query, false, flat));
+        return Ok(scan_batch(query, false, flat, Gaps::default()));
     }
     Ok(Done::Batch(Batch {
         entries: page.entries,
@@ -312,7 +325,7 @@ enum Children {
     /// A page is on its way.
     Asked,
     /// Pages so far end at a continuation token.
-    More(String),
+    More((String, Gaps)),
     Complete,
     /// Nothing further to hand over from this part.
     Closed,
@@ -542,18 +555,19 @@ impl Walk {
 
     /// Take a page of the children of the directory a part is in, or `None`
     /// when the request for it failed.
-    fn children(&mut self, at: usize, directory: &str, page: Option<Page>) -> Result<()> {
+    fn children(&mut self, at: usize, directory: &str, page: Option<(Page, Gaps)>) -> Result<()> {
         let part = &mut self.parts[at];
         // The page answers the part's request, unless the part has since
         // given up on its children; it is of use only while the part lists.
         let outstanding = part.directory == directory && matches!(part.children, Children::Asked);
         let current = outstanding && !part.done;
-        let Some(page) = page else {
+        let Some((page, gaps)) = page else {
             if current {
                 part.children = Children::Closed;
             }
             return Ok(());
         };
+        let gaps = gaps.after(true, &page);
         // Children and objects come in separate lists, each in order and all
         // after those of the page before. A page that arrives too late to be
         // used is still evidence of the store's order.
@@ -608,7 +622,7 @@ impl Walk {
             // Children the listing has already passed are too small to be
             // worth a request for every thousand of them.
             Some(_) if part.ahead.is_empty() && part.listed < part.last => Children::Closed,
-            Some(token) => Children::More(token),
+            Some(token) => Children::More((token, gaps)),
             None => Children::Complete,
         };
         Ok(())

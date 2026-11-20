@@ -169,7 +169,8 @@ enum Job {
     Scan {
         prefix: String,
         delimiter: bool,
-        token: Option<String>,
+        token: String,
+        gaps: Gaps,
     },
 }
 
@@ -179,7 +180,8 @@ struct Batch {
     pruned: Vec<String>,
 }
 
-fn scan_batch(prefix: String, delimiter: bool, page: Page) -> Batch {
+fn scan_batch(prefix: String, delimiter: bool, page: Page, gaps: Gaps) -> Batch {
+    let gaps = gaps.after(delimiter, &page);
     Batch {
         entries: page.entries,
         jobs: page
@@ -187,11 +189,85 @@ fn scan_batch(prefix: String, delimiter: bool, page: Page) -> Batch {
             .map(|token| Job::Scan {
                 prefix,
                 delimiter,
-                token: Some(token),
+                token,
+                gaps,
             })
             .into_iter()
             .collect(),
         pruned: Vec::new(),
+    }
+}
+
+/// What a listing with a delimiter carries from one page to the next to make
+/// up for a key the store leaves out.
+///
+/// After a page that ends with the common prefix `P/`, Tigris resumes the
+/// listing past the key `P0` instead of at it, so that key, if it exists, is
+/// missing from the next page. In byte order nothing else can come between
+/// the two. Every store is checked alike, since the same mistake is easy to
+/// make elsewhere: the next page is read together with a listing of `P0`
+/// itself, which finds the key on its first page in byte order.
+#[derive(Clone, Default)]
+pub(super) struct Gaps {
+    /// The key the previous page may have caused this one to leave out.
+    exposed: Option<String>,
+    /// Keys added that way. A store not in byte order may still list one
+    /// later; it is not reported twice.
+    added: Vec<String>,
+}
+
+impl Gaps {
+    /// The state for the page after `page`.
+    pub(super) fn after(self, delimiter: bool, page: &Page) -> Self {
+        let exposed = page
+            .next
+            .as_ref()
+            .filter(|_| delimiter)
+            .and(page.prefixes.last())
+            .filter(|last| page.entries.last().is_none_or(|entry| entry.key < **last))
+            .and_then(|last| last.strip_suffix('/'))
+            .map(|stem| format!("{stem}0"));
+        Self {
+            exposed,
+            added: self.added,
+        }
+    }
+
+    /// Read the page at `token`, adding the key the previous page exposed
+    /// if the store left it out.
+    pub(super) async fn read(
+        &mut self,
+        store: &impl Store,
+        prefix: &str,
+        delimiter: bool,
+        token: &str,
+    ) -> Result<Page> {
+        let Some(key) = self.exposed.take() else {
+            let mut page = read(store, prefix, delimiter, Some(token)).await?;
+            self.forget(&mut page);
+            return Ok(page);
+        };
+        let (page, check) = tokio::join!(
+            read(store, prefix, delimiter, Some(token)),
+            read(store, &key, true, None)
+        );
+        let mut page = page?;
+        self.forget(&mut page);
+        if page.entries.iter().all(|entry| entry.key != key) {
+            if let Some(entry) = check?.entries.into_iter().find(|entry| entry.key == key) {
+                page.entries.insert(0, entry);
+                self.added.push(key);
+            }
+        }
+        Ok(page)
+    }
+
+    /// Leave out keys already added.
+    fn forget(&self, page: &mut Page) {
+        if !self.added.is_empty() {
+            page.entries
+                .retain(|entry| !self.added.contains(&entry.key));
+        }
     }
 }
 
@@ -243,9 +319,10 @@ async fn execute(
             prefix,
             delimiter,
             token,
+            mut gaps,
         } => {
-            let page = read(store, &prefix, delimiter, token.as_deref()).await?;
-            return Ok(scan_batch(prefix, delimiter, page));
+            let page = gaps.read(store, &prefix, delimiter, &token).await?;
+            return Ok(scan_batch(prefix, delimiter, page, gaps));
         }
         Job::Discover { prefix, component } => (prefix, component),
     };
@@ -267,15 +344,15 @@ async fn execute(
     }
     if !split && component + 1 < pattern.components.len() {
         let page = read(store, &query, false, None).await?;
-        return Ok(scan_batch(query, false, page));
+        return Ok(scan_batch(query, false, page, Gaps::default()));
     }
     let page = read(store, &query, true, None).await?;
     if component + 1 == pattern.components.len() {
-        return Ok(scan_batch(query, true, page));
+        return Ok(scan_batch(query, true, page, Gaps::default()));
     }
     if page.next.is_some() || page.prefixes.len() > MAX_CHILDREN {
         let flat = read(store, &query, false, None).await?;
-        return Ok(scan_batch(query, false, flat));
+        return Ok(scan_batch(query, false, flat, Gaps::default()));
     }
     Ok(Batch {
         entries: page.entries,
@@ -376,7 +453,7 @@ async fn recursive(store: &impl Store, prune: Option<&Prune<'_>>, query: String)
             return Ok(batch);
         }
     }
-    Ok(scan_batch(query, false, flat))
+    Ok(scan_batch(query, false, flat, Gaps::default()))
 }
 
 pub(super) async fn enumerate(
