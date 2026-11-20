@@ -983,15 +983,13 @@ impl Engine {
             // Nothing to list: still send the request the copy sizes its
             // concurrency from, under a signed prefix with planned keys
             // beneath it if there is one.
-            let mut sorted: Vec<_> = plan.iter().map(&key).collect();
-            sorted.sort_unstable();
-            let probe = prefixes
+            let probe = plan
                 .iter()
-                .find(|prefix| {
-                    let at = sorted.partition_point(|key| key.as_ref() < prefix.as_str());
-                    sorted
-                        .get(at)
-                        .is_some_and(|key| key.starts_with(prefix.as_str()))
+                .find_map(|t| {
+                    let key = key(t);
+                    prefixes
+                        .iter()
+                        .find(|prefix| key.starts_with(prefix.as_str()))
                 })
                 .unwrap_or(&prefixes[0]);
             client::list_one(&self.client, &self.options.bucket, probe).await?;
