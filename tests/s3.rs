@@ -5631,8 +5631,12 @@ fn s3_paginated_download_records_control_latency() {
     assert!(control.is_finite() && control >= 0.0, "{plan}");
     // Check the measured latency reaches planning without requiring a loaded
     // runner to finish real HTTP requests within a wall-clock deadline.
-    let expected_limit = if control >= 0.050 { 256 } else { 64 };
-    assert_eq!(plan["request_limit"], expected_limit, "{plan}");
+    // A far endpoint starts with as many requests as objects.
+    if control >= 0.020 {
+        assert_eq!(plan["request_limit"], plan["object_workers"], "{plan}");
+    } else {
+        assert_eq!(plan["request_limit"], 64, "{plan}");
+    }
 }
 
 #[test]

@@ -445,13 +445,16 @@ async fn small_download_search_preserves_seeds_mixed_batches_and_overrides() {
 
     // An average below 1 MiB does not make every object small. Keep the
     // existing target when even one larger object needs streaming buffers.
-    let mixed = planning_engine(&[])
-        .object_workers(std::iter::repeat_n(64 * 1024, 8192).chain([1024 * 1024]))
+    let mixed = planning_engine(&[]);
+    mixed.tuning.observe_control(Duration::from_millis(100));
+    let mixed = mixed
+        .object_workers(std::iter::repeat_n(64 * 1024, 8192).chain([8 * 1024 * 1024]))
         .unwrap();
     assert_eq!(mixed.initial, 256);
     assert_eq!(mixed.maximum, Some(256));
 
     let fixed = planning_engine(&["--performance-tuning", "s3-objects=1024,s3-requests=128"]);
+    fixed.tuning.observe_control(Duration::from_millis(100));
     let concurrency = fixed
         .object_workers(std::iter::repeat_n(64 * 1024, 8192))
         .unwrap();
