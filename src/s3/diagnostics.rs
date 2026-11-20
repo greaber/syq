@@ -74,8 +74,6 @@ pub(super) fn request(
                     progress: observed.clone(),
                 })
             });
-            // The synchronous connector reads its file itself, bypassing SdkBody.
-            request.add_extension(progress.clone());
             progress
         })
     } else {
@@ -124,7 +122,7 @@ impl UploadProgress {
             state: Arc::new(Mutex::new(UploadState::default())),
         }
     }
-    pub fn handed(&self, bytes: usize) {
+    fn handed(&self, bytes: usize) {
         let mut state = self.state.lock().unwrap();
         state.bytes += bytes as u64;
         if state.bytes == self.length && state.finished.is_none() {

@@ -440,7 +440,7 @@ async fn connect_with(
         ))
         .build_with_resolver(super::dns::CoalescingDns::default());
     let sleep = aws_sdk_s3::config::SharedAsyncSleep::new(super::cancel::Sleep(uploads.clone()));
-    let transport = super::upload_http::client(transport, uploads);
+    let transport = super::cancel::client(transport, uploads);
     let transport = match authorization {
         Some(authorization) => super::authorization::http_client(transport, authorization),
         None => transport,
