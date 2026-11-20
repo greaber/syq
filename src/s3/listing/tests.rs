@@ -520,7 +520,7 @@ async fn directory_markers_do_not_stop_pruning_an_ignored_first_page() {
 }
 
 #[test]
-fn only_aws_general_purpose_endpoints_divide_listings() {
+fn only_aws_and_tigris_endpoints_divide_listings() {
     if std::env::var_os("SYQ_TEST_S3_DIVIDE_LISTINGS").is_some() {
         return;
     }
@@ -540,6 +540,10 @@ fn only_aws_general_purpose_endpoints_divide_listings() {
         "https://s3.cn-north-1.amazonaws.com.cn",
         "https://s3.dualstack.cn-northwest-1.amazonaws.com.cn",
         "https://bucket.vpce-1a2b3c4d-5e6f.s3.us-east-1.vpce.amazonaws.com",
+        // Tigris.
+        "https://t3.storage.dev",
+        "https://T3.Storage.Dev/",
+        "https://fly.storage.tigris.dev",
     ] {
         assert!(lists_in_byte_order(Some(endpoint), "bucket"), "{endpoint}");
     }
@@ -549,8 +553,14 @@ fn only_aws_general_purpose_endpoints_divide_listings() {
         "https://r2.cloudflarestorage.com.example.org",
         "https://storage.googleapis.com",
         "https://s3.us-west-002.backblazeb2.com",
-        "https://t3.storage.dev",
-        "https://fly.storage.tigris.dev",
+        "https://t3.storage.dev.example.org",
+        "https://evilt3.storage.dev",
+        "https://storage.dev",
+        "https://tigris.dev",
+        "https://faketigris.dev",
+        "https://fly.storage.tigris.dev.example.org",
+        "https://t3.storage.dev/archive/",
+        "https://fly.storage.tigris.dev/archive",
         "https://s3.amazonaws.com.example.org",
         "https://s3.us-east-1.amazonaws.com.example.org",
         "https://s3.amazonaws.com.",

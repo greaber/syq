@@ -40,8 +40,9 @@ service is back.
 ### Listing large prefixes
 
 Before it copies or removes a prefix, and for `--prune`, syq lists the
-objects under it. In general purpose buckets on AWS, syq divides a large
-listing with subdirectories into parts that it lists at the same time, so
+objects under it. In general purpose buckets on AWS, and on Tigris, syq
+divides a large listing with subdirectories into parts that it lists at the
+same time, so
 the listing can finish sooner when each request takes a while. This costs
 more list requests: usually up to about a quarter more on large listings.
 When a prefix has no more than a few dozen subdirectories and the first ones
@@ -49,11 +50,13 @@ hold many objects, syq may list each subdirectory by itself, at a request
 each, however few objects the others hold.
 
 Dividing a listing is safe only when the service returns keys in byte
-order, which AWS documents for general purpose buckets, so syq divides
-listings only there. With `--s3-endpoint`, that means the URL is an AWS S3
-endpoint: regional, dual-stack, FIPS, or the bucket address of a VPC
-endpoint. For other services, including Cloudflare R2, MinIO and other
-servers you run yourself, syq lists one page after another.
+order. AWS documents that for general purpose buckets, and Tigris was found
+to follow it in testing, so syq divides listings only there. With
+`--s3-endpoint`, that means the URL is an AWS S3 endpoint (regional,
+dual-stack, FIPS, or the bucket address of a VPC endpoint) or a Tigris
+endpoint (`t3.storage.dev` or under `tigris.dev`), with no path. For other
+services, including Cloudflare R2, MinIO and other servers you run
+yourself, syq lists one page after another.
 
 ## Upload and download
 

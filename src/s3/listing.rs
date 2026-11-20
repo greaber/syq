@@ -135,8 +135,8 @@ pub(super) fn lists_in_key_order(bucket: &str) -> bool {
 }
 
 /// Whether listings of `bucket` at `endpoint` may be divided into parts
-/// (`engine::Store::divides`): the provider must document that ListObjectsV2
-/// returns keys in UTF-8 byte order. `None` is the AWS endpoint the SDK
+/// (`engine::Store::divides`): ListObjectsV2 must return keys in UTF-8 byte
+/// order, and StartAfter must follow it. `None` is the AWS endpoint the SDK
 /// chooses.
 ///
 /// Of the providers checked, only AWS documents it: "List results are always
@@ -147,19 +147,30 @@ pub(super) fn lists_in_key_order(bucket: &str) -> bool {
 /// (https://docs.aws.amazon.com/AmazonS3/latest/userguide/olap-writing-lambda.html),
 /// so only names of general purpose buckets divide.
 ///
-/// Left out: Cloudflare R2, whose S3 API documentation states no order and
-/// for which a different order was reported
-/// (https://community.cloudflare.com/t/r2-listobjectsv2-returns-keys-in-non-standard-lexicographical-order/941399);
+/// Tigris states no order (https://www.tigrisdata.com/docs/api/s3/), but
+/// tests against it at `e7cc1893` found byte order throughout. About 5,000
+/// keys built to expose other orders (keys that extend others, case,
+/// punctuation around '/', NFC and NFD, CJK, emoji, percent signs) came back
+/// in byte order at page sizes from 1 to 1,000. StartAfter resumed in byte
+/// order, and both a divided listing and one page after another returned
+/// every key. Its delimiter listings skip the key after a page that ends with
+/// a common prefix, which `engine::Gaps` makes up for.
+///
+/// Left out: Cloudflare R2, which states no order and in the same tests
+/// sorted as if every key ended in a byte just above '9' (`a0` and `a/b`
+/// before `a`), with StartAfter following that order;
 /// Google Cloud Storage, which says "lexicographically by name" without
 /// saying by bytes (https://cloud.google.com/storage/docs/xml-api/get-bucket-list);
 /// Backblaze B2, "sorted alphabetically by key"
-/// (https://www.backblaze.com/apidocs/s3-list-objects-v2); Tigris, whose
-/// S3 compatibility page states no order (https://www.tigrisdata.com/docs/api/s3/);
+/// (https://www.backblaze.com/apidocs/s3-list-objects-v2);
 /// and every self-hosted or unrecognized endpoint.
 pub(super) fn lists_in_byte_order(endpoint: Option<&str>, bucket: &str) -> bool {
     general_purpose_bucket(bucket)
-        && endpoint
-            .is_none_or(|endpoint| aws_endpoint(endpoint) || (test_divides() && loopback(endpoint)))
+        && endpoint.is_none_or(|endpoint| {
+            aws_endpoint(endpoint)
+                || tigris_endpoint(endpoint)
+                || (test_divides() && loopback(endpoint))
+        })
 }
 
 /// The test servers are not AWS. Debug builds let them divide listings: they
@@ -210,19 +221,7 @@ fn general_purpose_bucket(bucket: &str) -> bool {
 /// Hosts that already name a bucket, access points, Object Lambda, Outposts,
 /// directory buckets (`s3express`) and multi-Region access points are not.
 fn aws_endpoint(endpoint: &str) -> bool {
-    let Ok(url) = url::Url::parse(endpoint) else {
-        return false;
-    };
-    // A path would come before the bucket's: another bucket, and a key. The
-    // SDK sends the path as given, so check it before any normalization.
-    let Some((_, rest)) = endpoint.split_once("://") else {
-        return false;
-    };
-    let path = rest.find(['/', '\\']).map_or("", |at| &rest[at..]);
-    if !matches!(path, "" | "/") || url.path() != "/" {
-        return false;
-    }
-    let Some(url::Host::Domain(host)) = url.host() else {
+    let Some(host) = base_host(endpoint) else {
         return false;
     };
     let labels: Vec<&str> = host.split('.').collect();
@@ -248,6 +247,33 @@ fn aws_endpoint(endpoint: &str) -> bool {
         ["bucket", endpoint, "s3", r, "vpce"] => endpoint.starts_with("vpce-") && region(r),
         [legacy] => legacy.strip_prefix("s3-").is_some_and(region),
         _ => false,
+    }
+}
+
+/// Whether `endpoint` is the base URL of a Tigris endpoint, recognized as
+/// `Options::is_tigris` does: `t3.storage.dev`, or a host under `tigris.dev`.
+fn tigris_endpoint(endpoint: &str) -> bool {
+    base_host(endpoint).is_some_and(|host| {
+        host == "t3.storage.dev"
+            || host
+                .strip_suffix(".tigris.dev")
+                .is_some_and(|name| !name.is_empty())
+    })
+}
+
+/// The domain of an endpoint URL with no path, in lowercase. A path would
+/// come before the bucket's: another bucket, and a key. The SDK sends the
+/// path as given, so it is checked before any normalization.
+fn base_host(endpoint: &str) -> Option<String> {
+    let url = url::Url::parse(endpoint).ok()?;
+    let (_, rest) = endpoint.split_once("://")?;
+    let path = rest.find(['/', '\\']).map_or("", |at| &rest[at..]);
+    if !matches!(path, "" | "/") || url.path() != "/" {
+        return None;
+    }
+    match url.host()? {
+        url::Host::Domain(host) => Some(host.to_owned()),
+        _ => None,
     }
 }
 
