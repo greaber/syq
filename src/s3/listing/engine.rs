@@ -277,6 +277,8 @@ impl Gap {
                 let mut checked = None;
                 let mut page = loop {
                     tokio::select! {
+                        // With one request slot free, the page goes first.
+                        biased;
                         page = &mut main => break page?,
                         result = &mut check, if checked.is_none() => checked = Some(result),
                     }
@@ -307,8 +309,14 @@ impl Gap {
         if let Some(refused) = &refused {
             ensure!(!may_hide(&page, &wanted), "{refused}");
         }
-        let mut next = Gap::after(&page, wanted);
-        next.refused = refused;
+        // Where the order is unknown, nothing is checked (`may_hide` above).
+        let next = match refused {
+            Some(refused) => Gap {
+                key: None,
+                refused: Some(refused),
+            },
+            None => Gap::after(&page, wanted),
+        };
         Ok((page, next))
     }
 

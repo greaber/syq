@@ -67,11 +67,19 @@ impl Store for Memory {
         _: Option<&str>,
     ) -> Result<Page> {
         self.calls.borrow_mut().push((prefix.into(), delimiter));
+        /// Counts a request in flight until it ends or is dropped.
+        struct Active<'a>(&'a Cell<usize>);
+        impl Drop for Active<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() - 1);
+            }
+        }
         self.active.set(self.active.get() + 1);
+        let active = Active(&self.active);
         self.peak.set(self.peak.get().max(self.active.get()));
         let delay = if delimiter { 1 } else { self.key_delay.get() };
         tokio::time::sleep(Duration::from_millis(delay)).await;
-        self.active.set(self.active.get() - 1);
+        drop(active);
         // A token names its query and where the next page starts: after a
         // key, or at the first key past a directory.
         let marker = format!("{}:{prefix}:", u8::from(delimiter));
