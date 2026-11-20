@@ -244,8 +244,10 @@ impl Worker {
     pub(super) fn run_inner(&mut self) -> Result<()> {
         loop {
             if !self.gate.allowed(self.id) {
-                // A parked worker keeps no publication waiting.
+                // A parked worker keeps no publication waiting, nor a range
+                // read buffer.
                 self.settle_between_items(true)?;
+                self.src.release_read_buffer();
                 let _parked = self
                     .observation
                     .as_ref()
@@ -280,7 +282,11 @@ impl Worker {
                     .observation
                     .as_ref()
                     .map(|a| a.span(crate::transfer_observations::Stage::AwaitingWork));
-                self.sched.next()
+                self.sched.try_next().unwrap_or_else(|| {
+                    // A worker waiting for work keeps no range read buffer.
+                    self.src.release_read_buffer();
+                    self.sched.next()
+                })
             };
             if matches!(item, Item::Exit) {
                 return Ok(());
@@ -869,6 +875,8 @@ impl Worker {
         mut next_group: impl FnMut(WorkSize) -> Option<std::ops::Range<usize>>,
         results: &mut [Option<SmallPutOutcome>],
     ) -> Result<()> {
+        // Small files are read whole, never into a kept range buffer.
+        self.src.release_read_buffer();
         let mut early = self.dst.track_small_batches(self.progress.clone())?;
         let window = crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH;
         let mut read_window = if self.src.supports_request_pipelining() {
@@ -2872,7 +2880,7 @@ impl Worker {
                 };
                 validate_range_reply(expected_off, expected_len, off, data.len())?;
                 let n = data.len() as u64;
-                self.dst.send(Request::WriteRange {
+                if let Some(buffer) = self.dst.send_recycling(Request::WriteRange {
                     path: job.dst.clone(),
                     inplace: job.inplace,
                     copy_id: self.copy_id(),
@@ -2880,7 +2888,9 @@ impl Worker {
                     off,
                     hash,
                     data: data.into(),
-                })?;
+                })? {
+                    self.src.reuse_read_buffer(buffer);
+                }
                 pending_writes.push_back((slot, n, started));
                 if pending_writes.len() >= write_window {
                     let write = pending_writes.pop_front().expect("pending write");
@@ -3029,7 +3039,7 @@ impl Worker {
                     break;
                 }
                 self.limit(claimed);
-                self.dst.send(Request::WriteRange {
+                if let Some(buffer) = self.dst.send_recycling(Request::WriteRange {
                     path: job.dst.clone(),
                     inplace: job.inplace,
                     copy_id: self.copy_id(),
@@ -3037,7 +3047,9 @@ impl Worker {
                     off,
                     hash,
                     data: data.into(),
-                })?;
+                })? {
+                    self.src.reuse_read_buffer(buffer);
+                }
                 sent += 1;
                 self.benchmark.streamed_blocks += 1;
                 self.benchmark.max_request_bytes = self.benchmark.max_request_bytes.max(claimed);

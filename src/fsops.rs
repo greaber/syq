@@ -915,6 +915,9 @@ pub struct FsOps {
     /// since `take_finalize_repeated`.
     finalize_repeated: bool,
     comparison_window: Option<ComparisonWindow>,
+    /// A served range's allocation, given back once its bytes were sent, for
+    /// the next `read_range` on this connection (`reuse_read_buffer`).
+    read_buffer: Option<Vec<u8>>,
     partial_candidates: HashMap<FileLocation, HashMap<PathBytes, Vec<PathBytes>>>,
     partial_directory_order: VecDeque<FileLocation>,
     /// Devices this connection has probed for whether a new file can be
@@ -1248,6 +1251,7 @@ impl FsOps {
             stage_connection: stages::new_connection(),
             finalize_repeated: false,
             comparison_window: None,
+            read_buffer: None,
             partial_candidates: HashMap::new(),
             partial_directory_order: VecDeque::new(),
             fixed_wide_mode_devices: HashMap::new(),
