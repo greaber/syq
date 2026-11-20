@@ -337,7 +337,20 @@ pub(super) fn switch_when_idle(domain: &Domain) -> Result<()> {
             }
             super::switch::Plan::ReplaceWhenIdle | super::switch::Plan::ReplaceNow => {}
         }
-        let answer = query(domain, Control::StopIfIdle)?;
+        let answer = match ask_stop_if_idle(domain) {
+            Ok(answer) => answer,
+            // Without an answer: a provider that has gone has stopped.
+            Err(error) if crate::service::unanswered(&error) => {
+                if !crate::service::is_running(&lock_path(domain))? {
+                    continue;
+                }
+                return Err(error.context(format!(
+                    "SSH authorization provider did not answer in {} whether it is idle",
+                    domain.runtime_path().display()
+                )));
+            }
+            Err(error) => return Err(error),
+        };
         if !answer.stopping {
             let mut fix = "syq persist receive on".to_owned();
             if let Some(scope) = domain.explicit_path() {
@@ -362,6 +375,41 @@ pub(super) fn switch_when_idle(domain: &Domain) -> Result<()> {
         await_exit(domain, answer.pid)?;
     }
     Ok(())
+}
+
+/// Ask the provider to stop if idle. It decides only after ending its idle
+/// account connections, so wait for the answer as long as for it to stop,
+/// saying so once after `SLOW_ANSWER_NOTE`: a provider of an earlier build
+/// stops once it decides, even when nobody waits for the answer any more.
+fn ask_stop_if_idle(domain: &Domain) -> Result<Snapshot> {
+    let mut stream = connect(domain, true)?;
+    crate::destination::write_message(&mut stream, &Control::StopIfIdle)?;
+    let asked = Instant::now();
+    let mut noted = false;
+    loop {
+        let until = asked
+            + if noted {
+                STOP_TIMEOUT
+            } else {
+                SLOW_ANSWER_NOTE
+            };
+        if crate::sys::readable_within(
+            stream.as_raw_fd(),
+            until.saturating_duration_since(Instant::now()),
+        ) {
+            break;
+        }
+        if asked.elapsed() >= STOP_TIMEOUT {
+            return Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
+        }
+        if !noted && asked.elapsed() >= SLOW_ANSWER_NOTE {
+            crate::output::diagnostic!(
+                "syq: waiting for the old local SSH authorization provider to answer whether it is idle"
+            );
+            noted = true;
+        }
+    }
+    crate::destination::read_framed(&mut stream, MAX_STATUS, "provider status")
 }
 
 /// Replace a provider from another build that cannot follow updates by
@@ -610,15 +658,37 @@ impl Service {
     /// connections nothing uses; whether it did. One attempt runs at a
     /// time; another meanwhile does not stop it. New requests wait from
     /// before the decision, and are admitted if it does not stop.
+    #[cfg(test)]
     fn stop_if_idle(&self) -> bool {
+        self.stop_if_idle_answering(|_| true)
+    }
+    /// Answer a request to stop if idle on `stream`, stopping only once the
+    /// answer is written.
+    fn answer_stop_if_idle(&self, stream: &mut impl Write) -> Result<()> {
+        let mut written = Ok(());
+        self.stop_if_idle_answering(|stopping| {
+            let mut answer = self.snapshot(None);
+            answer.stopping |= stopping;
+            written =
+                crate::destination::write_framed(stream, &answer, MAX_STATUS, "provider status");
+            written.is_ok()
+        });
+        written
+    }
+    /// [`Service::stop_if_idle`], stopping only if `answer`, given whether
+    /// it would stop, says the one asking heard it: a switch that has
+    /// stopped waiting keeps the provider it meant to replace.
+    fn stop_if_idle_answering(&self, answer: impl FnOnce(bool) -> bool) -> bool {
         let Ok(_attempt) = self.stop_attempt.try_lock() else {
+            answer(false);
             return false;
         };
         {
             let _inner = self.inner.lock().unwrap();
             self.switching.store(true, Ordering::SeqCst);
         }
-        let stopped = self.stop_admitted_if_idle();
+        let idle = self.stop_admitted_if_idle();
+        let stopped = answer(idle) && idle;
         {
             let _decided = self.switch_decided.0.lock().unwrap();
             if stopped {
@@ -744,10 +814,7 @@ impl Service {
                     self.stop.store(true, Ordering::Release);
                     None
                 }
-                Control::StopIfIdle => {
-                    self.stop_if_idle();
-                    None
-                }
+                Control::StopIfIdle => return self.answer_stop_if_idle(&mut stream),
                 Control::Decide(decision) => {
                     // Decisions use the matching build's Summary/Kind semantics.
                     anyhow::ensure!(
