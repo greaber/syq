@@ -412,15 +412,11 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let stream = UnixStream::connect(&path).unwrap();
         drop(listener);
-        match set_timeouts(&stream, Duration::from_secs(1)) {
-            Ok(()) => assert!(
-                !cfg!(target_vendor = "apple"),
-                "macOS set timeouts on a dropped connection"
-            ),
-            Err(error) => {
-                let error = anyhow::Error::from(error);
-                assert!(unanswered(&error), "{error:#}");
-            }
+        let result = set_timeouts(&stream, Duration::from_secs(1)).map_err(anyhow::Error::from);
+        // Linux sets them all the same.
+        assert_eq!(result.is_err(), cfg!(target_vendor = "apple"), "{result:?}");
+        if let Err(error) = result {
+            assert!(unanswered(&error), "{error:#}");
         }
     }
 
