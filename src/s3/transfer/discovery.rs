@@ -330,6 +330,21 @@ impl Walk {
         Ok(self.shortfall <= undecided.min(SLACK_PAGES * KEYS_PER_PAGE) || self.next_segment())
     }
 
+    /// Request the pages the copy waits for. Returns whether another page
+    /// is worth requesting.
+    async fn before_copy(&mut self, store: &impl Store) -> Result<bool> {
+        if !store.ordered() {
+            self.whole(store).await?;
+            return Ok(false);
+        }
+        for _ in 0..PAGES_BEFORE_COPY {
+            if !self.page(store).await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Directory buckets list in no particular order and cannot start after a
     /// key, so only a complete listing decides anything.
     async fn whole(&mut self, store: &impl Store) -> Result<()> {
@@ -420,17 +435,7 @@ impl Discovery {
             bucket,
             divides: false,
         };
-        let mut more = store.ordered();
-        if more {
-            for _ in 0..PAGES_BEFORE_COPY {
-                more = walk.page(&store).await?;
-                if !more {
-                    break;
-                }
-            }
-        } else {
-            walk.whole(&store).await?;
-        }
+        let more = walk.before_copy(&store).await?;
         let (sender, reach) = watch::channel(Reach {
             decided: walk.decided,
             finished: !more,
@@ -473,15 +478,19 @@ impl Discovery {
         })
     }
 
+    /// Whether a listing decides the key at plan position `index`.
+    fn lists(&self, index: usize) -> bool {
+        let segment = self.listed.partition_point(|range| range.end <= index);
+        self.listed
+            .get(segment)
+            .is_some_and(|range| range.start <= index)
+    }
+
     /// What the listing says about the key at plan position `index`, once the
     /// listing has passed it or ended.
     pub(super) fn lookup(&self, index: usize) -> impl Future<Output = Listed> + Send + 'static {
-        let segment = self.listed.partition_point(|range| range.end <= index);
         // A key no listing reaches need not wait for one.
-        let listed = self
-            .listed
-            .get(segment)
-            .is_some_and(|range| range.start <= index);
+        let listed = self.lists(index);
         let sizes = self.sizes.clone();
         let mut reach = self.reach.clone();
         async move {
@@ -493,13 +502,99 @@ impl Discovery {
                 .wait_for(|reach| reach.decided > index || reach.finished)
                 .await
                 .is_ok_and(|reach| reach.decided > index);
-            match sizes[index].load(Relaxed) {
-                _ if !decided => Listed::Unknown,
-                UNKNOWN => Listed::Unknown,
-                ABSENT => Listed::Absent,
-                size => Listed::Present(size),
+            if decided {
+                decision(&sizes, index)
+            } else {
+                Listed::Unknown
             }
         }
+    }
+
+    /// What the listing has decided about the key at plan position `index`
+    /// so far, without waiting: `None` while it may still decide.
+    pub(super) fn known(&self, index: usize) -> Option<Listed> {
+        if !self.lists(index) {
+            return Some(Listed::Unknown);
+        }
+        let reach = *self.reach.borrow();
+        if reach.decided > index {
+            Some(decision(&self.sizes, index))
+        } else if reach.finished {
+            Some(Listed::Unknown)
+        } else {
+            None
+        }
+    }
+}
+
+/// The decision recorded for a key the listing has passed.
+fn decision(sizes: &[AtomicU64], index: usize) -> Listed {
+    match sizes[index].load(Relaxed) {
+        UNKNOWN => Listed::Unknown,
+        ABSENT => Listed::Absent,
+        size => Listed::Present(size),
+    }
+}
+
+/// What the copy relies on about `key`, the plan's `position`th, once the
+/// destination listing has reached it. `complete` is the whole destination,
+/// listed before a copy that prunes; `discovery` is the listing that follows
+/// the plan.
+pub(super) fn listed(
+    args: &Args,
+    complete: Option<&super::DestinationListing>,
+    discovery: Option<&Discovery>,
+    position: usize,
+    key: &str,
+) -> impl Future<Output = Listed> + Send + 'static {
+    let complete = complete.map(|keys| in_complete(keys, key));
+    let reached = discovery
+        .filter(|_| complete.is_none())
+        .map(|discovery| discovery.lookup(position));
+    let trusted = trusts_absence_of(args, key);
+    async move {
+        let reached = match reached {
+            Some(reached) => Some(reached.await),
+            None => None,
+        };
+        rely(complete, reached, trusted)
+    }
+}
+
+/// What `listed` will say about `key`, if the listings have already decided
+/// it: `None` while the destination listing has yet to reach it.
+pub(super) fn known(
+    args: &Args,
+    complete: Option<&super::DestinationListing>,
+    discovery: Option<&Discovery>,
+    position: usize,
+    key: &str,
+) -> Option<Listed> {
+    let complete = complete.map(|keys| in_complete(keys, key));
+    let reached = match discovery.filter(|_| complete.is_none()) {
+        Some(discovery) => Some(discovery.known(position)?),
+        None => None,
+    };
+    Some(rely(complete, reached, trusts_absence_of(args, key)))
+}
+
+/// A key outside the prefixes the complete listing covers is unknown, not
+/// absent: a copy another machine signs for lists only some prefixes.
+fn in_complete(listed: &super::DestinationListing, key: &str) -> Listed {
+    match listed.size(key) {
+        Some(Some(size)) => Listed::Present(size),
+        Some(None) => Listed::Absent,
+        None => Listed::Unknown,
+    }
+}
+
+/// Which answer to rely on, shared by `listed` and `known` so they agree.
+fn rely(complete: Option<Listed>, reached: Option<Listed>, trusted: bool) -> Listed {
+    match (complete, reached) {
+        (Some(listed), _) => listed,
+        (None, Some(Listed::Absent)) if !trusted => Listed::Unknown,
+        (None, Some(listed)) => listed,
+        (None, None) => Listed::Unknown,
     }
 }
 impl Drop for Discovery {

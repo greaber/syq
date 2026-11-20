@@ -1,6 +1,11 @@
 use super::super::super::listing::engine::Entry;
+use super::super::DestinationListing;
 use super::*;
-use std::{cell::RefCell, collections::BTreeMap, ops::Bound};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashMap},
+    ops::Bound,
+};
 
 /// A bucket in key order. A continuation token names the last key returned.
 struct Bucket {
@@ -126,6 +131,221 @@ async fn discover_segments(bucket: &Bucket, segments: Vec<Segment>, keys: Keys) 
         size => Listed::Present(size),
     })
     .collect()
+}
+
+fn walk(prefix: &str, plan: &[String]) -> Walk {
+    let keys = Keys::new(plan.iter().map(|key| key.as_str().into()));
+    let whole = Segment::whole(prefix.to_owned(), &keys);
+    let sizes = (0..plan.len()).map(|_| AtomicU64::new(UNKNOWN)).collect();
+    Walk::new(vec![whole], keys, sizes)
+}
+
+/// The listing as the copy finds it when preparation starts, as
+/// `Discovery::start` leaves it, without the later pages.
+async fn at_copy_start(bucket: &Bucket, prefix: &str, plan: &[String]) -> Discovery {
+    let mut walk = walk(prefix, plan);
+    let more = walk.before_copy(bucket).await.unwrap();
+    let (_, reach) = watch::channel(Reach {
+        decided: walk.decided,
+        finished: !more,
+    });
+    Discovery {
+        listed: vec![0..plan.len()],
+        sizes: walk.sizes,
+        reach,
+        task: None,
+    }
+}
+
+fn cp(flags: &[&str]) -> Args {
+    let argv: Vec<_> = ["cp", "tree", "--to", "s3://bucket", "--into", "data"]
+        .iter()
+        .chain(flags)
+        .map(std::ffi::OsString::from)
+        .collect();
+    Args::parse_args(&argv).unwrap()
+}
+
+/// The keys whose existence checks an authorized upload signs before
+/// preparation. Checks that every key decided by then is decided as
+/// preparation will see it.
+async fn presigned(
+    args: &Args,
+    complete: Option<&DestinationListing>,
+    discovery: Option<&Discovery>,
+    plan: &[String],
+) -> Vec<String> {
+    for (position, key) in plan.iter().enumerate() {
+        if let Some(known) = known(args, complete, discovery, position, key) {
+            let listed = listed(args, complete, discovery, position, key).await;
+            assert_eq!(known, listed, "{key}");
+        }
+    }
+    super::super::authorization::upload_checks(plan.iter().map(String::as_str), |position, key| {
+        known(args, complete, discovery, position, key)
+    })
+    .map(|check| {
+        assert_eq!(check.method, "HEAD");
+        check.key
+    })
+    .collect()
+}
+
+#[tokio::test]
+async fn new_upload_presigns_no_existence_checks() {
+    // A new directory in a large prefix, and new files in an empty one.
+    for (bucket, plan) in [
+        (
+            Bucket::new(large()),
+            (0..500).map(|f| format!("big/m-new/f{f:03}")).collect(),
+        ),
+        (
+            Bucket::new([]),
+            (0..20).map(|f| format!("big/f{f:02}")).collect::<Vec<_>>(),
+        ),
+    ] {
+        let discovery = at_copy_start(&bucket, "big/", &plan).await;
+        for flags in [&[][..], &["--dry-run"], &["--if-exists=error"]] {
+            let args = cp(flags);
+            assert!(lists_destination(&args, "bucket"));
+            assert_eq!(
+                presigned(&args, None, Some(&discovery), &plan).await,
+                Vec::<String>::new(),
+                "{flags:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn existing_keys_and_untrusted_absences_keep_their_checks() {
+    let existing: Vec<_> = (0..300).map(|f| format!("data/f{f:03}")).collect();
+    let bucket = Bucket::new(existing.iter().cloned());
+    let mut plan = existing.clone();
+    plan.extend((0..300).map(|f| format!("data/g{f:03}")));
+    plan.push("data/new/".to_owned());
+    plan.sort();
+    let discovery = at_copy_start(&bucket, "data/", &plan).await;
+    assert_eq!(
+        presigned(&cp(&[]), None, Some(&discovery), &plan).await,
+        existing
+    );
+    // A directory marker that exists is accepted here, so only a HEAD may
+    // say it is absent.
+    let mut checked = existing.clone();
+    checked.push("data/new/".to_owned());
+    checked.sort();
+    assert_eq!(
+        presigned(&cp(&["--if-exists=error"]), None, Some(&discovery), &plan).await,
+        checked
+    );
+    // Pruning lists the whole destination first.
+    let complete = DestinationListing {
+        prefixes: vec!["data/".to_owned()],
+        keys: existing.iter().map(|key| (key.clone(), 1)).collect(),
+    };
+    assert_eq!(
+        presigned(&cp(&[]), Some(&complete), None, &plan).await,
+        existing
+    );
+}
+
+#[tokio::test]
+async fn keys_outside_a_complete_listing_keep_their_checks() {
+    // Pruning under signatures for named sources lists only the named
+    // directory; the named file beside it exists, and the listing cannot say.
+    let plan = ["data/dir/new".to_owned(), "data/file".to_owned()];
+    let complete = DestinationListing {
+        prefixes: vec!["data/dir/".to_owned()],
+        keys: HashMap::new(),
+    };
+    let args = cp(&["--prune"]);
+    assert_eq!(
+        listed(&args, Some(&complete), None, 1, "data/file").await,
+        Listed::Unknown
+    );
+    assert_eq!(
+        presigned(&args, Some(&complete), None, &plan).await,
+        ["data/file"]
+    );
+}
+
+#[tokio::test]
+async fn keys_outside_every_named_prefix_are_decided_at_once() {
+    let plan = named_plan();
+    let bucket = Bucket::new(["dst/a/1".to_owned(), "dst/a.txt".to_owned()]);
+    let keys = Keys::new(plan.iter().map(|key| key.as_str().into()));
+    let prefixes: Vec<String> = NAMED.map(str::to_owned).into();
+    let found = segments(&keys, &prefixes);
+    let listed: Vec<_> = found.iter().map(|segment| segment.range.clone()).collect();
+    let sizes: Arc<[AtomicU64]> = (0..plan.len()).map(|_| AtomicU64::new(UNKNOWN)).collect();
+    let mut walk = Walk::new(found, keys, sizes.clone());
+    // Before any page: the walk has not reached the named directories.
+    let (sender, reach) = watch::channel(Reach {
+        decided: walk.decided,
+        finished: false,
+    });
+    let discovery = Discovery {
+        listed,
+        sizes,
+        reach,
+        task: None,
+    };
+    let at = |key: &str| plan.iter().position(|planned| planned == key).unwrap();
+    // A named file and a lone key are checked with HEAD, whatever the walk.
+    assert_eq!(discovery.known(at("dst/a.txt")), Some(Listed::Unknown));
+    assert_eq!(discovery.lookup(at("dst/c/q")).await, Listed::Unknown);
+    assert_eq!(discovery.known(at("dst/a/2")), None);
+    while walk.page(&bucket).await.unwrap() {}
+    sender.send_replace(Reach {
+        decided: walk.decided,
+        finished: true,
+    });
+    assert_eq!(discovery.known(at("dst/a/2")), Some(Listed::Absent));
+    assert_eq!(discovery.lookup(at("dst/a/1")).await, Listed::Present(1));
+}
+
+#[tokio::test]
+async fn keys_the_listing_has_not_decided_are_presigned() {
+    let existing: Vec<_> = (0..5000).map(|f| format!("data/f{f:04}")).collect();
+    let bucket = Bucket::new(existing.iter().cloned());
+    let mut plan = existing.clone();
+    plan.extend((0..5000).map(|f| format!("data/f{f:04}n")));
+    plan.sort();
+    let discovery = at_copy_start(&bucket, "data/", &plan).await;
+    let decided = discovery.reach.borrow().decided;
+    assert!((1000..plan.len() / 2).contains(&decided), "{decided}");
+    let checked = presigned(&cp(&[]), None, Some(&discovery), &plan).await;
+    let expected: Vec<_> = plan
+        .iter()
+        .enumerate()
+        .filter(|(position, key)| *position >= decided || !key.ends_with('n'))
+        .map(|(_, key)| key.clone())
+        .collect();
+    assert_eq!(checked, expected);
+    // A listing that ended early leaves the rest to their checks too.
+    let (_, reach) = watch::channel(Reach {
+        decided,
+        finished: true,
+    });
+    let ended = Discovery {
+        listed: discovery.listed.clone(),
+        sizes: discovery.sizes.clone(),
+        reach,
+        task: None,
+    };
+    assert_eq!(
+        presigned(&cp(&[]), None, Some(&ended), &plan).await,
+        expected
+    );
+}
+
+#[tokio::test]
+async fn copies_that_do_not_list_presign_every_check() {
+    let plan: Vec<_> = (0..20).map(|f| format!("data/f{f:02}")).collect();
+    let args = cp(&["--if-exists=error", "--dry-run"]);
+    assert!(!lists_destination(&args, "bucket"));
+    assert_eq!(presigned(&args, None, None, &plan).await, plan);
 }
 
 /// Every decision must be what a HEAD would have found.
