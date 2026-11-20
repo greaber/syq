@@ -1235,10 +1235,13 @@ fn a_file_written_after_its_group_was_compared_is_hashed_again_before_its_update
         }
         let untouched = inode(&t.path("dst/untouched"));
         let (ready, continuation, guards) = (t.path("ready"), t.path("continue"), t.path("guards"));
+        // One worker compares both files in one group. With more, a loaded
+        // machine can split them between workers, and the other worker can
+        // compare `written` while this test writes it, or after.
         let mut child = rsync_inplace_command(
             &t,
             route,
-            &[],
+            &["--performance-tuning=workers=1"],
             &[
                 ("SYQ_TEST_SMALL_HASHED_READY_FILE", &ready.to_string_lossy()),
                 (
@@ -1254,6 +1257,12 @@ fn a_file_written_after_its_group_was_compared_is_hashed_again_before_its_update
         .start()
         .unwrap();
         wait_for_confinement_marker(&mut child, &ready, "the group's comparison");
+        let compared = fs::read_to_string(&guards).unwrap_or_default();
+        assert!(
+            compared.contains("untrusted ")
+                || compared.lines().any(|line| line == "leased written"),
+            "{route}: written was not leased before it was written: {compared:?}"
+        );
         OpenOptions::new()
             .write(true)
             .open(t.path("dst/written"))

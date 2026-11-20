@@ -100,10 +100,11 @@ pub(super) fn request_timeouts() -> TimeoutConfig {
         .build()
 }
 
-/// Time HEAD and LIST responses to their headers. Each is one small exchange,
-/// unlike data requests, whose duration follows their bodies. Only an answer
-/// about the object or listing counts: errors and throttling describe the
-/// service, and a redirect comes from a region that does not hold the bucket.
+/// Time HEAD and LIST responses to their headers, less any wait for a
+/// signature. Each is one small exchange, unlike data requests, whose duration
+/// follows their bodies. Only an answer about the object or listing counts:
+/// errors and throttling describe the service, and a redirect comes from a
+/// region that does not hold the bucket.
 #[derive(Debug)]
 struct ControlLatency(std::sync::Arc<std::sync::atomic::AtomicU64>);
 #[derive(Debug)]
@@ -181,10 +182,14 @@ impl Intercept for ControlLatency {
         _: &RuntimeComponents,
         cfg: &mut ConfigBag,
     ) -> std::result::Result<(), BoxError> {
-        let status = context.response().status().as_u16();
+        let response = context.response();
+        let status = response.status().as_u16();
         if let Some(ControlStart(start)) = cfg.load::<ControlStart>() {
             if (200..300).contains(&status) || status == 404 {
-                super::tuning::observe_control(&self.0, start.elapsed());
+                let signing = response
+                    .extension::<super::authorization::SigningWait>()
+                    .map_or(Duration::ZERO, |wait| wait.0);
+                super::tuning::observe_control(&self.0, start.elapsed().saturating_sub(signing));
             }
         }
         Ok(())
