@@ -243,8 +243,8 @@ fn a_server_uploads_with_urls_this_machine_signed() {
 
 /// Named sources are signed for at their own names in the destination
 /// directory and nowhere else in it, so the copy must look only there:
-/// a request for the directory itself would end it. `dataset-b` and
-/// `dataset.txt` sort between `dataset` and its contents.
+/// a request for the directory itself would end it. `dataset-b`,
+/// `dataset-c` and `dataset.txt` sort between `dataset` and its contents.
 #[test]
 fn named_sources_upload_within_the_paths_their_names_produce() {
     let lab = Lab::start("ok");
@@ -253,6 +253,11 @@ fn named_sources_upload_within_the_paths_their_names_produce() {
     std::fs::create_dir(lab.path("server-home/dataset-b")).unwrap();
     for name in ["c", "d"] {
         std::fs::write(lab.path("server-home/dataset-b").join(name), b"b\n").unwrap();
+    }
+    // Enough files to be worth a listing of their own.
+    std::fs::create_dir(lab.path("server-home/dataset-c")).unwrap();
+    for n in 0..12 {
+        std::fs::write(lab.path(&format!("server-home/dataset-c/f{n:02}")), b"c\n").unwrap();
     }
     for options in [&[][..], &["--prune", "--max-delete=0"]] {
         std::fs::remove_file(lab.path("stored-by-fixture/request-log")).ok();
@@ -264,6 +269,7 @@ fn named_sources_upload_within_the_paths_their_names_produce() {
                     "dataset",
                     "note.txt",
                     "dataset-b",
+                    "dataset-c",
                     "dataset.txt",
                 ][..],
                 &["--to", "s3://bucket", "--into", "backup"],
@@ -287,22 +293,25 @@ fn named_sources_upload_within_the_paths_their_names_produce() {
             "PUT /bucket/backup/note.txt",
             "PUT /bucket/backup/dataset.txt",
             "PUT /bucket/backup/dataset-b/c",
+            "PUT /bucket/backup/dataset-c/f11",
         ] {
             assert!(requests.contains(request), "{options:?}: {requests}");
         }
-        // Each named directory is listed under its own prefix; named files
-        // are checked one by one.
+        // Pruning lists each named directory under its own prefix. Without
+        // it, only `dataset-c` holds enough keys to be worth a listing; the
+        // other directories are checked one by one like the named files.
         let mut listed: Vec<_> = requests
             .lines()
             .filter_map(|line| line.split_once(" prefix=").map(|(_, prefix)| prefix))
             .collect();
         listed.sort();
         listed.dedup();
-        assert_eq!(
-            listed,
-            ["backup/dataset-b/", "backup/dataset/"],
-            "{options:?}: {requests}"
-        );
+        let expected: &[&str] = if options.is_empty() {
+            &["backup/dataset-c/"]
+        } else {
+            &["backup/dataset-b/", "backup/dataset-c/", "backup/dataset/"]
+        };
+        assert_eq!(listed, expected, "{options:?}: {requests}");
     }
 }
 

@@ -697,6 +697,9 @@ struct State {
     satisfied: BTreeSet<u64>,
     /// The number of requests in the exchange under way, if any.
     in_flight: usize,
+    /// Exchanges completed.
+    #[cfg(test)]
+    exchanges: usize,
 }
 impl State {
     fn ended(&self, started_elsewhere: bool) -> Result<()> {
@@ -764,6 +767,8 @@ impl Authorization {
                 signed_through: 0,
                 satisfied: BTreeSet::new(),
                 in_flight: 0,
+                #[cfg(test)]
+                exchanges: 0,
             }),
             exchanged: Condvar::new(),
             started_elsewhere: false,
@@ -910,6 +915,10 @@ impl Authorization {
             self.exchanged.notify_all();
             match signed {
                 Ok(signed) => {
+                    #[cfg(test)]
+                    {
+                        state.exchanges += 1;
+                    }
                     state.connection = Some(stream);
                     state.requests.extend(exchange.into_iter().zip(signed));
                     state.signed_through = through;
@@ -936,6 +945,11 @@ impl Authorization {
             .keys()
             .cloned()
             .collect()
+    }
+    /// Signing exchanges completed so far.
+    #[cfg(test)]
+    pub(crate) fn exchanges_so_far(&self) -> usize {
+        self.state.lock().unwrap().exchanges
     }
     pub(crate) fn signed(&self, request: Unsigned) -> Result<String> {
         if now()? >= self.configuration.expires_at {
