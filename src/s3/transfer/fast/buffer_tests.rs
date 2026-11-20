@@ -325,7 +325,11 @@ fn far_small_uploads_start_with_at_most_2048_objects_below_32_ms() {
         assert_eq!(engine.tuning.request_limit(), workers.initial, "{ms} ms");
         workers.initial
     };
+    // Only a capacity above 2,048 shows the lower start; raise the soft
+    // descriptor limit as the binary does at startup.
+    crate::raise_nofile();
     let capacity = start(100);
+    assert!(capacity > 2048, "small-object capacity {capacity}");
     assert_eq!(start(32), capacity);
     assert_eq!(start(20), capacity.min(2048));
     assert_eq!(start(31), capacity.min(2048));
