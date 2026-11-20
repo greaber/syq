@@ -1074,11 +1074,11 @@ fn a_late_children_page_out_of_order_fails_a_divided_walk() {
         next: None,
     };
     let error = walk()
-        .children(1, "t/", Some(page(["t/zy", "t/zx"])))
+        .children(1, "t/", Some((page(["t/zy", "t/zx"]), Gap::default())))
         .unwrap_err();
     assert!(error.is::<Unordered>());
     assert!(walk()
-        .children(1, "t/", Some(page(["t/zx", "t/zy"])))
+        .children(1, "t/", Some((page(["t/zx", "t/zy"]), Gap::default())))
         .is_ok());
     // A continuation that starts before the page it continues, after the
     // part has finished.
@@ -1087,7 +1087,7 @@ fn a_late_children_page_out_of_order_fails_a_divided_walk() {
     late.parts[1].children = Children::Asked;
     late.parts[1].children_end = "t/zz".to_owned();
     let error = late
-        .children(1, "t/", Some(page(["t/zm", "t/zn"])))
+        .children(1, "t/", Some((page(["t/zm", "t/zn"]), Gap::default())))
         .unwrap_err();
     assert!(error.is::<Unordered>());
 }
@@ -1159,7 +1159,13 @@ async fn keys_a_store_skips_after_a_common_prefix_are_listed() {
                     "{input} divides={divides} concurrency={concurrency}"
                 );
             }
+            store.calls.borrow_mut().clear();
             walked(&store, "tree/", concurrency, None).await;
+            // The walk hands `tree/g` over, leaving `tree/g0` to the children.
+            assert_eq!(
+                store.calls.borrow().contains(&("tree/g".to_owned(), false)),
+                divides && concurrency > 1
+            );
         }
     }
 }
@@ -1225,7 +1231,11 @@ async fn a_key_the_glob_cannot_match_needs_no_check() {
             token: Option<&str>,
             _: Option<&str>,
         ) -> Result<Page> {
-            anyhow::ensure!(delimiter, "refused");
+            if !delimiter {
+                return Err(anyhow::Error::msg("AccessDenied").context(
+                    crate::s3::client::RequestFailure::refused_for_test("S3 listing"),
+                ));
+            }
             self.0.page(prefix, delimiter, token, None).await
         }
     }
@@ -1241,9 +1251,21 @@ async fn a_key_the_glob_cannot_match_needs_no_check() {
     .unwrap();
     assert_eq!(keys.len(), 1000);
     let pattern = Pattern::parse("s3://bucket/edge/*").unwrap();
-    assert!(engine::enumerate(&store, &pattern, 1, |_| Ok(()))
+    let error = engine::enumerate(&store, &pattern, 1, |_| Ok(()))
         .await
-        .is_err());
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("without a delimiter"));
+    // A page of nothing but objects leaves nothing out after it, so the
+    // delimiter listing goes on while the pages hold no common prefix.
+    let store = DelimiterOnly(Memory::new((0..1001).map(|i| format!("edge/f{i:04}"))));
+    let mut keys = Vec::new();
+    engine::enumerate(&store, &pattern, 1, |entry| {
+        keys.push(entry.key);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(keys.len(), 1001);
     // Nor can a literal name be the key, which is longer than the prefix.
     let store = DelimiterOnly(Memory::new(
         std::iter::once("runs/day/f0".to_owned())
@@ -1259,4 +1281,92 @@ async fn a_key_the_glob_cannot_match_needs_no_check() {
     .await
     .unwrap();
     assert_eq!(keys, ["runs/day/f0"]);
+}
+
+#[tokio::test]
+async fn an_empty_page_settles_nothing_about_a_skipped_key() {
+    /// Pages by prefix and token.
+    struct Scripted(HashMap<(&'static str, Option<&'static str>), Result<Page, ()>>);
+    impl Store for Scripted {
+        fn divides(&self) -> bool {
+            true
+        }
+        async fn page(
+            &self,
+            prefix: &str,
+            _: bool,
+            token: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<Page> {
+            let page = self
+                .0
+                .iter()
+                .find(|((p, t), _)| *p == prefix && *t == token)
+                .map(|(_, page)| page)
+                .expect("an unexpected request");
+            let page = page.as_ref().map_err(|()| anyhow::anyhow!("refused"))?;
+            Ok(Page {
+                entries: page.entries.clone(),
+                prefixes: page.prefixes.clone(),
+                next: page.next.clone(),
+            })
+        }
+    }
+    let page = |entries: &[&str], prefixes: &[&str], next: Option<&str>| {
+        Ok(Page {
+            entries: entries
+                .iter()
+                .map(|key| Entry {
+                    key: (*key).to_owned(),
+                    size: 1,
+                    last_modified: None,
+                    etag: None,
+                })
+                .collect(),
+            prefixes: prefixes.iter().map(|p| (*p).to_owned()).collect(),
+            next: next.map(str::to_owned),
+        })
+    };
+    let first: Vec<String> = (0..999).map(|i| format!("edge/k{i:03}")).collect();
+    let first: Vec<&str> = first.iter().map(String::as_str).collect();
+    let cases = [
+        // An empty page before `p0`: listed once.
+        vec![
+            (("edge/", Some("1")), page(&[], &[], Some("2"))),
+            (
+                ("edge/", Some("2")),
+                page(&["edge/p0", "edge/z"], &[], None),
+            ),
+            (("edge/p0", None), page(&["edge/p0"], &[], None)),
+        ],
+        // `p0` skipped, and the check's first page empty.
+        vec![
+            (("edge/", Some("1")), page(&["edge/z"], &[], None)),
+            (("edge/p0", None), page(&[], &[], Some("c"))),
+            (("edge/p0", Some("c")), page(&["edge/p0"], &[], None)),
+        ],
+        // The page holds `p0`; the check's refusal does not matter.
+        vec![
+            (
+                ("edge/", Some("1")),
+                page(&["edge/p0", "edge/z"], &[], None),
+            ),
+            (("edge/p0", None), Err(())),
+        ],
+    ];
+    for case in cases {
+        let mut pages: HashMap<_, _> = case.into_iter().collect();
+        pages.insert(("edge/", None), page(&first, &["edge/p/"], Some("1")));
+        let store = Scripted(pages);
+        let mut keys = Vec::new();
+        let pattern = Pattern::parse("s3://bucket/edge/*").unwrap();
+        engine::enumerate(&store, &pattern, 1, |entry| {
+            keys.push(entry.key);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(keys.len(), 1001);
+        assert_eq!(keys.iter().filter(|key| *key == "edge/p0").count(), 1);
+    }
 }

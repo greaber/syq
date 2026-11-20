@@ -211,55 +211,102 @@ fn scan_batch(prefix: String, delimiter: bool, page: Page, gap: Gap) -> Batch {
 /// where the store's order is known (`byte_ordered`); every such store is
 /// checked, since the same mistake is easy to make elsewhere. Elsewhere a
 /// delimiter listing goes on past its first page only when the pattern
-/// cannot match the key.
+/// cannot match the key, or when nothing but objects comes before the last
+/// page.
 #[derive(Clone, Default)]
-pub(super) struct Gap(Option<String>);
+pub(super) struct Gap {
+    /// The key to make sure of on the next page.
+    key: Option<String>,
+    /// Where the order is unknown, a policy refused the listing without a
+    /// delimiter that was to replace this one. Reported if a page that goes
+    /// on holds a common prefix, after which a key could be missing.
+    refused: Option<String>,
+}
 
 impl Gap {
     /// The key to make sure of after `page`, if it ends with a common prefix
     /// and the key is `wanted`.
     pub(super) fn after(page: &Page, wanted: impl Fn(&str) -> bool) -> Self {
-        Self(
-            page.next
+        Self {
+            key: page
+                .next
                 .as_ref()
                 .and(page.prefixes.last())
                 .filter(|last| page.entries.last().is_none_or(|entry| entry.key < **last))
                 .and_then(|last| last.strip_suffix('/'))
                 .map(|stem| format!("{stem}0"))
                 .filter(|key| wanted(key)),
-        )
+            refused: None,
+        }
     }
 
-    /// Read the page at `token`, adding the key if the store left it out.
+    /// Read the page at `token`, adding the key if the store left it out,
+    /// and return it with what to make sure of on the page after it.
     pub(super) async fn read(
         self,
         store: &impl Store,
         prefix: &str,
         delimiter: bool,
         token: &str,
-    ) -> Result<Page> {
-        let Some(key) = self.0 else {
-            return read(store, prefix, delimiter, Some(token)).await;
-        };
-        let (page, check) = tokio::join!(
-            read(store, prefix, delimiter, Some(token)),
-            read(store, &key, true, None)
-        );
-        let mut page = page?;
-        if page.entries.first().is_none_or(|entry| entry.key != key) {
-            let check = check.with_context(|| {
-                format!("listing {key:?} to check for a key the store may have skipped after the common prefix before it")
-            })?;
-            if let Some(entry) = check
-                .entries
-                .into_iter()
-                .next()
-                .filter(|entry| entry.key == key)
-            {
-                page.entries.insert(0, entry);
+        wanted: impl Fn(&str) -> bool,
+    ) -> Result<(Page, Gap)> {
+        let Gap { key, refused } = self;
+        let page = match key {
+            None => read(store, prefix, delimiter, Some(token)).await?,
+            Some(key) => {
+                debug_assert!(byte_ordered(store), "checks rely on byte order");
+                let (page, check) = tokio::join!(
+                    read(store, prefix, delimiter, Some(token)),
+                    read(store, &key, true, None)
+                );
+                let mut page = page?;
+                if page.entries.is_empty() && page.prefixes.is_empty() && page.next.is_some() {
+                    // An empty page shows nothing; the next one starts at
+                    // the key or past it.
+                    return Ok((
+                        page,
+                        Gap {
+                            key: Some(key),
+                            refused,
+                        },
+                    ));
+                }
+                if page.entries.first().is_none_or(|entry| entry.key != key) {
+                    if let Some(entry) = Self::find(store, &key, check).await? {
+                        page.entries.insert(0, entry);
+                    }
+                }
+                page
             }
+        };
+        if let Some(refused) = &refused {
+            ensure!(page.next.is_none() || page.prefixes.is_empty(), "{refused}");
         }
-        Ok(page)
+        let mut next = Gap::after(&page, wanted);
+        next.refused = refused;
+        Ok((page, next))
+    }
+
+    /// The object `key`, from a listing of it whose first page is `first`.
+    async fn find(store: &impl Store, key: &str, first: Result<Page>) -> Result<Option<Entry>> {
+        let context = || {
+            format!("listing {key:?} to check for a key the store may have skipped after the common prefix before it")
+        };
+        let mut page = first.with_context(context)?;
+        // In byte order the key comes first, but an empty page shows nothing.
+        while page.entries.is_empty() && page.prefixes.is_empty() {
+            let Some(token) = page.next else {
+                break;
+            };
+            page = read(store, key, true, Some(&token))
+                .await
+                .with_context(context)?;
+        }
+        Ok(page
+            .entries
+            .into_iter()
+            .next()
+            .filter(|entry| entry.key == key))
     }
 }
 
@@ -313,15 +360,12 @@ async fn execute(
             token,
             gap,
         } => {
-            let page = gap.read(store, &prefix, delimiter, &token).await?;
             // Only the last component of a pattern pages with a delimiter.
-            let gap = if delimiter {
-                Gap::after(&page, |key| {
+            let (page, gap) = gap
+                .read(store, &prefix, delimiter, &token, |key| {
                     pattern.is_none_or(|pattern| pattern.matches(key))
                 })
-            } else {
-                Gap::default()
-            };
+                .await?;
             return Ok(scan_batch(prefix, delimiter, page, gap));
         }
         Job::Discover { prefix, component } => (prefix, component),
@@ -357,12 +401,22 @@ async fn execute(
             // assumes a store in another order would leave out only that
             // key, as Tigris does in byte order; none is known to leave out
             // any.
-            let flat = read(store, &query, false, None)
-                .await
-                .with_context(|| {
-                    format!("listing {query:?} without a delimiter, since a later delimiter page could leave out a key")
-                })?;
-            return Ok(scan_batch(query, false, flat, Gap::default()));
+            let why = || {
+                format!("listing {query:?} without a delimiter, since a later delimiter page could leave out a key")
+            };
+            match read(store, &query, false, None).await {
+                Ok(flat) => return Ok(scan_batch(query, false, flat, Gap::default())),
+                // A policy may require a delimiter. A page of nothing but
+                // objects leaves nothing out after it; go on while they are.
+                Err(error) if refused(&error) && page.prefixes.is_empty() => {
+                    let gap = Gap {
+                        key: None,
+                        refused: Some(format!("{:#}", error.context(why()))),
+                    };
+                    return Ok(scan_batch(query, true, page, gap));
+                }
+                Err(error) => return Err(error.context(why())),
+            }
         }
         let gap = Gap::after(&page, |key| pattern.matches(key));
         return Ok(scan_batch(query, true, page, gap));

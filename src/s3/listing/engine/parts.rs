@@ -96,7 +96,7 @@ enum Done {
         walk: usize,
         part: usize,
         directory: String,
-        page: Option<Page>,
+        page: Option<(Page, Gap)>,
     },
 }
 
@@ -150,9 +150,13 @@ async fn execute(
             // Only the choice of parts needs the children. A listing whose
             // request for them fails, perhaps refused by a policy that allows
             // listing the prefix alone, goes on by itself.
+            // Parts list every key, so any key a page leaves out is wanted.
             let page = match token {
-                Some((token, gap)) => gap.read(store, &directory, true, &token).await,
-                None => read(store, &directory, true, None).await,
+                Some((token, gap)) => gap.read(store, &directory, true, &token, |_| true).await,
+                None => read(store, &directory, true, None).await.map(|page| {
+                    let gap = Gap::after(&page, |_| true);
+                    (page, gap)
+                }),
             }
             .ok();
             return Ok(Done::Children {
@@ -168,15 +172,12 @@ async fn execute(
             token,
             gap,
         } => {
-            let page = gap.read(store, &prefix, delimiter, &token).await?;
             // Only the last component of a pattern pages with a delimiter.
-            let gap = if delimiter {
-                Gap::after(&page, |key| {
+            let (page, gap) = gap
+                .read(store, &prefix, delimiter, &token, |key| {
                     pattern.is_none_or(|pattern| pattern.matches(key))
                 })
-            } else {
-                Gap::default()
-            };
+                .await?;
             return Ok(scan_batch(prefix, delimiter, page, gap));
         }
         Job::Discover { prefix, component } => (prefix, component),
@@ -561,20 +562,18 @@ impl Walk {
 
     /// Take a page of the children of the directory a part is in, or `None`
     /// when the request for it failed.
-    fn children(&mut self, at: usize, directory: &str, page: Option<Page>) -> Result<()> {
+    fn children(&mut self, at: usize, directory: &str, page: Option<(Page, Gap)>) -> Result<()> {
         let part = &mut self.parts[at];
         // The page answers the part's request, unless the part has since
         // given up on its children; it is of use only while the part lists.
         let outstanding = part.directory == directory && matches!(part.children, Children::Asked);
         let current = outstanding && !part.done;
-        let Some(page) = page else {
+        let Some((page, gap)) = page else {
             if current {
                 part.children = Children::Closed;
             }
             return Ok(());
         };
-        // Parts list every key, so any key a page leaves out is wanted.
-        let gap = Gap::after(&page, |_| true);
         // Children and objects come in separate lists, each in order and all
         // after those of the page before. A page that arrives too late to be
         // used is still evidence of the store's order.
