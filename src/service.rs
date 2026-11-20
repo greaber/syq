@@ -325,7 +325,7 @@ pub(crate) struct Ending {
 impl Ending {
     /// Wait while a service holds the lock, calling `step` each time
     /// first, until it says the wait is over.
-    pub(crate) fn wait(&self, mut step: impl FnMut() -> bool) -> Result<()> {
+    fn wait(&self, mut step: impl FnMut() -> bool) -> Result<()> {
         let deadline = Instant::now() + self.timeout;
         let mut progress = Instant::now();
         while is_running(&self.lock)? {

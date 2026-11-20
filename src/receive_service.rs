@@ -763,10 +763,13 @@ fn query_retry(
     )
 }
 fn send(control: &Path, request: &LocalRequest) -> Result<Status> {
+    send_within(control, request, Duration::from_secs(1))
+}
+/// [`send`], giving the service `timeout` for each read and write.
+fn send_within(control: &Path, request: &LocalRequest, timeout: Duration) -> Result<Status> {
     // Older builds and released stand-ins may leave the socket's mode as
     // bound, so only its owner is checked.
-    let mut socket =
-        crate::service::connect(&suffixed(control, SOCKET), Duration::from_secs(1), false)?;
+    let mut socket = crate::service::connect(&suffixed(control, SOCKET), timeout, false)?;
     crate::destination::write_message(&mut socket, request)?;
     decode_status(control, read_status(&mut socket)?)
 }
@@ -1810,7 +1813,7 @@ fn replace_other(
             }
             // A connection it lost meanwhile leaves the old one receiving.
             successor.still_logged_in(control, &remote.label())?;
-            if stop_when_idle(control, state.pid)? {
+            if stop_when_idle(control)? {
                 successor.take_over()?;
                 return Ok(Some(Receiving::Started));
             }
@@ -1835,10 +1838,12 @@ fn replace_other(
 /// may take the control meanwhile, and nothing is sent that could stop it;
 /// the caller looks again at whoever owns the control.
 ///
-/// `pid` is the service's process. One that does not answer in time may
-/// still decide later (`decided_late`).
-fn stop_when_idle(control: &Path, pid: u32) -> Result<bool> {
-    let answer = match send(
+/// The service answers requests one at a time, so others may come first:
+/// wait for its answer as long as for it to stop. A service of an earlier
+/// build stops once it decides, even when nobody waits for the answer any
+/// more, so giving up sooner could leave nothing receiving.
+fn stop_when_idle(control: &Path) -> Result<bool> {
+    let answer = match send_within(
         control,
         &LocalRequest {
             version: VERSION,
@@ -1848,14 +1853,18 @@ fn stop_when_idle(control: &Path, pid: u32) -> Result<bool> {
             restart: false,
             stop_if_idle: true,
         },
+        STOP_TIMEOUT,
     ) {
         Ok(answer) => answer,
+        // Without an answer: a service that has gone has stopped.
         Err(error) if crate::service::unanswered(&error) => {
-            let error = error.context(format!(
+            if !crate::service::is_running(&suffixed(control, LOCK))? {
+                return Ok(true);
+            }
+            return Err(error.context(format!(
                 "receiving service did not answer at {} whether it is idle",
                 suffixed(control, SOCKET).display()
-            ));
-            return decided_late(control, pid).map_err(|_| error);
+            )));
         }
         Err(error) => return Err(error),
     };
@@ -1864,27 +1873,6 @@ fn stop_when_idle(control: &Path, pid: u32) -> Result<bool> {
     }
     await_exit(control, answer.pid)?;
     Ok(true)
-}
-
-/// Whether service process `pid` stopped after a request to stop once idle
-/// that it did not answer in time. It handles requests one at a time, in
-/// order, so it decides on that request before it answers any later one:
-/// wait until it answers again, or exits.
-fn decided_late(control: &Path, pid: u32) -> Result<bool> {
-    let mut kept = false;
-    crate::service::Ending {
-        progress: None,
-        ..ending(control)
-    }
-    .wait(|| match status(control, false) {
-        Ok(state) if state.pid == pid => {
-            kept = !state.stopping;
-            kept
-        }
-        Ok(_) => true,
-        Err(_) => !crate::service::process_alive(pid),
-    })?;
-    Ok(!kept)
 }
 
 /// Wait for service process `pid`, which is stopping, to give up the
@@ -4086,10 +4074,7 @@ mod tests {
             // Hold the connection, unanswered, past the client's timeout.
             let _ = client.read(&mut [0; 1]);
         });
-        let error = format!(
-            "{:#}",
-            stop_when_idle(&control, std::process::id()).unwrap_err()
-        );
+        let error = format!("{:#}", stop_when_idle(&control).unwrap_err());
         service.join().unwrap();
         assert!(
             error.starts_with(&format!(
@@ -4116,13 +4101,13 @@ mod tests {
         };
         let (_root, control, lock) = locked_control();
         let service = stand_in(&control, lock, late(true));
-        assert!(stop_when_idle(&control, std::process::id()).unwrap());
+        assert!(stop_when_idle(&control).unwrap());
         assert!(!is_running(&control));
         service.join().unwrap();
 
         let (_root, control, lock) = locked_control();
         let service = stand_in(&control, lock, late(false));
-        assert!(!stop_when_idle(&control, std::process::id()).unwrap());
+        assert!(!stop_when_idle(&control).unwrap());
         assert!(is_running(&control));
         send(
             &control,
@@ -4294,7 +4279,7 @@ mod tests {
             accounts_in_use: 0,
         };
         let service = stand_in(&control, lock, move |_| answer("other", busy, false));
-        assert!(!stop_when_idle(&control, std::process::id()).unwrap());
+        assert!(!stop_when_idle(&control).unwrap());
         assert!(is_running(&control));
         // The busy one was asked once and kept running.
         send(
@@ -4324,7 +4309,7 @@ mod tests {
         });
         // Its answer to stop_if_idle says it stops, and nothing else is
         // sent while it goes.
-        assert!(stop_when_idle(&control, std::process::id()).unwrap());
+        assert!(stop_when_idle(&control).unwrap());
         assert!(!is_running(&control));
         assert_eq!(
             service.join().unwrap(),
@@ -4386,7 +4371,7 @@ mod tests {
                 }));
             },
         );
-        assert!(stop_when_idle(&control, std::process::id()).unwrap());
+        assert!(stop_when_idle(&control).unwrap());
         old.join().unwrap();
         // The next owner still runs, and was only asked for its status.
         assert!(is_running(&control));
