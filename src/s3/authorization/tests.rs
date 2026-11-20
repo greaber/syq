@@ -1111,6 +1111,31 @@ fn a_request_signed_while_queued_beyond_a_full_exchange_survives_its_refusal() {
     assert!(authorization.finish_preparation().is_err());
 }
 
+/// Preparation finishes only after the exchange under way, so no request is
+/// signed after the copy says the authorizing machine may disconnect.
+#[test]
+fn finishing_waits_for_the_exchange_under_way() {
+    let (authorization, authorizer, first, release) = held_session();
+    let leader = sign_in_thread(&authorization, get("0"));
+    first.recv_timeout(Duration::from_secs(30)).unwrap();
+    let finishing = {
+        let authorization = authorization.clone();
+        std::thread::spawn(move || authorization.finish_preparation())
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!finishing.is_finished());
+    release.send(None).unwrap();
+    leader.join().unwrap().unwrap();
+    finishing.join().unwrap().unwrap();
+    // The authorizing machine saw the signing message, then the finish.
+    assert_eq!(authorizer.join().unwrap(), [(1, 1)]);
+    let error = authorization.authorize(vec![get("1")]).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("was not prepared before storage authorization disconnected"),
+        "{error:#}"
+    );
+}
+
 #[test]
 fn a_failed_exchange_fails_every_waiting_request() {
     let (authorization, authorizer, first, release) = held_session();
