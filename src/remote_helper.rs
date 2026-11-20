@@ -370,6 +370,10 @@ if ! cat > "$tmp"; then
     echo "syq: could not upload the remote helper" >&2
     exit {install_failed_exit}
 fi
+if [ ! -s "$tmp" ]; then
+    echo "syq: the uploaded remote helper is empty" >&2
+    exit {install_failed_exit}
+fi
 if ! chmod 700 "$tmp"; then
     echo "syq: cannot make the uploaded remote helper executable" >&2
     exit {install_failed_exit}

@@ -440,12 +440,14 @@ pub(super) fn is_enrollment_transport_failure(error: &anyhow::Error) -> bool {
 }
 
 /// Shell commands that make the store's directory `$d` and stage the
-/// uploaded syq at `$p` in it, removed again when the shell exits.
+/// uploaded syq at `$p` in it, removed again when the shell exits. An empty
+/// upload, as when the enrolling machine could not get the build, is
+/// refused rather than run as an empty script.
 /// Directories above the store follow the umask; the store's own are the
 /// owner's alone.
 fn stage_commands(stage: &str) -> String {
     format!(
-        "d=\"$HOME/{store}\"; p=\"$d/{stage}\"; mkdir -p -- \"$HOME/.local/lib\"; umask 077; mkdir -p -- \"$d\"; trap 'rm -f -- \"$p\"' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; cat >\"$p\"; chmod 700 \"$p\"",
+        "d=\"$HOME/{store}\"; p=\"$d/{stage}\"; mkdir -p -- \"$HOME/.local/lib\"; umask 077; mkdir -p -- \"$d\"; trap 'rm -f -- \"$p\"' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; cat >\"$p\"; if [ ! -s \"$p\" ]; then echo 'syq: the uploaded syq is empty' >&2; exit 1; fi; chmod 700 \"$p\"",
         store = crate::user_dirs::BINARY_STORE_IN_HOME,
     )
 }
