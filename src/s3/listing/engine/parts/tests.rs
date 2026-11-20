@@ -1207,7 +1207,10 @@ async fn a_key_the_glob_cannot_match_needs_no_check() {
     // `edge/p0` would match `edge/*`: the check is made, and its refusal
     // fails the listing rather than leave a key out unnoticed.
     let pattern = Pattern::parse("s3://bucket/edge/*").unwrap();
-    assert!(engine::enumerate(&store, &pattern, 1, |_| Ok(()))
+    let error = engine::enumerate(&store, &pattern, 1, |_| Ok(()))
         .await
-        .is_err());
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("\"edge/p0\" to check for a key the store may have skipped")
+    );
 }

@@ -3,7 +3,7 @@
 //! This implementation uses bounded page-sized work and the listing command's
 //! own pattern semantics; no upstream source is copied.
 use super::pattern::Pattern;
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde::Serialize;
 use std::{
@@ -246,7 +246,10 @@ impl Gap {
         );
         let mut page = page?;
         if page.entries.first().is_none_or(|entry| entry.key != key) {
-            if let Some(entry) = check?
+            let check = check.with_context(|| {
+                format!("listing {key:?} to check for a key the store may have skipped after the common prefix before it")
+            })?;
+            if let Some(entry) = check
                 .entries
                 .into_iter()
                 .next()

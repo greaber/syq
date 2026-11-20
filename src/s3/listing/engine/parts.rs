@@ -22,7 +22,9 @@ const PAGE: usize = 1000;
 // to choose them from, can be a request the sequential listing would not have
 // made. It may make this many once it is known to need a third page, and one
 // more for every `PAGES_PER_EXTRA` pages of keys listed, so a listing never
-// costs more than a fixed share over its sequential pages.
+// costs more than a fixed share over its sequential pages. A later page of
+// children can take one more request with it, to check for a key the store
+// may have left out (`Gap`).
 const EXTRA_REQUESTS: usize = 2;
 const PAGES_PER_EXTRA: usize = 4;
 // A listing asks for the children of its prefix once it is known to need a
