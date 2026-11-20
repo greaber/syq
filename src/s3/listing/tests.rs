@@ -342,19 +342,6 @@ async fn sparse_trees_stay_flat_and_exact_keys_stop_after_one_page_in_byte_order
     // Without that order, a key found on the first page needs no more, and
     // that page is the same request: a policy that refuses delimiters allows
     // it.
-    struct NoDelimiter(Memory);
-    impl Store for NoDelimiter {
-        async fn page(
-            &self,
-            prefix: &str,
-            delimiter: bool,
-            token: Option<&str>,
-            start_after: Option<&str>,
-        ) -> Result<Page> {
-            anyhow::ensure!(!delimiter, "refused");
-            self.0.page(prefix, delimiter, token, start_after).await
-        }
-    }
     let store = NoDelimiter(Memory::new(keys()));
     let mut found = Vec::new();
     engine::enumerate(
@@ -373,7 +360,7 @@ async fn sparse_trees_stay_flat_and_exact_keys_stop_after_one_page_in_byte_order
 }
 
 #[tokio::test]
-async fn unordered_stores_do_not_apply_exact_key_shortcut() {
+async fn unordered_stores_look_past_the_first_page_for_an_exact_key() {
     struct Unordered;
     impl Store for Unordered {
         fn ordered(&self) -> bool {
@@ -629,6 +616,25 @@ fn only_aws_general_purpose_endpoints_divide_listings() {
     }
 }
 
+/// Refuses listings with a delimiter, as a policy can.
+struct NoDelimiter<S>(S);
+impl<S: Store> Store for NoDelimiter<S> {
+    async fn page(
+        &self,
+        prefix: &str,
+        delimiter: bool,
+        token: Option<&str>,
+        start_after: Option<&str>,
+    ) -> Result<Page> {
+        if delimiter {
+            return Err(anyhow::Error::msg("AccessDenied").context(
+                crate::s3::client::RequestFailure::refused_for_test("S3 listing"),
+            ));
+        }
+        self.0.page(prefix, delimiter, token, start_after).await
+    }
+}
+
 /// Lists in the order measured on Cloudflare R2: as if every key ended in a
 /// byte just above `9`, so `a0`, `a/b` and `a19` come before `a1`.
 /// StartAfter follows the same order.
@@ -758,6 +764,32 @@ async fn listings_from_a_store_not_in_byte_order_miss_no_key() {
         assert_eq!(
             store.0.calls.borrow_mut().split_off(0),
             [("a".into(), false), ("a".into(), true)]
+        );
+    }
+    // Where a policy refuses the delimiter listing, the flat one goes on to
+    // the key on its second page, or to its end.
+    for present in [true, false] {
+        let store = NoDelimiter(R2Order(Memory::new(
+            (0..1001)
+                .map(|i| format!("a{i:04}"))
+                .chain(present.then(|| "a".to_owned())),
+        )));
+        let mut keys = Vec::new();
+        engine::enumerate(
+            &store,
+            &Pattern::parse("s3://bucket/a").unwrap(),
+            1,
+            |entry| {
+                keys.push(entry.key);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(keys, if present { vec!["a"] } else { vec![] });
+        assert_eq!(
+            *store.0 .0.calls.borrow(),
+            [("a".to_owned(), false), ("a".to_owned(), false)]
         );
     }
 }

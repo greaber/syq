@@ -140,6 +140,13 @@ impl std::fmt::Display for PartFailed {
     }
 }
 
+/// Whether a request failed because a policy refused it.
+fn refused(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::s3::client::RequestFailure>()
+        .is_some_and(crate::s3::client::RequestFailure::denied)
+}
+
 /// Whether the store's listings may rely on UTF-8 byte order.
 fn byte_ordered(store: &impl Store) -> bool {
     store.ordered() && store.divides()
@@ -392,18 +399,25 @@ pub(super) async fn enumerate(
         // Keep LIST permissions (no HEAD). In byte order the exact key, if
         // present, precedes every longer key on the first page.
         let page = read(store, &key, false, None).await?;
-        let truncated = page.next.is_some();
+        let flat = page.next;
         if let Some(entry) = page.entries.into_iter().find(|entry| entry.key == key) {
             return emit(entry);
         }
-        if byte_ordered(store) || !truncated {
+        if byte_ordered(store) || flat.is_none() {
             return Ok(());
         }
         // In another order it can come after longer keys. A delimiter
-        // listing leaves out the deeper ones; stop at the key.
-        let mut token = None;
+        // listing leaves out the deeper ones; stop at the key. Where a policy
+        // refuses delimiter listings, the flat one goes on instead.
+        let (mut delimiter, mut token) = (true, None);
         loop {
-            let page = read(store, &key, true, token.as_deref()).await?;
+            let page = match read(store, &key, delimiter, token.as_deref()).await {
+                Err(error) if delimiter && token.is_none() && refused(&error) => {
+                    (delimiter, token) = (false, flat.clone());
+                    continue;
+                }
+                page => page?,
+            };
             if let Some(entry) = page.entries.into_iter().find(|entry| entry.key == key) {
                 return emit(entry);
             }
