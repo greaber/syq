@@ -1810,7 +1810,7 @@ fn replace_other(
             }
             // A connection it lost meanwhile leaves the old one receiving.
             successor.still_logged_in(control, &remote.label())?;
-            if stop_when_idle(control)? {
+            if stop_when_idle(control, state.pid)? {
                 successor.take_over()?;
                 return Ok(Some(Receiving::Started));
             }
@@ -1834,8 +1834,11 @@ fn replace_other(
 /// It then only waits for that process to exit. Another service
 /// may take the control meanwhile, and nothing is sent that could stop it;
 /// the caller looks again at whoever owns the control.
-fn stop_when_idle(control: &Path) -> Result<bool> {
-    let answer = send(
+///
+/// `pid` is the service's process. One that does not answer in time may
+/// still decide later (`decided_late`).
+fn stop_when_idle(control: &Path, pid: u32) -> Result<bool> {
+    let answer = match send(
         control,
         &LocalRequest {
             version: VERSION,
@@ -1845,21 +1848,43 @@ fn stop_when_idle(control: &Path) -> Result<bool> {
             restart: false,
             stop_if_idle: true,
         },
-    )
-    .map_err(|error| {
-        if !crate::service::unanswered(&error) {
-            return error;
+    ) {
+        Ok(answer) => answer,
+        Err(error) if crate::service::unanswered(&error) => {
+            let error = error.context(format!(
+                "receiving service did not answer at {} whether it is idle",
+                suffixed(control, SOCKET).display()
+            ));
+            return decided_late(control, pid).map_err(|_| error);
         }
-        error.context(format!(
-            "receiving service did not answer at {} whether it is idle",
-            suffixed(control, SOCKET).display()
-        ))
-    })?;
+        Err(error) => return Err(error),
+    };
     if !answer.stopping {
         return Ok(false);
     }
     await_exit(control, answer.pid)?;
     Ok(true)
+}
+
+/// Whether service process `pid` stopped after a request to stop once idle
+/// that it did not answer in time. It handles requests one at a time, in
+/// order, so it decides on that request before it answers any later one:
+/// wait until it answers again, or exits.
+fn decided_late(control: &Path, pid: u32) -> Result<bool> {
+    let mut kept = false;
+    crate::service::Ending {
+        progress: None,
+        ..ending(control)
+    }
+    .wait(|| match status(control, false) {
+        Ok(state) if state.pid == pid => {
+            kept = !state.stopping;
+            kept
+        }
+        Ok(_) => true,
+        Err(_) => !crate::service::process_alive(pid),
+    })?;
+    Ok(!kept)
 }
 
 /// Wait for service process `pid`, which is stopping, to give up the
@@ -2161,8 +2186,9 @@ fn busy(workers: &[ProfileWorker]) -> Busy {
         accounts_in_use: accounts.iter().map(|a| a.in_use).sum(),
     }
 }
-/// Refuse new requests on every worker if all are idle, so the service can
+/// Hold new requests on every worker if all are idle, so the service can
 /// stop to switch builds without cutting anything off; whether it did.
+/// [`settle_close`] then refuses them for good or admits them again.
 fn close_if_idle(workers: &[ProfileWorker]) -> bool {
     if workers.iter().any(|w| !w.approvals.snapshots().is_empty()) {
         return false;
@@ -2186,14 +2212,21 @@ fn close_if_idle(workers: &[ProfileWorker]) -> bool {
     let closed = closing
         .into_iter()
         .fold(true, |closed, closing| closing.wait(deadline) && closed);
+    if !closed {
+        settle_close(workers, false);
+    }
+    closed
+}
+/// After [`close_if_idle`] closed them, refuse new requests on every
+/// worker for good (`close`), or admit them again.
+fn settle_close(workers: &[ProfileWorker], close: bool) {
     for worker in workers {
-        if closed {
+        if close {
             worker.activity.close();
         } else {
             worker.activity.reopen();
         }
     }
-    closed
 }
 
 fn reconcile(
@@ -2647,9 +2680,13 @@ fn serve(
                 // Its socket errors must not stop the receiving service.
                 if let Ok(request) = read_control_request(&mut client) {
                     if request.version == VERSION {
-                        if request.stop || (request.stop_if_idle && close_if_idle(&workers)) {
+                        if request.stop {
                             shutdown.store(true, Ordering::Release);
                         }
+                        // It stops once idle only if the client is there to
+                        // hear it: one that gave up waiting keeps it.
+                        let stop_once_answered =
+                            !request.stop && request.stop_if_idle && close_if_idle(&workers);
                         let retry = if request.restart {
                             Retry::Now
                         } else if request.retry {
@@ -2695,12 +2732,18 @@ fn serve(
                                 .as_ref()
                                 .and_then(|follower| follower.path().to_str().map(str::to_owned)),
                             switch: follower.as_ref().and_then(switch::Follower::report),
-                            stopping: shutdown.load(Ordering::Acquire),
+                            stopping: shutdown.load(Ordering::Acquire) || stop_once_answered,
                             older: None,
                             profiles,
                             decision_error,
                         };
-                        let _ = write_status(&mut client, &response);
+                        let answered = write_status(&mut client, &response).is_ok();
+                        if stop_once_answered {
+                            settle_close(&workers, answered);
+                            if answered {
+                                shutdown.store(true, Ordering::Release);
+                            }
+                        }
                     }
                 }
             }
@@ -4043,7 +4086,10 @@ mod tests {
             // Hold the connection, unanswered, past the client's timeout.
             let _ = client.read(&mut [0; 1]);
         });
-        let error = format!("{:#}", stop_when_idle(&control).unwrap_err());
+        let error = format!(
+            "{:#}",
+            stop_when_idle(&control, std::process::id()).unwrap_err()
+        );
         service.join().unwrap();
         assert!(
             error.starts_with(&format!(
@@ -4070,13 +4116,13 @@ mod tests {
         };
         let (_root, control, lock) = locked_control();
         let service = stand_in(&control, lock, late(true));
-        assert!(stop_when_idle(&control).unwrap());
+        assert!(stop_when_idle(&control, std::process::id()).unwrap());
         assert!(!is_running(&control));
         service.join().unwrap();
 
         let (_root, control, lock) = locked_control();
         let service = stand_in(&control, lock, late(false));
-        assert!(!stop_when_idle(&control).unwrap());
+        assert!(!stop_when_idle(&control, std::process::id()).unwrap());
         assert!(is_running(&control));
         send(
             &control,
@@ -4248,7 +4294,7 @@ mod tests {
             accounts_in_use: 0,
         };
         let service = stand_in(&control, lock, move |_| answer("other", busy, false));
-        assert!(!stop_when_idle(&control).unwrap());
+        assert!(!stop_when_idle(&control, std::process::id()).unwrap());
         assert!(is_running(&control));
         // The busy one was asked once and kept running.
         send(
@@ -4278,7 +4324,7 @@ mod tests {
         });
         // Its answer to stop_if_idle says it stops, and nothing else is
         // sent while it goes.
-        assert!(stop_when_idle(&control).unwrap());
+        assert!(stop_when_idle(&control, std::process::id()).unwrap());
         assert!(!is_running(&control));
         assert_eq!(
             service.join().unwrap(),
@@ -4340,7 +4386,7 @@ mod tests {
                 }));
             },
         );
-        assert!(stop_when_idle(&control).unwrap());
+        assert!(stop_when_idle(&control, std::process::id()).unwrap());
         old.join().unwrap();
         // The next owner still runs, and was only asked for its status.
         assert!(is_running(&control));
