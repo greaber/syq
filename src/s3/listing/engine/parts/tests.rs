@@ -1281,6 +1281,20 @@ async fn a_key_the_glob_cannot_match_needs_no_check() {
     .await
     .unwrap();
     assert_eq!(keys.len(), 1000);
+    // Nor after a common prefix whose key the page already holds.
+    let store = DelimiterOnly(Memory::new(
+        (0..998)
+            .map(|i| format!("edge/f{i:03}"))
+            .chain(["edge/p/x", "edge/p0", "edge/z"].map(String::from)),
+    ));
+    let mut keys = Vec::new();
+    engine::enumerate(&store, &pattern, 1, |entry| {
+        keys.push(entry.key);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(keys.len(), 1000);
     // A later page that holds a common prefix fails the listing with the
     // refusal, though earlier pages were listed.
     let store = DelimiterOnly(Memory::new(
@@ -1382,6 +1396,41 @@ async fn an_empty_page_settles_nothing_about_a_skipped_key() {
             (("edge/p0", None), Err(())),
         ],
     ];
+    // A page that holds `p0` settles it without waiting for the check.
+    struct Hangs(Scripted);
+    impl Store for Hangs {
+        fn divides(&self) -> bool {
+            true
+        }
+        async fn page(
+            &self,
+            prefix: &str,
+            delimiter: bool,
+            token: Option<&str>,
+            start_after: Option<&str>,
+        ) -> Result<Page> {
+            if prefix == "edge/p0" {
+                std::future::pending::<()>().await;
+            }
+            self.0.page(prefix, delimiter, token, start_after).await
+        }
+    }
+    let store = Hangs(Scripted(HashMap::from([
+        (("edge/", None), page(&first, &["edge/p/"], Some("1"))),
+        (
+            ("edge/", Some("1")),
+            page(&["edge/p0", "edge/z"], &[], None),
+        ),
+    ])));
+    let mut keys = Vec::new();
+    let pattern = Pattern::parse("s3://bucket/edge/*").unwrap();
+    engine::enumerate(&store, &pattern, 2, |entry| {
+        keys.push(entry.key);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(keys.len(), 1001);
     // Nor does an empty first page of an exact key's listing.
     let store = Scripted(HashMap::from([
         (("edge/p0", None), page(&[], &[], Some("x"))),
