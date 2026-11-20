@@ -15577,3 +15577,44 @@ fn paths_lie_beneath_a_prefix_only_across_a_slash() {
     assert!(RestrictedAuthority::scope_allows(&scope(true), b"/a/b/c"));
     assert!(!RestrictedAuthority::scope_allows(&scope(true), b"/a/bc"));
 }
+
+/// Requests that each find a state directory missing create it at once, as
+/// two approvals arriving together do for the enrollments directory: those
+/// that lose the race use the directory the winner made.
+#[test]
+fn requests_creating_a_state_directory_at_once_all_use_it() {
+    for _ in 0..20 {
+        let root = crate::test_support::tempdir().unwrap();
+        let directory = root.path().join("enrollments");
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    start.wait();
+                    ensure_directory(&directory, 0o700).unwrap();
+                });
+            }
+        });
+        assert!(directory.is_dir());
+    }
+}
+
+/// A symlink or a file where a state directory belongs is refused, even a
+/// symlink to a real directory.
+#[test]
+fn a_state_directory_must_be_a_real_directory() {
+    let root = crate::test_support::tempdir().unwrap();
+    let real = root.path().join("real");
+    fs::create_dir(&real).unwrap();
+    let link = root.path().join("link");
+    symlink(&real, &link).unwrap();
+    let file = root.path().join("file");
+    fs::write(&file, b"").unwrap();
+    for path in [&link, &file] {
+        let error = ensure_directory(path, 0o700).unwrap_err();
+        assert!(
+            format!("{error:#}").ends_with("is not a real directory"),
+            "{error:#}"
+        );
+    }
+}
