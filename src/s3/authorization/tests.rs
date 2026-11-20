@@ -883,7 +883,8 @@ type Messages = Vec<(usize, usize)>;
 /// A signing session with an authorizing machine that answers each request
 /// with a URL naming its key. It holds its reply to the first message until
 /// the test releases it, with `Some(error)` to refuse that message instead.
-/// It refuses any later message with a key under `allowed/refused`.
+/// It holds any later message with a key under `allowed/held` the same way,
+/// and refuses any later message with a key under `allowed/refused`.
 #[allow(clippy::type_complexity)]
 fn held_session() -> (
     Arc<Authorization>,
@@ -919,8 +920,11 @@ fn held_session() -> (
             };
             let in_flight = shared.state.lock().unwrap().in_flight;
             messages.push((batch.len(), in_flight));
-            if messages.len() == 1 {
-                arrived.send(()).unwrap();
+            let held_key = batch
+                .iter()
+                .any(|request| request["key"].as_str().unwrap().starts_with("allowed/held"));
+            if messages.len() == 1 || held_key {
+                let _ = arrived.send(());
                 if let Some(error) = held.recv_timeout(Duration::from_secs(30)).unwrap() {
                     write_message(&mut peer, &serde_json::json!({ "Error": error })).unwrap();
                     return messages;
@@ -1134,6 +1138,30 @@ fn finishing_waits_for_the_exchange_under_way() {
         format!("{error:#}").contains("was not prepared before storage authorization disconnected"),
         "{error:#}"
     );
+}
+
+/// A caller whose request an earlier exchange signed while it waited returns
+/// without waiting for an exchange of other callers' requests.
+#[test]
+fn a_request_signed_while_queued_returns_before_the_next_exchange() {
+    let (authorization, authorizer, first, release) = held_session();
+    let leader = sign_in_thread(&authorization, get("0"));
+    first.recv_timeout(Duration::from_secs(30)).unwrap();
+    let duplicate = sign_in_thread(&authorization, get("0"));
+    queued_reaches(&authorization, 1);
+    let held = sign_in_thread(&authorization, get("held"));
+    queued_reaches(&authorization, 2);
+    release.send(None).unwrap();
+    leader.join().unwrap().unwrap();
+    // The second exchange is held, yet the duplicate has its signature.
+    first.recv_timeout(Duration::from_secs(30)).unwrap();
+    let url = duplicate.join().unwrap().unwrap();
+    assert!(url.contains("/fixture/allowed/0?"), "{url}");
+    assert!(!held.is_finished());
+    release.send(None).unwrap();
+    held.join().unwrap().unwrap();
+    authorization.finish_preparation().unwrap();
+    assert_eq!(authorizer.join().unwrap(), [(1, 1), (1, 1)]);
 }
 
 #[test]

@@ -791,15 +791,22 @@ impl Authorization {
                     combined = true;
                 }
             }
+            // Two combined callers may ask for the same request.
+            if combined {
+                exchange.sort_unstable();
+                exchange.dedup();
+            }
             // Callers whose batches are complete need not wait for this exchange.
             self.exchanged.notify_all();
             if exchange.is_empty() {
                 continue;
             }
-            // Two combined callers may ask for the same request.
-            if combined {
-                exchange.sort_unstable();
-                exchange.dedup();
+            // If this caller's own batch is among them, a waiting caller
+            // sends the exchange instead, as one batch numbered after the
+            // last it includes.
+            if state.signed_through >= batch || state.satisfied.remove(&batch) {
+                state.queued.push_front((through, exchange));
+                return Ok(());
             }
             let mut stream = state.connection.take().unwrap();
             state.in_flight = exchange.len();
