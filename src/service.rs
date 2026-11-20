@@ -244,9 +244,21 @@ pub(crate) fn connect(path: &Path, timeout: Duration, private: bool) -> Result<U
         return Err(NotYetPrivate.into());
     }
     let stream = UnixStream::connect(path)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
+    set_timeouts(&stream, timeout)?;
     Ok(stream)
+}
+
+/// A service that stops just after a client connects drops the connection,
+/// and macOS then refuses to set its timeouts with EINVAL: report that as
+/// the reset connection it is, so that callers wait for the service.
+fn set_timeouts(stream: &UnixStream, timeout: Duration) -> io::Result<()> {
+    stream
+        .set_read_timeout(Some(timeout))
+        .and_then(|()| stream.set_write_timeout(Some(timeout)))
+        .map_err(|error| match error.raw_os_error() {
+            Some(libc::EINVAL) => io::Error::from(io::ErrorKind::ConnectionReset),
+            _ => error,
+        })
 }
 
 /// Whether nothing answered on a control socket, as while a locked service
@@ -388,6 +400,24 @@ mod tests {
 
     fn mode(path: &Path) -> u32 {
         fs::symlink_metadata(path).unwrap().mode() & 0o777
+    }
+
+    /// A service that stops between a client's connect and its setting the
+    /// timeouts drops the connection: macOS then refuses the timeouts with
+    /// EINVAL. That is a service not answering, as a reset connection is.
+    #[test]
+    fn a_connection_a_stopping_service_dropped_is_unanswered() {
+        let root = crate::test_support::short_tempdir().unwrap();
+        let path = root.path().join("s.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let stream = UnixStream::connect(&path).unwrap();
+        drop(listener);
+        let result = set_timeouts(&stream, Duration::from_secs(1)).map_err(anyhow::Error::from);
+        // Linux sets them all the same.
+        assert_eq!(result.is_err(), cfg!(target_vendor = "apple"), "{result:?}");
+        if let Err(error) = result {
+            assert!(unanswered(&error), "{error:#}");
+        }
     }
 
     #[test]

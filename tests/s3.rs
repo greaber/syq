@@ -40,6 +40,12 @@ mod file_body;
 #[path = "s3/directory_permissions.rs"]
 mod directory_permissions;
 
+#[path = "support/executable.rs"]
+mod executable;
+
+#[path = "s3/server_copies.rs"]
+mod server_copies;
+
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
@@ -279,6 +285,17 @@ fn serve(
         .filter_map(|l| l.split_once(':'))
         .map(|(k, v)| (k.to_ascii_lowercase(), v.trim().to_owned()))
         .collect::<std::collections::HashMap<_, _>>();
+    if fault.starts_with("from-server") {
+        server_copies::serve(
+            &mut socket,
+            fault,
+            method,
+            first.split_whitespace().nth(1).unwrap(),
+            &headers,
+            &gate,
+        );
+        return;
+    }
     let authorization = headers.get("authorization").unwrap();
     assert!(
         authorization.contains("x-tigris-consistent"),

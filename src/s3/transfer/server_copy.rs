@@ -267,7 +267,7 @@ impl Engine {
                 .map(|job| job.path == target && !job.key.ends_with('/')),
         )
         .await?;
-        self.discover_destination(&mut plan, copy_destination_key)
+        self.discover_destination(&mut plan, &prune.scopes, copy_destination_key)
             .await?;
         let workers = self.object_workers(plan.iter().map(|p| p.size))?;
         self.progress.files_total.store(plan.len() as u64, Relaxed);

@@ -252,6 +252,56 @@ fn selected_hash_is_independent_of_payload_integrity() {
 }
 
 #[test]
+fn range_reads_reuse_a_returned_buffer_after_short_reads_and_errors() {
+    let directory = crate::test_support::tempdir().unwrap();
+    let path = directory.path().join("source");
+    fs::write(&path, b"0123456789abcdef").unwrap();
+    let path = path.as_os_str().as_bytes();
+    let mut operations = FsOps::new();
+    let read = |operations: &mut FsOps, off, len| match operations
+        .read_range(path, None, 0, off, len)
+        .unwrap()
+    {
+        Response::Block { data, .. } => data,
+        other => panic!("unexpected response {other:?}"),
+    };
+
+    let first = read(&mut operations, 0, 13);
+    let storage = first.as_ptr();
+    operations.reuse_read_buffer(first);
+    // A shorter range, then a longer one within the capacity, keep it.
+    let shorter = read(&mut operations, 12, 4);
+    assert_eq!((shorter.as_ptr(), &shorter[..]), (storage, &b"cdef"[..]));
+    operations.reuse_read_buffer(shorter);
+    let longer = read(&mut operations, 3, 13);
+    assert_eq!(
+        (longer.as_ptr(), &longer[..]),
+        (storage, &b"3456789abcdef"[..])
+    );
+    operations.reuse_read_buffer(longer);
+
+    // A read past the end fails and keeps the buffer for the next read.
+    assert!(operations.read_range(path, None, 0, 12, 8).is_err());
+    let after_error = read(&mut operations, 0, 4);
+    assert_eq!(
+        (after_error.as_ptr(), &after_error[..]),
+        (storage, &b"0123"[..])
+    );
+
+    // Only one buffer is kept, and none larger than a read may be.
+    let mut operations = FsOps::new();
+    let oversized = Vec::with_capacity(crate::proto::MAX_READ_BYTES as usize + 1);
+    let oversized_storage = oversized.as_ptr();
+    operations.reuse_read_buffer(oversized);
+    let fresh = read(&mut operations, 0, 4);
+    assert_ne!(fresh.as_ptr(), oversized_storage);
+    operations.reuse_read_buffer(after_error);
+    operations.reuse_read_buffer(fresh);
+    let kept = read(&mut operations, 0, 4);
+    assert_eq!(kept.as_ptr(), storage);
+}
+
+#[test]
 fn an_inplace_ranged_copy_writes_only_a_file_it_creates() {
     // A new in-place destination is created exclusively at its name, and
     // the metadata read at its creation serves the condition check, the
