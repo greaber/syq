@@ -215,9 +215,9 @@ fn general_purpose_bucket(bucket: &str) -> bool {
 
 /// Whether `host`, of an endpoint URL with no path (`base_host`), is an AWS
 /// S3 endpoint for general purpose buckets, which the client addresses
-/// path-style: global, regional,
-/// legacy dash-regional, dual-stack and FIPS endpoints in the AWS and China
-/// partitions (https://docs.aws.amazon.com/general/latest/gr/s3.html), and
+/// path-style: global, regional, legacy dash-regional, dual-stack and FIPS
+/// endpoints in the AWS and China partitions
+/// (https://docs.aws.amazon.com/general/latest/gr/s3.html), and
 /// the bucket role of a VPC interface endpoint
 /// (https://docs.aws.amazon.com/AmazonS3/latest/userguide/privatelink-interface-endpoints.html).
 /// Hosts that already name a bucket, access points, Object Lambda, Outposts,
