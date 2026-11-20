@@ -582,6 +582,9 @@ impl Worker {
                 }
                 match next {
                     Some((Stage::Read, request)) => waiting.push_back((group, request)),
+                    // A patch whose source was read as the copy was aborted
+                    // is not sent: its files are left unfinished.
+                    Some(_) if self.sched.is_aborted() => in_flight -= 1,
                     Some((stage, request)) => {
                         self.dst.send(request)?;
                         destination.push_back((group, stage, std::time::Instant::now()));
@@ -974,7 +977,10 @@ impl Worker {
                             None => Compared::Differs,
                         });
                     } else {
-                        let commit = !state.failed && state.changed.is_none();
+                        // A copy aborted while its source was checked
+                        // publishes nothing more, as on the per-file path.
+                        let commit =
+                            !state.failed && state.changed.is_none() && !self.sched.is_aborted();
                         self.dst.send(Request::PatchEnd { commit })?;
                         destination.push_back((StreamStep::End(index), std::time::Instant::now()));
                     }

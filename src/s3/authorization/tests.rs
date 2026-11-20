@@ -707,6 +707,119 @@ fn validation_rejects_bad_buckets_and_scope_counts_on_both_sides() {
     request.validate().unwrap();
 }
 
+/// A signing session against the authorizing machine's own signing loop.
+/// `stop_after` makes that machine stop receiving after so many messages.
+fn session(stop_after: Option<usize>) -> (Authorization, std::thread::JoinHandle<Result<()>>) {
+    let (client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+    for socket in [&client, &server] {
+        socket
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+    }
+    let signer = Signer::fixture(approval());
+    let configuration = signer.configuration.clone();
+    let served = std::thread::spawn(move || {
+        let messages = std::sync::atomic::AtomicUsize::new(0);
+        crate::destination::storage::serve_signing(&mut server, &signer, || {
+            let seen = messages.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            stop_after.is_some_and(|limit| seen >= limit)
+        })
+    });
+    (
+        Authorization::new("fixture".into(), configuration, client),
+        served,
+    )
+}
+fn upload(index: usize) -> Unsigned {
+    Unsigned::new("PUT", &format!("allowed/{index}")).header("if-none-match", "*")
+}
+fn prepared(authorization: &Authorization) -> usize {
+    authorization.state.lock().unwrap().requests.len()
+}
+
+#[test]
+fn exchanges_carry_at_most_the_request_limit() {
+    let sizes = |count: usize| -> Vec<usize> {
+        exchanges((0..count).map(upload), EXCHANGE_REQUESTS)
+            .map(|exchange| exchange.len())
+            .collect()
+    };
+    assert_eq!(sizes(0), Vec::<usize>::new());
+    assert_eq!(sizes(1), [1]);
+    assert_eq!(sizes(EXCHANGE_REQUESTS), [EXCHANGE_REQUESTS]);
+    assert_eq!(sizes(EXCHANGE_REQUESTS + 1), [EXCHANGE_REQUESTS, 1]);
+    assert_eq!(
+        sizes(2 * EXCHANGE_REQUESTS),
+        [EXCHANGE_REQUESTS, EXCHANGE_REQUESTS]
+    );
+}
+
+#[test]
+fn requests_over_one_exchange_are_all_signed_before_preparation_finishes() {
+    let (authorization, served) = session(None);
+    let count = EXCHANGE_REQUESTS + 1;
+    for exchange in exchanges((0..count).map(upload), EXCHANGE_REQUESTS) {
+        authorization.authorize(exchange).unwrap();
+    }
+    assert_eq!(prepared(&authorization), count);
+    authorization.finish_preparation().unwrap();
+    served.join().unwrap().unwrap();
+    // The last request crossed into a second exchange and is still usable
+    // after the authorizing machine has gone.
+    for index in [0, EXCHANGE_REQUESTS - 1, EXCHANGE_REQUESTS] {
+        let url = authorization.signed(upload(index)).unwrap();
+        assert!(
+            url.contains(&format!("/fixture/allowed/{index}?")) && url.contains("X-Amz-Signature="),
+            "{index}"
+        );
+    }
+}
+
+#[test]
+fn a_refusal_inside_a_batch_fails_preparation_and_issues_nothing_from_it() {
+    let (authorization, served) = session(None);
+    // An earlier exchange that succeeded stays prepared.
+    authorization.authorize(vec![upload(0)]).unwrap();
+    let mut requests: Vec<_> = (1..=1000).map(upload).collect();
+    requests[500] = Unsigned::new("PUT", "sibling/file").header("if-none-match", "*");
+    let error = authorization.authorize(requests).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("storage request is outside the approved paths"),
+        "{error:#}"
+    );
+    // The authorizing machine ended the session at the refusal.
+    served.join().unwrap().unwrap();
+    // Requests signed earlier in the refused exchange are not kept, so none
+    // of its uploads can run, and the session signs nothing further.
+    assert_eq!(prepared(&authorization), 1);
+    for index in [1, 400, 600] {
+        assert!(authorization.signed(upload(index)).is_err(), "{index}");
+    }
+    assert!(authorization.authorize(vec![upload(2000)]).is_err());
+    // Preparation cannot finish, so the copy never reaches its data phase.
+    assert!(authorization.finish_preparation().is_err());
+}
+
+#[test]
+fn losing_the_authorizing_machine_inside_a_batch_fails_preparation() {
+    // It signs two messages of a larger exchange and then stops receiving.
+    let (authorization, served) = session(Some(2));
+    let error = authorization
+        .authorize((0..1000).map(upload).collect())
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("authorizing machine disconnected during preparation"),
+        "{error:#}"
+    );
+    assert!(served.join().unwrap().is_err());
+    assert_eq!(prepared(&authorization), 0);
+    assert!(authorization.signed(upload(0)).is_err());
+    assert!(authorization.finish_preparation().is_err());
+}
+
 /// A refusal ends the signing session; later requests it has not prepared
 /// report that refusal, not a disconnection, and preparation cannot finish.
 #[test]

@@ -20,6 +20,13 @@ pub(crate) fn connect(name: &str, request: Request) -> Result<(UnixStream, Confi
     validate_name(name)?;
     request.validate()?;
     let registration = load_registration(name)?;
+    connect_registered(name, &registration, request)
+}
+fn connect_registered(
+    name: &str,
+    registration: &Registration,
+    request: Request,
+) -> Result<(UnixStream, Configuration)> {
     // Unlike existing copies, this new operation cannot be handed to a released
     // helper that predates it. Reject before interpreting any new request bytes.
     if registration.identity != crate::identity::build() {
@@ -27,7 +34,7 @@ pub(crate) fn connect(name: &str, request: Request) -> Result<(UnixStream, Confi
     }
     super::notices::waiting(&format!("@{name}"), "this storage access");
     let (mut stream, reply) = exchange(
-        &registration,
+        registration,
         Message::Storage {
             command: crate::approval_command::current()?,
             cwd: crate::approval_command::current_directory(),
@@ -182,41 +189,48 @@ impl Receiver {
             &mut stream,
             &SigningReply::Configuration(signer.configuration.clone()),
         )?;
-        loop {
-            // Once approved, queued bytes are valid pipelined requests. The
-            // approval-phase probe treats those bytes as cancellation; rely on
-            // read_message for peer EOF and the registry for receiver shutdown.
-            anyhow::ensure!(
-                !receiving_stopped(),
-                "storage authorization cancelled during preparation"
-            );
-            match read_message(&mut stream)? {
-                SigningRequest::Sign(requests) => match (|| -> Result<Vec<String>> {
-                    anyhow::ensure!(requests.len() <= 128, "oversized storage signing batch");
-                    requests
-                        .iter()
-                        .map(|request| signer.sign(request))
-                        .collect()
-                })() {
-                    Ok(urls) => {
-                        for range in batches(&urls, |batch| {
-                            serde_json::to_vec(&SigningReply::Signed(batch.to_vec()))
-                        })? {
-                            write_message(
-                                &mut stream,
-                                &SigningReply::Signed(urls[range].to_vec()),
-                            )?;
-                        }
+        serve_signing(&mut stream, &signer, receiving_stopped)
+    }
+}
+
+/// Signs each batch the approved requester sends until it finishes. One
+/// refused request ends the session without signing the rest of its batch.
+pub(crate) fn serve_signing(
+    stream: &mut (impl Read + Write),
+    signer: &Signer,
+    receiving_stopped: impl Fn() -> bool,
+) -> Result<()> {
+    loop {
+        // Once approved, queued bytes are valid pipelined requests. The
+        // approval-phase probe treats those bytes as cancellation; rely on
+        // read_message for peer EOF and the registry for receiver shutdown.
+        anyhow::ensure!(
+            !receiving_stopped(),
+            "storage authorization cancelled during preparation"
+        );
+        match read_message(stream)? {
+            SigningRequest::Sign(requests) => match (|| -> Result<Vec<String>> {
+                anyhow::ensure!(requests.len() <= 128, "oversized storage signing batch");
+                requests
+                    .iter()
+                    .map(|request| signer.sign(request))
+                    .collect()
+            })() {
+                Ok(urls) => {
+                    for range in batches(&urls, |batch| {
+                        serde_json::to_vec(&SigningReply::Signed(batch.to_vec()))
+                    })? {
+                        write_message(stream, &SigningReply::Signed(urls[range].to_vec()))?;
                     }
-                    Err(error) => {
-                        write_message(&mut stream, &SigningReply::Error(error.to_string()))?;
-                        return Ok(());
-                    }
-                },
-                SigningRequest::Finish => {
-                    write_message(&mut stream, &SigningReply::Finished)?;
+                }
+                Err(error) => {
+                    write_message(stream, &SigningReply::Error(error.to_string()))?;
                     return Ok(());
                 }
+            },
+            SigningRequest::Finish => {
+                write_message(stream, &SigningReply::Finished)?;
+                return Ok(());
             }
         }
     }
@@ -345,6 +359,68 @@ mod pipeline_tests {
             assert_eq!(url, format!("{}?{}", request.key, "x".repeat(9000)));
         }
         receiver.join().unwrap();
+    }
+
+    fn approval() -> Request {
+        serde_json::from_value(serde_json::json!({
+            "bucket": "fixture", "endpoint": null, "region": null, "profile": null,
+            "scopes": [{"key": "allowed", "descendants": true}], "source": null,
+            "removal": null, "acl": {}, "upload": false, "delete": false,
+            "create_only": false, "lifetime": 60,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn authorizing_side_signs_a_full_message_and_refuses_a_larger_one() {
+        let (mut client, mut server) = sockets();
+        let receiver = std::thread::spawn(move || {
+            serve_signing(&mut server, &Signer::fixture(approval()), || false)
+        });
+        let requests = requests();
+        write_message(&mut client, &SigningRequest::Sign(requests[..128].to_vec())).unwrap();
+        let mut signed = 0;
+        while signed < 128 {
+            let SigningReply::Signed(urls) = read_message(&mut client).unwrap() else {
+                panic!("expected signed URLs")
+            };
+            signed += urls.len();
+        }
+        assert_eq!(signed, 128);
+        write_message(&mut client, &SigningRequest::Sign(requests[..129].to_vec())).unwrap();
+        let SigningReply::Error(error) = read_message(&mut client).unwrap() else {
+            panic!("expected a refusal")
+        };
+        assert!(error.contains("oversized storage signing batch"), "{error}");
+        // The refusal ends the session: nothing more is signed on it.
+        receiver.join().unwrap().unwrap();
+        assert!(read_message::<SigningReply>(&mut client).is_err());
+    }
+
+    #[test]
+    fn a_different_build_is_refused_before_anything_is_sent() {
+        let directory = crate::test_support::short_tempdir().unwrap();
+        let socket = directory.path().join("r.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let registration = Registration {
+            version: REGISTRATION_VERSION,
+            identity: format!("{}-other", crate::identity::build()),
+            socket,
+            secret: "test".into(),
+            program: b"/test/syq".to_vec(),
+        };
+        let error = connect_registered("laptop", &registration, approval())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("storage authorization requires matching syq builds"),
+            "{error}"
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]

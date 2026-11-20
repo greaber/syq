@@ -1032,6 +1032,11 @@ impl Worker {
                         }
                     }
                 };
+                // A group read as the copy was aborted is not published: its
+                // files are left unfinished, as those not yet read.
+                if self.sched.is_aborted() {
+                    break;
+                }
                 self.settle_setup_latency();
                 let read_stall_budget = if adaptive {
                     read_stall_budget.max(self.batch_budget.latency_target())
