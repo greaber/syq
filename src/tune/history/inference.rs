@@ -258,9 +258,9 @@ impl RunEvidence {
             .iter()
             .find(|p| p.1 >= best * (1.0 - crate::tune::NEAR_BEST_TOLERANCE))?
             .0;
-        let refine = points
-            .iter()
-            .any(|(n, rate)| *n != workers && *rate >= best * 0.95);
+        let refine = points.iter().any(|(n, rate)| {
+            *n != workers && *rate >= best * (1.0 - crate::tune::NEAR_BEST_TOLERANCE)
+        });
         Some(Comparison {
             workers,
             refine,

@@ -1199,11 +1199,11 @@ fn repeated_inconclusive_copies_do_not_raise_the_starting_count() {
 
 #[test]
 fn repeated_clear_gains_keep_raising_the_starting_count() {
-    let starts = starts_over_copies(|_| 1.3);
-    assert!(
-        starts.windows(2).all(|pair| pair[1] > pair[0]),
-        "{starts:?}"
-    );
+    // Just above the live tuner's own threshold for a gain, and well above it.
+    for ratio in [1.06, 1.3] {
+        let starts = starts_over_copies(|_| ratio);
+        assert_eq!(starts, [8, 16, 32, 64, 128, 256], "{ratio}");
+    }
 }
 
 #[test]
