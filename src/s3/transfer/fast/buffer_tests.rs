@@ -421,14 +421,24 @@ impl TightDescriptors {
     /// for the test itself.
     fn new() -> Self {
         let limits = crate::fsops::nofile_limits().unwrap();
+        let tight = Self(limits);
         let open = crate::fsops::current_open_descriptor_count(limits.rlim_cur).unwrap();
-        crate::fsops::set_nofile_limits(&libc::rlimit {
-            rlim_cur: open as libc::rlim_t + 66,
-            rlim_max: limits.rlim_max,
-        })
-        .unwrap();
-        assert!(crate::s3::tuning::small_object_capacity(1024).is_err());
-        Self(limits)
+        // The count of open descriptors can differ between reads (macOS's
+        // /dev/fd), so lower the limit until the budget really runs out.
+        let floor = open as libc::rlim_t + 8;
+        let mut soft = open as libc::rlim_t + 66;
+        loop {
+            crate::fsops::set_nofile_limits(&libc::rlimit {
+                rlim_cur: soft,
+                rlim_max: limits.rlim_max,
+            })
+            .unwrap();
+            if crate::s3::tuning::small_object_capacity(1024).is_err() {
+                return tight;
+            }
+            assert!(soft > floor, "the small-object budget did not run out");
+            soft -= 4;
+        }
     }
 }
 
