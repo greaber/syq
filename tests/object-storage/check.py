@@ -292,6 +292,33 @@ def check():
         assert observed['mtime'] == int((src / 'script').stat().st_mtime)
         assert isinstance(observed['s3_last_modified'], int)
 
+        # An unchanged object keeps metadata only the destination has. Here
+        # the destination listing is one key, whose name needs URL encoding.
+        kept = root / 'kept'
+        kept.mkdir()
+        name = 'a\ufffeb'
+        (kept / name).write_bytes(b'kept')
+        key = PREFIX + '/kept/' + name
+        try:
+            run(['--srcs-in', kept, '--to', remote, '--into', PREFIX + '/kept'])
+            headers, _ = request('HEAD', key)
+            headers = {k.lower(): v for k, v in headers.items()}
+            replaced = {k: v for k, v in headers.items() if k.startswith('x-amz-meta-')}
+            replaced['x-amz-meta-application'] = 'keep'
+            replaced['content-type'] = headers.get('content-type', 'application/octet-stream')
+            replaced['x-amz-copy-source'] = '/' + urllib.parse.quote(BUCKET + '/' + key)
+            replaced['x-amz-metadata-directive'] = 'REPLACE'
+            request('PUT', key, headers=replaced)
+            (kept / 'new').write_bytes(b'new')
+            run(['--srcs-in', kept, '--to', remote, '--into', PREFIX + '/kept'])
+            headers, _ = request('HEAD', key)
+            headers = {k.lower(): v for k, v in headers.items()}
+            assert headers.get('x-amz-meta-application') == 'keep', headers
+        finally:
+            # `clean` lists without URL encoding, which would alter this name.
+            for stale in (key, PREFIX + '/kept/new'):
+                request('DELETE', stale)
+
         # Retrying a partial multipart upload/download must reuse completed work.
         upload_key=PREFIX+'/resume-upload'
         interrupted([src/'large','--to',remote,'--as',upload_key])

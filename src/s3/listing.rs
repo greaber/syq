@@ -251,6 +251,15 @@ fn aws_endpoint(endpoint: &str) -> bool {
     }
 }
 
+/// The request [`S3::first_key`] sends, as storage signing names it.
+pub(super) fn first_key_request(prefix: &str) -> super::authorization::Unsigned {
+    super::authorization::Unsigned::new("GET", "")
+        .query("list-type", "2")
+        .query("prefix", prefix)
+        .query("max-keys", "1")
+        .query("encoding-type", "url")
+}
+
 /// The request [`S3::page`] sends for a page of `prefix` without a delimiter
 /// or continuation token, as storage signing names it, so that a copy can have
 /// it signed before sending it.
@@ -285,6 +294,26 @@ impl Store for S3<'_> {
         token: Option<&str>,
         start_after: Option<&str>,
     ) -> Result<Page> {
+        self.request(prefix, delimiter, token, start_after, 1000)
+            .await
+    }
+}
+
+impl S3<'_> {
+    /// The first key under `prefix`, if any, and whether more follow: the
+    /// request [`first_key_request`] names.
+    pub(super) async fn first_key(&self, prefix: &str) -> Result<Page> {
+        self.request(prefix, false, None, None, 1).await
+    }
+
+    async fn request(
+        &self,
+        prefix: &str,
+        delimiter: bool,
+        token: Option<&str>,
+        start_after: Option<&str>,
+        max_keys: i32,
+    ) -> Result<Page> {
         // Tigris returns nothing for a delimiter listing that starts after a
         // key ending in '/'; syq never sends StartAfter with a delimiter.
         debug_assert!(!(delimiter && start_after.is_some()));
@@ -293,7 +322,7 @@ impl Store for S3<'_> {
             .list_objects_v2()
             .bucket(self.bucket)
             .prefix(prefix)
-            .max_keys(1000)
+            .max_keys(max_keys)
             .encoding_type(aws_sdk_s3::types::EncodingType::Url)
             .set_delimiter(delimiter.then(|| "/".into()))
             .set_continuation_token(token.map(str::to_owned))

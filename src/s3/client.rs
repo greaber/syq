@@ -968,6 +968,9 @@ impl Listing {
     }
 }
 
+/// The most requests one listing sends at a time.
+pub(super) const LISTING_REQUESTS: usize = 32;
+
 /// List every object under a literal prefix with the bounded parallel engine.
 /// `endpoint` is the custom endpoint the client uses, if any: it decides
 /// whether a listing may be divided (`listing::lists_in_byte_order`).
@@ -979,6 +982,30 @@ pub(super) async fn list(
     concurrency: usize,
 ) -> Result<Listing> {
     list_with_times(client, endpoint, bucket, prefix, None, concurrency, false).await
+}
+
+/// Like [`list`], as one of several listings that run at once. Their
+/// requests share `slots`, so together they send no more requests at a time
+/// than `slots` allows.
+pub(super) async fn list_sharing(
+    client: &Client,
+    endpoint: Option<&str>,
+    bucket: &str,
+    prefix: &str,
+    concurrency: usize,
+    slots: &tokio::sync::Semaphore,
+) -> Result<Listing> {
+    list_limited(
+        client,
+        endpoint,
+        bucket,
+        prefix,
+        None,
+        concurrency,
+        false,
+        Some(slots),
+    )
+    .await
 }
 
 /// Delimiter requests a filtered listing may spend looking past a first page
@@ -1000,6 +1027,30 @@ pub(super) async fn list_with_times(
     concurrency: usize,
     retain_times: bool,
 ) -> Result<Listing> {
+    list_limited(
+        client,
+        endpoint,
+        bucket,
+        prefix,
+        matcher,
+        concurrency,
+        retain_times,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn list_limited(
+    client: &Client,
+    endpoint: Option<&str>,
+    bucket: &str,
+    prefix: &str,
+    matcher: Option<&ignore::gitignore::Gitignore>,
+    concurrency: usize,
+    retain_times: bool,
+    slots: Option<&tokio::sync::Semaphore>,
+) -> Result<Listing> {
     use super::listing::{
         self,
         engine::{self, Page, Prune, Store},
@@ -1016,6 +1067,8 @@ pub(super) async fn list_with_times(
         inner: listing::S3<'a>,
         root: &'a str,
         discovery_denied: AtomicBool,
+        /// Shared with listings that run at the same time.
+        slots: Option<&'a tokio::sync::Semaphore>,
     }
     impl Store for Checked<'_> {
         fn ordered(&self) -> bool {
@@ -1031,6 +1084,10 @@ pub(super) async fn list_with_times(
             token: Option<&str>,
             start_after: Option<&str>,
         ) -> Result<Page> {
+            let _slot = match self.slots {
+                Some(slots) => Some(slots.acquire().await?),
+                None => None,
+            };
             self.inner
                 .page(prefix, delimiter, token, start_after)
                 .await
@@ -1049,6 +1106,7 @@ pub(super) async fn list_with_times(
         },
         root: prefix,
         discovery_denied: AtomicBool::new(false),
+        slots,
     };
     let subtree = |key: &str, directory: bool| match exclusion(
         matcher,
@@ -1072,7 +1130,11 @@ pub(super) async fn list_with_times(
         let outcome = engine::enumerate_prefix(
             &store,
             prefix,
-            if fallback { 1 } else { concurrency.min(32) },
+            if fallback {
+                1
+            } else {
+                concurrency.min(LISTING_REQUESTS)
+            },
             prune.as_ref(),
             |entry| {
                 let directory = is_directory_marker(&entry.key, entry.size);

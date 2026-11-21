@@ -983,12 +983,12 @@ impl Engine {
                     // together saves a round trip to the signing machine
                     // for each prefix the listing reaches.
                     let ordered = super::listing::lists_in_key_order(&self.options.bucket);
-                    self.authorize_all(discovery::first_pages(&segments, &keys, ordered).map(
-                        |(prefix, after)| {
-                            super::listing::first_page_request(prefix, after.as_deref())
-                        },
-                    ))
-                    .await?;
+                    let divides = super::listing::lists_in_byte_order(
+                        self.options.endpoint.as_deref(),
+                        &self.options.bucket,
+                    );
+                    self.authorize_all(discovery::first_pages(&segments, &keys, ordered, divides))
+                        .await?;
                     return self.start_discovery(segments, keys).await;
                 }
             }
@@ -1010,53 +1010,45 @@ impl Engine {
         // Pruning needs every destination key, including keys absent from
         // the plan. Only this complete cache is reusable by the deletion
         // planner.
-        let mut found = DestinationListing::default();
+        //
         // A named file has nothing beneath its key for pruning to look
         // through, so an upload another machine signs for does not list
         // there. Every pruned directory stays covered.
         let named = self.authorization.is_some() && self.options.route == Route::Upload;
-        for prefix in prefixes {
-            if named
-                && !pruned.iter().any(|scope| {
-                    scope.is_empty()
-                        || [scope.as_slice(), b"/"]
-                            .concat()
-                            .starts_with(prefix.as_bytes())
-                })
+        let prefixes = prefixes
+            .into_iter()
+            .filter(|prefix| {
+                !named
+                    || pruned.iter().any(|scope| {
+                        scope.is_empty()
+                            || [scope.as_slice(), b"/"]
+                                .concat()
+                                .starts_with(prefix.as_bytes())
+                    })
+            })
+            .collect();
+        match self.list_completely(prefixes).await {
+            Ok(found) => {
+                if !found.prefixes.is_empty() {
+                    let _ = self.upload_keys.set(found);
+                }
+                Ok(())
+            }
+            // Signing the first pages stops when the copy is cancelled.
+            Err(error) if self.cancelled.load(Relaxed) => Err(error),
+            Err(error)
+                if error
+                    .downcast_ref::<client::RequestFailure>()
+                    .is_some_and(|failure| failure.region_mismatch()) =>
             {
-                continue;
-            }
-            let listing = client::list(
-                &self.client,
-                self.options.endpoint.as_deref(),
-                &self.options.bucket,
-                &prefix,
-                self.options.concurrency,
-            )
-            .await;
-            match listing {
-                Ok(listing) => {
-                    found.keys.extend(listing.into_objects());
-                    found.prefixes.push(prefix);
-                }
                 Err(error)
-                    if error
-                        .downcast_ref::<client::RequestFailure>()
-                        .is_some_and(|failure| failure.region_mismatch()) =>
-                {
-                    return Err(error);
-                }
-                Err(error) => {
-                    self.progress
-                        .error(&format!("list S3 destination: {error:#}"));
-                    return Ok(());
-                }
+            }
+            Err(error) => {
+                self.progress
+                    .error(&format!("list S3 destination: {error:#}"));
+                Ok(())
             }
         }
-        if !found.prefixes.is_empty() {
-            let _ = self.upload_keys.set(found);
-        }
-        Ok(())
     }
     async fn start_discovery(
         &self,
@@ -1065,6 +1057,7 @@ impl Engine {
     ) -> Result<()> {
         let discovery = Discovery::start(
             self.client.clone(),
+            self.options.endpoint.as_deref(),
             &self.options.bucket,
             segments,
             keys,
