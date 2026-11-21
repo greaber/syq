@@ -201,7 +201,7 @@ async fn copy(fault: &'static str, retries: u32, peers: bool, paced: bool) {
         metadata: None,
         mtime: metadata.mtime,
     };
-    let root = Root::open(dir.path()).unwrap();
+    let root = Arc::new(Root::open(dir.path()).unwrap());
     let path = RelativePath::new(b"destination").unwrap();
     let dropped = Arc::new(Mutex::new(None));
     let initial = if paced {
