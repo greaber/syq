@@ -588,6 +588,13 @@ async fn small_download_search_preserves_seeds_mixed_batches_and_overrides() {
         .unwrap();
     assert_eq!(mixed.initial, 256);
     assert_eq!(mixed.maximum, Some(256));
+    // Downloads widen only for objects under 1 MiB.
+    let boundary = planning_engine(&[]);
+    boundary.tuning.observe_control(Duration::from_millis(100));
+    let boundary = boundary
+        .object_workers(std::iter::repeat_n(64 * 1024, 8192).chain([1024 * 1024]))
+        .unwrap();
+    assert_eq!(boundary.initial, 256);
 
     let fixed = planning_engine(&["--performance-tuning", "s3-objects=1024,s3-requests=128"]);
     fixed.tuning.observe_control(Duration::from_millis(100));

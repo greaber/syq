@@ -62,6 +62,19 @@ fn the_tightest_limit_on_the_path_sets_the_room() {
         }),
         Limited(100)
     );
+    // Clean inactive file cache counts as free; dirty or written-back cache
+    // and anything else in use does not.
+    assert_eq!(
+        room("0::/a\n", |root| {
+            level(&root.join("a"), Some("1000"), Some("900"));
+            fs::write(
+                root.join("a/memory.stat"),
+                "anon 100\ninactive_file 700\nactive_file 100\nfile_dirty 150\nfile_writeback 50\n",
+            )
+            .unwrap();
+        }),
+        Limited(600)
+    );
     // Usage at or above the limit leaves nothing.
     assert_eq!(
         room("0::/a\n", |root| level(

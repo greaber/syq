@@ -50,8 +50,9 @@ impl Engine {
         let far = tiny && fixed_workers.is_none() && self.tuning.high_latency();
         // A far small download widens within the payload and descriptor
         // budget and what a visible cgroup v2 memory limit leaves, read once
-        // here; that bound also limits later growth, but never below the near
-        // start of 256. When memory or descriptors cannot be read it keeps the
+        // here; that bound also limits later growth. The memory bound never
+        // goes below the near start of 256, but a smaller descriptor budget
+        // still wins. When memory or descriptors cannot be read it keeps the
         // near start and plans like any other small download.
         let widened = match (far && small_download).then(memory::memory_room) {
             Some(MemoryRoom::Unknown) | None => None,

@@ -101,7 +101,21 @@ fn cgroup_room(text: &str, namespace: Option<&str>, mounts: &str, root: &Path) -
                 ) else {
                     return Unknown;
                 };
-                let here = max.saturating_sub(current);
+                // Usage includes file cache the kernel reclaims before it
+                // reaches the limit; count the clean inactive part as free,
+                // as a container's working set does. Without `memory.stat`,
+                // all of it counts as used.
+                let stat = std::fs::read_to_string(dir.join("memory.stat")).unwrap_or_default();
+                let field = |name: &str| {
+                    stat.lines()
+                        .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+                        .and_then(|value| value.trim().parse::<u64>().ok())
+                        .unwrap_or(0)
+                };
+                let reclaimable = field("inactive_file")
+                    .saturating_sub(field("file_dirty"))
+                    .saturating_sub(field("file_writeback"));
+                let here = max.saturating_sub(current.saturating_sub(reclaimable));
                 room = Some(room.map_or(here, |room: u64| room.min(here)));
             }
         }
@@ -122,8 +136,10 @@ fn cgroup_room(text: &str, namespace: Option<&str>, mounts: &str, root: &Path) -
 
 /// An estimate of what one more small object in flight costs beyond its
 /// body: connection and TLS state, socket buffers and bookkeeping. Measured
-/// cgroup charges were about 55-115 KiB per request apart from the body;
-/// this is an estimate, not a bound.
+/// cgroup charges ranged from about 55 KiB (unlimited, 2-8 KiB objects) to
+/// about 160 KiB beyond a 64 KiB body (about 1,000 in flight under a 400 MiB
+/// limit), so this is not conservative on its own: the half of the room that
+/// `objects_within` leaves unused is what kept that run at 72% of its limit.
 const PER_OBJECT: u64 = 128 * 1024;
 
 /// How many small objects of at most `largest` bytes fit in half of `room`.
