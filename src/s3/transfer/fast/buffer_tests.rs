@@ -318,6 +318,7 @@ fn far_small_copies_start_with_at_most_2048_objects_below_32_ms() {
     // Only a capacity above 2,048 shows the lower start; raise the soft
     // descriptor limit as the binary does at startup.
     crate::raise_nofile();
+    room(MemoryRoom::Unlimited);
     for route in [Route::Upload, Route::Download] {
         let plan = |ms| {
             let mut engine = planning_engine(&[]);
@@ -345,6 +346,71 @@ fn far_small_copies_start_with_at_most_2048_objects_below_32_ms() {
         // A near endpoint starts with 256 objects and ramps requests from 64.
         assert_eq!(plan(19), (256, 64), "{route:?}");
     }
+}
+
+fn room(room: MemoryRoom) {
+    crate::s3::tuning::memory::TEST_ROOM.with(|test| test.set(Some(room)));
+}
+
+#[test]
+fn far_small_downloads_widen_only_within_a_readable_memory_limit() {
+    crate::raise_nofile();
+    let mib = 1024 * 1024;
+    // Objects, requests and ceiling a far download of 10,000 objects plans.
+    let plan = |flags: &[&str], route: Route, size: u64, memory: MemoryRoom| {
+        room(memory);
+        let mut engine = planning_engine(flags);
+        engine.options.route = route;
+        engine.tuning.observe_control(Duration::from_millis(100));
+        let workers = engine
+            .object_workers(std::iter::repeat_n(size, 10_000))
+            .unwrap();
+        (
+            workers.initial,
+            engine.tuning.request_limit(),
+            workers.maximum,
+        )
+    };
+    let download = |memory, size| plan(&[], Route::Download, size, memory);
+    let (capacity, _, _) = download(MemoryRoom::Unlimited, 64 * 1024);
+    assert!(capacity > 2048, "small-object capacity {capacity}");
+    assert_eq!(
+        download(MemoryRoom::Unlimited, 64 * 1024),
+        (capacity, capacity, Some(capacity))
+    );
+    // Unreadable memory keeps the near start; the ceiling is as before.
+    assert_eq!(
+        download(MemoryRoom::Unknown, 64 * 1024),
+        (256, 256, Some(capacity))
+    );
+    // A limit bounds the start and the ceiling alike.
+    let within = crate::s3::tuning::memory::objects_within(400 * mib, 64 * 1024);
+    assert!((256..capacity).contains(&within));
+    assert_eq!(
+        download(MemoryRoom::Limited(400 * mib), 64 * 1024),
+        (within, within, Some(within))
+    );
+    // Never below the near start, which also bounds growth then.
+    assert_eq!(
+        download(MemoryRoom::Limited(mib), 64 * 1024),
+        (256, 256, Some(256))
+    );
+    // Set limits and counts still apply.
+    let limited = &["--resource-limits", "s3-objects=300"][..];
+    assert_eq!(
+        plan(limited, Route::Download, 64 * 1024, MemoryRoom::Unlimited),
+        (300, 300, Some(300))
+    );
+    let fixed = &["--performance-tuning", "s3-objects=3000"][..];
+    assert_eq!(
+        plan(fixed, Route::Download, 64 * 1024, MemoryRoom::Limited(mib)).0,
+        3000
+    );
+    // Uploads do not read memory limits.
+    assert_eq!(
+        plan(&[], Route::Upload, 64 * 1024, MemoryRoom::Limited(mib)),
+        plan(&[], Route::Upload, 64 * 1024, MemoryRoom::Unknown)
+    );
 }
 
 pub(super) fn planning_engine(extra: &[&str]) -> Engine {
@@ -432,6 +498,7 @@ fn completed_download_releases_blocking_capacity_for_secondary_hash() {
 
 #[tokio::test]
 async fn small_download_search_preserves_seeds_mixed_batches_and_overrides() {
+    room(MemoryRoom::Unlimited);
     let engine = planning_engine(&[]);
     engine.tuning.observe_control(Duration::from_millis(100));
     let concurrency = engine

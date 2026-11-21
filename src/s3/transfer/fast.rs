@@ -2,6 +2,7 @@
 use super::*;
 use crate::s3::{
     admission::{Checking, Concurrency},
+    tuning::memory::{self, MemoryRoom},
     writer,
 };
 
@@ -46,16 +47,27 @@ impl Engine {
         let ramp_whole_objects = single_request && !tiny && fixed_workers.is_none();
         let small_upload = self.options.route == Route::Upload && largest <= 1024 * 1024;
         let small_download = self.options.route == Route::Download && largest < 1024 * 1024;
+        let far = tiny && fixed_workers.is_none() && self.tuning.high_latency();
+        // Far small downloads widen only within what a cgroup v2 memory limit
+        // leaves, read once here. When that cannot be read they keep the
+        // near start of 256; an unlimited hierarchy says nothing more.
+        let room = (far && small_download).then(memory::memory_room);
         // Many small objects to or from a far endpoint start with as many
-        // objects in flight as the payload and descriptor budget allows.
-        let far_small = tiny
-            && fixed_workers.is_none()
-            && self.tuning.high_latency()
-            && (small_upload || small_download);
+        // objects in flight as the payload, descriptor and memory budgets allow.
+        let far_small =
+            far && (small_upload || small_download && room != Some(MemoryRoom::Unknown));
         let capacity = if small_upload || small_download {
             super::super::tuning::small_object_capacity(largest)?
         } else {
             256
+        };
+        // The same bound limits later growth. It never goes below the near
+        // start, which syq used before it read memory limits.
+        let capacity = match room {
+            Some(MemoryRoom::Limited(room)) => {
+                capacity.min(memory::objects_within(room, largest).max(256))
+            }
+            _ => capacity,
         };
         let workers = if let Some(fixed) = fixed_workers {
             fixed

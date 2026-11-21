@@ -416,5 +416,6 @@ pub(super) fn small_object_capacity(largest: u64) -> anyhow::Result<usize> {
     anyhow::ensure!(capacity > 0, "insufficient file descriptors for S3 objects; raise the open-file limit or reduce source selectors");
     Ok(capacity)
 }
+pub(super) mod memory;
 #[cfg(test)]
 mod tests;
