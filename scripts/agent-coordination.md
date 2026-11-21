@@ -136,7 +136,8 @@ wake an agent that has stopped checking updates.
 ## Review and triage
 
 Run the project’s required validation and `scripts/branch-status.py` before each
-review handoff and report its output, including unrelated red master checks.
+review handoff and report what it shows that needs attention, including
+unrelated red master checks.
 From a clean, pushed task branch with an open PR, provide a short task brief
 under `target/` or `current-plans/`. Include the user's actual requirements,
 constraints, exclusions, and unresolved questions. Label your own assumptions.
@@ -144,7 +145,7 @@ The PR description by itself is not evidence of what the user requested.
 
 ```sh
 python3 scripts/agent-coordination.py review start --pr 123 --agent implementation \
-  --mode triage --brief target/task-brief.md
+  --brief target/task-brief.md
 ```
 
 Claude is the default reviewer; choose `--reviewer codex` for a Codex reviewer.
@@ -224,8 +225,8 @@ requesting agent how to continue. Mode determines what you are asking it to do:
 | Mode | Requesting agent's work |
 | --- | --- |
 | `collect` | Leave the report available; no automatic triage. |
-| `triage` (default) | Wait, assess each finding, and discuss the assessment with the user. |
-| `auto` | Wait, assess, fix confirmed straightforward defects in scope, validate, commit/push, and request another review. |
+| `triage` | Wait, assess each finding, and discuss the assessment with the user before changing anything. |
+| `auto` (default) | Wait, assess, fix confirmed worthwhile defects in scope, decline the rest with a reason, validate, commit/push, and request another review. |
 
 In auto mode, the **implementing agent drives the loop** by following the
 returned instructions. This is not a separate background fixer; the original
@@ -243,10 +244,12 @@ Use `--unresolved FINDING_ID ...` to record persistent issues. Repeating an
 unresolved identifier stops the loop for discussion. A report marked blocked
 also requires discussion. Reviewer suggestions are not new user requirements.
 
-Auto mode is opt-in and defaults to at most three published review rounds
-(`--max-rounds N`). Attempts that fail without publishing a report do not count;
+Auto mode is the default, with at most three published review rounds
+(`--max-rounds N`): two to converge and one to confirm small final fixes.
+Attempts that fail without publishing a report do not count;
 attempt numbers still increase to keep their records distinct. At the completed
-round limit, start a new request if you want further review.
+round limit, tell the user what is still open before starting a new request
+for further review.
 An unchanged SHA stops for lack of progress. Failed attempts without a published
 report can be retried with `review next`; an explicit request to review an
 already reviewed SHA again uses `review next --allow-unchanged`. Semantic repetition still needs the

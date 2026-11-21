@@ -1,37 +1,50 @@
 ---
 name: syq-review
-description: How to review a syq pull request - which commit to review, how to report scope the user did not request, how to group findings, and what not to run. Use whenever you review or re-review a syq PR, including as a reviewer started by scripts/agent-coordination.py.
+description: How to review a syq pull request - which commit to review, how to report scope the task did not call for, how to weigh and group findings, and what not to run. Use whenever you review or re-review a syq PR, including as a reviewer started by scripts/agent-coordination.py.
 ---
 
 # Reviewing syq pull requests
 
-## Reviewing scope the user did not request
+Your report goes to the agent that requested the review, which decides what
+to change and what to tell the user. The user does not read pull requests or
+review reports. Probe hard for problems: that is the job. You are not
+expected to be obeyed, and a change that addresses none of your suggestions
+can still be right.
+
+## Scope the task did not call for
 
 A pull request description and its commit messages are the implementing
 agent's own account of the work. They show what the agent intended; they are
-not evidence that the user asked for or agreed to it. The user often has not
-seen the change before the review.
+not evidence that the user asked for or agreed to it.
 
 When reviewing, separate what the task called for from what the PR adds
 beyond it: new workflows or triggers, recurring CI or hosting cost, new
 policy or defaults, broadened guarantees, or behavior in unrelated areas.
-Report each such addition at the top of the review as a decision for the
-user, stating its cost or consequence, even when the PR explains it and even
-when the implementation is sound. Do not file it as a deliberate choice that
-needs no action. The user decides whether the expansion stays; "the PR says
-it is intentional" is not that decision.
+Report each such addition at the top of the review, stating its cost or
+consequence, even when the PR explains it and even when the implementation is
+sound. Do not file it as a deliberate choice that needs no action. The
+requesting agent must take it to the user, who decides whether the expansion
+stays; "the PR says it is intentional" is not that decision.
 
 ## Review reports
 
-- Group items by the action they need: worth addressing before merge,
-  decisions for the user with a recommendation, and fine as is. Say whether
-  each item is a problem, a good thing, or neutral. Lead with what needs
-  action and keep confirmations brief and last.
+- Group items by the action they need: scope beyond the task, defects worth
+  fixing before merge, suggestions and observations, and fine as is. Lead
+  with what needs action and keep confirmations brief and last.
+- For each finding, give the concrete situation that triggers it, how likely
+  that is, and what goes wrong. Without a realistic situation it is an
+  observation, not a defect. Do not overstate a finding to get it acted on,
+  and do not propose a fix larger than the problem.
 - Label each finding as introduced by the PR or pre-existing. Only findings
   the PR introduced are for the implementing agent. Report pre-existing
-  issues to the user separately, and do not carry them into later review
-  passes; otherwise each pass widens the change into code the task never
-  touched.
+  issues separately, and do not carry them into later review passes;
+  otherwise each pass widens the change into code the task never touched.
+- In a later round, check the changes made since your last round and the
+  findings the implementer agreed to fix. Raise a new finding on code that
+  has not changed since you reviewed it only when it is serious: wrong
+  results, data loss, or a security hole. Do not repeat a finding the
+  implementer declined with a reason, unless the reason is wrong; then say
+  why once.
 - Mention performance opportunities you notice, whether or not they block the
   PR or fall within its scope, with the mechanism and a way to measure the
   gain. Startup latency and throughput are core to the product.

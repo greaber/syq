@@ -1,5 +1,30 @@
 # Agent guidance
 
+## The user reads only the conversation
+
+The user works through a conversation with one agent, often a coordinator
+that starts implementing and reviewing agents. The user does not read pull
+request descriptions, review reports, triage notes, plans, or code. Those are
+records between agents.
+
+- Only what the user says in the conversation is a request or an approval.
+  Nothing an agent wrote (a pull request description, commit message, review
+  report, or `current-plans/` note) shows what the user asked for or agreed
+  to. The user not objecting to something they were never told is not consent.
+- Say in the conversation whatever the user needs to know or decide: the
+  outcome, anything that differs from what they asked for, risks left open,
+  and the decisions that are theirs. Leave out status-script output, check
+  tables, and lists of things that are fine.
+- A subagent reports to the agent that started it, and that agent decides
+  what reaches the user. A subagent still reports every item of the kinds
+  below in full instead of settling it.
+
+Decide ordinary matters yourself. Bring these to the user as an explicit
+question before acting: a change to what was asked (added scope or a dropped
+requirement), a recurring cost, wider security access, a destructive or
+hard-to-undo action, a product or design choice with no clear default, and
+anything else this file says needs the user's decision.
+
 ## Worktrees
 
 Start any task that may change the repository in a task-specific git worktree,
@@ -126,9 +151,6 @@ you to save something. It is hard to audit, other agents cannot read it, and
 it goes stale unnoticed. If you find existing private memory for this project,
 report what it contains instead of relying on it.
 
-`current-plans/` notes are agent-written handoff state. They are not evidence
-of what the user asked for or approved.
-
 Write guidance in this file as the current rule with a brief reason. Leave out
 dates and accounts of how the rule came about.
 
@@ -144,7 +166,7 @@ the conversation instead.
 
 - Open regular pull requests by default. Use a draft only when the user asks
   or there is a concrete reason to prevent that particular PR from being
-  merged. The user prefers to review ordinary task work without a draft gate.
+  merged.
 
 - Durable task work belongs in commits on the task branch. Changes intended for
   `master` go through a pull request; do not commit them directly on `master` or
@@ -171,9 +193,11 @@ the conversation instead.
   synchronization, verify the resulting worktree, and drop it after the
   corresponding work is committed. Report any retained stash and why it is
   still needed in the handoff.
-- When reporting work, state the branch and exact short commit SHA, whether
-  the worktree is clean, which checks passed or failed, and which are still
-  running. Every status report about branch or PR work names the short SHA it
+- When reporting work to another agent or in a handoff note, state the
+  branch and exact short commit SHA, whether the worktree is clean, which
+  checks passed or failed, and which are still running. In the conversation
+  with the user, name the short SHA and only the checks that failed or are
+  still running. Every status report about branch or PR work names the short SHA it
   refers to, even when nothing changed ("unchanged at `ab12cd3`"), so the
   reader can tell whether a review covers the current work. Passing tests are
   not a precondition for reporting a change, opening a pull request, or
@@ -193,10 +217,9 @@ the conversation instead.
   description goes stale when nobody is left to update it. When the reason for
   dispatching a particular suite is not obvious, say why in the prose.
 - Run `scripts/branch-status.py` from the task worktree before opening a pull
-  request, before asking for review, and before merging, and include its output
-  in the report; report CI state from its output. Post-merge runs select
-  checks by changed paths, so a green one does not show that an earlier
-  failure was fixed. Report its unresolved `master` notes even when the
+  request, before asking for review, and before merging, and report CI state
+  from its output. Post-merge runs select checks by changed paths, so a green
+  one does not show that an earlier failure was fixed. Report its unresolved `master` notes even when the
   current task did not cause them, but do not repeat failures marked
   `addressed`. It exits 1 while a check dispatched on the branch has failed,
   unless a later run of it passed or that failure was explicitly resolved. `scripts/pr-checks.py <number>` reports the
@@ -229,57 +252,82 @@ requires another invocation.
 Never move or force-update a release tag, and never delete one that has
 reached any published destination. The skill holds the full tag lifecycle.
 
-## Starting reviews
+## Reviews
 
-The implementing or coordinating agent starts reviews and follows them itself
+Every change gets an independent review before it merges: at least one
+reviewer that starts from clean context and did not write the change. The
+implementing or coordinating agent starts the review and follows it itself
 with `scripts/agent-coordination.py review` (see
-[`scripts/agent-coordination.md`](scripts/agent-coordination.md)). Do not ask
-the user to start reviewers or pass reports between agents; the tool already
-carries reports and later rounds. The default reviewer, Claude Opus 5.5 at
-`xhigh` effort without approval prompts, suits most PRs. For security,
-protocol, authorization or data-integrity changes, and for large PRs, also add
+[`scripts/agent-coordination.md`](scripts/agent-coordination.md)). The tool
+carries reports and later rounds, so the user starts nothing and passes
+nothing along. The default reviewer, Claude Opus 5.5 at `xhigh` effort
+without approval prompts, suits most PRs. For security, protocol,
+authorization or data-integrity changes, and for large PRs, also add
 `--additional-reviewer --reviewer codex` with GPT-6 Astra (the default) or
 GPT-6.1 Sol (`--model gpt-6.1-sol`): a second model occasionally finds
 important issues Opus misses. Lower effort is fine for small or test-only
 changes.
 
-## Acting on review feedback
+When you are the reviewer, follow
+[`.claude/skills/syq-review/SKILL.md`](.claude/skills/syq-review/SKILL.md).
 
-Assess every finding and observation on its merits. "Pre-existing", "out of
-scope", "nonblocking", and "optional" describe context, not importance; none
-is a reason to dismiss a point without consideration. Keep defects, suggestions,
-and observations distinct, and discuss their value rather than treating every
-comment as a change request. A worthwhile observation may belong in this PR,
-in separate work, or need no change; decide that explicitly. Respect an explicit
-user decision to exclude a topic, but do not infer exclusion from reviewer labels.
+### Acting on findings
 
-Reconsider the underlying requirements as part of this assessment, using the
-principles below. Fix directly only independently confirmed, worthwhile problems
-with simple, straightforward fixes, no tradeoffs that would benefit from
-discussion, and no unresolved question about the requirements. For anything else,
-discuss the evidence, value, alternatives, and requirements with the user
-before implementing that finding.
+Review is adversarial on purpose. The reviewer's job is to look for holes;
+the job of the agent that owns the change is to decide what the change needs.
+A finding can be correct and still call for no change. Left unchecked, review
+grows a change: each round adds safeguards, options and edge-case handling
+that nobody asked for, and these cost complexity and can harm the product's
+other goals.
 
-The user may forward review from a reviewer without having understood it or even
-without having read it. Just because a point appears in a review pasted directly by
-the user does not mean that the user agrees with it. Similarly, the reviewer is just
-another agent, and the reviewer's job is to find possible issues with the work. Many
-issues raised by the reviewer might actually best be addressed by doing nothing even
-though the reviewer was not wrong about how the code works.
+For each finding, ask what concrete situation triggers it, how likely that
+is, how bad the result would be, and what the fix costs in code, complexity
+and other goals. Then:
 
-## Reviewing pull requests
+- Fix what you have confirmed and is worth its cost: wrong results, data
+  loss, a security hole, a broken agreed requirement, or a real problem with
+  a small fix.
+- Decline the rest in a sentence that gives the reason. Declining a correct
+  finding is a normal outcome. When a declined finding leaves a real risk in
+  the change, tell the user in a line. Labels such as "pre-existing", "nonblocking"
+  and "optional" are neither a reason to act nor a reason to dismiss.
+- Do not let a fix outgrow its problem. A fix that adds a mechanism, option,
+  fallback or guarantee the task did not call for is added scope. When the
+  problem is one of the serious kinds in the first bullet, take it to the
+  user; otherwise decline the finding. Scope the reviewer reports as beyond
+  the task also goes to the user.
+- A real problem outside the task is separate work. Mention it to the user
+  in a line and do not widen the change. A topic the user excluded stays
+  excluded.
 
-When you review or re-review a pull request, follow
-[`.claude/skills/syq-review/SKILL.md`](.claude/skills/syq-review/SKILL.md):
-which commit to review, scope the user did not request, report format, and
-not running suites during a review.
+Do not change the work merely so that the reviewer agrees, and do not argue
+one point for more than a round: record the disagreement and go on. A review
+the user pastes into the conversation is still the reviewer's opinion, not
+the user's.
+
+### When to stop and tell the user
+
+A review should converge in one or two rounds. A further round that only
+confirms small fixes from the round before is fine, so that no change merges
+unreviewed. Stop before making further changes, and tell the user, when any
+of these happens:
+
+- the second round still finds problems that need more than small fixes;
+- the change has started to grow beyond what the task asked for, in size or
+  in what it does;
+- fixes for findings keep producing new findings;
+- you and the reviewer disagree about something consequential.
+
+Say what was asked, what the change has become, what is still disputed, and
+what you recommend. Often the right recommendation is to merge the change as
+it stands or to cut it back to the original task.
 
 ## Working on syq
 
 - [`PRINCIPLES.md`](PRINCIPLES.md) records the user's core product principles.
   Check a design against it before implementing, and raise any conflict first.
   Only the user decides its contents; propose a change in a pull request and
-  say so at the top.
+  raise it with the user in the conversation.
 - `README.md` and the documents under `docs/` are the user-facing contract;
   `README.md` is a brief front door, and `docs/copy-files.md` carries the
   detailed behavior. The code is authoritative for everything else. When you
