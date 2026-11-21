@@ -1,6 +1,7 @@
 ---
 name: syq-release
 description: Release syq through preparation, signed tagging, and verified publication. Use only when the user explicitly invokes $syq-release for a release operation; ordinary release requests, mentions, and skill maintenance do not activate it.
+disable-model-invocation: true
 ---
 
 # Release syq
@@ -26,6 +27,68 @@ matching Python SDK on PyPI. Python preparation and publication are required
 phases of the same release.
 Preserve protections and secret boundaries. Report concrete credential,
 required-review, or product-decision blockers; do not bypass them.
+
+The user chose this explicit invocation boundary to prevent accidental
+publication while allowing an invoked release to finish autonomously. Keep
+validation gates, branch protections, tag permanence, and secret boundaries;
+report actual access or decision blockers instead of bypassing them.
+
+## Release tag lifecycle
+
+- Pin the release candidate once preparation has merged and validation starts.
+  Later merges into `master` do not automatically replace or block that candidate.
+  Assess later changes for significant fixes worth including; restart with a new
+  candidate only when their value justifies repeating affected validation and
+  builds. The candidate must remain an ancestor of remote `master`.
+- Before pushing a syq release tag, require successful full-suite runs of
+  `ci.yml`, `rsync-compat.yml`, and `macos.yml` on the clean pinned candidate
+  or its first-parent ancestor with unchanged test inputs. The
+  release-preparation exception permits only syq package-version edits and
+  prose documents recognized by `scripts/release_test_inputs.py`; dependencies,
+  source, tests, workflows, and build inputs must match. Changed executable
+  documentation requires its focused tests; it does not invalidate unrelated
+  native/platform or SSH validation. Routine release preparation does not change
+  those examples. Report both the candidate and reused evidence SHAs. A task
+  branch or detached checkout at the candidate SHA is sufficient;
+  do not update the coordination checkout or clone solely to obtain a branch
+  named `master`. Start with `scripts/release-readiness.py v<version>` and reuse
+  its recorded default real-SSH validation when its test inputs are
+  unchanged under the same release-preparation exception. Its `--check-ssh` mode
+  runs and records missing local validation. Reuse post-merge or manual runs
+  when `scripts/verify-release-ci.py`
+  accepts their full-suite certificates; dispatch only workflows missing that
+  evidence and wait for them to succeed. Then run
+  `scripts/release-preflight.py v<version>` from that same commit. Treat any
+  failure as a blocker rather than pushing the tag to discover whether the
+  release workflow starts. Use `scripts/release-status.py v<version>` after
+  the push to correlate the exact tag, workflow, approvals, and publication
+  destinations.
+- Treat a release tag as provisional until its release workflow connects it
+  to permanent published state. If an attempt is
+  abandoned before that boundary, remove the failed tag locally and remotely
+  instead of reserving a version that was never released. Never force-update or
+  silently move the tag.
+- A release tag becomes permanent as soon as any associated version or artifact
+  reaches an immutable or append-only destination, including an immutable
+  GitHub release, a package registry, a module proxy, the Homebrew tap, or a
+  durable artifact attestation. Never move or delete a permanent tag. Repair or
+  rerun the remaining publication steps from that exact tag when safe, or cut a
+  new version when they cannot be completed consistently.
+- Before deleting a provisional tag, stop or wait for its active
+  workflows and audit every release destination with read-only checks. Resolve
+  the exact tag object and target commit; verify that no permanent publication
+  exists; and inspect and clean any recoverable draft state. Delete only the
+  explicitly audited local and remote refs, then verify their absence and
+  report what was removed and whether it can be recovered.
+
+## Changelog
+
+During release preparation, compare `CHANGELOG.md` with all changes since the
+previous published release. Include user-facing fixes, performance improvements,
+and consequential behavior or compatibility changes. Finalize the entry with
+the release version and date, and use it to prepare the GitHub release notes.
+Do not treat an existing changelog entry as evidence that later changes have
+already been covered. See `RELEASING.md` for the release checklist.
 
 ## Choose the next action from readiness
 
@@ -116,7 +179,8 @@ incomplete: rerun the idempotent workflow from the same permanent SDK tag and
 verify the registry rather than moving the tag or requiring a new release.
 Exercise the documented installation paths in disposable locations. A partial
 publication is incomplete, including a missing matching PyPI version. Apply the
-provisional/permanent tag rules in `AGENTS.md`; never move a permanent tag.
+provisional/permanent tag rules under Release tag lifecycle above; never move a
+permanent tag.
 
 When the release host does not have Homebrew, verify the Homebrew install path
 in a disposable Docker container instead of asking the user to install Homebrew
