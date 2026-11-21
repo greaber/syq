@@ -198,12 +198,12 @@ the conversation instead.
   checks by changed paths, so a green one does not show that an earlier
   failure was fixed. Report its unresolved `master` notes even when the
   current task did not cause them, but do not repeat failures marked
-  `addressed`. It exits 1 while a check dispatched on the branch has failed
-  and no later run of it passed. `scripts/pr-checks.py <number>` reports the
+  `addressed`. It exits 1 while a check dispatched on the branch has failed,
+  unless a later run of it passed or that failure was explicitly resolved. `scripts/pr-checks.py <number>` reports the
   same for any pull request from any checkout.
 - Pull requests do not start automated test workflows. Failed dispatched
   checks block the merge through the required `dispatched-checks` status,
-  including failures that already happen on `master`; the `syq-ci` skill
+  including failures that already happen on `master`; the `syq-ci` skill (`.claude/skills/syq-ci/SKILL.md`)
   explains the gate and how to resolve one check. The `merge-despite-failures`
   label overrides all failures. Adding the label is the user's decision: when
   a requested merge is blocked, report each failure, say whether `master`
@@ -214,7 +214,7 @@ the conversation instead.
 
 ## Release authorization
 
-Releases require the user to explicitly invoke `$syq-release` or select that
+Releases require the user to explicitly invoke `$syq-release` (`/syq-release` in Claude Code) or select that
 skill in the UI. The skill is committed at
 [`.agents/skills/syq-release/SKILL.md`](.agents/skills/syq-release/SKILL.md)
 with implicit invocation disabled. An ordinary “cut a release” request,
@@ -283,7 +283,7 @@ not running suites during a review.
 - `README.md` and the documents under `docs/` are the user-facing contract;
   `README.md` is a brief front door, and `docs/copy-files.md` carries the
   detailed behavior. The code is authoritative for everything else. When you
-  edit them, follow the `syq-docs-writing` skill.
+  edit them, follow the `syq-docs-writing` skill (`.claude/skills/syq-docs-writing/SKILL.md`).
 - Routinely reconsider whether requirements are actually required and how much
   they matter; no special reason or failure is needed to ask. Distinguish the
   user's goals from assumptions, design choices, and incidental safeguards.
@@ -306,8 +306,9 @@ not running suites during a review.
   `python3`. Use portable shell only for code that runs on users' machines or
   arbitrary hosts (the generated installer and `scripts/try-benchmark.sh`),
   `scripts/setup.sh`, the real-SSH container scripts, and thin wrappers that
-  only run other commands. Do not spend effort on Bash 3.2 compatibility for
-  development scripts.
+  only run other commands, such as the release runners' Nix and build steps.
+  CI and release tooling is too complex to maintain well in Bash, so do not
+  spend effort on Bash 3.2 compatibility for development scripts.
 - Keep CLI behavior, help text, `README.md`, `docs/`, and integration tests in
   sync. A behavior change lands in `docs/copy-files.md` (or the topical
   document that owns it), not in a new README section.
@@ -377,7 +378,7 @@ clients trust it. See RELEASING.md for the workflow's required inputs.
 
 Record CPU time (user and system) and exact peak memory for every process
 with each benchmark, not only elapsed time, and compare them with the
-baseline. Follow the `syq-benchmark` skill when benchmarking, making a
+baseline. Follow the `syq-benchmark` skill (`.claude/skills/syq-benchmark/SKILL.md`) when benchmarking, making a
 performance claim, or replacing an existing copy or I/O path.
 
 ## Verification
@@ -391,7 +392,7 @@ into a cache shared by all worktrees, then run
 `eval "$(scripts/setup.sh env)"` in the shell that runs the check. CI uses
 the same script.
 
-When writing or changing Rust tests, follow the `syq-rust-tests` skill:
+When writing or changing Rust tests, follow the `syq-rust-tests` skill (`.claude/skills/syq-rust-tests/SKILL.md`):
 fixtures use `test_support` temporary directories, executed files are written
 with `write_executable`, and background services must be stopped on failure.
 
@@ -419,7 +420,7 @@ the failure and ask the user before resolving it. Record why the failure no
 longer needs to block. Do not excuse an unfixed product defect or drop agreed
 coverage without the user's decision.
 
-The `syq-ci` skill has the commands for resolving a failed dispatched check
+The `syq-ci` skill (`.claude/skills/syq-ci/SKILL.md`) has the commands for resolving a failed dispatched check
 and for acknowledging a failed `master` run once all of its failures are
 accounted for by merged repairs and focused checks passed; that
 acknowledgment is authorized as part of completing the repair.
@@ -469,8 +470,9 @@ Choose checks from the behavior changed, not every workflow available. For
 Rust changes, run `cargo fmt --all -- --check`, a build, and the unit or
 integration tests that exercise the change. When a change adds, removes, or
 narrows a platform `cfg`, such as making tests Linux-only, also run
-`scripts/check-macos-lint.py` (about a minute on Linux), which keeps a macOS
-lint failure off `master`. Prefer exact or narrow filters in the `local`
+`scripts/check-macos-lint.py` (about a minute on Linux). Post-merge CI runs
+it as the `macos-lint` job with every Rust change, but running it before
+merge keeps the failure off `master`. Prefer exact or narrow filters in the `local`
 target. For a substantial runtime change, dispatch `suites=rust` rather than
 running clippy and every target locally. `scripts/branch-status.py --check`
 runs this local baseline when you want it:
@@ -502,8 +504,11 @@ scripts/test-real-ssh.py
 scripts/test-s3.py
 ```
 
-`tests/real-ssh/README.md` describes the real-SSH suite's coverage; the S3
-suite takes about a minute after the build.
+The real-SSH suite runs the candidate build through live OpenSSH clients and
+servers in three containers; `tests/real-ssh/README.md` describes its
+coverage. The S3 suite runs against a disposable local S3 server, takes about
+a minute after the build, and covers S3 upload, download, and server copy,
+expressions, directory markers, pruning, streams, and listing.
 
 Dispatch them in CI (`suites=real-ssh`, `suites=s3`) when their scenarios
 exercise the behavior you changed. Decide from the suite's scenarios, not from

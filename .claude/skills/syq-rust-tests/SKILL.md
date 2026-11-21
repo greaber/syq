@@ -27,6 +27,11 @@ stop it even when the test fails (for example with `PersistenceOff` in
 `tests/local.rs`); deleting the test's temporary directory leaves the service
 running.
 
+The repository's nextest configuration gives each test a two-minute deadline
+and a five-second termination grace period, then continues the remaining
+tests; keep a long test within that. CI uses nextest on Linux and macOS,
+including selected ignored tests.
+
 Prefer exact or narrow filters in the `local` target (`tests/local.rs` holds
 the shared helpers and `tests/local/<topic>.rs` the tests, named
 `<topic>::<test>`); those tests invoke the built binary against temporary
