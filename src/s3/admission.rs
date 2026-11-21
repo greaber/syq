@@ -71,14 +71,14 @@ pub(super) struct Concurrency {
     /// Lets objects beyond the transfer limit be checked. `None` keeps
     /// every object within that limit.
     pub checking: Option<Checking>,
+    /// Counts the responses that asked the client to slow down.
+    pub outage: Option<Arc<super::outage::Outage>>,
 }
 
 pub(super) struct Checking {
     /// The most objects in progress while those beyond the transfer limit
     /// are only being checked.
     pub maximum: usize,
-    /// Counts the responses that asked the client to slow down.
-    pub outage: Arc<super::outage::Outage>,
 }
 
 // Finding that an object needs no transfer takes a metadata request and
@@ -321,6 +321,23 @@ impl Controller {
         self.limit = self.maximum;
         self.upper = self.maximum + 1;
         self.lower = self.lower.min(self.limit - 1);
+        self.retreated(before)
+    }
+
+    /// The service asked for fewer requests during transfers. Halve the limit
+    /// and back off upward revisits, without permanently lowering `maximum` so
+    /// the controller can still recover if capacity later increases (for
+    /// example after prefix partitioning).
+    fn transfer_throttled(&mut self) -> usize {
+        let before = self.limit;
+        let up = usize::from(true);
+        self.failures[up] = (self.failures[up] + 1).min(3);
+        self.revisit_at[up] = self.scores + (8 << self.failures[up]);
+        let next = (before / 2).max(self.minimum);
+        self.limit = next;
+        self.upper = next + 1;
+        self.lower = self.lower.min(next.saturating_sub(1));
+        self.upward = true;
         self.retreated(before)
     }
 
@@ -718,9 +735,9 @@ where
         .map(|checking| Controller::checking(transfer_limit(&controller, limit), checking.maximum));
     let throttled = || {
         concurrency
-            .checking
+            .outage
             .as_ref()
-            .map_or(0, |checking| checking.outage.throttled_responses())
+            .map_or(0, |outage| outage.throttled_responses())
     };
     let mut seen_throttled = throttled();
     // Whether objects beyond the transfer limit are in progress, so that
@@ -813,18 +830,20 @@ where
                 }
             }
             _ = interval.tick(), if (concurrency.maximum.is_some() || checking.is_some()) && error.is_none() => {
+                // The service asks for fewer requests. Read the counter once
+                // per tick so both checking and transfers react consistently.
+                let responses = throttled();
+                let slowed = responses != seen_throttled;
+                seen_throttled = responses;
+                let checking_above = checking
+                    .as_ref()
+                    .is_some_and(|checking| checking.limit > checking.minimum);
                 if let Some(checking) = &mut checking {
                     let before = checking.limit;
                     let elapsed = checked_since.elapsed();
                     // Checked objects have queued for transfer slots for a
                     // whole sample: transfers set the pace.
                     let bound = gate.transfers_bound() && checking.limit > checking.minimum;
-                    // The service asks for fewer requests. Do not add to
-                    // them here, however many objects the transfer limit
-                    // itself keeps in progress.
-                    let responses = throttled();
-                    let slowed = responses != seen_throttled;
-                    seen_throttled = responses;
                     if slowed {
                         checking.throttled();
                     } else if bound {
@@ -861,6 +880,11 @@ where
                     continue;
                 }
                 if controller.is_none() {
+                    if slowed && !checking_above {
+                        if let Some(requests) = &concurrency.requests {
+                            requests.throttled();
+                        }
+                    }
                     // Preserve the existing request ramp before taking over.
                     // Only one controller changes concurrency at a time.
                     controller = begin(jobs.len());
@@ -883,6 +907,29 @@ where
                     // The transfer limit is not what bounds the objects in
                     // progress, so their rate says nothing about it.
                     controller.as_mut().unwrap().sampler.reset();
+                    activity = 0;
+                    completed = 0;
+                    old_activity = 0;
+                    fresh_completed = 0;
+                    since = Instant::now();
+                    continue;
+                }
+                if slowed && !checking_above {
+                    // Wait until an earlier cut has drained before cutting
+                    // again, so delayed 429/503 replies from a higher limit
+                    // cannot collapse concurrency in one burst.
+                    if tasks.len() <= limit {
+                        let before = limit;
+                        limit = controller.as_mut().unwrap().transfer_throttled();
+                        if limit != before {
+                            generation += 1;
+                            if let Some(observations) = &mut observations {
+                                observations.changed();
+                            }
+                        }
+                    } else {
+                        controller.as_mut().unwrap().sampler.reset();
+                    }
                     activity = 0;
                     completed = 0;
                     old_activity = 0;

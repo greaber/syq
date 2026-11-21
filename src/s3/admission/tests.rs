@@ -127,6 +127,7 @@ async fn tuning_continues_while_an_old_job_is_still_pending() {
                 initial_probe_up: true,
                 requests: None,
                 checking: None,
+                outage: None,
             },
             move |job, _| {
                 let active = active.clone();
@@ -509,6 +510,7 @@ async fn scheduler_learns_when_timer_processing_jitter_shortens_intervals() {
             initial_probe_up: true,
             requests: None,
             checking: None,
+            outage: None,
         },
         |_, _| {
             let active = active.clone();
@@ -555,6 +557,7 @@ async fn adaptive_scheduler_grows_without_losing_or_duplicating_jobs() {
             initial_probe_up: false,
             requests: None,
             checking: None,
+            outage: None,
         },
         |n, _| {
             let active = active.clone();
@@ -592,6 +595,7 @@ async fn fixed_limit_and_failure_drain_started_jobs() {
             initial_probe_up: false,
             requests: None,
             checking: None,
+            outage: None,
         },
         |n, _| {
             let started = started.clone();
@@ -673,10 +677,8 @@ fn checked(initial: usize, maximum: Option<usize>, checking: Option<usize>) -> C
         maximum,
         initial_probe_up: false,
         requests: None,
-        checking: checking.map(|maximum| Checking {
-            maximum,
-            outage: Arc::default(),
-        }),
+        checking: checking.map(|maximum| Checking { maximum }),
+        outage: Some(Arc::default()),
     }
 }
 
@@ -977,7 +979,7 @@ async fn throttling_responses_stop_checking_from_adding_requests() {
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let mut concurrency = checked(4, None, Some(64));
-        concurrency.checking.as_mut().unwrap().outage = outage.clone();
+        concurrency.outage = Some(outage.clone());
         parallel((0..40_000).collect(), concurrency, |_: usize, _| {
             let (outage, active, peak) = (outage.clone(), active.clone(), peak.clone());
             async move {
@@ -1004,4 +1006,80 @@ async fn throttling_responses_stop_checking_from_adding_requests() {
             assert!((1..1_000).contains(&throttled), "throttled {throttled}");
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn transfer_controller_backs_off_on_throttling_and_can_recover() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    let outage = Arc::new(crate::s3::outage::Outage::default());
+    let throttling = Arc::new(AtomicBool::new(true));
+    let active = Arc::new(AtomicUsize::new(0));
+    let settled_peak = Arc::new(AtomicUsize::new(0));
+    let late_peak = Arc::new(AtomicUsize::new(0));
+    parallel(
+        (0..40_000usize).collect(),
+        Concurrency {
+            initial: 32,
+            maximum: Some(64),
+            initial_probe_up: false,
+            requests: None,
+            checking: None,
+            outage: Some(outage.clone()),
+        },
+        |job, _| {
+            let outage = outage.clone();
+            let throttling = throttling.clone();
+            let active = active.clone();
+            let settled_peak = settled_peak.clone();
+            let late_peak = late_peak.clone();
+            async move {
+                // Stop throttling once 10,000 jobs are done so the controller
+                // can demonstrate recovery via periodic revisits.
+                if job == 10_000 {
+                    throttling.store(false, SeqCst);
+                }
+                let now = active.fetch_add(1, SeqCst) + 1;
+                // After initial cuts drain (before the first revisit probe),
+                // concurrency stays at or below the throttling threshold.
+                if (1_000..3_000).contains(&job) {
+                    settled_peak.fetch_max(now, SeqCst);
+                }
+                if job >= 30_000 {
+                    late_peak.fetch_max(now, SeqCst);
+                }
+                if throttling.load(SeqCst) && now > 8 {
+                    outage.throttled();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                active.fetch_sub(1, SeqCst);
+                Ok(Some(1024))
+            }
+        },
+    )
+    .await
+    .unwrap();
+    // Under throttling above 8, concurrency backed off from 32 down to <= 8.
+    assert!(
+        settled_peak.load(SeqCst) <= 8,
+        "settled_peak {}",
+        settled_peak.load(SeqCst)
+    );
+    // Once throttling stopped, revisits recovered above the throttled level.
+    assert!(
+        late_peak.load(SeqCst) > 8,
+        "late_peak {}",
+        late_peak.load(SeqCst)
+    );
+}
+
+#[test]
+fn transfer_throttled_halves_and_preserves_maximum() {
+    let mut controller = Controller::new(64, 256, true);
+    assert_eq!(controller.transfer_throttled(), 32);
+    assert_eq!(controller.maximum, 256);
+    assert_eq!(controller.upper, 33);
+    assert_eq!(controller.candidate(), 32);
+    assert_eq!(controller.transfer_throttled(), 16);
+    assert_eq!(controller.maximum, 256);
+    assert_eq!(controller.upper, 17);
 }

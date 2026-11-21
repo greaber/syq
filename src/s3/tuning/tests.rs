@@ -379,6 +379,7 @@ async fn request_ramp_bounds_preparation_and_refills_after_growth() {
                 initial_probe_up: true,
                 requests: Some(copy_budget.clone()),
                 checking: None,
+                outage: None,
             },
             move |job, _| {
                 let budget = copy_budget.clone();
@@ -460,6 +461,7 @@ async fn measured_handoff_can_probe_before_more_completions() {
                     initial_probe_up: upward,
                     requests: Some(budget.clone()),
                     checking: None,
+                    outage: None,
                 },
                 move |job, _| {
                     let budget = budget.clone();
@@ -561,6 +563,7 @@ async fn check_handoff_direction(probe_bytes: u64, expected_peak: usize, expecte
                 initial_probe_up: true,
                 requests: Some(copy_budget.clone()),
                 checking: None,
+                outage: None,
             },
             move |_, _| {
                 let budget = copy_budget.clone();
@@ -602,6 +605,7 @@ async fn object_handoff_drains_waiting_jobs_before_opening_request_capacity() {
                 initial_probe_up: true,
                 requests: Some(copy_budget.clone()),
                 checking: None,
+                outage: None,
             },
             move |job, _| {
                 let budget = copy_budget.clone();
@@ -804,4 +808,34 @@ fn small_object_budget_bounds_payload_memory_and_empty_objects() {
     assert_eq!(small_capacity(524288, 8, 0), 4096);
     assert_eq!(small_capacity(524288, 8, 64 * 1024), 4096);
     assert_eq!(small_capacity(524288, 8, 512 * 1024), 512);
+}
+
+#[tokio::test]
+async fn budget_backs_off_on_throttling_only_after_draining() {
+    let outage = Arc::new(crate::s3::outage::Outage::default());
+    let budget = Arc::new(Budget::with_outage(32, true, None, Some(outage.clone())));
+    // First throttle halves 32 -> 16 and settles the ramp.
+    outage.throttled();
+    budget.completed(1024);
+    assert_eq!(budget.state.lock().unwrap().limit, 16);
+    assert!(budget.state.lock().unwrap().settled);
+
+    // While more than `limit` requests are still in flight (draining from the
+    // previous limit), further delayed 429/503 replies must not cut again.
+    let mut permits = Vec::new();
+    budget.state.lock().unwrap().limit = 20;
+    for _ in 0..17 {
+        permits.push(budget.acquire().await);
+    }
+    budget.state.lock().unwrap().limit = 16;
+    outage.throttled();
+    budget.throttled();
+    assert_eq!(budget.state.lock().unwrap().limit, 16);
+
+    // Once active requests drain to the limit, a new throttle cuts again.
+    permits.pop();
+    outage.throttled();
+    budget.throttled();
+    assert_eq!(budget.state.lock().unwrap().limit, 8);
+    drop(permits);
 }
