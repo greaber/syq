@@ -15,6 +15,7 @@ native Linux notification actions control return copies
 return copies hand off between server PATH builds
 remote commands run through the return connection
 storage authorization through the return connection
+copies between a server and a bucket signed by the invoking machine
 explicit automatic approval supports unattended copies
 a restricted receiver answers lookups sent ahead of their scan batches
 a restricted receiver gets the final metadata of 4,300 directories in requests sent together

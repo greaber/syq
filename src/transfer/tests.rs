@@ -4572,9 +4572,11 @@ fn received_batch_feedback_sizes_the_next_source_request() {
                 next, 4,
                 "an abort during receipt consumption stops new claims"
             );
-            assert!(results[..4].iter().all(|r| matches!(r, Some(Ok(_)))));
-            assert!(results[4..].iter().all(Option::is_none));
-            assert_eq!(worker.progress.bytes_done.load(Relaxed), size * 4);
+            // Only the group written before the abort is published; those
+            // read meanwhile are not.
+            assert!(matches!(results[0], Some(Ok(_))));
+            assert!(results[1..].iter().all(Option::is_none));
+            assert_eq!(worker.progress.bytes_done.load(Relaxed), size);
         } else {
             assert_eq!(
                 limits[4].bytes,
@@ -4596,6 +4598,68 @@ fn received_batch_feedback_sizes_the_next_source_request() {
             "issued writes drained"
         );
     }
+}
+
+/// A worker pacing under a low `--bwlimit`, as one sending a comparison
+/// group's patches does, stops as soon as the copy fails elsewhere rather
+/// than sleeping out bytes it will no longer send; once the copy has
+/// failed, it does not pace at all.
+#[test]
+fn an_abort_ends_bandwidth_pacing_at_once() {
+    let sched = Arc::new(Sched::new(4 << 20, 32 << 20));
+    let state = Arc::new(Mutex::new(PipelineState::default()));
+    let mut worker = pipeline_worker(&sched, &state, &state, false);
+    // 16 KiB at 1 KiB/s pace for about sixteen seconds.
+    worker.bwlimit = Some(Arc::new(BandwidthLimit::new(1024)));
+    let started = std::time::Instant::now();
+    let failing = {
+        let sched = sched.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            sched.abort();
+        })
+    };
+    worker.limit(16 << 10);
+    let elapsed = started.elapsed();
+    failing.join().unwrap();
+    assert!(elapsed < std::time::Duration::from_secs(3), "{elapsed:?}");
+
+    let started = std::time::Instant::now();
+    worker.limit(16 << 10);
+    let elapsed = started.elapsed();
+    assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
+}
+
+/// A small-file batch whose pacing the copy's failure ended does not send
+/// its group's read: from a remote source the data would come back at the
+/// capped rate. The group stays unissued, to be requeued.
+#[test]
+fn a_batch_aborted_while_pacing_sends_no_read() {
+    let jobs: Vec<_> = (0..8)
+        .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), 1024)))
+        .collect();
+    let src = Arc::new(Mutex::new(PipelineState::default()));
+    let dst = Arc::new(Mutex::new(PipelineState::default()));
+    let sched = Arc::new(Sched::new(512, 8192));
+    let mut worker = pipeline_worker(&sched, &src, &dst, false);
+    // Eight 1 KiB files at 1 KiB/s pace for about eight seconds.
+    worker.bwlimit = Some(Arc::new(BandwidthLimit::new(1024)));
+    let failing = {
+        let sched = sched.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            sched.abort();
+        })
+    };
+    let started = std::time::Instant::now();
+    let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();
+    let mut groups = Some(0..8);
+    let _ = worker.transfer_small_batches(&jobs, move |_| groups.take(), &mut results);
+    let elapsed = started.elapsed();
+    failing.join().unwrap();
+    assert!(elapsed < std::time::Duration::from_secs(3), "{elapsed:?}");
+    assert!(src.lock().unwrap().requests.is_empty(), "no read was sent");
+    assert!(results.iter().all(Option::is_none), "{results:?}");
 }
 
 #[test]
@@ -4637,11 +4701,20 @@ fn aborted_batches_stop_claiming_groups_and_drain_issued_requests() {
         "abort prevents refilling the initial read window"
     );
     assert_eq!(reads.iter().map(|r| r.len()).sum::<usize>(), 256);
-    assert_eq!(worker.progress.bytes_done.load(Relaxed), 256 * size);
-    assert_eq!(worker.progress.files_done.load(Relaxed), 256);
+    // The abort arrived with the first group's data: the groups read are
+    // not published, as a file whose source recheck is pending is not.
+    assert_eq!(worker.progress.bytes_done.load(Relaxed), 0);
+    assert_eq!(worker.progress.files_done.load(Relaxed), 0);
     assert_eq!(worker.progress.errors.load(Relaxed), 0);
     assert!(source.replies.is_empty(), "issued source replies drained");
     let destination = dst.lock().unwrap();
+    assert!(
+        !destination
+            .requests
+            .iter()
+            .any(|r| matches!(r, Request::PutSmallBatch(_))),
+        "nothing published after the abort"
+    );
     assert!(
         destination.replies.is_empty(),
         "issued destination replies drained"
@@ -6265,6 +6338,65 @@ fn an_aborted_copy_sends_nothing_further_for_groups_in_flight() {
     assert_eq!(worker.progress.files_done.load(Relaxed), 1);
 }
 
+#[test]
+fn a_copy_aborted_while_a_group_is_read_sends_no_patch() {
+    // A rewritten file of 4 MiB, a group of its own. The copy is aborted, as
+    // by a fatal error elsewhere, while its differing blocks are read: the
+    // read carries the source's state, as a recheck does, and the patch it
+    // would publish is not sent.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let sched = differing_jobs(root, &[("file", 4 << 20, 1 << 20..2 << 20)]);
+    let unused = Arc::new(Mutex::new(PipelineState::default()));
+    let mut worker = pipeline_worker(&sched, &unused, &unused, true);
+    worker.src = {
+        let sched = sched.clone();
+        let mut source = crate::fsops::FsOps::new();
+        Box::new(AnsweringConn {
+            answer: move |mut request: Request| {
+                if let Request::ReadDifferingBatch { reads, .. } = &mut request {
+                    sched.abort();
+                    // Its files are read by path, as no source roots are
+                    // registered.
+                    for read in reads {
+                        read.source = None;
+                    }
+                }
+                source.handle(&request)
+            },
+            replies: Default::default(),
+        })
+    };
+    let patches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    worker.dst = {
+        let patches = patches.clone();
+        let mut destination = crate::fsops::FsOps::test_destination(&root.join("target"));
+        Box::new(AnsweringConn {
+            answer: move |request: Request| {
+                if let Request::PatchSmallBatch(_) = request {
+                    patches.fetch_add(1, Relaxed);
+                }
+                destination.handle(&request)
+            },
+            replies: Default::default(),
+        })
+    };
+    worker.fast_batch_files = 1;
+    Arc::get_mut(&mut worker.opts).unwrap().block = 1 << 20;
+    worker.process_item(sched.next()).unwrap();
+    assert!(sched.is_aborted());
+    assert_eq!(patches.load(Relaxed), 0, "patches sent");
+    assert!(!worker.src.reply_ready() && !worker.dst.reply_ready());
+    assert!(
+        read(root, "source/file") != read(root, "target/file"),
+        "the patch was published"
+    );
+    // The file is left unfinished, not failed.
+    assert_eq!(worker.progress.errors.load(Relaxed), 0);
+    assert_eq!(worker.progress.files_done.load(Relaxed), 0);
+    assert_eq!(worker.progress.bytes_done.load(Relaxed), 0);
+}
+
 /// A destination that serves each request as it is sent but, as a remote
 /// one, holds its replies until they are asked for, within a reply queue of
 /// `queue`. It records the most streamed patch pieces, and piece bytes, that
@@ -6668,6 +6800,48 @@ fn an_aborted_copy_takes_every_reply_of_a_wide_patch_stream() {
             read(root, "target/file"),
             "{case}"
         );
+        assert_eq!(worker.progress.files_done.load(Relaxed), 0, "{case}");
+        assert_eq!(worker.progress.bytes_done.load(Relaxed), 0, "{case}");
+    }
+}
+
+#[test]
+fn a_copy_aborted_while_a_streamed_patch_is_rechecked_publishes_nothing() {
+    // The copy is aborted as the last of 320 pieces is sent, before the
+    // reply to the source's recheck is taken (a remote source's recheck has
+    // been sent by then): every piece passed its abort check, but the patch
+    // still ends without publication, and the receiver keeps no stage.
+    for remote_source in [false, true] {
+        let case = format!("remote_source={remote_source}");
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
+        let how = Holding {
+            remote_source,
+            ..Holding::default()
+        };
+        let (sched, mut worker, held) =
+            stream_into_holding_destination(root, &files, how, |sched, pieces| {
+                if pieces == 320 {
+                    sched.abort();
+                }
+            });
+        assert!(sched.is_aborted());
+        assert_eq!(held.sent, 320, "{case}");
+        assert!(
+            worker.dst.recv().is_err(),
+            "{case}: a reply was left unread"
+        );
+        assert!(worker.src.recv().is_err(), "{case}: a read was left unread");
+        assert!(
+            read(root, "source/file") != read(root, "target/file"),
+            "{case}: the patch was published"
+        );
+        let left: Vec<_> = std::fs::read_dir(root.join("target"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["file"], "{case}");
         assert_eq!(worker.progress.files_done.load(Relaxed), 0, "{case}");
         assert_eq!(worker.progress.bytes_done.load(Relaxed), 0, "{case}");
     }

@@ -82,7 +82,7 @@ what they do.
 
 | Options | Values / purpose |
 |---|---|
-| `from_`, `to` | SSH endpoint or `s3://BUCKET`; omitted means local. One copy cannot combine SSH and S3 |
+| `from_`, `to` | SSH endpoint or `s3://BUCKET`; omitted means local. With one of each, [the server runs the copy](https://greaber.github.io/syq/object-storage.html#copy-between-a-server-and-a-bucket) and this machine signs its storage requests |
 | `into`, `into_new`, `into_existing` | Destination directory |
 | `as_`, `as_new`, `as_existing` | Exact destination path |
 | `mapping` | `Mapping`, `MapStream`, manifest path, or iterable of `MappingEntry`, instead of selectors; conflicts with `as_*`, `prune`, and `prune_before`. Async clients also accept `AsyncMapping` and async iterables |

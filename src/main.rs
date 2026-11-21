@@ -175,15 +175,7 @@ fn max_files_per_process() -> Option<libc::rlim_t> {
 /// descriptor copy's one location. Receiving names and object storage use no
 /// SSH login.
 fn reaches_ssh(args: &cli::Args) -> bool {
-    if args.s3.is_some() {
-        return false;
-    }
-    let ssh = |location: &cli::Location| {
-        location
-            .host
-            .as_deref()
-            .is_some_and(|host| !host.starts_with('@'))
-    };
+    let ssh = cli::Location::is_ssh_server;
     args.locations.iter().any(ssh)
         || args
             .descriptor_copy

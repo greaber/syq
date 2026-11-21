@@ -3,7 +3,7 @@
 //! This implementation uses bounded page-sized work and the listing command's
 //! own pattern semantics; no upstream source is copied.
 use super::pattern::Pattern;
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde::Serialize;
 use std::{
@@ -12,12 +12,10 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+mod parts;
+
 const MAX_CHILDREN: usize = 256;
-// Recursive discovery has no selective pattern to amortize empty/small child
-// requests. Require evidence of substantial child prefixes and bound speculative fanout.
-const MAX_RECURSIVE_CHILDREN: usize = 64;
 const SPLIT_QUEUE_LIMIT: usize = 4096;
-const MAX_RECURSIVE_PROBES: usize = 4;
 
 #[derive(Clone, Debug, Serialize)]
 pub(in crate::s3) struct Entry {
@@ -72,6 +70,18 @@ pub(in crate::s3) trait Store {
         true
     }
 
+    /// Whether a listing may rely on the store returning keys in UTF-8 byte
+    /// order. Only stores whose provider documents that order divide: a
+    /// listing with more than one request slot is then divided into parts
+    /// that run at the same time (`parts`), and an exact key is looked for on
+    /// the first page only. Every part but the last stops at the first key
+    /// handed over, so a key that the store returns out of order after that
+    /// point would be missed without an error. Other stores are listed one
+    /// page after another, which does not depend on the order.
+    fn divides(&self) -> bool {
+        false
+    }
+
     fn page(
         &self,
         prefix: &str,
@@ -91,6 +101,9 @@ impl<S: Store> Store for LimitedStore<'_, S> {
     fn ordered(&self) -> bool {
         self.inner.ordered()
     }
+    fn divides(&self) -> bool {
+        self.inner.divides()
+    }
     async fn page(
         &self,
         prefix: &str,
@@ -103,23 +116,75 @@ impl<S: Store> Store for LimitedStore<'_, S> {
     }
 }
 
+/// Keys arrived out of order after part of a listing was handed to other
+/// listings, so the listing may have stopped before its last key. A listing
+/// that is not divided does not depend on the order.
+#[derive(Debug)]
+pub(in crate::s3) struct Unordered;
+impl std::fmt::Display for Unordered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "S3 listing returned keys out of order; a listing with a concurrency of 1 does not rely on the order",
+        )
+    }
+}
+impl std::error::Error for Unordered {}
+
+/// The context of a failed listing of a narrower prefix that a listing in
+/// parts made: a policy may allow listing only the prefix itself.
+#[derive(Debug)]
+pub(in crate::s3) struct PartFailed;
+impl std::fmt::Display for PartFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("listing part of the prefix by itself failed")
+    }
+}
+
+/// Whether a request failed because a policy refused it.
+fn refused(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::s3::client::RequestFailure>()
+        .is_some_and(crate::s3::client::RequestFailure::denied)
+}
+
+/// Whether a key the pattern wants could be missing from the page after
+/// `page`, in a store that skips only the key `P0` after a common prefix `P/`
+/// in whatever order it lists.
+fn may_hide(page: &Page, wanted: impl Fn(&str) -> bool) -> bool {
+    page.next.is_some()
+        && page.prefixes.iter().any(|prefix| {
+            prefix.strip_suffix('/').is_some_and(|stem| {
+                let key = format!("{stem}0");
+                // A key the page already holds is not missing.
+                wanted(&key) && page.entries.iter().all(|entry| entry.key != key)
+            })
+        })
+}
+
+/// Whether the store's listings may rely on UTF-8 byte order.
+fn byte_ordered(store: &impl Store) -> bool {
+    store.ordered() && store.divides()
+}
+
+/// Whether this listing is divided into parts rather than listed as below.
+fn in_parts(store: &impl Store, concurrency: usize) -> bool {
+    concurrency > 1 && byte_ordered(store)
+}
+
 #[derive(Clone)]
 enum Job {
     Discover {
         prefix: String,
         component: usize,
-        depth: usize,
     },
     Recursive {
         prefix: String,
-        depth: usize,
-        start_after: Option<String>,
     },
     Scan {
         prefix: String,
         delimiter: bool,
-        token: Option<String>,
-        start_after: Option<String>,
+        token: String,
+        gap: Gap,
     },
 }
 
@@ -129,7 +194,9 @@ struct Batch {
     pruned: Vec<String>,
 }
 
-fn scan_batch(prefix: String, delimiter: bool, page: Page, start_after: Option<&str>) -> Batch {
+/// A page and the request for the next one. `gap` is the key that request
+/// must make sure of (`Gap::after`).
+fn scan_batch(prefix: String, delimiter: bool, page: Page, gap: Gap) -> Batch {
     Batch {
         entries: page.entries,
         jobs: page
@@ -137,12 +204,142 @@ fn scan_batch(prefix: String, delimiter: bool, page: Page, start_after: Option<&
             .map(|token| Job::Scan {
                 prefix,
                 delimiter,
-                token: Some(token),
-                start_after: start_after.map(str::to_owned),
+                token,
+                gap,
             })
             .into_iter()
             .collect(),
         pruned: Vec::new(),
+    }
+}
+
+/// The key a store may leave out of the page after one that ends with a
+/// common prefix.
+///
+/// After a delimiter page that ends with the common prefix `P/`, Tigris
+/// resumes the listing past the key `P0` instead of at it, so that key, if it
+/// exists, is missing from the next page. In byte order nothing else can come
+/// between the two, and a listing of `P0` itself shows the key first. So the
+/// next page is read together with that listing, and the key is added if the
+/// page left it out. That check relies on byte order, so it is made only
+/// where the store's order is known (`byte_ordered`); every such store is
+/// checked, since the same mistake is easy to make elsewhere. Elsewhere a
+/// delimiter listing goes on past its first page only while no page that
+/// goes on holds a common prefix whose skipped key the pattern could match
+/// (`may_hide`).
+#[derive(Clone, Default)]
+pub(super) struct Gap {
+    /// The key to make sure of on the next page.
+    key: Option<String>,
+    /// Where the order is unknown, a policy refused the listing without a
+    /// delimiter that was to replace this one. Reported if a page that goes
+    /// on holds a common prefix whose skipped key the pattern could match.
+    refused: Option<String>,
+}
+
+impl Gap {
+    /// The key to make sure of after `page`, if it ends with a common prefix
+    /// and the key is `wanted`.
+    pub(super) fn after(page: &Page, wanted: impl Fn(&str) -> bool) -> Self {
+        Self {
+            key: page
+                .next
+                .as_ref()
+                .and(page.prefixes.last())
+                .filter(|last| page.entries.last().is_none_or(|entry| entry.key < **last))
+                .and_then(|last| last.strip_suffix('/'))
+                .map(|stem| format!("{stem}0"))
+                .filter(|key| wanted(key)),
+            refused: None,
+        }
+    }
+
+    /// Read the page at `token`, adding the key if the store left it out,
+    /// and return it with what to make sure of on the page after it.
+    pub(super) async fn read(
+        self,
+        store: &impl Store,
+        prefix: &str,
+        delimiter: bool,
+        token: &str,
+        wanted: impl Fn(&str) -> bool,
+    ) -> Result<(Page, Gap)> {
+        let Gap { key, refused } = self;
+        let page = match key {
+            None => read(store, prefix, delimiter, Some(token)).await?,
+            Some(key) => {
+                debug_assert!(byte_ordered(store), "checks rely on byte order");
+                // The check runs while the page is read, and is dropped
+                // unfinished if the page settles the question.
+                let main = read(store, prefix, delimiter, Some(token));
+                let check = read(store, &key, true, None);
+                tokio::pin!(main, check);
+                let mut checked = None;
+                let mut page = loop {
+                    tokio::select! {
+                        // With one request slot free, the page goes first.
+                        biased;
+                        page = &mut main => break page?,
+                        result = &mut check, if checked.is_none() => checked = Some(result),
+                    }
+                };
+                if page.entries.is_empty() && page.prefixes.is_empty() && page.next.is_some() {
+                    // An empty page shows nothing; the next one starts at
+                    // the key or past it.
+                    return Ok((
+                        page,
+                        Gap {
+                            key: Some(key.clone()),
+                            refused,
+                        },
+                    ));
+                }
+                if page.entries.first().is_none_or(|entry| entry.key != key) {
+                    let check = match checked {
+                        Some(check) => check,
+                        None => check.await,
+                    };
+                    if let Some(entry) = Self::find(store, &key, check).await? {
+                        page.entries.insert(0, entry);
+                    }
+                }
+                page
+            }
+        };
+        if let Some(refused) = &refused {
+            ensure!(!may_hide(&page, &wanted), "{refused}");
+        }
+        // Where the order is unknown, nothing is checked (`may_hide` above).
+        let next = match refused {
+            Some(refused) => Gap {
+                key: None,
+                refused: Some(refused),
+            },
+            None => Gap::after(&page, wanted),
+        };
+        Ok((page, next))
+    }
+
+    /// The object `key`, from a listing of it whose first page is `first`.
+    async fn find(store: &impl Store, key: &str, first: Result<Page>) -> Result<Option<Entry>> {
+        let context = || {
+            format!("listing {key:?} to check for a key the store may have skipped after the common prefix before it")
+        };
+        let mut page = first.with_context(context)?;
+        // In byte order the key comes first, but an empty page shows nothing.
+        while page.entries.is_empty() && page.prefixes.is_empty() {
+            let Some(token) = page.next else {
+                break;
+            };
+            page = read(store, key, true, Some(&token))
+                .await
+                .with_context(context)?;
+        }
+        Ok(page
+            .entries
+            .into_iter()
+            .next()
+            .filter(|entry| entry.key == key))
     }
 }
 
@@ -152,27 +349,7 @@ pub(in crate::s3) async fn read(
     delimiter: bool,
     token: Option<&str>,
 ) -> Result<Page> {
-    read_after(store, prefix, delimiter, token, None).await
-}
-
-async fn read_after(
-    store: &impl Store,
-    prefix: &str,
-    delimiter: bool,
-    token: Option<&str>,
-    start_after: Option<&str>,
-) -> Result<Page> {
-    // Keep the wire request unchanged for continuation pages. The token carries
-    // the service position; StartAfter remains a local lower bound even when a
-    // provider silently ignores it on the initial request.
-    let mut page = store
-        .page(
-            prefix,
-            delimiter,
-            token,
-            start_after.filter(|_| token.is_none()),
-        )
-        .await?;
+    let page = store.page(prefix, delimiter, token, None).await?;
     ensure!(
         page.entries.len() + page.prefixes.len() <= 1000,
         "S3 listing exceeded the requested page size"
@@ -198,9 +375,6 @@ async fn read_after(
             "S3 listing returned an invalid common prefix"
         );
     }
-    if let Some(after) = start_after {
-        page.entries.retain(|entry| entry.key.as_str() > after);
-    }
     Ok(page)
 }
 
@@ -211,33 +385,23 @@ async fn execute(
     job: Job,
     split: bool,
 ) -> Result<Batch> {
-    let (mut prefix, mut component, depth) = match job {
-        Job::Recursive {
-            prefix,
-            depth,
-            start_after,
-        } => return recursive(store, prune, prefix, depth, split, start_after.as_deref()).await,
+    let (mut prefix, mut component) = match job {
+        Job::Recursive { prefix } => return recursive(store, prune, prefix).await,
         Job::Scan {
             prefix,
             delimiter,
             token,
-            start_after,
+            gap,
         } => {
-            let page = read_after(
-                store,
-                &prefix,
-                delimiter,
-                token.as_deref(),
-                start_after.as_deref(),
-            )
-            .await?;
-            return Ok(scan_batch(prefix, delimiter, page, start_after.as_deref()));
+            // Only the last component of a pattern pages with a delimiter.
+            let (page, gap) = gap
+                .read(store, &prefix, delimiter, &token, |key| {
+                    pattern.is_none_or(|pattern| pattern.matches(key))
+                })
+                .await?;
+            return Ok(scan_batch(prefix, delimiter, page, gap));
         }
-        Job::Discover {
-            prefix,
-            component,
-            depth,
-        } => (prefix, component, depth),
+        Job::Discover { prefix, component } => (prefix, component),
     };
     let pattern = pattern.expect("discovery jobs require a pattern");
     // Literal intermediate components need no existence probes: the eventual
@@ -253,19 +417,54 @@ async fn execute(
     let part = &pattern.components[component];
     let query = format!("{prefix}{}", part.literal_prefix());
     if part.recursive() {
-        return recursive(store, None, query, depth, split, None).await;
+        return recursive(store, None, query).await;
     }
     if !split && component + 1 < pattern.components.len() {
         let page = read(store, &query, false, None).await?;
-        return Ok(scan_batch(query, false, page, None));
+        return Ok(scan_batch(query, false, page, Gap::default()));
     }
     let page = read(store, &query, true, None).await?;
     if component + 1 == pattern.components.len() {
-        return Ok(scan_batch(query, true, page, None));
+        if page.next.is_some() && !byte_ordered(store) && !part.literal() && part.may_end_with('0')
+        {
+            // Making sure of a key a page may leave out (`Gap`) relies on
+            // byte order. List everything under the prefix instead, unless
+            // the pattern cannot match that key: it ends in '0' and is
+            // longer than the prefix, so a literal name is never it. That
+            // assumes a store in another order would leave out only that
+            // key, as Tigris does in byte order; none is known to leave out
+            // any.
+            let why = || {
+                format!("listing {query:?} without a delimiter, since a later delimiter page could leave out a key")
+            };
+            match read(store, &query, false, None).await {
+                Ok(flat) => {
+                    static SAID: std::sync::Once = std::sync::Once::new();
+                    SAID.call_once(|| {
+                        crate::output::diagnostic!(
+                            "syq _ls: listing every key under {query:?} without a delimiter, which can take much longer; other prefixes the pattern's last part reaches are listed the same way when their listings need more than one page: this store may not list keys in byte order, and its later delimiter pages could leave a key out"
+                        );
+                    });
+                    return Ok(scan_batch(query, false, flat, Gap::default()));
+                }
+                // A policy may require a delimiter. Go on with it while no
+                // page could be followed by a wanted key left out.
+                Err(error) if refused(&error) && !may_hide(&page, |key| pattern.matches(key)) => {
+                    let gap = Gap {
+                        key: None,
+                        refused: Some(format!("{:#}", error.context(why()))),
+                    };
+                    return Ok(scan_batch(query, true, page, gap));
+                }
+                Err(error) => return Err(error.context(why())),
+            }
+        }
+        let gap = Gap::after(&page, |key| pattern.matches(key));
+        return Ok(scan_batch(query, true, page, gap));
     }
     if page.next.is_some() || page.prefixes.len() > MAX_CHILDREN {
         let flat = read(store, &query, false, None).await?;
-        return Ok(scan_batch(query, false, flat, None));
+        return Ok(scan_batch(query, false, flat, Gap::default()));
     }
     Ok(Batch {
         entries: page.entries,
@@ -283,29 +482,10 @@ async fn execute(
             .map(|prefix| Job::Discover {
                 prefix,
                 component: component + 1,
-                depth: 0,
             })
             .collect(),
         pruned: Vec::new(),
     })
-}
-
-fn dense_children(query: &str, page: &Page) -> usize {
-    let mut counts = std::collections::HashMap::new();
-    for entry in &page.entries {
-        if let Some(slash) = entry
-            .key
-            .strip_prefix(query)
-            .and_then(|suffix| suffix.find('/'))
-        {
-            *counts
-                .entry(&entry.key[..query.len() + slash + 1])
-                .or_insert(0usize) += 1;
-        }
-    }
-    // A quarter-page child can amortize parallel requests at network latency;
-    // tiny directories cannot. This estimates density, not the total key count.
-    counts.values().filter(|count| **count >= 256).count()
 }
 
 /// When every object on a truncated first page, apart from directory markers,
@@ -317,7 +497,6 @@ async fn lookahead(
     store: &impl Store,
     prune: &Prune<'_>,
     query: &str,
-    depth: usize,
     flat: &Page,
 ) -> Result<Option<Batch>> {
     let budget = prune.probes.load(Ordering::Relaxed);
@@ -362,11 +541,7 @@ async fn lookahead(
                 entries: parents,
                 jobs: included
                     .into_iter()
-                    .map(|prefix| Job::Recursive {
-                        prefix,
-                        depth: depth + 1,
-                        start_after: None,
-                    })
+                    .map(|prefix| Job::Recursive { prefix })
                     .collect(),
                 pruned,
             }));
@@ -381,96 +556,16 @@ async fn lookahead(
     Ok(None)
 }
 
-async fn recursive(
-    store: &impl Store,
-    prune: Option<&Prune<'_>>,
-    query: String,
-    depth: usize,
-    split: bool,
-    start_after: Option<&str>,
-) -> Result<Batch> {
-    let mut flat = read_after(store, &query, false, None, start_after).await?;
+/// List everything under `query` one page after another, apart from the
+/// lookahead when filtered. Any store's order will do.
+async fn recursive(store: &impl Store, prune: Option<&Prune<'_>>, query: String) -> Result<Batch> {
+    let flat = read(store, &query, false, None).await?;
     if let Some(prune) = prune {
-        if start_after.is_none() {
-            if let Some(batch) = lookahead(store, prune, &query, depth, &flat).await? {
-                return Ok(batch);
-            }
+        if let Some(batch) = lookahead(store, prune, &query, &flat).await? {
+            return Ok(batch);
         }
-        // The dense split below would request every small sibling of two
-        // dense directories separately; filtered listings stay flat instead.
-        return Ok(scan_batch(query, false, flat, start_after));
     }
-    if flat.next.is_none()
-        || !split
-        || !store.ordered()
-        || depth >= MAX_RECURSIVE_PROBES
-        || flat.entries.len() < 1000
-        || dense_children(&query, &flat) == 0
-    {
-        return Ok(scan_batch(query, false, flat, start_after));
-    }
-    // Continue useful enumeration while probing. Small two-page trees finish
-    // here, and rejected probes add no sequential round trip to flat scans.
-    let (branches, continuation) = tokio::join!(
-        read(store, &query, true, None),
-        read_after(store, &query, false, flat.next.as_deref(), start_after),
-    );
-    let continuation = continuation?;
-    flat.entries.extend(continuation.entries);
-    flat.next = continuation.next;
-    if flat.next.is_none() {
-        return Ok(scan_batch(query, false, flat, start_after));
-    }
-    let branches = branches?;
-    if branches.next.is_some() || !(2..=MAX_RECURSIVE_CHILDREN).contains(&branches.prefixes.len()) {
-        return Ok(scan_batch(query, false, flat, start_after));
-    }
-    // One dense leading directory says little about its siblings. Spend at
-    // most one more useful flat page looking for a second substantial child.
-    if dense_children(&query, &flat) < 2 {
-        let next = read_after(store, &query, false, flat.next.as_deref(), start_after).await?;
-        flat.entries.extend(next.entries);
-        flat.next = next.next;
-    }
-    if flat.next.is_none() || dense_children(&query, &flat) < 2
-        || !flat.entries.windows(2).all(|pair| pair[0].key < pair[1].key)
-        // Do not replace an observed key with an incomplete directory view.
-        || flat.entries.iter().any(|entry| {
-            !branches.entries.iter().any(|direct| direct.key == entry.key)
-                && !branches.prefixes.iter().any(|child| entry.key.starts_with(child))
-        })
-    {
-        return Ok(scan_batch(query, false, flat, start_after));
-    }
-    // Retain every sampled child entry, then resume the partial last child
-    // strictly after the last sampled key. Continuation tokens stay with their
-    // original request; StartAfter establishes a new child-prefix listing.
-    let last = flat.entries.last().unwrap().key.clone();
-    let mut entries: Vec<_> = branches
-        .entries
-        .into_iter()
-        .filter(|entry| start_after.is_none_or(|start| entry.key.as_str() > start))
-        .collect();
-    entries.extend(flat.entries.into_iter().filter(|entry| {
-        branches
-            .prefixes
-            .iter()
-            .any(|prefix| entry.key.starts_with(prefix))
-    }));
-    Ok(Batch {
-        entries,
-        jobs: branches
-            .prefixes
-            .into_iter()
-            .filter(|prefix| prefix >= &last || last.starts_with(prefix))
-            .map(|prefix| Job::Recursive {
-                start_after: last.starts_with(&prefix).then(|| last.clone()),
-                prefix,
-                depth: depth + 1,
-            })
-            .collect(),
-        pruned: Vec::new(),
-    })
+    Ok(scan_batch(query, false, flat, Gap::default()))
 }
 
 pub(super) async fn enumerate(
@@ -483,22 +578,55 @@ pub(super) async fn enumerate(
         (1..=256).contains(&concurrency),
         "concurrency must be between 1 and 256"
     );
-    if store.ordered() && pattern.components.iter().all(|part| part.literal()) {
-        // General-purpose S3 listings are sorted: the exact prefix itself, if
-        // present, precedes every longer key. Keep LIST permissions (no HEAD).
+    if pattern.components.iter().all(|part| part.literal()) {
         let key = pattern
             .components
             .iter()
             .map(|part| part.literal_prefix())
             .collect::<Vec<_>>()
             .join("/");
-        let page = read(store, &key, false, None).await?;
-        for entry in page.entries {
-            if entry.key == key {
-                emit(entry)?;
+        // Keep LIST permissions (no HEAD). In byte order the exact key, if
+        // present, precedes every longer key on the first page that holds
+        // anything; an empty page that goes on settles nothing.
+        let mut page = read(store, &key, false, None).await?;
+        if byte_ordered(store) {
+            while page.entries.is_empty() {
+                let Some(token) = page.next else {
+                    break;
+                };
+                page = read(store, &key, false, Some(&token)).await?;
             }
         }
-        return Ok(());
+        let flat = page.next;
+        if let Some(entry) = page.entries.into_iter().find(|entry| entry.key == key) {
+            return emit(entry);
+        }
+        if flat.is_none() || byte_ordered(store) {
+            return Ok(());
+        }
+        // In another order it can come after longer keys. A delimiter
+        // listing leaves out the deeper ones; stop at the key. Where a policy
+        // refuses delimiter listings, the flat one goes on instead.
+        let (mut delimiter, mut token) = (true, None);
+        loop {
+            let page = match read(store, &key, delimiter, token.as_deref()).await {
+                Err(error) if delimiter && token.is_none() && refused(&error) => {
+                    (delimiter, token) = (false, flat.clone());
+                    continue;
+                }
+                page => page?,
+            };
+            if let Some(entry) = page.entries.into_iter().find(|entry| entry.key == key) {
+                return emit(entry);
+            }
+            let Some(next) = page.next else {
+                return Ok(());
+            };
+            token = Some(next);
+        }
+    }
+    if in_parts(store, concurrency) {
+        return parts::enumerate(store, pattern, concurrency, &mut emit).await;
     }
     enumerate_jobs(
         store,
@@ -508,7 +636,6 @@ pub(super) async fn enumerate(
         Job::Discover {
             prefix: String::new(),
             component: 0,
-            depth: 0,
         },
         &mut emit,
     )
@@ -520,10 +647,14 @@ pub(super) async fn enumerate(
 /// This only changes request scheduling; callers still validate and interpret
 /// object metadata, source types and destination mappings.
 ///
-/// With `prune`, the listing stays flat apart from the lookahead, and
-/// directories it names may be skipped: their common prefixes are returned
-/// instead of being listed. Objects in pruned directories may still be
-/// emitted, so callers must classify every entry themselves.
+/// With `prune`, directories it names may be skipped: their common prefixes
+/// are returned instead of being listed. Objects in pruned directories may
+/// still be emitted, so callers must classify every entry themselves. Unless
+/// the listing is divided into parts, it stays flat apart from the lookahead.
+///
+/// A listing in parts fails with [`Unordered`] when keys arrive out of order
+/// after part of it was handed to others; with a concurrency of one, or a
+/// store that does not divide, it is never in parts.
 pub(in crate::s3) async fn enumerate_prefix(
     store: &impl Store,
     prefix: &str,
@@ -531,6 +662,13 @@ pub(in crate::s3) async fn enumerate_prefix(
     prune: Option<&Prune<'_>>,
     mut emit: impl FnMut(Entry) -> Result<()>,
 ) -> Result<Vec<String>> {
+    ensure!(
+        (1..=256).contains(&concurrency),
+        "concurrency must be between 1 and 256"
+    );
+    if in_parts(store, concurrency) {
+        return parts::enumerate_prefix(store, prefix, concurrency, prune, &mut emit).await;
+    }
     enumerate_jobs(
         store,
         None,
@@ -538,8 +676,6 @@ pub(in crate::s3) async fn enumerate_prefix(
         concurrency,
         Job::Recursive {
             prefix: prefix.to_owned(),
-            depth: 0,
-            start_after: None,
         },
         &mut emit,
     )

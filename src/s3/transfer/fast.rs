@@ -54,7 +54,15 @@ impl Engine {
             fixed
         } else if tiny {
             if small_upload && self.tuning.high_latency() {
-                capacity
+                if self
+                    .tuning
+                    .control_latency()
+                    .is_some_and(|latency| latency < super::super::tuning::NEAR_FAR_LATENCY)
+                {
+                    capacity.min(2048)
+                } else {
+                    capacity
+                }
             } else {
                 256
             }
@@ -161,7 +169,7 @@ impl Engine {
             initial_probe_up: self
                 .tuning
                 .control_latency()
-                .is_some_and(|latency| latency >= Duration::from_millis(50)),
+                .is_some_and(|latency| latency >= super::super::tuning::HIGH_LATENCY),
         })
     }
 

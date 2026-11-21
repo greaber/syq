@@ -74,6 +74,14 @@ impl Component {
     pub fn matches(&self, text: &str) -> bool {
         matches(&self.0, text)
     }
+    /// Whether a name this matches can end with `c`.
+    pub fn may_end_with(&self, c: char) -> bool {
+        match self.0.last() {
+            Some(Token::Literal(last)) => *last == c,
+            Some(_) => true,
+            None => false,
+        }
+    }
 }
 
 #[derive(Debug)]

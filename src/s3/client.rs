@@ -100,10 +100,11 @@ pub(super) fn request_timeouts() -> TimeoutConfig {
         .build()
 }
 
-/// Time HEAD and LIST responses to their headers. Each is one small exchange,
-/// unlike data requests, whose duration follows their bodies. Only an answer
-/// about the object or listing counts: errors and throttling describe the
-/// service, and a redirect comes from a region that does not hold the bucket.
+/// Time HEAD and LIST responses to their headers, less any wait for a
+/// signature. Each is one small exchange, unlike data requests, whose duration
+/// follows their bodies. Only an answer about the object or listing counts:
+/// errors and throttling describe the service, and a redirect comes from a
+/// region that does not hold the bucket.
 #[derive(Debug)]
 struct ControlLatency(std::sync::Arc<std::sync::atomic::AtomicU64>);
 #[derive(Debug)]
@@ -181,10 +182,14 @@ impl Intercept for ControlLatency {
         _: &RuntimeComponents,
         cfg: &mut ConfigBag,
     ) -> std::result::Result<(), BoxError> {
-        let status = context.response().status().as_u16();
+        let response = context.response();
+        let status = response.status().as_u16();
         if let Some(ControlStart(start)) = cfg.load::<ControlStart>() {
             if (200..300).contains(&status) || status == 404 {
-                super::tuning::observe_control(&self.0, start.elapsed());
+                let signing = response
+                    .extension::<super::authorization::SigningWait>()
+                    .map_or(Duration::ZERO, |wait| wait.0);
+                super::tuning::observe_control(&self.0, start.elapsed().saturating_sub(signing));
             }
         }
         Ok(())
@@ -278,6 +283,17 @@ pub(super) struct RequestFailure {
 impl RequestFailure {
     pub(super) fn region_mismatch(&self) -> bool {
         self.status == Some(301) && self.region.is_some()
+    }
+    pub(super) fn denied(&self) -> bool {
+        self.status == Some(403)
+    }
+    #[cfg(test)]
+    pub(super) fn refused_for_test(operation: &str) -> Self {
+        Self {
+            operation: operation.into(),
+            status: Some(403),
+            region: None,
+        }
     }
 }
 impl std::fmt::Display for RequestFailure {
@@ -424,7 +440,7 @@ async fn connect_with(
         ))
         .build_with_resolver(super::dns::CoalescingDns::default());
     let sleep = aws_sdk_s3::config::SharedAsyncSleep::new(super::cancel::Sleep(uploads.clone()));
-    let transport = super::upload_http::client(transport, uploads);
+    let transport = super::cancel::client(transport, uploads);
     let transport = match authorization {
         Some(authorization) => super::authorization::http_client(transport, authorization),
         None => transport,
@@ -952,14 +968,44 @@ impl Listing {
     }
 }
 
+/// The most requests one listing sends at a time.
+pub(super) const LISTING_REQUESTS: usize = 32;
+
 /// List every object under a literal prefix with the bounded parallel engine.
+/// `endpoint` is the custom endpoint the client uses, if any: it decides
+/// whether a listing may be divided (`listing::lists_in_byte_order`).
 pub(super) async fn list(
     client: &Client,
+    endpoint: Option<&str>,
     bucket: &str,
     prefix: &str,
     concurrency: usize,
 ) -> Result<Listing> {
-    list_with_times(client, bucket, prefix, None, concurrency, false).await
+    list_with_times(client, endpoint, bucket, prefix, None, concurrency, false).await
+}
+
+/// Like [`list`], as one of several listings that run at once. Their
+/// requests share `slots`, so together they send no more requests at a time
+/// than `slots` allows.
+pub(super) async fn list_sharing(
+    client: &Client,
+    endpoint: Option<&str>,
+    bucket: &str,
+    prefix: &str,
+    concurrency: usize,
+    slots: &tokio::sync::Semaphore,
+) -> Result<Listing> {
+    list_limited(
+        client,
+        endpoint,
+        bucket,
+        prefix,
+        None,
+        concurrency,
+        false,
+        Some(slots),
+    )
+    .await
 }
 
 /// Delimiter requests a filtered listing may spend looking past a first page
@@ -974,11 +1020,36 @@ const LOOKAHEAD_PROBES: usize = 4;
 /// them.
 pub(super) async fn list_with_times(
     client: &Client,
+    endpoint: Option<&str>,
     bucket: &str,
     prefix: &str,
     matcher: Option<&ignore::gitignore::Gitignore>,
     concurrency: usize,
     retain_times: bool,
+) -> Result<Listing> {
+    list_limited(
+        client,
+        endpoint,
+        bucket,
+        prefix,
+        matcher,
+        concurrency,
+        retain_times,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn list_limited(
+    client: &Client,
+    endpoint: Option<&str>,
+    bucket: &str,
+    prefix: &str,
+    matcher: Option<&ignore::gitignore::Gitignore>,
+    concurrency: usize,
+    retain_times: bool,
+    slots: Option<&tokio::sync::Semaphore>,
 ) -> Result<Listing> {
     use super::listing::{
         self,
@@ -996,10 +1067,15 @@ pub(super) async fn list_with_times(
         inner: listing::S3<'a>,
         root: &'a str,
         discovery_denied: AtomicBool,
+        /// Shared with listings that run at the same time.
+        slots: Option<&'a tokio::sync::Semaphore>,
     }
     impl Store for Checked<'_> {
         fn ordered(&self) -> bool {
             self.inner.ordered()
+        }
+        fn divides(&self) -> bool {
+            self.inner.divides()
         }
         async fn page(
             &self,
@@ -1008,6 +1084,10 @@ pub(super) async fn list_with_times(
             token: Option<&str>,
             start_after: Option<&str>,
         ) -> Result<Page> {
+            let _slot = match self.slots {
+                Some(slots) => Some(slots.acquire().await?),
+                None => None,
+            };
             self.inner
                 .page(prefix, delimiter, token, start_after)
                 .await
@@ -1022,9 +1102,11 @@ pub(super) async fn list_with_times(
         inner: listing::S3 {
             client: client.clone(),
             bucket,
+            divides: listing::lists_in_byte_order(endpoint, bucket),
         },
         root: prefix,
         discovery_denied: AtomicBool::new(false),
+        slots,
     };
     let subtree = |key: &str, directory: bool| match exclusion(
         matcher,
@@ -1048,7 +1130,11 @@ pub(super) async fn list_with_times(
         let outcome = engine::enumerate_prefix(
             &store,
             prefix,
-            if fallback { 1 } else { concurrency.min(32) },
+            if fallback {
+                1
+            } else {
+                concurrency.min(LISTING_REQUESTS)
+            },
             prune.as_ref(),
             |entry| {
                 let directory = is_directory_marker(&entry.key, entry.size);
@@ -1087,6 +1173,11 @@ pub(super) async fn list_with_times(
             // denying discovery or child prefixes. No caller has consumed the
             // plan yet.
             Err(error) if !fallback && store.discovery_denied.load(Relaxed) && denied(&error) => {
+                fallback = true;
+            }
+            // The engine relies on key order only when it lists a prefix in
+            // parts. List it whole instead.
+            Err(error) if !fallback && error.is::<engine::Unordered>() => {
                 fallback = true;
             }
             Err(error) => return Err(error),

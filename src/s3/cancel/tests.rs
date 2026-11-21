@@ -1,156 +1,9 @@
 use super::*;
-use crate::s3::cancel::{self, Sleep};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-#[test]
-fn file_upload_accepts_precomputed_digest_but_rejects_placeholder_hash() {
-    let checksum = crate::s3::checksum::Algorithm::Sha256
-        .digest(b"abc")
-        .unwrap();
-    let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-    let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-    for (query, native, signed, valid) in [
-        ("", Some(checksum.as_str()), digest, true),
-        ("", Some(checksum.as_str()), empty, false),
-        ("", Some(checksum.as_str()), "UNSIGNED-PAYLOAD", false),
-        ("", None, "UNSIGNED-PAYLOAD", true),
-        ("", None, empty, false),
-        (
-            "?uploadId=id&partNumber=1",
-            Some(checksum.as_str()),
-            "UNSIGNED-PAYLOAD",
-            true,
-        ),
-    ] {
-        let mut request = http::Request::builder()
-            .method("PUT")
-            .uri(format!("https://storage.example/bucket/key{query}"))
-            .header("x-amz-content-sha256", signed);
-        if let Some(native) = native {
-            request = request.header("x-amz-checksum-sha256", native);
-        }
-        assert_eq!(
-            check_payload(&request.body(SdkBody::empty()).unwrap()).is_ok(),
-            valid
-        );
-    }
-}
-
-/// A source that grows, shrinks or disappears while the synchronous file
-/// body sends it fails the upload at once, without retries.
-#[tokio::test]
-async fn a_changed_source_fails_without_retries() {
-    for change in ["grows", "shrinks", "removed"] {
-        let temp = crate::test_support::tempdir().unwrap();
-        let path = temp.path().join("source");
-        let size = 4 * 1024 * 1024;
-        std::fs::write(&path, vec![b'x'; size as usize]).unwrap();
-        let args = crate::cli::Args::parse_args(
-            &[
-                "cp",
-                path.to_str().unwrap(),
-                "--to",
-                "s3://bucket",
-                "--as",
-                "object",
-            ]
-            .map(std::ffi::OsString::from),
-        )
-        .unwrap();
-        let source = crate::s3::local::upload_plan(&args)
-            .unwrap()
-            .sources
-            .pop()
-            .unwrap();
-        let file = FileBody::new(source, 0, size);
-        if change == "removed" {
-            std::fs::remove_file(&path).unwrap();
-        }
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let changed = path.clone();
-        // Answer each request after changing the source during the first.
-        let server = tokio::spawn(async move {
-            loop {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut headers = Vec::new();
-                while !headers.ends_with(b"\r\n\r\n") {
-                    headers.push(socket.read_u8().await.unwrap());
-                }
-                let source = std::fs::OpenOptions::new().append(true).open(&changed);
-                if change == "shrinks" {
-                    source.as_ref().unwrap().set_len(0).unwrap();
-                }
-                let mut body = (&mut socket).take(size);
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    tokio::io::copy(&mut body, &mut tokio::io::sink()),
-                )
-                .await;
-                if change == "grows" {
-                    std::io::Write::write_all(&mut source.as_ref().unwrap(), b"more").unwrap();
-                }
-                let _ = socket
-                    .write_all(b"HTTP/1.1 200 OK\r\nETag: \"e\"\r\nContent-Length: 0\r\n\r\n")
-                    .await;
-            }
-        });
-        let fallback = aws_smithy_http_client::Builder::new()
-            .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
-                aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
-            ))
-            .build_https();
-        let sdk = aws_sdk_s3::Client::from_conf(
-            aws_sdk_s3::config::Builder::new()
-                .behavior_version_latest()
-                .region(aws_sdk_s3::config::Region::new("us-east-1"))
-                .credentials_provider(aws_sdk_s3::config::Credentials::new(
-                    "test", "test", None, None, "fixture",
-                ))
-                .endpoint_url(endpoint)
-                .force_path_style(true)
-                .http_client(client(fallback, Arc::new(Cancellation::default())))
-                .request_checksum_calculation(
-                    aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
-                )
-                .build(),
-        );
-        let (attempts, _, error) = crate::s3::upload_send::tests::failed_upload(|| {
-            let request = sdk
-                .put_object()
-                .bucket("bucket")
-                .key("object")
-                .content_length(size as i64)
-                .body(body(size))
-                .customize()
-                .config_override(crate::s3::client::without_sdk_retries())
-                .disable_payload_signing()
-                .interceptor(file.clone());
-            let file = file.clone();
-            async move {
-                let result = request.send().await;
-                file.drain().await;
-                result
-            }
-        })
-        .await;
-        server.abort();
-        let expected = if change == "removed" {
-            "No such file"
-        } else {
-            "source changed during S3 copy"
-        };
-        assert_eq!(attempts, 1, "{change}: {error:#}");
-        assert!(
-            format!("{error:#}").contains(expected),
-            "{change}: {error:#}"
-        );
-    }
-}
 
 #[tokio::test]
 async fn cancellation_retires_buffered_and_file_uploads_and_rejects_new_requests() {
-    for synchronous in [false, true] {
+    for from_file in [false, true] {
         for phase in ["upload", "response-headers", "response-body"] {
             let await_response = phase != "upload";
             let temp = crate::test_support::tempdir().unwrap();
@@ -178,7 +31,6 @@ async fn cancellation_retires_buffered_and_file_uploads_and_rejects_new_requests
                 .sources
                 .pop()
                 .unwrap();
-            let file = FileBody::new(source, 0, size);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = format!("http://{}", listener.local_addr().unwrap());
             let (ready, started) = tokio::sync::oneshot::channel();
@@ -212,7 +64,7 @@ async fn cancellation_retires_buffered_and_file_uploads_and_rejects_new_requests
                 }
             });
             let cancellation = Arc::new(Cancellation::default());
-            let fallback = aws_smithy_http_client::Builder::new()
+            let transport = aws_smithy_http_client::Builder::new()
                 .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
                     aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
                 ))
@@ -230,14 +82,17 @@ async fn cancellation_retires_buffered_and_file_uploads_and_rejects_new_requests
                     )
                     .endpoint_url(endpoint)
                     .force_path_style(true)
-                    .http_client(client(fallback, cancellation.clone()))
+                    .http_client(client(transport, cancellation.clone()))
                     .request_checksum_calculation(
                         aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
                     )
                     .build(),
             );
-            let stream = if synchronous {
-                body(size)
+            let stream = if from_file {
+                let file = source.open().unwrap();
+                aws_sdk_s3::primitives::ByteStream::new(crate::s3::file_body::body(
+                    source, file, 0, size,
+                ))
             } else {
                 aws_sdk_s3::primitives::ByteStream::from(vec![0; size as usize])
             };
@@ -250,24 +105,13 @@ async fn cancellation_retires_buffered_and_file_uploads_and_rejects_new_requests
                 .customize()
                 .config_override(crate::s3::client::without_sdk_retries())
                 .disable_payload_signing();
-            let request = if synchronous {
-                request.interceptor(file.clone())
-            } else {
-                request
-            };
             let worker = tokio::spawn(request.send());
             let observed = tokio::time::timeout(Duration::from_secs(10), started).await;
-            // Also release the blocking worker if the fixture failed to start.
+            // Also release the request if the fixture failed to start.
             cancellation.cancel();
-            let outcome = tokio::time::timeout(Duration::from_secs(10), async {
-                let outcome = worker.await.unwrap();
-                file.drain().await;
-                outcome
-            })
-            .await;
+            let outcome = tokio::time::timeout(Duration::from_secs(10), worker).await;
             assert!(observed.unwrap().is_ok());
-            assert!(outcome.unwrap().is_err());
-            assert_eq!(file.active.count.load(Ordering::Acquire), 0);
+            assert!(outcome.unwrap().unwrap().is_err());
             tokio::time::timeout(Duration::from_secs(10), server)
                 .await
                 .unwrap()
@@ -307,7 +151,7 @@ async fn cancellation_retires_download_and_control_response_bodies() {
             assert!(matches!(socket.read(&mut buffer).await, Ok(0) | Err(_)));
         });
         let cancellation = Arc::new(Cancellation::default());
-        let fallback = aws_smithy_http_client::Builder::new()
+        let transport = aws_smithy_http_client::Builder::new()
             .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
                 aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
             ))
@@ -326,7 +170,7 @@ async fn cancellation_retires_download_and_control_response_bodies() {
                 .stalled_stream_protection(
                     aws_sdk_s3::config::StalledStreamProtectionConfig::disabled(),
                 )
-                .http_client(client(fallback, cancellation.clone()))
+                .http_client(client(transport, cancellation.clone()))
                 .build(),
         );
         let worker = tokio::spawn(async move {
@@ -418,7 +262,7 @@ async fn multipart_aborts_still_go_out_for_a_while_after_cancellation() {
         }
     });
     let cancellation = Arc::new(Cancellation::default());
-    let fallback = aws_smithy_http_client::Builder::new()
+    let transport = aws_smithy_http_client::Builder::new()
         .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
             aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
         ))
@@ -445,7 +289,7 @@ async fn multipart_aborts_still_go_out_for_a_while_after_cancellation() {
                 .stalled_stream_protection(
                     aws_sdk_s3::config::StalledStreamProtectionConfig::disabled(),
                 )
-                .http_client(client(fallback, cancellation.clone()))
+                .http_client(client(transport, cancellation.clone()))
                 .build(),
         );
     let abort = |key: &'static str| {
@@ -474,9 +318,9 @@ async fn multipart_aborts_still_go_out_for_a_while_after_cancellation() {
     assert!(partial.is_err());
     assert!(throttled.is_err());
     assert!(delete.is_err());
-    assert!(cancelled.elapsed() >= cancel::ABORT_GRACE);
+    assert!(cancelled.elapsed() >= ABORT_GRACE);
     // Not the 20 seconds the server asked the throttled abort to wait.
-    assert!(cancelled.elapsed() < cancel::ABORT_GRACE + Duration::from_secs(3));
+    assert!(cancelled.elapsed() < ABORT_GRACE + Duration::from_secs(3));
     // The grace is counted from cancellation, not from each abort.
     let late = tokio::time::Instant::now();
     assert!(abort("answered").await.is_err());
@@ -494,90 +338,4 @@ async fn multipart_aborts_still_go_out_for_a_while_after_cancellation() {
         );
     }
     server.abort();
-}
-
-#[path = "../../../tests/support/https.rs"]
-mod https;
-
-#[test]
-fn file_upload_uses_system_certificates() {
-    // A child process keeps its root-store cache and environment isolated even
-    // when this test is run with the multithreaded cargo test harness.
-    let Ok(endpoint) = std::env::var("SYQ_TEST_FILE_UPLOAD_TLS_ENDPOINT") else {
-        use crate::process::CommandExt as _;
-        let temp = crate::test_support::tempdir().unwrap();
-        let server = https::Server::start("127.0.0.1");
-        let ca = temp.path().join("ca.pem");
-        std::fs::write(&ca, &server.ca).unwrap();
-        std::fs::write(temp.path().join("source"), b"file upload through HTTPS").unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "s3::upload_http::tests::file_upload_uses_system_certificates",
-                "--nocapture",
-            ])
-            .current_dir(temp.path())
-            .env("SYQ_TEST_FILE_UPLOAD_TLS_ENDPOINT", server.url())
-            .env("SSL_CERT_FILE", ca)
-            .env_remove("SSL_CERT_DIR")
-            .env_remove("HTTPS_PROXY")
-            .env_remove("https_proxy")
-            .env_remove("ALL_PROXY")
-            .env_remove("all_proxy")
-            .capture_output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
-        let requests = server.requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].1, b"file upload through HTTPS");
-        return;
-    };
-    tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let args = crate::cli::Args::parse_args(
-            &["cp", "source", "--to", "s3://bucket", "--as", "object"]
-                .map(std::ffi::OsString::from),
-        )
-        .unwrap();
-        let source = crate::s3::local::upload_plan(&args)
-            .unwrap()
-            .sources
-            .pop()
-            .unwrap();
-        let size = std::fs::metadata("source").unwrap().len();
-        let file = FileBody::new(source, 0, size);
-        let fallback = aws_smithy_http_client::Builder::new()
-            .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
-                aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
-            ))
-            .build_https();
-        let sdk = aws_sdk_s3::Client::from_conf(
-            aws_sdk_s3::config::Builder::new()
-                .behavior_version_latest()
-                .region(aws_sdk_s3::config::Region::new("us-east-1"))
-                .credentials_provider(aws_sdk_s3::config::Credentials::new(
-                    "test", "test", None, None, "fixture",
-                ))
-                .timeout_config(crate::s3::client::request_timeouts())
-                .endpoint_url(endpoint)
-                .force_path_style(true)
-                .http_client(client(fallback, Arc::new(Cancellation::default())))
-                .request_checksum_calculation(
-                    aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
-                )
-                .build(),
-        );
-        sdk.put_object()
-            .bucket("bucket")
-            .key("object")
-            .content_length(size as i64)
-            .body(body(size))
-            .customize()
-            .config_override(crate::s3::client::without_sdk_retries())
-            .disable_payload_signing()
-            .interceptor(file.clone())
-            .send()
-            .await
-            .unwrap();
-        file.drain().await;
-    });
 }

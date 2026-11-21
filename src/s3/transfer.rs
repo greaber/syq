@@ -105,8 +105,9 @@ pub(super) struct Engine {
     client: Client,
     progress: Arc<Progress>,
     bandwidth: Option<crate::bwlimit::BandwidthLimit>,
-    /// Every destination key, when pruning listed them all before the copy.
-    upload_keys: OnceLock<HashMap<String, u64>>,
+    /// The destination keys under each listed prefix, when pruning listed
+    /// them before the copy.
+    upload_keys: OnceLock<DestinationListing>,
     /// Otherwise, the planned keys the destination listing has reached.
     discovery: OnceLock<Discovery>,
     copy_checksum_unsupported: std::sync::atomic::AtomicBool,
@@ -234,7 +235,50 @@ struct DownloadState {
     hash_algorithm: HashAlgorithm,
 }
 
+/// What listing an upload's destination found, and under which prefixes it
+/// looked. A key outside those prefixes was not looked for.
+#[derive(Default)]
+pub(super) struct DestinationListing {
+    prefixes: Vec<String>,
+    keys: HashMap<String, u64>,
+}
+impl DestinationListing {
+    fn covers(&self, key: &str) -> bool {
+        self.prefixes.iter().any(|prefix| key.starts_with(prefix))
+    }
+    /// The size of `key` when the listing found it, `Some(None)` when the
+    /// listing shows that it does not exist, and `None` when the listing
+    /// does not say.
+    fn size(&self, key: &str) -> Option<Option<u64>> {
+        match self.keys.get(key) {
+            Some(size) => Some(Some(*size)),
+            None => self.covers(key).then_some(None),
+        }
+    }
+}
+
 impl Engine {
+    /// The prefixes under which an upload's destination keys lie. A copy
+    /// another machine signs for lists only what that machine's signatures
+    /// cover (`authorization::upload_roots`); a named file there has no
+    /// prefix of its own and is checked with a request for its key.
+    fn destination_prefixes(&self) -> Result<Vec<String>> {
+        let roots = if self.authorization.is_some() {
+            super::authorization::upload_roots(&self.args, &self.options)?
+        } else {
+            vec![local::key_path(&self.args.locations.last().unwrap().path)?]
+        };
+        Ok(roots
+            .into_iter()
+            .map(|root| {
+                if root.is_empty() {
+                    root
+                } else {
+                    format!("{root}/")
+                }
+            })
+            .collect())
+    }
     fn expression_destination_path<'a>(&self, path: &'a str) -> &'a [u8] {
         let path = path.trim_end_matches('/');
         let root = self
@@ -317,7 +361,7 @@ impl Engine {
         self.cancelled.store(true, Relaxed);
         self.cancel_wake.notify_waiters();
         self.uploads.cancel();
-        // Drain started requests, including synchronous file bodies, before exit.
+        // Drain started requests before exit.
         let _ = work.await;
         match interrupted {
             Some(interrupted) => bail!("S3 copy {interrupted}; rerun the command to continue"),
@@ -370,8 +414,10 @@ impl Engine {
             }
             self.check_upload_placement(plan.first().map(|s| s.kind() != ObjectKind::Dir))
                 .await?;
-            self.discover_destination(&mut plan, |source| source.key.as_str().into())
-                .await?;
+            self.discover_destination(&mut plan, &prune.scopes, |source| {
+                source.key.as_str().into()
+            })
+            .await?;
             let workers = self.object_workers(plan.iter().map(|s| s.meta.len))?;
             self.progress.files_total.store(plan.len() as u64, Relaxed);
             self.progress.bytes_total.store(
@@ -383,6 +429,14 @@ impl Engine {
             );
             self.progress.scan_done.store(true, Relaxed);
             if self.authorization.is_some() {
+                // Preparation checks and hashes each file without asking the
+                // authorizing machine about it: the checks' requests are signed
+                // together first and the uploads' requests together afterwards.
+                // Each listed prefix's first page was signed before the
+                // listings started; a prefix's later pages, which continue
+                // from an earlier response, are signed as the listings reach
+                // them.
+                self.authorize_upload_checks(&plan).await?;
                 let prepared = Arc::new(Mutex::new(Vec::with_capacity(plan.len())));
                 let mut position = 0..;
                 parallel(plan, workers, |source, mut slot| {
@@ -407,7 +461,10 @@ impl Engine {
                     }
                 })
                 .await?;
+                let prepared = std::mem::take(&mut *prepared.lock().await);
                 let authorized = async {
+                    self.authorize_uploads(prepared.iter().map(|(_, _, _, _, work)| work))
+                        .await?;
                     self.prepare_pruning(&prune).await?;
                     self.finish_authorization().await?;
                     if self.args.prune_before {
@@ -416,7 +473,6 @@ impl Engine {
                     Ok::<_, anyhow::Error>(())
                 }
                 .await;
-                let prepared = std::mem::take(&mut *prepared.lock().await);
                 if let Err(error) = authorized {
                     for (_, _, _, _, work) in &prepared {
                         if let UploadPreparation::Ready(work) = work {
@@ -883,74 +939,133 @@ impl Engine {
         .into_bytes()
     }
     /// Learn which planned destination keys exist, so that new ones need no
-    /// HEAD. Pruning lists the whole destination first. Otherwise, where the
-    /// copy lists its destination, this puts `plan` in key order, the order
-    /// that listing follows.
+    /// HEAD. Pruning lists the destination first, everything under `pruned`
+    /// included. Otherwise, where the copy lists its destination, this puts
+    /// `plan` in key order, the order that listing follows.
+    ///
+    /// Both list under `destination_prefixes`: the destination, or for a
+    /// copy another machine signs for, each prefix its signatures cover.
     async fn discover_destination<T>(
         &self,
         plan: &mut [T],
+        pruned: &[Vec<u8>],
         key: impl for<'a> Fn(&'a T) -> std::borrow::Cow<'a, str>,
     ) -> Result<()> {
         if plan.len() < 2 || self.args.existing || self.args.ignore_existing {
             return Ok(());
         }
-        let target = local::key_path(&self.args.locations.last().unwrap().path)?;
-        let prefix = if target.is_empty() {
-            String::new()
-        } else {
-            format!("{target}/")
-        };
+        let prefixes = self.destination_prefixes()?;
         if !self.args.delete {
-            if !discovery::lists_destination(&self.args, &self.options.bucket) {
-                // Every key gets its HEAD, so a listing would save nothing.
-                // One request still goes first: the copy sizes its
-                // concurrency from a response seen before it starts, and a
-                // destination that cannot be listed fails here, as it does
-                // for the copies that list.
-                client::list_one(&self.client, &self.options.bucket, &prefix).await?;
-                return Ok(());
+            let lists = discovery::lists_destination(&self.args, &self.options.bucket);
+            if self.authorization.is_none() {
+                if !lists {
+                    // Every key gets its HEAD, so a listing would save
+                    // nothing. One request still goes first: the copy sizes
+                    // its concurrency from a response seen before it starts,
+                    // and a destination that cannot be listed fails here, as
+                    // it does for the copies that list.
+                    client::list_one(&self.client, &self.options.bucket, &prefixes[0]).await?;
+                    return Ok(());
+                }
+                plan.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
+                let keys = discovery::Keys::new(plan.iter().map(&key));
+                let whole = discovery::Segment::whole(prefixes[0].clone(), &keys);
+                return self.start_discovery(vec![whole], keys).await;
             }
-            plan.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
-            let discovery = Discovery::start(
-                self.client.clone(),
-                &self.options.bucket,
-                prefix,
-                discovery::Keys::new(plan.iter().map(key)),
-                self.cancelled.clone(),
-                self.progress.clone(),
-            )
-            .await?;
-            let _ = self.discovery.set(discovery);
+            // Under signatures, each signed prefix is listed for the planned
+            // keys beneath it.
+            if lists {
+                plan.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
+                let keys = discovery::Keys::new(plan.iter().map(&key));
+                let segments = discovery::segments(&keys, &prefixes);
+                if !segments.is_empty() {
+                    // Each prefix's first page is known now. Signing them
+                    // together saves a round trip to the signing machine
+                    // for each prefix the listing reaches.
+                    let ordered = super::listing::lists_in_key_order(&self.options.bucket);
+                    let divides = super::listing::lists_in_byte_order(
+                        self.options.endpoint.as_deref(),
+                        &self.options.bucket,
+                    );
+                    self.authorize_all(discovery::first_pages(&segments, &keys, ordered, divides))
+                        .await?;
+                    return self.start_discovery(segments, keys).await;
+                }
+            }
+            // Nothing to list: still send the request the copy sizes its
+            // concurrency from, under a signed prefix with planned keys
+            // beneath it if there is one.
+            let probe = plan
+                .iter()
+                .find_map(|t| {
+                    let key = key(t);
+                    prefixes
+                        .iter()
+                        .find(|prefix| key.starts_with(prefix.as_str()))
+                })
+                .unwrap_or(&prefixes[0]);
+            client::list_one(&self.client, &self.options.bucket, probe).await?;
             return Ok(());
         }
         // Pruning needs every destination key, including keys absent from
         // the plan. Only this complete cache is reusable by the deletion
         // planner.
-        let listing = client::list(
-            &self.client,
-            &self.options.bucket,
-            &prefix,
-            self.options.concurrency,
-        )
-        .await;
-        match listing {
-            Ok(listing) => {
-                let _ = self
-                    .upload_keys
-                    .set(listing.into_objects().into_iter().collect());
+        //
+        // A named file has nothing beneath its key for pruning to look
+        // through, so an upload another machine signs for does not list
+        // there. Every pruned directory stays covered.
+        let named = self.authorization.is_some() && self.options.route == Route::Upload;
+        let prefixes = prefixes
+            .into_iter()
+            .filter(|prefix| {
+                !named
+                    || pruned.iter().any(|scope| {
+                        scope.is_empty()
+                            || [scope.as_slice(), b"/"]
+                                .concat()
+                                .starts_with(prefix.as_bytes())
+                    })
+            })
+            .collect();
+        match self.list_completely(prefixes).await {
+            Ok(found) => {
+                if !found.prefixes.is_empty() {
+                    let _ = self.upload_keys.set(found);
+                }
+                Ok(())
             }
+            // Signing the first pages stops when the copy is cancelled.
+            Err(error) if self.cancelled.load(Relaxed) => Err(error),
             Err(error)
                 if error
                     .downcast_ref::<client::RequestFailure>()
                     .is_some_and(|failure| failure.region_mismatch()) =>
             {
-                return Err(error);
+                Err(error)
             }
             Err(error) => {
                 self.progress
                     .error(&format!("list S3 destination: {error:#}"));
+                Ok(())
             }
         }
+    }
+    async fn start_discovery(
+        &self,
+        segments: Vec<discovery::Segment>,
+        keys: discovery::Keys,
+    ) -> Result<()> {
+        let discovery = Discovery::start(
+            self.client.clone(),
+            self.options.endpoint.as_deref(),
+            &self.options.bucket,
+            segments,
+            keys,
+            self.cancelled.clone(),
+            self.progress.clone(),
+        )
+        .await?;
+        let _ = self.discovery.set(discovery);
         Ok(())
     }
     /// What a destination listing says about `key`, the plan's `position`th,
@@ -960,25 +1075,24 @@ impl Engine {
         position: usize,
         key: &str,
     ) -> impl std::future::Future<Output = Listed> + Send + 'static {
-        let complete = self.upload_keys.get().map(|keys| {
-            keys.get(key)
-                .map_or(Listed::Absent, |size| Listed::Present(*size))
-        });
-        let reached = self
-            .discovery
-            .get()
-            .map(|discovery| discovery.lookup(position));
-        let trusted = discovery::trusts_absence_of(&self.args, key);
-        async move {
-            match (complete, reached) {
-                (Some(listed), _) => listed,
-                (None, Some(reached)) => match reached.await {
-                    Listed::Absent if !trusted => Listed::Unknown,
-                    listed => listed,
-                },
-                (None, None) => Listed::Unknown,
-            }
-        }
+        discovery::listed(
+            &self.args,
+            self.upload_keys.get(),
+            self.discovery.get(),
+            position,
+            key,
+        )
+    }
+    /// What `listed` will say about `key`, if the listings have already
+    /// decided it.
+    fn known(&self, position: usize, key: &str) -> Option<Listed> {
+        discovery::known(
+            &self.args,
+            self.upload_keys.get(),
+            self.discovery.get(),
+            position,
+            key,
+        )
     }
     async fn check_upload_placement(&self, single_object: Option<bool>) -> Result<()> {
         if self.args.target_existence == Existence::Any {
@@ -1104,10 +1218,6 @@ impl Engine {
         )
         .await?;
         drop(_slot);
-        if let Err(error) = self.authorize_requests(update.requests()).await {
-            update.abort(&self.client, &self.options.bucket).await;
-            return Err(error);
-        }
         Ok(UploadPreparation::Ready(Box::new(PreparedUpload {
             source,
             size,
@@ -1405,10 +1515,6 @@ impl Engine {
             multipart,
             metadata_update: None,
         };
-        if let Err(error) = self.authorize_upload(&prepared).await {
-            self.abort_unrecorded_preparation(&prepared).await;
-            return Err(error);
-        }
         Ok(UploadPreparation::Ready(Box::new(prepared)))
     }
 
@@ -1467,27 +1573,20 @@ impl Engine {
         if size <= part_size || small.is_some() {
             let checksum = checksums.first().map(String::as_str);
             let _slot = self.tuning.requests.acquire().await;
-            let synchronous =
-                source.kind() == ObjectKind::File && small.is_none() && self.tuning.local_latency();
-            let sync_file =
-                synchronous.then(|| crate::s3::upload_http::FileBody::new(source.clone(), 0, size));
             self.upload_request(&source.key, None, algorithm, checksum)
                 .send(
                     content_md5(&source, small.as_ref(), 0, size),
                     |content_md5| {
-                        let (source, small, sync_file, metadata) =
-                            (&source, &small, &sync_file, &metadata);
+                        let (source, small, metadata) = (&source, &small, &metadata);
                         async move {
                             self.check_cancelled()?;
                             let body = if let Some(bytes) = &small {
                                 ByteStream::from(bytes.clone())
-                            } else if synchronous {
-                                crate::s3::upload_http::body(size)
                             } else {
                                 file_body(source, 0, size).await?
                             };
                             self.pace(size).await?;
-                            let request = self
+                            let result = self
                                 .client
                                 .put_object()
                                 .bucket(&self.options.bucket)
@@ -1500,16 +1599,9 @@ impl Engine {
                                 .set_if_none_match(must_be_new.then(|| "*".into()))
                                 .customize()
                                 .config_override(super::client::without_sdk_retries())
-                                .disable_payload_signing();
-                            let request = if let Some(file) = &sync_file {
-                                request.interceptor(file.clone())
-                            } else {
-                                request
-                            };
-                            let result = request.send().await;
-                            if let Some(file) = &sync_file {
-                                file.drain().await;
-                            }
+                                .disable_payload_signing()
+                                .send()
+                                .await;
                             Ok(result)
                         }
                     },
@@ -1596,26 +1688,15 @@ impl Engine {
                                 }
                             }
                             let _slot = self.tuning.requests.acquire().await;
-                            let sync_file = self.tuning.local_latency().then(|| {
-                                crate::s3::upload_http::FileBody::new(
-                                    source.clone(),
-                                    offset,
-                                    length,
-                                )
-                            });
                             let output = self
                                 .upload_request(&source.key, Some(number), algorithm, checksum)
-                                .send(content_md5(source, None, offset, length), |content_md5| {
-                                    let sync_file = &sync_file;
-                                    async move {
+                                .send(
+                                    content_md5(source, None, offset, length),
+                                    |content_md5| async move {
                                         self.check_cancelled()?;
-                                        let body = if sync_file.is_some() {
-                                            crate::s3::upload_http::body(length)
-                                        } else {
-                                            file_body(source, offset, length).await?
-                                        };
+                                        let body = file_body(source, offset, length).await?;
                                         self.pace(length).await?;
-                                        let request = self
+                                        let result = self
                                             .client
                                             .upload_part()
                                             .bucket(&self.options.bucket)
@@ -1630,19 +1711,12 @@ impl Engine {
                                             .set_content_md5(content_md5)
                                             .customize()
                                             .config_override(super::client::without_sdk_retries())
-                                            .disable_payload_signing();
-                                        let request = if let Some(file) = &sync_file {
-                                            request.interceptor(file.clone())
-                                        } else {
-                                            request
-                                        };
-                                        let result = request.send().await;
-                                        if let Some(file) = &sync_file {
-                                            file.drain().await;
-                                        }
+                                            .disable_payload_signing()
+                                            .send()
+                                            .await;
                                         Ok(result)
-                                    }
-                                })
+                                    },
+                                )
                                 .await?
                                 .map_err(|e| e.into_service_error())
                                 .context("upload part; rerun the command to resume")?;
@@ -2077,6 +2151,7 @@ impl Engine {
                     exact,
                     client::list_with_times(
                         &self.client,
+                        self.options.endpoint.as_deref(),
                         source_bucket,
                         &prefix,
                         matcher.as_ref(),
@@ -2128,6 +2203,7 @@ impl Engine {
                         None => {
                             client::list_with_times(
                                 &self.client,
+                                self.options.endpoint.as_deref(),
                                 source_bucket,
                                 &prefix,
                                 matcher.as_ref(),
@@ -3858,6 +3934,49 @@ fn symlink_metadata_differs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An engine for `argv`, a `syq` command line, that sends nothing.
+    pub(super) fn engine(argv: &[&str]) -> Engine {
+        let args = Arc::new(
+            Args::parse_args(
+                &argv
+                    .iter()
+                    .map(std::ffi::OsString::from)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        );
+        let options = args.s3.clone().unwrap();
+        let tuning = crate::s3::tuning::Tuning::new(
+            &options,
+            &args,
+            Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+        );
+        let config = aws_sdk_s3::config::Builder::new()
+            .behavior_version_latest()
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .build();
+        Engine {
+            args,
+            options,
+            tuning,
+            client: Client::from_conf(config),
+            progress: Progress::new(false, false, None),
+            bandwidth: None,
+            upload_keys: OnceLock::new(),
+            discovery: OnceLock::new(),
+            authorization: None,
+            copy_checksum_unsupported: Default::default(),
+            content_md5: Default::default(),
+            file_permissions: Default::default(),
+            metadata_replacements: Default::default(),
+            copy_tagging_unsupported: Default::default(),
+            outage: Default::default(),
+            cancelled: Default::default(),
+            cancel_wake: Default::default(),
+            uploads: Default::default(),
+        }
+    }
 
     #[test]
     fn native_upload_identity_binds_parts_algorithm_and_boundaries() {

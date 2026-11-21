@@ -1719,3 +1719,23 @@ fn selector_and_placement_tables_match_the_parser() {
         );
     }
 }
+
+/// An attached value ends a variadic option, as in clap, so a `-` after it
+/// is the next positional argument, a path named `-`; after a detached
+/// value it would be another value, and is refused as before.
+#[test]
+fn a_dash_after_an_attached_variadic_value_is_positional() {
+    let argv = |words: &[&str]| words.iter().map(OsString::from).collect::<Vec<_>>();
+    for option in ["--src-non-dirs", "--src-dirs", "--srcs"] {
+        let attached = format!("{option}=d");
+        super::reject_detached_dash_native_values(&argv(&[&attached, "-", "out"])).unwrap();
+        super::reject_detached_dash_native_values(&argv(&[&attached, "e", "-"])).unwrap();
+        for detached in [&[option, "d", "-", "out"][..], &[option, "d", "e", "-"]] {
+            let error = super::reject_detached_dash_native_values(&argv(detached)).unwrap_err();
+            assert!(
+                error.to_string().contains(&format!("use {option}=-")),
+                "{detached:?}: {error:#}"
+            );
+        }
+    }
+}

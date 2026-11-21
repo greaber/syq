@@ -2800,8 +2800,20 @@ impl FsOps {
         if u64::from(len) > MAX_READ_BYTES {
             bail!("read length {len} exceeds the {MAX_READ_BYTES}-byte protocol limit");
         }
-        let mut data = vec![0u8; len as usize];
-        self.read_source_into(path, source, attempt, off, &mut data)?;
+        let len = len as usize;
+        let mut data = match self.read_buffer.take() {
+            Some(mut data) => {
+                // Exact, so a slightly longer range does not double the buffer.
+                data.reserve_exact(len.saturating_sub(data.len()));
+                data.resize(len, 0);
+                data
+            }
+            None => vec![0u8; len],
+        };
+        if let Err(error) = self.read_source_into(path, source, attempt, off, &mut data) {
+            self.read_buffer = Some(data);
+            return Err(error);
+        }
         let hash = if self.hash_policy.transfer_integrity {
             let _hash = self
                 .operation
@@ -2811,6 +2823,19 @@ impl FsOps {
             [0; 32]
         };
         Ok(Response::Block { off, hash, data })
+    }
+
+    /// Keep a `read_range` buffer whose bytes were sent, so the next range
+    /// read reuses its allocation. One is kept, no larger than a read may be.
+    pub(crate) fn reuse_read_buffer(&mut self, buffer: Vec<u8>) {
+        if self.read_buffer.is_none() && buffer.capacity() as u64 <= MAX_READ_BYTES {
+            self.read_buffer = Some(buffer);
+        }
+    }
+
+    /// Free the kept buffer while this connection reads no ranges.
+    pub(crate) fn release_read_buffer(&mut self) {
+        self.read_buffer = None;
     }
 
     /// Fill `data` from a source at `off`.

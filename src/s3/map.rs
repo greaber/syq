@@ -29,6 +29,8 @@ pub(crate) fn run(args: &Args, options: &Options, out: &mut impl Write) -> Resul
             let store = listing::S3 {
                 client: client.clone(),
                 bucket: &storage.bucket,
+                // `map` reads pages one by one and never divides a listing.
+                divides: false,
             };
             let mut emitter = Emitter {
                 out,

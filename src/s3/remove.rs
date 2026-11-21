@@ -224,6 +224,7 @@ pub(super) fn selector_key(base: &str, location: &Location, exact_version: bool)
 async fn plan(
     args: &Args,
     client: &Client,
+    endpoint: Option<&str>,
     progress: &Progress,
     summary: &mut RmResultRecord,
 ) -> Result<Vec<Entry>> {
@@ -282,6 +283,7 @@ async fn plan(
             if !use_versions {
                 listed = client::list(
                     client,
+                    endpoint,
                     bucket,
                     &prefix,
                     args.s3.as_ref().unwrap().concurrency,
@@ -463,7 +465,14 @@ pub(super) fn run(args: Args) -> Result<i32> {
             if let Some(note) = note.filter(|_| args.verbose > 0 && !args.quiet) {
                 progress.println(&note);
             }
-            let entries = plan(&args, &client, &progress, &mut summary).await?;
+            let entries = plan(
+                &args,
+                &client,
+                options.endpoint.as_deref(),
+                &progress,
+                &mut summary,
+            )
+            .await?;
             if let Some(authorization) = &authorization {
                 if !args.dry_run {
                     let mut requests = Vec::with_capacity(entries.len());

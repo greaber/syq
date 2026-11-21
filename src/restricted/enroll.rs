@@ -440,12 +440,14 @@ pub(super) fn is_enrollment_transport_failure(error: &anyhow::Error) -> bool {
 }
 
 /// Shell commands that make the store's directory `$d` and stage the
-/// uploaded syq at `$p` in it, removed again when the shell exits.
+/// uploaded syq at `$p` in it, removed again when the shell exits. An empty
+/// upload, as when the enrolling machine could not get the build, is
+/// refused rather than run as an empty script.
 /// Directories above the store follow the umask; the store's own are the
 /// owner's alone.
 fn stage_commands(stage: &str) -> String {
     format!(
-        "d=\"$HOME/{store}\"; p=\"$d/{stage}\"; mkdir -p -- \"$HOME/.local/lib\"; umask 077; mkdir -p -- \"$d\"; trap 'rm -f -- \"$p\"' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; cat >\"$p\"; chmod 700 \"$p\"",
+        "d=\"$HOME/{store}\"; p=\"$d/{stage}\"; mkdir -p -- \"$HOME/.local/lib\"; umask 077; mkdir -p -- \"$d\"; trap 'rm -f -- \"$p\"' EXIT; trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; cat >\"$p\"; if [ ! -s \"$p\" ]; then echo 'syq: the uploaded syq is empty' >&2; exit 1; fi; chmod 700 \"$p\"",
         store = crate::user_dirs::BINARY_STORE_IN_HOME,
     )
 }
@@ -1453,7 +1455,11 @@ pub(super) fn install_remote_command(stage: &str, action: ManagementAction) -> S
         "for f in \"$s\"/*/syq; do t=${f%/syq}; t=${t##*/}; if stored \"$t\"; then printf '%s ' \"$t\"; fi; done".to_owned(),
         "printf '\\n'".to_owned(),
         match action {
-            ManagementAction::Install => "if test -f \"$HOME/.ssh/authorized_keys\"; then wc -c <\"$HOME/.ssh/authorized_keys\"; cat \"$HOME/.ssh/authorized_keys\"; else printf '0\\n'; fi",
+            // One read of the file gives both the count and the bytes, so a
+            // file rewritten meanwhile cannot make them disagree. The `x`
+            // keeps trailing newlines, which `$(...)` drops, and a failed
+            // `cat` still stops the script.
+            ManagementAction::Install => "if test -f \"$HOME/.ssh/authorized_keys\"; then k=$(cat \"$HOME/.ssh/authorized_keys\" && printf x); k=${k%x}; printf '%s' \"$k\" | wc -c; printf '%s' \"$k\"; else printf '0\\n'; fi",
             // Revoking finds no login key, and the revoker reads the file
             // itself, under its lock.
             ManagementAction::Revoke => "printf '0\\n'",

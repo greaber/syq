@@ -7,7 +7,7 @@ use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::ops::{Deref, DerefMut, Index, IndexMut};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The values used by the tuner's remaining-work gate. No paths or file identities.
 #[derive(Clone, Copy, Debug, serde::Serialize)]
@@ -693,6 +693,11 @@ pub struct Sched {
     inner: Mutex<Inner>,
     cv: Condvar,
     tune_cv: Condvar,
+    /// Whether the copy is aborted, for workers pacing under `--bwlimit`
+    /// (`sleep_unless_aborted`), with what wakes them on `abort`. Its own
+    /// lock keeps paced sleeps off `inner`, which every worker takes, and
+    /// `cv` wakes for every queued file.
+    paced_abort: (Mutex<bool>, Condvar),
     direct_fallback_workers: AtomicUsize,
     initial_range_workers: AtomicUsize,
     tune_request: AtomicUsize,
@@ -755,6 +760,7 @@ impl Sched {
             }),
             cv: Condvar::new(),
             tune_cv: Condvar::new(),
+            paced_abort: Default::default(),
             direct_fallback_workers: AtomicUsize::new(0),
             initial_range_workers: AtomicUsize::new(0),
             tune_request: AtomicUsize::new(0),
@@ -1005,12 +1011,27 @@ impl Sched {
     pub fn abort(&self) {
         self.inner.lock().unwrap().abort = true;
         self.cv.notify_all();
+        *self.paced_abort.0.lock().unwrap() = true;
+        self.paced_abort.1.notify_all();
         self.tune_cv.notify_one();
         self.worker_setups.cancel();
     }
 
     pub fn is_aborted(&self) -> bool {
         self.inner.lock().unwrap().abort
+    }
+
+    /// Sleep until `until`, or until the copy is aborted.
+    pub fn sleep_unless_aborted(&self, until: Instant) {
+        let (aborted, woken) = &self.paced_abort;
+        let mut aborted = aborted.lock().unwrap();
+        loop {
+            let now = Instant::now();
+            if *aborted || now >= until {
+                return;
+            }
+            aborted = woken.wait_timeout(aborted, until - now).unwrap().0;
+        }
     }
 
     /// A command-restricted receiver now holds this file unfinished.

@@ -1,14 +1,17 @@
-//! Cancel every S3 request and streaming response, and close the sockets
-//! that blocking file uploads register.
+//! Cancel every S3 request and streaming response.
 use aws_smithy_runtime_api::client::{
-    http::HttpConnectorFuture, orchestrator::HttpRequest, result::ConnectorError,
+    http::{
+        http_client_fn, HttpClient, HttpConnector, HttpConnectorFuture, SharedHttpClient,
+        SharedHttpConnector,
+    },
+    orchestrator::HttpRequest,
+    result::ConnectorError,
 };
 use std::{
     future::Future,
     io,
-    net::{Shutdown, TcpStream},
     pin::Pin,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex},
     task::{Context, Poll},
     time::Duration,
 };
@@ -18,7 +21,6 @@ use tokio::sync::Notify;
 struct State {
     /// When the copy was cancelled.
     cancelled: Option<tokio::time::Instant>,
-    sockets: Vec<Weak<TcpStream>>,
 }
 
 /// How long a multipart upload's abort may still run after cancellation.
@@ -41,38 +43,18 @@ pub(in crate::s3) struct Cancellation {
     changed: Arc<Notify>,
 }
 
-pub(super) fn interrupted() -> io::Error {
+fn interrupted() -> io::Error {
     io::Error::new(io::ErrorKind::Interrupted, "S3 copy cancelled")
 }
 
 impl Cancellation {
     pub fn cancel(&self) {
-        let sockets = {
-            let mut state = self.state.lock().unwrap();
-            state
-                .cancelled
-                .get_or_insert_with(tokio::time::Instant::now);
-            std::mem::take(&mut state.sockets)
-        };
+        self.state
+            .lock()
+            .unwrap()
+            .cancelled
+            .get_or_insert_with(tokio::time::Instant::now);
         self.changed.notify_waiters();
-        for socket in sockets.into_iter().filter_map(|s| s.upgrade()) {
-            let _ = socket.shutdown(Shutdown::Both);
-        }
-    }
-
-    pub(super) fn is_cancelled(&self) -> bool {
-        self.state.lock().unwrap().cancelled.is_some()
-    }
-
-    pub(super) fn register(&self, socket: &Arc<TcpStream>) -> io::Result<()> {
-        let mut state = self.state.lock().unwrap();
-        if state.cancelled.is_some() {
-            socket.shutdown(Shutdown::Both)?;
-            return Err(interrupted());
-        }
-        state.sockets.retain(|s| s.strong_count() > 0);
-        state.sockets.push(Arc::downgrade(socket));
-        Ok(())
     }
 
     /// Resolves when a request must stop: at cancellation, or `grace` after
@@ -93,7 +75,7 @@ impl Cancellation {
         }
     }
 
-    pub(super) fn wrap(
+    fn wrap(
         self: &Arc<Self>,
         request: HttpRequest,
         send: impl FnOnce(HttpRequest) -> HttpConnectorFuture,
@@ -120,6 +102,32 @@ impl Cancellation {
 }
 
 type Stop = Pin<Box<dyn Future<Output = ()> + Send + Sync>>;
+
+/// Wraps `transport` so that `cancellation` stops each of its requests and
+/// response bodies.
+pub(super) fn client(
+    transport: SharedHttpClient,
+    cancellation: Arc<Cancellation>,
+) -> SharedHttpClient {
+    http_client_fn(move |settings, components| {
+        SharedHttpConnector::new(Connector {
+            inner: transport.http_connector(settings, components),
+            cancellation: cancellation.clone(),
+        })
+    })
+}
+
+#[derive(Clone, Debug)]
+struct Connector {
+    inner: SharedHttpConnector,
+    cancellation: Arc<Cancellation>,
+}
+impl HttpConnector for Connector {
+    fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+        self.cancellation
+            .wrap(request, |request| self.inner.call(request))
+    }
+}
 
 /// The SDK's sleeps, such as its retry backoff, for a client this cancels.
 /// After cancellation none lasts past the abort grace, so an abort that the
@@ -174,3 +182,6 @@ impl http_body::Body for ResponseBody {
         self.body.size_hint()
     }
 }
+
+#[cfg(test)]
+mod tests;

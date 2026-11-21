@@ -185,6 +185,11 @@ fn open_waiting(path: &Path, lock_wait: Duration) -> Result<Connection> {
         .recursive(true)
         .mode(0o700)
         .create(parent)?;
+    // Only create and check the file here; SQLite opens its own. Close this
+    // before SQLite opens the file: closing any descriptor on a file
+    // releases every POSIX lock the process holds on it, SQLite's included.
+    // It also keeps the history's descriptors to SQLite's while a copy
+    // counts its open descriptors (`require_source_descriptor_capacity`).
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -194,6 +199,7 @@ fn open_waiting(path: &Path, lock_wait: Duration) -> Result<Connection> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     anyhow::ensure!(file.metadata()?.is_file(), "history is not a regular file");
+    drop(file);
     let mut db = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE

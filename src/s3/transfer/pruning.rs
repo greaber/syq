@@ -261,14 +261,20 @@ impl Engine {
                 if !prefix.is_empty() {
                     prefix.push('/');
                 }
-                let listed = match self.upload_keys.get() {
-                    Some(keys) => keys
+                let listed = match self
+                    .upload_keys
+                    .get()
+                    .filter(|listed| listed.covers(&prefix))
+                {
+                    Some(listed) => listed
+                        .keys
                         .iter()
                         .filter(|(key, _)| key.starts_with(&prefix))
                         .map(|(key, size)| (key.clone(), *size))
                         .collect(),
                     None => client::list(
                         &self.client,
+                        self.options.endpoint.as_deref(),
                         &self.options.bucket,
                         &prefix,
                         self.options.concurrency,
@@ -336,6 +342,48 @@ impl Engine {
         }
     }
 
+    /// Every destination key under each of `prefixes`, for pruning, which
+    /// needs complete listings. Like the listing that follows the plan, this
+    /// lists several prefixes at once ([`discovery::LISTINGS`]), and under a
+    /// signer has their first pages signed together beforehand rather than
+    /// one exchange with the signing machine as each listing starts. The
+    /// listings' requests together stay within what one listing sends at a
+    /// time. A listing that takes long holds up only its own prefix. An
+    /// error is that of the first listing to fail.
+    pub(super) async fn list_completely(
+        &self,
+        prefixes: Vec<String>,
+    ) -> Result<DestinationListing> {
+        // The first request a complete listing sends.
+        self.authorize_all(
+            prefixes
+                .iter()
+                .map(|prefix| crate::s3::listing::first_page_request(prefix, None)),
+        )
+        .await?;
+        let concurrency = self.options.concurrency;
+        let slots = tokio::sync::Semaphore::new(concurrency.clamp(1, client::LISTING_REQUESTS));
+        let mut listings = stream::iter(&prefixes)
+            .map(|prefix| {
+                client::list_sharing(
+                    &self.client,
+                    self.options.endpoint.as_deref(),
+                    &self.options.bucket,
+                    prefix,
+                    concurrency,
+                    &slots,
+                )
+            })
+            .buffer_unordered(discovery::LISTINGS);
+        let mut found = DestinationListing::default();
+        while let Some(listing) = listings.next().await {
+            found.keys.extend(listing?.into_objects());
+        }
+        drop(listings);
+        found.prefixes = prefixes;
+        Ok(found)
+    }
+
     pub(super) async fn prepare_pruning(&self, plan: &Plan) -> Result<()> {
         if self.authorization.is_none() || !self.args.delete {
             return Ok(());
@@ -343,26 +391,20 @@ impl Engine {
         // Cache complete listings before disconnect. The pruning pass reuses the
         // snapshot and still skips deletions if any copy failed.
         if self.upload_keys.get().is_none() {
-            let mut keys = HashMap::new();
-            for scope in &plan.scopes {
-                let key = std::str::from_utf8(scope)?;
-                let prefix = if key.is_empty() {
-                    String::new()
-                } else {
-                    format!("{key}/")
-                };
-                keys.extend(
-                    client::list(
-                        &self.client,
-                        &self.options.bucket,
-                        &prefix,
-                        self.options.concurrency,
-                    )
-                    .await?
-                    .into_objects(),
-                );
-            }
-            let _ = self.upload_keys.set(keys);
+            let prefixes = plan
+                .scopes
+                .iter()
+                .map(|scope| {
+                    let key = std::str::from_utf8(scope)?;
+                    Ok(if key.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{key}/")
+                    })
+                })
+                .collect::<Result<_>>()?;
+            let listed = self.list_completely(prefixes).await?;
+            let _ = self.upload_keys.set(listed);
         }
         if self.args.dry_run {
             return Ok(());
@@ -375,7 +417,16 @@ impl Engine {
             .map(|candidate| {
                 crate::s3::authorization::Unsigned::new("DELETE", candidate.key.as_ref().unwrap())
             })
-            .collect();
+            .collect::<Vec<_>>();
+        // More deletions than --max-delete allows are refused together
+        // later, so none of them needs a signature.
+        if self
+            .args
+            .max_delete
+            .is_some_and(|max| requests.len() as u64 > max)
+        {
+            return Ok(());
+        }
         self.authorize_requests(requests).await
     }
 

@@ -2671,6 +2671,97 @@ fn management_stage_is_scoped_to_one_shell_session() {
     );
     assert_eq!(output.status.code(), Some(23));
     assert!(!store.join(".syq-stage-test").exists());
+
+    // An empty upload, as when the enrolling machine could not get the
+    // build, is refused rather than run as an empty script.
+    let output = invoke(temporary.path(), b"", b"empty request");
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("syq: the uploaded syq is empty"), "{error}");
+    assert!(output.stdout.ends_with(b"upload\n"), "{:?}", output.stdout);
+    assert!(!store.join(".syq-stage-test").exists());
+}
+
+/// The greeting's `authorized_keys` byte count and the bytes after it come
+/// from one read of the file: one that changes in between, as when another
+/// enrollment or a revocation rewrites it, cannot leave the enrolling
+/// machine waiting for bytes that never come, or reading keys as the
+/// session's answer.
+#[test]
+fn the_greetings_authorized_keys_count_matches_the_keys_sent() {
+    let real_wc = std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join("wc"))
+                .find(|wc| wc.is_file())
+        })
+        .expect("wc on PATH");
+    let keys = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOriginalKeyLine original\n";
+    for (case, changed) in [
+        ("shrinks", "ssh-ed25519 short\n".to_owned()),
+        (
+            "grows",
+            format!("{keys}ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAnotherKey added\n"),
+        ),
+    ] {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let home = temporary.path().join("home");
+        fs::create_dir_all(home.join(".ssh")).unwrap();
+        fs::write(home.join(".ssh/authorized_keys"), keys).unwrap();
+        // A `wc` that, once it has counted, rewrites the file, as another
+        // command could at that moment.
+        let tools = temporary.path().join("tools");
+        crate::test_support::write_executable(
+            &tools.join("wc"),
+            format!(
+                "#!/bin/sh\n{wc} \"$@\"; status=$?\nprintf '%s' '{changed}' > \"$HOME/.ssh/authorized_keys\"\nexit $status\n",
+                wc = real_wc.display(),
+            ),
+            0o700,
+        );
+        let path = std::env::join_paths(
+            std::iter::once(tools).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(install_remote_command(
+                ".syq-stage-test",
+                ManagementAction::Install,
+            ))
+            .env("HOME", &home)
+            .env("PATH", path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_guarded()
+            .unwrap();
+        // A request with no stored build: the session answers `upload`.
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"{\"request\":1}\n\n\n#!/bin/sh\ncat >/dev/null\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let mut rest = &output.stdout[..];
+        for _ in 0..9 {
+            let end = rest.iter().position(|&byte| byte == b'\n').unwrap();
+            rest = &rest[end + 1..];
+        }
+        let end = rest.iter().position(|&byte| byte == b'\n').unwrap();
+        let count: usize = std::str::from_utf8(&rest[..end])
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        rest = &rest[end + 1..];
+        assert!(
+            rest.len() >= count && rest[count..].starts_with(b"upload\n"),
+            "{case}: {count} bytes declared, then {:?}",
+            String::from_utf8_lossy(rest)
+        );
+    }
 }
 
 #[test]
@@ -15576,4 +15667,45 @@ fn paths_lie_beneath_a_prefix_only_across_a_slash() {
     assert!(!RestrictedAuthority::scope_allows(&scope(false), b"/a/b/c"));
     assert!(RestrictedAuthority::scope_allows(&scope(true), b"/a/b/c"));
     assert!(!RestrictedAuthority::scope_allows(&scope(true), b"/a/bc"));
+}
+
+/// Requests that each find a state directory missing create it at once, as
+/// two approvals arriving together do for the enrollments directory: those
+/// that lose the race use the directory the winner made.
+#[test]
+fn requests_creating_a_state_directory_at_once_all_use_it() {
+    for _ in 0..20 {
+        let root = crate::test_support::tempdir().unwrap();
+        let directory = root.path().join("enrollments");
+        let start = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    start.wait();
+                    ensure_directory(&directory, 0o700).unwrap();
+                });
+            }
+        });
+        assert!(directory.is_dir());
+    }
+}
+
+/// A symlink or a file where a state directory belongs is refused, even a
+/// symlink to a real directory.
+#[test]
+fn a_state_directory_must_be_a_real_directory() {
+    let root = crate::test_support::tempdir().unwrap();
+    let real = root.path().join("real");
+    fs::create_dir(&real).unwrap();
+    let link = root.path().join("link");
+    symlink(&real, &link).unwrap();
+    let file = root.path().join("file");
+    fs::write(&file, b"").unwrap();
+    for path in [&link, &file] {
+        let error = ensure_directory(path, 0o700).unwrap_err();
+        assert!(
+            format!("{error:#}").ends_with("is not a real directory"),
+            "{error:#}"
+        );
+    }
 }

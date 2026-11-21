@@ -313,6 +313,28 @@ async fn pending_read_exact_keeps_consumed_bytes_across_observations() {
     assert_eq!(&bytes, b"abcd");
 }
 
+#[test]
+fn far_small_uploads_start_with_at_most_2048_objects_below_32_ms() {
+    let start = |ms| {
+        let mut engine = planning_engine(&[]);
+        engine.options.route = Route::Upload;
+        engine.tuning.observe_control(Duration::from_millis(ms));
+        let workers = engine
+            .object_workers(std::iter::repeat_n(1024, 10_000))
+            .unwrap();
+        assert_eq!(engine.tuning.request_limit(), workers.initial, "{ms} ms");
+        workers.initial
+    };
+    // Only a capacity above 2,048 shows the lower start; raise the soft
+    // descriptor limit as the binary does at startup.
+    crate::raise_nofile();
+    let capacity = start(100);
+    assert!(capacity > 2048, "small-object capacity {capacity}");
+    assert_eq!(start(32), capacity);
+    assert_eq!(start(20), capacity.min(2048));
+    assert_eq!(start(31), capacity.min(2048));
+}
+
 pub(super) fn planning_engine(extra: &[&str]) -> Engine {
     let argv = [
         "cp",
@@ -322,46 +344,7 @@ pub(super) fn planning_engine(extra: &[&str]) -> Engine {
         "--as",
         "destination",
     ];
-    let args = Arc::new(
-        Args::parse_args(
-            &argv
-                .iter()
-                .chain(extra)
-                .map(std::ffi::OsString::from)
-                .collect::<Vec<_>>(),
-        )
-        .unwrap(),
-    );
-    let options = args.s3.clone().unwrap();
-    let tuning = crate::s3::tuning::Tuning::new(
-        &options,
-        &args,
-        Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
-    );
-    let config = aws_sdk_s3::config::Builder::new()
-        .behavior_version_latest()
-        .region(aws_sdk_s3::config::Region::new("us-east-1"))
-        .build();
-    Engine {
-        args,
-        options,
-        tuning,
-        client: Client::from_conf(config),
-        progress: Progress::new(false, false, None),
-        bandwidth: None,
-        upload_keys: OnceLock::new(),
-        discovery: OnceLock::new(),
-        authorization: None,
-        copy_checksum_unsupported: Default::default(),
-        content_md5: Default::default(),
-        file_permissions: Default::default(),
-        metadata_replacements: Default::default(),
-        copy_tagging_unsupported: Default::default(),
-        outage: Default::default(),
-        cancelled: Default::default(),
-        cancel_wake: Default::default(),
-        uploads: Default::default(),
-    }
+    super::super::tests::engine(&[&argv, extra].concat())
 }
 
 #[test]

@@ -38,6 +38,9 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(15);
 /// bind a starting service only reads its preferences and endpoint record;
 /// a stopping one leaves at most one 1-second query unanswered.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(2);
+/// When a switch says it still waits for an old service's answer to a
+/// request to stop once idle.
+const SLOW_ANSWER_NOTE: Duration = Duration::from_secs(2);
 /// How often the service looks at its scope, its preferences and the file
 /// it follows, which bounds how long a change takes to be noticed.
 const TICK: Duration = Duration::from_millis(200);
@@ -1810,7 +1813,7 @@ fn replace_other(
             }
             // A connection it lost meanwhile leaves the old one receiving.
             successor.still_logged_in(control, &remote.label())?;
-            if stop_when_idle(control)? {
+            if stop_when_idle(control, &remote.label())? {
                 successor.take_over()?;
                 return Ok(Some(Receiving::Started));
             }
@@ -1834,18 +1837,50 @@ fn replace_other(
 /// It then only waits for that process to exit. Another service
 /// may take the control meanwhile, and nothing is sent that could stop it;
 /// the caller looks again at whoever owns the control.
-fn stop_when_idle(control: &Path) -> Result<bool> {
-    let answer = send(
-        control,
-        &LocalRequest {
-            version: VERSION,
-            stop: false,
-            decision: None,
-            retry: false,
-            restart: false,
-            stop_if_idle: true,
-        },
-    )?;
+///
+/// The service answers requests one at a time, so others may come first:
+/// wait for its answer as long as for it to stop, saying so once after
+/// [`SLOW_ANSWER_NOTE`]. A service of an earlier build stops once it
+/// decides, even when nobody waits for the answer any more, so giving up
+/// sooner could leave nothing receiving. `endpoint` is its server.
+fn stop_when_idle(control: &Path, endpoint: &str) -> Result<bool> {
+    let request = LocalRequest {
+        version: VERSION,
+        stop: false,
+        decision: None,
+        retry: false,
+        restart: false,
+        stop_if_idle: true,
+    };
+    let exchange = || {
+        // Only the owner of the socket is checked, as in `send`.
+        let mut socket = crate::service::connect(
+            &suffixed(control, SOCKET),
+            STOP_TIMEOUT - SLOW_ANSWER_NOTE,
+            false,
+        )?;
+        crate::destination::write_message(&mut socket, &request)?;
+        if !crate::sys::readable_within(socket.as_raw_fd(), SLOW_ANSWER_NOTE) {
+            crate::output::diagnostic!(
+                "syq: waiting for the old receiving service through {endpoint} to answer whether it is idle"
+            );
+        }
+        decode_status(control, read_status(&mut socket)?)
+    };
+    let answer = match exchange() {
+        Ok(answer) => answer,
+        // Without an answer: a service that has gone has stopped.
+        Err(error) if crate::service::unanswered(&error) => {
+            if !crate::service::is_running(&suffixed(control, LOCK))? {
+                return Ok(true);
+            }
+            return Err(error.context(format!(
+                "receiving service did not answer at {} whether it is idle",
+                suffixed(control, SOCKET).display()
+            )));
+        }
+        Err(error) => return Err(error),
+    };
     if !answer.stopping {
         return Ok(false);
     }
@@ -2152,8 +2187,9 @@ fn busy(workers: &[ProfileWorker]) -> Busy {
         accounts_in_use: accounts.iter().map(|a| a.in_use).sum(),
     }
 }
-/// Refuse new requests on every worker if all are idle, so the service can
+/// Hold new requests on every worker if all are idle, so the service can
 /// stop to switch builds without cutting anything off; whether it did.
+/// [`settle_close`] then refuses them for good or admits them again.
 fn close_if_idle(workers: &[ProfileWorker]) -> bool {
     if workers.iter().any(|w| !w.approvals.snapshots().is_empty()) {
         return false;
@@ -2177,14 +2213,21 @@ fn close_if_idle(workers: &[ProfileWorker]) -> bool {
     let closed = closing
         .into_iter()
         .fold(true, |closed, closing| closing.wait(deadline) && closed);
+    if !closed {
+        settle_close(workers, false);
+    }
+    closed
+}
+/// After [`close_if_idle`] closed them, refuse new requests on every
+/// worker for good (`close`), or admit them again.
+fn settle_close(workers: &[ProfileWorker], close: bool) {
     for worker in workers {
-        if closed {
+        if close {
             worker.activity.close();
         } else {
             worker.activity.reopen();
         }
     }
-    closed
 }
 
 fn reconcile(
@@ -2638,9 +2681,13 @@ fn serve(
                 // Its socket errors must not stop the receiving service.
                 if let Ok(request) = read_control_request(&mut client) {
                     if request.version == VERSION {
-                        if request.stop || (request.stop_if_idle && close_if_idle(&workers)) {
+                        if request.stop {
                             shutdown.store(true, Ordering::Release);
                         }
+                        // It stops once idle only if the client is there to
+                        // hear it: one that gave up waiting keeps it.
+                        let stop_once_answered =
+                            !request.stop && request.stop_if_idle && close_if_idle(&workers);
                         let retry = if request.restart {
                             Retry::Now
                         } else if request.retry {
@@ -2686,12 +2733,18 @@ fn serve(
                                 .as_ref()
                                 .and_then(|follower| follower.path().to_str().map(str::to_owned)),
                             switch: follower.as_ref().and_then(switch::Follower::report),
-                            stopping: shutdown.load(Ordering::Acquire),
+                            stopping: shutdown.load(Ordering::Acquire) || stop_once_answered,
                             older: None,
                             profiles,
                             decision_error,
                         };
-                        let _ = write_status(&mut client, &response);
+                        let answered = write_status(&mut client, &response).is_ok();
+                        if stop_once_answered {
+                            settle_close(&workers, answered);
+                            if answered {
+                                shutdown.store(true, Ordering::Release);
+                            }
+                        }
                     }
                 }
             }
@@ -4010,7 +4063,8 @@ mod tests {
                 let request = read_control_request(&mut client).unwrap();
                 requests.push(serde_json::to_string(&request).unwrap());
                 let answer = reply(&request);
-                write_status(&mut client, &answer).unwrap();
+                // As a service does, whether or not the client still waits.
+                let _ = write_status(&mut client, &answer);
                 if request.stop || answer.stopping {
                     fs::remove_file(&socket).unwrap();
                     then(lock);
@@ -4018,6 +4072,74 @@ mod tests {
                 }
             }
         })
+    }
+
+    /// A service that does not answer in time whether it is idle is named,
+    /// rather than reported as a bare read timeout; callers say what to do.
+    #[test]
+    fn a_service_that_does_not_answer_whether_it_is_idle_is_named() {
+        let (_root, control, _lock) = locked_control();
+        let listener = UnixListener::bind(suffixed(&control, SOCKET)).unwrap();
+        let service = std::thread::spawn(move || {
+            let (mut client, _) = listener.accept().unwrap();
+            let request = read_control_request(&mut client).unwrap();
+            assert!(request.stop_if_idle);
+            // Hold the connection, unanswered, past the client's timeout.
+            let _ = client.read(&mut [0; 1]);
+        });
+        let error = format!("{:#}", stop_when_idle(&control, "example").unwrap_err());
+        service.join().unwrap();
+        assert!(
+            error.starts_with(&format!(
+                "receiving service did not answer at {} whether it is idle",
+                suffixed(&control, SOCKET).display()
+            )),
+            "{error}"
+        );
+    }
+
+    /// A service answers requests one at a time, so it may answer a request
+    /// to stop once idle only after others. The switch waits for that answer
+    /// and follows it: a service that stopped is taken over, and one that
+    /// kept running keeps receiving.
+    #[test]
+    fn a_late_answer_to_stop_once_idle_is_still_followed() {
+        let late = |stops: bool| {
+            move |request: &LocalRequest| {
+                if request.stop_if_idle {
+                    std::thread::sleep(Duration::from_millis(1500));
+                }
+                answer("other", Busy::default(), stops && request.stop_if_idle)
+            }
+        };
+        let (_root, control, lock) = locked_control();
+        let service = stand_in(&control, lock, late(true));
+        assert!(stop_when_idle(&control, "example").unwrap());
+        assert!(!is_running(&control));
+        service.join().unwrap();
+
+        let (_root, control, lock) = locked_control();
+        let service = stand_in(&control, lock, late(false));
+        assert!(!stop_when_idle(&control, "example").unwrap());
+        assert!(is_running(&control));
+        send(
+            &control,
+            &LocalRequest {
+                version: VERSION,
+                stop: true,
+                decision: None,
+                retry: false,
+                restart: false,
+                stop_if_idle: false,
+            },
+        )
+        .unwrap();
+        service.join().unwrap();
+
+        // One that has already gone has stopped: its replacement takes over.
+        let (_root, control, lock) = locked_control();
+        drop(lock);
+        assert!(stop_when_idle(&control, "example").unwrap());
     }
 
     /// An approved account connection is reported as what it is, not as a
@@ -4175,7 +4297,7 @@ mod tests {
             accounts_in_use: 0,
         };
         let service = stand_in(&control, lock, move |_| answer("other", busy, false));
-        assert!(!stop_when_idle(&control).unwrap());
+        assert!(!stop_when_idle(&control, "example").unwrap());
         assert!(is_running(&control));
         // The busy one was asked once and kept running.
         send(
@@ -4205,7 +4327,7 @@ mod tests {
         });
         // Its answer to stop_if_idle says it stops, and nothing else is
         // sent while it goes.
-        assert!(stop_when_idle(&control).unwrap());
+        assert!(stop_when_idle(&control, "example").unwrap());
         assert!(!is_running(&control));
         assert_eq!(
             service.join().unwrap(),
@@ -4267,7 +4389,7 @@ mod tests {
                 }));
             },
         );
-        assert!(stop_when_idle(&control).unwrap());
+        assert!(stop_when_idle(&control, "example").unwrap());
         old.join().unwrap();
         // The next owner still runs, and was only asked for its status.
         assert!(is_running(&control));
@@ -4334,15 +4456,14 @@ mod tests {
         let root = crate::test_support::short_tempdir().unwrap();
         let control = root.path().join("cm-test");
         // A status check holds the lock as the service starts, then ends.
-        let probe = LockFile::open(&suffixed(&control, LOCK), true).unwrap();
-        assert!(probe.try_shared().unwrap());
-        let probing = std::thread::spawn(move || {
-            std::thread::sleep(PROBE_GRACE / 10);
-            drop(probe);
-        });
-        let lock = try_lock(&control).unwrap();
-        probing.join().unwrap();
-        assert!(lock.is_some());
+        let _lock = crate::lock_file::start_beside_a_brief_holder(
+            || {
+                let probe = LockFile::open(&suffixed(&control, LOCK), true).unwrap();
+                assert!(probe.try_shared().unwrap());
+                probe
+            },
+            || try_lock(&control).unwrap(),
+        );
     }
 
     #[test]
