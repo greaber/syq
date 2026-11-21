@@ -319,7 +319,7 @@ impl Engine {
         let control = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
         let uploads = Arc::new(super::cancel::Cancellation::default());
         let authorization = super::authorization::connect(&args, &options).await?;
-        let outage = Arc::new(super::outage::Outage::default());
+        let outage = Arc::new(crate::s3::outage::Outage::default());
         let (client, note) = client::connect_authorized(
             &mut options,
             control.clone(),
@@ -334,7 +334,7 @@ impl Engine {
         super::diagnostics::elapsed(setup, "client_setup", 0);
         let content_md5 = super::checksum::plain_http(options.endpoint.as_deref());
         Ok(Arc::new(Self {
-            tuning: super::tuning::Tuning::new(&options, &args, control),
+            tuning: super::tuning::Tuning::new(&options, &args, control, outage.clone()),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancel_wake: tokio::sync::Notify::new(),
             uploads,
@@ -4082,10 +4082,12 @@ mod tests {
             .unwrap(),
         );
         let options = args.s3.clone().unwrap();
+        let outage = Arc::new(crate::s3::outage::Outage::default());
         let tuning = crate::s3::tuning::Tuning::new(
             &options,
             &args,
             Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+            outage.clone(),
         );
         let config = aws_sdk_s3::config::Builder::new()
             .behavior_version_latest()
@@ -4106,7 +4108,7 @@ mod tests {
             file_permissions: Default::default(),
             metadata_replacements: Default::default(),
             copy_tagging_unsupported: Default::default(),
-            outage: Default::default(),
+            outage,
             cancelled: Default::default(),
             cancel_wake: Default::default(),
             uploads: Default::default(),
