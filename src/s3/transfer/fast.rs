@@ -48,26 +48,29 @@ impl Engine {
         let small_upload = self.options.route == Route::Upload && largest <= 1024 * 1024;
         let small_download = self.options.route == Route::Download && largest < 1024 * 1024;
         let far = tiny && fixed_workers.is_none() && self.tuning.high_latency();
-        // Far small downloads widen only within what a cgroup v2 memory limit
-        // leaves, read once here. When that cannot be read they keep the
-        // near start of 256; an unlimited hierarchy says nothing more.
-        let room = (far && small_download).then(memory::memory_room);
+        // A far small download widens within the payload and descriptor
+        // budget and what a visible cgroup v2 memory limit leaves, read once
+        // here; that bound also limits later growth, but never below the near
+        // start of 256. When memory or descriptors cannot be read it keeps the
+        // near start and plans like any other small download.
+        let widened = match (far && small_download).then(memory::memory_room) {
+            Some(MemoryRoom::Unknown) | None => None,
+            Some(room) => super::super::tuning::small_object_capacity(largest)
+                .ok()
+                .map(|capacity| match room {
+                    MemoryRoom::Limited(room) => {
+                        capacity.min(memory::objects_within(room, largest).max(256))
+                    }
+                    _ => capacity,
+                }),
+        };
         // Many small objects to or from a far endpoint start with as many
-        // objects in flight as the payload, descriptor and memory budgets allow.
-        let far_small =
-            far && (small_upload || small_download && room != Some(MemoryRoom::Unknown));
-        let capacity = if small_upload || small_download {
+        // objects in flight as those budgets allow.
+        let far_small = far && small_upload || widened.is_some();
+        let capacity = if small_upload {
             super::super::tuning::small_object_capacity(largest)?
         } else {
-            256
-        };
-        // The same bound limits later growth. It never goes below the near
-        // start, which syq used before it read memory limits.
-        let capacity = match room {
-            Some(MemoryRoom::Limited(room)) => {
-                capacity.min(memory::objects_within(room, largest).max(256))
-            }
-            _ => capacity,
+            widened.unwrap_or(256)
         };
         let workers = if let Some(fixed) = fixed_workers {
             fixed
@@ -133,10 +136,12 @@ impl Engine {
                     1024 * 1024
                 };
                 super::super::tuning::small_object_capacity(largest.min(buffer_size))?
+            } else if let Some(widened) = widened {
+                widened
             } else if small_download {
                 // Allow measured gains beyond the start when small objects
                 // fit the payload/FD budget.
-                capacity
+                super::super::tuning::small_object_capacity(largest)?
             } else {
                 256
             };

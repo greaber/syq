@@ -7,10 +7,11 @@ pub(in crate::s3) enum MemoryRoom {
     /// The smallest `memory.max` minus `memory.current` over the process's
     /// cgroup and every ancestor that sets a limit.
     Limited(u64),
-    /// The whole hierarchy was read and no level sets a limit. This says
-    /// nothing about the host's own memory.
+    /// No level sets a limit, and the whole hierarchy up to the host's root
+    /// was visible. This says nothing about the host's own memory.
     Unlimited,
-    /// No unified cgroup hierarchy, or a level could not be read.
+    /// No unified cgroup hierarchy, a level that could not be read, or no
+    /// visible limit while ancestors may be hidden (a cgroup namespace).
     Unknown,
 }
 
@@ -27,18 +28,45 @@ pub(in crate::s3) fn memory_room() -> MemoryRoom {
     if let Some(room) = TEST_ROOM.with(|room| room.get()) {
         return room;
     }
-    if cfg!(target_os = "linux") {
-        cgroup_room(Path::new("/proc/self/cgroup"), Path::new("/sys/fs/cgroup"))
-    } else {
-        MemoryRoom::Unknown
+    if !cfg!(target_os = "linux") {
+        return MemoryRoom::Unknown;
     }
+    let (Ok(cgroup), Ok(mounts)) = (
+        std::fs::read_to_string("/proc/self/cgroup"),
+        std::fs::read_to_string("/proc/self/mountinfo"),
+    ) else {
+        return MemoryRoom::Unknown;
+    };
+    let namespace = std::fs::read_link("/proc/self/ns/cgroup").ok();
+    let namespace = namespace.as_deref().and_then(Path::to_str);
+    cgroup_room(&cgroup, namespace, &mounts, Path::new("/sys/fs/cgroup"))
 }
 
-fn cgroup_room(proc_cgroup: &Path, root: &Path) -> MemoryRoom {
+/// The kernel's fixed identifier of the initial cgroup namespace.
+const INITIAL_NAMESPACE: &str = "cgroup:[4026531835]";
+
+/// `text` is `/proc/self/cgroup`, `namespace` the target of
+/// `/proc/self/ns/cgroup` and `mounts` `/proc/self/mountinfo`.
+fn cgroup_room(text: &str, namespace: Option<&str>, mounts: &str, root: &Path) -> MemoryRoom {
     use MemoryRoom::*;
-    let Ok(text) = std::fs::read_to_string(proc_cgroup) else {
+    // The hierarchy must be mounted at `root` from its own root: a subtree
+    // mount, or one outside a cgroup namespace (`/..`), does not map the
+    // process's path onto it.
+    // A later mount at the same point hides earlier ones.
+    let mounted = mounts
+        .lines()
+        .map(|line| line.split(' ').collect::<Vec<_>>())
+        .rfind(|fields| fields.get(4).map(Path::new) == Some(root))
+        .is_some_and(|fields| {
+            let separator = fields.iter().position(|field| *field == "-");
+            fields.get(3) == Some(&"/")
+                && separator.and_then(|i| fields.get(i + 1)) == Some(&"cgroup2")
+        });
+    if !mounted {
         return Unknown;
-    };
+    }
+    // Only the initial namespace shows every ancestor.
+    let whole = namespace == Some(INITIAL_NAMESPACE);
     // A unified hierarchy has one entry, `0::PATH`. Version 1 or hybrid
     // hierarchies list other controllers, whose limits this does not read.
     let mut lines = text.lines();
@@ -85,7 +113,11 @@ fn cgroup_room(proc_cgroup: &Path, root: &Path) -> MemoryRoom {
         };
         dir = parent.to_path_buf();
     }
-    room.map_or(Unlimited, Limited)
+    match room {
+        Some(room) => Limited(room),
+        None if whole => Unlimited,
+        None => Unknown,
+    }
 }
 
 /// An estimate of what one more small object in flight costs beyond its

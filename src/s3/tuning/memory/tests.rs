@@ -1,4 +1,4 @@
-use super::{cgroup_room, objects_within, MemoryRoom::*};
+use super::{cgroup_room, objects_within, MemoryRoom, MemoryRoom::*, INITIAL_NAMESPACE};
 use std::{fs, path::Path};
 
 fn level(dir: &Path, max: Option<&str>, current: Option<&str>) {
@@ -11,15 +11,37 @@ fn level(dir: &Path, max: Option<&str>, current: Option<&str>) {
     }
 }
 
-fn room(entry: &str, build: impl FnOnce(&Path)) -> super::MemoryRoom {
+/// A `/proc/self/mountinfo` line mounting a hierarchy from `source` at `root`.
+fn mount(source: &str, root: &Path, kind: &str) -> String {
+    format!(
+        "38 28 0:32 {source} {} rw,nosuid shared:10 - {kind} {kind} rw,nsdelegate\n",
+        root.display()
+    )
+}
+
+/// The answer for a hierarchy built under a temporary root, as `view`
+/// (namespace and mount table) shows it.
+fn room_in(
+    entry: &str,
+    view: impl FnOnce(&Path) -> (Option<&'static str>, String),
+    build: impl FnOnce(&Path),
+) -> MemoryRoom {
     let temp = crate::test_support::tempdir().unwrap();
     let root = temp.path().join("cgroup");
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("cgroup.controllers"), "cpu memory\n").unwrap();
     build(&root);
-    let proc = temp.path().join("proc-cgroup");
-    fs::write(&proc, entry).unwrap();
-    cgroup_room(&proc, &root)
+    let (namespace, mounts) = view(&root);
+    cgroup_room(entry, namespace, &mounts, &root)
+}
+
+/// Seen from the initial namespace with the whole hierarchy mounted.
+fn room(entry: &str, build: impl FnOnce(&Path)) -> MemoryRoom {
+    room_in(
+        entry,
+        |root| (Some(INITIAL_NAMESPACE), mount("/", root, "cgroup2")),
+        build,
+    )
 }
 
 #[test]
@@ -49,28 +71,37 @@ fn the_tightest_limit_on_the_path_sets_the_room() {
         )),
         Limited(0)
     );
-    // Inside a cgroup namespace the process's cgroup is the visible root.
+}
+
+#[test]
+fn no_limit_anywhere_is_unlimited_only_when_every_level_is_visible() {
+    let unlimited = |root: &Path| {
+        // The host root has no memory files; a level without the memory
+        // controller has none either.
+        level(&root.join("a"), None, None);
+        level(&root.join("a/b"), Some("max"), Some("100"));
+    };
+    assert_eq!(room("0::/a/b\n", unlimited), Unlimited);
+    // In another cgroup namespace, or with the namespace unreadable,
+    // ancestors above its root may limit memory too: only a visible limit
+    // counts.
+    let other = |root: &Path| (Some("cgroup:[4026535099]"), mount("/", root, "cgroup2"));
+    let unreadable = |root: &Path| (None, mount("/", root, "cgroup2"));
+    assert_eq!(room_in("0::/a/b\n", other, unlimited), Unknown);
+    assert_eq!(room_in("0::/a/b\n", unreadable, unlimited), Unknown);
+    // A container's view: its own cgroup is the visible root.
     assert_eq!(
-        room("0::/\n", |root| level(root, Some("1000"), Some("250"))),
+        room_in("0::/\n", other, |root| level(
+            root,
+            Some("1000"),
+            Some("250")
+        )),
         Limited(750)
     );
 }
 
 #[test]
-fn no_limit_anywhere_is_unlimited() {
-    assert_eq!(
-        room("0::/a/b\n", |root| {
-            // The host root has no memory files; a level without the memory
-            // controller has none either.
-            level(&root.join("a"), None, None);
-            level(&root.join("a/b"), Some("max"), Some("100"));
-        }),
-        Unlimited
-    );
-}
-
-#[test]
-fn anything_unreadable_is_unknown() {
+fn anything_unreadable_or_unmapped_is_unknown() {
     let limited = |root: &Path| level(&root.join("a"), Some("1000"), Some("1"));
     // Version 1 and hybrid hierarchies.
     assert_eq!(room("4:memory:/a\n", limited), Unknown);
@@ -92,15 +123,41 @@ fn anything_unreadable_is_unknown() {
         )),
         Unknown
     );
-    // No unified hierarchy mounted at the root.
+    // A mount of a subtree or of a root outside the namespace does not map
+    // the process's path; neither does a version 1 mount, a later mount over
+    // the hierarchy, or no mount at all.
+    for view in [
+        |root: &Path| {
+            (
+                Some(INITIAL_NAMESPACE),
+                mount("/system.slice", root, "cgroup2"),
+            )
+        },
+        |root: &Path| (Some(INITIAL_NAMESPACE), mount("/../..", root, "cgroup2")),
+        |root: &Path| (Some(INITIAL_NAMESPACE), mount("/", root, "cgroup")),
+        |root: &Path| {
+            let first = mount("/", root, "cgroup2");
+            (Some(INITIAL_NAMESPACE), first + &mount("/", root, "tmpfs"))
+        },
+        |_: &Path| (Some(INITIAL_NAMESPACE), String::new()),
+    ] {
+        assert_eq!(room_in("0::/a\n", view, limited), Unknown);
+    }
+    // No unified hierarchy at the mount point.
     let temp = crate::test_support::tempdir().unwrap();
-    let proc = temp.path().join("proc-cgroup");
-    fs::write(&proc, "0::/\n").unwrap();
-    assert_eq!(cgroup_room(&proc, temp.path()), Unknown);
+    let mounts = mount("/", temp.path(), "cgroup2");
     assert_eq!(
-        cgroup_room(&temp.path().join("missing"), temp.path()),
+        cgroup_room("0::/\n", Some(INITIAL_NAMESPACE), &mounts, temp.path()),
         Unknown
     );
+}
+
+#[test]
+fn memory_room_off_linux_is_unknown() {
+    let room = super::memory_room();
+    if !cfg!(target_os = "linux") {
+        assert_eq!(room, Unknown);
+    }
 }
 
 #[test]

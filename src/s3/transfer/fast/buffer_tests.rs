@@ -413,6 +413,65 @@ fn far_small_downloads_widen_only_within_a_readable_memory_limit() {
     );
 }
 
+/// Lowers the soft descriptor limit until dropped.
+struct TightDescriptors(libc::rlimit);
+
+impl TightDescriptors {
+    /// Leaves too few descriptors for the small-object budget, but enough
+    /// for the test itself.
+    fn new() -> Self {
+        let limits = crate::fsops::nofile_limits().unwrap();
+        let open = crate::fsops::current_open_descriptor_count(limits.rlim_cur).unwrap();
+        crate::fsops::set_nofile_limits(&libc::rlimit {
+            rlim_cur: open as libc::rlim_t + 66,
+            rlim_max: limits.rlim_max,
+        })
+        .unwrap();
+        assert!(crate::s3::tuning::small_object_capacity(1024).is_err());
+        Self(limits)
+    }
+}
+
+impl Drop for TightDescriptors {
+    fn drop(&mut self) {
+        crate::fsops::set_nofile_limits(&self.0).unwrap();
+    }
+}
+
+#[test]
+fn small_downloads_read_the_descriptor_budget_only_where_they_did_before() {
+    let plan = |flags: &[&str], far: bool, count: usize, memory: MemoryRoom| {
+        room(memory);
+        let engine = planning_engine(flags);
+        if far {
+            engine.tuning.observe_control(Duration::from_millis(100));
+        }
+        engine
+            .object_workers(std::iter::repeat_n(1024, count))
+            .map(|workers| (workers.initial, engine.tuning.request_limit()))
+            .map_err(|error| error.to_string())
+    };
+    let _tight = TightDescriptors::new();
+    // Paths that never read the budget still plan.
+    assert_eq!(plan(&[], false, 100, MemoryRoom::Unlimited), Ok((256, 64)));
+    assert_eq!(plan(&[], true, 100, MemoryRoom::Unknown), Ok((256, 256)));
+    let dry = &["--dry-run"][..];
+    assert_eq!(plan(dry, true, 10_000, MemoryRoom::Unknown), Ok((256, 256)));
+    let fixed = &["--performance-tuning", "s3-objects=8"][..];
+    assert_eq!(
+        plan(fixed, true, 10_000, MemoryRoom::Unlimited),
+        Ok((8, 256))
+    );
+    // A widened start that cannot read the budget keeps the near start.
+    assert_eq!(plan(&[], true, 100, MemoryRoom::Unlimited), Ok((256, 256)));
+    assert_eq!(
+        plan(dry, true, 10_000, MemoryRoom::Limited(1 << 30)),
+        Ok((256, 256))
+    );
+    // A batch large enough for the controller reads it, as before.
+    assert!(plan(&[], false, 10_000, MemoryRoom::Unlimited).is_err());
+}
+
 pub(super) fn planning_engine(extra: &[&str]) -> Engine {
     let argv = [
         "cp",
