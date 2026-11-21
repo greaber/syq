@@ -154,16 +154,18 @@ def instruction(review):
     if status == 'review_ready':
         common = ('Read the report and independently assess each finding under the existing task requirements. '
                   'Record the assessment with review triage, naming this round’s SHA. '
+                  'A correct finding can still need no change: weigh its likelihood and consequence '
+                  'against the cost of the fix, and decline with a reason when it is not worth it. '
                   'Use discuss for tradeoffs, scope changes, or persistent disagreement; '
                   'use complete only when the reviewed revision needs no further changes. '
                   'Do not merge or treat reviewer suggestions as user requirements. ')
         if mode == 'triage':
             return common + 'Assess and discuss with the user; this mode does not authorize fixes.'
-        return common + ('Auto mode authorizes confirmed straightforward fixes within the task. '
+        return common + ('Auto mode authorizes confirmed, worthwhile fixes within the task. '
                          'Validate, commit and push them, then use triage --action revise to launch '
                          'the next round and continue waiting. Before each handoff run '
-                         'scripts/branch-status.py when present and report its output, including '
-                         'unrelated red master checks. Record stable unresolved finding IDs; '
+                         'scripts/branch-status.py when present and report what it shows that needs '
+                         'attention, including unrelated red master checks. Record stable unresolved finding IDs; '
                          'repetition without progress requires discussion, not more changes.')
     return 'Automatic work stops here. Read the status, reason and disposition, and report to the user.'
 
@@ -238,7 +240,8 @@ def launch(store, review_id, snap, allow_unchanged=False):
         number = len(review['rounds']) + 1
         if sum(bool(r.get('report')) for r in review['rounds']) >= review['max_rounds']:
             review['status'] = 'round_limit'
-            review['reason'] = 'Completed review round limit reached; start a new request for further review'
+            review['reason'] = ('Completed review round limit reached; tell the user what is still open '
+                                'before starting a new request for further review')
             return view(review)
         if not allow_unchanged and any(r['sha'] == snap['sha'] and r.get('report')
                                        for r in review['rounds']):
