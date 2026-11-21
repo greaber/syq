@@ -256,6 +256,17 @@ struct LimitedSeq<'a, S> {
     inner: S,
     hold: &'a mut Hold,
 }
+/// Fixed-size tuple/array sequence adapter: its inline storage was already
+/// counted by the enclosing struct or collection, so element slots are not
+/// charged again while nested variable-length collections remain budgeted.
+struct LimitedTupleVisitor<'a, V> {
+    inner: V,
+    hold: &'a mut Hold,
+}
+struct LimitedTupleSeq<'a, S> {
+    inner: S,
+    hold: &'a mut Hold,
+}
 struct LimitedMap<'a, M> {
     inner: M,
     hold: &'a mut Hold,
@@ -293,6 +304,33 @@ impl<'de, S: SeqAccess<'de>> SeqAccess<'de> for LimitedSeq<'_, S> {
     }
     fn size_hint(&self) -> Option<usize> {
         None
+    }
+}
+impl<'de, S: SeqAccess<'de>> SeqAccess<'de> for LimitedTupleSeq<'_, S> {
+    type Error = S::Error;
+    fn next_element_seed<T: DeserializeSeed<'de>>(
+        &mut self,
+        seed: T,
+    ) -> Result<Option<T::Value>, Self::Error> {
+        self.inner.next_element_seed(LimitedSeed {
+            inner: seed,
+            hold: self.hold,
+        })
+    }
+    fn size_hint(&self) -> Option<usize> {
+        self.inner.size_hint()
+    }
+}
+impl<'de, V: Visitor<'de>> Visitor<'de> for LimitedTupleVisitor<'_, V> {
+    type Value = V::Value;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.expecting(f)
+    }
+    fn visit_seq<S: SeqAccess<'de>>(self, inner: S) -> Result<Self::Value, S::Error> {
+        self.inner.visit_seq(LimitedTupleSeq {
+            inner,
+            hold: self.hold,
+        })
     }
 }
 impl<'de, M: MapAccess<'de>> MapAccess<'de> for LimitedMap<'_, M> {
@@ -505,7 +543,7 @@ impl<'de, D: de::Deserializer<'de>> de::Deserializer<'de> for Limited<'_, D> {
     ) -> Result<V::Value, Self::Error> {
         self.inner.deserialize_tuple(
             len,
-            LimitedVisitor {
+            LimitedTupleVisitor {
                 inner: visitor,
                 hold: self.hold,
             },
@@ -520,7 +558,7 @@ impl<'de, D: de::Deserializer<'de>> de::Deserializer<'de> for Limited<'_, D> {
         self.inner.deserialize_tuple_struct(
             name,
             len,
-            LimitedVisitor {
+            LimitedTupleVisitor {
                 inner: visitor,
                 hold: self.hold,
             },
@@ -690,7 +728,7 @@ mod tests {
 
     #[test]
     fn a_reply_counted_for_more_reserves_no_more_than_a_granule() {
-        // A patch's result, a file's metadata or two digests are counted
+        // A patch's result, a file's metadata or four digests are counted
         // for more than a first reservation; they reserve no more than one
         // granule, as before.
         use crate::proto::{Response, SmallPatched};
@@ -705,7 +743,7 @@ mod tests {
                 replaced: None,
             })]),
             Response::Stats(vec![None]),
-            Response::Hashes(vec![Default::default(); 2]),
+            Response::Hashes(vec![Default::default(); 4]),
         ];
         for reply in counted {
             let bytes = postcard::to_stdvec(&reply).unwrap();
@@ -717,6 +755,118 @@ mod tests {
             );
             drop(held);
         }
+    }
+
+    #[test]
+    fn fixed_arrays_are_not_double_charged_in_collection_budget() {
+        use crate::proto::Response;
+        let shared = Arc::new(Budget {
+            used: AtomicUsize::new(0),
+            limit: MEMORY_LIMIT,
+        });
+        // Two 32-byte digests charge only their outer Vec slots (2 * 32 * 8 = 512),
+        // not another 512 bytes for the 64 individual u8 array elements.
+        let small = postcard::to_stdvec(&Response::Hashes(vec![[0u8; 32]; 2])).unwrap();
+        let held = decode_with_hold::<Response>(&small, hold(&shared)).unwrap();
+        assert_eq!(shared.used.load(Relaxed), MESSAGE_RESERVATION);
+        drop(held);
+        // 1,500,000 hashes (48 MiB of actual data) used to exhaust the 512 MiB
+        // budget at 1,048,576 hashes due to 16x double-charging.
+        let many = postcard::to_stdvec(&Response::Hashes(vec![[0u8; 32]; 1_500_000])).unwrap();
+        let held = decode_with_hold::<Response>(&many, hold(&shared)).unwrap();
+        assert!(matches!(held.value, Response::Hashes(ref h) if h.len() == 1_500_000));
+        drop(held);
+        assert_eq!(shared.used.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn path_bytes_wire_format_matches_plain_vec_u8_and_avoids_per_byte_budget() {
+        use crate::proto::{Entry, Kind, Request};
+        // Wire compatibility: postcard encodes serde_bytes / opt_bytes / vec_bytes
+        // byte-for-byte identically to Vec<u8> / Option<Vec<u8>> / Vec<Vec<u8>>.
+        #[derive(serde::Serialize)]
+        struct PlainEntry {
+            path: Vec<u8>,
+            kind: Kind,
+            size: u64,
+            mtime: i64,
+            mtime_nsec: u32,
+            mode: u32,
+            uid: u32,
+            gid: u32,
+            rdev: u64,
+            dev: u64,
+            ino: u64,
+            nlink: u64,
+            ctime: i64,
+            ctime_nsec: u32,
+            link: Option<Vec<u8>>,
+            inode_metadata: Option<Box<crate::inode_metadata::InodeMetadata>>,
+        }
+        let paths = vec![b"dir/alpha".to_vec(), b"dir/beta/gamma".to_vec()];
+        let plain_list = postcard::to_stdvec(&paths).unwrap();
+        let req = Request::PruneLookup {
+            paths: paths.clone(),
+        };
+        let encoded = postcard::to_stdvec(&req).unwrap();
+        assert!(encoded.ends_with(&plain_list));
+        // Long paths do not consume per-byte collection budget: two 64 KiB
+        // paths would previously have charged 1 MiB (8x per byte) and failed
+        // a single-granule (64 KiB) budget.
+        let long_path = vec![b'a'; RESERVATION_GRANULE];
+        let entry = Entry {
+            path: long_path.clone(),
+            kind: Kind::Symlink,
+            size: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+            mode: 0o777,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            dev: 0,
+            ino: 0,
+            nlink: 1,
+            ctime: 0,
+            ctime_nsec: 0,
+            link: Some(long_path.clone()),
+            atime: Default::default(),
+            inode_metadata: None,
+        };
+        let plain_entry = PlainEntry {
+            path: long_path.clone(),
+            kind: Kind::Symlink,
+            size: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+            mode: 0o777,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            dev: 0,
+            ino: 0,
+            nlink: 1,
+            ctime: 0,
+            ctime_nsec: 0,
+            link: Some(long_path.clone()),
+            inode_metadata: None,
+        };
+        let bytes = postcard::to_stdvec(&entry).unwrap();
+        assert_eq!(bytes, postcard::to_stdvec(&plain_entry).unwrap());
+        let shared = budget();
+        let decoded = decode_with_hold::<Entry>(&bytes, hold(&shared)).unwrap();
+        assert_eq!(decoded.value.path, long_path);
+        assert_eq!(decoded.value.link.as_deref(), Some(long_path.as_slice()));
+        assert_eq!(shared.used.load(Relaxed), RESERVATION_GRANULE);
+        drop(decoded);
+        // Hostile sequence of many empty paths is still stopped by the budget.
+        let hostile = postcard::to_stdvec(&Request::PruneLookup {
+            paths: vec![Vec::new(); 10_000],
+        })
+        .unwrap();
+        let error = decode_with_hold::<Request>(&hostile, hold(&shared)).unwrap_err();
+        assert!(error.to_string().contains("memory budget exhausted"));
+        assert_eq!(shared.used.load(Relaxed), 0);
     }
 
     #[test]
