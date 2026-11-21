@@ -20,7 +20,12 @@ pub(super) struct Tuning {
 }
 impl Tuning {
     /// `control` receives the fastest HEAD or LIST response seen by the client.
-    pub fn new(options: &Options, args: &crate::cli::Args, control: Arc<AtomicU64>) -> Self {
+    pub fn new(
+        options: &Options,
+        args: &crate::cli::Args,
+        control: Arc<AtomicU64>,
+        outage: Arc<super::outage::Outage>,
+    ) -> Self {
         Self {
             control_ns: control,
             reads: crate::s3::read_recovery::Recovery::default(),
@@ -31,7 +36,7 @@ impl Tuning {
             // integrity policy, or explicit overrides. Server copies use the
             // same seeds for all providers.
             tigris: !options.route.is_server_copy() && options.is_tigris(),
-            requests: Arc::new(Budget::with_ceiling(
+            requests: Arc::new(Budget::with_outage(
                 args.tuning_options
                     .and_then(|t| t.s3_requests)
                     .unwrap_or(64),
@@ -39,6 +44,7 @@ impl Tuning {
                 args.resource_limits
                     .as_ref()
                     .and_then(|limits| limits.s3_requests),
+                Some(outage),
             )),
         }
     }
@@ -137,9 +143,11 @@ struct Window {
     probe_preserved_rate: bool,
     object_rate: Option<(usize, f64, Duration)>,
     settled: bool,
+    seen_throttled: u64,
 }
 pub(super) struct Budget {
     ceiling: Option<usize>,
+    outage: Option<Arc<super::outage::Outage>>,
     state: Mutex<Window>,
     changed: Notify,
     received: AtomicU64,
@@ -161,12 +169,23 @@ impl Permit {
 impl Budget {
     #[cfg(test)]
     fn new(limit: usize, adaptive: bool) -> Self {
-        Self::with_ceiling(limit, adaptive, None)
+        Self::with_outage(limit, adaptive, None, None)
     }
+    #[cfg(test)]
     fn with_ceiling(limit: usize, adaptive: bool, ceiling: Option<usize>) -> Self {
+        Self::with_outage(limit, adaptive, ceiling, None)
+    }
+    fn with_outage(
+        limit: usize,
+        adaptive: bool,
+        ceiling: Option<usize>,
+        outage: Option<Arc<super::outage::Outage>>,
+    ) -> Self {
         let limit = limit.min(ceiling.unwrap_or(usize::MAX));
+        let seen_throttled = outage.as_ref().map_or(0, |o| o.throttled_responses());
         Self {
             ceiling,
+            outage,
             state: Mutex::new(Window {
                 active: 0,
                 limit,
@@ -185,6 +204,7 @@ impl Budget {
                 probe_preserved_rate: false,
                 object_rate: None,
                 settled: false,
+                seen_throttled,
             }),
             changed: Notify::new(),
             received: AtomicU64::new(0),
@@ -259,10 +279,59 @@ impl Budget {
         drop(s);
         self.changed.notify_waiters();
     }
+    /// Back off when the service asks for fewer requests (HTTP 429/503).
+    /// Halves the adaptive limit once active requests have drained to it, so
+    /// delayed replies from a previous cut cannot collapse the budget in one
+    /// burst.
+    pub fn throttled(&self) {
+        let mut s = self.state.lock().unwrap();
+        if let Some(outage) = &self.outage {
+            s.seen_throttled = outage.throttled_responses();
+        }
+        if !s.adaptive || s.active > s.limit {
+            return;
+        }
+        self.apply_throttle(&mut s);
+        drop(s);
+        self.changed.notify_waiters();
+    }
+    fn apply_throttle(&self, s: &mut Window) {
+        let before = s.limit;
+        let next = (before / 2).max(1);
+        s.limit = next;
+        s.max = s.max.min(next);
+        s.previous = None;
+        s.previous_progress_rate = None;
+        s.object_rate = None;
+        s.settled = true;
+        s.since = Some(Instant::now());
+        s.bytes = 0;
+        s.progress_start = self.received.load(Relaxed);
+        s.completed = 0;
+        s.recent.clear();
+        s.saturated = false;
+        if next != before {
+            super::diagnostics::request_window(before, next, 0.0, Duration::ZERO, 0, false, true);
+        }
+    }
     pub fn completed(&self, bytes: u64) {
         let mut s = self.state.lock().unwrap();
         s.bytes += bytes;
         s.completed += 1;
+        if s.adaptive {
+            if let Some(outage) = &self.outage {
+                let responses = outage.throttled_responses();
+                if responses != s.seen_throttled {
+                    s.seen_throttled = responses;
+                    if s.active <= s.limit {
+                        self.apply_throttle(&mut s);
+                        drop(s);
+                        self.changed.notify_waiters();
+                        return;
+                    }
+                }
+            }
+        }
         let Some(since) = s.since else { return };
         if !s.adaptive || s.settled {
             return;
