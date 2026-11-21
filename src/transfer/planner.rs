@@ -1440,8 +1440,12 @@ impl Planner<'_> {
         if self.mapping_mode && !self.opts.dry_run {
             let deferred: std::collections::HashSet<_> =
                 self.deferred.iter().map(|(path, ..)| path).collect();
-            self.src_overrides
-                .retain(|dst, _| deferred.contains(&join(&self.dst_root, dst)));
+            // A representative the planner kept may still go to a worker
+            // (`recheck_kept_representatives`), which names its source.
+            let kept = self.hardlinks.kept_destinations();
+            self.src_overrides.retain(|dst, _| {
+                deferred.contains(&join(&self.dst_root, dst)) || kept.contains(dst)
+            });
             self.implicit_dirs.retain(|path| deferred.contains(path));
             self.src_overrides.shrink_to_fit();
             self.implicit_dirs.shrink_to_fit();
@@ -2227,6 +2231,7 @@ impl Planner<'_> {
                     contested,
                 },
                 dst_entry,
+                target_condition,
             );
             return;
         }
@@ -3698,7 +3703,15 @@ impl Planner<'_> {
                     self.progress
                         .bytes_in_unchanged_files
                         .fetch_sub(entry.size, Relaxed);
-                    self.enqueue_with(source, dst, rel, dst_rel, entry, Some(destination), reason);
+                    self.enqueue_with(
+                        source,
+                        dst,
+                        rel,
+                        dst_rel,
+                        entry,
+                        Some(destination),
+                        (reason, false, false),
+                    );
                 }
                 (Some(error), _) => self.report_metadata_failure(Some(&dst), kind, &error),
             }
@@ -3709,7 +3722,12 @@ impl Planner<'_> {
         Ok(())
     }
 
-    fn report_metadata_failure(&self, dst: Option<&[u8]>, kind: DeclaredKind, error: &WireError) {
+    pub(super) fn report_metadata_failure(
+        &self,
+        dst: Option<&[u8]>,
+        kind: DeclaredKind,
+        error: &WireError,
+    ) {
         let os_kind = wire_os_kind(error);
         // The receiver's reply to a metadata change.
         let listing = crate::results::ReceiverListing::Listed;
@@ -4190,12 +4208,25 @@ impl Planner<'_> {
         entry: Entry,
         dst_entry: Option<Entry>,
     ) -> usize {
-        self.enqueue_with(source_path, dst, rel, rel_bytes, entry, dst_entry, None)
+        self.enqueue_with(
+            source_path,
+            dst,
+            rel,
+            rel_bytes,
+            entry,
+            dst_entry,
+            (None, false, false),
+        )
     }
 
     /// `enqueue`, replacing an existing destination file whatever its
     /// contents when `refused` says why, as when the receiver refused to
-    /// change its metadata in place.
+    /// change its metadata in place. With `copy_whole`, the file is known
+    /// to differ from its destination, as one whose source changed, after
+    /// its size and time were found to match, in a way they do not show: it
+    /// is copied whole, where it is when `--in-place=update` allows, without
+    /// a comparison. `retry` queues it as a worker queues a file whose
+    /// source changed: as its second attempt.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn enqueue_with(
         &mut self,
@@ -4205,7 +4236,7 @@ impl Planner<'_> {
         rel_bytes: PathBytes,
         entry: Entry,
         dst_entry: Option<Entry>,
-        refused: Option<crate::proto::ReplaceReason>,
+        (refused, copy_whole, retry): (Option<crate::proto::ReplaceReason>, bool, bool),
     ) -> usize {
         let (src, source) = source_path;
         let target_condition = self.leaf_condition_for(&dst, dst_entry.as_ref());
@@ -4247,7 +4278,7 @@ impl Planner<'_> {
             data: FileJobData {
                 compare_ranges: false,
                 compare_final: false,
-                compared: false,
+                compared: copy_whole,
                 resume_partial: false,
                 replace,
                 recompared: 0,
@@ -4259,7 +4290,7 @@ impl Planner<'_> {
                 entry,
                 policy_condition,
                 target_condition,
-                attempt: 0,
+                attempt: u32::from(retry),
                 done: Arc::new(AtomicU64::new(0)),
                 inplace,
                 in_place_refusal,
@@ -5186,7 +5217,11 @@ impl Planner<'_> {
     }
 
     /// The outcome of each of an `Apply` request's `count` operations.
-    fn applied(&self, response: Response, count: usize) -> Result<Vec<Option<WireError>>> {
+    pub(super) fn applied(
+        &self,
+        response: Response,
+        count: usize,
+    ) -> Result<Vec<Option<WireError>>> {
         match response {
             // A restricted receiver refuses a request whole when it would
             // break the grant, a limit say, and lists that refusal itself:
@@ -5196,7 +5231,10 @@ impl Planner<'_> {
                 Ok(vec![Some(WireError::from(error)); count])
             }
             response => match ok(response, "apply")? {
-                Response::Applied(v) => Ok(v),
+                Response::Applied(v) if v.len() == count => Ok(v),
+                Response::Applied(v) => {
+                    bail!("receiver returned {} results for {count} changes", v.len())
+                }
                 other => bail!("unexpected response {other:?}"),
             },
         }
@@ -6001,11 +6039,17 @@ fn merge_directory_metadata(
 /// set (`flags`), its depth, and the directory it must still be.
 type DirectoryMetadata = (PathBytes, Meta, u8, usize, TargetCondition);
 
-/// The most the failure of an early or final directory metadata operation
-/// adds to its reply (`proto::failed_set_meta_hint`).
+/// The most the failure of a directory metadata, file metadata or link
+/// operation adds to its reply (`proto::failed_set_meta_hint`): a link's
+/// error may name the name it links to as well as its own.
 fn failed_metadata_hint(op: &Op) -> usize {
     match op {
-        Op::SetMeta { path, meta, .. } => crate::proto::failed_set_meta_hint(path, meta),
+        Op::SetMeta { path, meta, .. } | Op::SetFileMetaIfSame { path, meta, .. } => {
+            crate::proto::failed_set_meta_hint(path, meta)
+        }
+        Op::Hardlink { path, source, .. } => {
+            crate::proto::failed_path_hint(path) + crate::proto::failed_path_hint(source)
+        }
         op => crate::proto::failed_path_hint(apply_path(op)),
     }
 }
@@ -6064,6 +6108,18 @@ fn request_sized(mut ops: Vec<Op>) -> Vec<Vec<Op>> {
         return parts;
     }
     vec![ops]
+}
+
+/// Metadata or link operations of a kind that each used to go in a request
+/// of its own, such as hard-link representatives' checks and links, as the
+/// requests they go in: each small enough that the failures of all its
+/// operations would fit its reply (`reply_sized`), and its request its
+/// frame (`request_sized`).
+pub(super) fn metadata_requests(ops: Vec<Op>) -> Vec<Vec<Op>> {
+    reply_sized(ops, usize::MAX, failed_metadata_hint)
+        .into_iter()
+        .flat_map(request_sized)
+        .collect()
 }
 
 /// The final directory metadata still to send, deepest first, as the
@@ -6427,6 +6483,62 @@ mod directory_metadata_tests {
             io_kind: Some(crate::proto::WireIoKind::OwnedDirectoryPermissions),
             raw_os_error: Some(i32::MAX),
             condition_not_met: true,
+        }
+    }
+
+    #[test]
+    fn file_metadata_and_link_requests_and_their_replies_fit_their_frames_when_every_file_fails() {
+        use crate::proto::{METADATA_BATCH_BYTES, METADATA_REPLY_BYTES};
+        // Kept hard-link representatives whose files vanished, and links to
+        // them, with the longest paths of non-UTF-8 bytes: the requests'
+        // replies, not the requests, decide how many go together
+        // (`metadata_requests`).
+        let tree = crate::test_support::tempdir().unwrap();
+        let mut receiver = crate::fsops::FsOps::rooted_for_test(tree.path());
+        let beneath = |index: usize| {
+            let mut path = vec![vec![0xff; 255]; 15].join(&b'/');
+            path.push(b'/');
+            path.extend_from_slice(&[0xff; 247]);
+            path.extend_from_slice(format!("{index:08}").as_bytes());
+            path
+        };
+        let meta = timed(Vec::new(), 0).1;
+        let checks: Vec<Op> = (0..400)
+            .map(|index| Op::SetFileMetaIfSame {
+                path: beneath(index),
+                condition: TargetCondition::Matches { dev: 1, ino: 1 },
+                meta: meta.clone(),
+                flags: flags::TIMES | flags::REPORT_IDENTITY,
+            })
+            .collect();
+        let links: Vec<Op> = (0..400)
+            .map(|index| Op::Hardlink {
+                path: beneath(index),
+                source: beneath(index + 400),
+                dev: 1,
+                ino: 1,
+                condition: TargetCondition::Any,
+            })
+            .collect();
+        for ops in [checks, links] {
+            let total = ops.len();
+            // Sized by their requests alone, all would go in one.
+            assert_eq!(request_sized(ops.clone()).len(), 1);
+            let requests = metadata_requests(ops);
+            assert!(requests.len() > 1);
+            let mut sent = 0;
+            for ops in requests {
+                let request = Request::Apply { ops: ops.clone() };
+                assert!(encoded_len(&request) < METADATA_BATCH_BYTES);
+                assert!(fits_its_frame(&request));
+                let errors = receiver.apply(&ops);
+                assert!(errors.iter().all(Option::is_some), "{errors:?}");
+                let reply = Response::Applied(errors);
+                assert!(encoded_len(&reply) <= METADATA_REPLY_BYTES);
+                assert!(fits_its_frame(&reply));
+                sent += ops.len();
+            }
+            assert_eq!(sent, total);
         }
     }
 

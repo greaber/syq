@@ -50,8 +50,10 @@ pub struct FileJobData {
     /// Compare bounded windows against the prepared private output.
     pub compare_ranges: bool,
     pub compare_final: bool,
-    /// A small destination was compared with this source and differs: the
-    /// copy replaces it whole instead of comparing it again.
+    /// The destination is known to differ from this source: a small one was
+    /// compared with it, or a hard-link representative's source changed
+    /// after its size and time were found to match. The copy writes it
+    /// whole instead of comparing it again.
     pub compared: bool,
     /// Earlier runs left partial copies of this file: it takes the per-file
     /// path, which resumes from them.

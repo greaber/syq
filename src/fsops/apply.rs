@@ -41,6 +41,10 @@ pub(super) fn apply_one(
     if matches!(op, Op::SetFileMetaIfSame { .. }) {
         hold_before_quick_metadata_for_test()?;
     }
+    #[cfg(debug_assertions)]
+    if let Op::SetFileMetaIfSame { flags, .. } = op {
+        refuse_representative_for_test(&target.label, *flags)?;
+    }
     apply_one_rooted(op, &target, owned, made).map_err(|error| {
         // A no-replace creation whose name something already holds made
         // nothing: its condition was not met.
@@ -1449,6 +1453,26 @@ pub(crate) fn set_mode_handle(file: &File, mode: u32) -> Result<()> {
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn set_mode_handle(file: &File, mode: u32) -> Result<()> {
     file.set_permissions(fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+/// Refuse to keep, as its owner check would, a hard-link representative
+/// whose name ends with `SYQ_TEST_REFUSE_REPRESENTATIVE`: the copy replaces
+/// it (`vouch::require`).
+#[cfg(debug_assertions)]
+fn refuse_representative_for_test(p: &Path, flags: u8) -> Result<()> {
+    if let Some(pat) = std::env::var_os("SYQ_TEST_REFUSE_REPRESENTATIVE") {
+        if flags & flags::REPORT_IDENTITY != 0
+            && !pat.is_empty()
+            && p.as_os_str().as_bytes().ends_with(pat.as_bytes())
+        {
+            return Err(vouch::replace_required(
+                p,
+                "change its metadata",
+                (ReplaceReason::Owner, "refused for a test"),
+            ));
+        }
+    }
     Ok(())
 }
 
