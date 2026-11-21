@@ -1,4 +1,5 @@
 use super::*;
+use crate::s3::tuning::memory::MemoryRoom;
 
 #[test]
 fn resource_ceilings_bound_initial_and_adaptive_s3_concurrency() {
@@ -348,8 +349,65 @@ fn far_small_copies_start_with_at_most_2048_objects_below_32_ms() {
     }
 }
 
+/// Plans with this cgroup answer and an abundant host.
 fn room(room: MemoryRoom) {
+    memory(room, Some(1 << 40));
+}
+
+/// Plans with this cgroup answer and the host's available memory (`None`
+/// for unreadable).
+fn memory(room: MemoryRoom, host: Option<u64>) {
     crate::s3::tuning::memory::TEST_ROOM.with(|test| test.set(Some(room)));
+    crate::s3::tuning::memory::TEST_HOST.with(|test| test.set(Some(host)));
+}
+
+#[test]
+fn far_downloads_plan_with_the_tighter_of_host_and_cgroup_memory() {
+    crate::raise_nofile();
+    let mib = 1024 * 1024;
+    let plan = |room: MemoryRoom, host: Option<u64>| {
+        memory(room, host);
+        let engine = planning_engine(&[]);
+        engine.tuning.observe_control(Duration::from_millis(100));
+        let workers = engine
+            .object_workers(std::iter::repeat_n(64 * 1024, 10_000))
+            .unwrap();
+        (
+            workers.initial,
+            engine.tuning.request_limit(),
+            workers.maximum,
+        )
+    };
+    let fit = |room: u64| crate::s3::tuning::memory::objects_within(room, 64 * 1024);
+    let widened = |n: usize| (n, n, Some(n));
+    let (capacity, _, _) = plan(MemoryRoom::Unlimited, Some(1 << 40));
+    assert!(capacity > 2048, "small-object capacity {capacity}");
+    // No cgroup limit, little host memory: the host bounds the start.
+    assert_eq!(
+        plan(MemoryRoom::Unlimited, Some(200 * mib)),
+        widened(fit(200 * mib))
+    );
+    // Both known: the tighter one counts.
+    assert_eq!(
+        plan(MemoryRoom::Limited(600 * mib), Some(300 * mib)),
+        widened(fit(300 * mib))
+    );
+    assert_eq!(
+        plan(MemoryRoom::Limited(300 * mib), Some(600 * mib)),
+        widened(fit(300 * mib))
+    );
+    // A finite cgroup limit counts without the host's figure.
+    assert_eq!(
+        plan(MemoryRoom::Limited(300 * mib), None),
+        widened(fit(300 * mib))
+    );
+    // Without a limit, an unreadable host figure is no evidence of room;
+    // neither is a readable one when the cgroup answer is unknown.
+    let near = (256, 256, Some(capacity));
+    assert_eq!(plan(MemoryRoom::Unlimited, None), near);
+    assert_eq!(plan(MemoryRoom::Unknown, Some(1 << 40)), near);
+    // Very little memory keeps the near start, never less.
+    assert_eq!(plan(MemoryRoom::Unlimited, Some(mib)), widened(256));
 }
 
 #[test]

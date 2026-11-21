@@ -1,4 +1,7 @@
-use super::{cgroup_room, objects_within, MemoryRoom, MemoryRoom::*, INITIAL_NAMESPACE};
+use super::{
+    cgroup_room, combine, mem_available, objects_within, MemoryRoom, MemoryRoom::*,
+    INITIAL_NAMESPACE,
+};
 use std::{fs, path::Path};
 
 fn level(dir: &Path, max: Option<&str>, current: Option<&str>) {
@@ -171,6 +174,24 @@ fn memory_room_off_linux_is_unknown() {
     if !cfg!(target_os = "linux") {
         assert_eq!(room, Unknown);
     }
+}
+
+#[test]
+fn host_memory_comes_from_mem_available() {
+    let meminfo = "MemTotal:       263583660 kB\nMemFree:  1 kB\nMemAvailable:   103681796 kB\n";
+    assert_eq!(mem_available(meminfo), Some(103681796 * 1024));
+    assert_eq!(mem_available("MemTotal: 1 kB\n"), None);
+    assert_eq!(mem_available("MemAvailable: lots kB\n"), None);
+}
+
+#[test]
+fn downloads_plan_with_the_tighter_known_figure() {
+    assert_eq!(combine(Limited(300), Some(200)), Some(200));
+    assert_eq!(combine(Limited(200), Some(300)), Some(200));
+    assert_eq!(combine(Limited(300), None), Some(300));
+    assert_eq!(combine(Unlimited, Some(200)), Some(200));
+    assert_eq!(combine(Unlimited, None), None);
+    assert_eq!(combine(Unknown, Some(200)), None);
 }
 
 #[test]

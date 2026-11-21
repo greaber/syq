@@ -8,7 +8,8 @@ pub(in crate::s3) enum MemoryRoom {
     /// cgroup and every ancestor that sets a limit.
     Limited(u64),
     /// No level sets a limit, and the whole hierarchy up to the host's root
-    /// was visible. This says nothing about the host's own memory.
+    /// was visible. This says nothing about the host's own memory, which
+    /// `download_room` reads separately.
     Unlimited,
     /// No unified cgroup hierarchy, a level that could not be read, or no
     /// visible limit while ancestors may be hidden (a cgroup namespace).
@@ -17,9 +18,53 @@ pub(in crate::s3) enum MemoryRoom {
 
 #[cfg(test)]
 thread_local! {
-    /// Lets planning tests choose the answer instead of reading the host.
+    /// Lets planning tests choose the answers instead of reading the host:
+    /// the cgroup answer, and the host's available memory (`Some(None)`
+    /// for unreadable).
     pub(in crate::s3) static TEST_ROOM: std::cell::Cell<Option<MemoryRoom>> =
         const { std::cell::Cell::new(None) };
+    pub(in crate::s3) static TEST_HOST: std::cell::Cell<Option<Option<u64>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Memory a far small download may plan with, read once per planning
+/// operation: the tighter of a visible cgroup limit's room and the host's
+/// available memory. A finite cgroup limit counts even when the host's
+/// figure cannot be read. Without a limit, only the host's figure counts:
+/// no limit does not mean the host has memory to spare. `None` keeps the
+/// near start; so does an unknown cgroup answer, since a limit syq cannot
+/// see may still apply.
+pub(in crate::s3) fn download_room() -> Option<u64> {
+    combine(memory_room(), host_available())
+}
+
+fn combine(room: MemoryRoom, host: Option<u64>) -> Option<u64> {
+    match room {
+        MemoryRoom::Limited(room) => Some(host.map_or(room, |host| room.min(host))),
+        MemoryRoom::Unlimited => host,
+        MemoryRoom::Unknown => None,
+    }
+}
+
+/// Memory the host reports as available for new work without swapping
+/// (`MemAvailable`), on Linux; `None` elsewhere or when it cannot be read.
+fn host_available() -> Option<u64> {
+    #[cfg(test)]
+    if let Some(host) = TEST_HOST.with(|host| host.get()) {
+        return host;
+    }
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    mem_available(&std::fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+fn mem_available(meminfo: &str) -> Option<u64> {
+    let line = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))?;
+    let kib = line.trim().strip_suffix("kB")?.trim().parse::<u64>().ok()?;
+    kib.checked_mul(1024)
 }
 
 /// Reads the current answer. Call once per planning operation.
@@ -143,8 +188,8 @@ fn cgroup_room(text: &str, namespace: Option<&str>, mounts: &str, root: &Path) -
 const PER_OBJECT: u64 = 128 * 1024;
 
 /// How many small objects of at most `largest` bytes fit in half of `room`.
-/// The other half is left for everything else in the cgroup; neither part is
-/// a guarantee against running out of memory.
+/// The other half is left for everything else in the cgroup or on the host;
+/// this is an estimate, not a guarantee against running out of memory.
 pub(in crate::s3) fn objects_within(room: u64, largest: u64) -> usize {
     usize::try_from(room / 2 / (PER_OBJECT + largest)).unwrap_or(usize::MAX)
 }

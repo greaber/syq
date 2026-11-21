@@ -2,7 +2,7 @@
 use super::*;
 use crate::s3::{
     admission::{Checking, Concurrency},
-    tuning::memory::{self, MemoryRoom},
+    tuning::memory,
     writer,
 };
 
@@ -49,22 +49,20 @@ impl Engine {
         let small_download = self.options.route == Route::Download && largest < 1024 * 1024;
         let far = tiny && fixed_workers.is_none() && self.tuning.high_latency();
         // A far small download widens within the payload and descriptor
-        // budget and what a visible cgroup v2 memory limit leaves, read once
-        // here; that bound also limits later growth. The memory bound never
-        // goes below the near start of 256, but a smaller descriptor budget
-        // still wins. When memory or descriptors cannot be read it keeps the
-        // near start and plans like any other small download.
-        let widened = match (far && small_download).then(memory::memory_room) {
-            Some(MemoryRoom::Unknown) | None => None,
-            Some(room) => super::super::tuning::small_object_capacity(largest)
-                .ok()
-                .map(|capacity| match room {
-                    MemoryRoom::Limited(room) => {
-                        capacity.min(memory::objects_within(room, largest).max(256))
-                    }
-                    _ => capacity,
-                }),
-        };
+        // budget and the memory `download_room` finds (a visible cgroup v2
+        // limit and the host's available memory), read once here; that bound
+        // also limits later growth. The memory bound never goes below the
+        // near start of 256, but a smaller descriptor budget still wins. When
+        // memory or descriptors cannot be read it keeps the near start and
+        // plans like any other small download.
+        let widened = (far && small_download)
+            .then(memory::download_room)
+            .flatten()
+            .and_then(|free| {
+                super::super::tuning::small_object_capacity(largest)
+                    .ok()
+                    .map(|capacity| capacity.min(memory::objects_within(free, largest).max(256)))
+            });
         // Many small objects to or from a far endpoint start with as many
         // objects in flight as those budgets allow.
         let far_small = far && small_upload || widened.is_some();

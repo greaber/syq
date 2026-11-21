@@ -75,10 +75,12 @@ see [`--s3-retries`](object-storage.md#retries).
 With an endpoint that answers in 20 ms or more, an upload or download of many
 small objects (each under 1 MiB) starts with up to 4,096 objects in flight instead of
 ramping up from a few hundred, and can use several hundred MiB of memory while
-it runs. On Linux, a download keeps that number within what a cgroup v2 memory
-limit (such as a container's) appears to leave free; when syq cannot see
-whether such a limit applies, a download starts from 256. Uploads
-do not check memory. To cap either, pass `--resource-limits s3-objects=N`.
+it runs. On Linux, a download keeps that number within what the host's
+available memory and any cgroup v2 memory limit (such as a container's) appear
+to leave free. This is an estimate, not a guarantee against running out of
+memory. When syq cannot tell how much memory is free, a download starts from
+256. Uploads do not check memory. To cap either, pass
+`--resource-limits s3-objects=N`.
 
 When most objects are already up to date, a copy mostly asks the service
 about each object and transfers little. Syq then checks more objects at once
