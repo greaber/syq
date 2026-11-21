@@ -5,6 +5,7 @@ __pycache__/
 *.pyc
 /.claude/*
 !/.claude/settings.json
+!/.claude/skills/
 /.worktrees/
 /.env*
 
