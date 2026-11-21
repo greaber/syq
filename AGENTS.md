@@ -22,7 +22,8 @@ records between agents.
 Decide ordinary matters yourself. Bring these to the user as an explicit
 question before acting: a change to what was asked (added scope or a dropped
 requirement), a recurring cost, wider security access, a destructive or
-hard-to-undo action, and a product or design choice with no clear default.
+hard-to-undo action, a product or design choice with no clear default, and
+anything else this file says needs the user's decision.
 
 ## Worktrees
 
@@ -192,9 +193,11 @@ the conversation instead.
   synchronization, verify the resulting worktree, and drop it after the
   corresponding work is committed. Report any retained stash and why it is
   still needed in the handoff.
-- When reporting work, state the branch and exact short commit SHA, whether
-  the worktree is clean, which checks passed or failed, and which are still
-  running. Every status report about branch or PR work names the short SHA it
+- When reporting work to another agent or in a handoff note, state the
+  branch and exact short commit SHA, whether the worktree is clean, which
+  checks passed or failed, and which are still running. In the conversation
+  with the user, name the short SHA and only the checks that failed or are
+  still running. Every status report about branch or PR work names the short SHA it
   refers to, even when nothing changed ("unchanged at `ab12cd3`"), so the
   reader can tell whether a review covers the current work. Passing tests are
   not a precondition for reporting a change, opening a pull request, or
@@ -215,9 +218,8 @@ the conversation instead.
   dispatching a particular suite is not obvious, say why in the prose.
 - Run `scripts/branch-status.py` from the task worktree before opening a pull
   request, before asking for review, and before merging, and report CI state
-  from its output. Post-merge runs select
-  checks by changed paths, so a green one does not show that an earlier
-  failure was fixed. Report its unresolved `master` notes even when the
+  from its output. Post-merge runs select checks by changed paths, so a green
+  one does not show that an earlier failure was fixed. Report its unresolved `master` notes even when the
   current task did not cause them, but do not repeat failures marked
   `addressed`. It exits 1 while a check dispatched on the branch has failed,
   unless a later run of it passed or that failure was explicitly resolved. `scripts/pr-checks.py <number>` reports the
@@ -286,11 +288,14 @@ and other goals. Then:
   loss, a security hole, a broken agreed requirement, or a real problem with
   a small fix.
 - Decline the rest in a sentence that gives the reason. Declining a correct
-  finding is a normal outcome. Labels such as "pre-existing", "nonblocking"
+  finding is a normal outcome. When a declined finding leaves a real risk in
+  the change, tell the user in a line. Labels such as "pre-existing", "nonblocking"
   and "optional" are neither a reason to act nor a reason to dismiss.
 - Do not let a fix outgrow its problem. A fix that adds a mechanism, option,
-  fallback or guarantee the task did not call for is added scope: decline the
-  finding or take it to the user.
+  fallback or guarantee the task did not call for is added scope. When the
+  problem is one of the serious kinds in the first bullet, take it to the
+  user; otherwise decline the finding. Scope the reviewer reports as beyond
+  the task also goes to the user.
 - A real problem outside the task is separate work. Mention it to the user
   in a line and do not widen the change. A topic the user excluded stays
   excluded.
@@ -302,14 +307,15 @@ the user's.
 
 ### When to stop and tell the user
 
-A review should converge in one or two rounds. Stop before making further
-changes, and tell the user, when any of these happens:
+A review should converge in one or two rounds. A further round that only
+confirms small fixes from the round before is fine, so that no change merges
+unreviewed. Stop before making further changes, and tell the user, when any
+of these happens:
 
-- a third review round would be needed;
-- the change has grown well beyond what the task asked for, in size or in
-  what it does;
-- fixes for findings keep producing new findings, or a declined finding
-  comes back;
+- the second round still finds problems that need more than small fixes;
+- the change has started to grow beyond what the task asked for, in size or
+  in what it does;
+- fixes for findings keep producing new findings;
 - you and the reviewer disagree about something consequential.
 
 Say what was asked, what the change has become, what is still disputed, and
@@ -321,7 +327,7 @@ it stands or to cut it back to the original task.
 - [`PRINCIPLES.md`](PRINCIPLES.md) records the user's core product principles.
   Check a design against it before implementing, and raise any conflict first.
   Only the user decides its contents; propose a change in a pull request and
-  say so at the top.
+  raise it with the user in the conversation.
 - `README.md` and the documents under `docs/` are the user-facing contract;
   `README.md` is a brief front door, and `docs/copy-files.md` carries the
   detailed behavior. The code is authoritative for everything else. When you

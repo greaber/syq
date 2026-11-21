@@ -82,7 +82,7 @@ def parser():
     p.add_argument('--additional-reviewer', action='store_true',
                    help='Explicitly start another independent reviewer for this task')
     p.add_argument('--mode', choices=['collect', 'triage', 'auto'], default='auto')
-    p.add_argument('--max-rounds', type=positive, default=2)
+    p.add_argument('--max-rounds', type=positive, default=3)
     p.add_argument('--notify', action='store_true', help='Also queue a hint to the requesting agent’s registered Codex endpoint')
     for action in ('status', 'wait', 'next', 'stop', 'stop-loop', 'worker', 'resume'):
         p = review.add_parser(action)

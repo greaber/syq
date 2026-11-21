@@ -136,7 +136,8 @@ wake an agent that has stopped checking updates.
 ## Review and triage
 
 Run the project’s required validation and `scripts/branch-status.py` before each
-review handoff and report its output, including unrelated red master checks.
+review handoff and report what it shows that needs attention, including
+unrelated red master checks.
 From a clean, pushed task branch with an open PR, provide a short task brief
 under `target/` or `current-plans/`. Include the user's actual requirements,
 constraints, exclusions, and unresolved questions. Label your own assumptions.
@@ -243,9 +244,9 @@ Use `--unresolved FINDING_ID ...` to record persistent issues. Repeating an
 unresolved identifier stops the loop for discussion. A report marked blocked
 also requires discussion. Reviewer suggestions are not new user requirements.
 
-Auto mode is the default, with at most two published review rounds
-(`--max-rounds N`): a review that needs a third round usually means the change
-is growing or the agents disagree, which the user should hear about. Attempts that fail without publishing a report do not count;
+Auto mode is the default, with at most three published review rounds
+(`--max-rounds N`): two to converge and one to confirm small final fixes.
+Attempts that fail without publishing a report do not count;
 attempt numbers still increase to keep their records distinct. At the completed
 round limit, tell the user what is still open before starting a new request
 for further review.
