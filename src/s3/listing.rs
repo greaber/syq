@@ -135,9 +135,8 @@ pub(super) fn lists_in_key_order(bucket: &str) -> bool {
 }
 
 /// Whether listings of `bucket` at `endpoint` may be divided into parts
-/// (`engine::Store::divides`): the provider must document that ListObjectsV2
-/// returns keys in UTF-8 byte order. `None` is the AWS endpoint the SDK
-/// chooses.
+/// (`engine::Store::divides`): ListObjectsV2 must return keys in UTF-8 byte
+/// order. `None` is the AWS endpoint the SDK chooses.
 ///
 /// Of the providers checked, only AWS documents it: "List results are always
 /// returned in UTF-8 binary order" (https://docs.aws.amazon.com/AmazonS3/latest/userguide/ListingKeysUsingAPIs.html),
@@ -147,19 +146,32 @@ pub(super) fn lists_in_key_order(bucket: &str) -> bool {
 /// (https://docs.aws.amazon.com/AmazonS3/latest/userguide/olap-writing-lambda.html),
 /// so only names of general purpose buckets divide.
 ///
-/// Left out: Cloudflare R2, whose S3 API documentation states no order and
-/// for which a different order was reported
-/// (https://community.cloudflare.com/t/r2-listobjectsv2-returns-keys-in-non-standard-lexicographical-order/941399);
+/// Tigris states no order (https://www.tigrisdata.com/docs/api/s3/), but ad
+/// hoc runs of syq at `e7cc1893` against its own buckets in November 2026,
+/// kept outside this repository, found byte order throughout. About 5,000
+/// keys built to expose other orders (keys that extend others, case,
+/// punctuation around '/', NFC and NFD, CJK, emoji, percent signs) came back
+/// in byte order at page sizes from 1 to 1,000. StartAfter without a
+/// delimiter resumed in byte order, and both a divided listing and one page
+/// after another returned every key. A delimiter listing skips the key `P0`
+/// after a page that ends with the common prefix `P/`, which `engine::Gap`
+/// makes up for. Buckets that read through to another provider's bucket
+/// (Tigris's shadow buckets) were not tested.
+///
+/// Left out: Cloudflare R2, which states no order and in the same tests
+/// sorted as if every key ended in a byte just above '9' (`a0` and `a/b`
+/// before `a`), with StartAfter following that order;
 /// Google Cloud Storage, which says "lexicographically by name" without
 /// saying by bytes (https://cloud.google.com/storage/docs/xml-api/get-bucket-list);
 /// Backblaze B2, "sorted alphabetically by key"
-/// (https://www.backblaze.com/apidocs/s3-list-objects-v2); Tigris, whose
-/// S3 compatibility page states no order (https://www.tigrisdata.com/docs/api/s3/);
+/// (https://www.backblaze.com/apidocs/s3-list-objects-v2);
 /// and every self-hosted or unrecognized endpoint.
 pub(super) fn lists_in_byte_order(endpoint: Option<&str>, bucket: &str) -> bool {
     general_purpose_bucket(bucket)
-        && endpoint
-            .is_none_or(|endpoint| aws_endpoint(endpoint) || (test_divides() && loopback(endpoint)))
+        && endpoint.is_none_or(|endpoint| {
+            base_host(endpoint).is_some_and(|host| aws_host(&host) || super::tigris_host(&host))
+                || (test_divides() && loopback(endpoint))
+        })
 }
 
 /// The test servers are not AWS. Debug builds let them divide listings: they
@@ -201,30 +213,16 @@ fn general_purpose_bucket(bucket: &str) -> bool {
         .any(|suffix| bucket.ends_with(suffix))
 }
 
-/// Whether `endpoint` is the base URL of an AWS S3 endpoint for general
-/// purpose buckets, which the client addresses path-style: global, regional,
-/// legacy dash-regional, dual-stack and FIPS endpoints in the AWS and China
-/// partitions (https://docs.aws.amazon.com/general/latest/gr/s3.html), and
+/// Whether `host`, of an endpoint URL with no path (`base_host`), is an AWS
+/// S3 endpoint for general purpose buckets, which the client addresses
+/// path-style: global, regional, legacy dash-regional, dual-stack and FIPS
+/// endpoints in the AWS and China partitions
+/// (https://docs.aws.amazon.com/general/latest/gr/s3.html), and
 /// the bucket role of a VPC interface endpoint
 /// (https://docs.aws.amazon.com/AmazonS3/latest/userguide/privatelink-interface-endpoints.html).
 /// Hosts that already name a bucket, access points, Object Lambda, Outposts,
 /// directory buckets (`s3express`) and multi-Region access points are not.
-fn aws_endpoint(endpoint: &str) -> bool {
-    let Ok(url) = url::Url::parse(endpoint) else {
-        return false;
-    };
-    // A path would come before the bucket's: another bucket, and a key. The
-    // SDK sends the path as given, so check it before any normalization.
-    let Some((_, rest)) = endpoint.split_once("://") else {
-        return false;
-    };
-    let path = rest.find(['/', '\\']).map_or("", |at| &rest[at..]);
-    if !matches!(path, "" | "/") || url.path() != "/" {
-        return false;
-    }
-    let Some(url::Host::Domain(host)) = url.host() else {
-        return false;
-    };
+fn aws_host(host: &str) -> bool {
     let labels: Vec<&str> = host.split('.').collect();
     let rest = match labels.as_slice() {
         [rest @ .., "amazonaws", "com"] | [rest @ .., "amazonaws", "com", "cn"] => rest,
@@ -248,6 +246,22 @@ fn aws_endpoint(endpoint: &str) -> bool {
         ["bucket", endpoint, "s3", r, "vpce"] => endpoint.starts_with("vpce-") && region(r),
         [legacy] => legacy.strip_prefix("s3-").is_some_and(region),
         _ => false,
+    }
+}
+
+/// The domain of an endpoint URL with no path, in lowercase. A path would
+/// come before the bucket's: another bucket, and a key. The SDK sends the
+/// path as given, so it is checked before any normalization.
+fn base_host(endpoint: &str) -> Option<String> {
+    let url = url::Url::parse(endpoint).ok()?;
+    let (_, rest) = endpoint.split_once("://")?;
+    let path = rest.find(['/', '\\']).map_or("", |at| &rest[at..]);
+    if !matches!(path, "" | "/") || url.path() != "/" {
+        return None;
+    }
+    match url.host()? {
+        url::Host::Domain(host) => Some(host.to_owned()),
+        _ => None,
     }
 }
 
