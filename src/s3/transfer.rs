@@ -2983,17 +2983,26 @@ impl Engine {
             state.save(&record)?;
             remove_partial(root, &old)?;
         }
-        let _cleanup = if state.has_record() {
+        let mut cleanup = if state.has_record() {
             None
         } else {
-            Some(PartialCleanup {
+            Some(PartialCleanup::new(
                 root,
-                path: RelativePath::new(record.partial.as_bytes())?,
-                identity: (record.dev, record.ino),
-            })
+                RelativePath::new(record.partial.as_bytes())?,
+                (record.dev, record.ino),
+            ))
         };
         let range_algorithm = record.hash_algorithm;
-        let record = Arc::new(Mutex::new(record));
+        struct DownloadRecord {
+            state: DownloadState,
+            saved: tokio::time::Instant,
+            dirty: bool,
+        }
+        let record = Arc::new(Mutex::new(DownloadRecord {
+            state: record,
+            saved: tokio::time::Instant::now(),
+            dirty: false,
+        }));
         let file = Arc::new(file);
         let allocation = file.clone();
         let size = object.size;
@@ -3029,7 +3038,7 @@ impl Engine {
                         self.progress.bytes_unchanged.fetch_add(length, Relaxed);
                         return Ok::<_, anyhow::Error>(());
                     }
-                    let previous = record.lock().await.parts.get(&index).cloned();
+                    let previous = record.lock().await.state.parts.get(&index).cloned();
                     if let Some(hash) = previous {
                         let f = file.clone();
                         let actual = tokio::task::spawn_blocking(move || {
@@ -3052,10 +3061,18 @@ impl Engine {
                             Some(range_algorithm),
                         )
                         .await?;
-                    output.finish().await?;
+                    output.flush().await?;
                     let mut record = record.lock().await;
-                    record.parts.insert(index, hash);
-                    state.save(&*record)?;
+                    record.state.parts.insert(index, hash);
+                    record.dirty = true;
+                    // The record grows with each part. Saving at most once a
+                    // second bounds its rewrites; an unsaved part only
+                    // downloads again on resume.
+                    if record.saved.elapsed() >= Duration::from_secs(1) {
+                        state.save(&record.state)?;
+                        record.saved = tokio::time::Instant::now();
+                        record.dirty = false;
+                    }
                     Ok(())
                 }
             })
@@ -3070,42 +3087,57 @@ impl Engine {
             .into_iter()
             .collect::<Result<Vec<_>>>();
         let flushed = output.finish().await;
-        copied?;
-        flushed?;
-        let partial = record.lock().await.partial.clone();
-        let partial_path = RelativePath::new(partial.as_bytes())?;
-        // A network filesystem may flush here; keep that off the async workers.
-        let writer = file.clone();
-        let label = path.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            crate::fsops::check_destination_writes(&writer, &label)
-        })
-        .await??;
-        for expected in self.download_digests(&metadata, expected_hash) {
-            let f = root.open_regular_read(&partial_path)?;
-            tokio::task::spawn_blocking(move || expected.verify_reader(&mut &f)).await??;
-        }
-        // A version ID pins immutable content; otherwise confirm the source
-        // still has the identity used on every range request.
-        if object.version.is_none() {
-            let final_object = client::head(&self.client, &self.options.bucket, &object.key)
-                .await?
-                .context("source disappeared during download")?;
-            if final_object.etag != object.etag || final_object.size != object.size {
-                bail!("source object changed during download");
+        let published = async {
+            copied?;
+            flushed?;
+            let partial = record.lock().await.state.partial.clone();
+            let partial_path = RelativePath::new(partial.as_bytes())?;
+            // A network filesystem may flush here; keep that off the async workers.
+            let writer = file.clone();
+            let label = path.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                crate::fsops::check_destination_writes(&writer, &label)
+            })
+            .await??;
+            for expected in self.download_digests(&metadata, expected_hash) {
+                let f = root.open_regular_read(&partial_path)?;
+                tokio::task::spawn_blocking(move || expected.verify_reader(&mut &f)).await??;
             }
+            // A version ID pins immutable content; otherwise confirm the source
+            // still has the identity used on every range request.
+            if object.version.is_none() {
+                let final_object = client::head(&self.client, &self.options.bucket, &object.key)
+                    .await?
+                    .context("source disappeared during download")?;
+                if final_object.etag != object.etag || final_object.size != object.size {
+                    bail!("source object changed during download");
+                }
+            }
+            self.check_cancelled()?;
+            local::apply_file_metadata(
+                &file,
+                &metadata,
+                &self.args,
+                existing.filter(|m| m.is_file()).map(|m| m.mode & 0o7777),
+                explicit,
+                || local::CreationPermissions::shared_for_file(&self.file_permissions, root, &path),
+            )?;
+            let m = file.metadata()?;
+            self.publish_download(root, &partial_path, &path, (m.dev(), m.ino()), replaces)?;
+            Ok::<_, anyhow::Error>(())
         }
-        self.check_cancelled()?;
-        local::apply_file_metadata(
-            &file,
-            &metadata,
-            &self.args,
-            existing.filter(|m| m.is_file()).map(|m| m.mode & 0o7777),
-            explicit,
-            || local::CreationPermissions::shared_for_file(&self.file_permissions, root, &path),
-        )?;
-        let m = file.metadata()?;
-        self.publish_download(root, &partial_path, &path, (m.dev(), m.ino()), replaces)?;
+        .await;
+        if let Err(error) = published {
+            let record = record.lock().await;
+            if record.dirty {
+                // Keep the download or publication failure as the reported error.
+                let _ = state.save(&record.state);
+            }
+            return Err(error);
+        }
+        if let Some(cleanup) = &mut cleanup {
+            cleanup.disarm();
+        }
         state.clear()?;
         Ok(Some(object.size))
     }
@@ -3191,15 +3223,21 @@ impl Engine {
     }
     #[allow(clippy::too_many_arguments)]
     async fn download_single(
-        &self,
+        self: &Arc<Self>,
         object: &Object,
-        root: &Root,
+        root: &Arc<Root>,
         path: &RelativePath,
         validation: (&Metadata, Option<&Digest>, crate::mapping::Metadata),
         (mode, replaces): (Option<u32>, Option<MatchedFile>),
         initial: Option<ByteStream>,
         initial_slot: Option<super::tuning::Permit>,
     ) -> Result<Option<u64>> {
+        // Objects at or below the streaming batch size (128 KiB) are already
+        // buffered in memory before their first write. Collecting them first
+        // avoids spawning a per-file Writer task and channels, keeps blocking
+        // filesystem calls off async worker threads, and skips creating a
+        // partial file when a GET or digest check fails.
+        const INLINE_LIMIT: u64 = 128 * 1024;
         let (metadata, expected_hash, explicit) = validation;
         let path_buf = path.to_path_buf();
         let label = path_buf
@@ -3211,37 +3249,25 @@ impl Engine {
         let partial = RelativePath::new(
             local::join(parent, &super::prune::partial_name(&random)).as_bytes(),
         )?;
-        let file = Arc::new(root.create_file(&partial, 0o600)?);
-        let _cleanup = PartialCleanup {
-            root,
-            path: partial.clone(),
-            identity: (file.metadata()?.dev(), file.metadata()?.ino()),
-        };
-        let result = async {
-            let digests = self.download_digests(metadata, expected_hash);
-            let algorithm = digests.first().map(|d| d.algorithm);
-            let output =
-                super::writer::Writer::with_readback(file.clone(), object.size, digests.len() > 1)?;
+        let digests = self.download_digests(metadata, expected_hash);
+        let algorithm = digests.first().map(|d| d.algorithm);
+        if object.size <= INLINE_LIMIT {
+            let mut chunks = Vec::new();
             let hash = if object.size == 0 && initial.is_none() {
                 algorithm
                     .map(|a| Digest::hash_bytes(a, &[]).value)
                     .unwrap_or_default()
             } else {
-                let copied = self
-                    .download_fast_range(
-                        object,
-                        &output,
-                        0,
-                        object.size,
-                        initial,
-                        initial_slot,
-                        algorithm,
-                    )
-                    .await;
-                let flushed = output.finish().await;
-                let hash = copied?;
-                flushed?;
-                hash
+                self.download_fast_range_into(
+                    object,
+                    fast::DownloadSink::Memory(&mut chunks),
+                    0,
+                    object.size,
+                    initial,
+                    initial_slot,
+                    algorithm,
+                )
+                .await?
             };
             if digests
                 .first()
@@ -3249,28 +3275,85 @@ impl Engine {
             {
                 bail!("download checksum mismatch");
             }
-            // If the caller requires a second algorithm, reread only for that
-            // distinct requirement, never rehash the same digest twice.
             for expected in digests.into_iter().skip(1) {
-                let f = file.clone();
-                tokio::task::spawn_blocking(move || expected.verify_reader(&mut &*f)).await??;
+                let mut hasher = expected.algorithm.hasher();
+                for chunk in &chunks {
+                    hasher.update(chunk);
+                }
+                expected.verify(&hasher.finalize())?;
             }
             self.check_cancelled()?;
-            let writer = file.clone();
-            let label = path_buf.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::fsops::check_destination_writes(&writer, &label)
+            let engine = self.clone();
+            let root = root.clone();
+            let path = path.clone();
+            let metadata = metadata.clone();
+            let size = object.size;
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let file = root.create_file(&partial, 0o600)?;
+                let m = file.metadata()?;
+                let identity = (m.dev(), m.ino());
+                let mut cleanup = PartialCleanup::new(&root, partial.clone(), identity);
+                super::writer::write_chunks(&file, &chunks)?;
+                crate::fsops::check_destination_writes(&file, &path_buf)?;
+                local::apply_file_metadata(&file, &metadata, &engine.args, mode, explicit, || {
+                    local::CreationPermissions::shared_for_file(
+                        &engine.file_permissions,
+                        &root,
+                        &path,
+                    )
+                })?;
+                engine.publish_download(&root, &partial, &path, identity, replaces)?;
+                cleanup.disarm();
+                Ok(())
             })
             .await??;
-            local::apply_file_metadata(&file, metadata, &self.args, mode, explicit, || {
-                local::CreationPermissions::shared_for_file(&self.file_permissions, root, path)
-            })?;
-            let m = file.metadata()?;
-            self.publish_download(root, &partial, path, (m.dev(), m.ino()), replaces)?;
-            Ok(Some(object.size))
+            return Ok(Some(size));
         }
-        .await;
-        result
+        let file = Arc::new(root.create_file(&partial, 0o600)?);
+        let m = file.metadata()?;
+        let identity = (m.dev(), m.ino());
+        let mut cleanup = PartialCleanup::new(root, partial.clone(), identity);
+        let output =
+            super::writer::Writer::with_readback(file.clone(), object.size, digests.len() > 1)?;
+        let copied = self
+            .download_fast_range(
+                object,
+                &output,
+                0,
+                object.size,
+                initial,
+                initial_slot,
+                algorithm,
+            )
+            .await;
+        let flushed = output.finish().await;
+        let hash = copied?;
+        flushed?;
+        if digests
+            .first()
+            .is_some_and(|expected| expected.value != hash)
+        {
+            bail!("download checksum mismatch");
+        }
+        // If the caller requires a second algorithm, reread only for that
+        // distinct requirement, never rehash the same digest twice.
+        for expected in digests.into_iter().skip(1) {
+            let f = file.clone();
+            tokio::task::spawn_blocking(move || expected.verify_reader(&mut &*f)).await??;
+        }
+        self.check_cancelled()?;
+        let writer = file.clone();
+        let label = path_buf.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::fsops::check_destination_writes(&writer, &label)
+        })
+        .await??;
+        local::apply_file_metadata(&file, metadata, &self.args, mode, explicit, || {
+            local::CreationPermissions::shared_for_file(&self.file_permissions, root, path)
+        })?;
+        self.publish_download(root, &partial, path, identity, replaces)?;
+        cleanup.disarm();
+        Ok(Some(object.size))
     }
     fn open_download_state(
         &self,
@@ -3441,11 +3524,8 @@ impl Engine {
         let partial_path = RelativePath::new(partial.as_bytes())?;
         let staged = Arc::new(root.create_file(&partial_path, 0o600)?);
         let created = staged.metadata()?;
-        let _cleanup = PartialCleanup {
-            root,
-            path: partial_path.clone(),
-            identity: (created.dev(), created.ino()),
-        };
+        let mut cleanup =
+            PartialCleanup::new(root, partial_path.clone(), (created.dev(), created.ino()));
         if !crate::fsops::SeedAccess::new(&staged).admits(&existing) {
             return Ok(LocalReplacement::Download(MatchedFile {
                 dev: before.dev(),
@@ -3498,6 +3578,7 @@ impl Engine {
             before.ino(),
             Some((before.ctime(), before.ctime_nsec() as u32)),
         )?;
+        cleanup.disarm();
         self.progress.add_bytes(object.size);
         Ok(LocalReplacement::Done(object.size))
     }
@@ -3894,9 +3975,26 @@ struct PartialCleanup<'a> {
     root: &'a Root,
     path: RelativePath,
     identity: (u64, u64),
+    active: bool,
+}
+impl<'a> PartialCleanup<'a> {
+    fn new(root: &'a Root, path: RelativePath, identity: (u64, u64)) -> Self {
+        Self {
+            root,
+            path,
+            identity,
+            active: true,
+        }
+    }
+    fn disarm(&mut self) {
+        self.active = false;
+    }
 }
 impl Drop for PartialCleanup<'_> {
     fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
         if self
             .root
             .metadata_optional(&self.path)
