@@ -2454,9 +2454,13 @@ fn validate_results(temp: &Path) {
 fn s3_ranges_signed_headers_metadata_and_results() {
     let server = Server::start("patterned");
     let temp = crate::test_support::tempdir().unwrap();
-    let output = server.cp(
-        temp.path(),
-        &[
+    // A hostname exercises the production DNS resolver as parallel GETs
+    // make new connections to this fixture.
+    let endpoint = server.address.replacen("127.0.0.1", "localhost", 1);
+    let output = server
+        .command(temp.path())
+        .args(["--s3-endpoint", &endpoint])
+        .args([
             "--from",
             "s3://bucket",
             "data",
@@ -2465,8 +2469,9 @@ fn s3_ranges_signed_headers_metadata_and_results() {
             "--integrity-checking=transfer=blake3",
             "--results",
             "results.jsonl",
-        ],
-    );
+        ])
+        .capture_output()
+        .unwrap();
     assert!(output.status.success(), "{}", output_text(&output));
     assert_eq!(
         std::fs::read(temp.path().join("download")).unwrap(),
