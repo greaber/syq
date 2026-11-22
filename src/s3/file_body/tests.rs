@@ -81,9 +81,11 @@ async fn chunks_read_the_range_and_reuse_released_buffers() {
     assert!(chunks.is_end_stream());
     assert_eq!(read, data[offset as usize..][..length as usize]);
     // Each chunk was released before the read after next, so the chunk
-    // being sent and the one read ahead took turns with two buffers.
-    assert_eq!(addresses.len(), 2);
-    assert_eq!(pool.idle().len(), 2);
+    // being sent and the one read ahead never needed more than two buffers.
+    // Whether the read ahead found the previous chunk's buffer released
+    // depends on when the blocking pool ran it, so one buffer may have done.
+    assert!(addresses.len() <= 2, "{} buffers", addresses.len());
+    assert_eq!(pool.idle().len(), addresses.len());
 }
 
 /// Handing on a chunk starts reading the next one, and only that one, so the
@@ -199,14 +201,17 @@ async fn a_source_changed_in_place_fails_the_last_chunk() {
         .unwrap()
         .write_all_at(b"changed", 0)
         .unwrap();
-    drop(frame(&mut chunks).await.unwrap().unwrap());
+    // Holding the first chunk makes the second read take a buffer of its own.
+    let first = frame(&mut chunks).await.unwrap().unwrap();
     let error = frame(&mut chunks).await.unwrap().unwrap_err();
     assert!(
         error.to_string().contains("source changed during S3 copy"),
         "{error}"
     );
     assert!(!chunks.is_end_stream());
-    eventually_idle(pool, 2).await;
+    assert_eq!(pool.idle().len(), 1, "the failed read returned its buffer");
+    drop(first);
+    assert_eq!(pool.idle().len(), 2);
 }
 
 /// Dropping a body, as cancellation does, while a read is in flight still

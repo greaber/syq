@@ -31,7 +31,14 @@ pub(super) fn serve_upload(
                 return;
             }
             if fault == "recovery-upload-source-replaced" {
-                let next = path.with_extension("next");
+                // Parts are sent in parallel, so each replacement is
+                // written under a name of its own.
+                static REPLACEMENTS: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let next = path.with_extension(format!(
+                    "next{}",
+                    REPLACEMENTS.fetch_add(1, Ordering::Relaxed)
+                ));
                 std::fs::write(&next, vec![b'x'; SIZE]).unwrap();
                 std::fs::rename(&next, &path).unwrap();
             } else {
