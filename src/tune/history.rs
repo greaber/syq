@@ -267,25 +267,31 @@ fn open_waiting(path: &Path, lock_wait: Duration) -> Result<Connection> {
     // Concurrent first opens can race while changing journal mode. SQLite
     // returns BUSY immediately for this lock upgrade, without the busy handler.
     // Retry only this operation, within the same small startup wait budget.
-    db.busy_timeout(Duration::ZERO)?;
-    let deadline = Instant::now() + lock_wait;
-    loop {
-        match db.pragma_update(None, "journal_mode", "WAL") {
-            Err(rusqlite::Error::SqliteFailure(error, _))
-                if error.code == rusqlite::ErrorCode::DatabaseBusy && Instant::now() < deadline =>
-            {
-                std::thread::sleep(
-                    Duration::from_millis(2)
-                        .min(deadline.saturating_duration_since(Instant::now())),
-                );
-            }
-            result => {
-                result.context("enable history WAL")?;
-                break;
+    if !db
+        .pragma_query_value(None, "journal_mode", |r| r.get::<_, String>(0))?
+        .eq_ignore_ascii_case("wal")
+    {
+        db.busy_timeout(Duration::ZERO)?;
+        let deadline = Instant::now() + lock_wait;
+        loop {
+            match db.pragma_update(None, "journal_mode", "WAL") {
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::DatabaseBusy
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(
+                        Duration::from_millis(2)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
+                result => {
+                    result.context("enable history WAL")?;
+                    break;
+                }
             }
         }
+        db.busy_timeout(lock_wait)?;
     }
-    db.busy_timeout(lock_wait)?;
     db.pragma_update(None, "foreign_keys", true)?;
     Ok(db)
 }
@@ -420,6 +426,34 @@ impl Recorder {
         }
     }
 
+    /// Only a run with measured alternatives can seed a later copy. Recheck
+    /// the parts of its route that can change during a copy (including fallback).
+    pub(crate) fn finish_learning(
+        &self,
+        key: &ContextKey,
+        src: &crate::conn::Endpoint,
+        dst: &crate::conn::Endpoint,
+        automatic: bool,
+    ) {
+        let measured = self
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .measurements
+            .has_comparison();
+        if automatic && measured {
+            let consistent = key.source_transport == transport(src)
+                && key.destination_transport == transport(dst)
+                && (!(src.is_remote() || dst.is_remote())
+                    || key.network
+                        == super::network::fingerprint().map(|n| self.token("network", &n)));
+            self.event(
+                "learning_context",
+                json!({"consistent":consistent,"automatic":true}),
+            );
+        }
+    }
+
     pub(crate) fn starting_count(&self, key: &ContextKey, allow_route: bool) -> Option<Hint> {
         let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
         if !state.ready() {
@@ -435,6 +469,24 @@ impl Recorder {
     pub(crate) fn complete(&self, success: bool, summary: Value) {
         let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
         if state.finished {
+            return;
+        }
+        // A one-file or empty worker-path copy can also finish before its
+        // first measurement. Keep failures, TCP preflight diagnostics and
+        // already published timelines, but take no writer lock just for this.
+        if success
+            && state.id.is_none()
+            && state.pending.iter().any(|e| {
+                e["kind"] == "planned" && e["data"]["files"].as_u64().is_some_and(|n| n <= 1)
+            })
+            && !state.pending.iter().any(|e| {
+                matches!(
+                    e["kind"].as_str(),
+                    Some("observation" | "transition" | "tcp_preflight")
+                )
+            })
+        {
+            state.abandon();
             return;
         }
         state.record("finish", summary.clone());
@@ -465,7 +517,7 @@ impl Writer {
         let elapsed_us = self.start.elapsed().as_micros().min(i64::MAX as u128) as u64;
         let sequence = self.sequence;
         self.sequence += 1;
-        if matches!(kind, "transition" | "sequential_evidence") {
+        if kind == "transition" {
             self.measurement_segment = sequence as i64;
         }
         if kind == "observation" {
@@ -766,12 +818,7 @@ fn prune_within(db: &Connection, budget: u64, current: i64, time: Duration) -> R
             batch = needed.clamp(1, (batch * 4).min(PRUNE_BATCH) as i128) as usize;
         }
     }
-    if size <= budget && free > budget {
-        // Rebuilding costs time in proportion to the kept history, not to
-        // the free space, which a gradual reclaim would have to move
-        // around. This happens once after a large shrink.
-        db.execute_batch("VACUUM;")?;
-    } else if size <= budget && size + free > budget {
+    if size <= budget && size + free > budget {
         // Later runs reuse free pages, so return only the ones that keep the
         // file over the budget. Each step of this pragma moves one page and
         // commits when the statement is dropped, so the same deadline bounds
@@ -853,6 +900,15 @@ pub(crate) fn activity_mode(mut mode: String, transport: bool) -> String {
     mode
 }
 
+fn transport(endpoint: &crate::conn::Endpoint) -> String {
+    match endpoint {
+        crate::conn::Endpoint::Remote(spec) if !spec.local_process => {
+            format!("{:?}", spec.data_transport())
+        }
+        _ => "Local".into(),
+    }
+}
+
 pub(crate) fn context_key(
     recorder: &Recorder,
     src: &crate::conn::Endpoint,
@@ -861,12 +917,6 @@ pub(crate) fn context_key(
     destination: Option<&str>,
     mode: String,
 ) -> ContextKey {
-    let transport = |endpoint: &crate::conn::Endpoint| match endpoint {
-        crate::conn::Endpoint::Remote(spec) if !spec.local_process => {
-            format!("{:?}", spec.data_transport())
-        }
-        _ => "Local".into(),
-    };
     let source_transport = transport(src);
     let destination_transport = transport(dst);
     let route = format!(

@@ -1,15 +1,12 @@
-//! Discrete-time simulation of [`Policy`] and [`Sampler`] against synthetic
+//! Discrete-time simulation of [`Policy`] and the live measurement window against synthetic
 //! throughput curves. It answers statistical questions that a handful of
 //! hardware runs cannot: how often a rule helps, how much throughput the
 //! search costs, and whether the remembered count drifts across copies.
 //!
-//! This coarse model does not model the fine-grained sequential evidence in
-//! [`run`]; it is not a validation of the production observation pipeline.
-//! It exercises policy decisions without threads or a clock:
-//! reductions apply at once, increases wait for connection setup while the
-//! settled count refreshes its baseline, the tail stops measuring, and two
-//! collapsed samples short-circuit a probe. It does not model handshakes
-//! competing with the transfer or connections warming up after activation.
+//! The simulation feeds half-second intervals to the live measurement window.
+//! Reductions apply at once and increases wait for connection setup while the
+//! settled count refreshes its baseline. It does not model handshakes competing
+//! with the transfer, partial counters, or congestion after activation.
 //! Initial connections are ready at time zero; elapsed time excludes their
 //! setup. Connection planning is checked every 250ms; activation and retirement
 //! are instantaneous. File credit, connection failures, and scheduler limits
@@ -153,7 +150,7 @@ struct Outcome {
     handshakes: usize,
     policy: Policy,
     /// Measured (active workers, rate) samples, as history would record them.
-    observations: Vec<(usize, f64)>,
+    observations: Vec<(usize, f64, f64)>,
 }
 
 fn copy(s: &Scenario, policy: Policy, rng: &mut Rng) -> Outcome {
@@ -174,12 +171,10 @@ fn copy_observing(
     let mut open = active;
     let mut handshakes = active;
     let mut connection_secs = 0.0;
-    let mut sampler = Sampler::default();
-    sampler.reset();
+    let mut evidence = evidence::Evidence::default();
     let (mut sample_start, mut sample_bytes) = (0.0f64, 0.0f64);
     let mut noise_end = SAMPLE_SECS;
     let (mut ideal_done, mut ideal_elapsed, mut near_secs) = (0.0, None, 0.0);
-    let mut collapsed = 0;
     let mut last_rate: Option<f64> = None;
     let mut reached = None;
     let mut tail_rollback_blocked = false;
@@ -197,7 +192,7 @@ fn copy_observing(
         let lead = Duration::from_secs_f64(s.setup_secs * 2.0 + 1.0);
         let wanted = if s.prepare {
             let plan = policy.connection_plan(
-                &sampler,
+                &evidence,
                 SAMPLE,
                 Duration::from_secs_f64(t - sample_start),
                 lead,
@@ -220,8 +215,8 @@ fn copy_observing(
         if policy.n < active {
             active = policy.n;
             policy.activated();
-            sampler.reset();
-            (sample_start, sample_bytes, collapsed) = (t, 0.0, 0);
+            evidence.clear();
+            (sample_start, sample_bytes) = (t, 0.0);
             continue;
         }
         let tail_blocks_increase = policy.n > active
@@ -246,7 +241,7 @@ fn copy_observing(
         }
 
         let rate = s.curve.rate(active, t) * noise;
-        let sample_end = sample_start + SAMPLE_SECS;
+        let sample_end = sample_start + 0.5;
         let mut until = ready_at.map_or(sample_end, |ready| ready.min(sample_end));
         until = until.min(noise_end).min(((t / 0.25).floor() + 1.0) * 0.25);
         if let Curve::Shift { at, .. } = s.curve {
@@ -291,8 +286,8 @@ fn copy_observing(
         if ready_at.is_some_and(|ready| ready <= t) {
             active = policy.n;
             policy.activated();
-            sampler.reset();
-            (sample_start, sample_bytes, collapsed) = (t, 0.0, 0);
+            evidence.clear();
+            (sample_start, sample_bytes) = (t, 0.0);
             continue;
         }
 
@@ -303,46 +298,30 @@ fn copy_observing(
             (sample_start, sample_bytes) = (t, 0.0);
             continue;
         }
-        let measured = sample_bytes / SAMPLE_SECS;
+        let seconds = t - sample_start;
+        let measured = sample_bytes / seconds;
         (sample_start, sample_bytes) = (t, 0.0);
         last_rate = Some(measured);
         let enough = total - done >= measured * SAMPLE_SECS * MEASUREMENT_SAMPLES;
         if enough {
-            observations.push((active, measured));
+            observations.push((active, measured, seconds));
         }
-        if policy.n > active {
-            if !enough {
-                policy.cancel_unapplied();
-                sampler.reset();
-            } else if let Some(score) = sampler.push(measured) {
-                policy.refresh_warming_baseline(score);
-            }
+        if policy.n > active && !enough {
+            policy.cancel_unapplied();
+            evidence.clear();
             continue;
         }
-        if !enough {
-            sampler.reset();
-            collapsed = 0;
-            continue;
-        }
-        if policy
-            .probe_base()
-            .is_some_and(|base| base > 0.0 && measured < 0.5 * base)
-        {
-            collapsed += 1;
+        let base = if policy.n == active {
+            policy.probe_base()
         } else {
-            collapsed = 0;
-        }
-        if collapsed >= 2 {
-            policy.observe(measured);
-            sampler.reset();
-            collapsed = 0;
-            continue;
-        }
-        if let Some(score) = sampler.push(measured) {
-            let before = policy.n;
-            policy.observe(score);
-            if policy.n != before {
-                sampler.reset();
+            None
+        };
+        if let Some(score) = evidence.push(measured, seconds, base.unwrap_or_default()) {
+            evidence.clear();
+            if policy.n > active {
+                policy.refresh_warming_baseline(score.rate);
+            } else {
+                policy.observe(score.rate);
             }
         }
     }
@@ -523,14 +502,14 @@ fn report() {
                     serde_json::json!({"consistent":true,"automatic":true}),
                 );
                 let mut segment = None;
-                for &(workers, rate) in &out.observations {
+                for &(workers, rate, seconds) in &out.observations {
                     if segment != Some(workers) {
                         writer.event("transition", serde_json::json!({}));
                         segment = Some(workers);
                     }
                     writer.event(
                         "observation",
-                        serde_json::json!({"active":workers,"seconds":SAMPLE_SECS,
+                        serde_json::json!({"active":workers,"seconds":seconds,
                             "rate":rate,"usable":true}),
                     );
                 }
@@ -713,7 +692,7 @@ fn preparation_waits_for_actual_connection_readiness() {
     assert_eq!(out.reached_near_best, Some(30.0));
     s.prepare = false;
     let out = copy(&s, Policy::new(8, 1, LIMIT), &mut Rng(1));
-    assert_eq!(out.reached_near_best, Some(37.5));
+    assert_eq!(out.reached_near_best, Some(s.setup_secs + SAMPLE_SECS));
 }
 
 #[test]

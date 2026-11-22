@@ -11,6 +11,11 @@ const STARTUP_CONNECTION_COST: f64 = 0.01;
 // inspectable, but only runs with ordered measurement rows seed new starts.
 pub(super) const MEASUREMENTS: i64 = 4;
 
+// Startup looks at up to 64 of the newest matching runs and the last 240
+// observations (about two minutes at half-second intervals) of each.
+const RUN_LIMIT: usize = 64;
+const OBSERVATION_LIMIT: usize = 240;
+
 struct Comparison {
     workers: usize,
     refine: bool,
@@ -45,30 +50,37 @@ pub(super) fn starting_count(
         } else {
             "AND ?3 IS NULL AND ?4 IS NULL"
         };
-        let mut statement = db.prepare(&format!("SELECT id,day FROM runs WHERE route=?1 AND mode=?2 AND eligible={MEASUREMENTS} AND status='success' AND lost=0 {filesystem_match} ORDER BY id DESC"))?;
-        let runs = statement.query_map(
-            params![
-                key.route,
-                key.mode,
-                if specific {
-                    key.source_filesystem.as_deref()
-                } else {
-                    None
-                },
-                if specific {
-                    key.destination_filesystem.as_deref()
-                } else {
-                    None
-                }
-            ],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-        )?;
+        let mut statement = db.prepare(&format!(
+            "SELECT id,day,(status='success' AND lost=0) FROM runs WHERE route=?1 AND mode=?2
+             AND eligible={MEASUREMENTS} {filesystem_match} ORDER BY id DESC LIMIT {RUN_LIMIT}"
+        ))?;
+        let mut runs = statement.query(params![
+            key.route,
+            key.mode,
+            specific
+                .then_some(key.source_filesystem.as_deref())
+                .flatten(),
+            specific
+                .then_some(key.destination_filesystem.as_deref())
+                .flatten(),
+        ])?;
+        // Seek to the beginning of this run's bounded tail, then replay it in
+        // sequence order. Older runs remain unread once we have 32 comparisons.
+        let mut measurements = db.prepare(&format!(
+            "SELECT segment,workers,seconds,rate,usable FROM measurements
+             WHERE run=?1 AND sequence>=COALESCE((SELECT sequence FROM measurements
+                 WHERE run=?1 ORDER BY sequence DESC LIMIT 1 OFFSET {}),0)
+             ORDER BY sequence",
+            OBSERVATION_LIMIT - 1
+        ))?;
         let mut choices = Vec::new();
-        let mut measurements = db.prepare(
-            "SELECT segment,workers,seconds,rate,usable FROM measurements WHERE run=?1 ORDER BY sequence",
-        )?;
-        for run in runs {
-            let (run, when) = run?;
+        let today = day();
+        while let Some(row) = runs.next()? {
+            if !row.get::<_, bool>(2)? {
+                continue;
+            }
+            let run: i64 = row.get(0)?;
+            let when: i64 = row.get(1)?;
             let mut evidence = RunEvidence::default();
             let mut rows = measurements.query([run])?;
             while let Some(row) = rows.next()? {
@@ -81,9 +93,8 @@ pub(super) fn starting_count(
                 });
             }
             if let Some(comparison) = evidence.finish() {
-                let rank = choices.len();
-                let age = day().saturating_sub(when).max(0) as f64;
-                let weight = 2.0_f64.powf(-age / 7.0) / (rank + 1) as f64;
+                let age = today.saturating_sub(when).max(0) as f64;
+                let weight = 2.0_f64.powf(-age / 7.0) / (choices.len() + 1) as f64;
                 if weight > 0.0 {
                     choices.push((comparison, weight, run));
                     if choices.len() == 32 {
@@ -143,9 +154,7 @@ impl Eligibility {
     pub(super) fn push(&mut self, event: &Value) {
         if event["kind"] == "start" {
             self.incompatible |= event["data"]["automatic"] == false
-                || event["data"]
-                    .get("overrides")
-                    .is_some_and(|v| !v.is_null() && v != "None");
+                || event["data"].get("overrides").is_some_and(|v| !v.is_null());
         }
         if event["kind"] == "learning_context" {
             self.consistent =
@@ -160,7 +169,11 @@ impl Eligibility {
     }
 
     pub(super) fn reusable(&self) -> bool {
-        self.consistent && !self.incompatible && self.counts.len() >= 2 && self.positive
+        self.consistent && !self.incompatible && self.has_comparison()
+    }
+
+    pub(super) fn has_comparison(&self) -> bool {
+        self.counts.len() >= 2 && self.positive
     }
 }
 
@@ -209,7 +222,7 @@ struct RunEvidence {
     current: Option<(i64, usize)>,
     current_rate: Option<f64>,
     reference: f64,
-    recent: crate::tune::evidence::Evidence,
+    recent: std::collections::VecDeque<(f64, f64)>,
 }
 
 impl RunEvidence {
@@ -227,15 +240,40 @@ impl RunEvidence {
             self.recent.clear();
             return;
         }
-        let score = self
-            .recent
-            .push(observation.rate, observation.seconds, self.reference)
-            .or_else(|| self.recent.window())
-            .filter(|score| score.rate.is_finite() && score.rate >= 0.0);
-        if let Some(score) = score {
-            self.points.insert(observation.workers, score.rate);
-            self.current_rate = Some(score.rate);
+        self.recent
+            .push_back((observation.rate, observation.seconds));
+        let mut duration: f64 = self.recent.iter().map(|p| p.1).sum();
+        while self.recent.len() > 2 && duration - self.recent[0].1 >= 5.0 {
+            duration -= self.recent.pop_front().unwrap().1;
         }
+        if let Some(rate) = self.recent_rate().filter(|r| r.is_finite()) {
+            self.points.insert(observation.workers, rate);
+            self.current_rate = Some(rate);
+        }
+    }
+
+    /// Keep the historical estimator stable across changes to live probing.
+    /// A clear change uses its recent intervals, otherwise average the window.
+    fn recent_rate(&self) -> Option<f64> {
+        let base = self.reference;
+        let (mut seconds, mut activity, mut low, mut high) = (0.0, 0.0, f64::INFINITY, 0.0_f64);
+        for (i, &(rate, elapsed)) in self.recent.iter().rev().enumerate() {
+            seconds += elapsed;
+            activity += rate * elapsed;
+            low = low.min(rate);
+            high = high.max(rate);
+            if i >= 1
+                && base > 0.0
+                && ((seconds >= 1.0 && low > 0.0 && high < base * 0.5)
+                    || (seconds >= 2.5 && ((low > 0.0 && high < base * 0.8) || low > base * 1.2))
+                    || (seconds >= 5.0 && (high < base * 0.95 || low * 0.95 > base)))
+            {
+                return Some(activity / seconds);
+            }
+        }
+        let duration: f64 = self.recent.iter().map(|p| p.1).sum();
+        (self.recent.len() >= 2 && duration >= 2.5)
+            .then(|| self.recent.iter().map(|(r, t)| r * t).sum::<f64>() / duration)
     }
 
     fn finish(self) -> Option<Comparison> {
@@ -473,32 +511,27 @@ mod tests {
     }
 
     #[test]
-    fn persisted_boundaries_split_windows_without_an_intervening_observation() {
-        for boundary in ["transition", "sequential_evidence"] {
-            let temp = crate::test_support::tempdir().unwrap();
-            let path = temp.path().join("history.sqlite");
-            let key = super::super::tests::key("a");
-            let writer = super::super::tests::recorder(&path);
-            writer.context(&key);
-            writer.event("learning_context", context()["data"].clone());
-            for _ in 0..2 {
-                writer.event("observation", observation(8, 100.0, true)["data"].clone());
-            }
-            writer.event(
-                "observation",
-                json!({"active":16,"seconds":0.5,"rate":20.0,"usable":true}),
-            );
-            writer.event(boundary, json!({}));
-            writer.event(
-                "observation",
-                json!({"active":16,"seconds":0.5,"rate":20.0,"usable":true}),
-            );
-            writer.complete(true, json!({}));
-            assert!(
-                writer.starting_count(&key, false).is_none(),
-                "{boundary} must split the window"
-            );
+    fn persisted_transition_splits_windows_without_an_intervening_observation() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("history.sqlite");
+        let key = super::super::tests::key("a");
+        let writer = super::super::tests::recorder(&path);
+        writer.context(&key);
+        writer.event("learning_context", context()["data"].clone());
+        for _ in 0..2 {
+            writer.event("observation", observation(8, 100.0, true)["data"].clone());
         }
+        writer.event(
+            "observation",
+            json!({"active":16,"seconds":0.5,"rate":20.0,"usable":true}),
+        );
+        writer.event("transition", json!({}));
+        writer.event(
+            "observation",
+            json!({"active":16,"seconds":0.5,"rate":20.0,"usable":true}),
+        );
+        writer.complete(true, json!({}));
+        assert!(writer.starting_count(&key, false).is_none());
     }
 
     #[test]
@@ -681,6 +714,71 @@ mod tests {
     }
 
     #[test]
+    fn recorded_live_scores_at_one_count_share_the_history_window() {
+        use crate::tune::{evidence::Evidence, trace::Trace, Policy, SAMPLE};
+
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("history.sqlite");
+        let writer = super::super::tests::recorder(&path);
+        let mut trace = Trace::new(Some(writer.clone()), &Policy::new(8, 1, 16), SAMPLE);
+        let mut live = Evidence::default();
+        for rate in [100.0; 5].into_iter().chain([110.0; 5]) {
+            let score = live.push(rate, 0.5, 0.0);
+            trace.observation(
+                json!({"active":8,"seconds":0.5,"rate":rate,"usable":true}),
+                score.as_ref(),
+                None,
+            );
+            if score.is_some() {
+                live.clear();
+            }
+        }
+        writer.complete(true, json!({}));
+        let db = Connection::open(path).unwrap();
+        let events = command::read_events(&db, 1).unwrap();
+        let mut evidence = RunEvidence::default();
+        let mut live_scores = Vec::new();
+        for event in events {
+            if let Some(observation) = Observation::from_event(&event) {
+                evidence.push(observation);
+            } else if event["kind"] == "sequential_evidence" {
+                live_scores.push(event["data"]["score"]["rate"].as_f64().unwrap());
+            }
+        }
+        assert_eq!(live_scores, [100.0, 110.0]);
+        assert_eq!(evidence.current_rate, Some(105.0));
+    }
+
+    #[test]
+    fn long_runs_read_only_the_indexed_tail_of_measurements() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("old.sqlite");
+        let key = super::super::tests::key("a");
+        let writer = record(&path, &key, None, true, &[(8, 100.0), (16, 200.0)]);
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "DELETE FROM measurements;
+            WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i < 50000)
+            INSERT INTO measurements SELECT 1,i,i,0,4,0.5,50,1 FROM n;
+            INSERT INTO measurements VALUES
+                (1,50001,0,1,8,2.5,100,1),(1,50002,0,1,8,2.5,100,1),
+                (1,50003,0,2,16,2.5,200,1),(1,50004,0,2,16,2.5,200,1);",
+        )
+        .unwrap();
+        drop(writer);
+        let reader = Connection::open(&path).unwrap();
+        assert_eq!(
+            starting_count(&reader, &key, false)
+                .unwrap()
+                .unwrap()
+                .workers,
+            16
+        );
+        let pages = super::super::tests::pages_read(&reader);
+        assert!(pages < 40, "lookup fetched {pages} pages for one run");
+    }
+
+    #[test]
     fn startup_reads_measurement_rows_without_parsing_diagnostics() {
         let temp = crate::test_support::tempdir().unwrap();
         let path = temp.path().join("history.sqlite");
@@ -743,7 +841,7 @@ mod tests {
     fn explicit_copy_overrides_do_not_seed_ordinary_copies() {
         let mut events = vec![
             json!({"kind":"start","data":{
-                "automatic":true,"overrides":"Some(TuningOptions { request_size: Some(1024) })"
+                "automatic":true,"overrides":{"request_size":1024}
             }}),
             observation(4, 50.0, true),
             observation(4, 50.0, true),
@@ -752,7 +850,7 @@ mod tests {
             context(),
         ];
         assert_eq!(infer_run(&events), None);
-        events[0]["data"]["overrides"] = json!("None");
+        events[0]["data"]["overrides"] = Value::Null;
         assert_eq!(infer_run(&events), Some((8, false)));
         events[0]["data"]["automatic"] = json!(false);
         assert_eq!(infer_run(&events), None);

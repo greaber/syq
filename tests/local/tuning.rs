@@ -852,6 +852,7 @@ fn tuning_options_control_the_native_small_copy_shortcut() {
         "batch-files=2,batch-bytes=512",
     ] {
         let destination = t.s(&format!("destination-{}", options.len()));
+        let history = t.path(&format!("history-{options}.sqlite"));
         let out = Command::new(env!("CARGO_BIN_EXE_syq"))
             .args([
                 "cp",
@@ -875,6 +876,8 @@ fn tuning_options_control_the_native_small_copy_shortcut() {
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
             .env("FAKE_RSH_LOG", t.path("rsh.log"))
+            .env("SYQ_TUNING_CACHE", t.path("cache.json"))
+            .env("SYQ_TUNING_HISTORY", &history)
             .env("XDG_CONFIG_HOME", t.path("config"))
             .env("XDG_CACHE_HOME", t.path("cache"))
             .run()
@@ -886,6 +889,11 @@ fn tuning_options_control_the_native_small_copy_shortcut() {
             "copy-path=ranges" => "range_requests",
             _ => "small_batches",
         };
+        assert_eq!(
+            history.exists(),
+            counter != "native_small_copies",
+            "the control copy must finish without even opening SQLite"
+        );
         assert_eq!(observed[counter], 1, "{observed}");
         assert_eq!(read(Path::new(&destination)), b"native small copy");
     }
@@ -1970,6 +1978,13 @@ fn tuning_history_records_short_copy_and_exports_interactive_timeline() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r["event"]["kind"] == "context")
+            .count(),
+        1
+    );
     assert_eq!(records[0]["run"]["status"], "success");
     let copying_ms = records[0]["run"]["summary"]["copying_elapsed_ms"]
         .as_u64()
@@ -2462,7 +2477,7 @@ fn whole_file_progress_reaches_tuner_before_completion() {
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             ) {
                 observed = db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM events WHERE json_extract(data,'$.kind')='sample' AND json_extract(data,'$.data.cumulative_bytes')=2097152 AND json_extract(data,'$.data.cumulative_files')=0)",
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE json_extract(data,'$.kind')='observation' AND json_extract(data,'$.data.cumulative_bytes')=2097152 AND json_extract(data,'$.data.cumulative_files')=0)",
                     [], |row| row.get::<_, bool>(0),
                 ).unwrap_or(false);
             }

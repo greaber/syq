@@ -182,7 +182,7 @@ fn unfinished_history(path: &Path, runs: i64) -> Connection {
 }
 
 /// How many pages this connection has read from the history so far.
-fn pages_read(db: &Connection) -> i64 {
+pub(super) fn pages_read(db: &Connection) -> i64 {
     let (mut current, mut highest) = (0, 0);
     // SAFETY: the handle belongs to this open connection, and both outputs
     // are valid for the call.
@@ -1226,6 +1226,48 @@ fn network_scoped_starts_separate_known_networks_and_preserve_unknown_fallback()
 }
 
 #[test]
+fn finish_learning_excludes_runs_after_transport_or_network_changes() {
+    use crate::conn::Endpoint;
+    for network_changed in [false, true] {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("history.sqlite");
+        let writer = recorder(&path);
+        let src = Endpoint::local();
+        let dst = super::super::tests::remote("host", true);
+        let mut key = context_key(&writer, &src, &dst, None, None, "default".into());
+        if network_changed {
+            key.network = Some("earlier network".into());
+        }
+        writer.context(&key);
+        for workers in [4, 8] {
+            writer.event(
+                "observation",
+                json!({"active":workers,"seconds":2.5,"rate":100,"usable":true}),
+            );
+        }
+        if !network_changed {
+            let Endpoint::Remote(spec) = &dst else {
+                unreachable!()
+            };
+            spec.tcp.lock().unwrap().as_mut().unwrap().failed = true;
+        }
+        writer.finish_learning(&key, &src, &dst, true);
+        writer.complete(true, json!({}));
+        let db = open(&path).unwrap();
+        let events = command::read_events(&db, 1).unwrap();
+        let context = events
+            .iter()
+            .find(|e| e["kind"] == "learning_context")
+            .unwrap();
+        assert_eq!(context["data"]["consistent"], false);
+        let eligible: i64 = db
+            .query_row("SELECT eligible FROM runs WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(eligible, 0);
+    }
+}
+
+#[test]
 fn routes_separate_direction_transport_and_tcp_fallback() {
     use crate::conn::Endpoint;
     let temp = crate::test_support::tempdir().unwrap();
@@ -1423,12 +1465,16 @@ fn rejected_counter_interval_does_not_discard_the_next_clean_interval() {
     });
     history.complete(true, json!({}));
     let db = Connection::open(path).unwrap();
-    let statuses: Vec<String> = db.prepare("SELECT json_extract(data,'$.data.disposition') FROM events WHERE json_extract(data,'$.kind')='sample' ORDER BY sequence").unwrap()
+    let statuses: Vec<String> = db.prepare("SELECT json_extract(data,'$.data.disposition') FROM events WHERE json_extract(data,'$.kind')='observation' ORDER BY sequence").unwrap()
         .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
-    assert_eq!(statuses[0], "counter_regressed");
+    let regressed = statuses
+        .iter()
+        .position(|s| s == "counter_regressed")
+        .unwrap();
     assert_eq!(
-        statuses[1], "warmup_excluded",
-        "clean interval must reach the sampler: {statuses:?}"
+        statuses[regressed + 1],
+        "measured",
+        "clean interval must reach the window: {statuses:?}"
     );
 }
 
@@ -1536,7 +1582,7 @@ fn a_copy_starts_without_waiting_for_its_history_to_open() {
     );
     // A periodic save would wait for the open, and so for `other`.
     writer.0.lock().unwrap().next_write = Instant::now() + Duration::from_secs(3600);
-    writer.event("planned", json!({"files":1}));
+    writer.event("planned", json!({"files":2}));
     other.execute_batch("COMMIT").unwrap();
     writer.context(&key("a"));
     writer.complete(true, json!({}));
@@ -1554,6 +1600,29 @@ fn a_copy_starts_without_waiting_for_its_history_to_open() {
         })
         .unwrap();
     assert_eq!((status.as_str(), destination.as_str()), ("success", "a"));
+}
+
+#[test]
+fn finishing_an_unmeasured_single_file_copy_never_waits_for_the_open() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let db = open(&path).unwrap();
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let writer = Recorder::at_waiting(
+        &path,
+        Instant::now(),
+        json!({}),
+        DEFAULT_BUDGET,
+        Duration::from_secs(60),
+    );
+    writer.event("planned", json!({"files":1}));
+    writer.complete(true, json!({"files":1}));
+    // The identity key cannot be created until the lock is released. The
+    // recorder completed without joining that thread or creating a run.
+    assert!(matches!(writer.0.lock().unwrap().store, Store::Opening(_)));
+    db.execute_batch("COMMIT").unwrap();
+    assert_eq!(run_count(&db), 0);
+    writer.0.lock().unwrap().store.ready().unwrap();
 }
 
 #[test]

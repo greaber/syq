@@ -5,7 +5,7 @@ fn measured_history_seeds_auto_tuning() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     let cache = t.path("tuning.json");
-    let run = |destination: &str, fixed: Option<usize>, limited: bool| {
+    let run = |source: &str, destination: &str, fixed: Option<usize>, limited: bool| {
         let mut command = compat_command();
         command
             .arg("-e")
@@ -20,7 +20,7 @@ fn measured_history_seeds_auto_tuning() {
             command.args(["--performance-tuning", &format!("workers={fixed}")]);
         }
         command
-            .arg(t.s("src"))
+            .arg(t.s(source))
             .arg(format!("fake:{}", t.s(destination)))
             .arg("--no-progress")
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
@@ -34,9 +34,12 @@ fn measured_history_seeds_auto_tuning() {
     };
     write(&t.path("src"), b"remembered start");
 
-    assert_output_ok(&run("seed", None, false));
+    // The worker-path history records a two-file copy even on a fast link.
+    write(&t.path("seed-src/one"), b"one");
+    write(&t.path("seed-src/two"), b"two");
+    assert_output_ok(&run("seed-src/", "seed", None, false));
     tuning::seed_start_from_last_run(&cache, 1);
-    let automatic = run("auto", None, false);
+    let automatic = run("src", "auto", None, false);
     assert_output_ok(&automatic);
     assert!(
         String::from_utf8_lossy(&automatic.stderr)
@@ -51,9 +54,9 @@ fn measured_history_seeds_auto_tuning() {
         String::from_utf8_lossy(&automatic.stdout)
     );
 
-    assert_output_ok(&run("limited-seed", None, true));
+    assert_output_ok(&run("seed-src/", "limited-seed", None, true));
     tuning::seed_start_from_last_run(&cache, 1);
-    let limited = run("limited", None, true);
+    let limited = run("src", "limited", None, true);
     assert_output_ok(&limited);
     assert!(
         String::from_utf8_lossy(&limited.stderr)
@@ -64,7 +67,7 @@ fn measured_history_seeds_auto_tuning() {
     assert_eq!(read(&t.path("limited")), read(&t.path("src")));
 
     // A fixed count does not start from the history.
-    let fixed = run("fixed", Some(3), true);
+    let fixed = run("src", "fixed", Some(3), true);
     assert_output_ok(&fixed);
     assert!(
         !String::from_utf8_lossy(&fixed.stderr).contains("auto-tuning: starting with"),
