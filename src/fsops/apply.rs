@@ -792,13 +792,12 @@ pub(super) fn set_meta_rooted(
         }
         Ok(())
     };
-    let metadata = target.root.metadata(&target.relative)?;
-    require_directory(metadata.is_dir())?;
+    // Select the inode once. Type, condition and changes all refer to this
+    // handle. After a change, check the name afresh from the root.
     let handle = target
         .root
         .open_metadata(&target.relative)
         .with_context(|| format!("open confined metadata handle {}", target.label.display()))?;
-    require_rooted_metadata(&handle, metadata, &target.label)?;
     let opened = handle.metadata()?;
     require_directory(opened.is_dir())?;
     let condition = match condition {
@@ -809,8 +808,7 @@ pub(super) fn set_meta_rooted(
         }
         condition => condition,
     };
-    require_rooted_condition(metadata, condition, &target.label)?;
-    require_open_target_known(&opened, &target.label, condition)?;
+    require_rooted_condition(root_metadata_from_std(&opened)?, condition, &target.label)?;
     let owner_differs = (flags & flags::OWNER != 0
         && (is_superuser() || flags & flags::REQUIRE_OWNER != 0)
         && opened.uid() != meta.uid)
@@ -853,9 +851,7 @@ pub(super) fn starting_group_may_differ(
         let observed = (|| -> Result<(u32, u32)> {
             let target = scope.target(path)?;
             let (parents, _) = target.relative.leaf()?;
-            let parent = target
-                .root
-                .metadata(&RelativePath::new(&parents.join(&b'/'))?)?;
+            let parent = target.root.metadata(&RelativePath::new(parents)?)?;
             Ok((parent.gid, parent.mode))
         })()
         .ok();
@@ -877,21 +873,20 @@ pub(super) fn new_file_group_may_differ(
     group: u32,
     parents: Option<&mut InplaceParents>,
 ) -> bool {
-    let Ok((directories, _)) = target.relative.leaf() else {
+    let Ok((directory, _)) = target.relative.leaf() else {
         return true;
     };
-    let directory = directories.join(&b'/');
     let observe = || -> Option<(u32, u32)> {
         let parent = target
             .root
-            .metadata(&RelativePath::new(&directory).ok()?)
+            .metadata(&RelativePath::new(directory).ok()?)
             .ok()?;
         Some((parent.gid, parent.mode))
     };
     let parent = match parents {
         Some(parents) => {
             let identity = target.root.identity();
-            let key = (identity.dev, identity.ino, directory.clone());
+            let key = (identity.dev, identity.ino, directory.to_vec());
             *parents.entry(key).or_insert_with(observe)
         }
         None => observe(),

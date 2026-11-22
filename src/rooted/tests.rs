@@ -588,7 +588,7 @@ fn openat2_directory_walk_matches_component_walk() {
     let tree = TestDir::new("openat2-directory-walk");
     fs::create_dir_all(tree.path().join("first/second/third")).unwrap();
     let base = File::open(tree.path()).unwrap();
-    let components = relative(b"first/second/third").components;
+    let components = relative(b"first/second/third").bytes;
 
     let Some(fast) = require_test_openat2(open_directory_components_openat2(&base, &components))
     else {
@@ -609,11 +609,11 @@ fn openat2_directory_walk_refuses_intermediate_symlink() {
     fs::create_dir_all(tree.path().join("real/child")).unwrap();
     symlink("real", tree.path().join("link")).unwrap();
     let base = File::open(tree.path()).unwrap();
-    let supported = relative(b"real/child").components;
+    let supported = relative(b"real/child").bytes;
     if require_test_openat2(open_directory_components_openat2(&base, &supported)).is_none() {
         return;
     }
-    let components = relative(b"link/child").components;
+    let components = relative(b"link/child").bytes;
 
     assert!(open_directory_components_openat2(&base, &components).is_err());
     let component_error = open_directory_components_one_at_a_time(&base, &components).unwrap_err();
@@ -631,7 +631,7 @@ fn openat2_directory_walk_allows_nested_mounts() {
         return;
     }
     let base = File::open("/").unwrap();
-    let components = relative(b"proc/sys").components;
+    let components = relative(b"proc/sys").bytes;
 
     let Some(fast) = require_test_openat2(open_directory_components_openat2(&base, &components))
     else {
@@ -1222,12 +1222,12 @@ fn operator_resolver_handles_deep_path_with_low_fd_limit() {
 
 #[test]
 fn validates_raw_relative_components() {
-    assert_eq!(relative(b"").components, Vec::<Vec<u8>>::new());
+    assert!(relative(b"").is_empty());
     assert_eq!(
-        relative(b"safe/name").components,
-        vec![b"safe".to_vec(), b"name".to_vec()]
+        relative(b"safe/name").leaf().unwrap(),
+        (b"safe".as_slice(), b"name".as_slice())
     );
-    assert_eq!(relative(b"non-utf8-\xff").components[0], b"non-utf8-\xff");
+    assert_eq!(relative(b"non-utf8-\xff").to_bytes(), b"non-utf8-\xff");
 
     for unsafe_path in [
         &b"/absolute"[..],
@@ -1515,7 +1515,7 @@ fn regular_opens_walk_paths_longer_than_one_syscall_accepts() {
         components.push(name);
     }
     components.push(b"file".to_vec());
-    let path = RelativePath { components };
+    let path = relative(&components.join(&b'/'));
     let mut file = root.create_file(&path, 0o600).unwrap();
     file.write_all(b"long path").unwrap();
     drop(file);

@@ -651,8 +651,7 @@ fn a_ranged_sidecar_is_created_in_its_staged_mode_and_published_from_that_read()
 fn directories_are_listed_before_stats_once_enough_of_their_names_are_asked_for() {
     // Sixteen names in one directory make it worth a listing; fewer do not;
     // absolute paths are left to the stat itself, and files at the root
-    // count for the root. The first requested name of each batch is what
-    // the listing is conditioned on.
+    // count for the root.
     let mut requests = HashMap::new();
     let mut paths: Vec<PathBytes> = (0..16).map(|i| format!("d/f{i}").into_bytes()).collect();
     paths.extend((0..15).map(|i| format!("e/f{i}").into_bytes()));
@@ -660,10 +659,7 @@ fn directories_are_listed_before_stats_once_enough_of_their_names_are_asked_for(
     paths.extend((0..20).map(|i| format!("/abs/f{i}").into_bytes()));
     let mut listed = directories_to_list(&paths, &mut requests);
     listed.sort();
-    assert_eq!(
-        listed,
-        vec![(&b""[..], &b"r0"[..], 16), (&b"d"[..], &b"d/f0"[..], 16)]
-    );
+    assert_eq!(listed, vec![(&b""[..], 16), (&b"d"[..], 16)]);
 
     // Names count across batches: one more name in `e` makes sixteen. A
     // directory that has been listed is not offered again.
@@ -671,27 +667,24 @@ fn directories_are_listed_before_stats_once_enough_of_their_names_are_asked_for(
     let paths: Vec<PathBytes> = vec![b"e/f15".to_vec(), b"d/f16".to_vec()];
     assert_eq!(
         directories_to_list(&paths, &mut requests),
-        vec![(&b"e"[..], &b"e/f15"[..], 16)]
+        vec![(&b"e"[..], 16)]
     );
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn directories_are_listed_only_when_their_size_and_space_fit_the_names() {
-    // Sizes and occupied blocks measured for directories of 36-byte names.
-    let listed = |names, size, bytes: u64| small_enough_to_list(names, size, bytes / 512);
-    // ZFS reports entry counts as sizes; the occupied space tells a large
-    // directory from a small one.
-    assert!(listed(16, 130, 8_704), "ZFS, 128 entries");
-    assert!(!listed(64, 2_002, 41_472), "ZFS, 2,000 entries");
-    assert!(listed(128, 2_002, 41_472), "ZFS, 2,000 entries");
-    assert!(!listed(64, 20_002, 2_122_240), "ZFS, 20,000 entries");
-    // XFS and ext4 sizes are bytes, and decide for small directories.
-    assert!(listed(16, 8_192, 12_288), "XFS, 128 entries");
-    assert!(!listed(64, 98_304, 135_168), "XFS, 2,000 entries");
-    assert!(listed(512, 98_304, 135_168), "XFS, 2,000 entries");
-    assert!(!listed(16, 12_288, 12_288), "ext4, 128 entries");
-    assert!(listed(512, 135_168, 139_264), "ext4, 2,000 entries");
+fn local_roots_skip_listing_bookkeeping() {
+    let directory = crate::test_support::tempdir().unwrap();
+    let root = Arc::new(Root::open(directory.path()).unwrap());
+    if root.on_network_file_system() {
+        return;
+    }
+    let paths = (0..LISTING_MIN_NAMES)
+        .map(|i| format!("d/f{i}").into_bytes())
+        .collect::<Vec<_>>();
+    let mut requests = HashMap::new();
+    list_nfs_directories_before_stats(&root, &paths, &mut requests);
+    assert!(requests.is_empty());
 }
 
 #[test]
@@ -3026,6 +3019,27 @@ fn offered_small_copy(prefix: &[u8], names: &[&[u8]]) -> SmallCopyRequest {
             })
             .collect(),
     }
+}
+
+#[test]
+fn control_copy_creates_its_stage_exclusively() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let offer = offered_small_copy(temporary.path().as_os_str().as_bytes(), &[b"file"]);
+    let path = temporary.path().join("file");
+    let sidecar = partial_path(&path, &offer.identity.copy_id).unwrap();
+    let stale = File::create(&sidecar).unwrap();
+    stale
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .unwrap();
+    let response = complete_small_copy(&mut FsOps::new(), (offer, vec![b"new".to_vec()]));
+    assert!(
+        matches!(response, Response::SmallFilesCopied(SmallCopyResponse {
+        outcome: SmallCopyOutcome::Published(ref results), ..
+    }) if results.len() == 1 && results[0].error.is_none()),
+        "{response:?}"
+    );
+    assert_eq!(fs::read(path).unwrap(), b"new");
+    assert_eq!(stale.metadata().unwrap().len(), 0);
 }
 
 /// An unchanged file whose metadata the receiver cannot change in place,
@@ -5444,6 +5458,16 @@ fn directory_metadata_reaches_only_a_directory() {
     let directory = fs::symlink_metadata(dir.join("directory")).unwrap();
     assert_eq!(directory.mode() & 0o7777, 0o750);
     assert_eq!(directory.mtime(), 1_500_000_000);
+    // Even an already-correct directory must satisfy the supplied condition.
+    let error = set_meta_rooted(
+        &target("directory"),
+        &meta,
+        all,
+        TargetCondition::Absent,
+        true,
+    )
+    .unwrap_err();
+    assert!(is_condition_not_met(&error));
     fs::remove_dir_all(&dir).unwrap();
 }
 

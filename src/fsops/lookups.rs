@@ -16,18 +16,34 @@
 //! receiver's own answers are recorded, never what the sender says about a
 //! name.
 //!
-//! Names are kept by a hash keyed at random for this process, so a sender
-//! cannot choose a name that passes for another, 16 bytes a name. Beyond
-//! `MAX_NAMES` nothing more is recorded, so a copy of many files holds the
-//! rest to the grant as if the receiver had not looked.
+//! The record compares exact Unix path bytes. Both the number of entries and
+//! the total bytes of their keys are bounded. Beyond either budget, publication
+//! uses the same checks as a name the receiver never looked up.
 
 use super::*;
-use std::collections::hash_map::RandomState;
-use std::hash::BuildHasher;
+use std::hash::{BuildHasher, RandomState};
+use std::sync::RwLock;
 
-/// The most names recorded: as many as a table of 2^22 entries holds,
-/// which takes 68 MiB (102 MiB while it last grows).
-pub(crate) const MAX_NAMES: usize = (1 << 22) / 8 * 7;
+const MAX_NAMES: usize = 1 << 20;
+const MAX_PATH_BYTES: usize = 32 << 20;
+
+#[derive(Default)]
+struct Names<S> {
+    entries: HashMap<Box<[u8]>, Looked, S>,
+    path_bytes: usize,
+}
+
+impl<S: BuildHasher> Names<S> {
+    /// Called only for a name known to be vacant under the write lock.
+    fn insert(&mut self, path: &[u8], looked: Looked, limit: usize) -> bool {
+        if self.entries.len() >= limit || path.len() > MAX_PATH_BYTES - self.path_bytes {
+            return false;
+        }
+        self.entries.insert(path.into(), looked);
+        self.path_bytes += path.len();
+        true
+    }
+}
 
 /// What the receiver found at a name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,11 +85,10 @@ pub(crate) enum Claim {
     Unknown,
 }
 
-pub(crate) struct PlanningLookups {
+pub(crate) struct PlanningLookups<S = RandomState> {
     recording: Recording,
     limit: usize,
-    key: RandomState,
-    names: Mutex<HashMap<u64, Looked>>,
+    names: RwLock<Names<S>>,
 }
 
 impl PlanningLookups {
@@ -85,15 +100,11 @@ impl PlanningLookups {
         Self {
             recording,
             limit,
-            key: RandomState::new(),
-            names: Mutex::new(HashMap::new()),
+            names: RwLock::default(),
         }
     }
-
-    fn key(&self, relative: &[u8]) -> u64 {
-        self.key.hash_one(relative)
-    }
-
+}
+impl<S: BuildHasher> PlanningLookups<S> {
     /// Whether a filesystem with `profile` needs this copy's record.
     fn needed_on(&self, profile: Profile) -> bool {
         match self.recording {
@@ -181,27 +192,19 @@ impl PlanningLookups {
     /// found. A claimed name, and a directory found empty or created, keep
     /// what they hold. Past the limit, a name not yet recorded stays so.
     pub(crate) fn record(&self, relative: &[u8], looked: Looked) {
-        let key = self.key(relative);
-        let mut names = self.names.lock().unwrap();
-        let full = names.len() >= self.limit;
-        match names.entry(key) {
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                if !matches!(entry.get(), Looked::Claimed | Looked::Empty) {
-                    entry.insert(looked);
-                }
-            }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                if !full {
-                    entry.insert(looked);
-                }
+        let mut names = self.names.write().unwrap();
+        match names.entries.get_mut(relative) {
+            Some(Looked::Claimed | Looked::Empty) => {}
+            Some(previous) => *previous = looked,
+            None => {
+                names.insert(relative, looked, self.limit);
             }
         }
     }
 
     /// What the receiver found at `relative`, if it recorded it.
     pub(crate) fn get(&self, relative: &[u8]) -> Option<Looked> {
-        let key = self.key(relative);
-        self.names.lock().unwrap().get(&key).copied()
+        self.names.read().unwrap().entries.get(relative).copied()
     }
 
     /// What the receiver found at `relative`, for a publication there,
@@ -219,26 +222,30 @@ impl PlanningLookups {
     }
 
     fn claim_name(&self, relative: &[u8]) -> Claim {
-        let key = self.key(relative);
-        let mut names = self.names.lock().unwrap();
-        match names.get(&key).copied() {
-            Some(Looked::Absent) => {
-                names.insert(key, Looked::Claimed);
+        let mut names = self.names.write().unwrap();
+        if names.entries.is_empty() {
+            return Claim::Unknown;
+        }
+        match names.entries.get_mut(relative) {
+            Some(state @ Looked::Absent) => {
+                *state = Looked::Claimed;
                 return Claim::Absent;
             }
             Some(Looked::Present { .. }) => return Claim::Present,
             Some(Looked::Claimed | Looked::Empty) => return Claim::Unknown,
-            None if names.is_empty() => return Claim::Unknown,
             None => {}
         }
         let mut end = relative.len();
         loop {
             let separator = relative[..end].iter().rposition(|byte| *byte == b'/');
             let above = &relative[..separator.unwrap_or(0)];
-            match names.get(&self.key(above)) {
-                Some(Looked::Absent | Looked::Empty) if names.len() < self.limit => {
-                    names.insert(key, Looked::Claimed);
-                    return Claim::Absent;
+            match names.entries.get(above) {
+                Some(Looked::Absent | Looked::Empty) => {
+                    return if names.insert(relative, Looked::Claimed, self.limit) {
+                        Claim::Absent
+                    } else {
+                        Claim::Unknown
+                    };
                 }
                 Some(_) => return Claim::Unknown,
                 None => match separator {
@@ -251,14 +258,16 @@ impl PlanningLookups {
 
     /// Forget `relative`, once the grant deletes it.
     pub(crate) fn forget(&self, relative: &[u8]) {
-        let key = self.key(relative);
-        self.names.lock().unwrap().remove(&key);
+        let mut names = self.names.write().unwrap();
+        if names.entries.remove(relative).is_some() {
+            names.path_bytes -= relative.len();
+        }
     }
 
     /// How many names are recorded.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.names.lock().unwrap().len()
+        self.names.read().unwrap().entries.len()
     }
 }
 
@@ -327,6 +336,50 @@ impl FsOps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn colliding_names_have_independent_authority() {
+        #[derive(Default)]
+        struct ConstantHash;
+        impl std::hash::Hasher for ConstantHash {
+            fn write(&mut self, _: &[u8]) {}
+            fn finish(&self) -> u64 {
+                0
+            }
+        }
+        let lookups = PlanningLookups::<std::hash::BuildHasherDefault<ConstantHash>> {
+            recording: Recording::Keep,
+            limit: 10,
+            names: RwLock::default(),
+        };
+        lookups.record(b"missing", Looked::Absent);
+        lookups.record(b"dir", Looked::Empty);
+        assert_eq!(lookups.claim(b"unknown"), Claim::Unknown);
+        assert_eq!(lookups.claim(b"dir/file"), Claim::Absent);
+        lookups.forget(b"other");
+        assert_eq!(lookups.claim(b"missing"), Claim::Absent);
+        assert_eq!(lookups.claim(b"dir/file"), Claim::Unknown);
+    }
+
+    #[test]
+    fn exact_path_claims_respect_component_boundaries_and_the_byte_budget() {
+        let lookups = PlanningLookups::new(Recording::Keep);
+        lookups.record(b"a/\xff", Looked::Empty);
+        assert_eq!(lookups.claim(b"a/\xffx/file"), Claim::Unknown);
+        assert_eq!(lookups.claim(b"a/\xff/file"), Claim::Absent);
+        assert_eq!(lookups.claim(b"a/\xff/file"), Claim::Unknown);
+
+        // Model the last few bytes of the budget without a large allocation.
+        lookups.names.write().unwrap().path_bytes = MAX_PATH_BYTES - 2;
+        lookups.record(b"ab", Looked::Absent);
+        assert_eq!(lookups.claim(b"a/\xff/new"), Claim::Unknown);
+        lookups.forget(b"aa");
+        lookups.record(b"aa", Looked::Absent);
+        assert_eq!(lookups.claim(b"aa"), Claim::Unknown);
+        lookups.forget(b"ab");
+        lookups.record(b"aa", Looked::Absent);
+        assert_eq!(lookups.claim(b"aa"), Claim::Absent);
+    }
 
     #[test]
     fn the_cached_device_is_the_files_own() {

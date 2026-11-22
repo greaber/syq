@@ -129,7 +129,14 @@ impl RootMetadata {
 /// operations that need a leaf reject it.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct RelativePath {
-    components: Vec<Vec<u8>>,
+    bytes: Vec<u8>,
+}
+
+fn split_leaf(path: &[u8]) -> (&[u8], &[u8]) {
+    match path.iter().rposition(|&b| b == b'/') {
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => (&[], path),
+    }
 }
 
 impl RelativePath {
@@ -140,67 +147,52 @@ impl RelativePath {
         if path.contains(&0) {
             bail!("confined path contains NUL");
         }
-        if path.is_empty() {
-            return Ok(Self {
-                components: Vec::new(),
-            });
-        }
-
-        let mut components = Vec::new();
-        for component in path.split(|byte| *byte == b'/') {
-            if component.is_empty() {
-                bail!("confined path contains an empty component");
+        if !path.is_empty() {
+            for component in path.split(|&b| b == b'/') {
+                if component.is_empty() {
+                    bail!("confined path contains an empty component");
+                }
+                if matches!(component, b"." | b"..") {
+                    bail!("confined path contains forbidden component");
+                }
             }
-            if component == b"." || component == b".." {
-                bail!("confined path contains forbidden component");
-            }
-            components.push(component.to_vec());
         }
-        Ok(Self { components })
+        Ok(Self {
+            bytes: path.to_vec(),
+        })
     }
 
-    /// The components of the holding directory, and the entry's own name.
-    pub(crate) fn leaf(&self) -> Result<(&[Vec<u8>], &[u8])> {
-        let (leaf, parents) = self
-            .components
-            .split_last()
-            .context("operation requires a descendant path")?;
-        Ok((parents, leaf))
+    /// The validated parent path and leaf, both borrowed from the original spelling.
+    pub(crate) fn leaf(&self) -> Result<(&[u8], &[u8])> {
+        anyhow::ensure!(!self.is_empty(), "operation requires a descendant path");
+        Ok(split_leaf(&self.bytes))
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.components.is_empty()
+        self.bytes.is_empty()
     }
 
-    /// The first component: the entry directly beneath the root that holds
-    /// the path, or is the path itself.
     pub(crate) fn first(&self) -> Option<&[u8]> {
-        self.components.first().map(Vec::as_slice)
+        self.bytes
+            .split(|&b| b == b'/')
+            .next()
+            .filter(|part| !part.is_empty())
     }
 
-    /// The path as one byte string, its components joined by `/`, which
-    /// `new` accepts again.
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
-        self.components.join(&b'/')
+        self.bytes.clone()
     }
 
     pub(crate) fn to_path_buf(&self) -> PathBuf {
-        let mut path = PathBuf::new();
-        for component in &self.components {
-            path.push(OsStr::from_bytes(component));
-        }
-        path
+        OsStr::from_bytes(&self.bytes).into()
     }
 
     fn label(&self) -> String {
-        if self.components.is_empty() {
-            return ".".into();
+        if self.is_empty() {
+            ".".into()
+        } else {
+            String::from_utf8_lossy(&self.bytes).into_owned()
         }
-        self.components
-            .iter()
-            .map(|component| String::from_utf8_lossy(component))
-            .collect::<Vec<_>>()
-            .join("/")
     }
 }
 
@@ -223,7 +215,7 @@ pub(crate) struct Root {
     directory: File,
     identity: RootIdentity,
     #[cfg(target_os = "linux")]
-    partial_name_limits: OnceLock<Mutex<HashMap<Vec<Vec<u8>>, usize>>>,
+    partial_name_limits: OnceLock<Mutex<HashMap<Vec<u8>, usize>>>,
     /// What the root's filesystem type implies, once read: its descriptor
     /// keeps that filesystem mounted, so its device number cannot be given
     /// to another while the root exists. A file with the root's device
@@ -374,6 +366,11 @@ impl Root {
             return false;
         }
         crate::fsops::leases_show_writers(file)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn on_nfs(&self) -> bool {
+        self.type_facts().magic == libc::NFS_SUPER_MAGIC as u32
     }
 
     /// Whether this root lies on a network filesystem, where each operation
@@ -716,7 +713,7 @@ impl Root {
     /// Open the root or a descendant directory without following any
     /// descendant symlink.
     pub(crate) fn open_directory(&self, path: &RelativePath) -> Result<File> {
-        open_directory_components(&self.directory, &path.components)
+        open_directory_components(&self.directory, &path.bytes)
             .with_context(|| format!("open confined directory {}", path.label()))
     }
 
@@ -802,7 +799,7 @@ impl Root {
         self.check_test_name_limit(path)?;
         path.leaf()?;
         #[cfg(target_os = "linux")]
-        match open_components_openat2(&self.directory, &path.components, flags, mode) {
+        match open_components_openat2(&self.directory, &path.bytes, flags, mode) {
             Ok(file) => return Ok(file),
             Err(error) if expected_open_failure(&error) => return Err(error.into()),
             Err(_) => {}
@@ -1305,7 +1302,9 @@ impl Root {
             });
         }
         let mut directory = self.directory.try_clone().context("duplicate root fd")?;
-        for (index, component) in parents.iter().enumerate() {
+        let mut end = 0;
+        for component in parents.split(|&b| b == b'/') {
+            end += component.len() + usize::from(end != 0);
             match open_directory_at(&directory, component) {
                 Ok(child) => {
                     directory = child;
@@ -1317,7 +1316,7 @@ impl Root {
                         .with_context(|| format!("resolve confined parent for {}", path.label()));
                 }
             }
-            let mode = mode_for(&parents[..=index].join(&b'/'));
+            let mode = mode_for(&parents[..end]);
             let component = component_cstring(component);
             loop {
                 let result = unsafe {
@@ -1533,7 +1532,12 @@ impl Root {
     #[cfg(all(test, target_os = "linux"))]
     fn check_test_name_limit(&self, path: &RelativePath) -> Result<()> {
         let limit = self.test_name_limit.load(Ordering::Relaxed);
-        if limit != 0 && path.components.iter().any(|part| part.len() > limit) {
+        if limit != 0
+            && path
+                .bytes
+                .split(|&b| b == b'/')
+                .any(|part| part.len() > limit)
+        {
             return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG).into());
         }
         Ok(())
@@ -1575,10 +1579,10 @@ impl Root {
         query: &impl Fn(&File) -> Result<usize>,
     ) -> Result<usize> {
         let (parents, _) = path.leaf()?;
-        let mut components = parents.to_vec();
+        let mut ancestor = parents;
         loop {
             let candidate = RelativePath {
-                components: components.clone(),
+                bytes: ancestor.to_vec(),
             };
             #[cfg(not(target_os = "macos"))]
             let directory = if candidate.is_empty() {
@@ -1620,8 +1624,8 @@ impl Root {
                     cache.insert(device, limit);
                     return Ok(limit);
                 }
-                Err(error) if absent_or_nondirectory(&error) && !components.is_empty() => {
-                    components.pop();
+                Err(error) if absent_or_nondirectory(&error) && !ancestor.is_empty() => {
+                    ancestor = split_leaf(ancestor).0;
                 }
                 Err(error) => return Err(error),
             }
@@ -2353,8 +2357,37 @@ impl Root {
         target: &RelativePath,
         staged_identity: (u64, u64),
     ) -> Result<()> {
-        let (staged_dev, staged_ino) = staged_identity;
-        let source_parent = self.resolve_parent(source)?;
+        self.rename_regular_in(source, target, staged_identity, None)
+    }
+
+    /// Hold the verified parent of a burst of sibling renames. The handle is
+    /// acquired at publication, after all writes and metadata changes.
+    pub(crate) fn sibling_directory<'a>(
+        &'a self,
+        path: &'a RelativePath,
+    ) -> Result<SiblingDirectory<'a>> {
+        Ok(SiblingDirectory {
+            root: self,
+            path: path.leaf()?.0,
+            directory: self.parent_directory(path)?,
+        })
+    }
+
+    pub(crate) fn rename_regular_in(
+        &self,
+        source: &RelativePath,
+        target: &RelativePath,
+        (staged_dev, staged_ino): (u64, u64),
+        siblings: Option<&SiblingDirectory<'_>>,
+    ) -> Result<()> {
+        let (parent, leaf) = source.leaf()?;
+        let source_parent = match siblings {
+            Some(held) if std::ptr::eq(self, held.root) && parent == held.path => ResolvedParent {
+                directory: DirectoryHandle::Borrowed(&held.directory),
+                leaf: component_cstring(leaf),
+            },
+            _ => self.resolve_parent(source)?,
+        };
         let target_parent = self.resolve_publish_target(source, &source_parent, target)?;
         let staged = metadata_at(source_parent.directory.as_raw_fd(), &source_parent.leaf)?;
         require_safe_staged_identity(staged, staged_dev, staged_ino, source)?;
@@ -3020,7 +3053,7 @@ impl std::ops::Deref for DirectoryHandle<'_> {
 /// the permissions its default ACL lets new entries have, once read.
 pub(crate) struct HeldParent {
     root: (u64, u64),
-    components: Vec<Vec<u8>>,
+    components: Vec<u8>,
     directory: File,
     permitted: Option<u32>,
 }
@@ -3036,6 +3069,12 @@ impl HeldParent {
         };
         Ok(proposed & permitted & 0o777)
     }
+}
+
+pub(crate) struct SiblingDirectory<'a> {
+    root: &'a Root,
+    path: &'a [u8],
+    directory: File,
 }
 
 pub(crate) struct ResolvedParent<'a> {
@@ -3385,54 +3424,52 @@ fn expected_open_failure(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(libc::ENOENT | libc::EEXIST))
 }
 
-fn open_directory_components(parent: &File, components: &[Vec<u8>]) -> io::Result<File> {
+fn open_directory_components(parent: &File, path: &[u8]) -> io::Result<File> {
     #[cfg(target_os = "linux")]
     {
-        match open_directory_components_fast(parent, components) {
+        match open_directory_components_fast(parent, path) {
             Ok(directory) => Ok(directory),
             Err(error) if expected_open_failure(&error) => Err(error),
-            Err(_) => open_directory_components_one_at_a_time(parent, components),
+            Err(_) => open_directory_components_one_at_a_time(parent, path),
         }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        open_directory_components_one_at_a_time(parent, components)
+        open_directory_components_one_at_a_time(parent, path)
     }
 }
 
-fn open_directory_components_one_at_a_time(
-    parent: &File,
-    components: &[Vec<u8>],
-) -> io::Result<File> {
-    let Some((first, remaining)) = components.split_first() else {
+fn open_directory_components_one_at_a_time(parent: &File, path: &[u8]) -> io::Result<File> {
+    if path.is_empty() {
         return parent.try_clone();
-    };
-    let mut directory = open_directory_at(parent, first)?;
+    }
+    let mut remaining = path.split(|&b| b == b'/');
+    let mut directory = open_directory_at(parent, remaining.next().unwrap())?;
     for component in remaining {
         directory = open_directory_at(&directory, component)?;
     }
     Ok(directory)
 }
 
-fn open_directory_components_fast(parent: &File, components: &[Vec<u8>]) -> io::Result<File> {
-    if components.is_empty() {
+fn open_directory_components_fast(parent: &File, path: &[u8]) -> io::Result<File> {
+    if path.is_empty() {
         return parent.try_clone();
     }
     #[cfg(target_os = "linux")]
     {
-        open_directory_components_openat2(parent, components)
+        open_directory_components_openat2(parent, path)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        open_directory_components_one_at_a_time(parent, components)
+        open_directory_components_one_at_a_time(parent, path)
     }
 }
 
 #[cfg(target_os = "linux")]
-fn open_directory_components_openat2(parent: &File, components: &[Vec<u8>]) -> io::Result<File> {
+fn open_directory_components_openat2(parent: &File, path: &[u8]) -> io::Result<File> {
     open_components_openat2(
         parent,
-        components,
+        path,
         libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         0,
     )
@@ -3441,7 +3478,7 @@ fn open_directory_components_openat2(parent: &File, components: &[Vec<u8>]) -> i
 #[cfg(target_os = "linux")]
 fn open_components_openat2(
     parent: &File,
-    components: &[Vec<u8>],
+    path: &[u8],
     flags: libc::c_int,
     mode: u32,
 ) -> io::Result<File> {
@@ -3457,14 +3494,6 @@ fn open_components_openat2(
     const RESOLVE_NO_SYMLINKS: u64 = 0x04;
     const RESOLVE_BENEATH: u64 = 0x08;
 
-    let path_len = components.iter().map(Vec::len).sum::<usize>() + components.len() - 1;
-    let mut path = Vec::with_capacity(path_len);
-    for (index, component) in components.iter().enumerate() {
-        if index != 0 {
-            path.push(b'/');
-        }
-        path.extend_from_slice(component);
-    }
     let path = CString::new(path).expect("RelativePath already rejected NUL");
     let how = OpenHow {
         flags: flags as u64,
@@ -3807,11 +3836,10 @@ pub(crate) enum LeafReplacement {
 
 /// The label of `name` in the directory that holds `path`.
 fn sibling_label(path: &RelativePath, name: &CStr) -> String {
-    let mut components = path.components.clone();
-    if let Some(leaf) = components.last_mut() {
-        *leaf = name.to_bytes().to_vec();
-    }
-    RelativePath { components }.label()
+    path.to_path_buf()
+        .with_file_name(OsStr::from_bytes(name.to_bytes()))
+        .display()
+        .to_string()
 }
 
 #[cfg(target_os = "linux")]
