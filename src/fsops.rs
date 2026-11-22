@@ -38,6 +38,8 @@ pub(crate) use fs_caps::distrust_owners_for_test;
 pub(crate) use fs_caps::file_system_of;
 pub(crate) use fs_caps::fixed_owners_and_modes;
 pub(crate) use fs_caps::reports_owners_faithfully;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use fs_caps::type_facts;
 #[cfg(target_os = "linux")]
 pub(crate) use fs_caps::{
     leases_show_writers, leases_trusted, TypeFacts, FUSE_SUPER_MAGIC, PROC_SUPER_MAGIC,

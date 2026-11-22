@@ -373,6 +373,13 @@ impl Root {
         self.type_facts().magic == libc::NFS_SUPER_MAGIC as u32
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn assume_nfs_for_test(&self) {
+        self.type_facts
+            .set(crate::fsops::type_facts(libc::NFS_SUPER_MAGIC as u32))
+            .unwrap();
+    }
+
     /// Whether this root lies on a network filesystem, where each operation
     /// waits a round trip.
     pub(crate) fn on_network_file_system(&self) -> bool {
