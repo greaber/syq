@@ -2486,12 +2486,12 @@ impl Engine {
         {
             return Ok(None);
         }
-        let destination_file = || -> Result<crate::expression::File> {
+        let destination_file = || -> Result<crate::expression::File<'static>> {
             let mut file = existing
                 .map(crate::expression::File::from_root)
                 .unwrap_or_default();
             if file.kind == Some(crate::proto::Kind::Symlink) {
-                file.link_target = Some(root.read_link(&path)?);
+                file.link_target = Some(root.read_link(&path)?.into());
             }
             Ok(file)
         };

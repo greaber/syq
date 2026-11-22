@@ -697,7 +697,7 @@ fn check_marker_kind(key: &str, size: u64, metadata: Option<&Metadata>) -> Resul
 }
 
 impl Object {
-    pub(super) fn expression_file(&self) -> crate::expression::File {
+    pub(super) fn expression_file(&self) -> crate::expression::File<'static> {
         crate::expression::File {
             exists: true,
             kind: Some(match self.kind() {

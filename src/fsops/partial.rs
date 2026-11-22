@@ -3644,27 +3644,39 @@ impl FsOps {
                         others.len()
                     ),
                 )?;
-                let directories = if *strict_metadata {
+                let mut dir_entries = if *strict_metadata {
                     self.prune_lookup(directories)?
                 } else {
                     self.stat_many(directories, false)
                 };
-                let safe_to_stat_others = directories.iter().all(|entry| {
+                let mut bytes = 0;
+                if self.preserving_inode_metadata()
+                    && !self.capture_plan_entries(directories, &mut dir_entries, &mut bytes)
+                {
+                    return Ok(Response::BatchPlanDeferred);
+                }
+                let safe_to_stat_others = dir_entries.iter().all(|entry| {
                     entry
                         .as_ref()
                         .is_some_and(|entry| entry.kind == Kind::Dir && entry.mode & 0o700 == 0o700)
                 });
                 let others = if safe_to_stat_others {
-                    Some(if *strict_metadata {
+                    let mut entries = if *strict_metadata {
                         self.prune_lookup(others)?
                     } else {
                         self.stat_many(others, false)
-                    })
+                    };
+                    if self.preserving_inode_metadata()
+                        && !self.capture_plan_entries(others, &mut entries, &mut bytes)
+                    {
+                        return Ok(Response::BatchPlanDeferred);
+                    }
+                    Some(entries)
                 } else {
                     None
                 };
                 Ok(Response::BatchPlan {
-                    directories,
+                    directories: dir_entries,
                     others,
                 })
             })(),

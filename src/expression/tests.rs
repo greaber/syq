@@ -1,5 +1,5 @@
 use super::*;
-fn source() -> File {
+fn source() -> File<'static> {
     File {
         exists: true,
         kind: Some(Kind::File),
@@ -198,4 +198,20 @@ fn service_time_is_distinct_and_available_from_listing() {
     .unwrap()
     .selects(&file, b"file")
     .unwrap());
+}
+
+#[test]
+fn raw_link_targets_compare_as_borrowed_bytes() {
+    let file = File {
+        link_target: Some((&b"../raw-\xff"[..]).into()),
+        ..source()
+    };
+    let expr = Expression::compile(r"src.link_target in ['other', '../raw-\xff']", false).unwrap();
+    assert!(expr
+        .evaluate(&file, b"link", &File::default(), b"", 0)
+        .unwrap());
+    let Value::String(bytes) = file.field(b"link", Field::LinkTarget) else {
+        panic!("missing target")
+    };
+    assert_eq!(bytes.as_ptr(), file.link_target.as_ref().unwrap().as_ptr());
 }

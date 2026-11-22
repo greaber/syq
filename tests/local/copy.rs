@@ -904,3 +904,42 @@ fn a_panicking_worker_fails_the_copy() {
         || (unsafe { libc::kill(group, 0) }) != 0,
     );
 }
+
+#[test]
+fn destination_claims_cover_only_plans_that_need_them() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"a");
+    write(&t.path("other/b"), b"b");
+    write(
+        &t.path("mapping"),
+        entry_line("a", "mapped", None).as_bytes(),
+    );
+    for (index, (args, tracked)) in [
+        (vec!["--srcs-in", "src"], false),
+        (vec!["--srcs-in", "src", "--prune"], true),
+        (vec!["--srcs-in", "src", "--srcs-in", "other"], true),
+        (vec!["--root", "src", "--mapping", "mapping"], true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let log = t.path(&format!("claims{index}"));
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .current_dir(t.path(""))
+            .arg("cp")
+            .args(args)
+            .arg("--into")
+            .arg(format!("dst{index}"))
+            .env("SYQ_TEST_DESTINATION_CLAIMS", &log)
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        let counts = fs::read_to_string(log).unwrap();
+        assert_eq!(
+            counts
+                .lines()
+                .any(|line| line.parse::<usize>().unwrap() > 0),
+            tracked
+        );
+    }
+}

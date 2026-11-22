@@ -147,6 +147,14 @@ pub(crate) fn inspect_descriptor_children(
     })
 }
 
+// Concurrent directory updates can make readdir return the same name twice.
+// Look each name up once against the open directory.
+fn sorted_directory_names(mut names: Vec<PathBytes>) -> std::vec::IntoIter<PathBytes> {
+    names.sort();
+    names.dedup();
+    names.into_iter()
+}
+
 struct DescriptorDirectory {
     relative: PathBytes,
     expected: RootMetadata,
@@ -210,11 +218,7 @@ impl DescriptorScan<'_> {
         };
         let mut names = match directory.names.take() {
             Some(names) => names,
-            None => {
-                let mut names = self.root.read_open_directory(&opened)?;
-                names.sort();
-                names.into_iter()
-            }
+            None => sorted_directory_names(self.root.read_open_directory(&opened)?),
         };
         let batch: Vec<_> = names.by_ref().take(FIRST_BATCH).collect();
         let mut events = Vec::with_capacity(batch.len());
@@ -787,6 +791,15 @@ mod tests {
     use std::fs;
     use std::os::unix::ffi::OsStringExt;
     use std::process::Command;
+
+    #[test]
+    fn duplicate_directory_names_leave_each_distinct_name_to_be_scanned() {
+        let names = [b"b", b"a", b"b", b"c", b"a"].map(|name| name.to_vec());
+        assert_eq!(
+            sorted_directory_names(names.into()).collect::<Vec<_>>(),
+            [b"a", b"b", b"c"].map(|name| name.to_vec())
+        );
+    }
 
     fn entry() -> Entry {
         Entry {

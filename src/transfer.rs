@@ -1322,7 +1322,7 @@ fn attempt_small_copy(
                 size: entry.size,
                 expression_source: args.copy_if.as_ref().map(|_| {
                     (
-                        crate::expression::File::from_entry(entry),
+                        crate::expression::File::owned_entry(entry),
                         crate::expression::source_path(&source.path, b"").to_vec(),
                     )
                 }),
@@ -4965,6 +4965,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         // makes the default decision for an absent destination.
         destination_children_known_missing: fresh_destination,
         destination_root_known_missing: dst_initially_missing,
+        // A single local descriptor scan maps unique relative names under a
+        // fixed prefix. A peer supplies its own names, and manifests and
+        // overlapping roots need not have that property. Pruning also uses
+        // these exact byte spellings to protect source counterparts.
+        track_claims: opts.delete
+            || multiple_distinct_sources
+            || opts.src_remote
+            || args.files_from.is_some()
+            || args.native_mapping.is_some(),
         dst_seen: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),
         blocked_directory_paths: std::collections::HashSet::new(),
