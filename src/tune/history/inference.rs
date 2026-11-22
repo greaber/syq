@@ -11,8 +11,8 @@ const STARTUP_CONNECTION_COST: f64 = 0.01;
 // inspectable, but only runs with ordered measurement rows seed new starts.
 pub(super) const MEASUREMENTS: i64 = 4;
 
-// Look past recent runs whose observations never formed a comparison while
-// keeping a hard bound on both index walks and the resulting evidence.
+// Startup looks at up to 64 of the newest matching runs and the last 240
+// observations (about two minutes at half-second intervals) of each.
 const RUN_LIMIT: usize = 64;
 const OBSERVATION_LIMIT: usize = 240;
 
@@ -511,32 +511,27 @@ mod tests {
     }
 
     #[test]
-    fn persisted_boundaries_split_windows_without_an_intervening_observation() {
-        for boundary in ["transition", "sequential_evidence"] {
-            let temp = crate::test_support::tempdir().unwrap();
-            let path = temp.path().join("history.sqlite");
-            let key = super::super::tests::key("a");
-            let writer = super::super::tests::recorder(&path);
-            writer.context(&key);
-            writer.event("learning_context", context()["data"].clone());
-            for _ in 0..2 {
-                writer.event("observation", observation(8, 100.0, true)["data"].clone());
-            }
-            writer.event(
-                "observation",
-                json!({"active":16,"seconds":0.5,"rate":20.0,"usable":true}),
-            );
-            writer.event(boundary, json!({}));
-            writer.event(
-                "observation",
-                json!({"active":16,"seconds":0.5,"rate":20.0,"usable":true}),
-            );
-            writer.complete(true, json!({}));
-            assert!(
-                writer.starting_count(&key, false).is_none(),
-                "{boundary} must split the window"
-            );
+    fn persisted_transition_splits_windows_without_an_intervening_observation() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("history.sqlite");
+        let key = super::super::tests::key("a");
+        let writer = super::super::tests::recorder(&path);
+        writer.context(&key);
+        writer.event("learning_context", context()["data"].clone());
+        for _ in 0..2 {
+            writer.event("observation", observation(8, 100.0, true)["data"].clone());
         }
+        writer.event(
+            "observation",
+            json!({"active":16,"seconds":0.5,"rate":20.0,"usable":true}),
+        );
+        writer.event("transition", json!({}));
+        writer.event(
+            "observation",
+            json!({"active":16,"seconds":0.5,"rate":20.0,"usable":true}),
+        );
+        writer.complete(true, json!({}));
+        assert!(writer.starting_count(&key, false).is_none());
     }
 
     #[test]
@@ -719,17 +714,38 @@ mod tests {
     }
 
     #[test]
-    fn history_uses_five_seconds_for_an_inconclusive_rate() {
-        let mut evidence = RunEvidence::default();
+    fn recorded_live_scores_at_one_count_share_the_history_window() {
+        use crate::tune::{evidence::Evidence, trace::Trace, Policy, SAMPLE};
+
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("history.sqlite");
+        let writer = super::super::tests::recorder(&path);
+        let mut trace = Trace::new(Some(writer.clone()), &Policy::new(8, 1, 16), SAMPLE);
+        let mut live = Evidence::default();
         for rate in [100.0; 5].into_iter().chain([110.0; 5]) {
-            evidence.push(Observation {
-                segment: 0,
-                workers: 8,
-                seconds: 0.5,
-                rate,
-                usable: true,
-            });
+            let score = live.push(rate, 0.5, 0.0);
+            trace.observation(
+                json!({"active":8,"seconds":0.5,"rate":rate,"usable":true}),
+                score.as_ref(),
+                None,
+            );
+            if score.is_some() {
+                live.clear();
+            }
         }
+        writer.complete(true, json!({}));
+        let db = Connection::open(path).unwrap();
+        let events = command::read_events(&db, 1).unwrap();
+        let mut evidence = RunEvidence::default();
+        let mut live_scores = Vec::new();
+        for event in events {
+            if let Some(observation) = Observation::from_event(&event) {
+                evidence.push(observation);
+            } else if event["kind"] == "sequential_evidence" {
+                live_scores.push(event["data"]["score"]["rate"].as_f64().unwrap());
+            }
+        }
+        assert_eq!(live_scores, [100.0, 110.0]);
         assert_eq!(evidence.current_rate, Some(105.0));
     }
 

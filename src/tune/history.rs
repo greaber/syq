@@ -517,7 +517,7 @@ impl Writer {
         let elapsed_us = self.start.elapsed().as_micros().min(i64::MAX as u128) as u64;
         let sequence = self.sequence;
         self.sequence += 1;
-        if matches!(kind, "transition" | "sequential_evidence") {
+        if kind == "transition" {
             self.measurement_segment = sequence as i64;
         }
         if kind == "observation" {
