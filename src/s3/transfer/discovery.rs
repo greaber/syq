@@ -338,6 +338,7 @@ struct Walk {
     keys: Arc<Keys>,
     decisions: Arc<Decisions>,
     decided: usize,
+    saves_head: HeadSavings,
     /// Planned keys by which the pages so far fell short of paying their way.
     shortfall: usize,
     /// The listing has passed every key up to this one.
@@ -346,6 +347,24 @@ struct Walk {
     /// planned keys that the next request should skip to the next one.
     token: Option<String>,
 }
+
+#[derive(Clone, Copy)]
+enum HeadSavings {
+    AnyDecision,
+    Present,
+    Absent,
+}
+
+impl HeadSavings {
+    fn counts(self, size: u64) -> bool {
+        match self {
+            Self::AnyDecision => size != UNKNOWN,
+            Self::Present => size < ABSENT,
+            Self::Absent => size == ABSENT,
+        }
+    }
+}
+
 impl Walk {
     fn new(segments: Vec<Segment>, keys: Arc<Keys>, decisions: Arc<Decisions>) -> Self {
         Self {
@@ -356,6 +375,7 @@ impl Walk {
             segment: 0,
             keys,
             decisions,
+            saves_head: HeadSavings::AnyDecision,
             shortfall: 0,
             passed: String::new(),
             token: None,
@@ -417,7 +437,7 @@ impl Walk {
         let complete = page.next.is_none();
         let last = page.entries.last().map(|entry| entry.key.as_str());
         let mut listed = page.entries.iter().peekable();
-        let before = self.decided;
+        let mut saved_heads = 0;
         while self.decided < end {
             let key = self.keys.get(self.decided);
             if !complete && last.is_none_or(|last| key > last) {
@@ -431,19 +451,19 @@ impl Walk {
                 _ => UNKNOWN,
             };
             self.decisions.store(self.decided, size);
+            saved_heads += usize::from(self.saves_head.counts(size));
             self.decided += 1;
         }
         if complete || self.decided == end {
             return Ok(self.next_segment());
         }
-        let decided = self.decided - before;
-        self.shortfall = (self.shortfall + KEYS_PER_PAGE).saturating_sub(decided);
+        self.shortfall = (self.shortfall + KEYS_PER_PAGE).saturating_sub(saved_heads);
         self.passed = last.unwrap_or(after).to_owned();
         // A continuation token is how providers page fastest, so keep to it
         // while pages pay their way. After one that did not, start again at
         // the next planned key to skip the destination keys before it.
         let skip =
-            decided < KEYS_PER_PAGE && predecessor(self.keys.get(self.decided)) > self.passed;
+            saved_heads < KEYS_PER_PAGE && predecessor(self.keys.get(self.decided)) > self.passed;
         self.token = page.next.filter(|_| !skip);
         // The keys still undecided could not make up a larger shortfall.
         let undecided = end - self.decided;
@@ -595,8 +615,8 @@ impl Discovery {
     /// while the copy runs.
     pub(super) async fn start(
         client: aws_sdk_s3::Client,
-        endpoint: Option<&str>,
-        bucket: &str,
+        options: &super::super::Options,
+        args: &Args,
         segments: Vec<Segment>,
         keys: Keys,
         cancelled: Arc<AtomicBool>,
@@ -604,7 +624,8 @@ impl Discovery {
     ) -> Result<Self> {
         ensure!(!segments.is_empty(), "no destination prefix to list");
         // `divides` says only whether these listings may rely on byte order.
-        let divides = listing::lists_in_byte_order(endpoint, bucket);
+        let bucket = options.bucket.as_str();
+        let divides = listing::lists_in_byte_order(options.endpoint.as_deref(), bucket);
         if listing::lists_in_key_order(bucket) && !divides {
             return Self::start_unordered(client, bucket, segments, keys, progress).await;
         }
@@ -616,10 +637,20 @@ impl Discovery {
             .map(|(index, segment)| (segment.range.clone(), index % listings))
             .collect();
         let keys = Arc::new(keys);
+        let saves_head = if args.ignore_existing {
+            HeadSavings::Present
+        } else if args.existing {
+            HeadSavings::Absent
+        } else {
+            HeadSavings::AnyDecision
+        };
         let mut walks: Vec<Walk> = (0..listings)
             .map(|listing| {
                 let segments = segments.iter().skip(listing).step_by(listings);
-                Walk::new(segments.cloned().collect(), keys.clone(), decisions.clone())
+                let mut walk =
+                    Walk::new(segments.cloned().collect(), keys.clone(), decisions.clone());
+                walk.saves_head = saves_head;
+                walk
             })
             .collect();
         // These listings read pages one by one.

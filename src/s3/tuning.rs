@@ -20,7 +20,7 @@ pub(super) struct Tuning {
     pub upload_buffers: Arc<tokio::sync::Semaphore>,
 }
 impl Tuning {
-    /// `control` receives the fastest HEAD or LIST response seen by the client.
+    /// `control` receives the fastest HEAD or LIST response after the first one.
     pub fn new(options: &Options, args: &crate::cli::Args, control: Arc<AtomicU64>) -> Self {
         Self {
             control_ns: control,
@@ -118,13 +118,7 @@ impl Tuning {
 /// The fastest control response at which an endpoint counts as far away, so
 /// that copies of many small objects start with every request in flight and
 /// probe upward instead of ramping from a low seed. A response on a reused
-/// connection takes one round trip. A copy's first request also opens the
-/// connection, so it takes about two round trips over HTTP and three over
-/// HTTPS (TCP, then TLS), and an upload into an empty prefix has no other
-/// sample. At 20 ms, an HTTPS endpoint counts as far from about a 6 ms round
-/// trip on a first request, a plain-HTTP one from about 10 ms, and any
-/// endpoint from 20 ms on a reused connection: distances at which many small
-/// objects finish sooner starting wide than ramping from 64.
+/// connection takes one round trip.
 pub(super) const HIGH_LATENCY: Duration = Duration::from_millis(20);
 /// Below this fastest control response, a far endpoint's uploads of small
 /// files start with at most 2,048 objects in flight instead of 4,096. The

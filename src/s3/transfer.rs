@@ -982,6 +982,7 @@ impl Engine {
             if self.options.route == Route::Upload
                 && self.authorization.is_none()
                 && !self.args.delete
+                && super::listing::lists_in_key_order(&self.options.bucket)
                 && plan.len() >= discovery::KEYS_PER_PAGE
             {
                 let prefixes = self.destination_prefixes()?;
@@ -1108,8 +1109,8 @@ impl Engine {
     ) -> Result<()> {
         let discovery = Discovery::start(
             self.client.clone(),
-            self.options.endpoint.as_deref(),
-            &self.options.bucket,
+            &self.options,
+            &self.args,
             segments,
             keys,
             self.cancelled.clone(),
@@ -1209,6 +1210,7 @@ impl Engine {
             &Object,
             &aws_sdk_s3::operation::head_object::HeadObjectOutput,
         ),
+        refresh_head: bool,
         slot: &mut TransferSlot,
     ) -> Result<UploadPreparation> {
         let size = object.size;
@@ -1225,6 +1227,30 @@ impl Engine {
             self.args.matching_meta_flags() | source.metadata.map_or(0, |m| m.apply_flags());
         slot.claim().await;
         let _slot = self.tuning.requests.acquire().await;
+        // A metadata-only replacement may leave the ETag unchanged while
+        // comparison reads the file. Preserve the current attributes.
+        let refreshed;
+        let current;
+        let (object, head) = if refresh_head {
+            refreshed = client::head_output(&self.client, &self.options.bucket, &source.key, None)
+                .await?
+                .context("destination disappeared during comparison")?;
+            current = client::from_head(&source.key, &refreshed)?;
+            anyhow::ensure!(
+                current.etag == object.etag
+                    && current.size == size
+                    && current.kind() == object.kind(),
+                "destination contents changed during comparison: {}",
+                source.key
+            );
+            if self.upload_requested_metadata_matches(&source, &current) {
+                self.progress.bytes_unchanged.fetch_add(size, Relaxed);
+                return Ok(UploadPreparation::Skipped);
+            }
+            (&current, &refreshed)
+        } else {
+            (object, head)
+        };
         let mut metadata = object.metadata.clone().unwrap_or(Metadata {
             kind: object.kind(),
             mode: if object.kind() == ObjectKind::Dir {
@@ -1384,6 +1410,7 @@ impl Engine {
                 .prepare_accepted_upload(
                     source,
                     (existing.as_ref().unwrap(), head.as_ref().unwrap()),
+                    false,
                     slot,
                 )
                 .await;
@@ -1549,6 +1576,7 @@ impl Engine {
                 .prepare_accepted_upload(
                     source,
                     (existing.as_ref().unwrap(), head.as_ref().unwrap()),
+                    true,
                     slot,
                 )
                 .await;
@@ -3097,7 +3125,7 @@ impl Engine {
         let size = object.size;
         tokio::task::spawn_blocking(move || super::writer::allocate(&allocation, size)).await??;
         let digests = self.download_digests(&metadata, expected_hash);
-        let stream_blake3 = seeded.is_empty()
+        let stream_blake3 = !reused_partial
             && object.size > part_size
             && part_size.is_multiple_of(blake3::CHUNK_LEN as u64)
             && digests

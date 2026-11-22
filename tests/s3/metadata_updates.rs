@@ -13,6 +13,7 @@ pub(super) fn serve(
 ) {
     let source = target.starts_with("/source/");
     let size = if fault.contains("large") { LARGE } else { 6 };
+    let concurrent_update = fault == "metadata-update-during-comparison";
     if fault.ends_with("missing") || fault.ends_with("conflict") {
         assert_eq!(
             method, "HEAD",
@@ -21,6 +22,7 @@ pub(super) fn serve(
     }
     match method {
         "HEAD" => {
+            let changed = concurrent_update && gate.0.load(Ordering::Relaxed);
             let mut fields = vec![
                 ("Content-Length".into(), size.to_string()),
                 (
@@ -59,7 +61,10 @@ pub(super) fn serve(
                 ("Content-Encoding".into(), "identity".into()),
                 ("Content-Language".into(), "en".into()),
                 ("Content-Disposition".into(), "inline".into()),
-                ("Cache-Control".into(), "max-age=60".into()),
+                (
+                    "Cache-Control".into(),
+                    if changed { "no-store" } else { "max-age=60" }.into(),
+                ),
                 ("Expires".into(), "0".into()),
                 (
                     "x-amz-website-redirect-location".into(),
@@ -67,7 +72,14 @@ pub(super) fn serve(
                 ),
                 (
                     "x-amz-meta-other".into(),
-                    if source { "source" } else { "destination" }.into(),
+                    if changed {
+                        "concurrently-updated"
+                    } else if source {
+                        "source"
+                    } else {
+                        "destination"
+                    }
+                    .into(),
                 ),
                 ("x-amz-tagging-count".into(), "1".into()),
                 ("x-amz-meta-syq-format".into(), "1".into()),
@@ -90,6 +102,11 @@ pub(super) fn serve(
                 if fault.ends_with("missing") { "1" } else { "0" }.into(),
             ));
             reply(socket, 200, &fields, b"", true);
+        }
+        "GET" if concurrent_update => {
+            assert_eq!(headers["if-match"], "\"destination\"");
+            gate.0.store(true, Ordering::Relaxed);
+            reply(socket, 200, &[], b"sample", false);
         }
         "GET" if target.contains("tagging") => {
             assert!(!source, "must preserve destination tags");
@@ -196,13 +213,23 @@ fn check_metadata(headers: &std::collections::HashMap<String, String>, fault: &s
         ("content-disposition", "inline"),
         (
             "cache-control",
-            if attributes { "no-store" } else { "max-age=60" },
+            if attributes || fault == "metadata-update-during-comparison" {
+                "no-store"
+            } else {
+                "max-age=60"
+            },
         ),
         ("expires", "0"),
         ("x-amz-website-redirect-location", "/destination"),
         (
             "x-amz-meta-other",
-            if attributes { "added" } else { "destination" },
+            if fault == "metadata-update-during-comparison" {
+                "concurrently-updated"
+            } else if attributes {
+                "added"
+            } else {
+                "destination"
+            },
         ),
         ("x-amz-meta-syq-mode", "384"),
         ("x-amz-meta-syq-mtime", "10"),
@@ -275,6 +302,31 @@ fn permission_only_upload_handles_large_objects_without_reading_local_contents()
             "{fault}"
         );
     }
+}
+
+#[test]
+fn metadata_only_upload_refreshes_attributes_changed_during_checksum_comparison() {
+    let temp = test_support::tempdir().unwrap();
+    let path = temp.path().join("source");
+    std::fs::write(&path, b"sample").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let server = Server::start("metadata-update-during-comparison");
+    let output = server.cp(
+        temp.path(),
+        &[
+            "source",
+            "--to",
+            "s3://destination",
+            "--as",
+            "copied",
+            "--integrity-checking",
+            "compare=blake3",
+            "--copy-metadata=permissions",
+        ],
+    );
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert!(server.gate.1.load(Ordering::Relaxed));
+    assert_eq!(server.requests.load(Ordering::Relaxed), 4);
 }
 
 #[test]

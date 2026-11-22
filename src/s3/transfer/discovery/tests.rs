@@ -432,6 +432,26 @@ async fn sparse_plan_stops_listing_and_leaves_the_rest_unknown() {
 }
 
 #[tokio::test]
+async fn existence_policies_keep_paging_only_when_they_save_heads() {
+    // Each 1000-entry page reaches 1000 planned keys. The policy can save
+    // all those HEADs, or none, depending on which decisions it uses.
+    let keys: Vec<_> = (0..4000).map(|i| format!("data/f{i:04}")).collect();
+    let present = Bucket::new(keys.iter().cloned());
+    let absent = Bucket::new(keys.iter().map(|key| format!("{key}a")));
+    for (bucket, saves_head, pages) in [
+        (&present, HeadSavings::Present, 4),
+        (&present, HeadSavings::Absent, SLACK_PAGES + 1),
+        (&absent, HeadSavings::Absent, 4),
+        (&absent, HeadSavings::Present, SLACK_PAGES + 1),
+    ] {
+        let mut walk = walk("data/", &keys);
+        walk.saves_head = saves_head;
+        while walk.page(bucket).await.unwrap() {}
+        assert_eq!(bucket.requests.take().len(), pages);
+    }
+}
+
+#[tokio::test]
 async fn few_keys_never_cost_more_pages_than_they_could_save() {
     let bucket = Bucket::new(large());
     let plan = ["big/d000/new".to_owned(), "big/d200/new".to_owned()];

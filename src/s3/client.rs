@@ -108,7 +108,19 @@ pub(super) fn request_timeouts() -> TimeoutConfig {
 /// errors and throttling describe the service, and a redirect comes from a
 /// region that does not hold the bucket.
 #[derive(Debug)]
-struct ControlLatency(std::sync::Arc<std::sync::atomic::AtomicU64>);
+struct ControlLatency {
+    fastest: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    seen_response: std::sync::atomic::AtomicBool,
+}
+
+impl ControlLatency {
+    fn new(fastest: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+        Self {
+            fastest,
+            seen_response: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
 #[derive(Debug)]
 struct ControlStart(tokio::time::Instant);
 impl aws_smithy_types::config_bag::Storable for ControlStart {
@@ -188,10 +200,21 @@ impl Intercept for ControlLatency {
         let status = response.status().as_u16();
         if let Some(ControlStart(start)) = cfg.load::<ControlStart>() {
             if (200..300).contains(&status) || status == 404 {
+                // The first control response may include DNS, TCP, and TLS.
+                // Keep the default tuning until another sample is available.
+                if !self
+                    .seen_response
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    return Ok(());
+                }
                 let signing = response
                     .extension::<super::authorization::SigningWait>()
                     .map_or(Duration::ZERO, |wait| wait.0);
-                super::tuning::observe_control(&self.0, start.elapsed().saturating_sub(signing));
+                super::tuning::observe_control(
+                    &self.fastest,
+                    start.elapsed().saturating_sub(signing),
+                );
             }
         }
         Ok(())
@@ -496,7 +519,7 @@ async fn connect_with(
             every: options.headers.clone(),
             write: options.write_headers.clone(),
         })
-        .interceptor(ControlLatency(control));
+        .interceptor(ControlLatency::new(control));
     if let Some(outage) = outage {
         config = config.interceptor(ObserveOutage(outage));
     }

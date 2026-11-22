@@ -1560,6 +1560,12 @@ fn serve(
                     b"<Error><Code>AccessDenied</Code></Error>",
                     false,
                 );
+            } else if fault.contains("sparse") {
+                let token = probes.load(Ordering::Relaxed);
+                let listing = format!(
+                    "<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>{token}</NextContinuationToken><Contents><Key>data/unrelated-{token}</Key><Size>1</Size></Contents></ListBucketResult>"
+                );
+                reply(&mut socket, 200, &[], listing.as_bytes(), false);
             } else {
                 let keys: String = (0..128)
                     .step_by(2)
@@ -1574,7 +1580,7 @@ fn serve(
         }
 
         let key = target.split('?').next().unwrap();
-        let index: usize = key.strip_prefix("/bucket/data/f").unwrap().parse().unwrap();
+        let index: usize = key.rsplit_once("/data/f").unwrap().1.parse().unwrap();
         let exists = index.is_multiple_of(2);
         if method == "HEAD" {
             if exists {
@@ -5681,6 +5687,41 @@ fn s3_upload_existence_policies_skip_heads_for_keys_the_listing_rules_out() {
             1 + heads + 64,
             "{fault}"
         );
+    }
+}
+
+#[test]
+fn s3_upload_existence_policies_do_not_page_through_sparse_directory_buckets() {
+    for (fault, flag) in [
+        ("upload-selection-sparse-keep", "--if-exists=keep"),
+        ("upload-selection-sparse-only", "--only-existing"),
+    ] {
+        let server = Server::start(fault);
+        let temp = test_support::tempdir().unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        for n in 0..64 {
+            std::fs::write(data.join(format!("f{n:03}")), b"x").unwrap();
+        }
+        let output = server
+            .command(temp.path())
+            .env("AWS_S3_DISABLE_EXPRESS_SESSION_AUTH", "true")
+            .args(["--s3-endpoint", &server.address])
+            .args([
+                "--srcs-in",
+                "data",
+                "--to",
+                "s3://bucket--use1-az1--x-s3",
+                "--into",
+                "data",
+                flag,
+                "--dry-run",
+            ])
+            .capture_output()
+            .unwrap();
+        assert!(output.status.success(), "{fault}: {}", output_text(&output));
+        assert_eq!(server.probes.load(Ordering::Relaxed), 0, "{fault}");
+        assert_eq!(server.requests.load(Ordering::Relaxed), 64, "{fault}");
     }
 }
 
