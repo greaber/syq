@@ -324,10 +324,11 @@ impl Controller {
         self.retreated(before)
     }
 
-    /// The service asked for fewer requests during transfers. Halve the limit
-    /// and back off upward revisits, without permanently lowering `maximum` so
-    /// the controller can still recover if capacity later increases (for
-    /// example after prefix partitioning).
+    /// The service asked for fewer requests during transfers. Step back to the
+    /// prior working level if an upward probe drew throttling, or halve the
+    /// settled limit, and back off upward revisits without permanently lowering
+    /// `maximum` so the controller can still recover if capacity later
+    /// increases (for example after prefix partitioning).
     fn transfer_throttled(&mut self) -> usize {
         let before = self.limit;
         let up = usize::from(true);
@@ -335,18 +336,12 @@ impl Controller {
         self.revisit_at[up] = self.scores + (8 << self.failures[up]);
         // When an upward probe or revisit drew throttling, return to the level
         // that was working rather than halving below it.
-        let (next, upper) = match &self.probe {
-            Some(probe) if probe.upward => {
-                let next = probe.from.max(self.minimum);
-                (next, before.max(next + 1))
-            }
-            _ => {
-                let next = (before / 2).max(self.minimum);
-                (next, next + 1)
-            }
+        let next = match &self.probe {
+            Some(probe) if probe.upward => probe.from.max(self.minimum),
+            _ => (before / 2).max(self.minimum),
         };
         self.limit = next;
-        self.upper = upper;
+        self.upper = next + 1;
         self.lower = self.lower.min(next.saturating_sub(1));
         self.upward = true;
         self.retreated(before)
@@ -805,9 +800,18 @@ where
             checking.limit.max(transfers)
         });
         // Stay gated until the objects admitted beyond the limit have left.
+        let was_gated = gated;
         gated = admitted > transfers || (gated && tasks.len() > transfers);
-        if let Some(requests) = &concurrency.requests {
-            requests.set_checking_above(gated);
+        if gated != was_gated {
+            if let Some(requests) = &concurrency.requests {
+                requests.set_checking_above(gated);
+            }
+            if was_gated && !gated {
+                // Consume throttles drawn while excess checking tasks were
+                // draining so the next tick cannot halve transfer concurrency
+                // after the gate closes.
+                seen_throttled = throttled();
+            }
         }
         gate.set_limit(if gated { transfers } else { usize::MAX });
         while error.is_none() && tasks.len() < admitted {

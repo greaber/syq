@@ -2,7 +2,7 @@
 use super::{Options, Route};
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
+        atomic::{AtomicU64, Ordering::Relaxed},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -91,10 +91,10 @@ impl Tuning {
         s.handed_off = false;
         s.backoff_windows = 0;
         s.throttle_backoff = 0;
+        s.checking_above = false;
         if let Some(outage) = &self.requests.outage {
             s.seen_throttled = outage.throttled_responses();
         }
-        self.requests.checking_above.store(false, Relaxed);
         s.max = request_cap;
         s.limit = self.fixed_requests.unwrap_or(seed).min(request_cap);
         if self.fixed_requests.is_none() && tiny && self.high_latency() {
@@ -171,6 +171,7 @@ struct Window {
     object_rate: Option<(usize, f64, Duration)>,
     settled: bool,
     handed_off: bool,
+    checking_above: bool,
     seen_throttled: u64,
     backoff_windows: usize,
     throttle_backoff: usize,
@@ -178,7 +179,6 @@ struct Window {
 pub(super) struct Budget {
     ceiling: Option<usize>,
     outage: Option<Arc<super::outage::Outage>>,
-    checking_above: AtomicBool,
     state: Mutex<Window>,
     changed: Notify,
     received: AtomicU64,
@@ -217,7 +217,6 @@ impl Budget {
         Self {
             ceiling,
             outage,
-            checking_above: AtomicBool::new(false),
             state: Mutex::new(Window {
                 active: 0,
                 limit,
@@ -237,6 +236,7 @@ impl Budget {
                 object_rate: None,
                 settled: false,
                 handed_off: false,
+                checking_above: false,
                 seen_throttled,
                 backoff_windows: 0,
                 throttle_backoff: 0,
@@ -316,16 +316,17 @@ impl Budget {
         Some((workers.min(s.limit), s.seen_throttled))
     }
     pub fn set_checking_above(&self, above: bool) {
-        let was = self.checking_above.swap(above, Relaxed);
+        let mut s = self.state.lock().unwrap();
+        let was = s.checking_above;
         if was && !above {
-            // Consume throttles drawn while expanded checking was active so
-            // they cannot cut the first transfer after the gate closes even if
-            // no transfer completed during that interval.
+            // Consume throttles drawn while expanded checking was active under
+            // the same lock before clearing the flag, so no concurrent
+            // completion or permit drop can observe the cleared flag first.
             if let Some(outage) = &self.outage {
-                let mut s = self.state.lock().unwrap();
                 s.seen_throttled = outage.throttled_responses();
             }
         }
+        s.checking_above = above;
     }
     pub fn finish_objects(&self, maximum: usize) {
         let maximum = maximum.min(self.ceiling.unwrap_or(usize::MAX));
@@ -357,7 +358,7 @@ impl Budget {
             return false;
         }
         s.seen_throttled = responses;
-        if !s.adaptive || s.handed_off || self.checking_above.load(Relaxed) || s.active > s.limit {
+        if !s.adaptive || s.handed_off || s.checking_above || s.active > s.limit {
             return false;
         }
         self.apply_throttle(s);

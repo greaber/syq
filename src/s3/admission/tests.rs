@@ -1094,7 +1094,7 @@ fn transfer_throttled_halves_and_preserves_maximum() {
     });
     controller.limit = 24;
     assert_eq!(controller.transfer_throttled(), 16);
-    assert_eq!(controller.upper, 24);
+    assert_eq!(controller.upper, 17);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1163,5 +1163,88 @@ async fn pre_handoff_single_throttle_cuts_once_not_twice() {
     assert!(
         (8..=10).contains(&peak),
         "post_throttle_peak {peak} expected near 8 (single cut from 16)"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn checking_drain_throttle_before_gate_close_does_not_cut_object_controller() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    let outage = Arc::new(crate::s3::outage::Outage::default());
+    let active_transfers = Arc::new(AtomicUsize::new(0));
+    let post_gate_peak = Arc::new(AtomicUsize::new(0));
+    let saw_gated = Arc::new(AtomicBool::new(false));
+    let injected_drain_throttle = Arc::new(AtomicBool::new(false));
+    let total_active = Arc::new(AtomicUsize::new(0));
+    // Phase 1 (0..2_500): unchanged checks so checking expands beyond the
+    // 16-object transfer limit and opens the gate. Once expanded, excess checks
+    // draw throttling so checking drops back to 16; as the final excess check
+    // drains before the next 250 ms tick, it records one more throttle.
+    // Phase 2 (2_500..3_200): pure transfers. The object controller must stay
+    // at >= 16 instead of being halved to 8 by the drain-phase checking 503.
+    parallel(
+        (0..3_200usize).collect(),
+        Concurrency {
+            initial: 16,
+            maximum: Some(32),
+            initial_probe_up: false,
+            requests: None,
+            checking: Some(Checking { maximum: 64 }),
+            outage: Some(outage.clone()),
+        },
+        |job, mut slot| {
+            let outage = outage.clone();
+            let active_transfers = active_transfers.clone();
+            let post_gate_peak = post_gate_peak.clone();
+            let saw_gated = saw_gated.clone();
+            let injected_drain_throttle = injected_drain_throttle.clone();
+            let total_active = total_active.clone();
+            async move {
+                let live = total_active.fetch_add(1, SeqCst) + 1;
+                if slot.beyond_limit() {
+                    saw_gated.store(true, SeqCst);
+                }
+                if job < 2_500 {
+                    // Let checking expand cleanly first, then throttle above 20
+                    // so checking drops back to 16 and drains.
+                    if job >= 1_500 && live > 20 {
+                        outage.throttled();
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    if job >= 1_800
+                        && slot.beyond_limit()
+                        && live <= 17
+                        && !injected_drain_throttle.swap(true, SeqCst)
+                    {
+                        // Throttle right as the last excess checking task
+                        // drains and closes the gate before the next tick.
+                        outage.throttled();
+                    }
+                    total_active.fetch_sub(1, SeqCst);
+                    Ok(None)
+                } else {
+                    slot.claim().await;
+                    let now = active_transfers.fetch_add(1, SeqCst) + 1;
+                    if job >= 2_600 {
+                        post_gate_peak.fetch_max(now, SeqCst);
+                    }
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    active_transfers.fetch_sub(1, SeqCst);
+                    total_active.fetch_sub(1, SeqCst);
+                    Ok(Some(1024))
+                }
+            }
+        },
+    )
+    .await
+    .unwrap();
+    assert!(saw_gated.load(SeqCst), "expected checking to open the gate");
+    assert!(
+        injected_drain_throttle.load(SeqCst),
+        "expected a throttle while draining excess checking tasks"
+    );
+    assert!(
+        post_gate_peak.load(SeqCst) >= 16,
+        "post_gate_peak {} dropped below 16 due to checking drain throttle",
+        post_gate_peak.load(SeqCst)
     );
 }
