@@ -16,6 +16,7 @@ pub(super) struct Tuning {
     upload: bool,
     pub requests: Arc<Budget>,
     pub reads: crate::s3::read_recovery::Recovery,
+    retained_upload_files: std::sync::OnceLock<Arc<tokio::sync::Semaphore>>,
     pub upload_buffers: Arc<tokio::sync::Semaphore>,
 }
 impl Tuning {
@@ -26,6 +27,7 @@ impl Tuning {
             reads: crate::s3::read_recovery::Recovery::default(),
             upload: options.route == Route::Upload,
             fixed_requests: args.tuning_options.and_then(|t| t.s3_requests),
+            retained_upload_files: Default::default(),
             upload_buffers: Arc::new(tokio::sync::Semaphore::new(256 * 1024 * 1024)),
             // Provider-specific transfer seeds do not change the data route,
             // integrity policy, or explicit overrides. Server copies use the
@@ -41,6 +43,22 @@ impl Tuning {
                     .and_then(|limits| limits.s3_requests),
             )),
         }
+    }
+    /// Keep at most one file per request slot across hashing and sending.
+    /// Size this after source selection so its pinned roots count against
+    /// descriptor headroom. A full budget just means reopening per request.
+    pub fn retain_upload_file(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.retained_upload_files
+            .get_or_init(|| {
+                let slots = small_object_capacity(1)
+                    .unwrap_or(0)
+                    .min(self.request_limit())
+                    .min(32);
+                Arc::new(tokio::sync::Semaphore::new(slots))
+            })
+            .clone()
+            .try_acquire_owned()
+            .ok()
     }
     #[cfg(test)]
     pub fn observe_control(&self, elapsed: Duration) {

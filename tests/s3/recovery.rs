@@ -4,12 +4,10 @@ use std::os::unix::fs::PermissionsExt;
 
 static REJECTED_PARTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static CORRUPTED_ONCE: AtomicBool = AtomicBool::new(false);
-/// The source file that `recovery-upload-source-*` changes while it is sent.
-static CHANGING_SOURCE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
-
 pub(super) fn serve_upload(
     socket: &mut TcpStream,
     fault: &str,
+    source: Option<&Path>,
     method: &str,
     target: &str,
     headers: &std::collections::HashMap<String, String>,
@@ -19,7 +17,7 @@ pub(super) fn serve_upload(
         .get("content-length")
         .map_or(0, |s| s.parse::<usize>().unwrap());
     if method == "PUT" && fault.starts_with("recovery-upload-source-") {
-        let path = CHANGING_SOURCE.lock().unwrap().clone().unwrap();
+        let path = source.unwrap();
         if matches!(
             fault,
             "recovery-upload-source-replaced" | "recovery-upload-source-removed"
@@ -31,18 +29,12 @@ pub(super) fn serve_upload(
                 return;
             }
             if fault == "recovery-upload-source-replaced" {
-                // Parts are sent in parallel, so each replacement is
-                // written under a name of its own.
-                static REPLACEMENTS: std::sync::atomic::AtomicUsize =
-                    std::sync::atomic::AtomicUsize::new(0);
-                let next = path.with_extension(format!(
-                    "next{}",
-                    REPLACEMENTS.fetch_add(1, Ordering::Relaxed)
-                ));
-                std::fs::write(&next, vec![b'x'; SIZE]).unwrap();
-                std::fs::rename(&next, &path).unwrap();
+                let mut replacement =
+                    tempfile::NamedTempFile::new_in(path.parent().unwrap()).unwrap();
+                replacement.write_all(&vec![b'x'; SIZE]).unwrap();
+                replacement.persist(path).unwrap();
             } else {
-                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_file(path);
             }
             reply(
                 socket,
@@ -107,6 +99,30 @@ pub(super) fn serve_upload(
             reply(socket, 200, &[],
                 b"<InitiateMultipartUploadResult><UploadId>new-upload</UploadId></InitiateMultipartUploadResult>", false);
         }
+        "PUT" if fault == "recovery-upload-move-before-retry" => {
+            if length > 0 {
+                if !gate.0.swap(true, Ordering::AcqRel) {
+                    let parent = source.unwrap().parent().unwrap();
+                    std::fs::rename(parent, parent.with_file_name("moved")).unwrap();
+                    reply(
+                        socket,
+                        503,
+                        &[],
+                        b"<Error><Code>SlowDown</Code></Error>",
+                        false,
+                    );
+                    return;
+                }
+                gate.1.store(true, Ordering::Release);
+            }
+            reply(
+                socket,
+                200,
+                &[("ETag".into(), "\"object\"".into())],
+                b"",
+                false,
+            );
+        }
         "PUT" => {
             assert!(target.contains("uploadId=new-upload"));
             assert!(body.iter().all(|b| *b == b'x'));
@@ -160,6 +176,9 @@ pub(super) fn serve_upload(
             assert!(body.contains("<PartNumber>1</PartNumber>"), "{body}");
             assert!(body.contains("<PartNumber>2</PartNumber>"), "{body}");
             assert!(!body.contains("<Checksum"), "{body}");
+            if fault == "recovery-upload-removed-during-completion" {
+                std::fs::remove_file(source.unwrap()).unwrap();
+            }
             gate.0.store(true, Ordering::Relaxed);
             reply(
                 socket,
@@ -316,10 +335,9 @@ fn a_source_that_changes_during_a_part_fails_without_retries() {
         "recovery-upload-source-shrinks",
     ] {
         let temp = crate::test_support::tempdir().unwrap();
-        let server = Server::start(fault);
         let file = temp.path().join("source");
+        let server = Server::with_source(fault, Some(&file));
         std::fs::write(&file, vec![b'x'; SIZE]).unwrap();
-        *CHANGING_SOURCE.lock().unwrap() = Some(file.clone());
         // Eight retries would back off for at least 22 seconds.
         let started = std::time::Instant::now();
         let output = server
@@ -351,10 +369,9 @@ fn a_source_replaced_or_removed_during_a_multipart_upload_is_not_published() {
         "recovery-upload-source-removed",
     ] {
         let temp = crate::test_support::tempdir().unwrap();
-        let server = Server::start(fault);
         let file = temp.path().join("source");
+        let server = Server::with_source(fault, Some(&file));
         std::fs::write(&file, vec![b'x'; SIZE]).unwrap();
-        *CHANGING_SOURCE.lock().unwrap() = Some(file.clone());
         let output = server
             .command_with_retries(temp.path(), 8)
             .args(["--s3-endpoint", &server.address])
@@ -372,6 +389,53 @@ fn a_source_replaced_or_removed_during_a_multipart_upload_is_not_published() {
         }
         assert!(!server.gate.0.load(Ordering::Relaxed), "{fault}: completed");
     }
+}
+
+#[test]
+fn moving_a_nested_directory_prevents_a_streamed_put_retry() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let file = temp.path().join("tree/nested/file");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::File::create(&file)
+        .unwrap()
+        .set_len(9 << 20)
+        .unwrap();
+    let server = Server::with_source("recovery-upload-move-before-retry", Some(&file));
+    let output = server
+        .command_with_part_size(temp.path(), 1, false)
+        .args([
+            "--s3-endpoint",
+            &server.address,
+            "--performance-tuning=s3-part-size=64M",
+            "--srcs-in",
+            "tree",
+            "--to",
+            "s3://bucket",
+            "--into",
+            "backup",
+        ])
+        .capture_output()
+        .unwrap();
+    assert!(!output.status.success(), "{}", output_text(&output));
+    assert!(server.gate.0.load(Ordering::Acquire), "first PUT refused");
+    assert!(
+        !server.gate.1.load(Ordering::Acquire),
+        "resent the moved file"
+    );
+}
+
+#[test]
+fn a_source_removed_during_multipart_completion_fails_the_copy() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let file = temp.path().join("source");
+    let server = Server::with_source("recovery-upload-removed-during-completion", Some(&file));
+    std::fs::write(&file, vec![b'x'; SIZE]).unwrap();
+    let output = server.cp(
+        temp.path(),
+        &["source", "--to", "s3://bucket", "--as", "object"],
+    );
+    assert!(server.gate.0.load(Ordering::Relaxed), "upload completed");
+    assert!(!output.status.success(), "{}", output_text(&output));
 }
 
 #[test]

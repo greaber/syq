@@ -106,6 +106,8 @@ impl Engine {
             let capacity = if self.options.route.is_server_copy() {
                 256
             } else if self.options.route == Route::Upload {
+                // Keep the measured Tigris worker ceiling. The nonblocking upload
+                // buffer budget controls memory independently of object admission.
                 let buffer_size = if self.tuning.tigris() {
                     8 * 1024 * 1024
                 } else {

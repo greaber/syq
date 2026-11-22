@@ -36,7 +36,7 @@ fn opened(temp: &std::path::Path, contents: &[u8]) -> Arc<Opened> {
         .pop()
         .unwrap();
     let file = source.open().unwrap();
-    Opened::new(source, file)
+    Opened::new(source, file, None)
 }
 
 fn pool(max_idle: usize) -> &'static Pool {
@@ -80,36 +80,9 @@ async fn chunks_read_the_range_and_reuse_released_buffers() {
     }
     assert!(chunks.is_end_stream());
     assert_eq!(read, data[offset as usize..][..length as usize]);
-    // Each chunk was released before the read after next, so the chunk
-    // being sent and the one read ahead never needed more than two buffers.
-    // Whether the read ahead found the previous chunk's buffer released
-    // depends on when the blocking pool ran it, so one buffer may have done.
-    assert!(addresses.len() <= 2, "{} buffers", addresses.len());
-    assert_eq!(pool.idle().len(), addresses.len());
-}
-
-/// Handing on a chunk starts reading the next one, and only that one, so the
-/// read overlaps sending the chunk before it.
-#[tokio::test]
-async fn each_chunk_handed_on_starts_reading_the_next() {
-    let temp = crate::test_support::tempdir().unwrap();
-    let data = patterned(3 * CHUNK);
-    let opened = opened(temp.path(), &data);
-    let pool = pool(8);
-    let mut chunks = Chunks::new(opened, 0, 3 * CHUNK as u64, pool);
-    assert!(
-        chunks.pending.is_none(),
-        "nothing is read before the first poll"
-    );
-    let mut held = Vec::new();
-    for _ in 0..2 {
-        held.push(frame(&mut chunks).await.unwrap().unwrap());
-        assert!(chunks.pending.is_some(), "the next chunk is being read");
-    }
-    held.push(frame(&mut chunks).await.unwrap().unwrap());
-    assert!(chunks.pending.is_none(), "nothing is read past the range");
-    assert!(frame(&mut chunks).await.is_none());
-    assert_eq!(held.concat(), data);
+    // Each chunk was released before the next read, so one buffer served all.
+    assert_eq!(addresses.len(), 1);
+    assert_eq!(pool.idle().len(), 1);
 }
 
 #[tokio::test]
@@ -164,24 +137,19 @@ async fn a_source_that_shrinks_fails_the_body_and_returns_its_buffer() {
     let opened = opened(temp.path(), &patterned(3 * CHUNK));
     let pool = pool(8);
     let mut chunks = Chunks::new(opened.clone(), 0, 3 * CHUNK as u64, pool);
-    // Shrink it before the body starts, since the read ahead of the second
-    // chunk begins as soon as the first is handed on.
+    drop(frame(&mut chunks).await.unwrap().unwrap());
     std::fs::File::options()
         .write(true)
         .open(temp.path().join("source"))
         .unwrap()
         .set_len(CHUNK as u64 + 10)
         .unwrap();
-    // Holding the first chunk makes the second read take a buffer of its own.
-    let first = frame(&mut chunks).await.unwrap().unwrap();
     let error = frame(&mut chunks).await.unwrap().unwrap_err();
     assert!(
         error.to_string().contains("source changed during S3 copy"),
         "{error}"
     );
-    assert_eq!(pool.idle().len(), 1, "the failed read returned its buffer");
-    drop(first);
-    assert_eq!(pool.idle().len(), 2);
+    assert_eq!(pool.idle().len(), 1);
 }
 
 /// A change that keeps the size shows in the timestamps, which the read of
@@ -193,25 +161,20 @@ async fn a_source_changed_in_place_fails_the_last_chunk() {
     let opened = opened(temp.path(), &patterned(2 * CHUNK));
     let pool = pool(8);
     let mut chunks = Chunks::new(opened.clone(), 0, 2 * CHUNK as u64, pool);
-    // Change it before the body starts: the last chunk is read ahead, and
-    // checked, as soon as the first is handed on.
+    drop(frame(&mut chunks).await.unwrap().unwrap());
     std::fs::File::options()
         .write(true)
         .open(temp.path().join("source"))
         .unwrap()
         .write_all_at(b"changed", 0)
         .unwrap();
-    // Holding the first chunk makes the second read take a buffer of its own.
-    let first = frame(&mut chunks).await.unwrap().unwrap();
     let error = frame(&mut chunks).await.unwrap().unwrap_err();
     assert!(
         error.to_string().contains("source changed during S3 copy"),
         "{error}"
     );
     assert!(!chunks.is_end_stream());
-    assert_eq!(pool.idle().len(), 1, "the failed read returned its buffer");
-    drop(first);
-    assert_eq!(pool.idle().len(), 2);
+    assert_eq!(pool.idle().len(), 1);
 }
 
 /// Dropping a body, as cancellation does, while a read is in flight still
@@ -391,7 +354,7 @@ async fn sdk_upload(
     retries: u32,
 ) -> (usize, Duration, anyhow::Error, bool) {
     let (client, server) = sdk().await;
-    let opened = Opened::new(source.clone(), file.try_clone().unwrap());
+    let opened = Opened::new(source.clone(), file.try_clone().unwrap(), None);
     let result = crate::s3::upload_send::tests::failed_upload_stopping(retries, || {
         client
             .put_object()

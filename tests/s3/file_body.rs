@@ -272,14 +272,17 @@ fn held_bytes(output: &Output) -> u64 {
 /// the file to send it.
 #[test]
 fn s3_small_enough_uploads_are_sent_from_the_hashing_read() {
-    for (size, held) in [(3 << 20 | 5, true), (8 << 20, true), ((8 << 20) + 1, false)] {
+    for (size, reserved) in [
+        (3 << 20 | 5, 4 << 20),
+        (8 << 20, 8 << 20),
+        ((8 << 20) + 1, 0),
+    ] {
         let temp = crate::test_support::tempdir().unwrap();
         let server = start("held", temp.path());
         std::fs::write(temp.path().join("source/object"), patterned(size)).unwrap();
         let output = upload(&server, temp.path(), 0);
         assert!(output.status.success(), "{size}: {}", output_text(&output));
         assert!(server.gate.1.load(Ordering::Acquire), "{size}");
-        let expected = if held { size as u64 } else { 0 };
-        assert_eq!(held_bytes(&output), expected, "{size}");
+        assert_eq!(held_bytes(&output), reserved, "{size}");
     }
 }

@@ -208,19 +208,21 @@ struct PreparedUpload {
     part_size: u64,
     algorithm: Algorithm,
     checksums: Vec<String>,
-    payload: Payload,
+    /// None reopens the selected file under a request permit.
+    payload: Option<Payload>,
     metadata: Metadata,
     must_be_new: bool,
     multipart: Option<PreparedMultipart>,
     metadata_update: Option<super::metadata_copy::Prepared>,
 }
-/// What an upload sends.
+/// What an upload request sends.
+#[derive(Clone)]
 enum Payload {
     /// The contents, read once while hashing them.
     Held(super::file_body::Held),
     /// The file, read again to send it: through the descriptor that hashed
     /// it, when preparation kept that open.
-    File(Option<Arc<super::file_body::Opened>>),
+    File(Arc<super::file_body::Opened>),
 }
 /// The largest single-request file kept in memory from hashing it to sending
 /// it: a 32nd of the 256 MiB upload buffer budget, so at least 32 uploads can
@@ -1238,7 +1240,7 @@ impl Engine {
                 self.authorization.is_some(),
             ),
             checksums: Vec::new(),
-            payload: Payload::File(None),
+            payload: None,
             metadata,
             must_be_new: false,
             multipart: None,
@@ -1382,7 +1384,11 @@ impl Engine {
                     .ok()
             })
             .flatten();
-        let keep_open = self.authorization.is_none();
+        // A streamed single PUT opens the pathname for each attempt anyway.
+        // Only multipart files benefit from keeping the hashing descriptor.
+        let retain_file = (size > part_size && self.authorization.is_none())
+            .then(|| self.tuning.retain_upload_file())
+            .flatten();
         self.check_cancelled()?;
         let source_clone = source.clone();
         let (hashes, payload) = tokio::task::spawn_blocking(move || -> Result<_> {
@@ -1395,12 +1401,12 @@ impl Engine {
                         whole_algorithm,
                         comparison_algorithm,
                     ),
-                    Payload::Held(held),
+                    Some(Payload::Held(held)),
                 ));
             }
             let file = source_clone.open()?;
             if let Some(reservation) = reservation {
-                let trace = super::diagnostics::upload_buffer(size);
+                let trace = super::diagnostics::upload_buffer(reservation.num_permits() as u64);
                 let held = super::file_body::Held::read(&file, size, (reservation, trace))?;
                 source_clone.check(&file)?;
                 return Ok((
@@ -1410,7 +1416,7 @@ impl Engine {
                         whole_algorithm,
                         comparison_algorithm,
                     ),
-                    Payload::Held(held),
+                    Some(Payload::Held(held)),
                 ));
             }
             let hashes = upload_hashes::ranges(
@@ -1430,14 +1436,24 @@ impl Engine {
                     })
                 },
             )?;
-            let opened = keep_open.then(|| super::file_body::Opened::new(source_clone, file));
-            Ok((hashes, Payload::File(opened)))
+            if hashes.concurrent {
+                source_clone.open()?;
+            }
+            let payload = retain_file.map(|permit| {
+                Payload::File(super::file_body::Opened::new(
+                    source_clone,
+                    file,
+                    Some(permit),
+                ))
+            });
+            Ok((hashes, payload))
         })
         .await??;
         let upload_hashes::Hashes {
             whole: whole_digest,
             comparison: comparison_digest,
             checksums,
+            ..
         } = hashes;
         if let Some(expected) = expected_hash {
             if !whole_digest.eq_ignore_ascii_case(&expected.value) {
@@ -1493,7 +1509,7 @@ impl Engine {
         let must_be_new = self.args.ignore_existing
             || self.args.target_existence == Existence::New
             || (self.args.protects_existing_contents() && existing.is_none());
-        let multipart = if size > part_size && matches!(payload, Payload::File(_)) {
+        let multipart = if size > part_size && source.kind() == ObjectKind::File {
             Some(
                 self.prepare_multipart(&source, digest, part_size, &metadata, algorithm)
                     .await?,
@@ -1568,48 +1584,48 @@ impl Engine {
             metadata_update: _,
         } = prepared;
         let _interval = self.progress.copying_interval();
-        // Only files are sent from the file rather than held.
-        let payload = match payload {
-            Payload::File(None) => Payload::File(Some(open_source(&source).await?)),
-            payload => payload,
-        };
-        if size <= part_size || matches!(payload, Payload::Held(_)) {
+        if size <= part_size || source.kind() != ObjectKind::File {
             let checksum = checksums.first().map(String::as_str);
             let _slot = self.tuning.requests.acquire().await;
             self.upload_request(&source.key, None, algorithm, checksum)
-                .send(content_md5(&payload, 0, size), |content_md5| {
-                    let (source, payload, metadata) = (&source, &payload, &metadata);
-                    async move {
-                        self.check_cancelled()?;
-                        let body = upload_body(payload, 0, size);
-                        self.pace(size).await?;
-                        let result = self
-                            .client
-                            .put_object()
-                            .bucket(&self.options.bucket)
-                            .key(&source.key)
-                            .body(body)
-                            .content_length(size as i64)
-                            .set_checksum_sha256(algorithm.header(Algorithm::Sha256, checksum))
-                            .set_content_md5(content_md5)
-                            .set_metadata(Some(metadata.encode()))
-                            .set_if_none_match(must_be_new.then(|| "*".into()))
-                            .customize()
-                            .config_override(super::client::without_sdk_retries())
-                            .disable_payload_signing()
-                            .send()
-                            .await;
-                        Ok(result)
-                    }
-                })
+                .send(
+                    async {
+                        let body = request_payload(payload.as_ref(), &source).await?;
+                        content_md5(&body, 0, size).await
+                    },
+                    |content_md5| {
+                        let (source, payload, metadata) = (&source, &payload, &metadata);
+                        async move {
+                            self.check_cancelled()?;
+                            // A streamed PUT must still name the selected file on every attempt.
+                            let payload = request_payload(payload.as_ref(), source).await?;
+                            let body = upload_body(&payload, 0, size);
+                            self.pace(size).await?;
+                            let result = self
+                                .client
+                                .put_object()
+                                .bucket(&self.options.bucket)
+                                .key(&source.key)
+                                .body(body)
+                                .content_length(size as i64)
+                                .set_checksum_sha256(algorithm.header(Algorithm::Sha256, checksum))
+                                .set_content_md5(content_md5)
+                                .set_metadata(Some(metadata.encode()))
+                                .set_if_none_match(must_be_new.then(|| "*".into()))
+                                .customize()
+                                .config_override(super::client::without_sdk_retries())
+                                .disable_payload_signing()
+                                .send()
+                                .await;
+                            Ok(result)
+                        }
+                    },
+                )
                 .await?
                 .map_err(|e| e.into_service_error())
                 .context("S3 PUT failed")?;
             self.tuning.requests.completed(size);
             self.progress.add_bytes(size);
-            if source.kind() == ObjectKind::File {
-                source.check(&source.open()?)?;
-            }
         } else {
             let PreparedMultipart {
                 recorded,
@@ -1633,6 +1649,16 @@ impl Engine {
                 State::without_cache()
             };
             let result: Result<()> = async {
+                // Storage-authorized files reopen after preparation. A reopen failure
+                // here must abort the upload when no recovery record can keep it.
+                let payload = if self.authorization.is_some() {
+                    match self.tuning.retain_upload_file() {
+                        Some(permit) => Some(open_source(&source, Some(permit)).await?),
+                        None => None,
+                    }
+                } else {
+                    payload
+                };
                 let acknowledged = Mutex::new(Acknowledged {
                     parts: upload.completed.clone(),
                     saved: tokio::time::Instant::now(),
@@ -1688,6 +1714,8 @@ impl Engine {
                                 }
                             }
                             let _slot = self.tuning.requests.acquire().await;
+                            let payload = request_payload(payload.as_ref(), source).await?;
+                            let payload = &payload;
                             let output = self
                                 .upload_request(&source.key, Some(number), algorithm, checksum)
                                 .send(
@@ -1769,7 +1797,7 @@ impl Engine {
                 self.check_cancelled()?;
                 // The parts' bodies checked the opened file after reading it;
                 // check the selected path too before publishing them.
-                source.check(&source.open()?)?;
+                source.open()?;
                 let mut completed = completed;
                 completed.sort_by_key(|p| p.part_number());
                 self.client
@@ -1796,6 +1824,9 @@ impl Engine {
             }
             result?;
             state.clear()?;
+        }
+        if source.kind() == ObjectKind::File {
+            source.open()?;
         }
         Ok(Some(size))
     }
@@ -3569,13 +3600,25 @@ pub(super) fn retryable<E: aws_sdk_s3::error::ProvideErrorMetadata>(
         .is_some_and(|code| THROTTLING_ERRORS.contains(&code) || TRANSIENT_ERRORS.contains(&code))
 }
 /// Open `source` for its upload, as the hashing read would have.
-async fn open_source(source: &Source) -> Result<Arc<super::file_body::Opened>> {
+async fn open_source(
+    source: &Source,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<Payload> {
     let source = source.clone();
     tokio::task::spawn_blocking(move || {
         let file = source.open()?;
-        anyhow::Ok(super::file_body::Opened::new(source, file))
+        anyhow::Ok(Payload::File(super::file_body::Opened::new(
+            source, file, permit,
+        )))
     })
     .await?
+}
+/// An unretained file is open only while its request holds a slot.
+async fn request_payload(payload: Option<&Payload>, source: &Source) -> Result<Payload> {
+    match payload {
+        Some(payload) => Ok(payload.clone()),
+        None => open_source(source, None).await,
+    }
 }
 /// The body sending `length` bytes of the payload from `offset`.
 fn upload_body(payload: &Payload, offset: u64, length: u64) -> ByteStream {
@@ -3584,8 +3627,7 @@ fn upload_body(payload: &Payload, offset: u64, length: u64) -> ByteStream {
             debug_assert_eq!((offset, length), (0, held.size()));
             held.body()
         }
-        Payload::File(Some(opened)) => super::file_body::body(opened, offset, length),
-        Payload::File(None) => unreachable!("an upload opens its file before sending it"),
+        Payload::File(opened) => super::file_body::body(opened, offset, length),
     })
 }
 fn upload_identity(
@@ -3633,8 +3675,7 @@ async fn content_md5(payload: &Payload, offset: u64, length: u64) -> Result<Stri
             held.chunks().for_each(|chunk| hash.update(chunk));
             return Ok(hash.finish());
         }
-        Payload::File(Some(opened)) => opened.clone(),
-        Payload::File(None) => unreachable!("an upload opens its file before sending it"),
+        Payload::File(opened) => opened.clone(),
     };
     tokio::task::spawn_blocking(move || opened.md5(offset, length)).await?
 }
@@ -3970,6 +4011,44 @@ mod tests {
             cancel_wake: Default::default(),
             uploads: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_full_descriptor_budget_reopens_the_file_under_the_request_permit() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("source");
+        std::fs::write(&path, b"selected").unwrap();
+        let engine = engine(&[
+            "cp",
+            path.to_str().unwrap(),
+            "--to",
+            "s3://bucket",
+            "--as",
+            "object",
+            "--performance-tuning=s3-requests=1",
+        ]);
+        let source = local::upload_plan(&engine.args)
+            .unwrap()
+            .sources
+            .pop()
+            .unwrap();
+        let permit = engine.tuning.retain_upload_file().unwrap();
+        let retained = open_source(&source, Some(permit)).await.unwrap();
+        assert!(engine.tuning.retain_upload_file().is_none());
+
+        let _request = engine.tuning.requests.acquire().await;
+        let reopened = request_payload(None, &source).await.unwrap();
+        let bytes = upload_body(&reopened, 0, source.meta.len)
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(bytes.as_ref(), b"selected");
+        // Dropping a per-request file doesn't free a retained slot.
+        drop(reopened);
+        assert!(engine.tuning.retain_upload_file().is_none());
+        drop(retained);
+        assert!(engine.tuning.retain_upload_file().is_some());
     }
 
     #[test]

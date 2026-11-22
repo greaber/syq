@@ -10,10 +10,8 @@
 //! threads, so a large upload kept over a gigabyte of freed memory. Reused
 //! buffers bound the allocations to the most chunks ever in use at once.
 //!
-//! A body reads one chunk ahead: as it hands a chunk to hyper it starts
-//! reading the next, so the disk read overlaps sending the one before. It
-//! holds at most that one chunk being read, and hyper holds only about one
-//! more until the socket takes it, so live memory stays near three chunks
+//! Each body holds at most one chunk being read, and hyper holds only about
+//! one more until the socket takes it, so live memory stays near two chunks
 //! per request in flight. An empty pool never blocks a read: it allocates a
 //! new buffer, which joins the pool when released if the pool has room.
 //!
@@ -33,10 +31,10 @@ use std::{
 
 const CHUNK: usize = 1024 * 1024;
 
-/// Idle buffers kept for reuse: three per request at the default ceiling of
-/// 256 requests in flight. Idle buffers were all in use at once at some
-/// point, so the cap only limits what a burst above it leaves behind.
-static POOL: Pool = Pool::new(768);
+/// Idle buffers kept for reuse: two per request at the default ceiling of 256
+/// requests in flight. Idle buffers were all in use at once at some point,
+/// so the cap only limits what a burst above it leaves behind.
+static POOL: Pool = Pool::new(512);
 
 struct Pool {
     idle: Mutex<Vec<Vec<u8>>>,
@@ -127,10 +125,19 @@ impl Drop for Buffer {
 pub(super) struct Opened {
     pub file: File,
     pub source: Source,
+    _retained: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 impl Opened {
-    pub fn new(source: Source, file: File) -> Arc<Self> {
-        Arc::new(Self { file, source })
+    pub fn new(
+        source: Source,
+        file: File,
+        retained: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            file,
+            source,
+            _retained: retained,
+        })
     }
     /// The Content-MD5 of `length` bytes from `offset`, failing if the source
     /// no longer matches what was selected once they are read.
@@ -309,8 +316,6 @@ struct Chunks {
     end: u64,
     /// Bodies shorter than a chunk use one buffer of their own size.
     pool: Option<&'static Pool>,
-    /// The read of the chunk at `offset`, started when the chunk before it
-    /// was handed on.
     pending: Option<Read>,
 }
 impl Chunks {
@@ -375,9 +380,6 @@ impl http_body::Body for Chunks {
         self.pending = None;
         let buffer = result??;
         self.offset += buffer.len as u64;
-        if self.offset < self.end {
-            self.pending = Some(self.read());
-        }
         Poll::Ready(Some(Ok(http_body::Frame::data(Bytes::from_owner(buffer)))))
     }
     fn is_end_stream(&self) -> bool {

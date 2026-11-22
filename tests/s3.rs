@@ -75,6 +75,10 @@ struct Server {
 }
 impl Server {
     fn start(fault: &'static str) -> Self {
+        Self::with_source(fault, None)
+    }
+    fn with_source(fault: &'static str, source: Option<&Path>) -> Self {
+        let source = source.map(Arc::<Path>::from);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = format!("http://{}", listener.local_addr().unwrap());
@@ -94,8 +98,9 @@ impl Server {
                         let count = count.clone();
                         let gate = worker_gate.clone();
                         let probes = worker_probes.clone();
+                        let source = source.clone();
                         workers.push(thread::spawn(move || {
-                            serve(socket, fault, count, gate, probes)
+                            serve(socket, fault, count, gate, probes, source.as_deref())
                         }));
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -266,6 +271,7 @@ fn serve(
     requests: Arc<AtomicUsize>,
     gate: Arc<(AtomicBool, AtomicBool)>,
     probes: Arc<AtomicUsize>,
+    source: Option<&Path>,
 ) {
     // BSD can inherit the listener's nonblocking mode; this handler uses
     // blocking I/O with timeouts on every platform.
@@ -359,6 +365,7 @@ fn serve(
         recovery::serve_upload(
             &mut socket,
             fault,
+            source,
             method,
             first.split_whitespace().nth(1).unwrap(),
             &headers,
@@ -2322,6 +2329,7 @@ fn s3_fixture_completes_response_on_inherited_nonblocking_socket() {
             Arc::new(AtomicUsize::new(0)),
             Arc::new((AtomicBool::new(false), AtomicBool::new(false))),
             Arc::new(AtomicUsize::new(0)),
+            None,
         )
     });
     let mut response = Vec::new();

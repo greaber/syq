@@ -7,6 +7,8 @@ pub(super) struct Hashes {
     pub comparison: Option<String>,
     /// One per part; empty when uploads send no request checksum.
     pub checksums: Vec<String>,
+    /// Recheck the pathname once all parallel readers have finished.
+    pub concurrent: bool,
 }
 
 struct PartHashes {
@@ -44,6 +46,7 @@ pub(super) fn bytes<'a>(
     Hashes {
         whole: whole_digest,
         comparison,
+        concurrent: false,
         checksums: native_hash.map(|hash| hash.finish()).into_iter().collect(),
     }
 }
@@ -159,6 +162,7 @@ where
         }
     };
     Ok(Hashes {
+        concurrent: parallel,
         whole: digest(whole),
         comparison: comparison.map(digest),
         checksums,
@@ -440,6 +444,7 @@ mod tests {
                 // Without request checksums or BLAKE3 subtrees, parts have no
                 // work: one sequential read computes the whole-file hash.
                 let parts_idle = native == Algorithm::None && !part_size.is_multiple_of(1024);
+                assert_eq!(result.concurrent, !parts_idle);
                 let (reads, expected_opens) = if parts_idle {
                     (1, 1)
                 } else {
