@@ -158,7 +158,6 @@ impl PinnedMissing {
                 | libc::O_CREAT
                 | libc::O_EXCL
                 | libc::O_NOFOLLOW
-                | libc::O_NONBLOCK
                 | libc::O_NOCTTY
                 | libc::O_CLOEXEC,
             mode & 0o777,
@@ -168,7 +167,6 @@ impl PinnedMissing {
         if !metadata.is_file() {
             bail!("the created path is not a regular file");
         }
-        clear_nonblocking(&file).context("normalize selected operator file flags")?;
         Ok(file)
     }
 }
