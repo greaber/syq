@@ -1161,6 +1161,7 @@ struct Observations {
     start: Instant,
     last: (u64, u64),
     supplied: bool,
+    last_rate: Option<f64>,
     evidence: evidence::Evidence,
 }
 
@@ -1171,6 +1172,7 @@ impl Observations {
             last: (meter.bytes(), meter.files()),
             supplied: gate.measurement_ready(active)
                 && sched.tuning_work(active, 0, FILE_CREDIT).parallel,
+            last_rate: None,
             evidence: Default::default(),
         }
     }
@@ -1198,6 +1200,8 @@ impl Observations {
         let usable = self.supplied && supplied && rate.is_some();
         let base = (active == policy.n).then(|| policy.probe_base()).flatten();
         let score = if let Some(rate) = rate.filter(|_| usable) {
+            // Preparation needs a work estimate before the window can select a count.
+            self.last_rate = Some(rate);
             self.evidence
                 .observe(rate, elapsed.as_secs_f64(), base.unwrap_or(0.0), sample)
         } else {
@@ -1223,7 +1227,8 @@ impl Observations {
         self.last = now;
         self.start = end;
         self.supplied = supplied;
-        if score.is_some() {
+        if let Some(score) = &score {
+            self.last_rate = Some(score.rate);
             self.evidence.clear();
         }
         score
@@ -1256,7 +1261,6 @@ fn run_with_interval(
     let mut trace = trace::Trace::new(meter.history(), &policy, sample);
     let mut active = policy.active();
     let poll = Duration::from_millis(250).min(sample);
-    let mut last_rate = None;
     let policy_start = Instant::now();
     let mut observations = Observations::new(meter.as_ref(), &gate, &sched, active);
     meter.set_active(active);
@@ -1272,7 +1276,6 @@ fn run_with_interval(
             meter.set_active(active);
             policy.advance_time(policy_start.elapsed(), sample);
             observations = Observations::new(meter.as_ref(), &gate, &sched, active);
-            last_rate = None;
             trace.transition(&policy, "resource_limit");
         }
 
@@ -1302,7 +1305,6 @@ fn run_with_interval(
             gate.set_active(requested);
             meter.set_active(requested);
             observations = Observations::new(meter.as_ref(), &gate, &sched, active);
-            last_rate = None;
             continue;
         }
 
@@ -1310,9 +1312,12 @@ fn run_with_interval(
         let preparation_count = forecast.map_or(policy.n, |(count, _)| count);
         let lead = gate.setup_lead();
         let preparation_activity =
-            required_remaining_activity(last_rate, preparation_count, sample).saturating_add(
-                last_rate.map_or(0, |rate| (rate * lead.as_secs_f64()).ceil() as u64),
-            );
+            required_remaining_activity(observations.last_rate, preparation_count, sample)
+                .saturating_add(
+                    observations
+                        .last_rate
+                        .map_or(0, |rate| (rate * lead.as_secs_f64()).ceil() as u64),
+                );
         let plan = policy.connection_plan(
             &observations.evidence,
             sample,
@@ -1339,12 +1344,12 @@ fn run_with_interval(
         // active while its candidate workers connect in the background.
         if policy.n != active {
             if matches!(policy.state, State::Explore { .. })
-                && !trace.enough_work(&sched, policy.n, last_rate, sample)
+                && !trace.enough_work(&sched, policy.n, observations.last_rate, sample)
             {
                 trace.cancel(
                     &mut policy,
                     "insufficient_remaining_work",
-                    last_rate,
+                    observations.last_rate,
                     sample,
                 );
                 continue;
@@ -1358,7 +1363,12 @@ fn run_with_interval(
                         sched.abort();
                         break;
                     }
-                    trace.cancel(&mut policy, "candidate_setup_failed", last_rate, sample);
+                    trace.cancel(
+                        &mut policy,
+                        "candidate_setup_failed",
+                        observations.last_rate,
+                        sample,
+                    );
                     gate.clear_failed_from(active);
                     continue;
                 }
@@ -1397,7 +1407,6 @@ fn run_with_interval(
         if let Some(score) =
             observations.measure(meter.as_ref(), &sched, &gate, &policy, &mut trace, sample)
         {
-            last_rate = Some(score.rate);
             if active == policy.n {
                 trace.observe(&mut policy, score.rate, "sequential_evidence");
                 if policy.n != active && crate::output::debug() {
