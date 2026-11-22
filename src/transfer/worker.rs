@@ -1319,7 +1319,7 @@ impl Worker {
                 self.file_error(*idx, error)?;
                 continue;
             }
-            j.done.store(j.entry.size, Relaxed);
+            j.done().store(j.entry.size, Relaxed);
             // Already counted for tuning when the destination acknowledged it.
             self.progress.files_done.fetch_add(1, Relaxed);
             self.note_replaced(j);
@@ -1814,7 +1814,7 @@ impl Worker {
             }
         };
         let to_send: u64 = ranges.iter().map(|(o, e)| e - o).sum();
-        job.done.store(size - to_send, Relaxed);
+        job.done().store(size - to_send, Relaxed);
         self.progress
             .bytes_unchanged
             .fetch_add(size - to_send, Relaxed);
@@ -2096,7 +2096,7 @@ impl Worker {
             Response::Ok => {
                 self.benchmark.local_whole_files += 1;
                 self.progress.add_bytes(job.entry.size - credited);
-                job.done.store(job.entry.size, Relaxed);
+                job.done().store(job.entry.size, Relaxed);
                 Ok(true)
             }
             Response::CopyLocalUnsupported => Ok(false),
@@ -2629,7 +2629,7 @@ impl Worker {
         credited: &mut u64,
         matched: &mut u64,
     ) {
-        job.done.fetch_add(len, Relaxed);
+        job.done().fetch_add(len, Relaxed);
         if reused {
             *matched += len;
             progress.bytes_unchanged.fetch_add(len, Relaxed);
@@ -2652,7 +2652,7 @@ impl Worker {
         flight.pending -= 1;
         flight.credited += n;
         progress.add_bytes(n);
-        job.done.fetch_add(n, Relaxed);
+        job.done().fetch_add(n, Relaxed);
         if slot != 0 && flight.pending == 0 && {
             let range = flight.handle.lock().unwrap();
             range.pos == range.end
@@ -3064,7 +3064,7 @@ impl Worker {
                 self.benchmark.streamed_blocks += 1;
                 self.benchmark.max_request_bytes = self.benchmark.max_request_bytes.max(claimed);
                 self.progress.add_bytes(claimed);
-                job.done.fetch_add(claimed, Relaxed);
+                job.done().fetch_add(claimed, Relaxed);
                 *credited += claimed;
             }
             Ok(())
@@ -3100,8 +3100,11 @@ impl Worker {
             return;
         }
         self.progress.bytes_done.fetch_sub(credited, Relaxed);
-        self.sched.jobs.lock().unwrap()[idx]
-            .done
+        self.sched
+            .jobs
+            .lock()
+            .unwrap()
+            .done(idx)
             .fetch_sub(credited, Relaxed);
     }
 
@@ -3313,7 +3316,7 @@ impl Worker {
                         ..e
                     };
                     j.attempt += 1;
-                    j.done.store(0, Relaxed);
+                    jobs.done(idx).store(0, Relaxed);
                     if let Some(published) = published {
                         jobs.set_destination(idx, published);
                     }
