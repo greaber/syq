@@ -1310,6 +1310,15 @@ fn workers_started_while_planning_small_files_share_the_copys_ssh_login() {
     );
 }
 
+// Keep the ordinary range pipeline small enough that it still has an unread
+// suffix when the independent login completes during the bandwidth-paced copy.
+#[cfg(debug_assertions)]
+const PACED_SSH_RANGE_OPTIONS: &[&str] = &[
+    "--performance-tuning=request-size=256K,pipeline-depth=4",
+    "--resource-limits",
+    "bandwidth=2M",
+];
+
 /// A worker on the shared login that meets a file too large to share it logs
 /// in on its own, and so do later connections. It keeps copying on the shared
 /// login until its own login is ready, then moves the rest of its work there.
@@ -1326,15 +1335,8 @@ fn a_worker_on_the_shared_ssh_login_logs_in_separately_for_a_large_file() {
     let large = prng(8 << 20, 9124);
     write(&t.path("src/large"), &large);
     list.push("large".into());
-    // The large file takes seconds at this rate, so the worker's own login,
-    // which takes a fraction of one here, is ready before its copy ends.
-    let (log, events) = copy_with_the_first_worker_held(
-        &t,
-        &fake_ssh(&t),
-        &list,
-        true,
-        &["--resource-limits", "bandwidth=2M"],
-    );
+    let (log, events) =
+        copy_with_the_first_worker_held(&t, &fake_ssh(&t), &list, true, PACED_SSH_RANGE_OPTIONS);
     assert_eq!(read(&t.path("dst/large")), large);
     assert_eq!(read(&t.path("dst/f4095")), b"f4095");
     assert!(
@@ -1396,13 +1398,8 @@ exec '{}' "$@"
         )
         .as_bytes(),
     );
-    let (_, events) = copy_with_the_first_worker_held(
-        &t,
-        &ssh,
-        &list,
-        true,
-        &["--resource-limits", "bandwidth=2M"],
-    );
+    let (_, events) =
+        copy_with_the_first_worker_held(&t, &ssh, &list, true, PACED_SSH_RANGE_OPTIONS);
     assert_eq!(read(&t.path("dst/large")), large);
     assert_eq!(read(&t.path("dst/f4095")), b"f4095");
     assert!(refused.exists(), "no worker tried a login of its own");
