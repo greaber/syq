@@ -10,7 +10,7 @@ const svg=document.getElementById('chart'), ns='http://www.w3.org/2000/svg';
 function draw(tag,attrs,text){const node=document.createElementNS(ns,tag);for(const [k,v]of Object.entries(attrs))node.setAttribute(k,String(v));if(text!==undefined)node.textContent=text;svg.append(node);return node;}
 function inspect(e){document.getElementById('detail').textContent=JSON.stringify(e,null,2);}
 const end=events.reduce((n,e)=>Math.max(n,e.elapsed_us/1e6),0)||1, maxWorkers=events.reduce((n,e)=>Math.max(n,e.data.active||e.data.workers||0),1);
-const samples=events.filter(e=>e.kind==='sample'&&e.data.seconds>0&&typeof e.data.bytes==='number'), maxRate=samples.reduce((n,e)=>Math.max(n,Math.max(0,e.data.bytes||0)/e.data.seconds),1);
+const samples=events.filter(e=>(e.kind==='sample'||e.kind==='observation')&&e.data.seconds>0&&typeof e.data.bytes==='number'), maxRate=samples.reduce((n,e)=>Math.max(n,Math.max(0,e.data.bytes||0)/e.data.seconds),1);
 const x=t=>65+900*t/end, yw=n=>175-130*n/maxWorkers, yr=n=>345-120*n/maxRate;
 draw('text',{x:65,y:23},'Enabled worker slots');draw('text',{x:65,y:212},'Measured byte progress (MB/s; may include buffering, not network capacity)');
 for(let i=0;i<=4;i++){let t=end*i/4;draw('line',{x1:x(t),x2:x(t),y1:32,y2:350,stroke:'#e1e7ec'});draw('text',{x:x(t),y:377,'text-anchor':'middle'},`${t.toFixed(2)}s`);draw('text',{x:55,y:yw(maxWorkers*i/4),'text-anchor':'end'},Math.round(maxWorkers*i/4));draw('text',{x:55,y:yr(maxRate*i/4),'text-anchor':'end'},(maxRate*i/4/1e6).toFixed(1));}
@@ -24,7 +24,7 @@ for(const e of events.filter(e=>e.kind==='decision'||e.kind==='transition')){con
 let page=0;
 const pageSize=200;
 function render(){
-  const visible=events.filter(e=>e.kind!=='sample'||document.getElementById('samples').checked);
+  const visible=events.filter(e=>(e.kind!=='sample'&&e.kind!=='observation')||document.getElementById('samples').checked);
   page=Math.max(0,Math.min(page,Math.ceil(visible.length/pageSize)-1));
   const start=page*pageSize,end=Math.min(start+pageSize,visible.length),body=document.getElementById('events');
   document.getElementById('page').textContent=visible.length?`${start+1}–${end} of ${visible.length} events`:'No events';

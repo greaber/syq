@@ -91,7 +91,11 @@ fn automatic_growth_can_explore_above_64() {
         let rate = policy.n.min(128) as f64 * 10e6;
         measure(&mut policy, rate);
     }
-    assert!(policy.settled() >= 128, "{:?}", policy.history);
+    assert!(
+        policy.settled() as f64 >= 128.0 * (1.0 - NEAR_BEST_TOLERANCE),
+        "{:?}",
+        policy.history
+    );
     assert!(policy.history.iter().any(|&count| count > 64));
 }
 
@@ -187,6 +191,74 @@ fn resume_worker_reset_preserves_cached_and_uncached_startup_modes() {
 }
 
 #[test]
+fn fallback_starts_a_clean_observation_at_the_new_count() {
+    struct Counters {
+        history: history::Recorder,
+        sched: Arc<Sched>,
+        reads: AtomicUsize,
+    }
+    impl Meter for Counters {
+        fn history(&self) -> Option<history::Recorder> {
+            Some(self.history.clone())
+        }
+        fn set_active(&self, _: usize) {}
+        fn files(&self) -> u64 {
+            0
+        }
+        fn bytes(&self) -> u64 {
+            let reads = self.reads.fetch_add(1, Relaxed);
+            if reads >= 3 {
+                self.sched.abort();
+            }
+            reads as u64 * 1000
+        }
+    }
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let history = history::tests::recorder(&path);
+    let sched = Arc::new(Sched::new(4 << 20, 32 << 20));
+    sched.push_file(crate::sched::tests::test_job(b"pending", 1 << 30));
+    sched.scan_done();
+    sched.arm_direct_fallback(4);
+    sched.request_direct_fallback();
+    let gate = Gate::new(1); // Old interval started before any worker was ready.
+    let meter = Arc::new(Counters {
+        history: history.clone(),
+        sched: sched.clone(),
+        reads: Default::default(),
+    });
+    run_with_interval(
+        Policy::new(1, 1, 4),
+        gate.clone(),
+        sched,
+        meter,
+        |id| gate.mark_ready(id),
+        Duration::from_millis(10),
+    );
+    history.complete(true, serde_json::json!({}));
+    let db = rusqlite::Connection::open(path).unwrap();
+    let first = db
+        .query_row(
+            "SELECT workers,usable FROM measurements ORDER BY sequence LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, usize>(0)?, row.get::<_, bool>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(first, (4, true));
+}
+
+#[test]
+fn adjacent_evidence_expires_on_the_live_clock() {
+    let mut policy = Policy::refine(8, 1, 16);
+    policy.advance_time(Duration::ZERO, SAMPLE);
+    policy.record(8, 100.0);
+    policy.record(9, 80.0);
+    assert_eq!(policy.target(Direction::Up), 8);
+    policy.advance_time(SAMPLE * (EVIDENCE_MAX_AGE as u32 + 1), SAMPLE);
+    assert!(policy.target(Direction::Up) > 8);
+}
+
+#[test]
 fn plateau_hint_keeps_modest_probes() {
     let mut p = Policy::refine(START_SSH, MIN, MAX);
     measure(&mut p, 80.0);
@@ -226,7 +298,7 @@ fn upward_gain_continues_but_inconclusive_result_holds() {
     let mut unnecessary = Policy::refine(10, MIN, MAX);
     measure(&mut unnecessary, 100.0);
     measure(&mut unnecessary, 104.0);
-    assert_eq!(unnecessary.settled(), 13);
+    assert_eq!(unnecessary.settled(), 10);
     assert_eq!(unnecessary.state, State::Hold);
 }
 
@@ -288,14 +360,18 @@ fn cached_gain_at_the_cap_holds_at_the_cap() {
 }
 
 #[test]
-fn uncached_start_reaches_full_rate_without_accepting_slower_reductions() {
+fn uncached_start_reaches_full_rate_and_stays_within_tolerance() {
     for (start, cap) in [(8, 32), (32, 64)] {
         let mut p = simulate(start, cap, 3, |_| 1.0);
         assert_eq!(p.settled(), cap, "history {:?}", p.history);
         for _ in 0..128 {
             let rate = p.n.min(cap) as f64 * 10e6;
             measure(&mut p, rate);
-            assert!(p.settled() >= cap, "history {:?}", p.history);
+            assert!(
+                p.settled() as f64 >= cap as f64 * (1.0 - NEAR_BEST_TOLERANCE),
+                "history {:?}",
+                p.history
+            );
         }
     }
 }
@@ -317,7 +393,7 @@ fn a_failed_up_probe_does_not_immediately_bounce_down() {
 }
 
 #[test]
-fn rejects_a_slightly_slower_downward_probe() {
+fn accepts_a_downward_probe_within_the_noise_band() {
     let mut p = Policy::refine(10, MIN, MAX);
     measure(&mut p, 100.0);
     measure(&mut p, 130.0);
@@ -327,17 +403,16 @@ fn rejects_a_slightly_slower_downward_probe() {
     }
     assert_eq!(p.n, 11);
     measure(&mut p, 129.0);
-    assert_eq!(p.settled(), 13);
-    assert_eq!(p.n, 13);
+    assert_eq!(p.settled(), 11);
 }
 
 #[test]
-fn flat_throughput_does_not_justify_a_reduction() {
+fn flat_throughput_settles_at_the_minimum() {
     let mut p = Policy::new(START_SSH, MIN, MAX);
     for _ in 0..200 {
         measure(&mut p, 100.0);
-        assert!(p.settled() >= START_SSH, "history {:?}", p.history);
     }
+    assert_eq!(p.settled(), MIN, "history {:?}", p.history);
 }
 
 #[test]
@@ -551,8 +626,7 @@ fn preparation_precedes_the_first_decision_without_activating_workers() {
         (Policy::new(16, 1, 64), 32),
         (Policy::refine(16, 1, 64), 21),
     ] {
-        let mut sampler = Sampler::default();
-        sampler.reset();
+        let sampler = evidence::Evidence::default();
         let lead = Duration::from_secs(12);
         let plan = policy.connection_plan(&sampler, SAMPLE, Duration::ZERO, lead, true);
         assert_eq!(plan.connect, candidate);
@@ -578,16 +652,11 @@ fn preparation_precedes_the_first_decision_without_activating_workers() {
 
 #[test]
 fn preparation_uses_earliest_sample_boundary_and_keeps_rollback_ready() {
-    let mut sampler = Sampler::default();
-    sampler.reset();
+    let mut sampler = evidence::Evidence::default();
+    assert_eq!(sampler.remaining(SAMPLE, Duration::ZERO), SAMPLE);
+    assert!(sampler.push(100.0, 0.5, 0.0).is_none());
     assert_eq!(
-        sampler.earliest_score_in(SAMPLE, Duration::ZERO),
-        SAMPLE * 3
-    );
-    assert_eq!(sampler.push(100.0), None);
-    assert_eq!(sampler.push(100.0), None);
-    assert_eq!(
-        sampler.earliest_score_in(SAMPLE, Duration::from_secs(2)),
+        sampler.remaining(SAMPLE, Duration::from_millis(1500)),
         Duration::from_millis(500)
     );
     let mut policy = Policy::refine(16, 1, 64);
@@ -622,7 +691,7 @@ fn distant_probe_releases_spares_then_prepares_before_it_is_due() {
     let mut policy = Policy::refine(16, 1, 64);
     policy.state = State::Hold;
     policy.due = [60, 60];
-    let sampler = Sampler::default();
+    let sampler = evidence::Evidence::default();
     let lead = Duration::from_secs(21); // measured ten seconds, doubled plus margin
     let plan = policy.connection_plan(&sampler, SAMPLE, Duration::ZERO, lead, true);
     assert_eq!(
@@ -632,21 +701,21 @@ fn distant_probe_releases_spares_then_prepares_before_it_is_due() {
             keep: 16
         }
     );
-    policy.tick = 55; // 25 seconds until earliest probe: retain, not yet open
+    policy.tick = 50; // 25 seconds until earliest probe: retain, not yet open
     let plan = policy.connection_plan(&sampler, SAMPLE, Duration::ZERO, lead, true);
     assert_eq!(plan.connect, 16);
     assert!(plan.keep >= 21);
-    policy.tick = 56; // 20 seconds: open now, before the policy changes
+    policy.tick = 52; // 20 seconds: open now, before the policy changes
     let plan = policy.connection_plan(&sampler, SAMPLE, Duration::ZERO, lead, true);
     assert_eq!(plan.connect, 21);
     assert_eq!(policy.n, 16);
-    assert_eq!(policy.tick, 56);
+    assert_eq!(policy.tick, 52);
 }
 
 #[test]
 fn preparation_respects_limits_and_skips_speculation_at_the_tail() {
     let policy = Policy::new(16, 1, 18);
-    let sampler = Sampler::default();
+    let sampler = evidence::Evidence::default();
     let lead = Duration::from_secs(30);
     let plan = policy.connection_plan(&sampler, SAMPLE, Duration::ZERO, lead, true);
     assert_eq!(plan.connect, 18);
@@ -690,22 +759,22 @@ fn warming_forecast_waits_for_candidate_measurements_not_baseline_refresh() {
     ] {
         assert_eq!(policy.observe(100.0), candidate);
         assert_eq!(policy.active(), 16);
-        let mut baseline = Sampler::default();
-        assert_eq!(baseline.push(100.0), None);
+        let mut baseline = evidence::Evidence::default();
+        assert!(baseline.push(100.0, 0.5, 0.0).is_none());
         // The next baseline score is due now, but the candidate still needs a
-        // discarded sample plus two measured samples after activation.
-        let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(6), true);
+        // fresh window after activation.
+        let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(1), true);
         assert_eq!(plan.connect, candidate);
         assert!(plan.keep >= candidate);
         assert!(policy.refresh_warming_baseline(100.0));
-        let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(6), true);
+        let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(1), true);
         assert_eq!(plan.connect, candidate);
         // Truly slow setup can still justify overlapping preparation, using the
         // earliest post-activation decision rather than a baseline refresh.
         let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(10), true);
         assert_eq!(plan.connect, following);
         policy.activated();
-        let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(6), true);
+        let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(1), true);
         assert_eq!(plan.connect, following);
     }
 }
@@ -746,6 +815,25 @@ fn setup_lead_includes_retries_and_does_not_shrink_after_one_fast_setup() {
     gate.mark_warming(1);
     gate.mark_ready(1);
     assert!(gate.setup_lead() >= Duration::from_secs(21));
+    let mut policy = Policy::refine(1, 1, 4);
+    policy.state = State::Hold;
+    policy.due = [12, 12];
+    policy.advance_time(Duration::ZERO, SAMPLE);
+    let plan = |lead| {
+        policy.connection_plan(
+            &evidence::Evidence::default(),
+            SAMPLE,
+            Duration::ZERO,
+            lead,
+            true,
+        )
+    };
+    assert!(plan(gate.setup_lead()).keep > 1);
+    // Even without another setup, the earlier retry must cease to keep
+    // this spare open indefinitely.
+    gate.setups.lock().unwrap()[0].0 -= SAMPLE * (EVIDENCE_MAX_AGE as u32 + 1);
+    gate.prepare(plan(gate.setup_lead()));
+    assert!(!gate.park(1, || false));
 }
 
 #[test]
@@ -756,7 +844,7 @@ fn missed_preparation_still_waits_for_ready_connections_and_optional_failure_iso
         gate.mark_ready(id);
     }
     let plan = policy.connection_plan(
-        &Sampler::default(),
+        &evidence::Evidence::default(),
         SAMPLE,
         Duration::ZERO,
         Duration::from_secs(10),
@@ -786,7 +874,7 @@ fn a_preparation_pause_does_not_close_imminently_needed_spares() {
     policy.state = State::Hold;
     policy.due = [1, 1];
     let plan = policy.connection_plan(
-        &Sampler::default(),
+        &evidence::Evidence::default(),
         SAMPLE,
         Duration::ZERO,
         Duration::from_secs(10),
@@ -804,8 +892,7 @@ fn one_worker_start_prepares_spare_before_initial_connection_is_ready() {
     let gate = Gate::new(1);
     assert_eq!(gate.begin_warming(1), vec![0]);
     assert!(!gate.ready_through(1));
-    let mut sampler = Sampler::default();
-    sampler.reset();
+    let sampler = evidence::Evidence::default();
     let mut policy = Policy::new(1, 1, 8);
     let plan = policy.connection_plan(
         &sampler,
@@ -837,13 +924,13 @@ fn one_worker_start_prepares_spare_before_initial_connection_is_ready() {
 }
 
 #[test]
-fn inconclusive_doubling_keeps_capacity_without_another_increase() {
+fn inconclusive_doubling_rolls_back_and_backs_off() {
     for score in [95.0, 100.0, 104.0] {
         let mut policy = Policy::new(8, 1, 64);
         measure(&mut policy, 100.0);
         assert_eq!(policy.n, 16);
         measure(&mut policy, score);
-        assert_eq!(policy.n, 16);
+        assert_eq!(policy.n, 8);
         assert_eq!(policy.state, State::Hold);
         assert!(!policy.startup_doubling);
         assert!(policy.measured());
@@ -853,18 +940,24 @@ fn inconclusive_doubling_keeps_capacity_without_another_increase() {
         );
         for _ in 0..PROBE_EVERY - 1 {
             measure(&mut policy, score);
-            assert_eq!(policy.n, 16);
+            assert_eq!(policy.n, 8);
         }
     }
 }
 
 #[test]
-fn downward_gain_requirement_preserves_clear_upward_loss_rollback() {
+fn noise_band_prefers_the_same_count_in_both_directions() {
     let mut policy = Policy::refine(8, 1, 64);
     measure(&mut policy, 100.0);
     measure(&mut policy, 94.0);
     assert_eq!(policy.n, 8);
-    for (score, keep_smaller) in [(106.0, true), (101.0, false), (100.0, false), (95.0, false)] {
+    for (score, keep_smaller) in [
+        (106.0, true),
+        (101.0, true),
+        (100.0, true),
+        (95.0, true),
+        (94.0, false),
+    ] {
         let mut policy = Policy::refine(16, 1, 64);
         policy.record(16, 100.0);
         assert!(policy.begin(Direction::Down, 100.0));
@@ -882,14 +975,14 @@ fn settled_count_follows_kept_increases_and_measured_reductions() {
     assert_eq!(policy.settled(), 8);
     measure(&mut policy, 200.0); // Clear gain at 16; propose 32.
     assert_eq!(policy.settled(), 16);
-    measure(&mut policy, 200.0); // An inconclusive increase keeps 32 live.
-    assert_eq!(policy.settled(), 32);
+    measure(&mut policy, 200.0); // An inconclusive increase restores 16.
+    assert_eq!(policy.settled(), 16);
 
     assert!(policy.begin(Direction::Down, 200.0));
     policy.activated();
-    assert_eq!(policy.n, 24);
+    assert_eq!(policy.n, 12);
     measure(&mut policy, 220.0);
-    assert_eq!(policy.settled(), 24);
+    assert_eq!(policy.settled(), 12);
     // Allow earlier, slower lower-count measurements to age before retrying.
     for _ in 0..EVIDENCE_MAX_AGE * 4 {
         if policy.settled() < 16 {
@@ -946,7 +1039,7 @@ fn floor_does_not_prevent_downward_recovery_after_growing() {
 }
 
 #[test]
-fn downward_probe_requires_a_measured_speed_increase() {
+fn downward_probe_accepts_the_near_best_boundary() {
     for score in [94.0, 95.0, 99.0, 100.0, 100.001, 101.0, 106.0] {
         let mut policy = Policy::refine(32, MIN, MAX);
         policy.record(32, 100.0);
@@ -956,19 +1049,22 @@ fn downward_probe_requires_a_measured_speed_increase() {
         measure(&mut policy, score);
         assert_eq!(
             policy.settled(),
-            if score * 0.95 > 100.0 { lower } else { 32 },
+            if score >= 95.0 { lower } else { 32 },
             "score={score}"
         );
     }
 }
 
 #[test]
-fn aging_evidence_does_not_make_a_slower_reduction_acceptable() {
+fn aging_evidence_keeps_settled_throughput_within_tolerance() {
     let mut p = Policy::refine(32, MIN, MAX);
     for _ in 0..1000 {
         let score = p.n.min(32) as f64 * 100.0 / 32.0;
         measure(&mut p, score);
-        assert!(p.settled() >= 32, "settled below full speed: {p:?}");
+        assert!(
+            p.settled() as f64 >= 32.0 * (1.0 - NEAR_BEST_TOLERANCE),
+            "settled outside tolerance: {p:?}"
+        );
     }
 }
 
@@ -1007,7 +1103,7 @@ fn smaller_upward_gain_does_not_resume_growth_below_old_high_water() {
         },
     );
     measure(&mut p, 66.0);
-    assert_eq!(p.n, 10);
+    assert_eq!(p.n, 8);
     assert!(matches!(p.state, State::Hold));
 }
 

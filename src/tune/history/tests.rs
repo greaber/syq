@@ -182,7 +182,7 @@ fn unfinished_history(path: &Path, runs: i64) -> Connection {
 }
 
 /// How many pages this connection has read from the history so far.
-fn pages_read(db: &Connection) -> i64 {
+pub(super) fn pages_read(db: &Connection) -> i64 {
     let (mut current, mut highest) = (0, 0);
     // SAFETY: the handle belongs to this open connection, and both outputs
     // are valid for the call.
@@ -1063,7 +1063,7 @@ fn tcp_preflight_preserves_evidence_without_storing_addresses() {
 }
 
 #[test]
-fn trace_records_inconclusive_upward_hold_without_claiming_a_plateau() {
+fn trace_records_rollback_of_flat_upward_probe() {
     use super::super::{trace::Trace, Policy};
     let temp = crate::test_support::tempdir().unwrap();
     let path = temp.path().join("history.sqlite");
@@ -1080,12 +1080,12 @@ fn trace_records_inconclusive_upward_hold_without_claiming_a_plateau() {
         .rev()
         .find(|e| e["kind"] == "decision")
         .unwrap();
-    assert_eq!(decision["data"]["reason"], "probe_inconclusive");
-    assert_eq!(decision["data"]["after"]["requested"], 16);
+    assert_eq!(decision["data"]["reason"], "probe_rejected");
+    assert_eq!(decision["data"]["after"]["requested"], 8);
     assert_eq!(decision["data"]["after"]["state"], "Hold");
     let end = events.last().unwrap();
     assert_eq!(end["data"]["completed_comparison"], true);
-    assert_eq!(end["data"]["last_accepted"], 16);
+    assert_eq!(end["data"]["last_accepted"], 8);
     assert!(end["data"].get("recommended").is_none());
     assert!(end["data"].get("discovery_complete").is_none());
 }
@@ -1173,8 +1173,7 @@ fn repeated_inconclusive_copies_do_not_raise_the_starting_count() {
         policy.activated();
         let larger = policy.active();
         policy.observe(97.0);
-        // The live copy keeps the inconclusive increase.
-        assert_eq!(policy.settled(), larger);
+        assert_eq!(policy.settled(), start);
         let writer = measured_run(&path, &context, &[(start, 100.0), (larger, 97.0)]);
         let run = command::read_run(&open(&path).unwrap(), saved(&writer)).unwrap();
         assert_eq!(run["recommendation_eligible"], true);
@@ -1423,12 +1422,16 @@ fn rejected_counter_interval_does_not_discard_the_next_clean_interval() {
     });
     history.complete(true, json!({}));
     let db = Connection::open(path).unwrap();
-    let statuses: Vec<String> = db.prepare("SELECT json_extract(data,'$.data.disposition') FROM events WHERE json_extract(data,'$.kind')='sample' ORDER BY sequence").unwrap()
+    let statuses: Vec<String> = db.prepare("SELECT json_extract(data,'$.data.disposition') FROM events WHERE json_extract(data,'$.kind')='observation' ORDER BY sequence").unwrap()
         .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
-    assert_eq!(statuses[0], "counter_regressed");
+    let regressed = statuses
+        .iter()
+        .position(|s| s == "counter_regressed")
+        .unwrap();
     assert_eq!(
-        statuses[1], "warmup_excluded",
-        "clean interval must reach the sampler: {statuses:?}"
+        statuses[regressed + 1],
+        "measured",
+        "clean interval must reach the window: {statuses:?}"
     );
 }
 
@@ -1536,7 +1539,7 @@ fn a_copy_starts_without_waiting_for_its_history_to_open() {
     );
     // A periodic save would wait for the open, and so for `other`.
     writer.0.lock().unwrap().next_write = Instant::now() + Duration::from_secs(3600);
-    writer.event("planned", json!({"files":1}));
+    writer.event("planned", json!({"files":2}));
     other.execute_batch("COMMIT").unwrap();
     writer.context(&key("a"));
     writer.complete(true, json!({}));
@@ -1554,6 +1557,29 @@ fn a_copy_starts_without_waiting_for_its_history_to_open() {
         })
         .unwrap();
     assert_eq!((status.as_str(), destination.as_str()), ("success", "a"));
+}
+
+#[test]
+fn finishing_an_unmeasured_single_file_copy_never_waits_for_the_open() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let db = open(&path).unwrap();
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let writer = Recorder::at_waiting(
+        &path,
+        Instant::now(),
+        json!({}),
+        DEFAULT_BUDGET,
+        Duration::from_secs(60),
+    );
+    writer.event("planned", json!({"files":1}));
+    writer.complete(true, json!({"files":1}));
+    // The identity key cannot be created until the lock is released. The
+    // recorder completed without joining that thread or creating a run.
+    assert!(matches!(writer.0.lock().unwrap().store, Store::Opening(_)));
+    db.execute_batch("COMMIT").unwrap();
+    assert_eq!(run_count(&db), 0);
+    writer.0.lock().unwrap().store.ready().unwrap();
 }
 
 #[test]

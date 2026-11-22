@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 
 pub(crate) struct Trace {
     recorder: Option<history::Recorder>,
+    observation: u64,
     sample: u64,
     recent_samples: std::collections::VecDeque<u64>,
     waiting: Option<&'static str>,
@@ -14,14 +15,15 @@ impl Trace {
     pub fn new(recorder: Option<history::Recorder>, policy: &Policy, interval: Duration) -> Self {
         let trace = Self {
             recorder,
+            observation: 0,
             sample: 0,
             recent_samples: Default::default(),
             waiting: None,
             last_work_check: None,
         };
         trace.event("policy_start",json!({"policy_version":POLICY_VERSION,"policy":snapshot(policy),
-            "sample_ms":interval.as_millis(),"discarded_intervals_after_reset":1,"stable_within":STABLE_WITHIN,
-            "maximum_samples":MAX_SAMPLES,"near_best_tolerance":NEAR_BEST_TOLERANCE,
+            "sample_ms":interval.as_millis(),"discarded_intervals_after_reset":usize::from(!policy.wall_clock),"stable_within":(!policy.wall_clock).then_some(STABLE_WITHIN),
+            "maximum_samples":(!policy.wall_clock).then_some(MAX_SAMPLES),"near_best_tolerance":NEAR_BEST_TOLERANCE,
             "step":STEP,"startup_step":STARTUP_STEP,"file_credit":FILE_CREDIT,"probe_every":PROBE_EVERY,
             "probe_backoff_max":PROBE_BACKOFF_MAX,"evidence_max_age":EVIDENCE_MAX_AGE,
             "clock_unit":if policy.wall_clock {"elapsed_sample_intervals"} else {"accepted_measurements"},
@@ -34,6 +36,25 @@ impl Trace {
     pub fn event(&self, kind: &str, data: Value) {
         if let Some(recorder) = &self.recorder {
             recorder.event(kind, data);
+        }
+    }
+
+    pub fn recording(&self) -> bool {
+        self.recorder.is_some()
+    }
+
+    pub(super) fn observation(
+        &mut self,
+        mut data: Value,
+        score: Option<&evidence::Score>,
+        base: Option<f64>,
+    ) {
+        self.observation += 1;
+        data["observation"] = json!(self.observation);
+        let active = data["active"].clone();
+        self.event("observation", data);
+        if let Some(score) = score {
+            self.event("sequential_evidence", json!({"score":score,"ending_observation":self.observation,"active":active,"baseline":base}));
         }
     }
 

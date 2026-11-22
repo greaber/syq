@@ -2224,29 +2224,27 @@ pub fn run(mut args: Args) -> Result<i32> {
     )? {
         progress.set_results(writer);
     }
-    if !args.dry_run {
-        if let Some(history) = tune::history::Recorder::start(
-            progress.start,
-            serde_json::json!({
+    let mut history_details = (!args.dry_run).then(|| serde_json::json!({
                 "policy_version": tune::POLICY_VERSION, "automatic": args.connections_default,
                 "configured_workers": (!args.connections_default).then_some(args.connections), "worker_limit": (args.automatic_worker_limit() != usize::MAX).then(|| args.automatic_worker_limit()),
                 "bandwidth_limit": args.bwlimit_bytes, "compression": args.compress,
                 "inplace": args.inplace, "checksum": args.checksum,
                 "comparison_hash": args.hash_algorithm, "transfer_integrity": args.transfer_integrity,
-                "transfer_hash": args.transfer_hash_type, "overrides": format!("{:?}", args.tuning_options),
+                "transfer_hash": args.transfer_hash_type, "overrides": args.tuning_options,
                 "sample_ms": tune::SAMPLE.as_millis(), "file_credit": tune::FILE_CREDIT
-            }),
-        ) {
-            let _ = progress.tuning_history.set(history);
-        }
-    }
+            }));
     let dry_run = args.dry_run;
     let prune = args.delete;
     let in_place_update = args.in_place_update;
     // A caller that lends this copy its stream, as a stream mapping does for
     // its pathname phase, records a fatal failure there itself.
     let records_failure = args.results_override.is_none();
-    let outcome = handoff.and_then(|()| run_transfer(args, Arc::clone(&progress)));
+    let outcome =
+        handoff.and_then(|()| run_transfer(args, Arc::clone(&progress), &mut history_details));
+    // Keep early failures inspectable even if the worker path never started.
+    if !matches!(outcome, Ok(0)) {
+        start_tuning_history(&progress, &mut history_details);
+    }
     if let Some(history) = progress.tuning_history.get() {
         history.complete(matches!(&outcome, Ok(0)), serde_json::json!({
             "elapsed_ms": progress.start.elapsed().as_millis(),
@@ -2605,7 +2603,20 @@ fn first_capacity_error(errors: &[Option<WireError>]) -> Option<WireError> {
         .cloned()
 }
 
-fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
+fn start_tuning_history(progress: &Progress, details: &mut Option<serde_json::Value>) {
+    if let Some(history) = details
+        .take()
+        .and_then(|d| tune::history::Recorder::start(progress.start, d))
+    {
+        let _ = progress.tuning_history.set(history);
+    }
+}
+
+fn run_transfer(
+    args: Args,
+    progress: Arc<Progress>,
+    history_details: &mut Option<serde_json::Value>,
+) -> Result<i32> {
     let setup = progress.clock.setup.begin();
     // Post-parse validation lives inside the wrapper's error coverage, so
     // its failures still settle the stream with a failed terminal record.
@@ -2993,6 +3004,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         Endpoint::Remote(_) => budgeted_workers.min(crate::conn::MAX_CONCURRENT_CONNECTS),
     };
     let small_copy_candidate = small_copy_eligible(&args, srcs, dst, &src_ep, &dst_ep);
+    if !small_copy_candidate {
+        start_tuning_history(&progress, history_details);
+    }
     drop(setup);
     let (mut src_ctl, early_sources, mut dst_ctl) = {
         let (a, b) = (src_ep.clone(), args.clone());
@@ -3149,9 +3163,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         // The grant admits the copy's worker maximum (see
         // `Args::automatic_worker_limit`); fixed counts stay within it.
         gate.set_connection_allowance(maximum_workers);
-    }
-    if let Some(history) = progress.tuning_history.get() {
-        gate.set_history(history.clone());
     }
     let destination_anchor: DestinationAnchorSlot = std::sync::Arc::new(std::sync::OnceLock::new());
     let source_roots: SourceRootsSlot = std::sync::Arc::new(std::sync::OnceLock::new());
@@ -3596,22 +3607,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     source_roots
         .set(registered_sources)
         .expect("source roots set once");
-    if let Some(history) = progress.tuning_history.get() {
-        let key = tune::history::context_key(
-            history,
-            &src_ep,
-            &dst_ep,
-            source_filesystem.as_ref().map(|fs| fs.identity.as_str()),
-            None,
-            "setup".into(),
-        );
-        history.context(&key);
-        history.event(
-            "context",
-            serde_json::json!({"stage":"source_registered", "key":key,
-            "source_type":source_filesystem.as_ref().map(|fs| &fs.kind)}),
-        );
-    }
     // Configure each network leg before selecting TCP or SSH. Source helpers
     // share one mapped budget; coordinator sends share one local budget. The
     // sender paces on every route: a receiving machine's socket and the TCP
@@ -3675,12 +3670,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         )?;
         match outcome {
             SmallCopy::Done(code) => {
-                if let Some(history) = progress.tuning_history.get() {
-                    history.event(
-                        "copy_path",
-                        serde_json::json!({"path":"fused_control_copy", "tuning":"not_started"}),
-                    );
-                }
                 src_ctl.detach();
                 dst_ctl.detach();
                 return Ok(code);
@@ -3698,6 +3687,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 )?;
             }
         }
+    }
+    // A successful control-connection copy has no workers or tuning decisions.
+    // Start history only if the offer declined and the worker path will run.
+    start_tuning_history(&progress, history_details);
+    if let Some(history) = progress.tuning_history.get() {
+        gate.set_history(history.clone());
     }
     let setup = progress.clock.setup.begin();
     let tcp_ports = use_tcp.then(|| parse_ports(&args.tcp_ports)).transpose()?;
@@ -5516,22 +5511,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         progress.tuning_history.get(),
         history_context.borrow().as_ref(),
     ) {
-        let final_key = tune::history::context_key(
-            history,
+        history.finish_learning(
+            initial,
             &src_ep,
             &dst_ep,
-            source_filesystem.as_ref().map(|fs| fs.identity.as_str()),
-            destination_filesystem
-                .as_ref()
-                .map(|fs| fs.identity.as_str()),
-            initial.mode.clone(),
-        );
-        history.event(
-            "learning_context",
-            serde_json::json!({
-                "consistent":initial.route == final_key.route,
-                "automatic":autotune && args.tuning_options.is_none()
-            }),
+            autotune && args.tuning_options.is_none(),
         );
     }
 
