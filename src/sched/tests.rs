@@ -2404,3 +2404,131 @@ fn abort_and_scan_end_wake_workers_and_eager_connections_alike() {
         waiters.join();
     }
 }
+
+/// Start `thieves` workers that each wait for and keep one range, then give
+/// the owner a range of `size` bytes: every thief must wake and steal a part
+/// while the owner has read none of it.
+fn every_waiting_thief_steals(size: u64, minimum: u64, thieves: usize) {
+    // The minimum is at least two blocks.
+    let sched = Arc::new(Sched::new(minimum / 2, minimum));
+    assert_eq!(sched.min_split, minimum);
+    sched.push_file(test_job(b"large", size));
+    sched.scan_done();
+    assert!(matches!(sched.try_next(), Some(Item::File(0))));
+    let (tx, stolen) = std::sync::mpsc::channel();
+    let threads: Vec<_> = (0..thieves)
+        .map(|_| {
+            let (sched, tx) = (sched.clone(), tx.clone());
+            std::thread::spawn(move || {
+                let Item::Range(handle) = sched.next() else {
+                    panic!("a thief takes a range")
+                };
+                tx.send(handle).unwrap();
+            })
+        })
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while sched.inner.lock().unwrap().waiting_workers < thieves {
+        assert!(Instant::now() < deadline, "thieves did not wait");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let owner = sched.ranges_ready(0, vec![(0, size)]).unwrap();
+    let mut ranges = vec![owner];
+    for got in 0..thieves {
+        ranges.push(
+            stolen
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "{size} bytes, {minimum} minimum: only {got} of {thieves} \
+                         waiting thieves were woken to steal"
+                    )
+                }),
+        );
+    }
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    // The parts cover the file exactly, each at least the minimum.
+    let mut parts: Vec<_> = ranges
+        .iter()
+        .map(|handle| {
+            let range = handle.lock().unwrap();
+            (range.pos, range.end)
+        })
+        .collect();
+    parts.sort_unstable();
+    let mut covered = 0;
+    for &(pos, end) in &parts {
+        assert_eq!(pos, covered, "{parts:?}");
+        assert!(end - pos >= minimum, "{parts:?}");
+        covered = end;
+    }
+    assert_eq!(covered, size, "{parts:?}");
+    for handle in &ranges {
+        let end = handle.lock().unwrap().end;
+        handle.lock().unwrap().pos = end;
+        sched.range_done(handle);
+    }
+    assert!(sched.finished());
+}
+
+#[test]
+fn a_split_whose_parts_both_split_again_wakes_a_thief_for_each() {
+    // The first thief leaves two parts that can each be split again.
+    every_waiting_thief_steals(4 << 10, 1 << 10, 3);
+    // And so do the two thieves after it.
+    every_waiting_thief_steals(8 << 10, 1 << 10, 6);
+}
+
+#[test]
+fn a_burst_file_taken_for_a_shared_patch_hands_on_the_patch_wakeup() {
+    let sched = Arc::new(Sched::new(64, 128));
+    sched.release_preflighted_work();
+    sched.push_file(test_job(b"compared", 1));
+    let Some(Item::File(compared)) = sched.try_next() else {
+        panic!("missing file")
+    };
+    // Two workers each wait for one item and keep it.
+    let (tx, taken) = std::sync::mpsc::channel();
+    let threads: Vec<_> = (0..2)
+        .map(|_| {
+            let (sched, tx) = (sched.clone(), tx.clone());
+            std::thread::spawn(move || {
+                let kind = match sched.next() {
+                    Item::File(_) => "file",
+                    Item::Patch(_) => "patch",
+                    _ => "other",
+                };
+                tx.send(kind).unwrap();
+            })
+        })
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while sched.inner.lock().unwrap().waiting_workers < 2 {
+        assert!(Instant::now() < deadline, "workers did not wait");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let recv = |context: &str| {
+        taken
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| panic!("{context}: no worker took anything"))
+    };
+    // A file queued inside a burst wakes no one; a shared patch wakes one
+    // worker, which takes the file first and keeps it.
+    let burst = sched.file_burst();
+    sched.push_file(test_job(b"planned", 1));
+    sched.share_patches(vec![shared_patch(&sched, compared, 7)]);
+    assert_eq!(recv("shared patch"), "file");
+    // The burst's end wakes the other worker for the patch.
+    drop(burst);
+    assert_eq!(recv("burst ended"), "patch");
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    sched.ranges_ready(compared, Vec::new());
+    sched.ranges_ready(1, Vec::new());
+    sched.patch_done();
+    sched.scan_done();
+    assert!(sched.finished());
+}

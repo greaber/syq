@@ -707,6 +707,14 @@ struct Inner {
     /// Bursts of planned files being queued (`file_burst`): their files wake
     /// no worker until the burst ends.
     bursts: usize,
+    /// Files queued inside a burst since workers were last woken for the
+    /// queue: no wakeup was issued for them.
+    unannounced_files: usize,
+    /// Wakeups for other work that woken workers spent on unannounced files,
+    /// which take priority over it (`take`). Whatever wakes workers for the
+    /// burst's files issues them again, so the other work is not left with
+    /// no worker coming for it.
+    spent_wakeups: usize,
     abort: bool,
 }
 
@@ -749,8 +757,14 @@ impl Inner {
 /// is released, the scan ends, or the copy is aborted or finishes.
 ///
 /// A range in flight can be stolen from repeatedly, so a range that can be
-/// split counts as one item: the worker that claims or steals one wakes one
-/// more waiter while a split remains, and each woken thief does the same.
+/// split counts as one item: the worker that claims one wakes one more
+/// waiter if it can be split, and a thief that splits one wakes a waiter
+/// for each of the two parts that can still be split.
+///
+/// A woken worker takes the most urgent work, not necessarily what it was
+/// woken for. Only files queued in a burst have no wakeup of their own, so
+/// a worker that takes one spends another item's wakeup, and the burst's
+/// end issues it again (`Inner::spent_wakeups`).
 pub struct Sched {
     inner: Mutex<Inner>,
     cv: Condvar,
@@ -822,6 +836,8 @@ impl Sched {
                 work_released: false,
                 trickle_batch: None,
                 bursts: 0,
+                unannounced_files: 0,
+                spent_wakeups: 0,
                 abort: false,
             }),
             cv: Condvar::new(),
@@ -882,6 +898,8 @@ impl Sched {
         }
         if inner.bursts == 0 {
             self.wake_for_queued_files(inner);
+        } else {
+            inner.unannounced_files += 1;
         }
         idx
     }
@@ -915,17 +933,19 @@ impl Sched {
     /// and `begin_fast_batch` divides the queue between those that come. A
     /// worker waits while runnable files are queued only if they were queued
     /// since it last looked, so the queue holds every file that still needs
-    /// a wakeup.
-    fn wake_for_queued_files(&self, inner: std::sync::MutexGuard<'_, Inner>) {
+    /// a wakeup. Wakeups that woken workers spent on files queued in a
+    /// burst, instead of the work they were woken for, are issued again.
+    fn wake_for_queued_files(&self, mut inner: std::sync::MutexGuard<'_, Inner>) {
         // New batches can run once the source-wide preflights have passed.
         // Until then the files wait for that release, which wakes everyone.
         if !(inner.scan_done || inner.work_released) {
             return;
         }
+        inner.unannounced_files = 0;
+        let items = inner.files.len() + std::mem::take(&mut inner.spent_wakeups);
         let waiting = inner.waiting_workers;
-        let files = inner.files.len();
         drop(inner);
-        self.notify_takers(waiting, files);
+        self.notify_takers(waiting, items);
     }
 
     /// Wake `items` of the `waiting` workers, or all of them when there are
@@ -1119,7 +1139,12 @@ impl Sched {
         if std::env::var_os("SYQ_TEST_COPY_AFTER_PLANNING").is_some() {
             return;
         }
-        self.inner.lock().unwrap().work_released = true;
+        let mut g = self.inner.lock().unwrap();
+        g.work_released = true;
+        // Every waiting worker is woken for the files queued so far.
+        g.unannounced_files = 0;
+        g.spent_wakeups = 0;
+        drop(g);
         self.cv.notify_all();
     }
 
@@ -1295,9 +1320,9 @@ impl Sched {
             for &(size, idx) in &files[1..] {
                 g.files.push((size, Reverse(FileOrder::new(idx))));
             }
-            // The returned siblings are queued items, and so is each group
-            // still unread, which the next thief steals.
-            let left = files.len() - 1 + usize::from(!batch.groups.is_empty());
+            // The returned siblings are queued items. Each group still
+            // unread had its wakeup when it was shared.
+            let left = files.len() - 1;
             drop(batch);
             self.notify_takers(g.waiting_workers, left);
             return Some(first);
@@ -1476,6 +1501,7 @@ impl Sched {
 
     fn take(&self, wait: bool) -> Option<Item> {
         let mut g = self.inner.lock().unwrap();
+        let mut woken = false;
         loop {
             if g.abort {
                 self.tune_cv.notify_one();
@@ -1491,7 +1517,16 @@ impl Sched {
                     g.finishing += 1;
                     return Some(Item::Finish { idx, matched });
                 }
+                // Other paths take queued files without counting them off.
+                g.unannounced_files = g.unannounced_files.min(g.files.len());
                 if let Some((_, Reverse(order))) = g.files.pop() {
+                    // A file queued in a burst has no wakeup of its own: a
+                    // worker woken for other work that takes it spends that
+                    // work's wakeup, which the burst's end issues again.
+                    if g.unannounced_files > 0 {
+                        g.unannounced_files -= 1;
+                        g.spent_wakeups += usize::from(woken);
+                    }
                     let idx = order.index();
                     g.probing += 1;
                     return Some(Item::File(idx));
@@ -1523,6 +1558,7 @@ impl Sched {
             }
             g = self.cv.wait(g).unwrap();
             g.waiting_workers -= 1;
+            woken = true;
         }
     }
 
@@ -1553,13 +1589,11 @@ impl Sched {
             drop(r);
             *g.outstanding.entry(idx).or_insert(0) += 1;
             let stolen = g.claim_range(idx, split, old_end, policy);
-            if victim_splits {
-                if g.waiting_workers > 0 {
-                    self.cv.notify_one();
-                }
-            } else {
-                self.wake_thief_for(g, &stolen);
+            // Each part that can still be split is an item of its own.
+            if victim_splits && g.waiting_workers > 0 {
+                self.cv.notify_one();
             }
+            self.wake_thief_for(g, &stolen);
             return Some(stolen);
         }
     }
