@@ -2,7 +2,7 @@
 use super::{Options, Route};
 use std::{
     sync::{
-        atomic::{AtomicU64, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -83,9 +83,16 @@ impl Tuning {
             .min(self.requests.ceiling.unwrap_or(usize::MAX));
         let mut s = self.requests.state.lock().unwrap();
         // Configuration separates completed planning from transfer admission.
-        // Planning HEADs use permits but supply no transfer-throughput samples.
+        // Planning HEADs use permits but supply no transfer-throughput samples,
+        // and earlier listing or discovery throttles must not cut a new batch.
         s.since = None;
         s.saturated = false;
+        s.backoff_windows = 0;
+        s.throttle_backoff = 0;
+        if let Some(outage) = &self.requests.outage {
+            s.seen_throttled = outage.throttled_responses();
+        }
+        self.requests.checking_above.store(false, Relaxed);
         s.max = request_cap;
         s.limit = self.fixed_requests.unwrap_or(seed).min(request_cap);
         if self.fixed_requests.is_none() && tiny && self.high_latency() {
@@ -162,10 +169,13 @@ struct Window {
     object_rate: Option<(usize, f64, Duration)>,
     settled: bool,
     seen_throttled: u64,
+    backoff_windows: usize,
+    throttle_backoff: usize,
 }
 pub(super) struct Budget {
     ceiling: Option<usize>,
     outage: Option<Arc<super::outage::Outage>>,
+    checking_above: AtomicBool,
     state: Mutex<Window>,
     changed: Notify,
     received: AtomicU64,
@@ -204,6 +214,7 @@ impl Budget {
         Self {
             ceiling,
             outage,
+            checking_above: AtomicBool::new(false),
             state: Mutex::new(Window {
                 active: 0,
                 limit,
@@ -223,6 +234,8 @@ impl Budget {
                 object_rate: None,
                 settled: false,
                 seen_throttled,
+                backoff_windows: 0,
+                throttle_backoff: 0,
             }),
             changed: Notify::new(),
             received: AtomicU64::new(0),
@@ -276,8 +289,14 @@ impl Budget {
     pub fn begin_objects(&self, workers: usize) -> Option<usize> {
         let mut s = self.state.lock().unwrap();
         // Reaching the object seed is not evidence that the last increase helped.
-        // Resolve that probe before allowing the object controller to grow again.
-        if s.adaptive && !s.settled && (s.limit < workers || s.previous.is_some()) {
+        // Resolve that probe before allowing the object controller to grow again,
+        // unless throttling already backed the ramp off and the object controller
+        // should take over recovery from the reduced limit.
+        if s.adaptive
+            && !s.settled
+            && s.backoff_windows == 0
+            && (s.limit < workers || s.previous.is_some())
+        {
             return None;
         }
         // Freeze the request ramp while the scheduler drains its existing jobs.
@@ -285,6 +304,9 @@ impl Budget {
         // limit here would let them bypass the newly chosen object concurrency.
         s.settled = true;
         Some(workers.min(s.limit))
+    }
+    pub fn set_checking_above(&self, above: bool) {
+        self.checking_above.store(above, Relaxed);
     }
     pub fn finish_objects(&self, maximum: usize) {
         let maximum = maximum.min(self.ceiling.unwrap_or(usize::MAX));
@@ -300,28 +322,39 @@ impl Budget {
     /// Back off when the service asks for fewer requests (HTTP 429/503).
     /// Halves the adaptive limit once active requests have drained to it, so
     /// delayed replies from a previous cut cannot collapse the budget in one
-    /// burst.
+    /// burst. Shared across completion, permit drop, and scheduler ticks so a
+    /// single throttled response cannot cut twice.
     pub fn throttled(&self) {
         let mut s = self.state.lock().unwrap();
-        if let Some(outage) = &self.outage {
-            s.seen_throttled = outage.throttled_responses();
+        self.check_throttle(&mut s);
+    }
+    fn check_throttle(&self, s: &mut Window) -> bool {
+        let Some(outage) = &self.outage else {
+            return false;
+        };
+        let responses = outage.throttled_responses();
+        if responses == s.seen_throttled {
+            return false;
         }
-        if !s.adaptive || s.active > s.limit {
-            return;
+        s.seen_throttled = responses;
+        if !s.adaptive || s.settled || self.checking_above.load(Relaxed) || s.active > s.limit {
+            return false;
         }
-        self.apply_throttle(&mut s);
-        drop(s);
-        self.changed.notify_waiters();
+        self.apply_throttle(s);
+        true
     }
     fn apply_throttle(&self, s: &mut Window) {
         let before = s.limit;
         let next = (before / 2).max(1);
         s.limit = next;
-        s.max = s.max.min(next);
+        // Keep `s.max` and `s.settled` intact so long-running multipart
+        // transfers can grow back after throttling clears, paced by clean
+        // cooldown windows.
+        s.throttle_backoff = (s.throttle_backoff.saturating_mul(2)).clamp(4, 16);
+        s.backoff_windows = s.throttle_backoff;
         s.previous = None;
         s.previous_progress_rate = None;
         s.object_rate = None;
-        s.settled = true;
         s.since = Some(Instant::now());
         s.bytes = 0;
         s.progress_start = self.received.load(Relaxed);
@@ -329,26 +362,15 @@ impl Budget {
         s.recent.clear();
         s.saturated = false;
         if next != before {
-            super::diagnostics::request_window(before, next, 0.0, Duration::ZERO, 0, false, true);
+            super::diagnostics::request_window(before, next, 0.0, Duration::ZERO, 0, false, false);
         }
     }
     pub fn completed(&self, bytes: u64) {
         let mut s = self.state.lock().unwrap();
         s.bytes += bytes;
         s.completed += 1;
-        if s.adaptive {
-            if let Some(outage) = &self.outage {
-                let responses = outage.throttled_responses();
-                if responses != s.seen_throttled {
-                    s.seen_throttled = responses;
-                    if s.active <= s.limit {
-                        self.apply_throttle(&mut s);
-                        drop(s);
-                        self.changed.notify_waiters();
-                        return;
-                    }
-                }
-            }
+        if self.check_throttle(&mut s) {
+            return;
         }
         let Some(since) = s.since else { return };
         if !s.adaptive || s.settled {
@@ -367,11 +389,21 @@ impl Budget {
         {
             return;
         }
+        let received = self.received.load(Relaxed);
+        if s.backoff_windows > 0 {
+            s.backoff_windows -= 1;
+            s.since = Some(Instant::now());
+            s.bytes = 0;
+            s.progress_start = received;
+            s.completed = 0;
+            s.recent.clear();
+            s.saturated = false;
+            return;
+        }
         // A throughput plateau is a reason to stop adding competing requests.
         // The first window includes startup and is only a baseline, but must
         // contain a full count: the first few replies understate its capacity.
         let rate = s.bytes as f64 / elapsed.as_secs_f64();
-        let received = self.received.load(Relaxed);
         let progress_rate =
             received.saturating_sub(s.progress_start) as f64 / elapsed.as_secs_f64();
         let before = s.limit;
@@ -438,6 +470,7 @@ impl Budget {
                         next_limit = s.limit.saturating_add((s.limit / 4).max(1));
                     }
                     s.previous = None;
+                    s.throttle_backoff = 0;
                 }
             }
             if !s.settled && s.saturated && s.limit < s.max {
@@ -468,22 +501,35 @@ impl Budget {
             s.saturated,
             s.settled,
         );
+        let grew = s.limit > before;
         s.since = Some(Instant::now());
         s.bytes = 0;
         s.progress_start = received;
         s.completed = 0;
         s.recent.clear();
         s.saturated = false;
-        self.changed.notify_waiters();
+        drop(s);
+        if grew {
+            self.changed.notify_waiters();
+        }
     }
 }
 impl Drop for Permit {
     fn drop(&mut self) {
-        self.budget.state.lock().unwrap().active -= 1;
-        // One completion frees one slot. Waking the entire queue makes every
-        // waiting request compete for that slot; capacity growth wakes all
-        // waiters separately in completed().
-        self.budget.changed.notify_one();
+        let mut s = self.budget.state.lock().unwrap();
+        s.active -= 1;
+        // Consume throttle signals on permit release too, so paths that do not
+        // report transferred bytes (such as multipart metadata copies or failed
+        // requests) still back off.
+        self.budget.check_throttle(&mut s);
+        let has_room = s.active < s.limit;
+        drop(s);
+        // One completion frees at most one slot. Waking the entire queue makes
+        // every waiting request compete for that slot; capacity growth wakes
+        // all waiters separately in completed().
+        if has_room {
+            self.budget.changed.notify_one();
+        }
     }
 }
 

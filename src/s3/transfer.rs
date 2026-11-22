@@ -319,7 +319,7 @@ impl Engine {
         let control = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
         let uploads = Arc::new(super::cancel::Cancellation::default());
         let authorization = super::authorization::connect(&args, &options).await?;
-        let outage = Arc::new(crate::s3::outage::Outage::default());
+        let outage = Arc::new(super::outage::Outage::default());
         let (client, note) = client::connect_authorized(
             &mut options,
             control.clone(),

@@ -76,7 +76,8 @@ When most objects are already up to date, a copy mostly asks the service
 about each object and transfers little. Syq then checks more objects at once
 than it would transfer, for as long as that finds unchanged objects faster:
 up to 256 of these metadata requests, and fewer once the service asks it to
-slow down. Objects that do need a transfer still wait for their turn under
+slow down. Transfers back off on throttling too, and recover once throttling
+clears. Objects that do need a transfer still wait for their turn under
 the usual limits. Setting `s3-objects` turns this off, and `s3-requests` and
 an `s3-objects` ceiling bound these requests too.
 

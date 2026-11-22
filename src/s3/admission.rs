@@ -760,6 +760,15 @@ where
     let mut observations = concurrency
         .maximum
         .and_then(|_| super::diagnostics::ObjectWindows::new());
+    struct CheckingAboveGuard(Option<Arc<super::tuning::Budget>>);
+    impl Drop for CheckingAboveGuard {
+        fn drop(&mut self) {
+            if let Some(requests) = &self.0 {
+                requests.set_checking_above(false);
+            }
+        }
+    }
+    let _checking_above_guard = CheckingAboveGuard(concurrency.requests.clone());
     loop {
         // Only objects holding a transfer slot make data requests.
         let transferring = if gated { gate.active() } else { tasks.len() };
@@ -780,6 +789,9 @@ where
         });
         // Stay gated until the objects admitted beyond the limit have left.
         gated = admitted > transfers || (gated && tasks.len() > transfers);
+        if let Some(requests) = &concurrency.requests {
+            requests.set_checking_above(gated);
+        }
         gate.set_limit(if gated { transfers } else { usize::MAX });
         while error.is_none() && tasks.len() < admitted {
             let Some(job) = jobs.next() else { break };
@@ -835,9 +847,10 @@ where
                 let responses = throttled();
                 let slowed = responses != seen_throttled;
                 seen_throttled = responses;
-                let checking_above = checking
-                    .as_ref()
-                    .is_some_and(|checking| checking.limit > checking.minimum);
+                let checking_above = gated
+                    || checking
+                        .as_ref()
+                        .is_some_and(|checking| checking.limit > checking.minimum);
                 if let Some(checking) = &mut checking {
                     let before = checking.limit;
                     let elapsed = checked_since.elapsed();

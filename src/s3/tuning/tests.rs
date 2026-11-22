@@ -817,11 +817,15 @@ fn small_object_budget_bounds_payload_memory_and_empty_objects() {
 async fn budget_backs_off_on_throttling_only_after_draining() {
     let outage = Arc::new(crate::s3::outage::Outage::default());
     let budget = Arc::new(Budget::with_outage(32, true, None, Some(outage.clone())));
-    // First throttle halves 32 -> 16 and settles the ramp.
+    // First throttle halves 32 -> 16 without lowering max or settling the ramp,
+    // and calling throttled() afterwards for the same signal does not cut again.
     outage.throttled();
     budget.completed(1024);
     assert_eq!(budget.state.lock().unwrap().limit, 16);
-    assert!(budget.state.lock().unwrap().settled);
+    assert_eq!(budget.state.lock().unwrap().max, 256);
+    assert!(!budget.state.lock().unwrap().settled);
+    budget.throttled();
+    assert_eq!(budget.state.lock().unwrap().limit, 16);
 
     // While more than `limit` requests are still in flight (draining from the
     // previous limit), further delayed 429/503 replies must not cut again.
@@ -841,4 +845,89 @@ async fn budget_backs_off_on_throttling_only_after_draining() {
     budget.throttled();
     assert_eq!(budget.state.lock().unwrap().limit, 8);
     drop(permits);
+}
+
+#[tokio::test]
+async fn multipart_budget_backs_off_on_throttling_and_recovers() {
+    let outage = Arc::new(crate::s3::outage::Outage::default());
+    let budget = Arc::new(Budget::with_outage(
+        64,
+        true,
+        Some(64),
+        Some(outage.clone()),
+    ));
+    // A throttle halves 64 -> 32 while keeping the 64 ceiling for recovery.
+    outage.throttled();
+    budget.completed(1024 * 1024);
+    {
+        let s = budget.state.lock().unwrap();
+        assert_eq!(s.limit, 32);
+        assert_eq!(s.max, 64);
+        assert!(!s.settled);
+        assert!(s.backoff_windows > 0);
+    }
+    // Drive clean saturated windows past the cooldown; the budget should grow
+    // back to 64 once throttling stops.
+    for _ in 0..8 {
+        let count = {
+            let mut s = budget.state.lock().unwrap();
+            s.since = Some(Instant::now() - Duration::from_secs(1));
+            s.saturated = true;
+            s.limit.max(16)
+        };
+        for _ in 0..count {
+            budget.completed(1024 * 1024);
+        }
+    }
+    assert_eq!(budget.state.lock().unwrap().limit, 64);
+}
+
+#[test]
+fn configure_ignores_pre_batch_throttles() {
+    let args = crate::cli::Args::parse_args(&[
+        std::ffi::OsString::from("cp"),
+        std::ffi::OsString::from("--from"),
+        std::ffi::OsString::from("s3://bucket"),
+        std::ffi::OsString::from("a"),
+        std::ffi::OsString::from("--as"),
+        std::ffi::OsString::from("b"),
+    ])
+    .unwrap();
+    let options = args.s3.clone().unwrap();
+    let control = Arc::new(AtomicU64::new(u64::MAX));
+    let outage = Arc::new(crate::s3::outage::Outage::default());
+    let tuning = Tuning::new(&options, &args, control, outage.clone());
+    // Listing / discovery throttles happen before transfer configuration.
+    outage.throttled();
+    outage.throttled();
+    tuning.configure(false, 64, 32);
+    tuning.requests.completed(1024);
+    assert_eq!(tuning.request_limit(), 32);
+}
+
+#[tokio::test]
+async fn permit_drop_without_completed_backs_off_on_throttling() {
+    let outage = Arc::new(crate::s3::outage::Outage::default());
+    let budget = Arc::new(Budget::with_outage(32, true, None, Some(outage.clone())));
+    let permit = budget.acquire().await;
+    outage.throttled();
+    drop(permit);
+    assert_eq!(budget.state.lock().unwrap().limit, 16);
+}
+
+#[tokio::test]
+async fn checking_above_skips_budget_throttle_cut() {
+    let outage = Arc::new(crate::s3::outage::Outage::default());
+    let budget = Arc::new(Budget::with_outage(32, true, None, Some(outage.clone())));
+    budget.set_checking_above(true);
+    let permit = budget.acquire().await;
+    outage.throttled();
+    budget.completed(1024);
+    drop(permit);
+    assert_eq!(budget.state.lock().unwrap().limit, 32);
+    // Clearing checking_above must not retroactively fire on the already-seen
+    // checking throttle.
+    budget.set_checking_above(false);
+    budget.throttled();
+    assert_eq!(budget.state.lock().unwrap().limit, 32);
 }
