@@ -117,7 +117,7 @@ pub trait Conn: Send {
         bail!("no streaming writes are active")
     }
     /// Start the non-writing fence without waiting for its reply. Pass its
-    /// result to finish even after failure, so the collector is always joined.
+    /// result to finish even after failure, so reply collection always ends.
     fn fence_streaming_writes(&mut self) -> Result<()> {
         bail!("no streaming writes are active")
     }
@@ -818,7 +818,7 @@ impl RpcObservation {
 #[derive(Debug)]
 pub(crate) struct ReceivedResponse {
     pub(crate) value: Response,
-    hold: crate::wire_budget::Hold,
+    _hold: crate::wire_budget::Hold,
     started_at: std::time::Instant,
     /// The file data it carries (`Replies`).
     bytes: usize,
@@ -832,17 +832,13 @@ impl ReceivedResponse {
         Self {
             bytes: replies::file_bytes(&value),
             value,
-            hold,
+            _hold: hold,
             started_at,
         }
     }
 
     fn into_inner(self) -> Response {
         self.value
-    }
-
-    pub(crate) fn into_parts(self) -> (Response, crate::wire_budget::Hold) {
-        (self.value, self.hold)
     }
 }
 
@@ -945,6 +941,8 @@ fn spawn_observed_reader(
     let (tx, rx) = std::sync::mpsc::sync_channel(replies);
     let queued = bytes.map(replies::QueuedBytes::new);
     let reader_queued = queued.clone();
+    let rx = Replies::new(rx, queued);
+    let write_replies = rx.write_replies.clone();
     let batch_receipts = std::sync::Arc::new(batch_progress::BatchReceipts::default());
     let receipts = batch_receipts.clone();
     let reader = std::thread::Builder::new()
@@ -994,6 +992,9 @@ fn spawn_observed_reader(
                     }
                     receipts.response(&message.value);
                 }
+                if write_replies.collect(msg.as_ref().map(|message| &message.value)) {
+                    continue;
+                }
                 let failed = msg.is_err();
                 if !send(msg) || failed {
                     break;
@@ -1006,7 +1007,7 @@ fn spawn_observed_reader(
             }
         })
         .map_err(crate::resources::allocation_error)?;
-    Ok((Replies::new(rx, queued), reader, batch_receipts))
+    Ok((rx, reader, batch_receipts))
 }
 
 fn receive_transport_stats(rx: &Replies, timeout: std::time::Duration) -> Option<TcpSocketStats> {
@@ -1312,11 +1313,12 @@ impl RemoteConn {
 
     /// The next reply, if it has arrived, without waiting for it.
     fn try_receive_next_response(&mut self) -> Result<Option<ReceivedResponse>> {
+        anyhow::ensure!(self.write_stream.is_none(), "streaming writes are active");
         use std::sync::mpsc::TryRecvError;
         let response = self
             .rx
             .as_ref()
-            .context("response reader is collecting streaming writes")?
+            .context("response reader missing")?
             .try_recv();
         match response {
             Ok(Ok(response)) => Ok(Some(response)),
@@ -1329,12 +1331,10 @@ impl RemoteConn {
     }
 
     fn receive_next_response(&mut self) -> Result<ReceivedResponse> {
+        anyhow::ensure!(self.write_stream.is_none(), "streaming writes are active");
         let _wait = self.rpc_observation.as_ref().map(|o| o.span(false));
         let response = if let Some(stop) = &self.transport_stop {
-            let rx = self
-                .rx
-                .as_ref()
-                .context("response reader is collecting streaming writes")?;
+            let rx = self.rx.as_ref().context("response reader missing")?;
             loop {
                 if stop.upgrade().is_none_or(|s| s.is_aborted()) {
                     if let Some(socket) = &self.tcp_socket {
@@ -1360,10 +1360,7 @@ impl RemoteConn {
                 }
             }
         } else {
-            self.rx
-                .as_ref()
-                .context("response reader is collecting streaming writes")?
-                .recv()
+            self.rx.as_ref().context("response reader missing")?.recv()
         };
         match response {
             Ok(Ok(r)) => Ok(r),
@@ -1646,15 +1643,13 @@ impl Conn for RemoteConn {
             "streaming writes already active"
         );
         self.receive_deferred(None)?;
-        match crate::streaming::WriteReplies::spawn(
-            self.rx.take().context("response reader missing")?,
-        ) {
-            Ok(stream) => self.write_stream = Some(stream),
-            Err(error) => {
-                self.dead = true;
-                return Err(error).context("start streaming reply reader");
-            }
-        }
+        self.write_stream = Some(
+            self.rx
+                .as_ref()
+                .context("response reader missing")?
+                .write_replies
+                .begin()?,
+        );
         Ok(())
     }
     fn check_streaming_writes(&mut self) -> Result<()> {
@@ -1682,18 +1677,17 @@ impl Conn for RemoteConn {
         }
     }
     fn finish_streaming_writes(&mut self, sent: u64, fence: Result<()>) -> Result<()> {
-        let _wait = self.rpc_observation.as_ref().map(|o| o.span(false));
         let stream = self
             .write_stream
             .take()
             .context("no streaming writes are active")?;
-        let (rx, state) = stream.finish(fence.is_err());
-        self.rx = Some(rx);
-        fence?;
-        if matches!(state.error, Some(crate::streaming::Failure::Transport(_)))
-            || !state.fenced
-            || state.count != sent
-        {
+        if let Err(error) = fence {
+            self.dead = true;
+            return Err(error);
+        }
+        let response = self.receive_next_response()?.into_inner();
+        let state = stream.status();
+        if !matches!(response, Response::WriteStreamDone) || !state.fenced || state.count != sent {
             self.dead = true;
             streaming_result(state.error)?;
             bail!("streaming write completion fence/count mismatch");
@@ -1790,12 +1784,6 @@ impl Drop for RemoteConn {
         // Stop the setup watch before the child is reaped below, so that
         // its PID cannot be reused while registered.
         self.worker_setup.take();
-        // Cancel the reply collector before joining the underlying response
-        // reader: otherwise it still owns the channel receiver on an unwind.
-        if let Some(stream) = self.write_stream.take() {
-            let (rx, _) = stream.finish(true);
-            self.rx = Some(rx);
-        }
         if !self.dead {
             let _ = self.w.write_msg(&Request::Shutdown);
         }

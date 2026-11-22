@@ -183,7 +183,7 @@ impl Conn for LocalConn {
         }
         let resp = self.ops.handle_in_place(&mut req);
         if let Some(state) = &mut self.write_stream {
-            state.record(resp);
+            state.record(&resp);
         } else {
             self.pending.push_back(resp);
         }

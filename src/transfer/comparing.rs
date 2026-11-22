@@ -20,17 +20,15 @@
 //!   ordinary course of its pipeline, which says nothing about whether more
 //!   would help, so it hashes the 32 MiB ahead from the start.
 //! - The comparison block of each window, from 64 KiB to the configured block.
-//!   Around each run of differing blocks, a copy sends up to a block of bytes
-//!   that did not change; more, smaller blocks cost a request each instead.
-//!   The worker balances the two from what it has measured: the rate at which
-//!   differing data crossed the link and how far apart the runs were. A push
-//!   times the destination's acknowledgments of differing blocks. A pull can
-//!   only time replies that may have waited in this machine's buffers, so its
-//!   blocks start at 256 KiB and only shrink (`adaptive_ceiling`).
+//!   The worker measures the spacing of runs of changed blocks and sizes
+//!   blocks to keep the extra bytes around their edges a small fraction of
+//!   the bytes compared. Larger blocks take fewer requests per window.
+//!   A pull keeps the 256 KiB ceiling so more comparisons can be queued
+//!   under the remote source's byte allowance.
 
 use super::*;
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Smallest comparison block: the protocol's hash granularity.
 const MIN_BLOCK: u64 = crate::proto::MIN_HASH_BLOCK_BYTES;
@@ -47,40 +45,33 @@ const MAX_WINDOW_BLOCKS: u64 = 1024;
 // connection, and a window of the smallest blocks still fills `MAX_WINDOW`.
 const _: () = assert!(MAX_AHEAD <= crate::proto::MAX_READ_BYTES);
 const _: () = assert!(MAX_WINDOW_BLOCKS * MIN_BLOCK >= MAX_WINDOW);
-/// What one more block costs, mostly the receiver's handling of its request.
-/// Measured as 25-35 us of receiver CPU per reused block on Linux.
-const BLOCK_COST: Duration = Duration::from_micros(25);
 /// File data the source's queued replies may carry (`conn::SOURCE_REPLY_BYTES`).
 const SOURCE_DATA_IN_FLIGHT: u64 = 16 << 20;
-/// Measurements count for about this many compared bytes, and the link's
-/// rate for about this much differing data, so that sizes follow a file or
-/// link whose character changes.
+/// Let recent compared bytes and change runs outweigh older ones.
 const COMPARED_MEMORY: f64 = (1u64 << 30) as f64;
-const SENT_MEMORY: f64 = (64u64 << 20) as f64;
+/// Each run can resend up to two block edges. Size their total at up to
+/// 1/16 of the compared bytes at the observed run density, within the
+/// supported bounds.
+const BYTES_PER_RUN_BLOCK: f64 = 2.0 * 16.0;
 
 /// One worker's comparison sizes and the measurements they come from. It
 /// lasts for the worker's copy, across the files it compares.
 #[derive(Clone, Debug)]
 pub(super) struct ComparisonSizing {
-    block: u64,
+    initial_block: u64,
     ahead: u64,
     /// Bytes compared, and runs of differing blocks among them.
     compared: f64,
     runs: f64,
-    /// Differing data sent over the link, and the seconds it took.
-    sent: f64,
-    sending: f64,
 }
 
 impl Default for ComparisonSizing {
     fn default() -> Self {
         Self {
-            block: START_BLOCK,
+            initial_block: START_BLOCK,
             ahead: START_AHEAD,
             compared: 0.0,
             runs: 0.0,
-            sent: 0.0,
-            sending: 0.0,
         }
     }
 }
@@ -89,7 +80,7 @@ impl ComparisonSizing {
     #[cfg(test)]
     pub(super) fn starting(block: u64, ahead: u64) -> Self {
         Self {
-            block,
+            initial_block: block,
             ahead,
             ..Self::default()
         }
@@ -103,7 +94,16 @@ impl ComparisonSizing {
 
     /// The block of the next window, no larger than `ceiling`.
     pub(super) fn block(&self, ceiling: u64) -> u64 {
-        self.block.min(ceiling).max(MIN_BLOCK.min(ceiling))
+        if self.runs == 0.0 {
+            return self.initial_block.clamp(MIN_BLOCK.min(ceiling), ceiling);
+        }
+        let best = (self.compared / (self.runs * BYTES_PER_RUN_BLOCK)) as u64;
+        // Quantize down to preserve the bound across ordinary sample variation.
+        let bounded = best.clamp(MIN_BLOCK.min(ceiling), ceiling);
+        bounded
+            .checked_ilog2()
+            .map_or(0, |power| 1 << power)
+            .max(MIN_BLOCK.min(ceiling))
     }
 
     /// Bytes of hashed windows not yet used that the worker may hold.
@@ -125,45 +125,13 @@ impl ComparisonSizing {
 
     /// The source answered for `bytes`, beginning `runs` runs of differing
     /// blocks.
-    pub(super) fn compared(&mut self, bytes: u64, runs: u64, ceiling: u64) {
+    pub(super) fn compared(&mut self, bytes: u64, runs: u64) {
         self.compared += bytes as f64;
         self.runs += runs as f64;
         if self.compared > COMPARED_MEMORY {
             self.compared /= 2.0;
             self.runs /= 2.0;
         }
-        self.resize(ceiling);
-    }
-
-    /// Differing data of `bytes` took `elapsed` on the link.
-    pub(super) fn sent(&mut self, bytes: u64, elapsed: Duration) {
-        self.sent += bytes as f64;
-        self.sending += elapsed.as_secs_f64();
-        if self.sent > SENT_MEMORY {
-            self.sent /= 2.0;
-            self.sending /= 2.0;
-        }
-    }
-
-    /// Balance bytes resent around each run against the cost of more blocks:
-    /// with runs `gap` bytes apart and data crossing at `rate`, a block of `b`
-    /// costs about `b / rate` per run and `BLOCK_COST * gap / b` in requests,
-    /// least at `b = sqrt(BLOCK_COST * rate * gap)`.
-    fn resize(&mut self, ceiling: u64) {
-        if self.runs == 0.0 || self.sent == 0.0 || self.sending == 0.0 {
-            return;
-        }
-        let rate = self.sent / self.sending;
-        let gap = self.compared / self.runs;
-        let best = (BLOCK_COST.as_secs_f64() * rate * gap).sqrt();
-        let floor = MIN_BLOCK.min(ceiling);
-        let best = (best as u64).clamp(floor, ceiling.max(floor));
-        // Powers of two, so that measurement noise does not change it often.
-        self.block = if best.is_power_of_two() {
-            best
-        } else {
-            (best.next_power_of_two() / 2).max(floor)
-        };
     }
 }
 
@@ -199,13 +167,11 @@ struct Window {
 /// was sent.
 enum Awaited {
     Hashes(Instant),
-    /// A block written or reused. `data` when the request carried the block
-    /// over the link.
+    /// A block written or reused.
     Write {
         len: u64,
         reused: bool,
         sent: Instant,
-        data: bool,
     },
 }
 
@@ -242,8 +208,6 @@ struct Flow {
     /// Where the last block the source answered for ended, if it differed:
     /// a differing block there continues its run.
     differing_end: Option<u64>,
-    /// When the destination's last reply arrived.
-    last_destination_reply: Option<Instant>,
     /// A window has been asked about: waits for hashes after that mean the
     /// look-ahead is too short.
     started: bool,
@@ -262,10 +226,8 @@ fn hashes_ran_out(sizes: &Sizes, flow: &Flow) -> bool {
 }
 
 impl Worker {
-    /// The largest block an automatic comparison uses: the configured one,
-    /// but in a pull no more than the starting block. A pull's replies can
-    /// wait in this machine's buffers before they are read, so the rate it
-    /// measures may only make blocks smaller.
+    /// A pull can queue only `SOURCE_DATA_IN_FLIGHT` of potential payloads;
+    /// keep its smaller ceiling so it can ask about more blocks at once.
     fn adaptive_ceiling(&self) -> u64 {
         let configured = self.opts.block.min(self.transfer_block());
         if self.opts.src_remote && !self.opts.dst_remote {
@@ -423,16 +385,16 @@ impl Worker {
                 continue;
             }
             let reply = match self.dst.try_recv_with_arrival() {
-                Some(arrived) => arrived?,
+                Some(arrived) => arrived?.0,
                 None => {
                     if hashes_ran_out(sizes, flow) {
                         self.comparison.starved();
                         sizes.ahead = self.comparison.ahead();
                     }
-                    self.dst.recv_with_arrival()?
+                    self.dst.recv()?
                 }
             };
-            self.receive_compared_destination(job, sizes, flow, credited, reply)?;
+            self.receive_compared_destination(job, flow, credited, reply)?;
         }
     }
 
@@ -541,15 +503,7 @@ impl Worker {
     ) -> Result<()> {
         let read = flow.reads.pop_front().expect("pending read");
         flow.reading -= read.len;
-        // A reply that has not yet arrived when it is waited for crosses the
-        // link from its first byte to its last; one already queued says
-        // nothing about the link.
-        let (waited, (response, started)) = match self.src.try_recv_with_arrival() {
-            Some(queued) => (false, queued?),
-            None => (!sizes.source_answers_at_once, self.src.recv_with_arrival()?),
-        };
-        let arrived = Instant::now();
-        let response = ok(response, "compare source block")?;
+        let response = ok(self.src.recv()?, "compare source block")?;
         let differs = match response {
             Response::RangeMatched { off, len } => {
                 validate_range_reply(read.off, read.len, off, len as usize)?;
@@ -565,7 +519,6 @@ impl Worker {
                         len: read.len,
                         reused: true,
                         sent: Instant::now(),
-                        data: false,
                     });
                 } else {
                     Self::acknowledge_comparison(
@@ -581,13 +534,6 @@ impl Worker {
             }
             Response::Block { off, hash, data } => {
                 validate_range_reply(read.off, read.len, off, data.len())?;
-                // The block crossed the link in this reply. Where it also
-                // crosses to a remote destination, that destination's
-                // acknowledgments time it instead.
-                if sizes.adaptive && self.opts.src_remote && !self.opts.dst_remote && waited {
-                    self.comparison
-                        .sent(read.len, arrived.saturating_duration_since(started));
-                }
                 self.benchmark.range_requests += 1;
                 self.limit(read.len);
                 self.dst.send(Request::WriteRange {
@@ -603,7 +549,6 @@ impl Worker {
                     len: read.len,
                     reused: false,
                     sent: Instant::now(),
-                    data: sizes.adaptive && self.opts.dst_remote,
                 });
                 true
             }
@@ -617,9 +562,8 @@ impl Worker {
         flow.retained = flow.retained.saturating_sub(read.len);
         if sizes.adaptive {
             // Windows of a range adjoin, so a run continues across them.
-            let ceiling = self.adaptive_ceiling();
             let run = u64::from(differs && flow.differing_end != Some(read.off));
-            self.comparison.compared(read.len, run, ceiling);
+            self.comparison.compared(read.len, run);
         }
         flow.differing_end = differs.then_some(read.off + read.len);
         Ok(())
@@ -630,16 +574,11 @@ impl Worker {
     fn receive_compared_destination(
         &mut self,
         job: &WorkerJob,
-        sizes: &Sizes,
         flow: &mut Flow,
         credited: &mut u64,
-        (response, arrived): (Response, Instant),
+        response: Response,
     ) -> Result<()> {
         let awaited = flow.awaited.pop_front().expect("awaited reply");
-        let since = flow
-            .last_destination_reply
-            .map_or(awaited.sent(), |last| last.max(awaited.sent()));
-        flow.last_destination_reply = Some(arrived);
         match awaited {
             Awaited::Hashes(_) => {
                 let window = flow
@@ -654,20 +593,13 @@ impl Worker {
                     window.block,
                 )?);
             }
-            Awaited::Write {
-                len, reused, data, ..
-            } => {
+            Awaited::Write { len, reused, .. } => {
                 match change_ok(response, "write compared block")? {
                     Response::Ok => {}
                     _ => {
                         return Err(anyhow::Error::new(RangeReplyMismatch)
                             .context("invalid comparison write acknowledgment"))
                     }
-                }
-                if data && sizes.adaptive {
-                    // The block crossed the link in its request.
-                    self.comparison
-                        .sent(len, arrived.saturating_duration_since(since));
                 }
                 Self::acknowledge_comparison(
                     &self.progress,
@@ -687,57 +619,40 @@ impl Worker {
 mod tests {
     use super::*;
 
-    fn measured(rate: f64, gap: u64, ceiling: u64) -> u64 {
-        let mut sizing = ComparisonSizing::default();
-        // A second of differing data at `rate`, and runs `gap` bytes apart.
-        sizing.sent(rate as u64, Duration::from_secs(1));
-        for _ in 0..64 {
-            sizing.compared(gap, 1, ceiling);
-        }
-        sizing.block(ceiling)
-    }
-
     #[test]
-    fn blocks_shrink_on_slow_links_and_grow_on_fast_ones_or_dense_changes() {
+    fn block_size_tracks_observed_run_spacing_with_bounded_edge_bytes() {
         let ceiling = 4 << 20;
-        // Runs 64 MiB apart, as for a few edits in a large file.
-        assert_eq!(measured(1e6, 64 << 20, ceiling), 64 << 10);
-        assert_eq!(measured(12.5e6, 64 << 20, ceiling), 128 << 10);
-        assert_eq!(measured(125e6, 64 << 20, ceiling), 256 << 10);
-        assert_eq!(measured(1.25e9, 64 << 20, ceiling), 1 << 20);
-        // One long run of changes: blocks cost requests and save nothing.
-        assert_eq!(measured(12.5e6, 1 << 30, ceiling), 512 << 10);
-        assert_eq!(measured(1.25e9, 1 << 30, ceiling), ceiling);
-        // Never above an explicit ceiling or below the protocol's floor.
-        assert_eq!(measured(1.25e9, 1 << 30, 1 << 20), 1 << 20);
-        assert_eq!(measured(1.0, 64 << 20, ceiling), MIN_BLOCK);
-        assert_eq!(measured(1.25e9, 1 << 30, 3 << 20), 2 << 20);
+        for (spacing, limit, expected) in [
+            (64 << 10, ceiling, MIN_BLOCK),
+            (8 << 20, ceiling, 256 << 10),
+            (64 << 20, ceiling, 2 << 20),
+            (1 << 30, ceiling, ceiling),
+            (1 << 30, 3 << 20, 2 << 20),
+            (1 << 30, 32 << 10, 32 << 10),
+        ] {
+            let mut sizing = ComparisonSizing::default();
+            sizing.compared(spacing, 1);
+            assert_eq!(sizing.block(limit), expected);
+            if expected > MIN_BLOCK {
+                assert!(32 * expected <= spacing);
+            }
+        }
     }
 
     #[test]
-    fn sizes_wait_for_measurements_and_forget_old_ones() {
+    fn sizes_wait_for_change_runs_and_forget_old_ones() {
         let ceiling = 4 << 20;
         let mut sizing = ComparisonSizing::default();
         assert_eq!(sizing.block(ceiling), START_BLOCK);
         assert_eq!(sizing.block(128 << 10), 128 << 10);
-        // Runs without data on the link, or data without runs, change nothing.
-        sizing.compared(64 << 20, 4, ceiling);
+        sizing.compared(64 << 20, 0);
         assert_eq!(sizing.block(ceiling), START_BLOCK);
-        let mut sizing = ComparisonSizing::default();
-        sizing.sent(1 << 20, Duration::from_secs(1));
-        sizing.compared(64 << 20, 0, ceiling);
-        assert_eq!(sizing.block(ceiling), START_BLOCK);
-        // A slow link with frequent runs, then a fast one with rare runs:
-        // the newer measurements win.
-        let mut sizing = ComparisonSizing::default();
-        sizing.sent(1 << 20, Duration::from_secs(1));
-        sizing.compared(1 << 30, 1 << 14, ceiling);
+        sizing.compared(1 << 30, 1 << 14);
         assert_eq!(sizing.block(ceiling), MIN_BLOCK);
         for _ in 0..16 {
-            sizing.sent(1 << 30, Duration::from_secs(1));
-            sizing.compared(1 << 30, 1, ceiling);
+            sizing.compared(1 << 30, 1);
         }
-        assert!(sizing.block(ceiling) >= 2 << 20);
+        assert_eq!(sizing.block(ceiling), ceiling);
     }
 
     #[test]
@@ -774,7 +689,6 @@ mod tests {
             len: 512,
             reused: true,
             sent: Instant::now(),
-            data: false,
         }]);
         assert!(
             !hashes_ran_out(&sizes(true), &acknowledging),

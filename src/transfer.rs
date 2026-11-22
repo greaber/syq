@@ -987,20 +987,14 @@ fn connect_source(
                 .checked_add(remote_source_handoff_workers)
                 .context("source worker count overflow")?,
         )?;
-        let entries = sources
-            .iter()
-            .zip(&roots)
-            .map(|(source, root)| {
-                stat_one_registered(
-                    &mut *connection,
-                    &source.path,
-                    &root.selection,
-                    source.follows_root(args.follows_native_source_paths()),
-                )
-                .ok()
-                .flatten()
+        let mut entries = Vec::with_capacity(sources.len());
+        let entries =
+            stat_registered_sources(&mut *connection, sources, &roots, args, |_, entry| {
+                entries.push(entry?.context("source is missing")?);
+                Ok(())
             })
-            .collect();
+            .ok()
+            .map(|()| entries);
         Some(SmallCopySources {
             roots,
             entries,
@@ -3925,22 +3919,24 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         // authoritative here, so its operator path is not resolved again.
         // Named symlinks are reported together, as a glob can name several.
         let mut links = Vec::new();
-        for (source_index, source) in srcs.iter().enumerate() {
-            match stat_one_registered(
-                &mut *src_ctl,
-                &source.path,
-                &source_roots.get().expect("source roots registered")[source_index].selection,
-                source.follows_root(args.follows_native_source_paths()),
-            )? {
-                Some(entry) if refuses_named_symlink(source.selection, entry.kind) => {
-                    links.push(source.path.as_slice())
+        stat_registered_sources(
+            &mut *src_ctl,
+            srcs,
+            source_roots.get().expect("source roots registered"),
+            &args,
+            |source, entry| {
+                match entry? {
+                    Some(entry) if refuses_named_symlink(source.selection, entry.kind) => {
+                        links.push(source.path.as_slice())
+                    }
+                    Some(entry) => {
+                        validate_native_source_type(&source.path, source.selection, entry.kind)?
+                    }
+                    None => bail!("source {} does not exist", display(&source.path)),
                 }
-                Some(entry) => {
-                    validate_native_source_type(&source.path, source.selection, entry.kind)?
-                }
-                None => bail!("source {} does not exist", display(&source.path)),
-            }
-        }
+                Ok(())
+            },
+        )?;
         if !links.is_empty() {
             return Err(named_symlink_sources_error(&links, srcs.len()));
         }
@@ -5726,14 +5722,15 @@ fn stat_many_registered(
         )?);
         return Ok(entries);
     }
-    match ok(
-        conn.call(Request::StatMany {
-            paths,
-            sources,
-            follow,
-        })?,
-        "stat",
-    )? {
+    stat_reply(conn.call(Request::StatMany {
+        paths,
+        sources,
+        follow,
+    })?)
+}
+
+fn stat_reply(response: Response) -> Result<Vec<Option<Entry>>> {
+    match ok(response, "stat")? {
         Response::Stats(v) => Ok(v),
         other => bail!("unexpected response {other:?}"),
     }
@@ -5895,20 +5892,48 @@ fn inspect_placement_target(conn: &mut dyn Conn, path: &[u8]) -> Result<Option<E
     )
 }
 
-fn stat_one_registered(
+/// Pipeline a bounded number of lookups, one request per argument. Each
+/// argument keeps its own follow policy and endpoint error. Apply results in
+/// argument order and drain the issued lookups if validation stops early.
+fn stat_registered_sources<'a>(
     conn: &mut dyn Conn,
-    path: &[u8],
-    source: &RegisteredPath,
-    follow: bool,
-) -> Result<Option<Entry>> {
-    Ok(stat_many_registered(
-        conn,
-        vec![path.to_vec()],
-        Some(vec![source.clone()]),
-        follow,
-    )?
-    .pop()
-    .flatten())
+    sources: &'a [Location],
+    roots: &[RegisteredSourceRoot],
+    args: &Args,
+    mut visit: impl FnMut(&'a Location, Result<Option<Entry>>) -> Result<()>,
+) -> Result<()> {
+    let depth = if conn.supports_request_pipelining() {
+        conn.reply_queue()
+            .unwrap_or(crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH)
+            .clamp(1, crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH)
+    } else {
+        1
+    };
+    for (sources, roots) in sources.chunks(depth).zip(roots.chunks(depth)) {
+        let sent: Vec<_> = sources
+            .iter()
+            .zip(roots)
+            .map(|(source, root)| {
+                conn.send(Request::StatMany {
+                    paths: vec![source.path.clone()],
+                    sources: Some(vec![root.selection.clone()]),
+                    follow: source.follows_root(args.follows_native_source_paths()),
+                })
+            })
+            .collect();
+        let mut result = Ok(());
+        for (source, sent) in sources.iter().zip(sent) {
+            let entry = sent
+                .and_then(|()| conn.recv())
+                .and_then(stat_reply)
+                .map(|mut entries| entries.pop().flatten());
+            if result.is_ok() {
+                result = visit(source, entry);
+            }
+        }
+        result?;
+    }
+    Ok(())
 }
 
 /// A copy that cannot widen its destination requires search permission on
