@@ -90,6 +90,16 @@ pub(super) fn serve(
             assert_eq!(path, "/bucket/stored/object");
             reply(socket, 200, &fields, OBJECT, false)
         }
+        "POST" if case == "from-server-reopen" && field("uploads").is_some() => {
+            // Hashing is done. Remove the source before returning the new upload ID.
+            std::fs::remove_file(directory.parent().unwrap().join("server-home/large")).unwrap();
+            reply(socket, 200, &[],
+                b"<InitiateMultipartUploadResult><UploadId>prepared</UploadId></InitiateMultipartUploadResult>", false);
+        }
+        "DELETE" if case == "from-server-reopen" => {
+            assert_eq!(field("uploadId"), Some("prepared"));
+            reply(socket, 204, &[], b"", false);
+        }
         "PUT" => {
             let length: usize = headers["content-length"].parse().unwrap();
             let mut body = vec![0; length];
@@ -195,6 +205,39 @@ const UPLOAD: &[&str] = &[
     "--into",
     "backup",
 ];
+
+#[test]
+fn storage_authorized_recovery_aborts_when_a_prepared_source_disappears() {
+    let lab = Lab::start("reopen");
+    std::fs::File::create(lab.path("server-home/large"))
+        .unwrap()
+        .set_len(6 << 20)
+        .unwrap();
+    // Make only the S3 recovery directory unavailable.
+    std::fs::create_dir_all(lab.path("cache/syq")).unwrap();
+    std::fs::write(lab.path("cache/syq/s3"), b"blocked").unwrap();
+    let output = lab.run(&[
+        "--from",
+        "server",
+        "large",
+        "--to",
+        "s3://bucket",
+        "--as",
+        "object",
+    ]);
+    let text = output_text(&output);
+    assert!(!output.status.success(), "{text}");
+    assert!(text.contains("without saving recovery progress"), "{text}");
+    assert_eq!(
+        lab.requests().lines().collect::<Vec<_>>(),
+        [
+            "HEAD /bucket/object",
+            "POST /bucket/object",
+            "DELETE /bucket/object"
+        ],
+        "{text}"
+    );
+}
 
 #[test]
 fn a_server_uploads_with_urls_this_machine_signed() {

@@ -10,6 +10,7 @@ async fn resource_request_ceiling_survives_configuration_and_object_handoff() {
         upload: false,
         requests: Arc::new(Budget::with_ceiling(64, true, Some(3))),
         reads: crate::s3::read_recovery::Recovery::default(),
+        retained_upload_files: Default::default(),
         upload_buffers: Arc::new(tokio::sync::Semaphore::new(1)),
     };
     assert_eq!(tuning.request_limit(), 3);
@@ -66,6 +67,7 @@ async fn transfer_configuration_discards_planning_admission_time() {
         tigris: false,
         upload: false,
         requests: Arc::new(Budget::new(1, true)),
+        retained_upload_files: Default::default(),
         upload_buffers: Arc::new(tokio::sync::Semaphore::new(1)),
     };
     let planning = tuning.requests.acquire().await;
@@ -766,6 +768,7 @@ fn initial_request_budget_accounts_for_direction_latency_and_overrides() {
             tigris,
             upload,
             requests: Arc::new(Budget::new(fixed.unwrap_or(64), fixed.is_none())),
+            retained_upload_files: Default::default(),
             upload_buffers: Arc::new(tokio::sync::Semaphore::new(256 * 1024 * 1024)),
         };
         if let Some(ms) = latency_ms {

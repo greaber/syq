@@ -146,6 +146,8 @@ impl Engine {
             let capacity = if self.options.route.is_server_copy() {
                 256
             } else if self.options.route == Route::Upload {
+                // Keep the measured Tigris worker ceiling. The nonblocking upload
+                // buffer budget controls memory independently of object admission.
                 let buffer_size = if self.tuning.tigris() {
                     8 * 1024 * 1024
                 } else {
@@ -578,16 +580,6 @@ async fn read_body<F: std::future::Future>(
     }
 }
 
-pub(super) struct UploadBuffer {
-    pub(super) bytes: Vec<u8>,
-    pub(super) _reservation: tokio::sync::OwnedSemaphorePermit,
-    pub(super) _trace: Option<crate::s3::diagnostics::UploadBufferTrace>,
-}
-impl AsRef<[u8]> for UploadBuffer {
-    fn as_ref(&self) -> &[u8] {
-        &self.bytes
-    }
-}
 #[cfg(test)]
 mod buffer_tests;
 

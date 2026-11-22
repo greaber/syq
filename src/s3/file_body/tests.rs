@@ -36,7 +36,7 @@ fn opened(temp: &std::path::Path, contents: &[u8]) -> Arc<Opened> {
         .pop()
         .unwrap();
     let file = source.open().unwrap();
-    Arc::new(Opened { file, source })
+    Opened::new(source, file, None)
 }
 
 fn pool(max_idle: usize) -> &'static Pool {
@@ -120,12 +120,7 @@ async fn copies_of_the_body_start_from_the_beginning() {
     let temp = crate::test_support::tempdir().unwrap();
     let data = patterned(3 * CHUNK);
     let opened = opened(temp.path(), &data);
-    let mut body = body(
-        opened.source.clone(),
-        opened.source.open().unwrap(),
-        CHUNK as u64,
-        2 * CHUNK as u64,
-    );
+    let mut body = body(&opened, CHUNK as u64, 2 * CHUNK as u64);
     let first = frame(&mut body).await.unwrap().unwrap();
     assert_eq!(first, data[CHUNK..2 * CHUNK]);
     let mut copy = body.try_clone().expect("the body can be sent again");
@@ -190,11 +185,8 @@ async fn a_body_dropped_mid_read_returns_its_buffer() {
     let opened = opened(temp.path(), &patterned(3 * CHUNK));
     let pool = pool(8);
     let mut chunks = Chunks::new(opened.clone(), 0, 3 * CHUNK as u64, pool);
-    // The first chunk's buffer is the only one, so the next read takes it.
-    drop(frame(&mut chunks).await.unwrap().unwrap());
-    assert_eq!(pool.idle().len(), 1);
-    // Holding the pool's lock stops that read before it takes the buffer, so
-    // it is still pending when the body is dropped.
+    // Holding the pool's lock stops the first read before it takes a
+    // buffer, so it is still pending when the body is dropped.
     let idle = pool.idle();
     let mut cx = Context::from_waker(std::task::Waker::noop());
     assert!(Pin::new(&mut chunks).poll_frame(&mut cx).is_pending());
@@ -269,8 +261,7 @@ async fn the_sdk_sends_the_body_that_matches_its_request_checksum() {
         .bucket("bucket")
         .key("object")
         .body(aws_sdk_s3::primitives::ByteStream::new(body(
-            opened.source.clone(),
-            opened.source.open().unwrap(),
+            &opened,
             0,
             data.len() as u64,
         )))
@@ -363,16 +354,14 @@ async fn sdk_upload(
     retries: u32,
 ) -> (usize, Duration, anyhow::Error, bool) {
     let (client, server) = sdk().await;
+    let opened = Opened::new(source.clone(), file.try_clone().unwrap(), None);
     let result = crate::s3::upload_send::tests::failed_upload_stopping(retries, || {
         client
             .put_object()
             .bucket("bucket")
             .key("object")
             .body(aws_sdk_s3::primitives::ByteStream::new(body(
-                source.clone(),
-                file.try_clone().unwrap(),
-                0,
-                length,
+                &opened, 0, length,
             )))
             .content_length(length as i64)
             .customize()
@@ -441,4 +430,90 @@ async fn a_read_error_is_retried() {
         !format!("{error:#}").contains("source changed"),
         "{error:#}"
     );
+}
+
+/// Every copy of the body the SDK takes for a new attempt starts again at the
+/// first byte, and the shared budget and pooled chunks are released only
+/// once the last copy and the last frame sent from it are gone.
+#[tokio::test]
+async fn held_contents_are_sent_from_pooled_chunks_until_the_last_copy_drops() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let data = patterned(2 * CHUNK + 5);
+    let opened = opened(temp.path(), &data);
+    let pool = pool(8);
+    let length = data.len() as u64;
+    let budget = Arc::new(tokio::sync::Semaphore::new(held_size(length) as usize));
+    let reservation = budget
+        .clone()
+        .try_acquire_many_owned(held_size(length))
+        .unwrap();
+    let held = Held::read_from(&opened.file, length, Box::new(reservation), pool).unwrap();
+    assert_eq!(held.size(), length);
+    assert_eq!(held.chunks().count(), 3);
+    assert_eq!(held.chunks().collect::<Vec<_>>().concat(), data);
+    assert!(pool.idle().is_empty());
+    let mut body = held.body();
+    drop(held);
+    let first = frame(&mut body).await.unwrap().unwrap();
+    assert_eq!(first, data[..CHUNK]);
+    let mut copy = body.try_clone().expect("the body can be sent again");
+    drop(body);
+    let mut resent = Vec::new();
+    while let Some(bytes) = frame(&mut copy).await {
+        resent.extend_from_slice(&bytes.unwrap());
+    }
+    assert_eq!(resent, data);
+    drop(copy);
+    // The first attempt's frame still holds every chunk and the budget.
+    assert_eq!(budget.available_permits(), 0);
+    assert!(pool.idle().is_empty());
+    drop(first);
+    assert_eq!(budget.available_permits(), held_size(length) as usize);
+    assert_eq!(pool.idle().len(), 3);
+}
+
+/// Contents shorter than a chunk take a buffer of their own size, and the
+/// budget they reserve matches what they hold.
+#[test]
+fn held_contents_shorter_than_a_chunk_do_not_use_the_pool() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let opened = opened(temp.path(), b"short contents");
+    let pool = pool(8);
+    let held = Held::read_from(&opened.file, 14, Box::new(()), pool).unwrap();
+    assert_eq!(held.chunks().collect::<Vec<_>>(), [&b"short contents"[..]]);
+    drop(held);
+    assert!(pool.idle().is_empty());
+    let empty = Held::read_from(&opened.file, 0, Box::new(()), pool).unwrap();
+    assert_eq!(empty.chunks().count(), 0);
+    assert_eq!(
+        [0, 14, CHUNK as u64 - 1, CHUNK as u64, CHUNK as u64 + 1].map(held_size),
+        [1, 14, CHUNK as u32 - 1, CHUNK as u32, 2 * CHUNK as u32]
+    );
+}
+
+/// Content-MD5 reads the range through the opened file and fails once the
+/// source no longer matches what was selected.
+#[test]
+fn content_md5_reads_the_opened_range_and_checks_the_source() {
+    use std::os::unix::fs::FileExt as _;
+    let temp = crate::test_support::tempdir().unwrap();
+    let data = patterned(2 * CHUNK + 9);
+    let opened = opened(temp.path(), &data);
+    let range = CHUNK + 3..data.len();
+    assert_eq!(
+        opened.md5(range.start as u64, range.len() as u64).unwrap(),
+        crate::s3::checksum::Algorithm::Md5
+            .digest(&data[range.clone()])
+            .unwrap()
+    );
+    std::fs::File::options()
+        .write(true)
+        .open(temp.path().join("source"))
+        .unwrap()
+        .write_all_at(b"changed", 0)
+        .unwrap();
+    let error = opened
+        .md5(range.start as u64, range.len() as u64)
+        .unwrap_err();
+    assert!(error.is::<crate::s3::local::SourceChanged>(), "{error:#}");
 }

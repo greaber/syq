@@ -90,8 +90,9 @@ async fn cancellation_retires_buffered_and_file_uploads_and_rejects_new_requests
             );
             let stream = if from_file {
                 let file = source.open().unwrap();
+                let opened = crate::s3::file_body::Opened::new(source, file, None);
                 aws_sdk_s3::primitives::ByteStream::new(crate::s3::file_body::body(
-                    source, file, 0, size,
+                    &opened, 0, size,
                 ))
             } else {
                 aws_sdk_s3::primitives::ByteStream::from(vec![0; size as usize])
