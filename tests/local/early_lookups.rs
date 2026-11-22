@@ -379,7 +379,20 @@ fn remote_metadata_rerun_uses_early_lookups() {
     } else {
         "--copy-metadata=mtime,permissions,acls,xattrs,atimes"
     };
+    // Reading a file during the first copy may advance its source atime.
+    // Give both scans the same atimes so the rerun needs no metadata fixes.
+    let times = fs::FileTimes::new().set_accessed(std::time::SystemTime::now());
+    let reset_atimes = || {
+        for index in 0..FILES {
+            fs::File::open(t.path(&format!("src/a/f{index:05}")))
+                .unwrap()
+                .set_times(times)
+                .unwrap();
+        }
+    };
+    reset_atimes();
     assert_output_ok(&copy(&t, &rsh, &[flags]));
+    reset_atimes();
     let output = copy(&t, &rsh, &[flags]);
     assert_output_ok(&output);
     assert!(
