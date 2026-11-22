@@ -95,7 +95,9 @@ pruning. Filesystem pruning always tunes its own workers.
 
 Syq starts each filesystem copy from the number of workers, and so of
 connections, that worked for earlier copies of the same kind, then keeps
-adjusting. `--performance-tuning workers=N`
+adjusting. During the copy, syq prefers fewer workers when they deliver
+within 5% of the throughput it measured with more workers.
+`--performance-tuning workers=N`
 bypasses the remembered count, and `--resource-limits workers=N` caps it. The
 counts come from the tuning history below. To turn it off, so that each copy
 starts from the default count, set `SYQ_TUNING_CACHE` to an empty value.
@@ -120,11 +122,11 @@ remembered counts. When a server coordinates a copy, the history is on that
 server; S3 copies record none.
 
 A small push completed on the control connection has no tuning timeline.
-Empty and single-file copies that finish before their first measurement also
-skip the final write unless the worker count changed, TCP diagnostics were recorded,
-or part of the timeline was already saved. Other copies save their timeline
-when they end. A copy that runs for more than a second
-also saves it every few seconds along the way: it is listed as `incomplete`
+Successful empty and single-file copies that finish before their first
+measurement also skip the final write unless syq changed the worker count,
+recorded TCP diagnostics, or already saved part of the timeline. Other copies
+save their timeline when they end. A copy that runs for more than a second
+also saves it every few seconds along the way. It is listed as `incomplete`
 until it ends, and stays that way, with what it had saved, if it is
 interrupted. A copy interrupted in its first second leaves no record.
 Recording does not hold a copy up for long: when many copies end at the same

@@ -99,7 +99,7 @@ impl Trace {
             return sched.work_left_for(workers, required, FILE_CREDIT);
         }
         let evidence = sched.tuning_work(workers, required, FILE_CREDIT);
-        self.last_work_check = Some((self.sample, evidence));
+        self.last_work_check = Some((self.observation, evidence));
         evidence.sufficient
     }
 
@@ -128,7 +128,7 @@ impl Trace {
         self.waiting = None;
         self.event(
             "decision",
-            json!({"reason":reason,"trigger":trigger,"score":score,
+            json!({"reason":reason,"trigger":trigger,"score":score,"ending_observation":(trigger == "sequential_evidence").then_some(self.observation),
             "sample_ids":if trigger == "sequential_evidence" { Vec::new() } else {self.recent_samples.iter().copied().collect::<Vec<_>>()},"before":before,"after":snapshot(policy),
             "active":policy.active(),"requested":policy.n}),
         );
@@ -137,7 +137,7 @@ impl Trace {
     pub fn refresh_baseline(&mut self, policy: &mut Policy, score: f64) {
         let before = self.recorder.as_ref().map(|_| snapshot(policy));
         policy.refresh_warming_baseline(score);
-        self.event("baseline_refreshed",json!({"score":score,"sample_ids":self.recent_samples,
+        self.event("baseline_refreshed",json!({"score":score,"ending_observation":self.observation,
             "before":before,"after":snapshot(policy),"active":policy.active(),"requested":policy.n}));
     }
 
