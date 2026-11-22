@@ -841,8 +841,8 @@ impl Root {
         if !metadata.is_file() {
             bail!("confined path {} is not a regular file", path.label());
         }
-        clear_nonblocking(&file)
-            .with_context(|| format!("normalize confined file flags for {}", path.label()))?;
+        // O_NONBLOCK prevents a raced FIFO open from blocking and has
+        // no effect on regular-file I/O.
         Ok((file, metadata))
     }
 
@@ -906,8 +906,10 @@ impl Root {
         #[cfg(any(target_os = "linux", test))]
         drop(permit);
         let metadata = file.metadata()?;
-        clear_nonblocking(&file)
-            .with_context(|| format!("normalize confined file flags for {}", path.label()))?;
+        if !metadata.is_file() {
+            clear_nonblocking(&file)
+                .with_context(|| format!("normalize confined file flags for {}", path.label()))?;
+        }
         Ok((file, metadata))
     }
 
