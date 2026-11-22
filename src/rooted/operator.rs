@@ -88,17 +88,15 @@ impl PinnedLeaf {
         )?;
         // A pathname replacement must not make the candidate open block before
         // its identity is checked. The selected object is not a FIFO here, but
-        // its replacement may be one. Regular files ignore O_NONBLOCK during
-        // I/O. Special files need blocking behavior restored after validation.
+        // its replacement may be one. Restore ordinary blocking I/O only after
+        // the opened object has been validated.
         let flags =
             libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NONBLOCK;
         let file = open_at(self.parent.as_raw_fd(), &self.name, flags, 0)
             .context("open selected operator file")?;
         let actual = root_metadata_from_std(&file.metadata()?)?;
         require_operator_identity(self.metadata, actual, "operator file")?;
-        if !actual.is_file() {
-            clear_nonblocking(&file).context("normalize selected operator file flags")?;
-        }
+        clear_nonblocking(&file).context("normalize selected operator file flags")?;
         Ok(file)
     }
 }

@@ -3,7 +3,7 @@
 //! and frees the helper for other transfers.
 use std::fs::File;
 use std::ops::Range;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -11,6 +11,7 @@ use std::thread::JoinHandle;
 
 pub(crate) const BLOCK: u64 = 1 << 20;
 const LOOKAHEAD: u64 = 4 * BLOCK;
+const ADVICE_BYTES: u64 = 128 << 10;
 // Recheck long cached reads occasionally in case the next region needs I/O.
 const PROBE_INTERVAL: u64 = 64 * BLOCK;
 
@@ -62,6 +63,7 @@ struct State {
     #[cfg(debug_assertions)]
     in_flight: bool,
     stopped: bool,
+    waiting: bool,
 }
 
 struct Worker {
@@ -124,11 +126,10 @@ impl Worker {
                     let request = state.window.as_mut().and_then(|window| {
                         window.offset = window.offset.max(window.copied);
                         let end = window.end.min(window.copied.saturating_add(LOOKAHEAD));
-                        // Linux may clip a WILLNEED request to the device's
-                        // readahead size. Advise each read block so one clipped
-                        // request cannot skip most of the lookahead window.
-                        let len = BLOCK.min(end.saturating_sub(window.offset));
-                        if len == 0 || (len < BLOCK && end < window.end) {
+                        // Linux can cap WILLNEED at 128 KiB on some devices.
+                        // Step by that size to cover the whole lookahead window.
+                        let len = ADVICE_BYTES.min(end.saturating_sub(window.offset));
+                        if len == 0 || (len < ADVICE_BYTES && end < window.end) {
                             return None;
                         }
                         let request = (window.source.clone(), window.offset, len);
@@ -136,7 +137,9 @@ impl Worker {
                         Some(request)
                     });
                     let Some((source, offset, len)) = request else {
+                        state.waiting = true;
                         state = wake.wait(state).unwrap_or_else(|e| e.into_inner());
+                        state.waiting = false;
                         continue;
                     };
                     #[cfg(debug_assertions)]
@@ -180,10 +183,13 @@ impl Worker {
 
     fn advance(&self, copied: u64) {
         let (lock, wake) = &*self.shared;
-        if let Some(window) = &mut lock.lock().unwrap_or_else(|e| e.into_inner()).window {
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(window) = &mut state.window {
             window.copied = copied;
+            if state.waiting {
+                wake.notify_one();
+            }
         }
-        wake.notify_one();
     }
 
     /// Wait until the helper has advised the window that `begin` opened at
@@ -223,6 +229,10 @@ pub(crate) struct ReadAhead {
     worker: Option<Worker>,
     stream: Option<Stream>,
     bytes_until_probe: u64,
+    // The reader keeps its source descriptors cached across consecutive reads.
+    next_read: Option<(RawFd, u64)>,
+    #[cfg(test)]
+    test_budget: Option<Arc<Budget>>,
     observation: Option<Arc<crate::transfer_observations::Actor>>,
     helper_observation: Option<Arc<crate::transfer_observations::Actor>>,
 }
@@ -338,7 +348,8 @@ impl ReadAhead {
                     "source range exceeds file offsets",
                 )
             })?;
-        if off == 0 {
+        let fd = source.as_raw_fd();
+        if self.next_read.take() != Some((fd, off)) {
             self.bytes_until_probe = 0;
         }
         let mut range = if let Some(stream) = &self.stream {
@@ -389,6 +400,7 @@ impl ReadAhead {
                 .saturating_sub(len as u64);
             data = remaining;
         }
+        range.preparation.next_read = Some((fd, end));
         range.preserve_stream();
         Ok(())
     }
@@ -430,7 +442,14 @@ impl PreparedRange<'_> {
         if self.attempted || !should_prepare {
             return;
         }
-        let Some(permit) = budget().acquire() else {
+        let helper_budget = budget();
+        #[cfg(test)]
+        let helper_budget = self
+            .preparation
+            .test_budget
+            .as_ref()
+            .unwrap_or(helper_budget);
+        let Some(permit) = helper_budget.acquire() else {
             return;
         };
         self.attempted = true;
@@ -552,8 +571,118 @@ mod tests {
         }
     }
 
+    fn record_reads(
+        preparation: &mut ReadAhead,
+        source: &File,
+        data: &mut [u8],
+        off: u64,
+        waited: bool,
+    ) -> (usize, Vec<u64>) {
+        let mut samples = 0;
+        let mut reads = Vec::new();
+        preparation
+            .read_exact_at_with(
+                source,
+                data,
+                off,
+                || {
+                    samples += 1;
+                    Activity {
+                        waits: Some(if waited { samples as libc::c_long } else { 0 }),
+                        ..Activity::default()
+                    }
+                },
+                |chunk, _| {
+                    reads.push(chunk.len() as u64);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        (samples, reads)
+    }
+
     #[test]
-    fn advice_uses_blocks_and_stream_end_fences_work_and_releases_the_permit() {
+    fn cached_probe_delay_ends_at_a_jump_or_descriptor_change() {
+        let tree = crate::test_support::tempdir().unwrap();
+        let source = File::create(tree.path().join("first")).unwrap();
+        let other = File::create(tree.path().join("second")).unwrap();
+        let mut preparation = ReadAhead::default();
+        let mut data = vec![0; LOOKAHEAD as usize];
+        let mut read = |source, off| record_reads(&mut preparation, source, &mut data, off, false);
+        assert_eq!(read(&source, BLOCK), (2, vec![BLOCK, LOOKAHEAD - BLOCK]));
+        assert_eq!(read(&source, BLOCK + LOOKAHEAD), (0, vec![LOOKAHEAD]));
+        assert_eq!(
+            read(&source, 4 * LOOKAHEAD),
+            (2, vec![BLOCK, LOOKAHEAD - BLOCK])
+        );
+        assert_eq!(
+            read(&other, 5 * LOOKAHEAD),
+            (2, vec![BLOCK, LOOKAHEAD - BLOCK])
+        );
+    }
+
+    #[test]
+    fn uncached_probe_starts_block_reads_across_a_stream() {
+        let tree = crate::test_support::tempdir().unwrap();
+        let source = File::create_new(tree.path().join("source")).unwrap();
+        source.set_len(2 * LOOKAHEAD).unwrap();
+        let mut data = vec![0; LOOKAHEAD as usize];
+        let mut preparation = ReadAhead {
+            test_budget: Some(Arc::new(Budget {
+                active: AtomicUsize::new(0),
+                limit: 1,
+            })),
+            ..ReadAhead::default()
+        };
+        preparation.begin_stream(0..2 * LOOKAHEAD);
+
+        let (samples, reads) = record_reads(&mut preparation, &source, &mut data, 0, true);
+        assert_eq!(samples, 2);
+        assert_eq!(reads, [BLOCK; 4]);
+        assert!(preparation.stream.as_ref().unwrap().active);
+        assert!(preparation.worker.is_some());
+
+        let (samples, reads) = record_reads(&mut preparation, &source, &mut data, LOOKAHEAD, true);
+        assert_eq!(samples, 0);
+        assert_eq!(reads, [BLOCK; 4]);
+        assert!(preparation.stream.as_ref().unwrap().active);
+        assert!(preparation.worker.is_some());
+
+        preparation.end_stream();
+        assert!(preparation.worker.is_none());
+    }
+
+    #[test]
+    fn uncached_read_probes_again_when_a_helper_slot_frees() {
+        let tree = crate::test_support::tempdir().unwrap();
+        let source = File::create_new(tree.path().join("source")).unwrap();
+        source.set_len(2 * LOOKAHEAD).unwrap();
+        let mut data = vec![0; LOOKAHEAD as usize];
+        let budget = Arc::new(Budget {
+            active: AtomicUsize::new(0),
+            limit: 1,
+        });
+        let permit = budget.acquire().unwrap();
+        let mut preparation = ReadAhead {
+            test_budget: Some(budget),
+            ..ReadAhead::default()
+        };
+        preparation.begin_stream(0..2 * LOOKAHEAD);
+
+        let (samples, reads) = record_reads(&mut preparation, &source, &mut data, 0, true);
+        assert_eq!(samples, 2);
+        assert_eq!(reads, [BLOCK, LOOKAHEAD - BLOCK]);
+        assert!(preparation.worker.is_none());
+
+        drop(permit);
+        let (samples, reads) = record_reads(&mut preparation, &source, &mut data, LOOKAHEAD, true);
+        assert_eq!(samples, 2);
+        assert_eq!(reads, [BLOCK; 4]);
+        assert!(preparation.worker.is_some());
+    }
+
+    #[test]
+    fn advice_covers_the_window_and_stream_end_fences_work_and_releases_the_permit() {
         use std::sync::mpsc;
         use std::time::Duration;
         let budget = Arc::new(Budget {
@@ -569,15 +698,15 @@ mod tests {
         })
         .unwrap();
         let start = 4096;
-        let tail = BLOCK / 2;
+        let tail = ADVICE_BYTES / 2;
         let end = start + LOOKAHEAD + tail;
         worker.begin(tempfile::tempfile().unwrap(), start, end);
-        for off in (start..start + LOOKAHEAD).step_by(BLOCK as usize) {
+        for off in (start..start + LOOKAHEAD).step_by(ADVICE_BYTES as usize) {
             assert_eq!(
                 requests.recv_timeout(Duration::from_secs(5)).unwrap(),
-                (off, BLOCK)
+                (off, ADVICE_BYTES)
             );
-            if off + BLOCK == start + LOOKAHEAD {
+            if off + ADVICE_BYTES == start + LOOKAHEAD {
                 worker.advance(start + tail);
             }
             release.send(()).unwrap();
