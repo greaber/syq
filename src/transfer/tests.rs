@@ -87,7 +87,6 @@ struct PipelineState {
     dead: bool,
     max_pending: usize,
     latency: Option<std::time::Duration>,
-    configuration_latency: Option<std::time::Duration>,
     ready: std::collections::VecDeque<std::time::Instant>,
     abort_on_receive: Option<Arc<Sched>>,
     abort_receive_number: Option<usize>,
@@ -356,7 +355,7 @@ impl Conn for PipelineConn {
                     assert_eq!(
                         state.requests.len(),
                         state.received,
-                        "latency check requires drained requests"
+                        "configuration starts on an idle connection"
                     );
                     if state.refuse_configuration {
                         Response::Err("hash policy differs from the authorized copy".into())
@@ -401,7 +400,7 @@ impl Conn for PipelineConn {
                     assert_eq!(
                         state.requests.len(),
                         state.received,
-                        "range latency check requires drained requests"
+                        "configuration starts on an idle connection"
                     );
                     state.replies.push_back(Response::Ok);
                 }
@@ -454,11 +453,7 @@ impl Conn for PipelineConn {
                 other => panic!("unexpected automatic range request {other:?}"),
             }
         }
-        let latency = if matches!(request, Request::ConfigureHashing(_)) {
-            state.configuration_latency
-        } else {
-            state.latency
-        };
+        let latency = state.latency;
         state.requests.push(request);
         state.sent_at.push(std::time::Instant::now());
         if let Some(latency) = latency {
@@ -2645,7 +2640,7 @@ fn stolen_file_groups_are_excluded_from_results_and_transport_retries() {
 fn stalled_source_drains_read_ahead_before_claiming_more_file_groups() {
     // Inject reply-start waits so scheduling delays cannot change which
     // side of the stall allowance a case exercises.
-    for (adaptive, refreshed_ms, rtt_us, setup_ms, reply_wait_ms, expected) in [
+    for (adaptive, handshake_ms, rtt_us, setup_ms, reply_wait_ms, expected) in [
         (false, 0, None, 0, 125, [4, 4, 4, 4, 5, 6, 7, 8]),
         (false, 0, Some(10_000), 0, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
         (false, 0, None, 200, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
@@ -2654,7 +2649,7 @@ fn stalled_source_drains_read_ahead_before_claiming_more_file_groups() {
         // The default adaptive group budget allows 250 ms of service.
         (true, 0, None, 0, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
         (true, 0, None, 0, 300, [4, 4, 4, 4, 5, 6, 7, 8]),
-        // A latency recheck also updates the source's stall allowance.
+        // Setup timing also sets the source's stall allowance.
         (true, 300, None, 0, 500, [4, 5, 6, 7, 8, 8, 8, 8]),
         (true, 300, None, 0, 1300, [4, 4, 4, 4, 5, 6, 7, 8]),
     ] {
@@ -2686,11 +2681,10 @@ fn stalled_source_drains_read_ahead_before_claiming_more_file_groups() {
         if adaptive {
             Arc::get_mut(&mut worker.opts).unwrap().tuning = Default::default();
         }
-        if refreshed_ms > 0 {
-            worker.batch_budget.refreshed_latency(
-                std::time::Duration::from_millis(refreshed_ms),
-                std::time::Instant::now(),
-            );
+        if handshake_ms > 0 {
+            worker
+                .batch_budget
+                .set_latency(std::time::Duration::from_millis(handshake_ms));
         }
         worker.gate.set_active(2);
         worker.setup_elapsed = std::time::Duration::from_millis(setup_ms);
@@ -3333,6 +3327,104 @@ fn clean_root_pins_the_edge_cases() {
             want.as_bytes(),
             "clean_root({given:?})"
         );
+    }
+}
+
+#[test]
+fn startup_stats_pipeline_in_argument_order_with_individual_errors_and_follow_flags() {
+    let args = Args::parse_args(&["cp".into(), "a".into(), "--as".into(), "dst".into()]).unwrap();
+    let sources = [
+        "remote:a",
+        "remote:b/",
+        "remote:c",
+        "remote:d/",
+        "remote:e",
+        "remote:f/",
+    ]
+    .map(|path| Location::parse(path).unwrap());
+    let dir = crate::test_support::tempdir().unwrap();
+    let session = crate::descriptor_broker::DescriptorSessionSlot::default();
+    let ticket = session
+        .register(std::fs::File::open(dir.path()).unwrap())
+        .unwrap();
+    let roots = sources.each_ref().map(|source| RegisteredSourceRoot {
+        filesystem: None,
+        ticket: ticket.clone(),
+        leaf_ticket: None,
+        selection: RegisteredPath::new(ticket.root_id(), source.basename()).unwrap(),
+        expected_leaf: None,
+        directory_mode: None,
+    });
+    for strict in [true, false] {
+        let state = Arc::new(Mutex::new(PipelineState {
+            reply_queue: Some(3),
+            replies: [
+                Response::Stats(vec![Some(pipeline_job(b"a", 1).entry.clone())]),
+                Response::Stats(vec![None]),
+                Response::Err("permission denied".into()),
+                Response::Stats(vec![]),
+                Response::Stats(vec![None, None]),
+                Response::Stats(vec![Some(pipeline_job(b"f", 6).entry.clone())]),
+            ]
+            .into(),
+            ..Default::default()
+        }));
+        let mut observed = Vec::new();
+        let result = stat_registered_sources(
+            &mut PipelineConn(state.clone()),
+            &sources,
+            &roots,
+            &args,
+            |source, entry| {
+                if strict {
+                    anyhow::ensure!(entry?.is_some(), "{} is missing", display(&source.path));
+                } else {
+                    observed.push((
+                        source.path.as_slice(),
+                        entry.map(|entry| entry.map(|e| e.size)),
+                    ));
+                }
+                Ok(())
+            },
+        );
+        let state = state.lock().unwrap();
+        assert_eq!(&state.sent_at_receive[..3], [3, 3, 3]);
+        for ((request, source), root) in state.requests.iter().zip(&sources).zip(&roots) {
+            assert!(
+                matches!(request, Request::StatMany { paths, sources: Some(capabilities), follow }
+                if paths == std::slice::from_ref(&source.path)
+                    && capabilities == std::slice::from_ref(&root.selection)
+                    && *follow == source.path.ends_with(b"/"))
+            );
+        }
+        if strict {
+            assert_eq!(result.unwrap_err().to_string(), "b/ is missing");
+            assert_eq!(state.received, 3, "drain the issued lookups");
+            assert_eq!(state.requests.len(), 3, "leave later lookups unissued");
+        } else {
+            result.unwrap();
+            assert_eq!(state.received, 6);
+            assert_eq!(state.sent_at_receive, [3, 3, 3, 6, 6, 6]);
+            assert_eq!(
+                observed.iter().map(|entry| entry.0).collect::<Vec<_>>(),
+                [b"a".as_slice(), b"b/", b"c", b"d/", b"e", b"f/"]
+            );
+            assert_eq!(*observed[0].1.as_ref().unwrap(), Some(1));
+            assert_eq!(*observed[1].1.as_ref().unwrap(), None);
+            assert!(observed[2]
+                .1
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("permission denied"));
+            for (index, count) in [(3, 0), (4, 2)] {
+                assert_eq!(
+                    observed[index].1.as_ref().unwrap_err().to_string(),
+                    format!("stat reply count {count} does not match request count 1")
+                );
+            }
+            assert_eq!(*observed[5].1.as_ref().unwrap(), Some(6));
+        }
     }
 }
 
@@ -4782,14 +4874,13 @@ fn explicit_batch_request_and_pipeline_settings_keep_fixed_grouping() {
 }
 
 #[test]
-fn batch_latency_recheck_distinguishes_queue_delay_from_slow_file_work() {
-    use std::time::{Duration, Instant};
+fn adaptive_batches_use_setup_latency_without_mid_copy_rpc() {
+    use std::time::Duration;
     for network_delay in [true, false] {
         let size = 16 << 10;
         let src = Arc::new(Mutex::new(PipelineState {
             auto_small_size: Some(size),
             latency: Some(Duration::from_millis(300)),
-            configuration_latency: network_delay.then_some(Duration::from_millis(300)),
             ..Default::default()
         }));
         let dst = Arc::new(Mutex::new(PipelineState {
@@ -4802,9 +4893,9 @@ fn batch_latency_recheck_distinguishes_queue_delay_from_slow_file_work() {
             pipeline_worker(&Arc::new(Sched::new(4 << 20, 32 << 20)), &src, &dst, false);
         Arc::get_mut(&mut worker.opts).unwrap().tuning = Default::default();
         worker.gate = Gate::new(8);
-        worker
-            .batch_budget
-            .refreshed_latency(Duration::ZERO, Instant::now() - Duration::from_secs(60));
+        if network_delay {
+            worker.batch_budget.set_latency(Duration::from_millis(300));
+        }
         let count = if network_delay { 128 } else { 24 };
         let jobs: Vec<_> = (0..count)
             .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), size)))
@@ -4829,26 +4920,13 @@ fn batch_latency_recheck_distinguishes_queue_delay_from_slow_file_work() {
             .unwrap();
         assert!(results.iter().all(|r| matches!(r, Some(Ok(_)))));
         let source = src.lock().unwrap();
-        let probe = source
+        assert!(source.max_pending <= 4 && source.replies.is_empty());
+        let groups: Vec<_> = source
             .requests
             .iter()
-            .position(|r| matches!(r, Request::ConfigureHashing(_)))
-            .expect("rechecked latency");
-        assert_eq!(
-            source
-                .requests
-                .iter()
-                .filter(|r| matches!(r, Request::ConfigureHashing(_)))
-                .count(),
-            1,
-            "checks do not repeat for every late group"
-        );
-        assert!(source.max_pending <= 4 && source.replies.is_empty());
-        let groups: Vec<_> = source.requests[probe + 1..]
-            .iter()
-            .filter_map(|r| match r {
-                Request::ReadSmallBatch(reads) => Some(reads.len()),
-                _ => None,
+            .map(|r| match r {
+                Request::ReadSmallBatch(reads) => reads.len(),
+                other => panic!("unexpected source request {other:?}"),
             })
             .collect();
         if network_delay {
@@ -4869,14 +4947,10 @@ fn batch_latency_recheck_distinguishes_queue_delay_from_slow_file_work() {
         }
         let destination = dst.lock().unwrap();
         assert!(destination.replies.is_empty());
-        assert_eq!(
-            destination
-                .requests
-                .iter()
-                .filter(|r| matches!(r, Request::ConfigureHashing(_)))
-                .count(),
-            1
-        );
+        assert!(destination
+            .requests
+            .iter()
+            .all(|r| matches!(r, Request::PutSmallBatch(_))));
         assert_eq!(
             worker.progress.bytes_done.load(Relaxed),
             size * count as u64
@@ -4885,98 +4959,7 @@ fn batch_latency_recheck_distinguishes_queue_delay_from_slow_file_work() {
 }
 
 #[test]
-fn batch_latency_recheck_honors_abort_and_retirement_before_more_requests() {
-    use std::time::{Duration, Instant};
-    for abort in [true, false] {
-        let size = 16 << 10;
-        let sched = Arc::new(Sched::new(4 << 20, 32 << 20));
-        let gate = Gate::new(2);
-        let src = Arc::new(Mutex::new(PipelineState {
-            auto_small_size: Some(size),
-            latency: Some(Duration::from_millis(300)),
-            abort_on_receive: abort.then(|| sched.clone()),
-            abort_receive_number: Some(5),
-            gate_changes: if abort {
-                Vec::new()
-            } else {
-                vec![(5, gate.clone(), 1)]
-            },
-            ..Default::default()
-        }));
-        let dst = Arc::new(Mutex::new(PipelineState {
-            auto_small_size: Some(size),
-            synchronous: true,
-            immediate_batch_receipts: Some(Arc::new(crate::conn::BatchReceipts::default())),
-            ..Default::default()
-        }));
-        let mut worker = pipeline_worker(&sched, &src, &dst, false);
-        Arc::get_mut(&mut worker.opts).unwrap().tuning = Default::default();
-        worker.id = 1;
-        worker.gate = gate;
-        worker
-            .batch_budget
-            .refreshed_latency(Duration::ZERO, Instant::now() - Duration::from_secs(60));
-        let jobs: Vec<_> = (0..64)
-            .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), size)))
-            .collect();
-        let mut next = 0;
-        let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();
-        worker
-            .transfer_small_batches(
-                &jobs,
-                |limit| {
-                    if next == jobs.len() {
-                        return None;
-                    }
-                    let end = (next + limit.files.min((limit.bytes / size).max(1) as usize))
-                        .min(jobs.len());
-                    let group = next..end;
-                    next = end;
-                    Some(group)
-                },
-                &mut results,
-            )
-            .unwrap();
-        let source = src.lock().unwrap();
-        assert_eq!(
-            source.requests.len(),
-            5,
-            "four data groups, then the latency check"
-        );
-        assert!(matches!(
-            source.requests.last(),
-            Some(Request::ConfigureHashing(_))
-        ));
-        assert!(source.replies.is_empty());
-        let destination = dst.lock().unwrap();
-        assert_eq!(
-            destination.requests.len(),
-            4,
-            "stop even before the other latency RPC"
-        );
-        assert!(destination.replies.is_empty());
-        assert_eq!(next, 16, "no further work admitted");
-        assert!(results[..16].iter().all(|r| matches!(r, Some(Ok(_)))));
-        assert!(results[16..].iter().all(Option::is_none));
-    }
-}
-
-#[test]
 fn adaptive_ordinary_reads_expose_slow_unread_tails_to_peers() {
-    check_adaptive_range_handoff(false, 5);
-}
-
-#[test]
-fn slow_ranges_become_shareable_before_draining_for_a_latency_check() {
-    check_adaptive_range_handoff(true, 5);
-}
-
-#[test]
-fn slow_ranges_keep_split_hints_current_while_draining() {
-    check_adaptive_range_handoff(true, 6);
-}
-
-fn check_adaptive_range_handoff(recheck: bool, steal_at: usize) {
     let block = 4 << 20;
     let size = 16 << 20;
     let sched = Arc::new(Sched::new(block, 32 << 20));
@@ -4986,50 +4969,33 @@ fn check_adaptive_range_handoff(recheck: bool, steal_at: usize) {
     let range = sched.ranges_ready(idx, vec![(0, size)]).unwrap();
     let src = Arc::new(Mutex::new(PipelineState {
         auto_ranges: true,
-        steal_range_at: Some((steal_at, sched.clone())),
+        steal_range_at: Some((6, sched.clone())),
         ..Default::default()
     }));
     let dst = Arc::new(Mutex::new(PipelineState {
         auto_ranges: true,
         // Inject service time without a slow or timing-sensitive test.
         arrival_delay: Some(std::time::Duration::from_secs(1)),
-        // The second completion can reveal worse service during the drain.
-        arrival_delays: if steal_at == 6 {
-            [1, 4].map(std::time::Duration::from_secs).into()
-        } else {
-            Default::default()
-        },
+        arrival_delays: [1, 4].map(std::time::Duration::from_secs).into(),
         ..Default::default()
     }));
     let mut worker = pipeline_worker(&sched, &src, &dst, false);
     let opts = Arc::get_mut(&mut worker.opts).unwrap();
     opts.block = block;
     opts.tuning = Default::default();
-    if recheck {
-        // The first slow completion makes a check due while three source
-        // requests are still outstanding. The peer tries to steal during
-        // that drain, before another read can publish a smaller split.
-        let mut budget = WorkBudget::ranges(block, std::time::Duration::from_millis(250), None);
-        budget.refreshed_latency(
-            std::time::Duration::from_millis(10),
-            std::time::Instant::now() - std::time::Duration::from_secs(60),
-        );
-        worker.range_budget = Some(budget);
-    }
+    worker.range_budget = Some(WorkBudget::ranges(
+        block,
+        std::time::Duration::from_millis(250),
+        Some(1 << 20),
+    ));
     let mut credited = 0;
     worker.transfer_range(&range, &mut credited).unwrap();
-    if recheck {
-        let state = src.lock().unwrap();
-        assert_eq!(
-            state.sent_at_receive[steal_at - 1],
-            7,
-            "no refill before the peer steals"
-        );
-        assert!(
-            matches!(state.requests[7], Request::ConfigureHashing(_)),
-            "the latency probe waits for all seven issued reads"
-        );
-    }
+    assert!(src
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .all(|r| matches!(r, Request::ReadRange { .. })));
     let peer_range = src
         .lock()
         .unwrap()
@@ -5046,17 +5012,18 @@ fn check_adaptive_range_handoff(recheck: bool, steal_at: usize) {
         ..Default::default()
     }));
     let mut peer = pipeline_worker(&sched, &peer_src, &peer_dst, false);
-    let expected_start = peer_range.lock().unwrap().split.unwrap().minimum / 2;
-    if steal_at == 6 {
-        assert!(
-            expected_start <= 128 << 10,
-            "the peer must inherit the smaller hint from the second slow completion: {expected_start}"
+    let expected_start = {
+        let stolen = peer_range.lock().unwrap();
+        let hint = stolen.split.unwrap();
+        assert_eq!(stolen.pos % hint.block, 0);
+        assert_eq!(hint.minimum, 2 * hint.block);
+        assert_eq!(
+            hint.block,
+            64 << 10,
+            "the second slow completion reduces the hint"
         );
-    }
-    assert!(
-        expected_start < 1 << 20,
-        "the donor has measured slow service"
-    );
+        hint.block
+    };
     let opts = Arc::get_mut(&mut peer.opts).unwrap();
     opts.block = block;
     opts.tuning = Default::default();
@@ -5118,7 +5085,7 @@ fn inherited_requests_preserve_worker_measurements_ceilings_and_overrides() {
         assert!(matches!(sched.next(), Item::File(_)));
         let range = sched.ranges_ready(idx, vec![(0, size)]).unwrap();
         range.lock().unwrap().split = Some(crate::sched::RangeSplit {
-            block: 512,
+            block: 64 << 10,
             minimum: 128 << 10,
         });
         let src = Arc::new(Mutex::new(PipelineState {
@@ -5227,12 +5194,10 @@ fn adaptive_ordinary_ranges_drain_on_abort_and_retirement() {
         sched.scan_done();
         assert!(matches!(sched.next(), Item::File(_)));
         let range = sched.ranges_ready(idx, vec![(0, 8 << 20)]).unwrap();
-        if starting_bytes != 1 << 20 {
-            range.lock().unwrap().split = Some(crate::sched::RangeSplit {
-                block: 512,
-                minimum: 2 * starting_bytes,
-            });
-        }
+        range.lock().unwrap().split = Some(crate::sched::RangeSplit {
+            block: starting_bytes,
+            minimum: 2 * starting_bytes,
+        });
         let src = Arc::new(Mutex::new(PipelineState {
             auto_ranges: true,
             ..Default::default()
@@ -5282,81 +5247,44 @@ fn adaptive_ordinary_ranges_drain_on_abort_and_retirement() {
 }
 
 #[test]
-fn ordinary_range_latency_rechecks_preserve_ownership_on_stop() {
-    use std::time::{Duration, Instant};
-    for stop in ["none", "abort", "retire"] {
-        let block = 4 << 20;
-        let size = 16 << 20;
-        let sched = Arc::new(Sched::new(block, 32 << 20));
-        let idx = sched.push_file(pipeline_job(b"file", size));
-        sched.scan_done();
-        assert!(matches!(sched.next(), Item::File(_)));
-        let range = sched.ranges_ready(idx, vec![(0, size)]).unwrap();
-        let src = Arc::new(Mutex::new(PipelineState {
-            auto_ranges: true,
-            ..Default::default()
-        }));
-        let dst = Arc::new(Mutex::new(PipelineState {
-            auto_ranges: true,
-            ..Default::default()
-        }));
-        let mut worker = pipeline_worker(&sched, &src, &dst, false);
-        let opts = Arc::get_mut(&mut worker.opts).unwrap();
-        opts.block = block;
-        opts.tuning = Default::default();
-        let mut budget = WorkBudget::ranges(block, Duration::from_millis(600), None);
-        budget.refreshed_latency(
-            Duration::from_millis(150),
-            Instant::now() - Duration::from_secs(60),
-        );
-        worker.range_budget = Some(budget);
-        if stop == "abort" {
-            src.lock().unwrap().abort_on_receive = Some(sched.clone());
-        } else if stop == "retire" {
-            src.lock()
-                .unwrap()
-                .gate_changes
-                .push((1, worker.gate.clone(), 0));
-        }
-        let mut credited = 0;
-        worker.transfer_range(&range, &mut credited).unwrap();
-        let source = src.lock().unwrap();
-        let destination = dst.lock().unwrap();
-        assert!(matches!(
-            source.requests.first(),
-            Some(Request::ConfigureHashing(_))
-        ));
-        assert_eq!(source.requests.len(), source.received);
-        assert_eq!(destination.requests.len(), destination.received);
-        if stop == "none" {
-            assert_eq!(credited, size);
-            assert!(matches!(
-                destination.requests.first(),
-                Some(Request::ConfigureHashing(_))
-            ));
-            assert!(sched.range_done(&range));
-        } else {
-            assert_eq!(credited, 0);
-            assert_eq!(
-                source.requests.len(),
-                1,
-                "no reads after stop during recheck"
-            );
-            assert!(
-                destination.requests.is_empty(),
-                "no second configuration after stop"
-            );
-            assert!(!sched.range_done(&range));
-            if stop == "retire" {
-                let Item::Range(tail) = sched.next() else {
-                    panic!("unread range returned")
-                };
-                assert_eq!(tail.lock().unwrap().pos, 0);
-                assert!(sched.range_done(&tail));
-            }
-        }
-        assert!(matches!(sched.next(), Item::Exit));
-    }
+fn cold_ordinary_range_starts_with_small_reads_and_grows_after_replies() {
+    let starting_bytes = 1 << 20;
+    let block = 4 << 20;
+    let size = 8 << 20;
+    let sched = Arc::new(Sched::new(block, 32 << 20));
+    let idx = sched.push_file(pipeline_job(b"file", size));
+    sched.scan_done();
+    assert!(matches!(sched.next(), Item::File(_)));
+    let range = sched.ranges_ready(idx, vec![(0, size)]).unwrap();
+    let src = Arc::new(Mutex::new(PipelineState {
+        auto_ranges: true,
+        ..Default::default()
+    }));
+    let dst = Arc::new(Mutex::new(PipelineState {
+        auto_ranges: true,
+        early_range_acks: true,
+        ..Default::default()
+    }));
+    let mut worker = pipeline_worker(&sched, &src, &dst, false);
+    let opts = Arc::get_mut(&mut worker.opts).unwrap();
+    opts.block = block;
+    opts.tuning = Default::default();
+    let mut credited = 0;
+    worker.transfer_range(&range, &mut credited).unwrap();
+    let source = src.lock().unwrap();
+    assert_eq!(source.sent_at_receive[0], 4);
+    assert!(source.requests[..4]
+        .iter()
+        .enumerate()
+        .all(|(i, r)| matches!(r, Request::ReadRange { off, len, .. }
+        if *off == i as u64 * starting_bytes && u64::from(*len) == starting_bytes)));
+    assert!(source.requests[4..]
+        .iter()
+        .any(|r| matches!(r, Request::ReadRange { len, .. } if u64::from(*len) > starting_bytes)));
+    assert!(source.replies.is_empty());
+    assert!(dst.lock().unwrap().replies.is_empty());
+    assert_eq!(credited, size);
+    assert!(sched.range_done(&range));
 }
 
 #[test]
@@ -5382,6 +5310,11 @@ fn arrived_range_writes_update_progress_before_the_next_source_reply() {
     let opts = Arc::get_mut(&mut worker.opts).unwrap();
     opts.block = block;
     opts.tuning = Default::default();
+    worker.range_budget = Some(WorkBudget::ranges(
+        block,
+        std::time::Duration::from_millis(250),
+        Some(1 << 20),
+    ));
     src.lock().unwrap().progress = Some(worker.progress.clone());
     let mut credited = 0;
     worker.transfer_range(&range, &mut credited).unwrap();

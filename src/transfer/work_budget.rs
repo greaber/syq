@@ -2,6 +2,10 @@
 //! progress or tuning evidence; requests already issued cannot be recalled.
 use std::time::{Duration, Instant};
 
+// Keep an application request large enough to amortize its framing and I/O.
+const MIN_RANGE_BYTES: u64 = 64 << 10;
+const START_RANGE_BYTES: u64 = 1 << 20;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct WorkSize {
     pub bytes: u64,
@@ -16,13 +20,10 @@ impl WorkSize {
 
 pub(super) struct WorkBudget {
     limit: WorkSize,
+    min_bytes: u64,
     max_bytes: u64,
     target: Duration,
-    recheck_latency: bool,
-    ever_slow: bool,
-    next_latency_check: Instant,
-    earliest_latency_check: Instant,
-    limit_at_check: WorkSize,
+    late_floor_samples: Option<(usize, Duration)>,
 }
 impl Default for WorkBudget {
     fn default() -> Self {
@@ -31,39 +32,28 @@ impl Default for WorkBudget {
                 bytes: 64 << 10,
                 files: 64,
             },
+            min_bytes: 1,
             max_bytes: 1 << 20,
             target: Duration::from_millis(250),
-            recheck_latency: false,
-            ever_slow: false,
-            next_latency_check: Instant::now() + Duration::from_secs(30),
-            earliest_latency_check: Instant::now() + Duration::from_secs(2),
-            limit_at_check: WorkSize {
-                bytes: 64 << 10,
-                files: 64,
-            },
+            late_floor_samples: None,
         }
     }
 }
 impl WorkBudget {
     pub fn ranges(max_bytes: u64, target: Duration, starting_bytes: Option<u64>) -> Self {
-        let limit = WorkSize {
-            bytes: starting_bytes.unwrap_or(1 << 20).max(512).min(max_bytes),
-            files: 0,
-        };
+        let min_bytes = MIN_RANGE_BYTES.min(max_bytes);
         Self {
-            limit,
+            limit: WorkSize {
+                bytes: starting_bytes
+                    .unwrap_or(START_RANGE_BYTES)
+                    .clamp(min_bytes, max_bytes),
+                files: 0,
+            },
+            min_bytes,
             max_bytes,
             target,
-            limit_at_check: limit,
-            ..Self::default()
+            late_floor_samples: None,
         }
-    }
-
-    pub fn range_latency_check_due(&self, now: Instant) -> bool {
-        // A healthy range already at its ceiling has nothing to gain from a
-        // periodic pause. Once any reply is slow, keep the existing checks,
-        // including those that lower a congestion-inflated allowance later.
-        (self.ever_slow || self.request_bytes() < self.max_bytes) && self.latency_check_due(now)
     }
 
     pub fn request_bytes(&self) -> u64 {
@@ -72,55 +62,28 @@ impl WorkBudget {
         // configured request/receiver ceiling.
         self.limit
             .bytes
-            .max(512)
-            .next_power_of_two()
+            .checked_next_power_of_two()
+            .unwrap_or(self.max_bytes)
             .min(self.max_bytes)
+    }
+
+    pub fn below_range_start(&self) -> bool {
+        self.limit.bytes < START_RANGE_BYTES.min(self.max_bytes)
     }
 
     /// Configuration RPCs supply a latency allowance on SSH too. Include both
     /// endpoints, but not connection startup, authentication or helper setup.
     pub fn set_latency(&mut self, round_trip: Duration) {
         // Replies can include service for the preceding groups in the
-        // pipeline. Allow a full window of round trips before draining or
-        // shrinking; a single-RPC allowance stalls fast delayed connections.
+        // pipeline. Allow a full window of round trips before restricting
+        // admission; a single-RPC allowance stalls fast delayed connections.
         self.target = Duration::from_millis(250)
             .max(round_trip.saturating_mul(crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH as u32));
+        self.late_floor_samples = None;
     }
 
     pub fn latency_target(&self) -> Duration {
         self.target
-    }
-
-    pub fn latency_check_due(&self, now: Instant) -> bool {
-        let shrunk = self.limit.bytes.saturating_mul(2) < self.limit_at_check.bytes
-            || self.limit.files.saturating_mul(2) < self.limit_at_check.files;
-        (now >= self.next_latency_check
-            && (self.recheck_latency || self.target > Duration::from_millis(250)))
-            || (now >= self.earliest_latency_check && self.recheck_latency && shrunk)
-    }
-
-    pub fn refreshed_latency(&mut self, round_trip: Duration, now: Instant) {
-        let previous = self.target;
-        let periodic = now >= self.next_latency_check;
-        self.set_latency(round_trip);
-        if !periodic {
-            // An urgent check responds to a slowdown. A transiently empty
-            // queue during its drain is not evidence for a lower allowance;
-            // periodic checks can lower it again when conditions improve.
-            self.target = self.target.max(previous);
-        }
-        self.recheck_latency = false;
-        self.limit_at_check = self.limit;
-        self.earliest_latency_check = now
-            + Duration::from_secs(2)
-                .max(round_trip.saturating_mul(8))
-                .min(Duration::from_secs(300));
-        // Draining for a check costs a round trip. Keep checks infrequent even
-        // when a slow data path remains above the target after a cheap RPC.
-        let interval = Duration::from_secs(30)
-            .max(round_trip.saturating_mul(32))
-            .min(Duration::from_secs(300));
-        self.next_latency_check = now + interval;
     }
 
     pub fn limit(&self) -> WorkSize {
@@ -139,8 +102,25 @@ impl WorkBudget {
     /// requests. Reduce immediately when service slows; grow at most fourfold
     /// per observation so a briefly cached operation cannot reserve a huge tail.
     pub fn observe(&mut self, work: WorkSize, elapsed: Duration) {
-        self.recheck_latency |= elapsed > self.target;
-        self.ever_slow |= self.recheck_latency;
+        // If an entire window of minimum-size requests is still late, use
+        // the shortest of those completions as a baseline. Allow some room
+        // for payload time so the range can grow again at the new latency.
+        if self.min_bytes == MIN_RANGE_BYTES
+            && self.min_bytes < self.max_bytes
+            && self.limit.bytes == self.min_bytes
+            && work.bytes == self.min_bytes
+            && elapsed > self.target
+        {
+            let (count, shortest) = self.late_floor_samples.get_or_insert((0, elapsed));
+            *count += 1;
+            *shortest = (*shortest).min(elapsed);
+            if *count == crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH {
+                self.target = shortest.saturating_mul(2);
+                self.late_floor_samples = None;
+            }
+        } else {
+            self.late_floor_samples = None;
+        }
         let elapsed = elapsed.max(Duration::from_micros(1)).as_nanos();
         let target = self.target.as_nanos();
         fn resized(current: u64, amount: u64, elapsed: u128, target: u128) -> u64 {
@@ -167,8 +147,16 @@ impl WorkBudget {
                 estimate.min(current)
             }
         }
-        self.limit.bytes =
-            resized(self.limit.bytes, work.bytes, elapsed, target).min(self.max_bytes);
+        let mut bytes = resized(self.limit.bytes, work.bytes, elapsed, target);
+        if self.min_bytes == MIN_RANGE_BYTES && elapsed > target && bytes == self.limit.bytes {
+            let request = self.request_bytes();
+            if work.bytes == request && request > self.min_bytes {
+                // If rounding keeps issuing the same full request after a
+                // proportional reduction, take the next smaller request.
+                bytes = bytes.min(1 << (request - 1).ilog2());
+            }
+        }
+        self.limit.bytes = bytes.clamp(self.min_bytes, self.max_bytes);
         self.limit.files =
             resized(self.limit.files as u64, work.files as u64, elapsed, target).min(2048) as usize;
     }
@@ -182,7 +170,7 @@ mod tests {
     fn range_requests_shrink_and_recover_within_the_payload_ceiling() {
         for max in [512, 4096, 3 << 20, 4 << 20] {
             let mut budget = WorkBudget::ranges(max, Duration::from_millis(250), None);
-            assert_eq!(budget.request_bytes(), max.min(1 << 20));
+            assert_eq!(budget.request_bytes(), max.min(START_RANGE_BYTES));
             for _ in 0..4 {
                 budget.observe(
                     WorkSize {
@@ -193,8 +181,8 @@ mod tests {
                 );
             }
             let reduced = budget.request_bytes();
-            assert!(reduced >= 512 && reduced <= max);
-            if max > 512 {
+            assert_eq!(reduced, max.min(MIN_RANGE_BYTES));
+            if max > MIN_RANGE_BYTES {
                 assert!(reduced < max);
             }
             for _ in 0..16 {
@@ -212,10 +200,58 @@ mod tests {
     }
 
     #[test]
+    fn range_requests_recover_when_latency_rises_after_startup() {
+        let observe_request = |budget: &mut WorkBudget, elapsed| {
+            budget.observe(
+                WorkSize {
+                    bytes: budget.request_bytes(),
+                    files: 0,
+                },
+                elapsed,
+            );
+        };
+        let ceiling = 4 << 20;
+        let mut budget = WorkBudget::ranges(ceiling, Duration::from_millis(250), None);
+        budget.set_latency(Duration::from_millis(20));
+        observe_request(&mut budget, Duration::from_millis(25));
+        assert_eq!(budget.request_bytes(), ceiling);
+
+        // A single proportional reduction rounds back up at each size.
+        let late = Duration::from_millis(375);
+        while budget.request_bytes() > MIN_RANGE_BYTES {
+            let request = budget.request_bytes();
+            observe_request(&mut budget, late);
+            assert_eq!(budget.request_bytes(), request);
+            observe_request(&mut budget, late);
+            assert_eq!(budget.request_bytes(), request / 2);
+        }
+        assert_eq!(budget.request_bytes(), MIN_RANGE_BYTES);
+        let initial_target = budget.latency_target();
+        observe_request(&mut budget, Duration::from_secs(10));
+        observe_request(&mut budget, initial_target);
+        assert_eq!(budget.latency_target(), initial_target);
+        assert_eq!(budget.request_bytes(), MIN_RANGE_BYTES);
+        observe_request(&mut budget, Duration::from_secs(10));
+        for _ in 2..crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH {
+            observe_request(&mut budget, late);
+        }
+        assert_eq!(budget.latency_target(), initial_target);
+        observe_request(&mut budget, late);
+        assert_eq!(budget.latency_target(), 2 * late);
+        assert!(budget.request_bytes() > MIN_RANGE_BYTES);
+        for _ in 0..8 {
+            let before = budget.request_bytes();
+            observe_request(&mut budget, late);
+            assert!(budget.request_bytes() >= before);
+        }
+        assert_eq!(budget.request_bytes(), ceiling);
+    }
+
+    #[test]
     fn inherited_range_sizes_are_bounded_and_can_grow_on_a_faster_peer() {
         for (ceiling, hint, expected) in [
-            (4 << 20, 0, 512),
-            (4 << 20, 32 << 10, 32 << 10),
+            (4 << 20, 0, MIN_RANGE_BYTES),
+            (4 << 20, 32 << 10, MIN_RANGE_BYTES),
             (512, 64 << 10, 512),
             (3 << 20, u64::MAX, 3 << 20),
         ] {
@@ -226,46 +262,6 @@ mod tests {
             }
             assert_eq!(budget.request_bytes(), ceiling);
         }
-    }
-
-    #[test]
-    fn healthy_ranges_skip_periodic_checks_at_the_ceiling_only() {
-        let mut budget = WorkBudget::ranges(4 << 20, Duration::from_millis(600), None);
-        let later = Instant::now() + Duration::from_secs(31);
-        assert!(
-            budget.range_latency_check_due(later),
-            "still below the ceiling"
-        );
-        budget.observe(budget.limit(), Duration::from_millis(100));
-        assert_eq!(budget.request_bytes(), 4 << 20);
-        assert!(!budget.range_latency_check_due(later));
-        assert!(!budget.range_latency_check_due(later + Duration::from_secs(600)));
-        assert!(
-            budget.latency_check_due(later),
-            "batch checks keep their existing policy"
-        );
-    }
-
-    #[test]
-    fn a_slow_range_keeps_checks_after_reaching_the_ceiling_again() {
-        let mut budget = WorkBudget::ranges(4 << 20, Duration::from_millis(600), None);
-        let later = Instant::now() + Duration::from_secs(31);
-        budget.observe(budget.limit(), Duration::from_secs(2));
-        assert!(budget.range_latency_check_due(later));
-        budget.refreshed_latency(Duration::from_millis(400), later);
-        assert_eq!(budget.latency_target(), Duration::from_millis(1600));
-        for _ in 0..8 {
-            budget.observe(budget.limit(), Duration::from_millis(100));
-        }
-        assert_eq!(budget.request_bytes(), 4 << 20);
-        assert!(!budget.range_latency_check_due(later + Duration::from_secs(29)));
-        assert!(budget.range_latency_check_due(later + Duration::from_secs(30)));
-        budget.refreshed_latency(Duration::from_millis(150), later + Duration::from_secs(30));
-        assert_eq!(budget.latency_target(), Duration::from_millis(600));
-        assert!(
-            budget.range_latency_check_due(later + Duration::from_secs(60)),
-            "a completed check must not forget the earlier slowdown"
-        );
     }
 
     #[test]
@@ -443,61 +439,5 @@ mod tests {
                 files: 256
             }
         );
-    }
-
-    #[test]
-    fn initial_periodic_check_waits_but_budget_collapse_can_check_early() {
-        let mut budget = WorkBudget::default();
-        let now = Instant::now();
-        budget.set_latency(Duration::from_millis(150));
-        budget.observe(budget.limit(), Duration::from_millis(100));
-        assert!(!budget.latency_check_due(now + Duration::from_secs(3)));
-        assert!(!budget.latency_check_due(now + Duration::from_secs(29)));
-        assert!(budget.latency_check_due(now + Duration::from_secs(31)));
-
-        let mut collapsed = WorkBudget::default();
-        collapsed.observe(collapsed.limit(), Duration::from_secs(2));
-        assert!(!collapsed.latency_check_due(now + Duration::from_secs(1)));
-        assert!(collapsed.latency_check_due(now + Duration::from_secs(3)));
-    }
-
-    #[test]
-    fn latency_checks_are_bounded_and_allow_recovery_when_queueing_disappears() {
-        let mut budget = WorkBudget::default();
-        let now = Instant::now() + Duration::from_secs(31);
-        assert!(!budget.latency_check_due(now));
-        budget.observe(budget.limit(), Duration::from_millis(400));
-        assert!(budget.latency_check_due(now));
-        budget.refreshed_latency(Duration::from_millis(300), now);
-        assert_eq!(budget.latency_target(), Duration::from_millis(1200));
-        budget.observe(budget.limit(), Duration::from_millis(1300));
-        assert!(!budget.latency_check_due(now + Duration::from_secs(29)));
-        assert!(budget.latency_check_due(now + Duration::from_secs(30)));
-        budget.refreshed_latency(Duration::from_millis(10), now + Duration::from_secs(30));
-        assert_eq!(budget.latency_target(), Duration::from_millis(250));
-        assert!(!budget.latency_check_due(now + Duration::from_secs(61)));
-        budget.observe(budget.limit(), Duration::from_secs(4));
-        assert!(!budget.latency_check_due(now + Duration::from_secs(31)));
-        assert!(
-            budget.latency_check_due(now + Duration::from_secs(33)),
-            "a new severe drop need not wait thirty seconds"
-        );
-        budget.refreshed_latency(Duration::from_secs(4), now + Duration::from_secs(33));
-        assert_eq!(budget.latency_target(), Duration::from_secs(16));
-        budget.observe(budget.limit(), Duration::from_secs(64));
-        assert!(budget.latency_check_due(now + Duration::from_secs(66)));
-        budget.refreshed_latency(Duration::from_millis(10), now + Duration::from_secs(66));
-        assert_eq!(
-            budget.latency_target(),
-            Duration::from_secs(16),
-            "an urgent check must not mistake a transiently empty queue for recovery"
-        );
-        assert!(!budget.latency_check_due(now + Duration::from_secs(95)));
-        assert!(budget.latency_check_due(now + Duration::from_secs(96)));
-        budget.refreshed_latency(Duration::from_millis(10), now + Duration::from_secs(96));
-        assert_eq!(budget.latency_target(), Duration::from_millis(250));
-        budget.refreshed_latency(Duration::MAX, now + Duration::from_secs(97));
-        assert!(!budget.latency_check_due(now + Duration::from_secs(396)));
-        assert!(budget.latency_check_due(now + Duration::from_secs(397)));
     }
 }

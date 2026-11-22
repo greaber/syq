@@ -13,16 +13,21 @@ pub(super) struct RangeFlight {
     pub(super) start: u64,
     pub(super) pending: usize,
     pub(super) credited: u64,
+    split_block: Option<u64>,
 }
 
 impl RangeFlight {
     pub(super) fn new(handle: RangeHandle) -> Self {
-        let start = handle.lock().unwrap().pos;
+        let (start, split_block) = {
+            let range = handle.lock().unwrap();
+            (range.pos, range.split.map(|split| split.block))
+        };
         Self {
             handle,
             start,
             pending: 0,
             credited: 0,
+            split_block,
         }
     }
 }
@@ -877,7 +882,7 @@ impl Worker {
     ) -> Result<()> {
         // Small files are read whole, never into a kept range buffer.
         self.src.release_read_buffer();
-        let mut early = self.dst.track_small_batches(self.progress.clone())?;
+        let early = self.dst.track_small_batches(self.progress.clone())?;
         let window = crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH;
         let mut read_window = if self.src.supports_request_pipelining() {
             window
@@ -906,8 +911,6 @@ impl Worker {
             std::collections::VecDeque::<(std::ops::Range<usize>, usize, std::time::Instant)>::new(
             );
         let mut writes = std::collections::VecDeque::<(Vec<usize>, std::time::Instant)>::new();
-        let mut refresh_latency = false;
-        let mut issued_end = 0;
         let result = (|| -> Result<()> {
             'issuing: loop {
                 // A retired worker finishes its issued groups, but leaves the
@@ -928,14 +931,6 @@ impl Worker {
                             )? {
                                 break 'issuing;
                             }
-                        }
-                        // First drain successful work. Repeating the unchanged
-                        // hashing configuration then measures a round trip with
-                        // no file work or earlier requests ahead of it.
-                        refresh_latency |=
-                            self.batch_budget.latency_check_due(started) && issued_end < jobs.len();
-                        if refresh_latency {
-                            break;
                         }
                         let oldest = reads
                             .front()
@@ -960,7 +955,6 @@ impl Worker {
                     let Some(group) = next_group(limit) else {
                         break;
                     };
-                    issued_end = group.end;
                     let mut requests = Vec::new();
                     for job in &jobs[group.clone()] {
                         self.limit(job.entry.size);
@@ -992,30 +986,6 @@ impl Worker {
                         if !self.receive_small_batch(write, jobs, results, early.as_ref())? {
                             break;
                         }
-                        continue;
-                    }
-                    if refresh_latency && self.gate.allowed(self.id) && !self.sched.is_aborted() {
-                        // Batch receipt tracking accepts only data writes. All
-                        // their replies have been consumed before this RPC.
-                        drop(early.take());
-                        let began = std::time::Instant::now();
-                        configure_hashing(&mut *self.src, self.opts.hash_policy)?;
-                        if !self.gate.allowed(self.id) || self.sched.is_aborted() {
-                            break;
-                        }
-                        configure_hashing(&mut *self.dst, self.opts.hash_policy)?;
-                        if debug() {
-                            crate::output::diagnostic!("syq: worker {}: batch latency recheck {:.3}s after {:.3}s; previous target {:.3}s, budget {:?}", self.id, began.elapsed().as_secs_f64(), self.progress.start.elapsed().as_secs_f64(), self.batch_budget.latency_target().as_secs_f64(), self.batch_budget.limit());
-                        }
-                        self.batch_budget
-                            .refreshed_latency(began.elapsed(), std::time::Instant::now());
-                        early = self.dst.track_small_batches(self.progress.clone())?;
-                        read_window = if self.src.supports_request_pipelining() {
-                            window
-                        } else {
-                            1
-                        };
-                        refresh_latency = false;
                         continue;
                     }
                     break;
@@ -2694,10 +2664,12 @@ impl Worker {
     }
 
     fn update_range_split(&self, handle: &RangeHandle, request: u64, ceiling: u64) {
+        // A stolen suffix starts on a transfer block boundary and is large
+        // enough to amortize its own request and scheduling overhead.
         self.sched.update_range_split(
             handle,
             crate::sched::RangeSplit {
-                block: 512,
+                block: request,
                 minimum: if request == ceiling {
                     self.sched.min_split
                 } else {
@@ -2734,11 +2706,10 @@ impl Worker {
             // keeps its own measurements, which may describe a faster link.
             let starting_bytes = inherited_split
                 .filter(|_| adaptive)
-                .map(|split| split.minimum / 2);
+                .map(|split| split.block);
             WorkBudget::ranges(block, self.batch_budget.latency_target(), starting_bytes)
         });
-        let mut slow = inherited_split.is_some();
-        let mut refresh_latency = false;
+        let mut slow = budget.below_range_start();
         let mut released = false;
         let result = (|| -> Result<()> {
             loop {
@@ -2762,27 +2733,9 @@ impl Worker {
                     }
                 }
                 released |= self.hands_back_ranges();
-                if adaptive && !released {
-                    if let Some(slot) = current {
-                        refresh_latency |=
-                            budget.range_latency_check_due(std::time::Instant::now());
-                        if refresh_latency && slow {
-                            // Keep peers informed as replies reveal slower
-                            // service during the drain, before the next read.
-                            self.update_range_split(
-                                &flights[slot].as_ref().expect("readable range").handle,
-                                budget.request_bytes(),
-                                block,
-                            );
-                        }
-                    }
-                }
                 // Check cancellation and optionally claim work with one scheduler
                 // lock, including while the last read replies are draining.
-                let claim = (!released
-                    && !refresh_latency
-                    && current.is_none()
-                    && pending_reads.len() < read_window)
+                let claim = (!released && current.is_none() && pending_reads.len() < read_window)
                     .then_some(max_range);
                 let mut next = match self.sched.range_work(idx, claim) {
                     RangeWork::Cancelled => break,
@@ -2796,7 +2749,7 @@ impl Worker {
                         self.sched.release_rest(&flight.handle);
                     }
                 }
-                while !released && !refresh_latency && pending_reads.len() < read_window {
+                while !released && pending_reads.len() < read_window {
                     if current.is_none() {
                         // Claim only when there is room to issue a read now.
                         // Larger ranges retain their streaming selection, and
@@ -2823,8 +2776,12 @@ impl Worker {
                     } else {
                         block
                     };
-                    if adaptive && slow {
+                    if adaptive
+                        && ((slow && request < block) || flight.split_block.is_some())
+                        && flight.split_block != Some(request)
+                    {
                         self.update_range_split(&flight.handle, request, block);
+                        flight.split_block = Some(request);
                     }
                     let (off, n) = {
                         let mut range = flight.handle.lock().unwrap();
@@ -2864,20 +2821,6 @@ impl Worker {
                             adaptive,
                             None,
                         )?;
-                        continue;
-                    }
-                    if refresh_latency && !released && !self.sched.is_aborted() {
-                        let began = std::time::Instant::now();
-                        configure_hashing(&mut *self.src, self.opts.hash_policy)?;
-                        if !self.gate.allowed(self.id)
-                            || self.sched.is_aborted()
-                            || self.sched.is_failed(idx)
-                        {
-                            continue;
-                        }
-                        configure_hashing(&mut *self.dst, self.opts.hash_policy)?;
-                        budget.refreshed_latency(began.elapsed(), std::time::Instant::now());
-                        refresh_latency = false;
                         continue;
                     }
                     break;
