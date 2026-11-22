@@ -20,6 +20,32 @@ pub(super) fn serve_upload(
         .map_or(0, |s| s.parse::<usize>().unwrap());
     if method == "PUT" && fault.starts_with("recovery-upload-source-") {
         let path = CHANGING_SOURCE.lock().unwrap().clone().unwrap();
+        if matches!(
+            fault,
+            "recovery-upload-source-replaced" | "recovery-upload-source-removed"
+        ) {
+            // Take the whole part, then replace or remove the selected
+            // file; the copy must not complete the upload.
+            let mut body = vec![0; length];
+            if socket.read_exact(&mut body).is_err() {
+                return;
+            }
+            if fault == "recovery-upload-source-replaced" {
+                let next = path.with_extension("next");
+                std::fs::write(&next, vec![b'x'; SIZE]).unwrap();
+                std::fs::rename(&next, &path).unwrap();
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+            reply(
+                socket,
+                200,
+                &[("ETag".into(), "\"part\"".into())],
+                b"",
+                false,
+            );
+            return;
+        }
         let file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
         if fault == "recovery-upload-source-shrinks" {
             // Shrink the file while the part is still being sent; the body
@@ -305,6 +331,39 @@ fn a_source_that_changes_during_a_part_fails_without_retries() {
         );
         assert!(elapsed < Duration::from_secs(10), "{fault}: {elapsed:?}");
         assert!(!server.gate.0.load(Ordering::Relaxed), "{fault}");
+    }
+}
+
+/// The parts of a multipart upload read one opened file. A source replaced
+/// or removed at its path after a part was sent, even with identical
+/// contents, still stops the copy before it completes the upload.
+#[test]
+fn a_source_replaced_or_removed_during_a_multipart_upload_is_not_published() {
+    for fault in [
+        "recovery-upload-source-replaced",
+        "recovery-upload-source-removed",
+    ] {
+        let temp = crate::test_support::tempdir().unwrap();
+        let server = Server::start(fault);
+        let file = temp.path().join("source");
+        std::fs::write(&file, vec![b'x'; SIZE]).unwrap();
+        *CHANGING_SOURCE.lock().unwrap() = Some(file.clone());
+        let output = server
+            .command_with_retries(temp.path(), 8)
+            .args(["--s3-endpoint", &server.address])
+            .arg(&file)
+            .args(["--to", "s3://bucket", "--as", "object"])
+            .capture_output()
+            .unwrap();
+        let text = output_text(&output);
+        assert!(!output.status.success(), "{fault}: {text}");
+        if fault == "recovery-upload-source-replaced" {
+            assert!(
+                text.contains("source changed during S3 copy"),
+                "{fault}: {text}"
+            );
+        }
+        assert!(!server.gate.0.load(Ordering::Relaxed), "{fault}: completed");
     }
 }
 

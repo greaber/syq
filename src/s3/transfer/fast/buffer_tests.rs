@@ -500,20 +500,3 @@ async fn whole_object_batches_start_conservatively_and_can_tune_higher() {
     assert_eq!(concurrency.initial, 8);
     assert!(concurrency.maximum.is_none());
 }
-
-#[tokio::test]
-async fn upload_memory_reservation_follows_the_last_sdk_body_clone() {
-    let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
-    let reservation = budget.clone().acquire_many_owned(8).await.unwrap();
-    let body = aws_smithy_types::body::SdkBody::from(bytes::Bytes::from_owner(UploadBuffer {
-        bytes: vec![42; 8],
-        _reservation: reservation,
-        _trace: None,
-    }));
-    let retry = body.try_clone().unwrap();
-    drop(body);
-    assert_eq!(retry.bytes(), Some(&[42; 8][..]));
-    assert!(budget.try_acquire().is_err());
-    drop(retry);
-    assert_eq!(budget.available_permits(), 8);
-}

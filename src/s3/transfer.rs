@@ -34,7 +34,6 @@ use std::sync::OnceLock;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::File,
-    io::Read,
     os::unix::fs::{FileExt, MetadataExt},
     sync::{atomic::Ordering::Relaxed, Arc},
     time::Duration,
@@ -209,12 +208,24 @@ struct PreparedUpload {
     part_size: u64,
     algorithm: Algorithm,
     checksums: Vec<String>,
-    small: Option<bytes::Bytes>,
+    payload: Payload,
     metadata: Metadata,
     must_be_new: bool,
     multipart: Option<PreparedMultipart>,
     metadata_update: Option<super::metadata_copy::Prepared>,
 }
+/// What an upload sends.
+enum Payload {
+    /// The contents, read once while hashing them.
+    Held(super::file_body::Held),
+    /// The file, read again to send it: through the descriptor that hashed
+    /// it, when preparation kept that open.
+    File(Option<Arc<super::file_body::Opened>>),
+}
+/// The largest single-request file kept in memory from hashing it to sending
+/// it: a 32nd of the 256 MiB upload buffer budget, so at least 32 uploads can
+/// hold their contents at once.
+const HELD_UPLOAD_LIMIT: u64 = 8 << 20;
 struct PreparedMultipart {
     recorded: bool,
     upload: UploadState,
@@ -1227,7 +1238,7 @@ impl Engine {
                 self.authorization.is_some(),
             ),
             checksums: Vec::new(),
-            small: None,
+            payload: Payload::File(None),
             metadata,
             must_be_new: false,
             multipart: None,
@@ -1354,59 +1365,52 @@ impl Engine {
             algorithm
         };
         let whole_algorithm = requested_algorithm.unwrap_or(HashAlgorithm::Blake3);
-        let buffer_limit = if self.tuning.tigris() {
-            8 << 20
-        } else {
-            1 << 20
-        };
-        let reservation = if self.authorization.is_none()
+        // Keep a single-request file's bytes from the hashing read to send
+        // them, when the shared budget has room for them now. Otherwise the
+        // file is read again to send it, rather than wait: the budget bounds
+        // memory, not how many uploads run. Storage-authorized uploads prepare
+        // every file before sending any, so they keep nothing.
+        let reservation = (self.authorization.is_none()
             && source.kind() == ObjectKind::File
             && size <= part_size
-            && size <= buffer_limit
-        {
-            Some(
+            && size <= HELD_UPLOAD_LIMIT)
+            .then(|| {
                 self.tuning
                     .upload_buffers
                     .clone()
-                    .acquire_many_owned(size.max(1) as u32)
-                    .await?,
-            )
-        } else {
-            None
-        };
+                    .try_acquire_many_owned(super::file_body::held_size(size))
+                    .ok()
+            })
+            .flatten();
+        let keep_open = self.authorization.is_none();
         self.check_cancelled()?;
         let source_clone = source.clone();
-        let (hashes, small) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let (hashes, payload) = tokio::task::spawn_blocking(move || -> Result<_> {
             if source_clone.kind() != ObjectKind::File {
-                let bytes = source_clone.bytes()?;
+                let held = super::file_body::Held::from_vec(source_clone.bytes()?);
                 return Ok((
                     upload_hashes::bytes(
-                        &bytes,
+                        held.chunks(),
                         part_checksums,
                         whole_algorithm,
                         comparison_algorithm,
                     ),
-                    Some(bytes::Bytes::from(bytes)),
+                    Payload::Held(held),
                 ));
             }
+            let file = source_clone.open()?;
             if let Some(reservation) = reservation {
-                let mut file = source_clone.open()?;
-                let buffer_trace = super::diagnostics::upload_buffer(size);
-                let mut bytes = vec![0; size as usize];
-                file.read_exact(&mut bytes)?;
+                let trace = super::diagnostics::upload_buffer(size);
+                let held = super::file_body::Held::read(&file, size, (reservation, trace))?;
                 source_clone.check(&file)?;
                 return Ok((
                     upload_hashes::bytes(
-                        &bytes,
+                        held.chunks(),
                         part_checksums,
                         whole_algorithm,
                         comparison_algorithm,
                     ),
-                    Some(bytes::Bytes::from_owner(fast::UploadBuffer {
-                        bytes,
-                        _reservation: reservation,
-                        _trace: buffer_trace,
-                    })),
+                    Payload::Held(held),
                 ));
             }
             let hashes = upload_hashes::ranges(
@@ -1416,30 +1420,24 @@ impl Engine {
                 whole_algorithm,
                 comparison_algorithm,
                 |end| {
-                    let file = source_clone.open()?;
-                    let source = &source_clone;
+                    let (file, source) = (&file, &source_clone);
                     Ok(move |buffer: &mut [u8], offset| {
                         file.read_exact_at(buffer, offset)?;
                         if offset + buffer.len() as u64 == end {
-                            source.check(&file)?;
+                            source.check(file)?;
                         }
                         Ok(())
                     })
                 },
             )?;
-            if hashes.concurrent {
-                // Parallel readers can finish at different times. Recheck the
-                // selected pathname after all parts complete, as before.
-                source_clone.check(&source_clone.open()?)?;
-            }
-            Ok((hashes, None))
+            let opened = keep_open.then(|| super::file_body::Opened::new(source_clone, file));
+            Ok((hashes, Payload::File(opened)))
         })
         .await??;
         let upload_hashes::Hashes {
             whole: whole_digest,
             comparison: comparison_digest,
             checksums,
-            concurrent: _,
         } = hashes;
         if let Some(expected) = expected_hash {
             if !whole_digest.eq_ignore_ascii_case(&expected.value) {
@@ -1495,7 +1493,7 @@ impl Engine {
         let must_be_new = self.args.ignore_existing
             || self.args.target_existence == Existence::New
             || (self.args.protects_existing_contents() && existing.is_none());
-        let multipart = if size > part_size && small.is_none() {
+        let multipart = if size > part_size && matches!(payload, Payload::File(_)) {
             Some(
                 self.prepare_multipart(&source, digest, part_size, &metadata, algorithm)
                     .await?,
@@ -1509,7 +1507,7 @@ impl Engine {
             part_size,
             algorithm,
             checksums,
-            small,
+            payload,
             metadata,
             must_be_new,
             multipart,
@@ -1563,54 +1561,55 @@ impl Engine {
             part_size,
             algorithm,
             checksums,
-            small,
+            payload,
             metadata,
             must_be_new,
             multipart,
             metadata_update: _,
         } = prepared;
         let _interval = self.progress.copying_interval();
-        if size <= part_size || small.is_some() {
+        // Only files are sent from the file rather than held.
+        let payload = match payload {
+            Payload::File(None) => Payload::File(Some(open_source(&source).await?)),
+            payload => payload,
+        };
+        if size <= part_size || matches!(payload, Payload::Held(_)) {
             let checksum = checksums.first().map(String::as_str);
             let _slot = self.tuning.requests.acquire().await;
             self.upload_request(&source.key, None, algorithm, checksum)
-                .send(
-                    content_md5(&source, small.as_ref(), 0, size),
-                    |content_md5| {
-                        let (source, small, metadata) = (&source, &small, &metadata);
-                        async move {
-                            self.check_cancelled()?;
-                            let body = if let Some(bytes) = &small {
-                                ByteStream::from(bytes.clone())
-                            } else {
-                                file_body(source, 0, size).await?
-                            };
-                            self.pace(size).await?;
-                            let result = self
-                                .client
-                                .put_object()
-                                .bucket(&self.options.bucket)
-                                .key(&source.key)
-                                .body(body)
-                                .content_length(size as i64)
-                                .set_checksum_sha256(algorithm.header(Algorithm::Sha256, checksum))
-                                .set_content_md5(content_md5)
-                                .set_metadata(Some(metadata.encode()))
-                                .set_if_none_match(must_be_new.then(|| "*".into()))
-                                .customize()
-                                .config_override(super::client::without_sdk_retries())
-                                .disable_payload_signing()
-                                .send()
-                                .await;
-                            Ok(result)
-                        }
-                    },
-                )
+                .send(content_md5(&payload, 0, size), |content_md5| {
+                    let (source, payload, metadata) = (&source, &payload, &metadata);
+                    async move {
+                        self.check_cancelled()?;
+                        let body = upload_body(payload, 0, size);
+                        self.pace(size).await?;
+                        let result = self
+                            .client
+                            .put_object()
+                            .bucket(&self.options.bucket)
+                            .key(&source.key)
+                            .body(body)
+                            .content_length(size as i64)
+                            .set_checksum_sha256(algorithm.header(Algorithm::Sha256, checksum))
+                            .set_content_md5(content_md5)
+                            .set_metadata(Some(metadata.encode()))
+                            .set_if_none_match(must_be_new.then(|| "*".into()))
+                            .customize()
+                            .config_override(super::client::without_sdk_retries())
+                            .disable_payload_signing()
+                            .send()
+                            .await;
+                        Ok(result)
+                    }
+                })
                 .await?
                 .map_err(|e| e.into_service_error())
                 .context("S3 PUT failed")?;
             self.tuning.requests.completed(size);
             self.progress.add_bytes(size);
+            if source.kind() == ObjectKind::File {
+                source.check(&source.open()?)?;
+            }
         } else {
             let PreparedMultipart {
                 recorded,
@@ -1650,6 +1649,7 @@ impl Engine {
                     .take_while(|_| std::future::ready(!failed.load(Relaxed)))
                     .map(|index| {
                         let source = &source;
+                        let payload = &payload;
                         let upload = &upload;
                         let uploaded = &uploaded;
                         let acknowledged = &acknowledged;
@@ -1691,10 +1691,10 @@ impl Engine {
                             let output = self
                                 .upload_request(&source.key, Some(number), algorithm, checksum)
                                 .send(
-                                    content_md5(source, None, offset, length),
+                                    content_md5(payload, offset, length),
                                     |content_md5| async move {
                                         self.check_cancelled()?;
-                                        let body = file_body(source, offset, length).await?;
+                                        let body = upload_body(payload, offset, length);
                                         self.pace(length).await?;
                                         let result = self
                                             .client
@@ -1767,6 +1767,8 @@ impl Engine {
                 }
                 let completed = results.into_iter().collect::<Result<Vec<_>>>()?;
                 self.check_cancelled()?;
+                // The parts' bodies checked the opened file after reading it;
+                // check the selected path too before publishing them.
                 source.check(&source.open()?)?;
                 let mut completed = completed;
                 completed.sort_by_key(|p| p.part_number());
@@ -1794,9 +1796,6 @@ impl Engine {
             }
             result?;
             state.clear()?;
-        }
-        if source.kind() == ObjectKind::File {
-            source.check(&source.open()?)?;
         }
         Ok(Some(size))
     }
@@ -3569,16 +3568,25 @@ pub(super) fn retryable<E: aws_sdk_s3::error::ProvideErrorMetadata>(
         .and_then(|e| e.code())
         .is_some_and(|code| THROTTLING_ERRORS.contains(&code) || TRANSIENT_ERRORS.contains(&code))
 }
-async fn file_body(source: &Source, offset: u64, length: u64) -> Result<ByteStream> {
+/// Open `source` for its upload, as the hashing read would have.
+async fn open_source(source: &Source) -> Result<Arc<super::file_body::Opened>> {
     let source = source.clone();
-    let (source, file) = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let file = source.open()?;
-        anyhow::Ok((source, file))
+        anyhow::Ok(super::file_body::Opened::new(source, file))
     })
-    .await??;
-    Ok(ByteStream::new(super::file_body::body(
-        source, file, offset, length,
-    )))
+    .await?
+}
+/// The body sending `length` bytes of the payload from `offset`.
+fn upload_body(payload: &Payload, offset: u64, length: u64) -> ByteStream {
+    ByteStream::new(match payload {
+        Payload::Held(held) => {
+            debug_assert_eq!((offset, length), (0, held.size()));
+            held.body()
+        }
+        Payload::File(Some(opened)) => super::file_body::body(opened, offset, length),
+        Payload::File(None) => unreachable!("an upload opens its file before sending it"),
+    })
 }
 fn upload_identity(
     algorithm: Algorithm,
@@ -3616,33 +3624,19 @@ fn upload_identity(
 }
 
 /// Content-MD5 for a destination that requires upload checksums. Only such
-/// destinations pay for this separate read.
-async fn content_md5(
-    source: &Source,
-    small: Option<&bytes::Bytes>,
-    offset: u64,
-    length: u64,
-) -> Result<String> {
-    if let Some(bytes) = small {
-        let range = &bytes[offset as usize..(offset + length) as usize];
-        return Ok(Algorithm::Md5.digest(range).unwrap());
-    }
-    let source = source.clone();
-    tokio::task::spawn_blocking(move || {
-        let file = source.open()?;
-        let mut hash = Algorithm::Md5.hasher().unwrap();
-        let mut buffer = super::file_body::scratch();
-        let mut done = 0;
-        while done < length {
-            let n = buffer.len().min((length - done) as usize);
-            file.read_exact_at(&mut buffer[..n], offset + done)?;
-            hash.update(&buffer[..n]);
-            done += n as u64;
+/// destinations pay for this separate read of a file not held in memory.
+async fn content_md5(payload: &Payload, offset: u64, length: u64) -> Result<String> {
+    let opened = match payload {
+        Payload::Held(held) => {
+            debug_assert_eq!((offset, length), (0, held.size()));
+            let mut hash = Algorithm::Md5.hasher().unwrap();
+            held.chunks().for_each(|chunk| hash.update(chunk));
+            return Ok(hash.finish());
         }
-        source.check(&file)?;
-        Ok(hash.finish())
-    })
-    .await?
+        Payload::File(Some(opened)) => opened.clone(),
+        Payload::File(None) => unreachable!("an upload opens its file before sending it"),
+    };
+    tokio::task::spawn_blocking(move || opened.md5(offset, length)).await?
 }
 
 fn hash_range(file: &File, offset: u64, length: u64, algorithm: HashAlgorithm) -> Result<String> {

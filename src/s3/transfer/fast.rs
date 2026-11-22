@@ -511,16 +511,6 @@ async fn read_body<F: std::future::Future>(
     }
 }
 
-pub(super) struct UploadBuffer {
-    pub(super) bytes: Vec<u8>,
-    pub(super) _reservation: tokio::sync::OwnedSemaphorePermit,
-    pub(super) _trace: Option<crate::s3::diagnostics::UploadBufferTrace>,
-}
-impl AsRef<[u8]> for UploadBuffer {
-    fn as_ref(&self) -> &[u8] {
-        &self.bytes
-    }
-}
 #[cfg(test)]
 mod buffer_tests;
 

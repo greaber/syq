@@ -94,6 +94,10 @@ pub(super) fn serve(
     reply(socket, 200, &[("ETag".into(), "\"x\"".into())], b"", false);
 }
 
+/// Larger than the single-request files syq keeps in memory between hashing
+/// and sending them, so the body reads the file.
+const STREAMED: usize = 9 << 20;
+
 fn patterned(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
 }
@@ -129,7 +133,7 @@ fn s3_file_body_retries_resend_the_file_from_the_start() {
     for case in ["cut-once", "busy-once"] {
         let temp = crate::test_support::tempdir().unwrap();
         let server = start(case, temp.path());
-        std::fs::write(temp.path().join("source/object"), patterned(3 << 20 | 5)).unwrap();
+        std::fs::write(temp.path().join("source/object"), patterned(STREAMED | 5)).unwrap();
         let output = upload(&server, temp.path(), 1);
         assert!(output.status.success(), "{case}: {}", output_text(&output));
         assert!(server.gate.1.load(Ordering::Acquire), "{case}");
@@ -160,7 +164,7 @@ fn s3_file_body_matches_its_content_md5() {
     for plain_http in [false, true] {
         let temp = crate::test_support::tempdir().unwrap();
         let server = start("checksum", temp.path());
-        std::fs::write(temp.path().join("source/object"), patterned(2 << 20 | 3)).unwrap();
+        std::fs::write(temp.path().join("source/object"), patterned(STREAMED | 3)).unwrap();
         let mut command = upload_command(&server, temp.path(), 0);
         if plain_http {
             command.env_remove(TREAT_HTTP_AS_HTTPS);
@@ -219,13 +223,14 @@ fn s3_file_body_uploads_follow_the_bandwidth_limit() {
     let temp = crate::test_support::tempdir().unwrap();
     let server = start("paced", temp.path());
     for name in ["first", "second"] {
-        std::fs::write(temp.path().join("source").join(name), patterned(2 << 20)).unwrap();
+        std::fs::write(temp.path().join("source").join(name), patterned(STREAMED)).unwrap();
     }
     let started = std::time::Instant::now();
     let output = server
-        .command(temp.path())
+        .command_with_part_size(temp.path(), 0, false)
         .args(["--s3-endpoint", &server.address])
-        .arg("--resource-limits=bandwidth=2M")
+        .args(["--performance-tuning", "s3-part-size=64M"])
+        .arg("--resource-limits=bandwidth=9M")
         .args([
             "--srcs-in",
             "source",
@@ -239,6 +244,42 @@ fn s3_file_body_uploads_follow_the_bandwidth_limit() {
     let elapsed = started.elapsed();
     assert!(output.status.success(), "{}", output_text(&output));
     assert!(server.gate.1.load(Ordering::Acquire));
-    // 4 MiB at 2 MiB/s: the second body waits about a second.
+    // 18 MiB at 9 MiB/s: the second body waits about a second.
     assert!(elapsed >= Duration::from_millis(900), "{elapsed:?}");
+}
+
+/// The highest number of upload bytes held in memory at once, from the
+/// diagnostics trace.
+fn held_bytes(output: &Output) -> u64 {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let trace = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("S3_DIAGNOSTICS "))
+        .map(|trace| serde_json::from_str::<serde_json::Value>(trace).unwrap())
+        .unwrap_or_else(|| panic!("no diagnostics: {stderr}"));
+    trace["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["phase"] == "upload_buffers")
+        .map(|event| event["live_bytes"].as_u64().unwrap())
+        .max()
+        .unwrap_or(0)
+}
+
+/// On any endpoint, a single-request file of up to 8 MiB is sent from the
+/// bytes that hashed it rather than read again; a larger one is read from
+/// the file to send it.
+#[test]
+fn s3_small_enough_uploads_are_sent_from_the_hashing_read() {
+    for (size, held) in [(3 << 20 | 5, true), (8 << 20, true), ((8 << 20) + 1, false)] {
+        let temp = crate::test_support::tempdir().unwrap();
+        let server = start("held", temp.path());
+        std::fs::write(temp.path().join("source/object"), patterned(size)).unwrap();
+        let output = upload(&server, temp.path(), 0);
+        assert!(output.status.success(), "{size}: {}", output_text(&output));
+        assert!(server.gate.1.load(Ordering::Acquire), "{size}");
+        let expected = if held { size as u64 } else { 0 };
+        assert_eq!(held_bytes(&output), expected, "{size}");
+    }
 }
