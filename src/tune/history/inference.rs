@@ -50,25 +50,11 @@ pub(super) fn starting_count(
         } else {
             "AND ?3 IS NULL AND ?4 IS NULL"
         };
-        // Each lookup reads at most two minutes of half-second observations
-        // from each recent run. Use the (run,sequence) primary key to seek
-        // directly to the tail, even for transfers that ran for days.
         let mut statement = db.prepare(&format!(
-            "WITH recent AS MATERIALIZED (
-                SELECT id, day, status, lost, COALESCE((
-                    SELECT sequence FROM measurements WHERE run=runs.id
-                    ORDER BY sequence DESC LIMIT 1 OFFSET {offset}
-                ),0) AS first FROM runs WHERE route=?1 AND mode=?2
-                AND eligible={MEASUREMENTS} {filesystem_match}
-                ORDER BY id DESC LIMIT {RUN_LIMIT}
-             )
-             SELECT id,day,segment,workers,seconds,rate,usable
-             FROM recent CROSS JOIN measurements
-             WHERE run=id AND sequence>=first AND status='success' AND lost=0
-             ORDER BY id DESC,sequence",
-            offset = OBSERVATION_LIMIT - 1
+            "SELECT id,day,(status='success' AND lost=0) FROM runs WHERE route=?1 AND mode=?2
+             AND eligible={MEASUREMENTS} {filesystem_match} ORDER BY id DESC LIMIT {RUN_LIMIT}"
         ))?;
-        let mut rows = statement.query(params![
+        let mut runs = statement.query(params![
             key.route,
             key.mode,
             specific
@@ -78,25 +64,33 @@ pub(super) fn starting_count(
                 .then_some(key.destination_filesystem.as_deref())
                 .flatten(),
         ])?;
+        // Seek to the beginning of this run's bounded tail, then replay it in
+        // sequence order. Older runs remain unread once we have 32 comparisons.
+        let mut measurements = db.prepare(&format!(
+            "SELECT segment,workers,seconds,rate,usable FROM measurements
+             WHERE run=?1 AND sequence>=COALESCE((SELECT sequence FROM measurements
+                 WHERE run=?1 ORDER BY sequence DESC LIMIT 1 OFFSET {}),0)
+             ORDER BY sequence",
+            OBSERVATION_LIMIT - 1
+        ))?;
         let mut choices = Vec::new();
         let today = day();
-        let mut row = rows.next()?;
-        while let Some(first) = row {
-            let run: i64 = first.get(0)?;
-            let when: i64 = first.get(1)?;
+        while let Some(row) = runs.next()? {
+            if !row.get::<_, bool>(2)? {
+                continue;
+            }
+            let run: i64 = row.get(0)?;
+            let when: i64 = row.get(1)?;
             let mut evidence = RunEvidence::default();
-            while let Some(current) = row {
-                if current.get::<_, i64>(0)? != run {
-                    break;
-                }
+            let mut rows = measurements.query([run])?;
+            while let Some(row) = rows.next()? {
                 evidence.push(Observation {
-                    segment: current.get(2)?,
-                    workers: current.get::<_, u32>(3)? as usize,
-                    seconds: current.get(4)?,
-                    rate: current.get(5)?,
-                    usable: current.get(6)?,
+                    segment: row.get(0)?,
+                    workers: row.get::<_, u32>(1)? as usize,
+                    seconds: row.get(2)?,
+                    rate: row.get(3)?,
+                    usable: row.get(4)?,
                 });
-                row = rows.next()?;
             }
             if let Some(comparison) = evidence.finish() {
                 let age = today.saturating_sub(when).max(0) as f64;
@@ -228,7 +222,7 @@ struct RunEvidence {
     current: Option<(i64, usize)>,
     current_rate: Option<f64>,
     reference: f64,
-    recent: crate::tune::evidence::Evidence,
+    recent: std::collections::VecDeque<(f64, f64)>,
 }
 
 impl RunEvidence {
@@ -246,14 +240,40 @@ impl RunEvidence {
             self.recent.clear();
             return;
         }
-        let score = self
-            .recent
-            .push(observation.rate, observation.seconds, self.reference)
-            .filter(|score| score.rate.is_finite() && score.rate >= 0.0);
-        if let Some(score) = score {
-            self.points.insert(observation.workers, score.rate);
-            self.current_rate = Some(score.rate);
+        self.recent
+            .push_back((observation.rate, observation.seconds));
+        let mut duration: f64 = self.recent.iter().map(|p| p.1).sum();
+        while self.recent.len() > 2 && duration - self.recent[0].1 >= 5.0 {
+            duration -= self.recent.pop_front().unwrap().1;
         }
+        if let Some(rate) = self.recent_rate().filter(|r| r.is_finite()) {
+            self.points.insert(observation.workers, rate);
+            self.current_rate = Some(rate);
+        }
+    }
+
+    /// Keep the historical estimator stable across changes to live probing.
+    /// A clear change uses its recent intervals, otherwise average the window.
+    fn recent_rate(&self) -> Option<f64> {
+        let base = self.reference;
+        let (mut seconds, mut activity, mut low, mut high) = (0.0, 0.0, f64::INFINITY, 0.0_f64);
+        for (i, &(rate, elapsed)) in self.recent.iter().rev().enumerate() {
+            seconds += elapsed;
+            activity += rate * elapsed;
+            low = low.min(rate);
+            high = high.max(rate);
+            if i >= 1
+                && base > 0.0
+                && ((seconds >= 1.0 && low > 0.0 && high < base * 0.5)
+                    || (seconds >= 2.5 && ((low > 0.0 && high < base * 0.8) || low > base * 1.2))
+                    || (seconds >= 5.0 && (high < base * 0.95 || low * 0.95 > base)))
+            {
+                return Some(activity / seconds);
+            }
+        }
+        let duration: f64 = self.recent.iter().map(|p| p.1).sum();
+        (self.recent.len() >= 2 && duration >= 2.5)
+            .then(|| self.recent.iter().map(|(r, t)| r * t).sum::<f64>() / duration)
     }
 
     fn finish(self) -> Option<Comparison> {
@@ -696,6 +716,21 @@ mod tests {
         let mut route_key = key.clone();
         route_key.destination_filesystem = Some("new filesystem".into());
         assert_eq!(fixed.starting_count(&route_key, true).unwrap().workers, 16);
+    }
+
+    #[test]
+    fn history_uses_five_seconds_for_an_inconclusive_rate() {
+        let mut evidence = RunEvidence::default();
+        for rate in [100.0; 5].into_iter().chain([110.0; 5]) {
+            evidence.push(Observation {
+                segment: 0,
+                workers: 8,
+                seconds: 0.5,
+                rate,
+                usable: true,
+            });
+        }
+        assert_eq!(evidence.current_rate, Some(105.0));
     }
 
     #[test]

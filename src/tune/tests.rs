@@ -91,11 +91,7 @@ fn automatic_growth_can_explore_above_64() {
         let rate = policy.n.min(128) as f64 * 10e6;
         measure(&mut policy, rate);
     }
-    assert!(
-        policy.settled() as f64 >= 128.0 * (1.0 - NEAR_BEST_TOLERANCE),
-        "{:?}",
-        policy.history
-    );
+    assert!(policy.settled() >= 128, "{:?}", policy.history);
     assert!(policy.history.iter().any(|&count| count > 64));
 }
 
@@ -298,7 +294,7 @@ fn upward_gain_continues_but_inconclusive_result_holds() {
     let mut unnecessary = Policy::refine(10, MIN, MAX);
     measure(&mut unnecessary, 100.0);
     measure(&mut unnecessary, 104.0);
-    assert_eq!(unnecessary.settled(), 10);
+    assert_eq!(unnecessary.settled(), 13);
     assert_eq!(unnecessary.state, State::Hold);
 }
 
@@ -360,18 +356,14 @@ fn cached_gain_at_the_cap_holds_at_the_cap() {
 }
 
 #[test]
-fn uncached_start_reaches_full_rate_and_stays_within_tolerance() {
+fn uncached_start_reaches_full_rate_without_accepting_slower_reductions() {
     for (start, cap) in [(8, 32), (32, 64)] {
         let mut p = simulate(start, cap, 3, |_| 1.0);
         assert_eq!(p.settled(), cap, "history {:?}", p.history);
         for _ in 0..128 {
             let rate = p.n.min(cap) as f64 * 10e6;
             measure(&mut p, rate);
-            assert!(
-                p.settled() as f64 >= cap as f64 * (1.0 - NEAR_BEST_TOLERANCE),
-                "history {:?}",
-                p.history
-            );
+            assert!(p.settled() >= cap, "history {:?}", p.history);
         }
     }
 }
@@ -393,7 +385,7 @@ fn a_failed_up_probe_does_not_immediately_bounce_down() {
 }
 
 #[test]
-fn accepts_a_downward_probe_within_the_noise_band() {
+fn rejects_a_slightly_slower_downward_probe() {
     let mut p = Policy::refine(10, MIN, MAX);
     measure(&mut p, 100.0);
     measure(&mut p, 130.0);
@@ -403,16 +395,32 @@ fn accepts_a_downward_probe_within_the_noise_band() {
     }
     assert_eq!(p.n, 11);
     measure(&mut p, 129.0);
-    assert_eq!(p.settled(), 11);
+    assert_eq!(p.settled(), 13);
+    assert_eq!(p.n, 13);
 }
 
 #[test]
-fn flat_throughput_settles_at_the_minimum() {
+fn modest_gains_per_doubling_hold_peak_throughput() {
+    let mut policy = Policy::new(8, 1, 128);
+    let rate = |workers: usize| 100.0 * 1.08_f64.powf((workers as f64).log2());
+    for _ in 0..4 {
+        let score = rate(policy.n);
+        measure(&mut policy, score);
+    }
+    for _ in 0..1000 {
+        let score = rate(policy.n);
+        measure(&mut policy, score);
+        assert_eq!(policy.settled(), 128);
+    }
+}
+
+#[test]
+fn flat_throughput_does_not_justify_a_reduction() {
     let mut p = Policy::new(START_SSH, MIN, MAX);
     for _ in 0..200 {
         measure(&mut p, 100.0);
+        assert!(p.settled() >= START_SSH, "history {:?}", p.history);
     }
-    assert_eq!(p.settled(), MIN, "history {:?}", p.history);
 }
 
 #[test]
@@ -924,13 +932,13 @@ fn one_worker_start_prepares_spare_before_initial_connection_is_ready() {
 }
 
 #[test]
-fn inconclusive_doubling_rolls_back_and_backs_off() {
+fn inconclusive_doubling_keeps_capacity_without_another_increase() {
     for score in [95.0, 100.0, 104.0] {
         let mut policy = Policy::new(8, 1, 64);
         measure(&mut policy, 100.0);
         assert_eq!(policy.n, 16);
         measure(&mut policy, score);
-        assert_eq!(policy.n, 8);
+        assert_eq!(policy.n, 16);
         assert_eq!(policy.state, State::Hold);
         assert!(!policy.startup_doubling);
         assert!(policy.measured());
@@ -940,24 +948,18 @@ fn inconclusive_doubling_rolls_back_and_backs_off() {
         );
         for _ in 0..PROBE_EVERY - 1 {
             measure(&mut policy, score);
-            assert_eq!(policy.n, 8);
+            assert_eq!(policy.n, 16);
         }
     }
 }
 
 #[test]
-fn noise_band_prefers_the_same_count_in_both_directions() {
+fn downward_gain_requirement_preserves_clear_upward_loss_rollback() {
     let mut policy = Policy::refine(8, 1, 64);
     measure(&mut policy, 100.0);
     measure(&mut policy, 94.0);
     assert_eq!(policy.n, 8);
-    for (score, keep_smaller) in [
-        (106.0, true),
-        (101.0, true),
-        (100.0, true),
-        (95.0, true),
-        (94.0, false),
-    ] {
+    for (score, keep_smaller) in [(106.0, true), (101.0, false), (100.0, false), (95.0, false)] {
         let mut policy = Policy::refine(16, 1, 64);
         policy.record(16, 100.0);
         assert!(policy.begin(Direction::Down, 100.0));
@@ -975,14 +977,14 @@ fn settled_count_follows_kept_increases_and_measured_reductions() {
     assert_eq!(policy.settled(), 8);
     measure(&mut policy, 200.0); // Clear gain at 16; propose 32.
     assert_eq!(policy.settled(), 16);
-    measure(&mut policy, 200.0); // An inconclusive increase restores 16.
-    assert_eq!(policy.settled(), 16);
+    measure(&mut policy, 200.0); // An inconclusive increase keeps 32 live.
+    assert_eq!(policy.settled(), 32);
 
     assert!(policy.begin(Direction::Down, 200.0));
     policy.activated();
-    assert_eq!(policy.n, 12);
+    assert_eq!(policy.n, 24);
     measure(&mut policy, 220.0);
-    assert_eq!(policy.settled(), 12);
+    assert_eq!(policy.settled(), 24);
     // Allow earlier, slower lower-count measurements to age before retrying.
     for _ in 0..EVIDENCE_MAX_AGE * 4 {
         if policy.settled() < 16 {
@@ -1039,7 +1041,7 @@ fn floor_does_not_prevent_downward_recovery_after_growing() {
 }
 
 #[test]
-fn downward_probe_accepts_the_near_best_boundary() {
+fn downward_probe_requires_a_measured_speed_increase() {
     for score in [94.0, 95.0, 99.0, 100.0, 100.001, 101.0, 106.0] {
         let mut policy = Policy::refine(32, MIN, MAX);
         policy.record(32, 100.0);
@@ -1049,22 +1051,19 @@ fn downward_probe_accepts_the_near_best_boundary() {
         measure(&mut policy, score);
         assert_eq!(
             policy.settled(),
-            if score >= 95.0 { lower } else { 32 },
+            if score * 0.95 > 100.0 { lower } else { 32 },
             "score={score}"
         );
     }
 }
 
 #[test]
-fn aging_evidence_keeps_settled_throughput_within_tolerance() {
+fn aging_evidence_does_not_make_a_slower_reduction_acceptable() {
     let mut p = Policy::refine(32, MIN, MAX);
     for _ in 0..1000 {
         let score = p.n.min(32) as f64 * 100.0 / 32.0;
         measure(&mut p, score);
-        assert!(
-            p.settled() as f64 >= 32.0 * (1.0 - NEAR_BEST_TOLERANCE),
-            "settled outside tolerance: {p:?}"
-        );
+        assert!(p.settled() >= 32, "settled below full speed: {p:?}");
     }
 }
 
@@ -1103,7 +1102,7 @@ fn smaller_upward_gain_does_not_resume_growth_below_old_high_water() {
         },
     );
     measure(&mut p, 66.0);
-    assert_eq!(p.n, 8);
+    assert_eq!(p.n, 10);
     assert!(matches!(p.state, State::Hold));
 }
 

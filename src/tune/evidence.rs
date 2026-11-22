@@ -8,7 +8,7 @@ pub(super) struct Score {
 }
 
 /// Consecutive usable intervals at a single active count. Live decisions
-/// consume a whole window. History can also read overlapping windows.
+/// consume a whole window unless throughput collapses.
 #[derive(Default)]
 pub(super) struct Evidence {
     intervals: std::collections::VecDeque<(f64, f64)>,
@@ -26,6 +26,7 @@ impl Evidence {
             .saturating_sub(partial)
     }
 
+    #[cfg(test)]
     pub fn push(&mut self, rate: f64, seconds: f64, base: f64) -> Option<Score> {
         self.observe(rate, seconds, base, super::SAMPLE)
     }

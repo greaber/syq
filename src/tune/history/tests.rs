@@ -1063,7 +1063,7 @@ fn tcp_preflight_preserves_evidence_without_storing_addresses() {
 }
 
 #[test]
-fn trace_records_rollback_of_flat_upward_probe() {
+fn trace_records_inconclusive_upward_hold_without_claiming_a_plateau() {
     use super::super::{trace::Trace, Policy};
     let temp = crate::test_support::tempdir().unwrap();
     let path = temp.path().join("history.sqlite");
@@ -1080,12 +1080,12 @@ fn trace_records_rollback_of_flat_upward_probe() {
         .rev()
         .find(|e| e["kind"] == "decision")
         .unwrap();
-    assert_eq!(decision["data"]["reason"], "probe_rejected");
-    assert_eq!(decision["data"]["after"]["requested"], 8);
+    assert_eq!(decision["data"]["reason"], "probe_inconclusive");
+    assert_eq!(decision["data"]["after"]["requested"], 16);
     assert_eq!(decision["data"]["after"]["state"], "Hold");
     let end = events.last().unwrap();
     assert_eq!(end["data"]["completed_comparison"], true);
-    assert_eq!(end["data"]["last_accepted"], 8);
+    assert_eq!(end["data"]["last_accepted"], 16);
     assert!(end["data"].get("recommended").is_none());
     assert!(end["data"].get("discovery_complete").is_none());
 }
@@ -1173,7 +1173,8 @@ fn repeated_inconclusive_copies_do_not_raise_the_starting_count() {
         policy.activated();
         let larger = policy.active();
         policy.observe(97.0);
-        assert_eq!(policy.settled(), start);
+        // The live copy keeps the inconclusive increase.
+        assert_eq!(policy.settled(), larger);
         let writer = measured_run(&path, &context, &[(start, 100.0), (larger, 97.0)]);
         let run = command::read_run(&open(&path).unwrap(), saved(&writer)).unwrap();
         assert_eq!(run["recommendation_eligible"], true);
@@ -1222,6 +1223,48 @@ fn network_scoped_starts_separate_known_networks_and_preserve_unknown_fallback()
     assert_eq!(start(Some("home")), 8);
     assert_eq!(start(Some("office")), 32);
     assert_eq!(start(None), 64);
+}
+
+#[test]
+fn finish_learning_excludes_runs_after_transport_or_network_changes() {
+    use crate::conn::Endpoint;
+    for network_changed in [false, true] {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("history.sqlite");
+        let writer = recorder(&path);
+        let src = Endpoint::local();
+        let dst = super::super::tests::remote("host", true);
+        let mut key = context_key(&writer, &src, &dst, None, None, "default".into());
+        if network_changed {
+            key.network = Some("earlier network".into());
+        }
+        writer.context(&key);
+        for workers in [4, 8] {
+            writer.event(
+                "observation",
+                json!({"active":workers,"seconds":2.5,"rate":100,"usable":true}),
+            );
+        }
+        if !network_changed {
+            let Endpoint::Remote(spec) = &dst else {
+                unreachable!()
+            };
+            spec.tcp.lock().unwrap().as_mut().unwrap().failed = true;
+        }
+        writer.finish_learning(&key, &src, &dst, true);
+        writer.complete(true, json!({}));
+        let db = open(&path).unwrap();
+        let events = command::read_events(&db, 1).unwrap();
+        let context = events
+            .iter()
+            .find(|e| e["kind"] == "learning_context")
+            .unwrap();
+        assert_eq!(context["data"]["consistent"], false);
+        let eligible: i64 = db
+            .query_row("SELECT eligible FROM runs WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(eligible, 0);
+    }
 }
 
 #[test]

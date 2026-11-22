@@ -7,8 +7,8 @@
 //! A fresh start doubles; strong gains restore doubling after a historical
 //! plateau proves obsolete. Failed experiments restore the previous count.
 //! Elapsed time bounds directional backoff (30 s up, 60 s down), independently
-//! of how many measurements stabilize. Within the throughput tolerance,
-//! the smaller worker count wins.
+//! of how many measurements stabilize. Upward wins ties; small inconclusive
+//! increases stay active while uncertain reductions restore the higher count.
 //!
 //! Candidate workers are connected while the current count remains active.
 //! They become active only when the whole candidate set is ready. Connected
@@ -58,7 +58,9 @@ const STARTUP_STEP: usize = 2;
 
 /// Multiplicative step after discovery, or with a closely matched plateau hint.
 pub const STEP: f64 = 1.3;
-/// Prefer the smaller count when it delivers at least this close to the larger count.
+/// Throughput tolerance for upward comparisons and plateau evidence. An
+/// inconclusive increase within this tolerance of its own baseline keeps the
+/// larger count without continuing growth. Reductions require a measured gain.
 const NEAR_BEST_TOLERANCE: f64 = 0.05;
 /// Sampling intervals between probes. Directional backoff is bounded in
 /// elapsed time by retry_after; rejected observations still advance deadlines.
@@ -303,7 +305,7 @@ impl Policy {
 
     /// Deletion can burn CPU spinning on filesystem locks without increasing
     /// throughput. Retain a changed count only when it measurably improves
-    /// throughput. Transfers also accept fewer workers at comparable throughput.
+    /// throughput; transfer policies keep their treatment of uncertain increases.
     pub(crate) fn require_gain(mut self) -> Self {
         self.require_gain = true;
         self
@@ -508,8 +510,10 @@ impl Policy {
     }
 
     fn record(&mut self, n: usize, score: f64) {
-        self.points
-            .retain(|_, p| self.tick.saturating_sub(p.measured_at) <= EVIDENCE_MAX_AGE);
+        if self.wall_clock {
+            self.points
+                .retain(|_, p| self.tick.saturating_sub(p.measured_at) <= EVIDENCE_MAX_AGE);
+        }
 
         self.points
             .entry(n)
@@ -677,14 +681,26 @@ impl Policy {
                     // high-water scores can describe conditions that no longer
                     // apply, even when revisiting them refreshes their age.
                     Direction::Up => base < score * (1.0 - NEAR_BEST_TOLERANCE),
-                    Direction::Down if !self.require_gain => {
-                        score >= base * (1.0 - NEAR_BEST_TOLERANCE)
-                    }
                     Direction::Down => score * (1.0 - NEAR_BEST_TOLERANCE) > base,
                 };
                 self.comparisons += 1;
                 let idx = direction.index();
                 let inverse = direction.opposite().index();
+                if !self.require_gain
+                    && direction == Direction::Up
+                    && !keep
+                    && base > 0.0
+                    && score >= base * (1.0 - NEAR_BEST_TOLERANCE)
+                {
+                    // Uncertainty is not evidence to remove workers, nor to
+                    // keep growing. Stop the ramp and wait before probing.
+                    self.startup_doubling = false;
+                    self.fails[idx] += 1;
+                    self.due[idx] = self.tick + self.retry_after(direction);
+                    self.due[inverse] = self.due[inverse].max(self.tick + PROBE_EVERY);
+                    self.state = State::Hold;
+                    return self.n;
+                }
                 if keep {
                     // Fresh gains override a historical plateau. Accelerate in
                     // either direction when the improvement is substantial.
@@ -696,14 +712,9 @@ impl Policy {
                     self.fails[idx] = 0;
                     self.due[inverse] = self.due[inverse].max(self.tick + PROBE_EVERY);
                     self.state = State::Hold;
-                    // Keep the best baseline across consecutive reductions so
-                    // several individually small losses cannot compound.
-                    let reference = if direction == Direction::Down {
-                        base.max(score)
-                    } else {
-                        score
-                    };
-                    self.begin(direction, reference);
+                    // Success is direct evidence that there may be more gain
+                    // in the same direction, so continue immediately.
+                    self.begin(direction, score);
                 } else {
                     self.startup_doubling = false;
                     self.fails[idx] += 1;
