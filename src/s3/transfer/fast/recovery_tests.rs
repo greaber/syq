@@ -15,8 +15,11 @@ use std::{
 use tokio::time::{Instant, Sleep};
 
 const SIZE: usize = 65536;
+fn data_sized(size: usize) -> Vec<u8> {
+    (0..size).map(|n| (n % 251) as u8).collect()
+}
 fn data() -> Vec<u8> {
-    (0..SIZE).map(|n| (n % 251) as u8).collect()
+    data_sized(SIZE)
 }
 
 struct Body {
@@ -73,18 +76,22 @@ impl http_body::Body for Body {
 
 #[derive(Debug, Clone)]
 struct Responses {
+    size: usize,
     fault: &'static str,
     requests: Arc<Mutex<Vec<(usize, Instant)>>>,
 }
 impl HttpConnector for Responses {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+        let size = self.size;
+        let last = size - 1;
+        let suffix = format!("-{last}");
         let start = request
             .headers()
             .get("range")
             .unwrap()
             .strip_prefix("bytes=")
             .unwrap()
-            .strip_suffix("-65535")
+            .strip_suffix(&suffix)
             .unwrap()
             .parse::<usize>()
             .unwrap();
@@ -117,21 +124,21 @@ impl HttpConnector for Responses {
             response.headers_mut().insert("etag", "\"fixture-v1\"");
             response
                 .headers_mut()
-                .insert("content-length", (SIZE - start).to_string());
+                .insert("content-length", (size - start).to_string());
             response.headers_mut().insert(
                 "content-range",
                 format!(
-                    "bytes {}-65535/65536",
+                    "bytes {}-{last}/{size}",
                     if fault == "range" { 0 } else { start }
                 ),
             );
-            let bytes = data();
+            let bytes = data_sized(size);
             *response.body_mut() = match fault {
                 "retry-slow" => SdkBody::from_body_1_x(Body::slow(&bytes[start..], false)),
                 "truncated" if number == 1 => {
-                    SdkBody::from(bytes[start..start + (SIZE - start) / 2].to_vec())
+                    SdkBody::from(bytes[start..start + (size - start) / 2].to_vec())
                 }
-                "corrupt" => SdkBody::from(vec![b'y'; SIZE - start]),
+                "corrupt" => SdkBody::from(vec![b'y'; size - start]),
                 _ => SdkBody::from(bytes[start..].to_vec()),
             };
             Ok(response)
@@ -140,6 +147,10 @@ impl HttpConnector for Responses {
 }
 
 async fn copy(fault: &'static str, retries: u32, peers: bool, paced: bool) {
+    copy_sized(SIZE, fault, retries, peers, paced).await;
+}
+
+async fn copy_sized(size: usize, fault: &'static str, retries: u32, peers: bool, paced: bool) {
     let dir = crate::test_support::tempdir().unwrap();
     let mut extra = vec!["--integrity-checking=transfer=blake3"];
     if paced {
@@ -149,6 +160,7 @@ async fn copy(fault: &'static str, retries: u32, peers: bool, paced: bool) {
     engine.options.retries = retries;
     let requests = Arc::new(Mutex::new(Vec::new()));
     let connector = Responses {
+        size,
         fault,
         requests: requests.clone(),
     };
@@ -171,7 +183,7 @@ async fn copy(fault: &'static str, retries: u32, peers: bool, paced: bool) {
         if peers {
             for _ in 0..32 {
                 observe.tuning.reads.completed(
-                    SIZE as u64,
+                    size as u64,
                     if fault == "uniform" {
                         Duration::from_secs(3)
                     } else {
@@ -182,7 +194,7 @@ async fn copy(fault: &'static str, retries: u32, peers: bool, paced: bool) {
             }
         }
     });
-    let bytes = data();
+    let bytes = data_sized(size);
     let metadata = Metadata {
         kind: crate::s3::client::ObjectKind::File,
         mode: 0o644,
@@ -195,7 +207,7 @@ async fn copy(fault: &'static str, retries: u32, peers: bool, paced: bool) {
     };
     let object = Object {
         key: "object".into(),
-        size: SIZE as u64,
+        size: size as u64,
         etag: "\"fixture-v1\"".into(),
         version: None,
         metadata: None,
@@ -289,17 +301,195 @@ async fn copy(fault: &'static str, retries: u32, peers: bool, paced: bool) {
 
 #[tokio::test(start_paused = true)]
 async fn slow_read_recovery_preserves_contents_and_identity() {
-    for fault in [
-        "ok",
-        "changed",
-        "retry-slow",
-        "idle",
-        "corrupt",
-        "range",
-        "truncated",
-    ] {
-        copy(fault, if fault == "truncated" { 2 } else { 1 }, true, false).await;
+    for size in [SIZE, 256 * 1024] {
+        for fault in [
+            "ok",
+            "changed",
+            "retry-slow",
+            "idle",
+            "corrupt",
+            "range",
+            "truncated",
+        ] {
+            copy_sized(
+                size,
+                fault,
+                if fault == "truncated" { 2 } else { 1 },
+                true,
+                false,
+            )
+            .await;
+        }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn memory_sink_transport_retry_clears_flushed_batches() {
+    // 20 fragments of 4 KiB (80 KiB <= 128 KiB inline limit) flush at least one
+    // 16-slice batch into DownloadSink::Memory before the transport error hits.
+    struct FailingAfterBatch {
+        chunks: VecDeque<bytes::Bytes>,
+    }
+    impl http_body::Body for FailingAfterBatch {
+        type Data = bytes::Bytes;
+        type Error = std::io::Error;
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            if let Some(chunk) = self.chunks.pop_front() {
+                Poll::Ready(Some(Ok(http_body::Frame::data(chunk))))
+            } else {
+                Poll::Ready(Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "simulated mid-body reset",
+                ))))
+            }
+        }
+    }
+    let size = 80 * 1024;
+    let bytes = data_sized(size);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let connector = Responses {
+        size,
+        fault: "ok",
+        requests: requests.clone(),
+    };
+    let mut engine = super::buffer_tests::planning_engine(&[
+        "--s3-retries",
+        "2",
+        "--integrity-checking=transfer=blake3",
+    ]);
+    engine.client = Client::from_conf(
+        aws_sdk_s3::config::Builder::new()
+            .behavior_version_latest()
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "test", "test", None, None, "fixture",
+            ))
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .http_client(http_client_fn(move |_, _| {
+                SharedHttpConnector::new(connector.clone())
+            }))
+            .build(),
+    );
+    let engine = Arc::new(engine);
+    let dir = crate::test_support::tempdir().unwrap();
+    let root = Arc::new(Root::open(dir.path()).unwrap());
+    let path = RelativePath::new(b"destination").unwrap();
+    let metadata = Metadata {
+        kind: crate::s3::client::ObjectKind::File,
+        mode: 0o644,
+        uid: unsafe { libc::geteuid() },
+        gid: unsafe { libc::getegid() },
+        mtime: 1700000000,
+        nsec: 0,
+        hash: Some(Digest::hash_bytes(HashAlgorithm::Blake3, &bytes).value),
+        hash_algorithm: HashAlgorithm::Blake3,
+    };
+    let object = Object {
+        key: "object".into(),
+        size: size as u64,
+        etag: "\"fixture-v1\"".into(),
+        version: None,
+        metadata: None,
+        mtime: metadata.mtime,
+    };
+    let initial = ByteStream::new(SdkBody::from_body_1_x(FailingAfterBatch {
+        chunks: bytes[..72 * 1024]
+            .chunks(4096)
+            .map(bytes::Bytes::copy_from_slice)
+            .collect(),
+    }));
+    engine
+        .download_single(
+            &object,
+            &root,
+            &path,
+            (&metadata, None, Default::default()),
+            (None, None),
+            Some(initial),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        std::fs::read(dir.path().join("destination")).unwrap(),
+        bytes
+    );
+}
+
+#[test]
+fn inline_download_cancelled_while_placement_queued_does_not_publish() {
+    // One blocking thread lets us hold the blocking pool while the inline
+    // download queues its placement closure, then cancel before it runs.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let dir = crate::test_support::tempdir().unwrap();
+        let destination = dir.path().join("destination");
+        std::fs::write(&destination, b"keep-original").unwrap();
+        let root = Arc::new(Root::open(dir.path()).unwrap());
+        let path = RelativePath::new(b"destination").unwrap();
+        let engine = Arc::new(super::buffer_tests::planning_engine(&[]));
+        let bytes = b"replacement payload".to_vec();
+        let metadata = Metadata {
+            kind: crate::s3::client::ObjectKind::File,
+            mode: 0o644,
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+            mtime: 1700000000,
+            nsec: 0,
+            hash: Some(Digest::hash_bytes(HashAlgorithm::Blake3, &bytes).value),
+            hash_algorithm: HashAlgorithm::Blake3,
+        };
+        let object = Object {
+            key: "object".into(),
+            size: bytes.len() as u64,
+            etag: "\"fixture-v1\"".into(),
+            version: None,
+            metadata: None,
+            mtime: metadata.mtime,
+        };
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        entered_rx.recv().unwrap();
+        let download_engine = engine.clone();
+        let download = tokio::spawn(async move {
+            download_engine
+                .download_single(
+                    &object,
+                    &root,
+                    &path,
+                    (&metadata, None, Default::default()),
+                    (None, None),
+                    Some(ByteStream::from(bytes)),
+                    None,
+                )
+                .await
+        });
+        // Yield until download_single has verified the body and queued its
+        // placement closure behind `blocker`.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        engine
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap();
+        assert!(download.await.unwrap().is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"keep-original");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    });
 }
 
 #[tokio::test(start_paused = true)]

@@ -3232,11 +3232,11 @@ impl Engine {
         initial: Option<ByteStream>,
         initial_slot: Option<super::tuning::Permit>,
     ) -> Result<Option<u64>> {
-        // Objects at or below the streaming batch size (128 KiB) are already
-        // buffered in memory before their first write. Collecting them first
-        // avoids spawning a per-file Writer task and channels, keeps blocking
-        // filesystem calls off async worker threads, and skips creating a
-        // partial file when a GET or digest check fails.
+        // Objects up to 128 KiB fit within a tight per-download memory bound.
+        // Collecting them in memory first avoids spawning a per-file Writer
+        // task and channels, keeps blocking filesystem calls off async worker
+        // threads, and skips creating a partial file when a GET or digest
+        // check fails.
         const INLINE_LIMIT: u64 = 128 * 1024;
         let (metadata, expected_hash, explicit) = validation;
         let path_buf = path.to_path_buf();
@@ -3289,6 +3289,7 @@ impl Engine {
             let metadata = metadata.clone();
             let size = object.size;
             tokio::task::spawn_blocking(move || -> Result<()> {
+                engine.check_cancelled()?;
                 let file = root.create_file(&partial, 0o600)?;
                 let m = file.metadata()?;
                 let identity = (m.dev(), m.ino());
@@ -3302,6 +3303,7 @@ impl Engine {
                         &path,
                     )
                 })?;
+                engine.check_cancelled()?;
                 engine.publish_download(&root, &partial, &path, identity, replaces)?;
                 cleanup.disarm();
                 Ok(())
