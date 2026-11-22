@@ -82,8 +82,6 @@ pub struct FileJobData {
     /// condition (`--as-new`) fails the file instead.
     pub policy_condition: bool,
     pub attempt: u32,
-    /// Bytes of this file in place on the destination (transferred or matched).
-    pub done: Arc<AtomicU64>,
     /// Written directly to the final path (no partial + rename).
     pub inplace: bool,
     /// Under `--in-place=update`, why this existing file is replaced
@@ -100,37 +98,81 @@ pub struct FileJobData {
     pub scanned: crate::proto::ScannedDestination,
 }
 
+/// Bytes of each job of a chunk in place on the destination (transferred
+/// or matched). Every version of a job counts into the same counter, so a
+/// worker holding an earlier version still records its progress.
+type Progress = Arc<[AtomicU64]>;
+
+/// Published slots never change. OnceLock permits appending jobs to a partial
+/// chunk while workers hold earlier slots, without unsafe aliasing or chunk COW.
+#[derive(Debug)]
+pub struct JobChunk {
+    slots: Vec<OnceLock<FileJobData>>,
+    progress: Progress,
+}
+
+/// A job changed since it was planned. Retry versions are sparse and own
+/// their data independently of the original chunk, sharing only its progress.
+#[derive(Clone, Debug)]
+pub struct RetryVersion {
+    data: FileJobData,
+    progress: Progress,
+    slot: usize,
+}
+
 // Snapshots retain a chunk or a private retry version, preserving worker
 // views while metadata changes.
 #[derive(Clone, Debug)]
 pub enum SnapshotData {
-    Shared(Arc<FileJobData>),
-    Chunk {
-        slots: Arc<Vec<OnceLock<FileJobData>>>,
-        slot: usize,
-    },
+    Shared(Arc<RetryVersion>),
+    Chunk { chunk: Arc<JobChunk>, slot: usize },
+}
+
+impl SnapshotData {
+    /// A job outside the scheduler's chunks, for tests of worker code.
+    #[cfg(test)]
+    pub fn detached(data: FileJobData) -> Self {
+        Self::Shared(Arc::new(RetryVersion {
+            data,
+            progress: Arc::new([AtomicU64::new(0)]),
+            slot: 0,
+        }))
+    }
+
+    /// Bytes of this file in place on the destination (transferred or matched).
+    pub fn done(&self) -> &AtomicU64 {
+        match self {
+            Self::Shared(retry) => &retry.progress[retry.slot],
+            Self::Chunk { chunk, slot } => &chunk.progress[*slot],
+        }
+    }
 }
 
 impl Borrow<FileJobData> for SnapshotData {
     fn borrow(&self) -> &FileJobData {
         match self {
-            Self::Shared(data) => data,
-            Self::Chunk { slots, slot } => slots[*slot].get().unwrap(),
+            Self::Shared(retry) => &retry.data,
+            Self::Chunk { chunk, slot } => chunk.slots[*slot].get().unwrap(),
         }
     }
 }
 
 pub type WorkerJob = FileJob<Option<Arc<Entry>>, SnapshotData>;
+
+impl<D> FileJob<D, SnapshotData> {
+    /// Bytes of this file in place on the destination (transferred or matched).
+    pub fn done(&self) -> &AtomicU64 {
+        self.data.done()
+    }
+}
+
 const JOBS_PER_CHUNK: usize = 1024;
 
-/// Published slots never change. OnceLock permits appending jobs to a partial
-/// chunk while workers hold earlier slots, without unsafe aliasing or chunk COW.
-/// Retry versions are sparse and owned independently of the original chunk.
 #[derive(Default)]
 pub struct Jobs {
-    chunks: Vec<Arc<Vec<OnceLock<FileJobData>>>>,
+    chunks: Vec<Arc<JobChunk>>,
     destinations: Vec<Option<Arc<Entry>>>,
-    retries: HashMap<usize, Arc<FileJobData>>,
+    retries: HashMap<usize, Arc<RetryVersion>>,
     /// How many of the first `named` jobs were planned to replace each
     /// multiply linked destination file, by device and inode. Counted only
     /// when first asked, then extended over the jobs planned since.
@@ -151,23 +193,23 @@ fn linked_identity(entry: &Entry) -> Option<(u64, u64)> {
 
 /// A borrowed current version also identifies the owner needed by snapshots.
 enum CurrentJob<'a> {
-    Retry(&'a Arc<FileJobData>),
-    Chunk(&'a Arc<Vec<OnceLock<FileJobData>>>, usize),
+    Retry(&'a Arc<RetryVersion>),
+    Chunk(&'a Arc<JobChunk>, usize),
 }
 
 impl<'a> CurrentJob<'a> {
     fn data(self) -> &'a FileJobData {
         match self {
-            Self::Retry(data) => data,
-            Self::Chunk(slots, slot) => slots[slot].get().unwrap(),
+            Self::Retry(retry) => &retry.data,
+            Self::Chunk(chunk, slot) => chunk.slots[slot].get().unwrap(),
         }
     }
 
     fn snapshot(self) -> SnapshotData {
         match self {
-            Self::Retry(data) => SnapshotData::Shared(data.clone()),
-            Self::Chunk(slots, slot) => SnapshotData::Chunk {
-                slots: slots.clone(),
+            Self::Retry(retry) => SnapshotData::Shared(retry.clone()),
+            Self::Chunk(chunk, slot) => SnapshotData::Chunk {
+                chunk: chunk.clone(),
                 slot,
             },
         }
@@ -181,7 +223,7 @@ impl Jobs {
 
     fn current(&self, idx: usize) -> CurrentJob<'_> {
         match self.retries.get(&idx) {
-            Some(data) => CurrentJob::Retry(data),
+            Some(retry) => CurrentJob::Retry(retry),
             None => {
                 let (chunk, slot) = Self::locate(idx);
                 CurrentJob::Chunk(&self.chunks[chunk], slot)
@@ -192,11 +234,12 @@ impl Jobs {
     fn push(&mut self, job: FileJob) {
         let (chunk, slot) = Self::locate(self.destinations.len());
         if slot == 0 {
-            self.chunks.push(Arc::new(
-                (0..JOBS_PER_CHUNK).map(|_| OnceLock::new()).collect(),
-            ));
+            self.chunks.push(Arc::new(JobChunk {
+                slots: (0..JOBS_PER_CHUNK).map(|_| OnceLock::new()).collect(),
+                progress: (0..JOBS_PER_CHUNK).map(|_| AtomicU64::new(0)).collect(),
+            }));
         }
-        self.chunks[chunk][slot]
+        self.chunks[chunk].slots[slot]
             .set(job.data)
             .expect("job slot published twice");
         self.destinations.push(job.dst_entry.map(Arc::new));
@@ -206,16 +249,25 @@ impl Jobs {
         // Only a changed job acquires a private allocation. Existing worker
         // snapshots retain their previous version, including across retries.
         let (chunk, slot) = Self::locate(idx);
-        let chunks = &self.chunks;
-        Arc::make_mut(
-            self.retries
-                .entry(idx)
-                .or_insert_with(|| Arc::new(chunks[chunk][slot].get().unwrap().clone())),
-        )
+        let chunk = &self.chunks[chunk];
+        &mut Arc::make_mut(self.retries.entry(idx).or_insert_with(|| {
+            Arc::new(RetryVersion {
+                data: chunk.slots[slot].get().unwrap().clone(),
+                progress: chunk.progress.clone(),
+                slot,
+            })
+        }))
+        .data
     }
 
     pub fn len(&self) -> usize {
         self.destinations.len()
+    }
+
+    /// Bytes of job `idx` in place on the destination (transferred or matched).
+    pub fn done(&self, idx: usize) -> &AtomicU64 {
+        let (chunk, slot) = Self::locate(idx);
+        &self.chunks[chunk].progress[slot]
     }
 
     /// Record that job `idx` is being prepared at the destination, and
@@ -689,9 +741,23 @@ impl Inner {
     }
 }
 
+/// How waiting workers are woken. `cv` has one kind of waiter, a worker in
+/// `take`, so a change that makes some number of items takeable wakes that
+/// many waiters (`wake_takers`) and the rest sleep on. A waiter woken for an
+/// item that another worker took looks, finds nothing and waits again. All
+/// of them are woken together only by a change every waiter waits for: work
+/// is released, the scan ends, or the copy is aborted or finishes.
+///
+/// A range in flight can be stolen from repeatedly, so a range that can be
+/// split counts as one item: the worker that claims or steals one wakes one
+/// more waiter while a split remains, and each woken thief does the same.
 pub struct Sched {
     inner: Mutex<Inner>,
     cv: Condvar,
+    /// Eager workers waiting to learn whether planning found file work
+    /// (`wait_for_anticipated_file_work`). Their own condition variable keeps
+    /// `cv`'s waiters all of one kind.
+    file_work_cv: Condvar,
     tune_cv: Condvar,
     /// Whether the copy is aborted, for workers pacing under `--bwlimit`
     /// (`sleep_unless_aborted`), with what wakes them on `abort`. Its own
@@ -759,6 +825,7 @@ impl Sched {
                 abort: false,
             }),
             cv: Condvar::new(),
+            file_work_cv: Condvar::new(),
             tune_cv: Condvar::new(),
             paced_abort: Default::default(),
             direct_fallback_workers: AtomicUsize::new(0),
@@ -810,10 +877,10 @@ impl Sched {
         inner.files.register(idx, &job.dst);
         inner.files.push((size, Reverse(FileOrder::new(idx))));
         if !std::mem::replace(&mut inner.file_work_anticipated, true) {
-            drop(inner);
-            // Also wake a worker waiting to learn whether there is file work.
-            self.cv.notify_all();
-        } else if inner.bursts == 0 {
+            // Also wake the workers waiting to learn whether there is file work.
+            self.file_work_cv.notify_all();
+        }
+        if inner.bursts == 0 {
             self.wake_for_queued_files(inner);
         }
         idx
@@ -858,12 +925,70 @@ impl Sched {
         let waiting = inner.waiting_workers;
         let files = inner.files.len();
         drop(inner);
-        if files < waiting {
-            for _ in 0..files {
+        self.notify_takers(waiting, files);
+    }
+
+    /// Wake `items` of the `waiting` workers, or all of them when there are
+    /// no more workers than items.
+    fn notify_takers(&self, waiting: usize, items: usize) {
+        if items >= waiting {
+            if waiting > 0 {
+                self.cv.notify_all();
+            }
+        } else {
+            for _ in 0..items {
                 self.cv.notify_one();
             }
-        } else if waiting > 0 {
+        }
+    }
+
+    /// Wake waiting workers after a change to `inner` that queued `added`
+    /// items: all of them if the copy has now finished, as they all exit,
+    /// and otherwise one for each item. A change that queued nothing and did
+    /// not finish the copy leaves waiting workers with nothing new to take.
+    fn wake_takers(&self, inner: std::sync::MutexGuard<'_, Inner>, added: usize) {
+        let waiting = inner.waiting_workers;
+        if waiting == 0 {
+            return;
+        }
+        if inner.finished() {
+            drop(inner);
             self.cv.notify_all();
+        } else if inner.scan_done || inner.work_released {
+            // Until release, queued work waits for it, and release wakes
+            // every worker.
+            drop(inner);
+            self.notify_takers(waiting, added);
+        }
+    }
+
+    /// Where a steal would split `range`: near its middle and on its policy's
+    /// block boundary, leaving each part at least its policy's minimum. None
+    /// when it is too short to split.
+    fn split_point(&self, range: &RangeState) -> Option<u64> {
+        let (block, minimum) = range
+            .split
+            .map_or((self.block, self.min_split), |s| (s.block, s.minimum));
+        let rem = range.end.checked_sub(range.pos)?;
+        if rem < minimum.saturating_mul(2) {
+            return None;
+        }
+        let middle = range.pos + rem / 2;
+        let fits = |split: u64| split - range.pos >= minimum && range.end - split >= minimum;
+        // The boundary above the middle leaves the owner the larger part;
+        // the one below serves when that would leave the thief too little.
+        let up = middle.div_ceil(block) * block;
+        let down = middle / block * block;
+        [up, down]
+            .into_iter()
+            .find(|&split| split > range.pos && split < range.end && fits(split))
+    }
+
+    /// Wake one more waiting worker when `range`, just claimed or split, can
+    /// be split again (`Sched`).
+    fn wake_thief_for(&self, inner: &Inner, range: &RangeHandle) {
+        if inner.waiting_workers > 0 && self.split_point(&range.lock().unwrap()).is_some() {
+            self.cv.notify_one();
         }
     }
 
@@ -937,7 +1062,7 @@ impl Sched {
         inner.file_work_anticipated = true;
         drop(inner);
         if first {
-            self.cv.notify_all();
+            self.file_work_cv.notify_all();
         }
     }
 
@@ -952,18 +1077,15 @@ impl Sched {
             if inner.scan_done || inner.abort {
                 return false;
             }
-            inner = self.cv.wait(inner).unwrap();
+            inner = self.file_work_cv.wait(inner).unwrap();
         }
     }
 
     pub fn requeue(&self, idx: usize) {
         let size = self.jobs.lock().unwrap()[idx].entry.size;
-        self.inner
-            .lock()
-            .unwrap()
-            .files
-            .push((size, Reverse(FileOrder::new(idx))));
-        self.cv.notify_one();
+        let mut g = self.inner.lock().unwrap();
+        g.files.push((size, Reverse(FileOrder::new(idx))));
+        self.wake_takers(g, 1);
     }
 
     /// End the probe of file `idx` and queue it again, in one step: between
@@ -974,7 +1096,7 @@ impl Sched {
         let mut g = self.inner.lock().unwrap();
         g.probing -= 1;
         g.files.push((size, Reverse(FileOrder::new(idx))));
-        self.cv.notify_all();
+        self.wake_takers(g, 1);
     }
 
     /// Files are queued a few at a time, as the directories they go into
@@ -1004,6 +1126,7 @@ impl Sched {
     pub fn scan_done(&self) {
         self.inner.lock().unwrap().scan_done = true;
         self.cv.notify_all();
+        self.file_work_cv.notify_all();
         self.tune_cv.notify_one();
         self.end_unneeded_worker_setups();
     }
@@ -1011,6 +1134,7 @@ impl Sched {
     pub fn abort(&self) {
         self.inner.lock().unwrap().abort = true;
         self.cv.notify_all();
+        self.file_work_cv.notify_all();
         *self.paced_abort.0.lock().unwrap() = true;
         self.paced_abort.1.notify_all();
         self.tune_cv.notify_one();
@@ -1123,7 +1247,7 @@ impl Sched {
         mut groups: VecDeque<std::ops::Range<usize>>,
     ) -> (std::ops::Range<usize>, FastBatchHandle) {
         let first = groups.pop_front().expect("nonempty fast batch");
-        let shareable = !groups.is_empty();
+        let shareable = groups.len();
         // Keep totals with each shareable group, so sampling costs O(groups),
         // not O(files). Claiming or stealing removes its totals with the group.
         let groups = groups
@@ -1138,9 +1262,10 @@ impl Sched {
             files,
             groups,
         }));
-        if shareable {
-            self.inner.lock().unwrap().fast_groups.push(handle.clone());
-            self.cv.notify_all();
+        if shareable > 0 {
+            let mut g = self.inner.lock().unwrap();
+            g.fast_groups.push(handle.clone());
+            self.wake_takers(g, shareable);
         }
         (first, handle)
     }
@@ -1170,7 +1295,11 @@ impl Sched {
             for &(size, idx) in &files[1..] {
                 g.files.push((size, Reverse(FileOrder::new(idx))));
             }
-            self.cv.notify_all();
+            // The returned siblings are queued items, and so is each group
+            // still unread, which the next thief steals.
+            let left = files.len() - 1 + usize::from(!batch.groups.is_empty());
+            drop(batch);
+            self.notify_takers(g.waiting_workers, left);
             return Some(first);
         }
         None
@@ -1184,7 +1313,7 @@ impl Sched {
         g.probing -= n;
         g.fast_probing -= n;
         g.fast_batches -= 1;
-        self.cv.notify_all();
+        self.wake_takers(g, 0);
     }
 
     /// Whether enough splittable activity remains to measure `n` workers.
@@ -1274,9 +1403,9 @@ impl Sched {
         if handle.lock().unwrap().split == Some(split) {
             return;
         }
-        let _guard = self.inner.lock().unwrap();
+        let guard = self.inner.lock().unwrap();
         handle.lock().unwrap().split = Some(split);
-        self.cv.notify_all();
+        self.wake_thief_for(&guard, handle);
         self.tune_cv.notify_one();
     }
 
@@ -1294,19 +1423,20 @@ impl Sched {
         drop(r);
         *g.outstanding.entry(idx).or_insert(0) += 1;
         g.ranges.push((idx, pos, end), split);
-        self.cv.notify_all();
+        self.wake_takers(g, 1);
     }
 
     /// Return an assignment claimed while a worker was being retired, before
     /// it issued any requests. Keep the work visible throughout the handoff.
     pub fn return_unstarted(&self, item: Item) {
-        match item {
+        let g = match item {
             Item::Exit => return,
             Item::File(idx) => {
                 let size = self.jobs.lock().unwrap()[idx].entry.size;
                 let mut g = self.inner.lock().unwrap();
                 g.probing -= 1;
                 g.files.push((size, Reverse(FileOrder::new(idx))));
+                g
             }
             Item::Range(handle) => {
                 let mut g = self.inner.lock().unwrap();
@@ -1315,19 +1445,23 @@ impl Sched {
                 // The queued range keeps the assignment's outstanding share.
                 g.ranges
                     .push((range.idx, range.pos, range.end), range.split);
+                drop(range);
+                g
             }
             Item::Finish { idx, matched } => {
                 let mut g = self.inner.lock().unwrap();
                 g.finishes.push((idx, matched));
                 g.finishing -= 1;
+                g
             }
             Item::Patch(patch) => {
                 let mut g = self.inner.lock().unwrap();
                 g.patches.push_front(patch);
                 g.patching -= 1;
+                g
             }
-        }
-        self.cv.notify_all();
+        };
+        self.wake_takers(g, 1);
     }
 
     pub fn next(&self) -> Item {
@@ -1349,7 +1483,9 @@ impl Sched {
             }
             if g.scan_done || g.work_released {
                 if let Some((idx, off, end, split)) = g.ranges.pop() {
-                    return Some(Item::Range(g.claim_range(idx, off, end, split)));
+                    let range = g.claim_range(idx, off, end, split);
+                    self.wake_thief_for(&g, &range);
+                    return Some(Item::Range(range));
                 }
                 if let Some((idx, matched)) = g.finishes.pop() {
                     g.finishing += 1;
@@ -1390,31 +1526,42 @@ impl Sched {
         }
     }
 
+    /// Split the in-flight range with the most left to read. The scheduler
+    /// lock fixes every range's end and split policy, but an owner claims
+    /// reads under its range's lock alone, so the range is checked again
+    /// once locked to split. An owner only moves forward, so a range that no
+    /// longer splits never splits again, and the search ends.
     fn steal(&self, g: &mut Inner) -> Option<RangeHandle> {
-        let mut best: Option<(u64, usize)> = None;
-        for (i, h) in g.inflight.iter().enumerate() {
-            let r = h.lock().unwrap();
-            let rem = r.end.saturating_sub(r.pos);
-            let minimum = r.split.map_or(self.min_split, |s| s.minimum);
-            if rem >= 2 * minimum && best.is_none_or(|(b, _)| rem > b) {
-                best = Some((rem, i));
+        loop {
+            let mut best: Option<(u64, usize)> = None;
+            for (i, h) in g.inflight.iter().enumerate() {
+                let r = h.lock().unwrap();
+                let rem = r.end.saturating_sub(r.pos);
+                if best.is_none_or(|(b, _)| rem > b) && self.split_point(&r).is_some() {
+                    best = Some((rem, i));
+                }
             }
+            let (_, i) = best?;
+            let victim = g.inflight[i].clone();
+            let mut r = victim.lock().unwrap();
+            let Some(split) = self.split_point(&r) else {
+                continue;
+            };
+            let (idx, old_end, policy) = (r.idx, r.end, r.split);
+            r.end = split;
+            let victim_splits = self.split_point(&r).is_some();
+            drop(r);
+            *g.outstanding.entry(idx).or_insert(0) += 1;
+            let stolen = g.claim_range(idx, split, old_end, policy);
+            if victim_splits {
+                if g.waiting_workers > 0 {
+                    self.cv.notify_one();
+                }
+            } else {
+                self.wake_thief_for(g, &stolen);
+            }
+            return Some(stolen);
         }
-        let (_, i) = best?;
-        let victim = g.inflight[i].clone();
-        let mut r = victim.lock().unwrap();
-        let rem = r.end - r.pos;
-        let policy = r.split;
-        let block = policy.map_or(self.block, |s| s.block);
-        let split = (r.pos + rem / 2).div_ceil(block) * block;
-        if split >= r.end || split <= r.pos {
-            return None;
-        }
-        let (idx, old_end) = (r.idx, r.end);
-        r.end = split;
-        drop(r);
-        *g.outstanding.entry(idx).or_insert(0) += 1;
-        Some(g.claim_range(idx, split, old_end, policy))
     }
 
     /// Pop further queued files no larger than `max_size` (largest-first order
@@ -1518,7 +1665,9 @@ impl Sched {
                 return None;
             }
             let (idx, off, end, split) = g.ranges.take_short(idx, size)?;
-            Some(g.claim_range(idx, off, end, split))
+            let range = g.claim_range(idx, off, end, split);
+            self.wake_thief_for(&g, &range);
+            Some(range)
         });
         RangeWork::Ready(next)
     }
@@ -1561,8 +1710,13 @@ impl Sched {
         let first = it
             .next()
             .map(|(off, end)| g.claim_range(idx, off, end, None));
+        let queued = it.as_slice().len();
         g.ranges.extend(idx, it.as_slice());
-        self.cv.notify_all();
+        // The first range is a thief's item while it can be split.
+        let splits = first
+            .as_ref()
+            .is_some_and(|first| self.split_point(&first.lock().unwrap()).is_some());
+        self.wake_takers(g, queued + usize::from(splits));
         first
     }
 
@@ -1577,8 +1731,9 @@ impl Sched {
         if done {
             g.outstanding.remove(&idx);
         }
-        self.cv.notify_all();
-        done && !g.abort && !g.failed.contains(&idx)
+        let publish = done && !g.abort && !g.failed.contains(&idx);
+        self.wake_takers(g, 0);
+        publish
     }
 
     /// A connection died with this range's acknowledgements uncertain. Put
@@ -1588,6 +1743,7 @@ impl Sched {
         let mut g = self.inner.lock().unwrap();
         g.inflight.retain(|candidate| !Arc::ptr_eq(candidate, h));
         let range = h.lock().unwrap();
+        let mut added = 1;
         if start < range.end {
             g.ranges.push((range.idx, start, range.end), range.split);
         } else {
@@ -1596,16 +1752,20 @@ impl Sched {
             if *n == 0 {
                 g.outstanding.remove(&range.idx);
                 g.finishes.push((range.idx, false));
+            } else {
+                added = 0;
             }
         }
-        self.cv.notify_all();
+        drop(range);
+        self.wake_takers(g, added);
     }
 
     /// Release a claimed publication after completion, failure, or queuing its
     /// retry. Keep it visible until then so other workers cannot exit early.
     pub fn finish_done(&self) {
-        self.inner.lock().unwrap().finishing -= 1;
-        self.cv.notify_all();
+        let mut g = self.inner.lock().unwrap();
+        g.finishing -= 1;
+        self.wake_takers(g, 0);
         self.tune_cv.notify_one();
     }
 
@@ -1617,10 +1777,10 @@ impl Sched {
         if patches.is_empty() {
             return;
         }
+        let added = patches.len();
         let mut g = self.inner.lock().unwrap();
         g.patches.extend(patches.into_iter().map(Box::new));
-        drop(g);
-        self.cv.notify_all();
+        self.wake_takers(g, added);
     }
 
     /// Take back a streamed patch that the comparison batch `compared_in`
@@ -1640,16 +1800,18 @@ impl Sched {
     /// A claimed streamed patch is settled: its file is complete, failed, or
     /// queued again.
     pub fn patch_done(&self) {
-        self.inner.lock().unwrap().patching -= 1;
-        self.cv.notify_all();
+        let mut g = self.inner.lock().unwrap();
+        g.patching -= 1;
+        self.wake_takers(g, 0);
         self.tune_cv.notify_one();
     }
 
     /// Final publication is separate from range accounting so a lost
     /// Finalize response can be retried on a fresh connection.
     pub fn requeue_finish(&self, idx: usize, matched: bool) {
-        self.inner.lock().unwrap().finishes.push((idx, matched));
-        self.cv.notify_one();
+        let mut g = self.inner.lock().unwrap();
+        g.finishes.push((idx, matched));
+        self.wake_takers(g, 1);
     }
 }
 

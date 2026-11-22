@@ -38,7 +38,6 @@ pub(crate) fn test_job(name: &[u8], size: u64) -> FileJob {
             target_condition: crate::proto::TargetCondition::Any,
             policy_condition: false,
             attempt: 0,
-            done: Arc::new(AtomicU64::new(0)),
             inplace: false,
             in_place_refusal: None,
         },
@@ -106,9 +105,14 @@ fn requeued_files_keep_their_identity_with_concurrent_batch_consumers() {
     let sched = Arc::new(Sched::new(64, 128));
     for idx in 0..257 {
         let mut job = test_job(b"source", 4096);
-        job.done.store(idx as u64, Relaxed);
         job.rel = idx.to_string();
-        sched.push_file(job);
+        assert_eq!(sched.push_file(job), idx);
+        sched
+            .jobs
+            .lock()
+            .unwrap()
+            .done(idx)
+            .store(idx as u64, Relaxed);
     }
     sched.scan_done();
     let seen = Mutex::new(Vec::new());
@@ -122,7 +126,7 @@ fn requeued_files_keep_their_identity_with_concurrent_batch_consumers() {
                     for idx in batch {
                         let jobs = sched.jobs.lock().unwrap();
                         assert_eq!(jobs[idx].rel, idx.to_string());
-                        assert_eq!(jobs[idx].done.load(Relaxed), idx as u64);
+                        assert_eq!(jobs.done(idx).load(Relaxed), idx as u64);
                         drop(jobs);
                         seen.lock().unwrap().push(idx);
                         if idx == 17 && !retried.swap(true, Relaxed) {
@@ -187,10 +191,10 @@ fn chunks_allow_append_retry_and_release_with_live_snapshots() {
     let mut jobs = Jobs::default();
     jobs.push(test_job(b"source", 7));
     let first = jobs.snapshot(0);
-    let SnapshotData::Chunk { slots, .. } = &first.data else {
+    let SnapshotData::Chunk { chunk, .. } = &first.data else {
         panic!("expected chunk");
     };
-    let owner = Arc::downgrade(slots);
+    let owner = Arc::downgrade(chunk);
     std::thread::scope(|scope| {
         scope.spawn(|| {
             for _ in 0..10_000 {
@@ -203,13 +207,13 @@ fn chunks_allow_append_retry_and_release_with_live_snapshots() {
     });
     let second = jobs.snapshot(1);
     let SnapshotData::Chunk {
-        slots: second_slots,
+        chunk: second_chunk,
         ..
     } = &second.data
     else {
         panic!("expected chunk");
     };
-    assert!(Arc::ptr_eq(slots, second_slots));
+    assert!(Arc::ptr_eq(chunk, second_chunk));
     assert!(jobs.retries.is_empty());
     assert_eq!(jobs.chunks.len(), 3);
     jobs[0].entry.size = 11;
@@ -254,7 +258,6 @@ fn jobs_preserve_indexes_snapshots_retries_and_release_capacity() {
                 target_condition: crate::proto::TargetCondition::Any,
                 policy_condition: false,
                 attempt: 0,
-                done: Arc::new(AtomicU64::new(0)),
                 inplace: false,
                 in_place_refusal: None,
                 rel_bytes: i.to_string().into_bytes(),
@@ -274,7 +277,7 @@ fn jobs_preserve_indexes_snapshots_retries_and_release_capacity() {
     jobs[1].entry.size = 99;
     jobs[1].attempt = 1;
     jobs[1].inplace = true;
-    jobs[1].done.store(3, Relaxed);
+    jobs.done(1).store(3, Relaxed);
     jobs.set_destination(1, entry.clone());
     let retry = jobs.snapshot(1);
     assert_eq!(before.entry.size, 7);
@@ -284,8 +287,11 @@ fn jobs_preserve_indexes_snapshots_retries_and_release_capacity() {
     assert_eq!(retry.entry.size, 99);
     assert_eq!(retry.attempt, 1);
     assert!(retry.inplace);
-    assert_eq!(retry.dst_entry.unwrap().size, 7);
-    assert_eq!(before.done.load(Relaxed), 3);
+    assert_eq!(retry.dst_entry.as_ref().unwrap().size, 7);
+    // Every version of a job counts its progress together.
+    assert_eq!(before.done().load(Relaxed), 3);
+    assert_eq!(retry.done().load(Relaxed), 3);
+    assert_eq!(jobs.done(0).load(Relaxed), 0);
     drop(jobs);
     assert_eq!(
         sched.inner.lock().unwrap().files.bytes,
@@ -977,7 +983,7 @@ fn preflight_release_runs_jobs_without_treating_an_empty_queue_as_eof() {
 }
 
 /// Workers that take files and hold them, so that nothing but a wakeup for
-/// queued files brings a waiting one back: finishing a file wakes them all.
+/// queued files brings a waiting one back.
 struct HoldingWorkers {
     sched: Arc<Sched>,
     taken: std::sync::mpsc::Receiver<usize>,
@@ -2037,4 +2043,364 @@ fn shared_patches_are_queued_work_until_settled() {
     sched.patch_done();
     assert!(sched.finished());
     assert!(matches!(sched.try_next(), Some(Item::Exit)));
+}
+
+/// Waiting workers that report what they take and the waits they begin, so
+/// a test can see how many of them a change woke: a woken worker with nothing
+/// to take waits again, and so does one that took something.
+struct Waiters {
+    sched: Arc<Sched>,
+    taken: std::sync::mpsc::Receiver<&'static str>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Waiters {
+    fn start(sched: &Arc<Sched>, workers: usize) -> Self {
+        let (tx, taken) = std::sync::mpsc::channel();
+        let threads = (0..workers)
+            .map(|_| {
+                let (sched, tx) = (sched.clone(), tx.clone());
+                std::thread::spawn(move || loop {
+                    let item = sched.next();
+                    let kind = match item {
+                        Item::Exit => "exit",
+                        Item::File(_) => "file",
+                        Item::Range(_) => "range",
+                        Item::Finish { .. } => "finish",
+                        Item::Patch(_) => "patch",
+                    };
+                    tx.send(kind).unwrap();
+                    if kind == "exit" {
+                        break;
+                    }
+                })
+            })
+            .collect();
+        let waiters = Self {
+            sched: sched.clone(),
+            taken,
+            threads,
+        };
+        waiters.settle();
+        waiters
+    }
+
+    /// Wait until every worker is asleep with no wakeup on its way, and
+    /// return how many waits they have begun. As in
+    /// `HoldingWorkers::wait_until_all_wait`, a notified worker still counts
+    /// as waiting until it runs, so wake them all and see each wait again.
+    fn settle(&self) -> usize {
+        let workers = self.threads.len();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let wait_for = |settled: &dyn Fn(&Inner) -> bool| loop {
+            let inner = self.sched.inner.lock().unwrap();
+            if settled(&inner) {
+                break inner.waits;
+            }
+            drop(inner);
+            assert!(Instant::now() < deadline, "workers did not settle");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let waits = wait_for(&|inner| inner.waiting_workers == workers);
+        self.sched.cv.notify_all();
+        wait_for(&|inner| inner.waiting_workers == workers && inner.waits >= waits + workers)
+    }
+
+    fn waits(&self) -> usize {
+        self.sched.inner.lock().unwrap().waits
+    }
+
+    /// Every worker is waiting again, having begun `waits` waits in all: a
+    /// worker that a change woke would begin another.
+    fn expect_waits(&self, waits: usize, context: &str) {
+        let workers = self.threads.len();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let inner = self.sched.inner.lock().unwrap();
+            if inner.waiting_workers == workers && inner.waits >= waits {
+                break;
+            }
+            drop(inner);
+            assert!(Instant::now() < deadline, "{context}: workers did not wait");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            self.waits(),
+            waits,
+            "{context}: woke a worker with nothing to take"
+        );
+    }
+
+    fn expect_taken(&self, expected: &[&str], context: &str) {
+        let mut taken: Vec<_> = (0..expected.len())
+            .map(|_| {
+                self.taken
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap_or_else(|_| panic!("{context}: too little was taken"))
+            })
+            .collect();
+        let mut expected = expected.to_vec();
+        taken.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(taken, expected, "{context}");
+    }
+
+    fn join(self) {
+        for thread in self.threads {
+            thread.join().unwrap();
+        }
+        assert!(self.taken.try_iter().all(|kind| kind == "exit"));
+    }
+}
+
+#[test]
+fn completions_wake_no_waiting_worker_until_the_copy_finishes() {
+    let sched = Arc::new(Sched::new(512, 1024));
+    sched.push_file(test_job(b"probed", 512));
+    sched.push_file(test_job(b"batched", 512));
+    sched.scan_done();
+    let (Some(Item::File(probed)), Some(Item::File(_))) = (sched.try_next(), sched.try_next())
+    else {
+        panic!("missing files")
+    };
+    // The second file is a small-file batch of its own.
+    assert_eq!(sched.begin_fast_batch(1, 1), 1);
+    let waiters = Waiters::start(&sched, 3);
+    let waits = waiters.waits();
+    // A probe that finds one range too short to steal from, and that
+    // range's completion, leave nothing to take.
+    let range = sched.ranges_ready(probed, vec![(0, 512)]).unwrap();
+    assert!(sched.range_done(&range));
+    waiters.expect_waits(waits, "a completion");
+    // A queued publication wakes one worker, which takes it.
+    sched.requeue_finish(probed, false);
+    waiters.expect_taken(&["finish"], "a queued publication");
+    waiters.expect_waits(waits + 1, "a queued publication");
+    sched.finish_done();
+    waiters.expect_waits(waits + 1, "a finished publication");
+    // The last completion finishes the copy and wakes every worker.
+    sched.complete_fast_batch(1);
+    waiters.expect_taken(&["exit", "exit", "exit"], "finished copy");
+    waiters.join();
+}
+
+#[test]
+fn steals_leave_both_parts_their_minimum_on_a_block_boundary() {
+    // 512-byte blocks and a 1024-byte minimum.
+    let sched = Sched::new(512, 1024);
+    sched.push_file(test_job(b"file", 2300));
+    sched.scan_done();
+    assert!(matches!(sched.try_next(), Some(Item::File(0))));
+    let owner = sched.ranges_ready(0, vec![(0, 2300)]).unwrap();
+    // The boundary above the middle (1536) would leave the thief 764
+    // bytes, so the one below it is used.
+    let Some(Item::Range(stolen)) = sched.try_next() else {
+        panic!("a range twice the minimum splits")
+    };
+    assert_eq!(owner.lock().unwrap().end, 1024);
+    let stolen_range = stolen.lock().unwrap();
+    assert_eq!((stolen_range.pos, stolen_range.end), (1024, 2300));
+    drop(stolen_range);
+    // Neither part splits again.
+    assert!(sched.try_next().is_none());
+    // A range with no block boundary that leaves both parts their minimum
+    // is not split, however long it is.
+    {
+        let mut range = owner.lock().unwrap();
+        range.end = 2148;
+        range.pos = 100;
+    }
+    stolen.lock().unwrap().pos = 2300;
+    assert!(sched.try_next().is_none());
+    assert!(!sched.range_done(&stolen));
+    owner.lock().unwrap().pos = 2148;
+    assert!(sched.range_done(&owner));
+    assert!(matches!(sched.try_next(), Some(Item::Exit)));
+}
+
+#[test]
+fn concurrent_thieves_respect_the_minimum_while_owners_advance() {
+    const BLOCK: u64 = 512;
+    const MINIMUM: u64 = 1024;
+    const SIZE: u64 = 256 << 10;
+    const WORKERS: usize = 6;
+    let sched = Arc::new(Sched::new(BLOCK, MINIMUM));
+    sched.push_file(test_job(b"large", SIZE));
+    sched.scan_done();
+    assert!(matches!(sched.try_next(), Some(Item::File(0))));
+    let holding = Arc::new(AtomicUsize::new(0));
+    let read = Arc::new(AtomicU64::new(0));
+    // Each worker reads its range a block at a time. The range's end moves
+    // only when a thief splits it, and then while the owner's position is
+    // the one it last left: the owner must keep at least the minimum.
+    let work = |sched: Arc<Sched>, first: Option<RangeHandle>| {
+        let (holding, read) = (holding.clone(), read.clone());
+        move || {
+            let mut next = first.map(Item::Range);
+            let mut first_range = true;
+            while let Item::Range(handle) = next.take().unwrap_or_else(|| sched.next()) {
+                let (mut pos, mut end) = {
+                    let range = handle.lock().unwrap();
+                    (range.pos, range.end)
+                };
+                assert!(end - pos >= MINIMUM, "stole {pos}..{end}");
+                if std::mem::take(&mut first_range) {
+                    // No worker reads until every one holds a range: the
+                    // waiting thieves woke one another.
+                    holding.fetch_add(1, Relaxed);
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while holding.load(Relaxed) < WORKERS {
+                        assert!(Instant::now() < deadline, "a waiting thief was not woken");
+                        std::thread::yield_now();
+                    }
+                }
+                loop {
+                    let mut range = handle.lock().unwrap();
+                    assert_eq!(range.pos, pos);
+                    if range.end != end {
+                        assert!(range.end >= pos + MINIMUM, "left {pos}..{}", range.end);
+                        assert_eq!(range.end % BLOCK, 0);
+                        end = range.end;
+                    }
+                    if pos == end {
+                        break;
+                    }
+                    let n = (end - pos).min(BLOCK);
+                    pos += n;
+                    range.pos = pos;
+                    drop(range);
+                    read.fetch_add(n, Relaxed);
+                    std::thread::yield_now();
+                }
+                sched.range_done(&handle);
+            }
+        }
+    };
+    let thieves: Vec<_> = (1..WORKERS)
+        .map(|_| std::thread::spawn(work(sched.clone(), None)))
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while sched.inner.lock().unwrap().waiting_workers < WORKERS - 1 {
+        assert!(Instant::now() < deadline, "thieves did not wait");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let first = sched.ranges_ready(0, vec![(0, SIZE)]).unwrap();
+    work(sched.clone(), Some(first))();
+    for thief in thieves {
+        thief.join().unwrap();
+    }
+    assert_eq!(read.load(Relaxed), SIZE, "every byte read exactly once");
+    assert!(sched.finished());
+    assert!(sched.inner.lock().unwrap().outstanding.is_empty());
+}
+
+#[test]
+fn concurrent_producers_and_consumers_lose_no_wakeup() {
+    const FILES: usize = 2000;
+    const WORKERS: usize = 8;
+    for round in 0..4 {
+        let sched = Arc::new(Sched::new(512, 1024));
+        sched.release_preflighted_work();
+        let seen: Arc<Vec<AtomicUsize>> =
+            Arc::new((0..FILES).map(|_| AtomicUsize::new(0)).collect());
+        let consumers: Vec<_> = (0..WORKERS)
+            .map(|_| {
+                let (sched, seen) = (sched.clone(), seen.clone());
+                std::thread::spawn(move || loop {
+                    match sched.next() {
+                        Item::Exit => break,
+                        Item::File(idx) => {
+                            // A third of the files are probed twice, and a
+                            // third have ranges other workers take.
+                            if seen[idx].fetch_add(1, Relaxed) == 0 && idx % 3 == 0 {
+                                sched.requeue_probed(idx);
+                            } else if idx % 3 == 1 {
+                                let first = sched
+                                    .ranges_ready(idx, vec![(0, 512), (512, 1024), (1024, 1536)])
+                                    .unwrap();
+                                if sched.range_done(&first) {
+                                    sched.requeue_finish(idx, false);
+                                }
+                            } else {
+                                sched.ranges_ready(idx, Vec::new());
+                            }
+                        }
+                        Item::Range(handle) => {
+                            let idx = handle.lock().unwrap().idx;
+                            if sched.range_done(&handle) {
+                                sched.requeue_finish(idx, false);
+                            }
+                        }
+                        Item::Finish { .. } => sched.finish_done(),
+                        Item::Patch(_) => unreachable!(),
+                    }
+                })
+            })
+            .collect();
+        // Two planners queue files concurrently, some in bursts.
+        let jobs: Vec<_> = (0..FILES).map(burst_job).collect();
+        let jobs = Arc::new(Mutex::new(jobs.into_iter()));
+        let producers: Vec<_> = (0..2)
+            .map(|producer| {
+                let (sched, jobs) = (sched.clone(), jobs.clone());
+                std::thread::spawn(move || loop {
+                    let burst = ((producer + round) % 2 == 0).then(|| sched.file_burst());
+                    for _ in 0..7 {
+                        let Some(job) = jobs.lock().unwrap().next() else {
+                            return;
+                        };
+                        sched.push_file(job);
+                    }
+                    drop(burst);
+                    std::thread::yield_now();
+                })
+            })
+            .collect();
+        for producer in producers {
+            producer.join().unwrap();
+        }
+        sched.scan_done();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for consumer in consumers {
+                consumer.join().unwrap();
+            }
+            done.send(()).unwrap();
+        });
+        finished
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|_| panic!("round {round}: a worker slept through work"));
+        assert!(sched.finished());
+        for (idx, count) in seen.iter().enumerate() {
+            let expected = if idx % 3 == 0 { 2 } else { 1 };
+            assert_eq!(count.load(Relaxed), expected, "round {round}: file {idx}");
+        }
+    }
+}
+
+#[test]
+fn abort_and_scan_end_wake_workers_and_eager_connections_alike() {
+    for abort in [false, true] {
+        let sched = Arc::new(Sched::new(512, 1024));
+        sched.release_preflighted_work();
+        let eager = {
+            let sched = sched.clone();
+            std::thread::spawn(move || sched.wait_for_anticipated_file_work())
+        };
+        let waiters = Waiters::start(&sched, 3);
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            !eager.is_finished(),
+            "an eager connection waits for file work"
+        );
+        if abort {
+            sched.abort();
+        } else {
+            sched.scan_done();
+        }
+        waiters.expect_taken(&["exit", "exit", "exit"], "end");
+        assert!(!eager.join().unwrap(), "no file work was found");
+        waiters.join();
+    }
 }

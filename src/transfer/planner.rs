@@ -4260,7 +4260,6 @@ impl Planner<'_> {
                 policy_condition,
                 target_condition,
                 attempt: 0,
-                done: Arc::new(AtomicU64::new(0)),
                 inplace,
                 in_place_refusal,
                 src_rel,

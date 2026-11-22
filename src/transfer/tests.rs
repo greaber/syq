@@ -524,18 +524,20 @@ impl Conn for PipelineConn {
 
 fn pipeline_snapshot(job: FileJob) -> WorkerJob {
     WorkerJob {
-        data: crate::sched::SnapshotData::Shared(Arc::new(job.data)),
+        data: crate::sched::SnapshotData::detached(job.data),
         dst_entry: job.dst_entry.map(Arc::new),
     }
 }
 
-fn pipeline_ranges(spans: &[(u64, u64)]) -> (Arc<Sched>, RangeHandle, FileJob) {
+/// The scheduler, the file's first range, and the file as it was queued,
+/// which shares its progress with every later version.
+fn pipeline_ranges(spans: &[(u64, u64)]) -> (Arc<Sched>, RangeHandle, WorkerJob) {
     let sched = Arc::new(Sched::new(512, 8192));
-    let job = pipeline_job(b"source", spans.last().unwrap().1);
-    sched.push_file(job.clone());
+    sched.push_file(pipeline_job(b"source", spans.last().unwrap().1));
     sched.scan_done();
     assert!(matches!(sched.next(), Item::File(0)));
     let handle = sched.ranges_ready(0, spans.to_vec()).unwrap();
+    let job = sched.jobs.lock().unwrap().snapshot(0);
     (sched, handle, job)
 }
 
@@ -741,7 +743,7 @@ fn a_worker_on_the_shared_ssh_login_logs_in_on_its_own_for_larger_files() {
     worker.transfer_range(&rest, &mut credited).unwrap();
     assert!(sched.range_done(&rest));
     assert_eq!(credited, 4096);
-    assert_eq!(job.done.load(Relaxed), 4096);
+    assert_eq!(job.done().load(Relaxed), 4096);
     assert!(shared.lock().unwrap().requests.is_empty());
     let requests = |state: &Arc<Mutex<PipelineState>>, read: bool| {
         state
@@ -1243,7 +1245,7 @@ fn changed_source_exhausts_retries_without_publishing() {
         assert!(matches!(sched.next(), Item::File(0)));
         let job = worker.job(0);
         assert_eq!(job.attempt, attempt);
-        job.done.store(job.entry.size, Relaxed);
+        job.done().store(job.entry.size, Relaxed);
         sched.ranges_ready(0, vec![]);
         let mut changed = job.entry.clone();
         changed.mtime += 1;
@@ -1290,7 +1292,7 @@ fn a_refused_finalize_whose_sidecar_is_gone_is_verified_by_contents() {
         let results = capture_results(&worker);
         assert!(matches!(sched.next(), Item::File(0)));
         let job = worker.job(0);
-        job.done.store(job.entry.size, Relaxed);
+        job.done().store(job.entry.size, Relaxed);
         sched.ranges_ready(0, vec![]);
         let hash = Response::FileHash {
             size: 512,
@@ -2308,7 +2310,7 @@ fn small_batch_reports_acknowledged_bytes_and_rolls_back_uncertain_credit() {
             assert_eq!(files, 7, "completion waits for the batch to drain");
         }
         assert_eq!(
-            jobs[0].done.load(Relaxed),
+            sched.jobs.lock().unwrap().done(0).load(Relaxed),
             if expected_files == 6 { 1 << 20 } else { 0 }
         );
         assert_eq!(sched.is_failed(0), failure == "changed");
@@ -2432,7 +2434,7 @@ fn later_batch_read_error_keeps_publications_and_requeues_unwritten_files() {
     assert_eq!(worker.progress.bytes_done.load(Relaxed), 4 << 20);
     assert_eq!(worker.progress.errors.load(Relaxed), 1);
     for &idx in &original[..4] {
-        assert_eq!(jobs[idx].done.load(Relaxed), 1 << 20);
+        assert_eq!(sched.jobs.lock().unwrap().done(idx).load(Relaxed), 1 << 20);
         assert!(!sched.is_failed(idx));
     }
     assert!(sched.is_failed(original[4]));
@@ -2834,7 +2836,7 @@ fn scattered_ranges_pipeline_and_recover_with_bounded_ownership() {
             assert_eq!(result.is_ok(), failure == "none", "{failure}: {result:?}");
             if failure == "none" {
                 assert_eq!(credited, 512);
-                assert_eq!(sched.jobs.lock().unwrap()[0].done.load(Relaxed), 2048);
+                assert_eq!(sched.jobs.lock().unwrap().done(0).load(Relaxed), 2048);
                 let source = src.lock().unwrap();
                 let destination = dst.lock().unwrap();
                 assert_eq!(source.requests.len(), 4);
@@ -2863,7 +2865,7 @@ fn scattered_ranges_pipeline_and_recover_with_bounded_ownership() {
                     spans,
                     vec![(0, 512), (1024, 1536), (2048, 2560), (3072, 3584)]
                 );
-                assert_eq!(sched.jobs.lock().unwrap()[0].done.load(Relaxed), 0);
+                assert_eq!(sched.jobs.lock().unwrap().done(0).load(Relaxed), 0);
                 assert!(sched.finished());
             } else {
                 if failure == "mismatch" {
@@ -2917,7 +2919,7 @@ fn multiblock_ranges_refill_windows_and_retry_only_unfinished_shares() {
             assert_eq!(result.is_ok(), failure.is_none(), "{result:?}");
             if failure.is_some() {
                 assert_eq!(
-                    job.done.load(Relaxed),
+                    job.done().load(Relaxed),
                     (completed_extras as u64 + 1) * 1536,
                     "partially acknowledged extras must be rolled back before retry"
                 );
@@ -2932,8 +2934,8 @@ fn multiblock_ranges_refill_windows_and_retry_only_unfinished_shares() {
                     let n = state.end - state.pos;
                     drop(state);
                     worker.progress.add_bytes(n);
-                    job.done.fetch_add(n, Relaxed);
-                    assert!(job.done.load(Relaxed) <= 12 * 1536);
+                    job.done().fetch_add(n, Relaxed);
+                    assert!(job.done().load(Relaxed) <= 12 * 1536);
                     assert_eq!(sched.range_done(&range), i == 11 - completed_extras);
                 }
                 let mut expected = spans;
@@ -2952,7 +2954,7 @@ fn multiblock_ranges_refill_windows_and_retry_only_unfinished_shares() {
                 }
                 assert!(sched.range_done(&h));
             }
-            assert_eq!(job.done.load(Relaxed), 12 * 1536);
+            assert_eq!(job.done().load(Relaxed), 12 * 1536);
             assert!(sched.finished());
         }
     }
@@ -2991,7 +2993,7 @@ fn long_extras_follow_range_selection_and_only_reserve_for_ready_peers() {
         worker.transfer_range(&h, &mut credited).unwrap();
         assert_eq!(src.lock().unwrap().requests.len(), 18, "{tuning}");
         assert_eq!(credited, 3072);
-        assert_eq!(job.done.load(Relaxed), 9216);
+        assert_eq!(job.done().load(Relaxed), 9216);
         assert!(sched.range_done(&h));
         assert!(sched.finished());
     }
@@ -3501,7 +3503,9 @@ fn large_small_file_batches_bound_long_path_frames_and_preserve_every_file() {
     assert!(sched.finished());
     assert_eq!(worker.progress.files_done.load(Relaxed), jobs.len() as u64);
     assert_eq!(worker.progress.errors.load(Relaxed), 0);
-    assert!(jobs.iter().all(|job| job.done.load(Relaxed) == 1));
+    let queued = sched.jobs.lock().unwrap();
+    assert!((0..jobs.len()).all(|idx| queued.done(idx).load(Relaxed) == 1));
+    drop(queued);
     let requests = source_requests.lock().unwrap();
     assert!(
         requests
@@ -3608,7 +3612,7 @@ fn local_copy_progress_is_live_but_failure_retracts_completion_credit() {
             if failure == "none" { 4096 } else { 0 }
         );
         assert_eq!(
-            job.done.load(Relaxed),
+            job.done().load(Relaxed),
             if failure == "none" { 4096 } else { 0 }
         );
         if matches!(failure, "regression" | "oversize") {
@@ -3673,7 +3677,7 @@ fn comparing_pull_pipelines_remote_reads_with_a_synchronous_destination() {
             );
             assert_eq!(src.lock().unwrap().max_pending, depth);
             assert_eq!(credited, 8192);
-            assert_eq!(job.done.load(Relaxed), 8192);
+            assert_eq!(job.done().load(Relaxed), 8192);
             assert_eq!(src.lock().unwrap().received, 16);
         }
     }
@@ -3997,7 +4001,7 @@ fn range_dispatch_excludes_retiring_workers_through_both_endpoint_drains() {
             assert!(gate.measurement_ready(1));
             worker.process_item(Item::Range(handle)).unwrap();
             assert!(!gate.allowed(1));
-            assert!(job.done.load(Relaxed) > 0, "path={path}");
+            assert!(job.done().load(Relaxed) > 0, "path={path}");
             for endpoint in [&src, &dst] {
                 let state = endpoint.lock().unwrap();
                 assert!(!state.tuning_snapshots.is_empty(), "path={path}");
@@ -4083,8 +4087,8 @@ fn publication_dispatch_excludes_retiring_workers_through_source_recheck() {
         for source_fails in [false, true] {
             let sched = Arc::new(Sched::new(512, 8192));
             let job = pipeline_job(b"source", 4096);
-            job.done.store(4096, Relaxed);
             sched.push_file(job.clone());
+            sched.jobs.lock().unwrap().done(0).store(4096, Relaxed);
             sched.scan_done();
             assert!(matches!(sched.next(), Item::File(0)));
             sched.ranges_ready(0, vec![]);
@@ -4157,8 +4161,8 @@ fn returned_last_publication_is_completed_by_the_remaining_worker() {
     for matched in [false, true] {
         let sched = Arc::new(Sched::new(512, 8192));
         let job = pipeline_job(b"source", 4096);
-        job.done.store(4096, Relaxed);
         sched.push_file(job.clone());
+        sched.jobs.lock().unwrap().done(0).store(4096, Relaxed);
         sched.scan_done();
         assert!(matches!(sched.next(), Item::File(0)));
         sched.ranges_ready(0, vec![]);
@@ -4211,8 +4215,8 @@ fn publication_connection_failure_releases_claim_after_queuing_retry() {
     for matched in [false, true] {
         let sched = Arc::new(Sched::new(512, 8192));
         let job = pipeline_job(b"source", 4096);
-        job.done.store(4096, Relaxed);
         sched.push_file(job.clone());
+        sched.jobs.lock().unwrap().done(0).store(4096, Relaxed);
         sched.scan_done();
         assert!(matches!(sched.next(), Item::File(0)));
         sched.ranges_ready(0, vec![]);
@@ -8541,7 +8545,7 @@ fn adaptive_comparison(
 ) -> (
     Worker,
     RangeHandle,
-    FileJob,
+    WorkerJob,
     Arc<Mutex<PipelineState>>,
     Arc<Mutex<PipelineState>>,
 ) {
@@ -8594,7 +8598,7 @@ fn adaptive_comparisons_flow_across_windows_within_the_look_ahead() {
             worker.transfer_range(&handle, &mut credited).unwrap();
             let case = format!("final={final_basis} remote={remote_source}");
             // Every block is in place, the matching ones counted as reused.
-            assert_eq!(job.done.load(Relaxed), size, "{case}");
+            assert_eq!(job.done().load(Relaxed), size, "{case}");
             assert_eq!(credited, size / 8, "{case}");
             assert_eq!(
                 worker.progress.bytes_unchanged.load(Relaxed),
@@ -8728,7 +8732,7 @@ fn a_failed_comparison_write_drains_both_connections_in_order() {
                 assert_eq!(state.received, state.requests.len(), "{case}");
                 assert!(state.replies.is_empty(), "{case}");
             }
-            assert!(job.done.load(Relaxed) < 32 << 10, "{case}");
+            assert!(job.done().load(Relaxed) < 32 << 10, "{case}");
             // Nothing is sent to either endpoint once the failure is seen.
             let dst = dst.lock().unwrap();
             let failed = dst
@@ -8769,7 +8773,7 @@ fn fixed_comparisons_never_ask_the_receiver_to_hold_more_than_it_may() {
         opts.tuning.pipeline_depth = Some(4);
         let mut credited = 0;
         worker.transfer_range(&handle, &mut credited).unwrap();
-        assert_eq!(job.done.load(Relaxed), size, "{block}");
+        assert_eq!(job.done().load(Relaxed), size, "{block}");
         let (mut held, mut most) = (0u64, 0u64);
         for request in &dst.lock().unwrap().requests {
             match request {

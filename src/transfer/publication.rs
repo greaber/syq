@@ -130,7 +130,7 @@ impl Worker {
         if earlier_partials && self.writes_partial_named_payload_for(&job.dst) {
             earlier_partials = false;
         }
-        if job.done.load(Relaxed) != job.entry.size {
+        if job.done().load(Relaxed) != job.entry.size {
             bail!("refusing to publish an incomplete file");
         }
         #[cfg(debug_assertions)]

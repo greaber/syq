@@ -1401,7 +1401,7 @@ impl Worker {
                     }
                     return self.file_error(idx, error);
                 }
-                job.done.store(job.entry.size, Relaxed);
+                job.done().store(job.entry.size, Relaxed);
                 if !streamed {
                     self.progress.add_bytes(sent);
                 }
@@ -1439,7 +1439,7 @@ impl Worker {
         if let Err(error) = self.record_hardlink_identity(idx, job, identity) {
             return self.file_error(idx, error);
         }
-        job.done.store(job.entry.size, Relaxed);
+        job.done().store(job.entry.size, Relaxed);
         self.progress
             .bytes_unchanged
             .fetch_add(job.entry.size, Relaxed);
