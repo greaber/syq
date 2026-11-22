@@ -1,3 +1,5 @@
+mod region;
+
 use super::{Header, Options};
 use anyhow::{bail, Context, Result};
 use aws_sdk_s3::{
@@ -234,23 +236,31 @@ impl Intercept for Headers {
         cfg: &mut ConfigBag,
     ) -> std::result::Result<(), BoxError> {
         let request = context.request_mut();
-        let url = url::Url::parse(request.uri())?;
-        let query = url.query_pairs().map(|(key, _)| key).collect::<Vec<_>>();
-        let method = request.method().to_owned();
-        for Header(name, value) in super::applicable_headers(
-            &self.every,
-            &self.write,
-            &method,
-            query.iter().map(|key| key.as_ref()),
-        ) {
+        let put = request.method() == "PUT";
+        let could_write = !self.write.is_empty() && (put || request.method() == "POST");
+        if self.every.is_empty()
+            && !could_write
+            && !(put && request.headers().get("x-amz-checksum-sha256").is_some())
+        {
+            return Ok(());
+        }
+
+        // The SDK has already constructed the URI. Decode query names only
+        // on requests that use them to select headers or payload signing.
+        let writes =
+            could_write && super::writes_object(request.method(), query_names(request.uri()));
+        for Header(name, value) in self
+            .every
+            .iter()
+            .chain(self.write.iter().filter(|_| writes))
+        {
             request
                 .headers_mut()
                 .try_insert(name.clone(), value.clone())?;
         }
-        let request = context.request();
-        if request.method() == "PUT" {
+        if put {
             if let Some(checksum) = request.headers().get("x-amz-checksum-sha256") {
-                let multipart = query.iter().any(|key| key == "uploadId");
+                let multipart = query_names(request.uri()).any(|key| key == "uploadId");
                 if let Some(hash) =
                     super::checksum::single_put_payload("PUT", multipart, Some(checksum))?
                 {
@@ -261,6 +271,11 @@ impl Intercept for Headers {
         }
         Ok(())
     }
+}
+
+fn query_names(uri: &str) -> impl Iterator<Item = std::borrow::Cow<'_, str>> {
+    let query = uri.split_once('?').map_or("", |(_, query)| query);
+    url::form_urlencoded::parse(query.as_bytes()).map(|(key, _)| key)
 }
 
 /// S3 names a bucket's region on every response, including the redirect or
@@ -365,7 +380,8 @@ pub(super) async fn connect(
     control: std::sync::Arc<std::sync::atomic::AtomicU64>,
     uploads: std::sync::Arc<super::cancel::Cancellation>,
 ) -> Result<(Client, Option<String>)> {
-    connect_authorized(options, control, uploads, None, None).await
+    let (client, note, _) = connect_authorized(options, control, uploads, None, None).await?;
+    Ok((client, note))
 }
 
 pub(super) async fn connect_authorized(
@@ -374,7 +390,7 @@ pub(super) async fn connect_authorized(
     uploads: std::sync::Arc<super::cancel::Cancellation>,
     authorization: Option<std::sync::Arc<super::authorization::Authorization>>,
     outage: Option<std::sync::Arc<super::outage::Outage>>,
-) -> Result<(Client, Option<String>)> {
+) -> Result<Connection> {
     let shared = if let Some(authorization) = &authorization {
         options.endpoint = Some(authorization.configuration.endpoint.clone());
         options.region = Some(authorization.configuration.region.clone());
@@ -396,7 +412,16 @@ pub(super) async fn connect_authorized(
     } else {
         local_config(options).await
     };
-    connect_with(options, shared, control, uploads, authorization, outage).await
+    connect_with(
+        options,
+        shared,
+        control,
+        uploads,
+        authorization,
+        outage,
+        false,
+    )
+    .await
 }
 
 /// Connects with this machine's own configuration, like [`connect`], and also
@@ -411,7 +436,7 @@ pub(super) async fn connect_local(
 )> {
     let shared = local_config(options).await;
     let credentials = shared.credentials_provider();
-    let (client, _) = connect_with(options, shared, control, uploads, None, None).await?;
+    let (client, _, _) = connect_with(options, shared, control, uploads, None, None, true).await?;
     Ok((client, credentials))
 }
 
@@ -426,6 +451,10 @@ async fn local_config(options: &Options) -> aws_types::SdkConfig {
     loader.load().await
 }
 
+pub(super) type DiscoveredRegion = std::sync::Arc<std::sync::OnceLock<String>>;
+
+type Connection = (Client, Option<String>, Option<DiscoveredRegion>);
+
 async fn connect_with(
     options: &mut Options,
     shared: aws_types::SdkConfig,
@@ -433,7 +462,8 @@ async fn connect_with(
     uploads: std::sync::Arc<super::cancel::Cancellation>,
     authorization: Option<std::sync::Arc<super::authorization::Authorization>>,
     outage: Option<std::sync::Arc<super::outage::Outage>>,
-) -> Result<(Client, Option<String>)> {
+    fixed_region: bool,
+) -> Result<Connection> {
     let transport = aws_smithy_http_client::Builder::new()
         .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
             aws_smithy_http_client::tls::rustls_provider::CryptoMode::AwsLc,
@@ -494,33 +524,47 @@ async fn connect_with(
         })
         .or_else(|| shared.endpoint_url().map(str::to_owned));
     options.endpoint = endpoint.clone();
-    let mut note = None;
-    let lookup = looks_up_region(options.region.as_deref(), endpoint.as_deref());
     if let Some(endpoint) = endpoint {
         super::validate_endpoint(&endpoint)?;
         config = config.endpoint_url(endpoint).force_path_style(true);
     }
-    if lookup {
-        // AWS serves each bucket from one region and redirects requests sent
-        // elsewhere. A region from the environment or a profile is the
-        // account's default, not a fact about this bucket, so it only chooses
-        // where to ask. `--s3-region` is a statement about the bucket and is
-        // used as given.
-        let hint = shared
-            .region()
-            .map_or("us-east-1", |r| r.as_ref())
-            .to_owned();
-        let probe = Client::from_conf(config.clone().build());
-        match bucket_region(&probe, &options.bucket).await {
-            Ok(region) => config = config.region(Region::new(region)),
-            Err(reason) => {
-                note = Some(format!(
-                    "could not look up the bucket's region, signing for {hint}: {reason}"
-                ))
-            }
-        }
+    Ok(connect_region(config, options, shared.region(), fixed_region).await)
+}
+
+async fn connect_region(
+    mut config: aws_sdk_s3::config::Builder,
+    options: &Options,
+    hint: Option<&Region>,
+    fixed_region: bool,
+) -> Connection {
+    if !looks_up_region(options.region.as_deref(), options.endpoint.as_deref()) {
+        return (Client::from_conf(config.build()), None, None);
     }
-    Ok((Client::from_conf(config.build()), note))
+    if hint.is_some() && !fixed_region && !options.route.is_server_copy() {
+        // An AWS environment or profile region is a starting point. The
+        // first real request can tell us if this bucket lives elsewhere.
+        let corrected = DiscoveredRegion::default();
+        config = region::allow_redirect(config, &options.bucket, corrected.clone());
+        return (Client::from_conf(config.build()), None, Some(corrected));
+    }
+
+    // Without a configured region, ask from the default endpoint. The
+    // authorizing machine also needs to publish a fixed signing region.
+    // A two-bucket copy uses one region for both and checks the source first.
+    let probe = Client::from_conf(config.clone().build());
+    let note = match bucket_region(&probe, &options.bucket).await {
+        Ok(region) => {
+            config = config.region(Region::new(region));
+            None
+        }
+        Err(reason) => {
+            let hint = hint.map_or("us-east-1", |r| r.as_ref());
+            Some(format!(
+                "could not look up the bucket's region, signing for {hint}: {reason}"
+            ))
+        }
+    };
+    (Client::from_conf(config.build()), note, None)
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

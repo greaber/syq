@@ -1,28 +1,37 @@
-//! Share concurrent system lookups, without retaining addresses or failures
-//! after the callers finish. A connection burst must not become a DNS burst.
+//! Share concurrent system lookups and briefly reuse successful answers.
 use aws_smithy_runtime_api::client::dns::{
     DnsFuture, ResolveDns, ResolveDnsError, SharedDnsResolver,
 };
 use std::{
     collections::HashMap,
     net::{IpAddr, ToSocketAddrs},
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex, OnceLock, Weak},
+    time::Duration,
 };
-use tokio::sync::OnceCell;
+use tokio::{sync::OnceCell, time::Instant};
 
 type Lookup = OnceCell<Result<Vec<IpAddr>, Arc<ResolveDnsError>>>;
 
 const MAX_CONCURRENT_LOOKUPS: usize = 8;
+const CACHE_CAPACITY: usize = 64;
+// The system resolver does not expose record TTLs.
+const CACHE_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Default)]
+struct Lookups {
+    inflight: HashMap<String, Weak<Lookup>>,
+    cached: HashMap<String, (Instant, Vec<IpAddr>)>,
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct CoalescingDns {
     resolver: SharedDnsResolver,
-    lookups: Arc<Mutex<HashMap<String, Weak<Lookup>>>>,
+    lookups: Arc<Mutex<Lookups>>,
 }
 
 impl Default for CoalescingDns {
     fn default() -> Self {
-        Self::new(SharedDnsResolver::new(SystemDns::default()))
+        Self::new(SharedDnsResolver::new(SystemDns))
     }
 }
 
@@ -40,17 +49,45 @@ impl ResolveDns for CoalescingDns {
         DnsFuture::new(async move {
             let lookup = {
                 let mut lookups = self.lookups.lock().expect("DNS lookup lock poisoned");
-                lookups.retain(|_, value| value.strong_count() > 0);
-                if let Some(lookup) = lookups.get(name).and_then(Weak::upgrade) {
+                let now = Instant::now();
+                if let Some((expires, addresses)) = lookups.cached.get(name) {
+                    if now < *expires {
+                        return Ok(addresses.clone());
+                    }
+                    lookups.cached.remove(name);
+                }
+                lookups.inflight.retain(|_, value| value.strong_count() > 0);
+                if let Some(lookup) = lookups.inflight.get(name).and_then(Weak::upgrade) {
                     lookup
                 } else {
                     let lookup = Arc::new(OnceCell::new());
-                    lookups.insert(name.into(), Arc::downgrade(&lookup));
+                    lookups
+                        .inflight
+                        .insert(name.into(), Arc::downgrade(&lookup));
                     lookup
                 }
             };
             lookup
-                .get_or_init(|| async { self.resolver.resolve_dns(name).await.map_err(Arc::new) })
+                .get_or_init(|| async {
+                    let addresses = self.resolver.resolve_dns(name).await.map_err(Arc::new)?;
+                    if !addresses.is_empty() {
+                        let mut lookups = self.lookups.lock().expect("DNS lookup lock poisoned");
+                        if lookups.cached.len() == CACHE_CAPACITY {
+                            let oldest = lookups
+                                .cached
+                                .iter()
+                                .min_by_key(|(_, (expires, _))| expires)
+                                .map(|(name, _)| name.clone())
+                                .unwrap();
+                            lookups.cached.remove(&oldest);
+                        }
+                        lookups
+                            .cached
+                            .insert(name.into(), (Instant::now() + CACHE_TTL, addresses.clone()));
+                        lookups.inflight.remove(name);
+                    }
+                    Ok(addresses)
+                })
                 .await
                 .clone()
                 .map_err(ResolveDnsError::new)
@@ -59,21 +96,16 @@ impl ResolveDns for CoalescingDns {
 }
 
 #[derive(Debug)]
-struct SystemDns {
-    slots: Arc<tokio::sync::Semaphore>,
-}
-impl Default for SystemDns {
-    fn default() -> Self {
-        Self {
-            slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LOOKUPS)),
-        }
-    }
-}
+struct SystemDns;
+
 impl ResolveDns for SystemDns {
     fn resolve_dns<'a>(&'a self, name: &'a str) -> DnsFuture<'a> {
-        let name = name.to_owned();
+        static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
         DnsFuture::new(async move {
-            system_lookup(self.slots.clone(), move || {
+            let slots =
+                SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LOOKUPS)));
+            let name = name.to_owned();
+            system_lookup(slots.clone(), move || {
                 (name.as_str(), 0)
                     .to_socket_addrs()
                     .map(|addresses| addresses.map(|a| a.ip()).collect())
@@ -84,27 +116,31 @@ impl ResolveDns for SystemDns {
 }
 
 // A pooled HTTP connection can satisfy a request while a speculative connection
-// is still resolving DNS. System lookups cannot be cancelled, so Tokio's blocking
-// pool would make runtime shutdown wait for an unused lookup. Isolate only DNS
-// on detached threads; file I/O continues to use the runtime's normal drain.
+// is resolving DNS. libc lookups cannot be cancelled. This process-wide pool
+// runs only DNS, so it does not delay shutdown of the transfer's runtime.
 async fn system_lookup(
     slots: Arc<tokio::sync::Semaphore>,
     lookup: impl FnOnce() -> std::io::Result<Vec<IpAddr>> + Send + 'static,
 ) -> Result<Vec<IpAddr>, ResolveDnsError> {
+    static POOL: OnceLock<std::io::Result<tokio::runtime::Runtime>> = OnceLock::new();
     let permit = slots.acquire_owned().await.map_err(ResolveDnsError::new)?;
+    let pool = POOL.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .thread_name("syq-s3-dns")
+            .max_blocking_threads(MAX_CONCURRENT_LOOKUPS)
+            .build()
+    });
+    let pool = pool
+        .as_ref()
+        .map_err(|error| ResolveDnsError::new(std::io::Error::other(error.to_string())))?;
     let (send, receive) = tokio::sync::oneshot::channel();
-    std::thread::Builder::new()
-        .name("syq-s3-dns".into())
-        .spawn(move || {
-            // Cancellation does not release capacity while libc is still running.
-            // This bounds outstanding threads even across cancelled lookups.
-            if !send.is_closed() {
-                let result = lookup();
-                drop(permit);
-                let _ = send.send(result);
-            }
-        })
-        .map_err(ResolveDnsError::new)?;
+    pool.spawn_blocking(move || {
+        if !send.is_closed() {
+            let result = lookup();
+            drop(permit);
+            let _ = send.send(result);
+        }
+    });
     receive
         .await
         .map_err(ResolveDnsError::new)?
@@ -213,8 +249,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn shares_inflight_lookups_but_does_not_cache_results_or_errors() {
+    #[tokio::test(start_paused = true)]
+    async fn shares_inflight_lookups_and_caches_only_successes_until_expiry() {
         let calls = Arc::new(AtomicUsize::new(0));
         let resolver = CoalescingDns::new(SharedDnsResolver::new(Resolver(calls.clone())));
         for name in ["example", "missing"] {
@@ -224,8 +260,27 @@ mod tests {
             assert!(results.iter().all(|r| r.is_ok() == (name == "example")));
             assert_eq!(calls.load(Ordering::SeqCst), before + 1);
             let _ = resolver.resolve_dns(name).await;
+            if name == "example" {
+                assert_eq!(calls.load(Ordering::SeqCst), before + 1);
+                tokio::time::advance(CACHE_TTL).await;
+                resolver.resolve_dns(name).await.unwrap();
+            }
             assert_eq!(calls.load(Ordering::SeqCst), before + 2);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cache_evicts_the_oldest_answer_at_capacity() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver = CoalescingDns::new(SharedDnsResolver::new(Resolver(calls.clone())));
+        for index in 0..=CACHE_CAPACITY {
+            resolver.resolve_dns(&index.to_string()).await.unwrap();
+            tokio::time::advance(Duration::from_millis(1)).await;
+        }
+        resolver.resolve_dns("1").await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), CACHE_CAPACITY + 1);
+        resolver.resolve_dns("0").await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), CACHE_CAPACITY + 2);
     }
 
     #[tokio::test]

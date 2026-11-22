@@ -559,6 +559,7 @@ async fn direct_download_can_resume_after_a_long_pause_within_one_read() {
             Some(body),
             None,
             Some(HashAlgorithm::Blake3),
+            None,
         )
         .await
         .unwrap();
@@ -641,7 +642,7 @@ async fn permanent_get_failures_are_not_retried() {
         );
         let started = Instant::now();
         let result = engine
-            .download_fast_range(&object, &output, 0, SIZE as u64, None, None, None)
+            .download_fast_range(&object, &output, 0, SIZE as u64, None, None, None, None)
             .await;
         let calls = calls.load(std::sync::atomic::Ordering::Relaxed);
         if permanent {

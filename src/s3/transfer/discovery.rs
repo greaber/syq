@@ -33,8 +33,9 @@ use tokio::sync::watch;
 /// only where the store lists in byte order, and otherwise only from a
 /// complete listing (`Discovery::start`): elsewhere an existing object could
 /// look absent, and an upload in its place would drop metadata only the
-/// destination has. Even so, relying on it must not change what the copy
-/// does, so these copies ask about every key.
+/// destination has. Copies whose overwrite policy needs current metadata
+/// ask with HEAD before proceeding. Existence-only uploads can separately
+/// use a listing to rule out keys they would skip.
 pub(super) fn trusts_absence(args: &Args) -> bool {
     // The object would be skipped by --only-existing, refused instead of kept
     // by keep, overwritten though newer by update-if-older, and judged by
@@ -58,7 +59,7 @@ pub(super) fn trusts_absence(args: &Args) -> bool {
 /// relies on them at all. A directory marker that exists is accepted under
 /// `--if-exists=error`, where a write that must create it would be refused.
 pub(super) fn trusts_absence_of(args: &Args, key: &str) -> bool {
-    !(key.ends_with('/') && args.protects_existing_contents())
+    args.existing || !(key.ends_with('/') && args.protects_existing_contents())
 }
 
 /// Whether a copy to `bucket` lists its destination to learn which planned
@@ -84,7 +85,7 @@ const LIST_COST: usize = 12;
 /// Planned keys a page must decide to be worth requesting. LIST is billed
 /// about [`LIST_COST`] times a HEAD, and a worker waiting for the page could
 /// have sent its own HEAD instead.
-const KEYS_PER_PAGE: usize = 64;
+pub(super) const KEYS_PER_PAGE: usize = 64;
 /// Planned keys beneath a prefix worth its complete listing alongside the
 /// copy where the order is unknown. A smaller plan has its keys checked
 /// before a page could come back.

@@ -269,6 +269,11 @@ fn permission_only_upload_handles_large_objects_without_reading_local_contents()
             .unwrap();
         assert!(output.status.success(), "{fault}: {}", output_text(&output));
         assert!(server.gate.1.load(Ordering::Relaxed));
+        assert_eq!(
+            server.requests.load(Ordering::Relaxed),
+            if fault.ends_with("large") { 6 } else { 2 },
+            "{fault}"
+        );
     }
 }
 
