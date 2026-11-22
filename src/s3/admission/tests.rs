@@ -1082,6 +1082,19 @@ fn transfer_throttled_halves_and_preserves_maximum() {
     assert_eq!(controller.transfer_throttled(), 16);
     assert_eq!(controller.maximum, 256);
     assert_eq!(controller.upper, 17);
+
+    // An upward probe or revisit that draws throttling steps back to the prior
+    // working level instead of halving below it.
+    controller.probe = Some(Probe {
+        from: 16,
+        baseline: 100.0,
+        upward: true,
+        revisit: true,
+        confirming: false,
+    });
+    controller.limit = 24;
+    assert_eq!(controller.transfer_throttled(), 16);
+    assert_eq!(controller.upper, 24);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1144,80 +1157,11 @@ async fn pre_handoff_single_throttle_cuts_once_not_twice() {
     )
     .await
     .unwrap();
-    // One pre-handoff throttle should halve 16 -> 8, not double-cut to 4.
+    // One pre-handoff throttle should halve 16 -> 8, neither skipping the cut
+    // nor double-cutting to 4.
+    let peak = post_throttle_peak.load(SeqCst);
     assert!(
-        post_throttle_peak.load(SeqCst) >= 8,
-        "post_throttle_peak {} indicates double cut below 8",
-        post_throttle_peak.load(SeqCst)
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn throttled_checking_above_transfer_limit_leaves_budget_untouched() {
-    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-    let outage = Arc::new(crate::s3::outage::Outage::default());
-    let args = crate::cli::Args::parse_args(&[
-        std::ffi::OsString::from("cp"),
-        std::ffi::OsString::from("a"),
-        std::ffi::OsString::from("--to"),
-        std::ffi::OsString::from("s3://bucket"),
-        std::ffi::OsString::from("--as"),
-        std::ffi::OsString::from("b"),
-    ])
-    .unwrap();
-    let options = args.s3.clone().unwrap();
-    let tuning = crate::s3::tuning::Tuning::new(
-        &options,
-        &args,
-        Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
-        outage.clone(),
-    );
-    tuning.configure(false, 64, 16);
-    let budget = tuning.requests.clone();
-    let checking_active = Arc::new(AtomicUsize::new(0));
-    parallel(
-        (0..4_000usize).collect(),
-        Concurrency {
-            initial: 16,
-            maximum: None,
-            initial_probe_up: false,
-            requests: Some(budget.clone()),
-            checking: Some(Checking { maximum: 64 }),
-            outage: Some(outage.clone()),
-        },
-        |job, mut slot| {
-            let outage = outage.clone();
-            let budget = budget.clone();
-            let checking_active = checking_active.clone();
-            async move {
-                let now = checking_active.fetch_add(1, SeqCst) + 1;
-                if now > 20 {
-                    outage.throttled();
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                checking_active.fetch_sub(1, SeqCst);
-                if job % 50 == 0 {
-                    slot.claim().await;
-                    let permit = budget.acquire().await;
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                    budget.completed(1024);
-                    drop(permit);
-                    Ok(Some(1024))
-                } else {
-                    Ok(None)
-                }
-            }
-        },
-    )
-    .await
-    .unwrap();
-    assert!(
-        outage.throttled_responses() > 0,
-        "expected checking requests above transfer limit to trigger throttling"
-    );
-    assert_eq!(
-        tuning.request_limit(),
-        16,
-        "throttling while checking is above transfer limit must not halve the request budget"
+        (8..=10).contains(&peak),
+        "post_throttle_peak {peak} expected near 8 (single cut from 16)"
     );
 }

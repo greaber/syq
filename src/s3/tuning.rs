@@ -87,6 +87,8 @@ impl Tuning {
         // and earlier listing or discovery throttles must not cut a new batch.
         s.since = None;
         s.saturated = false;
+        s.settled = false;
+        s.handed_off = false;
         s.backoff_windows = 0;
         s.throttle_backoff = 0;
         if let Some(outage) = &self.requests.outage {
@@ -168,6 +170,7 @@ struct Window {
     probe_preserved_rate: bool,
     object_rate: Option<(usize, f64, Duration)>,
     settled: bool,
+    handed_off: bool,
     seen_throttled: u64,
     backoff_windows: usize,
     throttle_backoff: usize,
@@ -233,6 +236,7 @@ impl Budget {
                 probe_preserved_rate: false,
                 object_rate: None,
                 settled: false,
+                handed_off: false,
                 seen_throttled,
                 backoff_windows: 0,
                 throttle_backoff: 0,
@@ -286,7 +290,12 @@ impl Budget {
         // Keep the actual attempted limit when smaller probes narrow the gap.
         (s.settled && s.limit == previous).then_some(s.proposed_limit)
     }
+    #[cfg(test)]
     pub fn begin_objects(&self, workers: usize) -> Option<usize> {
+        self.begin_objects_with_throttled(workers)
+            .map(|(limit, _)| limit)
+    }
+    pub fn begin_objects_with_throttled(&self, workers: usize) -> Option<(usize, u64)> {
         let mut s = self.state.lock().unwrap();
         // Reaching the object seed is not evidence that the last increase helped.
         // Resolve that probe before allowing the object controller to grow again,
@@ -303,10 +312,20 @@ impl Budget {
         // Some jobs may still be waiting in acquire(); increasing the request
         // limit here would let them bypass the newly chosen object concurrency.
         s.settled = true;
-        Some(workers.min(s.limit))
+        s.handed_off = true;
+        Some((workers.min(s.limit), s.seen_throttled))
     }
     pub fn set_checking_above(&self, above: bool) {
-        self.checking_above.store(above, Relaxed);
+        let was = self.checking_above.swap(above, Relaxed);
+        if was && !above {
+            // Consume throttles drawn while expanded checking was active so
+            // they cannot cut the first transfer after the gate closes even if
+            // no transfer completed during that interval.
+            if let Some(outage) = &self.outage {
+                let mut s = self.state.lock().unwrap();
+                s.seen_throttled = outage.throttled_responses();
+            }
+        }
     }
     pub fn finish_objects(&self, maximum: usize) {
         let maximum = maximum.min(self.ceiling.unwrap_or(usize::MAX));
@@ -316,6 +335,7 @@ impl Budget {
             s.max = maximum;
         }
         s.adaptive = false;
+        s.handed_off = true;
         drop(s);
         self.changed.notify_waiters();
     }
@@ -337,7 +357,7 @@ impl Budget {
             return false;
         }
         s.seen_throttled = responses;
-        if !s.adaptive || s.settled || self.checking_above.load(Relaxed) || s.active > s.limit {
+        if !s.adaptive || s.handed_off || self.checking_above.load(Relaxed) || s.active > s.limit {
             return false;
         }
         self.apply_throttle(s);
@@ -347,9 +367,10 @@ impl Budget {
         let before = s.limit;
         let next = (before / 2).max(1);
         s.limit = next;
-        // Keep `s.max` and `s.settled` intact so long-running multipart
-        // transfers can grow back after throttling clears, paced by clean
-        // cooldown windows.
+        // Keep `s.max` intact and reopen `s.settled` so long-running multipart
+        // transfers can grow back after throttling clears, even if a previous
+        // throughput probe had settled the ramp.
+        s.settled = false;
         s.throttle_backoff = (s.throttle_backoff.saturating_mul(2)).clamp(4, 16);
         s.backoff_windows = s.throttle_backoff;
         s.previous = None;

@@ -505,3 +505,57 @@ async fn whole_object_batches_start_conservatively_and_can_tune_higher() {
     assert_eq!(concurrency.initial, 8);
     assert!(concurrency.maximum.is_none());
 }
+
+#[tokio::test(start_paused = true)]
+async fn throttled_checking_above_transfer_limit_leaves_multipart_budget_untouched() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    // Build the exact production multipart Concurrency via Engine::object_workers
+    // (maximum == None, checking == Some) to verify `requests` is still wired
+    // so checking_above protects the shared transfer budget.
+    let engine = planning_engine(&[]);
+    let mut concurrency = engine
+        .object_workers(std::iter::repeat_n(64 * 1024 * 1024u64, 4_000))
+        .unwrap();
+    assert!(concurrency.maximum.is_none());
+    assert!(concurrency.checking.is_some());
+    assert!(concurrency.requests.is_some());
+    concurrency.initial = 16;
+    engine.tuning.configure(false, 64, 16);
+    let outage = engine.outage.clone();
+    let budget = engine.tuning.requests.clone();
+    let checking_active = Arc::new(AtomicUsize::new(0));
+    crate::s3::admission::parallel((0..4_000usize).collect(), concurrency, |job, mut slot| {
+        let outage = outage.clone();
+        let budget = budget.clone();
+        let checking_active = checking_active.clone();
+        async move {
+            let now = checking_active.fetch_add(1, SeqCst) + 1;
+            if now > 20 {
+                outage.throttled();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            checking_active.fetch_sub(1, SeqCst);
+            if job % 50 == 0 {
+                slot.claim().await;
+                let permit = budget.acquire().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                budget.completed(1024);
+                drop(permit);
+                Ok(Some(1024))
+            } else {
+                Ok(None)
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        outage.throttled_responses() > 0,
+        "expected checking requests above transfer limit to trigger throttling"
+    );
+    assert_eq!(
+        engine.tuning.request_limit(),
+        16,
+        "throttling while checking is above transfer limit must not halve the request budget"
+    );
+}

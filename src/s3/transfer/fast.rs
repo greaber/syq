@@ -203,12 +203,13 @@ impl Engine {
                 },
             }
         });
+        let has_checking = checking.is_some();
         Ok(Concurrency {
             initial,
             maximum,
             checking,
             outage: Some(self.outage.clone()),
-            requests: maximum.map(|_| self.tuning.requests.clone()),
+            requests: (maximum.is_some() || has_checking).then(|| self.tuning.requests.clone()),
             initial_probe_up: self
                 .tuning
                 .control_latency()

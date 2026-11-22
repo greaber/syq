@@ -333,9 +333,20 @@ impl Controller {
         let up = usize::from(true);
         self.failures[up] = (self.failures[up] + 1).min(3);
         self.revisit_at[up] = self.scores + (8 << self.failures[up]);
-        let next = (before / 2).max(self.minimum);
+        // When an upward probe or revisit drew throttling, return to the level
+        // that was working rather than halving below it.
+        let (next, upper) = match &self.probe {
+            Some(probe) if probe.upward => {
+                let next = probe.from.max(self.minimum);
+                (next, before.max(next + 1))
+            }
+            _ => {
+                let next = (before / 2).max(self.minimum);
+                (next, next + 1)
+            }
+        };
         self.limit = next;
-        self.upper = next + 1;
+        self.upper = upper;
         self.lower = self.lower.min(next.saturating_sub(1));
         self.upward = true;
         self.retreated(before)
@@ -648,9 +659,12 @@ where
 {
     let begin = |remaining: usize| {
         let maximum = concurrency.maximum?;
-        let initial = match &concurrency.requests {
-            Some(requests) => requests.begin_objects(concurrency.initial)?,
-            None => concurrency.initial,
+        let (initial, handed_seen) = match &concurrency.requests {
+            Some(requests) => {
+                let (initial, seen) = requests.begin_objects_with_throttled(concurrency.initial)?;
+                (initial, Some(seen))
+            }
+            None => (concurrency.initial, None),
         };
         let rejected = concurrency
             .requests
@@ -702,7 +716,7 @@ where
                 }
             }
         }
-        Some(controller)
+        Some((controller, handed_seen))
     };
     // While the request ramp is in charge, prepare only one job beyond
     // its current capacity. That waiter signals demand without starting
@@ -717,7 +731,10 @@ where
             limit
         }
     };
-    let mut controller = begin(jobs.len());
+    let (mut controller, initial_handed_seen) = match begin(jobs.len()) {
+        Some((controller, seen)) => (Some(controller), seen),
+        None => (None, None),
+    };
     let mut handoff_pending = controller.is_some() && concurrency.requests.is_some();
     let mut limit = controller.as_ref().map_or(concurrency.initial, |c| c.limit);
     let gate = Arc::new(Gate {
@@ -739,7 +756,7 @@ where
             .as_ref()
             .map_or(0, |outage| outage.throttled_responses())
     };
-    let mut seen_throttled = throttled();
+    let mut seen_throttled = throttled().max(initial_handed_seen.unwrap_or(0));
     // Whether objects beyond the transfer limit are in progress, so that
     // transfers take their slots from the gate.
     let mut gated = false;
@@ -900,14 +917,20 @@ where
                     }
                     // Preserve the existing request ramp before taking over.
                     // Only one controller changes concurrency at a time.
-                    controller = begin(jobs.len());
-                    if let Some(controller) = &controller {
+                    if let Some((next_controller, handed_seen)) = begin(jobs.len()) {
+                        if let Some(handed_seen) = handed_seen {
+                            // Carry the budget's observed throttle count into
+                            // the controller so a throttle handled just before
+                            // handoff cannot cut concurrency a second time.
+                            seen_throttled = seen_throttled.max(handed_seen);
+                        }
                         generation += 1;
                         if let Some(observations) = &mut observations {
                             observations.changed();
                         }
-                        limit = controller.limit;
+                        limit = next_controller.limit;
                         handoff_pending = concurrency.requests.is_some();
+                        controller = Some(next_controller);
                     }
                     activity = 0;
                     completed = 0;

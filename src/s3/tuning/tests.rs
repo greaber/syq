@@ -856,7 +856,9 @@ async fn multipart_budget_backs_off_on_throttling_and_recovers() {
         Some(64),
         Some(outage.clone()),
     ));
-    // A throttle halves 64 -> 32 while keeping the 64 ceiling for recovery.
+    // Simulate a multipart ramp that already settled after a rejected probe:
+    // throttling must still back off and reopen the ramp for recovery.
+    budget.state.lock().unwrap().settled = true;
     outage.throttled();
     budget.completed(1024 * 1024);
     {
@@ -925,9 +927,12 @@ async fn checking_above_skips_budget_throttle_cut() {
     budget.completed(1024);
     drop(permit);
     assert_eq!(budget.state.lock().unwrap().limit, 32);
-    // Clearing checking_above must not retroactively fire on the already-seen
-    // checking throttle.
+    // Even if another checking throttle arrives with no permit drop or
+    // completion before leaving checking_above, leaving checking_above
+    // consumes it so the next transfer is not cut.
+    outage.throttled();
     budget.set_checking_above(false);
+    budget.completed(1024);
     budget.throttled();
     assert_eq!(budget.state.lock().unwrap().limit, 32);
 }
