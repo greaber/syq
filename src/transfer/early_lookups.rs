@@ -25,9 +25,18 @@ pub(super) struct EarlyLookup {
     /// select and map the batch.
     directories: Vec<PathBytes>,
     others: Vec<PathBytes>,
+    // Decisions in scan order up to the first error, reported in turn.
+    selection: Option<(Vec<bool>, Option<anyhow::Error>)>,
     /// The reply to come, and how many other requests the destination had
     /// been sent when the lookup was (`Planner::other_requests`).
     reply: Option<(PendingReply, u64)>,
+}
+
+impl EarlyLookup {
+    pub(super) fn take_selection(&mut self) -> Option<impl Iterator<Item = Result<bool>> + use<>> {
+        let (decisions, error) = self.selection.take()?;
+        Some(decisions.into_iter().map(Ok).chain(error.map(Err)))
+    }
 }
 
 #[derive(Default)]
@@ -88,14 +97,20 @@ impl Planner<'_> {
         let filtered = self.filters_scanned_entries();
         #[cfg(debug_assertions)]
         let filtered = filtered && std::env::var_os("SYQ_TEST_EARLY_LOOKUPS_UNFILTERED").is_none();
+        let mut selection = filtered.then(|| (Vec::with_capacity(entries.len()), None));
         for entry in entries {
-            if filtered {
+            if let Some((decisions, error)) = &mut selection {
                 match self.selects_scanned_entry(entry, src_root) {
-                    Ok(true) => {}
-                    Ok(false) => continue,
+                    Ok(keep) => {
+                        decisions.push(keep);
+                        if !keep {
+                            continue;
+                        }
+                    }
                     // The batch's turn reports it and ends the copy: ask
                     // nothing for it.
-                    Err(_) => {
+                    Err(e) => {
+                        *error = Some(e);
                         directories.clear();
                         others.clear();
                         break;
@@ -112,6 +127,7 @@ impl Planner<'_> {
         self.early_lookups.shown.push_back(EarlyLookup {
             directories,
             others,
+            selection,
             reply: None,
         });
         self.send_early_lookups();
@@ -174,9 +190,13 @@ impl Planner<'_> {
                 .others
                 .iter()
                 .eq(mapped.others.iter().map(|planned| &planned.dst));
-        let response = response
-            .ok()
-            .filter(|response| current && matches!(response, Response::BatchPlan { .. }));
+        let response = response.ok().filter(|response| {
+            current
+                && matches!(
+                    response,
+                    Response::BatchPlan { .. } | Response::BatchPlanDeferred
+                )
+        });
         #[cfg(debug_assertions)]
         let _ = crate::fsops::record_test_event(
             "SYQ_TEST_EARLY_LOOKUPS",

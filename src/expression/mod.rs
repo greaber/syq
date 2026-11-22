@@ -17,14 +17,14 @@ enum Type {
     Timestamp,
     Null,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Value {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Value<S> {
     Bool(bool),
-    String(Vec<u8>),
+    String(S),
     Quantity(i128, Type),
     Null,
 }
-impl Value {
+impl<S> Value<S> {
     fn ty(&self) -> Type {
         match self {
             Self::Bool(_) => Type::Bool,
@@ -60,6 +60,22 @@ enum Field {
     LinkTarget,
 }
 impl Field {
+    fn path_bytes(self, path: &[u8]) -> Option<&[u8]> {
+        use Field::*;
+        // Placement is known even if the destination does not exist.
+        let name = path.rsplit(|b| *b == b'/').next().unwrap_or(path);
+        match self {
+            Path => Some(path),
+            Name => Some(name),
+            Extension => Some(
+                name.iter()
+                    .rposition(|b| *b == b'.')
+                    .filter(|i| *i != 0)
+                    .map_or(&[][..], |i| &name[i + 1..]),
+            ),
+            _ => None,
+        }
+    }
     fn parse(name: &str) -> Result<Self> {
         Ok(match name {
             "path" => Self::Path,
@@ -97,7 +113,7 @@ impl Field {
 /// Metadata already acquired by the copy path. Missing fields are distinct
 /// from zero values; a failed metadata read must be reported by the caller.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
-pub(crate) struct File {
+pub(crate) struct File<'a> {
     pub exists: bool,
     pub kind: Option<Kind>,
     pub size: Option<u64>,
@@ -110,10 +126,16 @@ pub(crate) struct File {
     pub device: Option<u64>,
     pub inode: Option<u64>,
     pub nlink: Option<u64>,
-    pub link_target: Option<Vec<u8>>,
+    pub link_target: Option<std::borrow::Cow<'a, [u8]>>,
 }
-impl File {
-    pub fn from_entry(e: &Entry) -> Self {
+impl<'a> File<'a> {
+    pub fn from_entry(e: &'a Entry) -> Self {
+        Self::entry_fields(e, e.link.as_deref().map(Into::into))
+    }
+    pub fn owned_entry(e: &Entry) -> File<'static> {
+        File::entry_fields(e, e.link.clone().map(Into::into))
+    }
+    fn entry_fields(e: &Entry, link_target: Option<std::borrow::Cow<'a, [u8]>>) -> Self {
         Self {
             exists: true,
             kind: Some(e.kind),
@@ -126,7 +148,7 @@ impl File {
             device: Some(e.dev),
             inode: Some(e.ino),
             nlink: Some(e.nlink),
-            link_target: e.link.clone(),
+            link_target,
             s3_last_modified: None,
         }
     }
@@ -157,32 +179,21 @@ impl File {
             s3_last_modified: None,
         }
     }
-    fn field(&self, path: &[u8], field: Field) -> Value {
+    fn field<'b>(&'b self, path: &'b [u8], field: Field) -> Value<&'b [u8]> {
         use Field::*;
-        let string = |s: &[u8]| Value::String(s.to_vec());
         let quantity = |n: Option<i128>, t| n.map_or(Value::Null, |n| Value::Quantity(n, t));
-        // Placement is known even if the destination does not exist.
-        let name = path.rsplit(|b| *b == b'/').next().unwrap_or(path);
-        match field {
-            Path => return string(path),
-            Name => return string(name),
-            Extension => {
-                return string(
-                    name.iter()
-                        .rposition(|b| *b == b'.')
-                        .filter(|i| *i != 0)
-                        .map_or(&[][..], |i| &name[i + 1..]),
-                )
-            }
-            Exists => return Value::Bool(self.exists),
-            _ => {}
+        if let Some(bytes) = field.path_bytes(path) {
+            return Value::String(bytes);
+        }
+        if matches!(field, Exists) {
+            return Value::Bool(self.exists);
         }
         if !self.exists {
             return Value::Null;
         }
         match field {
             Kind => self.kind.map_or(Value::Null, |k| {
-                string(match k {
+                Value::String(match k {
                     crate::proto::Kind::File => b"file",
                     crate::proto::Kind::Dir => b"dir",
                     crate::proto::Kind::Symlink => b"symlink",
@@ -210,7 +221,10 @@ impl File {
             Device => quantity(self.device.map(i128::from), Type::Number),
             Inode => quantity(self.inode.map(i128::from), Type::Number),
             Links => quantity(self.nlink.map(i128::from), Type::Number),
-            LinkTarget => self.link_target.as_deref().map_or(Value::Null, string),
+            LinkTarget => self
+                .link_target
+                .as_deref()
+                .map_or(Value::Null, Value::String),
             _ => unreachable!(),
         }
     }
@@ -220,7 +234,7 @@ impl File {
 /// from known-unavailable (`null`) fields, so short-circuiting stays exact.
 #[derive(Clone, Copy)]
 pub(crate) enum Facts<'a> {
-    Complete(&'a File),
+    Complete(&'a File<'a>),
     S3Listing {
         size: u64,
         directory_marker: bool,
@@ -236,13 +250,13 @@ impl std::fmt::Display for NeedMetadata {
     }
 }
 impl std::error::Error for NeedMetadata {}
-impl Facts<'_> {
-    fn field(self, path: &[u8], field: Field) -> Result<Value> {
+impl<'a> Facts<'a> {
+    fn field(self, path: &'a [u8], field: Field) -> Result<Value<&'a [u8]>> {
         if let Self::Complete(file) = self {
             return Ok(file.field(path, field));
         }
-        if matches!(field, Field::Path | Field::Name | Field::Extension) {
-            return Ok(File::default().field(path, field));
+        if let Some(bytes) = field.path_bytes(path) {
+            return Ok(Value::String(bytes));
         }
         if let Self::S3Listing {
             size,
@@ -292,7 +306,7 @@ enum Op {
 }
 #[derive(Clone, Debug)]
 enum Node {
-    Literal(Value),
+    Literal(Value<Vec<u8>>),
     Field(bool, Field),
     Now,
     Not(Box<Node>),
@@ -362,9 +376,14 @@ impl Node {
             Self::Coalesce(a, b) => common_type(a.ty()?, b.ty()?)?,
         })
     }
-    fn eval(&self, c: &ContextValues<'_>) -> Result<Value> {
+    fn eval<'a>(&'a self, c: &ContextValues<'a>) -> Result<Value<&'a [u8]>> {
         Ok(match self {
-            Self::Literal(v) => v.clone(),
+            Self::Literal(v) => match v {
+                Value::String(s) => Value::String(s.as_slice()),
+                Value::Quantity(n, ty) => Value::Quantity(*n, *ty),
+                Value::Bool(b) => Value::Bool(*b),
+                Value::Null => Value::Null,
+            },
             Self::Now => Value::Quantity(c.now, Type::Timestamp),
             Self::Field(dst, f) => {
                 if *dst {
@@ -390,7 +409,7 @@ impl Node {
             Self::Between(a, b, d) => {
                 let value = a.eval(c)?;
                 Value::Bool(
-                    binary(Op::Ge, value.clone(), b.eval(c)?)?.boolean()?
+                    binary(Op::Ge, value, b.eval(c)?)?.boolean()?
                         && binary(Op::Le, value, d.eval(c)?)?.boolean()?,
                 )
             }
@@ -398,7 +417,7 @@ impl Node {
                 let value = a.eval(c)?;
                 let mut found = false;
                 for item in items {
-                    if binary(Op::Eq, value.clone(), item.eval(c)?)?.boolean()? {
+                    if binary(Op::Eq, value, item.eval(c)?)?.boolean()? {
                         found = true;
                         break;
                     }
@@ -406,7 +425,7 @@ impl Node {
                 Value::Bool(found)
             }
             Self::Pattern(n, pattern) => match n.eval(c)? {
-                Value::String(v) => Value::Bool(pattern.is_match(&v)),
+                Value::String(v) => Value::Bool(pattern.is_match(v)),
                 _ => bail!("cannot match an unavailable value; test it against null first"),
             },
             Self::If(cond, a, b) => {
@@ -473,7 +492,7 @@ fn binary_type(op: Op, a: Type, b: Type) -> Result<Type> {
         _ => bail!("invalid arithmetic between {a:?} and {b:?}"),
     })
 }
-fn binary(op: Op, a: Value, b: Value) -> Result<Value> {
+fn binary<'a>(op: Op, a: Value<&'a [u8]>, b: Value<&'a [u8]>) -> Result<Value<&'a [u8]>> {
     use Op::*;
     if matches!(op, Eq | Ne) {
         return Ok(Value::Bool(if op == Eq { a == b } else { a != b }));

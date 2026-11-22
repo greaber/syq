@@ -1966,6 +1966,47 @@ fn unlink_never_recurses_into_a_directory() {
 }
 
 #[test]
+fn plan_batch_keeps_requested_inode_metadata_and_bounds_its_reply() {
+    let tree = crate::test_support::tempdir().unwrap();
+    fs::write(tree.path().join("leaf"), b"data").unwrap();
+    let paths = vec![path_bytes(&tree.path().join("leaf"))];
+    let mut ops = FsOps::new();
+    ops.inode_preservation = crate::inode_metadata::Selection {
+        acls: true,
+        xattrs: true,
+        atimes: true,
+        crtimes: cfg!(target_os = "macos"),
+        ..Default::default()
+    };
+    let expected = ops.stat_many_request(&paths, None, false).unwrap();
+    let response = ops.handle(&Request::PlanBatch {
+        directories: vec![],
+        others: paths.clone(),
+        strict_metadata: false,
+    });
+    let Response::BatchPlan {
+        others: Some(entries),
+        ..
+    } = response
+    else {
+        panic!("{response:?}")
+    };
+    let actual = entries[0]
+        .as_ref()
+        .unwrap()
+        .inode_metadata
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        Some(actual),
+        expected[0].as_ref().unwrap().inode_metadata.as_ref()
+    );
+    let mut entries = ops.stat_many(&paths, false);
+    let mut bytes = crate::proto::METADATA_BATCH_BYTES;
+    assert!(!ops.capture_plan_entries(&paths, &mut entries, &mut bytes));
+}
+
+#[test]
 fn plan_batch_only_stats_leaves_below_ready_directories() {
     let root = test_dir();
     let ready = root.join("ready");

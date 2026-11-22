@@ -213,6 +213,13 @@ impl DescriptorScan<'_> {
             None => {
                 let mut names = self.root.read_open_directory(&opened)?;
                 names.sort();
+                // Directory contents can change during readdir. A single scan
+                // must never emit the same destination spelling twice.
+                anyhow::ensure!(
+                    !names.windows(2).any(|pair| pair[0] == pair[1]),
+                    "duplicate name while scanning {}",
+                    String::from_utf8_lossy(&directory.relative)
+                );
                 names.into_iter()
             }
         };

@@ -261,8 +261,20 @@ fn a_filtered_rerun_uses_every_lookup_it_sent_early() {
     assert!(out.contains("transferred 2,400 files"), "{out}");
     assert!(holds_the_fifth(&t));
 
-    let output = copy(&t, &rsh, &["--where", FIFTH]);
+    let output = copy_with(
+        &t,
+        &rsh,
+        &["--where", FIFTH],
+        &[("SYQ_TEST_SCANNED_SELECTION", &t.s("selection"))],
+    );
     assert_output_ok(&output);
+    assert_eq!(
+        fs::read_to_string(t.path("selection"))
+            .unwrap()
+            .lines()
+            .count(),
+        2 * FILES
+    );
     let out = stdout(&output);
     assert!(out.contains("transferred 0 files"), "{out}");
     assert!(out.contains("unchanged (2,400 files)"), "{out}");
@@ -353,4 +365,27 @@ fn a_batch_whose_selection_fails_is_not_looked_up_early() {
     // would have discarded the reply; the earlier ones were used.
     assert!(sent >= 1, "no lookup was sent early\n{err}");
     assert_eq!((used, repeated, withdrawn, discarded), (sent, 0, 0, 0));
+}
+
+#[test]
+fn remote_metadata_rerun_uses_early_lookups() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    fill(&t.path("src/a"), "f", FILES);
+    // Preserve mtime for the unchanged-file comparison. Only macOS
+    // destinations can set arbitrary birth times.
+    let flags = if cfg!(target_os = "macos") {
+        "--copy-metadata=mtime,permissions,acls,xattrs,atimes,crtimes"
+    } else {
+        "--copy-metadata=mtime,permissions,acls,xattrs,atimes"
+    };
+    assert_output_ok(&copy(&t, &rsh, &[flags]));
+    let output = copy(&t, &rsh, &[flags]);
+    assert_output_ok(&output);
+    assert!(
+        stdout(&output).contains("transferred 0 files"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(fates(&t)[1] > 0, "expected an early rich lookup to be used");
 }

@@ -48,10 +48,10 @@ impl Source {
             crate::expression::source_path(&self.label, &self.path)
         }
     }
-    pub fn expression_file(&self) -> Result<crate::expression::File> {
+    pub fn expression_file(&self) -> Result<crate::expression::File<'static>> {
         let mut file = crate::expression::File::from_root(self.meta);
         if self.meta.is_symlink() {
-            file.link_target = Some(self.root.read_link(&RelativePath::new(&self.path)?)?);
+            file.link_target = Some(self.root.read_link(&RelativePath::new(&self.path)?)?.into());
         }
         Ok(file)
     }

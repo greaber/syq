@@ -15,6 +15,7 @@ pub(super) struct Planner<'a> {
     /// handshake. The coordinator may be running on a different platform.
     pub(super) destination_supports_confined_socket_nodes: bool,
     pub(super) destination_metadata_platform: String,
+    pub(super) track_claims: bool,
     /// Destination paths claimed by source entries (see `Claim`).
     pub(super) dst_seen: std::collections::HashMap<PathBytes, Claim>,
     /// Directories this run will not create — --existing: they don't exist
@@ -759,7 +760,7 @@ impl Planner<'_> {
                         });
                         if root.kind != Kind::Dir && pl.selected_file_is_ignored(src_root)? {
                             pl.progress.paths_ignored.fetch_add(1, Relaxed);
-                            if !pl.opts.delete_excluded {
+                            if pl.track_claims && !pl.opts.delete_excluded {
                                 pl.dst_seen
                                     .entry(join(dst_root, &sub))
                                     .or_insert(Claim::Weak);
@@ -1327,9 +1328,14 @@ impl Planner<'_> {
         early: &mut Option<super::early_lookups::EarlyLookup>,
     ) -> Result<()> {
         let batch = if self.filters_scanned_entries() {
+            let mut cached = early.as_mut().and_then(|lookup| lookup.take_selection());
             let mut selected = Vec::with_capacity(batch.len());
             for entry in batch {
-                if !self.selects_scanned_entry(&entry, src_root)? {
+                let keep = match &mut cached {
+                    Some(decisions) => decisions.next().expect("selection covers the shown batch"),
+                    None => self.selects_scanned_entry(&entry, src_root),
+                }?;
+                if !keep {
                     // Selection never makes a source counterpart extraneous.
                     if self.opts.delete {
                         let dst = join(dst_root, &join(sub, &entry.path));
@@ -1429,6 +1435,11 @@ impl Planner<'_> {
     }
 
     pub(super) fn retire_planning_state(&mut self) {
+        #[cfg(debug_assertions)]
+        let _ = crate::fsops::record_test_event(
+            "SYQ_TEST_DESTINATION_CLAIMS",
+            format_args!("{}", self.dst_seen.len()),
+        );
         // These sets exist only to validate and apply mapped scan entries.
         // Jobs already own the source spelling needed by workers. Deletion
         // alone still needs the destination claims.
@@ -1473,6 +1484,8 @@ impl Planner<'_> {
             .map(Vec::as_slice)
             .unwrap_or(&entry.path);
         let path = crate::expression::source_path(src_root, relative);
+        #[cfg(debug_assertions)]
+        crate::fsops::record_test_event("SYQ_TEST_SCANNED_SELECTION", format_args!("evaluated"))?;
         self.opts
             .expressions
             .selects(&crate::expression::File::from_entry(entry), path)
@@ -1552,13 +1565,18 @@ impl Planner<'_> {
             // A later real claim can replace a weak claim from an entry that
             // is not copied. In that case it is the first capacity-relevant
             // object at this path even though the namespace was already seen.
-            let new_capacity_object = match self.dst_seen.get(&dst) {
-                None => true,
-                Some(Claim::Weak) if claim != Claim::Weak => true,
-                Some(_) => false,
-            };
-            let Some(contested) = self.claim_dst(&dst, &rel, claim) else {
-                continue;
+            let (contested, new_capacity_object) = if self.track_claims {
+                let new_object = match self.dst_seen.get(&dst) {
+                    None => true,
+                    Some(Claim::Weak) => claim != Claim::Weak,
+                    Some(_) => false,
+                };
+                let Some(contested) = self.claim_dst(&dst, &rel, claim) else {
+                    continue;
+                };
+                (contested, new_object)
+            } else {
+                (false, true)
             };
             if claim != Claim::Weak && self.under_blocked_directory(&dst) {
                 continue;
@@ -1581,7 +1599,7 @@ impl Planner<'_> {
                 .expect("scanner and manifest paths are strict relative paths");
             match claim {
                 Claim::Dir => {
-                    if opts.expressions.active() {
+                    if opts.expressions.update.is_some() {
                         directory_expression_sources.insert(
                             dst.clone(),
                             crate::expression::source_path(src_root, source_relative).to_vec(),
@@ -2160,7 +2178,7 @@ impl Planner<'_> {
                 ));
             }
             self.progress.files_excluded.fetch_add(1, Relaxed);
-            if !contested {
+            if self.track_claims && !contested {
                 // Nothing will be written here; let another source have it.
                 self.dst_seen.insert(dst_path, Claim::Weak);
             }
@@ -3846,7 +3864,9 @@ impl Planner<'_> {
     /// Whether this copy looks each batch's destinations up in one request
     /// as the batch arrives (`inspect_destination_batch`).
     pub(super) fn batch_lookups_configured(&self) -> bool {
-        !self.opts.inode_preservation.any()
+        // With both options stat_many compares the strict observation's
+        // identity and ctime against a second, rich snapshot.
+        !(self.opts.inode_preservation.any() && self.opts.expressions.update.is_some())
             && self.opts.dst_remote
             && self.buffer.is_none()
             && !self.opts.dry_run
@@ -3922,6 +3942,7 @@ impl Planner<'_> {
                 }
                 Ok(())
             }
+            Response::BatchPlanDeferred if self.opts.inode_preservation.any() => Ok(()),
             other => bail!("unexpected response {other:?}"),
         }
     }

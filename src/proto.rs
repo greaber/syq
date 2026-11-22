@@ -1706,7 +1706,7 @@ pub struct SmallCopyIdentity {
 pub struct SmallCopyFile {
     pub path: PathBytes,
     /// Original source facts and expression path, before publication modes.
-    pub expression_source: Option<(crate::expression::File, PathBytes)>,
+    pub expression_source: Option<(crate::expression::File<'static>, PathBytes)>,
     pub size: u64,
     pub meta: Meta,
 }
@@ -1997,6 +1997,8 @@ pub enum Response {
     ScanWarnAt(ScanWarning),
     /// Reply to NewFileOwner.
     NewFileOwner(NewFileOwner),
+    /// Rich metadata needs the ordinary, chunked directory and leaf lookups.
+    BatchPlanDeferred,
 }
 
 /// Who a file the receiver creates in the destination belongs to.
