@@ -15,7 +15,7 @@ pub(crate) const MEMORY_LIMIT: usize = 512 << 20;
 /// `Response` (a few hundred bytes, in a queue slot allocated with its
 /// channel). A queued acknowledgment, matched range or data block, whose
 /// data is not counted, costs the allowance this rather than a whole
-/// granule. A message counted for more, such as one with two or more
+/// granule. A message counted for more, such as one with four or more
 /// digests or a file's metadata, reserves granules, as before.
 const MESSAGE_RESERVATION: usize = 1 << 10;
 /// Reservations beyond a message's first grow in granules, so that a large
@@ -760,23 +760,73 @@ mod tests {
     #[test]
     fn fixed_arrays_are_not_double_charged_in_collection_budget() {
         use crate::proto::Response;
+        // Two 32-byte digests charge only their outer Vec slots (2 * 32 * 8 = 512),
+        // not another 512 bytes for the 64 individual u8 array elements.
         let shared = Arc::new(Budget {
             used: AtomicUsize::new(0),
             limit: MEMORY_LIMIT,
         });
-        // Two 32-byte digests charge only their outer Vec slots (2 * 32 * 8 = 512),
-        // not another 512 bytes for the 64 individual u8 array elements.
         let small = postcard::to_stdvec(&Response::Hashes(vec![[0u8; 32]; 2])).unwrap();
         let held = decode_with_hold::<Response>(&small, hold(&shared)).unwrap();
         assert_eq!(shared.used.load(Relaxed), MESSAGE_RESERVATION);
         drop(held);
-        // 1,500,000 hashes (48 MiB of actual data) used to exhaust the 512 MiB
-        // budget at 1,048,576 hashes due to 16x double-charging.
-        let many = postcard::to_stdvec(&Response::Hashes(vec![[0u8; 32]; 1_500_000])).unwrap();
-        let held = decode_with_hold::<Response>(&many, hold(&shared)).unwrap();
-        assert!(matches!(held.value, Response::Hashes(ref h) if h.len() == 1_500_000));
+
+        // 4,096 digests charge 4,096 * 32 * 8 = 1 MiB (plus the Response header)
+        // rather than 2 MiB from double-charging each inner u8 element.
+        let tight = Arc::new(Budget {
+            used: AtomicUsize::new(0),
+            limit: (1 << 20) + RESERVATION_GRANULE,
+        });
+        let many = postcard::to_stdvec(&Response::Hashes(vec![[0u8; 32]; 4_096])).unwrap();
+        let held = decode_with_hold::<Response>(&many, hold(&tight)).unwrap();
+        assert!(matches!(held.value, Response::Hashes(ref h) if h.len() == 4_096));
         drop(held);
+        assert_eq!(tight.used.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn variable_collection_inside_tuple_remains_budgeted() {
+        #[derive(Debug, serde::Serialize, serde::Deserialize)]
+        struct TupleWrapper(u32, Vec<u64>);
+
+        let shared = budget();
+        let tuple_bytes = postcard::to_stdvec(&(7u32, vec![1u64; 4_096])).unwrap();
+        let err = decode_with_hold::<(u32, Vec<u64>)>(&tuple_bytes, hold(&shared)).unwrap_err();
+        assert!(err.to_string().contains("memory budget exhausted"));
         assert_eq!(shared.used.load(Relaxed), 0);
+
+        let struct_bytes = postcard::to_stdvec(&TupleWrapper(7, vec![1u64; 4_096])).unwrap();
+        let err = decode_with_hold::<TupleWrapper>(&struct_bytes, hold(&shared)).unwrap_err();
+        assert!(err.to_string().contains("memory budget exhausted"));
+        assert_eq!(shared.used.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn legacy_path_list_with_non_utf8_bytes_decodes_cleanly() {
+        use crate::proto::Request;
+        #[derive(serde::Serialize)]
+        enum LegacyRequest {
+            PruneLookup { paths: Vec<Vec<u8>> },
+        }
+        // Check Request::PruneLookup discriminant matches via real encoding,
+        // and verify a plain Vec<Vec<u8>> payload containing non-UTF-8 bytes
+        // round-trips identically through the vec_bytes adapter.
+        let raw_paths = vec![b"dir/\xffbad".to_vec(), b"dir/ok/file".to_vec()];
+        let expected_req = Request::PruneLookup {
+            paths: raw_paths.clone(),
+        };
+        let encoded = postcard::to_stdvec(&expected_req).unwrap();
+        let legacy_tail = postcard::to_stdvec(&raw_paths).unwrap();
+        let prefix_len = encoded.len() - legacy_tail.len();
+        let mut legacy_frame = encoded[..prefix_len].to_vec();
+        legacy_frame.extend_from_slice(&legacy_tail);
+        let shared = budget();
+        let decoded = decode_with_hold::<Request>(&legacy_frame, hold(&shared)).unwrap();
+        match decoded.value {
+            Request::PruneLookup { paths } => assert_eq!(paths, raw_paths),
+            other => panic!("unexpected request: {other:?}"),
+        }
+        let _ = LegacyRequest::PruneLookup { paths: raw_paths };
     }
 
     #[test]

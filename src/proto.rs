@@ -150,30 +150,6 @@ pub(crate) fn existing_hashes_fit(block: u64, lens: impl IntoIterator<Item = u64
 /// Path bytes, as given by the user (absolute, or relative to the server's cwd).
 pub type PathBytes = Vec<u8>;
 
-/// Serde adapter for `Option<PathBytes>` using byte-buffer encoding so postcard
-/// decodes the bytes directly instead of element-by-element through `SeqAccess`.
-/// Wire encoding is byte-for-byte identical to `Option<Vec<u8>>`.
-mod opt_bytes {
-    use serde::{Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(
-        value: &Option<Vec<u8>>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        match value {
-            Some(bytes) => serializer.serialize_some(serde_bytes::Bytes::new(bytes)),
-            None => serializer.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Option<Vec<u8>>, D::Error> {
-        <Option<serde_bytes::ByteBuf> as serde::Deserialize>::deserialize(deserializer)
-            .map(|opt| opt.map(serde_bytes::ByteBuf::into_vec))
-    }
-}
-
 /// Serde adapter for `Vec<PathBytes>` whose outer sequence stays budgeted while
 /// each element decodes as a byte buffer instead of byte-by-byte.
 /// Wire encoding is byte-for-byte identical to `Vec<Vec<u8>>`.
@@ -345,7 +321,7 @@ pub struct Entry {
     /// unlink/recreate race that happens to reuse the same inode number.
     pub ctime: i64,
     pub ctime_nsec: u32,
-    #[serde(with = "opt_bytes")]
+    #[serde(with = "serde_bytes")]
     pub link: Option<PathBytes>,
     // Only used while capturing metadata on the scanning endpoint. The
     // selected value travels in inode_metadata; ordinary scans pay no wire cost.
@@ -1743,6 +1719,7 @@ impl std::fmt::Display for ScanWarning {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ReadStreamRequest {
+    #[serde(with = "serde_bytes")]
     pub path: PathBytes,
     pub source: Option<RegisteredPath>,
     pub attempt: u32,
@@ -1797,6 +1774,7 @@ pub struct SmallCopyIdentity {
 /// directory.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallCopyFile {
+    #[serde(with = "serde_bytes")]
     pub path: PathBytes,
     /// Original source facts and expression path, before publication modes.
     pub expression_source: Option<(crate::expression::File<'static>, PathBytes)>,
