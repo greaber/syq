@@ -1003,6 +1003,44 @@ fn inactive_remote_stream_fence_does_not_write_or_take_the_reader() {
 }
 
 #[test]
+fn unexpected_last_streaming_acknowledgment_marks_the_connection_dead() {
+    let (mut conn, mut replies, mut requests) = connection_with_peer();
+    conn.begin_streaming_writes().unwrap();
+    for off in 0..2 {
+        conn.send(Request::WriteRange {
+            path: b"file".to_vec(),
+            inplace: false,
+            copy_id: [0; 16],
+            attempt: 0,
+            off,
+            hash: [0; 32],
+            data: vec![42].into(),
+        })
+        .unwrap();
+        assert!(matches!(
+            requests.read_msg::<Request>().unwrap(),
+            Request::WriteRange { off: sent, .. } if sent == off
+        ));
+    }
+    let fence = conn.fence_streaming_writes();
+    assert!(matches!(
+        requests.read_msg::<Request>().unwrap(),
+        Request::WriteStreamFence
+    ));
+    replies.write_msg(&Response::Ok).unwrap();
+    replies
+        .write_msg(&Response::Path(b"unexpected".to_vec()))
+        .unwrap();
+    replies.write_msg(&Response::WriteStreamDone).unwrap();
+
+    let err = conn.finish_streaming_writes(2, fence).unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("unexpected response to a streaming write"));
+    assert!(conn.is_dead());
+}
+
+#[test]
 fn remote_streaming_reuses_the_connection_reader_across_large_ranges() {
     use std::os::unix::net::UnixStream;
     use std::time::Duration;

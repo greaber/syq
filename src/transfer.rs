@@ -5926,7 +5926,14 @@ fn stat_registered_sources<'a>(
             let entry = sent
                 .and_then(|()| conn.recv())
                 .and_then(stat_reply)
-                .map(|mut entries| entries.pop().flatten());
+                .and_then(|mut entries| {
+                    anyhow::ensure!(
+                        entries.len() == 1,
+                        "stat reply count {} does not match request count 1",
+                        entries.len()
+                    );
+                    Ok(entries.pop().flatten())
+                });
             if result.is_ok() {
                 result = visit(source, entry);
             }

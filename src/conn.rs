@@ -1687,7 +1687,11 @@ impl Conn for RemoteConn {
         }
         let response = self.receive_next_response()?.into_inner();
         let state = stream.status();
-        if !matches!(response, Response::WriteStreamDone) || !state.fenced || state.count != sent {
+        if matches!(state.error, Some(crate::streaming::Failure::Transport(_)))
+            || !matches!(response, Response::WriteStreamDone)
+            || !state.fenced
+            || state.count != sent
+        {
             self.dead = true;
             streaming_result(state.error)?;
             bail!("streaming write completion fence/count mismatch");

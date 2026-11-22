@@ -3331,8 +3331,15 @@ fn clean_root_pins_the_edge_cases() {
 #[test]
 fn startup_stats_pipeline_in_argument_order_with_individual_errors_and_follow_flags() {
     let args = Args::parse_args(&["cp".into(), "a".into(), "--as".into(), "dst".into()]).unwrap();
-    let sources = ["remote:a", "remote:b/", "remote:c", "remote:d/"]
-        .map(|path| Location::parse(path).unwrap());
+    let sources = [
+        "remote:a",
+        "remote:b/",
+        "remote:c",
+        "remote:d/",
+        "remote:e",
+        "remote:f/",
+    ]
+    .map(|path| Location::parse(path).unwrap());
     let dir = crate::test_support::tempdir().unwrap();
     let session = crate::descriptor_broker::DescriptorSessionSlot::default();
     let ticket = session
@@ -3353,7 +3360,9 @@ fn startup_stats_pipeline_in_argument_order_with_individual_errors_and_follow_fl
                 Response::Stats(vec![Some(pipeline_job(b"a", 1).entry.clone())]),
                 Response::Stats(vec![None]),
                 Response::Err("permission denied".into()),
-                Response::Stats(vec![Some(pipeline_job(b"d", 4).entry.clone())]),
+                Response::Stats(vec![]),
+                Response::Stats(vec![None, None]),
+                Response::Stats(vec![Some(pipeline_job(b"f", 6).entry.clone())]),
             ]
             .into(),
             ..Default::default()
@@ -3392,10 +3401,11 @@ fn startup_stats_pipeline_in_argument_order_with_individual_errors_and_follow_fl
             assert_eq!(state.requests.len(), 3, "leave later lookups unissued");
         } else {
             result.unwrap();
-            assert_eq!(state.received, 4);
+            assert_eq!(state.received, 6);
+            assert_eq!(state.sent_at_receive, [3, 3, 3, 6, 6, 6]);
             assert_eq!(
                 observed.iter().map(|entry| entry.0).collect::<Vec<_>>(),
-                [b"a".as_slice(), b"b/", b"c", b"d/"]
+                [b"a".as_slice(), b"b/", b"c", b"d/", b"e", b"f/"]
             );
             assert_eq!(*observed[0].1.as_ref().unwrap(), Some(1));
             assert_eq!(*observed[1].1.as_ref().unwrap(), None);
@@ -3405,7 +3415,13 @@ fn startup_stats_pipeline_in_argument_order_with_individual_errors_and_follow_fl
                 .unwrap_err()
                 .to_string()
                 .contains("permission denied"));
-            assert_eq!(*observed[3].1.as_ref().unwrap(), Some(4));
+            for (index, count) in [(3, 0), (4, 2)] {
+                assert_eq!(
+                    observed[index].1.as_ref().unwrap_err().to_string(),
+                    format!("stat reply count {count} does not match request count 1")
+                );
+            }
+            assert_eq!(*observed[5].1.as_ref().unwrap(), Some(6));
         }
     }
 }
@@ -5227,9 +5243,10 @@ fn adaptive_ordinary_ranges_drain_on_abort_and_retirement() {
 }
 
 #[test]
-fn cold_ordinary_range_fills_the_read_window_at_the_payload_ceiling() {
+fn cold_ordinary_range_starts_with_small_reads_and_grows_after_replies() {
+    let starting_bytes = 1 << 20;
     let block = 4 << 20;
-    let size = 4 * block;
+    let size = 8 << 20;
     let sched = Arc::new(Sched::new(block, 32 << 20));
     let idx = sched.push_file(pipeline_job(b"file", size));
     sched.scan_done();
@@ -5241,6 +5258,7 @@ fn cold_ordinary_range_fills_the_read_window_at_the_payload_ceiling() {
     }));
     let dst = Arc::new(Mutex::new(PipelineState {
         auto_ranges: true,
+        early_range_acks: true,
         ..Default::default()
     }));
     let mut worker = pipeline_worker(&sched, &src, &dst, false);
@@ -5251,11 +5269,14 @@ fn cold_ordinary_range_fills_the_read_window_at_the_payload_ceiling() {
     worker.transfer_range(&range, &mut credited).unwrap();
     let source = src.lock().unwrap();
     assert_eq!(source.sent_at_receive[0], 4);
-    assert_eq!(source.requests.len(), 4);
-    assert!(source
-        .requests
+    assert!(source.requests[..4]
         .iter()
-        .all(|r| matches!(r, Request::ReadRange { len, .. } if u64::from(*len) == block)));
+        .enumerate()
+        .all(|(i, r)| matches!(r, Request::ReadRange { off, len, .. }
+        if *off == i as u64 * starting_bytes && u64::from(*len) == starting_bytes)));
+    assert!(source.requests[4..]
+        .iter()
+        .any(|r| matches!(r, Request::ReadRange { len, .. } if u64::from(*len) > starting_bytes)));
     assert!(source.replies.is_empty());
     assert!(dst.lock().unwrap().replies.is_empty());
     assert_eq!(credited, size);

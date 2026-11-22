@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 // Keep an application request large enough to amortize its framing and I/O.
 const MIN_RANGE_BYTES: u64 = 64 << 10;
+const START_RANGE_BYTES: u64 = 1 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct WorkSize {
@@ -22,6 +23,7 @@ pub(super) struct WorkBudget {
     min_bytes: u64,
     max_bytes: u64,
     target: Duration,
+    late_floor_samples: Option<(usize, Duration)>,
 }
 impl Default for WorkBudget {
     fn default() -> Self {
@@ -33,6 +35,7 @@ impl Default for WorkBudget {
             min_bytes: 1,
             max_bytes: 1 << 20,
             target: Duration::from_millis(250),
+            late_floor_samples: None,
         }
     }
 }
@@ -42,13 +45,14 @@ impl WorkBudget {
         Self {
             limit: WorkSize {
                 bytes: starting_bytes
-                    .unwrap_or(max_bytes)
+                    .unwrap_or(START_RANGE_BYTES)
                     .clamp(min_bytes, max_bytes),
                 files: 0,
             },
             min_bytes,
             max_bytes,
             target,
+            late_floor_samples: None,
         }
     }
 
@@ -71,6 +75,7 @@ impl WorkBudget {
         // admission; a single-RPC allowance stalls fast delayed connections.
         self.target = Duration::from_millis(250)
             .max(round_trip.saturating_mul(crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH as u32));
+        self.late_floor_samples = None;
     }
 
     pub fn latency_target(&self) -> Duration {
@@ -93,6 +98,25 @@ impl WorkBudget {
     /// requests. Reduce immediately when service slows; grow at most fourfold
     /// per observation so a briefly cached operation cannot reserve a huge tail.
     pub fn observe(&mut self, work: WorkSize, elapsed: Duration) {
+        // If an entire window of minimum-size requests is still late, use
+        // the shortest of those completions as a baseline. Allow some room
+        // for payload time so the range can grow again at the new latency.
+        if self.min_bytes == MIN_RANGE_BYTES
+            && self.min_bytes < self.max_bytes
+            && self.limit.bytes == self.min_bytes
+            && work.bytes == self.min_bytes
+            && elapsed > self.target
+        {
+            let (count, shortest) = self.late_floor_samples.get_or_insert((0, elapsed));
+            *count += 1;
+            *shortest = (*shortest).min(elapsed);
+            if *count == crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH {
+                self.target = shortest.saturating_mul(2);
+                self.late_floor_samples = None;
+            }
+        } else {
+            self.late_floor_samples = None;
+        }
         let elapsed = elapsed.max(Duration::from_micros(1)).as_nanos();
         let target = self.target.as_nanos();
         fn resized(current: u64, amount: u64, elapsed: u128, target: u128) -> u64 {
@@ -134,7 +158,7 @@ mod tests {
     fn range_requests_shrink_and_recover_within_the_payload_ceiling() {
         for max in [512, 4096, 3 << 20, 4 << 20] {
             let mut budget = WorkBudget::ranges(max, Duration::from_millis(250), None);
-            assert_eq!(budget.request_bytes(), max);
+            assert_eq!(budget.request_bytes(), max.min(START_RANGE_BYTES));
             for _ in 0..4 {
                 budget.observe(
                     WorkSize {
@@ -161,6 +185,40 @@ mod tests {
             assert_eq!(budget.request_bytes(), max);
             assert_eq!(budget.limit().files, 0);
         }
+    }
+
+    #[test]
+    fn range_requests_recover_when_latency_rises_after_startup() {
+        let ceiling = 4 << 20;
+        let mut budget = WorkBudget::ranges(ceiling, Duration::from_millis(250), None);
+        budget.set_latency(Duration::from_millis(20));
+        budget.observe(budget.limit(), Duration::from_millis(25));
+        assert_eq!(budget.request_bytes(), ceiling);
+
+        let late = Duration::from_millis(750);
+        for _ in 0..4 {
+            budget.observe(budget.limit(), late);
+        }
+        assert_eq!(budget.request_bytes(), MIN_RANGE_BYTES);
+        let initial_target = budget.latency_target();
+        budget.observe(budget.limit(), Duration::from_secs(10));
+        budget.observe(budget.limit(), Duration::from_millis(25));
+        assert_eq!(budget.latency_target(), initial_target);
+        for _ in 0..2 {
+            budget.observe(budget.limit(), late);
+        }
+        assert_eq!(budget.request_bytes(), MIN_RANGE_BYTES);
+        for _ in 1..crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH {
+            budget.observe(budget.limit(), late);
+        }
+        assert_eq!(budget.latency_target(), initial_target);
+        budget.observe(budget.limit(), late);
+        assert_eq!(budget.latency_target(), 2 * late);
+        assert!(budget.request_bytes() > MIN_RANGE_BYTES);
+        for _ in 0..8 {
+            budget.observe(budget.limit(), late);
+        }
+        assert_eq!(budget.request_bytes(), ceiling);
     }
 
     #[test]
