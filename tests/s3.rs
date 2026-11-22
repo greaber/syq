@@ -2057,7 +2057,10 @@ fn serve(
         reply(&mut socket, 404, &[], b"", false);
         return;
     }
-    let size = if fault.starts_with("single")
+    let size = if fault == "single-swap" {
+        // Above the 128 KiB inline single-GET buffer so `.partial` exists while streaming.
+        256 * 1024
+    } else if fault.starts_with("single")
         || (fault.starts_with("prefix-")
             && fault != "prefix-multipart"
             && !fault.starts_with("prefix-recovery"))
