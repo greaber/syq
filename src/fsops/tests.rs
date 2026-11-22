@@ -673,6 +673,29 @@ fn directories_are_listed_before_stats_once_enough_of_their_names_are_asked_for(
 
 #[cfg(target_os = "linux")]
 #[test]
+fn a_capped_nfs_listing_is_retried_when_more_names_are_requested() {
+    let temporary = crate::test_support::tempdir().unwrap();
+    let directory = temporary.path().join("d");
+    fs::create_dir(&directory).unwrap();
+    let paths: Vec<_> = (0..=LISTING_MIN_NAMES * LISTING_ENTRIES_PER_NAME)
+        .map(|i| {
+            let name = format!("f{i}");
+            File::create(directory.join(&name)).unwrap();
+            format!("d/{name}").into_bytes()
+        })
+        .collect();
+    let root = Arc::new(Root::open(temporary.path()).unwrap());
+    root.assume_nfs_for_test();
+    let mut requests = HashMap::new();
+    let (first, rest) = paths.split_at(LISTING_MIN_NAMES);
+    list_nfs_directories_before_stats(&root, first, &mut requests);
+    assert_eq!(requests[b"d".as_slice()], Some(LISTING_MIN_NAMES));
+    list_nfs_directories_before_stats(&root, &rest[..LISTING_MIN_NAMES], &mut requests);
+    assert_eq!(requests[b"d".as_slice()], None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn local_roots_skip_listing_bookkeeping() {
     let directory = crate::test_support::tempdir().unwrap();
     let root = Arc::new(Root::open(directory.path()).unwrap());

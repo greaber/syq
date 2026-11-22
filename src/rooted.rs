@@ -782,6 +782,21 @@ impl Root {
         self.open_regular_known(path, libc::O_RDWR)
     }
 
+    /// Open only a directory, including one whose search permission its
+    /// owner is about to restore. The empty path already has a pinned handle.
+    pub(crate) fn open_directory_for_metadata(&self, path: &RelativePath) -> Result<File> {
+        #[cfg(target_os = "macos")]
+        if !path.is_empty() {
+            // O_SEARCH would require search permission on the leaf itself.
+            return self.open_leaf(
+                path,
+                libc::O_EVTONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+            );
+        }
+        self.open_directory(path)
+    }
+
     pub(crate) fn open_metadata(&self, path: &RelativePath) -> Result<File> {
         if path.is_empty() {
             // The root is already selected and pinned. Reopening it through
@@ -1480,14 +1495,12 @@ impl Root {
     }
 
     /// Read up to about `limit` entries of a retained directory, keeping
-    /// nothing: what the read leaves in the kernel's caches is the point.
+    /// nothing. Return whether the read reached the end of the directory.
     #[cfg(target_os = "linux")]
-    pub(crate) fn walk_open_directory(&self, directory: &File, limit: usize) -> Result<()> {
+    pub(crate) fn walk_open_directory(&self, directory: &File, limit: usize) -> Result<bool> {
         let readable = open_readable_directory_at(directory, b".")
             .context("open readable confined directory")?;
-        crate::sys::walk_directory_entries(readable, limit)
-            .map(|_| ())
-            .context("read confined directory")
+        crate::sys::walk_directory_entries(readable, limit).context("read confined directory")
     }
 
     /// Start with the common Linux limit, independent of previous failures.

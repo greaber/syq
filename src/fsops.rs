@@ -3505,8 +3505,11 @@ fn directories_to_list<'a>(
         let Some(asked) = requests.entry(parent.to_vec()).or_insert(Some(0)) else {
             continue;
         };
-        *asked += names;
-        if *asked >= LISTING_MIN_NAMES {
+        let previous = *asked;
+        *asked = asked.saturating_add(names);
+        // On a partial listing, grow the budget geometrically. Retrying from
+        // the beginning for every small batch would repeatedly read its prefix.
+        if *asked >= LISTING_MIN_NAMES && asked.checked_ilog2() != previous.checked_ilog2() {
             candidates.push((parent, *asked));
         }
     }
@@ -3518,7 +3521,7 @@ fn directories_to_list<'a>(
 /// NFS client confirm the entry with the server, one LOOKUP per name; a
 /// listing confirms every entry it reads in one request per few hundred and
 /// leaves their stats to the client's cache. A local filesystem answers
-/// either from memory, so only NFS directories are listed, once per destination.
+/// either from memory. Stop listing an NFS directory once a read reaches EOF.
 #[cfg(target_os = "linux")]
 fn list_nfs_directories_before_stats(
     root: &Arc<Root>,
@@ -3531,7 +3534,7 @@ fn list_nfs_directories_before_stats(
         return;
     }
     let candidates = directories_to_list(paths, requests);
-    // Whether the directory is settled: listed, or not on NFS.
+    // A complete listing or a non-NFS directory needs no further attempt.
     let list = |(parent, names): &(&[u8], usize)| -> bool {
         let Ok(relative) = RelativePath::new(parent) else {
             return true;
@@ -3539,15 +3542,18 @@ fn list_nfs_directories_before_stats(
         let Ok(directory) = root.open_directory(&relative) else {
             return false;
         };
-        let Ok(fs) = file_system_of(&directory) else {
-            return false;
-        };
-        if fs.magic() != fs_caps::NFS_SUPER_MAGIC {
-            return true;
+        // The root is already known to be on NFS. Ask about a different
+        // filesystem only on a mount crossing, using the cached mount traits.
+        if lookups::cached_device(&directory) != Some(root.identity().dev) {
+            let Ok((_, traits)) = opened_file_system(&directory) else {
+                return false;
+            };
+            if !traits.is_nfs {
+                return true;
+            }
         }
-        let _ =
-            root.walk_open_directory(&directory, names.saturating_mul(LISTING_ENTRIES_PER_NAME));
-        true
+        root.walk_open_directory(&directory, names.saturating_mul(LISTING_ENTRIES_PER_NAME))
+            .unwrap_or(false)
     };
     let settled: Vec<bool> = if candidates.len() < 2 {
         candidates.iter().map(list).collect()

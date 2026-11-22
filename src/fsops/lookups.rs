@@ -24,7 +24,8 @@ use super::*;
 use std::hash::{BuildHasher, RandomState};
 use std::sync::RwLock;
 
-const MAX_NAMES: usize = 1 << 20;
+// A table with 2^20 buckets holds this many names at its 7/8 load factor.
+const MAX_NAMES: usize = (1 << 20) / 8 * 7;
 const MAX_PATH_BYTES: usize = 32 << 20;
 
 #[derive(Default)]

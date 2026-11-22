@@ -1892,12 +1892,12 @@ impl FsOps {
                 .then(|| root.replacement_turn());
             let _turn = root.mutation_turn(&directory).ok();
             // Reopen from the root at the start of publication. Only ordinary
-            // renames borrow this handle. Conditional links and exchanges keep
-            // their per-name resolution and cleanup, as do restricted grants.
+            // renames borrow this handle. Leave its descriptor available if
+            // any publication in the run needs to open its own parent.
             let siblings = if stages.len() > 1
                 && !self.restricted_destination()
                 && directory.leaf().is_ok_and(|(parent, _)| !parent.is_empty())
-                && stages.iter().any(|(i, _)| {
+                && stages.iter().all(|(i, _)| {
                     matches!(
                         puts[*i].condition,
                         TargetCondition::Any | TargetCondition::Matches { .. }
@@ -2276,12 +2276,67 @@ mod tests {
         );
         let results =
             ops.put_small_batch(&mut [put("selected/a", b"first"), put("selected/b", b"second")]);
-        assert!(results[0].is_ok());
-        if results[1].is_ok() {
-            assert_eq!(fs::read(base.join("held/b")).unwrap(), b"second");
-        }
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        assert_eq!(fs::read(base.join("held/b")).unwrap(), b"second");
         assert_eq!(fs::read(base.join("held/a")).unwrap(), b"first");
         assert_eq!(fs::read(base.join("other/b")).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn mixed_sibling_publications_reuse_the_last_parent_descriptor() {
+        use crate::process::CommandExt as _;
+
+        // Change the descriptor limit only in this test's own process.
+        const CHILD: &str = "SYQ_TEST_MIXED_SIBLING_FDS";
+        if std::env::var_os(CHILD).is_none() {
+            let name = "fsops::small_batch::tests::mixed_sibling_publications_reuse_the_last_parent_descriptor";
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env(CHILD, "1")
+                .capture_output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        let mut limits = nofile_limits().unwrap();
+        limits.rlim_cur = limits.rlim_cur.min(64);
+        set_nofile_limits(&limits).unwrap();
+
+        let temporary = crate::test_support::tempdir().unwrap();
+        let parent = temporary.path().join("selected");
+        fs::create_dir(&parent).unwrap();
+        let mut ops = receiver(temporary.path());
+        let held = Arc::new(Mutex::new(Vec::new()));
+        let _hook = crate::rooted::install_publication_test_hook(
+            ops.destination_root.as_ref().unwrap().identity(),
+            &RelativePath::new(b"selected/a").unwrap(),
+            crate::rooted::PublicationTestPoint::AfterAnyRename,
+            {
+                let held = held.clone();
+                move || {
+                    // The first rename still holds its parent. Releasing that
+                    // descriptor must suffice for the second publication.
+                    let mut held = held.lock().unwrap();
+                    loop {
+                        match File::open("/dev/null") {
+                            Ok(file) => held.push(file),
+                            Err(error) => {
+                                assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+                                break;
+                            }
+                        }
+                    }
+                }
+            },
+        );
+        let mut puts = [put("selected/a", b"first"), put("selected/b", b"second")];
+        puts[1].condition = TargetCondition::Absent;
+        let results = ops.put_small_batch(&mut puts);
+        assert!(!held.lock().unwrap().is_empty());
+        drop(held);
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        assert_eq!(fs::read(parent.join("a")).unwrap(), b"first");
+        assert_eq!(fs::read(parent.join("b")).unwrap(), b"second");
     }
 
     fn entries(directory: &Path) -> usize {

@@ -777,29 +777,26 @@ pub(super) fn set_meta_rooted(
     condition: TargetCondition,
     directory: bool,
 ) -> Result<()> {
-    let require_directory = |is_dir: bool| {
-        if !is_dir {
-            if directory {
-                bail!(
-                    "destination {} is no longer a directory",
-                    target.label.display()
-                );
-            }
-            bail!(
-                "{} is not changed in place: only a directory's metadata is",
-                target.label.display()
-            );
-        }
-        Ok(())
-    };
-    // Select the inode once. Type, condition and changes all refer to this
-    // handle. After a change, check the name afresh from the root.
+    // Require a directory in the open itself, before even opening a device
+    // someone put at the name. Check the name afresh after any change.
     let handle = target
         .root
-        .open_metadata(&target.relative)
-        .with_context(|| format!("open confined metadata handle {}", target.label.display()))?;
+        .open_directory_for_metadata(&target.relative)
+        .map_err(|error| {
+            let wrong_type = error.downcast_ref::<io::Error>().is_some_and(|error| {
+                matches!(error.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP))
+            });
+            let label = target.label.display();
+            let message = match (wrong_type, directory) {
+                (true, true) => format!("destination {label} is no longer a directory"),
+                (true, false) => {
+                    format!("{label} is not changed in place: only a directory's metadata is")
+                }
+                _ => format!("open confined metadata handle {label}"),
+            };
+            error.context(message)
+        })?;
     let opened = handle.metadata()?;
-    require_directory(opened.is_dir())?;
     let condition = match condition {
         TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. }
             if !target.root.link_counts_trusted_on(opened.dev(), &handle) =>
