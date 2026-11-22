@@ -1328,7 +1328,9 @@ impl Planner<'_> {
         early: &mut Option<super::early_lookups::EarlyLookup>,
     ) -> Result<()> {
         let batch = if self.filters_scanned_entries() {
-            let mut cached = early.as_mut().and_then(|lookup| lookup.take_selection());
+            let mut cached = early
+                .as_mut()
+                .and_then(|lookup| lookup.take_selection(&batch));
             let mut selected = Vec::with_capacity(batch.len());
             for entry in batch {
                 let keep = match &mut cached {
@@ -3866,8 +3868,12 @@ impl Planner<'_> {
     pub(super) fn batch_lookups_configured(&self) -> bool {
         // With both options stat_many compares the strict observation's
         // identity and ctime against a second, rich snapshot.
-        !(self.opts.inode_preservation.any() && self.opts.expressions.update.is_some())
-            && self.opts.dst_remote
+        if self.opts.inode_preservation.any()
+            && (self.opts.expressions.update.is_some() || self.early_lookups.rich_batch_deferred)
+        {
+            return false;
+        }
+        self.opts.dst_remote
             && self.buffer.is_none()
             && !self.opts.dry_run
             && !self.destination_children_known_missing
@@ -3912,12 +3918,15 @@ impl Planner<'_> {
                     if directories.is_empty() && others.is_empty() {
                         return Ok(());
                     }
+                    let Some(request) = Request::plan_batch(
+                        &directories,
+                        &others,
+                        self.opts.expressions.update.is_some(),
+                    ) else {
+                        return Ok(());
+                    };
                     self.count_batch_lookup();
-                    let response = self.dst.call(Request::PlanBatch {
-                        directories: directories.clone(),
-                        others: others.clone(),
-                        strict_metadata: self.opts.expressions.update.is_some(),
-                    })?;
+                    let response = self.dst.call(request)?;
                     (directories, others, response)
                 }
             };
@@ -3942,7 +3951,15 @@ impl Planner<'_> {
                 }
                 Ok(())
             }
-            Response::BatchPlanDeferred if self.opts.inode_preservation.any() => Ok(()),
+            Response::BatchPlanDeferred if self.opts.inode_preservation.any() => {
+                self.early_lookups.rich_batch_deferred = true;
+                #[cfg(debug_assertions)]
+                let _ = crate::fsops::record_test_event(
+                    "SYQ_TEST_DESTINATION_LOOKUPS",
+                    format_args!("deferred"),
+                );
+                Ok(())
+            }
             other => bail!("unexpected response {other:?}"),
         }
     }

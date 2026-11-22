@@ -26,16 +26,63 @@ pub(super) struct EarlyLookup {
     directories: Vec<PathBytes>,
     others: Vec<PathBytes>,
     // Decisions in scan order up to the first error, reported in turn.
-    selection: Option<(Vec<bool>, Option<anyhow::Error>)>,
+    selection: Option<BatchSelection>,
     /// The reply to come, and how many other requests the destination had
     /// been sent when the lookup was (`Planner::other_requests`).
     reply: Option<(PendingReply, u64)>,
 }
 
+struct BatchSelection {
+    len: usize,
+    first: PathBytes,
+    last: PathBytes,
+    decisions: Vec<bool>,
+    error: Option<anyhow::Error>,
+}
+
+impl BatchSelection {
+    fn new(batch: &[Entry]) -> Option<Self> {
+        Some(Self {
+            len: batch.len(),
+            first: batch.first()?.path.clone(),
+            last: batch.last()?.path.clone(),
+            decisions: Vec::with_capacity(batch.len()),
+            error: None,
+        })
+    }
+
+    fn matches(&self, batch: &[Entry]) -> bool {
+        self.len == batch.len()
+            && batch.first().is_some_and(|entry| entry.path == self.first)
+            && batch.last().is_some_and(|entry| entry.path == self.last)
+    }
+}
+
 impl EarlyLookup {
-    pub(super) fn take_selection(&mut self) -> Option<impl Iterator<Item = Result<bool>> + use<>> {
-        let (decisions, error) = self.selection.take()?;
-        Some(decisions.into_iter().map(Ok).chain(error.map(Err)))
+    pub(super) fn take_selection(
+        &mut self,
+        batch: &[Entry],
+    ) -> Option<impl Iterator<Item = Result<bool>> + use<>> {
+        let selection = self
+            .selection
+            .take()
+            .filter(|selection| selection.matches(batch))?;
+        Some(
+            selection
+                .decisions
+                .into_iter()
+                .map(Ok)
+                .chain(selection.error.map(Err)),
+        )
+    }
+
+    fn discard_reply(&mut self, dst: &mut dyn Conn, deferred: &mut bool, _fate: &str) {
+        if let Some((reply, _)) = self.reply.take() {
+            *deferred |= matches!(dst.take_reply(reply), Ok(Response::BatchPlanDeferred));
+            #[cfg(debug_assertions)]
+            let _ =
+                crate::fsops::record_test_event("SYQ_TEST_EARLY_LOOKUPS", format_args!("{_fate}"));
+        }
     }
 }
 
@@ -52,6 +99,8 @@ pub(super) struct EarlyLookups {
     /// by others that do, so the count starts again from none, and a copy
     /// whose batches keep sending more wastes few.
     quiet_run: usize,
+    /// The receiver asked for chunked rich metadata lookups on this run.
+    pub(super) rich_batch_deferred: bool,
 }
 
 impl Planner<'_> {
@@ -88,6 +137,9 @@ impl Planner<'_> {
         sub: &[u8],
         dst_root: &[u8],
     ) {
+        if self.early_lookups.rich_batch_deferred {
+            return;
+        }
         let mut directories = Vec::new();
         let mut others = Vec::new();
         // `map_batch` joins the same three parts, the last two first.
@@ -97,12 +149,12 @@ impl Planner<'_> {
         let filtered = self.filters_scanned_entries();
         #[cfg(debug_assertions)]
         let filtered = filtered && std::env::var_os("SYQ_TEST_EARLY_LOOKUPS_UNFILTERED").is_none();
-        let mut selection = filtered.then(|| (Vec::with_capacity(entries.len()), None));
+        let mut selection = filtered.then(|| BatchSelection::new(entries)).flatten();
         for entry in entries {
-            if let Some((decisions, error)) = &mut selection {
+            if let Some(selection) = &mut selection {
                 match self.selects_scanned_entry(entry, src_root) {
                     Ok(keep) => {
-                        decisions.push(keep);
+                        selection.decisions.push(keep);
                         if !keep {
                             continue;
                         }
@@ -110,7 +162,7 @@ impl Planner<'_> {
                     // The batch's turn reports it and ends the copy: ask
                     // nothing for it.
                     Err(e) => {
-                        *error = Some(e);
+                        selection.error = Some(e);
                         directories.clear();
                         others.clear();
                         break;
@@ -151,12 +203,13 @@ impl Planner<'_> {
             if early.reply.is_some() || (early.directories.is_empty() && early.others.is_empty()) {
                 continue;
             }
+            let Some(request) =
+                Request::plan_batch(&early.directories, &early.others, strict_metadata)
+            else {
+                continue;
+            };
             // A failure to send is reported by the batch's lookup in turn.
-            let Ok(reply) = self.dst.send_pending(Request::PlanBatch {
-                directories: early.directories.clone(),
-                others: early.others.clone(),
-                strict_metadata,
-            }) else {
+            let Ok(reply) = self.dst.send_pending(request) else {
                 return;
             };
             self.early_lookups.sent += 1;
@@ -190,22 +243,22 @@ impl Planner<'_> {
                 .others
                 .iter()
                 .eq(mapped.others.iter().map(|planned| &planned.dst));
-        let response = response.ok().filter(|response| {
-            current
-                && matches!(
-                    response,
-                    Response::BatchPlan { .. } | Response::BatchPlanDeferred
-                )
+        // A deferral carries no observations that can go stale. Even a
+        // discarded lookup can tell us to stop requesting rich batches.
+        let response = response.ok().filter(|response| match response {
+            Response::BatchPlan { .. } => current,
+            Response::BatchPlanDeferred => current || self.opts.inode_preservation.any(),
+            _ => false,
         });
         #[cfg(debug_assertions)]
         let _ = crate::fsops::record_test_event(
             "SYQ_TEST_EARLY_LOOKUPS",
             format_args!(
                 "{}",
-                if response.is_some() {
-                    "used"
-                } else {
-                    "repeated"
+                match &response {
+                    Some(Response::BatchPlan { .. }) => "used",
+                    Some(Response::BatchPlanDeferred) => "deferred",
+                    _ => "repeated",
                 }
             ),
         );
@@ -213,15 +266,12 @@ impl Planner<'_> {
     }
 
     /// Take and drop the reply to a lookup that will not be used.
-    pub(super) fn discard_early_lookup(&mut self, early: EarlyLookup) {
-        if let Some((reply, _)) = early.reply {
-            let _ = self.dst.take_reply(reply);
-            #[cfg(debug_assertions)]
-            let _ = crate::fsops::record_test_event(
-                "SYQ_TEST_EARLY_LOOKUPS",
-                format_args!("discarded"),
-            );
-        }
+    pub(super) fn discard_early_lookup(&mut self, mut early: EarlyLookup) {
+        early.discard_reply(
+            self.dst,
+            &mut self.early_lookups.rich_batch_deferred,
+            "discarded",
+        );
     }
 
     /// Take and drop the replies to the lookups in flight: the destination
@@ -229,14 +279,11 @@ impl Planner<'_> {
     /// batches stay shown, to be looked up again.
     pub(super) fn withdraw_early_lookups(&mut self) {
         for early in &mut self.early_lookups.shown {
-            if let Some((reply, _)) = early.reply.take() {
-                let _ = self.dst.take_reply(reply);
-                #[cfg(debug_assertions)]
-                let _ = crate::fsops::record_test_event(
-                    "SYQ_TEST_EARLY_LOOKUPS",
-                    format_args!("withdrawn"),
-                );
-            }
+            early.discard_reply(
+                self.dst,
+                &mut self.early_lookups.rich_batch_deferred,
+                "withdrawn",
+            );
         }
     }
 
@@ -259,5 +306,22 @@ impl Planner<'_> {
             self.early_lookups.quiet_run = 0;
         }
         self.send_early_lookups();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_selection_checks_batch_length_and_endpoints() {
+        let entry = |name: u8| implicit_dir_entry(vec![name]);
+        let shown = (*b"abc").map(entry);
+        let selection = BatchSelection::new(&shown).unwrap();
+        assert!(selection.matches(&shown));
+        for different in [b"ab".as_slice(), b"abbc", b"xbc", b"abx"] {
+            let batch: Vec<_> = different.iter().copied().map(entry).collect();
+            assert!(!selection.matches(&batch));
+        }
     }
 }

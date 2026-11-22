@@ -3,8 +3,9 @@
 //! `SYQ_TEST_SCAN_AHEAD_WAIT` makes the scan hold every batch it may before
 //! the planner takes the next one, so each lookup that can be sent early is.
 //! `SYQ_TEST_EARLY_LOOKUPS` records what became of each: `sent`, then `used`,
-//! `repeated` in the batch's turn, `withdrawn` while its batch still waits,
-//! or `discarded`. `SYQ_TEST_EARLY_LOOKUPS_UNFILTERED` makes an early lookup
+//! `deferred` to chunked lookups, `repeated` in the batch's turn, `withdrawn`
+//! while its batch still waits, or `discarded`.
+//! `SYQ_TEST_EARLY_LOOKUPS_UNFILTERED` makes an early lookup
 //! ask about the entries `--where` leaves out too.
 
 use super::*;
@@ -30,7 +31,7 @@ fn fill_with_late_directory(t: &Tmp, last: Option<&str>) {
     }
 }
 
-fn copy(t: &Tmp, rsh: &Path, extra: &[&str]) -> Output {
+pub(super) fn copy(t: &Tmp, rsh: &Path, extra: &[&str]) -> Output {
     copy_with(t, rsh, extra, &[])
 }
 
@@ -400,5 +401,7 @@ fn remote_metadata_rerun_uses_early_lookups() {
         "{}",
         stdout(&output)
     );
-    assert!(fates(&t)[1] > 0, "expected an early rich lookup to be used");
+    let early = fs::read_to_string(t.path("early")).unwrap();
+    assert!(early.lines().any(|line| line == "used"), "{early}");
+    assert!(!early.lines().any(|line| line == "deferred"), "{early}");
 }
