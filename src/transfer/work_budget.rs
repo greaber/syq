@@ -67,6 +67,10 @@ impl WorkBudget {
             .min(self.max_bytes)
     }
 
+    pub fn below_range_start(&self) -> bool {
+        self.limit.bytes < START_RANGE_BYTES.min(self.max_bytes)
+    }
+
     /// Configuration RPCs supply a latency allowance on SSH too. Include both
     /// endpoints, but not connection startup, authentication or helper setup.
     pub fn set_latency(&mut self, round_trip: Duration) {
@@ -143,8 +147,16 @@ impl WorkBudget {
                 estimate.min(current)
             }
         }
-        self.limit.bytes = resized(self.limit.bytes, work.bytes, elapsed, target)
-            .clamp(self.min_bytes, self.max_bytes);
+        let mut bytes = resized(self.limit.bytes, work.bytes, elapsed, target);
+        if self.min_bytes == MIN_RANGE_BYTES && elapsed > target && bytes == self.limit.bytes {
+            let request = self.request_bytes();
+            if work.bytes == request && request > self.min_bytes {
+                // If rounding keeps issuing the same full request after a
+                // proportional reduction, take the next smaller request.
+                bytes = bytes.min(1 << (request - 1).ilog2());
+            }
+        }
+        self.limit.bytes = bytes.clamp(self.min_bytes, self.max_bytes);
         self.limit.files =
             resized(self.limit.files as u64, work.files as u64, elapsed, target).min(2048) as usize;
     }
@@ -189,34 +201,48 @@ mod tests {
 
     #[test]
     fn range_requests_recover_when_latency_rises_after_startup() {
+        let observe_request = |budget: &mut WorkBudget, elapsed| {
+            budget.observe(
+                WorkSize {
+                    bytes: budget.request_bytes(),
+                    files: 0,
+                },
+                elapsed,
+            );
+        };
         let ceiling = 4 << 20;
         let mut budget = WorkBudget::ranges(ceiling, Duration::from_millis(250), None);
         budget.set_latency(Duration::from_millis(20));
-        budget.observe(budget.limit(), Duration::from_millis(25));
+        observe_request(&mut budget, Duration::from_millis(25));
         assert_eq!(budget.request_bytes(), ceiling);
 
-        let late = Duration::from_millis(750);
-        for _ in 0..4 {
-            budget.observe(budget.limit(), late);
+        // A single proportional reduction rounds back up at each size.
+        let late = Duration::from_millis(375);
+        while budget.request_bytes() > MIN_RANGE_BYTES {
+            let request = budget.request_bytes();
+            observe_request(&mut budget, late);
+            assert_eq!(budget.request_bytes(), request);
+            observe_request(&mut budget, late);
+            assert_eq!(budget.request_bytes(), request / 2);
         }
         assert_eq!(budget.request_bytes(), MIN_RANGE_BYTES);
         let initial_target = budget.latency_target();
-        budget.observe(budget.limit(), Duration::from_secs(10));
-        budget.observe(budget.limit(), Duration::from_millis(25));
+        observe_request(&mut budget, Duration::from_secs(10));
+        observe_request(&mut budget, initial_target);
         assert_eq!(budget.latency_target(), initial_target);
-        for _ in 0..2 {
-            budget.observe(budget.limit(), late);
-        }
         assert_eq!(budget.request_bytes(), MIN_RANGE_BYTES);
-        for _ in 1..crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH {
-            budget.observe(budget.limit(), late);
+        observe_request(&mut budget, Duration::from_secs(10));
+        for _ in 2..crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH {
+            observe_request(&mut budget, late);
         }
         assert_eq!(budget.latency_target(), initial_target);
-        budget.observe(budget.limit(), late);
+        observe_request(&mut budget, late);
         assert_eq!(budget.latency_target(), 2 * late);
         assert!(budget.request_bytes() > MIN_RANGE_BYTES);
         for _ in 0..8 {
-            budget.observe(budget.limit(), late);
+            let before = budget.request_bytes();
+            observe_request(&mut budget, late);
+            assert!(budget.request_bytes() >= before);
         }
         assert_eq!(budget.request_bytes(), ceiling);
     }

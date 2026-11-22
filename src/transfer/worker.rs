@@ -2643,8 +2643,8 @@ impl Worker {
         budget: &mut WorkBudget,
         adaptive: bool,
         received: Option<Result<(Response, std::time::Instant)>>,
-    ) -> Result<()> {
-        if adaptive {
+    ) -> Result<bool> {
+        let slow = if adaptive {
             let (response, arrived) = received.unwrap_or_else(|| self.dst.recv_with_arrival())?;
             change_ok(response, "write")?;
             // A range that started before both setup replies were read.
@@ -2652,12 +2652,15 @@ impl Worker {
                 budget.set_latency(round_trip);
             }
             let elapsed = arrived.saturating_duration_since(started);
+            let slow = elapsed > budget.latency_target();
             budget.observe(WorkSize { bytes: n, files: 0 }, elapsed);
+            slow
         } else {
             change_ok(self.dst.recv()?, "write")?;
-        }
+            false
+        };
         Self::acknowledge_range_write(&self.sched, &self.progress, job, flights, slot, n);
-        Ok(())
+        Ok(slow)
     }
 
     fn update_range_split(&self, handle: &RangeHandle, request: u64, ceiling: u64) {
@@ -2706,6 +2709,7 @@ impl Worker {
                 .map(|split| split.block);
             WorkBudget::ranges(block, self.batch_budget.latency_target(), starting_bytes)
         });
+        let mut slow = budget.below_range_start();
         let mut released = false;
         let result = (|| -> Result<()> {
             loop {
@@ -2718,7 +2722,7 @@ impl Worker {
                             break;
                         };
                         let write = pending_writes.pop_front().expect("arrived write");
-                        self.receive_range_write(
+                        slow |= self.receive_range_write(
                             job,
                             &mut flights,
                             write,
@@ -2773,7 +2777,7 @@ impl Worker {
                         block
                     };
                     if adaptive
-                        && (request < block || flight.split_block.is_some())
+                        && ((slow && request < block) || flight.split_block.is_some())
                         && flight.split_block != Some(request)
                     {
                         self.update_range_split(&flight.handle, request, block);
@@ -2809,7 +2813,7 @@ impl Worker {
                 let Some((slot, expected_off, expected_len, started)) = pending_reads.pop_front()
                 else {
                     if let Some(write) = pending_writes.pop_front() {
-                        self.receive_range_write(
+                        slow |= self.receive_range_write(
                             job,
                             &mut flights,
                             write,
@@ -2843,7 +2847,7 @@ impl Worker {
                 pending_writes.push_back((slot, n, started));
                 if pending_writes.len() >= write_window {
                     let write = pending_writes.pop_front().expect("pending write");
-                    self.receive_range_write(
+                    slow |= self.receive_range_write(
                         job,
                         &mut flights,
                         write,
