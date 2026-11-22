@@ -9,6 +9,46 @@ use crate::s3::{
 /// transfer limit. Tiny objects over a slow link already start this high.
 const CHECKING_REQUESTS: usize = 256;
 
+pub(super) enum DownloadSink<'a> {
+    Writer(&'a writer::Writer),
+    Memory(&'a mut Vec<bytes::Bytes>),
+}
+
+impl DownloadSink<'_> {
+    fn direct(&self) -> bool {
+        matches!(self, Self::Writer(writer) if writer.direct())
+    }
+    async fn write(&mut self, bytes: bytes::Bytes, offset: u64) -> Result<()> {
+        match self {
+            Self::Writer(writer) => writer.write(bytes, offset).await,
+            Self::Memory(chunks) => {
+                chunks.push(bytes);
+                Ok(())
+            }
+        }
+    }
+    async fn write_batch(&mut self, batch: Vec<bytes::Bytes>, offset: u64) -> Result<()> {
+        match self {
+            Self::Writer(writer) => writer.write_batch(batch, offset).await,
+            Self::Memory(chunks) => {
+                chunks.extend(batch);
+                Ok(())
+            }
+        }
+    }
+    async fn flush(&self) -> Result<()> {
+        match self {
+            Self::Writer(writer) => writer.flush().await,
+            Self::Memory(_) => Ok(()),
+        }
+    }
+    fn reset(&mut self) {
+        if let Self::Memory(chunks) = self {
+            chunks.clear();
+        }
+    }
+}
+
 impl Engine {
     pub(super) fn object_workers(&self, sizes: impl Iterator<Item = u64>) -> Result<Concurrency> {
         let mut count = 0u64;
@@ -217,6 +257,28 @@ impl Engine {
         output: &writer::Writer,
         offset: u64,
         length: u64,
+        initial: Option<ByteStream>,
+        initial_slot: Option<crate::s3::tuning::Permit>,
+        algorithm: Option<HashAlgorithm>,
+    ) -> Result<String> {
+        self.download_fast_range_into(
+            object,
+            DownloadSink::Writer(output),
+            offset,
+            length,
+            initial,
+            initial_slot,
+            algorithm,
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn download_fast_range_into(
+        &self,
+        object: &Object,
+        mut output: DownloadSink<'_>,
+        offset: u64,
+        length: u64,
         mut initial: Option<ByteStream>,
         initial_slot: Option<crate::s3::tuning::Permit>,
         algorithm: Option<HashAlgorithm>,
@@ -385,6 +447,10 @@ impl Engine {
                         .map(|h| Digest::from_hash(algorithm.unwrap(), &h.finalize()).value)
                         .unwrap_or_default());
                 }
+                let writer = match &output {
+                    DownloadSink::Writer(writer) => *writer,
+                    DownloadSink::Memory(_) => unreachable!("memory sink is never direct"),
+                };
                 let mut body = body.into_async_read();
                 let mut buffer = writer::Aligned::new(1024 * 1024)?;
                 while done < length {
@@ -408,7 +474,7 @@ impl Engine {
                     let padded = want.next_multiple_of(4096);
                     buffer.bytes_mut()[want..padded].fill(0);
                     self.pace(want as u64).await?;
-                    buffer = output.write_direct(buffer, offset + done, padded).await?;
+                    buffer = writer.write_direct(buffer, offset + done, padded).await?;
                     done += want as u64;
                     anyhow::ensure!(!recover(done, waited), SlowRead);
                 }
@@ -441,7 +507,7 @@ impl Engine {
                         && !unanswerable
                         && e.downcast_ref::<Permanent>().is_none() =>
                 {
-                    output.finish().await?;
+                    output.flush().await?;
                     self.check_cancelled()?;
                     if e.downcast_ref::<SlowRead>().is_none() {
                         // Only our own slow-read decision trusts the prefix.
@@ -451,6 +517,7 @@ impl Engine {
                         batch.clear();
                         fragments.clear();
                         batch_size = 0;
+                        output.reset();
                         tokio::time::sleep(
                             retry_delay.unwrap_or_else(|| crate::s3::retry::delay(attempt, false)),
                         )

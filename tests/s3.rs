@@ -2057,7 +2057,10 @@ fn serve(
         reply(&mut socket, 404, &[], b"", false);
         return;
     }
-    let size = if fault.starts_with("single")
+    let size = if fault == "single-swap" {
+        // Above the 128 KiB inline single-GET buffer so `.partial` exists while streaming.
+        256 * 1024
+    } else if fault.starts_with("single")
         || (fault.starts_with("prefix-")
             && fault != "prefix-multipart"
             && !fault.starts_with("prefix-recovery"))
@@ -2598,9 +2601,13 @@ fn s3_first_range_supplies_metadata_without_serializing_the_remaining_ranges() {
 #[cfg(debug_assertions)]
 #[test]
 fn s3_late_close_preserves_download_destination() {
-    for multipart in [false, true] {
+    for (fixture, expected_size, multipart) in [
+        ("single-ok", 65536, false),
+        ("ok", SIZE, false),
+        ("ok", SIZE, true),
+    ] {
         for existing in [false, true] {
-            let server = Server::start("ok");
+            let server = Server::start(fixture);
             let temp = crate::test_support::tempdir().unwrap();
             let destination = temp.path().join("download");
             if existing {
@@ -2616,7 +2623,8 @@ fn s3_late_close_preserves_download_destination() {
                 "--as",
                 "download",
             ]);
-            // The default part size keeps this fixture in download_single;
+            // `single-ok` exercises the <=128 KiB inline path; `ok` without
+            // explicit 5 MiB parts exercises the streaming single-GET path;
             // explicit 5 MiB parts take the checkpointed ranged path.
             let output = command
                 .env("SYQ_TEST_FAIL_WRITER_CLOSE", "download")
@@ -2633,12 +2641,22 @@ fn s3_late_close_preserves_download_destination() {
             } else {
                 assert!(!destination.exists());
             }
+            if !multipart {
+                assert!(!std::fs::read_dir(temp.path()).unwrap().any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".partial")));
+            }
             let retry = command
                 .env_remove("SYQ_TEST_FAIL_WRITER_CLOSE")
                 .capture_output()
                 .unwrap();
             assert!(retry.status.success(), "{}", output_text(&retry));
-            assert_eq!(std::fs::read(&destination).unwrap(), vec![b'x'; SIZE]);
+            assert_eq!(
+                std::fs::read(&destination).unwrap(),
+                vec![b'x'; expected_size]
+            );
         }
     }
 }
