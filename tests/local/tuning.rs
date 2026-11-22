@@ -2477,7 +2477,7 @@ fn whole_file_progress_reaches_tuner_before_completion() {
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             ) {
                 observed = db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM events WHERE json_extract(data,'$.kind')='sample' AND json_extract(data,'$.data.cumulative_bytes')=2097152 AND json_extract(data,'$.data.cumulative_files')=0)",
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE json_extract(data,'$.kind')='observation' AND json_extract(data,'$.data.cumulative_bytes')=2097152 AND json_extract(data,'$.data.cumulative_files')=0)",
                     [], |row| row.get::<_, bool>(0),
                 ).unwrap_or(false);
             }

@@ -241,7 +241,7 @@ fn fallback_starts_a_clean_observation_at_the_new_count() {
         .query_row(
             "SELECT workers,usable FROM measurements ORDER BY sequence LIMIT 1",
             [],
-            |row| Ok((row.get::<_, usize>(0)?, row.get::<_, bool>(1)?)),
+            |row| Ok((row.get::<_, u32>(0)?, row.get::<_, bool>(1)?)),
         )
         .unwrap();
     assert_eq!(first, (4, true));

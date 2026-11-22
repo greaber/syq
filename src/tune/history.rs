@@ -479,10 +479,12 @@ impl Recorder {
             && state.pending.iter().any(|e| {
                 e["kind"] == "planned" && e["data"]["files"].as_u64().is_some_and(|n| n <= 1)
             })
-            && !state
-                .pending
-                .iter()
-                .any(|e| e["kind"] == "observation" || e["kind"] == "tcp_preflight")
+            && !state.pending.iter().any(|e| {
+                matches!(
+                    e["kind"].as_str(),
+                    Some("observation" | "transition" | "tcp_preflight")
+                )
+            })
         {
             state.abandon();
             return;

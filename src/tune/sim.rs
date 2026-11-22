@@ -3,13 +3,10 @@
 //! hardware runs cannot: how often a rule helps, how much throughput the
 //! search costs, and whether the remembered count drifts across copies.
 //!
-//! This coarse model does not model the fine-grained sequential evidence in
-//! [`run`]; it is not a validation of the production observation pipeline.
-//! It exercises policy decisions without threads or a clock:
-//! reductions apply at once, increases wait for connection setup while the
-//! settled count refreshes its baseline, the tail stops measuring, and two
-//! collapsed samples short-circuit a probe. It does not model handshakes
-//! competing with the transfer or connections warming up after activation.
+//! The simulation feeds half-second intervals to the live measurement window.
+//! Reductions apply at once and increases wait for connection setup while the
+//! settled count refreshes its baseline. It does not model handshakes competing
+//! with the transfer, partial counters, or congestion after activation.
 //! Initial connections are ready at time zero; elapsed time excludes their
 //! setup. Connection planning is checked every 250ms; activation and retirement
 //! are instantaneous. File credit, connection failures, and scheduler limits
