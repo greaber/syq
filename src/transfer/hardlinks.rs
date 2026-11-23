@@ -703,8 +703,6 @@ impl Planner<'_> {
                     path: kept.leaf.dst.clone(),
                     condition: kept.condition,
                     meta,
-                    // Its metadata matches (`keeps_representative`): none of
-                    // it needs fixing.
                     flags: self.opts.ownership_flags(&kept.leaf.dst_rel) | flags::REPORT_IDENTITY,
                 }
             })
@@ -968,7 +966,7 @@ impl Planner<'_> {
                         break;
                     }
                 }
-                let (ops, links): (Vec<Op>, Vec<_>) = prepared.pop_front().unwrap();
+                let (ops, batch): (Vec<Op>, Vec<_>) = prepared.pop_front().unwrap();
                 // Tests count each request's links and the requests still
                 // unanswered when it is sent.
                 #[cfg(debug_assertions)]
@@ -977,11 +975,11 @@ impl Planner<'_> {
                     format_args!("link {} {}", ops.len(), in_flight.len()),
                 );
                 match self.dst.send_pending(Request::Apply { ops }) {
-                    Ok(reply) => in_flight.push_back((reply, links)),
+                    Ok(reply) => in_flight.push_back((reply, batch)),
                     Err(error) => failure = Some(error),
                 }
             }
-            let Some((reply, links)) = in_flight.pop_front() else {
+            let Some((reply, batch)) = in_flight.pop_front() else {
                 break;
             };
             let response = match self.dst.take_reply(reply) {
@@ -990,7 +988,7 @@ impl Planner<'_> {
                 // step, so the replies after it are not waited for.
                 Err(error) => return Err(failure.unwrap_or(error)),
             };
-            if let Err(error) = self.settle_link_request(response, &links) {
+            if let Err(error) = self.settle_link_request(response, &batch) {
                 failure.get_or_insert(error);
             }
         }
@@ -1116,10 +1114,6 @@ impl Planner<'_> {
         links: &[(&ReadyGroup, &Follower)],
     ) -> Result<()> {
         let errors = self.applied(response, links.len())?;
-        anyhow::ensure!(
-            errors.len() == links.len(),
-            "hardlink receiver returned an incomplete result batch"
-        );
         let paths: Vec<PathBytes> = links
             .iter()
             .map(|(_, follower)| follower.dst.clone())
@@ -1320,5 +1314,80 @@ impl Worker {
                 .insert(index, Some(identity));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inode_metadata::{ExtendedAttributes, InodeMetadata, Timestamp};
+
+    #[test]
+    fn kept_parts_excludes_inode_metadata_for_checks_and_includes_it_for_rechecks() {
+        let root_id: crate::descriptor_broker::RegisteredRootId =
+            serde_json::from_str("1").unwrap();
+        let xattrs = ExtendedAttributes {
+            privileged: false,
+            values: vec![(b"user.test".to_vec(), vec![b'x'; 60 * 1024])],
+        };
+        let mut hardlinks = Hardlinks::default();
+        for i in 0..72usize {
+            let name = format!("g{i:02}").into_bytes();
+            let source = RegisteredPath::new(root_id, name.clone()).unwrap();
+            let entry = Entry {
+                path: name.clone(),
+                kind: Kind::File,
+                size: 8,
+                mtime: 1_700_000_000,
+                mtime_nsec: 0,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                dev: 1,
+                ino: i as u64 + 1,
+                nlink: 2,
+                ctime: 1_700_000_000,
+                ctime_nsec: 0,
+                link: None,
+                atime: Timestamp::default(),
+                inode_metadata: Some(Box::new(InodeMetadata {
+                    xattrs: Some(xattrs.clone()),
+                    ..Default::default()
+                })),
+            };
+            let leaf = Planned {
+                src: name.clone(),
+                source,
+                dst: [b"/dst/".as_slice(), &name].concat(),
+                dst_rel: name.clone(),
+                rel: String::from_utf8(name).unwrap(),
+                e: entry.clone(),
+                contested: false,
+            };
+            hardlinks.groups.push(Group {
+                representative: 0,
+                preview: None,
+                kept: Some(Box::new(Kept {
+                    leaf,
+                    condition: TargetCondition::Matches {
+                        dev: 1,
+                        ino: i as u64 + 1,
+                    },
+                    destination: entry,
+                    identity: None,
+                })),
+                followers: Vec::new(),
+            });
+        }
+        let indices: Vec<usize> = (0..72).collect();
+        let check_parts = hardlinks.kept_parts(&indices, 8192, false);
+        assert_eq!(check_parts.len(), 1);
+        assert_eq!(check_parts[0], indices);
+
+        let recheck_parts = hardlinks.kept_parts(&indices, 8192, true);
+        assert!(recheck_parts.len() > 1, "parts: {}", recheck_parts.len());
+        let flattened: Vec<usize> = recheck_parts.into_iter().flatten().copied().collect();
+        assert_eq!(flattened, indices);
     }
 }
