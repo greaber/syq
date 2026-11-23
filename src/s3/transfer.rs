@@ -318,7 +318,7 @@ impl Engine {
             .endpoint
             .or_else(|| std::env::var("AWS_ENDPOINT_URL_S3").ok())
             .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok());
-        let control = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let control = Arc::<super::tuning::ControlSamples>::default();
         let uploads = Arc::new(super::cancel::Cancellation::default());
         let authorization = super::authorization::connect(&args, &options).await?;
         let outage = Arc::new(super::outage::Outage::default());
@@ -4199,11 +4199,7 @@ mod tests {
             .unwrap(),
         );
         let options = args.s3.clone().unwrap();
-        let tuning = crate::s3::tuning::Tuning::new(
-            &options,
-            &args,
-            Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
-        );
+        let tuning = crate::s3::tuning::Tuning::new(&options, &args, Arc::default());
         let config = aws_sdk_s3::config::Builder::new()
             .behavior_version_latest()
             .region(aws_sdk_s3::config::Region::new("us-east-1"))

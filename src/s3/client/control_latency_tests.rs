@@ -1,13 +1,11 @@
 use super::*;
+use crate::s3::tuning::ControlSamples;
 use aws_smithy_runtime_api::client::{
     http::{http_client_fn, HttpConnector, HttpConnectorFuture, SharedHttpConnector},
     orchestrator::{HttpRequest, HttpResponse},
 };
 use aws_smithy_types::body::SdkBody;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 struct Responses;
@@ -47,7 +45,7 @@ impl HttpConnector for Responses {
     }
 }
 
-fn client(control: Arc<AtomicU64>) -> Client {
+fn client(control: Arc<ControlSamples>) -> Client {
     Client::from_conf(
         aws_sdk_s3::config::Builder::new()
             .behavior_version_latest()
@@ -63,8 +61,8 @@ fn client(control: Arc<AtomicU64>) -> Client {
 }
 
 #[tokio::test(start_paused = true)]
-async fn cold_control_response_does_not_seed_high_latency() {
-    let control = Arc::new(AtomicU64::new(u64::MAX));
+async fn cold_control_response_counts_only_until_a_warm_one_arrives() {
+    let control = Arc::<ControlSamples>::default();
     let client = client(control.clone());
     assert!(client
         .head_object()
@@ -73,21 +71,24 @@ async fn cold_control_response_does_not_seed_high_latency() {
         .send()
         .await
         .is_err());
-    // 36 ms crosses the 20 and 32 ms tuning thresholds. The 15 ms
-    // steady-state sample belongs in the lower concurrency tier.
-    assert_eq!(control.load(Ordering::Relaxed), u64::MAX);
+    // With only the first response, as when one listing page plans the
+    // copy, that response describes the endpoint.
+    assert_eq!(control.fastest(), 36_000_000);
     client
         .list_objects_v2()
         .bucket("bucket")
         .send()
         .await
         .unwrap();
-    assert_eq!(control.load(Ordering::Relaxed), 15_000_000);
+    // 36 ms crosses the 20 and 32 ms tuning thresholds. The 15 ms
+    // steady-state sample belongs in the lower concurrency tier, so it
+    // replaces the slower first response.
+    assert_eq!(control.fastest(), 15_000_000);
 }
 
 #[tokio::test(start_paused = true)]
 async fn latency_uses_individual_control_responses_and_ignores_errors_and_data() {
-    let control = Arc::new(AtomicU64::new(u64::MAX));
+    let control = Arc::<ControlSamples>::default();
     let client = client(control.clone());
     assert!(client
         .head_object()
@@ -107,7 +108,7 @@ async fn latency_uses_individual_control_responses_and_ignores_errors_and_data()
     );
     // Flat pages give no evidence that directory discovery would help.
     assert_eq!(start.elapsed(), Duration::from_millis(120));
-    assert_eq!(control.load(Ordering::Relaxed), 15_000_000);
+    assert_eq!(control.fastest(), 15_000_000);
     for status in [301, 429, 503] {
         assert!(client
             .head_object()
@@ -116,7 +117,7 @@ async fn latency_uses_individual_control_responses_and_ignores_errors_and_data()
             .send()
             .await
             .is_err());
-        assert_eq!(control.load(Ordering::Relaxed), 15_000_000);
+        assert_eq!(control.fastest(), 15_000_000);
     }
     client
         .get_object()
@@ -125,7 +126,7 @@ async fn latency_uses_individual_control_responses_and_ignores_errors_and_data()
         .send()
         .await
         .unwrap();
-    assert_eq!(control.load(Ordering::Relaxed), 15_000_000);
+    assert_eq!(control.fastest(), 15_000_000);
     assert!(client
         .head_object()
         .bucket("bucket")
@@ -133,7 +134,7 @@ async fn latency_uses_individual_control_responses_and_ignores_errors_and_data()
         .send()
         .await
         .is_err());
-    assert_eq!(control.load(Ordering::Relaxed), 1_000_000);
+    assert_eq!(control.fastest(), 1_000_000);
 }
 
 /// How long the fake storage service takes to answer, and how long the fake
@@ -188,7 +189,7 @@ async fn latency_leaves_out_the_wait_for_a_signature() {
         },
         socket,
     ));
-    let control = Arc::new(AtomicU64::new(u64::MAX));
+    let control = Arc::<ControlSamples>::default();
     let client = Client::from_conf(
         aws_sdk_s3::config::Builder::new()
             .behavior_version_latest()
@@ -218,7 +219,7 @@ async fn latency_leaves_out_the_wait_for_a_signature() {
     }
     assert!(start.elapsed() >= SIGNING + STORAGE);
     // The storage service's own time stays in the sample.
-    let sample = Duration::from_nanos(control.load(Ordering::Relaxed));
+    let sample = Duration::from_nanos(control.fastest());
     assert!(sample >= STORAGE && sample < SIGNING / 2, "{sample:?}");
     authorizer.join().unwrap();
 }

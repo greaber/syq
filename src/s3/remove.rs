@@ -458,7 +458,7 @@ pub(super) fn run(args: Args) -> Result<i32> {
         let outage = std::sync::Arc::new(super::outage::Outage::default());
         let work = async {
             let mut options = args.s3.clone().unwrap();
-            let control = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+            let control = std::sync::Arc::<super::tuning::ControlSamples>::default();
             let uploads = std::sync::Arc::new(super::cancel::Cancellation::default());
             let authorization = super::authorization::connect(&args, &options).await?;
             let (client, note, _) = client::connect_authorized(&mut options, control.clone(), uploads, authorization.clone(), Some(outage.clone())).await?;

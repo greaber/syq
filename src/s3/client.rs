@@ -109,14 +109,14 @@ pub(super) fn request_timeouts() -> TimeoutConfig {
 /// region that does not hold the bucket.
 #[derive(Debug)]
 struct ControlLatency {
-    fastest: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    samples: std::sync::Arc<super::tuning::ControlSamples>,
     seen_response: std::sync::atomic::AtomicBool,
 }
 
 impl ControlLatency {
-    fn new(fastest: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+    fn new(samples: std::sync::Arc<super::tuning::ControlSamples>) -> Self {
         Self {
-            fastest,
+            samples,
             seen_response: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -200,21 +200,20 @@ impl Intercept for ControlLatency {
         let status = response.status().as_u16();
         if let Some(ControlStart(start)) = cfg.load::<ControlStart>() {
             if (200..300).contains(&status) || status == 404 {
-                // The first control response may include DNS, TCP, and TLS.
-                // Keep the default tuning until another sample is available.
-                if !self
-                    .seen_response
-                    .swap(true, std::sync::atomic::Ordering::Relaxed)
-                {
-                    return Ok(());
-                }
                 let signing = response
                     .extension::<super::authorization::SigningWait>()
                     .map_or(Duration::ZERO, |wait| wait.0);
-                super::tuning::observe_control(
-                    &self.fastest,
-                    start.elapsed().saturating_sub(signing),
-                );
+                let elapsed = start.elapsed().saturating_sub(signing);
+                // The first response may include connection setup; see
+                // `ControlSamples`.
+                if self
+                    .seen_response
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    self.samples.observe(elapsed);
+                } else {
+                    self.samples.observe_first(elapsed);
+                }
             }
         }
         Ok(())
@@ -400,7 +399,7 @@ async fn bucket_region(client: &Client, bucket: &str) -> std::result::Result<Str
 /// Also returns a note for verbose output when the region lookup got no answer.
 pub(super) async fn connect(
     options: &mut Options,
-    control: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    control: std::sync::Arc<super::tuning::ControlSamples>,
     uploads: std::sync::Arc<super::cancel::Cancellation>,
 ) -> Result<(Client, Option<String>)> {
     let (client, note, _) = connect_authorized(options, control, uploads, None, None).await?;
@@ -409,7 +408,7 @@ pub(super) async fn connect(
 
 pub(super) async fn connect_authorized(
     options: &mut Options,
-    control: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    control: std::sync::Arc<super::tuning::ControlSamples>,
     uploads: std::sync::Arc<super::cancel::Cancellation>,
     authorization: Option<std::sync::Arc<super::authorization::Authorization>>,
     outage: Option<std::sync::Arc<super::outage::Outage>>,
@@ -451,7 +450,7 @@ pub(super) async fn connect_authorized(
 /// returns the credentials provider the client signs with.
 pub(super) async fn connect_local(
     options: &mut Options,
-    control: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    control: std::sync::Arc<super::tuning::ControlSamples>,
     uploads: std::sync::Arc<super::cancel::Cancellation>,
 ) -> Result<(
     Client,
@@ -481,7 +480,7 @@ type Connection = (Client, Option<String>, Option<DiscoveredRegion>);
 async fn connect_with(
     options: &mut Options,
     shared: aws_types::SdkConfig,
-    control: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    control: std::sync::Arc<super::tuning::ControlSamples>,
     uploads: std::sync::Arc<super::cancel::Cancellation>,
     authorization: Option<std::sync::Arc<super::authorization::Authorization>>,
     outage: Option<std::sync::Arc<super::outage::Outage>>,
