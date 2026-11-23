@@ -131,6 +131,7 @@ impl Store for Memory {
                 cursor = Bound::Excluded(key.clone());
             }
         }
+        page.complete = page.next.is_none();
         if page.next.is_none() && !delimiter {
             self.ended.borrow_mut().insert(prefix.to_owned());
         }
@@ -847,7 +848,12 @@ async fn stores_without_key_order_are_listed_whole() {
     .await
     .unwrap();
     assert_eq!(keys, 30_000);
-    assert_eq!(*store.0.calls.borrow(), vec![("t/".to_owned(), false); 30]);
+    // Nor is it listed by directory: a directory bucket takes only prefixes
+    // that end in a slash, and it has more directories than listings start
+    // at once.
+    let calls = store.0.calls.borrow();
+    assert!(calls.iter().all(|(prefix, _)| prefix == "t/"));
+    assert_eq!(calls.iter().filter(|(_, delimiter)| !delimiter).count(), 30);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1080,6 +1086,7 @@ fn a_late_children_page_out_of_order_fails_a_divided_walk() {
         entries: keys.map(object).into(),
         prefixes: Vec::new(),
         next: None,
+        complete: true,
     };
     let error = walk()
         .children(1, "t/", Some((page(["t/zy", "t/zx"]), Gap::default())))
@@ -1113,6 +1120,7 @@ fn walks_that_cannot_burst_keep_no_sample() {
             .collect(),
         prefixes: Vec::new(),
         next: next.map(str::to_owned),
+        complete: next.is_none(),
     };
     let mut walk = Walk::new("t/".to_owned(), true, true);
     // A sparse first page rules the burst out.
@@ -1359,6 +1367,7 @@ async fn an_empty_page_settles_nothing_about_a_skipped_key() {
                 entries: page.entries.clone(),
                 prefixes: page.prefixes.clone(),
                 next: page.next.clone(),
+                complete: page.complete,
             })
         }
     }
@@ -1375,6 +1384,7 @@ async fn an_empty_page_settles_nothing_about_a_skipped_key() {
                 .collect(),
             prefixes: prefixes.iter().map(|p| (*p).to_owned()).collect(),
             next: next.map(str::to_owned),
+            complete: next.is_none(),
         })
     };
     let first: Vec<String> = (0..999).map(|i| format!("edge/k{i:03}")).collect();

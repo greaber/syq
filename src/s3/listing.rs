@@ -172,6 +172,13 @@ fn test_divides() -> bool {
     false
 }
 
+/// Whether a debug build reports that a listing was split by directory, so
+/// that the S3 suite can confirm it against a real server.
+#[cfg(debug_assertions)]
+pub(super) fn test_reports_splits() -> bool {
+    std::env::var_os("SYQ_TEST_S3_REPORT_SPLITS").is_some_and(|v| v == "1")
+}
+
 fn loopback(endpoint: &str) -> bool {
     url::Url::parse(endpoint).is_ok_and(|url| match url.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
@@ -283,6 +290,10 @@ impl Store for S3<'_> {
         lists_in_key_order(self.bucket)
     }
 
+    fn slash_only(&self) -> bool {
+        self.bucket.ends_with("--x-s3") || self.bucket.ends_with("--xa-s3")
+    }
+
     fn divides(&self) -> bool {
         self.divides
     }
@@ -372,10 +383,15 @@ impl S3<'_> {
         } else {
             None
         };
+        // A response that leaves out IsTruncated, or that gives a
+        // continuation token anyway, may have more to list.
+        let complete =
+            response.is_truncated() == Some(false) && response.next_continuation_token().is_none();
         Ok(Page {
             entries,
             prefixes,
             next,
+            complete,
         })
     }
 }

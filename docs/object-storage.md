@@ -40,20 +40,38 @@ service is back.
 ### Listing large prefixes
 
 Before it copies or removes a prefix, and for `--prune`, syq lists the
-objects under it. In general purpose buckets on AWS, syq divides a large
-listing with subdirectories into parts that it lists at the same time, so
-the listing can finish sooner when each request takes a while. This costs
-more list requests: usually up to about a quarter more on large listings.
-When a prefix has no more than a few dozen subdirectories and the first ones
-hold many objects, syq may list each subdirectory by itself, at a request
-each, however few objects the others hold.
+objects under it. When the listing needs more than one page and the prefix
+has subdirectories, syq may list parts of it at the same time, so the
+listing can finish sooner when each request takes a while. This costs more
+list requests: usually up to about a quarter more on large listings, or
+around a couple hundred more when many subdirectories look large at first but
+turn out to hold few objects.
 
-Dividing a listing is safe only when the service returns keys in byte
-order, which AWS documents for general purpose buckets, so syq divides
-listings only there. With `--s3-endpoint`, that means the URL is an AWS S3
-endpoint: regional, dual-stack, FIPS, or the bucket address of a VPC
-endpoint. For other services, including Cloudflare R2, MinIO and other
-servers you run yourself, syq lists one page after another.
+In general purpose buckets on AWS, which return keys in byte order, syq
+divides a large listing into ranges of keys. With `--s3-endpoint`, that
+means the URL is an AWS S3 endpoint: regional, dual-stack, FIPS, or the
+bucket address of a VPC endpoint. When a prefix has no more than a few
+dozen subdirectories and the first ones hold many objects, syq may list each
+subdirectory by itself, at a request each, however few objects the others
+hold.
+
+Other services, including Cloudflare R2, Google Cloud Storage, Backblaze B2,
+Tigris, MinIO and other servers you run yourself, do not promise that order.
+There syq asks for the prefix's subdirectories and lists each by itself;
+subdirectories whose names start the same way may share a listing. S3
+directory buckets and their access points, whose names end in `--x-s3` and
+`--xa-s3`, do not promise it either, and list only prefixes that end in a
+slash. There syq lists each subdirectory by itself, and lists a prefix with
+more than a few dozen subdirectories one page after another.
+
+Syq also lists a prefix one page after another when its subdirectories are
+small, or when the service does not name them all in one response that says
+it is complete. That happens with more than a thousand subdirectories, and a
+service may stop short with fewer.
+
+When syq copies or removes a prefix, and a bucket policy lets it list the
+prefix but not the parts it lists separately, syq lists the prefix again one
+page after another.
 
 ## Upload and download
 
