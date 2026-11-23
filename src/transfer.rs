@@ -1184,6 +1184,16 @@ fn small_copy_eligible(
 /// times can cost, and is how often `--results` records progress.
 const CAPPED_SMALL_COPY_SECONDS: u64 = 1;
 
+fn small_blocks(
+    response: Response,
+    count: usize,
+) -> Result<Vec<std::result::Result<SmallBlock, String>>> {
+    match ok(response, "read small batch")? {
+        Response::SmallBlocks(blocks) if blocks.len() == count => Ok(blocks),
+        other => bail!("unexpected response {other:?}"),
+    }
+}
+
 /// Offer source metadata during receiver configuration, then read and send
 /// only requested payloads. The same control session retains the destination
 /// and publishes through the ordinary staged path, without data workers.
@@ -1442,10 +1452,7 @@ fn attempt_small_copy(
             } else {
                 let count = reads.len();
                 reader.send(Request::ReadSmallBatch(reads))?;
-                match ok(reader.recv()?, "read small batch")? {
-                    Response::SmallBlocks(blocks) if blocks.len() == count => blocks,
-                    other => bail!("unexpected response {other:?}"),
-                }
+                small_blocks(reader.recv()?, count)?
             }
             .into_iter();
             let mut payloads = Vec::new();

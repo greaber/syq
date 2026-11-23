@@ -38,6 +38,8 @@ pub(crate) use fs_caps::distrust_owners_for_test;
 pub(crate) use fs_caps::file_system_of;
 pub(crate) use fs_caps::fixed_owners_and_modes;
 pub(crate) use fs_caps::reports_owners_faithfully;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use fs_caps::type_facts;
 #[cfg(target_os = "linux")]
 pub(crate) use fs_caps::{
     leases_show_writers, leases_trusted, TypeFacts, FUSE_SUPER_MAGIC, PROC_SUPER_MAGIC,
@@ -641,14 +643,6 @@ pub(crate) fn network_directory_named_for_test() -> bool {
         && std::env::var_os("SYQ_TEST_NETWORK_DIRECTORY").is_some()
 }
 
-/// One file of a small copy, staged but not yet published.
-struct StagedSmallFile {
-    root: Arc<Root>,
-    partial: RelativePath,
-    target: RelativePath,
-    file: File,
-}
-
 /// The single directory entry a small-copy file names beneath the request
 /// prefix. Nested paths are the ordinary engine's business.
 fn small_copy_leaf<'a>(request_prefix: &[u8], path: &'a [u8]) -> Result<&'a [u8]> {
@@ -847,16 +841,15 @@ fn is_superuser() -> bool {
 
 /// The mode, owner and group a small copy would change on the existing file
 /// `stat` describes to give it `meta`, among those `flags` selects.
-#[allow(clippy::unnecessary_cast)] // libc stat field widths differ on Darwin.
-fn small_copy_repair(flags: u8, stat: &libc::stat, meta: &Meta) -> u8 {
+fn small_copy_repair(flags: u8, stat: &RootMetadata, meta: &Meta) -> u8 {
     let mut repair = 0;
-    if flags & flags::MODE != 0 && stat.st_mode as u32 & 0o7777 != meta.mode & 0o7777 {
+    if flags & flags::MODE != 0 && stat.mode & 0o7777 != meta.mode & 0o7777 {
         repair |= flags::MODE;
     }
-    if flags & flags::OWNER != 0 && stat.st_uid != meta.uid {
+    if flags & flags::OWNER != 0 && stat.uid != meta.uid {
         repair |= flags::OWNER;
     }
-    if flags & flags::GROUP != 0 && stat.st_gid != meta.gid {
+    if flags & flags::GROUP != 0 && stat.gid != meta.gid {
         repair |= flags::GROUP;
     }
     repair
@@ -866,7 +859,7 @@ struct PreparedSmallCopy {
     request: SmallCopyRequest,
     anchor: DirectoryAnchor,
     root: Arc<Root>,
-    destinations: Vec<Option<libc::stat>>,
+    destinations: Vec<Option<RootMetadata>>,
     permitted: Vec<bool>,
     unchanged: Vec<bool>,
     /// Unchanged files the receiver replaces from their payloads, since it
@@ -877,6 +870,7 @@ struct PreparedSmallCopy {
 pub struct FsOps {
     deletions: Option<crate::deletion::Batch>,
     prepared_small_copy: Option<PreparedSmallCopy>,
+    small_writers: OnceLock<Option<rayon::ThreadPool>>,
     /// The patch whose new data is arriving in pieces, between `PatchBegin`
     /// and `PatchEnd`.
     patch_stream: Option<Box<small_batch::PatchStream>>,
@@ -980,7 +974,7 @@ struct ComparisonWindow {
 
 /// What each directory gives new files of its ACL, by root identity and
 /// directory, as `receiver_mode::CreationPermissions` keys them.
-type InheritedAcls = HashMap<(u64, u64, Vec<Vec<u8>>), crate::inode_metadata::Inherited>;
+type InheritedAcls = HashMap<(u64, u64, Vec<u8>), crate::inode_metadata::Inherited>;
 
 struct HeldBasis {
     location: FileLocation,
@@ -1264,6 +1258,7 @@ impl FsOps {
             creation_permissions: Default::default(),
             inherited_acls: Default::default(),
             prepared_small_copy: None,
+            small_writers: OnceLock::new(),
             patch_stream: None,
             compared_files: Default::default(),
             operator_selection: None,
@@ -1447,7 +1442,6 @@ impl FsOps {
     /// A restricted receiver opens the directory beneath the root its
     /// authority holds and installs nothing: its session is as it was, so a
     /// copy the shortcut does not finish goes on over the same connection.
-    #[allow(clippy::unnecessary_cast)] // libc stat field widths differ on Darwin.
     fn prepare_small_files(&mut self, request: &SmallCopyRequest) -> Result<Response> {
         let restricted = self.restricted_destination();
         if restricted && request.request_prefix != request.directory {
@@ -1520,8 +1514,8 @@ impl FsOps {
         // so unsupported type replacements can use the general engine.
         let mut destinations = Vec::with_capacity(names.len());
         for name in &names {
-            match operator_lstat_at(&directory, name) {
-                Ok(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFREG => {
+            match crate::rooted::metadata_at(directory.as_raw_fd(), &CString::new(*name)?) {
+                Ok(stat) if stat.is_file() => {
                     destinations.push(Some(stat));
                 }
                 Ok(_) => {
@@ -1557,22 +1551,7 @@ impl FsOps {
                     .as_ref()
                     .context("small copy condition requires source metadata")?;
                 let destination = stat
-                    .as_ref()
-                    .map(|stat| crate::expression::File {
-                        exists: true,
-                        kind: Some(Kind::File),
-                        size: Some(stat.st_size as u64),
-                        mtime: Some((stat.st_mtime as i64, stat.st_mtime_nsec as u32)),
-                        ctime: Some((stat.st_ctime as i64, stat.st_ctime_nsec as u32)),
-                        s3_last_modified: None,
-                        mode: Some(stat.st_mode as u32 & 0o7777),
-                        uid: Some(stat.st_uid),
-                        gid: Some(stat.st_gid),
-                        device: Some(stat.st_dev as u64),
-                        inode: Some(stat.st_ino as u64),
-                        nlink: Some(stat.st_nlink as u64),
-                        link_target: None,
-                    })
+                    .map(crate::expression::File::from_root)
                     .unwrap_or_default();
                 expression
                     .evaluate(
@@ -1596,12 +1575,9 @@ impl FsOps {
                 !permitted
                     || stat.as_ref().is_some_and(|stat| {
                         request.flags & flags::TIMES != 0
-                            && stat.st_size as u64 == file.size
-                            && stat.st_mtime == file.meta.mtime
-                            && destination_fraction_matches(
-                                file.meta.mtime_nsec,
-                                stat.st_mtime_nsec as u32,
-                            )
+                            && stat.len == file.size
+                            && stat.mtime == file.meta.mtime
+                            && destination_fraction_matches(file.meta.mtime_nsec, stat.mtime_nsec)
                     })
             })
             .collect();
@@ -1662,8 +1638,7 @@ impl FsOps {
             let current = handle.metadata()?;
             // A file that changed since it was inspected is copied, and its
             // publication then finds that it changed.
-            let same_file =
-                (current.dev(), current.ino()) == (stat.st_dev as u64, stat.st_ino as u64);
+            let same_file = (current.dev(), current.ino()) == (stat.dev, stat.ino);
             if !same_file
                 || !vouch::allows(
                     &target,
@@ -1699,7 +1674,6 @@ impl FsOps {
         }
     }
 
-    #[allow(clippy::unnecessary_cast)] // libc stat field widths differ on Darwin.
     fn copy_small_files(&mut self, payloads: &[SmallCopyPayload]) -> Result<Response> {
         let PreparedSmallCopy {
             request,
@@ -1763,7 +1737,7 @@ impl FsOps {
                 || unchanged[i]
                 || destinations[i]
                     .as_ref()
-                    .is_none_or(|stat| stat.st_size as u64 != file.size)
+                    .is_none_or(|stat| stat.len != file.size)
             {
                 continue;
             }
@@ -1778,8 +1752,8 @@ impl FsOps {
                     &opened,
                     &target.label,
                     TargetCondition::Matches {
-                        dev: stat.st_dev as u64,
-                        ino: stat.st_ino as u64,
+                        dev: stat.dev,
+                        ino: stat.ino,
                     },
                 )?;
                 let mut bytes = Vec::with_capacity(file.size as usize);
@@ -1844,7 +1818,7 @@ impl FsOps {
             }
             // The file it replaces is the one inspected above.
             let replaced = match &destinations[i] {
-                Some(stat) => crate::proto::ScannedDestination::File(stat.st_mode as u32 & 0o7777),
+                Some(stat) => crate::proto::ScannedDestination::File(stat.mode & 0o7777),
                 None => crate::proto::ScannedDestination::Absent,
             };
             match self.stage_small_file(
@@ -1885,8 +1859,8 @@ impl FsOps {
                     // that file, and no other.
                     let replaced = destination.as_ref().filter(|_| same[i]).map(|stat| {
                         TargetCondition::Matches {
-                            dev: stat.st_dev as u64,
-                            ino: stat.st_ino as u64,
+                            dev: stat.dev,
+                            ino: stat.ino,
                         }
                     });
                     if !permitted[i] {
@@ -1899,16 +1873,12 @@ impl FsOps {
                     let condition = destination
                         .as_ref()
                         .map_or(TargetCondition::Absent, |stat| TargetCondition::Matches {
-                            dev: stat.st_dev as u64,
-                            ino: stat.st_ino as u64,
+                            dev: stat.dev,
+                            ino: stat.ino,
                         });
                     match item {
-                        Some(item) => {
-                            let published = publish_partial_rooted(
-                                &item.root,
-                                &item.partial,
-                                &item.target,
-                                &item.file,
+                        Some((stage, meta)) => {
+                            let published = stage.publish(
                                 if let Some(replaced) = replaced {
                                     replaced
                                 } else if matches!(
@@ -1921,14 +1891,13 @@ impl FsOps {
                                     TargetCondition::Any
                                 },
                                 (None, false, false),
+                                None,
                             );
-                            // Closed before its staged name goes.
-                            drop(item);
                             SmallCopyFileResult {
                                 disposition: SmallCopyDisposition::Copied,
                                 repaired: false,
                                 error: published
-                                    .and_then(partial::PublishedStage::remove)
+                                    .and_then(|published| stage.finish(&meta, 0, published))
                                     .err()
                                     .map(|error| wire_error(&error)),
                             }
@@ -2020,39 +1989,19 @@ impl FsOps {
         mut meta: Meta,
         mut flags: u8,
         replaced: crate::proto::ScannedDestination,
-    ) -> Result<StagedSmallFile> {
+    ) -> Result<(small_batch::SmallStage, Meta)> {
         let path = self.destination_relative(path)?;
         let rooted = self
             .rooted_destination_target(&path)?
             .context("small copy requires the destination root")?;
         self.resolve_publication(&rooted, &mut meta, &mut flags, &mut None, replaced)?;
-        let meta = &meta;
-        self.uncache_rooted(&rooted.root, &rooted.relative);
-        let Stage {
-            relative: partial,
-            label,
-            file,
-            opened,
-        } = self.open_stage(
-            &rooted,
-            copy_id,
-            StagePolicy::new(Sidecar::Stage).mode(staged_file_mode(meta, flags)),
-        )?;
-        observed_write(&self.operation, &file, data, 0, false)
-            .with_context(|| format!("write {}", label.display()))?;
-        check_written_file(&rooted.root, opened.dev(), &file, &label)?;
-        set_meta_file(&file, meta, flags)
-            .with_context(|| format!("set metadata {}", label.display()))?;
-        // `publish_partial_rooted` re-checks the staged name against the open
-        // descriptor immediately before the rename.
-        #[cfg(any(test, debug_assertions))]
-        fail_put_small_before_rename_for_test(&rooted.label)?;
-        Ok(StagedSmallFile {
-            root: rooted.root,
-            partial,
-            target: rooted.relative,
-            file,
-        })
+        // Control offers always stage exclusively. Keep their batch-level
+        // publication barrier while using the worker's write and metadata path.
+        let policy = StagePolicy::new(Sidecar::Stage).mode(staged_file_mode(&meta, flags));
+        let stage = self.open_small_stage(rooted, copy_id, policy)?;
+        self.write_small_contents(&stage, data, None)?;
+        stage.prepare_publication(&meta, flags)?;
+        Ok((stage, meta))
     }
 
     /// Install the exact control-session root delivered during worker
@@ -3521,25 +3470,7 @@ struct HeldMetadataParent {
 /// many of them have been asked about.
 #[cfg(target_os = "linux")]
 const LISTING_MIN_NAMES: usize = 16;
-/// A listing costs the client a few microseconds for every entry it reads,
-/// about what a lookup costs per name when lookups run in parallel on a
-/// fast network, so a directory is listed only when its size says it is
-/// not much larger than the names asked about so far: at most this many
-/// bytes per name plus one block, against 25 to 60 bytes per entry on most
-/// filesystems.
-#[cfg(target_os = "linux")]
-const LISTING_BYTES_PER_NAME: u64 = 256;
-#[cfg(target_os = "linux")]
-const LISTING_SLACK_BYTES: u64 = 4 << 10;
-/// ZFS reports a directory's entry count as its size, so the space the
-/// directory occupies is checked too. That space includes overhead, 8 to
-/// 17 KiB for a ZFS directory of up to several hundred entries, so it gets a
-/// larger allowance.
-#[cfg(target_os = "linux")]
-const LISTING_ALLOCATED_SLACK_BYTES: u64 = 16 << 10;
-/// Whatever size the filesystem reports (ZFS reports its entry count), the
-/// listing stops after this many entries per name, enough to reach the end
-/// of any directory the size allows.
+/// Bound the readdir work by the number of requested names.
 #[cfg(target_os = "linux")]
 const LISTING_ENTRIES_PER_NAME: usize = 16;
 /// Directories remembered for listing before the record starts over.
@@ -3548,14 +3479,14 @@ const LISTING_DIRECTORIES_MAX: usize = 1 << 16;
 
 /// Count the given relative paths into `requests` by parent directory, and
 /// return the directories now asked about often enough to be listed, each
-/// with this batch's first path in it and the names asked about so far.
+/// with the number of names asked about so far.
 /// Absolute paths are left to the stat itself.
 #[cfg(target_os = "linux")]
 fn directories_to_list<'a>(
     paths: &'a [PathBytes],
     requests: &mut HashMap<PathBytes, Option<usize>>,
-) -> Vec<(&'a [u8], &'a [u8], usize)> {
-    let mut batch: HashMap<&[u8], (&[u8], usize)> = HashMap::new();
+) -> Vec<(&'a [u8], usize)> {
+    let mut batch: HashMap<&[u8], usize> = HashMap::new();
     for path in paths {
         if path.starts_with(b"/") {
             continue;
@@ -3564,31 +3495,25 @@ fn directories_to_list<'a>(
             Some(separator) => &path[..separator],
             None => &b""[..],
         };
-        batch.entry(parent).or_insert((path.as_slice(), 0)).1 += 1;
+        *batch.entry(parent).or_default() += 1;
     }
     if requests.len() > LISTING_DIRECTORIES_MAX {
         requests.clear();
     }
     let mut candidates = Vec::new();
-    for (parent, (first, names)) in batch {
+    for (parent, names) in batch {
         let Some(asked) = requests.entry(parent.to_vec()).or_insert(Some(0)) else {
             continue;
         };
-        *asked += names;
-        if *asked >= LISTING_MIN_NAMES {
-            candidates.push((parent, first, *asked));
+        let previous = *asked;
+        *asked = asked.saturating_add(names);
+        // On a partial listing, grow the budget geometrically. Retrying from
+        // the beginning for every small batch would repeatedly read its prefix.
+        if *asked >= LISTING_MIN_NAMES && asked.checked_ilog2() != previous.checked_ilog2() {
+            candidates.push((parent, *asked));
         }
     }
     candidates
-}
-
-/// Whether a directory of `size` reported bytes occupying `blocks` 512-byte
-/// blocks is small enough to list for `names` requested names.
-#[cfg(target_os = "linux")]
-fn small_enough_to_list(names: usize, size: u64, blocks: u64) -> bool {
-    let expected = LISTING_BYTES_PER_NAME.saturating_mul(names as u64);
-    size <= expected.saturating_add(LISTING_SLACK_BYTES)
-        && blocks.saturating_mul(512) <= expected.saturating_add(LISTING_ALLOCATED_SLACK_BYTES)
 }
 
 /// List each NFS directory that enough of the paths about to be stat'ed
@@ -3596,46 +3521,39 @@ fn small_enough_to_list(names: usize, size: u64, blocks: u64) -> bool {
 /// NFS client confirm the entry with the server, one LOOKUP per name; a
 /// listing confirms every entry it reads in one request per few hundred and
 /// leaves their stats to the client's cache. A local filesystem answers
-/// either from memory, so only NFS directories are listed. A listing tells
-/// the client nothing about names that do not exist, so a directory is
-/// listed only when the first requested name is there. Each directory is
-/// listed at most once per destination.
+/// either from memory. Stop listing an NFS directory once a read reaches EOF.
 #[cfg(target_os = "linux")]
 fn list_nfs_directories_before_stats(
     root: &Arc<Root>,
     paths: &[PathBytes],
     requests: &mut HashMap<PathBytes, Option<usize>>,
 ) {
+    // Skip even counting paths for local roots. A nested NFS mount beneath
+    // a local root still gets ordinary per-name lookups.
+    if !root.on_nfs() {
+        return;
+    }
     let candidates = directories_to_list(paths, requests);
-    // Whether the directory is settled: listed, or not on NFS.
-    let list = |(parent, first, names): &(&[u8], &[u8], usize)| -> bool {
+    // A complete listing or a non-NFS directory needs no further attempt.
+    let list = |(parent, names): &(&[u8], usize)| -> bool {
         let Ok(relative) = RelativePath::new(parent) else {
             return true;
         };
         let Ok(directory) = root.open_directory(&relative) else {
             return false;
         };
-        let Ok((_, traits)) = opened_file_system(&directory) else {
-            return false;
-        };
-        if !traits.is_nfs {
-            return true;
+        // The root is already known to be on NFS. Ask about a different
+        // filesystem only on a mount crossing, using the cached mount traits.
+        if lookups::cached_device(&directory) != Some(root.identity().dev) {
+            let Ok((_, traits)) = opened_file_system(&directory) else {
+                return false;
+            };
+            if !traits.is_nfs {
+                return true;
+            }
         }
-        let Ok(metadata) = directory.metadata() else {
-            return false;
-        };
-        if !small_enough_to_list(*names, metadata.len(), metadata.blocks()) {
-            return false;
-        }
-        let Ok(first) = RelativePath::new(first) else {
-            return false;
-        };
-        if !matches!(root.metadata_optional(&first), Ok(Some(_))) {
-            return false;
-        }
-        let _ =
-            root.walk_open_directory(&directory, names.saturating_mul(LISTING_ENTRIES_PER_NAME));
-        true
+        root.walk_open_directory(&directory, names.saturating_mul(LISTING_ENTRIES_PER_NAME))
+            .unwrap_or(false)
     };
     let settled: Vec<bool> = if candidates.len() < 2 {
         candidates.iter().map(list).collect()
@@ -3645,7 +3563,7 @@ fn list_nfs_directories_before_stats(
     } else {
         candidates.iter().map(list).collect()
     };
-    for ((parent, _, _), settled) in candidates.iter().zip(settled) {
+    for ((parent, _), settled) in candidates.iter().zip(settled) {
         if settled {
             requests.insert(parent.to_vec(), None);
         }

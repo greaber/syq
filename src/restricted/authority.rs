@@ -555,6 +555,11 @@ impl ConfinedRoot {
         })
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn assume_nfs_for_test(&self) {
+        self.root.assume_nfs_for_test();
+    }
+
     #[cfg(test)]
     pub(super) fn identity(&self) -> crate::rooted::RootIdentity {
         self.root.identity()

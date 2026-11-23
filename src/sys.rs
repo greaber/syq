@@ -223,20 +223,28 @@ pub(crate) fn directory_is_empty(directory: File) -> io::Result<bool> {
 }
 
 /// Read about `limit` entries of a directory without keeping them, and
-/// return how many it read. The read itself is the point: on NFS it
-/// refreshes the client's entries and attributes for what it read. The
-/// Linux NFS client fetches attributes with the entries only for a read
-/// that starts at the beginning of the directory, so this is one read
-/// sized for the limit; with longer names it returns fewer entries.
+/// return whether the listing reached EOF. On NFS the read refreshes
+/// the client's entries and attributes. The Linux NFS client fetches the
+/// attributes only for a read starting at the beginning of the directory,
+/// so size the first read for the limit. Longer names fit fewer entries.
 #[cfg(target_os = "linux")]
-pub(crate) fn walk_directory_entries(directory: File, limit: usize) -> io::Result<usize> {
+pub(crate) fn walk_directory_entries(directory: File, limit: usize) -> io::Result<bool> {
     let mut buffer = vec![0u8; limit.saturating_mul(32).clamp(8 << 10, 16 << 20)];
     let mut seen = 0;
-    read_directory_step(&directory, &mut buffer, &mut |_| {
+    let may_have_more = read_directory_step(&directory, &mut buffer, &mut |_| {
         seen += 1;
         seen < limit
     })?;
-    Ok(seen)
+    if seen >= limit {
+        return Ok(false);
+    }
+    // Long names can fill the byte buffer before we reach the entry limit.
+    // Check the current offset for another entry without walking the tail.
+    if may_have_more {
+        directory_is_empty(directory)
+    } else {
+        Ok(true)
+    }
 }
 
 /// Call `each` with every entry but `.` and `..`, stopping when it returns
@@ -424,8 +432,8 @@ mod tests {
             File::create(dir.path().join(format!("f{index:04}"))).unwrap();
         }
         let open = || File::open(dir.path()).unwrap();
-        assert_eq!(walk_directory_entries(open(), usize::MAX).unwrap(), 1000);
-        assert_eq!(walk_directory_entries(open(), 10).unwrap(), 10);
+        assert!(walk_directory_entries(open(), usize::MAX).unwrap());
+        assert!(!walk_directory_entries(open(), 10).unwrap());
         assert!(!directory_is_empty(open()).unwrap());
         let empty = crate::test_support::tempdir().unwrap();
         assert!(directory_is_empty(File::open(empty.path()).unwrap()).unwrap());
@@ -441,13 +449,11 @@ mod tests {
             .collect();
         assert_eq!(names, expected);
 
-        // The walk is a single read: with long names it returns fewer
-        // entries than the limit rather than reading on.
+        // Long names hit the byte budget before the entry limit.
         let long = crate::test_support::tempdir().unwrap();
         for index in 0..300 {
             File::create(long.path().join(format!("{index:0200}"))).unwrap();
         }
-        let read = walk_directory_entries(File::open(long.path()).unwrap(), 300).unwrap();
-        assert!((1..300).contains(&read), "{read}");
+        assert!(!walk_directory_entries(File::open(long.path()).unwrap(), 300).unwrap());
     }
 }

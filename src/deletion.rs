@@ -148,14 +148,14 @@ pub(crate) struct DirectoryBatch {
 
 struct RemovalParent {
     root: Arc<Root>,
-    parents: Vec<Vec<u8>>,
+    parents: Vec<u8>,
     directory: Option<File>,
 }
 
 #[cfg(target_os = "linux")]
 struct DeletionDirectory {
     root: Arc<Root>,
-    parents: Vec<Vec<u8>>,
+    parents: Vec<u8>,
     _permit: crate::rooted::directory_gate::Permit,
     entries: usize,
     bytes: u64,

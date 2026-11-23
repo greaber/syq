@@ -3291,6 +3291,7 @@ impl FsOps {
             &target.root,
             &src_relative,
             &target.relative,
+            None,
             &file,
             condition,
             (
@@ -4197,6 +4198,7 @@ pub(super) fn publish_partial_rooted(
     root: &Arc<Root>,
     source: &RelativePath,
     target: &RelativePath,
+    siblings: Option<&crate::rooted::SiblingDirectory<'_>>,
     staged: &File,
     condition: TargetCondition,
     (owned, skips, unchecked_keep): (Option<&owned::OwnedObjects>, bool, bool),
@@ -4210,7 +4212,7 @@ pub(super) fn publish_partial_rooted(
     let staged_identity = (staged_dev, staged_ino);
     let published = match condition {
         TargetCondition::Any | TargetCondition::Matches { .. } => root
-            .rename_regular_if_same(source, target, staged_identity)
+            .rename_regular_in(source, target, staged_identity, siblings)
             .map(|()| None),
         // An ordinary copy that keeps existing files renames over a name
         // another program took in the moment before, rather than pay for a
@@ -4219,7 +4221,7 @@ pub(super) fn publish_partial_rooted(
         TargetCondition::Absent
             if unchecked_keep && !root.renames_without_replacing_on(metadata.dev(), staged) =>
         {
-            root.rename_regular_if_same(source, target, staged_identity)
+            root.rename_regular_in(source, target, staged_identity, siblings)
                 .map(|()| None)
         }
         TargetCondition::Absent => {
@@ -5391,14 +5393,6 @@ pub(super) enum OpenedPartial {
 }
 
 impl OpenedPartial {
-    /// The device the stage is on, when its metadata was read.
-    pub(super) fn dev(&self) -> Option<u64> {
-        match self {
-            OpenedPartial::Created(created) => Some(created.dev()),
-            OpenedPartial::Reused(_) => None,
-        }
-    }
-
     /// The length of the reopened partial, whose bytes may be resumed.
     pub(super) fn basis_size(&self) -> Option<u64> {
         match self {

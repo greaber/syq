@@ -116,6 +116,54 @@ pub(super) struct SmallStage {
 }
 
 impl SmallStage {
+    pub(super) fn prepare_publication(&self, meta: &Meta, flags: u8) -> Result<()> {
+        check_written_file(
+            &self.target.root,
+            Some(self.created.dev()),
+            &self.file,
+            &self.label,
+        )?;
+        set_meta_written_file_for_publication(&self.file, meta, flags, &self.created)
+            .with_context(|| format!("set metadata {}", self.label.display()))?;
+        #[cfg(any(test, debug_assertions))]
+        fail_put_small_before_rename_for_test(&self.target.label)?;
+        Ok(())
+    }
+
+    pub(super) fn publish(
+        &self,
+        condition: TargetCondition,
+        permissions: (Option<&owned::OwnedObjects>, bool, bool),
+        siblings: Option<&crate::rooted::SiblingDirectory<'_>>,
+    ) -> Result<PublishedStage> {
+        publish_partial_rooted(
+            &self.target.root,
+            &self.partial,
+            &self.target.relative,
+            siblings,
+            &self.file,
+            condition,
+            permissions,
+        )
+    }
+
+    pub(super) fn finish(
+        self,
+        meta: &Meta,
+        flags: u8,
+        published: PublishedStage,
+    ) -> Result<Option<(u64, u64)>> {
+        crate::inode_metadata::finish_publication(
+            &self.file,
+            meta.inode_metadata.as_deref(),
+            meta.mode,
+        )?;
+        let identity = known_identity(&self.created, flags);
+        drop(self);
+        published.remove()?;
+        Ok(identity)
+    }
+
     #[cfg(target_os = "macos")]
     fn register(&self, creation: sidecars::Creation<'_>) {
         creation.register(
@@ -127,44 +175,17 @@ impl SmallStage {
     }
 }
 
-/// Apply `each` to `items` on up to `PARALLEL_WRITES` threads, in order.
-/// This thread runs the first part, as it would otherwise only wait, and
-/// any part whose thread the system refuses to start.
-fn on_threads<T: Send, R: Send>(items: Vec<T>, each: impl Fn(T) -> R + Sync) -> Vec<R> {
-    let per_thread = items.len().div_ceil(PARALLEL_WRITES).max(1);
-    let mut parts = Vec::new();
-    let mut items = items.into_iter().peekable();
-    while items.peek().is_some() {
-        parts.push(Mutex::new(Some(
-            items.by_ref().take(per_thread).collect::<Vec<_>>(),
-        )));
+/// Keep each connection's network writes independent of other workers.
+fn map_writes<T: Send, R: Send>(
+    pool: Option<&rayon::ThreadPool>,
+    items: Vec<T>,
+    each: impl Fn(T) -> R + Sync + Send,
+) -> Vec<R> {
+    use rayon::prelude::*;
+    match pool {
+        Some(pool) => pool.install(|| items.into_par_iter().map(each).collect()),
+        None => items.into_iter().map(each).collect(),
     }
-    let Some((first, rest)) = parts.split_first() else {
-        return Vec::new();
-    };
-    // Whichever thread runs a part takes it. A thread that could not start
-    // never took its part, so this thread finds it still there.
-    let run = |part: &Mutex<Option<Vec<T>>>| {
-        let part = part.lock().unwrap().take().unwrap_or_default();
-        part.into_iter().map(&each).collect::<Vec<_>>()
-    };
-    let run = &run;
-    std::thread::scope(|scope| {
-        let threads: Vec<_> = rest
-            .iter()
-            .map(|part| start_thread(scope, move || run(part)).ok())
-            .collect();
-        let mut results = run(first);
-        for (part, thread) in rest.iter().zip(threads) {
-            results.extend(match thread {
-                Some(thread) => thread
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
-                None => run(part),
-            });
-        }
-        results
-    })
 }
 
 #[cfg(test)]
@@ -172,8 +193,6 @@ thread_local! {
     /// Fingerprints taken on this thread leave out change times, as
     /// `SYQ_TEST_COARSE_CHANGE_TIMES` does for a process.
     static COARSE_CHANGE_TIMES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Refuses the threads this thread starts, as a process limit would.
-    static REFUSE_THREADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Patched files this thread wrote over a clone of the file they replace.
     static CLONED_PATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Runs when a patch's stage holds the clone or copy of the file it
@@ -206,18 +225,6 @@ pub(crate) fn with_coarse_change_times<R>(f: impl FnOnce() -> R) -> R {
     let result = f();
     COARSE_CHANGE_TIMES.set(false);
     result
-}
-
-/// Start `work` on a thread of `scope`, unless the system refuses one.
-fn start_thread<'scope, R: Send + 'scope>(
-    scope: &'scope std::thread::Scope<'scope, '_>,
-    work: impl FnOnce() -> R + Send + 'scope,
-) -> io::Result<std::thread::ScopedJoinHandle<'scope, R>> {
-    #[cfg(test)]
-    if REFUSE_THREADS.get() {
-        return Err(io::Error::from_raw_os_error(libc::EAGAIN));
-    }
-    std::thread::Builder::new().spawn_scoped(scope, work)
 }
 
 /// Descriptors that bursts may hold beyond the one each put needs anyway.
@@ -260,7 +267,7 @@ impl Drop for ReservedDescriptors {
 fn sibling_name<'a>(first: &RootedTarget, other: &'a RootedTarget) -> Option<&'a [u8]> {
     let (directory, _) = first.relative.leaf().ok()?;
     let (other_directory, name) = other.relative.leaf().ok()?;
-    (first.root.identity() == other.root.identity() && directory == other_directory).then_some(name)
+    (Arc::ptr_eq(&first.root, &other.root) && directory == other_directory).then_some(name)
 }
 
 /// A patch reuses at least this much, and half its file, before its stage
@@ -1836,13 +1843,22 @@ impl FsOps {
         let network = stages.first().is_some_and(|(_, stage)| {
             stages.len() > 1 && on_network_file_system(&stage.file, stage.created.dev())
         });
+        let pool = network
+            .then(|| {
+                self.small_writers
+                    .get_or_init(|| {
+                        crate::resources::optional_pool("syq-small-write", PARALLEL_WRITES)
+                    })
+                    .as_ref()
+            })
+            .flatten();
         let written: Vec<Result<()>> = if network {
             let writing = self
                 .operation
                 .span(crate::transfer_observations::Stage::DestinationWrite);
             let bytes = AtomicU64::new(0);
             let this = &*self;
-            let written = on_threads(stages.iter().collect(), |(index, stage)| {
+            let written = map_writes(pool, stages.iter().collect(), |(index, stage)| {
                 this.write_small_stage(&puts[*index], source(*index), stage, Some(&bytes))
             });
             writing.bytes(bytes.into_inner());
@@ -1875,8 +1891,28 @@ impl FsOps {
                 .any(|(index, _)| puts[*index].replaces)
                 .then(|| root.replacement_turn());
             let _turn = root.mutation_turn(&directory).ok();
+            // Reopen from the root at the start of publication. Only ordinary
+            // renames borrow this handle. Leave its descriptor available if
+            // any publication in the run needs to open its own parent.
+            let siblings = if stages.len() > 1
+                && !self.restricted_destination()
+                && directory.leaf().is_ok_and(|(parent, _)| !parent.is_empty())
+                && stages.iter().all(|(i, _)| {
+                    matches!(
+                        puts[*i].condition,
+                        TargetCondition::Any | TargetCondition::Matches { .. }
+                    )
+                }) {
+                root.sibling_directory(&directory).ok()
+            } else {
+                None
+            };
             for (index, stage) in stages {
-                match self.publish_small_stage(&puts[index], &stage) {
+                match stage.publish(
+                    puts[index].condition,
+                    self.publication_permissions(),
+                    siblings.as_ref(),
+                ) {
                     Ok(staged) => published.push((index, stage, staged)),
                     Err(error) => results[index] = Err(wire_error(&error)),
                 }
@@ -1890,11 +1926,7 @@ impl FsOps {
                 .map_err(|error| wire_error(&error));
             (index, result)
         };
-        let finished = if network {
-            on_threads(published, finish)
-        } else {
-            published.into_iter().map(finish).collect()
-        };
+        let finished = map_writes(pool, published, finish);
         for (index, result) in finished {
             results[index] = result;
         }
@@ -1995,8 +2027,17 @@ impl FsOps {
         } else {
             policy.mode(mode).write_only().new_contents_only()
         };
+        self.open_small_stage(target, &put.copy_id, policy)
+    }
+
+    pub(super) fn open_small_stage(
+        &mut self,
+        target: RootedTarget,
+        copy_id: &CopyId,
+        policy: StagePolicy,
+    ) -> Result<SmallStage> {
         self.uncache_rooted(&target.root, &target.relative);
-        let stage = self.open_stage(&target, &put.copy_id, policy)?;
+        let stage = self.open_stage(&target, copy_id, policy)?;
         let created = stage.metadata()?;
         Ok(SmallStage {
             target,
@@ -2072,23 +2113,9 @@ impl FsOps {
         if let Some(source) = source {
             self.write_patch_stage(source, stage, unobserved)?;
         } else {
-            self.preallocate_stage(stage, put.data.len() as u64)?;
-            match unobserved {
-                None => observed_write(&self.operation, &stage.file, &put.data, 0, self.sparse),
-                Some(bytes) => write_data(&stage.file, &put.data, 0, self.sparse).inspect(|()| {
-                    bytes.fetch_add(put.data.len() as u64, Ordering::Relaxed);
-                }),
-            }
-            .with_context(|| format!("write {}", stage.label.display()))?;
+            self.write_small_contents(stage, &put.data, unobserved)?;
         }
-        check_written_file(
-            &stage.target.root,
-            Some(stage.created.dev()),
-            &stage.file,
-            &stage.label,
-        )?;
-        set_meta_written_file_for_publication(&stage.file, &put.meta, put.flags, &stage.created)
-            .with_context(|| format!("set metadata {}", stage.label.display()))?;
+        stage.prepare_publication(&put.meta, put.flags)?;
         // A new name published by a hard link has its permission check
         // done here, on the writing thread, rather than under the
         // directory's lock as it links (`Root::prepare_link_from`).
@@ -2101,8 +2128,23 @@ impl FsOps {
         {
             crate::rooted::Root::prepare_link_from(&stage.file);
         }
-        #[cfg(any(test, debug_assertions))]
-        fail_put_small_before_rename_for_test(&stage.target.label)?;
+        Ok(())
+    }
+
+    pub(super) fn write_small_contents(
+        &self,
+        stage: &SmallStage,
+        data: &[u8],
+        unobserved: Option<&AtomicU64>,
+    ) -> Result<()> {
+        self.preallocate_stage(stage, data.len() as u64)?;
+        match unobserved {
+            None => observed_write(&self.operation, &stage.file, data, 0, self.sparse),
+            Some(bytes) => write_data(&stage.file, data, 0, self.sparse).inspect(|()| {
+                bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+            }),
+        }
+        .with_context(|| format!("write {}", stage.label.display()))?;
         Ok(())
     }
 
@@ -2113,17 +2155,14 @@ impl FsOps {
         put: &SmallPut,
         stage: &SmallStage,
     ) -> Result<PublishedStage> {
-        publish_partial_rooted(
-            &stage.target.root,
-            &stage.partial,
-            &stage.target.relative,
-            &stage.file,
-            put.condition,
-            (
-                self.owned.as_deref(),
-                self.skips_unmet_conditions,
-                self.unchecked_keep,
-            ),
+        stage.publish(put.condition, self.publication_permissions(), None)
+    }
+
+    fn publication_permissions(&self) -> (Option<&owned::OwnedObjects>, bool, bool) {
+        (
+            self.owned.as_deref(),
+            self.skips_unmet_conditions,
+            self.unchecked_keep,
         )
     }
 
@@ -2135,15 +2174,7 @@ impl FsOps {
         stage: SmallStage,
         published: PublishedStage,
     ) -> Result<Option<(u64, u64)>> {
-        crate::inode_metadata::finish_publication(
-            &stage.file,
-            put.meta.inode_metadata.as_deref(),
-            put.meta.mode,
-        )?;
-        let identity = known_identity(&stage.created, put.flags);
-        drop(stage);
-        published.remove()?;
-        Ok(identity)
+        stage.finish(&put.meta, put.flags, published)
     }
 }
 
@@ -2221,6 +2252,91 @@ mod tests {
         ops.install_destination(File::open(directory).unwrap(), b"logical")
             .unwrap();
         ops
+    }
+
+    #[test]
+    fn sibling_publication_does_not_follow_a_replaced_parent() {
+        let temporary = crate::test_support::tempdir().unwrap();
+        let base = temporary.path();
+        fs::create_dir(base.join("selected")).unwrap();
+        fs::create_dir(base.join("other")).unwrap();
+        fs::write(base.join("other/b"), b"untouched").unwrap();
+        let mut ops = receiver(base);
+        let _hook = crate::rooted::install_publication_test_hook(
+            ops.destination_root.as_ref().unwrap().identity(),
+            &RelativePath::new(b"selected/a").unwrap(),
+            crate::rooted::PublicationTestPoint::AfterAnyRename,
+            {
+                let base = base.to_owned();
+                move || {
+                    fs::rename(base.join("selected"), base.join("held")).unwrap();
+                    std::os::unix::fs::symlink("other", base.join("selected")).unwrap();
+                }
+            },
+        );
+        let results =
+            ops.put_small_batch(&mut [put("selected/a", b"first"), put("selected/b", b"second")]);
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        assert_eq!(fs::read(base.join("held/b")).unwrap(), b"second");
+        assert_eq!(fs::read(base.join("held/a")).unwrap(), b"first");
+        assert_eq!(fs::read(base.join("other/b")).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn mixed_sibling_publications_reuse_the_last_parent_descriptor() {
+        use crate::process::CommandExt as _;
+
+        // Change the descriptor limit only in this test's own process.
+        const CHILD: &str = "SYQ_TEST_MIXED_SIBLING_FDS";
+        if std::env::var_os(CHILD).is_none() {
+            let name = "fsops::small_batch::tests::mixed_sibling_publications_reuse_the_last_parent_descriptor";
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env(CHILD, "1")
+                .capture_output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        let mut limits = nofile_limits().unwrap();
+        limits.rlim_cur = limits.rlim_cur.min(64);
+        set_nofile_limits(&limits).unwrap();
+
+        let temporary = crate::test_support::tempdir().unwrap();
+        let parent = temporary.path().join("selected");
+        fs::create_dir(&parent).unwrap();
+        let mut ops = receiver(temporary.path());
+        let held = Arc::new(Mutex::new(Vec::new()));
+        let _hook = crate::rooted::install_publication_test_hook(
+            ops.destination_root.as_ref().unwrap().identity(),
+            &RelativePath::new(b"selected/a").unwrap(),
+            crate::rooted::PublicationTestPoint::AfterAnyRename,
+            {
+                let held = held.clone();
+                move || {
+                    // The first rename still holds its parent. Releasing that
+                    // descriptor must suffice for the second publication.
+                    let mut held = held.lock().unwrap();
+                    loop {
+                        match File::open("/dev/null") {
+                            Ok(file) => held.push(file),
+                            Err(error) => {
+                                assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+                                break;
+                            }
+                        }
+                    }
+                }
+            },
+        );
+        let mut puts = [put("selected/a", b"first"), put("selected/b", b"second")];
+        puts[1].condition = TargetCondition::Absent;
+        let results = ops.put_small_batch(&mut puts);
+        assert!(!held.lock().unwrap().is_empty());
+        drop(held);
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        assert_eq!(fs::read(parent.join("a")).unwrap(), b"first");
+        assert_eq!(fs::read(parent.join("b")).unwrap(), b"second");
     }
 
     fn entries(directory: &Path) -> usize {
@@ -3977,36 +4093,16 @@ mod tests {
     }
 
     #[test]
-    fn parts_keep_their_order_when_threads_are_refused() {
-        // This thread runs the first part itself, and every part when no
-        // thread starts; a panic in any part reaches the caller.
-        let caller = std::thread::current().id();
-        let first_part = 20usize.div_ceil(PARALLEL_WRITES);
-        for refused in [false, true] {
-            REFUSE_THREADS.set(refused);
-            let ran = on_threads((0..20).collect(), |i: usize| {
-                (i, std::thread::current().id())
-            });
-            REFUSE_THREADS.set(false);
-            let order: Vec<_> = ran.iter().map(|(i, _)| *i).collect();
-            assert_eq!(order, (0..20).collect::<Vec<_>>(), "refused={refused}");
-            for (i, thread) in ran {
+    fn network_bursts_preserve_order_with_or_without_a_pool() {
+        let pool = crate::resources::optional_pool("test-small-writes", 2);
+        for pool in [pool.as_ref(), None] {
+            for _ in 0..2 {
                 assert_eq!(
-                    thread == caller,
-                    refused || i < first_part,
-                    "refused={refused} item {i}"
+                    map_writes(pool, (0..20).collect(), |i| i),
+                    (0..20).collect::<Vec<_>>()
                 );
             }
-            for panicking in [0, 19] {
-                REFUSE_THREADS.set(refused);
-                let outcome = std::panic::catch_unwind(|| {
-                    on_threads((0..20).collect(), |i: usize| assert_ne!(i, panicking))
-                });
-                REFUSE_THREADS.set(false);
-                assert!(outcome.is_err(), "refused={refused} item {panicking}");
-            }
         }
-        assert!(on_threads(Vec::<usize>::new(), |i| i).is_empty());
     }
 
     #[test]
