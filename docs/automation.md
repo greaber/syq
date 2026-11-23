@@ -147,10 +147,10 @@ the receiver refuses, for example one that would go over its limits, is
 refused as a whole, with a record for every change in it. syq can then send
 some of those changes again one at a time, so a file with such a record may
 still have been completed, and a file refused again has a second record. The
-terminal `result` says the copy was refused. An unchanged file the receiver
-still checks — such as the first name of each multiply linked file under
-`--copy-metadata=hardlinks` (`-H`) — counts against its limit, so allow for
-those when choosing the limit for a retry.
+terminal `result` says the copy was refused. Under `--copy-metadata=hardlinks`
+(`-H`), every name of a multiply linked file counts even when nothing changes:
+the receiver checks the first and links each other name again. Allow for those
+when choosing the limit for a retry.
 
 Unchanged and excluded entries appear only in totals, and a live run emits no
 record for a metadata-only update. A parent directory that syq failed to
