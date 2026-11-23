@@ -24,11 +24,18 @@ impl Hardlinks {
     }
 
     /// `groups`, kept representatives, in consecutive parts of at most
-    /// `most`, each also ending once the scanned entries it holds pass
-    /// `SOURCE_BATCH_PATH_BYTES`: they carry any ACLs and extended
-    /// attributes copied, which each part's requests and replies repeat.
+    /// `most`, each also ending once its byte estimate passes
+    /// `SOURCE_BATCH_PATH_BYTES`. When `include_entry` is set, the estimate
+    /// includes each scanned entry (carrying any ACLs and extended
+    /// attributes copied) for source-stat passes whose requests or replies
+    /// carry them; otherwise only the destination path overhead is counted.
     /// Each part holds at least one.
-    fn kept_parts<'g>(&self, mut groups: &'g [usize], most: usize) -> Vec<&'g [usize]> {
+    fn kept_parts<'g>(
+        &self,
+        mut groups: &'g [usize],
+        most: usize,
+        include_entry: bool,
+    ) -> Vec<&'g [usize]> {
         let mut parts = Vec::new();
         while !groups.is_empty() {
             let mut bytes = 0usize;
@@ -37,9 +44,13 @@ impl Hardlinks {
                 .take(most)
                 .position(|&group| {
                     let leaf = self.kept_leaf(group);
-                    bytes = bytes
-                        .saturating_add(source_request_bytes(&leaf.src, Some(&leaf.source)))
-                        .saturating_add(leaf.e.size_hint());
+                    let entry_bytes = if include_entry {
+                        source_request_bytes(&leaf.src, Some(&leaf.source))
+                            .saturating_add(leaf.e.size_hint())
+                    } else {
+                        leaf.dst.len().saturating_add(128)
+                    };
+                    bytes = bytes.saturating_add(entry_bytes);
                     bytes > SOURCE_BATCH_PATH_BYTES
                 })
                 .map_or(groups.len().min(most), |index| index.max(1));
@@ -592,7 +603,7 @@ impl Planner<'_> {
         self.withdraw_early_lookups();
         // The files to replace are queued together.
         let _burst = self.sched.file_burst();
-        let mut parts = self.hardlinks.kept_parts(&kept, 8192).into_iter();
+        let mut parts = self.hardlinks.kept_parts(&kept, 8192, false).into_iter();
         let mut ready = std::collections::VecDeque::new();
         let mut in_flight = std::collections::VecDeque::new();
         // What ends the checks: a failure to send or an unusable reply, or a
@@ -681,10 +692,17 @@ impl Planner<'_> {
             .iter()
             .map(|&group| {
                 let kept = self.hardlinks.groups[group].kept.as_ref().unwrap();
+                let mut meta = self.opts.metadata_for(&kept.leaf.dst_rel, &kept.leaf.e);
+                // Its metadata matches (`keeps_representative`): none of it
+                // needs fixing, including ACLs, extended attributes, access
+                // time and birth time. Keeping `inode_metadata` would re-send
+                // and re-read unchanged attributes on every kept
+                // representative.
+                meta.inode_metadata = None;
                 Op::SetFileMetaIfSame {
                     path: kept.leaf.dst.clone(),
                     condition: kept.condition,
-                    meta: self.opts.metadata_for(&kept.leaf.dst_rel, &kept.leaf.e),
+                    meta,
                     // Its metadata matches (`keeps_representative`): none of
                     // it needs fixing.
                     flags: self.opts.ownership_flags(&kept.leaf.dst_rel) | flags::REPORT_IDENTITY,
@@ -719,7 +737,7 @@ impl Planner<'_> {
             .collect();
         // The files to copy again are queued together.
         let _burst = self.sched.file_burst();
-        for groups in self.hardlinks.kept_parts(&kept, 4096) {
+        for groups in self.hardlinks.kept_parts(&kept, 4096, true) {
             self.recheck_representatives(source, groups)?;
         }
         Ok(())

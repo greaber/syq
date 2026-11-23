@@ -1381,3 +1381,93 @@ fn a_kept_representative_whose_source_vanished_is_not_handed_on() {
     assert!(!events.contains("worker"), "{events}");
     assert_eq!(read(&t.path("dst/a")), b"first");
 }
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+#[test]
+fn kept_representatives_with_xattrs_keep_their_attributes_and_recheck_changes() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let set_user_xattr = |path: &Path, name: &str, value: &[u8]| {
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name = CString::new(name).unwrap();
+        assert_eq!(
+            unsafe {
+                libc::lsetxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                )
+            },
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+    };
+    let get_user_xattr = |path: &Path, name: &str| -> Vec<u8> {
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name = CString::new(name).unwrap();
+        let mut value = vec![0u8; 65536];
+        let count = unsafe {
+            libc::lgetxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        };
+        assert!(count >= 0, "{}", std::io::Error::last_os_error());
+        value.truncate(count as usize);
+        value
+    };
+
+    let t = Tmp::new();
+    // 72 * 60 KiB > SOURCE_BATCH_PATH_BYTES (4 MiB): checks are still sent as
+    // one part (`check 72`) because `kept_checks` omits unchanged xattrs.
+    let payload = vec![b'x'; 60 * 1024];
+    for i in 0..72usize {
+        let rep = t.path(&format!("src/g{i:02}"));
+        write(&rep, format!("payload-{i:02}").as_bytes());
+        set_user_xattr(&rep, "user.test", &payload);
+        fs::hard_link(&rep, t.path(&format!("src/g{i:02}.link"))).unwrap();
+    }
+    assert_output_ok(&copy_recording_hardlinks(&t, &["-X"], true).run().unwrap());
+    let before_inodes: Vec<_> = (0..72usize)
+        .map(|i| identity(&t.path(&format!("dst/g{i:02}"))))
+        .collect();
+
+    assert_output_ok(&copy_recording_hardlinks(&t, &["-X"], true).run().unwrap());
+    let events = fs::read_to_string(t.path("hardlink-events")).unwrap();
+    let checks: Vec<_> = events
+        .lines()
+        .filter(|line| line.starts_with("check"))
+        .collect();
+    assert_eq!(checks, ["check 72"], "{events}");
+    assert_eq!(events.matches("kept").count(), 72, "{events}");
+    assert!(!events.contains("worker"), "{events}");
+    for (i, &before) in before_inodes.iter().enumerate() {
+        let rep = t.path(&format!("dst/g{i:02}"));
+        let link = t.path(&format!("dst/g{i:02}.link"));
+        assert_eq!(identity(&rep), before);
+        assert_eq!(identity(&link), before);
+        assert_eq!(get_user_xattr(&rep, "user.test"), payload);
+    }
+
+    let updated = vec![b'y'; 60 * 1024];
+    set_user_xattr(&t.path("src/g00"), "user.test", &updated);
+    assert_output_ok(&copy_recording_hardlinks(&t, &["-X"], true).run().unwrap());
+    let events = fs::read_to_string(t.path("hardlink-events")).unwrap();
+    let checks: Vec<_> = events
+        .lines()
+        .filter(|line| line.starts_with("check"))
+        .collect();
+    assert_eq!(checks, ["check 71"], "{events}");
+    assert_eq!(events.matches("kept").count(), 71, "{events}");
+    assert_eq!(get_user_xattr(&t.path("dst/g00"), "user.test"), updated);
+    assert_eq!(
+        identity(&t.path("dst/g00")),
+        identity(&t.path("dst/g00.link"))
+    );
+}
