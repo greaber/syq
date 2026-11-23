@@ -781,30 +781,26 @@ pub(super) fn set_meta_rooted(
     condition: TargetCondition,
     directory: bool,
 ) -> Result<()> {
-    let require_directory = |is_dir: bool| {
-        if !is_dir {
-            if directory {
-                bail!(
-                    "destination {} is no longer a directory",
-                    target.label.display()
-                );
-            }
-            bail!(
-                "{} is not changed in place: only a directory's metadata is",
-                target.label.display()
-            );
-        }
-        Ok(())
-    };
-    let metadata = target.root.metadata(&target.relative)?;
-    require_directory(metadata.is_dir())?;
+    // Require a directory in the open itself, before even opening a device
+    // someone put at the name. Check the name afresh after any change.
     let handle = target
         .root
-        .open_metadata(&target.relative)
-        .with_context(|| format!("open confined metadata handle {}", target.label.display()))?;
-    require_rooted_metadata(&handle, metadata, &target.label)?;
+        .open_directory_for_metadata(&target.relative)
+        .map_err(|error| {
+            let wrong_type = error.downcast_ref::<io::Error>().is_some_and(|error| {
+                matches!(error.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP))
+            });
+            let label = target.label.display();
+            let message = match (wrong_type, directory) {
+                (true, true) => format!("destination {label} is no longer a directory"),
+                (true, false) => {
+                    format!("{label} is not changed in place: only a directory's metadata is")
+                }
+                _ => format!("open confined metadata handle {label}"),
+            };
+            error.context(message)
+        })?;
     let opened = handle.metadata()?;
-    require_directory(opened.is_dir())?;
     let condition = match condition {
         TargetCondition::Matches { .. } | TargetCondition::MatchesFingerprint { .. }
             if !target.root.link_counts_trusted_on(opened.dev(), &handle) =>
@@ -813,8 +809,7 @@ pub(super) fn set_meta_rooted(
         }
         condition => condition,
     };
-    require_rooted_condition(metadata, condition, &target.label)?;
-    require_open_target_known(&opened, &target.label, condition)?;
+    require_rooted_condition(root_metadata_from_std(&opened)?, condition, &target.label)?;
     let owner_differs = (flags & flags::OWNER != 0
         && (is_superuser() || flags & flags::REQUIRE_OWNER != 0)
         && opened.uid() != meta.uid)
@@ -857,9 +852,7 @@ pub(super) fn starting_group_may_differ(
         let observed = (|| -> Result<(u32, u32)> {
             let target = scope.target(path)?;
             let (parents, _) = target.relative.leaf()?;
-            let parent = target
-                .root
-                .metadata(&RelativePath::new(&parents.join(&b'/'))?)?;
+            let parent = target.root.metadata(&RelativePath::new(parents)?)?;
             Ok((parent.gid, parent.mode))
         })()
         .ok();
@@ -881,21 +874,20 @@ pub(super) fn new_file_group_may_differ(
     group: u32,
     parents: Option<&mut InplaceParents>,
 ) -> bool {
-    let Ok((directories, _)) = target.relative.leaf() else {
+    let Ok((directory, _)) = target.relative.leaf() else {
         return true;
     };
-    let directory = directories.join(&b'/');
     let observe = || -> Option<(u32, u32)> {
         let parent = target
             .root
-            .metadata(&RelativePath::new(&directory).ok()?)
+            .metadata(&RelativePath::new(directory).ok()?)
             .ok()?;
         Some((parent.gid, parent.mode))
     };
     let parent = match parents {
         Some(parents) => {
             let identity = target.root.identity();
-            let key = (identity.dev, identity.ino, directory.clone());
+            let key = (identity.dev, identity.ino, directory.to_vec());
             *parents.entry(key).or_insert_with(observe)
         }
         None => observe(),

@@ -79,7 +79,7 @@ impl Place<'_> {
             .relative
             .leaf()
             .ok()
-            .and_then(|(directories, _)| RelativePath::new(&directories.join(&b'/')).ok())?;
+            .and_then(|(directories, _)| RelativePath::new(directories).ok())?;
         if self.preview {
             return Some(
                 self.root
@@ -94,7 +94,7 @@ impl Place<'_> {
     /// than `group` (`apply::group_may_differ`), from its directory.
     fn new_file_group_may_differ(&self, group: u32) -> bool {
         let parent = self.relative.leaf().ok().and_then(|(directories, _)| {
-            let directory = RelativePath::new(&directories.join(&b'/')).ok()?;
+            let directory = RelativePath::new(directories).ok()?;
             let metadata = self.root.metadata(&directory).ok()?;
             Some((metadata.gid, metadata.mode))
         });

@@ -994,12 +994,7 @@ impl Worker {
                     (Vec::new(), std::time::Duration::ZERO)
                 } else {
                     let (response, waited) = self.src.recv_with_wait()?;
-                    let blocks =
-                        ok(response, "read small batch").and_then(|response| match response {
-                            Response::SmallBlocks(blocks) if blocks.len() == count => Ok(blocks),
-                            other => bail!("unexpected response {other:?}"),
-                        });
-                    match blocks {
+                    match small_blocks(response, count) {
                         Ok(blocks) => (blocks, waited),
                         Err(error) => {
                             Self::fail_small_batch(results, group, &error);

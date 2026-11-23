@@ -40,7 +40,7 @@ thread_local! {
 #[derive(Eq, Hash, PartialEq)]
 struct Directory {
     root: RootIdentity,
-    parents: Vec<Vec<u8>>,
+    parents: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -155,7 +155,7 @@ pub(super) fn replacement(device: u64) -> Permit {
     gate.acquire()
 }
 
-pub(super) fn turn(root: RootIdentity, parents: &[Vec<u8>]) -> Turn {
+pub(super) fn turn(root: RootIdentity, parents: &[u8]) -> Turn {
     // A nested turn waits for nothing either: waiting for a second directory
     // while holding the first could deadlock two batches.
     let permit = acquire(root, parents);
@@ -166,7 +166,7 @@ pub(super) fn turn(root: RootIdentity, parents: &[Vec<u8>]) -> Turn {
     }
 }
 
-pub(super) fn acquire(root: RootIdentity, parents: &[Vec<u8>]) -> Permit {
+pub(super) fn acquire(root: RootIdentity, parents: &[u8]) -> Permit {
     if TURNS.with(Cell::get) != 0 {
         return Permit(None);
     }
@@ -189,7 +189,7 @@ pub(super) fn acquire(root: RootIdentity, parents: &[Vec<u8>]) -> Permit {
 /// Small-file deletion keeps a few syscalls active while other callers park.
 /// Its callers retain the root and release a turn before taking another one.
 #[cfg(target_os = "linux")]
-pub(crate) fn deletion(root: RootIdentity, parents: &[Vec<u8>]) -> Permit {
+pub(crate) fn deletion(root: RootIdentity, parents: &[u8]) -> Permit {
     static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
     let gate = REGISTRY
         .get_or_init(|| {
@@ -216,7 +216,7 @@ mod tests {
     fn key(ino: u64, parent: &[u8]) -> Directory {
         Directory {
             root: RootIdentity { dev: 1, ino },
-            parents: vec![parent.to_vec()],
+            parents: parent.to_vec(),
         }
     }
 
@@ -272,8 +272,8 @@ mod tests {
     #[test]
     fn a_turn_covers_its_own_threads_operations_until_it_ends() {
         let root = RootIdentity { dev: 7, ino: 7 };
-        let parent = vec![b"burst".to_vec()];
-        let other = vec![b"elsewhere".to_vec()];
+        let parent = b"burst".to_vec();
+        let other = b"elsewhere".to_vec();
         let held = turn(root, &parent);
         // Operations inside the turn, a nested turn, and a panic that unwinds
         // through a nested turn all leave the outer turn in place.

@@ -2273,8 +2273,11 @@ fn the_copys_lookups_reuse_the_authoritys_directory_listings() {
     let named = destination.as_os_str().as_bytes();
     let grant = copy_operation(&args, &sources, named).unwrap();
     let protected = Vec::new();
+    let confined = ConfinedRoot::resolve(named, &protected, false, None).unwrap();
+    // Exercise the NFS listing path on the fixture's own device.
+    confined.assume_nfs_for_test();
     let authority = RestrictedAuthority::new(
-        ConfinedRoot::resolve(named, &protected, false, None).unwrap(),
+        confined,
         DestinationRules::for_test(grant),
         [0; 32],
         generate_results_key(EnrollmentId::random()).unwrap(),

@@ -296,4 +296,4 @@ pub(super) const CREATION_PERMISSION_DIRECTORIES: usize = 4096;
 
 /// The permission bits each directory's default ACL lets new files have, by
 /// root identity and directory.
-pub(super) type CreationPermissions = HashMap<(u64, u64, Vec<Vec<u8>>), u32>;
+pub(super) type CreationPermissions = HashMap<(u64, u64, Vec<u8>), u32>;
