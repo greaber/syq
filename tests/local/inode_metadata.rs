@@ -215,6 +215,72 @@ fn xattr_only_change_is_visible_in_dry_run_without_mutation() {
     assert!(text.contains("metadata-only"), "{text}");
 }
 
+/// Give the two trees distinct inodes with matching content, mtime and
+/// attributes. Hard links keep a many-entry lookup fixture inexpensive.
+#[cfg(debug_assertions)]
+fn matching_lookup_trees(t: &Tmp, subdir: &str, count: usize, attribute: &[u8]) {
+    for side in ["src", "dst"] {
+        let dir = t.path(side).join(subdir);
+        fs::create_dir_all(&dir).unwrap();
+        let seed = t.path(&format!("{side}-seed"));
+        let file = fs::File::create(&seed).unwrap();
+        set_attr(&seed, "user.lookup", attribute);
+        file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000))
+            .unwrap();
+        for index in 0..count {
+            fs::hard_link(&seed, dir.join(format!("f{index:05}"))).unwrap();
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn early_lookups_with_long_paths_fall_back_to_chunked_rich_stats() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    // Even 4,096 of these paths need more than one 8 MiB request.
+    let subdir = format!("{}/", "a".repeat(220)).repeat(10);
+    matching_lookup_trees(&t, &subdir, 10_000, b"same");
+    let output = super::early_lookups::copy(&t, &rsh, &["--copy-metadata=mtime,xattrs"]);
+    assert_output_ok(&output);
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("unchanged (10,000 files)"), "{out}");
+    let lookups = fs::read_to_string(t.path("lookups")).unwrap();
+    let chunks: Vec<usize> = lookups
+        .lines()
+        .filter_map(|line| line.strip_prefix("stat "))
+        .map(|count| count.parse().unwrap())
+        .collect();
+    assert!(chunks.iter().sum::<usize>() >= 4096, "{lookups}");
+    assert!(chunks.iter().all(|&count| count < 4096), "{lookups}");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn early_lookups_after_a_deferred_rich_reply_use_chunked_stats() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    matching_lookup_trees(&t, "a", 12_000, &[0x5a; 3072]);
+    let output = super::early_lookups::copy(&t, &rsh, &["--copy-metadata=mtime,xattrs"]);
+    assert_output_ok(&output);
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("unchanged (12,000 files)"), "{out}");
+
+    // Each full scan batch exceeds the 6 MiB reply budget. After the
+    // first deferral even the final, shorter batch uses ordinary stats.
+    let lookups = fs::read_to_string(t.path("lookups")).unwrap();
+    let mut lines = lookups.lines();
+    assert!(lines.any(|line| line == "deferred"), "{lookups}");
+    let mut leaves = 0;
+    for line in lines {
+        assert!(!line.starts_with("batch "), "{lookups}");
+        if let Some(count) = line.strip_prefix("stat ") {
+            leaves += count.parse::<usize>().unwrap();
+        }
+    }
+    assert!(leaves > 8192, "{lookups}");
+}
+
 #[test]
 fn rich_metadata_is_batched_and_unchanged_reruns_are_empty() {
     let t = Tmp::new();

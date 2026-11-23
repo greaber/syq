@@ -53,6 +53,9 @@
             # the distributable executable and checks its release identity.
             doCheck = false;
             env = {
+              # Keep in sync with .cargo/config.toml: seed aws-lc from the
+              # operating system, not from about 30 ms of CPU-jitter sampling.
+              AWS_LC_SYS_NO_JITTER_ENTROPY = "1";
               CARGO_BUILD_TARGET = pkgs.stdenv.hostPlatform.rust.rustcTarget;
               RUSTC_WRAPPER = rustcWrapper;
               CC = cWrapper "cc";

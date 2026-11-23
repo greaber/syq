@@ -5,8 +5,7 @@
 use crate::proto::{Response, WireError};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
-use std::thread::JoinHandle;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Start the destination fence before draining the source, so independent
@@ -135,8 +134,6 @@ pub(crate) fn claim_block_with_digest(
     }
 }
 
-pub(crate) type Responses = crate::conn::Replies;
-
 #[derive(Clone, Debug)]
 pub(crate) enum Failure {
     Endpoint(WireError),
@@ -152,86 +149,71 @@ pub(crate) struct Completions {
 }
 
 impl Completions {
-    pub fn record(&mut self, response: Response) {
+    pub fn record(&mut self, response: &Response) {
         self.count += 1;
         let error = match response {
             Response::Ok => return,
-            Response::EndpointError(error) => Failure::Endpoint(error),
-            Response::Err(error) => Failure::Rejected(error),
+            Response::EndpointError(error) => Failure::Endpoint(error.clone()),
+            Response::Err(error) => Failure::Rejected(error.clone()),
             _ => Failure::Transport("unexpected response to a streaming write".into()),
         };
         self.error.get_or_insert(error);
     }
 }
 
-pub(crate) struct WriteReplies {
-    state: Arc<Mutex<Completions>>,
-    abort: Arc<AtomicBool>,
-    thread: Option<JoinHandle<Responses>>,
+/// One connection reader can collect acknowledgments for successive ranges.
+/// Outside a range it sends ordinary replies through the connection's queue.
+#[derive(Default)]
+pub(crate) struct WriteReplyState {
+    collecting: AtomicBool,
+    active: Mutex<Option<Completions>>,
 }
 
-impl WriteReplies {
-    pub fn spawn(rx: Responses) -> io::Result<Self> {
-        let state = Arc::new(Mutex::new(Completions::default()));
-        let abort = Arc::new(AtomicBool::new(false));
-        let (status, stopped) = (state.clone(), abort.clone());
-        let thread = std::thread::Builder::new().spawn(move || {
-            while !stopped.load(Ordering::Acquire) {
-                // Normally woken by a reply, not a timer. The timeout only
-                // lets a failed sender cancel without leaking a drain thread.
-                match rx.recv_timeout(Duration::from_millis(50)) {
-                    Ok(Ok(message)) => {
-                        let (response, _hold) = message.into_parts();
-                        if matches!(response, Response::WriteStreamDone) {
-                            status.lock().unwrap().fenced = true;
-                            break;
-                        }
-                        status.lock().unwrap().record(response);
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                    message => {
-                        let error = match message {
-                            Ok(Err(error)) => error.to_string(),
-                            _ => "streaming response reader stopped".into(),
-                        };
-                        // A dead connection overrides a prior operation error:
-                        // the caller must not reuse an unfenced connection.
-                        status.lock().unwrap().error = Some(Failure::Transport(error));
-                        break;
-                    }
-                }
+impl WriteReplyState {
+    pub fn begin(self: &Arc<Self>) -> anyhow::Result<WriteReplies> {
+        let mut active = self.active.lock().unwrap();
+        anyhow::ensure!(active.is_none(), "streaming writes already active");
+        *active = Some(Completions::default());
+        self.collecting.store(true, Ordering::Release);
+        Ok(WriteReplies(self.clone()))
+    }
+
+    /// Consume write acknowledgments directly on the connection reader.
+    /// Forward the fence and transport failures to wake the usual receiver.
+    pub fn collect(&self, reply: Result<&Response, &io::Error>) -> bool {
+        if !self.collecting.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut active = self.active.lock().unwrap();
+        let Some(state) = active.as_mut() else {
+            return false;
+        };
+        match reply {
+            Ok(Response::WriteStreamDone) => state.fenced = true,
+            Err(error) => state.error = Some(Failure::Transport(error.to_string())),
+            Ok(response) => {
+                state.record(response);
+                return true;
             }
-            rx
-        })?;
-        Ok(Self {
-            state,
-            abort,
-            thread: Some(thread),
-        })
+        }
+        self.collecting.store(false, Ordering::Release);
+        false
     }
+}
 
+pub(crate) struct WriteReplies(Arc<WriteReplyState>);
+
+impl WriteReplies {
     pub fn status(&self) -> Completions {
-        self.state.lock().unwrap().clone()
-    }
-
-    pub fn finish(mut self, abort: bool) -> (Responses, Completions) {
-        self.abort.store(abort, Ordering::Release);
-        let rx = self
-            .thread
-            .take()
-            .unwrap()
-            .join()
-            .expect("write reply reader panicked");
-        (rx, self.status())
+        self.0.active.lock().unwrap().as_ref().unwrap().clone()
     }
 }
 
 impl Drop for WriteReplies {
     fn drop(&mut self) {
-        self.abort.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        let mut active = self.0.active.lock().unwrap();
+        self.0.collecting.store(false, Ordering::Release);
+        *active = None;
     }
 }
 

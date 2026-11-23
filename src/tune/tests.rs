@@ -187,6 +187,74 @@ fn resume_worker_reset_preserves_cached_and_uncached_startup_modes() {
 }
 
 #[test]
+fn fallback_starts_a_clean_observation_at_the_new_count() {
+    struct Counters {
+        history: history::Recorder,
+        sched: Arc<Sched>,
+        reads: AtomicUsize,
+    }
+    impl Meter for Counters {
+        fn history(&self) -> Option<history::Recorder> {
+            Some(self.history.clone())
+        }
+        fn set_active(&self, _: usize) {}
+        fn files(&self) -> u64 {
+            0
+        }
+        fn bytes(&self) -> u64 {
+            let reads = self.reads.fetch_add(1, Relaxed);
+            if reads >= 3 {
+                self.sched.abort();
+            }
+            reads as u64 * 1000
+        }
+    }
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    let history = history::tests::recorder(&path);
+    let sched = Arc::new(Sched::new(4 << 20, 32 << 20));
+    sched.push_file(crate::sched::tests::test_job(b"pending", 1 << 30));
+    sched.scan_done();
+    sched.arm_direct_fallback(4);
+    sched.request_direct_fallback();
+    let gate = Gate::new(1); // Old interval started before any worker was ready.
+    let meter = Arc::new(Counters {
+        history: history.clone(),
+        sched: sched.clone(),
+        reads: Default::default(),
+    });
+    run_with_interval(
+        Policy::new(1, 1, 4),
+        gate.clone(),
+        sched,
+        meter,
+        |id| gate.mark_ready(id),
+        Duration::from_millis(10),
+    );
+    history.complete(true, serde_json::json!({}));
+    let db = rusqlite::Connection::open(path).unwrap();
+    let first = db
+        .query_row(
+            "SELECT workers,usable FROM measurements ORDER BY sequence LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, u32>(0)?, row.get::<_, bool>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(first, (4, true));
+}
+
+#[test]
+fn adjacent_evidence_expires_on_the_live_clock() {
+    let mut policy = Policy::refine(8, 1, 16);
+    policy.advance_time(Duration::ZERO, SAMPLE);
+    policy.record(8, 100.0);
+    policy.record(9, 80.0);
+    assert_eq!(policy.target(Direction::Up), 8);
+    policy.advance_time(SAMPLE * (EVIDENCE_MAX_AGE as u32 + 1), SAMPLE);
+    assert!(policy.target(Direction::Up) > 8);
+}
+
+#[test]
 fn plateau_hint_keeps_modest_probes() {
     let mut p = Policy::refine(START_SSH, MIN, MAX);
     measure(&mut p, 80.0);
@@ -329,6 +397,21 @@ fn rejects_a_slightly_slower_downward_probe() {
     measure(&mut p, 129.0);
     assert_eq!(p.settled(), 13);
     assert_eq!(p.n, 13);
+}
+
+#[test]
+fn modest_gains_per_doubling_hold_peak_throughput() {
+    let mut policy = Policy::new(8, 1, 128);
+    let rate = |workers: usize| 100.0 * 1.08_f64.powf((workers as f64).log2());
+    for _ in 0..4 {
+        let score = rate(policy.n);
+        measure(&mut policy, score);
+    }
+    for _ in 0..1000 {
+        let score = rate(policy.n);
+        measure(&mut policy, score);
+        assert_eq!(policy.settled(), 128);
+    }
 }
 
 #[test]
@@ -551,8 +634,7 @@ fn preparation_precedes_the_first_decision_without_activating_workers() {
         (Policy::new(16, 1, 64), 32),
         (Policy::refine(16, 1, 64), 21),
     ] {
-        let mut sampler = Sampler::default();
-        sampler.reset();
+        let sampler = evidence::Evidence::default();
         let lead = Duration::from_secs(12);
         let plan = policy.connection_plan(&sampler, SAMPLE, Duration::ZERO, lead, true);
         assert_eq!(plan.connect, candidate);
@@ -578,16 +660,11 @@ fn preparation_precedes_the_first_decision_without_activating_workers() {
 
 #[test]
 fn preparation_uses_earliest_sample_boundary_and_keeps_rollback_ready() {
-    let mut sampler = Sampler::default();
-    sampler.reset();
+    let mut sampler = evidence::Evidence::default();
+    assert_eq!(sampler.remaining(SAMPLE, Duration::ZERO), SAMPLE);
+    assert!(sampler.push(100.0, 0.5, 0.0).is_none());
     assert_eq!(
-        sampler.earliest_score_in(SAMPLE, Duration::ZERO),
-        SAMPLE * 3
-    );
-    assert_eq!(sampler.push(100.0), None);
-    assert_eq!(sampler.push(100.0), None);
-    assert_eq!(
-        sampler.earliest_score_in(SAMPLE, Duration::from_secs(2)),
+        sampler.remaining(SAMPLE, Duration::from_millis(1500)),
         Duration::from_millis(500)
     );
     let mut policy = Policy::refine(16, 1, 64);
@@ -622,7 +699,7 @@ fn distant_probe_releases_spares_then_prepares_before_it_is_due() {
     let mut policy = Policy::refine(16, 1, 64);
     policy.state = State::Hold;
     policy.due = [60, 60];
-    let sampler = Sampler::default();
+    let sampler = evidence::Evidence::default();
     let lead = Duration::from_secs(21); // measured ten seconds, doubled plus margin
     let plan = policy.connection_plan(&sampler, SAMPLE, Duration::ZERO, lead, true);
     assert_eq!(
@@ -632,21 +709,21 @@ fn distant_probe_releases_spares_then_prepares_before_it_is_due() {
             keep: 16
         }
     );
-    policy.tick = 55; // 25 seconds until earliest probe: retain, not yet open
+    policy.tick = 50; // 25 seconds until earliest probe: retain, not yet open
     let plan = policy.connection_plan(&sampler, SAMPLE, Duration::ZERO, lead, true);
     assert_eq!(plan.connect, 16);
     assert!(plan.keep >= 21);
-    policy.tick = 56; // 20 seconds: open now, before the policy changes
+    policy.tick = 52; // 20 seconds: open now, before the policy changes
     let plan = policy.connection_plan(&sampler, SAMPLE, Duration::ZERO, lead, true);
     assert_eq!(plan.connect, 21);
     assert_eq!(policy.n, 16);
-    assert_eq!(policy.tick, 56);
+    assert_eq!(policy.tick, 52);
 }
 
 #[test]
 fn preparation_respects_limits_and_skips_speculation_at_the_tail() {
     let policy = Policy::new(16, 1, 18);
-    let sampler = Sampler::default();
+    let sampler = evidence::Evidence::default();
     let lead = Duration::from_secs(30);
     let plan = policy.connection_plan(&sampler, SAMPLE, Duration::ZERO, lead, true);
     assert_eq!(plan.connect, 18);
@@ -690,22 +767,22 @@ fn warming_forecast_waits_for_candidate_measurements_not_baseline_refresh() {
     ] {
         assert_eq!(policy.observe(100.0), candidate);
         assert_eq!(policy.active(), 16);
-        let mut baseline = Sampler::default();
-        assert_eq!(baseline.push(100.0), None);
+        let mut baseline = evidence::Evidence::default();
+        assert!(baseline.push(100.0, 0.5, 0.0).is_none());
         // The next baseline score is due now, but the candidate still needs a
-        // discarded sample plus two measured samples after activation.
-        let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(6), true);
+        // fresh window after activation.
+        let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(1), true);
         assert_eq!(plan.connect, candidate);
         assert!(plan.keep >= candidate);
         assert!(policy.refresh_warming_baseline(100.0));
-        let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(6), true);
+        let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(1), true);
         assert_eq!(plan.connect, candidate);
         // Truly slow setup can still justify overlapping preparation, using the
         // earliest post-activation decision rather than a baseline refresh.
         let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(10), true);
         assert_eq!(plan.connect, following);
         policy.activated();
-        let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(6), true);
+        let plan = policy.connection_plan(&baseline, SAMPLE, SAMPLE, Duration::from_secs(1), true);
         assert_eq!(plan.connect, following);
     }
 }
@@ -746,6 +823,25 @@ fn setup_lead_includes_retries_and_does_not_shrink_after_one_fast_setup() {
     gate.mark_warming(1);
     gate.mark_ready(1);
     assert!(gate.setup_lead() >= Duration::from_secs(21));
+    let mut policy = Policy::refine(1, 1, 4);
+    policy.state = State::Hold;
+    policy.due = [12, 12];
+    policy.advance_time(Duration::ZERO, SAMPLE);
+    let plan = |lead| {
+        policy.connection_plan(
+            &evidence::Evidence::default(),
+            SAMPLE,
+            Duration::ZERO,
+            lead,
+            true,
+        )
+    };
+    assert!(plan(gate.setup_lead()).keep > 1);
+    // Even without another setup, the earlier retry must cease to keep
+    // this spare open indefinitely.
+    gate.setups.lock().unwrap()[0].0 -= SAMPLE * (EVIDENCE_MAX_AGE as u32 + 1);
+    gate.prepare(plan(gate.setup_lead()));
+    assert!(!gate.park(1, || false));
 }
 
 #[test]
@@ -756,7 +852,7 @@ fn missed_preparation_still_waits_for_ready_connections_and_optional_failure_iso
         gate.mark_ready(id);
     }
     let plan = policy.connection_plan(
-        &Sampler::default(),
+        &evidence::Evidence::default(),
         SAMPLE,
         Duration::ZERO,
         Duration::from_secs(10),
@@ -786,7 +882,7 @@ fn a_preparation_pause_does_not_close_imminently_needed_spares() {
     policy.state = State::Hold;
     policy.due = [1, 1];
     let plan = policy.connection_plan(
-        &Sampler::default(),
+        &evidence::Evidence::default(),
         SAMPLE,
         Duration::ZERO,
         Duration::from_secs(10),
@@ -804,8 +900,7 @@ fn one_worker_start_prepares_spare_before_initial_connection_is_ready() {
     let gate = Gate::new(1);
     assert_eq!(gate.begin_warming(1), vec![0]);
     assert!(!gate.ready_through(1));
-    let mut sampler = Sampler::default();
-    sampler.reset();
+    let sampler = evidence::Evidence::default();
     let mut policy = Policy::new(1, 1, 8);
     let plan = policy.connection_plan(
         &sampler,

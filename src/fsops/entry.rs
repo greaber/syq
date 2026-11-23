@@ -305,6 +305,34 @@ impl FsOps {
         Ok(())
     }
 
+    /// Enrich only a bounded single-frame reply. If capture fails, let the
+    /// planner inspect the paths it actually needs after directory handling,
+    /// where it reports the ordinary capture error.
+    pub(super) fn capture_plan_entries(
+        &self,
+        paths: &[PathBytes],
+        entries: &mut [Option<Entry>],
+        bytes: &mut usize,
+    ) -> bool {
+        for (path, entry) in paths.iter().zip(entries) {
+            if let Some(entry) = entry {
+                if self
+                    .capture_entry_metadata(path, None, false, entry)
+                    .is_err()
+                {
+                    return false;
+                }
+                *bytes += entry.size_hint();
+            } else {
+                *bytes += 1;
+            }
+            if *bytes > crate::proto::METADATA_BATCH_BYTES {
+                return false;
+            }
+        }
+        true
+    }
+
     pub(super) fn stat_many_request(
         &mut self,
         paths: &[PathBytes],

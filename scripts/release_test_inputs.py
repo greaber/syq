@@ -33,6 +33,8 @@ def prose(path):
     return (path in {'README.md', 'CHANGELOG.md', 'RELEASING.md', 'CONTRIBUTING.md', 'AGENTS.md',
                      'PRINCIPLES.md'}
             or path.startswith('.github/release-notes/') and path.endswith('.md')
+            # Agent skills hold guidance moved out of AGENTS.md; they are not test inputs.
+            or path.startswith(('.claude/skills/', '.agents/skills/')) and path.endswith('.md')
             or path.startswith('docs/') and path.endswith('.md') and path not in EXAMPLE_PAGES)
 
 

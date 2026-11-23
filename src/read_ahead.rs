@@ -1,9 +1,9 @@
 //! Source-page preparation for already-owned read ranges. No transport or
-//! payload queue lives here. Dropping a range fences all its advisory work;
-//! the bounded helper can be reused for another range, file, or attempt.
+//! payload queue lives here. Dropping a range fences all its advisory work
+//! and frees the helper for other transfers.
 use std::fs::File;
 use std::ops::Range;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -11,7 +11,9 @@ use std::thread::JoinHandle;
 
 pub(crate) const BLOCK: u64 = 1 << 20;
 const LOOKAHEAD: u64 = 4 * BLOCK;
-const REQUEST: u64 = 128 << 10;
+const ADVICE_BYTES: u64 = 128 << 10;
+// Recheck long cached reads occasionally in case the next region needs I/O.
+const PROBE_INTERVAL: u64 = 64 * BLOCK;
 
 struct Budget {
     active: AtomicUsize,
@@ -58,8 +60,10 @@ struct Window {
 #[derive(Default)]
 struct State {
     window: Option<Window>,
+    #[cfg(debug_assertions)]
     in_flight: bool,
     stopped: bool,
+    waiting: bool,
 }
 
 struct Worker {
@@ -122,8 +126,10 @@ impl Worker {
                     let request = state.window.as_mut().and_then(|window| {
                         window.offset = window.offset.max(window.copied);
                         let end = window.end.min(window.copied.saturating_add(LOOKAHEAD));
-                        let len = REQUEST.min(end.saturating_sub(window.offset));
-                        if len == 0 {
+                        // Linux can cap WILLNEED at 128 KiB on some devices.
+                        // Step by that size to cover the whole lookahead window.
+                        let len = ADVICE_BYTES.min(end.saturating_sub(window.offset));
+                        if len == 0 || (len < ADVICE_BYTES && end < window.end) {
                             return None;
                         }
                         let request = (window.source.clone(), window.offset, len);
@@ -131,19 +137,27 @@ impl Worker {
                         Some(request)
                     });
                     let Some((source, offset, len)) = request else {
+                        state.waiting = true;
                         state = wake.wait(state).unwrap_or_else(|e| e.into_inner());
+                        state.waiting = false;
                         continue;
                     };
-                    state.in_flight = true;
+                    #[cfg(debug_assertions)]
+                    {
+                        state.in_flight = true;
+                    }
                     drop(state);
                     let error = advise(source.as_raw_fd(), offset, len);
                     drop(source);
                     state = lock.lock().unwrap_or_else(|e| e.into_inner());
-                    state.in_flight = false;
                     if error != 0 {
                         state.window = None;
                     }
-                    wake.notify_all();
+                    #[cfg(debug_assertions)]
+                    {
+                        state.in_flight = false;
+                        wake.notify_all();
+                    }
                 }
             })?;
         Ok(Self {
@@ -156,6 +170,7 @@ impl Worker {
     fn begin(&self, source: File, copied: u64, end: u64) {
         let (lock, wake) = &*self.shared;
         let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(debug_assertions)]
         debug_assert!(state.window.is_none() && !state.in_flight);
         state.window = Some(Window {
             source: Arc::new(source),
@@ -168,10 +183,13 @@ impl Worker {
 
     fn advance(&self, copied: u64) {
         let (lock, wake) = &*self.shared;
-        if let Some(window) = &mut lock.lock().unwrap_or_else(|e| e.into_inner()).window {
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(window) = &mut state.window {
             window.copied = copied;
+            if state.waiting {
+                wake.notify_one();
+            }
         }
-        wake.notify_one();
     }
 
     /// Wait until the helper has advised the window that `begin` opened at
@@ -191,20 +209,10 @@ impl Worker {
             state = wake.wait(state).unwrap_or_else(|e| e.into_inner());
         }
     }
-
-    fn finish(&self) {
-        let (lock, wake) = &*self.shared;
-        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
-        state.window = None;
-        while state.in_flight {
-            state = wake.wait(state).unwrap_or_else(|e| e.into_inner());
-        }
-    }
 }
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        self.finish();
         let (lock, wake) = &*self.shared;
         lock.lock().unwrap_or_else(|e| e.into_inner()).stopped = true;
         wake.notify_one();
@@ -214,12 +222,17 @@ impl Drop for Worker {
     }
 }
 
-/// Includes idle helpers in the process-wide budget: connection reuse must
-/// never accumulate an unbounded number of sleeping helper threads.
+/// A helper owns a permit only for the lifetime of its range. An idle
+/// connection keeps the observation state but has no helper thread.
 #[derive(Default)]
 pub(crate) struct ReadAhead {
     worker: Option<Worker>,
     stream: Option<Stream>,
+    bytes_until_probe: u64,
+    // The reader keeps its source descriptors cached across consecutive reads.
+    next_read: Option<(RawFd, u64)>,
+    #[cfg(test)]
+    test_budget: Option<Arc<Budget>>,
     observation: Option<Arc<crate::transfer_observations::Actor>>,
     helper_observation: Option<Arc<crate::transfer_observations::Actor>>,
 }
@@ -245,6 +258,7 @@ impl ReadAhead {
     /// reads, but must be fenced before the stream stops or releases a suffix.
     pub(crate) fn begin_stream(&mut self, range: Range<u64>) {
         self.end_stream();
+        self.bytes_until_probe = 0;
         self.stream = Some(Stream {
             range,
             active: false,
@@ -255,27 +269,27 @@ impl ReadAhead {
     pub(crate) fn shrink_stream(&mut self, end: u64) {
         if let Some(stream) = &mut self.stream {
             if end < stream.range.end {
-                if stream.active {
-                    let _wait = self
-                        .observation
-                        .as_ref()
-                        .map(|a| a.span(crate::transfer_observations::Stage::PrefetchFence));
-                    self.worker.as_ref().unwrap().finish();
-                }
                 stream.range.end = end;
                 stream.active = false;
                 stream.attempted = false;
+                self.stop_worker();
+                self.bytes_until_probe = 0;
             }
         }
     }
 
     pub(crate) fn end_stream(&mut self) {
-        if self.stream.take().is_some_and(|stream| stream.active) {
+        self.stream = None;
+        self.stop_worker();
+    }
+
+    fn stop_worker(&mut self) {
+        if let Some(worker) = self.worker.take() {
             let _wait = self
                 .observation
                 .as_ref()
                 .map(|a| a.span(crate::transfer_observations::Stage::PrefetchFence));
-            self.worker.as_ref().unwrap().finish();
+            drop(worker);
         }
     }
 
@@ -304,6 +318,27 @@ impl ReadAhead {
         data: &mut [u8],
         off: u64,
     ) -> std::io::Result<()> {
+        let observation = self.observation.clone();
+        self.read_exact_at_with(source, data, off, Activity::sample, |chunk, copied| {
+            let read = observation
+                .as_ref()
+                .map(|a| a.span(crate::transfer_observations::Stage::SourceRead));
+            source.read_exact_at(chunk, copied)?;
+            if let Some(read) = read {
+                read.bytes(chunk.len() as u64);
+            }
+            Ok(())
+        })
+    }
+
+    fn read_exact_at_with(
+        &mut self,
+        source: &File,
+        mut data: &mut [u8],
+        off: u64,
+        mut sample: impl FnMut() -> Activity,
+        mut read: impl FnMut(&mut [u8], u64) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
         let end = off
             .checked_add(data.len() as u64)
             .filter(|end| *end <= i64::MAX as u64)
@@ -313,7 +348,10 @@ impl ReadAhead {
                     "source range exceeds file offsets",
                 )
             })?;
-        let observation = self.observation.clone();
+        let fd = source.as_raw_fd();
+        if self.next_read.take() != Some((fd, off)) {
+            self.bytes_until_probe = 0;
+        }
         let mut range = if let Some(stream) = &self.stream {
             let (bounds, active, attempted) =
                 (stream.range.clone(), stream.active, stream.attempted);
@@ -329,23 +367,40 @@ impl ReadAhead {
             self.range(source, off..end)
         };
         let mut copied = off;
-        for chunk in data.chunks_mut(BLOCK as usize) {
-            let before = (range.needs_observation()
-                && copied + (chunk.len() as u64) < range.range.end)
-                .then(Activity::sample);
-            {
-                let read = observation
-                    .as_ref()
-                    .map(|a| a.span(crate::transfer_observations::Stage::SourceRead));
-                source.read_exact_at(chunk, copied)?;
-                if let Some(read) = read {
-                    read.bytes(chunk.len() as u64);
+        let mut sampled = false;
+        while !data.is_empty() {
+            let block = data.len().min(BLOCK as usize);
+            let probe = !sampled
+                && range.needs_observation()
+                && range.preparation.bytes_until_probe == 0
+                && copied + (block as u64) < range.range.end;
+            // A short first read can start prefetch before the rest of the
+            // request. Once cached, issue full reads between samples. Active
+            // readers advance by blocks so the helper can replenish ahead.
+            let len = if probe || range.active {
+                block
+            } else {
+                data.len()
+            };
+            let (chunk, remaining) = data.split_at_mut(len);
+            let before = probe.then(&mut sample);
+            read(chunk, copied)?;
+            copied += len as u64;
+            let prepare = before.is_some_and(|before| sample().read_wait_since(before));
+            range.advance(copied, prepare);
+            if probe {
+                sampled = true;
+                if !prepare && !range.active {
+                    range.preparation.bytes_until_probe = PROBE_INTERVAL;
                 }
             }
-            copied += chunk.len() as u64;
-            let prepare = before.is_some_and(|before| Activity::sample().read_wait_since(before));
-            range.advance(copied, prepare);
+            range.preparation.bytes_until_probe = range
+                .preparation
+                .bytes_until_probe
+                .saturating_sub(len as u64);
+            data = remaining;
         }
+        range.preparation.next_read = Some((fd, end));
         range.preserve_stream();
         Ok(())
     }
@@ -387,19 +442,21 @@ impl PreparedRange<'_> {
         if self.attempted || !should_prepare {
             return;
         }
-        if self.preparation.worker.is_none() {
-            let Some(permit) = budget().acquire() else {
-                return;
-            };
-            self.attempted = true;
-            self.preparation.worker =
-                Worker::start(permit, self.preparation.helper_observation.clone()).ok();
-        }
-        self.attempted = true;
-        let Some(worker) = &self.preparation.worker else {
+        let helper_budget = budget();
+        #[cfg(test)]
+        let helper_budget = self
+            .preparation
+            .test_budget
+            .as_ref()
+            .unwrap_or(helper_budget);
+        let Some(permit) = helper_budget.acquire() else {
             return;
         };
+        self.attempted = true;
         let Ok(source) = self.source.try_clone() else {
+            return;
+        };
+        let Ok(worker) = Worker::start(permit, self.preparation.helper_observation.clone()) else {
             return;
         };
         worker.begin(source, copied, self.range.end);
@@ -407,6 +464,7 @@ impl PreparedRange<'_> {
         if std::env::var_os("SYQ_TEST_READ_AHEAD_FIRST_ADVICE").is_some() {
             worker.wait_for_first_advice(copied);
         }
+        self.preparation.worker = Some(worker);
         self.active = true;
         if crate::output::debug() {
             crate::output::diagnostic!(
@@ -421,12 +479,7 @@ impl Drop for PreparedRange<'_> {
     fn drop(&mut self) {
         if !self.preserve {
             if self.active {
-                let _wait = self
-                    .preparation
-                    .observation
-                    .as_ref()
-                    .map(|a| a.span(crate::transfer_observations::Stage::PrefetchFence));
-                self.preparation.worker.as_ref().unwrap().finish();
+                self.preparation.stop_worker();
             }
             if let Some(stream) = &mut self.preparation.stream {
                 stream.active = false;
@@ -478,24 +531,158 @@ mod tests {
         assert!(preparation.worker.is_none());
     }
     #[test]
-    fn finished_ranges_release_the_source_and_reuse_a_bounded_helper() {
+    fn cached_reads_use_full_requests_between_probes() {
+        use std::cell::Cell;
+
+        let source = tempfile::tempfile().unwrap();
+        let mut data = vec![0; LOOKAHEAD as usize];
+        for streamed in [false, true] {
+            let mut preparation = ReadAhead::default();
+            if streamed {
+                preparation.begin_stream(0..PROBE_INTERVAL + LOOKAHEAD);
+            }
+            for off in (0..=PROBE_INTERVAL).step_by(data.len()) {
+                let samples = Cell::new(0);
+                let mut reads = Vec::new();
+                preparation
+                    .read_exact_at_with(
+                        &source,
+                        &mut data,
+                        off,
+                        || {
+                            samples.set(samples.get() + 1);
+                            Activity::default()
+                        },
+                        |chunk, copied| {
+                            reads.push((copied, chunk.len() as u64));
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                if off == 0 || off == PROBE_INTERVAL {
+                    assert_eq!(samples.get(), 2);
+                    assert_eq!(reads, [(off, BLOCK), (off + BLOCK, LOOKAHEAD - BLOCK)]);
+                } else {
+                    assert_eq!(samples.get(), 0);
+                    assert_eq!(reads, [(off, LOOKAHEAD)]);
+                }
+                assert!(preparation.worker.is_none());
+            }
+        }
+    }
+
+    fn record_reads(
+        preparation: &mut ReadAhead,
+        source: &File,
+        data: &mut [u8],
+        off: u64,
+        waited: bool,
+    ) -> (usize, Vec<u64>) {
+        let mut samples = 0;
+        let mut reads = Vec::new();
+        preparation
+            .read_exact_at_with(
+                source,
+                data,
+                off,
+                || {
+                    samples += 1;
+                    Activity {
+                        waits: Some(if waited { samples as libc::c_long } else { 0 }),
+                        ..Activity::default()
+                    }
+                },
+                |chunk, _| {
+                    reads.push(chunk.len() as u64);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        (samples, reads)
+    }
+
+    #[test]
+    fn cached_probe_delay_ends_at_a_jump_or_descriptor_change() {
+        let tree = crate::test_support::tempdir().unwrap();
+        let source = File::create(tree.path().join("first")).unwrap();
+        let other = File::create(tree.path().join("second")).unwrap();
+        let mut preparation = ReadAhead::default();
+        let mut data = vec![0; LOOKAHEAD as usize];
+        let mut read = |source, off| record_reads(&mut preparation, source, &mut data, off, false);
+        assert_eq!(read(&source, BLOCK), (2, vec![BLOCK, LOOKAHEAD - BLOCK]));
+        assert_eq!(read(&source, BLOCK + LOOKAHEAD), (0, vec![LOOKAHEAD]));
+        assert_eq!(
+            read(&source, 4 * LOOKAHEAD),
+            (2, vec![BLOCK, LOOKAHEAD - BLOCK])
+        );
+        assert_eq!(
+            read(&other, 5 * LOOKAHEAD),
+            (2, vec![BLOCK, LOOKAHEAD - BLOCK])
+        );
+    }
+
+    #[test]
+    fn uncached_probe_starts_block_reads_across_a_stream() {
+        let tree = crate::test_support::tempdir().unwrap();
+        let source = File::create_new(tree.path().join("source")).unwrap();
+        source.set_len(2 * LOOKAHEAD).unwrap();
+        let mut data = vec![0; LOOKAHEAD as usize];
+        let mut preparation = ReadAhead {
+            test_budget: Some(Arc::new(Budget {
+                active: AtomicUsize::new(0),
+                limit: 1,
+            })),
+            ..ReadAhead::default()
+        };
+        preparation.begin_stream(0..2 * LOOKAHEAD);
+
+        let (samples, reads) = record_reads(&mut preparation, &source, &mut data, 0, true);
+        assert_eq!(samples, 2);
+        assert_eq!(reads, [BLOCK; 4]);
+        assert!(preparation.stream.as_ref().unwrap().active);
+        assert!(preparation.worker.is_some());
+
+        let (samples, reads) = record_reads(&mut preparation, &source, &mut data, LOOKAHEAD, true);
+        assert_eq!(samples, 0);
+        assert_eq!(reads, [BLOCK; 4]);
+        assert!(preparation.stream.as_ref().unwrap().active);
+        assert!(preparation.worker.is_some());
+
+        preparation.end_stream();
+        assert!(preparation.worker.is_none());
+    }
+
+    #[test]
+    fn uncached_read_probes_again_when_a_helper_slot_frees() {
+        let tree = crate::test_support::tempdir().unwrap();
+        let source = File::create_new(tree.path().join("source")).unwrap();
+        source.set_len(2 * LOOKAHEAD).unwrap();
+        let mut data = vec![0; LOOKAHEAD as usize];
         let budget = Arc::new(Budget {
             active: AtomicUsize::new(0),
             limit: 1,
         });
-        let worker = Worker::start(budget.acquire().unwrap(), None).unwrap();
-        for start in [4096, 65536] {
-            worker.begin(tempfile::tempfile().unwrap(), start, start + 4096);
-            worker.finish();
-            let state = worker.shared.0.lock().unwrap();
-            assert!(state.window.is_none() && !state.in_flight);
-            assert!(budget.acquire().is_none());
-        }
-        drop(worker);
-        assert!(budget.acquire().is_some());
+        let permit = budget.acquire().unwrap();
+        let mut preparation = ReadAhead {
+            test_budget: Some(budget),
+            ..ReadAhead::default()
+        };
+        preparation.begin_stream(0..2 * LOOKAHEAD);
+
+        let (samples, reads) = record_reads(&mut preparation, &source, &mut data, 0, true);
+        assert_eq!(samples, 2);
+        assert_eq!(reads, [BLOCK, LOOKAHEAD - BLOCK]);
+        assert!(preparation.worker.is_none());
+
+        drop(permit);
+        let (samples, reads) = record_reads(&mut preparation, &source, &mut data, LOOKAHEAD, true);
+        assert_eq!(samples, 2);
+        assert_eq!(reads, [BLOCK; 4]);
+        assert!(preparation.worker.is_some());
     }
+
     #[test]
-    fn advice_stays_inside_demand_and_finish_fences_inflight_work() {
+    fn advice_covers_the_window_and_stream_end_fences_work_and_releases_the_permit() {
         use std::sync::mpsc;
         use std::time::Duration;
         let budget = Arc::new(Budget {
@@ -504,40 +691,49 @@ mod tests {
         });
         let (entered, requests) = mpsc::channel();
         let (release, proceed) = mpsc::channel();
-        let worker = Arc::new(
-            Worker::start_with(budget.acquire().unwrap(), move |_, off, len| {
-                entered.send((off, len)).unwrap();
-                proceed.recv_timeout(Duration::from_secs(5)).unwrap();
-                0
-            })
-            .unwrap(),
-        );
-        let source = tempfile::tempfile().unwrap();
-        worker.begin(source, 4096, 8192);
+        let worker = Worker::start_with(budget.acquire().unwrap(), move |_, off, len| {
+            entered.send((off, len)).unwrap();
+            proceed.recv_timeout(Duration::from_secs(5)).unwrap();
+            0
+        })
+        .unwrap();
+        let start = 4096;
+        let tail = ADVICE_BYTES / 2;
+        let end = start + LOOKAHEAD + tail;
+        worker.begin(tempfile::tempfile().unwrap(), start, end);
+        for off in (start..start + LOOKAHEAD).step_by(ADVICE_BYTES as usize) {
+            assert_eq!(
+                requests.recv_timeout(Duration::from_secs(5)).unwrap(),
+                (off, ADVICE_BYTES)
+            );
+            if off + ADVICE_BYTES == start + LOOKAHEAD {
+                worker.advance(start + tail);
+            }
+            release.send(()).unwrap();
+        }
         assert_eq!(
             requests.recv_timeout(Duration::from_secs(5)).unwrap(),
-            (4096, 4096)
+            (start + LOOKAHEAD, tail)
         );
+
+        let mut preparation = ReadAhead::default();
+        preparation.begin_stream(start..end);
+        preparation.worker = Some(worker);
+        preparation.stream.as_mut().unwrap().active = true;
         let (finished, done) = mpsc::channel();
-        let finisher = worker.clone();
         let join = std::thread::spawn(move || {
-            finisher.finish();
+            preparation.end_stream();
+            assert!(preparation.worker.is_none());
+            assert!(preparation.stream.is_none());
             finished.send(()).unwrap();
         });
         assert!(done.recv_timeout(Duration::from_millis(30)).is_err());
+        assert!(budget.acquire().is_none());
         release.send(()).unwrap();
         done.recv_timeout(Duration::from_secs(5)).unwrap();
         join.join().unwrap();
         assert!(requests.try_recv().is_err());
-        // A disjoint new request must not advise the gap or the old source.
-        worker.begin(tempfile::tempfile().unwrap(), 65536, 65537);
-        assert_eq!(
-            requests.recv_timeout(Duration::from_secs(5)).unwrap(),
-            (65536, 1)
-        );
-        release.send(()).unwrap();
-        worker.finish();
-        assert!(requests.try_recv().is_err());
+        assert!(budget.acquire().is_some());
     }
 
     #[test]
@@ -554,16 +750,7 @@ mod tests {
         assert!(preparation.stream.as_ref().unwrap().active);
         preparation.shrink_stream(2 * BLOCK);
         assert_eq!(preparation.stream.as_ref().unwrap().range.end, 2 * BLOCK);
-        assert!(preparation
-            .worker
-            .as_ref()
-            .unwrap()
-            .shared
-            .0
-            .lock()
-            .unwrap()
-            .window
-            .is_none());
+        assert!(preparation.worker.is_none());
         {
             let mut range = preparation.range(&source, BLOCK..2 * BLOCK);
             range.advance(BLOCK, true);
@@ -575,16 +762,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
         assert!(!preparation.stream.as_ref().unwrap().active);
-        assert!(preparation
-            .worker
-            .as_ref()
-            .unwrap()
-            .shared
-            .0
-            .lock()
-            .unwrap()
-            .window
-            .is_none());
+        assert!(preparation.worker.is_none());
         preparation.end_stream();
         assert!(preparation.stream.is_none());
     }

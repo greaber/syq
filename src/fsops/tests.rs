@@ -252,6 +252,56 @@ fn selected_hash_is_independent_of_payload_integrity() {
 }
 
 #[test]
+fn range_reads_reuse_a_returned_buffer_after_short_reads_and_errors() {
+    let directory = crate::test_support::tempdir().unwrap();
+    let path = directory.path().join("source");
+    fs::write(&path, b"0123456789abcdef").unwrap();
+    let path = path.as_os_str().as_bytes();
+    let mut operations = FsOps::new();
+    let read = |operations: &mut FsOps, off, len| match operations
+        .read_range(path, None, 0, off, len)
+        .unwrap()
+    {
+        Response::Block { data, .. } => data,
+        other => panic!("unexpected response {other:?}"),
+    };
+
+    let first = read(&mut operations, 0, 13);
+    let storage = first.as_ptr();
+    operations.reuse_read_buffer(first);
+    // A shorter range, then a longer one within the capacity, keep it.
+    let shorter = read(&mut operations, 12, 4);
+    assert_eq!((shorter.as_ptr(), &shorter[..]), (storage, &b"cdef"[..]));
+    operations.reuse_read_buffer(shorter);
+    let longer = read(&mut operations, 3, 13);
+    assert_eq!(
+        (longer.as_ptr(), &longer[..]),
+        (storage, &b"3456789abcdef"[..])
+    );
+    operations.reuse_read_buffer(longer);
+
+    // A read past the end fails and keeps the buffer for the next read.
+    assert!(operations.read_range(path, None, 0, 12, 8).is_err());
+    let after_error = read(&mut operations, 0, 4);
+    assert_eq!(
+        (after_error.as_ptr(), &after_error[..]),
+        (storage, &b"0123"[..])
+    );
+
+    // Only one buffer is kept, and none larger than a read may be.
+    let mut operations = FsOps::new();
+    let oversized = Vec::with_capacity(crate::proto::MAX_READ_BYTES as usize + 1);
+    let oversized_storage = oversized.as_ptr();
+    operations.reuse_read_buffer(oversized);
+    let fresh = read(&mut operations, 0, 4);
+    assert_ne!(fresh.as_ptr(), oversized_storage);
+    operations.reuse_read_buffer(after_error);
+    operations.reuse_read_buffer(fresh);
+    let kept = read(&mut operations, 0, 4);
+    assert_eq!(kept.as_ptr(), storage);
+}
+
+#[test]
 fn an_inplace_ranged_copy_writes_only_a_file_it_creates() {
     // A new in-place destination is created exclusively at its name, and
     // the metadata read at its creation serves the condition check, the
@@ -1913,6 +1963,47 @@ fn unlink_never_recurses_into_a_directory() {
     assert!(errs[1].is_none() && !dir.join("f").exists());
     assert!(errs[2].is_none(), "a vanished leaf is not an error");
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn plan_batch_keeps_requested_inode_metadata_and_bounds_its_reply() {
+    let tree = crate::test_support::tempdir().unwrap();
+    fs::write(tree.path().join("leaf"), b"data").unwrap();
+    let paths = vec![path_bytes(&tree.path().join("leaf"))];
+    let mut ops = FsOps::new();
+    ops.inode_preservation = crate::inode_metadata::Selection {
+        acls: true,
+        xattrs: true,
+        atimes: true,
+        crtimes: cfg!(target_os = "macos"),
+        ..Default::default()
+    };
+    let expected = ops.stat_many_request(&paths, None, false).unwrap();
+    let response = ops.handle(&Request::PlanBatch {
+        directories: vec![],
+        others: paths.clone(),
+        strict_metadata: false,
+    });
+    let Response::BatchPlan {
+        others: Some(entries),
+        ..
+    } = response
+    else {
+        panic!("{response:?}")
+    };
+    let actual = entries[0]
+        .as_ref()
+        .unwrap()
+        .inode_metadata
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        Some(actual),
+        expected[0].as_ref().unwrap().inode_metadata.as_ref()
+    );
+    let mut entries = ops.stat_many(&paths, false);
+    let mut bytes = crate::proto::METADATA_BATCH_BYTES;
+    assert!(!ops.capture_plan_entries(&paths, &mut entries, &mut bytes));
 }
 
 #[test]
@@ -7116,6 +7207,33 @@ fn descriptor_capacity_reservation_preserves_descriptors_and_limits() {
     reserve_descriptor_capacity(64);
     assert_eq!(capacity(), reserved, "reuse shrank the table");
     assert_eq!(descriptors(), before);
+}
+
+/// A descriptor at or above the limit, as a parent can leave one at a high
+/// number before lowering the limit, takes none of the slots below it, so
+/// the snapshot does not count it.
+#[test]
+fn live_descriptor_snapshot_leaves_out_descriptors_above_the_limit() {
+    let limits = nofile_limits().unwrap();
+    let threshold = limits.rlim_cur.min(4096);
+    let file = std::fs::File::open("/dev/null").unwrap();
+    let high = unsafe {
+        libc::fcntl(
+            std::os::fd::AsRawFd::as_raw_fd(&file),
+            libc::F_DUPFD_CLOEXEC,
+            (threshold - 1) as libc::c_int,
+        )
+    };
+    assert_eq!(
+        high,
+        (threshold - 1) as libc::c_int,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+    let below = current_open_descriptor_count(threshold - 1).unwrap();
+    let including = current_open_descriptor_count(threshold).unwrap();
+    unsafe { libc::close(high) };
+    assert_eq!(including, below + 1);
 }
 
 #[test]

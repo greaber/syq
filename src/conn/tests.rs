@@ -1003,6 +1003,156 @@ fn inactive_remote_stream_fence_does_not_write_or_take_the_reader() {
 }
 
 #[test]
+fn unexpected_last_streaming_acknowledgment_marks_the_connection_dead() {
+    let (mut conn, mut replies, mut requests) = connection_with_peer();
+    conn.begin_streaming_writes().unwrap();
+    for off in 0..2 {
+        conn.send(Request::WriteRange {
+            path: b"file".to_vec(),
+            inplace: false,
+            copy_id: [0; 16],
+            attempt: 0,
+            off,
+            hash: [0; 32],
+            data: vec![42].into(),
+        })
+        .unwrap();
+        assert!(matches!(
+            requests.read_msg::<Request>().unwrap(),
+            Request::WriteRange { off: sent, .. } if sent == off
+        ));
+    }
+    let fence = conn.fence_streaming_writes();
+    assert!(matches!(
+        requests.read_msg::<Request>().unwrap(),
+        Request::WriteStreamFence
+    ));
+    replies.write_msg(&Response::Ok).unwrap();
+    replies
+        .write_msg(&Response::Path(b"unexpected".to_vec()))
+        .unwrap();
+    replies.write_msg(&Response::WriteStreamDone).unwrap();
+
+    let err = conn.finish_streaming_writes(2, fence).unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("unexpected response to a streaming write"));
+    assert!(conn.is_dead());
+}
+
+#[test]
+fn remote_streaming_reuses_the_connection_reader_across_large_ranges() {
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    const BLOCK: usize = 64 << 10;
+    const BLOCKS: u64 = (17 << 20) / BLOCK as u64;
+    let (client, server) = UnixStream::pair().unwrap();
+    for socket in [&client, &server] {
+        let deadline = Some(Duration::from_secs(5));
+        socket.set_read_timeout(deadline).unwrap();
+        socket.set_write_timeout(deadline).unwrap();
+    }
+    let peer = std::thread::spawn(move || {
+        let mut reader = FrameReader::new(server.try_clone().unwrap());
+        let mut writer = FrameWriter::new(server, false);
+        writer.write_msg(&hello_ok()).unwrap();
+        for round in 0..2 {
+            for block in 0..BLOCKS {
+                assert!(
+                    matches!(reader.read_msg().unwrap(), Request::WriteRange { off, data, .. }
+                    if off == block * BLOCK as u64 && data.len() == BLOCK)
+                );
+                let response = if round == 0 && block == 1 {
+                    Response::EndpointError(WireError {
+                        message: "disk full".into(),
+                        io_kind: Some(WireIoKind::NoSpace),
+                        raw_os_error: None,
+                        condition_not_met: false,
+                    })
+                } else {
+                    Response::Ok
+                };
+                writer.write_msg(&response).unwrap();
+            }
+            assert!(matches!(
+                reader.read_msg().unwrap(),
+                Request::WriteStreamFence
+            ));
+            writer.write_msg(&Response::WriteStreamDone).unwrap();
+            assert!(matches!(
+                reader.read_msg().unwrap(),
+                Request::Canonicalize { .. }
+            ));
+            writer
+                .write_msg(&Response::Path(b"next operation".to_vec()))
+                .unwrap();
+        }
+    });
+    let (rx, reader) = spawn_reader(Box::new(client.try_clone().unwrap()), 1);
+    let reader_id = reader.thread().id();
+    let collector = rx.write_replies.clone();
+    let mut conn = RemoteConn {
+        batch_receipts: Default::default(),
+        deferred: Default::default(),
+        transport_stop: None,
+        observation: Default::default(),
+        child: None,
+        approved_login: None,
+        worker_setup: None,
+        w: FrameWriter::new(Box::new(client), false),
+        rx: Some(rx),
+        replies: crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH,
+        reader: Some(reader),
+        label: "stream reply reader test".into(),
+        dead: false,
+        rpc_observation: None,
+        write_stream: None,
+        peer: None,
+        tcp_socket: None,
+        named_socket: None,
+        multiplexed_ssh: false,
+        detached: false,
+    };
+    assert!(matches!(conn.recv().unwrap(), Response::HelloOk { .. }));
+    for round in 0..2 {
+        conn.begin_streaming_writes().unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            &collector,
+            &conn.rx.as_ref().unwrap().write_replies
+        ));
+        let mut data = vec![42; BLOCK];
+        for block in 0..BLOCKS {
+            data = conn
+                .send_recycling(Request::WriteRange {
+                    path: b"file".to_vec(),
+                    inplace: false,
+                    copy_id: [0; 16],
+                    attempt: 0,
+                    off: block * BLOCK as u64,
+                    hash: [0; 32],
+                    data: data.into(),
+                })
+                .unwrap()
+                .unwrap();
+        }
+        let fence = conn.fence_streaming_writes();
+        let finished = conn.finish_streaming_writes(BLOCKS, fence);
+        if round == 0 {
+            assert!(finished.unwrap_err().to_string().contains("disk full"));
+        } else {
+            finished.unwrap();
+        }
+        assert!(!conn.is_dead());
+        assert_eq!(conn.reader.as_ref().unwrap().thread().id(), reader_id);
+        assert!(
+            matches!(conn.call(Request::Canonicalize { path: b"file".to_vec() }).unwrap(), Response::Path(path) if path == b"next operation")
+        );
+    }
+    peer.join().unwrap();
+}
+
+#[test]
 fn an_old_client_is_not_retried() {
     let error: anyhow::Error = OpenSshVersionError("too old".to_owned()).into();
     assert!(is_non_retryable_connect_error(&error));

@@ -2800,8 +2800,20 @@ impl FsOps {
         if u64::from(len) > MAX_READ_BYTES {
             bail!("read length {len} exceeds the {MAX_READ_BYTES}-byte protocol limit");
         }
-        let mut data = vec![0u8; len as usize];
-        self.read_source_into(path, source, attempt, off, &mut data)?;
+        let len = len as usize;
+        let mut data = match self.read_buffer.take() {
+            Some(mut data) => {
+                // Exact, so a slightly longer range does not double the buffer.
+                data.reserve_exact(len.saturating_sub(data.len()));
+                data.resize(len, 0);
+                data
+            }
+            None => vec![0u8; len],
+        };
+        if let Err(error) = self.read_source_into(path, source, attempt, off, &mut data) {
+            self.read_buffer = Some(data);
+            return Err(error);
+        }
         let hash = if self.hash_policy.transfer_integrity {
             let _hash = self
                 .operation
@@ -2811,6 +2823,19 @@ impl FsOps {
             [0; 32]
         };
         Ok(Response::Block { off, hash, data })
+    }
+
+    /// Keep a `read_range` buffer whose bytes were sent, so the next range
+    /// read reuses its allocation. One is kept, no larger than a read may be.
+    pub(crate) fn reuse_read_buffer(&mut self, buffer: Vec<u8>) {
+        if self.read_buffer.is_none() && buffer.capacity() as u64 <= MAX_READ_BYTES {
+            self.read_buffer = Some(buffer);
+        }
+    }
+
+    /// Free the kept buffer while this connection reads no ranges.
+    pub(crate) fn release_read_buffer(&mut self) {
+        self.read_buffer = None;
     }
 
     /// Fill `data` from a source at `off`.
@@ -3619,27 +3644,39 @@ impl FsOps {
                         others.len()
                     ),
                 )?;
-                let directories = if *strict_metadata {
+                let mut dir_entries = if *strict_metadata {
                     self.prune_lookup(directories)?
                 } else {
                     self.stat_many(directories, false)
                 };
-                let safe_to_stat_others = directories.iter().all(|entry| {
+                let mut bytes = 0;
+                if self.preserving_inode_metadata()
+                    && !self.capture_plan_entries(directories, &mut dir_entries, &mut bytes)
+                {
+                    return Ok(Response::BatchPlanDeferred);
+                }
+                let safe_to_stat_others = dir_entries.iter().all(|entry| {
                     entry
                         .as_ref()
                         .is_some_and(|entry| entry.kind == Kind::Dir && entry.mode & 0o700 == 0o700)
                 });
                 let others = if safe_to_stat_others {
-                    Some(if *strict_metadata {
+                    let mut entries = if *strict_metadata {
                         self.prune_lookup(others)?
                     } else {
                         self.stat_many(others, false)
-                    })
+                    };
+                    if self.preserving_inode_metadata()
+                        && !self.capture_plan_entries(others, &mut entries, &mut bytes)
+                    {
+                        return Ok(Response::BatchPlanDeferred);
+                    }
+                    Some(entries)
                 } else {
                     None
                 };
                 Ok(Response::BatchPlan {
-                    directories,
+                    directories: dir_entries,
                     others,
                 })
             })(),

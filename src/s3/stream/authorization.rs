@@ -294,5 +294,6 @@ pub(crate) fn request(
         create_only: args.ignore_existing || existence == crate::cli::Existence::New,
         lifetime: DEFAULT_LIFETIME,
         headers: crate::s3::authorization::command_headers(options),
+        max_delete: None,
     }
 }

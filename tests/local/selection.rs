@@ -40,24 +40,40 @@ fn native_hyphen_prefixed_selector_values_require_equals() {
     );
     assert!(!t.path("detached").exists());
 
-    for (selector_args, destination) in [
-        (&["--srcs", "foo", "-"][..], "detached-bulk"),
-        (&["--srcs=foo", "-"][..], "detached-inline-bulk"),
-    ] {
-        let base = t.s("base");
-        let destination_path = t.s(destination);
-        let mut args = vec!["cp", "--cwd", base.as_str()];
-        args.extend_from_slice(selector_args);
-        args.extend_from_slice(&["--into", destination_path.as_str()]);
-        let detached_bulk = native_syq(&args);
-        assert!(!detached_bulk.status.success());
-        assert!(
-            stderr_of(&detached_bulk).contains("use --srcs=-"),
-            "{}",
-            stderr_of(&detached_bulk)
-        );
-        assert!(!t.path(destination).exists());
-    }
+    let detached_bulk = native_syq(&[
+        "cp",
+        "--cwd",
+        &t.s("base"),
+        "--srcs",
+        "foo",
+        "-",
+        "--into",
+        &t.s("detached-bulk"),
+    ]);
+    assert!(!detached_bulk.status.success());
+    assert!(
+        stderr_of(&detached_bulk).contains("use --srcs=-"),
+        "{}",
+        stderr_of(&detached_bulk)
+    );
+    assert!(!t.path("detached-bulk").exists());
+
+    // An attached value ends `--srcs`, so the `-` after it is a positional
+    // source, the directory named `-`.
+    run_native_ok(&[
+        "cp",
+        "--cwd",
+        &t.s("base"),
+        "--srcs=foo",
+        "-",
+        "--into",
+        &t.s("inline-bulk"),
+    ]);
+    assert_eq!(read(&t.path("inline-bulk/foo")), b"ordinary source");
+    assert_eq!(
+        read(&t.path("inline-bulk/-/file")),
+        b"literal hyphen directory"
+    );
 
     run_native_ok(&[
         "cp",

@@ -7,7 +7,7 @@ pub(super) struct Hashes {
     pub comparison: Option<String>,
     /// One per part; empty when uploads send no request checksum.
     pub checksums: Vec<String>,
-    /// Parts were read concurrently, so no single read saw the file finish.
+    /// Recheck the pathname once all parallel readers have finished.
     pub concurrent: bool,
 }
 
@@ -16,25 +16,38 @@ struct PartHashes {
     blake3: Option<[u8; 32]>,
 }
 
-pub(super) fn bytes(
-    bytes: &[u8],
+/// Hashes of contents already in memory, as consecutive chunks. They form a
+/// single part.
+pub(super) fn bytes<'a>(
+    chunks: impl IntoIterator<Item = &'a [u8]>,
     native: Algorithm,
     whole: HashAlgorithm,
     comparison: Option<HashAlgorithm>,
 ) -> Hashes {
-    let whole_digest = Digest::hash_bytes(whole, bytes).value;
-    let comparison = comparison.map(|algorithm| {
-        if algorithm == whole {
-            whole_digest.clone()
-        } else {
-            Digest::hash_bytes(algorithm, bytes).value
+    let mut whole_hash = whole.hasher();
+    let mut comparison_hash = comparison
+        .filter(|&algorithm| algorithm != whole)
+        .map(HashAlgorithm::hasher);
+    let mut native_hash = native.hasher();
+    for chunk in chunks {
+        whole_hash.update(chunk);
+        if let Some(hash) = &mut comparison_hash {
+            hash.update(chunk);
         }
+        if let Some(hash) = &mut native_hash {
+            hash.update(chunk);
+        }
+    }
+    let whole_digest = Digest::from_hash(whole, &whole_hash.finalize()).value;
+    let comparison = comparison.map(|algorithm| match comparison_hash.take() {
+        Some(hash) => Digest::from_hash(algorithm, &hash.finalize()).value,
+        None => whole_digest.clone(),
     });
     Hashes {
         whole: whole_digest,
         comparison,
-        checksums: native.digest(bytes).into_iter().collect(),
         concurrent: false,
+        checksums: native_hash.map(|hash| hash.finish()).into_iter().collect(),
     }
 }
 
@@ -43,7 +56,9 @@ pub(super) fn bytes(
 // reuse that read when each part starts at a BLAKE3 chunk boundary. Other whole
 // hashes use one sequential read, alongside the parts when they have work.
 // The factory gives each parallel part and whole-file pass its own reader. Its
-// end offset lets the caller check source identity after the final read.
+// end offset lets the caller check source identity after the reader's final
+// read. Readers may share one open file: the last check to run follows every
+// read.
 pub(super) fn ranges<R>(
     size: u64,
     part_size: u64,
@@ -76,7 +91,7 @@ where
             || -> Result<()> {
                 if !whole_hashes.is_empty() {
                     let mut read = open(size)?;
-                    let mut buffer = vec![0; 1024 * 1024];
+                    let mut buffer = crate::s3::file_body::scratch();
                     let mut offset = 0;
                     while offset < size {
                         let length = (size - offset).min(buffer.len() as u64) as usize;
@@ -96,7 +111,18 @@ where
     } else {
         let mut read = open(size)?;
         let mut parts = Vec::new();
-        let mut buffer = vec![0; 1024 * 1024];
+        // Most files are far smaller than the read size, and preparation
+        // hashes many at once: a whole pooled buffer each costs far more
+        // memory than one the file's size.
+        let mut small;
+        let mut pooled;
+        let buffer: &mut [u8] = if size < 1024 * 1024 {
+            small = vec![0; size as usize];
+            &mut small
+        } else {
+            pooled = crate::s3::file_body::scratch();
+            &mut pooled
+        };
         for index in 0..size.div_ceil(part_size).max(1) {
             let mut hash = native.hasher();
             let mut offset = index * part_size;
@@ -136,10 +162,10 @@ where
         }
     };
     Ok(Hashes {
+        concurrent: parallel,
         whole: digest(whole),
         comparison: comparison.map(digest),
         checksums,
-        concurrent: parallel,
     })
 }
 
@@ -172,7 +198,9 @@ where
             let mut read = open(end)?;
             let mut native = native.hasher();
             let mut subtrees = Vec::new();
-            let mut buffer = vec![0; part_size.min(1024 * 1024) as usize];
+            let mut buffer = crate::s3::file_body::scratch();
+            let length = buffer.len().min(part_size as usize);
+            let buffer = &mut buffer[..length];
             let mut offset = start;
             while offset < end {
                 let subtree_start = offset;
@@ -244,6 +272,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::bytes as bytes_hashes;
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -435,6 +464,38 @@ mod tests {
                         .filter_map(|b| native.digest(b))
                         .collect::<Vec<_>>()
                 );
+            }
+        }
+    }
+
+    /// Held contents hash the same however they are split into chunks.
+    #[test]
+    fn chunked_bytes_hash_like_one_slice() {
+        let bytes: Vec<_> = (0..3 * 1024 * 1024 + 17).map(|n| (n % 251) as u8).collect();
+        for split in [0, 1, 1024 * 1024, bytes.len()] {
+            let chunks: Vec<&[u8]> = if split == 0 {
+                Vec::new()
+            } else {
+                bytes.chunks(split).collect()
+            };
+            let content = if split == 0 { &[][..] } else { &bytes[..] };
+            for native in [Algorithm::None, Algorithm::Sha256, Algorithm::Md5] {
+                for (whole, comparison) in [
+                    (HashAlgorithm::Blake3, None),
+                    (HashAlgorithm::Blake3, Some(HashAlgorithm::Blake3)),
+                    (HashAlgorithm::Sha256, Some(HashAlgorithm::Xxh3)),
+                ] {
+                    let result = bytes_hashes(chunks.iter().copied(), native, whole, comparison);
+                    assert_eq!(result.whole, Digest::hash_bytes(whole, content).value);
+                    assert_eq!(
+                        result.comparison,
+                        comparison.map(|a| Digest::hash_bytes(a, content).value)
+                    );
+                    assert_eq!(
+                        result.checksums,
+                        native.digest(content).into_iter().collect::<Vec<_>>()
+                    );
+                }
             }
         }
     }

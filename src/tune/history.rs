@@ -57,8 +57,47 @@ const ACTIVE_RUNS: i64 = 256;
 #[derive(Clone)]
 pub(crate) struct Recorder(Arc<Mutex<Writer>>);
 
-struct Writer {
+/// A copy opens its history on another thread as it starts, so that its
+/// first byte does not wait for it; it waits only when it first needs the
+/// history, typically some milliseconds later.
+enum Store {
+    Opening(std::thread::JoinHandle<Result<Opened>>),
+    Open(Opened),
+    /// The history could not be opened, and this copy records nothing.
+    Unavailable,
+}
+
+struct Opened {
     db: Connection,
+    salt: [u8; 32],
+}
+
+impl Store {
+    /// Wait for the history to open, and return it if it did.
+    fn ready(&mut self) -> Option<&Opened> {
+        if matches!(self, Store::Opening(_)) {
+            let Store::Opening(opening) = std::mem::replace(self, Store::Unavailable) else {
+                unreachable!()
+            };
+            match opening.join() {
+                Ok(Ok(opened)) => *self = Store::Open(opened),
+                Ok(Err(error)) => diagnostic(&error),
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        }
+        self.opened()
+    }
+
+    fn opened(&self) -> Option<&Opened> {
+        match self {
+            Store::Open(opened) => Some(opened),
+            _ => None,
+        }
+    }
+}
+
+struct Writer {
+    store: Store,
     /// The run's row, which the first save creates.
     id: Option<i64>,
     day: i64,
@@ -75,7 +114,6 @@ struct Writer {
     finished: bool,
     measurements: inference::Eligibility,
     measurement_segment: i64,
-    salt: [u8; 32],
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -147,6 +185,11 @@ fn open_waiting(path: &Path, lock_wait: Duration) -> Result<Connection> {
         .recursive(true)
         .mode(0o700)
         .create(parent)?;
+    // Only create and check the file here; SQLite opens its own. Close this
+    // before SQLite opens the file: closing any descriptor on a file
+    // releases every POSIX lock the process holds on it, SQLite's included.
+    // It also keeps the history's descriptors to SQLite's while a copy
+    // counts its open descriptors (`require_source_descriptor_capacity`).
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -156,6 +199,7 @@ fn open_waiting(path: &Path, lock_wait: Duration) -> Result<Connection> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     anyhow::ensure!(file.metadata()?.is_file(), "history is not a regular file");
+    drop(file);
     let mut db = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -223,25 +267,31 @@ fn open_waiting(path: &Path, lock_wait: Duration) -> Result<Connection> {
     // Concurrent first opens can race while changing journal mode. SQLite
     // returns BUSY immediately for this lock upgrade, without the busy handler.
     // Retry only this operation, within the same small startup wait budget.
-    db.busy_timeout(Duration::ZERO)?;
-    let deadline = Instant::now() + lock_wait;
-    loop {
-        match db.pragma_update(None, "journal_mode", "WAL") {
-            Err(rusqlite::Error::SqliteFailure(error, _))
-                if error.code == rusqlite::ErrorCode::DatabaseBusy && Instant::now() < deadline =>
-            {
-                std::thread::sleep(
-                    Duration::from_millis(2)
-                        .min(deadline.saturating_duration_since(Instant::now())),
-                );
-            }
-            result => {
-                result.context("enable history WAL")?;
-                break;
+    if !db
+        .pragma_query_value(None, "journal_mode", |r| r.get::<_, String>(0))?
+        .eq_ignore_ascii_case("wal")
+    {
+        db.busy_timeout(Duration::ZERO)?;
+        let deadline = Instant::now() + lock_wait;
+        loop {
+            match db.pragma_update(None, "journal_mode", "WAL") {
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::DatabaseBusy
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(
+                        Duration::from_millis(2)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
+                result => {
+                    result.context("enable history WAL")?;
+                    break;
+                }
             }
         }
+        db.busy_timeout(lock_wait)?;
     }
-    db.busy_timeout(lock_wait)?;
     db.pragma_update(None, "foreign_keys", true)?;
     Ok(db)
 }
@@ -249,8 +299,8 @@ fn open_waiting(path: &Path, lock_wait: Duration) -> Result<Connection> {
 impl Recorder {
     pub(crate) fn start(start: Instant, details: Value) -> Option<Self> {
         let path = path()?;
-        match budget().and_then(|budget| Self::at(&path, start, details, budget)) {
-            Ok(recorder) => Some(recorder),
+        match budget() {
+            Ok(budget) => Some(Self::at(&path, start, details, budget)),
             Err(error) => {
                 diagnostic(&error);
                 None
@@ -258,7 +308,7 @@ impl Recorder {
         }
     }
 
-    fn at(path: &Path, start: Instant, details: Value, budget: u64) -> Result<Self> {
+    fn at(path: &Path, start: Instant, details: Value, budget: u64) -> Self {
         Self::at_waiting(path, start, details, budget, OPEN_LOCK_WAIT)
     }
 
@@ -269,21 +319,25 @@ impl Recorder {
         details: Value,
         budget: u64,
         lock_wait: Duration,
-    ) -> Result<Self> {
-        // Starting a copy only reads an existing history: its identity key
-        // here and, later, earlier runs for a starting count. Other copies'
-        // writes do not hold these reads up, and this copy's own run is
-        // written later, off the path to its first byte.
-        let db = open_waiting(path, lock_wait)?;
-        let salt = identity_key(&db)?;
-        db.busy_timeout(Duration::ZERO)?;
+    ) -> Self {
         // The first save is counted from here, not from `start`. A copy's
         // clock can start well before its history opens, as when choosing
         // its authorization first connects to a server, and that copy is
         // still starting.
         let opened = Instant::now();
+        let path = path.to_owned();
+        let store = std::thread::Builder::new()
+            .name("syq-history".into())
+            .spawn(move || open_store(&path, lock_wait))
+            .map_or_else(
+                |error| {
+                    diagnostic(&anyhow::Error::from(error).context("open tuning history"));
+                    Store::Unavailable
+                },
+                Store::Opening,
+            );
         let recorder = Self(Arc::new(Mutex::new(Writer {
-            db,
+            store,
             id: None,
             day: day(),
             start,
@@ -297,15 +351,17 @@ impl Recorder {
             finished: false,
             measurements: Default::default(),
             measurement_segment: 0,
-            salt,
         })));
         recorder.event("start", details);
-        Ok(recorder)
+        recorder
     }
 
     pub(crate) fn token(&self, domain: &str, value: &str) -> String {
-        let state = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        let mut h = blake3::Hasher::new_keyed(&state.salt);
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        // Without a history the key is never saved, and any salt will do.
+        state.ready();
+        let salt = state.store.opened().map_or([0; 32], |opened| opened.salt);
+        let mut h = blake3::Hasher::new_keyed(&salt);
         h.update(domain.as_bytes());
         h.update(&[0]);
         h.update(value.as_bytes());
@@ -370,9 +426,41 @@ impl Recorder {
         }
     }
 
+    /// Only a run with measured alternatives can seed a later copy. Recheck
+    /// the parts of its route that can change during a copy (including fallback).
+    pub(crate) fn finish_learning(
+        &self,
+        key: &ContextKey,
+        src: &crate::conn::Endpoint,
+        dst: &crate::conn::Endpoint,
+        automatic: bool,
+    ) {
+        let measured = self
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .measurements
+            .has_comparison();
+        if automatic && measured {
+            let consistent = key.source_transport == transport(src)
+                && key.destination_transport == transport(dst)
+                && (!(src.is_remote() || dst.is_remote())
+                    || key.network
+                        == super::network::fingerprint().map(|n| self.token("network", &n)));
+            self.event(
+                "learning_context",
+                json!({"consistent":consistent,"automatic":true}),
+            );
+        }
+    }
+
     pub(crate) fn starting_count(&self, key: &ContextKey, allow_route: bool) -> Option<Hint> {
-        let state = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        inference::starting_count(&state.db, key, allow_route)
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if !state.ready() {
+            return None;
+        }
+        let db = &state.store.opened()?.db;
+        inference::starting_count(db, key, allow_route)
             .ok()
             .flatten()
     }
@@ -381,6 +469,24 @@ impl Recorder {
     pub(crate) fn complete(&self, success: bool, summary: Value) {
         let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
         if state.finished {
+            return;
+        }
+        // A one-file or empty worker-path copy can also finish before its
+        // first measurement. Keep failures, TCP preflight diagnostics and
+        // already published timelines, but take no writer lock just for this.
+        if success
+            && state.id.is_none()
+            && state.pending.iter().any(|e| {
+                e["kind"] == "planned" && e["data"]["files"].as_u64().is_some_and(|n| n <= 1)
+            })
+            && !state.pending.iter().any(|e| {
+                matches!(
+                    e["kind"].as_str(),
+                    Some("observation" | "transition" | "tcp_preflight")
+                )
+            })
+        {
+            state.abandon();
             return;
         }
         state.record("finish", summary.clone());
@@ -392,12 +498,26 @@ impl Recorder {
 }
 
 impl Writer {
+    #[cfg(test)]
+    fn db(&mut self) -> &Connection {
+        &self.store.ready().expect("history opens").db
+    }
+
+    /// Wait for the history to open. A copy without one records nothing.
+    fn ready(&mut self) -> bool {
+        let ready = self.store.ready().is_some();
+        if !ready {
+            self.abandon();
+        }
+        ready
+    }
+
     /// Keep an event for the next save.
     fn record(&mut self, kind: &str, mut data: Value) {
         let elapsed_us = self.start.elapsed().as_micros().min(i64::MAX as u128) as u64;
         let sequence = self.sequence;
         self.sequence += 1;
-        if matches!(kind, "transition" | "sequential_evidence") {
+        if kind == "transition" {
             self.measurement_segment = sequence as i64;
         }
         if kind == "observation" {
@@ -426,6 +546,9 @@ impl Writer {
     /// ended, in one transaction, waiting at most `wait` for the writer lock.
     /// The first save creates the run's row.
     fn commit(&mut self, wait: Duration, outcome: Option<&Outcome>) -> Result<()> {
+        if !self.ready() {
+            return Ok(());
+        }
         // Other copies wait for as long as this one holds the writer lock, so
         // everything that needs no lock is done before it is taken.
         //
@@ -451,18 +574,16 @@ impl Writer {
             .collect::<Result<Vec<_>>>()?;
         let today = day();
         let id = {
-            let mut create = self.db.prepare_cached(
+            let db = &self.store.opened().expect("history is open").db;
+            let mut create = db.prepare_cached(
                 "INSERT INTO runs(day,updated_day,build,lost,context,route,source_fs,
                     destination_fs,mode,status,eligible,summary)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             )?;
-            let mut insert = self
-                .db
-                .prepare_cached("INSERT INTO events VALUES (?1,?2,?3,?4)")?;
-            let mut measurement = self
-                .db
-                .prepare_cached("INSERT INTO measurements VALUES (?1,?2,?3,?4,?5,?6,?7,?8)")?;
-            let transaction = begin_within(&self.db, wait)?;
+            let mut insert = db.prepare_cached("INSERT INTO events VALUES (?1,?2,?3,?4)")?;
+            let mut measurement =
+                db.prepare_cached("INSERT INTO measurements VALUES (?1,?2,?3,?4,?5,?6,?7,?8)")?;
+            let transaction = begin_within(db, wait)?;
             let id = if let Some(id) = self.id {
                 let found = transaction.execute(
                     "UPDATE runs SET lost=?1,updated_day=?3 WHERE id=?2",
@@ -562,8 +683,9 @@ impl Writer {
         // lock, samples, context and the outcome commit together.
         self.commit(finish_wait(self.start.elapsed()), Some(&outcome))?;
         // Maintenance is best effort and must not renew the lock-wait budget.
-        if let Some(id) = self.id.filter(|_| !self.finished) {
-            prune(&self.db, self.budget, id)?;
+        if let (Some(id), Some(opened)) = (self.id.filter(|_| !self.finished), self.store.opened())
+        {
+            prune(&opened.db, self.budget, id)?;
         }
         Ok(())
     }
@@ -597,6 +719,18 @@ fn begin_within(db: &Connection, wait: Duration) -> Result<rusqlite::Transaction
             result => return Ok(result?),
         }
     }
+}
+
+/// Open the history at `path` for a copy, as `Store` describes.
+fn open_store(path: &Path, lock_wait: Duration) -> Result<Opened> {
+    // Starting a copy only reads an existing history: its identity key
+    // here and, later, earlier runs for a starting count. Other copies'
+    // writes do not hold these reads up, and this copy's own run is
+    // written when it ends.
+    let db = open_waiting(path, lock_wait)?;
+    let salt = identity_key(&db)?;
+    db.busy_timeout(Duration::ZERO)?;
+    Ok(Opened { db, salt })
 }
 
 /// The key that makes this history's tokens, created with the history.
@@ -684,12 +818,7 @@ fn prune_within(db: &Connection, budget: u64, current: i64, time: Duration) -> R
             batch = needed.clamp(1, (batch * 4).min(PRUNE_BATCH) as i128) as usize;
         }
     }
-    if size <= budget && free > budget {
-        // Rebuilding costs time in proportion to the kept history, not to
-        // the free space, which a gradual reclaim would have to move
-        // around. This happens once after a large shrink.
-        db.execute_batch("VACUUM;")?;
-    } else if size <= budget && size + free > budget {
+    if size <= budget && size + free > budget {
         // Later runs reuse free pages, so return only the ones that keep the
         // file over the budget. Each step of this pragma moves one page and
         // commits when the statement is dropped, so the same deadline bounds
@@ -771,6 +900,15 @@ pub(crate) fn activity_mode(mut mode: String, transport: bool) -> String {
     mode
 }
 
+fn transport(endpoint: &crate::conn::Endpoint) -> String {
+    match endpoint {
+        crate::conn::Endpoint::Remote(spec) if !spec.local_process => {
+            format!("{:?}", spec.data_transport())
+        }
+        _ => "Local".into(),
+    }
+}
+
 pub(crate) fn context_key(
     recorder: &Recorder,
     src: &crate::conn::Endpoint,
@@ -779,12 +917,6 @@ pub(crate) fn context_key(
     destination: Option<&str>,
     mode: String,
 ) -> ContextKey {
-    let transport = |endpoint: &crate::conn::Endpoint| match endpoint {
-        crate::conn::Endpoint::Remote(spec) if !spec.local_process => {
-            format!("{:?}", spec.data_transport())
-        }
-        _ => "Local".into(),
-    };
     let source_transport = transport(src);
     let destination_transport = transport(dst);
     let route = format!(

@@ -102,6 +102,7 @@ impl Drop for Sending {
 pub(crate) struct Replies {
     rx: mpsc::Receiver<io::Result<ReceivedResponse>>,
     bytes: Option<Arc<QueuedBytes>>,
+    pub(super) write_replies: Arc<crate::streaming::WriteReplyState>,
 }
 
 type Reply = io::Result<ReceivedResponse>;
@@ -111,7 +112,11 @@ impl Replies {
         rx: mpsc::Receiver<io::Result<ReceivedResponse>>,
         bytes: Option<Arc<QueuedBytes>>,
     ) -> Self {
-        Self { rx, bytes }
+        Self {
+            rx,
+            bytes,
+            write_replies: Arc::default(),
+        }
     }
 
     pub(crate) fn recv(&self) -> Result<Reply, RecvError> {

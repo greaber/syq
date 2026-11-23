@@ -44,7 +44,7 @@ HARNESS = Path("tests/rsync-compat/harness_test.py")
 GROUPS = {
     "package": ("test-cargo-package.py",),
     "installer": ("test-installer.py",),
-    "benchmark": ("test-benchmark-concurrency.py", "test-try-benchmark.py"),
+    "benchmark": ("test-benchmark-concurrency.py", "test-s3-order-probe.py", "test-try-benchmark.py"),
     "release": ("test-python-sdk-release-tools.py", "test-release-tools.py"),
     "orchestration": ("test-find-release-build.py", "test-generated-sdk-post-merge-ci.py",
                       "test-nightly-ci.py", "test-release-orchestration.py",

@@ -40,6 +40,12 @@ mod file_body;
 #[path = "s3/directory_permissions.rs"]
 mod directory_permissions;
 
+#[path = "support/executable.rs"]
+mod executable;
+
+#[path = "s3/server_copies.rs"]
+mod server_copies;
+
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
@@ -69,6 +75,10 @@ struct Server {
 }
 impl Server {
     fn start(fault: &'static str) -> Self {
+        Self::with_source(fault, None)
+    }
+    fn with_source(fault: &'static str, source: Option<&Path>) -> Self {
+        let source = source.map(Arc::<Path>::from);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = format!("http://{}", listener.local_addr().unwrap());
@@ -88,8 +98,9 @@ impl Server {
                         let count = count.clone();
                         let gate = worker_gate.clone();
                         let probes = worker_probes.clone();
+                        let source = source.clone();
                         workers.push(thread::spawn(move || {
-                            serve(socket, fault, count, gate, probes)
+                            serve(socket, fault, count, gate, probes, source.as_deref())
                         }));
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -185,6 +196,18 @@ impl Server {
             .capture_output()
             .unwrap()
     }
+    /// Like `cp`, at a server taken to list in byte order, as this one does:
+    /// only there may a destination listing show a key absent. Release
+    /// builds cannot take a loopback endpoint to.
+    #[cfg(debug_assertions)]
+    fn cp_in_byte_order(&self, temp: &Path, args: &[&str]) -> Output {
+        self.command(temp)
+            .env("SYQ_TEST_S3_DIVIDE_LISTINGS", "1")
+            .args(["--s3-endpoint", &self.address])
+            .args(args)
+            .capture_output()
+            .unwrap()
+    }
 }
 impl Drop for Server {
     fn drop(&mut self) {
@@ -248,6 +271,7 @@ fn serve(
     requests: Arc<AtomicUsize>,
     gate: Arc<(AtomicBool, AtomicBool)>,
     probes: Arc<AtomicUsize>,
+    source: Option<&Path>,
 ) {
     // BSD can inherit the listener's nonblocking mode; this handler uses
     // blocking I/O with timeouts on every platform.
@@ -279,6 +303,17 @@ fn serve(
         .filter_map(|l| l.split_once(':'))
         .map(|(k, v)| (k.to_ascii_lowercase(), v.trim().to_owned()))
         .collect::<std::collections::HashMap<_, _>>();
+    if fault.starts_with("from-server") {
+        server_copies::serve(
+            &mut socket,
+            fault,
+            method,
+            first.split_whitespace().nth(1).unwrap(),
+            &headers,
+            &gate,
+        );
+        return;
+    }
     let authorization = headers.get("authorization").unwrap();
     assert!(
         authorization.contains("x-tigris-consistent"),
@@ -330,6 +365,7 @@ fn serve(
         recovery::serve_upload(
             &mut socket,
             fault,
+            source,
             method,
             first.split_whitespace().nth(1).unwrap(),
             &headers,
@@ -1416,6 +1452,10 @@ fn serve(
         }
         return;
     }
+    if fault == "parts-unordered" || fault == "parts-prefix-policy" {
+        serve_unordered_parts(&mut socket, method, first, &probes, fault);
+        return;
+    }
     if fault.starts_with("parallel-") {
         if method == "HEAD" {
             if first.starts_with("HEAD /bucket/tree ") {
@@ -1469,14 +1509,8 @@ fn serve(
             "<IsTruncated>false</IsTruncated><CommonPrefixes><Prefix>tree/a/</Prefix></CommonPrefixes><CommonPrefixes><Prefix>tree/b/</Prefix></CommonPrefixes>".to_owned()
         } else {
             let (range, next) = match (prefix, token) {
-                ("tree/" | "tree/a/", None) => (0..1000, Some("next")),
+                ("tree/", None) => (0..1000, Some("next")),
                 ("tree/", Some("next")) => (1000..2000, Some("last")),
-                ("tree/a/", Some("next")) => (1000..2000, None),
-                ("tree/b/", None)
-                    if query.get("start-after").map(|s| s.as_ref()) == Some("tree/b/2999") =>
-                {
-                    (3000..4000, None)
-                }
                 ("tree/", Some("last")) | ("tree/b/", None) => (2000..3000, Some("tail")),
                 ("tree/" | "tree/b/", Some("tail")) => (3000..4000, None),
                 other => panic!("unexpected listing {other:?}"),
@@ -2030,7 +2064,10 @@ fn serve(
         reply(&mut socket, 404, &[], b"", false);
         return;
     }
-    let size = if fault.starts_with("single")
+    let size = if fault == "single-swap" {
+        // Above the 128 KiB inline single-GET buffer so `.partial` exists while streaming.
+        256 * 1024
+    } else if fault.starts_with("single")
         || (fault.starts_with("prefix-")
             && fault != "prefix-multipart"
             && !fault.starts_with("prefix-recovery"))
@@ -2295,6 +2332,7 @@ fn s3_fixture_completes_response_on_inherited_nonblocking_socket() {
             Arc::new(AtomicUsize::new(0)),
             Arc::new((AtomicBool::new(false), AtomicBool::new(false))),
             Arc::new(AtomicUsize::new(0)),
+            None,
         )
     });
     let mut response = Vec::new();
@@ -2571,9 +2609,13 @@ fn s3_first_range_supplies_metadata_without_serializing_the_remaining_ranges() {
 #[cfg(debug_assertions)]
 #[test]
 fn s3_late_close_preserves_download_destination() {
-    for multipart in [false, true] {
+    for (fixture, expected_size, multipart) in [
+        ("single-ok", 65536, false),
+        ("ok", SIZE, false),
+        ("ok", SIZE, true),
+    ] {
         for existing in [false, true] {
-            let server = Server::start("ok");
+            let server = Server::start(fixture);
             let temp = crate::test_support::tempdir().unwrap();
             let destination = temp.path().join("download");
             if existing {
@@ -2589,7 +2631,8 @@ fn s3_late_close_preserves_download_destination() {
                 "--as",
                 "download",
             ]);
-            // The default part size keeps this fixture in download_single;
+            // `single-ok` exercises the <=128 KiB inline path; `ok` without
+            // explicit 5 MiB parts exercises the streaming single-GET path;
             // explicit 5 MiB parts take the checkpointed ranged path.
             let output = command
                 .env("SYQ_TEST_FAIL_WRITER_CLOSE", "download")
@@ -2606,12 +2649,22 @@ fn s3_late_close_preserves_download_destination() {
             } else {
                 assert!(!destination.exists());
             }
+            if !multipart {
+                assert!(!std::fs::read_dir(temp.path()).unwrap().any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".partial")));
+            }
             let retry = command
                 .env_remove("SYQ_TEST_FAIL_WRITER_CLOSE")
                 .capture_output()
                 .unwrap();
             assert!(retry.status.success(), "{}", output_text(&retry));
-            assert_eq!(std::fs::read(&destination).unwrap(), vec![b'x'; SIZE]);
+            assert_eq!(
+                std::fs::read(&destination).unwrap(),
+                vec![b'x'; expected_size]
+            );
         }
     }
 }
@@ -4803,6 +4856,7 @@ fn s3_listing_costs_are_bounded_without_changing_selection() {
     }
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn s3_upload_destination_discovery_is_bounded() {
     for (fault, placement, success, expected_requests) in [
@@ -4832,7 +4886,7 @@ fn s3_upload_destination_discovery_is_bounded() {
             std::fs::write(temp.path().join("three"), b"three").unwrap();
             args.insert(0, "three");
         }
-        let output = server.cp(temp.path(), &args);
+        let output = server.cp_in_byte_order(temp.path(), &args);
         assert_eq!(
             output.status.success(),
             success,
@@ -5431,11 +5485,12 @@ fn serve_copy_pages(socket: &mut TcpStream, first: &str, probes: &AtomicUsize) {
     }
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn s3_bucket_copy_asks_only_about_destination_keys_its_listing_shows() {
     let server = Server::start("copy-pages");
     let temp = crate::test_support::tempdir().unwrap();
-    let output = server.cp(
+    let output = server.cp_in_byte_order(
         temp.path(),
         &[
             "--from",
@@ -5455,6 +5510,7 @@ fn s3_bucket_copy_asks_only_about_destination_keys_its_listing_shows() {
     assert_eq!(server.probes.load(Ordering::Relaxed), 10);
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn s3_upload_pages_through_a_large_destination_while_copying() {
     let server = Server::start("upload-pages");
@@ -5468,18 +5524,16 @@ fn s3_upload_pages_through_a_large_destination_while_copying() {
     for n in 0..5 {
         std::fs::write(data.join(format!("zz{n}")), b"x").unwrap();
     }
-    let output = server.cp(
-        temp.path(),
-        &[
-            "--srcs-in",
-            "data",
-            "--to",
-            "s3://bucket",
-            "--into",
-            "data",
-            "--dry-run",
-        ],
-    );
+    let args = [
+        "--srcs-in",
+        "data",
+        "--to",
+        "s3://bucket",
+        "--into",
+        "data",
+        "--dry-run",
+    ];
+    let output = server.cp_in_byte_order(temp.path(), &args);
     assert!(output.status.success(), "{}", output_text(&output));
     // The copy starts after two pages; the third arrives while it runs and
     // shows the five new keys absent. Listed keys get a HEAD, new ones none.
@@ -5534,6 +5588,7 @@ fn s3_upload_asks_about_every_key_where_a_wrong_absence_would_change_the_result(
     }
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn s3_upload_continues_with_head_when_a_later_listing_page_fails() {
     let server = Server::start("upload-pages-fail");
@@ -5546,7 +5601,7 @@ fn s3_upload_continues_with_head_when_a_later_listing_page_fails() {
     for n in 0..5 {
         std::fs::write(data.join(format!("zz{n}")), b"x").unwrap();
     }
-    let output = server.cp(
+    let output = server.cp_in_byte_order(
         temp.path(),
         &[
             "--srcs-in",
@@ -5957,6 +6012,7 @@ fn server_copy_only_new_uses_a_conditional_write() {
     assert!(output.status.success(), "{}", output_text(&output));
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn server_copy_reuses_destination_discovery_and_prunes_beneath_file_keys() {
     for (fault, extra, requests) in [
@@ -5971,7 +6027,7 @@ fn server_copy_reuses_destination_discovery_and_prunes_beneath_file_keys() {
     ] {
         let server = Server::start(fault);
         let temp = crate::test_support::tempdir().unwrap();
-        let output = server.cp(
+        let output = server.cp_in_byte_order(
             temp.path(),
             &[
                 "--from",
@@ -6993,6 +7049,211 @@ fn parallel_listing_failure_stops_copy_and_removal_before_mutation() {
             output_text(&output)
         );
         assert!(!temp.path().join("out/a/file").exists());
+    }
+}
+
+/// Lists `tree/` in order, but every other listing of keys in reverse: once
+/// a divided listing has handed keys over, it must list the prefix again one
+/// request at a time. `starts` counts the listings of `tree/` begun. With
+/// `parts-prefix-policy`, a policy refuses every prefix but `tree/` instead.
+fn serve_unordered_parts(
+    socket: &mut TcpStream,
+    method: &str,
+    first: &str,
+    starts: &AtomicUsize,
+    fault: &str,
+) {
+    if method == "HEAD" {
+        if first.starts_with("HEAD /bucket/tree ") {
+            reply(socket, 404, &[], b"", true);
+        } else {
+            let fields = [
+                ("Content-Length".into(), "1".into()),
+                ("ETag".into(), "\"source\"".into()),
+            ];
+            reply(socket, 200, &fields, b"", true);
+        }
+        return;
+    }
+    assert!(first.contains("list-type=2"), "{first}");
+    let target = first.split_whitespace().nth(1).unwrap();
+    let url = url::Url::parse(&format!("http://fixture{target}")).unwrap();
+    let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
+    let prefix = query["prefix"].as_ref();
+    let delimiter = query.contains_key("delimiter");
+    if fault == "parts-prefix-policy" && prefix != "tree/" {
+        reply(
+            socket,
+            403,
+            &[],
+            b"<Error><Code>AccessDenied</Code></Error>",
+            false,
+        );
+        return;
+    }
+    // A token counts the items of the listing before the page.
+    let start: usize = query
+        .get("continuation-token")
+        .map_or(0, |token| token.parse().unwrap());
+    let mut items: Vec<String> = (0..40)
+        .flat_map(|d| (0..300).map(move |i| format!("tree/d{d:02}/{i:04}")))
+        .filter(|key| key.starts_with(prefix))
+        .map(|key| match key[prefix.len()..].find('/') {
+            Some(slash) if delimiter => key[..prefix.len() + slash + 1].to_owned(),
+            _ => key,
+        })
+        .collect();
+    items.dedup();
+    let next = (items.len() > start + 1000).then_some(start + 1000);
+    let mut page: Vec<_> = items.iter().skip(start).take(1000).collect();
+    if prefix == "tree/" && !delimiter && start == 0 {
+        starts.fetch_add(1, Ordering::Relaxed);
+    }
+    if prefix != "tree/" && !delimiter {
+        page.reverse();
+    }
+    let body = page
+        .iter()
+        .map(|item| {
+            if item.ends_with('/') {
+                format!("<CommonPrefixes><Prefix>{item}</Prefix></CommonPrefixes>")
+            } else {
+                format!("<Contents><Key>{item}</Key><Size>1</Size></Contents>")
+            }
+        })
+        .collect::<String>();
+    let body = format!(
+        "<ListBucketResult><IsTruncated>{}</IsTruncated>{}{body}</ListBucketResult>",
+        next.is_some(),
+        next.map(|token| format!("<NextContinuationToken>{token}</NextContinuationToken>"))
+            .unwrap_or_default()
+    );
+    reply(socket, 200, &[], body.as_bytes(), false);
+}
+
+// Release builds cannot divide a listing at a loopback endpoint.
+#[cfg(debug_assertions)]
+#[test]
+fn ls_says_how_to_list_a_prefix_only_its_own_listing_may_list() {
+    let temp = crate::test_support::tempdir().unwrap();
+    let server = Server::start("parts-prefix-policy");
+    let ls = |divide: bool, concurrency: &str| {
+        let process = server.command_for(temp.path(), "cp");
+        let mut command = Command::new(process.get_program());
+        for (name, value) in process.get_envs() {
+            match value {
+                Some(value) => command.env(name, value),
+                None => command.env_remove(name),
+            };
+        }
+        command.current_dir(temp.path());
+        if divide {
+            command.env("SYQ_TEST_S3_DIVIDE_LISTINGS", "1");
+        } else {
+            command.env_remove("SYQ_TEST_S3_DIVIDE_LISTINGS");
+        }
+        command.args([
+            "_ls",
+            "s3://bucket/tree/**",
+            "--s3-region",
+            "us-east-1",
+            "--s3-header",
+            "X-Tigris-Consistent: true",
+            "--s3-endpoint",
+            &server.address,
+            "--concurrency",
+            concurrency,
+        ]);
+        command.capture_output().unwrap()
+    };
+    let hint = "rerun with --concurrency 1";
+    // Divided, a part's listing is refused, and the error says what to do.
+    let output = ls(true, "32");
+    assert!(!output.status.success());
+    assert!(
+        output_text(&output).contains(hint),
+        "{}",
+        output_text(&output)
+    );
+    // That works.
+    let output = ls(true, "1");
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().count(),
+        12_000
+    );
+    // Not divided, the listing asks only for the prefix itself.
+    let output = ls(false, "32");
+    assert!(output.status.success(), "{}", output_text(&output));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().count(),
+        12_000
+    );
+}
+
+// Release builds cannot divide a listing at a loopback endpoint.
+#[cfg(debug_assertions)]
+#[test]
+fn a_divided_listing_out_of_order_is_listed_again_whole() {
+    for command in ["cp", "rm"] {
+        let temp = crate::test_support::tempdir().unwrap();
+        let server = Server::start("parts-unordered");
+        let mut process = server.command_for(temp.path(), command);
+        // The test server is not AWS; debug builds let it divide.
+        process.env("SYQ_TEST_S3_DIVIDE_LISTINGS", "1");
+        process.args([
+            "--s3-endpoint",
+            &server.address,
+            "--dry-run",
+            "--results",
+            "results.ndjson",
+        ]);
+        if command == "cp" {
+            process.args([
+                "--from",
+                "s3://bucket",
+                "--srcs-in",
+                "tree",
+                "--into",
+                "out",
+            ]);
+        } else {
+            process.args(["--on", "s3://bucket", "--srcs-in", "tree"]);
+        }
+        let output = process.capture_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{command}: {}",
+            output_text(&output)
+        );
+        // Divided first, then listed again whole.
+        assert_eq!(
+            server.probes.load(Ordering::Relaxed),
+            2,
+            "{command}: listings of tree/"
+        );
+        let (key, kind) = if command == "cp" {
+            ("src", "trace")
+        } else {
+            ("path", "removal_trace")
+        };
+        let actual: std::collections::BTreeSet<String> =
+            std::fs::read_to_string(temp.path().join("results.ndjson"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|record| record["type"] == kind)
+                .map(|record| record[key]["value"].as_str().unwrap().to_owned())
+                .collect();
+        let expected: std::collections::BTreeSet<_> = (0..40)
+            .flat_map(|d| (0..300).map(move |i| format!("tree/d{d:02}/{i:04}")))
+            .collect();
+        assert!(
+            actual == expected,
+            "{command}: {} of {} objects",
+            actual.len(),
+            expected.len()
+        );
     }
 }
 

@@ -102,8 +102,7 @@ starts from the default count, set `SYQ_TUNING_CACHE` to an empty value.
 
 ## Inspect tuning history
 
-To see why syq chose its worker counts, inspect the local timeline that each
-filesystem copy records:
+To see why syq chose its worker counts, inspect the local tuning history:
 
 ```sh
 syq tuning-cache list
@@ -120,8 +119,12 @@ records can change between versions and are not part of the
 remembered counts. When a server coordinates a copy, the history is on that
 server; S3 copies record none.
 
-A copy saves its timeline when it ends. One that runs for more than a second
-also saves it every few seconds along the way: it is listed as `incomplete`
+A small push completed on the control connection has no tuning timeline.
+Successful empty and single-file copies that finish before their first
+measurement also skip the final write unless syq changed the worker count,
+recorded TCP diagnostics, or already saved part of the timeline. Other copies
+save their timeline when they end. A copy that runs for more than a second
+also saves it every few seconds along the way. It is listed as `incomplete`
 until it ends, and stays that way, with what it had saved, if it is
 interrupted. A copy interrupted in its first second leaves no record.
 Recording does not hold a copy up for long: when many copies end at the same

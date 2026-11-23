@@ -235,7 +235,7 @@ impl Parser {
         })
     }
 }
-fn number(s: &str) -> Result<Value> {
+fn number(s: &str) -> Result<Value<Vec<u8>>> {
     if let Some(octal) = s.strip_prefix("0o") {
         return Ok(Value::Quantity(
             i128::from_str_radix(octal, 8).context("invalid octal number")?,

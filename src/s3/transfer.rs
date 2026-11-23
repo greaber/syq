@@ -34,7 +34,6 @@ use std::sync::OnceLock;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::File,
-    io::Read,
     os::unix::fs::{FileExt, MetadataExt},
     sync::{atomic::Ordering::Relaxed, Arc},
     time::Duration,
@@ -105,8 +104,9 @@ pub(super) struct Engine {
     client: Client,
     progress: Arc<Progress>,
     bandwidth: Option<crate::bwlimit::BandwidthLimit>,
-    /// Every destination key, when pruning listed them all before the copy.
-    upload_keys: OnceLock<HashMap<String, u64>>,
+    /// The destination keys under each listed prefix, when pruning listed
+    /// them before the copy.
+    upload_keys: OnceLock<DestinationListing>,
     /// Otherwise, the planned keys the destination listing has reached.
     discovery: OnceLock<Discovery>,
     copy_checksum_unsupported: std::sync::atomic::AtomicBool,
@@ -208,12 +208,26 @@ struct PreparedUpload {
     part_size: u64,
     algorithm: Algorithm,
     checksums: Vec<String>,
-    small: Option<bytes::Bytes>,
+    /// None reopens the selected file under a request permit.
+    payload: Option<Payload>,
     metadata: Metadata,
     must_be_new: bool,
     multipart: Option<PreparedMultipart>,
     metadata_update: Option<super::metadata_copy::Prepared>,
 }
+/// What an upload request sends.
+#[derive(Clone)]
+enum Payload {
+    /// The contents, read once while hashing them.
+    Held(super::file_body::Held),
+    /// The file, read again to send it: through the descriptor that hashed
+    /// it, when preparation kept that open.
+    File(Arc<super::file_body::Opened>),
+}
+/// The largest single-request file kept in memory from hashing it to sending
+/// it: a 32nd of the 256 MiB upload buffer budget, so at least 32 uploads can
+/// hold their contents at once.
+const HELD_UPLOAD_LIMIT: u64 = 8 << 20;
 struct PreparedMultipart {
     recorded: bool,
     upload: UploadState,
@@ -234,7 +248,50 @@ struct DownloadState {
     hash_algorithm: HashAlgorithm,
 }
 
+/// What listing an upload's destination found, and under which prefixes it
+/// looked. A key outside those prefixes was not looked for.
+#[derive(Default)]
+pub(super) struct DestinationListing {
+    prefixes: Vec<String>,
+    keys: HashMap<String, u64>,
+}
+impl DestinationListing {
+    fn covers(&self, key: &str) -> bool {
+        self.prefixes.iter().any(|prefix| key.starts_with(prefix))
+    }
+    /// The size of `key` when the listing found it, `Some(None)` when the
+    /// listing shows that it does not exist, and `None` when the listing
+    /// does not say.
+    fn size(&self, key: &str) -> Option<Option<u64>> {
+        match self.keys.get(key) {
+            Some(size) => Some(Some(*size)),
+            None => self.covers(key).then_some(None),
+        }
+    }
+}
+
 impl Engine {
+    /// The prefixes under which an upload's destination keys lie. A copy
+    /// another machine signs for lists only what that machine's signatures
+    /// cover (`authorization::upload_roots`); a named file there has no
+    /// prefix of its own and is checked with a request for its key.
+    fn destination_prefixes(&self) -> Result<Vec<String>> {
+        let roots = if self.authorization.is_some() {
+            super::authorization::upload_roots(&self.args, &self.options)?
+        } else {
+            vec![local::key_path(&self.args.locations.last().unwrap().path)?]
+        };
+        Ok(roots
+            .into_iter()
+            .map(|root| {
+                if root.is_empty() {
+                    root
+                } else {
+                    format!("{root}/")
+                }
+            })
+            .collect())
+    }
     fn expression_destination_path<'a>(&self, path: &'a str) -> &'a [u8] {
         let path = path.trim_end_matches('/');
         let root = self
@@ -317,7 +374,7 @@ impl Engine {
         self.cancelled.store(true, Relaxed);
         self.cancel_wake.notify_waiters();
         self.uploads.cancel();
-        // Drain started requests, including synchronous file bodies, before exit.
+        // Drain started requests before exit.
         let _ = work.await;
         match interrupted {
             Some(interrupted) => bail!("S3 copy {interrupted}; rerun the command to continue"),
@@ -370,8 +427,10 @@ impl Engine {
             }
             self.check_upload_placement(plan.first().map(|s| s.kind() != ObjectKind::Dir))
                 .await?;
-            self.discover_destination(&mut plan, |source| source.key.as_str().into())
-                .await?;
+            self.discover_destination(&mut plan, &prune.scopes, |source| {
+                source.key.as_str().into()
+            })
+            .await?;
             let workers = self.object_workers(plan.iter().map(|s| s.meta.len))?;
             self.progress.files_total.store(plan.len() as u64, Relaxed);
             self.progress.bytes_total.store(
@@ -383,6 +442,14 @@ impl Engine {
             );
             self.progress.scan_done.store(true, Relaxed);
             if self.authorization.is_some() {
+                // Preparation checks and hashes each file without asking the
+                // authorizing machine about it: the checks' requests are signed
+                // together first and the uploads' requests together afterwards.
+                // Each listed prefix's first page was signed before the
+                // listings started; a prefix's later pages, which continue
+                // from an earlier response, are signed as the listings reach
+                // them.
+                self.authorize_upload_checks(&plan).await?;
                 let prepared = Arc::new(Mutex::new(Vec::with_capacity(plan.len())));
                 let mut position = 0..;
                 parallel(plan, workers, |source, mut slot| {
@@ -407,7 +474,10 @@ impl Engine {
                     }
                 })
                 .await?;
+                let prepared = std::mem::take(&mut *prepared.lock().await);
                 let authorized = async {
+                    self.authorize_uploads(prepared.iter().map(|(_, _, _, _, work)| work))
+                        .await?;
                     self.prepare_pruning(&prune).await?;
                     self.finish_authorization().await?;
                     if self.args.prune_before {
@@ -416,7 +486,6 @@ impl Engine {
                     Ok::<_, anyhow::Error>(())
                 }
                 .await;
-                let prepared = std::mem::take(&mut *prepared.lock().await);
                 if let Err(error) = authorized {
                     for (_, _, _, _, work) in &prepared {
                         if let UploadPreparation::Ready(work) = work {
@@ -883,74 +952,133 @@ impl Engine {
         .into_bytes()
     }
     /// Learn which planned destination keys exist, so that new ones need no
-    /// HEAD. Pruning lists the whole destination first. Otherwise, where the
-    /// copy lists its destination, this puts `plan` in key order, the order
-    /// that listing follows.
+    /// HEAD. Pruning lists the destination first, everything under `pruned`
+    /// included. Otherwise, where the copy lists its destination, this puts
+    /// `plan` in key order, the order that listing follows.
+    ///
+    /// Both list under `destination_prefixes`: the destination, or for a
+    /// copy another machine signs for, each prefix its signatures cover.
     async fn discover_destination<T>(
         &self,
         plan: &mut [T],
+        pruned: &[Vec<u8>],
         key: impl for<'a> Fn(&'a T) -> std::borrow::Cow<'a, str>,
     ) -> Result<()> {
         if plan.len() < 2 || self.args.existing || self.args.ignore_existing {
             return Ok(());
         }
-        let target = local::key_path(&self.args.locations.last().unwrap().path)?;
-        let prefix = if target.is_empty() {
-            String::new()
-        } else {
-            format!("{target}/")
-        };
+        let prefixes = self.destination_prefixes()?;
         if !self.args.delete {
-            if !discovery::lists_destination(&self.args, &self.options.bucket) {
-                // Every key gets its HEAD, so a listing would save nothing.
-                // One request still goes first: the copy sizes its
-                // concurrency from a response seen before it starts, and a
-                // destination that cannot be listed fails here, as it does
-                // for the copies that list.
-                client::list_one(&self.client, &self.options.bucket, &prefix).await?;
-                return Ok(());
+            let lists = discovery::lists_destination(&self.args, &self.options.bucket);
+            if self.authorization.is_none() {
+                if !lists {
+                    // Every key gets its HEAD, so a listing would save
+                    // nothing. One request still goes first: the copy sizes
+                    // its concurrency from a response seen before it starts,
+                    // and a destination that cannot be listed fails here, as
+                    // it does for the copies that list.
+                    client::list_one(&self.client, &self.options.bucket, &prefixes[0]).await?;
+                    return Ok(());
+                }
+                plan.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
+                let keys = discovery::Keys::new(plan.iter().map(&key));
+                let whole = discovery::Segment::whole(prefixes[0].clone(), &keys);
+                return self.start_discovery(vec![whole], keys).await;
             }
-            plan.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
-            let discovery = Discovery::start(
-                self.client.clone(),
-                &self.options.bucket,
-                prefix,
-                discovery::Keys::new(plan.iter().map(key)),
-                self.cancelled.clone(),
-                self.progress.clone(),
-            )
-            .await?;
-            let _ = self.discovery.set(discovery);
+            // Under signatures, each signed prefix is listed for the planned
+            // keys beneath it.
+            if lists {
+                plan.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
+                let keys = discovery::Keys::new(plan.iter().map(&key));
+                let segments = discovery::segments(&keys, &prefixes);
+                if !segments.is_empty() {
+                    // Each prefix's first page is known now. Signing them
+                    // together saves a round trip to the signing machine
+                    // for each prefix the listing reaches.
+                    let ordered = super::listing::lists_in_key_order(&self.options.bucket);
+                    let divides = super::listing::lists_in_byte_order(
+                        self.options.endpoint.as_deref(),
+                        &self.options.bucket,
+                    );
+                    self.authorize_all(discovery::first_pages(&segments, &keys, ordered, divides))
+                        .await?;
+                    return self.start_discovery(segments, keys).await;
+                }
+            }
+            // Nothing to list: still send the request the copy sizes its
+            // concurrency from, under a signed prefix with planned keys
+            // beneath it if there is one.
+            let probe = plan
+                .iter()
+                .find_map(|t| {
+                    let key = key(t);
+                    prefixes
+                        .iter()
+                        .find(|prefix| key.starts_with(prefix.as_str()))
+                })
+                .unwrap_or(&prefixes[0]);
+            client::list_one(&self.client, &self.options.bucket, probe).await?;
             return Ok(());
         }
         // Pruning needs every destination key, including keys absent from
         // the plan. Only this complete cache is reusable by the deletion
         // planner.
-        let listing = client::list(
-            &self.client,
-            &self.options.bucket,
-            &prefix,
-            self.options.concurrency,
-        )
-        .await;
-        match listing {
-            Ok(listing) => {
-                let _ = self
-                    .upload_keys
-                    .set(listing.into_objects().into_iter().collect());
+        //
+        // A named file has nothing beneath its key for pruning to look
+        // through, so an upload another machine signs for does not list
+        // there. Every pruned directory stays covered.
+        let named = self.authorization.is_some() && self.options.route == Route::Upload;
+        let prefixes = prefixes
+            .into_iter()
+            .filter(|prefix| {
+                !named
+                    || pruned.iter().any(|scope| {
+                        scope.is_empty()
+                            || [scope.as_slice(), b"/"]
+                                .concat()
+                                .starts_with(prefix.as_bytes())
+                    })
+            })
+            .collect();
+        match self.list_completely(prefixes).await {
+            Ok(found) => {
+                if !found.prefixes.is_empty() {
+                    let _ = self.upload_keys.set(found);
+                }
+                Ok(())
             }
+            // Signing the first pages stops when the copy is cancelled.
+            Err(error) if self.cancelled.load(Relaxed) => Err(error),
             Err(error)
                 if error
                     .downcast_ref::<client::RequestFailure>()
                     .is_some_and(|failure| failure.region_mismatch()) =>
             {
-                return Err(error);
+                Err(error)
             }
             Err(error) => {
                 self.progress
                     .error(&format!("list S3 destination: {error:#}"));
+                Ok(())
             }
         }
+    }
+    async fn start_discovery(
+        &self,
+        segments: Vec<discovery::Segment>,
+        keys: discovery::Keys,
+    ) -> Result<()> {
+        let discovery = Discovery::start(
+            self.client.clone(),
+            self.options.endpoint.as_deref(),
+            &self.options.bucket,
+            segments,
+            keys,
+            self.cancelled.clone(),
+            self.progress.clone(),
+        )
+        .await?;
+        let _ = self.discovery.set(discovery);
         Ok(())
     }
     /// What a destination listing says about `key`, the plan's `position`th,
@@ -960,25 +1088,24 @@ impl Engine {
         position: usize,
         key: &str,
     ) -> impl std::future::Future<Output = Listed> + Send + 'static {
-        let complete = self.upload_keys.get().map(|keys| {
-            keys.get(key)
-                .map_or(Listed::Absent, |size| Listed::Present(*size))
-        });
-        let reached = self
-            .discovery
-            .get()
-            .map(|discovery| discovery.lookup(position));
-        let trusted = discovery::trusts_absence_of(&self.args, key);
-        async move {
-            match (complete, reached) {
-                (Some(listed), _) => listed,
-                (None, Some(reached)) => match reached.await {
-                    Listed::Absent if !trusted => Listed::Unknown,
-                    listed => listed,
-                },
-                (None, None) => Listed::Unknown,
-            }
-        }
+        discovery::listed(
+            &self.args,
+            self.upload_keys.get(),
+            self.discovery.get(),
+            position,
+            key,
+        )
+    }
+    /// What `listed` will say about `key`, if the listings have already
+    /// decided it.
+    fn known(&self, position: usize, key: &str) -> Option<Listed> {
+        discovery::known(
+            &self.args,
+            self.upload_keys.get(),
+            self.discovery.get(),
+            position,
+            key,
+        )
     }
     async fn check_upload_placement(&self, single_object: Option<bool>) -> Result<()> {
         if self.args.target_existence == Existence::Any {
@@ -1104,10 +1231,6 @@ impl Engine {
         )
         .await?;
         drop(_slot);
-        if let Err(error) = self.authorize_requests(update.requests()).await {
-            update.abort(&self.client, &self.options.bucket).await;
-            return Err(error);
-        }
         Ok(UploadPreparation::Ready(Box::new(PreparedUpload {
             source,
             size,
@@ -1117,7 +1240,7 @@ impl Engine {
                 self.authorization.is_some(),
             ),
             checksums: Vec::new(),
-            small: None,
+            payload: None,
             metadata,
             must_be_new: false,
             multipart: None,
@@ -1244,59 +1367,56 @@ impl Engine {
             algorithm
         };
         let whole_algorithm = requested_algorithm.unwrap_or(HashAlgorithm::Blake3);
-        let buffer_limit = if self.tuning.tigris() {
-            8 << 20
-        } else {
-            1 << 20
-        };
-        let reservation = if self.authorization.is_none()
+        // Keep a single-request file's bytes from the hashing read to send
+        // them, when the shared budget has room for them now. Otherwise the
+        // file is read again to send it, rather than wait: the budget bounds
+        // memory, not how many uploads run. Storage-authorized uploads prepare
+        // every file before sending any, so they keep nothing.
+        let reservation = (self.authorization.is_none()
             && source.kind() == ObjectKind::File
             && size <= part_size
-            && size <= buffer_limit
-        {
-            Some(
+            && size <= HELD_UPLOAD_LIMIT)
+            .then(|| {
                 self.tuning
                     .upload_buffers
                     .clone()
-                    .acquire_many_owned(size.max(1) as u32)
-                    .await?,
-            )
-        } else {
-            None
-        };
+                    .try_acquire_many_owned(super::file_body::held_size(size))
+                    .ok()
+            })
+            .flatten();
+        // A streamed single PUT opens the pathname for each attempt anyway.
+        // Only multipart files benefit from keeping the hashing descriptor.
+        let retain_file = (size > part_size && self.authorization.is_none())
+            .then(|| self.tuning.retain_upload_file())
+            .flatten();
         self.check_cancelled()?;
         let source_clone = source.clone();
-        let (hashes, small) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let (hashes, payload) = tokio::task::spawn_blocking(move || -> Result<_> {
             if source_clone.kind() != ObjectKind::File {
-                let bytes = source_clone.bytes()?;
+                let held = super::file_body::Held::from_vec(source_clone.bytes()?);
                 return Ok((
                     upload_hashes::bytes(
-                        &bytes,
+                        held.chunks(),
                         part_checksums,
                         whole_algorithm,
                         comparison_algorithm,
                     ),
-                    Some(bytes::Bytes::from(bytes)),
+                    Some(Payload::Held(held)),
                 ));
             }
+            let file = source_clone.open()?;
             if let Some(reservation) = reservation {
-                let mut file = source_clone.open()?;
-                let buffer_trace = super::diagnostics::upload_buffer(size);
-                let mut bytes = vec![0; size as usize];
-                file.read_exact(&mut bytes)?;
+                let trace = super::diagnostics::upload_buffer(reservation.num_permits() as u64);
+                let held = super::file_body::Held::read(&file, size, (reservation, trace))?;
                 source_clone.check(&file)?;
                 return Ok((
                     upload_hashes::bytes(
-                        &bytes,
+                        held.chunks(),
                         part_checksums,
                         whole_algorithm,
                         comparison_algorithm,
                     ),
-                    Some(bytes::Bytes::from_owner(fast::UploadBuffer {
-                        bytes,
-                        _reservation: reservation,
-                        _trace: buffer_trace,
-                    })),
+                    Some(Payload::Held(held)),
                 ));
             }
             let hashes = upload_hashes::ranges(
@@ -1306,30 +1426,34 @@ impl Engine {
                 whole_algorithm,
                 comparison_algorithm,
                 |end| {
-                    let file = source_clone.open()?;
-                    let source = &source_clone;
+                    let (file, source) = (&file, &source_clone);
                     Ok(move |buffer: &mut [u8], offset| {
                         file.read_exact_at(buffer, offset)?;
                         if offset + buffer.len() as u64 == end {
-                            source.check(&file)?;
+                            source.check(file)?;
                         }
                         Ok(())
                     })
                 },
             )?;
             if hashes.concurrent {
-                // Parallel readers can finish at different times. Recheck the
-                // selected pathname after all parts complete, as before.
-                source_clone.check(&source_clone.open()?)?;
+                source_clone.open()?;
             }
-            Ok((hashes, None))
+            let payload = retain_file.map(|permit| {
+                Payload::File(super::file_body::Opened::new(
+                    source_clone,
+                    file,
+                    Some(permit),
+                ))
+            });
+            Ok((hashes, payload))
         })
         .await??;
         let upload_hashes::Hashes {
             whole: whole_digest,
             comparison: comparison_digest,
             checksums,
-            concurrent: _,
+            ..
         } = hashes;
         if let Some(expected) = expected_hash {
             if !whole_digest.eq_ignore_ascii_case(&expected.value) {
@@ -1385,7 +1509,7 @@ impl Engine {
         let must_be_new = self.args.ignore_existing
             || self.args.target_existence == Existence::New
             || (self.args.protects_existing_contents() && existing.is_none());
-        let multipart = if size > part_size && small.is_none() {
+        let multipart = if size > part_size && source.kind() == ObjectKind::File {
             Some(
                 self.prepare_multipart(&source, digest, part_size, &metadata, algorithm)
                     .await?,
@@ -1399,16 +1523,12 @@ impl Engine {
             part_size,
             algorithm,
             checksums,
-            small,
+            payload,
             metadata,
             must_be_new,
             multipart,
             metadata_update: None,
         };
-        if let Err(error) = self.authorize_upload(&prepared).await {
-            self.abort_unrecorded_preparation(&prepared).await;
-            return Err(error);
-        }
         Ok(UploadPreparation::Ready(Box::new(prepared)))
     }
 
@@ -1457,37 +1577,31 @@ impl Engine {
             part_size,
             algorithm,
             checksums,
-            small,
+            payload,
             metadata,
             must_be_new,
             multipart,
             metadata_update: _,
         } = prepared;
         let _interval = self.progress.copying_interval();
-        if size <= part_size || small.is_some() {
+        if size <= part_size || source.kind() != ObjectKind::File {
             let checksum = checksums.first().map(String::as_str);
             let _slot = self.tuning.requests.acquire().await;
-            let synchronous =
-                source.kind() == ObjectKind::File && small.is_none() && self.tuning.local_latency();
-            let sync_file =
-                synchronous.then(|| crate::s3::upload_http::FileBody::new(source.clone(), 0, size));
             self.upload_request(&source.key, None, algorithm, checksum)
                 .send(
-                    content_md5(&source, small.as_ref(), 0, size),
+                    async {
+                        let body = request_payload(payload.as_ref(), &source).await?;
+                        content_md5(&body, 0, size).await
+                    },
                     |content_md5| {
-                        let (source, small, sync_file, metadata) =
-                            (&source, &small, &sync_file, &metadata);
+                        let (source, payload, metadata) = (&source, &payload, &metadata);
                         async move {
                             self.check_cancelled()?;
-                            let body = if let Some(bytes) = &small {
-                                ByteStream::from(bytes.clone())
-                            } else if synchronous {
-                                crate::s3::upload_http::body(size)
-                            } else {
-                                file_body(source, 0, size).await?
-                            };
+                            // A streamed PUT must still name the selected file on every attempt.
+                            let payload = request_payload(payload.as_ref(), source).await?;
+                            let body = upload_body(&payload, 0, size);
                             self.pace(size).await?;
-                            let request = self
+                            let result = self
                                 .client
                                 .put_object()
                                 .bucket(&self.options.bucket)
@@ -1500,16 +1614,9 @@ impl Engine {
                                 .set_if_none_match(must_be_new.then(|| "*".into()))
                                 .customize()
                                 .config_override(super::client::without_sdk_retries())
-                                .disable_payload_signing();
-                            let request = if let Some(file) = &sync_file {
-                                request.interceptor(file.clone())
-                            } else {
-                                request
-                            };
-                            let result = request.send().await;
-                            if let Some(file) = &sync_file {
-                                file.drain().await;
-                            }
+                                .disable_payload_signing()
+                                .send()
+                                .await;
                             Ok(result)
                         }
                     },
@@ -1542,6 +1649,16 @@ impl Engine {
                 State::without_cache()
             };
             let result: Result<()> = async {
+                // Storage-authorized files reopen after preparation. A reopen failure
+                // here must abort the upload when no recovery record can keep it.
+                let payload = if self.authorization.is_some() {
+                    match self.tuning.retain_upload_file() {
+                        Some(permit) => Some(open_source(&source, Some(permit)).await?),
+                        None => None,
+                    }
+                } else {
+                    payload
+                };
                 let acknowledged = Mutex::new(Acknowledged {
                     parts: upload.completed.clone(),
                     saved: tokio::time::Instant::now(),
@@ -1558,6 +1675,7 @@ impl Engine {
                     .take_while(|_| std::future::ready(!failed.load(Relaxed)))
                     .map(|index| {
                         let source = &source;
+                        let payload = &payload;
                         let upload = &upload;
                         let uploaded = &uploaded;
                         let acknowledged = &acknowledged;
@@ -1596,26 +1714,17 @@ impl Engine {
                                 }
                             }
                             let _slot = self.tuning.requests.acquire().await;
-                            let sync_file = self.tuning.local_latency().then(|| {
-                                crate::s3::upload_http::FileBody::new(
-                                    source.clone(),
-                                    offset,
-                                    length,
-                                )
-                            });
+                            let payload = request_payload(payload.as_ref(), source).await?;
+                            let payload = &payload;
                             let output = self
                                 .upload_request(&source.key, Some(number), algorithm, checksum)
-                                .send(content_md5(source, None, offset, length), |content_md5| {
-                                    let sync_file = &sync_file;
-                                    async move {
+                                .send(
+                                    content_md5(payload, offset, length),
+                                    |content_md5| async move {
                                         self.check_cancelled()?;
-                                        let body = if sync_file.is_some() {
-                                            crate::s3::upload_http::body(length)
-                                        } else {
-                                            file_body(source, offset, length).await?
-                                        };
+                                        let body = upload_body(payload, offset, length);
                                         self.pace(length).await?;
-                                        let request = self
+                                        let result = self
                                             .client
                                             .upload_part()
                                             .bucket(&self.options.bucket)
@@ -1630,19 +1739,12 @@ impl Engine {
                                             .set_content_md5(content_md5)
                                             .customize()
                                             .config_override(super::client::without_sdk_retries())
-                                            .disable_payload_signing();
-                                        let request = if let Some(file) = &sync_file {
-                                            request.interceptor(file.clone())
-                                        } else {
-                                            request
-                                        };
-                                        let result = request.send().await;
-                                        if let Some(file) = &sync_file {
-                                            file.drain().await;
-                                        }
+                                            .disable_payload_signing()
+                                            .send()
+                                            .await;
                                         Ok(result)
-                                    }
-                                })
+                                    },
+                                )
                                 .await?
                                 .map_err(|e| e.into_service_error())
                                 .context("upload part; rerun the command to resume")?;
@@ -1693,7 +1795,9 @@ impl Engine {
                 }
                 let completed = results.into_iter().collect::<Result<Vec<_>>>()?;
                 self.check_cancelled()?;
-                source.check(&source.open()?)?;
+                // The parts' bodies checked the opened file after reading it;
+                // check the selected path too before publishing them.
+                source.open()?;
                 let mut completed = completed;
                 completed.sort_by_key(|p| p.part_number());
                 self.client
@@ -1722,7 +1826,7 @@ impl Engine {
             state.clear()?;
         }
         if source.kind() == ObjectKind::File {
-            source.check(&source.open()?)?;
+            source.open()?;
         }
         Ok(Some(size))
     }
@@ -2077,6 +2181,7 @@ impl Engine {
                     exact,
                     client::list_with_times(
                         &self.client,
+                        self.options.endpoint.as_deref(),
                         source_bucket,
                         &prefix,
                         matcher.as_ref(),
@@ -2128,6 +2233,7 @@ impl Engine {
                         None => {
                             client::list_with_times(
                                 &self.client,
+                                self.options.endpoint.as_deref(),
                                 source_bucket,
                                 &prefix,
                                 matcher.as_ref(),
@@ -2410,12 +2516,12 @@ impl Engine {
         {
             return Ok(None);
         }
-        let destination_file = || -> Result<crate::expression::File> {
+        let destination_file = || -> Result<crate::expression::File<'static>> {
             let mut file = existing
                 .map(crate::expression::File::from_root)
                 .unwrap_or_default();
             if file.kind == Some(crate::proto::Kind::Symlink) {
-                file.link_target = Some(root.read_link(&path)?);
+                file.link_target = Some(root.read_link(&path)?.into());
             }
             Ok(file)
         };
@@ -2907,17 +3013,26 @@ impl Engine {
             state.save(&record)?;
             remove_partial(root, &old)?;
         }
-        let _cleanup = if state.has_record() {
+        let mut cleanup = if state.has_record() {
             None
         } else {
-            Some(PartialCleanup {
+            Some(PartialCleanup::new(
                 root,
-                path: RelativePath::new(record.partial.as_bytes())?,
-                identity: (record.dev, record.ino),
-            })
+                RelativePath::new(record.partial.as_bytes())?,
+                (record.dev, record.ino),
+            ))
         };
         let range_algorithm = record.hash_algorithm;
-        let record = Arc::new(Mutex::new(record));
+        struct DownloadRecord {
+            state: DownloadState,
+            saved: tokio::time::Instant,
+            dirty: bool,
+        }
+        let record = Arc::new(Mutex::new(DownloadRecord {
+            state: record,
+            saved: tokio::time::Instant::now(),
+            dirty: false,
+        }));
         let file = Arc::new(file);
         let allocation = file.clone();
         let size = object.size;
@@ -2953,7 +3068,7 @@ impl Engine {
                         self.progress.bytes_unchanged.fetch_add(length, Relaxed);
                         return Ok::<_, anyhow::Error>(());
                     }
-                    let previous = record.lock().await.parts.get(&index).cloned();
+                    let previous = record.lock().await.state.parts.get(&index).cloned();
                     if let Some(hash) = previous {
                         let f = file.clone();
                         let actual = tokio::task::spawn_blocking(move || {
@@ -2976,10 +3091,18 @@ impl Engine {
                             Some(range_algorithm),
                         )
                         .await?;
-                    output.finish().await?;
+                    output.flush().await?;
                     let mut record = record.lock().await;
-                    record.parts.insert(index, hash);
-                    state.save(&*record)?;
+                    record.state.parts.insert(index, hash);
+                    record.dirty = true;
+                    // The record grows with each part. Saving at most once a
+                    // second bounds its rewrites; an unsaved part only
+                    // downloads again on resume.
+                    if record.saved.elapsed() >= Duration::from_secs(1) {
+                        state.save(&record.state)?;
+                        record.saved = tokio::time::Instant::now();
+                        record.dirty = false;
+                    }
                     Ok(())
                 }
             })
@@ -2994,42 +3117,57 @@ impl Engine {
             .into_iter()
             .collect::<Result<Vec<_>>>();
         let flushed = output.finish().await;
-        copied?;
-        flushed?;
-        let partial = record.lock().await.partial.clone();
-        let partial_path = RelativePath::new(partial.as_bytes())?;
-        // A network filesystem may flush here; keep that off the async workers.
-        let writer = file.clone();
-        let label = path.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            crate::fsops::check_destination_writes(&writer, &label)
-        })
-        .await??;
-        for expected in self.download_digests(&metadata, expected_hash) {
-            let f = root.open_regular_read(&partial_path)?;
-            tokio::task::spawn_blocking(move || expected.verify_reader(&mut &f)).await??;
-        }
-        // A version ID pins immutable content; otherwise confirm the source
-        // still has the identity used on every range request.
-        if object.version.is_none() {
-            let final_object = client::head(&self.client, &self.options.bucket, &object.key)
-                .await?
-                .context("source disappeared during download")?;
-            if final_object.etag != object.etag || final_object.size != object.size {
-                bail!("source object changed during download");
+        let published = async {
+            copied?;
+            flushed?;
+            let partial = record.lock().await.state.partial.clone();
+            let partial_path = RelativePath::new(partial.as_bytes())?;
+            // A network filesystem may flush here; keep that off the async workers.
+            let writer = file.clone();
+            let label = path.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                crate::fsops::check_destination_writes(&writer, &label)
+            })
+            .await??;
+            for expected in self.download_digests(&metadata, expected_hash) {
+                let f = root.open_regular_read(&partial_path)?;
+                tokio::task::spawn_blocking(move || expected.verify_reader(&mut &f)).await??;
             }
+            // A version ID pins immutable content; otherwise confirm the source
+            // still has the identity used on every range request.
+            if object.version.is_none() {
+                let final_object = client::head(&self.client, &self.options.bucket, &object.key)
+                    .await?
+                    .context("source disappeared during download")?;
+                if final_object.etag != object.etag || final_object.size != object.size {
+                    bail!("source object changed during download");
+                }
+            }
+            self.check_cancelled()?;
+            local::apply_file_metadata(
+                &file,
+                &metadata,
+                &self.args,
+                existing.filter(|m| m.is_file()).map(|m| m.mode & 0o7777),
+                explicit,
+                || local::CreationPermissions::shared_for_file(&self.file_permissions, root, &path),
+            )?;
+            let m = file.metadata()?;
+            self.publish_download(root, &partial_path, &path, (m.dev(), m.ino()), replaces)?;
+            Ok::<_, anyhow::Error>(())
         }
-        self.check_cancelled()?;
-        local::apply_file_metadata(
-            &file,
-            &metadata,
-            &self.args,
-            existing.filter(|m| m.is_file()).map(|m| m.mode & 0o7777),
-            explicit,
-            || local::CreationPermissions::shared_for_file(&self.file_permissions, root, &path),
-        )?;
-        let m = file.metadata()?;
-        self.publish_download(root, &partial_path, &path, (m.dev(), m.ino()), replaces)?;
+        .await;
+        if let Err(error) = published {
+            let record = record.lock().await;
+            if record.dirty {
+                // Keep the download or publication failure as the reported error.
+                let _ = state.save(&record.state);
+            }
+            return Err(error);
+        }
+        if let Some(cleanup) = &mut cleanup {
+            cleanup.disarm();
+        }
         state.clear()?;
         Ok(Some(object.size))
     }
@@ -3115,15 +3253,21 @@ impl Engine {
     }
     #[allow(clippy::too_many_arguments)]
     async fn download_single(
-        &self,
+        self: &Arc<Self>,
         object: &Object,
-        root: &Root,
+        root: &Arc<Root>,
         path: &RelativePath,
         validation: (&Metadata, Option<&Digest>, crate::mapping::Metadata),
         (mode, replaces): (Option<u32>, Option<MatchedFile>),
         initial: Option<ByteStream>,
         initial_slot: Option<super::tuning::Permit>,
     ) -> Result<Option<u64>> {
+        // Objects up to 128 KiB fit within a tight per-download memory bound.
+        // Collecting them in memory first avoids spawning a per-file Writer
+        // task and channels, keeps blocking filesystem calls off async worker
+        // threads, and skips creating a partial file when a GET or digest
+        // check fails.
+        const INLINE_LIMIT: u64 = 128 * 1024;
         let (metadata, expected_hash, explicit) = validation;
         let path_buf = path.to_path_buf();
         let label = path_buf
@@ -3135,37 +3279,25 @@ impl Engine {
         let partial = RelativePath::new(
             local::join(parent, &super::prune::partial_name(&random)).as_bytes(),
         )?;
-        let file = Arc::new(root.create_file(&partial, 0o600)?);
-        let _cleanup = PartialCleanup {
-            root,
-            path: partial.clone(),
-            identity: (file.metadata()?.dev(), file.metadata()?.ino()),
-        };
-        let result = async {
-            let digests = self.download_digests(metadata, expected_hash);
-            let algorithm = digests.first().map(|d| d.algorithm);
-            let output =
-                super::writer::Writer::with_readback(file.clone(), object.size, digests.len() > 1)?;
+        let digests = self.download_digests(metadata, expected_hash);
+        let algorithm = digests.first().map(|d| d.algorithm);
+        if object.size <= INLINE_LIMIT {
+            let mut chunks = Vec::new();
             let hash = if object.size == 0 && initial.is_none() {
                 algorithm
                     .map(|a| Digest::hash_bytes(a, &[]).value)
                     .unwrap_or_default()
             } else {
-                let copied = self
-                    .download_fast_range(
-                        object,
-                        &output,
-                        0,
-                        object.size,
-                        initial,
-                        initial_slot,
-                        algorithm,
-                    )
-                    .await;
-                let flushed = output.finish().await;
-                let hash = copied?;
-                flushed?;
-                hash
+                self.download_fast_range_into(
+                    object,
+                    fast::DownloadSink::Memory(&mut chunks),
+                    0,
+                    object.size,
+                    initial,
+                    initial_slot,
+                    algorithm,
+                )
+                .await?
             };
             if digests
                 .first()
@@ -3173,28 +3305,87 @@ impl Engine {
             {
                 bail!("download checksum mismatch");
             }
-            // If the caller requires a second algorithm, reread only for that
-            // distinct requirement, never rehash the same digest twice.
             for expected in digests.into_iter().skip(1) {
-                let f = file.clone();
-                tokio::task::spawn_blocking(move || expected.verify_reader(&mut &*f)).await??;
+                let mut hasher = expected.algorithm.hasher();
+                for chunk in &chunks {
+                    hasher.update(chunk);
+                }
+                expected.verify(&hasher.finalize())?;
             }
             self.check_cancelled()?;
-            let writer = file.clone();
-            let label = path_buf.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::fsops::check_destination_writes(&writer, &label)
+            let engine = self.clone();
+            let root = root.clone();
+            let path = path.clone();
+            let metadata = metadata.clone();
+            let size = object.size;
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                engine.check_cancelled()?;
+                let file = root.create_file(&partial, 0o600)?;
+                let m = file.metadata()?;
+                let identity = (m.dev(), m.ino());
+                let mut cleanup = PartialCleanup::new(&root, partial.clone(), identity);
+                super::writer::write_chunks(&file, &chunks)?;
+                crate::fsops::check_destination_writes(&file, &path_buf)?;
+                local::apply_file_metadata(&file, &metadata, &engine.args, mode, explicit, || {
+                    local::CreationPermissions::shared_for_file(
+                        &engine.file_permissions,
+                        &root,
+                        &path,
+                    )
+                })?;
+                engine.check_cancelled()?;
+                engine.publish_download(&root, &partial, &path, identity, replaces)?;
+                cleanup.disarm();
+                Ok(())
             })
             .await??;
-            local::apply_file_metadata(&file, metadata, &self.args, mode, explicit, || {
-                local::CreationPermissions::shared_for_file(&self.file_permissions, root, path)
-            })?;
-            let m = file.metadata()?;
-            self.publish_download(root, &partial, path, (m.dev(), m.ino()), replaces)?;
-            Ok(Some(object.size))
+            return Ok(Some(size));
         }
-        .await;
-        result
+        let file = Arc::new(root.create_file(&partial, 0o600)?);
+        let m = file.metadata()?;
+        let identity = (m.dev(), m.ino());
+        let mut cleanup = PartialCleanup::new(root, partial.clone(), identity);
+        let output =
+            super::writer::Writer::with_readback(file.clone(), object.size, digests.len() > 1)?;
+        let copied = self
+            .download_fast_range(
+                object,
+                &output,
+                0,
+                object.size,
+                initial,
+                initial_slot,
+                algorithm,
+            )
+            .await;
+        let flushed = output.finish().await;
+        let hash = copied?;
+        flushed?;
+        if digests
+            .first()
+            .is_some_and(|expected| expected.value != hash)
+        {
+            bail!("download checksum mismatch");
+        }
+        // If the caller requires a second algorithm, reread only for that
+        // distinct requirement, never rehash the same digest twice.
+        for expected in digests.into_iter().skip(1) {
+            let f = file.clone();
+            tokio::task::spawn_blocking(move || expected.verify_reader(&mut &*f)).await??;
+        }
+        self.check_cancelled()?;
+        let writer = file.clone();
+        let label = path_buf.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::fsops::check_destination_writes(&writer, &label)
+        })
+        .await??;
+        local::apply_file_metadata(&file, metadata, &self.args, mode, explicit, || {
+            local::CreationPermissions::shared_for_file(&self.file_permissions, root, path)
+        })?;
+        self.publish_download(root, &partial, path, identity, replaces)?;
+        cleanup.disarm();
+        Ok(Some(object.size))
     }
     fn open_download_state(
         &self,
@@ -3365,11 +3556,8 @@ impl Engine {
         let partial_path = RelativePath::new(partial.as_bytes())?;
         let staged = Arc::new(root.create_file(&partial_path, 0o600)?);
         let created = staged.metadata()?;
-        let _cleanup = PartialCleanup {
-            root,
-            path: partial_path.clone(),
-            identity: (created.dev(), created.ino()),
-        };
+        let mut cleanup =
+            PartialCleanup::new(root, partial_path.clone(), (created.dev(), created.ino()));
         if !crate::fsops::SeedAccess::new(&staged).admits(&existing) {
             return Ok(LocalReplacement::Download(MatchedFile {
                 dev: before.dev(),
@@ -3422,6 +3610,7 @@ impl Engine {
             before.ino(),
             Some((before.ctime(), before.ctime_nsec() as u32)),
         )?;
+        cleanup.disarm();
         self.progress.add_bytes(object.size);
         Ok(LocalReplacement::Done(object.size))
     }
@@ -3448,7 +3637,7 @@ impl Engine {
             .await
             .map_err(|e| e.into_service_error())?;
         let mut body = output.body.into_async_read();
-        let mut buffer = vec![0; 1024 * 1024];
+        let mut buffer = super::file_body::scratch();
         let mut hash = algorithm.hasher();
         let mut n = 0;
         loop {
@@ -3493,16 +3682,36 @@ pub(super) fn retryable<E: aws_sdk_s3::error::ProvideErrorMetadata>(
         .and_then(|e| e.code())
         .is_some_and(|code| THROTTLING_ERRORS.contains(&code) || TRANSIENT_ERRORS.contains(&code))
 }
-async fn file_body(source: &Source, offset: u64, length: u64) -> Result<ByteStream> {
+/// Open `source` for its upload, as the hashing read would have.
+async fn open_source(
+    source: &Source,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<Payload> {
     let source = source.clone();
-    let (source, file) = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let file = source.open()?;
-        anyhow::Ok((source, file))
+        anyhow::Ok(Payload::File(super::file_body::Opened::new(
+            source, file, permit,
+        )))
     })
-    .await??;
-    Ok(ByteStream::new(super::file_body::body(
-        source, file, offset, length,
-    )))
+    .await?
+}
+/// An unretained file is open only while its request holds a slot.
+async fn request_payload(payload: Option<&Payload>, source: &Source) -> Result<Payload> {
+    match payload {
+        Some(payload) => Ok(payload.clone()),
+        None => open_source(source, None).await,
+    }
+}
+/// The body sending `length` bytes of the payload from `offset`.
+fn upload_body(payload: &Payload, offset: u64, length: u64) -> ByteStream {
+    ByteStream::new(match payload {
+        Payload::Held(held) => {
+            debug_assert_eq!((offset, length), (0, held.size()));
+            held.body()
+        }
+        Payload::File(opened) => super::file_body::body(opened, offset, length),
+    })
 }
 fn upload_identity(
     algorithm: Algorithm,
@@ -3540,37 +3749,22 @@ fn upload_identity(
 }
 
 /// Content-MD5 for a destination that requires upload checksums. Only such
-/// destinations pay for this separate read.
-async fn content_md5(
-    source: &Source,
-    small: Option<&bytes::Bytes>,
-    offset: u64,
-    length: u64,
-) -> Result<String> {
-    if let Some(bytes) = small {
-        let range = &bytes[offset as usize..(offset + length) as usize];
-        return Ok(Algorithm::Md5.digest(range).unwrap());
-    }
-    let source = source.clone();
-    tokio::task::spawn_blocking(move || {
-        let file = source.open()?;
-        let mut hash = Algorithm::Md5.hasher().unwrap();
-        let mut buffer = vec![0; length.clamp(1, 1024 * 1024) as usize];
-        let mut done = 0;
-        while done < length {
-            let n = buffer.len().min((length - done) as usize);
-            file.read_exact_at(&mut buffer[..n], offset + done)?;
-            hash.update(&buffer[..n]);
-            done += n as u64;
+/// destinations pay for this separate read of a file not held in memory.
+async fn content_md5(payload: &Payload, offset: u64, length: u64) -> Result<String> {
+    let opened = match payload {
+        Payload::Held(held) => {
+            debug_assert_eq!((offset, length), (0, held.size()));
+            let mut hash = Algorithm::Md5.hasher().unwrap();
+            held.chunks().for_each(|chunk| hash.update(chunk));
+            return Ok(hash.finish());
         }
-        source.check(&file)?;
-        Ok(hash.finish())
-    })
-    .await?
+        Payload::File(opened) => opened.clone(),
+    };
+    tokio::task::spawn_blocking(move || opened.md5(offset, length)).await?
 }
 
 fn hash_range(file: &File, offset: u64, length: u64, algorithm: HashAlgorithm) -> Result<String> {
-    let mut buffer = vec![0; 1024 * 1024];
+    let mut buffer = super::file_body::scratch();
     let mut done = 0;
     let mut hash = algorithm.hasher();
     while done < length {
@@ -3582,8 +3776,6 @@ fn hash_range(file: &File, offset: u64, length: u64, algorithm: HashAlgorithm) -
     Ok(Digest::from_hash(algorithm, &hash.finalize()).value)
 }
 
-/// The bytes a seeded part is hashed in at a time, by each thread.
-const SEED_HASH_CHUNK: usize = 1 << 20;
 /// The most threads seeding a new partial.
 const SEED_THREADS: usize = 4;
 
@@ -3620,7 +3812,7 @@ fn seed_download_parts(
         .clamp(1, SEED_THREADS)
         .min(parts.len().max(1));
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let seed_part = |buffer: &mut Vec<u8>, index: u64, hash: &String| -> Result<Option<String>> {
+    let seed_part = |buffer: &mut [u8], index: u64, hash: &String| -> Result<Option<String>> {
         let offset = index * part_size;
         let length = part_size.min(size - offset);
         if !cloned {
@@ -3650,10 +3842,12 @@ fn seed_download_parts(
         let workers: Vec<_> = (0..threads)
             .map(|_| {
                 scope.spawn(|| -> Result<Vec<(u64, String)>> {
-                    let mut buffer = vec![0; SEED_HASH_CHUNK.min(part_size as usize)];
+                    let mut scratch = super::file_body::scratch();
+                    let length = scratch.len().min(part_size as usize);
+                    let buffer = &mut scratch[..length];
                     let mut kept = Vec::new();
                     while let Some(&(index, hash)) = parts.get(next.fetch_add(1, Relaxed)) {
-                        if let Some(hash) = seed_part(&mut buffer, index, hash)? {
+                        if let Some(hash) = seed_part(buffer, index, hash)? {
                             kept.push((index, hash));
                         }
                     }
@@ -3717,7 +3911,7 @@ fn holds_digests(file: &std::fs::File, digests: &[Digest]) -> Result<bool> {
         }
     }
     let mut hashers: Vec<_> = algorithms.iter().map(|a| a.hasher()).collect();
-    let mut buffer = vec![0; 1 << 20];
+    let mut buffer = super::file_body::scratch();
     let mut offset = 0;
     loop {
         let count = match file.read_at(&mut buffer, offset) {
@@ -3818,9 +4012,26 @@ struct PartialCleanup<'a> {
     root: &'a Root,
     path: RelativePath,
     identity: (u64, u64),
+    active: bool,
+}
+impl<'a> PartialCleanup<'a> {
+    fn new(root: &'a Root, path: RelativePath, identity: (u64, u64)) -> Self {
+        Self {
+            root,
+            path,
+            identity,
+            active: true,
+        }
+    }
+    fn disarm(&mut self) {
+        self.active = false;
+    }
 }
 impl Drop for PartialCleanup<'_> {
     fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
         if self
             .root
             .metadata_optional(&self.path)
@@ -3858,6 +4069,87 @@ fn symlink_metadata_differs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An engine for `argv`, a `syq` command line, that sends nothing.
+    pub(super) fn engine(argv: &[&str]) -> Engine {
+        let args = Arc::new(
+            Args::parse_args(
+                &argv
+                    .iter()
+                    .map(std::ffi::OsString::from)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        );
+        let options = args.s3.clone().unwrap();
+        let tuning = crate::s3::tuning::Tuning::new(
+            &options,
+            &args,
+            Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+        );
+        let config = aws_sdk_s3::config::Builder::new()
+            .behavior_version_latest()
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .build();
+        Engine {
+            args,
+            options,
+            tuning,
+            client: Client::from_conf(config),
+            progress: Progress::new(false, false, None),
+            bandwidth: None,
+            upload_keys: OnceLock::new(),
+            discovery: OnceLock::new(),
+            authorization: None,
+            copy_checksum_unsupported: Default::default(),
+            content_md5: Default::default(),
+            file_permissions: Default::default(),
+            metadata_replacements: Default::default(),
+            copy_tagging_unsupported: Default::default(),
+            outage: Default::default(),
+            cancelled: Default::default(),
+            cancel_wake: Default::default(),
+            uploads: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_descriptor_budget_reopens_the_file_under_the_request_permit() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("source");
+        std::fs::write(&path, b"selected").unwrap();
+        let engine = engine(&[
+            "cp",
+            path.to_str().unwrap(),
+            "--to",
+            "s3://bucket",
+            "--as",
+            "object",
+            "--performance-tuning=s3-requests=1",
+        ]);
+        let source = local::upload_plan(&engine.args)
+            .unwrap()
+            .sources
+            .pop()
+            .unwrap();
+        let permit = engine.tuning.retain_upload_file().unwrap();
+        let retained = open_source(&source, Some(permit)).await.unwrap();
+        assert!(engine.tuning.retain_upload_file().is_none());
+
+        let _request = engine.tuning.requests.acquire().await;
+        let reopened = request_payload(None, &source).await.unwrap();
+        let bytes = upload_body(&reopened, 0, source.meta.len)
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(bytes.as_ref(), b"selected");
+        // Dropping a per-request file doesn't free a retained slot.
+        drop(reopened);
+        assert!(engine.tuning.retain_upload_file().is_none());
+        drop(retained);
+        assert!(engine.tuning.retain_upload_file().is_some());
+    }
 
     #[test]
     fn native_upload_identity_binds_parts_algorithm_and_boundaries() {

@@ -62,14 +62,6 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
     let remote = format!("fake:{}", t.s("dst"));
     let marker = t.path("drop-after-samples");
     let cache = t.path("tuning.json");
-    write(
-        &cache,
-        serde_json::to_string_pretty(&serde_json::json!({
-            "paths": { "local>fake|ssh": 2 }
-        }))
-        .unwrap()
-        .as_bytes(),
-    );
 
     let mut command = compat_command();
     command
@@ -92,7 +84,7 @@ fn live_warming_retirement_and_post_sample_recovery_stay_consistent() {
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("XDG_CONFIG_HOME", t.path("config"))
         .env("SYQ_TUNING_CACHE", &cache)
-        // Match the unscoped legacy cache fixture regardless of the host network.
+        // Keep the history's route key independent of the host network.
         .env("SYQ_TEST_TUNING_NETWORK", "")
         .env("SYQ_DEBUG", "1")
         .env("SYQ_TEST_TUNE_SAMPLE_MS", "50");
@@ -508,7 +500,6 @@ fn one_worker_hint_prepares_spare_before_slow_connection_is_ready() {
     write(&t.path("src/one"), &data);
     write(&t.path("src/two"), &data);
     let cache = t.path("tuning.json");
-    write(&cache, br#"{"paths":{"local>fake|ssh":1}}"#);
     let remote = format!("fake:{}", t.s("dst"));
     let mut command = compat_command();
     command
@@ -529,7 +520,7 @@ fn one_worker_hint_prepares_spare_before_slow_connection_is_ready() {
         .env("FAKE_RSH_LOG", t.path("rsh.log"))
         .env("XDG_CONFIG_HOME", t.path("config"))
         .env("SYQ_TUNING_CACHE", &cache)
-        // Match the unscoped legacy cache fixture regardless of the host network.
+        // Keep the history's route key independent of the host network.
         .env("SYQ_TEST_TUNING_NETWORK", "")
         .env("SYQ_DEBUG", "1")
         .env("SYQ_TEST_TUNE_SAMPLE_MS", "50");
@@ -912,4 +903,43 @@ fn a_panicking_worker_fails_the_copy() {
         std::time::Duration::from_secs(10),
         || (unsafe { libc::kill(group, 0) }) != 0,
     );
+}
+
+#[test]
+fn destination_claims_cover_only_plans_that_need_them() {
+    let t = Tmp::new();
+    write(&t.path("src/a"), b"a");
+    write(&t.path("other/b"), b"b");
+    write(
+        &t.path("mapping"),
+        entry_line("a", "mapped", None).as_bytes(),
+    );
+    for (index, (args, tracked)) in [
+        (vec!["--srcs-in", "src"], false),
+        (vec!["--srcs-in", "src", "--prune"], true),
+        (vec!["--srcs-in", "src", "--srcs-in", "other"], true),
+        (vec!["--root", "src", "--mapping", "mapping"], true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let log = t.path(&format!("claims{index}"));
+        let output = Command::new(env!("CARGO_BIN_EXE_syq"))
+            .current_dir(t.path(""))
+            .arg("cp")
+            .args(args)
+            .arg("--into")
+            .arg(format!("dst{index}"))
+            .env("SYQ_TEST_DESTINATION_CLAIMS", &log)
+            .run()
+            .unwrap();
+        assert_output_ok(&output);
+        let counts = fs::read_to_string(log).unwrap();
+        assert_eq!(
+            counts
+                .lines()
+                .any(|line| line.parse::<usize>().unwrap() > 0),
+            tracked
+        );
+    }
 }

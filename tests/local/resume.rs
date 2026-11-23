@@ -1,19 +1,11 @@
 use super::*;
 
 #[test]
-fn measured_history_seeds_auto_tuning_and_fixed_counts_preserve_legacy_cache() {
+fn measured_history_seeds_auto_tuning() {
     let t = Tmp::new();
     let rsh = fake_rsh(&t);
     let cache = t.path("tuning.json");
-    write(
-        &cache,
-        serde_json::to_string_pretty(&serde_json::json!({
-            "paths": { "local>fake|ssh": 1 }
-        }))
-        .unwrap()
-        .as_bytes(),
-    );
-    let run = |destination: &str, fixed: Option<usize>, limited: bool| {
+    let run = |source: &str, destination: &str, fixed: Option<usize>, limited: bool| {
         let mut command = compat_command();
         command
             .arg("-e")
@@ -28,23 +20,26 @@ fn measured_history_seeds_auto_tuning_and_fixed_counts_preserve_legacy_cache() {
             command.args(["--performance-tuning", &format!("workers={fixed}")]);
         }
         command
-            .arg(t.s("src"))
+            .arg(t.s(source))
             .arg(format!("fake:{}", t.s(destination)))
             .arg("--no-progress")
             .env("FAKE_REMOTE_HOME", t.path("remote-home"))
             .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
             .env("FAKE_RSH_LOG", t.path("rsh.log"))
             .env("SYQ_TUNING_CACHE", &cache)
-            // Match the unscoped legacy cache fixture regardless of the host network.
+            // Keep the history's route key independent of the host network.
             .env("SYQ_TEST_TUNING_NETWORK", "")
             .run()
             .unwrap()
     };
     write(&t.path("src"), b"remembered start");
 
-    assert_output_ok(&run("seed", None, false));
+    // The worker-path history records a two-file copy even on a fast link.
+    write(&t.path("seed-src/one"), b"one");
+    write(&t.path("seed-src/two"), b"two");
+    assert_output_ok(&run("seed-src/", "seed", None, false));
     tuning::seed_start_from_last_run(&cache, 1);
-    let automatic = run("auto", None, false);
+    let automatic = run("src", "auto", None, false);
     assert_output_ok(&automatic);
     assert!(
         String::from_utf8_lossy(&automatic.stderr)
@@ -59,9 +54,9 @@ fn measured_history_seeds_auto_tuning_and_fixed_counts_preserve_legacy_cache() {
         String::from_utf8_lossy(&automatic.stdout)
     );
 
-    assert_output_ok(&run("limited-seed", None, true));
+    assert_output_ok(&run("seed-src/", "limited-seed", None, true));
     tuning::seed_start_from_last_run(&cache, 1);
-    let limited = run("limited", None, true);
+    let limited = run("src", "limited", None, true);
     assert_output_ok(&limited);
     assert!(
         String::from_utf8_lossy(&limited.stderr)
@@ -71,10 +66,14 @@ fn measured_history_seeds_auto_tuning_and_fixed_counts_preserve_legacy_cache() {
     );
     assert_eq!(read(&t.path("limited")), read(&t.path("src")));
 
-    let fixed = run("fixed", Some(3), true);
+    // A fixed count does not start from the history.
+    let fixed = run("src", "fixed", Some(3), true);
     assert_output_ok(&fixed);
-    let cached: serde_json::Value = serde_json::from_slice(&read(&cache)).unwrap();
-    assert_eq!(cached["paths"]["local>fake|ssh"], 1);
+    assert!(
+        !String::from_utf8_lossy(&fixed.stderr).contains("auto-tuning: starting with"),
+        "{}",
+        String::from_utf8_lossy(&fixed.stderr)
+    );
 }
 
 #[cfg(debug_assertions)]

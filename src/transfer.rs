@@ -987,20 +987,14 @@ fn connect_source(
                 .checked_add(remote_source_handoff_workers)
                 .context("source worker count overflow")?,
         )?;
-        let entries = sources
-            .iter()
-            .zip(&roots)
-            .map(|(source, root)| {
-                stat_one_registered(
-                    &mut *connection,
-                    &source.path,
-                    &root.selection,
-                    source.follows_root(args.follows_native_source_paths()),
-                )
-                .ok()
-                .flatten()
+        let mut entries = Vec::with_capacity(sources.len());
+        let entries =
+            stat_registered_sources(&mut *connection, sources, &roots, args, |_, entry| {
+                entries.push(entry?.context("source is missing")?);
+                Ok(())
             })
-            .collect();
+            .ok()
+            .map(|()| entries);
         Some(SmallCopySources {
             roots,
             entries,
@@ -1322,7 +1316,7 @@ fn attempt_small_copy(
                 size: entry.size,
                 expression_source: args.copy_if.as_ref().map(|_| {
                     (
-                        crate::expression::File::from_entry(entry),
+                        crate::expression::File::owned_entry(entry),
                         crate::expression::source_path(&source.path, b"").to_vec(),
                     )
                 }),
@@ -2224,29 +2218,27 @@ pub fn run(mut args: Args) -> Result<i32> {
     )? {
         progress.set_results(writer);
     }
-    if !args.dry_run {
-        if let Some(history) = tune::history::Recorder::start(
-            progress.start,
-            serde_json::json!({
+    let mut history_details = (!args.dry_run).then(|| serde_json::json!({
                 "policy_version": tune::POLICY_VERSION, "automatic": args.connections_default,
                 "configured_workers": (!args.connections_default).then_some(args.connections), "worker_limit": (args.automatic_worker_limit() != usize::MAX).then(|| args.automatic_worker_limit()),
                 "bandwidth_limit": args.bwlimit_bytes, "compression": args.compress,
                 "inplace": args.inplace, "checksum": args.checksum,
                 "comparison_hash": args.hash_algorithm, "transfer_integrity": args.transfer_integrity,
-                "transfer_hash": args.transfer_hash_type, "overrides": format!("{:?}", args.tuning_options),
+                "transfer_hash": args.transfer_hash_type, "overrides": args.tuning_options,
                 "sample_ms": tune::SAMPLE.as_millis(), "file_credit": tune::FILE_CREDIT
-            }),
-        ) {
-            let _ = progress.tuning_history.set(history);
-        }
-    }
+            }));
     let dry_run = args.dry_run;
     let prune = args.delete;
     let in_place_update = args.in_place_update;
     // A caller that lends this copy its stream, as a stream mapping does for
     // its pathname phase, records a fatal failure there itself.
     let records_failure = args.results_override.is_none();
-    let outcome = handoff.and_then(|()| run_transfer(args, Arc::clone(&progress)));
+    let outcome =
+        handoff.and_then(|()| run_transfer(args, Arc::clone(&progress), &mut history_details));
+    // Keep early failures inspectable even if the worker path never started.
+    if !matches!(outcome, Ok(0)) {
+        start_tuning_history(&progress, &mut history_details);
+    }
     if let Some(history) = progress.tuning_history.get() {
         history.complete(matches!(&outcome, Ok(0)), serde_json::json!({
             "elapsed_ms": progress.start.elapsed().as_millis(),
@@ -2605,7 +2597,20 @@ fn first_capacity_error(errors: &[Option<WireError>]) -> Option<WireError> {
         .cloned()
 }
 
-fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
+fn start_tuning_history(progress: &Progress, details: &mut Option<serde_json::Value>) {
+    if let Some(history) = details
+        .take()
+        .and_then(|d| tune::history::Recorder::start(progress.start, d))
+    {
+        let _ = progress.tuning_history.set(history);
+    }
+}
+
+fn run_transfer(
+    args: Args,
+    progress: Arc<Progress>,
+    history_details: &mut Option<serde_json::Value>,
+) -> Result<i32> {
     let setup = progress.clock.setup.begin();
     // Post-parse validation lives inside the wrapper's error coverage, so
     // its failures still settle the stream with a failed terminal record.
@@ -2993,6 +2998,9 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         Endpoint::Remote(_) => budgeted_workers.min(crate::conn::MAX_CONCURRENT_CONNECTS),
     };
     let small_copy_candidate = small_copy_eligible(&args, srcs, dst, &src_ep, &dst_ep);
+    if !small_copy_candidate {
+        start_tuning_history(&progress, history_details);
+    }
     drop(setup);
     let (mut src_ctl, early_sources, mut dst_ctl) = {
         let (a, b) = (src_ep.clone(), args.clone());
@@ -3149,9 +3157,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         // The grant admits the copy's worker maximum (see
         // `Args::automatic_worker_limit`); fixed counts stay within it.
         gate.set_connection_allowance(maximum_workers);
-    }
-    if let Some(history) = progress.tuning_history.get() {
-        gate.set_history(history.clone());
     }
     let destination_anchor: DestinationAnchorSlot = std::sync::Arc::new(std::sync::OnceLock::new());
     let source_roots: SourceRootsSlot = std::sync::Arc::new(std::sync::OnceLock::new());
@@ -3596,22 +3601,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
     source_roots
         .set(registered_sources)
         .expect("source roots set once");
-    if let Some(history) = progress.tuning_history.get() {
-        let key = tune::history::context_key(
-            history,
-            &src_ep,
-            &dst_ep,
-            source_filesystem.as_ref().map(|fs| fs.identity.as_str()),
-            None,
-            "setup".into(),
-        );
-        history.context(&key);
-        history.event(
-            "context",
-            serde_json::json!({"stage":"source_registered", "key":key,
-            "source_type":source_filesystem.as_ref().map(|fs| &fs.kind)}),
-        );
-    }
     // Configure each network leg before selecting TCP or SSH. Source helpers
     // share one mapped budget; coordinator sends share one local budget. The
     // sender paces on every route: a receiving machine's socket and the TCP
@@ -3675,12 +3664,6 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         )?;
         match outcome {
             SmallCopy::Done(code) => {
-                if let Some(history) = progress.tuning_history.get() {
-                    history.event(
-                        "copy_path",
-                        serde_json::json!({"path":"fused_control_copy", "tuning":"not_started"}),
-                    );
-                }
                 src_ctl.detach();
                 dst_ctl.detach();
                 return Ok(code);
@@ -3698,6 +3681,12 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
                 )?;
             }
         }
+    }
+    // A successful control-connection copy has no workers or tuning decisions.
+    // Start history only if the offer declined and the worker path will run.
+    start_tuning_history(&progress, history_details);
+    if let Some(history) = progress.tuning_history.get() {
+        gate.set_history(history.clone());
     }
     let setup = progress.clock.setup.begin();
     let tcp_ports = use_tcp.then(|| parse_ports(&args.tcp_ports)).transpose()?;
@@ -3925,22 +3914,24 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         // authoritative here, so its operator path is not resolved again.
         // Named symlinks are reported together, as a glob can name several.
         let mut links = Vec::new();
-        for (source_index, source) in srcs.iter().enumerate() {
-            match stat_one_registered(
-                &mut *src_ctl,
-                &source.path,
-                &source_roots.get().expect("source roots registered")[source_index].selection,
-                source.follows_root(args.follows_native_source_paths()),
-            )? {
-                Some(entry) if refuses_named_symlink(source.selection, entry.kind) => {
-                    links.push(source.path.as_slice())
+        stat_registered_sources(
+            &mut *src_ctl,
+            srcs,
+            source_roots.get().expect("source roots registered"),
+            &args,
+            |source, entry| {
+                match entry? {
+                    Some(entry) if refuses_named_symlink(source.selection, entry.kind) => {
+                        links.push(source.path.as_slice())
+                    }
+                    Some(entry) => {
+                        validate_native_source_type(&source.path, source.selection, entry.kind)?
+                    }
+                    None => bail!("source {} does not exist", display(&source.path)),
                 }
-                Some(entry) => {
-                    validate_native_source_type(&source.path, source.selection, entry.kind)?
-                }
-                None => bail!("source {} does not exist", display(&source.path)),
-            }
-        }
+                Ok(())
+            },
+        )?;
         if !links.is_empty() {
             return Err(named_symlink_sources_error(&links, srcs.len()));
         }
@@ -4965,6 +4956,15 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         // makes the default decision for an absent destination.
         destination_children_known_missing: fresh_destination,
         destination_root_known_missing: dst_initially_missing,
+        // A single local descriptor scan maps unique relative names under a
+        // fixed prefix. A peer supplies its own names, and manifests and
+        // overlapping roots need not have that property. Pruning also uses
+        // these exact byte spellings to protect source counterparts.
+        track_claims: opts.delete
+            || multiple_distinct_sources
+            || opts.src_remote
+            || args.files_from.is_some()
+            || args.native_mapping.is_some(),
         dst_seen: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),
         blocked_directory_paths: std::collections::HashSet::new(),
@@ -5524,22 +5524,11 @@ fn run_transfer(args: Args, progress: Arc<Progress>) -> Result<i32> {
         progress.tuning_history.get(),
         history_context.borrow().as_ref(),
     ) {
-        let final_key = tune::history::context_key(
-            history,
+        history.finish_learning(
+            initial,
             &src_ep,
             &dst_ep,
-            source_filesystem.as_ref().map(|fs| fs.identity.as_str()),
-            destination_filesystem
-                .as_ref()
-                .map(|fs| fs.identity.as_str()),
-            initial.mode.clone(),
-        );
-        history.event(
-            "learning_context",
-            serde_json::json!({
-                "consistent":initial.route == final_key.route,
-                "automatic":autotune && args.tuning_options.is_none()
-            }),
+            autotune && args.tuning_options.is_none(),
         );
     }
 
@@ -5725,14 +5714,15 @@ fn stat_many_registered(
         )?);
         return Ok(entries);
     }
-    match ok(
-        conn.call(Request::StatMany {
-            paths,
-            sources,
-            follow,
-        })?,
-        "stat",
-    )? {
+    stat_reply(conn.call(Request::StatMany {
+        paths,
+        sources,
+        follow,
+    })?)
+}
+
+fn stat_reply(response: Response) -> Result<Vec<Option<Entry>>> {
+    match ok(response, "stat")? {
         Response::Stats(v) => Ok(v),
         other => bail!("unexpected response {other:?}"),
     }
@@ -5894,20 +5884,55 @@ fn inspect_placement_target(conn: &mut dyn Conn, path: &[u8]) -> Result<Option<E
     )
 }
 
-fn stat_one_registered(
+/// Pipeline a bounded number of lookups, one request per argument. Each
+/// argument keeps its own follow policy and endpoint error. Apply results in
+/// argument order and drain the issued lookups if validation stops early.
+fn stat_registered_sources<'a>(
     conn: &mut dyn Conn,
-    path: &[u8],
-    source: &RegisteredPath,
-    follow: bool,
-) -> Result<Option<Entry>> {
-    Ok(stat_many_registered(
-        conn,
-        vec![path.to_vec()],
-        Some(vec![source.clone()]),
-        follow,
-    )?
-    .pop()
-    .flatten())
+    sources: &'a [Location],
+    roots: &[RegisteredSourceRoot],
+    args: &Args,
+    mut visit: impl FnMut(&'a Location, Result<Option<Entry>>) -> Result<()>,
+) -> Result<()> {
+    let depth = if conn.supports_request_pipelining() {
+        conn.reply_queue()
+            .unwrap_or(crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH)
+            .clamp(1, crate::transfer_tuning::DEFAULT_PIPELINE_DEPTH)
+    } else {
+        1
+    };
+    for (sources, roots) in sources.chunks(depth).zip(roots.chunks(depth)) {
+        let sent: Vec<_> = sources
+            .iter()
+            .zip(roots)
+            .map(|(source, root)| {
+                conn.send(Request::StatMany {
+                    paths: vec![source.path.clone()],
+                    sources: Some(vec![root.selection.clone()]),
+                    follow: source.follows_root(args.follows_native_source_paths()),
+                })
+            })
+            .collect();
+        let mut result = Ok(());
+        for (source, sent) in sources.iter().zip(sent) {
+            let entry = sent
+                .and_then(|()| conn.recv())
+                .and_then(stat_reply)
+                .and_then(|mut entries| {
+                    anyhow::ensure!(
+                        entries.len() == 1,
+                        "stat reply count {} does not match request count 1",
+                        entries.len()
+                    );
+                    Ok(entries.pop().flatten())
+                });
+            if result.is_ok() {
+                result = visit(source, entry);
+            }
+        }
+        result?;
+    }
+    Ok(())
 }
 
 /// A copy that cannot widen its destination requires search permission on

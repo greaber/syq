@@ -130,7 +130,9 @@ impl Writer {
             .await
             .context("S3 destination writer stopped")
     }
-    pub async fn finish(&self) -> Result<()> {
+    /// Drain buffered writes already submitted to this writer without
+    /// truncating a direct-I/O file to its final length.
+    pub async fn flush(&self) -> Result<()> {
         // No queue means no buffered write was submitted. In particular,
         // direct writes never need an idle blocking receiver of their own.
         if let Some(send) = self.send.get() {
@@ -142,11 +144,30 @@ impl Writer {
                 .context("S3 destination writer failed")?
                 .map_err(anyhow::Error::msg)?;
         }
+        Ok(())
+    }
+    pub async fn finish(&self) -> Result<()> {
+        self.flush().await?;
         if self.direct.is_some() {
             self.file.set_len(self.size)?;
         }
         Ok(())
     }
+}
+
+/// Write a sequence of chunks to `file` starting at offset 0, in batches of
+/// at most 16 slices (the POSIX minimum `IOV_MAX`).
+pub(super) fn write_chunks(file: &File, chunks: &[bytes::Bytes]) -> std::io::Result<()> {
+    let mut offset = 0u64;
+    for group in chunks.chunks(16) {
+        let len: u64 = group.iter().map(|chunk| chunk.len() as u64).sum();
+        if len == 0 {
+            continue;
+        }
+        write_batch(file, group, offset)?;
+        offset += len;
+    }
+    Ok(())
 }
 
 // Each batch contains at most 16 slices, the POSIX minimum IOV_MAX.
@@ -513,5 +534,25 @@ mod tests {
             assert!(writer.finish().await.is_err());
             assert_eq!(std::fs::read(path).unwrap(), b"original");
         }
+    }
+
+    #[test]
+    fn write_chunks_writes_multiple_iovec_groups_in_order() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = dir.path().join("chunks");
+        let file = File::create(&path).unwrap();
+        let mut chunks = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..35u8 {
+            if i % 7 == 0 {
+                chunks.push(bytes::Bytes::new());
+            } else {
+                let slice = vec![i; (i as usize % 5) + 1];
+                expected.extend_from_slice(&slice);
+                chunks.push(bytes::Bytes::from(slice));
+            }
+        }
+        write_chunks(&file, &chunks).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
     }
 }

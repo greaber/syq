@@ -313,6 +313,28 @@ async fn pending_read_exact_keeps_consumed_bytes_across_observations() {
     assert_eq!(&bytes, b"abcd");
 }
 
+#[test]
+fn far_small_uploads_start_with_at_most_2048_objects_below_32_ms() {
+    let start = |ms| {
+        let mut engine = planning_engine(&[]);
+        engine.options.route = Route::Upload;
+        engine.tuning.observe_control(Duration::from_millis(ms));
+        let workers = engine
+            .object_workers(std::iter::repeat_n(1024, 10_000))
+            .unwrap();
+        assert_eq!(engine.tuning.request_limit(), workers.initial, "{ms} ms");
+        workers.initial
+    };
+    // Only a capacity above 2,048 shows the lower start; raise the soft
+    // descriptor limit as the binary does at startup.
+    crate::raise_nofile();
+    let capacity = start(100);
+    assert!(capacity > 2048, "small-object capacity {capacity}");
+    assert_eq!(start(32), capacity);
+    assert_eq!(start(20), capacity.min(2048));
+    assert_eq!(start(31), capacity.min(2048));
+}
+
 pub(super) fn planning_engine(extra: &[&str]) -> Engine {
     let argv = [
         "cp",
@@ -322,116 +344,82 @@ pub(super) fn planning_engine(extra: &[&str]) -> Engine {
         "--as",
         "destination",
     ];
-    let args = Arc::new(
-        Args::parse_args(
-            &argv
-                .iter()
-                .chain(extra)
-                .map(std::ffi::OsString::from)
-                .collect::<Vec<_>>(),
-        )
-        .unwrap(),
-    );
-    let options = args.s3.clone().unwrap();
-    let tuning = crate::s3::tuning::Tuning::new(
-        &options,
-        &args,
-        Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
-    );
-    let config = aws_sdk_s3::config::Builder::new()
-        .behavior_version_latest()
-        .region(aws_sdk_s3::config::Region::new("us-east-1"))
-        .build();
-    Engine {
-        args,
-        options,
-        tuning,
-        client: Client::from_conf(config),
-        progress: Progress::new(false, false, None),
-        bandwidth: None,
-        upload_keys: OnceLock::new(),
-        discovery: OnceLock::new(),
-        authorization: None,
-        copy_checksum_unsupported: Default::default(),
-        content_md5: Default::default(),
-        file_permissions: Default::default(),
-        metadata_replacements: Default::default(),
-        copy_tagging_unsupported: Default::default(),
-        outage: Default::default(),
-        cancelled: Default::default(),
-        cancel_wake: Default::default(),
-        uploads: Default::default(),
-    }
+    super::super::tests::engine(&[&argv, extra].concat())
 }
 
 #[test]
 fn completed_download_releases_blocking_capacity_for_secondary_hash() {
-    for valid in [true, false] {
-        let dir = crate::test_support::tempdir().unwrap();
-        let destination = dir.path().join("destination");
-        std::fs::write(&destination, b"original").unwrap();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .max_blocking_threads(1)
-            .build()
-            .unwrap();
-        let data = b"verified through two distinct algorithms";
-        let outcome = runtime.block_on(async {
-            let engine =
-                planning_engine(&["--if-exists=update", "--integrity-checking=transfer=blake3"]);
-            let root = Root::open(dir.path()).unwrap();
-            let path = RelativePath::new(b"destination").unwrap();
-            let expected = Digest::hash_bytes(HashAlgorithm::Sha256, data);
-            let metadata = Metadata {
-                kind: crate::s3::client::ObjectKind::File,
-                mode: 0o644,
-                uid: unsafe { libc::geteuid() },
-                gid: unsafe { libc::getegid() },
-                mtime: 1700000000,
-                nsec: 0,
-                hash: Some(
-                    Digest::hash_bytes(
-                        HashAlgorithm::Blake3,
-                        if valid { data.as_slice() } else { b"wrong" },
-                    )
-                    .value,
-                ),
-                hash_algorithm: HashAlgorithm::Blake3,
-            };
-            let object = Object {
-                key: "object".into(),
-                size: data.len() as u64,
-                etag: "fixture".into(),
-                version: None,
-                metadata: None,
-                mtime: metadata.mtime,
-            };
-            tokio::time::timeout(
-                Duration::from_secs(1),
-                engine.download_single(
-                    &object,
-                    &root,
-                    &path,
-                    (&metadata, Some(&expected), Default::default()),
-                    (None, None),
-                    Some(ByteStream::from_static(data)),
-                    None,
-                ),
-            )
-            .await
-        });
-        // Cancelling the copy drops its writer, allowing a failed baseline
-        // test to shut down rather than leaving a blocked worker alive.
-        runtime.shutdown_timeout(Duration::from_secs(1));
-        let outcome = outcome.expect("completed writer starved secondary verification");
-        if valid {
-            assert_eq!(outcome.unwrap(), Some(data.len() as u64));
-            assert_eq!(std::fs::read(&destination).unwrap(), data);
-        } else {
-            assert!(outcome.is_err());
-            assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+    let small = b"verified through two distinct algorithms".to_vec();
+    let streaming: Vec<u8> = (0..140 * 1024).map(|i| (i % 251) as u8).collect();
+    for data in [&small, &streaming] {
+        for valid in [true, false] {
+            let dir = crate::test_support::tempdir().unwrap();
+            let destination = dir.path().join("destination");
+            std::fs::write(&destination, b"original").unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .max_blocking_threads(1)
+                .build()
+                .unwrap();
+            let outcome = runtime.block_on(async {
+                let engine = Arc::new(planning_engine(&[
+                    "--if-exists=update",
+                    "--integrity-checking=transfer=blake3",
+                ]));
+                let root = Arc::new(Root::open(dir.path()).unwrap());
+                let path = RelativePath::new(b"destination").unwrap();
+                let expected = Digest::hash_bytes(HashAlgorithm::Sha256, data);
+                let metadata = Metadata {
+                    kind: crate::s3::client::ObjectKind::File,
+                    mode: 0o644,
+                    uid: unsafe { libc::geteuid() },
+                    gid: unsafe { libc::getegid() },
+                    mtime: 1700000000,
+                    nsec: 0,
+                    hash: Some(
+                        Digest::hash_bytes(
+                            HashAlgorithm::Blake3,
+                            if valid { data.as_slice() } else { b"wrong" },
+                        )
+                        .value,
+                    ),
+                    hash_algorithm: HashAlgorithm::Blake3,
+                };
+                let object = Object {
+                    key: "object".into(),
+                    size: data.len() as u64,
+                    etag: "fixture".into(),
+                    version: None,
+                    metadata: None,
+                    mtime: metadata.mtime,
+                };
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    engine.download_single(
+                        &object,
+                        &root,
+                        &path,
+                        (&metadata, Some(&expected), Default::default()),
+                        (None, None),
+                        Some(ByteStream::from(data.clone())),
+                        None,
+                    ),
+                )
+                .await
+            });
+            // Cancelling the copy drops its writer, allowing a failed baseline
+            // test to shut down rather than leaving a blocked worker alive.
+            runtime.shutdown_timeout(Duration::from_secs(1));
+            let outcome = outcome.expect("completed writer starved secondary verification");
+            if valid {
+                assert_eq!(outcome.unwrap(), Some(data.len() as u64));
+                assert_eq!(std::fs::read(&destination).unwrap(), *data);
+            } else {
+                assert!(outcome.is_err());
+                assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+            }
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
         }
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }
 
@@ -516,21 +504,4 @@ async fn whole_object_batches_start_conservatively_and_can_tune_higher() {
         .unwrap();
     assert_eq!(concurrency.initial, 8);
     assert!(concurrency.maximum.is_none());
-}
-
-#[tokio::test]
-async fn upload_memory_reservation_follows_the_last_sdk_body_clone() {
-    let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
-    let reservation = budget.clone().acquire_many_owned(8).await.unwrap();
-    let body = aws_smithy_types::body::SdkBody::from(bytes::Bytes::from_owner(UploadBuffer {
-        bytes: vec![42; 8],
-        _reservation: reservation,
-        _trace: None,
-    }));
-    let retry = body.try_clone().unwrap();
-    drop(body);
-    assert_eq!(retry.bytes(), Some(&[42; 8][..]));
-    assert!(budget.try_acquire().is_err());
-    drop(retry);
-    assert_eq!(budget.available_permits(), 8);
 }

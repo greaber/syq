@@ -899,6 +899,31 @@ fn trusted_owner_never_falls_back_to_a_second_pathname_lookup() {
     assert!(require_operator_link_fallback_allowed(OperatorSymlinkPolicy::FollowAll).is_ok());
 }
 
+#[test]
+fn selected_regular_file_restores_blocking_io() {
+    let tree = TestDir::new("operator-regular-read");
+    fs::write(tree.path().join("rules"), b"drop\n").unwrap();
+    let base = File::open(tree.path()).unwrap();
+    let resolver = OperatorResolver::beneath(&base, true, OperatorSymlinkPolicy::Refuse).unwrap();
+    let selected = resolver
+        .resolve(
+            b"rules",
+            OperatorFinalComponent::ReadableEntry {
+                follow_symlink: true,
+            },
+            false,
+            &mut Vec::new(),
+        )
+        .unwrap();
+    let PinnedPath::Leaf(leaf) = selected else {
+        panic!("regular file was not selected as a leaf");
+    };
+    let file = leaf.open_read().unwrap();
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    assert_ne!(flags, -1);
+    assert_eq!(flags & libc::O_NONBLOCK, 0);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn selected_fifo_reopens_exactly_and_waits_for_a_writer() {
@@ -1544,7 +1569,7 @@ fn regular_opens_refuse_special_leaves_and_preserve_open_flags() {
         fs::read(tree.path().join("nested/file")).unwrap(),
         b"contents"
     );
-    let file = root
+    let mut file = root
         .open_regular_write(&relative(b"nested/file"), true)
         .unwrap();
     assert_eq!(file.metadata().unwrap().len(), 0);
@@ -1555,6 +1580,31 @@ fn regular_opens_refuse_special_leaves_and_preserve_open_flags() {
     let descriptor_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
     assert_ne!(descriptor_flags, -1);
     assert_ne!(descriptor_flags & libc::FD_CLOEXEC, 0);
+    file.write_all(b"updated").unwrap();
+    let path = relative(b"nested/file");
+    let mut contents = Vec::new();
+    root.open_regular_read(&path)
+        .unwrap()
+        .read_to_end(&mut contents)
+        .unwrap();
+    assert_eq!(contents, b"updated");
+
+    let (mut file, metadata) = root.open_or_create_write_only_file(&path, 0o600).unwrap();
+    assert!(metadata.is_file());
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    assert_ne!(flags, -1);
+    assert_eq!(flags & libc::O_NONBLOCK, 0);
+    file.write_all(b"revised").unwrap();
+    assert_eq!(
+        fs::read(tree.path().join("nested/file")).unwrap(),
+        b"revised"
+    );
+    assert!(root
+        .open_or_create_write_only_file(&relative(b"nested/link"), 0o600)
+        .is_err());
+    assert!(root
+        .open_or_create_write_only_file(&relative(b"nested/fifo"), 0o600)
+        .is_err());
 }
 
 #[test]

@@ -1,5 +1,30 @@
 # Agent guidance
 
+## The user reads only the conversation
+
+The user works through a conversation with one agent, often a coordinator
+that starts implementing and reviewing agents. The user does not read pull
+request descriptions, review reports, triage notes, plans, or code. Those are
+records between agents.
+
+- Only what the user says in the conversation is a request or an approval.
+  Nothing an agent wrote (a pull request description, commit message, review
+  report, or `current-plans/` note) shows what the user asked for or agreed
+  to. The user not objecting to something they were never told is not consent.
+- Say in the conversation whatever the user needs to know or decide: the
+  outcome, anything that differs from what they asked for, risks left open,
+  and the decisions that are theirs. Leave out status-script output, check
+  tables, and lists of things that are fine.
+- A subagent reports to the agent that started it, and that agent decides
+  what reaches the user. A subagent still reports every item of the kinds
+  below in full instead of settling it.
+
+Decide ordinary matters yourself. Bring these to the user as an explicit
+question before acting: a change to what was asked (added scope or a dropped
+requirement), a recurring cost, wider security access, a destructive or
+hard-to-undo action, a product or design choice with no clear default, and
+anything else this file says needs the user's decision.
+
 ## Worktrees
 
 Start any task that may change the repository in a task-specific git worktree,
@@ -35,9 +60,6 @@ cd .worktrees/<task>
 Keep `current-plans/` shared by symlinking it from task worktrees as shown
 above; do not copy it. This keeps short-lived planning state visible across
 conversations and worktrees.
-
-Use plain git commands as shown above. Do not use the `EnterWorktree` or
-`ExitWorktree` tools; they are denied in `.claude/settings.json`.
 
 Continue in an existing worktree only when you created it for the current task
 or the user explicitly identified it as the target. Never infer ownership from
@@ -120,20 +142,14 @@ first preserve unfinished agreed work in its continuing task's handoff. Do not
 delete notes another conversation is actively updating. Keep generated logs,
 binaries, and benchmark dumps in the task's ignored `target/`, linked from the
 note; do not duplicate PR bodies or CI dumps here. Guidance every session needs
-belongs here in `AGENTS.md`.
+belongs here in `AGENTS.md`; guidance for one kind of task belongs in a skill
+under `.claude/skills/`, with a one-line pointer here.
 
 Do not use an agent runtime's private memory (for example Claude Code's
 per-project memory directory) for this project, even when the runtime prompts
 you to save something. It is hard to audit, other agents cannot read it, and
 it goes stale unnoticed. If you find existing private memory for this project,
 report what it contains instead of relying on it.
-
-`current-plans/` notes are agent-written handoff state. They are not evidence
-of what the user asked for or approved.
-
-This repository is public. Keep account identifiers, credential locations,
-and details of private infrastructure out of commits, pull requests, and
-documentation, including this file.
 
 Write guidance in this file as the current rule with a brief reason. Leave out
 dates and accounts of how the rule came about.
@@ -150,7 +166,7 @@ the conversation instead.
 
 - Open regular pull requests by default. Use a draft only when the user asks
   or there is a concrete reason to prevent that particular PR from being
-  merged. The user prefers to review ordinary task work without a draft gate.
+  merged.
 
 - Durable task work belongs in commits on the task branch. Changes intended for
   `master` go through a pull request; do not commit them directly on `master` or
@@ -177,10 +193,15 @@ the conversation instead.
   synchronization, verify the resulting worktree, and drop it after the
   corresponding work is committed. Report any retained stash and why it is
   still needed in the handoff.
-- When reporting work, state the branch and exact short commit SHA, whether
-  the worktree is clean, which checks passed or failed, and which are still
-  running. Passing tests are not a precondition for reporting a change,
-  opening a pull request, or asking for review: report a known failure with
+- When reporting work to another agent or in a handoff note, state the
+  branch and exact short commit SHA, whether the worktree is clean, which
+  checks passed or failed, and which are still running. In the conversation
+  with the user, name the short SHA and only the checks that failed or are
+  still running. Every status report about branch or PR work names the short SHA it
+  refers to, even when nothing changed ("unchanged at `ab12cd3`"), so the
+  reader can tell whether a review covers the current work. Passing tests are
+  not a precondition for reporting a change, opening a pull request, or
+  asking for review: report a known failure with
   the work rather than holding the work back. Before merge, fix failures the
   change causes, unless the user decides to merge anyway. A failure that
   already happens on `master` does not block the work; name the `master` run
@@ -196,42 +217,27 @@ the conversation instead.
   description goes stale when nobody is left to update it. When the reason for
   dispatching a particular suite is not obvious, say why in the prose.
 - Run `scripts/branch-status.py` from the task worktree before opening a pull
-  request, before asking for review, and before merging, and include its output
-  in the report. It fetches `origin/master` and prints the branch SHA,
-  cleanliness, and position relative to it, the pull request's GitHub head and
-  check results, and the latest post-merge and nightly `ci`, `rsync-compat`,
-  and `macos` runs on `master`. Post-merge runs select checks by changed
-  paths, so a green one does not show that an earlier failure was fixed; the
-  nightly run executes the full suite when test inputs changed. The script
-  lists a red post-merge or nightly `master` run, and failures left by
-  recently merged branches, as notes without failing; report unresolved notes
-  even when the current task did not cause them. Do not repeat master failures
-  marked `addressed`; the linked repair has already been reported. A new failed
-  run or rerun needs attention again. A failed check in a run
-  dispatched on this branch makes it exit 1 until a later run of that check
-  passes or that exact failed job is explicitly resolved as described below.
-  It lists the latest result of each check dispatched on the branch
-  and the runs still unfinished; report CI state from this output.
-  `scripts/pr-checks.py <number>` lists the same for any pull request, open or
-  merged, from any checkout. `--check` also runs the Rust baseline below, and
-  `--json` prints the same facts for scripting.
-- Pull requests do not start automated test workflows. The same failed
-  dispatched checks fail the pull request's `dispatched-checks` status, which
-  branch protection requires, so GitHub refuses the merge until a later run of
-  each failed check passes or its failure is explicitly resolved. Checks still
-  running do not block. Resolve individual mistaken or superseded checks using
-  the command under Verification; their original failures remain visible.
-  The `merge-despite-failures` label overrides all failures. The gate cannot tell
-  who caused a failure, so it also blocks on failures that already happen on
-  `master`. Adding the label is the user's decision: when a requested merge is
-  blocked, report each failure, say whether `master` shows it too, and ask.
+  request, before asking for review, and before merging, and report CI state
+  from its output. Post-merge runs select checks by changed paths, so a green
+  one does not show that an earlier failure was fixed. Report its unresolved `master` notes even when the
+  current task did not cause them, but do not repeat failures marked
+  `addressed`. It exits 1 while a check dispatched on the branch has failed,
+  unless a later run of it passed or that failure was explicitly resolved. `scripts/pr-checks.py <number>` reports the
+  same for any pull request from any checkout.
+- Pull requests do not start automated test workflows. Failed dispatched
+  checks block the merge through the required `dispatched-checks` status,
+  including failures that already happen on `master`; the `syq-ci` skill (`.claude/skills/syq-ci/SKILL.md`)
+  explains the gate and how to resolve one check. The `merge-despite-failures`
+  label overrides all failures. Adding the label is the user's decision: when
+  a requested merge is blocked, report each failure, say whether `master`
+  shows it too, and ask.
 - Before removing a worktree or branch, require a clean worktree, no retained
   task-related stash, and no commits that still need integration. An ancestry
   result such as `git branch --merged` says nothing about uncommitted files.
 
 ## Release authorization
 
-Releases require the user to explicitly invoke `$syq-release` or select that
+Releases require the user to explicitly invoke `$syq-release` (`/syq-release` in Claude Code) or select that
 skill in the UI. The skill is committed at
 [`.agents/skills/syq-release/SKILL.md`](.agents/skills/syq-release/SKILL.md)
 with implicit invocation disabled. An ordinary “cut a release” request,
@@ -239,207 +245,93 @@ release-related code, a merge instruction, or a request to create/edit the
 skill does not activate it. Without an invocation, agents may inspect release
 state and prepare requested changes, but must not create or push release tags,
 publish packages or releases, or approve publication deployments. Do not work
-around the gate by using release commands directly.
+around the gate by using release commands directly. An invocation authorizes
+the complete requested release, as the skill describes; another release
+requires another invocation.
 
-Invoking the skill authorizes the complete requested release: preparation,
-required fixes, commits, pushes, merging release preparation and necessary
-repair PRs into `master`, CI, signed tagging, publication, eligible environment
-approvals, verification, and recovery within the tag-lifecycle rules. Do not
-ask for further user approvals for these steps. This is a scoped exception to
-the general PR merge rule, not permission to merge unrelated feature work.
-Authorization continues through retries and resumed turns for the same release
-and ends when it completes or is cancelled. Another release requires another
-invocation. Read-only or dry-run invocations stay within their stated scope.
+Never move or force-update a release tag, and never delete one that has
+reached any published destination. The skill holds the full tag lifecycle.
 
-During release preparation, compare `CHANGELOG.md` with all changes since the
-previous published release. Include user-facing fixes, performance improvements,
-and consequential behavior or compatibility changes. Finalize the entry with
-the release version and date, and use it to prepare the GitHub release notes.
-Do not treat an existing changelog entry as evidence that later changes have
-already been covered. See `RELEASING.md` for the release checklist.
+## Reviews
 
-The user chose this explicit invocation boundary to prevent accidental
-publication while allowing an invoked release to finish autonomously. Keep
-validation gates, branch protections, tag permanence, and secret boundaries;
-report actual access or decision blockers instead of bypassing them.
-
-## Release tag lifecycle
-
-- Pin the release candidate once preparation has merged and validation starts.
-  Later merges into `master` do not automatically replace or block that candidate.
-  Assess later changes for significant fixes worth including; restart with a new
-  candidate only when their value justifies repeating affected validation and
-  builds. The candidate must remain an ancestor of remote `master`.
-- Before pushing a syq release tag, require successful full-suite runs of
-  `ci.yml`, `rsync-compat.yml`, and `macos.yml` on the clean pinned candidate
-  or its first-parent ancestor with unchanged test inputs. The
-  release-preparation exception permits only syq package-version edits and
-  prose documents recognized by `scripts/release_test_inputs.py`; dependencies,
-  source, tests, workflows, and build inputs must match. Changed executable
-  documentation requires its focused tests; it does not invalidate unrelated
-  native/platform or SSH validation. Routine release preparation does not change
-  those examples. Report both the candidate and reused evidence SHAs. A task branch or
-  detached checkout at the candidate SHA is sufficient;
-  do not update the coordination checkout or clone solely to obtain a branch
-  named `master`. Start with `scripts/release-readiness.py v<version>` and reuse
-  its recorded default real-SSH validation when its test inputs are
-  unchanged under the same release-preparation exception. Its `--check-ssh` mode
-  runs and records missing local validation. Reuse post-merge or manual runs
-  when `scripts/verify-release-ci.py`
-  accepts their full-suite certificates; dispatch only workflows missing that
-  evidence and wait for them to succeed. Then run
-  `scripts/release-preflight.py v<version>` from that same commit. Treat any
-  failure as a blocker rather than pushing the tag to discover whether the
-  release workflow starts. Use `scripts/release-status.py v<version>` after
-  the push to correlate the exact tag, workflow, approvals, and publication
-  destinations.
-- Treat a release tag as provisional until its release workflow connects it
-  to permanent published state. If an attempt is
-  abandoned before that boundary, remove the failed tag locally and remotely
-  instead of reserving a version that was never released. Never force-update or
-  silently move the tag.
-- A release tag becomes permanent as soon as any associated version or artifact
-  reaches an immutable or append-only destination, including an immutable
-  GitHub release, a package registry, a module proxy, the Homebrew tap, or a
-  durable artifact attestation. Never move or delete a permanent tag. Repair or
-  rerun the remaining publication steps from that exact tag when safe, or cut a
-  new version when they cannot be completed consistently.
-- Before deleting a provisional tag, stop or wait for its active
-  workflows and audit every release destination with read-only checks. Resolve
-  the exact tag object and target commit; verify that no permanent publication
-  exists; and inspect and clean any recoverable draft state. Delete only the
-  explicitly audited local and remote refs, then verify their absence and
-  report what was removed and whether it can be recovered.
-
-## Always report the commit you are talking about
-
-- Any status report about branch or PR work states the short SHA it refers
-  to: what you just pushed, what CI ran against, what you are about to
-  change. "PR #123 is green" is not actionable; "PR #123 is green at
-  `ab12cd3`" is.
-- This pairs with the reviewer-side rule below. When the working agent and
-  the reviewing agent both name a SHA, the reader can tell at a glance
-  whose turn it is: same SHA means the review covers the current work,
-  different SHAs mean one of them is behind and needs to act.
-- State the SHA even when nothing changed — "unchanged at `ab12cd3`" is
-  the fact the reader needs to route the next step.
-
-## Starting reviews
-
-The implementing or coordinating agent starts reviews and follows them itself
+Every change gets an independent review before it merges: at least one
+reviewer that starts from clean context and did not write the change. The
+implementing or coordinating agent starts the review and follows it itself
 with `scripts/agent-coordination.py review` (see
-[`scripts/agent-coordination.md`](scripts/agent-coordination.md)). Do not ask
-the user to start reviewers or pass reports between agents; the tool already
-carries reports and later rounds. The default reviewer, Claude Opus 5.5 at
-`xhigh` effort without approval prompts, suits most PRs. For security,
-protocol, authorization or data-integrity changes, and for large PRs, also add
+[`scripts/agent-coordination.md`](scripts/agent-coordination.md)). The tool
+carries reports and later rounds, so the user starts nothing and passes
+nothing along. The default reviewer, Claude Opus 5.5 at `xhigh` effort
+without approval prompts, suits most PRs. For security, protocol,
+authorization or data-integrity changes, and for large PRs, also add
 `--additional-reviewer --reviewer codex` with GPT-6 Astra (the default) or
 GPT-6.1 Sol (`--model gpt-6.1-sol`): a second model occasionally finds
 important issues Opus misses. Lower effort is fine for small or test-only
 changes.
 
-## Acting on review feedback
+When you are the reviewer, follow
+[`.claude/skills/syq-review/SKILL.md`](.claude/skills/syq-review/SKILL.md).
 
-Assess every finding and observation on its merits. "Pre-existing", "out of
-scope", "nonblocking", and "optional" describe context, not importance; none
-is a reason to dismiss a point without consideration. Keep defects, suggestions,
-and observations distinct, and discuss their value rather than treating every
-comment as a change request. A worthwhile observation may belong in this PR,
-in separate work, or need no change; decide that explicitly. Respect an explicit
-user decision to exclude a topic, but do not infer exclusion from reviewer labels.
+### Acting on findings
 
-Reconsider the underlying requirements as part of this assessment, using the
-principles below. Fix directly only independently confirmed, worthwhile problems
-with simple, straightforward fixes, no tradeoffs that would benefit from
-discussion, and no unresolved question about the requirements. For anything else,
-discuss the evidence, value, alternatives, and requirements with the user
-before implementing that finding.
+Review is adversarial on purpose. The reviewer's job is to look for holes;
+the job of the agent that owns the change is to decide what the change needs.
+A finding can be correct and still call for no change. Left unchecked, review
+grows a change: each round adds safeguards, options and edge-case handling
+that nobody asked for, and these cost complexity and can harm the product's
+other goals.
 
-The user may forward review from a reviewer without having understood it or even
-without having read it. Just because a point appears in a review pasted directly by
-the user does not mean that the user agrees with it. Similarly, the reviewer is just
-another agent, and the reviewer's job is to find possible issues with the work. Many
-issues raised by the reviewer might actually best be addressed by doing nothing even
-though the reviewer was not wrong about how the code works.
+For each finding, ask what concrete situation triggers it, how likely that
+is, how bad the result would be, and what the fix costs in code, complexity
+and other goals. Then:
 
-## Reviewing scope the user did not request
+- Fix what you have confirmed and is worth its cost: wrong results, data
+  loss, a security hole, a broken agreed requirement, or a real problem with
+  a small fix.
+- Decline the rest in a sentence that gives the reason. Declining a correct
+  finding is a normal outcome. When a declined finding leaves a real risk in
+  the change, tell the user in a line. Labels such as "pre-existing", "nonblocking"
+  and "optional" are neither a reason to act nor a reason to dismiss.
+- Do not let a fix outgrow its problem. A fix that adds a mechanism, option,
+  fallback or guarantee the task did not call for is added scope. When the
+  problem is one of the serious kinds in the first bullet, take it to the
+  user; otherwise decline the finding. Scope the reviewer reports as beyond
+  the task also goes to the user.
+- A real problem outside the task is separate work. Mention it to the user
+  in a line and do not widen the change. A topic the user excluded stays
+  excluded.
 
-A pull request description and its commit messages are the implementing
-agent's own account of the work. They show what the agent intended; they are
-not evidence that the user asked for or agreed to it. The user often has not
-seen the change before the review.
+Do not change the work merely so that the reviewer agrees, and do not argue
+one point for more than a round: record the disagreement and go on. A review
+the user pastes into the conversation is still the reviewer's opinion, not
+the user's.
 
-When reviewing, separate what the task called for from what the PR adds
-beyond it: new workflows or triggers, recurring CI or hosting cost, new
-policy or defaults, broadened guarantees, or behavior in unrelated areas.
-Report each such addition at the top of the review as a decision for the
-user, stating its cost or consequence, even when the PR explains it and even
-when the implementation is sound. Do not file it as a deliberate choice that
-needs no action. The user decides whether the expansion stays; "the PR says
-it is intentional" is not that decision.
+### When to stop and tell the user
 
-## Review reports
+A review should converge in one or two rounds. A further round that only
+confirms small fixes from the round before is fine, so that no change merges
+unreviewed. Stop before making further changes, and tell the user, when any
+of these happens:
 
-- Group items by the action they need: worth addressing before merge,
-  decisions for the user with a recommendation, and fine as is. Say whether
-  each item is a problem, a good thing, or neutral. Lead with what needs
-  action and keep confirmations brief and last.
-- Label each finding as introduced by the PR or pre-existing. Only findings
-  the PR introduced are for the implementing agent. Report pre-existing
-  issues to the user separately, and do not carry them into later review
-  passes; otherwise each pass widens the change into code the task never
-  touched.
-- Mention performance opportunities you notice, whether or not they block the
-  PR or fall within its scope, with the mechanism and a way to measure the
-  gain. Startup latency and throughput are core to the product.
-- Do not flag a missing `CHANGELOG.md` entry on an ordinary PR. The changelog
-  is brought up to date during release preparation.
-- Do not run test suites, lints or CI during a review; the implementing
-  agent and CI own them. Take CI state from `scripts/pr-checks.py` (without
-  `--check`), not from the description. Note results whose SHA is older than the reviewed SHA when
-  later commits could change them, and report failed checks. Checks still
-  running do not block merge. If a check that matters for the change has not
-  run, say which and why, and leave dispatching it to the implementing agent.
-  Run code only to examine behavior that no existing test covers, such as a
-  focused reproduction of a suspected defect in a disposable directory, and
-  build only as that needs. If an existing test looks wrong, report it rather
-  than running it.
+- the second round still finds problems that need more than small fixes;
+- the change has started to grow beyond what the task asked for, in size or
+  in what it does;
+- fixes for findings keep producing new findings;
+- you and the reviewer disagree about something consequential.
 
-## PR review freshness
-
-- For any GitHub PR review or re-review, never assume the current checkout `HEAD` is the latest PR code. Resolve the PR's `headRefName`, `headRefOid`, and head-repository identity (owner and repository) first. Treat the GitHub `headRefOid` as authoritative unless a fresher local commit is verified as described below.
-- In this repo's multi-worktree review workflow, also resolve the local branch ref for the PR's `headRefName`. A detached review worktree can stay pinned to an old commit even when the branch ref has moved.
-- A matching branch name is not proof that a local ref belongs to the PR, especially for fork PRs. Treat a local ref as PR code only when its worktree ownership is explicit and its repository identity and ancestry relative to `headRefOid` have been verified.
-- If the local ref is missing, behind the GitHub head, divergent from it, or cannot be tied unambiguously to the PR's head repository, review the GitHub `headRefOid`. Fetch that exact head into a dedicated review ref or worktree when necessary, without overwriting an unrelated local branch, and report the discrepancy.
-- If local and GitHub refs match, review that SHA. If the local ref is ahead, use it only when the worktree belongs to the task and the GitHub `headRefOid` is its ancestor; tell the user that GitHub is stale and either review the unpushed local tip explicitly or wait for it to be pushed.
-- Skip a repeated review only when the chosen target SHA matches the last SHA
-  that this same agent reviewed for this PR in its own conversation history
-  (including preserved context when resuming that conversation). Report that
-  the PR is unchanged since this agent's review and name the SHA. An explicit
-  user request to review it again overrides this shortcut.
-- Use only that agent's own conversation history to establish its previous
-  review. Do not use GitHub reviews, comments, review decisions, shared review
-  notes, or another agent's review history to decide to skip. Agents may share
-  a GitHub account, and multiple agents must be able to review the same commit
-  independently. If this agent has no record of its own prior review, proceed
-  with the review.
-- Always state the exact reviewed SHA and whether it came from the local branch tip or the GitHub PR head.
+Say what was asked, what the change has become, what is still disputed, and
+what you recommend. Often the right recommendation is to merge the change as
+it stands or to cut it back to the original task.
 
 ## Working on syq
 
 - [`PRINCIPLES.md`](PRINCIPLES.md) records the user's core product principles.
   Check a design against it before implementing, and raise any conflict first.
   Only the user decides its contents; propose a change in a pull request and
-  say so at the top.
+  raise it with the user in the conversation.
 - `README.md` and the documents under `docs/` are the user-facing contract;
-  `README.md` is a brief front door and `docs/` is the source of the
-  documentation site published with GitHub Pages (mdBook, configured by
-  `book.toml`; every page must be listed in `docs/SUMMARY.md`;
-  `scripts/check-doc-links.py` checks links). `docs/copy-files.md` carries the
-  detailed behavior. Write these documents directly and conversationally, in
-  plain words; a reader should not need project jargon such as "retained" or
-  "the ordinary engine" to follow them. The code is authoritative for
-  everything else.
+  `README.md` is a brief front door, and `docs/copy-files.md` carries the
+  detailed behavior. The code is authoritative for everything else. When you
+  edit them, follow the `syq-docs-writing` skill (`.claude/skills/syq-docs-writing/SKILL.md`).
 - Routinely reconsider whether requirements are actually required and how much
   they matter; no special reason or failure is needed to ask. Distinguish the
   user's goals from assumptions, design choices, and incidental safeguards.
@@ -457,17 +349,14 @@ it is intentional" is not that decision.
   for a concrete scenario or consumer that needs them.
 - Write repository tooling (CI scope, release, status, and test scripts) in
   Python using only the standard library, run with the interpreter pinned by
-  `scripts/setup.sh`. CI and the release workflows use that interpreter too,
-  so the tooling needs no separate compatibility floor for older Python
-  releases. The exception is `tests/real-ssh/*.py`: those scripts run inside
-  the Debian test containers and must work with that image's `python3`. Use
-  portable shell only for code that runs on users' machines or arbitrary
-  hosts (the generated installer and `scripts/try-benchmark.sh`), code that
-  must run before pinned tools exist (`scripts/setup.sh`), the real-SSH
-  container scripts, and thin wrappers that only run other commands, such as
-  the release runners' Nix and build steps. CI and release tooling is too
-  complex to maintain well in Bash, so do not spend effort on Bash 3.2
-  compatibility for development scripts.
+  `scripts/setup.sh`, so it needs no compatibility floor for older Python.
+  `tests/real-ssh/*.py` must instead work with the Debian test image's
+  `python3`. Use portable shell only for code that runs on users' machines or
+  arbitrary hosts (the generated installer and `scripts/try-benchmark.sh`),
+  `scripts/setup.sh`, the real-SSH container scripts, and thin wrappers that
+  only run other commands, such as the release runners' Nix and build steps.
+  CI and release tooling is too complex to maintain well in Bash, so do not
+  spend effort on Bash 3.2 compatibility for development scripts.
 - Keep CLI behavior, help text, `README.md`, `docs/`, and integration tests in
   sync. A behavior change lands in `docs/copy-files.md` (or the topical
   document that owns it), not in a new README section.
@@ -477,19 +366,6 @@ it is intentional" is not that decision.
   belong there. Keep only brief `current-plans/` notes needed to continue
   active work. State a limitation as a fact about today's behavior, not as
   an intention.
-- Match documentation detail to the page's job. Setup and task guides should
-  give a useful example, explain consequential choices, and link to reference
-  material. Reference pages hold option interactions and scripting contracts;
-  security pages explain trust boundaries. Algorithm mechanics and regression
-  histories usually belong in code, tests, or the PR description.
-- When adding behavior, revise the paragraph that owns it rather than appending
-  a new explanation everywhere it is mentioned. Read the surrounding section
-  as a new user: keep details that help them act or interpret a result. A fixed
-  bug does not automatically need a new paragraph. Avoid release-number history
-  and unmeasured tuning advice in guides; benchmark claims need linked evidence.
-- Use [the docs audit skill](.agents/skills/syq-docs-audit/SKILL.md) for requested
-  editorial audits and during release preparation. An audit can identify a
-  product question without changing runtime behavior to simplify its explanation.
 - Exercise copy, resume, verification, and removal behavior in disposable
   temporary directories. Treat `syq --rm`, remote destinations, bootstrap
   installation, and operations on real user data as potentially destructive.
@@ -527,9 +403,11 @@ Files shared between syq versions, because they hold information that should
 persist through updates, should stay readable by newer versions. Breaking
 that compatibility needs an explicit discussion with the user first.
 
-## Release secrets
+## Public repository and release secrets
 
-This repository is public. Do not commit credentials, tokens, private keys,
+This repository is public. Keep account identifiers, credential locations,
+and details of private infrastructure out of commits, pull requests, and
+documentation, including this file. Do not commit credentials, tokens, private keys,
 or encrypted credential inventories to syq. Encryption does not make a
 credential file appropriate for this repository. Credentials are stored
 privately outside the repository so that public clones do not receive
@@ -546,37 +424,10 @@ clients trust it. See RELEASING.md for the workflow's required inputs.
 
 ## Performance evidence
 
-Choose benchmark duration to suit the behavior being measured; there is no
-fixed minimum. Short tests can measure startup or small operations, but do not
-infer sustained performance from subsecond runs unless there is evidence that
-they reach a representative steady state quickly. Consider startup, autotuning
-and variability, and lengthen or repeat the test as needed to support the claim.
-
-Record resource use with every benchmark, not only elapsed time. At minimum,
-report CPU time (user and system) and peak memory for each process, the
-coordinator and every helper, and compare both with the baseline. Also record
-the other resources the change could affect, such as bytes sent or written,
-threads and open files, filesystem or network requests, and disk space. A
-change can be faster while using several times the memory or CPU, and timing
-alone hides that.
-
-Measure peak memory exactly. `ru_maxrss` (what `wait4` and `/usr/bin/time`
-report) reads the kernel's per-CPU RSS counters without their pending deltas.
-Each CPU can hold back up to twice the CPU count in pages, so on a 96-CPU
-Linux host a reading can be about 768 KiB low for each CPU the process ran on,
-and few-run medians jump between values that far apart with no real change. Read `VmHWM` and `VmRSS` from
-`/proc/PID/status`, or `/proc/PID/smaps_rollup`, before the process exits, or
-compare enough samples to see the clusters.
-
-When new code replaces or bypasses an existing path, first list what the
-existing path does for performance and resource use: preallocation, cloning
-or in-kernel copies, read-ahead and access hints, request sizes, memory bounds
-and batching. Either carry each one over, or measure the cases it was meant to
-help and show that the new path does not regress them. Measure on the kinds of
-system those choices target, such as filesystems with and without cloning
-(XFS or btrfs against ext4), network filesystems, and slow and fast links. A
-choice that only matters elsewhere is invisible on the development machine's
-own filesystem.
+Record CPU time (user and system) and exact peak memory for every process
+with each benchmark, not only elapsed time, and compare them with the
+baseline. Follow the `syq-benchmark` skill (`.claude/skills/syq-benchmark/SKILL.md`) when benchmarking, making a
+performance claim, or replacing an existing copy or I/O path.
 
 ## Verification
 
@@ -589,24 +440,9 @@ into a cache shared by all worktrees, then run
 `eval "$(scripts/setup.sh env)"` in the shell that runs the check. CI uses
 the same script.
 
-Rust fixtures use `test_support::tempdir()` or `test_support::temp_dir()`
-from `tests/support/temp.rs` (re-exported by `src/test_support.rs` for unit
-tests). These resolve the ambient temporary root before creating fixtures,
-so macOS `/var` and other host symlinks do not become paths under test.
-Create intentional symlinks inside that root; do not canonicalize product
-arguments or add follow flags merely to make a fixture pass. For fixtures that
-must fit Unix socket path limits, use `test_support::short_tempdir()`; it
-centralizes the canonical short-root exception without changing `TMPDIR`.
-Create any file that a test or the product code under test executes with
-`write_executable` or `copy_executable` from `tests/support/executable.rs`.
-They write it in a child process; a file the test process writes itself can
-stay open in a process that another thread starts at that moment, so running
-it fails with "Text file busy". Nextest gives each test its own process, but
-plain `cargo test` shares one, and tests and product code also start
-processes from several threads. A test that starts a background service, such
-as `persist receive on`, must stop it even when the test fails (for example
-with `PersistenceOff` in `tests/local.rs`); deleting the test's temporary
-directory leaves the service running.
+When writing or changing Rust tests, follow the `syq-rust-tests` skill (`.claude/skills/syq-rust-tests/SKILL.md`):
+fixtures use `test_support` temporary directories, executed files are written
+with `write_executable`, and background services must be stopped on failure.
 
 Testing happens in three places, each running more than the one before:
 before merge, after merge (post-merge CI, which selects checks by changed
@@ -632,37 +468,10 @@ the failure and ask the user before resolving it. Record why the failure no
 longer needs to block. Do not excuse an unfixed product defect or drop agreed
 coverage without the user's decision.
 
-Use the job ID at the end of its GitHub job URL:
-
-```bash
-GITHUB_REPOSITORY=greaber/syq scripts/dispatched-checks-status.py <pr> \
-  --resolve-job <job-id> --reason 'Why this failure no longer blocks' \
-  --replacement <https-url>
-```
-
-The reason is one line of at most 140 characters; the replacement URL is optional.
-This records a separate GitHub status with the author and time, then refreshes
-the gate. It covers only that PR and exact failed job, not other or future
-failures. The command needs permission to write commit statuses.
-Resolutions do not count as passing tests or release validation.
-
-After repairs merge into `master`, stop repeated reminders for a failed nightly
-or post-merge run once all of that run's failures are accounted for by the repairs
-and focused checks passed. A full nightly rerun is not required to acknowledge
-those repairs. Record the reason and link to the merged repair (including its
-validation) or replacement evidence:
-
-```bash
-scripts/branch-status.py --address-master-run <run-id> \
-  --reason 'Failures addressed by the merged repair; focused checks passed' \
-  --fix <https-url>
-```
-
-This is authorized as part of completing the repair. It records a separate
-GitHub status for that exact run attempt; the original failure remains visible,
-and a new failed run or rerun is reported normally. It only suppresses repeated
-reminders, without changing PR gates, test conclusions, or release validation.
-Do not acknowledge a whole run while some failures still need repair.
+The `syq-ci` skill (`.claude/skills/syq-ci/SKILL.md`) has the commands for resolving a failed dispatched check
+and for acknowledging a failed `master` run once all of its failures are
+accounted for by merged repairs and focused checks passed; that
+acknowledgment is authorized as part of completing the repair.
 
 Weigh cost as well as relevance. For changes to code, tooling, tests, or
 executable documentation, run `scripts/run-tooling-tests.py --quick` once on
@@ -685,29 +494,18 @@ replying or merging:
 gh workflow run ci.yml --ref <task-branch> -f suites='real-ssh s3'
 ```
 
-`suites` takes the names listed in `SUITES` in `scripts/ci-scope.py`,
-including `rust` (formatting, clippy, and every Rust target), `macos-lint`
-(clippy for Apple Silicon on Linux), `tooling`, `python-sdk`, `linux-arm64`,
-`macos-intel`, `s3`, `real-ssh`, and single real-SSH profiles. Report such
-checks as running in your reply; GitHub keeps their results, so the pull
-request needs no update when they finish. They
-keep running if the pull request merges. A later run with the same `suites`
-value on the branch cancels the earlier run of those jobs, so dispatch once
-the change has settled rather than after every commit.
-A check is a job name, and a combined selection names the `rust` job after
-all its parts, so to clear a failed check, dispatch the same `suites` value
-again or rerun the failed run. The same applies to what you ask of subagents:
-do not have a subagent run slow suites before it reports.
+`suites` takes the names listed in `SUITES` in `scripts/ci-scope.py`. Report
+such checks as running in your reply. A later run with the same `suites` value
+on the branch cancels the earlier one, so dispatch once the change has
+settled; the `syq-ci` skill has the details. Do not have a subagent run slow
+suites before it reports.
 
 Dispatch the macOS suite (`gh workflow run macos.yml --ref <task-branch>`)
 only for platform-sensitive changes: code paths that differ on macOS,
 filesystem or process behavior, and packaging. Each run occupies a macOS
 runner for half an hour or more, and post-merge and nightly runs cover the
 rest. Do not rerun it after it passed at the same commit, or after a passing
-run on the branch, unless the later commits could change its result. On a task
-branch it runs SDK packaging and the release tooling suites only when the
-branch changes them or with `-f complete=true`, and a newer dispatch on the
-same branch cancels the older run.
+run on the branch, unless the later commits could change its result.
 
 After synchronizing a branch with `master`, build; when conflicts touched
 code, also run the focused tests for that code. Use `--locked` for Cargo
@@ -720,13 +518,10 @@ Choose checks from the behavior changed, not every workflow available. For
 Rust changes, run `cargo fmt --all -- --check`, a build, and the unit or
 integration tests that exercise the change. When a change adds, removes, or
 narrows a platform `cfg`, such as making tests Linux-only, also run
-`scripts/check-macos-lint.py`. It lints the macOS build on Linux in about a
-minute. Post-merge CI runs it as the `macos-lint` job with every Rust change,
-but running it before merge keeps the failure off `master`. Prefer
-exact or narrow filters in the `local` target (`tests/local.rs` holds the
-shared helpers and `tests/local/<topic>.rs` the tests, named
-`<topic>::<test>`); those tests invoke the built binary against temporary
-trees. For a substantial runtime change, dispatch `suites=rust` rather than
+`scripts/check-macos-lint.py` (about a minute on Linux). Post-merge CI runs
+it as the `macos-lint` job with every Rust change, but running it before
+merge keeps the failure off `master`. Prefer exact or narrow filters in the `local`
+target. For a substantial runtime change, dispatch `suites=rust` rather than
 running clippy and every target locally. `scripts/branch-status.py --check`
 runs this local baseline when you want it:
 
@@ -736,52 +531,18 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo nextest run --locked --bin syq
 ```
 
-Use `cargo nextest run` for Rust tests. Its repository configuration gives
-each test a two-minute deadline and a five-second termination grace period,
-then continues the remaining tests. Plain `cargo test` has no enforced
-timeout; use it only for builds/listing or investigations requiring its shared
-process. CI uses nextest on Linux and macOS, including selected ignored tests.
+Use `cargo nextest run` for Rust tests; its repository configuration gives
+each test a deadline. Plain `cargo test` has no enforced timeout; use it only
+for builds/listing or investigations requiring its shared process.
 
 For one exact Rust unit test, use
 `cargo nextest run --locked --bin syq -- --exact 'module::tests::name'`; for an
 integration test, replace `--bin syq` with its target, such as `--test local`.
 Confirm the named test ran; a zero-test or ignored result is not validation.
 
-A workflow lacking a focused option is not a reason to run its full suite.
-For arbitrary checks on a Linux or macOS runner, use the manual focused
-runner from a clean, pushed task branch:
-
-```bash
-scripts/run-focused-check.py --runner macos --cargo-cache -- \
-  cargo nextest run --locked --bin syq --run-ignored all --no-tests fail \
-  -- --exact 'module::tests::name'
-scripts/run-focused-check.py --runner linux --script target/check.sh
-```
-
-The script file is local and need not be committed; it may contain setup and
-multiple commands. It runs with Bash `-euo pipefail` in the checked-out repository.
-With `--cargo-cache`, the runner also installs the pinned cargo-nextest. Use
-pinned setup commands for other tools; the runner does not install all SDK
-toolchains or reproduce another workflow's setup automatically. For a workflow
-setup regression, reproduce the relevant setup as well as the failing command.
-Inputs and logs are public: do not include secrets. Confirm exact Rust tests
-actually ran; nextest rejects filters that match zero tests, while plain
-`cargo test` accepts them.
-
-The helper selects the current remote branch, pins its checkout commit,
-prints the SHA and run URL, and watches that exact run through
-`gh run watch`; run it in the background when you do not need the result
-before replying. Checks run on GitHub-hosted runners; `--ref` explicitly tests
-another pushed branch or tag; `--timeout` changes the default 15-minute limit.
-Only enable `--cargo-cache` for checks needing Rust builds.
-No builds or test suites run implicitly, and these checks do not certify a
-full suite for release. Add reusable focused checks when repeated use
-justifies them rather than adding a permanent option for every repair.
-
-For an exact Rust test on another platform, pass `--run-ignored all` and
-`--no-tests fail` as in the first example: the test runs even where it is
-marked ignored, and the check fails when the name does not exist on that
-platform. Replace `--bin syq` with `--test <target>` for an integration test.
+A workflow lacking a focused option is not a reason to run its full suite:
+the `syq-ci` skill shows how to run one check, such as a single Rust test, on
+a Linux or macOS runner.
 
 Two suites cover behavior that the Rust targets cannot reach. Both run in
 Docker and can run locally:
@@ -791,12 +552,11 @@ scripts/test-real-ssh.py
 scripts/test-s3.py
 ```
 
-- `scripts/test-real-ssh.py` runs the candidate build through live OpenSSH
-  clients and servers in three containers. See `tests/real-ssh/README.md` for
-  its isolation and coverage.
-- `scripts/test-s3.py` runs against a disposable local S3 server in Docker and
-  takes about a minute after the build. It covers S3 upload, download, and
-  server copy, expressions, directory markers, pruning, streams, and listing.
+The real-SSH suite runs the candidate build through live OpenSSH clients and
+servers in three containers; `tests/real-ssh/README.md` describes its
+coverage. The S3 suite runs against a disposable local S3 server, takes about
+a minute after the build, and covers S3 upload, download, and server copy,
+expressions, directory markers, pruning, streams, and listing.
 
 Dispatch them in CI (`suites=real-ssh`, `suites=s3`) when their scenarios
 exercise the behavior you changed. Decide from the suite's scenarios, not from
@@ -809,8 +569,7 @@ manual `ci.yml` runs include both.
 
 Do not describe an earlier run as testing the current tree; the SHAs in the
 check table and the status scripts say what ran where. Release validation
-follows the commit and release-preparation evidence rules under release tag
-lifecycle.
+follows the evidence rules in the `syq-release` skill.
 
 Nightly should run every test in the repository. Leaving a test out of
 nightly needs the user's explicit agreement. Full validation remains required

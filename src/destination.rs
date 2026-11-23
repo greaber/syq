@@ -1599,7 +1599,8 @@ enum Closed {
     Yes,
 }
 /// The longest a request waits for a tentative close to be decided, within
-/// the time the service takes to decide (`ssh_auth::CLOSE_WAIT`).
+/// the time the service takes to decide (`ssh_auth::CLOSE_WAIT`) and to
+/// write its answer (the control socket's write timeout).
 const CLOSE_DECISION: Duration = Duration::from_secs(1);
 /// One request being handled, until dropped.
 struct Handling<'a>(&'a Activity);

@@ -252,47 +252,21 @@ fn unsplit_or_exhausted_blocks_need_no_extra_hash() {
 }
 
 #[test]
-fn streaming_replies_drain_without_a_block_credit_window() {
-    let (tx, rx) = mpsc::sync_channel(1);
-    let replies = WriteReplies::spawn(rx.into()).unwrap();
-    let (finished, done) = mpsc::channel();
-    let sender = std::thread::spawn(move || {
-        for _ in 0..10_000 {
-            tx.send(queued(Response::Ok)).unwrap();
-        }
-        tx.send(queued(Response::WriteStreamDone)).unwrap();
-        tx.send(queued(Response::Path(b"next operation".to_vec())))
-            .unwrap();
-        finished.send(()).unwrap();
-    });
-    done.recv_timeout(Duration::from_secs(5))
-        .expect("reply collection blocked without worker receives");
-    let (rx, state) = replies.finish(false);
-    assert_eq!(state.count, 10_000);
-    assert!(state.fenced && state.error.is_none());
-    assert!(matches!(
-        rx.recv().unwrap().unwrap().value,
-        Response::Path(_)
-    ));
-    sender.join().unwrap();
-}
-
-#[test]
-fn streaming_replies_preserve_errors_and_wait_for_the_fence() {
-    let (tx, rx) = mpsc::channel();
-    let replies = WriteReplies::spawn(rx.into()).unwrap();
-    tx.send(queued(Response::Ok)).unwrap();
-    tx.send(queued(Response::EndpointError(WireError {
+fn streaming_replies_preserve_errors_through_the_fence() {
+    let reader = Arc::new(WriteReplyState::default());
+    let replies = reader.begin().unwrap();
+    assert!(reader.begin().is_err());
+    assert!(reader.collect(Ok(&Response::Ok)));
+    assert!(reader.collect(Ok(&Response::EndpointError(WireError {
         message: "disk full".into(),
         io_kind: Some(crate::proto::WireIoKind::NoSpace),
         raw_os_error: None,
         condition_not_met: false,
-    })))
-    .unwrap();
-    tx.send(queued(Response::Err("later error".into())))
-        .unwrap();
-    tx.send(queued(Response::WriteStreamDone)).unwrap();
-    let (_, state) = replies.finish(false);
+    }))));
+    assert!(reader.collect(Ok(&Response::Err("later error".into()))));
+    assert!(!reader.collect(Ok(&Response::WriteStreamDone)));
+    assert!(!reader.collect(Ok(&Response::Path(b"next operation".to_vec()))));
+    let state = replies.status();
     assert_eq!(state.count, 3);
     assert!(state.fenced);
     assert!(
@@ -301,26 +275,15 @@ fn streaming_replies_preserve_errors_and_wait_for_the_fence() {
 }
 
 #[test]
-fn streaming_replies_eof_is_not_success_and_abort_wakes_a_quiet_collector() {
-    let (tx, rx) = mpsc::channel();
-    let replies = WriteReplies::spawn(rx.into()).unwrap();
-    tx.send(queued(Response::Ok)).unwrap();
-    drop(tx);
-    let (_, state) = replies.finish(false);
+fn streaming_replies_forward_transport_failure_and_allow_teardown_without_a_fence() {
+    let reader = Arc::new(WriteReplyState::default());
+    let replies = reader.begin().unwrap();
+    assert!(reader.collect(Ok(&Response::Err("write refused".into()))));
+    let eof = io::Error::new(io::ErrorKind::UnexpectedEof, "reader stopped");
+    assert!(!reader.collect(Err(&eof)));
+    let state = replies.status();
     assert!(!state.fenced && matches!(state.error, Some(Failure::Transport(_))));
-    let (_tx, rx) = mpsc::channel();
-    let replies = WriteReplies::spawn(rx.into()).unwrap();
-    let start = std::time::Instant::now();
-    let _ = replies.finish(true);
-    assert!(start.elapsed() < Duration::from_secs(2));
-}
-
-fn queued(value: Response) -> io::Result<crate::conn::ReceivedResponse> {
-    Ok(crate::conn::ReceivedResponse::from_frame((
-        crate::wire_budget::Budgeted {
-            value,
-            hold: crate::wire_budget::Hold::new(),
-        },
-        std::time::Instant::now(),
-    )))
+    drop(replies);
+    drop(reader.begin().unwrap());
+    assert!(!reader.collect(Ok(&Response::Ok)));
 }

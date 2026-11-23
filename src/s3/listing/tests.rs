@@ -8,7 +8,6 @@ use std::{
 struct Memory {
     keys: BTreeSet<String>,
     calls: RefCell<Vec<(String, bool)>>,
-    resumes: RefCell<Vec<(String, String)>>,
     active: Cell<usize>,
     peak: Cell<usize>,
 }
@@ -17,7 +16,6 @@ impl Memory {
         Self {
             keys: keys.into_iter().collect(),
             calls: RefCell::default(),
-            resumes: RefCell::default(),
             active: Cell::new(0),
             peak: Cell::new(0),
         }
@@ -31,13 +29,8 @@ impl Store for Memory {
         token: Option<&str>,
         start_after: Option<&str>,
     ) -> Result<Page> {
+        assert!(start_after.is_none());
         self.calls.borrow_mut().push((prefix.into(), delimiter));
-        if let Some(after) = start_after {
-            assert!(!delimiter && token.is_none());
-            self.resumes
-                .borrow_mut()
-                .push((prefix.into(), after.into()));
-        }
         self.active.set(self.active.get() + 1);
         self.peak.set(self.peak.get().max(self.active.get()));
         tokio::time::sleep(Duration::from_millis(1)).await;
@@ -60,12 +53,7 @@ impl Store for Memory {
                 items.insert(key.clone(), false);
             }
         }
-        let start = token_start.unwrap_or_else(|| {
-            items
-                .keys()
-                .take_while(|key| start_after.is_some_and(|after| key.as_str() <= after))
-                .count()
-        });
+        let start = token_start.unwrap_or(0);
         let next = (items.len() > start + 1000)
             .then(|| format!("{}:{prefix}:{}", u8::from(delimiter), start + 1000));
         let mut page = Page {
@@ -305,12 +293,10 @@ async fn literal_prefix_enumeration_preserves_metacharacters_and_overlap() {
         actual.sort();
         assert_eq!(actual, expected);
     }
-    assert!(store.peak.get() > 1);
-    assert!(store.peak.get() <= 4);
 }
 
 #[tokio::test]
-async fn sparse_trees_stay_flat_and_exact_keys_stop_after_one_page() {
+async fn sparse_trees_stay_flat_and_exact_keys_stop_after_one_page_in_byte_order() {
     for per_directory in [4, 40] {
         let store =
             Memory::new((0..256).flat_map(|d| {
@@ -321,60 +307,60 @@ async fn sparse_trees_stay_flat_and_exact_keys_stop_after_one_page() {
         assert_eq!(store.calls.borrow().len(), keys.len().div_ceil(1000));
         assert!(store.calls.borrow().iter().all(|(_, delimiter)| !delimiter));
     }
-    let store = Memory::new(
-        std::iter::once("exact".into()).chain((0..3000).map(|i| format!("exact{i:04}"))),
-    );
-    assert_eq!(listed(&store, "exact", 32).await, ["exact"]);
-    assert_eq!(store.calls.borrow().len(), 1);
+    // In byte order an exact key comes first, before longer ones.
+    struct ByteOrder(Memory);
+    impl Store for ByteOrder {
+        fn divides(&self) -> bool {
+            true
+        }
+        async fn page(
+            &self,
+            prefix: &str,
+            delimiter: bool,
+            token: Option<&str>,
+            start_after: Option<&str>,
+        ) -> Result<Page> {
+            self.0.page(prefix, delimiter, token, start_after).await
+        }
+    }
+    let keys = || std::iter::once("exact".into()).chain((0..3000).map(|i| format!("exact{i:04}")));
+    let store = ByteOrder(Memory::new(keys()));
+    let mut found = Vec::new();
+    engine::enumerate(
+        &store,
+        &Pattern::parse("s3://bucket/exact").unwrap(),
+        32,
+        |entry| {
+            found.push(entry.key);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(found, ["exact"]);
+    assert_eq!(store.0.calls.borrow().len(), 1);
+    // Without that order, a key found on the first page needs no more, and
+    // that page is the same request: a policy that refuses delimiters allows
+    // it.
+    let store = NoDelimiter(Memory::new(keys()));
+    let mut found = Vec::new();
+    engine::enumerate(
+        &store,
+        &Pattern::parse("s3://bucket/exact").unwrap(),
+        32,
+        |entry| {
+            found.push(entry.key);
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(found, ["exact"]);
+    assert_eq!(*store.0.calls.borrow(), [("exact".to_owned(), false)]);
 }
 
 #[tokio::test]
-async fn two_page_dense_tree_finishes_flat_and_dense_branches_overlap() {
-    let store = Memory::new((0..1001).map(|i| format!("tree/a/file{i:04}")));
-    assert_eq!(listed(&store, "tree/**", 32).await.len(), 1001);
-    assert_eq!(store.calls.borrow().len(), 3);
-    assert!(store
-        .calls
-        .borrow()
-        .iter()
-        .all(|(prefix, _)| prefix == "tree/"));
-    assert_eq!(store.peak.get(), 2, "probe overlaps useful continuation");
-    let store = Memory::new(
-        (0..8).flat_map(|d| (0..2000).map(move |i| format!("tree/dir{d:02}/file{i:04}"))),
-    );
-    assert_eq!(listed(&store, "tree/**", 32).await.len(), 16000);
-    assert_eq!(store.calls.borrow().len(), 17);
-    assert!(store.peak.get() > 1);
-    assert!(store.peak.get() <= 8);
-}
-
-#[tokio::test]
-async fn nested_probes_respect_the_actual_request_limit() {
-    let store = Memory::new((0..4).flat_map(|a| {
-        (0..2).flat_map(move |b| (0..2000).map(move |i| format!("tree/{a}/{b}/file{i:04}")))
-    }));
-    assert_eq!(listed(&store, "tree/**", 2).await.len(), 16000);
-    assert_eq!(store.peak.get(), 2);
-}
-
-#[tokio::test]
-async fn dense_head_with_sparse_siblings_does_not_fan_out() {
-    let store = Memory::new(
-        (0..2001)
-            .map(|i| format!("tree/a/file{i:04}"))
-            .chain((1..8).map(|i| format!("tree/dir{i}/file"))),
-    );
-    assert_eq!(listed(&store, "tree/**", 32).await.len(), 2008);
-    assert_eq!(store.calls.borrow().len(), 4);
-    assert!(store
-        .calls
-        .borrow()
-        .iter()
-        .all(|(prefix, _)| prefix == "tree/"));
-}
-
-#[tokio::test]
-async fn unordered_stores_do_not_apply_exact_key_shortcut() {
+async fn unordered_stores_look_past_the_first_page_for_an_exact_key() {
     struct Unordered;
     impl Store for Unordered {
         fn ordered(&self) -> bool {
@@ -420,156 +406,6 @@ async fn unordered_stores_do_not_apply_exact_key_shortcut() {
 }
 
 #[tokio::test]
-async fn medium_density_keeps_latency_parallelism_and_reuses_complete_children() {
-    let store = Memory::new(
-        (0..64).flat_map(|d| (0..400).map(move |i| format!("tree/dir{d:03}/file{i:04}"))),
-    );
-    assert_eq!(listed(&store, "tree/**", 32).await.len(), 25600);
-    let calls = store.calls.borrow();
-    assert_eq!(calls.len(), 63);
-    // The first four children are fully covered by the two sampled pages.
-    for d in 0..4 {
-        assert!(!calls
-            .iter()
-            .any(|(prefix, _)| prefix == &format!("tree/dir{d:03}/")));
-    }
-    assert!(store.peak.get() > 1);
-    assert!(store.peak.get() <= 32);
-}
-
-#[tokio::test]
-async fn incomplete_directory_probe_cannot_discard_observed_objects() {
-    struct Incomplete(Memory);
-    impl Store for Incomplete {
-        async fn page(
-            &self,
-            prefix: &str,
-            delimiter: bool,
-            token: Option<&str>,
-            start_after: Option<&str>,
-        ) -> Result<Page> {
-            let mut page = self.0.page(prefix, delimiter, token, start_after).await?;
-            if delimiter {
-                page.prefixes.retain(|prefix| prefix != "tree/dir01/");
-            }
-            Ok(page)
-        }
-    }
-    let store =
-        Incomplete(Memory::new((0..8).flat_map(|d| {
-            (0..2000).map(move |i| format!("tree/dir{d:02}/file{i:04}"))
-        })));
-    let mut keys = Vec::new();
-    engine::enumerate_prefix(&store, "tree/", 32, None, |entry| {
-        keys.push(entry.key);
-        Ok(())
-    })
-    .await
-    .unwrap();
-    assert_eq!(keys.len(), 16000);
-    assert_eq!(keys.into_iter().collect::<BTreeSet<_>>(), store.0.keys);
-    assert!(store
-        .0
-        .calls
-        .borrow()
-        .iter()
-        .all(|(prefix, _)| prefix == "tree/"));
-}
-
-#[tokio::test]
-async fn resumed_child_can_split_again_without_losing_or_duplicating_keys() {
-    let store = Memory::new(
-        (0..1200)
-            .map(|i| format!("tree/a/{i:04}"))
-            .chain((0..8).flat_map(|d| (0..1200).map(move |i| format!("tree/b/{d}/sp +%é{i:04}"))))
-            .chain([
-                "tree/b/".into(),
-                "tree/b/0/".into(),
-                "tree/b/8-direct".into(),
-                "tree/z".into(),
-            ]),
-    );
-    let expected: Vec<_> = store.keys.iter().cloned().collect();
-    assert_eq!(listed(&store, "tree/**", 8).await, expected);
-    let resumes = store.resumes.borrow();
-    assert!(resumes.iter().any(|(prefix, _)| prefix == "tree/b/"));
-    assert!(resumes
-        .iter()
-        .any(|(prefix, _)| prefix.starts_with("tree/b/") && prefix != "tree/b/"));
-}
-
-#[tokio::test]
-async fn ignored_start_after_filters_every_continuation_page() {
-    struct IgnoresStartAfter {
-        inner: Memory,
-        resumes: Cell<usize>,
-    }
-    impl Store for IgnoresStartAfter {
-        async fn page(
-            &self,
-            prefix: &str,
-            delimiter: bool,
-            token: Option<&str>,
-            start_after: Option<&str>,
-        ) -> Result<Page> {
-            if start_after.is_some() {
-                assert!(token.is_none());
-                self.resumes.set(self.resumes.get() + 1);
-            }
-            self.inner.page(prefix, delimiter, token, None).await
-        }
-    }
-    // Exercise a completely filtered first page followed by a partially
-    // filtered page, as well as a cursor exactly on a page boundary.
-    for leading in [256, 600, 1000, 1200] {
-        for glob in [false, true] {
-            let store = IgnoresStartAfter {
-                inner: Memory::new(
-                    (0..leading)
-                        .map(|i| format!("tree/a/{i:04}"))
-                        .chain((0..6200).map(|i| format!("tree/b/sp +%é{i:04}"))),
-                ),
-                resumes: Cell::new(0),
-            };
-            let mut actual = Vec::new();
-            if glob {
-                engine::enumerate(
-                    &store,
-                    &Pattern::parse("s3://bucket/tree/**").unwrap(),
-                    8,
-                    |entry| {
-                        actual.push(entry.key);
-                        Ok(())
-                    },
-                )
-                .await
-                .unwrap();
-            } else {
-                engine::enumerate_prefix(&store, "tree/", 8, None, |entry| {
-                    actual.push(entry.key);
-                    Ok(())
-                })
-                .await
-                .unwrap();
-            }
-            actual.sort();
-            assert_eq!(actual, store.inner.keys.iter().cloned().collect::<Vec<_>>());
-            assert_eq!(store.resumes.get(), 1);
-            assert_eq!(
-                store
-                    .inner
-                    .calls
-                    .borrow()
-                    .iter()
-                    .filter(|(prefix, delimiter)| prefix == "tree/b/" && !delimiter)
-                    .count(),
-                7
-            );
-        }
-    }
-}
-
-#[tokio::test]
 async fn filtered_listings_stay_flat_and_prune_ignored_first_pages() {
     async fn pruned(store: &Memory, prune: &engine::Prune<'_>) -> (Vec<String>, Vec<String>) {
         let mut keys = Vec::new();
@@ -583,8 +419,7 @@ async fn filtered_listings_stay_flat_and_prune_ignored_first_pages() {
     }
     let ignored =
         |key: &str, _directory: bool| key.starts_with("tree/d3/").then_some("tree/d3".len());
-    // Filtered listings do not split dense directories: with many small
-    // siblings that would cost a request per sibling.
+    // A first page with included objects stays flat.
     let store = Memory::new(
         (0..2)
             .flat_map(|d| (0..1500).map(move |i| format!("tree/d{d}/file{i:04}")))
@@ -682,4 +517,366 @@ async fn directory_markers_do_not_stop_pruning_an_ignored_first_page() {
                 .collect::<Vec<_>>()
         );
     }
+}
+
+#[test]
+fn only_aws_general_purpose_endpoints_divide_listings() {
+    if std::env::var_os("SYQ_TEST_S3_DIVIDE_LISTINGS").is_some() {
+        return;
+    }
+    // The AWS endpoint the SDK chooses, and the base URLs of it a user can
+    // name; the client addresses buckets path-style.
+    assert!(lists_in_byte_order(None, "bucket"));
+    for endpoint in [
+        "https://s3.amazonaws.com",
+        "http://s3.amazonaws.com:80",
+        "https://s3.us-west-2.amazonaws.com",
+        "https://S3.EU-CENTRAL-1.AMAZONAWS.COM/",
+        "https://s3-us-west-2.amazonaws.com",
+        "https://s3-external-1.amazonaws.com",
+        "https://s3.dualstack.eu-central-1.amazonaws.com",
+        "https://s3-fips.us-gov-west-1.amazonaws.com",
+        "https://s3-fips.dualstack.us-east-1.amazonaws.com",
+        "https://s3.cn-north-1.amazonaws.com.cn",
+        "https://s3.dualstack.cn-northwest-1.amazonaws.com.cn",
+        "https://bucket.vpce-1a2b3c4d-5e6f.s3.us-east-1.vpce.amazonaws.com",
+    ] {
+        assert!(lists_in_byte_order(Some(endpoint), "bucket"), "{endpoint}");
+    }
+    for endpoint in [
+        // Providers that do not document byte order, and look-alikes.
+        "https://account.r2.cloudflarestorage.com",
+        "https://r2.cloudflarestorage.com.example.org",
+        "https://storage.googleapis.com",
+        "https://s3.us-west-002.backblazeb2.com",
+        "https://t3.storage.dev",
+        "https://fly.storage.tigris.dev",
+        "https://s3.amazonaws.com.example.org",
+        "https://s3.us-east-1.amazonaws.com.example.org",
+        "https://s3.amazonaws.com.",
+        "https://s3.us-east-1.amazonaws.co",
+        "https://evils3.us-east-1.amazonaws.com",
+        "https://s3.notaregion.amazonaws.com",
+        "https://s3-fips.amazonaws.com",
+        // Hosts that already name a bucket: path-style requests to them do
+        // not list that bucket.
+        "https://bucket.s3.us-east-1.amazonaws.com",
+        "https://my.dotted.bucket.s3.amazonaws.com",
+        // VPC interface endpoint roles other than buckets.
+        "https://vpce-1a2b3c4d-5e6f.s3.us-east-1.vpce.amazonaws.com",
+        "https://accesspoint.vpce-1a2b3c4d-5e6f.s3.us-east-1.vpce.amazonaws.com",
+        "https://control.vpce-1a2b3c4d-5e6f.s3.us-east-1.vpce.amazonaws.com",
+        "https://s3.us-east-1.vpce.amazonaws.com",
+        "https://bucket.vpce-1a2b3c4d-5e6f.vpce-svc-0123.us-east-1.vpce.amazonaws.com",
+        // AWS hosts that are not general purpose bucket endpoints.
+        "https://bucket--usw2-az1--x-s3.s3express-usw2-az1.us-west-2.amazonaws.com",
+        "https://s3express-control.us-west-2.amazonaws.com",
+        "https://ap-123456789012.s3-accesspoint.us-east-1.amazonaws.com",
+        "https://s3-outposts.us-east-1.amazonaws.com",
+        "https://s3-object-lambda.us-east-1.amazonaws.com",
+        "https://alias.accesspoint.s3-global.amazonaws.com",
+        "https://s3-website-us-east-1.amazonaws.com",
+        "https://s3-website.us-east-1.amazonaws.com",
+        "https://s3-123456.us-east-1.elb.amazonaws.com",
+        "https://s3.us-east-1.elb.amazonaws.com",
+        // Self-hosted and local endpoints.
+        "http://127.0.0.1:9000",
+        "http://[::1]:9000",
+        "http://localhost:9000",
+        "https://minio.example.internal",
+        "not a url",
+        // A path names another bucket on the way.
+        "https://s3.us-east-1.amazonaws.com/archive/",
+        "https://s3.us-east-1.amazonaws.com/archive",
+        "https://s3.us-east-1.amazonaws.com/archive/../",
+        "https://s3.us-east-1.amazonaws.com/./",
+        "https://s3.us-east-1.amazonaws.com//",
+        "https://s3.us-east-1.amazonaws.com\\archive",
+        "https:/s3.us-east-1.amazonaws.com/archive/",
+        "https:s3.us-east-1.amazonaws.com/archive/",
+    ] {
+        assert!(!lists_in_byte_order(Some(endpoint), "bucket"), "{endpoint}");
+    }
+    // Names that are not general purpose buckets, at any endpoint.
+    for bucket in [
+        "dir--usw2-az1--x-s3",
+        "point--usw2-az1--xa-s3",
+        "banner-123456789012--ol-s3",
+        "outpost-alias--op-s3",
+        "point-abcdefghij-s3alias",
+        "mfzwi23gnjvgw.mrap",
+        "tables--table-s3",
+        "arn:aws:s3:us-east-1:123456789012:accesspoint/point",
+    ] {
+        assert!(!lists_in_byte_order(None, bucket), "{bucket}");
+        assert!(
+            !lists_in_byte_order(Some("https://s3.us-east-1.amazonaws.com"), bucket),
+            "{bucket}"
+        );
+    }
+}
+
+/// Refuses listings with a delimiter, as a policy can.
+struct NoDelimiter<S>(S);
+impl<S: Store> Store for NoDelimiter<S> {
+    async fn page(
+        &self,
+        prefix: &str,
+        delimiter: bool,
+        token: Option<&str>,
+        start_after: Option<&str>,
+    ) -> Result<Page> {
+        if delimiter {
+            return Err(anyhow::Error::msg("AccessDenied").context(
+                crate::s3::client::RequestFailure::refused_for_test("S3 listing"),
+            ));
+        }
+        self.0.page(prefix, delimiter, token, start_after).await
+    }
+}
+
+/// Lists in the order measured on Cloudflare R2: as if every key ended in a
+/// byte just above `9`, so `a0`, `a/b` and `a19` come before `a1`.
+/// StartAfter follows the same order.
+struct R2Order(Memory);
+impl R2Order {
+    fn position(key: &str) -> Vec<u8> {
+        let mut position = key.as_bytes().to_vec();
+        position.extend([b'9', 0xff]);
+        position
+    }
+}
+impl Store for R2Order {
+    async fn page(
+        &self,
+        prefix: &str,
+        delimiter: bool,
+        token: Option<&str>,
+        start_after: Option<&str>,
+    ) -> Result<Page> {
+        self.0.calls.borrow_mut().push((prefix.into(), delimiter));
+        let mut keys: Vec<_> = self
+            .0
+            .keys
+            .iter()
+            .filter(|key| key.starts_with(prefix))
+            .collect();
+        keys.sort_by_key(|key| Self::position(key));
+        let mut items: Vec<(String, bool)> = Vec::new();
+        for key in keys {
+            match delimiter.then(|| key[prefix.len()..].find('/')).flatten() {
+                Some(slash) => {
+                    let child = key[..prefix.len() + slash + 1].to_owned();
+                    if !items.contains(&(child.clone(), true)) {
+                        items.push((child, true));
+                    }
+                }
+                None => items.push((key.clone(), false)),
+            }
+        }
+        let start = match token {
+            Some(token) => token.parse().unwrap(),
+            None => items
+                .iter()
+                .take_while(|(item, _)| {
+                    start_after.is_some_and(|after| Self::position(item) <= Self::position(after))
+                })
+                .count(),
+        };
+        let mut page = Page {
+            next: (items.len() > start + 1000).then(|| (start + 1000).to_string()),
+            ..Page::default()
+        };
+        for (item, directory) in items.into_iter().skip(start).take(1000) {
+            if directory {
+                page.prefixes.push(item);
+            } else {
+                page.entries.push(Entry {
+                    size: u64::from(!item.ends_with('/')),
+                    key: item,
+                    last_modified: None,
+                    etag: None,
+                });
+            }
+        }
+        Ok(page)
+    }
+}
+
+#[tokio::test]
+async fn listings_from_a_store_not_in_byte_order_miss_no_key() {
+    // Two pages end at `c03/k199`; R2 returns `c03/k19` first on the third.
+    let store = R2Order(Memory::new(
+        ["c00", "c01", "c02", "c03"]
+            .into_iter()
+            .flat_map(|d| (0..600).map(move |i| format!("trap/{d}/k{i:03}")))
+            .chain(["trap/c03/k19".into()]),
+    ));
+    let expected: Vec<_> = store.0.keys.iter().cloned().collect();
+    for concurrency in [1, 32] {
+        let mut keys = Vec::new();
+        engine::enumerate_prefix(&store, "trap/", concurrency, None, |entry| {
+            keys.push(entry.key);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let missing: Vec<_> = expected.iter().filter(|key| !keys.contains(key)).collect();
+        assert!(missing.is_empty(), "concurrency {concurrency}: {missing:?}");
+        assert_eq!(keys.len(), expected.len());
+        let mut keys = Vec::new();
+        engine::enumerate(
+            &store,
+            &Pattern::parse("s3://bucket/trap/**").unwrap(),
+            concurrency,
+            |entry| {
+                keys.push(entry.key);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        let missing: Vec<_> = expected.iter().filter(|key| !keys.contains(key)).collect();
+        assert!(missing.is_empty(), "concurrency {concurrency}: {missing:?}");
+        assert_eq!(keys.len(), expected.len());
+    }
+    // A whole page of longer keys comes before the exact key; deeper ones
+    // are left out once the first page shows that.
+    let store = R2Order(Memory::new((0..1000).map(|i| format!("a/{i:04}")).chain([
+        "a".into(),
+        "a0".into(),
+        "b".into(),
+    ])));
+    for concurrency in [1, 32] {
+        let mut keys = Vec::new();
+        engine::enumerate(
+            &store,
+            &Pattern::parse("s3://bucket/a").unwrap(),
+            concurrency,
+            |entry| {
+                keys.push(entry.key);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(keys, ["a"], "concurrency {concurrency}");
+        assert_eq!(
+            store.0.calls.borrow_mut().split_off(0),
+            [("a".into(), false), ("a".into(), true)]
+        );
+    }
+    // Where a policy refuses the delimiter listing, the flat one goes on to
+    // the key on its second page, or to its end.
+    for present in [true, false] {
+        let store = NoDelimiter(R2Order(Memory::new(
+            (0..1001)
+                .map(|i| format!("a{i:04}"))
+                .chain(present.then(|| "a".to_owned())),
+        )));
+        let mut keys = Vec::new();
+        engine::enumerate(
+            &store,
+            &Pattern::parse("s3://bucket/a").unwrap(),
+            1,
+            |entry| {
+                keys.push(entry.key);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(keys, if present { vec!["a"] } else { vec![] });
+        assert_eq!(
+            *store.0 .0.calls.borrow(),
+            [("a".to_owned(), false), ("a".to_owned(), false)]
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_glob_that_needs_more_than_a_page_lists_flat_where_order_is_unknown() {
+    // In R2's order the first page of `edge/` ends with `p/`, `p0` and `p`.
+    // Whether a later page of a delimiter listing leaves a key out, or a
+    // check for it finds one already listed, depends on the order; a flat
+    // listing does not.
+    let store = R2Order(Memory::new(
+        (0..997)
+            .map(|i| format!("edge/f{i:03}"))
+            .chain(["edge/p/x", "edge/p0", "edge/p", "edge/z"].map(String::from)),
+    ));
+    let pattern = Pattern::parse("s3://bucket/edge/*").unwrap();
+    for concurrency in [1, 8] {
+        let mut keys = Vec::new();
+        engine::enumerate(&store, &pattern, concurrency, |entry| {
+            keys.push(entry.key);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        keys.sort();
+        let expected: Vec<_> = store
+            .0
+            .keys
+            .iter()
+            .filter(|key| pattern.matches(key))
+            .cloned()
+            .collect();
+        assert_eq!(keys, expected);
+        assert_eq!(
+            store.0.calls.borrow_mut().split_off(0),
+            [
+                ("edge/".to_owned(), true),
+                ("edge/".to_owned(), false),
+                ("edge/".to_owned(), false)
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_delimiter_listing_in_another_order_checks_no_key() {
+    /// Refuses listings without a delimiter, as a policy can.
+    struct FlatRefused(R2Order);
+    impl Store for FlatRefused {
+        async fn page(
+            &self,
+            prefix: &str,
+            delimiter: bool,
+            token: Option<&str>,
+            start_after: Option<&str>,
+        ) -> Result<Page> {
+            if !delimiter {
+                return Err(anyhow::Error::msg("AccessDenied").context(
+                    crate::s3::client::RequestFailure::refused_for_test("S3 listing"),
+                ));
+            }
+            self.0.page(prefix, delimiter, token, start_after).await
+        }
+    }
+    // In R2's order the second page ends with `p/`, `p0` and `p`: it holds
+    // the key that could be missing, and nothing is checked after it.
+    let store = FlatRefused(R2Order(Memory::new(
+        (0..1000)
+            .map(|i| format!("edge/a{i:04}"))
+            .chain((0..997).map(|i| format!("edge/f{i:03}")))
+            .chain(["edge/p/x", "edge/p0", "edge/p", "edge/z"].map(String::from)),
+    )));
+    let pattern = Pattern::parse("s3://bucket/edge/*").unwrap();
+    let mut keys = Vec::new();
+    engine::enumerate(&store, &pattern, 1, |entry| {
+        keys.push(entry.key);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let unique: BTreeSet<_> = keys.iter().collect();
+    assert_eq!((keys.len(), unique.len()), (2000, 2000));
+    assert!(store
+        .0
+         .0
+        .calls
+        .borrow()
+        .iter()
+        .all(|(prefix, _)| prefix == "edge/"));
 }

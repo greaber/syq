@@ -87,7 +87,6 @@ struct PipelineState {
     dead: bool,
     max_pending: usize,
     latency: Option<std::time::Duration>,
-    configuration_latency: Option<std::time::Duration>,
     ready: std::collections::VecDeque<std::time::Instant>,
     abort_on_receive: Option<Arc<Sched>>,
     abort_receive_number: Option<usize>,
@@ -356,7 +355,7 @@ impl Conn for PipelineConn {
                     assert_eq!(
                         state.requests.len(),
                         state.received,
-                        "latency check requires drained requests"
+                        "configuration starts on an idle connection"
                     );
                     if state.refuse_configuration {
                         Response::Err("hash policy differs from the authorized copy".into())
@@ -401,7 +400,7 @@ impl Conn for PipelineConn {
                     assert_eq!(
                         state.requests.len(),
                         state.received,
-                        "range latency check requires drained requests"
+                        "configuration starts on an idle connection"
                     );
                     state.replies.push_back(Response::Ok);
                 }
@@ -454,11 +453,7 @@ impl Conn for PipelineConn {
                 other => panic!("unexpected automatic range request {other:?}"),
             }
         }
-        let latency = if matches!(request, Request::ConfigureHashing(_)) {
-            state.configuration_latency
-        } else {
-            state.latency
-        };
+        let latency = state.latency;
         state.requests.push(request);
         state.sent_at.push(std::time::Instant::now());
         if let Some(latency) = latency {
@@ -524,18 +519,20 @@ impl Conn for PipelineConn {
 
 fn pipeline_snapshot(job: FileJob) -> WorkerJob {
     WorkerJob {
-        data: crate::sched::SnapshotData::Shared(Arc::new(job.data)),
+        data: crate::sched::SnapshotData::detached(job.data),
         dst_entry: job.dst_entry.map(Arc::new),
     }
 }
 
-fn pipeline_ranges(spans: &[(u64, u64)]) -> (Arc<Sched>, RangeHandle, FileJob) {
+/// The scheduler, the file's first range, and the file as it was queued,
+/// which shares its progress with every later version.
+fn pipeline_ranges(spans: &[(u64, u64)]) -> (Arc<Sched>, RangeHandle, WorkerJob) {
     let sched = Arc::new(Sched::new(512, 8192));
-    let job = pipeline_job(b"source", spans.last().unwrap().1);
-    sched.push_file(job.clone());
+    sched.push_file(pipeline_job(b"source", spans.last().unwrap().1));
     sched.scan_done();
     assert!(matches!(sched.next(), Item::File(0)));
     let handle = sched.ranges_ready(0, spans.to_vec()).unwrap();
+    let job = sched.jobs.lock().unwrap().snapshot(0);
     (sched, handle, job)
 }
 
@@ -741,7 +738,7 @@ fn a_worker_on_the_shared_ssh_login_logs_in_on_its_own_for_larger_files() {
     worker.transfer_range(&rest, &mut credited).unwrap();
     assert!(sched.range_done(&rest));
     assert_eq!(credited, 4096);
-    assert_eq!(job.done.load(Relaxed), 4096);
+    assert_eq!(job.done().load(Relaxed), 4096);
     assert!(shared.lock().unwrap().requests.is_empty());
     let requests = |state: &Arc<Mutex<PipelineState>>, read: bool| {
         state
@@ -1243,7 +1240,7 @@ fn changed_source_exhausts_retries_without_publishing() {
         assert!(matches!(sched.next(), Item::File(0)));
         let job = worker.job(0);
         assert_eq!(job.attempt, attempt);
-        job.done.store(job.entry.size, Relaxed);
+        job.done().store(job.entry.size, Relaxed);
         sched.ranges_ready(0, vec![]);
         let mut changed = job.entry.clone();
         changed.mtime += 1;
@@ -1290,7 +1287,7 @@ fn a_refused_finalize_whose_sidecar_is_gone_is_verified_by_contents() {
         let results = capture_results(&worker);
         assert!(matches!(sched.next(), Item::File(0)));
         let job = worker.job(0);
-        job.done.store(job.entry.size, Relaxed);
+        job.done().store(job.entry.size, Relaxed);
         sched.ranges_ready(0, vec![]);
         let hash = Response::FileHash {
             size: 512,
@@ -2308,7 +2305,7 @@ fn small_batch_reports_acknowledged_bytes_and_rolls_back_uncertain_credit() {
             assert_eq!(files, 7, "completion waits for the batch to drain");
         }
         assert_eq!(
-            jobs[0].done.load(Relaxed),
+            sched.jobs.lock().unwrap().done(0).load(Relaxed),
             if expected_files == 6 { 1 << 20 } else { 0 }
         );
         assert_eq!(sched.is_failed(0), failure == "changed");
@@ -2432,7 +2429,7 @@ fn later_batch_read_error_keeps_publications_and_requeues_unwritten_files() {
     assert_eq!(worker.progress.bytes_done.load(Relaxed), 4 << 20);
     assert_eq!(worker.progress.errors.load(Relaxed), 1);
     for &idx in &original[..4] {
-        assert_eq!(jobs[idx].done.load(Relaxed), 1 << 20);
+        assert_eq!(sched.jobs.lock().unwrap().done(idx).load(Relaxed), 1 << 20);
         assert!(!sched.is_failed(idx));
     }
     assert!(sched.is_failed(original[4]));
@@ -2643,7 +2640,7 @@ fn stolen_file_groups_are_excluded_from_results_and_transport_retries() {
 fn stalled_source_drains_read_ahead_before_claiming_more_file_groups() {
     // Inject reply-start waits so scheduling delays cannot change which
     // side of the stall allowance a case exercises.
-    for (adaptive, refreshed_ms, rtt_us, setup_ms, reply_wait_ms, expected) in [
+    for (adaptive, handshake_ms, rtt_us, setup_ms, reply_wait_ms, expected) in [
         (false, 0, None, 0, 125, [4, 4, 4, 4, 5, 6, 7, 8]),
         (false, 0, Some(10_000), 0, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
         (false, 0, None, 200, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
@@ -2652,7 +2649,7 @@ fn stalled_source_drains_read_ahead_before_claiming_more_file_groups() {
         // The default adaptive group budget allows 250 ms of service.
         (true, 0, None, 0, 125, [4, 5, 6, 7, 8, 8, 8, 8]),
         (true, 0, None, 0, 300, [4, 4, 4, 4, 5, 6, 7, 8]),
-        // A latency recheck also updates the source's stall allowance.
+        // Setup timing also sets the source's stall allowance.
         (true, 300, None, 0, 500, [4, 5, 6, 7, 8, 8, 8, 8]),
         (true, 300, None, 0, 1300, [4, 4, 4, 4, 5, 6, 7, 8]),
     ] {
@@ -2684,11 +2681,10 @@ fn stalled_source_drains_read_ahead_before_claiming_more_file_groups() {
         if adaptive {
             Arc::get_mut(&mut worker.opts).unwrap().tuning = Default::default();
         }
-        if refreshed_ms > 0 {
-            worker.batch_budget.refreshed_latency(
-                std::time::Duration::from_millis(refreshed_ms),
-                std::time::Instant::now(),
-            );
+        if handshake_ms > 0 {
+            worker
+                .batch_budget
+                .set_latency(std::time::Duration::from_millis(handshake_ms));
         }
         worker.gate.set_active(2);
         worker.setup_elapsed = std::time::Duration::from_millis(setup_ms);
@@ -2834,7 +2830,7 @@ fn scattered_ranges_pipeline_and_recover_with_bounded_ownership() {
             assert_eq!(result.is_ok(), failure == "none", "{failure}: {result:?}");
             if failure == "none" {
                 assert_eq!(credited, 512);
-                assert_eq!(sched.jobs.lock().unwrap()[0].done.load(Relaxed), 2048);
+                assert_eq!(sched.jobs.lock().unwrap().done(0).load(Relaxed), 2048);
                 let source = src.lock().unwrap();
                 let destination = dst.lock().unwrap();
                 assert_eq!(source.requests.len(), 4);
@@ -2863,7 +2859,7 @@ fn scattered_ranges_pipeline_and_recover_with_bounded_ownership() {
                     spans,
                     vec![(0, 512), (1024, 1536), (2048, 2560), (3072, 3584)]
                 );
-                assert_eq!(sched.jobs.lock().unwrap()[0].done.load(Relaxed), 0);
+                assert_eq!(sched.jobs.lock().unwrap().done(0).load(Relaxed), 0);
                 assert!(sched.finished());
             } else {
                 if failure == "mismatch" {
@@ -2917,7 +2913,7 @@ fn multiblock_ranges_refill_windows_and_retry_only_unfinished_shares() {
             assert_eq!(result.is_ok(), failure.is_none(), "{result:?}");
             if failure.is_some() {
                 assert_eq!(
-                    job.done.load(Relaxed),
+                    job.done().load(Relaxed),
                     (completed_extras as u64 + 1) * 1536,
                     "partially acknowledged extras must be rolled back before retry"
                 );
@@ -2932,8 +2928,8 @@ fn multiblock_ranges_refill_windows_and_retry_only_unfinished_shares() {
                     let n = state.end - state.pos;
                     drop(state);
                     worker.progress.add_bytes(n);
-                    job.done.fetch_add(n, Relaxed);
-                    assert!(job.done.load(Relaxed) <= 12 * 1536);
+                    job.done().fetch_add(n, Relaxed);
+                    assert!(job.done().load(Relaxed) <= 12 * 1536);
                     assert_eq!(sched.range_done(&range), i == 11 - completed_extras);
                 }
                 let mut expected = spans;
@@ -2952,7 +2948,7 @@ fn multiblock_ranges_refill_windows_and_retry_only_unfinished_shares() {
                 }
                 assert!(sched.range_done(&h));
             }
-            assert_eq!(job.done.load(Relaxed), 12 * 1536);
+            assert_eq!(job.done().load(Relaxed), 12 * 1536);
             assert!(sched.finished());
         }
     }
@@ -2991,7 +2987,7 @@ fn long_extras_follow_range_selection_and_only_reserve_for_ready_peers() {
         worker.transfer_range(&h, &mut credited).unwrap();
         assert_eq!(src.lock().unwrap().requests.len(), 18, "{tuning}");
         assert_eq!(credited, 3072);
-        assert_eq!(job.done.load(Relaxed), 9216);
+        assert_eq!(job.done().load(Relaxed), 9216);
         assert!(sched.range_done(&h));
         assert!(sched.finished());
     }
@@ -3335,6 +3331,104 @@ fn clean_root_pins_the_edge_cases() {
 }
 
 #[test]
+fn startup_stats_pipeline_in_argument_order_with_individual_errors_and_follow_flags() {
+    let args = Args::parse_args(&["cp".into(), "a".into(), "--as".into(), "dst".into()]).unwrap();
+    let sources = [
+        "remote:a",
+        "remote:b/",
+        "remote:c",
+        "remote:d/",
+        "remote:e",
+        "remote:f/",
+    ]
+    .map(|path| Location::parse(path).unwrap());
+    let dir = crate::test_support::tempdir().unwrap();
+    let session = crate::descriptor_broker::DescriptorSessionSlot::default();
+    let ticket = session
+        .register(std::fs::File::open(dir.path()).unwrap())
+        .unwrap();
+    let roots = sources.each_ref().map(|source| RegisteredSourceRoot {
+        filesystem: None,
+        ticket: ticket.clone(),
+        leaf_ticket: None,
+        selection: RegisteredPath::new(ticket.root_id(), source.basename()).unwrap(),
+        expected_leaf: None,
+        directory_mode: None,
+    });
+    for strict in [true, false] {
+        let state = Arc::new(Mutex::new(PipelineState {
+            reply_queue: Some(3),
+            replies: [
+                Response::Stats(vec![Some(pipeline_job(b"a", 1).entry.clone())]),
+                Response::Stats(vec![None]),
+                Response::Err("permission denied".into()),
+                Response::Stats(vec![]),
+                Response::Stats(vec![None, None]),
+                Response::Stats(vec![Some(pipeline_job(b"f", 6).entry.clone())]),
+            ]
+            .into(),
+            ..Default::default()
+        }));
+        let mut observed = Vec::new();
+        let result = stat_registered_sources(
+            &mut PipelineConn(state.clone()),
+            &sources,
+            &roots,
+            &args,
+            |source, entry| {
+                if strict {
+                    anyhow::ensure!(entry?.is_some(), "{} is missing", display(&source.path));
+                } else {
+                    observed.push((
+                        source.path.as_slice(),
+                        entry.map(|entry| entry.map(|e| e.size)),
+                    ));
+                }
+                Ok(())
+            },
+        );
+        let state = state.lock().unwrap();
+        assert_eq!(&state.sent_at_receive[..3], [3, 3, 3]);
+        for ((request, source), root) in state.requests.iter().zip(&sources).zip(&roots) {
+            assert!(
+                matches!(request, Request::StatMany { paths, sources: Some(capabilities), follow }
+                if paths == std::slice::from_ref(&source.path)
+                    && capabilities == std::slice::from_ref(&root.selection)
+                    && *follow == source.path.ends_with(b"/"))
+            );
+        }
+        if strict {
+            assert_eq!(result.unwrap_err().to_string(), "b/ is missing");
+            assert_eq!(state.received, 3, "drain the issued lookups");
+            assert_eq!(state.requests.len(), 3, "leave later lookups unissued");
+        } else {
+            result.unwrap();
+            assert_eq!(state.received, 6);
+            assert_eq!(state.sent_at_receive, [3, 3, 3, 6, 6, 6]);
+            assert_eq!(
+                observed.iter().map(|entry| entry.0).collect::<Vec<_>>(),
+                [b"a".as_slice(), b"b/", b"c", b"d/", b"e", b"f/"]
+            );
+            assert_eq!(*observed[0].1.as_ref().unwrap(), Some(1));
+            assert_eq!(*observed[1].1.as_ref().unwrap(), None);
+            assert!(observed[2]
+                .1
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("permission denied"));
+            for (index, count) in [(3, 0), (4, 2)] {
+                assert_eq!(
+                    observed[index].1.as_ref().unwrap_err().to_string(),
+                    format!("stat reply count {count} does not match request count 1")
+                );
+            }
+            assert_eq!(*observed[5].1.as_ref().unwrap(), Some(6));
+        }
+    }
+}
+
+#[test]
 fn suppressed_summary_does_not_hide_coordinator_statistics() {
     let mut args = Args::parse_args(&[
         "cp".into(),
@@ -3501,7 +3595,9 @@ fn large_small_file_batches_bound_long_path_frames_and_preserve_every_file() {
     assert!(sched.finished());
     assert_eq!(worker.progress.files_done.load(Relaxed), jobs.len() as u64);
     assert_eq!(worker.progress.errors.load(Relaxed), 0);
-    assert!(jobs.iter().all(|job| job.done.load(Relaxed) == 1));
+    let queued = sched.jobs.lock().unwrap();
+    assert!((0..jobs.len()).all(|idx| queued.done(idx).load(Relaxed) == 1));
+    drop(queued);
     let requests = source_requests.lock().unwrap();
     assert!(
         requests
@@ -3608,7 +3704,7 @@ fn local_copy_progress_is_live_but_failure_retracts_completion_credit() {
             if failure == "none" { 4096 } else { 0 }
         );
         assert_eq!(
-            job.done.load(Relaxed),
+            job.done().load(Relaxed),
             if failure == "none" { 4096 } else { 0 }
         );
         if matches!(failure, "regression" | "oversize") {
@@ -3673,7 +3769,7 @@ fn comparing_pull_pipelines_remote_reads_with_a_synchronous_destination() {
             );
             assert_eq!(src.lock().unwrap().max_pending, depth);
             assert_eq!(credited, 8192);
-            assert_eq!(job.done.load(Relaxed), 8192);
+            assert_eq!(job.done().load(Relaxed), 8192);
             assert_eq!(src.lock().unwrap().received, 16);
         }
     }
@@ -3997,7 +4093,7 @@ fn range_dispatch_excludes_retiring_workers_through_both_endpoint_drains() {
             assert!(gate.measurement_ready(1));
             worker.process_item(Item::Range(handle)).unwrap();
             assert!(!gate.allowed(1));
-            assert!(job.done.load(Relaxed) > 0, "path={path}");
+            assert!(job.done().load(Relaxed) > 0, "path={path}");
             for endpoint in [&src, &dst] {
                 let state = endpoint.lock().unwrap();
                 assert!(!state.tuning_snapshots.is_empty(), "path={path}");
@@ -4083,8 +4179,8 @@ fn publication_dispatch_excludes_retiring_workers_through_source_recheck() {
         for source_fails in [false, true] {
             let sched = Arc::new(Sched::new(512, 8192));
             let job = pipeline_job(b"source", 4096);
-            job.done.store(4096, Relaxed);
             sched.push_file(job.clone());
+            sched.jobs.lock().unwrap().done(0).store(4096, Relaxed);
             sched.scan_done();
             assert!(matches!(sched.next(), Item::File(0)));
             sched.ranges_ready(0, vec![]);
@@ -4157,8 +4253,8 @@ fn returned_last_publication_is_completed_by_the_remaining_worker() {
     for matched in [false, true] {
         let sched = Arc::new(Sched::new(512, 8192));
         let job = pipeline_job(b"source", 4096);
-        job.done.store(4096, Relaxed);
         sched.push_file(job.clone());
+        sched.jobs.lock().unwrap().done(0).store(4096, Relaxed);
         sched.scan_done();
         assert!(matches!(sched.next(), Item::File(0)));
         sched.ranges_ready(0, vec![]);
@@ -4211,8 +4307,8 @@ fn publication_connection_failure_releases_claim_after_queuing_retry() {
     for matched in [false, true] {
         let sched = Arc::new(Sched::new(512, 8192));
         let job = pipeline_job(b"source", 4096);
-        job.done.store(4096, Relaxed);
         sched.push_file(job.clone());
+        sched.jobs.lock().unwrap().done(0).store(4096, Relaxed);
         sched.scan_done();
         assert!(matches!(sched.next(), Item::File(0)));
         sched.ranges_ready(0, vec![]);
@@ -4572,9 +4668,11 @@ fn received_batch_feedback_sizes_the_next_source_request() {
                 next, 4,
                 "an abort during receipt consumption stops new claims"
             );
-            assert!(results[..4].iter().all(|r| matches!(r, Some(Ok(_)))));
-            assert!(results[4..].iter().all(Option::is_none));
-            assert_eq!(worker.progress.bytes_done.load(Relaxed), size * 4);
+            // Only the group written before the abort is published; those
+            // read meanwhile are not.
+            assert!(matches!(results[0], Some(Ok(_))));
+            assert!(results[1..].iter().all(Option::is_none));
+            assert_eq!(worker.progress.bytes_done.load(Relaxed), size);
         } else {
             assert_eq!(
                 limits[4].bytes,
@@ -4596,6 +4694,68 @@ fn received_batch_feedback_sizes_the_next_source_request() {
             "issued writes drained"
         );
     }
+}
+
+/// A worker pacing under a low `--bwlimit`, as one sending a comparison
+/// group's patches does, stops as soon as the copy fails elsewhere rather
+/// than sleeping out bytes it will no longer send; once the copy has
+/// failed, it does not pace at all.
+#[test]
+fn an_abort_ends_bandwidth_pacing_at_once() {
+    let sched = Arc::new(Sched::new(4 << 20, 32 << 20));
+    let state = Arc::new(Mutex::new(PipelineState::default()));
+    let mut worker = pipeline_worker(&sched, &state, &state, false);
+    // 16 KiB at 1 KiB/s pace for about sixteen seconds.
+    worker.bwlimit = Some(Arc::new(BandwidthLimit::new(1024)));
+    let started = std::time::Instant::now();
+    let failing = {
+        let sched = sched.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            sched.abort();
+        })
+    };
+    worker.limit(16 << 10);
+    let elapsed = started.elapsed();
+    failing.join().unwrap();
+    assert!(elapsed < std::time::Duration::from_secs(3), "{elapsed:?}");
+
+    let started = std::time::Instant::now();
+    worker.limit(16 << 10);
+    let elapsed = started.elapsed();
+    assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
+}
+
+/// A small-file batch whose pacing the copy's failure ended does not send
+/// its group's read: from a remote source the data would come back at the
+/// capped rate. The group stays unissued, to be requeued.
+#[test]
+fn a_batch_aborted_while_pacing_sends_no_read() {
+    let jobs: Vec<_> = (0..8)
+        .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), 1024)))
+        .collect();
+    let src = Arc::new(Mutex::new(PipelineState::default()));
+    let dst = Arc::new(Mutex::new(PipelineState::default()));
+    let sched = Arc::new(Sched::new(512, 8192));
+    let mut worker = pipeline_worker(&sched, &src, &dst, false);
+    // Eight 1 KiB files at 1 KiB/s pace for about eight seconds.
+    worker.bwlimit = Some(Arc::new(BandwidthLimit::new(1024)));
+    let failing = {
+        let sched = sched.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            sched.abort();
+        })
+    };
+    let started = std::time::Instant::now();
+    let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();
+    let mut groups = Some(0..8);
+    let _ = worker.transfer_small_batches(&jobs, move |_| groups.take(), &mut results);
+    let elapsed = started.elapsed();
+    failing.join().unwrap();
+    assert!(elapsed < std::time::Duration::from_secs(3), "{elapsed:?}");
+    assert!(src.lock().unwrap().requests.is_empty(), "no read was sent");
+    assert!(results.iter().all(Option::is_none), "{results:?}");
 }
 
 #[test]
@@ -4637,11 +4797,20 @@ fn aborted_batches_stop_claiming_groups_and_drain_issued_requests() {
         "abort prevents refilling the initial read window"
     );
     assert_eq!(reads.iter().map(|r| r.len()).sum::<usize>(), 256);
-    assert_eq!(worker.progress.bytes_done.load(Relaxed), 256 * size);
-    assert_eq!(worker.progress.files_done.load(Relaxed), 256);
+    // The abort arrived with the first group's data: the groups read are
+    // not published, as a file whose source recheck is pending is not.
+    assert_eq!(worker.progress.bytes_done.load(Relaxed), 0);
+    assert_eq!(worker.progress.files_done.load(Relaxed), 0);
     assert_eq!(worker.progress.errors.load(Relaxed), 0);
     assert!(source.replies.is_empty(), "issued source replies drained");
     let destination = dst.lock().unwrap();
+    assert!(
+        !destination
+            .requests
+            .iter()
+            .any(|r| matches!(r, Request::PutSmallBatch(_))),
+        "nothing published after the abort"
+    );
     assert!(
         destination.replies.is_empty(),
         "issued destination replies drained"
@@ -4705,14 +4874,13 @@ fn explicit_batch_request_and_pipeline_settings_keep_fixed_grouping() {
 }
 
 #[test]
-fn batch_latency_recheck_distinguishes_queue_delay_from_slow_file_work() {
-    use std::time::{Duration, Instant};
+fn adaptive_batches_use_setup_latency_without_mid_copy_rpc() {
+    use std::time::Duration;
     for network_delay in [true, false] {
         let size = 16 << 10;
         let src = Arc::new(Mutex::new(PipelineState {
             auto_small_size: Some(size),
             latency: Some(Duration::from_millis(300)),
-            configuration_latency: network_delay.then_some(Duration::from_millis(300)),
             ..Default::default()
         }));
         let dst = Arc::new(Mutex::new(PipelineState {
@@ -4725,9 +4893,9 @@ fn batch_latency_recheck_distinguishes_queue_delay_from_slow_file_work() {
             pipeline_worker(&Arc::new(Sched::new(4 << 20, 32 << 20)), &src, &dst, false);
         Arc::get_mut(&mut worker.opts).unwrap().tuning = Default::default();
         worker.gate = Gate::new(8);
-        worker
-            .batch_budget
-            .refreshed_latency(Duration::ZERO, Instant::now() - Duration::from_secs(60));
+        if network_delay {
+            worker.batch_budget.set_latency(Duration::from_millis(300));
+        }
         let count = if network_delay { 128 } else { 24 };
         let jobs: Vec<_> = (0..count)
             .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), size)))
@@ -4752,26 +4920,13 @@ fn batch_latency_recheck_distinguishes_queue_delay_from_slow_file_work() {
             .unwrap();
         assert!(results.iter().all(|r| matches!(r, Some(Ok(_)))));
         let source = src.lock().unwrap();
-        let probe = source
+        assert!(source.max_pending <= 4 && source.replies.is_empty());
+        let groups: Vec<_> = source
             .requests
             .iter()
-            .position(|r| matches!(r, Request::ConfigureHashing(_)))
-            .expect("rechecked latency");
-        assert_eq!(
-            source
-                .requests
-                .iter()
-                .filter(|r| matches!(r, Request::ConfigureHashing(_)))
-                .count(),
-            1,
-            "checks do not repeat for every late group"
-        );
-        assert!(source.max_pending <= 4 && source.replies.is_empty());
-        let groups: Vec<_> = source.requests[probe + 1..]
-            .iter()
-            .filter_map(|r| match r {
-                Request::ReadSmallBatch(reads) => Some(reads.len()),
-                _ => None,
+            .map(|r| match r {
+                Request::ReadSmallBatch(reads) => reads.len(),
+                other => panic!("unexpected source request {other:?}"),
             })
             .collect();
         if network_delay {
@@ -4792,14 +4947,10 @@ fn batch_latency_recheck_distinguishes_queue_delay_from_slow_file_work() {
         }
         let destination = dst.lock().unwrap();
         assert!(destination.replies.is_empty());
-        assert_eq!(
-            destination
-                .requests
-                .iter()
-                .filter(|r| matches!(r, Request::ConfigureHashing(_)))
-                .count(),
-            1
-        );
+        assert!(destination
+            .requests
+            .iter()
+            .all(|r| matches!(r, Request::PutSmallBatch(_))));
         assert_eq!(
             worker.progress.bytes_done.load(Relaxed),
             size * count as u64
@@ -4808,98 +4959,7 @@ fn batch_latency_recheck_distinguishes_queue_delay_from_slow_file_work() {
 }
 
 #[test]
-fn batch_latency_recheck_honors_abort_and_retirement_before_more_requests() {
-    use std::time::{Duration, Instant};
-    for abort in [true, false] {
-        let size = 16 << 10;
-        let sched = Arc::new(Sched::new(4 << 20, 32 << 20));
-        let gate = Gate::new(2);
-        let src = Arc::new(Mutex::new(PipelineState {
-            auto_small_size: Some(size),
-            latency: Some(Duration::from_millis(300)),
-            abort_on_receive: abort.then(|| sched.clone()),
-            abort_receive_number: Some(5),
-            gate_changes: if abort {
-                Vec::new()
-            } else {
-                vec![(5, gate.clone(), 1)]
-            },
-            ..Default::default()
-        }));
-        let dst = Arc::new(Mutex::new(PipelineState {
-            auto_small_size: Some(size),
-            synchronous: true,
-            immediate_batch_receipts: Some(Arc::new(crate::conn::BatchReceipts::default())),
-            ..Default::default()
-        }));
-        let mut worker = pipeline_worker(&sched, &src, &dst, false);
-        Arc::get_mut(&mut worker.opts).unwrap().tuning = Default::default();
-        worker.id = 1;
-        worker.gate = gate;
-        worker
-            .batch_budget
-            .refreshed_latency(Duration::ZERO, Instant::now() - Duration::from_secs(60));
-        let jobs: Vec<_> = (0..64)
-            .map(|i| pipeline_snapshot(pipeline_job(format!("file{i}").as_bytes(), size)))
-            .collect();
-        let mut next = 0;
-        let mut results = (0..jobs.len()).map(|_| None).collect::<Vec<_>>();
-        worker
-            .transfer_small_batches(
-                &jobs,
-                |limit| {
-                    if next == jobs.len() {
-                        return None;
-                    }
-                    let end = (next + limit.files.min((limit.bytes / size).max(1) as usize))
-                        .min(jobs.len());
-                    let group = next..end;
-                    next = end;
-                    Some(group)
-                },
-                &mut results,
-            )
-            .unwrap();
-        let source = src.lock().unwrap();
-        assert_eq!(
-            source.requests.len(),
-            5,
-            "four data groups, then the latency check"
-        );
-        assert!(matches!(
-            source.requests.last(),
-            Some(Request::ConfigureHashing(_))
-        ));
-        assert!(source.replies.is_empty());
-        let destination = dst.lock().unwrap();
-        assert_eq!(
-            destination.requests.len(),
-            4,
-            "stop even before the other latency RPC"
-        );
-        assert!(destination.replies.is_empty());
-        assert_eq!(next, 16, "no further work admitted");
-        assert!(results[..16].iter().all(|r| matches!(r, Some(Ok(_)))));
-        assert!(results[16..].iter().all(Option::is_none));
-    }
-}
-
-#[test]
 fn adaptive_ordinary_reads_expose_slow_unread_tails_to_peers() {
-    check_adaptive_range_handoff(false, 5);
-}
-
-#[test]
-fn slow_ranges_become_shareable_before_draining_for_a_latency_check() {
-    check_adaptive_range_handoff(true, 5);
-}
-
-#[test]
-fn slow_ranges_keep_split_hints_current_while_draining() {
-    check_adaptive_range_handoff(true, 6);
-}
-
-fn check_adaptive_range_handoff(recheck: bool, steal_at: usize) {
     let block = 4 << 20;
     let size = 16 << 20;
     let sched = Arc::new(Sched::new(block, 32 << 20));
@@ -4909,50 +4969,33 @@ fn check_adaptive_range_handoff(recheck: bool, steal_at: usize) {
     let range = sched.ranges_ready(idx, vec![(0, size)]).unwrap();
     let src = Arc::new(Mutex::new(PipelineState {
         auto_ranges: true,
-        steal_range_at: Some((steal_at, sched.clone())),
+        steal_range_at: Some((6, sched.clone())),
         ..Default::default()
     }));
     let dst = Arc::new(Mutex::new(PipelineState {
         auto_ranges: true,
         // Inject service time without a slow or timing-sensitive test.
         arrival_delay: Some(std::time::Duration::from_secs(1)),
-        // The second completion can reveal worse service during the drain.
-        arrival_delays: if steal_at == 6 {
-            [1, 4].map(std::time::Duration::from_secs).into()
-        } else {
-            Default::default()
-        },
+        arrival_delays: [1, 4].map(std::time::Duration::from_secs).into(),
         ..Default::default()
     }));
     let mut worker = pipeline_worker(&sched, &src, &dst, false);
     let opts = Arc::get_mut(&mut worker.opts).unwrap();
     opts.block = block;
     opts.tuning = Default::default();
-    if recheck {
-        // The first slow completion makes a check due while three source
-        // requests are still outstanding. The peer tries to steal during
-        // that drain, before another read can publish a smaller split.
-        let mut budget = WorkBudget::ranges(block, std::time::Duration::from_millis(250), None);
-        budget.refreshed_latency(
-            std::time::Duration::from_millis(10),
-            std::time::Instant::now() - std::time::Duration::from_secs(60),
-        );
-        worker.range_budget = Some(budget);
-    }
+    worker.range_budget = Some(WorkBudget::ranges(
+        block,
+        std::time::Duration::from_millis(250),
+        Some(1 << 20),
+    ));
     let mut credited = 0;
     worker.transfer_range(&range, &mut credited).unwrap();
-    if recheck {
-        let state = src.lock().unwrap();
-        assert_eq!(
-            state.sent_at_receive[steal_at - 1],
-            7,
-            "no refill before the peer steals"
-        );
-        assert!(
-            matches!(state.requests[7], Request::ConfigureHashing(_)),
-            "the latency probe waits for all seven issued reads"
-        );
-    }
+    assert!(src
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .all(|r| matches!(r, Request::ReadRange { .. })));
     let peer_range = src
         .lock()
         .unwrap()
@@ -4969,17 +5012,18 @@ fn check_adaptive_range_handoff(recheck: bool, steal_at: usize) {
         ..Default::default()
     }));
     let mut peer = pipeline_worker(&sched, &peer_src, &peer_dst, false);
-    let expected_start = peer_range.lock().unwrap().split.unwrap().minimum / 2;
-    if steal_at == 6 {
-        assert!(
-            expected_start <= 128 << 10,
-            "the peer must inherit the smaller hint from the second slow completion: {expected_start}"
+    let expected_start = {
+        let stolen = peer_range.lock().unwrap();
+        let hint = stolen.split.unwrap();
+        assert_eq!(stolen.pos % hint.block, 0);
+        assert_eq!(hint.minimum, 2 * hint.block);
+        assert_eq!(
+            hint.block,
+            64 << 10,
+            "the second slow completion reduces the hint"
         );
-    }
-    assert!(
-        expected_start < 1 << 20,
-        "the donor has measured slow service"
-    );
+        hint.block
+    };
     let opts = Arc::get_mut(&mut peer.opts).unwrap();
     opts.block = block;
     opts.tuning = Default::default();
@@ -5041,7 +5085,7 @@ fn inherited_requests_preserve_worker_measurements_ceilings_and_overrides() {
         assert!(matches!(sched.next(), Item::File(_)));
         let range = sched.ranges_ready(idx, vec![(0, size)]).unwrap();
         range.lock().unwrap().split = Some(crate::sched::RangeSplit {
-            block: 512,
+            block: 64 << 10,
             minimum: 128 << 10,
         });
         let src = Arc::new(Mutex::new(PipelineState {
@@ -5150,12 +5194,10 @@ fn adaptive_ordinary_ranges_drain_on_abort_and_retirement() {
         sched.scan_done();
         assert!(matches!(sched.next(), Item::File(_)));
         let range = sched.ranges_ready(idx, vec![(0, 8 << 20)]).unwrap();
-        if starting_bytes != 1 << 20 {
-            range.lock().unwrap().split = Some(crate::sched::RangeSplit {
-                block: 512,
-                minimum: 2 * starting_bytes,
-            });
-        }
+        range.lock().unwrap().split = Some(crate::sched::RangeSplit {
+            block: starting_bytes,
+            minimum: 2 * starting_bytes,
+        });
         let src = Arc::new(Mutex::new(PipelineState {
             auto_ranges: true,
             ..Default::default()
@@ -5205,81 +5247,44 @@ fn adaptive_ordinary_ranges_drain_on_abort_and_retirement() {
 }
 
 #[test]
-fn ordinary_range_latency_rechecks_preserve_ownership_on_stop() {
-    use std::time::{Duration, Instant};
-    for stop in ["none", "abort", "retire"] {
-        let block = 4 << 20;
-        let size = 16 << 20;
-        let sched = Arc::new(Sched::new(block, 32 << 20));
-        let idx = sched.push_file(pipeline_job(b"file", size));
-        sched.scan_done();
-        assert!(matches!(sched.next(), Item::File(_)));
-        let range = sched.ranges_ready(idx, vec![(0, size)]).unwrap();
-        let src = Arc::new(Mutex::new(PipelineState {
-            auto_ranges: true,
-            ..Default::default()
-        }));
-        let dst = Arc::new(Mutex::new(PipelineState {
-            auto_ranges: true,
-            ..Default::default()
-        }));
-        let mut worker = pipeline_worker(&sched, &src, &dst, false);
-        let opts = Arc::get_mut(&mut worker.opts).unwrap();
-        opts.block = block;
-        opts.tuning = Default::default();
-        let mut budget = WorkBudget::ranges(block, Duration::from_millis(600), None);
-        budget.refreshed_latency(
-            Duration::from_millis(150),
-            Instant::now() - Duration::from_secs(60),
-        );
-        worker.range_budget = Some(budget);
-        if stop == "abort" {
-            src.lock().unwrap().abort_on_receive = Some(sched.clone());
-        } else if stop == "retire" {
-            src.lock()
-                .unwrap()
-                .gate_changes
-                .push((1, worker.gate.clone(), 0));
-        }
-        let mut credited = 0;
-        worker.transfer_range(&range, &mut credited).unwrap();
-        let source = src.lock().unwrap();
-        let destination = dst.lock().unwrap();
-        assert!(matches!(
-            source.requests.first(),
-            Some(Request::ConfigureHashing(_))
-        ));
-        assert_eq!(source.requests.len(), source.received);
-        assert_eq!(destination.requests.len(), destination.received);
-        if stop == "none" {
-            assert_eq!(credited, size);
-            assert!(matches!(
-                destination.requests.first(),
-                Some(Request::ConfigureHashing(_))
-            ));
-            assert!(sched.range_done(&range));
-        } else {
-            assert_eq!(credited, 0);
-            assert_eq!(
-                source.requests.len(),
-                1,
-                "no reads after stop during recheck"
-            );
-            assert!(
-                destination.requests.is_empty(),
-                "no second configuration after stop"
-            );
-            assert!(!sched.range_done(&range));
-            if stop == "retire" {
-                let Item::Range(tail) = sched.next() else {
-                    panic!("unread range returned")
-                };
-                assert_eq!(tail.lock().unwrap().pos, 0);
-                assert!(sched.range_done(&tail));
-            }
-        }
-        assert!(matches!(sched.next(), Item::Exit));
-    }
+fn cold_ordinary_range_starts_with_small_reads_and_grows_after_replies() {
+    let starting_bytes = 1 << 20;
+    let block = 4 << 20;
+    let size = 8 << 20;
+    let sched = Arc::new(Sched::new(block, 32 << 20));
+    let idx = sched.push_file(pipeline_job(b"file", size));
+    sched.scan_done();
+    assert!(matches!(sched.next(), Item::File(_)));
+    let range = sched.ranges_ready(idx, vec![(0, size)]).unwrap();
+    let src = Arc::new(Mutex::new(PipelineState {
+        auto_ranges: true,
+        ..Default::default()
+    }));
+    let dst = Arc::new(Mutex::new(PipelineState {
+        auto_ranges: true,
+        early_range_acks: true,
+        ..Default::default()
+    }));
+    let mut worker = pipeline_worker(&sched, &src, &dst, false);
+    let opts = Arc::get_mut(&mut worker.opts).unwrap();
+    opts.block = block;
+    opts.tuning = Default::default();
+    let mut credited = 0;
+    worker.transfer_range(&range, &mut credited).unwrap();
+    let source = src.lock().unwrap();
+    assert_eq!(source.sent_at_receive[0], 4);
+    assert!(source.requests[..4]
+        .iter()
+        .enumerate()
+        .all(|(i, r)| matches!(r, Request::ReadRange { off, len, .. }
+        if *off == i as u64 * starting_bytes && u64::from(*len) == starting_bytes)));
+    assert!(source.requests[4..]
+        .iter()
+        .any(|r| matches!(r, Request::ReadRange { len, .. } if u64::from(*len) > starting_bytes)));
+    assert!(source.replies.is_empty());
+    assert!(dst.lock().unwrap().replies.is_empty());
+    assert_eq!(credited, size);
+    assert!(sched.range_done(&range));
 }
 
 #[test]
@@ -5305,6 +5310,11 @@ fn arrived_range_writes_update_progress_before_the_next_source_reply() {
     let opts = Arc::get_mut(&mut worker.opts).unwrap();
     opts.block = block;
     opts.tuning = Default::default();
+    worker.range_budget = Some(WorkBudget::ranges(
+        block,
+        std::time::Duration::from_millis(250),
+        Some(1 << 20),
+    ));
     src.lock().unwrap().progress = Some(worker.progress.clone());
     let mut credited = 0;
     worker.transfer_range(&range, &mut credited).unwrap();
@@ -6265,6 +6275,65 @@ fn an_aborted_copy_sends_nothing_further_for_groups_in_flight() {
     assert_eq!(worker.progress.files_done.load(Relaxed), 1);
 }
 
+#[test]
+fn a_copy_aborted_while_a_group_is_read_sends_no_patch() {
+    // A rewritten file of 4 MiB, a group of its own. The copy is aborted, as
+    // by a fatal error elsewhere, while its differing blocks are read: the
+    // read carries the source's state, as a recheck does, and the patch it
+    // would publish is not sent.
+    let temporary = crate::test_support::tempdir().unwrap();
+    let root = temporary.path();
+    let sched = differing_jobs(root, &[("file", 4 << 20, 1 << 20..2 << 20)]);
+    let unused = Arc::new(Mutex::new(PipelineState::default()));
+    let mut worker = pipeline_worker(&sched, &unused, &unused, true);
+    worker.src = {
+        let sched = sched.clone();
+        let mut source = crate::fsops::FsOps::new();
+        Box::new(AnsweringConn {
+            answer: move |mut request: Request| {
+                if let Request::ReadDifferingBatch { reads, .. } = &mut request {
+                    sched.abort();
+                    // Its files are read by path, as no source roots are
+                    // registered.
+                    for read in reads {
+                        read.source = None;
+                    }
+                }
+                source.handle(&request)
+            },
+            replies: Default::default(),
+        })
+    };
+    let patches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    worker.dst = {
+        let patches = patches.clone();
+        let mut destination = crate::fsops::FsOps::test_destination(&root.join("target"));
+        Box::new(AnsweringConn {
+            answer: move |request: Request| {
+                if let Request::PatchSmallBatch(_) = request {
+                    patches.fetch_add(1, Relaxed);
+                }
+                destination.handle(&request)
+            },
+            replies: Default::default(),
+        })
+    };
+    worker.fast_batch_files = 1;
+    Arc::get_mut(&mut worker.opts).unwrap().block = 1 << 20;
+    worker.process_item(sched.next()).unwrap();
+    assert!(sched.is_aborted());
+    assert_eq!(patches.load(Relaxed), 0, "patches sent");
+    assert!(!worker.src.reply_ready() && !worker.dst.reply_ready());
+    assert!(
+        read(root, "source/file") != read(root, "target/file"),
+        "the patch was published"
+    );
+    // The file is left unfinished, not failed.
+    assert_eq!(worker.progress.errors.load(Relaxed), 0);
+    assert_eq!(worker.progress.files_done.load(Relaxed), 0);
+    assert_eq!(worker.progress.bytes_done.load(Relaxed), 0);
+}
+
 /// A destination that serves each request as it is sent but, as a remote
 /// one, holds its replies until they are asked for, within a reply queue of
 /// `queue`. It records the most streamed patch pieces, and piece bytes, that
@@ -6668,6 +6737,48 @@ fn an_aborted_copy_takes_every_reply_of_a_wide_patch_stream() {
             read(root, "target/file"),
             "{case}"
         );
+        assert_eq!(worker.progress.files_done.load(Relaxed), 0, "{case}");
+        assert_eq!(worker.progress.bytes_done.load(Relaxed), 0, "{case}");
+    }
+}
+
+#[test]
+fn a_copy_aborted_while_a_streamed_patch_is_rechecked_publishes_nothing() {
+    // The copy is aborted as the last of 320 pieces is sent, before the
+    // reply to the source's recheck is taken (a remote source's recheck has
+    // been sent by then): every piece passed its abort check, but the patch
+    // still ends without publication, and the receiver keeps no stage.
+    for remote_source in [false, true] {
+        let case = format!("remote_source={remote_source}");
+        let temporary = crate::test_support::tempdir().unwrap();
+        let root = temporary.path();
+        let files = [("file", 48 << 20, scattered_blocks(40 << 20))];
+        let how = Holding {
+            remote_source,
+            ..Holding::default()
+        };
+        let (sched, mut worker, held) =
+            stream_into_holding_destination(root, &files, how, |sched, pieces| {
+                if pieces == 320 {
+                    sched.abort();
+                }
+            });
+        assert!(sched.is_aborted());
+        assert_eq!(held.sent, 320, "{case}");
+        assert!(
+            worker.dst.recv().is_err(),
+            "{case}: a reply was left unread"
+        );
+        assert!(worker.src.recv().is_err(), "{case}: a read was left unread");
+        assert!(
+            read(root, "source/file") != read(root, "target/file"),
+            "{case}: the patch was published"
+        );
+        let left: Vec<_> = std::fs::read_dir(root.join("target"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["file"], "{case}");
         assert_eq!(worker.progress.files_done.load(Relaxed), 0, "{case}");
         assert_eq!(worker.progress.bytes_done.load(Relaxed), 0, "{case}");
     }
@@ -8367,7 +8478,7 @@ fn adaptive_comparison(
 ) -> (
     Worker,
     RangeHandle,
-    FileJob,
+    WorkerJob,
     Arc<Mutex<PipelineState>>,
     Arc<Mutex<PipelineState>>,
 ) {
@@ -8420,7 +8531,7 @@ fn adaptive_comparisons_flow_across_windows_within_the_look_ahead() {
             worker.transfer_range(&handle, &mut credited).unwrap();
             let case = format!("final={final_basis} remote={remote_source}");
             // Every block is in place, the matching ones counted as reused.
-            assert_eq!(job.done.load(Relaxed), size, "{case}");
+            assert_eq!(job.done().load(Relaxed), size, "{case}");
             assert_eq!(credited, size / 8, "{case}");
             assert_eq!(
                 worker.progress.bytes_unchanged.load(Relaxed),
@@ -8554,7 +8665,7 @@ fn a_failed_comparison_write_drains_both_connections_in_order() {
                 assert_eq!(state.received, state.requests.len(), "{case}");
                 assert!(state.replies.is_empty(), "{case}");
             }
-            assert!(job.done.load(Relaxed) < 32 << 10, "{case}");
+            assert!(job.done().load(Relaxed) < 32 << 10, "{case}");
             // Nothing is sent to either endpoint once the failure is seen.
             let dst = dst.lock().unwrap();
             let failed = dst
@@ -8595,7 +8706,7 @@ fn fixed_comparisons_never_ask_the_receiver_to_hold_more_than_it_may() {
         opts.tuning.pipeline_depth = Some(4);
         let mut credited = 0;
         worker.transfer_range(&handle, &mut credited).unwrap();
-        assert_eq!(job.done.load(Relaxed), size, "{block}");
+        assert_eq!(job.done().load(Relaxed), size, "{block}");
         let (mut held, mut most) = (0u64, 0u64);
         for request in &dst.lock().unwrap().requests {
             match request {

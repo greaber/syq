@@ -363,7 +363,7 @@ impl Worker {
         );
         let result = result.and(source_end).and(destination_end);
         if result.is_err() && self.transport_dead() {
-            job.done.fetch_sub(flow.matched, Relaxed);
+            job.done().fetch_sub(flow.matched, Relaxed);
             self.progress
                 .bytes_unchanged
                 .fetch_sub(flow.matched, Relaxed);

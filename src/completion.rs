@@ -1004,6 +1004,9 @@ impl<'a> CompletionContext<'a> {
                 context.present.insert(arg.get_id().to_string());
                 if let Some(value) = value {
                     context.value(arg, value, 1);
+                    // Like clap, an attached value is the option's only one,
+                    // so the next word is not another value.
+                    context.pending = None;
                 } else if arg.get_action().takes_values() {
                     context.pending = Some((arg, 0));
                 } else {
@@ -1147,7 +1150,7 @@ fn filesystem_command_candidates(
     }
     match command {
         "cp" | "rm" | "clean-partials" | "map" if context.sources_allowed(command) => {
-            complete_path_for(command, &context.options, current, true)
+            complete_path_for(command, &context.options, current, true, false)
         }
         "rsync" => complete_rsync_operand(&context.options, current),
         _ => Ok(Vec::new()),
@@ -1183,8 +1186,10 @@ fn complete_argument(
     }
     let name = option_name(arg);
     let kind = value_completion(command, &name, meta).unwrap_or(ValueCompletion::None);
-    let mut values = complete_value(command, &context.options, current, kind)?;
-    if directories_only_id(arg.get_id().as_str()) {
+    let directories_only = directories_only_id(arg.get_id().as_str());
+    let mut values = complete_value(command, &context.options, current, kind, directories_only)?;
+    if directories_only {
+        // A remote listing has no type filter.
         values.retain(|candidate| candidate.value.ends_with(b"/"));
     }
     Ok(values)
@@ -1337,6 +1342,7 @@ fn complete_value(
     args: &[Vec<u8>],
     current: &[u8],
     kind: ValueCompletion,
+    directories_only: bool,
 ) -> Result<Vec<Candidate>> {
     match kind {
         ValueCompletion::ReceivingProfile => Ok(crate::receive_service::profile_names(
@@ -1367,12 +1373,17 @@ fn complete_value(
             pscope_from_args(command, args),
         )),
         ValueCompletion::SourcePath { apply_base } => {
-            complete_source_path(command, args, current, apply_base)
+            complete_source_path(command, args, current, apply_base, directories_only)
         }
-        ValueCompletion::DestinationPath => complete_path_for(command, args, current, false),
-        ValueCompletion::LocalPath { directories_only } => {
-            Ok(local_path_candidates(current, directories_only))
+        ValueCompletion::DestinationPath => {
+            complete_path_for(command, args, current, false, directories_only)
         }
+        ValueCompletion::LocalPath {
+            directories_only: kind_directories_only,
+        } => Ok(local_path_candidates(
+            current,
+            kind_directories_only || directories_only,
+        )),
         ValueCompletion::None => Ok(Vec::new()),
     }
 }
@@ -1447,14 +1458,15 @@ fn complete_path_for(
     args: &[Vec<u8>],
     current: &[u8],
     source: bool,
+    directories_only: bool,
 ) -> Result<Vec<Candidate>> {
     if source {
-        return complete_source_path(command, args, current, true);
+        return complete_source_path(command, args, current, true, directories_only);
     }
     let Some(endpoint_text) = find_option_value(args, b"--to") else {
         return Ok(local_path_candidates_at(
             current,
-            false,
+            directories_only,
             None,
             path_policy(command, args, false, true),
         ));
@@ -1467,7 +1479,7 @@ fn complete_path_for(
     let Some(endpoint) = parse_native_endpoint(Some(endpoint_text))? else {
         return Ok(local_path_candidates_at(
             current,
-            false,
+            directories_only,
             None,
             path_policy(command, args, false, true),
         ));
@@ -1491,6 +1503,7 @@ fn complete_source_path(
     args: &[Vec<u8>],
     current: &[u8],
     apply_base: bool,
+    directories_only: bool,
 ) -> Result<Vec<Candidate>> {
     // Removal follows parent paths when requested, but selects the final link
     // itself. --cwd and --root still resolve their complete directory paths.
@@ -1509,7 +1522,12 @@ fn complete_source_path(
             b"--from"
         },
     ) else {
-        return Ok(local_path_candidates_at(current, false, base, policy));
+        return Ok(local_path_candidates_at(
+            current,
+            directories_only,
+            base,
+            policy,
+        ));
     };
     if endpoint_text.starts_with("s3://") {
         // S3 keys are not SSH paths. Tab must not open an SSH connection or
@@ -1517,7 +1535,12 @@ fn complete_source_path(
         return Ok(Vec::new());
     }
     let Some(endpoint) = parse_native_endpoint(Some(endpoint_text))? else {
-        return Ok(local_path_candidates_at(current, false, base, policy));
+        return Ok(local_path_candidates_at(
+            current,
+            directories_only,
+            base,
+            policy,
+        ));
     };
     remote_path_candidates(command, args, endpoint, current, Vec::new(), base, policy)
 }

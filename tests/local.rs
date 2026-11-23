@@ -192,9 +192,10 @@ fn run_native_ok(args: &[&str]) -> String {
     let out = native_syq(args);
     assert!(
         out.status.success(),
-        "native syq {:?} failed: status {:?}\nstdout:\n{}\nstderr:\n{}",
+        "native syq {:?} failed: {}\nstdout:\n{}\nstderr:\n{}",
         args,
-        out.status.code(),
+        // Names the signal of a process that a signal ended.
+        out.status,
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
@@ -205,9 +206,10 @@ fn run_ok(args: &[&str]) -> String {
     let out = syq(args);
     assert!(
         out.status.success(),
-        "syq {:?} failed: status {:?}\nstdout:\n{}\nstderr:\n{}",
+        "syq {:?} failed: {}\nstdout:\n{}\nstderr:\n{}",
         args,
-        out.status.code(),
+        // Names the signal of a process that a signal ended.
+        out.status,
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );

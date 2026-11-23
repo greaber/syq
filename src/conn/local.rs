@@ -183,7 +183,7 @@ impl Conn for LocalConn {
         }
         let resp = self.ops.handle_in_place(&mut req);
         if let Some(state) = &mut self.write_stream {
-            state.record(resp);
+            state.record(&resp);
         } else {
             self.pending.push_back(resp);
         }
@@ -191,6 +191,12 @@ impl Conn for LocalConn {
             Request::WriteRange { data, .. } => Some(data.into_vec()),
             _ => None,
         })
+    }
+    fn reuse_read_buffer(&mut self, buffer: Vec<u8>) {
+        self.ops.reuse_read_buffer(buffer);
+    }
+    fn release_read_buffer(&mut self) {
+        self.ops.release_read_buffer();
     }
     fn recv(&mut self) -> Result<Response> {
         let _wait = self.rpc_observation.as_ref().map(|o| o.span(false));

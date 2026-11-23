@@ -1706,7 +1706,7 @@ pub struct SmallCopyIdentity {
 pub struct SmallCopyFile {
     pub path: PathBytes,
     /// Original source facts and expression path, before publication modes.
-    pub expression_source: Option<(crate::expression::File, PathBytes)>,
+    pub expression_source: Option<(crate::expression::File<'static>, PathBytes)>,
     pub size: u64,
     pub meta: Meta,
 }
@@ -1790,7 +1790,29 @@ pub struct SmallCopyResponse {
     pub outcome: SmallCopyOutcome,
 }
 
+fn plan_batch_size_hint(directories: &[PathBytes], others: &[PathBytes]) -> usize {
+    directories
+        .iter()
+        .chain(others)
+        .map(|path| path.len() + 8)
+        .sum::<usize>()
+        + 48
+}
+
 impl Request {
+    /// A combined destination lookup when its paths fit a single metadata frame.
+    pub(crate) fn plan_batch(
+        directories: &[PathBytes],
+        others: &[PathBytes],
+        strict_metadata: bool,
+    ) -> Option<Self> {
+        (plan_batch_size_hint(directories, others) < MAX_METADATA_FRAME).then(|| Self::PlanBatch {
+            directories: directories.to_vec(),
+            others: others.to_vec(),
+            strict_metadata,
+        })
+    }
+
     /// Requests an authenticated source-worker connection may execute. Keep
     /// this protocol boundary shared by remote dispatch and the in-process
     /// adapter so choosing a local endpoint cannot grant mutation authority.
@@ -1997,6 +2019,8 @@ pub enum Response {
     ScanWarnAt(ScanWarning),
     /// Reply to NewFileOwner.
     NewFileOwner(NewFileOwner),
+    /// Rich metadata needs the ordinary, chunked directory and leaf lookups.
+    BatchPlanDeferred,
 }
 
 /// Who a file the receiver creates in the destination belongs to.
@@ -2314,14 +2338,7 @@ impl SizeHint for Request {
                 directories,
                 others,
                 ..
-            } => {
-                directories
-                    .iter()
-                    .chain(others)
-                    .map(|path| path.len() + 8)
-                    .sum::<usize>()
-                    + 48
-            }
+            } => plan_batch_size_hint(directories, others),
             Request::WidenDirectories { directories, .. } => {
                 directories
                     .iter()

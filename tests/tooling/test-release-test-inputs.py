@@ -61,6 +61,20 @@ class InputsTests(unittest.TestCase):
         self.assertEqual(fingerprint(self.base), fingerprint(head))
         self.assertEqual(list(candidates(head)), [head, self.base])
 
+    def test_agent_skill_guidance_is_prose(self):
+        for name in ['.claude/skills/example/SKILL.md', '.agents/skills/example/SKILL.md']:
+            with self.subTest(name=name):
+                self.git('reset', '--hard', self.base)
+                p = Path(name)
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text('Guidance\n')
+                self.assertEqual(fingerprint(self.base), fingerprint(self.commit()))
+        self.git('reset', '--hard', self.base)
+        p = Path('.agents/skills/example/agents/openai.yaml')
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text('policy: {}\n')
+        self.assertNotEqual(fingerprint(self.base), fingerprint(self.commit()))
+
     def test_dependency_and_other_manifest_changes_require_tests(self):
         for name, before, after in [('Cargo.toml', 'example = "1.0"', 'example = "2.0"'),
                                     ('Cargo.lock', 'version = "1.0.0"', 'version = "2.0.0"'),
