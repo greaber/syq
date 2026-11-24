@@ -22,41 +22,89 @@ pub(crate) enum PathToken {
 }
 
 /// Collect a pattern for each path condition among the top-level `and`
-/// conjuncts of `node`. Conditions under `or`, `not`, `if` or `coalesce`
-/// are not necessary for a match, so they are left alone.
-pub(super) fn conjuncts(node: &Node, patterns: &mut Vec<Vec<PathToken>>) {
+/// conjuncts of `node`, from the left, and return whether evaluation always
+/// gets past `node` without an error. Conditions under `or`, `not`, `if` or
+/// `coalesce` are not necessary for a match, so they are left alone.
+///
+/// Collecting stops at the first conjunct that may fail: an entry that a
+/// later path condition rules out must still reach it, so that the error it
+/// reports, such as a comparison with a directory's `null` size, is not
+/// skipped along with the entry.
+pub(super) fn conjuncts(node: &Node, patterns: &mut Vec<Vec<PathToken>>) -> bool {
     match node {
-        Node::Binary(Op::And, a, b) => {
-            conjuncts(a, patterns);
-            conjuncts(b, patterns);
-        }
+        Node::Binary(Op::And, a, b) => conjuncts(a, patterns) && conjuncts(b, patterns),
         Node::Pattern(subject, _, Some(glob)) if is_path(subject) => {
             if let Some(tokens) = glob_tokens(glob) {
                 patterns.push(tokens);
             }
+            true
         }
-        Node::Binary(Op::Eq, a, b) => {
-            let literal = match (&**a, &**b) {
-                (field, Node::Literal(Value::String(text)))
-                | (Node::Literal(Value::String(text)), field)
-                    if is_path(field) =>
-                {
-                    text
-                }
-                _ => return,
-            };
+        Node::Binary(Op::Eq, a, b) if path_literal(a, b).is_some() => {
             // S3 paths are UTF-8; other bytes match no key, which the full
             // evaluation decides.
-            if let Ok(text) = std::str::from_utf8(literal) {
+            if let Some(Ok(text)) = path_literal(a, b).map(std::str::from_utf8) {
                 patterns.push(text.chars().map(PathToken::Literal).collect());
             }
+            true
         }
-        _ => {}
+        node => total(node) == Some(false),
     }
 }
 
 fn is_path(node: &Node) -> bool {
     matches!(node, Node::Field(false, Field::Path))
+}
+
+/// The text that `path` is compared with, if `a` and `b` are the path and a
+/// string literal.
+fn path_literal<'a>(a: &'a Node, b: &'a Node) -> Option<&'a [u8]> {
+    match (a, b) {
+        (field, Node::Literal(Value::String(text)))
+        | (Node::Literal(Value::String(text)), field)
+            if is_path(field) =>
+        {
+            Some(text.as_slice())
+        }
+        _ => None,
+    }
+}
+
+/// Whether evaluating `node` never fails: `None` if it may, and otherwise
+/// whether its value may be `null`. A field never fails; one that a listing
+/// does not give is read first. Arithmetic is assumed to fail, since it can
+/// overflow or divide by zero, and so is whatever fails on `null`: ordered
+/// comparisons, patterns, and `not`, `and` and `or`, which need a boolean.
+fn total(node: &Node) -> Option<bool> {
+    let known = |node: &Node| total(node) == Some(false);
+    match node {
+        Node::Literal(value) => Some(*value == Value::Null),
+        Node::Field(_, field) => Some(!matches!(
+            field,
+            Field::Path | Field::Name | Field::Extension | Field::Exists
+        )),
+        Node::Now => Some(false),
+        Node::Not(n) => known(n).then_some(false),
+        Node::Binary(Op::And | Op::Or, a, b) => (known(a) && known(b)).then_some(false),
+        Node::Binary(Op::Eq | Op::Ne, a, b) => {
+            (total(a).is_some() && total(b).is_some()).then_some(false)
+        }
+        Node::Binary(Op::Lt | Op::Le | Op::Gt | Op::Ge, a, b) => {
+            (known(a) && known(b)).then_some(false)
+        }
+        Node::In(a, items) => {
+            (total(a).is_some() && items.iter().all(|item| total(item).is_some())).then_some(false)
+        }
+        Node::Between(a, low, high) => (known(a) && known(low) && known(high)).then_some(false),
+        Node::Pattern(subject, ..) => known(subject).then_some(false),
+        Node::If(condition, a, b) => {
+            if !known(condition) {
+                return None;
+            }
+            Some(total(a)? | total(b)?)
+        }
+        Node::Coalesce(a, b) => Some(total(a)? & total(b)?),
+        Node::Negative(_) | Node::Binary(..) => None,
+    }
 }
 
 /// The tokens of `globset`'s parser (version 0.4), kept as it builds them.

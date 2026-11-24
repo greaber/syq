@@ -1,9 +1,11 @@
 use super::*;
 use std::{collections::BTreeMap, sync::Mutex};
 
-/// A bucket served from memory: ListObjectsV2 with prefixes, the delimiter
-/// `/` and pages of up to `max-keys`, and HEAD with syq metadata. Every
-/// request is logged.
+/// A bucket served from memory, under any name: ListObjectsV2 with
+/// prefixes, the delimiter `/` and pages of up to `max-keys`, and HEAD with
+/// syq metadata. Every request is logged. A directory bucket's name, ending
+/// in `--x-s3` or `--xa-s3`, also gets the session its client asks for
+/// first, and refuses a prefix that is neither empty nor ends with `/`.
 struct Bucket {
     address: String,
     requests: Arc<Mutex<Vec<String>>>,
@@ -12,12 +14,14 @@ struct Bucket {
 }
 
 /// How the bucket fails: `only` lists only that prefix, refusing others;
-/// `partial` refuses the second page of every listing.
+/// `partial` refuses the second page of every listing; `list_only` refuses
+/// every HEAD request.
 #[derive(Clone, Copy, Default)]
 struct Faults {
     only: Option<&'static str>,
     partial: bool,
     missing_token: bool,
+    list_only: bool,
 }
 
 impl Bucket {
@@ -91,7 +95,8 @@ impl Bucket {
     }
 
     /// The requests since the last call: `HEAD key`, or `LIST prefix` with
-    /// `/` after it for a delimiter listing.
+    /// `/` after it for a delimiter listing. A directory bucket's session is
+    /// left out.
     fn take(&self) -> Vec<String> {
         std::mem::take(&mut *self.requests.lock().unwrap())
     }
@@ -130,9 +135,21 @@ fn serve_bucket(
     let path = percent_encoding::percent_decode_str(url.path())
         .decode_utf8()
         .unwrap();
+    let (bucket, key) = path[1..].split_once('/').unwrap_or((&path[1..], ""));
+    let directory_bucket = bucket.ends_with("--x-s3") || bucket.ends_with("--xa-s3");
+    let query: BTreeMap<String, String> = url.query_pairs().into_owned().collect();
+    if method == "GET" && query.contains_key("session") {
+        assert!(directory_bucket, "{request}");
+        let body = "<CreateSessionResult><Credentials><SessionToken>session</SessionToken><SecretAccessKey>secret</SecretAccessKey><AccessKeyId>access</AccessKeyId><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials></CreateSessionResult>";
+        reply(&mut socket, 200, &[], body.as_bytes(), false);
+        return;
+    }
     if method == "HEAD" {
-        let key = path.strip_prefix("/bucket/").unwrap();
         observed.lock().unwrap().push(format!("HEAD {key}"));
+        if faults.list_only {
+            reply(&mut socket, 403, &[], b"", true);
+            return;
+        }
         let Some(body) = keys.get(key) else {
             reply(&mut socket, 404, &[], b"", true);
             return;
@@ -170,7 +187,7 @@ fn serve_bucket(
         return;
     }
     assert_eq!(method, "GET", "{request}");
-    let query: BTreeMap<String, String> = url.query_pairs().into_owned().collect();
+    assert_eq!(key, "", "{request}");
     assert_eq!(query.get("list-type").map(String::as_str), Some("2"));
     let prefix = query.get("prefix").cloned().unwrap_or_default();
     let delimiter = query.contains_key("delimiter");
@@ -179,6 +196,16 @@ fn serve_bucket(
         if delimiter { " /" } else { "" }
     ));
     let token = query.get("continuation-token");
+    if directory_bucket && !(prefix.is_empty() || prefix.ends_with('/')) {
+        reply(
+            &mut socket,
+            400,
+            &[],
+            b"<Error><Code>InvalidArgument</Code><Message>Prefix must end in a slash</Message></Error>",
+            false,
+        );
+        return;
+    }
     if faults.only.is_some_and(|only| only != prefix) || (faults.partial && token.is_some()) {
         reply(
             &mut socket,
@@ -223,7 +250,7 @@ fn serve_bucket(
             ));
         } else {
             body.push_str(&format!(
-                "<Contents><Key>{}</Key><Size>{}</Size><LastModified>2026-01-01T00:00:00.000Z</LastModified><ETag>&quot;tag&quot;</ETag></Contents>",
+                "<Contents><Key>{}</Key><Size>{}</Size><LastModified>2026-01-01T00:00:00.500Z</LastModified><ETag>&quot;tag&quot;</ETag></Contents>",
                 encode(item),
                 keys[item].len()
             ));
@@ -246,13 +273,18 @@ const BUCKET: &[(&str, &str)] = &[
     ("sp ace/a+b%2F", "x"),
 ];
 
-fn sorted(output: &Output) -> Vec<String> {
+/// The lines a successful command printed, in order.
+fn printed(output: &Output) -> Vec<String> {
     assert!(output.status.success(), "{}", output_text(output));
-    let mut lines: Vec<String> = String::from_utf8(output.stdout.clone())
+    String::from_utf8(output.stdout.clone())
         .unwrap()
         .lines()
         .map(str::to_owned)
-        .collect();
+        .collect()
+}
+
+fn sorted(output: &Output) -> Vec<String> {
+    let mut lines = printed(output);
     lines.sort();
     lines
 }
@@ -300,8 +332,9 @@ fn find_and_ls_need_only_listings_and_report_each_directory_once() {
     bucket.take();
     for args in [vec!["ls"], vec!["find", "--depth", "1"]] {
         let output = bucket.find(temp.path(), &[args, vec!["--on", "s3://bucket"]].concat());
+        // A page's objects and directories print together in key order.
         assert_eq!(
-            sorted(&output),
+            printed(&output),
             ["deep", "empty", "logs", "meta", "sp ace", "top.txt"]
         );
         // One delimiter listing of the bucket's root.
@@ -491,6 +524,232 @@ fn path_conditions_narrow_listings_and_other_fields_need_head_requests() {
         ],
     );
     assert_eq!(sorted(&output), ["deep", "meta/link"]);
+
+    // A path condition after one that may fail narrows nothing: the size
+    // of the first directory listed is null, as without the path condition.
+    bucket.take();
+    let output = bucket.find(
+        temp.path(),
+        &[
+            "find",
+            "--on",
+            "s3://bucket",
+            "--where",
+            "size > 0B and path = 'tree/missing'",
+        ],
+    );
+    assert!(!output.status.success(), "{}", output_text(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unavailable"),
+        "{}",
+        output_text(&output)
+    );
+    let requests = bucket.take();
+    assert!(
+        lists(&requests).iter().all(|r| !r.contains("tree")),
+        "{requests:?}"
+    );
+}
+
+/// Whether an object is a directory is known from its key, so comparing
+/// its kind with "dir" needs no HEAD request, which a policy that allows
+/// only listing refuses.
+#[test]
+fn kind_compared_with_dir_needs_no_head_request() {
+    let temp = test_support::tempdir().unwrap();
+    let bucket = Bucket::start(
+        BUCKET,
+        Faults {
+            list_only: true,
+            ..Faults::default()
+        },
+    );
+    let output = bucket.find(
+        temp.path(),
+        &["ls", "--on", "s3://bucket", "--where", "kind = \"dir\""],
+    );
+    assert_eq!(sorted(&output), ["deep", "empty", "logs", "meta", "sp ace"]);
+    let output = bucket.find(
+        temp.path(),
+        &["find", "--on", "s3://bucket", "--where", "kind != \"dir\""],
+    );
+    assert_eq!(
+        sorted(&output),
+        [
+            "deep/x/y/z",
+            "logs/2025/c.json",
+            "logs/2026/a.json",
+            "logs/2026/b.log",
+            "meta/file",
+            "meta/link",
+            "sp ace/a+b%2F",
+            "top.txt",
+        ]
+    );
+    let requests = bucket.take();
+    assert!(
+        requests.iter().all(|r| r.starts_with("LIST")),
+        "{requests:?}"
+    );
+    // Another kind still needs the object's metadata.
+    let output = bucket.find(
+        temp.path(),
+        &["find", "--on", "s3://bucket", "--where", "kind = \"file\""],
+    );
+    assert!(!output.status.success(), "{}", output_text(&output));
+}
+
+/// A HEAD request gives Last-Modified to the second, a listing to the
+/// millisecond; an object that needed a HEAD request is compared with the
+/// listing's time.
+#[test]
+fn a_head_request_keeps_the_listed_time() {
+    let temp = test_support::tempdir().unwrap();
+    let bucket = Bucket::start(&[("plain", "x")], Faults::default());
+    let output = bucket.find(
+        temp.path(),
+        &[
+            "find",
+            "--on",
+            "s3://bucket",
+            "--where",
+            "s3_last_modified > timestamp('2026-01-01T00:00:00.250Z') and mtime is null",
+        ],
+    );
+    assert_eq!(sorted(&output), ["plain"]);
+    assert_eq!(
+        bucket
+            .take()
+            .iter()
+            .filter(|r| r.starts_with("HEAD"))
+            .count(),
+        1
+    );
+}
+
+/// An object and keys under its name followed by `/` both print as that
+/// name; `--json` tells them apart by kind. A `PATH` names the object.
+#[test]
+fn an_object_and_a_directory_can_share_a_name() {
+    let temp = test_support::tempdir().unwrap();
+    let bucket = Bucket::start(
+        &[("tree/a", "object"), ("tree/a/child", "c"), ("tree/b", "b")],
+        Faults::default(),
+    );
+    let output = bucket.find(temp.path(), &["find", "--on", "s3://bucket", "tree"]);
+    assert_eq!(
+        sorted(&output),
+        ["tree/a", "tree/a", "tree/a/child", "tree/b"]
+    );
+    let output = bucket.find(
+        temp.path(),
+        &["ls", "--on", "s3://bucket", "tree", "--json"],
+    );
+    let json = printed(&output);
+    assert_eq!(json.len(), 3, "{json:?}");
+    assert!(
+        json[0].starts_with(r#"{"path":"tree/a","kind":"file","size":6,"#),
+        "{json:?}"
+    );
+    assert_eq!(json[1], r#"{"path":"tree/a","kind":"dir"}"#);
+    assert!(
+        json[2].starts_with(r#"{"path":"tree/b","kind":"file","#),
+        "{json:?}"
+    );
+    let output = bucket.find(temp.path(), &["find", "--on", "s3://bucket", "tree/a"]);
+    assert_eq!(sorted(&output), ["tree/a"]);
+    let output = bucket.find(temp.path(), &["find", "--on", "s3://bucket", "tree/a/"]);
+    assert_eq!(sorted(&output), ["tree/a/child"]);
+}
+
+/// S3 directory buckets and their access points list only prefixes that
+/// are empty or end with `/`, and the fixture refuses others. Roots and
+/// path conditions still find what they name, and a glob still keeps the
+/// listing to the directories that can hold a match.
+#[test]
+fn directory_buckets_are_listed_with_prefixes_that_end_with_a_slash() {
+    let temp = test_support::tempdir().unwrap();
+    let bucket = Bucket::start(
+        &[
+            ("file", "f"),
+            ("logs/file", "x"),
+            ("logs/filed/more", "x"),
+            ("logs/2025-12/service-a/old.json", "x"),
+            ("logs/2026-01/service-a/a.json", "x"),
+            ("logs/2026-01/service-a/a.txt", "x"),
+            ("logs/2026-01/service-b/b.json", "x"),
+            ("logs/2026-02/service-a/c.json", "x"),
+            ("other/x", "x"),
+        ],
+        Faults::default(),
+    );
+    for name in ["dir--usw2-az1--x-s3", "point--usw2-az1--xa-s3"] {
+        let on = format!("s3://{name}");
+        for slots in ["1", "32"] {
+            let find = |args: &[&str]| {
+                let tuning = format!("s3-requests={slots}");
+                let output = bucket.find(
+                    temp.path(),
+                    &[args, &["--on", &on, "--performance-tuning", &tuning][..]].concat(),
+                );
+                let case = format!("{name} {slots} {args:?}");
+                let requests = bucket.take();
+                assert!(
+                    lists(&requests)
+                        .iter()
+                        .all(|r| r.trim_end_matches(" /") == "LIST "
+                            || r.trim_end_matches(" /").ends_with('/')),
+                    "{case}: {requests:?}"
+                );
+                (sorted(&output), requests)
+            };
+            assert_eq!(
+                find(&["ls", "logs"]).0,
+                [
+                    "logs/2025-12",
+                    "logs/2026-01",
+                    "logs/2026-02",
+                    "logs/file",
+                    "logs/filed",
+                ]
+            );
+            assert_eq!(find(&["find", "file"]).0, ["file"]);
+            assert_eq!(find(&["find", "logs/file"]).0, ["logs/file"]);
+            assert_eq!(find(&["find", "logs/filed"]).0, ["logs/filed/more"]);
+            assert_eq!(
+                find(&["find", "--where", "path = 'logs/file'"]).0,
+                ["logs/file"]
+            );
+            let (found, requests) = find(&[
+                "find",
+                "--where",
+                "path glob 'logs/2026-*/service-a/*.json'",
+            ]);
+            assert_eq!(
+                found,
+                [
+                    "logs/2026-01/service-a/a.json",
+                    "logs/2026-02/service-a/c.json",
+                ]
+            );
+            if slots == "32" {
+                assert!(
+                    !requests.iter().any(|r| r.contains("2025-12")
+                        || r.contains("service-b")
+                        || r.contains("other")),
+                    "{name}: {requests:?}"
+                );
+            }
+            let output = bucket.find(temp.path(), &["find", "--on", &on, "missing"]);
+            assert!(!output.status.success(), "{}", output_text(&output));
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("no objects under"),
+                "{}",
+                output_text(&output)
+            );
+            bucket.take();
+        }
+    }
 }
 
 #[test]
@@ -568,13 +827,15 @@ fn keys_are_decoded_and_a_failed_page_fails_the_listing() {
 }
 
 /// Where a policy lets only the prefix itself be listed, a listing divided
-/// by directory fails; with nothing printed yet, the listing starts over
-/// with one request at a time.
+/// by directory or narrowed by a path condition fails; with nothing printed
+/// yet, the listing starts over with one request at a time, which lists
+/// only the prefix.
 #[test]
 fn a_listing_only_the_prefix_may_make_starts_over_with_one_request() {
     let temp = test_support::tempdir().unwrap();
     let keys: Vec<(String, &str)> = (0..40)
         .flat_map(|d| (0..60).map(move |i| (format!("tree/d{d:02}/{i:04}"), "x")))
+        .chain([("tree/a".to_owned(), "a"), ("tree/sub/x".to_owned(), "x")])
         .collect();
     let keys: Vec<(&str, &str)> = keys
         .iter()
@@ -591,7 +852,49 @@ fn a_listing_only_the_prefix_may_make_starts_over_with_one_request() {
     assert!(output.status.success(), "{}", output_text(&output));
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).lines().count(),
-        40 * 60 + 40
+        40 * 60 + 40 + 3
+    );
+    let output = bucket.find(
+        temp.path(),
+        &[
+            "find",
+            "--on",
+            "s3://bucket",
+            "tree/",
+            "--where",
+            "path = 'tree/a'",
+        ],
+    );
+    assert_eq!(sorted(&output), ["tree/a"]);
+    // With one request at a time, the prefix is listed by itself from the
+    // start.
+    bucket.take();
+    let output = bucket.find(
+        temp.path(),
+        &[
+            "find",
+            "--on",
+            "s3://bucket",
+            "tree/",
+            "--where",
+            "path glob 'tree/sub/**'",
+            "--performance-tuning",
+            "s3-requests=1",
+        ],
+    );
+    assert_eq!(sorted(&output), ["tree/sub/x"]);
+    let requests = bucket.take();
+    assert!(requests.iter().all(|r| r == "LIST tree/"), "{requests:?}");
+    // A PATH without a slash names the object or the directory; a policy
+    // that refuses the listing of the object's key leaves the directory.
+    let output = bucket.find(temp.path(), &["ls", "--on", "s3://bucket", "tree"]);
+    let listed = sorted(&output);
+    assert_eq!(listed.len(), 42, "{listed:?}");
+    assert!(
+        ["tree/a", "tree/d00", "tree/sub"]
+            .iter()
+            .all(|path| listed.iter().any(|line| line == path)),
+        "{listed:?}"
     );
     // To a depth, every directory needs its own listing.
     let output = bucket.find(

@@ -258,13 +258,36 @@ fn s3_directories_are_known_from_the_listing() {
             .unwrap(),
         Some(false)
     );
-    // An object's kind needs its metadata.
+    // An object's kind needs its metadata, but not whether it is a
+    // directory: only a directory marker is.
     let object = Facts::S3Listing {
         size: 3,
         directory_marker: false,
         last_modified: None,
     };
     assert_eq!(policy.selects_listing_known(object, b"a").unwrap(), None);
+    for (text, expected) in [
+        ("kind = 'dir'", Some(false)),
+        ("'dir' = kind", Some(false)),
+        ("kind != 'dir'", Some(true)),
+        ("kind != 'dir' and size = 3B", Some(true)),
+        ("not kind = 'dir' and kind = 'file'", None),
+        ("kind = 'symlink'", None),
+    ] {
+        let policy = Policy::compile_listing(Some(text)).unwrap();
+        assert_eq!(
+            policy.selects_listing_known(object, b"a").unwrap(),
+            expected,
+            "{text}"
+        );
+    }
+    let marker = Facts::S3Listing {
+        size: 0,
+        directory_marker: true,
+        last_modified: None,
+    };
+    let policy = Policy::compile_listing(Some("kind != 'dir'")).unwrap();
+    assert_eq!(policy.selects_listing_known(marker, b"a").unwrap(), None);
     let policy = Policy::compile_listing(Some("size = 3B and path glob '*'")).unwrap();
     assert_eq!(
         policy.selects_listing_known(object, b"a").unwrap(),
@@ -286,10 +309,55 @@ fn path_conditions_joined_by_and_are_pushed_down() {
         [[lit("logs/"), vec![S], lit(".json")].concat()]
     );
     assert_eq!(
-        pushed("size > 0B and (src.path = 'a/b' and path glob 'a/**')"),
+        pushed("extension = 'b' and (src.path = 'a/b' and path glob 'a/**')"),
         [lit("a/b"), [lit("a/"), vec![R]].concat()]
     );
     assert_eq!(pushed("'x' = path"), [lit("x")]);
+    // A condition that may fail stops the narrowing: an entry a later path
+    // condition rules out must still reach it, and report its error.
+    assert_eq!(
+        pushed("path glob 'logs/2026-*/*' and size > 1MiB"),
+        [[lit("logs/2026-"), vec![S], lit("/"), vec![S]].concat()]
+    );
+    assert_eq!(
+        pushed("extension = 'json' and path glob 'logs/2026-*/*'"),
+        [[lit("logs/2026-"), vec![S], lit("/"), vec![S]].concat()]
+    );
+    assert_eq!(
+        pushed("path = 'a' and size > 0B and path = 'b'"),
+        [lit("a")]
+    );
+    for text in [
+        "kind = 'file' and size is null and mtime is not null and name in ['a', null]",
+        "exists and not (name glob 'x*' or extension < 'm') and name between 'a' and 'z'",
+        "coalesce(size, 0B) = 0B and if(exists, mtime, now) is null and now > timestamp('2020-01-01T00:00:00Z')",
+        "if(exists, name, extension) glob '*' and coalesce(link_target, name) glob '*'",
+        "true",
+    ] {
+        assert_eq!(
+            pushed(&format!("{text} and path = 'p'")),
+            [lit("p")],
+            "{text}"
+        );
+    }
+    for text in [
+        "size > 0B",
+        "kind glob 'f*'",
+        "mtime < now",
+        "size + 1B = 2B",
+        "size / 0 = 0B",
+        "-size = 0B",
+        "size between 0B and 1B",
+        "not if(exists, true, null)",
+        "coalesce(size, null) > 0B",
+        "if(size > 0B, true, false)",
+        "link_target glob '*'",
+    ] {
+        assert!(
+            pushed(&format!("{text} and path = 'p'")).is_empty(),
+            "{text}"
+        );
+    }
     // Conditions that are not necessary for a match narrow nothing.
     for text in [
         "path glob 'a/*' or size > 0B",

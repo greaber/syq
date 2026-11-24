@@ -343,6 +343,62 @@ fn an_unreadable_directory_is_reported_and_skipped() {
     assert!(skipped[0].contains("logs/2026"), "{skipped:?}");
 }
 
+/// Output from a slow walk is flushed while the walk goes on, not only at
+/// its end, at most once per interval.
+#[test]
+fn a_slow_walk_flushes_its_output_as_it_goes() {
+    /// Takes a while over each entry, and notes how much output each
+    /// flush found.
+    #[derive(Default)]
+    struct Slow {
+        out: Vec<u8>,
+        flushes: Vec<usize>,
+    }
+    impl Write for Slow {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            if data == b"\n" {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            self.out.write(data)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes.push(self.out.len());
+            Ok(())
+        }
+    }
+    impl Sink for Slow {
+        fn unreadable(&mut self, message: String) -> Result<()> {
+            panic!("{message}");
+        }
+    }
+    let temp = tree();
+    let mut slow = Slow::default();
+    let started = Instant::now();
+    write_local(&options(temp.path()), &mut slow).unwrap();
+    let elapsed = started.elapsed();
+    let total = slow.out.len();
+    assert!(
+        slow.flushes
+            .iter()
+            .any(|&flushed| 0 < flushed && flushed < total),
+        "{:?} of {total}",
+        slow.flushes
+    );
+    // Each flush has something new to send, and they are at least an
+    // interval apart.
+    assert!(
+        slow.flushes.windows(2).all(|pair| pair[0] < pair[1]),
+        "{:?}",
+        slow.flushes
+    );
+    let most = (elapsed.as_millis() / FLUSH_INTERVAL.as_millis()) as usize;
+    assert!(
+        slow.flushes.len() <= most,
+        "{:?} in {elapsed:?}",
+        slow.flushes
+    );
+}
+
 /// A helper receives the options over the wire, so it checks them itself.
 #[test]
 fn helper_refuses_bad_roots_and_fields() {

@@ -186,19 +186,23 @@ fn level(
 ) -> Batch {
     let mut found = Vec::with_capacity(page.entries.len() + page.prefixes.len());
     let mut jobs = Vec::new();
-    for entry in page.entries {
-        if entry.key == prefix {
+    let next_last = page.prefixes.last().cloned().or(last.clone());
+    // Report the page in key order: its objects and its subdirectories come
+    // in two lists, each in that order.
+    let mut entries = page.entries.into_iter().peekable();
+    let mut objects = |found: &mut Vec<Found>, before: Option<&str>| {
+        while let Some(entry) =
+            entries.next_if(|entry| before.is_none_or(|child| entry.key.as_str() < child))
+        {
             // The directory's own marker was reported by its common
             // prefix; an object of the same name with contents is not.
-            if entry.size > 0 && depth > 0 {
+            if entry.key != prefix || (entry.size > 0 && depth > 0) {
                 found.push(Found::Object(entry));
             }
-            continue;
         }
-        found.push(Found::Object(entry));
-    }
-    let next_last = page.prefixes.last().cloned().or(last.clone());
+    };
     for child in page.prefixes {
+        objects(&mut found, Some(&child));
         if last.as_ref() == Some(&child) {
             continue;
         }
@@ -213,6 +217,7 @@ fn level(
         }
         found.push(Found::Directory(child));
     }
+    objects(&mut found, None);
     if let Some(token) = page.next {
         jobs.push(Job::Level {
             prefix,

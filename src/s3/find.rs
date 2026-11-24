@@ -133,6 +133,10 @@ fn directory_prefix(key: &str) -> String {
 /// The root `path` names beneath `base`, found with listings only: a path
 /// ending with `/` names a directory; another names the object of that key
 /// if there is one, else the directory.
+///
+/// A store that lists only prefixes ending with `/` finds the object in a
+/// listing of the directory that holds it, which can take many requests, so
+/// there the directory is looked for first and is chosen if it holds keys.
 async fn resolve(store: &listing::S3<'_>, base: &str, path: &[u8]) -> Result<Root> {
     let display = crate::native_find::root_display(path).to_vec();
     if display.is_empty() {
@@ -143,27 +147,53 @@ async fn resolve(store: &listing::S3<'_>, base: &str, path: &[u8]) -> Result<Roo
     }
     let key = local::join(base, &local::key_path(&display)?);
     let shown = String::from_utf8_lossy(path);
-    if !path.ends_with(b"/") {
-        let (object, under) = levels::exact(store, &key).await?;
-        if let Some(entry) = object {
+    let prefix = format!("{key}/");
+    let object = !path.ends_with(b"/");
+    let mut refused = None;
+    if object && !store.slash_only() {
+        match levels::exact(store, &key).await {
+            Ok((Some(entry), _)) => return Ok(Root::Object { entry, display }),
+            Ok((None, true)) => return Ok(Root::Directory { prefix, display }),
+            Ok((None, false)) => {}
+            // A policy that lets you list only the prefix `key/` refuses
+            // a listing of `key`.
+            Err(error) if denied(&error) => refused = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+    if holds_keys(store, &prefix).await? {
+        return Ok(Root::Directory { prefix, display });
+    }
+    if object && store.slash_only() {
+        if let Some(entry) = engine::exact_in_directory(store, &key).await? {
             return Ok(Root::Object { entry, display });
         }
-        if under {
-            return Ok(Root::Directory {
-                prefix: format!("{key}/"),
-                display,
-            });
-        }
     }
-    let prefix = format!("{key}/");
-    let mut page = store.first_key(&prefix).await?;
+    if let Some(error) = refused {
+        return Err(error.context(format!(
+            "cannot list {shown}: no objects under {prefix:?}, and listing {key:?} to look for the object was refused"
+        )));
+    }
+    bail!("cannot list {shown}: no S3 object {key:?}, and no objects under {prefix:?}");
+}
+
+/// Whether any key starts with `prefix`, which ends with `/`.
+async fn holds_keys(store: &listing::S3<'_>, prefix: &str) -> Result<bool> {
+    let mut page = store.first_key(prefix).await?;
     while page.entries.is_empty() {
         let Some(token) = page.next.take() else {
-            bail!("cannot list {shown}: no S3 object {key:?}, and no objects under {prefix:?}");
+            return Ok(false);
         };
-        page = engine::read(store, &prefix, false, Some(&token)).await?;
+        page = engine::read(store, prefix, false, Some(&token)).await?;
     }
-    Ok(Root::Directory { prefix, display })
+    Ok(true)
+}
+
+/// Whether a request failed because a policy refused it.
+fn denied(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<client::RequestFailure>()
+        .is_some_and(client::RequestFailure::denied)
 }
 
 struct Finder<'a, W> {
@@ -250,9 +280,13 @@ impl<W: Write> Finder<'_, W> {
         }
         let mut concurrency = self.concurrency;
         loop {
+            // One request at a time lists the root's prefix itself, as a
+            // policy that lets you list only that prefix requires; a
+            // narrowed listing lists others.
+            let pattern = pattern.as_ref().filter(|_| concurrency > 1);
             let state = State::new(self, prefix.clone(), display.clone());
             let paced = state.paced(&prefix);
-            let result = match &pattern {
+            let result = match pattern {
                 Some(pattern) => {
                     state
                         .run(engine::enumerate(&paced, pattern, concurrency, |entry| {
@@ -296,13 +330,11 @@ impl<W: Write> Finder<'_, W> {
             let Err(error) = result else {
                 return Ok(());
             };
-            // Divided listings fail where a policy allows listing only the
-            // prefix itself, and where keys arrive out of order; a listing
-            // one page after another does not. Start over if nothing was
-            // printed yet.
-            let denied = error
-                .downcast_ref::<client::RequestFailure>()
-                .is_some_and(client::RequestFailure::denied)
+            // Divided and narrowed listings fail where a policy allows
+            // listing only the prefix itself, and divided ones where keys
+            // arrive out of order; a listing of the prefix one page after
+            // another does not. Start over if nothing was printed yet.
+            let denied = denied(&error)
                 && (state.discovery_denied.get()
                     || error.downcast_ref::<engine::PartFailed>().is_some());
             if concurrency == 1 || !(denied || error.is::<engine::Unordered>()) {
@@ -648,12 +680,13 @@ impl<'a, 'f, W: Write> State<'a, 'f, W> {
             let Some(object) = object else {
                 continue;
             };
-            if queued.filter
-                && !self
-                    .finder
-                    .policy
-                    .selects_listing(&object.expression_file(), &queued.path)?
-            {
+            let mut file = object.expression_file();
+            // A listing gives the time to the millisecond, HEAD to the
+            // second.
+            if queued.entry.last_modified.is_some() {
+                file.s3_last_modified = queued.entry.last_modified;
+            }
+            if queued.filter && !self.finder.policy.selects_listing(&file, &queued.path)? {
                 continue;
             }
             self.print_object(&queued.path, &queued.entry, Some(&object))?;

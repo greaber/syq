@@ -40,7 +40,8 @@ and `-> TARGET` after a symlink. On S3, the time is the S3 Last-Modified time.
 
 `--json` prints one object per line. On filesystems it holds `path`, `kind`,
 `size` for regular files, and `mtime` in Unix seconds; on S3, `path`, `kind`,
-`size`, `s3_last_modified` and `etag` from the listing:
+`size`, `s3_last_modified` and `etag` from the listing, without a request for
+each object:
 
 ```json
 {"path":"src/main.rs","kind":"file","size":1824,"mtime":1795517300}

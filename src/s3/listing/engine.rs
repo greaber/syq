@@ -434,7 +434,40 @@ async fn execute(
         component += 1;
     }
     let part = &pattern.components[component];
-    let query = format!("{prefix}{}", part.literal_prefix());
+    // A store that lists only prefixes ending with '/' lists the whole
+    // directory instead, and what the part does not match is left out of
+    // what it finds.
+    let query = if store.slash_only() {
+        prefix.clone()
+    } else {
+        format!("{prefix}{}", part.literal_prefix())
+    };
+    if part.recursive() && store.slash_only() && !part.literal_prefix().is_empty() {
+        // Only the subdirectories whose names start as the part does are
+        // listed whole.
+        let start = format!("{prefix}{}", part.literal_prefix());
+        let page = read(store, &prefix, true, None).await?;
+        if page.next.is_some() || page.prefixes.len() > MAX_CHILDREN {
+            if defer_recursive {
+                return Ok(Batch {
+                    entries: Vec::new(),
+                    jobs: vec![Job::Recursive { prefix }],
+                    pruned: Vec::new(),
+                });
+            }
+            return recursive(store, None, prefix).await;
+        }
+        return Ok(Batch {
+            entries: page.entries,
+            jobs: page
+                .prefixes
+                .into_iter()
+                .filter(|child| child.starts_with(&start))
+                .map(|prefix| Job::Recursive { prefix })
+                .collect(),
+            pruned: Vec::new(),
+        });
+    }
     if part.recursive() {
         if defer_recursive {
             return Ok(Batch {
@@ -611,6 +644,12 @@ pub(in crate::s3) async fn enumerate(
             .map(|part| part.literal_prefix())
             .collect::<Vec<_>>()
             .join("/");
+        if store.slash_only() {
+            if let Some(entry) = exact_in_directory(store, &key).await? {
+                emit(entry)?;
+            }
+            return Ok(());
+        }
         // Keep LIST permissions (no HEAD). In byte order the exact key, if
         // present, precedes every longer key on the first page that holds
         // anything; an empty page that goes on settles nothing.
@@ -667,6 +706,29 @@ pub(in crate::s3) async fn enumerate(
     )
     .await?;
     Ok(())
+}
+
+/// The object `key`, looked for with listings only in a store that lists
+/// only prefixes ending with '/': the directory that holds it is listed with
+/// the delimiter, which leaves out what its subdirectories hold.
+pub(in crate::s3) async fn exact_in_directory(
+    store: &impl Store,
+    key: &str,
+) -> Result<Option<Entry>> {
+    let directory = &key[..key.rfind('/').map_or(0, |at| at + 1)];
+    let mut token = None;
+    loop {
+        let page = read(store, directory, true, token.as_deref())
+            .await
+            .with_context(|| format!("looking for the S3 object {key:?}"))?;
+        if let Some(entry) = page.entries.into_iter().find(|entry| entry.key == key) {
+            return Ok(Some(entry));
+        }
+        let Some(next) = page.next else {
+            return Ok(None);
+        };
+        token = Some(next);
+    }
 }
 
 /// Literal prefixes from copy/removal selectors must never be parsed as globs.

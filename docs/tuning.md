@@ -95,8 +95,9 @@ pruning. Filesystem pruning always tunes its own workers.
 
 `syq find` and `syq ls` send up to 32 S3 listing requests at a time. Use
 `--performance-tuning s3-requests=N` to change that (1–256; larger values
-count as 256). With `s3-requests=1`, a listing of a whole prefix reads one
-page after another, which a bucket policy that lets you list only the prefix
+count as 256). With `s3-requests=1`, `syq find` without a depth lists the
+whole prefix one page after another, without narrowing it to what a `path`
+condition can match, as a bucket policy that lets you list only the prefix
 itself requires. Filesystem listings have no tuning keys.
 
 ## Remembered connection counts

@@ -13,6 +13,7 @@ use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::fsops::{PinnedSource, SourceSelector};
 use crate::proto::{Entry, Kind, OperatorSymlinkPolicy, SourceRootBase};
@@ -339,7 +340,10 @@ pub fn run(args: &crate::cli::Args) -> Result<i32> {
         let mut unreadable = 0;
         loop {
             match connection.recv()? {
-                crate::proto::Response::NativeFindData(data) => out.write_all(&data)?,
+                crate::proto::Response::NativeFindData(data) => {
+                    out.write_all(&data)?;
+                    out.flush()?;
+                }
                 crate::proto::Response::NativeFindUnreadable(message) => {
                     out.flush()?;
                     crate::output::diagnostic!("syq: {message}");
@@ -400,6 +404,9 @@ struct Selection {
     display: Vec<u8>,
 }
 
+/// How long output may wait in a buffer while a walk goes on.
+const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+
 struct Walk<'a, W> {
     out: &'a mut W,
     printer: Printer,
@@ -408,6 +415,9 @@ struct Walk<'a, W> {
     depth: Option<u32>,
     read_link_targets: bool,
     skipped: usize,
+    /// When output was last flushed, and whether any was written since.
+    flushed: Instant,
+    unflushed: bool,
 }
 
 struct Pending {
@@ -452,6 +462,8 @@ pub fn write_local(options: &Options, out: &mut impl Sink) -> Result<usize> {
         ignore: crate::scan::build_ignore(&options.ignore)?,
         depth: options.depth,
         skipped: 0,
+        flushed: Instant::now(),
+        unflushed: false,
     };
     // Check every root before writing anything, so that a missing one
     // fails before any output. Each is pinned again to list it, so many
@@ -537,6 +549,7 @@ impl<W: Sink> Walk<'_, W> {
         }) = pending.pop()
         {
             self.emit(&join(&selection.display, &entry.path), &entry)?;
+            self.pace()?;
             if entry.kind == Kind::Dir && self.depth.is_none_or(|max| depth < max) {
                 self.push_children(
                     &selection.root,
@@ -634,6 +647,17 @@ impl<W: Sink> Walk<'_, W> {
         Ok(())
     }
 
+    /// Flush what was written since the last flush if that was a while
+    /// ago, so that output shows while a slow walk goes on.
+    fn pace(&mut self) -> Result<()> {
+        if self.unflushed && self.flushed.elapsed() >= FLUSH_INTERVAL {
+            self.out.flush()?;
+            self.flushed = Instant::now();
+            self.unflushed = false;
+        }
+        Ok(())
+    }
+
     fn emit(&mut self, path: &[u8], entry: &Entry) -> Result<()> {
         if self.policy.selection.is_some()
             && !self
@@ -642,6 +666,7 @@ impl<W: Sink> Walk<'_, W> {
         {
             return Ok(());
         }
+        self.unflushed = true;
         self.printer.write(
             self.out,
             &Record {

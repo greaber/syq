@@ -296,6 +296,29 @@ impl<'a> Facts<'a> {
         }
         Err(NeedMetadata.into())
     }
+
+    /// Whether the entry is known not to be a directory before its metadata
+    /// is read: an S3 object whose key is not a directory marker, which syq
+    /// refuses to read as a directory.
+    fn never_directory(self) -> bool {
+        matches!(
+            self,
+            Self::S3Listing {
+                directory_marker: false,
+                ..
+            }
+        )
+    }
+}
+
+/// Whether `a` and `b` compare the entry's own kind with `"dir"`.
+fn compares_kind_with_dir(a: &Node, b: &Node) -> bool {
+    matches!(
+        (a, b),
+        (Node::Field(false, Field::Kind), Node::Literal(Value::String(text)))
+            | (Node::Literal(Value::String(text)), Node::Field(false, Field::Kind))
+            if text.as_slice() == b"dir"
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -418,6 +441,13 @@ impl Node {
             }
             Self::Binary(Op::Or, a, b) => {
                 Value::Bool(a.eval(c)?.boolean()? || b.eval(c)?.boolean()?)
+            }
+            // An object's kind needs its metadata, but whether it is a
+            // directory does not.
+            Self::Binary(op @ (Op::Eq | Op::Ne), a, b)
+                if c.src.never_directory() && compares_kind_with_dir(a, b) =>
+            {
+                Value::Bool(*op == Op::Ne)
             }
             Self::Binary(op, a, b) => binary(*op, a.eval(c)?, b.eval(c)?)?,
             Self::Between(a, b, d) => {
@@ -596,9 +626,10 @@ impl Expression {
     }
     /// Path patterns that every path the expression selects matches: one
     /// for each `path glob` or `path =` condition joined to the rest by
-    /// `and` alone. Each pattern can match more paths than its condition
-    /// does, never fewer, so a listing may skip whatever matches none of
-    /// them, but must still evaluate the expression on what it lists.
+    /// `and` alone, with no condition before it that may fail. Each pattern
+    /// can match more paths than its condition does, never fewer, so a
+    /// listing may skip whatever matches none of them, but must still
+    /// evaluate the expression on what it lists.
     pub fn s3_path_pushdown(&self) -> Vec<Vec<PathToken>> {
         let mut patterns = Vec::new();
         pushdown::conjuncts(&self.root, &mut patterns);

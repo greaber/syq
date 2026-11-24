@@ -114,7 +114,9 @@ A `PATH` that ends with `/` names a prefix. Another `PATH` names the object
 with that key if there is one, and otherwise the `PATH/` prefix, as in
 copies; `-C` sets the prefix that paths start from. Directories are the
 prefixes that keys imply, including empty directory markers. Each prints
-once, without a trailing slash, and has no size or times.
+once, without a trailing slash, and has no size or times. An object can
+share its name with a directory, as an object `a` beside keys under `a/`
+does; both print as `a`, and `--long` and `--json` show their kinds.
 
 Listing needs only permission to list the bucket (`s3:ListBucket`).
 `syq ls`, and `syq find` with `--depth`, read one directory at a time, with a
@@ -123,17 +125,22 @@ under the prefix, dividing the work as copies do (see
 [Listing large prefixes](#listing-large-prefixes)). A `path glob` or `path =`
 condition joined to the rest of `--where` with `and` limits the requests to
 the prefixes that can hold a match, such as `laptop/photos/2026-*/` rather
-than all of `laptop/`. Services that don't promise to list keys in byte order
-can leave a key out of a later page that a directory listing asks for, so
-there syq lists a directory with more than a thousand entries whole instead,
-which can take much longer for a deep tree, and says so.
+than all of `laptop/`, unless a condition before it could fail, as
+`size > 1MiB` does on a directory, whose size is `null`. Services that don't
+promise to list keys in byte order can leave a key out of a later page that a
+directory listing asks for, so there syq lists a directory with more than a
+thousand entries whole instead, which can take much longer for a deep tree,
+and says so.
 
-Conditions on `path`, `name`, `extension`, `size`, `s3_last_modified`, and a
-directory's `kind` use the listing alone. Other fields of an object, including
-whether it is a file or a symlink that syq stored, need a HEAD request for
-each object the listed fields haven't ruled out, as do `--include` `kind`,
-`mtime`, `mode`, `uid` and `gid`; syq sends up to 32 at a time. `--long` and
-the default `--json` fields never need one, and show every object as a file.
+Conditions on `path`, `name`, `extension`, `size`, `s3_last_modified`, a
+directory's `kind`, and whether `kind` is `"dir"` use the listing alone. Other
+fields of an object, including whether it is a file or a symlink that syq
+stored, need a HEAD request for each object the listed fields haven't ruled
+out, as do `--include` `kind`, `mtime`, `mode`, `uid` and `gid`; syq sends up
+to 32 at a time. `--long` and the default `--json` fields never need a HEAD
+request for an object, and show every object as a file. Without
+`--s3-region`, syq also asks AWS where the bucket is, with one HEAD request
+for the bucket itself.
 
 <a id="metadata-and-integrity"></a>
 <a id="overwrites-and-recovery"></a>
