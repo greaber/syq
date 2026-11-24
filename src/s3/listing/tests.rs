@@ -57,6 +57,7 @@ impl Store for Memory {
         let next = (items.len() > start + 1000)
             .then(|| format!("{}:{prefix}:{}", u8::from(delimiter), start + 1000));
         let mut page = Page {
+            complete: next.is_none(),
             next,
             ..Page::default()
         };
@@ -408,8 +409,15 @@ async fn unordered_stores_look_past_the_first_page_for_an_exact_key() {
 #[tokio::test]
 async fn filtered_listings_stay_flat_and_prune_ignored_first_pages() {
     async fn pruned(store: &Memory, prune: &engine::Prune<'_>) -> (Vec<String>, Vec<String>) {
+        listed_with(store, prune, 8).await
+    }
+    async fn listed_with(
+        store: &Memory,
+        prune: &engine::Prune<'_>,
+        concurrency: usize,
+    ) -> (Vec<String>, Vec<String>) {
         let mut keys = Vec::new();
-        let pruned = engine::enumerate_prefix(store, "tree/", 8, Some(prune), |entry| {
+        let pruned = engine::enumerate_prefix(store, "tree/", concurrency, Some(prune), |entry| {
             keys.push(entry.key);
             Ok(())
         })
@@ -419,7 +427,7 @@ async fn filtered_listings_stay_flat_and_prune_ignored_first_pages() {
     }
     let ignored =
         |key: &str, _directory: bool| key.starts_with("tree/d3/").then_some("tree/d3".len());
-    // A first page with included objects stays flat.
+    // With one request slot, a first page with included objects stays flat.
     let store = Memory::new(
         (0..2)
             .flat_map(|d| (0..1500).map(move |i| format!("tree/d{d}/file{i:04}")))
@@ -429,10 +437,23 @@ async fn filtered_listings_stay_flat_and_prune_ignored_first_pages() {
         subtree: &ignored,
         probes: 4.into(),
     };
-    let (keys, pruned_prefixes) = pruned(&store, &prune).await;
+    let (keys, pruned_prefixes) = listed_with(&store, &prune, 1).await;
     assert!(pruned_prefixes.is_empty());
     assert_eq!(keys.len(), store.keys.len());
     assert_eq!(*store.calls.borrow(), vec![("tree/".to_owned(), false); 4]);
+    // With more, its directories are listed by themselves or in groups.
+    store.calls.borrow_mut().clear();
+    let (mut keys, pruned_prefixes) = pruned(&store, &prune).await;
+    assert!(pruned_prefixes.is_empty());
+    keys.sort();
+    assert_eq!(keys, store.keys.iter().cloned().collect::<Vec<_>>());
+    assert_eq!(
+        store.calls.borrow()[..2],
+        [("tree/".into(), false), ("tree/".into(), true)]
+    );
+    assert!(store.calls.borrow()[2..]
+        .iter()
+        .all(|(prefix, delimiter)| !delimiter && prefix != "tree/"));
     // A first page entirely in a pruned directory switches to a directory
     // listing at once, following a single included child.
     let store = Memory::new(
@@ -683,8 +704,10 @@ impl Store for R2Order {
                 })
                 .count(),
         };
+        let next = (items.len() > start + 1000).then(|| (start + 1000).to_string());
         let mut page = Page {
-            next: (items.len() > start + 1000).then(|| (start + 1000).to_string()),
+            complete: next.is_none(),
+            next,
             ..Page::default()
         };
         for (item, directory) in items.into_iter().skip(start).take(1000) {
@@ -879,4 +902,180 @@ async fn a_delimiter_listing_in_another_order_checks_no_key() {
         .borrow()
         .iter()
         .all(|(prefix, _)| prefix == "edge/"));
+}
+
+/// Serves ListObjectsV2 for a set of keys in byte order, recording the prefix
+/// and delimiter of each request.
+#[derive(Clone, Debug)]
+struct Served {
+    keys: std::sync::Arc<BTreeSet<String>>,
+    /// The IsTruncated and NextContinuationToken elements of every response,
+    /// in place of those that describe the listing.
+    ending: Option<&'static str>,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<(String, bool)>>>,
+}
+
+impl Served {
+    fn new(keys: impl IntoIterator<Item = String>, ending: Option<&'static str>) -> Self {
+        Self {
+            keys: std::sync::Arc::new(keys.into_iter().collect()),
+            ending,
+            requests: Default::default(),
+        }
+    }
+
+    fn client(&self) -> aws_sdk_s3::Client {
+        use aws_smithy_runtime_api::client::http::{http_client_fn, SharedHttpConnector};
+        let connector = self.clone();
+        aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::config::Builder::new()
+                .behavior_version_latest()
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    "test", "test", None, None, "fixture",
+                ))
+                .endpoint_url("http://127.0.0.1:9")
+                .force_path_style(true)
+                .disable_s3_express_session_auth(true)
+                .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+                .http_client(http_client_fn(move |_, _| {
+                    SharedHttpConnector::new(connector.clone())
+                }))
+                .build(),
+        )
+    }
+}
+
+impl aws_smithy_runtime_api::client::http::HttpConnector for Served {
+    fn call(
+        &self,
+        request: aws_smithy_runtime_api::client::orchestrator::HttpRequest,
+    ) -> aws_smithy_runtime_api::client::http::HttpConnectorFuture {
+        let url = url::Url::parse(request.uri()).unwrap();
+        let query: std::collections::HashMap<String, String> =
+            url.query_pairs().into_owned().collect();
+        let prefix = query.get("prefix").cloned().unwrap_or_default();
+        let delimiter = query.contains_key("delimiter");
+        let start: usize = query
+            .get("continuation-token")
+            .map_or(0, |token| token.parse().unwrap());
+        let most: usize = query["max-keys"].parse().unwrap();
+        self.requests
+            .lock()
+            .unwrap()
+            .push((prefix.clone(), delimiter));
+        let items: BTreeSet<(String, bool)> = self
+            .keys
+            .range(prefix.clone()..)
+            .take_while(|key| key.starts_with(&prefix))
+            .map(
+                |key| match delimiter.then(|| key[prefix.len()..].find('/')).flatten() {
+                    Some(slash) => (key[..prefix.len() + slash + 1].to_owned(), true),
+                    None => (key.clone(), false),
+                },
+            )
+            .collect();
+        let mut body = String::from("<ListBucketResult>");
+        body.push_str(&match self.ending {
+            Some(ending) => ending.to_owned(),
+            None if items.len() > start + most => format!(
+                "<IsTruncated>true</IsTruncated><NextContinuationToken>{}</NextContinuationToken>",
+                start + most
+            ),
+            None => "<IsTruncated>false</IsTruncated>".to_owned(),
+        });
+        for (item, directory) in items.iter().skip(start).take(most) {
+            body.push_str(&if *directory {
+                format!("<CommonPrefixes><Prefix>{item}</Prefix></CommonPrefixes>")
+            } else {
+                format!("<Contents><Key>{item}</Key><Size>1</Size></Contents>")
+            });
+        }
+        body.push_str("</ListBucketResult>");
+        aws_smithy_runtime_api::client::http::HttpConnectorFuture::ready(Ok(
+            aws_smithy_runtime_api::client::orchestrator::HttpResponse::new(
+                200.try_into().unwrap(),
+                aws_smithy_types::body::SdkBody::from(body),
+            ),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn only_a_response_that_says_it_is_not_truncated_completes_a_listing() {
+    for (ending, next, complete) in [
+        (None, None, true),
+        (Some("<IsTruncated>false</IsTruncated>"), None, true),
+        // IsTruncated left out.
+        (Some(""), None, false),
+        (
+            Some(
+                "<IsTruncated>false</IsTruncated><NextContinuationToken>1</NextContinuationToken>",
+            ),
+            None,
+            false,
+        ),
+        (
+            Some("<IsTruncated>true</IsTruncated><NextContinuationToken>1</NextContinuationToken>"),
+            Some("1"),
+            false,
+        ),
+    ] {
+        let served = Served::new(["p/a".to_owned(), "p/b/c".to_owned()], ending);
+        let store = S3 {
+            client: served.client(),
+            bucket: "bucket",
+            divides: false,
+        };
+        for delimiter in [false, true] {
+            let page = store.page("p/", delimiter, None, None).await.unwrap();
+            assert_eq!(page.next.as_deref(), next, "{ending:?}");
+            assert_eq!(page.complete, complete, "{ending:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn directory_buckets_and_their_access_points_list_only_prefixes_that_end_in_a_slash() {
+    assert!(!lists_in_key_order("dir--usw2-az1--x-s3"));
+    assert!(lists_in_key_order("point--usw2-az1--xa-s3"));
+    for bucket in ["dir--usw2-az1--x-s3", "point--usw2-az1--xa-s3"] {
+        // Ten directories are listed each by itself; forty would be grouped
+        // in a store that takes any prefix.
+        for (directories, per_directory) in [(10, 1000), (40, 200)] {
+            let keys: Vec<String> = (0..directories)
+                .flat_map(|d| (0..per_directory).map(move |k| format!("t/d{d}/k{k:04}")))
+                .collect();
+            let served = Served::new(keys.iter().cloned(), None);
+            let store = S3 {
+                client: served.client(),
+                bucket,
+                divides: lists_in_byte_order(None, bucket),
+            };
+            assert!(store.slash_only() && !store.divides(), "{bucket}");
+            let mut listed = Vec::new();
+            engine::enumerate_prefix(&store, "t/", 32, None, |entry| {
+                listed.push(entry.key);
+                Ok(())
+            })
+            .await
+            .unwrap();
+            listed.sort();
+            let mut expected = keys.clone();
+            expected.sort();
+            let case = format!("{bucket} {directories} x {per_directory}");
+            assert_eq!(listed, expected, "{case}");
+            let requests = served.requests.lock().unwrap();
+            assert!(
+                requests.iter().all(|(prefix, _)| prefix.ends_with('/')),
+                "{case}: {requests:?}"
+            );
+            if directories == 10 {
+                assert!(
+                    (0..10).all(|d| requests.contains(&(format!("t/d{d}/"), false))),
+                    "{case}: {requests:?}"
+                );
+            }
+        }
+    }
 }

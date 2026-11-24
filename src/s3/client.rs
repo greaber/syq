@@ -1074,6 +1074,9 @@ async fn list_limited(
         fn ordered(&self) -> bool {
             self.inner.ordered()
         }
+        fn slash_only(&self) -> bool {
+            self.inner.slash_only()
+        }
         fn divides(&self) -> bool {
             self.inner.divides()
         }

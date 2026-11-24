@@ -13,6 +13,7 @@ use std::{
 };
 
 mod parts;
+mod split;
 
 const MAX_CHILDREN: usize = 256;
 const SPLIT_QUEUE_LIMIT: usize = 4096;
@@ -63,11 +64,22 @@ pub(in crate::s3) struct Page {
     pub entries: Vec<Entry>,
     pub prefixes: Vec<String>,
     pub next: Option<String>,
+    /// Whether the response said that the listing ends here: it was not
+    /// truncated and gave no continuation token. A response that leaves out
+    /// whether it was truncated ends the listing too (`next` is `None`), but
+    /// is not complete.
+    pub complete: bool,
 }
 
 pub(in crate::s3) trait Store {
     fn ordered(&self) -> bool {
         true
+    }
+
+    /// Whether prefixes passed to [`Self::page`] must end in a slash (or be
+    /// empty), as for AWS directory buckets and their access points.
+    fn slash_only(&self) -> bool {
+        !self.ordered()
     }
 
     /// Whether a listing may rely on the store returning keys in UTF-8 byte
@@ -76,8 +88,9 @@ pub(in crate::s3) trait Store {
     /// that run at the same time (`parts`), and an exact key is looked for on
     /// the first page only. Every part but the last stops at the first key
     /// handed over, so a key that the store returns out of order after that
-    /// point would be missed without an error. Other stores are listed one
-    /// page after another, which does not depend on the order.
+    /// point would be missed without an error. With more than one request
+    /// slot, other stores list each directory by itself (`split`), which does
+    /// not depend on the order; with one, they list one page after another.
     fn divides(&self) -> bool {
         false
     }
@@ -100,6 +113,9 @@ struct LimitedStore<'a, S> {
 impl<S: Store> Store for LimitedStore<'_, S> {
     fn ordered(&self) -> bool {
         self.inner.ordered()
+    }
+    fn slash_only(&self) -> bool {
+        self.inner.slash_only()
     }
     fn divides(&self) -> bool {
         self.inner.divides()
@@ -384,6 +400,8 @@ async fn execute(
     prune: Option<&Prune<'_>>,
     job: Job,
     split: bool,
+    // Return recursive listings as jobs rather than starting them.
+    defer_recursive: bool,
 ) -> Result<Batch> {
     let (mut prefix, mut component) = match job {
         Job::Recursive { prefix } => return recursive(store, prune, prefix).await,
@@ -417,6 +435,13 @@ async fn execute(
     let part = &pattern.components[component];
     let query = format!("{prefix}{}", part.literal_prefix());
     if part.recursive() {
+        if defer_recursive {
+            return Ok(Batch {
+                entries: Vec::new(),
+                jobs: vec![Job::Recursive { prefix: query }],
+                pruned: Vec::new(),
+            });
+        }
         return recursive(store, None, query).await;
     }
     if !split && component + 1 < pattern.components.len() {
@@ -530,7 +555,7 @@ async fn lookahead(
             .prefixes
             .into_iter()
             .partition(|child| (prune.subtree)(child, true).is_some());
-        if page.next.is_some() || included.len() > 1 {
+        if !page.complete || page.next.is_some() || included.len() > 1 {
             break;
         }
         parents.extend(page.entries);
@@ -649,12 +674,13 @@ pub(super) async fn enumerate(
 ///
 /// With `prune`, directories it names may be skipped: their common prefixes
 /// are returned instead of being listed. Objects in pruned directories may
-/// still be emitted, so callers must classify every entry themselves. Unless
-/// the listing is divided into parts, it stays flat apart from the lookahead.
+/// still be emitted, so callers must classify every entry themselves. With a
+/// concurrency of one, the listing stays flat apart from the lookahead.
 ///
 /// A listing in parts fails with [`Unordered`] when keys arrive out of order
 /// after part of it was handed to others; with a concurrency of one, or a
-/// store that does not divide, it is never in parts.
+/// store that does not divide, it is never in parts. A listing of a narrower
+/// prefix that fails, in parts or by directory, carries [`PartFailed`].
 pub(in crate::s3) async fn enumerate_prefix(
     store: &impl Store,
     prefix: &str,
@@ -694,6 +720,11 @@ async fn enumerate_jobs(
         (1..=256).contains(&concurrency),
         "concurrency must be between 1 and 256"
     );
+    if concurrency > 1 {
+        // Stores that list in byte order were divided into parts instead.
+        debug_assert!(!byte_ordered(store));
+        return split::enumerate_jobs(store, pattern, prune, concurrency, first, emit).await;
+    }
     let store = LimitedStore {
         inner: store,
         slots: tokio::sync::Semaphore::new(concurrency),
@@ -707,7 +738,7 @@ async fn enumerate_jobs(
                 break;
             };
             let split = concurrency > 1 && pending.len() + active.len() < SPLIT_QUEUE_LIMIT;
-            active.push(execute(&store, pattern, prune, job, split));
+            active.push(execute(&store, pattern, prune, job, split, false));
         }
         let Some(batch) = active.next().await else {
             return Ok(pruned);

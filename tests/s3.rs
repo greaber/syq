@@ -1509,8 +1509,9 @@ fn serve(
             "<IsTruncated>false</IsTruncated><CommonPrefixes><Prefix>tree/a/</Prefix></CommonPrefixes><CommonPrefixes><Prefix>tree/b/</Prefix></CommonPrefixes>".to_owned()
         } else {
             let (range, next) = match (prefix, token) {
-                ("tree/", None) => (0..1000, Some("next")),
+                ("tree/" | "tree/a/", None) => (0..1000, Some("next")),
                 ("tree/", Some("next")) => (1000..2000, Some("last")),
+                ("tree/a/", Some("next")) => (1000..2000, None),
                 ("tree/", Some("last")) | ("tree/b/", None) => (2000..3000, Some("tail")),
                 ("tree/" | "tree/b/", Some("tail")) => (3000..4000, None),
                 other => panic!("unexpected listing {other:?}"),
@@ -7167,28 +7168,24 @@ fn ls_says_how_to_list_a_prefix_only_its_own_listing_may_list() {
         command.capture_output().unwrap()
     };
     let hint = "rerun with --concurrency 1";
-    // Divided, a part's listing is refused, and the error says what to do.
-    let output = ls(true, "32");
-    assert!(!output.status.success());
-    assert!(
-        output_text(&output).contains(hint),
-        "{}",
-        output_text(&output)
-    );
-    // That works.
-    let output = ls(true, "1");
-    assert!(output.status.success(), "{}", output_text(&output));
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).lines().count(),
-        12_000
-    );
-    // Not divided, the listing asks only for the prefix itself.
-    let output = ls(false, "32");
-    assert!(output.status.success(), "{}", output_text(&output));
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).lines().count(),
-        12_000
-    );
+    // Divided into parts, or listed by directory where the store's order is
+    // unknown, a narrower listing is refused, and the error says what to do.
+    for divide in [true, false] {
+        let output = ls(divide, "32");
+        assert!(!output.status.success());
+        assert!(
+            output_text(&output).contains(hint),
+            "{}",
+            output_text(&output)
+        );
+        // That works: the listing asks only for the prefix itself.
+        let output = ls(divide, "1");
+        assert!(output.status.success(), "{}", output_text(&output));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).lines().count(),
+            12_000
+        );
+    }
 }
 
 // Release builds cannot divide a listing at a loopback endpoint.
