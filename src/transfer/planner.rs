@@ -1130,6 +1130,7 @@ impl Planner<'_> {
                                 *shown += 1;
                             };
                             src.scan_selected(
+                                src_root,
                                 &source,
                                 &selected_paths,
                                 &mut sink,
@@ -1142,10 +1143,11 @@ impl Planner<'_> {
                         };
                         self.drop_early_lookups();
                         self.scan_warned |= warned.get();
+                        let scanned = scanned?;
                         if self.collision {
                             break;
                         }
-                        if scanned? {
+                        if scanned {
                             if !self.scan_warned {
                                 completed_subtrees.extend(current.subtrees);
                             }

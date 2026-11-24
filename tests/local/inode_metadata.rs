@@ -1076,3 +1076,87 @@ fn a_scan_reading_inode_metadata_finds_the_entries_it_prunes() {
     assert!(!t.path("dst/extra").exists());
     assert_eq!(read(&t.path("dst/file")), b"file");
 }
+
+#[test]
+fn files_from_recursive_preserves_and_repairs_descendant_xattrs() {
+    for (list_body, include_b) in [("a\n", false), ("a\nb\n", true)] {
+        for remote in [false, true] {
+            let t = Tmp::new();
+            let rsh = fake_rsh(&t);
+            write(&t.path("src/a/file"), b"alpha");
+            write(&t.path("src/a/sub/child"), b"nested");
+            write(&t.path("src/b/file"), b"beta");
+            for i in 0..1050 {
+                write(&t.path(&format!("src/a/many/m{i:04}")), b"m");
+            }
+            let mut targets = vec![
+                "a".to_string(),
+                "a/file".to_string(),
+                "a/sub".to_string(),
+                "a/sub/child".to_string(),
+                "a/many".to_string(),
+                "a/many/m0000".to_string(),
+                "a/many/m1049".to_string(),
+            ];
+            if include_b {
+                targets.extend(["b".to_string(), "b/file".to_string()]);
+            }
+            for rel in &targets {
+                set_attr(&t.path(&format!("src/{rel}")), "user.test", b"initial");
+            }
+            write(&t.path("list"), list_body.as_bytes());
+
+            let run_copy = || {
+                let mut cmd = compat_command();
+                cmd.args(["-aX", "-r", "--files-from"])
+                    .arg(t.path("list"))
+                    .arg("--no-progress");
+                if remote {
+                    cmd.args(["-e"])
+                        .arg(&rsh)
+                        .args(["--rsync-path", env!("CARGO_BIN_EXE_syq"), "--syq-no-tcp"])
+                        .arg(t.path("src"))
+                        .arg(format!("host:{}", t.s("dst")))
+                        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+                        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+                        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+                        .env("XDG_CONFIG_HOME", t.path("config"))
+                        .env("XDG_CACHE_HOME", t.path("cache"));
+                } else {
+                    cmd.arg(t.path("src")).arg(t.path("dst"));
+                }
+                cmd.run().unwrap()
+            };
+
+            assert_output_ok(&run_copy());
+            for rel in &targets {
+                assert_eq!(
+                    attr(&t.path(&format!("dst/{rel}")), "user.test").as_deref(),
+                    Some(&b"initial"[..]),
+                    "fresh copy: list={list_body:?} remote={remote} rel={rel}"
+                );
+            }
+            if !include_b {
+                assert!(!t.path("dst/b").exists());
+            }
+
+            for rel in &targets {
+                set_attr(&t.path(&format!("src/{rel}")), "user.test", b"updated");
+            }
+            let rerun = run_copy();
+            assert_output_ok(&rerun);
+            let out = String::from_utf8_lossy(&rerun.stdout);
+            assert!(
+                out.contains("transferred 0 files"),
+                "list={list_body:?} remote={remote}: {out}"
+            );
+            for rel in &targets {
+                assert_eq!(
+                    attr(&t.path(&format!("dst/{rel}")), "user.test").as_deref(),
+                    Some(&b"updated"[..]),
+                    "metadata rerun: list={list_body:?} remote={remote} rel={rel}"
+                );
+            }
+        }
+    }
+}

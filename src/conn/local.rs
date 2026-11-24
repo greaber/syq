@@ -319,23 +319,29 @@ impl Conn for LocalConn {
 
     fn scan_selected(
         &mut self,
+        root: &[u8],
         source: &RegisteredPath,
         selections: &[PathBytes],
         sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
         upcoming: Option<crate::scan::Upcoming<'_>>,
         warn: &mut dyn FnMut(crate::proto::ScanWarning),
     ) -> Result<bool> {
-        let Some(source) = self.ops.source_scan_root(Some(source))? else {
+        let Some(scan_root) = self.ops.source_scan_root(Some(source))? else {
             return Ok(false);
         };
-        if source.expected_leaf.is_some() {
+        if scan_root.expected_leaf.is_some() {
             return Ok(false);
         }
+        let mut capture = |mut batch: Vec<Entry>| {
+            self.ops
+                .capture_scan_metadata(root, Some(source), false, &mut batch)?;
+            sink(batch)
+        };
         crate::scan::scan_descriptor_selected(
-            source.root,
-            &source.relative,
+            scan_root.root,
+            &scan_root.relative,
             selections,
-            sink,
+            &mut capture,
             upcoming,
             warn,
         )?;

@@ -294,6 +294,7 @@ pub trait Conn: Send {
     /// ordinary per-selection scan path. Selected roots are already planned.
     fn scan_selected(
         &mut self,
+        _root: &[u8],
         _source: &RegisteredPath,
         _selections: &[PathBytes],
         _sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
