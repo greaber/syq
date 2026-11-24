@@ -297,6 +297,7 @@ pub trait Conn: Send {
         _source: &RegisteredPath,
         _selections: &[PathBytes],
         _sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        _upcoming: Option<crate::scan::Upcoming<'_>>,
         _warn: &mut dyn FnMut(crate::proto::ScanWarning),
     ) -> Result<bool> {
         Ok(false)

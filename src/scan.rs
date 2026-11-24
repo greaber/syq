@@ -737,6 +737,7 @@ pub(crate) fn scan_descriptor_selected(
     scan_root: &[u8],
     selections: &[PathBytes],
     sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+    upcoming: Option<Upcoming<'_>>,
     warn: &mut dyn FnMut(ScanWarning),
 ) -> Result<()> {
     let mut directories = Vec::with_capacity(selections.len());
@@ -752,7 +753,7 @@ pub(crate) fn scan_descriptor_selected(
         }
     }
     directories.reverse();
-    let (tx, rx) = mpsc::sync_channel(queued_chunks(false));
+    let (tx, rx) = mpsc::sync_channel(queued_chunks(upcoming.is_some()));
     let scan_root = scan_root.to_vec();
     let scan_started = Instant::now();
     let producer = std::thread::Builder::new()
@@ -769,7 +770,7 @@ pub(crate) fn scan_descriptor_selected(
         &mut batch,
         &mut ignored_batch,
         sink,
-        None,
+        upcoming,
         &mut |_| Ok(()),
         warn,
     );

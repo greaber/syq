@@ -322,6 +322,7 @@ impl Conn for LocalConn {
         source: &RegisteredPath,
         selections: &[PathBytes],
         sink: &mut dyn FnMut(Vec<Entry>) -> Result<()>,
+        upcoming: Option<crate::scan::Upcoming<'_>>,
         warn: &mut dyn FnMut(crate::proto::ScanWarning),
     ) -> Result<bool> {
         let Some(source) = self.ops.source_scan_root(Some(source))? else {
@@ -335,6 +336,7 @@ impl Conn for LocalConn {
             &source.relative,
             selections,
             sink,
+            upcoming,
             warn,
         )?;
         Ok(true)

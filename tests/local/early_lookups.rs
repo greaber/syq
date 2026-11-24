@@ -405,3 +405,204 @@ fn remote_metadata_rerun_uses_early_lookups() {
     assert!(early.lines().any(|line| line == "used"), "{early}");
     assert!(!early.lines().any(|line| line == "deferred"), "{early}");
 }
+
+fn files_from_copy_with(
+    t: &Tmp,
+    rsh: &Path,
+    list: &Path,
+    extra: &[&str],
+    env: &[(&str, &str)],
+) -> Output {
+    for log in ["early", "lookups"] {
+        let _ = fs::remove_file(t.path(log));
+    }
+    compat_command()
+        .args(["-a", "--files-from"])
+        .arg(list)
+        .args(["-e"])
+        .arg(rsh)
+        .args([
+            "--rsync-path",
+            env!("CARGO_BIN_EXE_syq"),
+            "--syq-no-tcp",
+            "--no-progress",
+        ])
+        .args(extra)
+        .arg(t.path("src"))
+        .arg(format!("host:{}", t.s("dst")))
+        .env("FAKE_REMOTE_HOME", t.path("remote-home"))
+        .env("FAKE_REMOTE_BIN", t.path("remote-bin"))
+        .env("FAKE_RSH_LOG", t.path("rsh.log"))
+        .env("XDG_CONFIG_HOME", t.path("config"))
+        .env("XDG_CACHE_HOME", t.path("cache"))
+        .env("SYQ_TEST_SCAN_AHEAD_WAIT", "1")
+        .env("SYQ_TEST_EARLY_LOOKUPS", t.path("early"))
+        .env("SYQ_TEST_DESTINATION_LOOKUPS", t.path("lookups"))
+        .envs(env.iter().copied())
+        .run()
+        .unwrap()
+}
+
+#[test]
+fn files_from_explicit_list_uses_early_lookups_on_rerun() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    let total = 2 * FILES + 500;
+    fill(&t.path("src/a"), "f", total);
+    let list: String = (0..total).map(|i| format!("a/f{i:05}\n")).collect();
+    write(&t.path("list"), list.as_bytes());
+    assert_output_ok(&files_from_copy_with(&t, &rsh, &t.path("list"), &[], &[]));
+
+    let output = files_from_copy_with(&t, &rsh, &t.path("list"), &[], &[]);
+    assert_output_ok(&output);
+    let out = stdout(&output);
+    assert!(out.contains("transferred 0 files"), "{out}");
+    assert!(out.contains("unchanged (12,500 files)"), "{out}");
+    let [sent, used, repeated, withdrawn, discarded] = fates(&t);
+    assert!(sent >= 2, "{sent} lookups were sent early");
+    assert_eq!((used, repeated, withdrawn, discarded), (sent, 0, 0, 0));
+    assert_eq!(batch_lookups(&t), sent + 1);
+}
+
+#[test]
+fn files_from_recursive_selected_dirs_use_early_lookups_on_rerun() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    fill(&t.path("src/a"), "f", FILES);
+    fill(&t.path("src/b"), "g", FILES);
+    write(&t.path("list"), b"a\nb\n");
+    assert_output_ok(&files_from_copy_with(
+        &t,
+        &rsh,
+        &t.path("list"),
+        &["-r"],
+        &[],
+    ));
+
+    let output = files_from_copy_with(&t, &rsh, &t.path("list"), &["-r"], &[]);
+    assert_output_ok(&output);
+    let out = stdout(&output);
+    assert!(out.contains("transferred 0 files"), "{out}");
+    assert!(out.contains("unchanged (12,000 files)"), "{out}");
+    let [sent, used, repeated, withdrawn, discarded] = fates(&t);
+    assert!(sent >= 2, "{sent} lookups were sent early");
+    assert_eq!((used, repeated, withdrawn, discarded), (sent, 0, 0, 0));
+    // One lookup for the list chunk (`["a", "b"]`), one for the first scan batch.
+    assert_eq!(batch_lookups(&t), sent + 2);
+}
+
+#[test]
+fn files_from_recursive_with_explicit_child_before_dir_deduplicates_with_early_lookups() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    fill(&t.path("src/a"), "f", FILES);
+    fill(&t.path("src/b"), "g", FILES);
+    write(&t.path("list"), b"a/f00000\nb/g03000\na\nb\n");
+    let first = files_from_copy_with(&t, &rsh, &t.path("list"), &["-r"], &[]);
+    assert_output_ok(&first);
+    assert_eq!(transferred(&stdout(&first)), (2 * FILES) as u64);
+
+    let output = files_from_copy_with(&t, &rsh, &t.path("list"), &["-r"], &[]);
+    assert_output_ok(&output);
+    let out = stdout(&output);
+    assert!(out.contains("transferred 0 files"), "{out}");
+    assert!(out.contains("unchanged (12,000 files)"), "{out}");
+    let [sent, used, repeated, withdrawn, discarded] = fates(&t);
+    assert!(sent >= 2, "{sent} lookups were sent early");
+    assert_eq!((used, repeated, withdrawn, discarded), (sent, 0, 0, 0));
+    assert_eq!(batch_lookups(&t), sent + 2);
+}
+
+#[test]
+fn files_from_late_directory_and_apply_failure_keep_early_replies_balanced() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    fill(&t.path("src/a"), "f", 2 * FILES);
+    let mut initial_list = String::new();
+    for i in 0..2 * FILES {
+        initial_list.push_str(&format!("a/f{i:05}\n"));
+    }
+    write(&t.path("initial-list"), initial_list.as_bytes());
+    assert_output_ok(&files_from_copy_with(
+        &t,
+        &rsh,
+        &t.path("initial-list"),
+        &[],
+        &[],
+    ));
+
+    // Add a late directory in chunks after `a` so early lookups for `z_late`
+    // are in flight when creating `dst/z_late`.
+    fill(&t.path("src/z_late"), "g", FILES);
+    let mut full_list = initial_list.clone();
+    for i in 0..FILES {
+        full_list.push_str(&format!("z_late/g{i:05}\n"));
+    }
+    write(&t.path("full-list"), full_list.as_bytes());
+    let output = files_from_copy_with(&t, &rsh, &t.path("full-list"), &[], &[]);
+    assert_output_ok(&output);
+    let out = stdout(&output);
+    assert!(out.contains("transferred 6,000 files"), "{out}");
+    assert!(out.contains("unchanged (12,000 files)"), "{out}");
+    let [sent, used, repeated, withdrawn, discarded] = fates(&t);
+    assert!(sent >= 2, "expected early lookups: {sent}");
+    assert_eq!(used + repeated + withdrawn + discarded, sent);
+    assert!(
+        withdrawn + repeated >= 1,
+        "expected withdrawn/repeated lookups when creating late directory"
+    );
+    assert_eq!(read(&t.path("dst/z_late/g05999")), b"data");
+
+    // Failing directory creation mid-stream with ENOSPC while later chunks'
+    // early lookups are in flight must still consume every sent lookup.
+    write(&t.path("src/z_fail/h00000"), b"fail");
+    fill(&t.path("src/z_more"), "k", FILES);
+    let mut fail_list = initial_list;
+    fail_list.push_str("z_fail/h00000\n");
+    for i in 0..FILES {
+        fail_list.push_str(&format!("z_more/k{i:05}\n"));
+    }
+    write(&t.path("fail-list"), fail_list.as_bytes());
+    let output = files_from_copy_with(
+        &t,
+        &rsh,
+        &t.path("fail-list"),
+        &[],
+        &[("SYQ_TEST_FAIL_APPLY_ENOSPC", "z_fail")],
+    );
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr_of(&output);
+    assert!(err.contains("z_fail"), "{err}");
+    let [sent, used, repeated, withdrawn, discarded] = fates(&t);
+    assert!(sent >= 2, "expected early lookups before failure: {sent}");
+    assert_eq!(used + repeated + withdrawn + discarded, sent);
+    assert!(
+        repeated + withdrawn + discarded >= 1,
+        "expected unconsumed early lookups drained on failure"
+    );
+}
+
+#[test]
+fn files_from_across_chunks_handles_duplicates_bad_chains_and_late_parents() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    fill(&t.path("src/a"), "f", 5000);
+    write(&t.path("src/bad/ok"), b"valid");
+    write(&t.path("src/file_as_dir"), b"plain");
+    let mut list = String::from("bad/missing/x\nfile_as_dir\n");
+    for i in 0..5000 {
+        list.push_str(&format!("a/f{i:05}\n"));
+    }
+    // Past the 4,096-line chunk boundary: duplicate spellings, valid child under
+    // `bad` whose earlier chain failed, and a child through a non-directory leaf.
+    list.push_str("a//f00000\n./a/./f00000/\nbad/ok\nfile_as_dir/sub\n");
+    write(&t.path("list"), list.as_bytes());
+    let output = files_from_copy_with(&t, &rsh, &t.path("list"), &[], &[]);
+    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("bad/missing/x"), "{err}");
+    assert!(err.contains("file_as_dir/sub"), "{err}");
+    assert_eq!(transferred(&stdout(&output)), 5002);
+    assert_eq!(read(&t.path("dst/bad/ok")), b"valid");
+    assert!(!t.path("dst/bad/missing").exists());
+}
