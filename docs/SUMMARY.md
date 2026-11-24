@@ -29,6 +29,8 @@
   - [cp](commands/cp.md)
   - [rm](commands/rm.md)
   - [clean-partials](commands/clean-partials.md)
+  - [find](commands/find.md)
+  - [ls](commands/ls.md)
   - [map](commands/map.md)
   - [ssh](commands/ssh.md)
   - [exec](commands/exec.md)

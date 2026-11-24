@@ -84,13 +84,18 @@ def check_parts():
     env['SYQ_TEST_S3_REPORT_SPLITS'] = '1'
     for divide in (True, False):
         run_env = env | {'SYQ_TEST_S3_DIVIDE_LISTINGS': '1'} if divide else env
-        listed = subprocess.run([c.SYQ, '_ls', f'{remote}/{prefix}/**', '--s3-region', c.REGION],
+        listed = subprocess.run([c.SYQ, 'find', '--on', remote, prefix + '/', '--json',
+                                 '--s3-region', c.REGION, *c.header_args()],
                                 capture_output=True, text=True, timeout=120, env=run_env)
         assert listed.returncode == 0, listed.stderr
         assert ('listing divided into parts' in listed.stderr) == divide, listed.stderr
         assert ('listing split by directory' in listed.stderr) != divide, listed.stderr
-        keys = [json.loads(line)['key'] for line in listed.stdout.splitlines()]
-        assert len(keys) == len(objects) and set(keys) == set(objects)
+        records = [json.loads(line) for line in listed.stdout.splitlines()]
+        files = [record['path'] for record in records if record['kind'] == 'file']
+        directories = [record['path'] for record in records if record['kind'] == 'dir']
+        assert len(files) == len(set(files)) and set(files) == {key for key in objects if not key.endswith('/')}
+        assert len(directories) == len(set(directories))
+        assert set(directories) == {key.rsplit('/', 1)[0] for key in objects if key.count('/') > prefix.count('/') + 1}
     # check() above copies without the hooks; these copies list in parts and
     # by directory, leaving the ignored directory out.
     expected = {key[len(prefix) + 1:] for key in objects

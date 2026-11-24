@@ -5,9 +5,11 @@
 # Use S3 storage
 
 [`syq cp`](commands/cp.md) copies files to, from and between S3-compatible
-buckets, and [`syq rm`](commands/rm.md) removes objects. Name the bucket with
-`--from s3://BUCKET`, `--to s3://BUCKET`, or `--on s3://BUCKET`; source names
-and placement options then name keys within it. The bucket must already exist.
+buckets, [`syq rm`](commands/rm.md) removes objects, and
+[`syq find`](commands/find.md) and [`syq ls`](commands/ls.md) list them. Name
+the bucket with `--from s3://BUCKET`, `--to s3://BUCKET`, or
+`--on s3://BUCKET`; source names and placement options then name keys within
+it. The bucket must already exist.
 
 <a id="credentials-and-providers"></a>
 <a id="parallelism"></a>
@@ -39,13 +41,13 @@ service is back.
 
 ### Listing large prefixes
 
-Before it copies or removes a prefix, and for `--prune`, syq lists the
-objects under it. When the listing needs more than one page and the prefix
-has subdirectories, syq may list parts of it at the same time, so the
-listing can finish sooner when each request takes a while. This costs more
-list requests: usually up to about a quarter more on large listings, or
-around a couple hundred more when many subdirectories look large at first but
-turn out to hold few objects.
+Before it copies or removes a prefix, for `--prune`, and for `syq find`
+without `--depth`, syq lists the objects under it. When the listing needs
+more than one page and the prefix has subdirectories, syq may list parts of
+it at the same time, so the listing can finish sooner when each request takes
+a while. This costs more list requests: usually up to about a quarter more on
+large listings, or around a couple hundred more when many subdirectories look
+large at first but turn out to hold few objects.
 
 In general purpose buckets on AWS, which return keys in byte order, syq
 divides a large listing into ranges of keys. With `--s3-endpoint`, that
@@ -71,7 +73,9 @@ service may stop short with fewer.
 
 When syq copies or removes a prefix, and a bucket policy lets it list the
 prefix but not the parts it lists separately, syq lists the prefix again one
-page after another.
+page after another. `syq find` does the same if it has printed nothing yet;
+otherwise it fails and says to rerun with
+`--performance-tuning s3-requests=1`.
 
 ## Upload and download
 
@@ -94,6 +98,42 @@ syq cp --from s3://backups --srcs-in laptop --to s3://archive --into laptop
 For removal examples, see [Remove files](remove.md#on-another-machine).
 Read [Versions and deletion](#versions-and-deletion) before deleting versioned
 objects.
+
+## List objects
+
+[`syq find`](commands/find.md) lists keys as paths, and
+[`syq ls`](commands/ls.md) lists one level:
+
+```sh
+syq ls --on s3://backups
+syq find --on s3://backups laptop/photos --long
+syq find --on s3://backups -C laptop --where 'path glob "photos/2026-*/**"'
+```
+
+A `PATH` that ends with `/` names a prefix. Another `PATH` names the object
+with that key if there is one, and otherwise the `PATH/` prefix, as in
+copies; `-C` sets the prefix that paths start from. Directories are the
+prefixes that keys imply, including empty directory markers. Each prints
+once, without a trailing slash, and has no size or times.
+
+Listing needs only permission to list the bucket (`s3:ListBucket`).
+`syq ls`, and `syq find` with `--depth`, read one directory at a time, with a
+request for each thousand entries. `syq find` without a depth lists every key
+under the prefix, dividing the work as copies do (see
+[Listing large prefixes](#listing-large-prefixes)). A `path glob` or `path =`
+condition joined to the rest of `--where` with `and` limits the requests to
+the prefixes that can hold a match, such as `laptop/photos/2026-*/` rather
+than all of `laptop/`. Services that don't promise to list keys in byte order
+can leave a key out of a later page that a directory listing asks for, so
+there syq lists a directory with more than a thousand entries whole instead,
+which can take much longer for a deep tree, and says so.
+
+Conditions on `path`, `name`, `extension`, `size`, `s3_last_modified`, and a
+directory's `kind` use the listing alone. Other fields of an object, including
+whether it is a file or a symlink that syq stored, need a HEAD request for
+each object the listed fields haven't ruled out, as do `--include` `kind`,
+`mtime`, `mode`, `uid` and `gid`; syq sends up to 32 at a time. `--long` and
+the default `--json` fields never need one, and show every object as a file.
 
 <a id="metadata-and-integrity"></a>
 <a id="overwrites-and-recovery"></a>

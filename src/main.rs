@@ -40,6 +40,7 @@ mod janky_cat;
 mod local_copy;
 mod lock_file;
 mod mapping;
+mod native_find;
 mod native_map;
 mod native_rm;
 mod output;
@@ -398,14 +399,6 @@ fn run() {
             }
         }
     }
-    if argv.get(1).and_then(|arg| arg.to_str()) == Some("_ls") {
-        match s3::listing::run(&argv[2..]) {
-            Ok(code) => crate::output::exit(code),
-            Err(error) => {
-                crate::output::exit_on_error(&error, 1, "syq _ls");
-            }
-        }
-    }
     if argv.get(1).and_then(|arg| arg.to_str()) == Some("tuning-cache") {
         match tune::history::run(&argv[2..]) {
             Ok(code) => crate::output::exit(code),
@@ -497,6 +490,8 @@ fn run() {
         descriptor_copy::run(args)
     } else if args.interface == cli::Interface::NativeMap {
         native_map::run(&args)
+    } else if args.interface == cli::Interface::NativeFind {
+        native_find::run(&args)
     } else if args.s3.is_some() {
         s3::run(args)
     } else if args.rm {

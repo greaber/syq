@@ -218,6 +218,8 @@ pub(crate) enum TuningRoute {
     Removal,
     /// An S3 removal.
     S3Removal,
+    /// An S3 listing by `find` or `ls`.
+    S3Listing,
 }
 
 impl TuningRoute {
@@ -228,6 +230,7 @@ impl TuningRoute {
             Self::S3Copy => S3_COPY,
             Self::Removal => REMOVAL,
             Self::S3Removal => S3_REMOVAL,
+            Self::S3Listing => S3_LISTING,
         }
     }
 
@@ -243,6 +246,7 @@ impl TuningRoute {
             ),
             Self::Stream => format!("performance control {key:?} is not supported with this descriptor copy: streams transfer one object without file comparison or small-file batching; S3 uses its part controls"),
             Self::Removal | Self::S3Removal => "removal supports only performance-tuning workers for filesystems or s3-requests for S3".into(),
+            Self::S3Listing => format!("performance-tuning {key} is not supported for listings; they take only s3-requests"),
             Self::Copy | Self::S3Copy => format!("performance-tuning {key} is not supported for this copy"),
         }
     }
@@ -253,6 +257,7 @@ const STREAM: u8 = 2;
 const S3_COPY: u8 = 4;
 const REMOVAL: u8 = 8;
 const S3_REMOVAL: u8 = 16;
+const S3_LISTING: u8 = 32;
 
 /// One `--performance-tuning` key: its name, the routes that use it, how
 /// to set it from a value, and how to show it when set.
@@ -289,7 +294,7 @@ fn copy_path(value: &str, _key: &str) -> Result<CopyPath> {
 #[rustfmt::skip]
 const KEYS: &[Key] = &[
     key!("workers", COPY | STREAM | REMOVAL, workers, |v, k| count(v, k, 65536)),
-    key!("s3-requests", S3_COPY | S3_REMOVAL, s3_requests, |v, k| count(v, k, 65536)),
+    key!("s3-requests", S3_COPY | S3_REMOVAL | S3_LISTING, s3_requests, |v, k| count(v, k, 65536)),
     key!("s3-objects", S3_COPY, s3_object_workers, |v, k| count(v, k, 65536)),
     key!("s3-parts-per-object", S3_COPY, s3_part_workers, |v, k| count(v, k, 1024)),
     key!("s3-part-size", S3_COPY, s3_part_size, |v, k| size(v, Some(k), 5 << 20, 5 << 30)),
@@ -463,6 +468,7 @@ mod tests {
                 (TuningRoute::S3Copy, s3),
                 (TuningRoute::Removal, key == "workers"),
                 (TuningRoute::S3Removal, key == "s3-requests"),
+                (TuningRoute::S3Listing, key == "s3-requests"),
             ] {
                 assert_eq!(
                     tuning.check_route(route).is_ok(),

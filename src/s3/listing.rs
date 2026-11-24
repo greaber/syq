@@ -1,127 +1,17 @@
-//! Experimental S3 object listing, separate from copy selection and state.
+//! ListObjectsV2 listings: `find` and `ls`, `map`, and copy, download and
+//! removal planning.
 pub(super) mod engine;
-mod pattern;
+pub(super) mod pattern;
 #[cfg(test)]
 mod tests;
 
 use anyhow::{Context, Result};
-use clap::{CommandFactory, FromArgMatches, Parser};
 use engine::{Entry, Page, Store};
+#[cfg(test)]
 use pattern::Pattern;
-use std::{ffi::OsString, io::Write, sync::Arc};
 
-#[derive(Parser)]
-#[command(
-    name = "syq _ls",
-    about = "List matching S3 objects as NDJSON (experimental; interface may change)",
-    long_about = "List matching S3 objects as newline-delimited JSON. This command is experimental: its spelling, arguments, patterns, and output may change or be removed between releases.\n\nPatterns match the whole key. Quote them: ? matches one non-slash character, * matches zero or more non-slash characters, and ** matches zero or more characters including slashes. Every other character is literal, including backslashes and trailing slashes. Use ** explicitly for recursive listing. In a/**/b, both slashes are required: it does not match a/b.\n\nRecords arrive in unspecified order. Empty results succeed. A nonzero exit status means the listing is incomplete; stdout may already contain records. Objects are listed as stored, including directory markers; no virtual directories or filesystem metadata are inferred.",
-    before_help = "Examples:\n  syq _ls 's3://bucket/logs/**'\n  syq _ls 's3://bucket/logs/2026-*/service-a/*.json'\n  syq _ls 's3://bucket/**'"
-)]
-struct Command {
-    /// Literal S3 object key or quoted pattern
-    #[arg(value_name = "S3_PATH")]
-    path: String,
-    #[command(flatten)]
-    storage: super::Flags,
-    /// Maximum concurrent listing tasks; 1 skips speculative prefix discovery
-    #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u16).range(1..=256))]
-    concurrency: u16,
-}
-
-pub(crate) fn command_for_help() -> clap::Command {
-    crate::help::configure(Command::command()).mut_arg("s3_header", |arg| {
-        arg.help("Add a header before signing every S3 request (repeatable)")
-    })
-}
-
-pub(crate) fn run(args: &[OsString]) -> Result<i32> {
-    let matches = match command_for_help().try_get_matches_from(
-        std::iter::once(OsString::from("syq _ls")).chain(args.iter().cloned()),
-    ) {
-        Ok(matches) => matches,
-        Err(error) => {
-            let code = error.exit_code();
-            error.print()?;
-            return Ok(code);
-        }
-    };
-    let command = Command::from_arg_matches(&matches)?;
-    crate::fsops::reserve_startup_descriptors();
-    let pattern = Pattern::parse(&command.path)?;
-    let mut options = super::Options {
-        bucket: pattern.bucket.clone(),
-        route: super::Route::Download,
-        endpoint: command.storage.s3_endpoint,
-        region: command.storage.s3_region,
-        profile: command.storage.s3_profile,
-        headers: command.storage.s3_header,
-        write_headers: vec![],
-        concurrency: 1,
-        part_size: 0,
-        retries: command.storage.s3_retries.unwrap_or(super::DEFAULT_RETRIES),
-        automatic_concurrency: false,
-        automatic_part_size: false,
-    };
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(async {
-            let (client, note) =
-                super::client::connect(&mut options, Arc::default(), Arc::default()).await?;
-            if let Some(note) = note {
-                crate::output::diagnostic!("syq _ls: {note}");
-            }
-            let store = S3 {
-                client,
-                bucket: &pattern.bucket,
-                divides: lists_in_byte_order(options.endpoint.as_deref(), &pattern.bucket),
-            };
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-            engine::enumerate(
-                &store,
-                &pattern,
-                usize::from(command.concurrency),
-                |entry| {
-                    #[derive(serde::Serialize)]
-                    struct Record<'a> {
-                        bucket: &'a str,
-                        #[serde(flatten)]
-                        entry: Entry,
-                    }
-                    serde_json::to_writer(
-                        &mut out,
-                        &Record {
-                            bucket: &pattern.bucket,
-                            entry,
-                        },
-                    )?;
-                    out.write_all(b"\n")?;
-                    out.flush()?;
-                    Ok(())
-                },
-            )
-            .await
-            .map_err(|error| {
-                // A policy may allow listing only the prefix itself, and the
-                // listings of narrower prefixes that divide it are refused.
-                let denied = error
-                    .downcast_ref::<super::client::RequestFailure>()
-                    .is_some_and(super::client::RequestFailure::denied);
-                if denied && error.downcast_ref::<engine::PartFailed>().is_some() {
-                    error.context(
-                        "if only the prefix itself may be listed, rerun with --concurrency 1",
-                    )
-                } else {
-                    error
-                }
-            })
-        })?;
-    Ok(0)
-}
-
-/// ListObjectsV2 pages for every S3 listing: `_ls`, `map`, and copy,
-/// download and removal planning.
+/// ListObjectsV2 pages for every S3 listing: `find` and `ls`, `map`, and
+/// copy, download and removal planning.
 pub(super) struct S3<'a> {
     pub(super) client: aws_sdk_s3::Client,
     pub(super) bucket: &'a str,

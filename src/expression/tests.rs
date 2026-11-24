@@ -215,3 +215,92 @@ fn raw_link_targets_compare_as_borrowed_bytes() {
     };
     assert_eq!(bytes.as_ptr(), file.link_target.as_ref().unwrap().as_ptr());
 }
+#[test]
+fn listing_names_fields_bare_and_filters_directories() {
+    let policy = Policy::compile_listing(Some("kind = 'dir' and src.name = 'logs'")).unwrap();
+    let directory = File {
+        exists: true,
+        kind: Some(Kind::Dir),
+        ..File::default()
+    };
+    assert!(policy.selects_listing(&directory, b"logs").unwrap());
+    assert!(!policy.selects_listing(&directory, b"other").unwrap());
+    // Copies keep directories regardless of --where.
+    assert!(policy.selects(&directory, b"other").unwrap());
+    let policy = Policy::compile_listing(Some("size > 1MiB")).unwrap();
+    assert!(policy.selects_listing(&source(), b"a").unwrap());
+    assert!(!policy
+        .selects_listing(&directory, b"a")
+        .is_ok_and(|selected| selected));
+    for text in ["dst.size > 0B", "dst.exists", "unknown = 1"] {
+        assert!(Policy::compile_listing(Some(text)).is_err(), "{text}");
+    }
+    // Copy selection still needs the prefix.
+    assert!(Policy::compile(Some("size > 1MiB"), None).is_err());
+}
+
+#[test]
+fn s3_directories_are_known_from_the_listing() {
+    let policy = Policy::compile_listing(Some(
+        "kind = 'dir' and size is null and mtime is null and s3_last_modified is null and exists",
+    ))
+    .unwrap();
+    assert_eq!(
+        policy
+            .selects_listing_known(Facts::S3Directory, b"logs/day00")
+            .unwrap(),
+        Some(true)
+    );
+    let policy = Policy::compile_listing(Some("kind = 'file'")).unwrap();
+    assert_eq!(
+        policy
+            .selects_listing_known(Facts::S3Directory, b"logs")
+            .unwrap(),
+        Some(false)
+    );
+    // An object's kind needs its metadata.
+    let object = Facts::S3Listing {
+        size: 3,
+        directory_marker: false,
+        last_modified: None,
+    };
+    assert_eq!(policy.selects_listing_known(object, b"a").unwrap(), None);
+    let policy = Policy::compile_listing(Some("size = 3B and path glob '*'")).unwrap();
+    assert_eq!(
+        policy.selects_listing_known(object, b"a").unwrap(),
+        Some(true)
+    );
+}
+
+#[test]
+fn path_conditions_joined_by_and_are_pushed_down() {
+    use PathToken::{Literal as L, Recursive as R, Star as S};
+    let lit = |text: &str| text.chars().map(L).collect::<Vec<_>>();
+    let pushed = |text: &str| {
+        Expression::compile_listing(text)
+            .unwrap()
+            .s3_path_pushdown()
+    };
+    assert_eq!(
+        pushed("path glob 'logs/*.json'"),
+        [[lit("logs/"), vec![S], lit(".json")].concat()]
+    );
+    assert_eq!(
+        pushed("size > 0B and (src.path = 'a/b' and path glob 'a/**')"),
+        [lit("a/b"), [lit("a/"), vec![R]].concat()]
+    );
+    assert_eq!(pushed("'x' = path"), [lit("x")]);
+    // Conditions that are not necessary for a match narrow nothing.
+    for text in [
+        "path glob 'a/*' or size > 0B",
+        "not path glob 'a/*'",
+        "path not glob 'a/*'",
+        "if(true, path glob 'a/*', true)",
+        "path matches '^a/'",
+        "name glob 'a*'",
+        "path = '\\xff'",
+        "path != 'a'",
+    ] {
+        assert!(pushed(text).is_empty(), "{text}");
+    }
+}

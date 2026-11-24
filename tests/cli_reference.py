@@ -153,6 +153,8 @@ def render(command, parsed, commands):
                         body = "Fix deletion concurrency: [workers=N for filesystems or s3-requests=N for S3](../tuning.md#deletion)"
                     elif flag == "--performance-tuning" and command == ("clean-partials",):
                         body = "Filesystem removal workers: [workers=N](../tuning.md#deletion)"
+                    elif flag == "--performance-tuning" and command in (("find",), ("ls",)):
+                        body = "Simultaneous S3 listing requests: [s3-requests=N](../tuning.md#listing)"
             # Some management arguments have no help string. Their usage and
             # command-specific prose supply meaning; never silently omit them.
             body = body or "See the command description above."
@@ -165,9 +167,6 @@ def collect(binary):
     commands = {}
     def visit(command):
         usage, groups, children = parse_help(read_help(binary, command))
-        # Experimental commands appear only in full help, not the public book.
-        if not command:
-            children = [(name, about) for name, about in children if name != "_ls"]
         parsed = usage, groups, children
         commands[command] = parsed
         for name, _ in parsed[2]:

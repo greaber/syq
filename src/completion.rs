@@ -533,11 +533,11 @@ fn candidates(index: usize, words: &[OsString]) -> Result<Vec<Candidate>> {
     };
     let args_before = &words[2..index];
     match command {
-        "completion" | "persist" | "receiver" | "exec" | "ssh" | "tuning-cache" | "_ls" => {
+        "completion" | "persist" | "receiver" | "exec" | "ssh" | "tuning-cache" => {
             management_candidates(command, args_before, current)
         }
         "help" => Ok(help_candidates(args_before, current)),
-        "cp" | "rm" | "clean-partials" | "map" | "rsync" => {
+        "cp" | "rm" | "clean-partials" | "map" | "find" | "ls" | "rsync" => {
             filesystem_command_candidates(command, args_before, current)
         }
         _ => Ok(Vec::new()),
@@ -683,6 +683,8 @@ fn root_candidates(current: &[u8]) -> Vec<Candidate> {
         "exec",
         "rm",
         "clean-partials",
+        "find",
+        "ls",
         "map",
         "rsync",
         "persist",
@@ -1149,7 +1151,9 @@ fn filesystem_command_candidates(
         }
     }
     match command {
-        "cp" | "rm" | "clean-partials" | "map" if context.sources_allowed(command) => {
+        "cp" | "rm" | "clean-partials" | "map" | "find" | "ls"
+            if context.sources_allowed(command) =>
+        {
             complete_path_for(command, &context.options, current, true, false)
         }
         "rsync" => complete_rsync_operand(&context.options, current),
@@ -1249,6 +1253,18 @@ fn value_completion(
                 Some(ValueCompletion::DestinationPath)
             }
             b"--mapping" | b"--results" | b"--ignore-from" => Some(ValueCompletion::LocalPath {
+                directories_only: false,
+            }),
+            b"--pscope" => Some(ValueCompletion::LocalPath {
+                directories_only: true,
+            }),
+            _ => None,
+        },
+        "find" | "ls" => match option {
+            b"--auth-from" => Some(ValueCompletion::AuthFrom),
+            b"--on" => Some(ValueCompletion::Endpoint(EndpointSyntax::Native)),
+            b"-C" | b"--cwd" | b"--root" => Some(ValueCompletion::SourcePath { apply_base: false }),
+            b"--ignore-from" => Some(ValueCompletion::LocalPath {
                 directories_only: false,
             }),
             b"--pscope" => Some(ValueCompletion::LocalPath {
@@ -1516,7 +1532,7 @@ fn complete_source_path(
     let base = if apply_base { source_base(args) } else { None };
     let Some(endpoint_text) = find_option_value(
         args,
-        if matches!(command, "rm" | "clean-partials") {
+        if matches!(command, "rm" | "clean-partials" | "find" | "ls") {
             b"--on"
         } else {
             b"--from"

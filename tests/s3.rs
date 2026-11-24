@@ -7135,10 +7135,10 @@ fn serve_unordered_parts(
 // Release builds cannot divide a listing at a loopback endpoint.
 #[cfg(debug_assertions)]
 #[test]
-fn ls_says_how_to_list_a_prefix_only_its_own_listing_may_list() {
+fn find_lists_a_prefix_only_its_own_listing_may_list() {
     let temp = crate::test_support::tempdir().unwrap();
     let server = Server::start("parts-prefix-policy");
-    let ls = |divide: bool, concurrency: &str| {
+    let find = |divide: bool, tuning: Option<&str>| {
         let process = server.command_for(temp.path(), "cp");
         let mut command = Command::new(process.get_program());
         for (name, value) in process.get_envs() {
@@ -7154,36 +7154,47 @@ fn ls_says_how_to_list_a_prefix_only_its_own_listing_may_list() {
             command.env_remove("SYQ_TEST_S3_DIVIDE_LISTINGS");
         }
         command.args([
-            "_ls",
-            "s3://bucket/tree/**",
+            "find",
+            "--on",
+            "s3://bucket",
+            "tree/",
             "--s3-region",
             "us-east-1",
             "--s3-header",
             "X-Tigris-Consistent: true",
             "--s3-endpoint",
             &server.address,
-            "--concurrency",
-            concurrency,
         ]);
+        if let Some(tuning) = tuning {
+            command.args(["--performance-tuning", tuning]);
+        }
         command.capture_output().unwrap()
     };
-    let hint = "rerun with --concurrency 1";
+    // 12,000 keys in 40 directories.
+    let complete = 12_000 + 40;
     // Divided into parts, or listed by directory where the store's order is
-    // unknown, a narrower listing is refused, and the error says what to do.
+    // unknown, a narrower listing is refused. With nothing printed, the
+    // listing starts over one page at a time; otherwise the error says what
+    // to do.
     for divide in [true, false] {
-        let output = ls(divide, "32");
-        assert!(!output.status.success());
-        assert!(
-            output_text(&output).contains(hint),
-            "{}",
-            output_text(&output)
-        );
-        // That works: the listing asks only for the prefix itself.
-        let output = ls(divide, "1");
+        let output = find(divide, None);
+        if output.status.success() {
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).lines().count(),
+                complete
+            );
+        } else {
+            assert!(
+                output_text(&output).contains("--performance-tuning s3-requests=1"),
+                "{}",
+                output_text(&output)
+            );
+        }
+        let output = find(divide, Some("s3-requests=1"));
         assert!(output.status.success(), "{}", output_text(&output));
         assert_eq!(
             String::from_utf8_lossy(&output.stdout).lines().count(),
-            12_000
+            complete
         );
     }
 }

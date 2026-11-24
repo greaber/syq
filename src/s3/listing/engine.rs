@@ -12,6 +12,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+pub(in crate::s3) mod levels;
 mod parts;
 mod split;
 
@@ -467,7 +468,7 @@ async fn execute(
                     static SAID: std::sync::Once = std::sync::Once::new();
                     SAID.call_once(|| {
                         crate::output::diagnostic!(
-                            "syq _ls: listing every key under {query:?} without a delimiter, which can take much longer; other prefixes the pattern's last part reaches are listed the same way when their listings need more than one page: this store may not list keys in byte order, and its later delimiter pages could leave a key out"
+                            "syq find: listing every key under {query:?} without a delimiter, which can take much longer; other prefixes the pattern's last part reaches are listed the same way when their listings need more than one page: this store may not list keys in byte order, and its later delimiter pages could leave a key out"
                         );
                     });
                     return Ok(scan_batch(query, false, flat, Gap::default()));
@@ -593,7 +594,7 @@ async fn recursive(store: &impl Store, prune: Option<&Prune<'_>>, query: String)
     Ok(scan_batch(query, false, flat, Gap::default()))
 }
 
-pub(super) async fn enumerate(
+pub(in crate::s3) async fn enumerate(
     store: &impl Store,
     pattern: &Pattern,
     concurrency: usize,

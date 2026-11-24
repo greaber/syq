@@ -1,8 +1,9 @@
 # Select entries with expressions
 
 Use `--where` to select files and other non-directory source entries in `map`
-and `cp`, and `--copy-if` to decide whether a copy may update its destination.
-Both take a quoted expression:
+and `cp`, or the entries that [`find` and `ls`](#find-and-ls) list, and
+`--copy-if` to decide whether a copy may update its destination. Both take a
+quoted expression:
 
 ```sh
 # Copy regular files between 1 MiB and 100 MiB.
@@ -44,10 +45,29 @@ metadata read, fails the copy and prevents pruning; files already copied
 stay. Mistakes in syntax, field names and types are reported before copying
 starts.
 
+## find and ls
+
+[`syq find`](commands/find.md) and [`syq ls`](commands/ls.md) filter what
+they list with `--where`, directories included. A field needs no `src.`
+prefix there, as in `size > 1MiB`, and `path` is the path as printed,
+starting with the `PATH` you gave:
+
+```sh
+syq find --where 'kind = "dir" and name glob "*-old"'
+syq find logs --where 'path glob "logs/2026-*/**" and extension = "json"'
+```
+
+On S3, a directory's fields other than its path fields, `kind` and `exists`
+are `null`, so a size comparison fails on the first directory. Test the
+value first, as in `size is not null and size > 1MiB`. A `path glob` or
+`path =` condition joined to the rest with `and` also narrows the S3 listing;
+see [List objects](object-storage.md#list-objects).
+
 ## Fields
 
-Prefix every field with `src.` or `dst.`. Metadata describes the entry
-itself: a symlink found inside a directory is not followed.
+Prefix every field with `src.` or `dst.`; `find` and `ls` also accept the
+bare name. Metadata describes the entry itself: a symlink found inside a
+directory is not followed.
 
 | Field | Type and meaning |
 |---|---|

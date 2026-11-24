@@ -40,14 +40,19 @@ fn configure_at(mut command: Command, path: &str) -> Command {
     // required operands stay visible and only everyday options enter short help.
     if !matches!(
         path,
-        "syq cp" | "syq rm" | "syq clean-partials" | "syq map" | "syq rsync"
+        "syq cp"
+            | "syq rm"
+            | "syq clean-partials"
+            | "syq map"
+            | "syq find"
+            | "syq ls"
+            | "syq rsync"
     ) {
         command = command.mut_args(|arg| {
             let common = arg.is_positional()
                 || arg.is_required_set()
                 || matches!(arg.get_id().as_str(), "help" | "version" | "self_update")
                 || match path {
-                    "syq _ls" => true,
                     "syq exec" => matches!(arg.get_id().as_str(), "on" | "cwd"),
                     "syq persist connect" => arg.get_id() == "timeout",
                     "syq persist auth-from" => matches!(arg.get_id().as_str(), "host" | "reset"),
@@ -159,12 +164,17 @@ pub(crate) fn filesystem(command: Command) -> Command {
     let clean = command.get_name() == "syq clean-partials";
     let removal = command.get_name() == "syq rm";
     let rm = removal || clean;
+    let find = matches!(command.get_name(), "syq find" | "syq ls");
     let command = command.mut_args(|arg| {
         if arg.is_hide_set() {
             return arg;
         }
         let id_owned = arg.get_id().to_string();
         let id = id_owned.as_str();
+        if find {
+            let (common, heading) = find_heading(id);
+            return arg.hide_short_help(!common).help_heading(heading);
+        }
         let common = if rsync {
             matches!(
                 id,
@@ -317,6 +327,27 @@ pub(crate) const REMOVAL_SELECTION_HELP: &[(&str, &str)] = &[
     ("sources", "Selected objects (shorthand for --src)"),
 ];
 
+/// Whether a `find` or `ls` option is in short help, and its heading.
+fn find_heading(id: &str) -> (bool, &'static str) {
+    match id {
+        "paths" | "on" | "cwd" => (true, "What to list"),
+        "root" | "follow" | "follow_src" => (false, "What to list"),
+        "depth" | "where_expression" | "ignore" => (true, "Selection"),
+        "ignore_from" => (false, "Selection"),
+        "long" | "json" | "null" => (true, "Output"),
+        "include" => (false, "Output"),
+        "s3_endpoint" | "s3_region" | "s3_profile" | "s3_header" | "s3_retries" => {
+            (false, "Object storage")
+        }
+        "auth_from" | "rsh" | "syq_path" | "no_bootstrap" | "pscope" => {
+            (false, "SSH and transport")
+        }
+        "performance_tuning" => (false, "Performance tuning"),
+        "help" | "version" => (true, "Help and version"),
+        _ => (false, "Other options"),
+    }
+}
+
 /// Group copy options by the decisions a user makes, independently of parser layout.
 fn copy_heading(id: &str) -> (&'static str, usize) {
     match id {
@@ -377,7 +408,8 @@ pub(crate) fn root() -> Command {
         .subcommand(Command::new("exec").about("From a server, run a command on a receiving machine after it approves"))
         .subcommand(Command::new("rm").about("Remove selected files and directory trees"))
         .subcommand(Command::new("clean-partials").about("Delete partial files that interrupted syq copies left in directory trees"))
-        .subcommand(Command::new("_ls").hide(true).about("List S3 objects (experimental; interface may change)"))
+        .subcommand(Command::new("find").about("List files and directories beneath paths, locally, over SSH, or in S3"))
+        .subcommand(Command::new("ls").about("List the entries directly in a directory (find --depth 1)"))
         .subcommand(Command::new("map").about("Print source-to-destination mappings as NDJSON"))
         .subcommand(Command::new("rsync").about("Copy using rsync-compatible syntax"))
         .subcommand(Command::new("persist").about("Keep SSH connections open, and receive files and requests from connected servers"))
@@ -389,9 +421,7 @@ pub(crate) fn root() -> Command {
 
 /// Keep inspection commands out of common help without hiding completion.
 pub(crate) fn root_for_help(full: bool) -> Command {
-    root()
-        .mut_subcommand("tuning-cache", |command| command.hide(!full))
-        .mut_subcommand("_ls", |command| command.hide(!full))
+    root().mut_subcommand("tuning-cache", |command| command.hide(!full))
 }
 
 pub(crate) fn lifecycle() -> Command {

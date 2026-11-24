@@ -91,6 +91,14 @@ Removal and pruning adjust their concurrency automatically. To fix it, use
 `s3-requests=N` for S3 removal; in a copy, `s3-requests` also applies to S3
 pruning. Filesystem pruning always tunes its own workers.
 
+## Listing
+
+`syq find` and `syq ls` send up to 32 S3 listing requests at a time. Use
+`--performance-tuning s3-requests=N` to change that (1–256; larger values
+count as 256). With `s3-requests=1`, a listing of a whole prefix reads one
+page after another, which a bucket policy that lets you list only the prefix
+itself requires. Filesystem listings have no tuning keys.
+
 ## Remembered connection counts
 
 Syq starts each filesystem copy from the number of workers, and so of

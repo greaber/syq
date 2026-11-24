@@ -1,8 +1,11 @@
 //! Typed, side-effect-free predicates over a source and its mapped destination.
 //! Compilation resolves fields and patterns once; evaluation performs no I/O.
 mod parser;
+mod pushdown;
 #[cfg(test)]
 mod tests;
+
+pub(crate) use pushdown::PathToken;
 
 use crate::proto::{Entry, Kind};
 use anyhow::{bail, Context, Result};
@@ -240,6 +243,9 @@ pub(crate) enum Facts<'a> {
         directory_marker: bool,
         last_modified: Option<(i64, u32)>,
     },
+    /// A directory in an S3 listing, from a common prefix or a directory
+    /// marker. Listings report it with no metadata of its own.
+    S3Directory,
     Unread,
 }
 #[derive(Debug)]
@@ -257,6 +263,13 @@ impl<'a> Facts<'a> {
         }
         if let Some(bytes) = field.path_bytes(path) {
             return Ok(Value::String(bytes));
+        }
+        if let Self::S3Directory = self {
+            return Ok(match field {
+                Field::Exists => Value::Bool(true),
+                Field::Kind => Value::String(b"dir"),
+                _ => Value::Null,
+            });
         }
         if let Self::S3Listing {
             size,
@@ -314,7 +327,8 @@ enum Node {
     Binary(Op, Box<Node>, Box<Node>),
     In(Box<Node>, Vec<Node>),
     Between(Box<Node>, Box<Node>, Box<Node>),
-    Pattern(Box<Node>, regex::bytes::Regex),
+    /// A pattern match, with the glob's text when it is a glob.
+    Pattern(Box<Node>, regex::bytes::Regex, Option<Box<str>>),
     If(Box<Node>, Box<Node>, Box<Node>),
     Coalesce(Box<Node>, Box<Node>),
 }
@@ -322,7 +336,7 @@ impl Node {
     fn uses_source_s3_time(&self) -> bool {
         match self {
             Self::Field(false, Field::S3LastModified) => true,
-            Self::Not(n) | Self::Negative(n) | Self::Pattern(n, _) => n.uses_source_s3_time(),
+            Self::Not(n) | Self::Negative(n) | Self::Pattern(n, ..) => n.uses_source_s3_time(),
             Self::Binary(_, a, b) | Self::Coalesce(a, b) => {
                 a.uses_source_s3_time() || b.uses_source_s3_time()
             }
@@ -365,7 +379,7 @@ impl Node {
                 }
                 Bool
             }
-            Self::Pattern(a, _) => {
+            Self::Pattern(a, ..) => {
                 require(a.ty()? == String, "pattern matching requires a string")?;
                 Bool
             }
@@ -424,7 +438,7 @@ impl Node {
                 }
                 Value::Bool(found)
             }
-            Self::Pattern(n, pattern) => match n.eval(c)? {
+            Self::Pattern(n, pattern, _) => match n.eval(c)? {
                 Value::String(v) => Value::Bool(pattern.is_match(v)),
                 _ => bail!("cannot match an unavailable value; test it against null first"),
             },
@@ -542,18 +556,53 @@ struct ContextValues<'a> {
     dst_path: &'a [u8],
     now: i128,
 }
+/// Which fields an expression may name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fields {
+    /// `src.` fields: copy selection.
+    Source,
+    /// `src.` and `dst.` fields: update conditions.
+    SourceAndDestination,
+    /// A listed entry's own fields, bare or with `src.`: `find` and `ls`.
+    Listing,
+}
 #[derive(Clone, Debug)]
 pub(crate) struct Expression {
     root: Node,
 }
 impl Expression {
     pub fn compile(text: &str, destination: bool) -> Result<Self> {
-        let root = parser::parse(text, destination)?;
+        Self::compile_with(
+            text,
+            if destination {
+                Fields::SourceAndDestination
+            } else {
+                Fields::Source
+            },
+        )
+    }
+    /// Compile a filter of listed entries, whose fields may be named
+    /// without `src.`.
+    pub fn compile_listing(text: &str) -> Result<Self> {
+        Self::compile_with(text, Fields::Listing)
+    }
+    fn compile_with(text: &str, fields: Fields) -> Result<Self> {
+        let root = parser::parse(text, fields)?;
         require(
             root.ty()? == Type::Bool,
             "expression must produce a boolean",
         )?;
         Ok(Self { root })
+    }
+    /// Path patterns that every path the expression selects matches: one
+    /// for each `path glob` or `path =` condition joined to the rest by
+    /// `and` alone. Each pattern can match more paths than its condition
+    /// does, never fewer, so a listing may skip whatever matches none of
+    /// them, but must still evaluate the expression on what it lists.
+    pub fn s3_path_pushdown(&self) -> Vec<Vec<PathToken>> {
+        let mut patterns = Vec::new();
+        pushdown::conjuncts(&self.root, &mut patterns);
+        patterns
     }
     pub fn evaluate(
         &self,
@@ -613,6 +662,42 @@ impl Policy {
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos() as i128,
         })
+    }
+    /// Compile `--where` for `find` and `ls`: fields may be named without
+    /// `src.`, and directories are filtered like other entries.
+    pub fn compile_listing(selection: Option<&str>) -> Result<Self> {
+        Ok(Self {
+            selection: selection
+                .map(|s| Expression::compile_listing(s).context("--where"))
+                .transpose()?,
+            update: None,
+            now: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos() as i128,
+        })
+    }
+    /// Whether a listed entry passes `--where`. Unlike [`Self::selects`],
+    /// directories are filtered too.
+    pub fn selects_listing(&self, entry: &File, path: &[u8]) -> Result<bool> {
+        self.selection
+            .as_ref()
+            .map_or(Ok(true), |e| {
+                e.evaluate(entry, path, &File::default(), b"", self.now)
+            })
+            .context("--where")
+    }
+    /// As [`Self::selects_listing`], from what a listing shows. `None` means
+    /// that evaluation reached a field the listing does not provide.
+    pub fn selects_listing_known(&self, entry: Facts<'_>, path: &[u8]) -> Result<Option<bool>> {
+        if let Facts::Complete(file) = entry {
+            return self.selects_listing(file, path).map(Some);
+        }
+        let Some(expression) = &self.selection else {
+            return Ok(Some(true));
+        };
+        expression
+            .evaluate_known(entry, path, Facts::Unread, b"", self.now)
+            .context("--where")
     }
     pub fn uses_source_s3_time(&self) -> bool {
         [&self.selection, &self.update]

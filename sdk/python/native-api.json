@@ -194,6 +194,72 @@
         "pscope"
       ],
       "follow_up": []
+    },
+    "find": {
+      "sdk": "follow_up",
+      "python": [],
+      "internal": [],
+      "aliases": {},
+      "raw_only": [],
+      "follow_up": [
+        "on",
+        "cwd",
+        "root",
+        "follow",
+        "follow-src",
+        "depth",
+        "ignore",
+        "ignore-from",
+        "where",
+        "long",
+        "json",
+        "null",
+        "include",
+        "performance-tuning",
+        "rsh",
+        "syq-path",
+        "no-bootstrap",
+        "auth-from",
+        "pscope",
+        "s3-endpoint",
+        "s3-region",
+        "s3-profile",
+        "s3-header",
+        "s3-retries"
+      ]
+    },
+    "ls": {
+      "sdk": "follow_up",
+      "python": [],
+      "internal": [],
+      "aliases": {},
+      "raw_only": [],
+      "follow_up": [
+        "on",
+        "cwd",
+        "root",
+        "follow",
+        "follow-src",
+        "depth",
+        "ignore",
+        "ignore-from",
+        "where",
+        "long",
+        "json",
+        "null",
+        "include",
+        "performance-tuning",
+        "rsh",
+        "syq-path",
+        "no-bootstrap",
+        "auth-from",
+        "pscope",
+        "s3-endpoint",
+        "s3-region",
+        "s3-profile",
+        "s3-header",
+        "s3-retries"
+      ]
     }
   }
 }

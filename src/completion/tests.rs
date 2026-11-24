@@ -259,11 +259,15 @@ fn path_candidates_preserve_raw_names_and_mark_directories() {
 fn root_and_option_candidates_come_from_public_command_metadata() {
     assert!(values(root_candidates(b"c")).contains(&b"cp".to_vec()));
     assert!(root_candidates(b"_l").is_empty());
-    let listing = public_command("_ls").unwrap();
-    assert_eq!(
-        values(option_candidates(&listing, b"--conc")),
-        vec![b"--concurrency".to_vec()]
-    );
+    assert_eq!(values(root_candidates(b"l")), vec![b"ls".to_vec()]);
+    assert!(values(root_candidates(b"f")).contains(&b"find".to_vec()));
+    for name in ["find", "ls"] {
+        let listing = public_command(name).unwrap();
+        assert_eq!(
+            values(option_candidates(&listing, b"--ignore-f")),
+            vec![b"--ignore-from".to_vec()]
+        );
+    }
     let command = crate::cli::command_for_completion("cp").unwrap();
     let options = values(option_candidates(&command, b"--coor"));
     assert_eq!(options, vec![b"--coordinate-at".to_vec()]);
