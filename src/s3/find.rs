@@ -278,15 +278,12 @@ impl<W: Write> Finder<'_, W> {
                 ))
                 .await;
         }
+        let mut pattern = pattern;
         let mut concurrency = self.concurrency;
         loop {
-            // One request at a time lists the root's prefix itself, as a
-            // policy that lets you list only that prefix requires; a
-            // narrowed listing lists others.
-            let pattern = pattern.as_ref().filter(|_| concurrency > 1);
             let state = State::new(self, prefix.clone(), display.clone());
             let paced = state.paced(&prefix);
-            let result = match pattern {
+            let result = match &pattern {
                 Some(pattern) => {
                     state
                         .run(engine::enumerate(&paced, pattern, concurrency, |entry| {
@@ -302,7 +299,11 @@ impl<W: Write> Finder<'_, W> {
                     };
                     let prune = self.ignore.as_ref().map(|_| engine::Prune {
                         subtree: &subtree,
-                        probes: AtomicUsize::new(LOOKAHEAD_PROBES),
+                        probes: AtomicUsize::new(if concurrency == 1 {
+                            0
+                        } else {
+                            LOOKAHEAD_PROBES
+                        }),
                     });
                     state
                         .run(async {
@@ -333,18 +334,25 @@ impl<W: Write> Finder<'_, W> {
             // Divided and narrowed listings fail where a policy allows
             // listing only the prefix itself, and divided ones where keys
             // arrive out of order; a listing of the prefix one page after
-            // another does not. Start over if nothing was printed yet.
+            // another without lookahead probes does not. Start over if nothing
+            // was printed yet.
             let denied = denied(&error)
                 && (state.discovery_denied.get()
                     || error.downcast_ref::<engine::PartFailed>().is_some());
-            if concurrency == 1 || !(denied || error.is::<engine::Unordered>()) {
+            if (pattern.is_none() && concurrency == 1)
+                || !(denied || error.is::<engine::Unordered>())
+            {
                 return Err(error);
             }
             if state.printed.get() {
-                return Err(error.context(
-                    "to list the prefix one page after another, as a policy that lets you list only the prefix itself requires, rerun with --performance-tuning s3-requests=1",
-                ));
+                if concurrency > 1 {
+                    return Err(error.context(
+                        "to list the prefix one page after another, as a policy that lets you list only the prefix itself requires, rerun with --performance-tuning s3-requests=1",
+                    ));
+                }
+                return Err(error);
             }
+            pattern = None;
             concurrency = 1;
         }
     }
@@ -681,11 +689,9 @@ impl<'a, 'f, W: Write> State<'a, 'f, W> {
                 continue;
             };
             let mut file = object.expression_file();
-            // A listing gives the time to the millisecond, HEAD to the
-            // second.
-            if queued.entry.last_modified.is_some() {
-                file.s3_last_modified = queued.entry.last_modified;
-            }
+            // Keep the listing's Last-Modified (millisecond precision, or
+            // absent) so HEAD filtering sees the same value as LIST filtering.
+            file.s3_last_modified = queued.entry.last_modified;
             if queued.filter && !self.finder.policy.selects_listing(&file, &queued.path)? {
                 continue;
             }

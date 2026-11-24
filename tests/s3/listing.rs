@@ -15,13 +15,16 @@ struct Bucket {
 
 /// How the bucket fails: `only` lists only that prefix, refusing others;
 /// `partial` refuses the second page of every listing; `list_only` refuses
-/// every HEAD request.
+/// every HEAD request; `deny_head` refuses HEAD for one key; `omit_list_time`
+/// leaves LastModified out of listings.
 #[derive(Clone, Copy, Default)]
 struct Faults {
     only: Option<&'static str>,
     partial: bool,
     missing_token: bool,
     list_only: bool,
+    deny_head: Option<&'static str>,
+    omit_list_time: bool,
 }
 
 impl Bucket {
@@ -146,7 +149,7 @@ fn serve_bucket(
     }
     if method == "HEAD" {
         observed.lock().unwrap().push(format!("HEAD {key}"));
-        if faults.list_only {
+        if faults.list_only || faults.deny_head == Some(key) {
             reply(&mut socket, 403, &[], b"", true);
             return;
         }
@@ -249,8 +252,13 @@ fn serve_bucket(
                 encode(item)
             ));
         } else {
+            let last_modified = if faults.omit_list_time {
+                ""
+            } else {
+                "<LastModified>2026-01-01T00:00:00.500Z</LastModified>"
+            };
             body.push_str(&format!(
-                "<Contents><Key>{}</Key><Size>{}</Size><LastModified>2026-01-01T00:00:00.500Z</LastModified><ETag>&quot;tag&quot;</ETag></Contents>",
+                "<Contents><Key>{}</Key><Size>{}</Size>{last_modified}<ETag>&quot;tag&quot;</ETag></Contents>",
                 encode(item),
                 keys[item].len()
             ));
@@ -625,6 +633,64 @@ fn a_head_request_keeps_the_listed_time() {
             .count(),
         1
     );
+    // An omitted listing LastModified stays null when HEAD returns one.
+    let bucket = Bucket::start(
+        &[("plain", "x")],
+        Faults {
+            omit_list_time: true,
+            ..Faults::default()
+        },
+    );
+    let output = bucket.find(
+        temp.path(),
+        &[
+            "find",
+            "--on",
+            "s3://bucket",
+            "--where",
+            "s3_last_modified is null and mtime is null",
+        ],
+    );
+    assert_eq!(sorted(&output), ["plain"]);
+    assert_eq!(
+        bucket
+            .take()
+            .iter()
+            .filter(|r| r.starts_with("HEAD"))
+            .count(),
+        1
+    );
+    // A path condition after one that may send HEAD narrows nothing, so a
+    // HEAD failure is still reported regardless of concurrency.
+    let bucket = Bucket::start(
+        &[("tree/private", "x"), ("tree/public", "x")],
+        Faults {
+            deny_head: Some("tree/private"),
+            ..Faults::default()
+        },
+    );
+    for extra in [&[][..], &["--performance-tuning", "s3-requests=1"][..]] {
+        let mut args = vec![
+            "find",
+            "--on",
+            "s3://bucket",
+            "tree/",
+            "--where",
+            "mtime is null and path = 'tree/public'",
+        ];
+        args.extend_from_slice(extra);
+        let output = bucket.find(temp.path(), &args);
+        assert!(
+            !output.status.success(),
+            "{extra:?}: {}",
+            output_text(&output)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("403"),
+            "{extra:?}: {}",
+            output_text(&output)
+        );
+    }
 }
 
 /// An object and keys under its name followed by `/` both print as that
@@ -866,9 +932,28 @@ fn a_listing_only_the_prefix_may_make_starts_over_with_one_request() {
         ],
     );
     assert_eq!(sorted(&output), ["tree/a"]);
-    // With one request at a time, the prefix is listed by itself from the
-    // start.
+    // With one request at a time, an unfiltered listing sends only requests
+    // for the prefix itself; a narrowed listing still narrows and falls back
+    // if refused before printing.
     bucket.take();
+    let output = bucket.find(
+        temp.path(),
+        &[
+            "find",
+            "--on",
+            "s3://bucket",
+            "tree/",
+            "--performance-tuning",
+            "s3-requests=1",
+        ],
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().count(),
+        40 * 60 + 40 + 3
+    );
+    let requests = bucket.take();
+    assert!(requests.iter().all(|r| r == "LIST tree/"), "{requests:?}");
+
     let output = bucket.find(
         temp.path(),
         &[
@@ -884,7 +969,35 @@ fn a_listing_only_the_prefix_may_make_starts_over_with_one_request() {
     );
     assert_eq!(sorted(&output), ["tree/sub/x"]);
     let requests = bucket.take();
-    assert!(requests.iter().all(|r| r == "LIST tree/"), "{requests:?}");
+    assert_eq!(
+        requests,
+        [
+            "LIST tree/",
+            "LIST tree/sub/",
+            "LIST tree/",
+            "LIST tree/",
+            "LIST tree/",
+        ],
+        "{requests:?}"
+    );
+    // On a normal bucket, s3-requests=1 still narrows to the path condition.
+    let normal = Bucket::start(&keys, Faults::default());
+    let output = normal.find(
+        temp.path(),
+        &[
+            "find",
+            "--on",
+            "s3://bucket",
+            "tree/",
+            "--where",
+            "path = 'tree/a'",
+            "--performance-tuning",
+            "s3-requests=1",
+        ],
+    );
+    assert_eq!(sorted(&output), ["tree/a"]);
+    let requests = normal.take();
+    assert_eq!(requests, ["LIST tree/", "LIST tree/a"], "{requests:?}");
     // A PATH without a slash names the object or the directory; a policy
     // that refuses the listing of the object's key leaves the directory.
     let output = bucket.find(temp.path(), &["ls", "--on", "s3://bucket", "tree"]);
@@ -902,6 +1015,34 @@ fn a_listing_only_the_prefix_may_make_starts_over_with_one_request() {
         &["find", "--on", "s3://bucket", "tree/", "--depth", "2"],
     );
     assert!(!output.status.success());
+
+    // Sequential mode also disables ignore lookahead probes, so --ignore works
+    // when only the root prefix may be listed.
+    let ignored_keys: Vec<(String, &str)> = (0..1001)
+        .map(|i| (format!("tree/a/{i:04}"), "x"))
+        .chain([("tree/z/keep".to_owned(), "x")])
+        .collect();
+    let ignored_keys: Vec<(&str, &str)> = ignored_keys
+        .iter()
+        .map(|(key, body)| (key.as_str(), *body))
+        .collect();
+    let bucket = Bucket::start(
+        &ignored_keys,
+        Faults {
+            only: Some("tree/"),
+            ..Faults::default()
+        },
+    );
+    for extra in [&[][..], &["--performance-tuning", "s3-requests=1"][..]] {
+        let mut args = vec!["find", "--on", "s3://bucket", "tree/", "--ignore", "a/"];
+        args.extend_from_slice(extra);
+        let output = bucket.find(temp.path(), &args);
+        assert_eq!(sorted(&output), ["tree/z", "tree/z/keep"], "{extra:?}");
+        let requests = bucket.take();
+        if !extra.is_empty() {
+            assert!(requests.iter().all(|r| r == "LIST tree/"), "{requests:?}");
+        }
+    }
 }
 
 #[test]

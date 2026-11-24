@@ -70,18 +70,26 @@ fn path_literal<'a>(a: &'a Node, b: &'a Node) -> Option<&'a [u8]> {
 }
 
 /// Whether evaluating `node` never fails: `None` if it may, and otherwise
-/// whether its value may be `null`. A field never fails; one that a listing
-/// does not give is read first. Arithmetic is assumed to fail, since it can
-/// overflow or divide by zero, and so is whatever fails on `null`: ordered
-/// comparisons, patterns, and `not`, `and` and `or`, which need a boolean.
+/// whether its value may be `null`. Fields that require an S3 `HEAD` request
+/// (`kind`, `mtime`, `mode`, `uid`, `gid`) may fail if the `HEAD` fails, so
+/// they return `None`. Arithmetic is assumed to fail, since it can overflow
+/// or divide by zero, and so is whatever fails on `null`: ordered comparisons,
+/// patterns, and `not`, `and` and `or`, which need a boolean.
 fn total(node: &Node) -> Option<bool> {
     let known = |node: &Node| total(node) == Some(false);
     match node {
         Node::Literal(value) => Some(*value == Value::Null),
-        Node::Field(_, field) => Some(!matches!(
-            field,
-            Field::Path | Field::Name | Field::Extension | Field::Exists
-        )),
+        Node::Field(_, field) => match field {
+            Field::Path | Field::Name | Field::Extension | Field::Exists => Some(false),
+            Field::Kind | Field::Mtime | Field::Mode | Field::Uid | Field::Gid => None,
+            Field::Size
+            | Field::S3LastModified
+            | Field::Ctime
+            | Field::Device
+            | Field::Inode
+            | Field::Links
+            | Field::LinkTarget => Some(true),
+        },
         Node::Now => Some(false),
         Node::Not(n) => known(n).then_some(false),
         Node::Binary(Op::And | Op::Or, a, b) => (known(a) && known(b)).then_some(false),

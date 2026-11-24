@@ -328,9 +328,9 @@ fn path_conditions_joined_by_and_are_pushed_down() {
         [lit("a")]
     );
     for text in [
-        "kind = 'file' and size is null and mtime is not null and name in ['a', null]",
+        "size is null and s3_last_modified is not null and name in ['a', null]",
         "exists and not (name glob 'x*' or extension < 'm') and name between 'a' and 'z'",
-        "coalesce(size, 0B) = 0B and if(exists, mtime, now) is null and now > timestamp('2020-01-01T00:00:00Z')",
+        "coalesce(size, 0B) = 0B and if(exists, s3_last_modified, now) is null and now > timestamp('2020-01-01T00:00:00Z')",
         "if(exists, name, extension) glob '*' and coalesce(link_target, name) glob '*'",
         "true",
     ] {
@@ -342,8 +342,14 @@ fn path_conditions_joined_by_and_are_pushed_down() {
     }
     for text in [
         "size > 0B",
+        "kind = 'file'",
+        "kind is not null",
         "kind glob 'f*'",
+        "mtime is null",
         "mtime < now",
+        "mode is null",
+        "uid is null",
+        "gid is null",
         "size + 1B = 2B",
         "size / 0 = 0B",
         "-size = 0B",
