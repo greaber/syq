@@ -1,6 +1,7 @@
 //! HTTPS trust for release downloads. The AWS SDK uses the same system
 //! certificate loader for S3.
 
+use rustls::crypto::aws_lc_rs::default_provider;
 use std::sync::{Arc, LazyLock};
 use ureq::tls::{Certificate, RootCerts, TlsConfig};
 
@@ -31,7 +32,7 @@ static TRUST: LazyLock<Trust> = LazyLock::new(|| {
     Trust {
         config: TlsConfig::builder()
             .root_certs(RootCerts::Specific(Arc::new(certificates)))
-            .unversioned_rustls_crypto_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .unversioned_rustls_crypto_provider(Arc::new(default_provider()))
             .build(),
         empty_store,
     }
