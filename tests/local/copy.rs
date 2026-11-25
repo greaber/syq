@@ -914,6 +914,7 @@ fn destination_claims_cover_only_plans_that_need_them() {
         &t.path("mapping"),
         entry_line("a", "mapped", None).as_bytes(),
     );
+    write(&t.path("list"), b"a\n");
     for (index, (args, tracked)) in [
         (vec!["--srcs-in", "src"], false),
         (vec!["--srcs-in", "src", "--prune"], true),
@@ -942,4 +943,16 @@ fn destination_claims_cover_only_plans_that_need_them() {
             tracked
         );
     }
+    let ff_log = t.path("claims-files-from");
+    let output = compat_command()
+        .current_dir(t.path(""))
+        .args(["-a", "--files-from", "list", "src", "dst-ff"])
+        .env("SYQ_TEST_DESTINATION_CLAIMS", &ff_log)
+        .run()
+        .unwrap();
+    assert_output_ok(&output);
+    let counts = fs::read_to_string(ff_log).unwrap();
+    assert!(!counts
+        .lines()
+        .any(|line| line.parse::<usize>().unwrap() > 0));
 }
