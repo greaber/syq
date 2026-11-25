@@ -336,6 +336,7 @@ fn serve(
             &mut socket,
             method,
             first.split_whitespace().nth(1).unwrap(),
+            &headers,
         );
         return;
     }
@@ -2580,46 +2581,114 @@ fn s3_mapping_download_overlaps_heads_and_validates_before_copying() {
 }
 
 #[test]
-fn s3_rerun_checks_unchanged_objects_beyond_the_transfer_limit() {
-    use checking::{CHANGED, GETS, HEADS, MODIFIED, SIZE, UNCHANGED};
+fn s3_rerun_checks_share_the_request_limit_with_transfers() {
+    use checking::{CHANGED, GETS, HEADS, MODIFIED, REQUESTS, SIZE, UNCHANGED};
+    let _counting = checking::exclusive();
     let server = Server::start("checking");
     let temp = crate::test_support::tempdir().unwrap();
     let destination = temp.path().join("out");
     std::fs::create_dir(&destination).unwrap();
     let name = |index| destination.join(&checking::key(index)["data/".len()..]);
     let modified = std::time::UNIX_EPOCH + Duration::from_secs(MODIFIED);
-    for index in 0..UNCHANGED {
-        // Only size and time are compared, so the files can stay sparse.
-        let file = std::fs::File::create(name(index)).unwrap();
-        file.set_len(SIZE).unwrap();
-        file.set_modified(modified).unwrap();
-    }
-    let output = server
-        .command_with_part_size(temp.path(), 0, false)
-        .args(["--s3-endpoint", &server.address])
-        .args(["--from", "s3://bucket", "--srcs-in", "data", "--into"])
-        .arg(&destination)
-        .capture_output()
-        .unwrap();
-    assert!(output.status.success(), "{}", output_text(&output));
-    for index in UNCHANGED..UNCHANGED + CHANGED {
-        assert_eq!(std::fs::read(name(index)).unwrap(), b"x");
-    }
-    assert_eq!(std::fs::metadata(name(0)).unwrap().len(), SIZE);
-    // Transfers start at 32 objects. Unchanged objects give no transfer
-    // samples to raise that with, so more of them are checked at once...
+    let copy = |extra: &[&str]| {
+        for index in 0..UNCHANGED {
+            // Only size and time are compared, so the files can stay sparse.
+            let file = std::fs::File::create(name(index)).unwrap();
+            file.set_len(SIZE).unwrap();
+            file.set_modified(modified).unwrap();
+        }
+        for index in UNCHANGED..UNCHANGED + CHANGED {
+            let _ = std::fs::remove_file(name(index));
+        }
+        for counter in [&HEADS, &GETS, &REQUESTS] {
+            counter.reset();
+        }
+        let output = server
+            .command_with_part_size(temp.path(), 0, false)
+            .args(["--s3-endpoint", &server.address])
+            .args(extra)
+            .args(["--from", "s3://bucket", "--srcs-in", "data", "--into"])
+            .arg(&destination)
+            .capture_output()
+            .unwrap();
+        assert!(output.status.success(), "{}", output_text(&output));
+        for index in UNCHANGED..UNCHANGED + CHANGED {
+            assert_eq!(std::fs::read(name(index)).unwrap(), b"x");
+        }
+        assert_eq!(std::fs::metadata(name(0)).unwrap().len(), SIZE);
+    };
+    // A count the user fixed bounds checks and transfers together.
+    copy(&["--performance-tuning=s3-requests=24"]);
+    assert!(
+        (2..=24).contains(&REQUESTS.peak()),
+        "{} requests at once",
+        REQUESTS.peak()
+    );
+    // Otherwise the checks of unchanged objects show the limit what more
+    // requests achieve, and it grows from the 32 every copy starts with.
+    copy(&[]);
     assert!(
         HEADS.peak() > 32,
         "{} metadata requests at once",
         HEADS.peak()
     );
-    assert!(HEADS.peak() <= 256, "{} metadata requests", HEADS.peak());
-    // ...while the objects that then need a transfer still take turns.
+    assert!(REQUESTS.peak() <= 256, "{} requests", REQUESTS.peak());
+}
+
+#[test]
+fn s3_upload_rerun_checks_share_the_request_limit_with_transfers() {
+    use checking::{CHANGED, HEADS, MODIFIED, PUTS, REQUESTS, SIZE, UNCHANGED};
+    use std::os::unix::fs::PermissionsExt;
+    let _counting = checking::exclusive();
+    let server = Server::start("checking");
+    let temp = crate::test_support::tempdir().unwrap();
+    let source = temp.path().join("data");
+    std::fs::create_dir(&source).unwrap();
+    let name = |index| source.join(&checking::key(index)["data/".len()..]);
+    let modified = std::time::UNIX_EPOCH + Duration::from_secs(MODIFIED);
+    for index in 0..UNCHANGED {
+        // The destination shows the same size and time, so the files can
+        // stay sparse: nothing reads them.
+        let file = std::fs::File::create(name(index)).unwrap();
+        file.set_len(SIZE).unwrap();
+        file.set_modified(modified).unwrap();
+        file.set_permissions(std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+    }
+    for index in UNCHANGED..UNCHANGED + CHANGED {
+        std::fs::write(name(index), b"x").unwrap();
+    }
+    let copy = |extra: &[&str]| {
+        for counter in [&HEADS, &PUTS, &REQUESTS] {
+            counter.reset();
+        }
+        let output = server
+            .command_with_part_size(temp.path(), 0, false)
+            .args(["--s3-endpoint", &server.address])
+            .args(extra)
+            .args(["--srcs-in", "data", "--to", "s3://bucket", "--into", "data"])
+            .capture_output()
+            .unwrap();
+        assert!(output.status.success(), "{}", output_text(&output));
+        assert!(PUTS.peak() > 0, "nothing uploaded");
+    };
+    // The HEADs that check whether a file needs uploading take request
+    // permits like the uploads, so a count the user fixed bounds both.
+    copy(&["--performance-tuning=s3-requests=24"]);
     assert!(
-        (1..=32).contains(&GETS.peak()),
-        "{} downloads at once",
-        GETS.peak()
+        (2..=24).contains(&REQUESTS.peak()),
+        "{} requests at once",
+        REQUESTS.peak()
     );
+    // Otherwise they show the limit what more requests achieve, and it
+    // grows from the 32 every copy starts with.
+    copy(&[]);
+    assert!(
+        HEADS.peak() > 32,
+        "{} metadata requests at once",
+        HEADS.peak()
+    );
+    assert!(REQUESTS.peak() <= 256, "{} requests", REQUESTS.peak());
 }
 
 #[test]
@@ -5855,9 +5924,14 @@ fn s3_paginated_download_records_control_latency() {
     let control = plan["control_s"].as_f64().expect("observed latency");
     assert!(control.is_finite() && control >= 0.0, "{plan}");
     // Check the measured latency reaches planning without requiring a loaded
-    // runner to finish real HTTP requests within a wall-clock deadline.
-    let expected_limit = if control >= 0.050 { 256 } else { 64 };
+    // runner to finish real HTTP requests within a wall-clock deadline: small
+    // objects from a far endpoint start with more requests.
+    let expected_limit = if control >= 0.020 { 256 } else { 64 };
     assert_eq!(plan["request_limit"], expected_limit, "{plan}");
+    assert!(
+        plan["object_workers"].as_u64().unwrap() <= 2 * expected_limit,
+        "{plan}"
+    );
 }
 
 #[test]

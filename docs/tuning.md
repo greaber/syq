@@ -53,7 +53,7 @@ Use these keys for `syq cp` with S3 endpoints:
 
 | Key | Default | Accepted values / meaning |
 |---|---|---|
-| `s3-requests` | Automatic | 1–65536 simultaneous data requests across objects; excludes idle sockets and metadata requests, apart from each object's own metadata requests in a copy between buckets and the extra checks of unchanged objects described below |
+| `s3-requests` | Automatic | 1–65536 simultaneous data requests across objects, counting the requests that check whether an object needs copying; excludes idle sockets and other metadata requests, apart from each object's own metadata requests in a copy between buckets |
 | `s3-objects` | Automatic | 1–65536 objects in progress, including preparation and finalization |
 | `s3-parts-per-object` | Automatic | 1–1024 simultaneous parts or ranges per object |
 | `s3-part-size` | 16 MiB for uploads, 8 MiB for downloads, 256 MiB for copies between buckets; adjusted for some providers and fast links | 5 MiB–5 GiB per upload part or download range. Larger parts take fewer requests; smaller ones let one object use more requests at once and resend less after a failure |
@@ -72,15 +72,46 @@ ceilings, pass the same keys to `--resource-limits` instead. Part size grows
 when needed to stay within S3's limit of 10,000 parts per upload. For retries,
 see [`--s3-retries`](object-storage.md#retries).
 
-When most objects are already up to date, a copy mostly asks the service
-about each object and transfers little. Syq then checks more objects at once
-than it would transfer, for as long as that finds unchanged objects faster:
-up to 256 of these metadata requests, and fewer once the service asks it to
-slow down. Objects that do need a transfer still wait for their turn under
-the usual limits. Setting `s3-objects` turns this off, and `s3-requests` and
-an `s3-objects` ceiling bound these requests too. Automatic transfer concurrency
-also backs off when the service throttles requests and recovers once throttling
-clears.
+Unless you fix it, syq adjusts the number of requests in flight as the copy
+goes. Each copy starts with a number that suits its objects and endpoint, but
+never more than a ceiling set with `--resource-limits` or what memory and the
+open-file limit allow:
+
+- files of up to a megabyte each, uploaded to a distant endpoint (one that
+  takes 20 ms or more to answer a listing or metadata request), start with as
+  many requests as memory and the open-file limit allow, up to 4,096, or at
+  most 2,048 when the endpoint answers within about 30 ms, unless every file
+  is exactly a megabyte;
+- other objects averaging under a megabyte, to or from a distant endpoint,
+  start with 256, and syq adds requests an eighth at a time rather than
+  doubling them, since each download in flight holds its response;
+- objects averaging a megabyte or more (including files of exactly a
+  megabyte) that each take one request start with 32;
+- anything else starts with 64.
+
+Uploads to Tigris start as they would to a nearby endpoint.
+
+From there, syq doubles the requests while the added ones bring at least half
+their share of the speed, so that each doubling speeds the copy up by about
+40% or more. Once they bring less, it goes back to what the measured speed
+needs, then keeps adjusting by an eighth at a time in either direction. When
+the service asks syq to slow down (HTTP 429 or 503), the number halves as
+soon as that answer arrives, even while the request is still being retried,
+and then grows back by an eighth at a time. Answers to requests sent before a
+halving, and to their retries, are taken as part of the same complaint while
+any of those requests is still in flight, for up to 30 seconds, so a burst of
+them halves the number once.
+
+The number of objects in progress follows the requests, at up to twice as
+many. When each object takes one request, that is within what memory and the
+open-file limit allow, but files to upload averaging up to 8 MiB, which syq
+keeps in memory from hashing them to sending them, get ready ahead of their
+requests only as far as its 256 MiB of upload buffers hold them. A batch with
+objects sent in parts keeps at most 32 in progress, or 256 when most of it is
+small objects, since their parts keep the requests busy. Checking whether an
+object needs copying takes a request, as a transfer does, so a copy that
+finds most objects up to date checks many at once, and `s3-requests` bounds
+checks and transfers together.
 
 <a id="s3-streams"></a>
 

@@ -316,14 +316,14 @@ impl Prepared {
         F: Fn() -> A,
         A: Future<Output = Result<P>>,
     {
-        self.execute_counted(client, bucket, workers, acquire, || async {}, |_| {})
+        self.execute_counted(client, bucket, workers, acquire, || async {}, |_, _| {})
             .await
     }
 
     /// Run the copy, holding a permit from `acquire` for each request and
-    /// reporting each copied range's length to `copied`. A failed multipart
-    /// copy drains its started parts, then aborts while holding what
-    /// `cleanup` yields, even after cancellation.
+    /// reporting each copied range's length to `copied` with its permit. A
+    /// failed multipart copy drains its started parts, then aborts while
+    /// holding what `cleanup` yields, even after cancellation.
     pub(super) async fn execute_counted<F, A, P, C, Q>(
         &self,
         client: &Client,
@@ -331,7 +331,7 @@ impl Prepared {
         workers: usize,
         acquire: F,
         cleanup: impl FnOnce() -> C,
-        copied: impl Fn(u64),
+        copied: impl Fn(&mut P, u64),
     ) -> Result<()>
     where
         F: Fn() -> A,
@@ -339,9 +339,9 @@ impl Prepared {
         C: Future<Output = Q>,
     {
         let Some(Multipart { id, part_size }) = &self.multipart else {
-            let _permit = acquire().await?;
+            let mut permit = acquire().await?;
             copy_object(client, bucket, self.request.clone()).await?;
-            copied(self.size);
+            copied(&mut permit, self.size);
             return Ok(());
         };
         let key = &self.request.key;
@@ -355,7 +355,7 @@ impl Prepared {
                     let copied = &copied;
                     async move {
                         anyhow::ensure!(!failed.load(Relaxed), "another server-copy part failed");
-                        let _permit = acquire().await?;
+                        let mut permit = acquire().await?;
                         anyhow::ensure!(!failed.load(Relaxed), "another server-copy part failed");
                         let output = client
                             .upload_part_copy()
@@ -379,7 +379,7 @@ impl Prepared {
                                     .context("S3 omitted copied part ETag")?,
                             )
                             .build();
-                        copied(end - start + 1);
+                        copied(&mut permit, end - start + 1);
                         Ok(part)
                     }
                 })

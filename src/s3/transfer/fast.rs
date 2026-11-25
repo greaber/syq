@@ -1,13 +1,16 @@
 //! Automatic request scheduling and bounded writers, independent of hash policy.
 use super::*;
-use crate::s3::{
-    admission::{Checking, Concurrency},
-    writer,
-};
+use crate::s3::{admission::Concurrency, tuning, writer};
 
-/// The most metadata requests in flight for objects checked beyond the
-/// transfer limit. Tiny objects over a slow link already start this high.
-const CHECKING_REQUESTS: usize = 256;
+/// Objects in progress at most when each object takes several requests: its
+/// parts already keep the request limit busy.
+const MULTIPART_OBJECTS: usize = 32;
+/// Requests in flight when a batch starts with objects in parts, or with
+/// small objects on a near endpoint.
+const MULTIPART_REQUESTS: usize = 64;
+/// Requests in flight when a batch of small objects other than files to
+/// upload starts on a far endpoint.
+const FAR_SMALL_REQUESTS: usize = 256;
 
 pub(super) enum DownloadSink<'a> {
     Writer(&'a writer::Writer),
@@ -61,18 +64,16 @@ impl Engine {
         }
         if count == 0 {
             return Ok(Concurrency {
-                initial: 1,
-                maximum: None,
-                initial_probe_up: false,
+                objects: 1,
+                ready: usize::MAX,
                 requests: None,
-                checking: None,
-                outage: None,
             });
         }
         let average = bytes / count;
         let tiny = average < 1024 * 1024;
+        let route = &self.options.route;
         let single_request = largest
-            <= if self.options.route.is_server_copy() {
+            <= if route.is_server_copy() {
                 self.copy_request_limit(largest)
             } else {
                 self.part_size(largest)
@@ -84,137 +85,115 @@ impl Engine {
             .as_ref()
             .and_then(|limits| limits.s3_object_workers)
             .unwrap_or(usize::MAX);
-        let ramp_whole_objects = single_request && !tiny && fixed_workers.is_none();
-        let small_upload = self.options.route == Route::Upload && largest <= 1024 * 1024;
-        let capacity = if small_upload {
-            super::super::tuning::small_object_capacity(largest)?
+        let small_upload = *route == Route::Upload && largest <= 1024 * 1024;
+        // What memory and descriptors allow in progress at once when each
+        // object takes one request: payloads within 256 MiB and four
+        // descriptors per object. Larger objects stream their parts. Every
+        // small upload needs room for its files; anything else keeps the
+        // usual ceiling where the open-file limit leaves little room.
+        let small_capacity = |largest| {
+            let capacity = tuning::small_object_capacity(largest);
+            if small_upload {
+                capacity
+            } else {
+                Ok(capacity.unwrap_or(256))
+            }
+        };
+        let capacity = if !single_request || route.is_server_copy() {
+            256
+        } else if *route == Route::Upload {
+            // Keep the measured Tigris ceiling for files of 1 to 8 MiB. The
+            // nonblocking upload buffer budget bounds memory separately.
+            let buffer_size = if self.tuning.tigris() {
+                8 << 20
+            } else {
+                1 << 20
+            };
+            small_capacity(largest.min(buffer_size))?
+        } else if largest < 1024 * 1024 {
+            small_capacity(largest)?
         } else {
             256
-        };
-        let workers = if let Some(fixed) = fixed_workers {
-            fixed
-        } else if tiny {
-            if small_upload && self.tuning.high_latency() {
-                if self
-                    .tuning
-                    .control_latency()
-                    .is_some_and(|latency| latency < super::super::tuning::NEAR_FAR_LATENCY)
-                {
-                    capacity.min(2048)
-                } else {
-                    capacity
-                }
-            } else {
-                256
-            }
-        } else if single_request {
-            // Taper the object seed instead of dropping eightfold at 1 MiB.
-            ((256 * 1024 * 1024) / average.max(1)).clamp(32, 256) as usize
-        } else {
-            32
         };
         if small_upload && fixed_workers.is_some_and(|n| n > capacity) {
             bail!("s3-objects exceeds the available small-upload capacity ({capacity}); lower it or increase the open-file limit");
         }
-        // Automatic small-upload admission leaves room for source opens,
-        // payload buffers, and descriptors pinned during discovery.
-        let workers = if small_upload {
-            workers.min(capacity)
+        let (initial, gradual) =
+            self.initial_requests(tiny, small_upload, single_request, capacity);
+        self.tuning.configure(initial, capacity, gradual);
+        let objects = fixed_workers.unwrap_or(if single_request {
+            capacity
+        } else if tiny {
+            // Mostly small objects, with a few in parts.
+            256
         } else {
-            workers
-        }
-        .min(object_limit);
-        // Object size and control latency do not establish available bandwidth.
-        // Start whole-object batches conservatively and measure before growing;
-        // preparation follows the same request budget.
-        self.tuning.configure(
-            tiny,
-            if small_upload { workers } else { 256 },
-            if ramp_whole_objects { 32 } else { 64 },
-        );
-        let starting = if ramp_whole_objects {
-            workers.min(self.tuning.request_limit())
-        } else {
-            workers
-        };
-        // Batches larger than the starting concurrency can use the object
-        // controller, with preparation bounded by its current request limit.
-        let maximum = if count > starting as u64
-            && fixed_workers.is_none()
-            && !self.args.dry_run
-            && single_request
-        {
-            let capacity = if self.options.route.is_server_copy() {
-                256
-            } else if self.options.route == Route::Upload {
-                // Keep the measured Tigris worker ceiling. The nonblocking upload
-                // buffer budget controls memory independently of object admission.
-                let buffer_size = if self.tuning.tigris() {
-                    8 * 1024 * 1024
-                } else {
-                    1024 * 1024
-                };
-                super::super::tuning::small_object_capacity(largest.min(buffer_size))?
-            } else if largest < 1024 * 1024 {
-                // Keep the starting load unchanged, but allow measured gains
-                // beyond 256 when small objects fit the payload/FD budget.
-                super::super::tuning::small_object_capacity(largest)?
-            } else {
-                256
-            };
-            let maximum = capacity.min(count as usize).min(object_limit);
-            Some(maximum)
-        } else {
-            None
-        };
-        // Let the object controller measure fresh generations immediately,
-        // rather than first running a second, request-level concurrency search.
-        let initial = starting.min(maximum.unwrap_or(starting));
-        self.tuning.report(initial);
-        // Finding an object unchanged takes one metadata request, or two
-        // between buckets, so the ceiling counts those requests. A fixed
-        // object count leaves nothing to adjust, a request count the user
-        // set bounds these requests too, and small uploads keep the room
-        // their descriptors leave.
-        let checking = fixed_workers.is_none().then(|| {
-            let requests = self
-                .args
-                .tuning_options
-                .and_then(|tuning| tuning.s3_requests)
-                .into_iter()
-                .chain(
-                    self.args
-                        .resource_limits
-                        .as_ref()
-                        .and_then(|limits| limits.s3_requests),
-                )
-                .fold(CHECKING_REQUESTS, usize::min);
-            let per_object = if self.options.route.is_server_copy() {
-                2
-            } else {
-                1
-            };
-            let maximum = (requests / per_object).max(1).min(object_limit);
-            Checking {
-                maximum: if small_upload {
-                    maximum.min(capacity)
-                } else {
-                    maximum
-                },
-            }
+            MULTIPART_OBJECTS
         });
-        let has_checking = checking.is_some();
-        Ok(Concurrency {
-            initial,
-            maximum,
-            checking,
-            outage: Some(self.outage.clone()),
-            requests: (maximum.is_some() || has_checking).then(|| self.tuning.requests.clone()),
-            initial_probe_up: self
-                .tuning
-                .control_latency()
-                .is_some_and(|latency| latency >= super::super::tuning::HIGH_LATENCY),
-        })
+        // Files to upload get ready ahead of their requests only as far as
+        // the upload buffers can hold them; others would be read twice.
+        // Larger files, and storage-authorized uploads, keep nothing there
+        // and are read again to send anyway.
+        let ready = if *route == Route::Upload
+            && single_request
+            && self.authorization.is_none()
+            && average <= HELD_UPLOAD_LIMIT
+        {
+            (tuning::UPLOAD_BUFFER_BYTES / average.max(1)) as usize
+        } else {
+            usize::MAX
+        };
+        let concurrency = Concurrency {
+            objects: objects.min(object_limit),
+            ready,
+            requests: fixed_workers
+                .is_none()
+                .then(|| self.tuning.requests.clone()),
+        };
+        self.tuning.report(concurrency.limit());
+        Ok(concurrency)
+    }
+
+    /// Requests in flight when a batch starts, and whether they grow from
+    /// there gradually. The limit then moves with what the batch's own
+    /// requests measure, so the start only saves the windows it would take
+    /// to get there, which a short copy cannot win back.
+    fn initial_requests(
+        &self,
+        tiny: bool,
+        small_upload: bool,
+        single_request: bool,
+        capacity: usize,
+    ) -> (usize, bool) {
+        if tiny && self.tuning.far() {
+            // Small objects' requests mostly wait for the round trip. Small
+            // files to upload start with all their memory and descriptors
+            // allow, which is as many as their requests can use.
+            if small_upload {
+                let near_far = self
+                    .tuning
+                    .control_latency()
+                    .is_some_and(|latency| latency < tuning::NEAR_FAR_LATENCY);
+                return (
+                    if near_far {
+                        capacity.min(2048)
+                    } else {
+                        capacity
+                    },
+                    false,
+                );
+            }
+            // Each download in flight holds its response, so more of them
+            // are added an eighth at a time: a short copy then ends before
+            // it holds thousands it would barely use, and a long one still
+            // reaches what its requests show pays.
+            return (FAR_SMALL_REQUESTS, true);
+        }
+        if single_request && !tiny {
+            // Objects of a megabyte or more fill a path with fewer requests.
+            (tuning::INITIAL_REQUESTS, false)
+        } else {
+            (MULTIPART_REQUESTS, false)
+        }
     }
 
     pub(super) fn part_size(&self, size: u64) -> u64 {
@@ -226,7 +205,9 @@ impl Engine {
                 Route::ServerCopy { .. } => 256 * 1024 * 1024,
                 Route::Upload if self.tuning.tigris() => 8 * 1024 * 1024,
                 Route::Upload => 16 * 1024 * 1024,
-                Route::Download if self.tuning.local_latency() => 64 * 1024 * 1024,
+                // A few large ranges fill a nearby endpoint's path, and each
+                // range in flight holds several megabytes of buffers.
+                Route::Download if self.tuning.local() => 64 * 1024 * 1024,
                 Route::Download if self.tuning.tigris() => 16 * 1024 * 1024,
                 Route::Download => 8 * 1024 * 1024,
             }
@@ -240,9 +221,10 @@ impl Engine {
             match self.options.route {
                 // Every part still acquires a permit from the shared budget.
                 Route::ServerCopy { .. } => self.tuning.request_capacity(),
-                Route::Download if self.tuning.local_latency() => 4,
+                Route::Download if self.tuning.local() => 4,
                 Route::Upload if self.tuning.tigris() => 32,
                 Route::Download if self.tuning.tigris() => 8,
+                // The request limit, not this, bounds parts across objects.
                 Route::Upload | Route::Download => 64,
             }
         };
@@ -290,7 +272,7 @@ impl Engine {
         algorithm: Option<HashAlgorithm>,
         mut tree: Option<&mut subtrees::Part>,
     ) -> Result<String> {
-        let slot = match initial_slot {
+        let mut slot = match initial_slot {
             Some(slot) => slot,
             None => self.tuning.requests.acquire().await,
         };
@@ -394,7 +376,6 @@ impl Engine {
                         if bytes.len() as u64 > length - done {
                             return Err(Permanent("S3 body exceeded length".into()).into());
                         }
-                        slot.received(bytes.len());
                         if let Some(h) = &mut hash {
                             h.update(&bytes);
                         }
@@ -477,7 +458,6 @@ impl Engine {
                                 || offset + done + want as u64 == object.size),
                         "unaligned S3 direct range"
                     );
-                    slot.received(want);
                     if let Some(h) = &mut hash {
                         h.update(&buffer.bytes()[..want]);
                     }
@@ -510,7 +490,7 @@ impl Engine {
                         tokio::time::Instant::now(),
                     );
                     crate::s3::diagnostics::elapsed(started, "download_range", attempt_length);
-                    self.tuning.requests.completed(length);
+                    slot.completed(length);
                     self.progress.add_bytes(length);
                     self.outage.responded();
                     return Ok(hash);

@@ -1,17 +1,107 @@
-//! Process-local admission control. Samples are useful copies, not calibration traffic.
-use super::{Options, Route};
+//! One adaptive limit on the S3 requests a copy keeps in flight.
+//!
+//! Each batch starts from a number planning chooses for its objects and
+//! endpoint (`Tuning::configure`), and adjusts the limit from the copy's own
+//! requests; nothing is spent on calibration traffic.
+//! Little's law relates the average number of requests in flight, N, the
+//! rate at which work finishes, X (bytes plus `REQUEST_CREDIT` per request),
+//! and the time a request spends in flight per unit of its work, T: X = N/T.
+//! T is measured directly, as the requests' response times over their work.
+//! A change of the limit is judged by its elasticity, how much of the change
+//! in N showed in X: 1 while nothing queues, falling towards 0 as requests
+//! queue on the link, at the service or in this process.
+//!
+//! - While N fills the limit, the limit doubles, and once a change has been
+//!   undone, or from the start of a batch that planning asks to grow
+//!   gradually, grows by an eighth.
+//! - A step up whose added requests carry less than half their share of the
+//!   rate (`PAYING`), in two windows, is undone to what the new rate needs at
+//!   the old rate per request. Steps down by an eighth follow, until one
+//!   costs its share of the rate and is undone in turn, so that the limit
+//!   follows a path that saturates at fewer requests. Below one request
+//!   there is nothing to try, so steps up follow.
+//! - When the service asks for fewer requests (HTTP 429 or 503), the limit
+//!   halves as the response arrives, whether or not a window is open or the
+//!   request is then retried. Requests admitted before that halving ran into
+//!   what it answered, and their retries keep their permits, so further
+//!   refusals while any of them is in flight do not halve it again: a burst
+//!   halves the limit once, not once per refusal. Only a halving has this
+//!   effect; a refusal after any other change halves at once.
+//!
+//! A window starts only once nearly all requests admitted before the last
+//! change have finished, so a change is never judged by the requests that
+//! caused it. It ends once as many requests have finished as were in flight
+//! on average, which by Little's law takes a mean response time, and once
+//! the finished requests' time within the window accounts for most of the
+//! window's request-seconds in flight, so that quick checks finishing beside
+//! long transfers do not stand for the transfers. Requests that stay in
+//! flight only bound that wait, to at most `UNCOVERED_WAIT`.
+use super::{outage::Outage, Options, Route};
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering::Relaxed},
         Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
-use tokio::sync::Notify;
+use tokio::{
+    sync::{watch, Notify},
+    time::Instant,
+};
+
+/// Requests in flight when a batch starts, unless planning chooses another
+/// start or the user fixed the count.
+pub(super) const INITIAL_REQUESTS: usize = 32;
+/// The most requests in flight unless a batch's budget allows another number.
+const DEFAULT_CEILING: usize = 256;
+/// The shortest measurement window, so that requests answered within a
+/// millisecond or two do not make every scheduling delay a decision.
+const SAMPLE: Duration = Duration::from_millis(50);
+/// Requests a window must see finish before it describes the limit.
+const MIN_COMPLETIONS: usize = 16;
+/// A window may start while this fraction of the limit is still requests
+/// admitted before the last change, or once those have taken this many
+/// windows' time, so that a few slow ones cannot hold back every decision.
+const STRAGGLERS: usize = 16;
+const STRAGGLER_WINDOWS: u32 = 4;
+/// The share of the window's request-seconds in flight that the finished
+/// requests' time within the window must account for before it describes
+/// the limit.
+const COVERED: f64 = 0.7;
+/// The longest a window that has seen enough requests finish waits for the
+/// rest to account for its time. A request may take hours, so one still in
+/// flight is never known to have stalled, but a few that hang must not hold
+/// every later decision back.
+const UNCOVERED_WAIT: Duration = Duration::from_secs(30);
+/// Work credited to each request besides its bytes, for the fixed cost of a
+/// request, so that checks and small objects count as progress.
+const REQUEST_CREDIT: u64 = crate::tune::FILE_CREDIT;
+
+/// The fastest control response at which an endpoint counts as far away, so
+/// that copies of many small objects start with every request their memory
+/// and descriptors allow, instead of taking several windows to grow there.
+/// A response on a reused connection takes one round trip. When a copy has
+/// only a client's first response, which also opens the connection, it takes
+/// about two round trips over HTTP and three over HTTPS, so the endpoint
+/// counts as far from about a 10 or 6 ms round trip.
+pub(super) const HIGH_LATENCY: Duration = Duration::from_millis(20);
+/// Below this fastest control response, a far endpoint's uploads of small
+/// files start with at most 2,048 objects in flight instead of 4,096. The
+/// response takes at least one round trip, so the endpoint is closer than
+/// this, and at up to 30 ms 2,048 objects finish as soon as 4,096 in about
+/// 40% less memory. From 60 ms they finish later.
+pub(super) const NEAR_FAR_LATENCY: Duration = Duration::from_millis(32);
+/// Below this fastest control response the endpoint is on the same machine
+/// or a fast LAN, where a few large ranges download an object as fast as
+/// many and hold far less memory in flight.
+pub(super) const LOCAL_LATENCY: Duration = Duration::from_millis(3);
+
+/// The upload bytes held in memory across files at once, from the read
+/// that hashes each file to the request that sends it.
+pub(super) const UPLOAD_BUFFER_BYTES: u64 = 256 << 20;
 
 pub(super) struct Tuning {
     control: Arc<ControlSamples>,
-    fixed_requests: Option<usize>,
     tigris: bool,
     upload: bool,
     pub requests: Arc<Budget>,
@@ -20,34 +110,32 @@ pub(super) struct Tuning {
     pub upload_buffers: Arc<tokio::sync::Semaphore>,
 }
 impl Tuning {
-    /// `control` receives the client's HEAD and LIST response times.
+    /// `control` receives the client's HEAD and LIST response times, and
+    /// `outage` reports each response that asks the client to slow down.
     pub fn new(
         options: &Options,
         args: &crate::cli::Args,
         control: Arc<ControlSamples>,
-        outage: Arc<super::outage::Outage>,
+        outage: Arc<Outage>,
     ) -> Self {
+        let requests = Arc::new(Budget::new(
+            args.tuning_options.and_then(|t| t.s3_requests),
+            args.resource_limits
+                .as_ref()
+                .and_then(|limits| limits.s3_requests),
+        ));
+        outage.slow_down(&requests);
         Self {
             control,
             reads: crate::s3::read_recovery::Recovery::default(),
             upload: options.route == Route::Upload,
-            fixed_requests: args.tuning_options.and_then(|t| t.s3_requests),
             retained_upload_files: Default::default(),
-            upload_buffers: Arc::new(tokio::sync::Semaphore::new(256 * 1024 * 1024)),
-            // Provider-specific transfer seeds do not change the data route,
+            upload_buffers: Arc::new(tokio::sync::Semaphore::new(UPLOAD_BUFFER_BYTES as usize)),
+            // Provider-specific transfer starts do not change the data route,
             // integrity policy, or explicit overrides. Server copies use the
-            // same seeds for all providers.
+            // same starts for all providers.
             tigris: !options.route.is_server_copy() && options.is_tigris(),
-            requests: Arc::new(Budget::with_outage(
-                args.tuning_options
-                    .and_then(|t| t.s3_requests)
-                    .unwrap_or(64),
-                args.tuning_options.and_then(|t| t.s3_requests).is_none(),
-                args.resource_limits
-                    .as_ref()
-                    .and_then(|limits| limits.s3_requests),
-                Some(outage),
-            )),
+            requests,
         }
     }
     /// Keep at most one file per request slot across hashing and sending.
@@ -70,80 +158,45 @@ impl Tuning {
     pub fn observe_control(&self, elapsed: Duration) {
         self.control.observe(elapsed);
     }
-    pub fn high_latency(&self) -> bool {
-        let ns = self.control.fastest();
-        // Tigris uploads keep their conservative seed. Downloads still need
-        // enough requests in flight to cover a long round trip, regardless of
-        // provider; short copies cannot recover time spent ramping from 64.
-        (!self.tigris || !self.upload) && ns != u64::MAX && ns >= HIGH_LATENCY.as_nanos() as u64
+    /// Whether the endpoint is far enough away that small objects' requests
+    /// spend nearly all their time waiting for it. Tigris uploads keep the
+    /// usual start, which measured faster there.
+    pub fn far(&self) -> bool {
+        (!self.tigris || !self.upload)
+            && self
+                .control_latency()
+                .is_some_and(|latency| latency >= HIGH_LATENCY)
     }
-    pub fn configure(&self, tiny: bool, request_cap: usize, seed: usize) {
-        let request_cap = request_cap
-            .max(self.fixed_requests.unwrap_or(1))
-            .min(self.requests.ceiling.unwrap_or(usize::MAX));
-        let mut s = self.requests.state.lock().unwrap();
-        // Configuration separates completed planning from transfer admission.
-        // Planning HEADs use permits but supply no transfer-throughput samples,
-        // and earlier listing or discovery throttles must not cut a new batch.
-        s.since = None;
-        s.saturated = false;
-        s.settled = false;
-        s.handed_off = false;
-        s.backoff_windows = 0;
-        s.throttle_backoff = 0;
-        s.checking_above = false;
-        if let Some(outage) = &self.requests.outage {
-            s.seen_throttled = outage.throttled_responses();
-        }
-        s.max = request_cap;
-        s.limit = self.fixed_requests.unwrap_or(seed).min(request_cap);
-        if self.fixed_requests.is_none() && tiny && self.high_latency() {
-            // At high request latency, starting below the measured capacity
-            // leaves short queues waiting through an extra response cycle.
-            s.limit = request_cap;
-        }
+    /// Whether the endpoint answers within `LOCAL_LATENCY`.
+    pub fn local(&self) -> bool {
+        self.control_latency()
+            .is_some_and(|latency| latency < LOCAL_LATENCY)
     }
     pub fn tigris(&self) -> bool {
         self.tigris
     }
-    /// Whether the user set the request count, as a value or as a ceiling.
-    pub fn requests_set(&self) -> bool {
-        self.fixed_requests.is_some() || self.requests.ceiling.is_some()
+    /// Start a batch at `initial` requests, whose memory and descriptors
+    /// allow `ceiling` in flight at once, growing by an eighth at a time
+    /// rather than doubling when `gradual`.
+    pub fn configure(&self, initial: usize, ceiling: usize, gradual: bool) {
+        self.requests.configure(initial, ceiling, gradual);
     }
+    /// The most requests that may be in flight: the count the user fixed, or
+    /// the batch's ceiling.
     pub fn request_capacity(&self) -> usize {
-        self.fixed_requests
-            .unwrap_or_else(|| self.requests.state.lock().unwrap().max)
+        self.requests.capacity()
     }
     pub fn request_limit(&self) -> usize {
-        self.requests.state.lock().unwrap().limit
+        self.requests.limit()
     }
     pub fn control_latency(&self) -> Option<Duration> {
         let ns = self.control.fastest();
         (ns != u64::MAX).then(|| Duration::from_nanos(ns))
     }
-    pub fn report(&self, workers: usize) {
-        super::diagnostics::planning(self.control_latency(), workers, self.request_limit());
-    }
-    /// Whether the endpoint answers within 3 ms, as on the same machine or a
-    /// fast LAN, where downloads use a few large ranges per object.
-    pub fn local_latency(&self) -> bool {
-        self.control.fastest() < 3_000_000
+    pub fn report(&self, objects: usize) {
+        super::diagnostics::planning(self.control_latency(), objects, self.request_limit());
     }
 }
-/// The fastest control response at which an endpoint counts as far away, so
-/// that copies of many small objects start with every request in flight and
-/// probe upward instead of ramping from a low seed. A response on a reused
-/// connection takes one round trip. When a copy has only a client's first
-/// response, which also opens the connection, it takes about two round trips
-/// over HTTP and three over HTTPS, so the endpoint counts as far from about a
-/// 10 or 6 ms round trip.
-pub(super) const HIGH_LATENCY: Duration = Duration::from_millis(20);
-/// Below this fastest control response, a far endpoint's uploads of small
-/// files start with at most 2,048 objects in flight instead of 4,096. The
-/// response takes at least one round trip, so the endpoint is closer than
-/// this, and at up to 30 ms 2,048 objects finish as soon as 4,096 in about
-/// 40% less memory. From 60 ms they finish later.
-pub(super) const NEAR_FAR_LATENCY: Duration = Duration::from_millis(32);
 /// Path latency is the fastest single control response. The time to plan a copy
 /// grows with the number of listing pages, so it says little about the path.
 ///
@@ -186,98 +239,463 @@ impl ControlSamples {
 fn nanos(elapsed: Duration) -> u64 {
     elapsed.as_nanos().min(u64::MAX as u128) as u64
 }
+
+/// One measurement window, as the policy sees it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Sample {
+    /// The average number of requests in flight.
+    pub in_flight: f64,
+    /// Seconds in flight per unit of work: the finished requests' response
+    /// times over their bytes plus `REQUEST_CREDIT` each.
+    pub time: f64,
+    /// Work finished per second as counted, for diagnostics.
+    pub rate: f64,
+}
+
+/// Growth pays while each request added carries at least this fraction of
+/// what a request already in flight carries on average: doubling the
+/// requests must raise the rate by at least 41%.
+const PAYING: f64 = 0.5;
+
+/// A window's limit and what it measured.
+#[derive(Clone, Copy, Debug)]
+struct Point {
+    limit: usize,
+    in_flight: f64,
+    /// By Little's law, the rate work finishes: requests in flight over each
+    /// one's time in flight per unit of work.
+    rate: f64,
+}
+impl Point {
+    /// How much of the change in requests in flight since `before` showed in
+    /// the rate: 1 when each request added carried as much as the others, 0
+    /// when the rate did not change. `None` when too few requests changed to
+    /// tell.
+    fn elasticity(&self, before: &Point) -> Option<f64> {
+        let requests = (self.in_flight / before.in_flight).ln();
+        (requests.abs() >= 0.05).then(|| (self.rate / before.rate).ln() / requests)
+    }
+}
+
+/// The decisions, apart from the accounting that measures each window.
+#[derive(Debug, Default)]
+pub(super) struct Policy {
+    /// A change has been undone or the service throttled, so growth no
+    /// longer doubles.
+    settled: bool,
+    /// Steps lower the limit, after a step up did not pay, until one costs
+    /// as much rate as the requests it removed.
+    down: bool,
+    /// The window before the last change, which the change is judged against.
+    reference: Option<Point>,
+    /// The last change already had a window that did not pay. Connections a
+    /// change opens start slowly, so it gets one more before it is undone.
+    doubted: bool,
+}
+impl Policy {
+    pub fn observe(&mut self, limit: usize, max: usize, sample: Sample) -> usize {
+        if sample.time <= 0.0 || sample.in_flight <= 0.0 {
+            return limit;
+        }
+        let here = Point {
+            limit,
+            in_flight: sample.in_flight,
+            rate: sample.in_flight / sample.time,
+        };
+        let step = (limit / 8).max(1);
+        if let Some(before) = self.reference.filter(|before| before.limit != limit) {
+            match here.elasticity(&before) {
+                Some(paid) if limit > before.limit && paid < PAYING => {
+                    if !self.doubted {
+                        self.doubted = true;
+                        return limit;
+                    }
+                    // Little's law: the requests that carry the new rate at
+                    // the old rate per request.
+                    let needed = (before.in_flight * here.rate / before.rate).round() as usize;
+                    self.settled = true;
+                    self.down = true;
+                    return self.change(here, needed.clamp(before.limit, limit - 1));
+                }
+                // The requests a step down removed carried their share: back.
+                Some(paid) if limit < before.limit && paid > PAYING => {
+                    self.down = false;
+                    return self.change(here, before.limit.min(max));
+                }
+                _ => {}
+            }
+        }
+        // Nothing below one request to try: probe upwards again.
+        if limit <= 1 {
+            self.down = false;
+        }
+        // The last change stands, or there was none: step on.
+        let after = if self.down {
+            limit.saturating_sub(step).max(1)
+        } else if here.in_flight >= (limit - step) as f64 {
+            let grown = if self.settled {
+                limit + step
+            } else {
+                limit * 2
+            };
+            grown.min(max).max(limit)
+        } else {
+            // Without demand for the whole limit, more would go unused.
+            limit
+        };
+        self.change(here, after)
+    }
+    /// Move to `after`, to be judged against `here`; a limit that stays
+    /// has been judged.
+    fn change(&mut self, here: Point, after: usize) -> usize {
+        self.doubted = false;
+        self.reference = (after != here.limit).then_some(here);
+        after
+    }
+    /// The service asked for fewer requests.
+    pub fn throttled(&mut self, limit: usize) -> usize {
+        *self = Self {
+            settled: true,
+            ..Self::default()
+        };
+        (limit / 2).max(1)
+    }
+}
+
+/// Accounting for the current measurement window.
 struct Window {
+    start: Option<Instant>,
+    /// When `area` was last brought up to date.
+    last: Instant,
+    /// Request-seconds in flight since `start`.
+    area: f64,
+    work: u64,
+    completed: usize,
+    /// The finished requests' response times, in seconds.
+    responses: f64,
+    /// The part of those response times since `start`, in seconds: the
+    /// finished requests' share of `area`. A request admitted before the
+    /// window counts only its time within it.
+    covered: f64,
+    /// The mean time a request spent in flight in the last complete window,
+    /// which bounds the wait for stragglers.
+    response: Duration,
+}
+impl Window {
+    fn new(now: Instant) -> Self {
+        Self {
+            start: None,
+            last: now,
+            area: 0.0,
+            work: 0,
+            completed: 0,
+            responses: 0.0,
+            covered: 0.0,
+            response: Duration::ZERO,
+        }
+    }
+    fn begin(&mut self, now: Instant) {
+        self.start = Some(now);
+        self.last = now;
+        self.area = 0.0;
+        self.work = 0;
+        self.completed = 0;
+        self.responses = 0.0;
+        self.covered = 0.0;
+    }
+    /// Bring the window up to `now`, with `active` requests in flight since
+    /// it was last brought up to date, or start it once `settled`. Call
+    /// before `active` changes.
+    fn advance(&mut self, now: Instant, active: usize, settled: bool) {
+        if self.start.is_some() {
+            self.area += active as f64 * now.saturating_duration_since(self.last).as_secs_f64();
+            self.last = now;
+        } else if settled {
+            self.begin(now);
+        }
+    }
+    /// The window's sample, once it has run long enough to describe the limit.
+    fn sample(&self, now: Instant) -> Option<(Sample, Duration)> {
+        let elapsed = now.saturating_duration_since(self.start?);
+        if elapsed < SAMPLE {
+            return None;
+        }
+        let seconds = elapsed.as_secs_f64();
+        let in_flight = self.area / seconds;
+        // The first requests to finish are the fastest; wait for the rest.
+        if (self.completed as f64) < in_flight.max(MIN_COMPLETIONS as f64) {
+            return None;
+        }
+        // Little's law holds for the requests that finished only once their
+        // time within the window accounts for most of the time requests
+        // spent in flight in it: quick checks finishing beside long
+        // transfers would otherwise stand for the transfers too, and so
+        // would one long transfer from before the window finishing early in
+        // it while the others are still in flight.
+        let covered = self.covered >= COVERED * self.area;
+        // Once the window has waited long enough for its stragglers, those
+        // still in flight count as having carried nothing yet, and the rate
+        // is the work finished per second.
+        if !covered && elapsed < UNCOVERED_WAIT {
+            return None;
+        }
+        let spent = if covered { self.responses } else { self.area };
+        let sample = Sample {
+            in_flight,
+            time: spent / self.work as f64,
+            rate: self.work as f64 / seconds,
+        };
+        Some((
+            sample,
+            Duration::from_secs_f64(self.responses / self.completed as f64),
+        ))
+    }
+}
+
+struct Control {
+    /// The batch's ceiling, within the user's.
+    max: usize,
+    /// The ceiling the user set, if any.
+    ceiling: Option<usize>,
+    policy: Policy,
+    window: Window,
+}
+impl Control {
+    fn new(max: usize, ceiling: Option<usize>, now: Instant) -> Self {
+        Self {
+            max,
+            ceiling,
+            policy: Policy::default(),
+            window: Window::new(now),
+        }
+    }
+}
+
+struct State {
     active: usize,
     limit: usize,
-    max: usize,
-    adaptive: bool,
-    since: Option<Instant>,
-    bytes: u64,
-    completed: usize,
-    recent: std::collections::VecDeque<(Instant, u64)>,
-    saturated: bool,
-    previous: Option<(usize, f64)>,
-    progress_start: u64,
-    previous_progress_rate: Option<f64>,
-    proposed_limit: usize,
-    slower_limit: usize,
-    probe_preserved_rate: bool,
-    object_rate: Option<(usize, f64, Duration)>,
-    settled: bool,
-    handed_off: bool,
-    checking_above: bool,
-    seen_throttled: u64,
-    backoff_windows: usize,
-    throttle_backoff: usize,
+    /// Counts changes of the limit.
+    generation: u64,
+    /// When the limit last changed.
+    changed: Instant,
+    /// Requests in flight admitted before the last change.
+    old: usize,
+    /// Requests in flight admitted before the service last asked for fewer
+    /// requests, whose refusals that halving answered.
+    refused: usize,
+    /// The generation that halving started, and when.
+    cut: (u64, Instant),
+    /// `None` when the user fixed the count.
+    control: Option<Control>,
 }
+impl State {
+    fn advance(&mut self, now: Instant) {
+        let (active, old, limit, changed) = (self.active, self.old, self.limit, self.changed);
+        if let Some(control) = &mut self.control {
+            let window = &mut control.window;
+            let settled = old <= limit / STRAGGLERS
+                || now >= changed + STRAGGLER_WINDOWS * SAMPLE.max(window.response);
+            window.advance(now, active, settled);
+        }
+    }
+    /// The limit changed: what is in flight now was admitted before, and
+    /// the next window waits for it.
+    fn changed(&mut self, after: usize, now: Instant) -> usize {
+        self.generation += 1;
+        self.changed = now;
+        self.old = self.active;
+        if let Some(control) = &mut self.control {
+            control.window.start = None;
+        }
+        std::mem::replace(&mut self.limit, after)
+    }
+    /// Count a request admitted at `started` that finished having moved
+    /// `bytes`, and decide once the window allows. Returns the limit before
+    /// and after a change.
+    fn finished(&mut self, now: Instant, started: Instant, bytes: u64) -> Option<(usize, usize)> {
+        let limit = self.limit;
+        let control = self.control.as_mut()?;
+        let window = &mut control.window;
+        let start = window.start?;
+        // A request that finished as the window started belongs before it.
+        if start == now {
+            return None;
+        }
+        window.completed += 1;
+        window.responses += now.saturating_duration_since(started).as_secs_f64();
+        window.covered += now
+            .saturating_duration_since(started.max(start))
+            .as_secs_f64();
+        window.work = window
+            .work
+            .saturating_add(bytes.saturating_add(REQUEST_CREDIT));
+        let (sample, response) = window.sample(now)?;
+        window.response = response;
+        let after = control.policy.observe(limit, control.max, sample);
+        super::diagnostics::request_window(
+            limit,
+            after,
+            &sample,
+            window.completed,
+            now.saturating_duration_since(window.start?),
+        );
+        if after == limit {
+            window.begin(now);
+            return None;
+        }
+        self.changed(after, now);
+        Some((limit, after))
+    }
+    /// The service asked for fewer requests. Returns the limit before and
+    /// after a change.
+    fn throttled(&mut self, now: Instant) -> Option<(usize, usize)> {
+        let limit = self.limit;
+        let control = self.control.as_mut()?;
+        // Requests admitted before the last halving ran into what it
+        // answered, and so do their retries, which keep their permits; but
+        // a few that stay in flight long after it, which may have hung, do
+        // not hold back the next.
+        if self.refused > 0 && now < self.cut.1 + UNCOVERED_WAIT {
+            return None;
+        }
+        let after = control.policy.throttled(limit);
+        super::diagnostics::request_throttled(limit, after);
+        // What the window measured was the service refusing requests; at one
+        // request the limit stays, and the next window starts afresh.
+        self.changed(after, now);
+        self.refused = self.active;
+        self.cut = (self.generation, now);
+        (after != limit).then_some((limit, after))
+    }
+    /// A request admitted in `generation` finished.
+    fn released(&mut self, generation: u64) {
+        self.active -= 1;
+        if generation != self.generation {
+            self.old = self.old.saturating_sub(1);
+        }
+        if generation < self.cut.0 {
+            self.refused = self.refused.saturating_sub(1);
+        }
+    }
+}
+
+/// The permits for S3 requests, one per request in flight.
 pub(super) struct Budget {
-    ceiling: Option<usize>,
-    outage: Option<Arc<super::outage::Outage>>,
-    state: Mutex<Window>,
+    state: Mutex<State>,
+    /// Wakes requests waiting for a permit.
     changed: Notify,
-    received: AtomicU64,
+    /// The current limit, for admission that follows it.
+    limit: watch::Sender<usize>,
 }
+/// One request's place in flight. A request that succeeds reports the bytes
+/// it moved; the permit accounts for them, with its response time, when it
+/// is released.
 pub(super) struct Permit {
     budget: Arc<Budget>,
-    track_received: bool,
+    generation: u64,
+    started: Instant,
+    bytes: u64,
 }
 impl Permit {
-    // Download traffic can include retries; it is evidence for interpreting a
-    // partial sample, not for accepting a gain or declaring a copy successful.
-    // Requests admitted after ramp-up skip the shared counter entirely.
-    pub fn received(&self, bytes: usize) {
-        if self.track_received {
-            self.budget.received.fetch_add(bytes as u64, Relaxed);
-        }
+    /// The request succeeded after moving `bytes`.
+    pub fn completed(&mut self, bytes: u64) {
+        self.bytes = self.bytes.saturating_add(bytes);
     }
 }
 impl Budget {
-    #[cfg(test)]
-    fn new(limit: usize, adaptive: bool) -> Self {
-        Self::with_outage(limit, adaptive, None, None)
-    }
-    #[cfg(test)]
-    fn with_ceiling(limit: usize, adaptive: bool, ceiling: Option<usize>) -> Self {
-        Self::with_outage(limit, adaptive, ceiling, None)
-    }
-    fn with_outage(
-        limit: usize,
-        adaptive: bool,
-        ceiling: Option<usize>,
-        outage: Option<Arc<super::outage::Outage>>,
-    ) -> Self {
-        let limit = limit.min(ceiling.unwrap_or(usize::MAX));
-        let seen_throttled = outage.as_ref().map_or(0, |o| o.throttled_responses());
+    /// `fixed` is a count the user set, `ceiling` one the user capped.
+    pub(super) fn new(fixed: Option<usize>, ceiling: Option<usize>) -> Self {
+        let now = Instant::now();
+        let (limit, control) = match fixed {
+            Some(fixed) => (fixed, None),
+            None => {
+                let max = DEFAULT_CEILING.min(ceiling.unwrap_or(usize::MAX));
+                let control = Control::new(max, ceiling, now);
+                (INITIAL_REQUESTS.min(max), Some(control))
+            }
+        };
         Self {
-            ceiling,
-            outage,
-            state: Mutex::new(Window {
+            state: Mutex::new(State {
                 active: 0,
                 limit,
-                max: 256.min(ceiling.unwrap_or(usize::MAX)),
-                adaptive,
-                since: None,
-                bytes: 0,
-                completed: 0,
-                recent: std::collections::VecDeque::new(),
-                saturated: false,
-                previous: None,
-                progress_start: 0,
-                previous_progress_rate: None,
-                proposed_limit: limit,
-                slower_limit: 0,
-                probe_preserved_rate: false,
-                object_rate: None,
-                settled: false,
-                handed_off: false,
-                checking_above: false,
-                seen_throttled,
-                backoff_windows: 0,
-                throttle_backoff: 0,
+                generation: 0,
+                changed: now,
+                old: 0,
+                refused: 0,
+                cut: (0, now),
+                control,
             }),
             changed: Notify::new(),
-            received: AtomicU64::new(0),
+            limit: watch::Sender::new(limit),
         }
+    }
+    /// Start a batch at `initial` requests in flight, with `ceiling` as its
+    /// most, growing by an eighth at a time rather than doubling when
+    /// `gradual`. Nothing carries over from the last batch, whose requests
+    /// say little about this one's, nor do earlier refusals, which the
+    /// requests that drew them have answered.
+    pub fn configure(&self, initial: usize, ceiling: usize, gradual: bool) {
+        let mut state = self.state.lock().unwrap();
+        let Some(control) = &mut state.control else {
+            return;
+        };
+        let max = ceiling.min(control.ceiling.unwrap_or(usize::MAX)).max(1);
+        let now = Instant::now();
+        *control = Control::new(max, control.ceiling, now);
+        control.policy.settled = gradual;
+        let after = initial.clamp(1, max);
+        let before = state.changed(after, now);
+        self.publish(&state, Some((before, after)));
+    }
+    /// Wake requests and admission for a change of the limit. The state
+    /// lock is held, so that changes reach admission in the order they
+    /// happened: otherwise `4 → 2` could publish after `2 → 1`, leaving 2
+    /// to hide a later `1 → 2`.
+    fn publish(&self, _state: &std::sync::MutexGuard<'_, State>, change: Option<(usize, usize)>) {
+        let Some((before, after)) = change else {
+            return;
+        };
+        if after > before {
+            self.changed.notify_waiters();
+        }
+        self.limit.send_if_modified(|limit| {
+            let changed = *limit != after;
+            *limit = after;
+            changed
+        });
+    }
+    pub fn limit(&self) -> usize {
+        self.state.lock().unwrap().limit
+    }
+    /// Move the limit as a measurement would.
+    #[cfg(test)]
+    pub fn set_limit(&self, after: usize) {
+        let mut state = self.state.lock().unwrap();
+        let before = state.changed(after, Instant::now());
+        self.publish(&state, Some((before, after)));
+    }
+    /// Whether growth is by an eighth at a time rather than doubling.
+    #[cfg(test)]
+    pub fn gradual(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.control.as_ref().is_some_and(|c| c.policy.settled)
+    }
+    pub fn capacity(&self) -> usize {
+        let state = self.state.lock().unwrap();
+        state.control.as_ref().map_or(state.limit, |c| c.max)
+    }
+    /// Follow the limit as it changes.
+    pub fn subscribe(&self) -> watch::Receiver<usize> {
+        self.limit.subscribe()
+    }
+    /// A response asked the client to slow down (HTTP 429 or 503). Called as
+    /// it arrives, while its request may still be retried.
+    pub fn throttled(&self) {
+        let mut state = self.state.lock().unwrap();
+        let now = Instant::now();
+        state.advance(now);
+        let change = state.throttled(now);
+        self.publish(&state, change);
     }
     pub async fn acquire(self: &Arc<Self>) -> Permit {
         loop {
@@ -285,307 +703,37 @@ impl Budget {
             tokio::pin!(ready);
             ready.as_mut().enable();
             {
-                let mut s = self.state.lock().unwrap();
-                if s.active < s.limit {
-                    // Planning and source preparation precede request admission;
-                    // they must not depress the ramp's first throughput score.
-                    s.since.get_or_insert_with(Instant::now);
-                    s.active += 1;
+                let mut state = self.state.lock().unwrap();
+                let now = Instant::now();
+                state.advance(now);
+                if state.active < state.limit {
+                    state.active += 1;
                     return Permit {
                         budget: self.clone(),
-                        track_received: s.adaptive && !s.settled,
+                        generation: state.generation,
+                        started: now,
+                        bytes: 0,
                     };
                 }
-                s.saturated = true;
             }
             ready.await;
         }
     }
-    pub fn preparation_limit(&self) -> usize {
-        self.state.lock().unwrap().limit.saturating_add(1)
-    }
-    pub fn slower_limit(&self) -> usize {
-        self.state.lock().unwrap().slower_limit
-    }
-    // A rejected doubling can still have a small gain. This only chooses the
-    // first object probe; it does not accept the higher request setting.
-    pub fn probe_preserved_rate(&self) -> bool {
-        self.state.lock().unwrap().probe_preserved_rate
-    }
-    pub fn object_rate(&self, workers: usize) -> Option<(f64, Duration)> {
-        let s = self.state.lock().unwrap();
-        s.object_rate
-            .filter(|(limit, _, _)| *limit == workers)
-            .map(|(_, rate, elapsed)| (rate, elapsed))
-    }
-    pub fn rejected_limit(&self) -> Option<usize> {
-        let s = self.state.lock().unwrap();
-        let (previous, _) = s.previous?;
-        // Keep the actual attempted limit when smaller probes narrow the gap.
-        (s.settled && s.limit == previous).then_some(s.proposed_limit)
-    }
-    #[cfg(test)]
-    pub fn begin_objects(&self, workers: usize) -> Option<usize> {
-        self.begin_objects_with_throttled(workers)
-            .map(|(limit, _)| limit)
-    }
-    pub fn begin_objects_with_throttled(&self, workers: usize) -> Option<(usize, u64)> {
-        let mut s = self.state.lock().unwrap();
-        // Reaching the object seed is not evidence that the last increase helped.
-        // Resolve that probe before allowing the object controller to grow again,
-        // unless throttling already backed the ramp off and the object controller
-        // should take over recovery from the reduced limit.
-        if s.adaptive
-            && !s.settled
-            && s.backoff_windows == 0
-            && (s.limit < workers || s.previous.is_some())
-        {
-            return None;
-        }
-        // Freeze the request ramp while the scheduler drains its existing jobs.
-        // Some jobs may still be waiting in acquire(); increasing the request
-        // limit here would let them bypass the newly chosen object concurrency.
-        s.settled = true;
-        s.handed_off = true;
-        Some((workers.min(s.limit), s.seen_throttled))
-    }
-    pub fn set_checking_above(&self, above: bool) {
-        let mut s = self.state.lock().unwrap();
-        let was = s.checking_above;
-        if was && !above {
-            // Consume throttles drawn while expanded checking was active under
-            // the same lock before clearing the flag, so no concurrent
-            // completion or permit drop can observe the cleared flag first.
-            if let Some(outage) = &self.outage {
-                s.seen_throttled = outage.throttled_responses();
-            }
-        }
-        s.checking_above = above;
-    }
-    pub fn finish_objects(&self, maximum: usize) {
-        let maximum = maximum.min(self.ceiling.unwrap_or(usize::MAX));
-        let mut s = self.state.lock().unwrap();
-        if s.adaptive {
-            s.limit = maximum;
-            s.max = maximum;
-        }
-        s.adaptive = false;
-        s.handed_off = true;
-        drop(s);
-        self.changed.notify_waiters();
-    }
-    /// Back off when the service asks for fewer requests (HTTP 429/503).
-    /// Halves the adaptive limit once active requests have drained to it, so
-    /// delayed replies from a previous cut cannot collapse the budget in one
-    /// burst. Shared across completion, permit drop, and scheduler ticks so a
-    /// single throttled response cannot cut twice.
-    pub fn throttled(&self) {
-        let mut s = self.state.lock().unwrap();
-        self.check_throttle(&mut s);
-    }
-    fn check_throttle(&self, s: &mut Window) -> bool {
-        let Some(outage) = &self.outage else {
-            return false;
-        };
-        let responses = outage.throttled_responses();
-        if responses == s.seen_throttled {
-            return false;
-        }
-        s.seen_throttled = responses;
-        if !s.adaptive || s.handed_off || s.checking_above || s.active > s.limit {
-            return false;
-        }
-        self.apply_throttle(s);
-        true
-    }
-    fn apply_throttle(&self, s: &mut Window) {
-        let before = s.limit;
-        let next = (before / 2).max(1);
-        s.limit = next;
-        // Keep `s.max` intact and reopen `s.settled` so long-running multipart
-        // transfers can grow back after throttling clears, even if a previous
-        // throughput probe had settled the ramp.
-        s.settled = false;
-        s.throttle_backoff = (s.throttle_backoff.saturating_mul(2)).clamp(4, 16);
-        s.backoff_windows = s.throttle_backoff;
-        s.previous = None;
-        s.previous_progress_rate = None;
-        s.object_rate = None;
-        s.since = Some(Instant::now());
-        s.bytes = 0;
-        s.progress_start = self.received.load(Relaxed);
-        s.completed = 0;
-        s.recent.clear();
-        s.saturated = false;
-        if next != before {
-            super::diagnostics::request_window(before, next, 0.0, Duration::ZERO, 0, false, false);
-        }
-    }
-    pub fn completed(&self, bytes: u64) {
-        let mut s = self.state.lock().unwrap();
-        s.bytes += bytes;
-        s.completed += 1;
-        if self.check_throttle(&mut s) {
-            return;
-        }
-        let Some(since) = s.since else { return };
-        if !s.adaptive || s.settled {
-            return;
-        }
+    fn release(&self, permit: &Permit) {
+        let mut state = self.state.lock().unwrap();
         let now = Instant::now();
-        let elapsed = now.duration_since(since);
-        // Seventeen endpoints give sixteen complete inter-arrival intervals.
-        s.recent.push_back((now, bytes));
-        if s.recent.len() > 17 {
-            s.recent.pop_front();
-        }
-        if elapsed < Duration::from_millis(250)
-            || s.completed < 16
-            || (s.previous.is_none() && s.completed < s.limit)
-        {
-            return;
-        }
-        let received = self.received.load(Relaxed);
-        if s.backoff_windows > 0 {
-            s.backoff_windows -= 1;
-            s.since = Some(Instant::now());
-            s.bytes = 0;
-            s.progress_start = received;
-            s.completed = 0;
-            s.recent.clear();
-            s.saturated = false;
-            return;
-        }
-        // A throughput plateau is a reason to stop adding competing requests.
-        // The first window includes startup and is only a baseline, but must
-        // contain a full count: the first few replies understate its capacity.
-        let rate = s.bytes as f64 / elapsed.as_secs_f64();
-        let progress_rate =
-            received.saturating_sub(s.progress_start) as f64 / elapsed.as_secs_f64();
-        let before = s.limit;
-        let mut next_limit = s.limit.saturating_mul(2);
-        if s.saturated || s.previous.is_some() {
-            if let Some((old_limit, old_rate)) = s.previous {
-                // A quarter-sized probe should not need the gain of a doubling.
-                // Keep the same gain per additional request slot.
-                let added_fraction = s.limit as f64 / old_limit as f64 - 1.0;
-                let required_gain = if s.previous_progress_rate.is_some_and(|rate| rate > 0.0) {
-                    1.0 + 0.05 * added_fraction
-                } else {
-                    1.05
-                };
-                // At the object seed there may be no request waiter. A partial
-                // response wave then understates capacity on long-latency paths;
-                // collect a full count before accepting or rejecting this probe.
-                if !s.saturated && s.completed < s.limit {
-                    return;
-                }
-                if rate < old_rate * required_gain {
-                    if s.completed < s.limit {
-                        if let Some(old_progress) =
-                            s.previous_progress_rate.filter(|old| *old > 0.0)
-                        {
-                            // Downloads expose bytes still in flight. Compare
-                            // those rates before calling an incomplete wave a
-                            // loss. A late completion burst cannot erase a slow
-                            // body window, nor can unfinished bytes look idle.
-                            if progress_rate >= old_progress * required_gain {
-                                return;
-                            }
-                        } else {
-                            // Uploads expose only successful completion here.
-                            // Keep their recent-arrival confirmation: the whole
-                            // window can contain a response-cycle gap.
-                            if s.recent.len() < 17 {
-                                return;
-                            }
-                            let recent_elapsed = now.duration_since(s.recent[0].0).as_secs_f64();
-                            let recent_bytes: u64 = s.recent.iter().skip(1).map(|(_, n)| *n).sum();
-                            if recent_bytes as f64 / recent_elapsed >= old_rate * required_gain {
-                                return;
-                            }
-                        }
-                    }
-                    s.probe_preserved_rate = rate >= old_rate;
-                    s.limit = old_limit;
-                    s.settled = true;
-                } else if s.completed < s.limit {
-                    // Early completions can still belong to the old setting.
-                    // Require more evidence before accepting a gain, while a
-                    // saturated losing probe can stop at the usual sample cadence.
-                    return;
-                } else {
-                    // Keep the inferior setting so object admission does not
-                    // discard what this completed request probe just learned.
-                    s.slower_limit = old_limit;
-                    // A modest gain from a larger download window calls for
-                    // a smaller next probe, limiting work committed to overload.
-                    if s.previous_progress_rate.is_some_and(|rate| rate > 0.0)
-                        && rate < old_rate * (1.0 + 0.25 * added_fraction)
-                    {
-                        next_limit = s.limit.saturating_add((s.limit / 4).max(1));
-                    }
-                    s.previous = None;
-                    s.throttle_backoff = 0;
-                }
-            }
-            if !s.settled && s.saturated && s.limit < s.max {
-                s.previous = Some((s.limit, rate));
-                s.previous_progress_rate = Some(progress_rate);
-                s.limit = next_limit.min(s.max);
-                s.proposed_limit = s.limit;
-            }
-        }
-        // Only single-request object batches reuse this score. Match object
-        // activity units, including the fixed credit for each completed file.
-        // A changed limit or rejected probe cannot supply its new baseline.
-        s.object_rate = None;
-        if !s.settled && s.limit == before && s.completed >= before {
-            s.object_rate = Some((
-                before,
-                (s.bytes as f64 + s.completed as f64 * crate::tune::FILE_CREDIT as f64)
-                    / elapsed.as_secs_f64(),
-                elapsed,
-            ));
-        }
-        super::diagnostics::request_window(
-            before,
-            s.limit,
-            rate,
-            elapsed,
-            s.completed,
-            s.saturated,
-            s.settled,
-        );
-        let grew = s.limit > before;
-        s.since = Some(Instant::now());
-        s.bytes = 0;
-        s.progress_start = received;
-        s.completed = 0;
-        s.recent.clear();
-        s.saturated = false;
-        drop(s);
-        if grew {
-            self.changed.notify_waiters();
-        }
+        state.advance(now);
+        state.released(permit.generation);
+        let change = state.finished(now, permit.started, permit.bytes);
+        // One completion frees one slot. Waking the entire queue makes every
+        // waiting request compete for that slot; growth wakes them all.
+        self.changed.notify_one();
+        self.publish(&state, change);
     }
 }
 impl Drop for Permit {
     fn drop(&mut self) {
-        let mut s = self.budget.state.lock().unwrap();
-        s.active -= 1;
-        // Consume throttle signals on permit release too, so paths that do not
-        // report transferred bytes (such as multipart metadata copies or failed
-        // requests) still back off.
-        self.budget.check_throttle(&mut s);
-        let has_room = s.active < s.limit;
-        drop(s);
-        // One completion frees at most one slot. Waking the entire queue makes
-        // every waiting request compete for that slot; capacity growth wakes
-        // all waiters separately in completed().
-        if has_room {
-            self.budget.changed.notify_one();
-        }
+        self.budget.release(self);
     }
 }
 

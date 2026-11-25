@@ -15,18 +15,14 @@ fn resource_ceilings_bound_initial_and_adaptive_s3_concurrency() {
                 "s3-objects=3,s3-requests=2,s3-parts-per-object=1",
             ]);
             engine.options.route = route.clone();
-            engine.tuning.observe_control(Duration::from_millis(100));
             let workers = engine
                 .object_workers(std::iter::repeat_n(size, 1024))
                 .unwrap();
-            assert!((1..=3).contains(&workers.initial));
-            assert!(workers.maximum.is_none_or(|n| n <= 3));
+            assert!(workers.objects <= 3);
+            assert!((1..=3).contains(&workers.limit()));
             assert_eq!(engine.part_workers(), 1);
             assert!(engine.tuning.request_limit() <= 2);
-            if let Some(maximum) = workers.maximum {
-                engine.tuning.requests.finish_objects(maximum);
-                assert!(engine.tuning.request_limit() <= 2);
-            }
+            assert!(engine.tuning.request_capacity() <= 2);
         }
     }
     let fixed = planning_engine(&[
@@ -36,64 +32,135 @@ fn resource_ceilings_bound_initial_and_adaptive_s3_concurrency() {
     let workers = fixed
         .object_workers(std::iter::repeat_n(1024, 1024))
         .unwrap();
-    assert_eq!(workers.initial, 7);
-    assert!(workers.maximum.is_none());
+    assert_eq!(workers.objects, 7);
+    assert!(workers.requests.is_none());
     assert_eq!(fixed.tuning.request_limit(), 6);
     assert_eq!(fixed.part_workers(), 5);
 }
 
 #[test]
-fn objects_checked_beyond_the_transfer_limit_stay_within_set_limits() {
+fn request_and_object_ceilings_apply_to_checks_and_transfers_alike() {
+    // So that uploads' descriptor budget allows 256 objects.
+    crate::raise_nofile();
     let copy = || Route::ServerCopy {
         source_bucket: "source".into(),
     };
-    let checking = |flags: &[&str], route: Route| {
+    // Checks take request permits like transfers, so the same two ceilings
+    // bound both: the objects in progress and the requests in flight.
+    let ceilings = |flags: &[&str], route: Route| {
         let mut engine = planning_engine(flags);
         engine.options.route = route;
-        engine
+        let workers = engine
             .object_workers(std::iter::repeat_n(8u64 << 20, 1024))
-            .unwrap()
-            .checking
-            .map(|checking| checking.maximum)
+            .unwrap();
+        (workers.objects, engine.tuning.request_capacity())
     };
-    assert_eq!(checking(&[], Route::Upload), Some(256));
-    assert_eq!(checking(&[], Route::Download), Some(256));
-    // A copy between buckets asks about the source and the destination.
-    assert_eq!(checking(&[], copy()), Some(128));
-    for (flag, route, expected) in [
-        ("--resource-limits=s3-objects=40", Route::Upload, Some(40)),
-        ("--resource-limits=s3-objects=40", copy(), Some(40)),
+    for (flags, route, expected) in [
+        (&[][..], Route::Upload, (256, 256)),
+        (&[][..], Route::Download, (256, 256)),
+        (&[][..], copy(), (256, 256)),
         (
-            "--resource-limits=s3-requests=40",
-            Route::Download,
-            Some(40),
-        ),
-        ("--resource-limits=s3-requests=40", copy(), Some(20)),
-        (
-            "--performance-tuning=s3-requests=16",
+            &["--resource-limits=s3-objects=40"][..],
             Route::Upload,
-            Some(16),
+            (40, 256),
         ),
-        ("--performance-tuning=s3-requests=1", copy(), Some(1)),
-        // A fixed object count is the number of objects in progress.
-        ("--performance-tuning=s3-objects=7", Route::Upload, None),
+        (&["--resource-limits=s3-objects=40"][..], copy(), (40, 256)),
+        (
+            &["--resource-limits=s3-requests=40"][..],
+            Route::Download,
+            (256, 40),
+        ),
+        (&["--resource-limits=s3-requests=40"][..], copy(), (256, 40)),
+        (
+            &["--performance-tuning=s3-requests=16"][..],
+            Route::Upload,
+            (256, 16),
+        ),
+        (
+            &["--performance-tuning=s3-objects=7"][..],
+            Route::Upload,
+            (7, 256),
+        ),
     ] {
-        assert_eq!(checking(&[flag], route), expected, "{flag}");
+        assert_eq!(ceilings(flags, route), expected, "{flags:?}");
     }
-    // Between buckets a request count the user set also admits each
-    // object's own metadata requests, as before.
-    for (flags, set) in [
-        (&[][..], false),
-        (&["--performance-tuning=s3-requests=16"][..], true),
-        (&["--resource-limits=s3-requests=16"][..], true),
-        (&["--resource-limits=s3-objects=16"][..], false),
-    ] {
-        assert_eq!(
-            planning_engine(flags).tuning.requests_set(),
-            set,
-            "{flags:?}"
+}
+
+#[test]
+fn only_files_the_upload_buffers_hold_wait_for_room_in_them() {
+    // So that uploads' descriptor budget allows 256 objects.
+    crate::raise_nofile();
+    let in_progress = |size: u64| {
+        let (engine, _temp) = route_engine("upload", &[]);
+        let workers = engine
+            .object_workers(std::iter::repeat_n(size, 1024))
+            .unwrap();
+        engine.tuning.requests.set_limit(64);
+        workers.limit()
+    };
+    // Files of up to 8 MiB are kept from hashing to sending them, so no
+    // more get ready ahead of their requests than the buffers hold: 64 of
+    // 4 MiB, beside 64 requests.
+    assert_eq!(in_progress(4 << 20), 64);
+    // Larger files sent in one request are read again to send them anyway,
+    // so the objects in progress follow the requests as for downloads,
+    // rather than stop at the 21 files of 12 MiB the buffers would hold.
+    assert_eq!(in_progress(12 << 20), 128);
+}
+
+/// Where the open-file limit leaves no room beyond the descriptors kept for
+/// sockets and opens, only small uploads fail; other copies keep the usual
+/// ceiling.
+#[test]
+fn a_low_open_file_limit_fails_only_small_uploads() {
+    const CHILD: &str = "SYQ_TEST_LOW_NOFILE_OBJECT_WORKERS";
+    if std::env::var_os(CHILD).is_none() {
+        // Only the child lowers its limit; other tests are unaffected.
+        let name =
+            "s3::transfer::fast::buffer_tests::a_low_open_file_limit_fails_only_small_uploads";
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{output:?}"
         );
+        return;
     }
+    let mut limits = crate::fsops::nofile_limits().unwrap();
+    limits.rlim_cur = limits.rlim_cur.min(64);
+    crate::fsops::set_nofile_limits(&limits).unwrap();
+    assert!(tuning::small_object_capacity(1024).is_err());
+    let small = || std::iter::repeat_n(1024u64, 100);
+    // Downloads of small objects, few or many, a count the user fixed,
+    for count in [2, 100] {
+        let workers = planning_engine(&[])
+            .object_workers(std::iter::repeat_n(1024u64, count))
+            .unwrap();
+        assert_eq!(workers.objects, 256);
+    }
+    let fixed = planning_engine(&["--performance-tuning", "s3-objects=1"]);
+    assert_eq!(fixed.object_workers(small()).unwrap().objects, 1);
+    let (fixed, _temp) = route_engine("upload", &["--performance-tuning", "s3-objects=2"]);
+    let workers = fixed
+        .object_workers(std::iter::repeat_n(4u64 << 20, 100))
+        .unwrap();
+    assert_eq!(workers.objects, 2);
+    // a dry run, and a single object.
+    planning_engine(&["--dry-run"])
+        .object_workers(small())
+        .unwrap();
+    planning_engine(&[])
+        .object_workers(std::iter::once(1024))
+        .unwrap();
+    // Every small upload needs room for its files.
+    let (upload, _temp) = route_engine("upload", &[]);
+    assert!(upload.object_workers(small()).is_err());
+    let (upload, _temp) = route_engine("upload", &["--performance-tuning", "s3-objects=1"]);
+    assert!(upload.object_workers(small()).is_err());
 }
 
 #[test]
@@ -107,77 +174,105 @@ fn server_copy_threshold_tracks_single_request_scheduling() {
     assert_eq!(engine.copy_request_limit(limit + 1), limit);
     assert_eq!((6u64 << 30).div_ceil(engine.part_size(6u64 << 30)), 24);
     assert_eq!(engine.part_workers(), engine.tuning.request_capacity());
-    assert!(engine
-        .object_workers([256 << 20; 100].into_iter())
-        .unwrap()
-        .maximum
-        .is_some());
-    assert!(engine
-        .object_workers([limit + 1; 100].into_iter())
-        .unwrap()
-        .maximum
-        .is_none());
+    // Objects of one request each may all be in progress; objects in parts
+    // keep the request limit busy with fewer.
+    let objects = |engine: &Engine, size| {
+        engine
+            .object_workers([size; 100].into_iter())
+            .unwrap()
+            .objects
+    };
+    assert_eq!(objects(&engine, 256 << 20), 256);
+    assert_eq!(objects(&engine, limit + 1), MULTIPART_OBJECTS);
     let mut explicit = planning_engine(&["--performance-tuning", "s3-part-size=64M"]);
     explicit.options.route = Route::ServerCopy {
         source_bucket: "source".into(),
     };
     assert_eq!(explicit.copy_request_limit(32 << 20), 64 << 20);
-    assert!(explicit
-        .object_workers([256 << 20; 100].into_iter())
-        .unwrap()
-        .maximum
-        .is_none());
+    assert_eq!(objects(&explicit, 256 << 20), MULTIPART_OBJECTS);
+}
+
+/// An engine for `route`, whose tuning knows the route from the start.
+fn route_engine(route: &str, extra: &[&str]) -> (Engine, Option<tempfile::TempDir>) {
+    match route {
+        "upload" => {
+            let temp = crate::test_support::tempdir().unwrap();
+            let path = temp.path().join("source");
+            std::fs::write(&path, b"selected").unwrap();
+            let argv = [
+                "cp",
+                path.to_str().unwrap(),
+                "--to",
+                "s3://bucket",
+                "--as",
+                "o",
+            ];
+            let engine = super::super::tests::engine(&[&argv[..], extra].concat());
+            (engine, Some(temp))
+        }
+        "download" => (planning_engine(extra), None),
+        _ => (
+            planning_engine(&[&["--to", "s3://destination"][..], extra].concat()),
+            None,
+        ),
+    }
 }
 
 #[test]
-fn server_copy_tuning_is_provider_neutral_and_respects_explicit_limits() {
-    let mut observed = Vec::new();
-    for (endpoint, tigris) in [
-        ("https://t3.storage.dev", true),
-        ("https://storage.example", false),
+fn transfers_start_by_route_endpoint_and_explicit_limits() {
+    const MIB: u64 = 1 << 20;
+    const LOCAL: u64 = 1;
+    const NEAR: u64 = 10;
+    const FAR: u64 = 100;
+    let example = "https://storage.example";
+    let tigris = "https://t3.storage.dev";
+    // Part size and parts per object for a 32 GiB object; requests in flight
+    // when a batch of such objects starts, and when 512 small ones start
+    // (`None`: as many as the batch's memory and descriptors allow).
+    for (route, endpoint, ms, parts, small) in [
+        ("upload", example, LOCAL, (16 * MIB, 64), Some(64)),
+        ("upload", example, FAR, (16 * MIB, 64), None),
+        ("upload", tigris, LOCAL, (8 * MIB, 32), Some(64)),
+        // Tigris uploads keep the usual start, which measured faster there.
+        ("upload", tigris, FAR, (8 * MIB, 32), Some(64)),
+        ("download", example, LOCAL, (64 * MIB, 4), Some(64)),
+        ("download", example, NEAR, (8 * MIB, 64), Some(64)),
+        ("download", example, FAR, (8 * MIB, 64), Some(256)),
+        ("download", tigris, LOCAL, (64 * MIB, 4), Some(64)),
+        ("download", tigris, FAR, (16 * MIB, 8), Some(256)),
+        ("copy", example, LOCAL, (256 * MIB, 256), Some(64)),
+        ("copy", tigris, FAR, (256 * MIB, 256), Some(256)),
     ] {
-        for extra in [
-            "",
-            "s3-requests=1",
-            "s3-requests=128",
-            "s3-parts-per-object=7",
-        ] {
-            let mut flags = vec!["--to", "s3://destination", "--s3-endpoint", endpoint];
+        for extra in ["", "s3-requests=128", "s3-parts-per-object=7"] {
+            let mut flags = vec!["--s3-endpoint", endpoint];
             if !extra.is_empty() {
                 flags.extend(["--performance-tuning", extra]);
             }
-            let engine = planning_engine(&flags);
-            assert_eq!(engine.options.is_tigris(), tigris);
-            assert!(!engine.tuning.tigris());
-            engine.tuning.observe_control(Duration::from_millis(100));
-            let workers = engine.object_workers([32u64 << 30].into_iter()).unwrap();
-            let expected = match extra {
-                "s3-requests=1" => 1,
-                "s3-requests=128" => 128,
-                "s3-parts-per-object=7" => 7,
-                _ => 256,
+            let (engine, _temp) = route_engine(route, &flags);
+            engine.tuning.observe_control(Duration::from_millis(ms));
+            let case = format!("{route} {endpoint} {ms} ms {extra}");
+            let fixed = (extra == "s3-requests=128").then_some(128);
+            engine.object_workers([32u64 << 30].into_iter()).unwrap();
+            let workers = match (extra, route) {
+                ("s3-parts-per-object=7", _) => 7,
+                (_, "copy") => fixed.unwrap_or(parts.1),
+                _ => parts.1,
             };
-            // A per-object queue follows the global exploration range,
-            // not the initial 64 permits; explicit limits remain binding.
-            assert_eq!(engine.part_workers(), expected);
-            observed.push((
-                workers.initial,
-                engine.part_size(32u64 << 30),
-                engine.part_workers(),
-                engine.tuning.request_limit(),
-            ));
+            assert_eq!(
+                (engine.part_size(32u64 << 30), engine.part_workers()),
+                (parts.0, workers),
+                "{case}"
+            );
+            assert_eq!(engine.tuning.request_limit(), fixed.unwrap_or(64), "{case}");
             engine.object_workers([1024u64; 512].into_iter()).unwrap();
+            let capacity = engine.tuning.request_capacity();
             assert_eq!(
                 engine.tuning.request_limit(),
-                match extra {
-                    "s3-requests=1" => 1,
-                    "s3-requests=128" => 128,
-                    _ => 256,
-                }
+                fixed.unwrap_or(small.unwrap_or(capacity).min(capacity)),
+                "{case}"
             );
         }
     }
-    assert_eq!(observed[..4], observed[4..]);
 }
 
 #[tokio::test]
@@ -315,25 +410,45 @@ async fn pending_read_exact_keeps_consumed_bytes_across_observations() {
 }
 
 #[test]
-fn far_small_uploads_start_with_at_most_2048_objects_below_32_ms() {
+fn far_small_uploads_start_with_at_most_2048_requests_below_32_ms() {
+    // Only a capacity above 2,048 shows the lower start; raise the soft
+    // descriptor limit as the binary does at startup.
+    crate::raise_nofile();
     let start = |ms| {
-        let mut engine = planning_engine(&[]);
-        engine.options.route = Route::Upload;
+        let (engine, _temp) = route_engine("upload", &[]);
         engine.tuning.observe_control(Duration::from_millis(ms));
         let workers = engine
             .object_workers(std::iter::repeat_n(1024, 10_000))
             .unwrap();
-        assert_eq!(engine.tuning.request_limit(), workers.initial, "{ms} ms");
-        workers.initial
+        // Objects follow the requests, within what memory and descriptors
+        // allow.
+        assert_eq!(engine.tuning.request_capacity(), workers.objects, "{ms} ms");
+        assert_eq!(
+            workers.limit(),
+            (2 * engine.tuning.request_limit()).min(workers.objects),
+            "{ms} ms"
+        );
+        (engine.tuning.request_limit(), workers.objects)
     };
-    // Only a capacity above 2,048 shows the lower start; raise the soft
-    // descriptor limit as the binary does at startup.
-    crate::raise_nofile();
-    let capacity = start(100);
+    let (limit, capacity) = start(100);
+    {
+        let (engine, _temp) = route_engine("upload", &[]);
+        engine.tuning.observe_control(Duration::from_millis(100));
+        engine
+            .object_workers(std::iter::repeat_n(1024, 10_000))
+            .unwrap();
+        assert!(!engine.tuning.requests.gradual());
+    }
     assert!(capacity > 2048, "small-object capacity {capacity}");
-    assert_eq!(start(32), capacity);
-    assert_eq!(start(20), capacity.min(2048));
-    assert_eq!(start(31), capacity.min(2048));
+    // Far away, every request memory and descriptors allow from the start;
+    assert_eq!(limit, capacity);
+    assert_eq!(start(32).0, capacity);
+    // a little nearer, no more than 2,048,
+    assert_eq!(start(20).0, capacity.min(2048));
+    assert_eq!(start(31).0, capacity.min(2048));
+    // and near, the usual start, to grow from what the requests show.
+    assert_eq!(start(19).0, 64);
+    assert_eq!(start(1).0, 64);
 }
 
 pub(super) fn planning_engine(extra: &[&str]) -> Engine {
@@ -425,138 +540,117 @@ fn completed_download_releases_blocking_capacity_for_secondary_hash() {
 }
 
 #[tokio::test]
-async fn small_download_search_preserves_seeds_mixed_batches_and_overrides() {
+async fn far_small_downloads_start_at_256_requests_within_their_ceiling() {
     let engine = planning_engine(&[]);
     engine.tuning.observe_control(Duration::from_millis(100));
     let concurrency = engine
         .object_workers(std::iter::repeat_n(64 * 1024, 8192))
         .unwrap();
-    let maximum = concurrency.maximum.unwrap();
-    assert!((1..=4096).contains(&maximum));
-    assert_eq!(concurrency.initial, maximum.min(256));
-    assert_eq!(engine.tuning.request_limit(), 256);
+    assert!((1..=4096).contains(&concurrency.objects));
+    assert_eq!(engine.tuning.request_capacity(), concurrency.objects);
+    assert_eq!(engine.tuning.request_limit(), concurrency.objects.min(256));
+    // Each response in flight holds its buffers: add them gradually.
+    assert!(engine.tuning.requests.gradual());
+    assert_eq!(
+        concurrency.limit(),
+        concurrency.objects.min(2 * engine.tuning.request_limit())
+    );
 
     // An average below 1 MiB does not make every object small. Keep the
-    // existing target when even one larger object needs streaming buffers.
-    let mixed = planning_engine(&[])
+    // existing ceiling when even one larger object needs streaming buffers.
+    let mixed = planning_engine(&[]);
+    mixed.tuning.observe_control(Duration::from_millis(100));
+    let concurrency = mixed
         .object_workers(std::iter::repeat_n(64 * 1024, 8192).chain([1024 * 1024]))
         .unwrap();
-    assert_eq!(mixed.initial, 256);
-    assert_eq!(mixed.maximum, Some(256));
+    assert_eq!(concurrency.objects, 256);
+    assert_eq!(mixed.tuning.request_capacity(), 256);
+    assert_eq!(mixed.tuning.request_limit(), 256);
 
     let fixed = planning_engine(&["--performance-tuning", "s3-objects=1024,s3-requests=128"]);
     let concurrency = fixed
         .object_workers(std::iter::repeat_n(64 * 1024, 8192))
         .unwrap();
-    assert_eq!(concurrency.initial, 1024);
-    assert!(concurrency.maximum.is_none());
+    assert_eq!(concurrency.limit(), 1024);
+    assert!(concurrency.requests.is_none());
     assert_eq!(fixed.tuning.request_limit(), 128);
+}
+
+#[test]
+fn files_get_ready_ahead_of_their_requests_only_as_far_as_upload_buffers_hold() {
+    let (engine, _temp) = route_engine("upload", &[]);
+    // Thirty-two 8 MiB files fill the upload buffers: no more get ready
+    // beside the 32 requests in flight,
+    let concurrency = engine
+        .object_workers(std::iter::repeat_n(8 * 1024 * 1024, 64))
+        .unwrap();
+    assert_eq!(engine.tuning.request_limit(), 32);
+    assert_eq!(concurrency.limit(), 32);
+    // though objects still follow a higher request limit.
+    concurrency.requests.as_ref().unwrap().set_limit(64);
+    assert_eq!(concurrency.limit(), 64);
+    // Small files fit many times over: twice the requests get ready.
+    let (engine, _temp) = route_engine("upload", &[]);
+    let concurrency = engine
+        .object_workers(std::iter::repeat_n(64 * 1024, 1024))
+        .unwrap();
+    assert_eq!(concurrency.limit(), 2 * engine.tuning.request_limit());
 }
 
 #[tokio::test]
 async fn whole_object_batches_start_conservatively_and_can_tune_higher() {
+    let initial = crate::s3::tuning::INITIAL_REQUESTS;
     for count in [16, 32, 33, 128, 4096] {
         let engine = planning_engine(&[]);
         let concurrency = engine
             .object_workers(std::iter::repeat_n(1024 * 1024, count))
             .unwrap();
-        assert_eq!(engine.tuning.request_limit(), 32);
-        assert_eq!(concurrency.maximum, (count > 32).then_some(count.min(256)));
-        assert_eq!(concurrency.initial, 32);
-        if count > 32 {
-            let requests = concurrency.requests.unwrap();
-            assert_eq!(requests.preparation_limit(), 33);
-            assert_eq!(requests.begin_objects(concurrency.initial), Some(32));
-            requests.finish_objects(concurrency.maximum.unwrap());
-            assert_eq!(requests.preparation_limit(), count.min(256) + 1);
-        }
+        assert_eq!(engine.tuning.request_limit(), initial);
+        assert_eq!(engine.tuning.request_capacity(), 256);
+        assert_eq!(concurrency.objects, 256);
+        assert_eq!(concurrency.limit(), 2 * initial);
+        let requests = concurrency.requests.as_ref().unwrap();
+        requests.set_limit(1000);
+        assert_eq!(concurrency.limit(), 256);
     }
     for size_mib in [1, 2, 4, 8] {
-        let engine = planning_engine(&[]);
-        engine.tuning.observe_control(Duration::from_millis(100));
-        let concurrency = engine
-            .object_workers(std::iter::repeat_n(size_mib * 1024 * 1024, 512))
-            .unwrap();
-        assert_eq!(concurrency.initial, 32);
-        assert_eq!(engine.tuning.request_limit(), 32);
-        assert_eq!(concurrency.maximum, Some(256));
-        let requests = concurrency.requests.unwrap();
-        assert_eq!(requests.preparation_limit(), 33);
-        assert_eq!(requests.begin_objects(concurrency.initial), Some(32));
-    }
-    {
-        let engine = planning_engine(&["--dry-run"]);
-        let concurrency = engine
-            .object_workers(std::iter::repeat_n(1024 * 1024, 512))
-            .unwrap();
-        assert_eq!(concurrency.initial, 32);
-        assert_eq!(engine.tuning.request_limit(), 32);
-        assert!(concurrency.maximum.is_none());
+        for flags in [&[][..], &["--dry-run"][..]] {
+            let engine = planning_engine(flags);
+            engine.tuning.observe_control(Duration::from_millis(100));
+            let concurrency = engine
+                .object_workers(std::iter::repeat_n(size_mib * 1024 * 1024, 512))
+                .unwrap();
+            assert_eq!(concurrency.limit(), 2 * initial);
+            assert_eq!(engine.tuning.request_limit(), initial);
+            assert_eq!(concurrency.objects, 256);
+        }
     }
     let engine = planning_engine(&["--performance-tuning", "s3-requests=64"]);
     let concurrency = engine
         .object_workers(std::iter::repeat_n(1024 * 1024, 512))
         .unwrap();
-    assert_eq!(concurrency.initial, 64);
+    assert_eq!(concurrency.limit(), 128);
     assert_eq!(engine.tuning.request_limit(), 64);
     let engine = planning_engine(&["--performance-tuning", "s3-objects=8"]);
     let concurrency = engine
         .object_workers(std::iter::repeat_n(1024 * 1024, 128))
         .unwrap();
-    assert_eq!(concurrency.initial, 8);
-    assert!(concurrency.maximum.is_none());
+    assert_eq!(concurrency.limit(), 8);
+    assert!(concurrency.requests.is_none());
 }
 
-#[tokio::test(start_paused = true)]
-async fn throttled_checking_above_transfer_limit_leaves_multipart_budget_untouched() {
-    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-    // Build the exact production multipart Concurrency via Engine::object_workers
-    // (maximum == None, checking == Some) to verify `requests` is still wired
-    // so checking_above protects the shared transfer budget.
+#[test]
+fn a_refusal_lowers_the_copy_request_limit_as_it_arrives() {
     let engine = planning_engine(&[]);
-    let mut concurrency = engine
+    engine
         .object_workers(std::iter::repeat_n(64 * 1024 * 1024u64, 4_000))
         .unwrap();
-    assert!(concurrency.maximum.is_none());
-    assert!(concurrency.checking.is_some());
-    assert!(concurrency.requests.is_some());
-    concurrency.initial = 16;
-    engine.tuning.configure(false, 64, 16);
-    let outage = engine.outage.clone();
-    let budget = engine.tuning.requests.clone();
-    let checking_active = Arc::new(AtomicUsize::new(0));
-    crate::s3::admission::parallel((0..4_000usize).collect(), concurrency, |job, mut slot| {
-        let outage = outage.clone();
-        let budget = budget.clone();
-        let checking_active = checking_active.clone();
-        async move {
-            let now = checking_active.fetch_add(1, SeqCst) + 1;
-            if now > 20 {
-                outage.throttled();
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            checking_active.fetch_sub(1, SeqCst);
-            if job % 50 == 0 {
-                slot.claim().await;
-                let permit = budget.acquire().await;
-                tokio::time::sleep(Duration::from_millis(5)).await;
-                budget.completed(1024);
-                drop(permit);
-                Ok(Some(1024))
-            } else {
-                Ok(None)
-            }
-        }
-    })
-    .await
-    .unwrap();
-    assert!(
-        outage.throttled_responses() > 0,
-        "expected checking requests above transfer limit to trigger throttling"
-    );
-    assert_eq!(
-        engine.tuning.request_limit(),
-        16,
-        "throttling while checking is above transfer limit must not halve the request budget"
-    );
+    let before = engine.tuning.request_limit();
+    // The client reports the refusal while its request may still retry.
+    engine.outage.throttled();
+    assert_eq!(engine.tuning.request_limit(), before / 2);
+    // A count the user fixed stays.
+    let fixed = planning_engine(&["--performance-tuning", "s3-requests=6"]);
+    fixed.outage.throttled();
+    assert_eq!(fixed.tuning.request_limit(), 6);
 }

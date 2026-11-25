@@ -1,5 +1,6 @@
 //! A prefix whose objects nearly all match the destination already, behind
-//! responses slow enough to see how many requests are in flight.
+//! responses slow enough to see how many requests are in flight. It serves
+//! the prefix as a source to download and as a destination to upload into.
 use super::*;
 
 /// Objects whose destination file matches. Their average size starts
@@ -24,24 +25,54 @@ impl InFlight {
             peak: AtomicUsize::new(0),
         }
     }
-    fn hold(&self, time: Duration) {
+    fn enter(&self) {
         let now = self.now.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(now, Ordering::SeqCst);
-        thread::sleep(time);
+    }
+    fn leave(&self) {
         self.now.fetch_sub(1, Ordering::SeqCst);
+    }
+    /// Hold a request of this kind, which also counts among `REQUESTS`.
+    fn hold(&self, time: Duration) {
+        REQUESTS.enter();
+        self.enter();
+        thread::sleep(time);
+        self.leave();
+        REQUESTS.leave();
     }
     pub(super) fn peak(&self) -> usize {
         self.peak.load(Ordering::SeqCst)
     }
+    pub(super) fn reset(&self) {
+        self.peak
+            .store(self.now.load(Ordering::SeqCst), Ordering::SeqCst);
+    }
 }
 pub(super) static HEADS: InFlight = InFlight::new();
 pub(super) static GETS: InFlight = InFlight::new();
+pub(super) static PUTS: InFlight = InFlight::new();
+/// Checks and transfers together.
+pub(super) static REQUESTS: InFlight = InFlight::new();
+
+/// Hold while counting this fixture's requests: the counters are shared by
+/// every test in the process, as tests run under plain `cargo test`.
+pub(super) fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+    static COUNTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    COUNTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 pub(super) fn key(index: usize) -> String {
     format!("data/f{index:05}")
 }
 
-pub(super) fn serve(socket: &mut TcpStream, method: &str, target: &str) {
+pub(super) fn serve(
+    socket: &mut TcpStream,
+    method: &str,
+    target: &str,
+    headers: &std::collections::HashMap<String, String>,
+) {
     let url = url::Url::parse(&format!("http://fixture{target}")).unwrap();
     let query: std::collections::HashMap<_, _> = url.query_pairs().collect();
     let index = url
@@ -147,6 +178,19 @@ pub(super) fn serve(socket: &mut TcpStream, method: &str, target: &str) {
         ("GET", Some(index)) if (UNCHANGED..UNCHANGED + CHANGED).contains(&index) => {
             GETS.hold(Duration::from_millis(50));
             reply(socket, 200, &object(1), b"x", false);
+        }
+        ("PUT", Some(index)) if (UNCHANGED..UNCHANGED + CHANGED).contains(&index) => {
+            let mut body = vec![0; headers["content-length"].parse().unwrap()];
+            socket.read_exact(&mut body).unwrap();
+            assert_eq!(body, b"x");
+            PUTS.hold(Duration::from_millis(50));
+            reply(
+                socket,
+                200,
+                &[("ETag".into(), "\"put\"".into())],
+                b"",
+                false,
+            );
         }
         _ => panic!("unexpected request {method} {target}"),
     }

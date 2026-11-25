@@ -9,7 +9,7 @@ mod subtrees;
 mod upload_hashes;
 
 use super::{
-    admission::{parallel, TransferSlot},
+    admission::parallel,
     checksum::Algorithm,
     client::{self, Metadata, Object, ObjectKind},
     local::{self, Destination, Source},
@@ -455,7 +455,7 @@ impl Engine {
                 self.authorize_upload_checks(&plan).await?;
                 let prepared = Arc::new(Mutex::new(Vec::with_capacity(plan.len())));
                 let mut position = 0..;
-                parallel(plan, workers, |source, mut slot| {
+                parallel(plan, workers, |source| {
                     let listed = self.listed(position.next().unwrap(), &source.key);
                     let engine = self.clone();
                     let prepared = prepared.clone();
@@ -464,7 +464,7 @@ impl Engine {
                         let label = source.label.clone();
                         let kind = source.kind();
                         let expected = source.expected_hash.clone();
-                        match engine.prepare_upload(source, listed.await, &mut slot).await {
+                        match engine.prepare_upload(source, listed.await).await {
                             Ok(work) => prepared
                                 .lock()
                                 .await
@@ -473,7 +473,7 @@ impl Engine {
                                 engine.settle(&label, &key, kind, &Err(error), expected.as_ref())
                             }
                         }
-                        Ok(None)
+                        Ok(())
                     }
                 })
                 .await?;
@@ -503,33 +503,29 @@ impl Engine {
                         UploadPreparation::Preview(n) => *n,
                         UploadPreparation::Skipped => 0,
                     }))?;
-                parallel(
-                    prepared,
-                    workers,
-                    |(key, label, kind, expected, work), mut slot| {
-                        let engine = self.clone();
-                        async move {
-                            // Keep admitting jobs after cancellation so each one can
-                            // abort its unrecorded upload, but report nothing new.
-                            if engine.check_cancelled().is_err() {
-                                if let UploadPreparation::Ready(work) = &work {
-                                    engine.abort_unrecorded_preparation(work).await;
-                                }
-                                return Ok(None);
+                parallel(prepared, workers, |(key, label, kind, expected, work)| {
+                    let engine = self.clone();
+                    async move {
+                        // Keep admitting jobs after cancellation so each one can
+                        // abort its unrecorded upload, but report nothing new.
+                        if engine.check_cancelled().is_err() {
+                            if let UploadPreparation::Ready(work) = &work {
+                                engine.abort_unrecorded_preparation(work).await;
                             }
-                            let result = engine.execute_upload(work, &mut slot).await;
-                            engine.settle(&label, &key, kind, &result, expected.as_ref());
-                            Ok(result.ok().flatten())
+                            return Ok(());
                         }
-                    },
-                )
+                        let result = engine.execute_upload(work).await;
+                        engine.settle(&label, &key, kind, &result, expected.as_ref());
+                        Ok(())
+                    }
+                })
                 .await?;
             } else {
                 if self.args.prune_before {
                     self.prune(std::mem::take(&mut prune), None).await?;
                 }
                 let mut position = 0..;
-                parallel(plan, workers, |source, mut slot| {
+                parallel(plan, workers, |source| {
                     let listed = self.listed(position.next().unwrap(), &source.key);
                     let engine = self.clone();
                     async move {
@@ -541,9 +537,9 @@ impl Engine {
                         let listed = listed.await;
                         engine.check_cancelled()?;
                         let expected = source.expected_hash.as_ref().cloned();
-                        let result = engine.upload(source, listed, &mut slot).await;
+                        let result = engine.upload(source, listed).await;
                         engine.settle(&label, &key, kind, &result, expected.as_ref());
-                        Ok(result.ok().flatten())
+                        Ok(())
                     }
                 })
                 .await?;
@@ -610,7 +606,7 @@ impl Engine {
                     .await?;
                 }
                 let mut service_times = service_times.into_iter();
-                parallel(plan, workers, |mut job, mut slot| {
+                parallel(plan, workers, |mut job| {
                     let service_time = service_times.next().flatten();
                     let engine = self.clone();
                     let dst = destination.clone();
@@ -622,11 +618,7 @@ impl Engine {
                     async move {
                         engine.check_cancelled()?;
                         let result = match prepared {
-                            Ok(()) => {
-                                engine
-                                    .download(&mut job, &dst, dirs, service_time, &mut slot)
-                                    .await
-                            }
+                            Ok(()) => engine.download(&mut job, &dst, dirs, service_time).await,
                             Err(error) => Err(error),
                         }
                         .map_err(|error| {
@@ -665,7 +657,7 @@ impl Engine {
                             &result,
                             job.expected_hash(),
                         );
-                        Ok(result.ok().flatten())
+                        Ok(())
                     }
                 })
                 .await?;
@@ -1211,7 +1203,6 @@ impl Engine {
             &aws_sdk_s3::operation::head_object::HeadObjectOutput,
         ),
         refresh_head: bool,
-        slot: &mut TransferSlot,
     ) -> Result<UploadPreparation> {
         let size = object.size;
         if self.upload_requested_metadata_matches(&source, object) {
@@ -1225,7 +1216,6 @@ impl Engine {
         let desired = source.metadata(None);
         let flags =
             self.args.matching_meta_flags() | source.metadata.map_or(0, |m| m.apply_flags());
-        slot.claim().await;
         let _slot = self.tuning.requests.acquire().await;
         // A metadata-only replacement may leave the ETag unchanged while
         // comparison reads the file. Preserve the current attributes.
@@ -1312,7 +1302,6 @@ impl Engine {
         self: &Arc<Self>,
         source: Source,
         listed: Listed,
-        slot: &mut TransferSlot,
     ) -> Result<UploadPreparation> {
         if (self.args.ignore_existing && matches!(listed, Listed::Present(_)))
             || (self.args.existing && listed == Listed::Absent)
@@ -1323,6 +1312,9 @@ impl Engine {
         let head = if listed == Listed::Absent && !self.args.ignore_existing {
             None
         } else {
+            // A check is a request like any other: the request limit bounds
+            // it, and its completion counts as progress.
+            let _permit = self.tuning.requests.acquire().await;
             client::head_output(&self.client, &self.options.bucket, &source.key, None).await?
         };
         let existing = head
@@ -1411,12 +1403,9 @@ impl Engine {
                     source,
                     (existing.as_ref().unwrap(), head.as_ref().unwrap()),
                     false,
-                    slot,
                 )
                 .await;
         }
-        // Everything from here reads the file or changes the destination.
-        slot.claim().await;
         let comparable = existing
             .as_ref()
             .filter(|o| o.kind() == source.kind() && o.size == size);
@@ -1577,7 +1566,6 @@ impl Engine {
                     source,
                     (existing.as_ref().unwrap(), head.as_ref().unwrap()),
                     true,
-                    slot,
                 )
                 .await;
         }
@@ -1611,27 +1599,17 @@ impl Engine {
         Ok(UploadPreparation::Ready(Box::new(prepared)))
     }
 
-    async fn upload(
-        self: &Arc<Self>,
-        source: Source,
-        listed: Listed,
-        slot: &mut TransferSlot,
-    ) -> Result<Option<u64>> {
-        let prepared = self.prepare_upload(source, listed, slot).await?;
-        self.execute_upload(prepared, slot).await
+    async fn upload(self: &Arc<Self>, source: Source, listed: Listed) -> Result<Option<u64>> {
+        let prepared = self.prepare_upload(source, listed).await?;
+        self.execute_upload(prepared).await
     }
 
-    async fn execute_upload(
-        self: &Arc<Self>,
-        prepared: UploadPreparation,
-        slot: &mut TransferSlot,
-    ) -> Result<Option<u64>> {
+    async fn execute_upload(self: &Arc<Self>, prepared: UploadPreparation) -> Result<Option<u64>> {
         let prepared = match prepared {
             UploadPreparation::Skipped => return Ok(None),
             UploadPreparation::Preview(size) => return Ok(Some(size)),
             UploadPreparation::Ready(prepared) => *prepared,
         };
-        slot.claim().await;
         if let Some(update) = &prepared.metadata_update {
             update
                 .execute_counted(
@@ -1644,7 +1622,7 @@ impl Engine {
                         Ok(slot)
                     },
                     || async {},
-                    |bytes| self.tuning.requests.completed(bytes),
+                    |slot: &mut super::tuning::Permit, bytes| slot.completed(bytes),
                 )
                 .await?;
             self.progress
@@ -1667,7 +1645,7 @@ impl Engine {
         let _interval = self.progress.copying_interval();
         if size <= part_size || source.kind() != ObjectKind::File {
             let checksum = checksums.first().map(String::as_str);
-            let _slot = self.tuning.requests.acquire().await;
+            let mut slot = self.tuning.requests.acquire().await;
             self.upload_request(&source.key, None, algorithm, checksum)
                 .send(
                     async {
@@ -1705,7 +1683,7 @@ impl Engine {
                 .await?
                 .map_err(|e| e.into_service_error())
                 .context("S3 PUT failed")?;
-            self.tuning.requests.completed(size);
+            slot.completed(size);
             self.progress.add_bytes(size);
         } else {
             let PreparedMultipart {
@@ -1794,7 +1772,7 @@ impl Engine {
                                         .build());
                                 }
                             }
-                            let _slot = self.tuning.requests.acquire().await;
+                            let mut slot = self.tuning.requests.acquire().await;
                             let payload = request_payload(payload.as_ref(), source).await?;
                             let payload = &payload;
                             let output = self
@@ -1850,7 +1828,7 @@ impl Engine {
                                     acknowledged.dirty = false;
                                 }
                             }
-                            self.tuning.requests.completed(length);
+                            slot.completed(length);
                             self.progress.add_bytes(length);
                             Ok(CompletedPart::builder()
                                 .part_number(number)
@@ -2548,7 +2526,6 @@ impl Engine {
         destination: &Destination,
         directories: DirectoryMetadata,
         service_time: Option<(i64, u32)>,
-        slot: &mut TransferSlot,
     ) -> Result<Option<u64>> {
         let known_source = job.source_object.as_deref().map(Object::expression_file);
         let source_facts = known_source.as_ref().map_or(
@@ -2652,7 +2629,6 @@ impl Engine {
         };
         let mut initial_slot = None;
         let initial = if get_first {
-            slot.claim().await;
             initial_slot = Some(self.tuning.requests.acquire().await);
             Some(
                 self.client
@@ -2686,6 +2662,9 @@ impl Engine {
         } else if let Some(object) = job.source_object.as_deref() {
             object.clone()
         } else {
+            // The check is a request like any other, within the same limit;
+            // its slot is free again before a transfer takes one.
+            let _slot = self.tuning.requests.acquire().await;
             client::head(&self.client, &self.options.bucket, &job.key)
                 .await?
                 .context("S3 source disappeared after listing")?
@@ -2788,7 +2767,6 @@ impl Engine {
             if object.size > 1024 * 1024 {
                 bail!("S3 symlink target is too large");
             }
-            slot.claim().await;
             let bytes = self.get_small(&object, initial, initial_slot).await?;
             if let Some(hash) = metadata
                 .hash
@@ -2853,7 +2831,6 @@ impl Engine {
                     || self.args.protects_existing_contents()
                     || self.stored_comparison_hash(&object).is_some())
             {
-                slot.claim().await;
                 checked = self.verify_download(root, &path, &object).await?;
                 unchanged = checked.is_some();
             }
@@ -2864,7 +2841,6 @@ impl Engine {
             job.path
         );
         if unchanged && expected_hash.is_some() {
-            slot.claim().await;
             match self.verify_expected_local(root, &path, expected_hash).await {
                 Ok(Some(hashed)) => Hashed::add(&mut checked, hashed),
                 Ok(None) => {}
@@ -2896,7 +2872,6 @@ impl Engine {
                 return Ok(Some(object.size));
             }
             let mode = existing.map(|m| m.mode & 0o7777);
-            slot.claim().await;
             match self
                 .replace_from_local(
                     root,
@@ -2955,7 +2930,6 @@ impl Engine {
             self.progress.add_bytes(object.size);
             return Ok(Some(object.size));
         }
-        slot.claim().await;
         directories.create_missing_parents(root, &path)?;
         if object.size <= part_size {
             return self
@@ -3253,6 +3227,7 @@ impl Engine {
             }
             // Fresh ranges validate If-Match, the ETag, and the total length.
             if object.version.is_none() && reused_partial {
+                let _slot = self.tuning.requests.acquire().await;
                 let final_object = client::head(&self.client, &self.options.bucket, &object.key)
                     .await?
                     .context("source disappeared during download")?;
@@ -3744,7 +3719,7 @@ impl Engine {
         Some((metadata.hash_algorithm, metadata.hash.as_deref()?))
     }
     async fn remote_hash_as(&self, object: &Object, algorithm: HashAlgorithm) -> Result<String> {
-        let _slot = self.tuning.requests.acquire().await;
+        let mut slot = self.tuning.requests.acquire().await;
         let output = self
             .client
             .get_object()
@@ -3770,6 +3745,7 @@ impl Engine {
         if n != object.size {
             bail!("S3 response was truncated or exceeded its advertised size");
         }
+        slot.completed(n);
         Ok(Digest::from_hash(algorithm, &hash.finalize()).value)
     }
 }

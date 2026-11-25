@@ -1,6 +1,9 @@
 //! Stop a batch when S3 stops answering, instead of spending every object's
 //! retries on a service that is down.
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed},
+    Arc, OnceLock, Weak,
+};
 
 /// Requests that fail after their retries without an answer from the service,
 /// with none answered in between, before a batch stops. A partial outage or
@@ -13,6 +16,20 @@ pub(crate) struct Outage {
     stopped: AtomicBool,
     notify: tokio::sync::Notify,
     throttled: AtomicU64,
+    requests: Requests,
+}
+
+/// The request limit to lower as each throttling response arrives.
+#[derive(Default)]
+struct Requests(OnceLock<Weak<super::tuning::Budget>>);
+impl std::fmt::Debug for Requests {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.get().is_some() {
+            "Requests(set)"
+        } else {
+            "Requests(unset)"
+        })
+    }
 }
 
 impl Outage {
@@ -44,9 +61,19 @@ impl Outage {
     /// was then retried.
     pub(crate) fn throttled(&self) {
         self.throttled.fetch_add(1, Relaxed);
+        if let Some(requests) = self.requests.0.get().and_then(Weak::upgrade) {
+            requests.throttled();
+        }
+    }
+
+    /// Lower `requests` as each throttling response arrives, rather than when
+    /// its request, which may be retried first, finishes.
+    pub(super) fn slow_down(&self, requests: &Arc<super::tuning::Budget>) {
+        let _ = self.requests.0.set(Arc::downgrade(requests));
     }
 
     /// How many responses have asked that so far.
+    #[cfg(test)]
     pub(crate) fn throttled_responses(&self) -> u64 {
         self.throttled.load(Relaxed)
     }

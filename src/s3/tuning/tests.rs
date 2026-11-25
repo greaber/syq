@@ -1,672 +1,352 @@
 use super::*;
 use std::{future::Future, task::Context};
 
-#[tokio::test]
-async fn resource_request_ceiling_survives_configuration_and_object_handoff() {
-    let tuning = Tuning {
-        control: Arc::default(),
-        fixed_requests: None,
-        tigris: false,
-        upload: false,
-        requests: Arc::new(Budget::with_ceiling(64, true, Some(3))),
-        reads: crate::s3::read_recovery::Recovery::default(),
-        retained_upload_files: Default::default(),
-        upload_buffers: Arc::new(tokio::sync::Semaphore::new(1)),
-    };
-    assert_eq!(tuning.request_limit(), 3);
-    for tiny in [false, true] {
-        tuning.observe_control(Duration::from_millis(100));
-        tuning.configure(tiny, 512, 64);
-        assert_eq!(tuning.request_limit(), 3);
-        assert_eq!(tuning.request_capacity(), 3);
-    }
-    let budget = &tuning.requests;
-    let a = budget.acquire().await;
-    let b = budget.acquire().await;
-    let c = budget.acquire().await;
-    let mut blocked = Box::pin(budget.acquire());
-    assert!(futures_util::poll!(&mut blocked).is_pending());
-    budget.finish_objects(512);
-    assert_eq!(tuning.request_limit(), 3);
-    assert!(futures_util::poll!(&mut blocked).is_pending());
-    drop(a);
-    let next = tokio::time::timeout(Duration::from_secs(1), blocked)
-        .await
-        .unwrap();
-    drop((b, c, next));
+fn new_budget(fixed: Option<usize>, ceiling: Option<usize>) -> (Arc<Budget>, Arc<Outage>) {
+    let outage = Arc::new(Outage::default());
+    let budget = Arc::new(Budget::new(fixed, ceiling));
+    outage.slow_down(&budget);
+    (budget, outage)
 }
 
-#[tokio::test]
-async fn planning_time_does_not_advance_the_first_request_window() {
-    let budget = Arc::new(Budget::new(64, true));
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let held = budget.acquire().await;
-    // A full request queue is waiting, but the transfer has only just begun.
-    budget.state.lock().unwrap().saturated = true;
-    for _ in 0..16 {
-        budget.completed(1024);
-    }
-    let (limit, previous, since) = {
-        let state = budget.state.lock().unwrap();
-        (state.limit, state.previous, state.since)
-    };
-    assert_eq!(limit, 64);
-    assert!(previous.is_none());
-    drop(held);
-    let _next = budget.acquire().await;
-    let next_since = budget.state.lock().unwrap().since;
-    assert_eq!(next_since, since);
-}
-
-#[tokio::test]
-async fn transfer_configuration_discards_planning_admission_time() {
-    let tuning = Tuning {
-        control: Arc::default(),
-        reads: crate::s3::read_recovery::Recovery::default(),
-        fixed_requests: None,
-        tigris: false,
-        upload: false,
-        requests: Arc::new(Budget::new(1, true)),
-        retained_upload_files: Default::default(),
-        upload_buffers: Arc::new(tokio::sync::Semaphore::new(1)),
-    };
-    let planning = tuning.requests.acquire().await;
-    let mut waiting = Box::pin(tuning.requests.acquire());
-    assert!(futures_util::poll!(&mut waiting).is_pending());
-    drop(waiting);
-    drop(planning);
-    {
-        let state = tuning.requests.state.lock().unwrap();
-        assert!(state.since.is_some());
-        assert!(state.saturated);
-        assert_eq!(state.active, 0);
-    }
-    tuning.configure(false, 256, 64);
-    {
-        let state = tuning.requests.state.lock().unwrap();
-        assert!(state.since.is_none());
-        assert!(!state.saturated);
-    }
-    let started = Instant::now();
-    let _transfer = tuning.requests.acquire().await;
-    assert!(tuning.requests.state.lock().unwrap().since.unwrap() >= started);
-    for _ in 0..16 {
-        tuning.requests.completed(1024);
-    }
-    let state = tuning.requests.state.lock().unwrap();
-    assert_eq!(state.limit, 64);
-    assert!(state.previous.is_none());
-}
-
-#[test]
-fn request_baseline_waits_for_a_full_count() {
-    let budget = Budget::new(64, true);
-    {
-        let mut s = budget.state.lock().unwrap();
-        s.since = Some(Instant::now() - Duration::from_secs(1));
-        s.saturated = true;
-    }
-    for _ in 0..63 {
-        budget.completed(1024);
-    }
-    {
-        let s = budget.state.lock().unwrap();
-        assert_eq!(s.limit, 64);
-        assert!(s.previous.is_none());
-        assert_eq!(s.completed, 63);
-    }
-    budget.completed(1024);
-    let s = budget.state.lock().unwrap();
-    assert_eq!(s.limit, 128);
-    assert_eq!(s.previous.unwrap().0, 64);
-    assert!(s.recent.is_empty());
-}
-
-#[test]
-fn smaller_download_probes_keep_useful_gains_and_the_actual_rejected_bound() {
-    // A weak gain keeps small steps; a strong gain per added slot resumes
-    // doubling, even though that small probe gained less than 25% overall.
-    for (millis, proposed) in [(2075, 100), (1875, 160)] {
-        let budget = Budget::new(32, true);
-        let mib = 1024 * 1024;
-        let sample = |count: usize, millis: u64, received: u64| {
-            {
-                let mut s = budget.state.lock().unwrap();
-                s.since = Some(Instant::now() - Duration::from_millis(millis));
-                s.completed = count - 1;
-                s.bytes = (count as u64 - 1) * mib;
-                s.saturated = true;
-            }
-            budget.received.store(received * mib, Relaxed);
-            budget.completed(mib);
-        };
-        sample(32, 1000, 32);
-        assert_eq!(budget.state.lock().unwrap().limit, 64);
-        // A doubling improves rate by about 18%, so approach more cautiously.
-        sample(64, 1700, 96);
-        assert_eq!(budget.state.lock().unwrap().limit, 80);
-        // The smaller step can give only 2.4% more throughput and still help.
-        // Requiring the doubling's 5% gain would reject this useful step.
-        sample(80, millis, 176);
-        assert_eq!(budget.state.lock().unwrap().limit, proposed);
-        // Handoff must preserve the attempted bound, including 100.
-        sample(16, 1000, 192);
-        assert_eq!(budget.begin_objects(256), Some(80));
-        assert_eq!(budget.rejected_limit(), Some(proposed));
-        assert_eq!(budget.slower_limit(), 64);
+/// A window with `in_flight` requests on average, which spent `time` seconds
+/// in flight per unit of work.
+fn sample(in_flight: f64, time: f64) -> Sample {
+    Sample {
+        in_flight,
+        time,
+        rate: in_flight / time,
     }
 }
 
 #[test]
-fn incoming_download_progress_defers_partial_loss_but_not_a_stall() {
-    let budget = Budget::new(64, true);
-    let mib = 1024 * 1024;
-    {
-        let mut s = budget.state.lock().unwrap();
-        let now = Instant::now();
-        // R2-shaped expansion: completed bytes fall from 32 MiB/482 ms
-        // to 17 MiB/350 ms, but incoming bytes rise from 39 to 32 MiB.
-        s.since = Some(now - Duration::from_millis(350));
-        s.previous = Some((32, 32.0 * mib as f64 / 0.482));
-        s.previous_progress_rate = Some(39.0 * mib as f64 / 0.482);
-        s.saturated = true;
-        s.bytes = 16 * mib;
-        s.completed = 16;
-        s.recent = (0..16)
-            .map(|i| (now - Duration::from_millis(320 - i * 20), mib))
-            .collect();
-    }
-    budget.received.store(32 * mib, Relaxed);
-    budget.completed(mib);
-    assert_eq!(budget.state.lock().unwrap().limit, 64);
-    assert!(!budget.state.lock().unwrap().settled);
-    // No more body progress: the same partial sample can now reject.
-    budget.state.lock().unwrap().since = Some(Instant::now() - Duration::from_secs(1));
-    budget.completed(mib);
-    assert_eq!(budget.state.lock().unwrap().limit, 32);
-    assert!(budget.state.lock().unwrap().settled);
+fn growth_doubles_while_requests_fill_the_limit_and_keep_paying() {
+    let mut policy = Policy::default();
+    // Fewer requests than the limit allowed were in flight: more would go
+    // unused.
+    assert_eq!(policy.observe(32, 4096, sample(20.0, 0.1)), 32);
+    assert_eq!(policy.observe(32, 4096, sample(32.0, 0.1)), 64);
+    // Each step's requests carried their share of the rate.
+    assert_eq!(policy.observe(64, 4096, sample(64.0, 0.1)), 128);
+    // Never past the batch's ceiling.
+    assert_eq!(policy.observe(128, 200, sample(128.0, 0.1)), 200);
+    assert_eq!(policy.observe(200, 200, sample(200.0, 0.1)), 200);
 }
 
 #[test]
-fn a_late_download_burst_does_not_hide_a_slow_body_window() {
-    let budget = Budget::new(128, true);
-    let mib = 1024 * 1024;
-    {
-        let mut s = budget.state.lock().unwrap();
-        let now = Instant::now();
-        s.since = Some(now - Duration::from_secs(5));
-        s.previous = Some((64, 80.0 * mib as f64));
-        s.previous_progress_rate = Some(80.0 * mib as f64);
-        s.saturated = true;
-        s.bytes = 16 * mib;
-        s.completed = 16;
-        s.recent = (0..16)
-            .map(|i| (now - Duration::from_micros(4000 - i * 250), mib))
-            .collect();
-    }
-    // All 128 MiB arrived, but over five seconds rather than at 80 MiB/s.
-    // Seventeen near-simultaneous EOFs are not evidence of a fast link.
-    budget.received.store(128 * mib, Relaxed);
-    budget.completed(mib);
-    assert_eq!(budget.state.lock().unwrap().limit, 64);
-    assert!(budget.state.lock().unwrap().settled);
+fn a_step_up_that_does_not_pay_is_undone_to_what_the_rate_needs() {
+    let mut policy = Policy::default();
+    assert_eq!(policy.observe(32, 4096, sample(32.0, 0.1)), 64);
+    // Twice the requests raise the rate only by 28%: about 41 requests
+    // fill the path. New connections start slowly, so one window is not
+    // enough to undo the step,
+    let saturated = |requests: f64| sample(requests, requests / 409.6);
+    assert_eq!(policy.observe(64, 4096, saturated(64.0)), 64);
+    // but a second is. 32 requests carried 320 units; 409.6 need 41.
+    assert_eq!(policy.observe(64, 4096, saturated(64.0)), 41);
+    // Steps down follow, until one costs as much rate as it removed
+    assert_eq!(policy.observe(41, 4096, saturated(41.0)), 36);
+    assert_eq!(policy.observe(36, 4096, sample(36.0, 0.1)), 41);
+    // and growth resumes, by an eighth at a time.
+    assert_eq!(policy.observe(41, 4096, saturated(41.0)), 46);
 }
 
 #[test]
-fn a_fast_response_burst_is_not_an_early_request_loss() {
-    let budget = Budget::new(128, true);
-    let bytes = 1024 * 1024;
-    {
-        let mut s = budget.state.lock().unwrap();
-        let now = Instant::now();
-        s.since = Some(now - Duration::from_millis(250));
-        s.previous = Some((64, 256.0 * bytes as f64));
-        s.saturated = true;
-        s.bytes = 53 * bytes;
-        s.completed = 53;
-        s.recent = (0..16)
-            .map(|i| (now - Duration::from_micros(4000 - i * 250), bytes))
-            .collect();
-    }
-    // 54 replies / 250 ms looks slower than the baseline. The latest
-    // replies are arriving rapidly, so this partial wave is inconclusive.
-    budget.completed(bytes);
-    {
-        let mut s = budget.state.lock().unwrap();
-        assert_eq!(s.limit, 128);
-        assert!(!s.settled);
-        assert_eq!(s.completed, 54);
-        s.since = Some(Instant::now() - Duration::from_millis(300));
-        s.bytes = 127 * bytes;
-        s.completed = 127;
-    }
-    budget.completed(bytes);
-    let s = budget.state.lock().unwrap();
-    assert_eq!(s.limit, 256);
-    assert!(!s.settled);
-    assert!(s.recent.is_empty());
+fn steps_down_that_reach_one_request_probe_upwards_again() {
+    let mut policy = Policy::default();
+    // The path carries the same rate however many requests share it.
+    let saturated = |requests: f64| sample(requests, requests / 100.0);
+    assert_eq!(policy.observe(2, 4096, saturated(2.0)), 4);
+    assert_eq!(policy.observe(4, 4096, saturated(4.0)), 4);
+    assert_eq!(policy.observe(4, 4096, saturated(4.0)), 2);
+    assert_eq!(policy.observe(2, 4096, saturated(2.0)), 1);
+    // There is no step below one request; the limit does not stay there.
+    assert_eq!(policy.observe(1, 4096, saturated(1.0)), 2);
+    assert_eq!(policy.observe(2, 4096, saturated(2.0)), 2);
+    assert_eq!(policy.observe(2, 4096, saturated(2.0)), 1);
+    assert_eq!(policy.observe(1, 4096, saturated(1.0)), 2);
 }
 
 #[test]
-fn request_probe_requires_enough_completions_to_accept_a_gain() {
-    let budget = Budget::new(64, true);
-    {
-        let mut state = budget.state.lock().unwrap();
-        state.since = Some(Instant::now() - Duration::from_secs(1));
-        state.saturated = true;
-    }
-    for _ in 0..64 {
-        budget.completed(4096);
-    }
-    // A partial response wave appears faster, but fewer than 128 requests
-    // have completed since increasing concurrency from 64 to 128.
-    {
-        let mut state = budget.state.lock().unwrap();
-        state.since = Some(Instant::now() - Duration::from_secs(1));
-        state.bytes = 79 * 4096;
-        state.completed = 79;
-        state.saturated = true;
-    }
-    budget.completed(4096);
-    let observed = {
-        let state = budget.state.lock().unwrap();
-        (state.limit, state.completed, state.settled)
-    };
-    assert_eq!(observed, (128, 80, false));
-    assert_eq!(budget.slower_limit(), 0);
-    // If progress then stalls, reject the probe without waiting for 128
-    // completions. The original baseline is still available for comparison.
-    {
-        let mut state = budget.state.lock().unwrap();
-        let now = Instant::now();
-        state.since = Some(now - Duration::from_secs(2));
-        state.recent = (0..16)
-            .map(|i| (now - Duration::from_millis(1015 - i), 4096))
-            .collect();
-    }
-    budget.completed(4096);
-    let observed = {
-        let state = budget.state.lock().unwrap();
-        (state.limit, state.settled)
-    };
-    assert_eq!(observed, (64, true));
-    assert_eq!(budget.slower_limit(), 0);
+fn a_slow_first_window_does_not_undo_growth() {
+    let mut policy = Policy::default();
+    assert_eq!(policy.observe(64, 4096, sample(64.0, 0.1)), 128);
+    // Requests on new connections take longer at first.
+    assert_eq!(policy.observe(128, 4096, sample(128.0, 0.17)), 128);
+    assert_eq!(policy.observe(128, 4096, sample(128.0, 0.105)), 256);
 }
 
 #[test]
-fn object_controller_waits_for_request_ramp_or_plateau() {
-    let budget = Budget::new(64, true);
-    assert_eq!(budget.begin_objects(256), None);
-    assert_eq!(budget.slower_limit(), 0);
-    for (bytes, completions, expected) in [(1024, 64, 128), (2048, 128, 256)] {
-        {
-            let mut s = budget.state.lock().unwrap();
-            s.since = Some(Instant::now() - Duration::from_secs(1));
-            s.saturated = true;
-        }
-        for _ in 0..completions {
-            budget.completed(bytes);
-        }
-        assert_eq!(budget.state.lock().unwrap().limit, expected);
-        assert_eq!(budget.slower_limit(), if expected == 128 { 0 } else { 64 });
-        assert_eq!(budget.begin_objects(256), None);
-    }
-    // The final increase must be evaluated even without a request waiter.
-    {
-        let mut s = budget.state.lock().unwrap();
-        s.since = Some(Instant::now() - Duration::from_secs(1));
-        s.completed = 255;
-        s.bytes = 255 * 4096;
-        assert!(!s.saturated);
-    }
-    budget.completed(4096);
-    assert!(budget.state.lock().unwrap().previous.is_none());
-    assert_eq!(budget.begin_objects(256), Some(256));
-    assert!(budget.rejected_limit().is_none());
-    assert_eq!(budget.slower_limit(), 128);
-    assert_eq!(budget.state.lock().unwrap().limit, 256);
-    budget.finish_objects(512);
-    assert_eq!(budget.state.lock().unwrap().limit, 512);
-    assert!(!budget.state.lock().unwrap().adaptive);
-
-    let budget = Budget::new(64, true);
-    budget.state.lock().unwrap().settled = true;
-    assert_eq!(budget.begin_objects(256), Some(64));
-    assert_eq!(budget.state.lock().unwrap().limit, 64);
-    budget.finish_objects(512);
-    assert!(!budget.state.lock().unwrap().adaptive);
+fn a_slower_service_does_not_lower_a_judged_limit() {
+    let mut policy = Policy::default();
+    assert_eq!(policy.observe(512, 1024, sample(512.0, 0.05)), 1024);
+    assert_eq!(policy.observe(1024, 1024, sample(1024.0, 0.05)), 1024);
+    // Each request takes four times as long, with no change of the limit:
+    // nothing this copy did.
+    assert_eq!(policy.observe(1024, 1024, sample(1024.0, 0.2)), 1024);
+    assert_eq!(policy.observe(1024, 1024, sample(1024.0, 0.2)), 1024);
 }
 
 #[test]
-fn final_request_probe_keeps_partial_samples_before_rejecting_a_loss() {
-    let budget = Budget::new(256, true);
-    let since = Instant::now() - Duration::from_secs(1);
-    {
-        let mut s = budget.state.lock().unwrap();
-        s.since = Some(since);
-        s.previous = Some((128, 1024.0 * 1024.0));
-    }
-    // Even an apparent loss may just be an incomplete response wave when
-    // there is no waiter. Neither hand off nor discard the pending sample.
-    for count in 1..256 {
-        budget.completed(1024);
-        assert_eq!(budget.begin_objects(256), None);
-        let s = budget.state.lock().unwrap();
-        assert_eq!(s.completed, count);
-        assert_eq!(s.bytes, count as u64 * 1024);
-        assert_eq!(s.since, Some(since));
-        assert!(!s.settled);
-    }
-    budget.completed(1024);
-    assert!(budget.rejected_limit().is_some());
-    assert_eq!(budget.begin_objects(256), Some(128));
-    assert_eq!(budget.preparation_limit(), 129);
-    budget.finish_objects(512);
-    assert_eq!(budget.state.lock().unwrap().limit, 512);
+fn throttling_halves_and_ends_doubling() {
+    let mut policy = Policy::default();
+    assert_eq!(policy.throttled(100), 50);
+    assert_eq!(policy.throttled(1), 1);
+    assert_eq!(policy.observe(50, 4096, sample(50.0, 0.1)), 56);
 }
 
-#[tokio::test(start_paused = true)]
-async fn request_ramp_bounds_preparation_and_refills_after_growth() {
-    let budget = Arc::new(Budget::new(2, true));
-    let gate = Arc::new(tokio::sync::Semaphore::new(0));
-    let (prepared, mut observed) = tokio::sync::mpsc::unbounded_channel();
-    let copy_budget = budget.clone();
-    let copy_gate = gate.clone();
-    let copy = tokio::spawn(async move {
-        crate::s3::admission::parallel(
-            (0..8).collect(),
-            crate::s3::admission::Concurrency {
-                initial: 8,
-                maximum: Some(16),
-                initial_probe_up: true,
-                requests: Some(copy_budget.clone()),
-                checking: None,
-                outage: None,
-            },
-            move |job, _| {
-                let budget = copy_budget.clone();
-                let gate = copy_gate.clone();
-                let prepared = prepared.clone();
-                async move {
-                    prepared.send(job).unwrap();
-                    let _permit = budget.acquire().await;
-                    gate.acquire().await.unwrap().forget();
-                    Ok(Some(1024))
-                }
-            },
-        )
-        .await
-    });
-    let mut jobs = Vec::new();
-    for _ in 0..3 {
-        jobs.push(
-            tokio::time::timeout(Duration::from_secs(1), observed.recv())
-                .await
-                .expect("prepared work did not refill")
-                .unwrap(),
-        );
-    }
-    let extra_before = tokio::time::timeout(Duration::from_millis(100), observed.recv()).await;
-    let saturated = budget.state.lock().unwrap().saturated;
-    budget.state.lock().unwrap().since = Some(Instant::now() - Duration::from_secs(1));
-    for _ in 0..16 {
-        budget.completed(1024);
-    }
-    let grown_limit = budget.state.lock().unwrap().limit;
-    for _ in 0..2 {
-        jobs.push(
-            tokio::time::timeout(Duration::from_secs(1), observed.recv())
-                .await
-                .expect("prepared work did not refill")
-                .unwrap(),
-        );
-    }
-    let extra_after = tokio::time::timeout(Duration::from_millis(100), observed.recv()).await;
-    gate.add_permits(8);
-    copy.await.unwrap().unwrap();
-    while let Some(job) = observed.recv().await {
-        jobs.push(job);
-    }
-    assert!(extra_before.is_err(), "prepared more than one waiting job");
-    assert!(saturated, "the prepared waiter must signal request demand");
-    assert_eq!(grown_limit, 4);
-    assert!(
-        extra_after.is_err(),
-        "growth prepared too many waiting jobs"
+#[test]
+fn each_batch_starts_where_planning_chose_within_its_ceiling() {
+    let (budget, _) = new_budget(None, None);
+    assert_eq!(budget.limit(), INITIAL_REQUESTS);
+    assert_eq!(budget.capacity(), DEFAULT_CEILING);
+    budget.configure(INITIAL_REQUESTS, 4096, false);
+    assert_eq!(
+        (budget.limit(), budget.capacity()),
+        (INITIAL_REQUESTS, 4096)
     );
-    jobs.sort_unstable();
-    assert_eq!(jobs, (0..8).collect::<Vec<_>>());
-}
+    // A wide start for far small objects, up to the ceiling.
+    budget.configure(4096, 4096, false);
+    assert_eq!((budget.limit(), budget.capacity()), (4096, 4096));
+    budget.configure(INITIAL_REQUESTS, 8, false);
+    assert_eq!((budget.limit(), budget.capacity()), (8, 8));
+    budget.configure(0, 8, false);
+    assert_eq!(budget.limit(), 1);
 
-#[tokio::test(start_paused = true)]
-async fn measured_handoff_can_probe_before_more_completions() {
-    for (rate, upward, count, maximum, expected) in [
-        (Some((4, 1000.0)), true, 32, 16, 8),
-        (Some((4, 1000.0)), true, 15, 16, 4),
-        (Some((2, 1000.0)), true, 32, 16, 4),
-        (None, true, 32, 16, 4),
-        (Some((4, 1000.0)), false, 32, 16, 4),
-        (Some((4, 1000.0)), true, 32, 4, 4),
-    ] {
-        let budget = Arc::new(Budget::new(4, true));
-        budget.state.lock().unwrap().object_rate =
-            rate.map(|(limit, rate)| (limit, rate, Duration::from_secs(1)));
-        let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let (prepared, mut observed) = tokio::sync::mpsc::unbounded_channel();
-        let copy_gate = gate.clone();
-        let copy = tokio::spawn(async move {
-            crate::s3::admission::parallel(
-                (0..count).collect(),
-                crate::s3::admission::Concurrency {
-                    initial: 4,
-                    maximum: Some(maximum),
-                    initial_probe_up: upward,
-                    requests: Some(budget.clone()),
-                    checking: None,
-                    outage: None,
-                },
-                move |job, _| {
-                    let budget = budget.clone();
-                    let gate = copy_gate.clone();
-                    let prepared = prepared.clone();
-                    async move {
-                        let _permit = budget.acquire().await;
-                        prepared.send(job).unwrap();
-                        gate.acquire().await.unwrap().forget();
-                        Ok(Some(1024))
-                    }
-                },
-            )
-            .await
-        });
-        // No object has completed yet. A matching request measurement is
-        // the only possible evidence for an immediate increase.
-        let mut jobs = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
-        while let Ok(Some(job)) = tokio::time::timeout_at(deadline, observed.recv()).await {
-            jobs.push(job);
-        }
-        let initial = jobs.len();
-        gate.add_permits(count);
-        copy.await.unwrap().unwrap();
-        while let Some(job) = observed.recv().await {
-            jobs.push(job);
-        }
-        assert_eq!(
-            initial, expected,
-            "rate={rate:?}, count={count}, upward={upward}"
-        );
-        jobs.sort_unstable();
-        assert_eq!(jobs, (0..count).collect::<Vec<_>>());
-    }
+    // A ceiling the user set bounds every batch.
+    let (capped, _) = new_budget(None, Some(16));
+    capped.configure(4096, 4096, false);
+    assert_eq!((capped.limit(), capped.capacity()), (16, 16));
+    capped.configure(INITIAL_REQUESTS, 4, false);
+    assert_eq!((capped.limit(), capped.capacity()), (4, 4));
+
+    // A count the user fixed stays.
+    let (fixed, _) = new_budget(Some(6), None);
+    fixed.configure(4096, 4096, false);
+    assert_eq!((fixed.limit(), fixed.capacity()), (6, 6));
 }
 
 #[test]
-fn handoff_rate_matches_a_completed_probe_at_the_same_limit() {
-    let budget = Budget::new(64, true);
-    budget.state.lock().unwrap().max = 128;
-    for (completions, saturated) in [(64, true), (128, false)] {
-        {
-            let mut state = budget.state.lock().unwrap();
-            state.since = Some(Instant::now() - Duration::from_secs(1));
-            state.saturated = saturated;
-        }
-        for _ in 0..completions {
-            budget.completed(2048);
-        }
-        assert!(budget.object_rate(64).is_none());
-    }
-    let (rate, elapsed) = budget.object_rate(128).unwrap();
-    assert!(elapsed >= Duration::from_secs(1));
-    let expected = 128.0 * (2048 + crate::tune::FILE_CREDIT) as f64;
-    assert!((rate / expected - 1.0).abs() < 0.01);
+fn refusals_before_a_batch_do_not_cut_it() {
+    let (budget, outage) = new_budget(None, None);
+    // Listing or discovery refusals arrive before transfers are configured.
+    outage.throttled();
+    outage.throttled();
+    budget.configure(INITIAL_REQUESTS, 64, false);
+    assert_eq!(budget.limit(), INITIAL_REQUESTS);
+}
+
+fn poll_permit(budget: &Arc<Budget>, cx: &mut Context<'_>) -> Permit {
+    let std::task::Poll::Ready(permit) = Box::pin(budget.acquire()).as_mut().poll(cx) else {
+        panic!("slot unavailable");
+    };
+    permit
 }
 
 #[tokio::test(start_paused = true)]
-async fn object_handoff_tries_downward_after_a_rejected_request_increase() {
-    check_handoff_direction(256, 64, 32).await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn object_handoff_refines_upward_after_a_small_request_gain() {
-    // A 3.125% gain is too small to accept doubled requests, but suggests
-    // looking between 64 and 128 before trying fewer than 64 objects.
-    check_handoff_direction(1056, 96, 96).await;
-}
-
-async fn check_handoff_direction(probe_bytes: u64, expected_peak: usize, expected_active: usize) {
-    use std::sync::atomic::AtomicUsize;
-
-    let budget = Arc::new(Budget::new(64, true));
-    // The request ramp rejects 128 and returns to 64 in both cases.
-    for (bytes, completions, expected) in [(2048, 64, 128), (probe_bytes, 128, 64)] {
-        {
-            let mut state = budget.state.lock().unwrap();
-            state.since = Some(Instant::now() - Duration::from_secs(1));
-            state.saturated = true;
-        }
-        for _ in 0..completions {
-            budget.completed(bytes);
-        }
-        let limit = budget.state.lock().unwrap().limit;
-        assert_eq!(limit, expected);
-    }
-    assert!(budget.rejected_limit().is_some());
-    assert!(budget.object_rate(64).is_none());
-    let peak = Arc::new(AtomicUsize::new(0));
-    let copy_budget = budget.clone();
-    let copy_peak = peak.clone();
-    let copy = tokio::spawn(async move {
-        crate::s3::admission::parallel(
-            (0..8192).collect(),
-            crate::s3::admission::Concurrency {
-                initial: 256,
-                maximum: Some(256),
-                initial_probe_up: true,
-                requests: Some(copy_budget.clone()),
-                checking: None,
-                outage: None,
-            },
-            move |_, _| {
-                let budget = copy_budget.clone();
-                let peak = copy_peak.clone();
-                async move {
-                    let _permit = budget.acquire().await;
-                    let active = budget.state.lock().unwrap().active;
-                    peak.fetch_max(active, Relaxed);
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    Ok(Some(1024))
-                }
-            },
-        )
-        .await
-    });
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-    let first_probe_peak = peak.load(Relaxed);
-    let first_probe_active = budget.state.lock().unwrap().active;
-    // The starting direction does not prevent later increases.
-    copy.await.unwrap().unwrap();
-    assert_eq!(first_probe_peak, expected_peak);
-    assert_eq!(first_probe_active, expected_active);
-    assert!(peak.load(Relaxed) > 64);
-}
-
-#[tokio::test(start_paused = true)]
-async fn object_handoff_drains_waiting_jobs_before_opening_request_capacity() {
-    let budget = Arc::new(Budget::new(2, true));
-    let gate = Arc::new(tokio::sync::Semaphore::new(0));
-    let (started, mut observed) = tokio::sync::mpsc::unbounded_channel();
-    let copy_budget = budget.clone();
-    let copy_gate = gate.clone();
-    let copy = tokio::spawn(async move {
-        crate::s3::admission::parallel(
-            (0..8).collect(),
-            crate::s3::admission::Concurrency {
-                initial: 8,
-                maximum: Some(16),
-                initial_probe_up: true,
-                requests: Some(copy_budget.clone()),
-                checking: None,
-                outage: None,
-            },
-            move |job, _| {
-                let budget = copy_budget.clone();
-                let gate = copy_gate.clone();
-                let started = started.clone();
-                async move {
-                    let _request = budget.acquire().await;
-                    started.send(job).unwrap();
-                    gate.acquire().await.unwrap().forget();
-                    Ok(Some(1024))
-                }
-            },
-        )
-        .await
-    });
-    // Two requests are running; prepared work waits for a permit.
-    observed.recv().await.unwrap();
-    observed.recv().await.unwrap();
-    budget.state.lock().unwrap().settled = true;
-    tokio::time::advance(Duration::from_millis(250)).await;
-    let unexpected = tokio::time::timeout(Duration::from_millis(100), observed.recv()).await;
-    gate.add_permits(8);
-    copy.await.unwrap().unwrap();
-    assert!(
-        unexpected.is_err(),
-        "handoff started another request before draining old jobs"
-    );
-    let mut remaining = 0;
-    while observed.recv().await.is_some() {
-        remaining += 1;
-    }
-    assert_eq!(remaining, 6);
-    assert_eq!(budget.state.lock().unwrap().active, 0);
-}
-
-#[test]
-fn object_handoff_wakes_waiters_without_a_permit_drop() {
-    struct Wakes(std::sync::atomic::AtomicUsize);
-    impl std::task::Wake for Wakes {
-        fn wake(self: Arc<Self>) {
-            self.0.fetch_add(1, Relaxed);
-        }
-    }
-    let wakes = Arc::new(Wakes(std::sync::atomic::AtomicUsize::new(0)));
-    let waker = std::task::Waker::from(wakes.clone());
+async fn idle_time_before_the_first_request_is_not_measured() {
+    let (budget, _) = new_budget(None, None);
+    budget.configure(INITIAL_REQUESTS, 4096, false);
+    // Planning, listing or preparation take a while before any request.
+    tokio::time::advance(Duration::from_secs(10)).await;
+    let waker = futures_util::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
-    let budget = Arc::new(Budget::new(1, true));
-    let std::task::Poll::Ready(held) = Box::pin(budget.acquire()).as_mut().poll(&mut cx) else {
-        panic!("initial slot unavailable");
-    };
-    let mut waiting = Box::pin(budget.acquire());
-    assert!(waiting.as_mut().poll(&mut cx).is_pending());
-    assert_eq!(budget.begin_objects(1), Some(1));
-    assert_eq!(wakes.0.load(Relaxed), 0);
-    assert!(waiting.as_mut().poll(&mut cx).is_pending());
-    budget.finish_objects(2);
-    assert_eq!(wakes.0.load(Relaxed), 1);
-    assert!(waiting.as_mut().poll(&mut cx).is_ready());
+    let mut held: Vec<_> = (0..32).map(|_| poll_permit(&budget, &mut cx)).collect();
+    // Half the requests finish after 100 ms, and others take their places:
+    // the fastest half of a window.
+    tokio::time::advance(Duration::from_millis(100)).await;
+    held.drain(..16);
+    held.extend((0..16).map(|_| poll_permit(&budget, &mut cx)));
+    assert_eq!(budget.limit(), 32);
+    // Once as many have finished as were in flight, the window describes
+    // the limit. Had it started at the batch rather than at the first
+    // request, it would have ended at the first 16.
+    tokio::time::advance(Duration::from_millis(100)).await;
+    held.drain(..15);
+    assert_eq!(budget.limit(), 32);
+    held.drain(..1);
+    assert_eq!(budget.limit(), 64);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_burst_of_refusals_halves_once_until_the_requests_before_it_drain() {
+    let (budget, outage) = new_budget(None, None);
+    budget.configure(INITIAL_REQUESTS, 4096, false);
+    let mut limits = budget.subscribe();
+    let waker = futures_util::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut held: Vec<_> = (0..32).map(|_| poll_permit(&budget, &mut cx)).collect();
+    tokio::time::advance(Duration::from_millis(10)).await;
+    // The refusal halves the limit as it arrives, while every request,
+    // including the refused one being retried, still holds its permit, and
+    // admission sees the new limit at once.
+    outage.throttled();
+    assert_eq!(budget.limit(), 16);
+    assert!(limits.has_changed().unwrap());
+    assert_eq!(*limits.borrow_and_update(), 16);
+    // Responses to requests sent before the halving still ask the client
+    // to slow down, also once no more are in flight than it allows; the
+    // halving already answered them.
+    while !held.is_empty() {
+        outage.throttled();
+        held.pop();
+        assert_eq!(budget.limit(), 16);
+    }
+    // Once they have drained, the service refusing requests sent at the
+    // new limit asks for fewer still.
+    let held: Vec<_> = (0..16).map(|_| poll_permit(&budget, &mut cx)).collect();
+    tokio::time::advance(Duration::from_millis(10)).await;
+    outage.throttled();
+    assert_eq!(budget.limit(), 8);
     drop(held);
+}
+
+#[tokio::test(start_paused = true)]
+async fn simultaneous_refusals_of_a_few_requests_halve_once() {
+    let (budget, outage) = new_budget(None, None);
+    budget.configure(256, 4096, false);
+    let waker = futures_util::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    // Far fewer requests are in flight than the limit allows, and all of
+    // them are refused at once: one halving answers them all.
+    let held: Vec<_> = (0..4).map(|_| poll_permit(&budget, &mut cx)).collect();
+    tokio::time::advance(Duration::from_millis(10)).await;
+    for _ in 0..4 {
+        outage.throttled();
+    }
+    assert_eq!(budget.limit(), 128);
+    drop(held);
+    let held = poll_permit(&budget, &mut cx);
+    outage.throttled();
+    assert_eq!(budget.limit(), 64);
+    drop(held);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refusal_right_after_a_step_down_halves_at_once() {
+    let (budget, outage) = new_budget(None, None);
+    budget.configure(64, 4096, false);
+    let waker = futures_util::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let held: Vec<_> = (0..64).map(|_| poll_permit(&budget, &mut cx)).collect();
+    // A measurement steps the limit down while more requests are in flight
+    // than it now allows. The service refusing one of them asks for fewer
+    // than that step chose.
+    budget.set_limit(41);
+    tokio::time::advance(Duration::from_millis(10)).await;
+    outage.throttled();
+    assert_eq!(budget.limit(), 20);
+    drop(held);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refusal_as_a_window_opens_still_counts() {
+    let (budget, outage) = new_budget(None, None);
+    budget.configure(INITIAL_REQUESTS, 4096, false);
+    let waker = futures_util::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut held: Vec<_> = (0..32).map(|_| poll_permit(&budget, &mut cx)).collect();
+    tokio::time::advance(Duration::from_millis(10)).await;
+    outage.throttled();
+    assert_eq!(budget.limit(), 16);
+    // The requests from before the halving drain, and requests admitted
+    // after it are refused just as the next window opens.
+    held.clear();
+    held.extend((0..16).map(|_| poll_permit(&budget, &mut cx)));
+    tokio::time::advance(Duration::from_millis(10)).await;
+    outage.throttled();
+    assert_eq!(budget.limit(), 8);
+    drop(held);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_request_hung_since_a_halving_does_not_hold_back_the_next() {
+    let (budget, outage) = new_budget(None, None);
+    budget.configure(INITIAL_REQUESTS, 4096, false);
+    let waker = futures_util::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut held: Vec<_> = (0..32).map(|_| poll_permit(&budget, &mut cx)).collect();
+    outage.throttled();
+    assert_eq!(budget.limit(), 16);
+    // One request from before the halving stays in flight. Refusals soon
+    // after it may be its own retries, which the halving answered,
+    held.truncate(1);
+    held.extend((0..15).map(|_| poll_permit(&budget, &mut cx)));
+    tokio::time::advance(Duration::from_secs(1)).await;
+    outage.throttled();
+    assert_eq!(budget.limit(), 16);
+    // but it cannot hold back the next halving for good.
+    tokio::time::advance(UNCOVERED_WAIT).await;
+    outage.throttled();
+    assert_eq!(budget.limit(), 8);
+    drop(held);
+}
+
+#[tokio::test(start_paused = true)]
+async fn throttling_after_growth_halves_while_older_requests_drain() {
+    let (budget, outage) = new_budget(None, None);
+    budget.configure(INITIAL_REQUESTS, 4096, false);
+    let waker = futures_util::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut old: Vec<_> = (0..32).map(|_| poll_permit(&budget, &mut cx)).collect();
+    tokio::time::advance(Duration::from_millis(100)).await;
+    old.drain(..16);
+    old.extend((0..16).map(|_| poll_permit(&budget, &mut cx)));
+    tokio::time::advance(Duration::from_millis(100)).await;
+    old.drain(..16);
+    assert_eq!(budget.limit(), 64);
+    // Sixteen requests admitted at 32 are still in flight, enough to keep
+    // the next window from starting, when requests admitted at 64 are
+    // refused: the growth went too far, and halving must not wait for them.
+    let mut new: Vec<_> = (0..32).map(|_| poll_permit(&budget, &mut cx)).collect();
+    tokio::time::advance(Duration::from_millis(10)).await;
+    outage.throttled();
+    new.pop();
+    assert_eq!(budget.limit(), 32);
+    // More complaints from requests sent before the halving are answered.
+    outage.throttled();
+    new.pop();
+    assert_eq!(budget.limit(), 32);
+    drop((old, new));
+}
+
+#[tokio::test(start_paused = true)]
+async fn growth_wakes_every_waiting_request_it_admits() {
+    let (budget, _) = new_budget(None, None);
+    budget.configure(INITIAL_REQUESTS, 4096, false);
+    let admitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let waker = futures_util::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut held: Vec<_> = (0..32).map(|_| poll_permit(&budget, &mut cx)).collect();
+    let (release, released) = tokio::sync::watch::channel(false);
+    let waiters: Vec<_> = (0..64)
+        .map(|_| {
+            let (budget, admitted) = (budget.clone(), admitted.clone());
+            let mut released = released.clone();
+            tokio::spawn(async move {
+                let _permit = budget.acquire().await;
+                admitted.fetch_add(1, Relaxed);
+                let _ = released.wait_for(|released| *released).await;
+            })
+        })
+        .collect();
+    tokio::task::yield_now().await;
+    assert_eq!(admitted.load(Relaxed), 0);
+    tokio::time::advance(Duration::from_millis(300)).await;
+    // Without yielding, so that only growth can wake the waiters beyond
+    // the 32 freed slots.
+    held.clear();
+    assert_eq!(budget.limit(), 64);
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(admitted.load(Relaxed), 64);
+    assert_eq!(budget.state.lock().unwrap().active, 64);
+    release.send_replace(true);
+    for waiter in waiters {
+        waiter.await.unwrap();
+    }
+    drop(held);
+    assert_eq!(budget.state.lock().unwrap().active, 0);
 }
 
 #[test]
@@ -680,10 +360,8 @@ fn releasing_one_slot_wakes_only_one_queued_request() {
     let wakes = Arc::new(Wakes(std::sync::atomic::AtomicUsize::new(0)));
     let waker = std::task::Waker::from(wakes.clone());
     let mut cx = Context::from_waker(&waker);
-    let budget = Arc::new(Budget::new(1, false));
-    let std::task::Poll::Ready(held) = Box::pin(budget.acquire()).as_mut().poll(&mut cx) else {
-        panic!("initial slot unavailable");
-    };
+    let (budget, _) = new_budget(Some(1), None);
+    let held = poll_permit(&budget, &mut cx);
     let mut waiting: Vec<_> = (0..64).map(|_| Box::pin(budget.acquire())).collect();
     for request in &mut waiting {
         assert!(request.as_mut().poll(&mut cx).is_pending());
@@ -694,12 +372,10 @@ fn releasing_one_slot_wakes_only_one_queued_request() {
 
 #[test]
 fn cancelled_notified_request_passes_the_free_slot_to_another_waiter() {
-    let budget = Arc::new(Budget::new(1, false));
+    let (budget, _) = new_budget(Some(1), None);
     let waker = futures_util::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
-    let std::task::Poll::Ready(held) = Box::pin(budget.acquire()).as_mut().poll(&mut cx) else {
-        panic!("initial slot unavailable");
-    };
+    let held = poll_permit(&budget, &mut cx);
     let mut cancelled = Box::pin(budget.acquire());
     let mut next = Box::pin(budget.acquire());
     assert!(cancelled.as_mut().poll(&mut cx).is_pending());
@@ -714,113 +390,325 @@ fn cancelled_notified_request_passes_the_free_slot_to_another_waiter() {
     assert_eq!(budget.state.lock().unwrap().active, 0);
 }
 
-#[test]
-fn capacity_growth_admits_multiple_waiters_without_releasing_existing_slots() {
-    let budget = Arc::new(Budget::new(4, true));
-    let waker = futures_util::task::noop_waker();
-    let mut cx = Context::from_waker(&waker);
-    let mut held = Vec::new();
-    for _ in 0..4 {
-        let std::task::Poll::Ready(permit) = Box::pin(budget.acquire()).as_mut().poll(&mut cx)
-        else {
-            panic!("initial slot unavailable");
-        };
-        held.push(permit);
+/// A simulated storage service for closed-loop runs under paused time.
+#[derive(Clone, Copy)]
+struct Service {
+    /// The time to a response when nothing queues.
+    rtt: Duration,
+    bytes: u64,
+    /// Bytes per second one request moves, and the path in total, shared
+    /// by the requests in flight.
+    per_request: Option<f64>,
+    bandwidth: Option<f64>,
+    /// More requests in flight than this are asked to slow down, and are
+    /// answered after a retry.
+    throttle_above: Option<usize>,
+}
+impl Service {
+    fn far_small_objects() -> Self {
+        Self {
+            rtt: Duration::from_millis(100),
+            bytes: 4096,
+            per_request: None,
+            bandwidth: None,
+            throttle_above: None,
+        }
     }
-    let mut waiting: Vec<_> = (0..4).map(|_| Box::pin(budget.acquire())).collect();
-    for request in &mut waiting {
-        assert!(request.as_mut().poll(&mut cx).is_pending());
+    /// Answer a request while `active()` requests are in flight, in slices
+    /// so that the path's bandwidth is shared as their number changes.
+    async fn respond(&self, outage: &Outage, active: impl Fn() -> usize) {
+        if self.throttle_above.is_some_and(|above| active() > above) {
+            outage.throttled();
+            // The retry follows the refusal.
+            tokio::time::sleep(2 * self.rtt).await;
+        }
+        tokio::time::sleep(self.rtt).await;
+        const SLICES: u32 = 8;
+        for _ in 0..SLICES {
+            let rate = match (self.per_request, self.bandwidth) {
+                (Some(each), Some(total)) => each.min(total / active() as f64),
+                (Some(each), None) => each,
+                (None, Some(total)) => total / active() as f64,
+                (None, None) => return,
+            };
+            let slice = self.bytes as f64 / f64::from(SLICES);
+            tokio::time::sleep(Duration::from_secs_f64(slice / rate)).await;
+        }
     }
-    budget.state.lock().unwrap().since = Some(Instant::now() - Duration::from_secs(1));
-    for _ in 0..16 {
-        budget.completed(1024);
-    }
-    for request in &mut waiting {
-        let std::task::Poll::Ready(permit) = request.as_mut().poll(&mut cx) else {
-            panic!("capacity growth left an available slot asleep");
-        };
-        held.push(permit);
-    }
-    assert_eq!(budget.state.lock().unwrap().active, 8);
-    assert!(Box::pin(budget.acquire())
-        .as_mut()
-        .poll(&mut cx)
-        .is_pending());
-    drop(held);
-    assert_eq!(budget.state.lock().unwrap().active, 0);
 }
 
-#[test]
-fn initial_request_budget_accounts_for_direction_latency_and_overrides() {
-    // (upload, Tigris, observed latency, small objects, explicit maximum, expected)
-    for (upload, tigris, latency_ms, tiny, fixed, expected) in [
-        (false, true, Some(100), true, None, 256),
-        (true, true, Some(100), true, None, 64),
-        (false, false, Some(100), true, None, 256),
-        (true, false, Some(100), true, None, 256),
-        (true, false, Some(20), true, None, 256),
-        (true, false, Some(19), true, None, 64),
-        (false, true, Some(1), true, None, 64),
-        (false, true, None, true, None, 64),
-        (false, true, Some(100), false, None, 64),
-        (false, true, Some(100), true, Some(16), 16),
-    ] {
-        let tuning = Tuning {
-            control: Arc::default(),
-            reads: crate::s3::read_recovery::Recovery::default(),
-            fixed_requests: fixed,
-            tigris,
-            upload,
-            requests: Arc::new(Budget::new(fixed.unwrap_or(64), fixed.is_none())),
-            retained_upload_files: Default::default(),
-            upload_buffers: Arc::new(tokio::sync::Semaphore::new(256 * 1024 * 1024)),
-        };
-        if let Some(ms) = latency_ms {
-            tuning.observe_control(Duration::from_millis(ms));
-        }
-        tuning.configure(tiny, 256, 64);
-        assert_eq!(
-                tuning.requests.state.lock().unwrap().limit,
-                expected,
-                "upload={upload}, tigris={tigris}, latency={latency_ms:?}, tiny={tiny}, fixed={fixed:?}",
-            );
-        let ready = fixed.is_some() || expected >= 256;
-        assert_eq!(
-            tuning.requests.begin_objects(256),
-            ready.then_some(256.min(expected))
+struct Run {
+    /// The limit every 10 ms.
+    limits: Vec<usize>,
+    /// Bytes completed every 10 ms.
+    bytes: Vec<u64>,
+    /// The most requests in flight seen.
+    peak: usize,
+}
+impl Run {
+    fn at(&self, seconds: f64) -> usize {
+        self.limits[(seconds * 100.0) as usize]
+    }
+    fn between(&self, from: f64, to: f64) -> &[usize] {
+        &self.limits[(from * 100.0) as usize..(to * 100.0) as usize]
+    }
+    fn rate(&self, from: f64, to: f64) -> f64 {
+        let bytes: u64 = self.bytes[(from * 100.0) as usize..(to * 100.0) as usize]
+            .iter()
+            .sum();
+        bytes as f64 / (to - from)
+    }
+}
+
+/// Run `demand` requests at once against `service` for `seconds`, each
+/// sending its next request when the last one finishes. `change` replaces
+/// the service at the given time.
+async fn simulate(
+    budget: &Arc<Budget>,
+    outage: &Arc<Outage>,
+    service: Service,
+    demand: usize,
+    seconds: u64,
+    change: Option<(f64, Service)>,
+) -> Run {
+    let service = Arc::new(Mutex::new(service));
+    let done = Arc::new(AtomicU64::new(0));
+    let end = Instant::now() + Duration::from_secs(seconds);
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..demand {
+        let (budget, outage, service, done) = (
+            budget.clone(),
+            outage.clone(),
+            service.clone(),
+            done.clone(),
         );
-        if ready {
-            assert_eq!(tuning.request_limit(), expected);
-            tuning.requests.finish_objects(512);
-            assert_eq!(tuning.request_limit(), fixed.unwrap_or(512));
-            assert!(!tuning.requests.state.lock().unwrap().adaptive);
+        tasks.spawn(async move {
+            while Instant::now() < end {
+                let mut permit = budget.acquire().await;
+                let service = *service.lock().unwrap();
+                service
+                    .respond(&outage, || budget.state.lock().unwrap().active)
+                    .await;
+                permit.completed(service.bytes);
+                done.fetch_add(service.bytes, Relaxed);
+                drop(permit);
+            }
+        });
+    }
+    let start = Instant::now();
+    let mut run = Run {
+        limits: Vec::new(),
+        bytes: Vec::new(),
+        peak: 0,
+    };
+    let mut last = 0;
+    let mut ticks = tokio::time::interval(Duration::from_millis(10));
+    while Instant::now() < end {
+        ticks.tick().await;
+        if let Some((at, next)) = change {
+            if start.elapsed().as_secs_f64() >= at {
+                *service.lock().unwrap() = next;
+            }
         }
+        let state = budget.state.lock().unwrap();
+        run.peak = run.peak.max(state.active);
+        run.limits.push(state.limit);
+        drop(state);
+        let total = done.load(Relaxed);
+        run.bytes.push(total - last);
+        last = total;
+    }
+    while tasks.join_next().await.is_some() {}
+    let mut changes = Vec::new();
+    for (tick, pair) in run.limits.windows(2).enumerate() {
+        if pair[0] != pair[1] {
+            changes.push(format!("{:.2}s:{}", (tick + 1) as f64 / 100.0, pair[1]));
+        }
+    }
+    eprintln!("TRACE {}", changes.join(" "));
+    run
+}
+
+#[tokio::test(start_paused = true)]
+async fn far_small_objects_ramp_up_smoothly_from_a_small_start() {
+    let (budget, outage) = new_budget(None, None);
+    budget.configure(INITIAL_REQUESTS, 4096, false);
+    let run = simulate(
+        &budget,
+        &outage,
+        Service::far_small_objects(),
+        8192,
+        6,
+        None,
+    )
+    .await;
+    // No jump of more than a doubling, and never past the ceiling.
+    for pair in run.limits.windows(2) {
+        assert!(pair[1] <= pair[0] * 2, "{pair:?}");
+    }
+    assert!(run.peak <= 4096);
+    // It starts small rather than with thousands of requests in flight
+    assert_eq!(run.at(0.0), INITIAL_REQUESTS);
+    assert!(run.at(0.5) <= 128, "{}", run.at(0.5));
+    // and still reaches the ceiling within a few seconds at 100 ms.
+    assert_eq!(run.at(4.0), 4096);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_gradual_start_grows_by_eighths_and_still_reaches_the_ceiling() {
+    let (budget, outage) = new_budget(None, None);
+    budget.configure(256, 4096, true);
+    let run = simulate(
+        &budget,
+        &outage,
+        Service::far_small_objects(),
+        8192,
+        12,
+        None,
+    )
+    .await;
+    assert_eq!(run.at(0.0), 256);
+    for pair in run.limits.windows(2) {
+        assert!(pair[1] <= pair[0] + pair[0] / 8, "{pair:?}");
+    }
+    assert_eq!(run.at(11.9), 4096);
+}
+
+#[tokio::test(start_paused = true)]
+async fn requests_stop_growing_where_the_path_saturates() {
+    // Each request moves 50 MiB/s, the path 2 GiB/s: about 41 requests
+    // fill it, and more only queue.
+    let mib = 1024.0 * 1024.0;
+    let service = Service {
+        rtt: Duration::from_millis(2),
+        bytes: 8 << 20,
+        per_request: Some(50.0 * mib),
+        bandwidth: Some(2048.0 * mib),
+        throttle_above: None,
+    };
+    let (budget, outage) = new_budget(None, None);
+    budget.configure(INITIAL_REQUESTS, 256, false);
+    let run = simulate(&budget, &outage, service, 512, 20, None).await;
+    // The limit overshoots by at most one doubling, then keeps within a
+    // few steps of what the path needs, as it probes for changes,
+    assert!(run.peak <= 64, "{}", run.peak);
+    let settled = run.between(5.0, 20.0);
+    assert!(
+        settled.iter().all(|limit| (32..=56).contains(limit)),
+        "{settled:?}"
+    );
+    // without giving up throughput.
+    assert!(
+        run.rate(5.0, 20.0) >= 0.95 * 2048.0 * mib,
+        "{}",
+        run.rate(5.0, 20.0) / mib
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn throttling_backs_off_and_growth_resumes_once_it_stops() {
+    let unthrottled = Service {
+        rtt: Duration::from_millis(50),
+        ..Service::far_small_objects()
+    };
+    let throttled = Service {
+        throttle_above: Some(100),
+        ..unthrottled
+    };
+    let (budget, outage) = new_budget(None, None);
+    budget.configure(INITIAL_REQUESTS, 4096, false);
+    let run = simulate(
+        &budget,
+        &outage,
+        throttled,
+        8192,
+        14,
+        Some((7.0, unthrottled)),
+    )
+    .await;
+    // The service lets 100 requests through. Each time more are in flight
+    // the limit halves as the refusal arrives, then grows by an eighth at a
+    // time.
+    let throttling = run.between(1.0, 7.0);
+    assert!(
+        throttling.iter().all(|limit| *limit <= 101 + 101 / 8),
+        "{throttling:?}"
+    );
+    let average = throttling.iter().sum::<usize>() / throttling.len();
+    assert!((50..=110).contains(&average), "{average}");
+    assert!(outage.throttled_responses() > 0);
+    // Without throttling, growth resumes: by an eighth at a time, no
+    // longer doubling.
+    let after = run.between(7.0, 14.0);
+    for pair in after.windows(2) {
+        assert!(pair[1] <= pair[0] + pair[0] / 8 + 1, "{pair:?}");
+    }
+    assert!(run.at(13.9) >= 400, "{}", run.at(13.9));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slower_service_does_not_starve_the_copy() {
+    // Responses take four times as long from 5 s: nothing this copy did.
+    let (budget, outage) = new_budget(None, None);
+    budget.configure(INITIAL_REQUESTS, 1024, false);
+    let fast = Service {
+        rtt: Duration::from_millis(20),
+        ..Service::far_small_objects()
+    };
+    let slow = Service {
+        rtt: Duration::from_millis(80),
+        ..fast
+    };
+    let run = simulate(&budget, &outage, fast, 2048, 10, Some((5.0, slow))).await;
+    assert_eq!(run.at(4.9), 1024);
+    // At most one halving before the next window shows that fewer requests
+    // do not shorten the time,
+    assert!(run.between(5.0, 10.0).iter().all(|limit| *limit >= 512));
+    // and the limit returns to the ceiling.
+    assert_eq!(run.at(9.9), 1024);
+}
+
+fn new_tuning(tigris: bool, upload: bool) -> Tuning {
+    Tuning {
+        control: Arc::default(),
+        tigris,
+        upload,
+        requests: new_budget(None, None).0,
+        reads: crate::s3::read_recovery::Recovery::default(),
+        retained_upload_files: Default::default(),
+        upload_buffers: Arc::new(tokio::sync::Semaphore::new(1)),
     }
 }
 
 #[test]
 fn a_lone_cold_response_keeps_the_wide_start_until_a_warm_one_arrives() {
-    let tuning = Tuning {
-        control: Arc::default(),
-        reads: crate::s3::read_recovery::Recovery::default(),
-        fixed_requests: None,
-        tigris: false,
-        upload: false,
-        requests: Arc::new(Budget::new(64, true)),
-        retained_upload_files: Default::default(),
-        upload_buffers: Arc::new(tokio::sync::Semaphore::new(1)),
-    };
+    let tuning = new_tuning(false, true);
+    assert!(!tuning.far() && !tuning.local());
     // One listing page on a 90 ms endpoint: only the cold response exists.
     tuning.control.observe_first(Duration::from_millis(270));
     assert_eq!(tuning.control_latency(), Some(Duration::from_millis(270)));
-    tuning.configure(true, 256, 64);
-    assert_eq!(tuning.request_limit(), 256);
-    // A 10 ms endpoint whose cold response crossed the threshold ramps
-    // normally once a warm response shows the real distance.
+    assert!(tuning.far());
+    // A 10 ms endpoint whose cold response crossed the threshold starts
+    // as a near one once a warm response shows the real distance.
     tuning.control.observe(Duration::from_millis(10));
     assert_eq!(tuning.control_latency(), Some(Duration::from_millis(10)));
-    tuning.configure(true, 256, 64);
-    assert_eq!(tuning.request_limit(), 64);
+    assert!(!tuning.far() && !tuning.local());
+    tuning.control.observe(Duration::from_micros(500));
+    assert!(tuning.local());
+    // Tigris uploads keep the usual start however far the endpoint is.
+    let tigris = new_tuning(true, true);
+    tigris.control.observe(Duration::from_millis(90));
+    assert!(!tigris.far());
+    let download = new_tuning(true, false);
+    download.control.observe(Duration::from_millis(90));
+    assert!(download.far());
+}
+
+#[test]
+fn a_fixed_request_count_ignores_refusals() {
+    let (budget, outage) = new_budget(Some(6), None);
+    outage.throttled();
+    assert_eq!(budget.limit(), 6);
 }
 
 #[test]
@@ -838,125 +726,257 @@ fn small_object_budget_bounds_payload_memory_and_empty_objects() {
     assert_eq!(small_capacity(524288, 8, 512 * 1024), 512);
 }
 
-#[tokio::test]
-async fn budget_backs_off_on_throttling_only_after_draining() {
-    let outage = Arc::new(crate::s3::outage::Outage::default());
-    let budget = Arc::new(Budget::with_outage(32, true, None, Some(outage.clone())));
-    // First throttle halves 32 -> 16 without lowering max or settling the ramp,
-    // and calling throttled() afterwards for the same signal does not cut again.
-    outage.throttled();
-    budget.completed(1024);
-    assert_eq!(budget.state.lock().unwrap().limit, 16);
-    assert_eq!(budget.state.lock().unwrap().max, 256);
-    assert!(!budget.state.lock().unwrap().settled);
-    budget.throttled();
-    assert_eq!(budget.state.lock().unwrap().limit, 16);
-
-    // While more than `limit` requests are still in flight (draining from the
-    // previous limit), further delayed 429/503 replies must not cut again.
-    let mut permits = Vec::new();
-    budget.state.lock().unwrap().limit = 20;
-    for _ in 0..17 {
-        permits.push(budget.acquire().await);
+#[tokio::test(start_paused = true)]
+async fn a_few_slow_requests_cannot_hold_back_the_next_decision() {
+    let (budget, _) = new_budget(None, None);
+    budget.configure(INITIAL_REQUESTS, 4096, false);
+    let waker = futures_util::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut old: Vec<_> = (0..32).map(|_| poll_permit(&budget, &mut cx)).collect();
+    budget.set_limit(64);
+    // All but eight of the requests admitted before the change finish, and
+    // the new ones keep finishing every 10 ms.
+    tokio::time::advance(Duration::from_millis(10)).await;
+    old.truncate(8);
+    let mut new: Vec<_> = (0..56).map(|_| poll_permit(&budget, &mut cx)).collect();
+    let cycle = |new: &mut Vec<Permit>, cx: &mut Context<'_>| {
+        new.drain(..);
+        new.extend((0..56).map(|_| poll_permit(&budget, cx)));
+    };
+    // The stragglers might yet finish, so no window starts,
+    for _ in 0..15 {
+        tokio::time::advance(Duration::from_millis(10)).await;
+        cycle(&mut new, &mut cx);
     }
-    budget.state.lock().unwrap().limit = 16;
-    outage.throttled();
-    budget.throttled();
-    assert_eq!(budget.state.lock().unwrap().limit, 16);
-
-    // Once active requests drain to the limit, a new throttle cuts again.
-    permits.pop();
-    outage.throttled();
-    budget.throttled();
-    assert_eq!(budget.state.lock().unwrap().limit, 8);
-    drop(permits);
+    assert_eq!(budget.limit(), 64);
+    assert!(budget
+        .state
+        .lock()
+        .unwrap()
+        .control
+        .as_ref()
+        .unwrap()
+        .window
+        .start
+        .is_none());
+    // but after several windows' time they no longer hold it back.
+    for _ in 0..20 {
+        tokio::time::advance(Duration::from_millis(10)).await;
+        cycle(&mut new, &mut cx);
+    }
+    assert_eq!(budget.limit(), 128);
+    drop((old, new));
 }
 
-#[tokio::test]
-async fn multipart_budget_backs_off_on_throttling_and_recovers() {
-    let outage = Arc::new(crate::s3::outage::Outage::default());
-    let budget = Arc::new(Budget::with_outage(
-        64,
-        true,
-        Some(64),
-        Some(outage.clone()),
-    ));
-    // Simulate a multipart ramp that already settled after a rejected probe:
-    // throttling must still back off and reopen the ramp for recovery.
-    budget.state.lock().unwrap().settled = true;
-    outage.throttled();
-    budget.completed(1024 * 1024);
-    {
-        let s = budget.state.lock().unwrap();
-        assert_eq!(s.limit, 32);
-        assert_eq!(s.max, 64);
-        assert!(!s.settled);
-        assert!(s.backoff_windows > 0);
+/// Half the request slots hang, while requests in the other half keep
+/// finishing. A request may take hours, so the hung ones are never known
+/// to have stalled, but they must not hold every later decision back.
+#[tokio::test(start_paused = true)]
+async fn hung_requests_cannot_freeze_the_limit() {
+    hung_requests_after(None).await;
+}
+
+/// However slow the batch's responses have been, a window waits at most
+/// `UNCOVERED_WAIT` for the requests in flight to account for its time.
+#[tokio::test(start_paused = true)]
+async fn slow_responses_do_not_lengthen_the_wait_for_hung_requests() {
+    hung_requests_after(Some(Duration::from_secs(115))).await;
+}
+
+/// `hung_requests_cannot_freeze_the_limit`, after one request of the batch
+/// took `slow` to finish.
+async fn hung_requests_after(slow: Option<Duration>) {
+    let (budget, _) = new_budget(None, None);
+    budget.configure(INITIAL_REQUESTS, 4096, false);
+    let waker = futures_util::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    if let Some(slow) = slow {
+        let permit = poll_permit(&budget, &mut cx);
+        tokio::time::advance(slow).await;
+        drop(permit);
+        // The next windows start afresh, within the same batch.
+        budget.set_limit(INITIAL_REQUESTS);
     }
-    // Drive clean saturated windows past the cooldown; the budget should grow
-    // back to 64 once throttling stops.
-    for _ in 0..8 {
-        let count = {
-            let mut s = budget.state.lock().unwrap();
-            s.since = Some(Instant::now() - Duration::from_secs(1));
-            s.saturated = true;
-            s.limit.max(16)
-        };
-        for _ in 0..count {
-            budget.completed(1024 * 1024);
+    let hung: Vec<_> = (0..16).map(|_| poll_permit(&budget, &mut cx)).collect();
+    let mut running: Vec<_> = (0..16).map(|_| poll_permit(&budget, &mut cx)).collect();
+    let mut limits = vec![];
+    for _ in 0..400 {
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let n = running.len();
+        for permit in &mut running {
+            permit.completed(64 << 10);
         }
+        running.clear();
+        running.extend((0..n).map(|_| poll_permit(&budget, &mut cx)));
+        // New requests take what growth frees, and finish as the others do.
+        loop {
+            let state = budget.state.lock().unwrap();
+            let free = state.active < state.limit;
+            drop(state);
+            if !free {
+                break;
+            }
+            running.push(poll_permit(&budget, &mut cx));
+        }
+        limits.push(budget.limit());
     }
-    assert_eq!(budget.state.lock().unwrap().limit, 64);
+    // The finished requests' times never account for 70% of the time in
+    // flight while the hung half still counts: they might be long transfers.
+    assert_eq!(limits[250], INITIAL_REQUESTS);
+    // After `UNCOVERED_WAIT` the window ends anyway, at the rate the others
+    // carry, and the limit grows.
+    assert!(limits[350] > INITIAL_REQUESTS, "{limits:?}");
+    drop(hung);
+}
+
+/// A long transfer admitted before a change finishes just after the next
+/// window opens, beside quick checks, while the other transfers admitted
+/// with it are still in flight. Its ten seconds alone exceed the window's
+/// request-seconds, but only its last moments were spent in the window, so
+/// the window still does not describe the transfers.
+#[tokio::test(start_paused = true)]
+async fn a_transfer_from_before_a_window_covers_only_its_time_within_it() {
+    let (budget, _) = new_budget(None, None);
+    budget.configure(64, 4096, false);
+    let waker = futures_util::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut carried = poll_permit(&budget, &mut cx);
+    let transfers: Vec<_> = (0..63).map(|_| poll_permit(&budget, &mut cx)).collect();
+    // A measured step up, judged by the window after these drain or have
+    // taken a few windows' time.
+    budget.set_limit(72);
+    tokio::time::advance(Duration::from_millis(9950)).await;
+    let mut checks: Vec<_> = (0..4).map(|_| poll_permit(&budget, &mut cx)).collect();
+    let cycle = |checks: &mut Vec<Permit>, cx: &mut Context<'_>| {
+        checks.clear();
+        checks.extend((0..4).map(|_| poll_permit(&budget, cx)));
+    };
+    for _ in 0..50 {
+        tokio::time::advance(Duration::from_millis(1)).await;
+        cycle(&mut checks, &mut cx);
+    }
+    carried.completed(256 << 20);
+    drop(carried);
+    for _ in 0..10 {
+        tokio::time::advance(Duration::from_millis(1)).await;
+        cycle(&mut checks, &mut cx);
+    }
+    // Had the transfer's whole response time counted, the window would
+    // have ended with nearly the whole limit in flight, and doubled it.
+    assert_eq!(budget.limit(), 72);
+    let state = budget.state.lock().unwrap();
+    let window = &state.control.as_ref().unwrap().window;
+    assert!(window.completed > 200, "{}", window.completed);
+    assert!(window.covered < COVERED * window.area);
+    drop(state);
+    drop((transfers, checks));
 }
 
 #[test]
-fn configure_ignores_pre_batch_throttles() {
-    let args = crate::cli::Args::parse_args(&[
-        std::ffi::OsString::from("cp"),
-        std::ffi::OsString::from("--from"),
-        std::ffi::OsString::from("s3://bucket"),
-        std::ffi::OsString::from("a"),
-        std::ffi::OsString::from("--as"),
-        std::ffi::OsString::from("b"),
-    ])
-    .unwrap();
-    let options = args.s3.clone().unwrap();
-    let outage = Arc::new(crate::s3::outage::Outage::default());
-    let tuning = Tuning::new(&options, &args, Arc::default(), outage.clone());
-    // Listing / discovery throttles happen before transfer configuration.
-    outage.throttled();
-    outage.throttled();
-    tuning.configure(false, 64, 32);
-    tuning.requests.completed(1024);
-    assert_eq!(tuning.request_limit(), 32);
+fn limit_changes_reach_admission_in_order() {
+    let (budget, _) = new_budget(None, None);
+    let limits = budget.subscribe();
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for thread in 0..4 {
+            let (budget, done) = (&budget, &done);
+            scope.spawn(move || {
+                for step in 0..20_000 {
+                    budget.set_limit(1 + (thread * 7 + step) % 5);
+                }
+                done.fetch_add(1, Relaxed);
+            });
+        }
+        // Whenever the limit can be read, admission already follows it: a
+        // change published after the lock is released could be overtaken
+        // by a later one and leave its stale value behind.
+        while done.load(Relaxed) < 4 {
+            let state = budget.state.lock().unwrap();
+            assert_eq!(*limits.borrow(), state.limit);
+        }
+    });
 }
 
-#[tokio::test]
-async fn permit_drop_without_completed_backs_off_on_throttling() {
-    let outage = Arc::new(crate::s3::outage::Outage::default());
-    let budget = Arc::new(Budget::with_outage(32, true, None, Some(outage.clone())));
-    let permit = budget.acquire().await;
-    outage.throttled();
-    drop(permit);
-    assert_eq!(budget.state.lock().unwrap().limit, 16);
-}
-
-#[tokio::test]
-async fn checking_above_skips_budget_throttle_cut() {
-    let outage = Arc::new(crate::s3::outage::Outage::default());
-    let budget = Arc::new(Budget::with_outage(32, true, None, Some(outage.clone())));
-    budget.set_checking_above(true);
-    let permit = budget.acquire().await;
-    outage.throttled();
-    budget.completed(1024);
-    drop(permit);
-    assert_eq!(budget.state.lock().unwrap().limit, 32);
-    // Even if another checking throttle arrives with no permit drop or
-    // completion before leaving checking_above, leaving checking_above
-    // consumes it so the next transfer is not cut.
-    outage.throttled();
-    budget.set_checking_above(false);
-    budget.completed(1024);
-    budget.throttled();
-    assert_eq!(budget.state.lock().unwrap().limit, 32);
+/// Quick checks of objects that need no transfer, beside transfers that
+/// each take seconds, all within the one limit. Most windows end before
+/// any transfer finishes; the checks' short response times must not stand
+/// for the transfers still in flight.
+#[tokio::test(start_paused = true)]
+async fn quick_checks_beside_long_transfers_do_not_drive_growth() {
+    let mib = 1024.0 * 1024.0;
+    // Each transfer moves 50 MiB/s, the path 2 GiB/s: about 41 transfers
+    // fill it.
+    let transfer = Service {
+        rtt: Duration::from_millis(2),
+        bytes: 256 << 20,
+        per_request: Some(50.0 * mib),
+        bandwidth: Some(2048.0 * mib),
+        throttle_above: None,
+    };
+    let check = Service {
+        rtt: Duration::from_millis(2),
+        bytes: 0,
+        per_request: None,
+        bandwidth: None,
+        throttle_above: None,
+    };
+    let (budget, outage) = new_budget(None, None);
+    budget.configure(INITIAL_REQUESTS, 256, false);
+    let transfers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let done = Arc::new(AtomicU64::new(0));
+    let end = Instant::now() + Duration::from_secs(60);
+    let mut tasks = tokio::task::JoinSet::new();
+    for task in 0..512 {
+        let (budget, outage, transfers, done) = (
+            budget.clone(),
+            outage.clone(),
+            transfers.clone(),
+            done.clone(),
+        );
+        // A few tasks check objects one after another.
+        let service = if task < 4 { check } else { transfer };
+        tasks.spawn(async move {
+            while Instant::now() < end {
+                let mut permit = budget.acquire().await;
+                if service.bytes > 0 {
+                    transfers.fetch_add(1, Relaxed);
+                }
+                service.respond(&outage, || transfers.load(Relaxed)).await;
+                if service.bytes > 0 {
+                    transfers.fetch_sub(1, Relaxed);
+                }
+                permit.completed(service.bytes);
+                done.fetch_add(service.bytes, Relaxed);
+                drop(permit);
+            }
+        });
+    }
+    let mut limits = Vec::new();
+    let mut peak = 0;
+    let mut ticks = tokio::time::interval(Duration::from_millis(10));
+    let mut bytes_after_20s = 0;
+    while Instant::now() < end {
+        ticks.tick().await;
+        let state = budget.state.lock().unwrap();
+        peak = peak.max(state.limit);
+        limits.push(state.limit);
+        drop(state);
+        if limits.len() == 2000 {
+            bytes_after_20s = done.load(Relaxed);
+        }
+    }
+    let rate = (done.load(Relaxed) - bytes_after_20s) as f64 / 40.0;
+    while tasks.join_next().await.is_some() {}
+    let mut changes = Vec::new();
+    for (tick, pair) in limits.windows(2).enumerate() {
+        if pair[0] != pair[1] {
+            changes.push(format!("{:.2}s:{}", (tick + 1) as f64 / 100.0, pair[1]));
+        }
+    }
+    eprintln!("TRACE {} rate {:.0} MiB/s", changes.join(" "), rate / mib);
+    // More transfers than the path needs only queue on it.
+    let settled = &limits[2000..];
+    assert!(settled.iter().all(|limit| *limit <= 128), "{settled:?}");
+    assert!(peak < 256, "{peak}");
+    assert!(rate >= 0.8 * 2048.0 * mib, "{}", rate / mib);
 }

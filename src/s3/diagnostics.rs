@@ -211,36 +211,14 @@ pub(super) fn finish() {
     }
 }
 
-/// A change of the transfer limit, or with `checking` of the number of
-/// objects in progress while those beyond that limit are only checked. The
-/// rate is transferred bytes plus file credit, or checked objects.
-pub(super) fn object_concurrency(
-    checking: bool,
-    before: usize,
-    after: usize,
-    activity_per_second: f64,
-) {
-    if let Some(trace) = trace() {
-        let phase = if checking {
-            "checking_concurrency"
-        } else {
-            "object_concurrency"
-        };
-        record(
-            json!({"phase":phase,"at_s":trace.start.elapsed().as_secs_f64(),"before":before,"after":after,"activity_per_second":activity_per_second}),
-        );
-    }
-}
-
-/// Rates actually used by the request ramp, before counters are reset.
+/// A measurement window of the S3 request limit and what it decided. Work is
+/// bytes plus a fixed credit per request.
 pub(super) fn request_window(
     before: usize,
     after: usize,
-    bytes_per_second: f64,
-    elapsed: Duration,
+    sample: &super::tuning::Sample,
     completed: usize,
-    saturated: bool,
-    settled: bool,
+    elapsed: Duration,
 ) {
     if let Some(trace) = trace() {
         record(json!({
@@ -248,103 +226,24 @@ pub(super) fn request_window(
             "at_s": trace.start.elapsed().as_secs_f64(),
             "before": before,
             "after": after,
-            "bytes_per_second": bytes_per_second,
-            "elapsed_s": elapsed.as_secs_f64(),
+            "in_flight": sample.in_flight,
+            "time": sample.time,
+            "rate": sample.rate,
             "completed": completed,
-            "saturated": saturated,
-            "settled": settled,
+            "elapsed_s": elapsed.as_secs_f64(),
         }));
     }
 }
 
-// Reuse the scheduler's preparation generations while diagnostics are enabled.
-// These do not assert the concurrency at socket admission.
-#[derive(Default)]
-pub(super) struct ObjectWindows {
-    generation: u64,
-    fresh_completed: usize,
-    fresh_activity: u64,
-}
-
-pub(super) struct ObjectWindow {
-    pub limit: usize,
-    pub active: usize,
-    pub queued: usize,
-    pub completed: usize,
-    pub activity: u64,
-    pub elapsed: Duration,
-    pub warmup: bool,
-    pub previous_rate: Option<f64>,
-    pub probe_from: Option<usize>,
-    pub probe_baseline: Option<f64>,
-}
-
-impl ObjectWindows {
-    pub fn new() -> Option<Self> {
-        trace()?;
-        Some(Self::default())
-    }
-    pub fn completed(&mut self, prepared: u64, activity: Option<u64>) {
-        if prepared == self.generation {
-            if let Some(activity) = activity {
-                self.fresh_completed += 1;
-                self.fresh_activity = self.fresh_activity.saturating_add(activity);
-            }
-        }
-    }
-    pub fn changed(&mut self) {
-        self.generation += 1;
-        self.reset();
-    }
-    pub fn reset(&mut self) {
-        self.fresh_completed = 0;
-        self.fresh_activity = 0;
-    }
-    pub fn sample(&mut self, window: ObjectWindow) {
-        if let Some(trace) = trace() {
-            record(json!({
-                "phase": "object_window",
-                "at_s": trace.start.elapsed().as_secs_f64(),
-                "generation": self.generation,
-                "limit": window.limit,
-                "active": window.active,
-                "queued": window.queued,
-                "elapsed_s": window.elapsed.as_secs_f64(),
-                "completed": window.completed,
-                "activity": window.activity,
-                "fresh_completed": self.fresh_completed,
-                "fresh_activity": self.fresh_activity,
-                "warmup": window.warmup,
-                "previous_rate": window.previous_rate,
-                "probe_from": window.probe_from,
-                "probe_baseline": window.probe_baseline,
-            }));
-        }
-        self.reset();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn object_windows_distinguish_old_and_current_work() {
-        let mut windows = ObjectWindows::default();
-        windows.changed();
-        windows.completed(0, Some(100));
-        windows.completed(1, Some(200));
-        assert_eq!((windows.fresh_completed, windows.fresh_activity), (1, 200));
-
-        windows.reset(); // A new measurement window, but the same setting.
-        windows.completed(1, Some(300));
-        assert_eq!((windows.fresh_completed, windows.fresh_activity), (1, 300));
-
-        windows.completed(1, None); // Skipped and failed copies add no activity.
-        assert_eq!((windows.fresh_completed, windows.fresh_activity), (1, 300));
-        windows.changed();
-        windows.completed(1, Some(400));
-        assert_eq!((windows.fresh_completed, windows.fresh_activity), (0, 0));
+/// The S3 request limit fell because the service asked for fewer requests.
+pub(super) fn request_throttled(before: usize, after: usize) {
+    if let Some(trace) = trace() {
+        record(json!({
+            "phase": "request_throttled",
+            "at_s": trace.start.elapsed().as_secs_f64(),
+            "before": before,
+            "after": after,
+        }));
     }
 }
 
