@@ -1792,7 +1792,7 @@ fn close_scope_with_timeout(scope: &Path, master_exit_timeout: Duration) -> Resu
                 failures.push(format!("{}: {error:#}", record.label()));
             }
         }
-        if socket_is_live(&socket) {
+        if socket_is_live_or_busy(&socket) {
             if let Err(error) = close_master_with_timeout(&socket, record, master_exit_timeout) {
                 failures.push(format!("{}: {error:#}", record.label()));
             }
@@ -1883,6 +1883,19 @@ fn close_scope_with_timeout(scope: &Path, master_exit_timeout: Duration) -> Resu
     Ok(())
 }
 
+/// Non-blocking liveness probe for shutdown: treats a full accept queue
+/// (`WouldBlock` / `EINPROGRESS`) as live so an unresponsive master whose
+/// backlog is full cannot block `close_scope` before the bounded shutdown runs.
+fn socket_is_live_or_busy(path: &Path) -> bool {
+    match socket_is_ready(path) {
+        Ok(ready) => ready,
+        Err(error) => {
+            error.kind() == std::io::ErrorKind::WouldBlock
+                || error.raw_os_error() == Some(libc::EINPROGRESS)
+        }
+    }
+}
+
 fn close_master_with_timeout(
     socket: &Path,
     record: &EndpointRecord,
@@ -1898,7 +1911,7 @@ fn close_master_with_timeout(
         MASTER_EXIT_OUTPUT_LIMIT,
     )
     .with_context(|| format!("ask SSH master for {} to exit", record.label()))?;
-    if output.status.success() || !socket_is_live(socket) {
+    if output.status.success() || !socket_is_live_or_busy(socket) {
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2394,5 +2407,42 @@ mod tests {
         assert!(format!("{error:#}").contains("timed out"), "{error:#}");
         assert!(scope.exists());
         assert!(socket.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn close_scope_does_not_hang_when_unresponsive_master_backlog_is_full() {
+        let temporary = crate::test_support::short_tempdir().unwrap();
+        let scope = temporary.path().join("scope");
+        initialize_scope(&scope).unwrap();
+        let socket = prepare_endpoint(&scope, None, "example", None, None).unwrap();
+        let listener =
+            socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+        listener
+            .bind(&socket2::SockAddr::unix(&socket).unwrap())
+            .unwrap();
+        listener.listen(1).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // Fill the listener's accept queue so a blocking connect would hang.
+        let mut saturated = false;
+        for _ in 0..16 {
+            match socket_is_ready(&socket) {
+                Ok(true) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    saturated = true;
+                    break;
+                }
+                other => panic!("unexpected probe result while filling backlog: {other:?}"),
+            }
+        }
+        assert!(saturated, "expected listener backlog to reach WouldBlock");
+        assert!(socket_is_live_or_busy(&socket));
+
+        let error = close_scope_with_timeout(&scope, Duration::from_millis(200)).unwrap_err();
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+        assert!(scope.exists());
+        assert!(socket.exists());
+        drop(listener);
     }
 }
