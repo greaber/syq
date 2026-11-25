@@ -951,3 +951,138 @@ exec /bin/sh -c "$1""#,
         assert!(stderr.contains(&format!("elapsed {duration}")), "{stderr}");
     }
 }
+
+/// Put a `zstd` on the fake remote's `PATH` when the fixture's own does not
+/// reach this host's, and say whether there is one.
+fn remote_zstd(t: &Tmp) -> bool {
+    if ["/usr/bin/zstd", "/bin/zstd"]
+        .iter()
+        .any(|path| Path::new(path).exists())
+    {
+        return true;
+    }
+    let Some(found) = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|directory| directory.join("zstd"))
+            .find(|candidate| candidate.is_file())
+    }) else {
+        eprintln!("skipping: this host has no zstd for the remote to decompress with");
+        return false;
+    };
+    std::os::unix::fs::symlink(found, t.path("remote-bin/zstd")).unwrap();
+    true
+}
+
+/// A server that has `zstd` downloads the release's zstd archive, and the
+/// client verifies it against the signed zstd listing the server relays.
+#[test]
+fn remote_download_prefers_the_zstd_archive_when_the_server_has_zstd() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    setup_release_bootstrap(&t);
+    if !remote_zstd(&t) {
+        return;
+    }
+    write(&t.path("src"), b"zstd helper");
+    let remote = format!("fake:{}", t.s("dst"));
+    let out = remote_syq_command(&t, &rsh, &["-a", &t.s("src"), &remote])
+        .env(
+            "FAKE_REMOTE_RELEASE_ZSTD_MANIFEST",
+            t.path("release-zstd-manifest.json"),
+        )
+        .env("FAKE_REMOTE_RELEASE_ZSTD_ARCHIVE", t.path("release.zst"))
+        // A gzip download would fail.
+        .env("FAKE_REMOTE_RELEASE_ARCHIVE", t.path("missing.gz"))
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"zstd helper");
+    assert_eq!(
+        read(&stored_remote_helper(&t)),
+        read(Path::new(env!("CARGO_BIN_EXE_syq")))
+    );
+    // The manifest, the zstd listing, and the zstd archive.
+    assert_eq!(read(&t.path("curl.log")), b"fetch\nfetch\nfetch\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("uploading"), "{stderr}");
+    assert!(!stored_local_helper(&t).exists(), "{stderr}");
+}
+
+/// The digest of a zstd download is checked against the signed zstd listing,
+/// not the gzip archive's, and a mismatch is discarded for an upload.
+#[test]
+fn remote_zstd_download_that_fails_verification_is_replaced_by_an_upload() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    setup_release_bootstrap(&t);
+    if !remote_zstd(&t) {
+        return;
+    }
+    // Valid zstd data, but not the archive the listing signs.
+    let substituted = zstd::bulk::compress(&read(Path::new(env!("CARGO_BIN_EXE_syq"))), 2).unwrap();
+    write(&t.path("substituted.zst"), &substituted);
+    write(&t.path("src"), b"verified upload");
+    let remote = format!("fake:{}", t.s("dst"));
+    let out = remote_syq_command(&t, &rsh, &["-a", &t.s("src"), &remote])
+        .env(
+            "FAKE_REMOTE_RELEASE_ZSTD_MANIFEST",
+            t.path("release-zstd-manifest.json"),
+        )
+        .env(
+            "FAKE_REMOTE_RELEASE_ZSTD_ARCHIVE",
+            t.path("substituted.zst"),
+        )
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"verified upload");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "remote helper download failed integrity verification (expected SHA-256 {}, got {})",
+            sha256_hex(&read(&t.path("release.zst"))),
+            sha256_hex(&substituted)
+        )),
+        "{stderr}"
+    );
+    assert!(stderr.contains("uploading the verified helper"), "{stderr}");
+    assert_eq!(
+        read(&stored_remote_helper(&t)),
+        read(Path::new(env!("CARGO_BIN_EXE_syq")))
+    );
+}
+
+/// The helper the client downloads for an upload comes from the zstd archive
+/// of a release that lists one, and from gzip for a release from before.
+#[test]
+fn uploaded_helper_downloads_zstd_or_gzip_by_what_the_release_lists() {
+    let asset = release_bootstrap_fixture().asset;
+    for zstd in [true, false] {
+        let t = Tmp::new();
+        let rsh = fake_rsh(&t);
+        setup_release_bootstrap(&t);
+        executable(&t.path("remote-bin/curl"), b"#!/bin/sh\nexit 22\n");
+        // Remove the archive that should not be used, and with gzip, the
+        // zstd listing, as for a release from before zstd archives.
+        if zstd {
+            fs::remove_file(t.path(&format!("{asset}.gz"))).unwrap();
+        } else {
+            fs::remove_file(t.path("syq-release-zstd.json")).unwrap();
+            fs::remove_file(t.path(&format!("{asset}.zst"))).unwrap();
+        }
+        write(&t.path("src"), b"uploaded");
+        let remote = format!("fake:{}", t.s("dst"));
+        let out = remote_syq(&t, &rsh, &["-a", &t.s("src"), &remote]);
+        assert_output_ok(&out);
+        assert_eq!(read(&t.path("dst")), b"uploaded");
+        for helper in [stored_remote_helper(&t), stored_local_helper(&t)] {
+            assert_eq!(
+                read(&helper),
+                read(Path::new(env!("CARGO_BIN_EXE_syq"))),
+                "zstd={zstd}"
+            );
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stderr.contains("warning"), "zstd={zstd}: {stderr}");
+    }
+}

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Generate a version-pinned installer whose trusted hashes come from the signed
-release manifest. The generated script needs only POSIX sh at install time.
+release manifest and zstd archive listing. The generated script needs only
+POSIX sh at install time, and uses the zstd archive where `zstd` is installed.
 
-Usage: scripts/generate-installer.py MANIFEST OUTPUT
+Usage: scripts/generate-installer.py MANIFEST ZSTD_MANIFEST OUTPUT
 """
 import os
 import re
@@ -37,8 +38,9 @@ Install syq @VERSION@ without sudo.
 Usage: install.sh [--bin-dir DIR]
 
 The default is $HOME/.local/bin. The installer detects this host, downloads
-the pinned release archive, checks its embedded SHA-256 and size, verifies the
-binary's version and release identity, then replaces the destination atomically.
+the pinned release archive (zstd when zstd is installed, gzip otherwise), checks
+its embedded SHA-256 and size, verifies the binary's version and release
+identity, then replaces the destination atomically.
 USAGE
 }
 
@@ -61,6 +63,15 @@ case "$(uname -s):$(uname -m)" in
 # The installer after its platform table, copied verbatim.
 TAIL = r'''*) echo "install.sh: unsupported platform: $(uname -s) $(uname -m)" >&2; exit 1 ;;
 esac
+
+# The zstd archive is smaller and unpacks faster; gzip is everywhere.
+format=gzip
+if command -v zstd >/dev/null 2>&1; then
+  format=zstd
+  archive=$zstd_archive
+  expected_sha=$zstd_sha
+  expected_size=$zstd_size
+fi
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/syq-install.XXXXXXXX")
 install_tmp=
@@ -116,7 +127,14 @@ fi
   exit 1
 }
 
-gzip -dc "$download" > "$program"
+if [ "$format" = zstd ]; then
+  zstd -d -q -c "$download" > "$program"
+else
+  gzip -dc "$download" > "$program"
+fi || {
+  echo "install.sh: could not decompress the downloaded $format archive" >&2
+  exit 1
+}
 chmod 755 "$program"
 got=$("$program" --version 2>/dev/null) || {
   echo 'install.sh: downloaded syq cannot run on this host' >&2
@@ -157,32 +175,44 @@ esac
 '''
 
 
-def archive_fields(manifest, target):
+def archive_fields(archive, target, suffix):
     """The name, SHA-256, and size of a target's archive, after validation."""
     try:
-        archive = manifest["artifacts"][target]["archive"]
         name, sha256, size = archive["name"], archive["sha256"], archive["size"]
     except (KeyError, TypeError):
         name = sha256 = size = None
     if not (isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9._-]+", name)
+            and name.endswith(suffix)
             and isinstance(sha256, str) and re.fullmatch(r"[0-9a-f]{64}", sha256)
             and type(size) is int and size > 0):
-        raise ToolError(f"invalid archive metadata for {target}")
+        raise ToolError(f"invalid {suffix} archive metadata for {target}")
     return name, sha256, str(size)
 
 
+def entry(document, *keys):
+    for key in keys:
+        document = document.get(key) if isinstance(document, dict) else None
+    return document
+
+
 def main():
-    if len(sys.argv) != 3:
-        print(f"usage: {sys.argv[0]} MANIFEST OUTPUT", file=sys.stderr)
+    if len(sys.argv) != 4:
+        print(f"usage: {sys.argv[0]} MANIFEST ZSTD_MANIFEST OUTPUT", file=sys.stderr)
         return 2
-    manifest_path, output = sys.argv[1:]
+    manifest_path, zstd_manifest_path, output = sys.argv[1:]
     manifest = load_release_manifest(manifest_path)
-    table = [(pattern, *archive_fields(manifest, target)) for target, pattern in TARGETS.items()]
+    zstd_manifest = load_release_manifest(zstd_manifest_path)
+    if zstd_manifest["tag"] != manifest["tag"]:
+        raise ToolError("the zstd archive manifest describes another release")
     values = {"VERSION": manifest["version"], "DOWNLOAD_BASE": DOWNLOAD_BASE,
               "TAG": manifest["tag"]}
     script = re.sub(r"@(VERSION|DOWNLOAD_BASE|TAG)@", lambda match: values[match.group(1)], HEAD)
-    for row in table:
-        script += "{}) archive='{}'; expected_sha='{}'; expected_size='{}' ;;\n".format(*row)
+    for target, pattern in TARGETS.items():
+        gzip = archive_fields(entry(manifest, "artifacts", target, "archive"), target, ".gz")
+        zstd = archive_fields(entry(zstd_manifest, "archives", target), target, ".zst")
+        script += ("{}) archive='{}'; expected_sha='{}'; expected_size='{}';"
+                   " zstd_archive='{}'; zstd_sha='{}'; zstd_size='{}' ;;\n").format(
+                       pattern, *gzip, *zstd)
     script += TAIL
     with open(output, "w", encoding="utf-8", newline="") as destination:
         destination.write(script)

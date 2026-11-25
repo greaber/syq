@@ -2,6 +2,9 @@
 """Validate a complete four-target build and create deterministic release
 metadata, checksums, the standalone installer, and the Homebrew formula.
 
+The zstd archives are listed in their own manifest: releases before them parse
+syq-release-manifest.json strictly and would refuse one with another field.
+
 Usage: scripts/package-release.py vVERSION DIST_DIR
 """
 import difflib
@@ -16,6 +19,8 @@ import tempfile
 from tooling import cargo_version, report_errors, sha256_file
 
 SCRIPTS = Path(os.path.abspath(__file__)).parent
+MANIFEST = "syq-release-manifest.json"
+ZSTD_MANIFEST = "syq-release-zstd.json"
 TARGETS = {
     "linux-x86_64": "syq-linux-x86_64",
     "linux-aarch64": "syq-linux-aarch64",
@@ -51,35 +56,39 @@ def main():
         print(f"tag {tag} does not match Cargo.toml version {package_version}", file=sys.stderr)
         return 1
 
-    artifacts = {}
-    for target, asset in TARGETS.items():
-        binary = os.path.join(dist, asset)
-        archive = binary + ".gz"
-        for path in (binary, archive):
-            if not regular(path):
-                print(f"missing regular asset: {path}", file=sys.stderr)
-                return 1
-        binary_hash = sha256_file(binary)
-        archive_hash = sha256_file(archive)
-        with open(binary + ".sha256", "w") as checksum:
-            checksum.write(f"{binary_hash}  {asset}\n")
-        with open(archive + ".sha256", "w") as checksum:
-            checksum.write(f"{archive_hash}  {asset}.gz\n")
-        artifacts[target] = {
-            "binary": {"name": asset, "sha256": binary_hash, "size": os.path.getsize(binary)},
-            "archive": {"name": f"{asset}.gz", "sha256": archive_hash,
-                        "size": os.path.getsize(archive)},
-        }
+    def described(name):
+        """Write NAME's checksum file and return its manifest entry."""
+        path = os.path.join(dist, name)
+        digest = sha256_file(path)
+        with open(path + ".sha256", "w") as checksum:
+            checksum.write(f"{digest}  {name}\n")
+        return {"name": name, "sha256": digest, "size": os.path.getsize(path)}
 
-    core = {"schema": 1, "repository": "https://github.com/greaber/syq", "version": version,
-            "tag": tag, "artifacts": artifacts}
+    artifacts = {}
+    zstd_archives = {}
+    for target, asset in TARGETS.items():
+        for name in (asset, f"{asset}.gz", f"{asset}.zst"):
+            if not regular(os.path.join(dist, name)):
+                print(f"missing regular asset: {os.path.join(dist, name)}", file=sys.stderr)
+                return 1
+        artifacts[target] = {"binary": described(asset), "archive": described(f"{asset}.gz")}
+        zstd_archives[target] = described(f"{asset}.zst")
+
+    identity = {"schema": 1, "repository": "https://github.com/greaber/syq", "version": version,
+                "tag": tag}
+    core = dict(identity, artifacts=artifacts)
+    zstd_manifest = os.path.join(dist, ZSTD_MANIFEST)
+    with open(zstd_manifest, "w") as output:
+        output.write(json.dumps(dict(identity, archives=zstd_archives,
+                                     signature_scheme="ed25519-jcs-v1"),
+                                indent=2, sort_keys=True) + "\n")
     descriptor, manifest_core = tempfile.mkstemp()
     try:
         with os.fdopen(descriptor, "w") as output:
             output.write(json.dumps(core, indent=2, sort_keys=True) + "\n")
         installer = os.path.join(dist, "install.sh")
         formula = os.path.join(dist, "syq.rb")
-        run(SCRIPTS / "generate-installer.py", manifest_core, installer)
+        run(SCRIPTS / "generate-installer.py", manifest_core, zstd_manifest, installer)
         run(SCRIPTS / "generate-homebrew-formula.py", manifest_core, formula)
     finally:
         os.unlink(manifest_core)
@@ -91,13 +100,14 @@ def main():
                              "size": os.path.getsize(formula)},
         "signature_scheme": "ed25519-jcs-v1",
     })
-    with open(os.path.join(dist, "syq-release-manifest.json"), "w") as output:
+    with open(os.path.join(dist, MANIFEST), "w") as output:
         output.write(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 
     # Anything unexpected here indicates a partial or contaminated release job.
     expected = sorted([name for asset in TARGETS.values()
-                       for name in (asset, f"{asset}.sha256", f"{asset}.gz", f"{asset}.gz.sha256")]
-                      + ["install.sh", "syq-release-manifest.json", "syq.rb"])
+                       for file in (asset, f"{asset}.gz", f"{asset}.zst")
+                       for name in (file, f"{file}.sha256")]
+                      + ["install.sh", MANIFEST, ZSTD_MANIFEST, "syq.rb"])
     actual = sorted(os.listdir(dist))
     if expected != actual:
         sys.stdout.writelines(difflib.unified_diff(

@@ -199,15 +199,18 @@ impl RemoteSpec {
         let mut authorized = false;
         match report {
             Ok(Some(report)) if valid_sha256(&report.sha256) => {
-                match crate::update::trusted_current_helper_from_manifest(target, &report.manifest)
-                {
+                match crate::update::trusted_current_helper_from_manifest(
+                    target,
+                    &report.manifest,
+                    report.zstd_manifest.as_deref(),
+                ) {
                     Ok(trusted) => {
-                        if report.sha256 == trusted.archive_sha256() {
+                        if report.sha256 == trusted.remote_archive_sha256() {
                             authorized = true;
                         } else {
                             integrity_warning = Some(format!(
                                 "remote helper download failed integrity verification (expected SHA-256 {}, got {})",
-                                trusted.archive_sha256(),
+                                trusted.remote_archive_sha256(),
                                 report.sha256
                             ));
                         }
@@ -346,6 +349,9 @@ pub(super) enum RemoteDownloadOutcome {
 #[derive(Debug)]
 pub(super) struct RemoteDownloadReport {
     pub(super) manifest: Vec<u8>,
+    /// The signed zstd listing, present when the remote downloaded the zstd
+    /// archive instead of gzip.
+    pub(super) zstd_manifest: Option<Vec<u8>>,
     pub(super) sha256: String,
 }
 
@@ -471,42 +477,23 @@ pub(super) fn read_remote_download_report(
     if protocol_line(&line) != b"syq-helper-manifest-begin" {
         return Ok(None);
     }
-
-    let mut manifest = Vec::new();
-    loop {
-        if read_report_line(reader, &mut line)? == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "remote manifest was not terminated",
-            ));
-        }
-        let framed = protocol_line(&line);
-        if framed == b"syq-helper-manifest-end" {
-            break;
-        }
-        let data = framed
-            .strip_prefix(b"syq-helper-manifest-data:")
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "remote manifest contained unframed protocol data",
-                )
-            })?;
-        if manifest.len().saturating_add(data.len() + 1) > MAX_MANIFEST_SIZE {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "remote manifest exceeded 1 MiB",
-            ));
-        }
-        manifest.extend_from_slice(data);
-        manifest.push(b'\n');
-    }
+    let manifest = read_report_manifest(reader, &mut line)?;
 
     if read_report_line(reader, &mut line)? == 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "remote helper digest was missing",
         ));
+    }
+    let mut zstd_manifest = None;
+    if protocol_line(&line) == b"syq-helper-zstd-manifest-begin" {
+        zstd_manifest = Some(read_report_manifest(reader, &mut line)?);
+        if read_report_line(reader, &mut line)? == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "remote helper digest was missing",
+            ));
+        }
     }
     let digest = protocol_line(&line)
         .strip_prefix(b"syq-helper-sha256:")
@@ -529,7 +516,44 @@ pub(super) fn read_remote_download_report(
             "remote helper report contained trailing or malformed protocol data",
         ));
     }
-    Ok(Some(RemoteDownloadReport { manifest, sha256 }))
+    Ok(Some(RemoteDownloadReport {
+        manifest,
+        zstd_manifest,
+        sha256,
+    }))
+}
+
+/// Read framed manifest lines up to their end marker, after a begin marker.
+fn read_report_manifest(reader: &mut impl BufRead, line: &mut Vec<u8>) -> std::io::Result<Vec<u8>> {
+    let mut manifest = Vec::new();
+    loop {
+        if read_report_line(reader, line)? == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "remote manifest was not terminated",
+            ));
+        }
+        let framed = protocol_line(line);
+        if framed == b"syq-helper-manifest-end" {
+            return Ok(manifest);
+        }
+        let data = framed
+            .strip_prefix(b"syq-helper-manifest-data:")
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "remote manifest contained unframed protocol data",
+                )
+            })?;
+        if manifest.len().saturating_add(data.len() + 1) > MAX_MANIFEST_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "remote manifest exceeded 1 MiB",
+            ));
+        }
+        manifest.extend_from_slice(data);
+        manifest.push(b'\n');
+    }
 }
 
 pub(super) fn protocol_line(mut line: &[u8]) -> &[u8] {

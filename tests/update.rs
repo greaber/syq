@@ -68,6 +68,28 @@ struct UpdateFixture {
     home: PathBuf,
     public_key: String,
     original: Vec<u8>,
+    release_version: String,
+    replacement: Vec<u8>,
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The key that signs every fixture release.
+fn release_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[31; 32])
+}
+
+fn sign_release_document(mut document: serde_json::Value) -> Vec<u8> {
+    let canonical = serde_json_canonicalizer::to_vec(&document).unwrap();
+    document["signature"] = base64::engine::general_purpose::STANDARD
+        .encode(release_signing_key().sign(&canonical).to_bytes())
+        .into();
+    serde_json::to_vec_pretty(&document).unwrap()
 }
 
 impl UpdateFixture {
@@ -127,19 +149,13 @@ impl UpdateFixture {
             "homebrew_formula": {"name": "syq.rb", "sha256": "2".repeat(64), "size": 1},
             "signature_scheme": "ed25519-jcs-v1"
         });
-        let signing = SigningKey::from_bytes(&[31; 32]);
-        let canonical = serde_json_canonicalizer::to_vec(&manifest).unwrap();
-        let signature =
-            base64::engine::general_purpose::STANDARD.encode(signing.sign(&canonical).to_bytes());
-        let mut manifest = manifest;
-        manifest["signature"] = signature.into();
         fs::write(
             temp.path("fixtures/syq-release-manifest.json"),
-            serde_json::to_vec_pretty(&manifest).unwrap(),
+            sign_release_document(manifest),
         )
         .unwrap();
-        let public_key =
-            base64::engine::general_purpose::STANDARD.encode(signing.verifying_key().to_bytes());
+        let public_key = base64::engine::general_purpose::STANDARD
+            .encode(release_signing_key().verifying_key().to_bytes());
 
         let home = temp.path("home");
         fs::create_dir_all(&home).unwrap();
@@ -150,7 +166,48 @@ impl UpdateFixture {
             installed,
             public_key,
             original,
+            release_version: release_version.into(),
+            replacement: replacement.into(),
         }
+    }
+
+    /// Publish the release's zstd archive and its signed listing, as every
+    /// release since zstd archives does. Without them, the fixture is a
+    /// release from before.
+    fn publish_zstd(&self) {
+        let target = release_target();
+        let asset = format!("syq-{target}");
+        let archive = zstd::bulk::compress(&self.replacement, 19).unwrap();
+        fs::write(self.temp.path(&format!("fixtures/{asset}.zst")), &archive).unwrap();
+        let listing = serde_json::json!({
+            "schema": 1,
+            "repository": "https://github.com/greaber/syq",
+            "version": self.release_version,
+            "tag": format!("v{}", self.release_version),
+            "archives": {
+                (target): {
+                    "name": format!("{asset}.zst"),
+                    "sha256": sha256_hex(&archive),
+                    "size": archive.len()
+                }
+            },
+            "signature_scheme": "ed25519-jcs-v1"
+        });
+        fs::write(
+            self.temp.path("fixtures/syq-release-zstd.json"),
+            sign_release_document(listing),
+        )
+        .unwrap();
+    }
+
+    /// Append to a published file, as a corrupt or substituted download.
+    fn tamper(&self, name: &str) {
+        File::options()
+            .append(true)
+            .open(self.temp.path(&format!("fixtures/{name}")))
+            .unwrap()
+            .write_all(b"tamper")
+            .unwrap();
     }
 
     /// A path in the fixture home's binary store.
@@ -407,6 +464,60 @@ fn self_update_leaves_a_newer_release_another_update_installed_meanwhile() {
     );
     assert_eq!(fs::read(&fixture.installed).unwrap(), newer_program);
     assert_eq!(fixture.receipt()["version"], env!("CARGO_PKG_VERSION"));
+}
+
+#[test]
+fn signed_self_update_prefers_the_zstd_archive() {
+    let release_version = next_release_version();
+    let fixture = UpdateFixture::new(&release_version, &format!("v{release_version}"));
+    fixture.register();
+    fixture.publish_zstd();
+    // A gzip download would now fail.
+    fixture.tamper(&format!("syq-{}.gz", release_target()));
+
+    let update = fixture.command("--self-update");
+    assert_success(&update);
+    assert!(String::from_utf8_lossy(&update.stdout)
+        .contains(&format!("updated syq to {release_version}")));
+    assert!(update.stderr.is_empty(), "{update:?}");
+    assert_eq!(fs::read(&fixture.installed).unwrap(), fixture.replacement);
+    assert_eq!(fixture.receipt()["version"], release_version);
+}
+
+#[test]
+fn self_update_uses_gzip_when_the_zstd_listing_fails_verification() {
+    let release_version = next_release_version();
+    let fixture = UpdateFixture::new(&release_version, &format!("v{release_version}"));
+    fixture.register();
+    fixture.publish_zstd();
+    let path = fixture.temp.path("fixtures/syq-release-zstd.json");
+    let mut listing: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    listing["archives"][release_target()]["size"] = 1.into();
+    fs::write(&path, serde_json::to_vec_pretty(&listing).unwrap()).unwrap();
+
+    let update = fixture.command("--self-update");
+    assert_success(&update);
+    let stderr = String::from_utf8_lossy(&update.stderr);
+    assert!(
+        stderr.contains("cannot use the zstd release archive")
+            && stderr.contains("signature verification failed")
+            && stderr.contains("downloading the gzip archive instead"),
+        "{stderr}"
+    );
+    assert_eq!(fs::read(&fixture.installed).unwrap(), fixture.replacement);
+}
+
+#[test]
+fn self_update_rejects_a_tampered_zstd_archive_without_changing_install() {
+    let release_version = next_release_version();
+    let fixture = UpdateFixture::new(&release_version, &format!("v{release_version}"));
+    fixture.register();
+    fixture.publish_zstd();
+    fixture.tamper(&format!("syq-{}.zst", release_target()));
+
+    let update = fixture.command("--self-update");
+    assert_failure_contains(&update, "response exceeds the expected");
+    fixture.assert_original_unchanged();
 }
 
 #[test]
@@ -1012,6 +1123,31 @@ fn use_version_downloads_exact_release_and_reuses_it_offline() {
         .installed
         .with_file_name(".syq-install.json")
         .exists());
+}
+
+/// A release with zstd archives is downloaded from zstd and stored with only
+/// its main manifest, which is what releases before zstd archives read when
+/// they share the store.
+#[test]
+fn use_version_downloads_a_zstd_release_and_stores_its_main_manifest() {
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    fixture.publish_zstd();
+    fixture.tamper(&format!("syq-{}.gz", release_target()));
+    let first =
+        fixture.command_at_args(&fixture.installed, &["--use-version", "0.7.0", "--version"]);
+    assert_success(&first);
+    assert_eq!(first.stdout, b"syq 0.7.0\n");
+    let directory = fixture.release_directory("0.7.0");
+    let mut stored: Vec<_> = fs::read_dir(&directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    stored.sort();
+    assert_eq!(stored, ["syq", "syq-release-manifest.json"]);
+    assert_eq!(
+        fs::read(directory.join("syq-release-manifest.json")).unwrap(),
+        fs::read(fixture.temp.path("fixtures/syq-release-manifest.json")).unwrap()
+    );
 }
 
 /// An access control list on the store that passes write access on to what

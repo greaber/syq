@@ -8,6 +8,7 @@ from support import SCRIPTS
 
 import copy
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -89,6 +90,33 @@ def sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def python_sdk_manifest_loader():
+    """The strict release manifest reader of the Python SDK release tooling."""
+    spec = importlib.util.spec_from_file_location(
+        "prepare_python_sdk_release", SCRIPTS / "prepare-python-sdk-release.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.load_manifest
+
+
+# The main manifest exactly as releases before zstd archives read it: their
+# parser refuses any field it does not know, at every level.
+OLD_MANIFEST_FIELDS = ["artifacts", "homebrew_formula", "installer", "repository", "schema",
+                       "signature_scheme", "tag", "version"]
+
+
+def assert_old_reader_accepts(test, manifest):
+    test.assertEqual(sorted(set(manifest) - {"signature"}), OLD_MANIFEST_FIELDS)
+    test.assertEqual(manifest["schema"], 1)
+    for target, artifact in manifest["artifacts"].items():
+        test.assertEqual(sorted(artifact), ["archive", "binary"], target)
+        for file in artifact.values():
+            test.assertEqual(sorted(file), ["name", "sha256", "size"], target)
+        test.assertEqual(artifact["archive"]["name"], artifact["binary"]["name"] + ".gz")
+    for file in (manifest["installer"], manifest["homebrew_formula"]):
+        test.assertEqual(sorted(file), ["name", "sha256", "size"])
+
+
 def openssl(*args, **kwargs):
     return subprocess.run(["openssl", *args], check=True, stdout=subprocess.PIPE, **kwargs).stdout
 
@@ -116,6 +144,8 @@ class ReleaseToolTests(unittest.TestCase):
             archive = subprocess.run(["gzip", "-9", "-n", "-c", str(binary)], check=True,
                                      stdout=subprocess.PIPE).stdout
             (dist / f"{asset}.gz").write_bytes(archive)
+            # Packaging only hashes archives; the installer tests unpack real ones.
+            (dist / f"{asset}.zst").write_bytes(b"zstd stand-in for " + asset.encode())
         return dist
 
     def package(self, name):
@@ -154,15 +184,28 @@ class ReleaseToolTests(unittest.TestCase):
     def test_packaging_is_complete_reproducible_and_strict(self):
         first = self.package("first")
         second = self.package("second")
-        self.assertEqual(len([path for path in first.iterdir() if path.is_file()]), 19)
-        for checksum in ("syq-linux-x86_64.sha256", "syq-linux-x86_64.gz.sha256"):
+        self.assertEqual(len([path for path in first.iterdir() if path.is_file()]), 28)
+        for checksum in ("syq-linux-x86_64.sha256", "syq-linux-x86_64.gz.sha256",
+                         "syq-linux-x86_64.zst.sha256"):
             digest, name = (first / checksum).read_text().rstrip("\n").split("  ")
             self.assertEqual(digest, sha256(first / name), checksum)
         manifest = json.loads((first / "syq-release-manifest.json").read_text())
         self.assertEqual(manifest["schema"], 1)
-        self.assertEqual(sorted(manifest), ["artifacts", "homebrew_formula", "installer", "repository",
-                                            "schema", "signature_scheme", "tag", "version"])
+        assert_old_reader_accepts(self, manifest)
         self.assertEqual(len(manifest["artifacts"]), 4)
+        zstd = json.loads((first / "syq-release-zstd.json").read_text())
+        self.assertEqual(sorted(zstd), ["archives", "repository", "schema", "signature_scheme",
+                                        "tag", "version"])
+        self.assertEqual({key: zstd[key] for key in ("schema", "repository", "version", "tag")},
+                         {key: manifest[key] for key in ("schema", "repository", "version", "tag")})
+        self.assertEqual(zstd["signature_scheme"], "ed25519-jcs-v1")
+        self.assertEqual(sorted(zstd["archives"]), sorted(manifest["artifacts"]))
+        for target, archive in zstd["archives"].items():
+            name = manifest["artifacts"][target]["binary"]["name"] + ".zst"
+            self.assertEqual(archive, {"name": name, "sha256": sha256(first / name),
+                                       "size": (first / name).stat().st_size})
+            self.assertIn(f"zstd_archive='{name}'; zstd_sha='{archive['sha256']}'",
+                          (first / "install.sh").read_text())
         self.assertEqual(manifest["installer"]["name"], "install.sh")
         self.assertEqual(manifest["installer"]["sha256"], sha256(first / "install.sh"))
         self.assertEqual(manifest["homebrew_formula"]["name"], "syq.rb")
@@ -183,16 +226,52 @@ class ReleaseToolTests(unittest.TestCase):
                          sorted(path.name for path in second.iterdir()))
         for path in first.iterdir():
             self.assertEqual(path.read_bytes(), (second / path.name).read_bytes(), path.name)
-        missing = self.prepare_dist("missing")
-        (missing / "syq-macos-arm64.gz").unlink()
-        self.expect_failure("missing regular asset",
-                            [SCRIPTS / "package-release.py", TAG, missing])
+        for archive in ("syq-macos-arm64.gz", "syq-macos-arm64.zst"):
+            missing = self.prepare_dist(f"missing-{archive}")
+            (missing / archive).unlink()
+            self.expect_failure("missing regular asset",
+                                [SCRIPTS / "package-release.py", TAG, missing])
         unexpected = self.prepare_dist("unexpected")
         (unexpected / "extra").write_text("not a release asset\n")
         self.expect_failure("release directory contains missing or unexpected files",
                             [SCRIPTS / "package-release.py", TAG, unexpected])
         self.expect_failure("does not match Cargo.toml version",
                             [SCRIPTS / "package-release.py", "v99.99.99", first])
+
+    @unittest.skipUnless(shutil.which("zstd") and shutil.which("curl"),
+                         "the installer smoke test needs zstd and curl")
+    def test_release_installer_smoke_installs_from_zstd_and_gzip(self):
+        # Stand-in executables that answer what the smoke test asks, in real
+        # archives, through the generated installer.
+        dist = self.work / "smoke"
+        dist.mkdir()
+        program = f"""#!/bin/sh
+case "$1" in
+  --version) echo 'syq {VERSION}' ;;
+  --build-identity) echo '{TAG}' ;;
+  --register-standalone-install)
+    # The installer's PATH has only what it needs itself.
+    directory=$(cd "${{0%/*}}" && pwd -P)
+    printf '{{"provider": "standalone", "version": "{VERSION}", "binary": "%s"}}' \\
+      "$directory/${{0##*/}}" > "$directory/.syq-install.json" ;;
+  cp) mkdir -p "$4" && cp "$2" "$4/" ;;
+  *) exit 2 ;;
+esac
+"""
+        for asset in ASSETS:
+            binary = dist / asset
+            binary.write_text(program)
+            binary.chmod(0o755)
+            for compressor, suffix in [(["gzip", "-9", "-n"], ".gz"),
+                                       (["zstd", "-19", "--single-thread", "-q"], ".zst")]:
+                (dist / f"{asset}{suffix}").write_bytes(subprocess.run(
+                    [*compressor, "-c", str(binary)], check=True, stdout=subprocess.PIPE).stdout)
+        subprocess.run([str(SCRIPTS / "package-release.py"), TAG, str(dist)], check=True)
+        result = subprocess.run([sys.executable, str(SCRIPTS / "smoke-release-installer.py"),
+                                 str(dist)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("from its zstd and gzip archives", result.stdout)
 
     def test_crates_io_accepts_only_the_exact_package(self):
         # crates.io reruns accept only the exact package checksum, distinguish a
@@ -233,19 +312,30 @@ class ReleaseToolTests(unittest.TestCase):
         env = dict(os.environ, SYQ_RELEASE_SIGNING_KEY_PEM_B64=key_b64 + "\n",
                    SYQ_RELEASE_PUBLIC_KEY=public_key_b64(key))
         manifest = first / "syq-release-manifest.json"
-        subprocess.run([str(SCRIPTS / "sign-release-manifest.py"), str(manifest), CANONICALIZER],
-                       env=env, check=True)
-        self.assertEqual(len([path for path in first.iterdir() if path.is_file()]), 19)
-        embedded_b64 = json.loads(manifest.read_text())["signature"]
-        self.assertTrue(embedded_b64)
-        signature = self.work / "embedded-signature.raw"
-        signature.write_bytes(openssl("base64", "-d", "-A", input=embedded_b64.encode()))
-        payload = self.work / "manifest.jcs"
-        payload.write_bytes(subprocess.run(
-            [CANONICALIZER, "--release-manifest-signing-payload", str(manifest)], check=True,
-            stdout=subprocess.PIPE).stdout)
-        openssl("pkeyutl", "-verify", "-rawin", "-pubin", "-inkey", str(public), "-in", str(payload),
-                "-sigfile", str(signature))
+        unsigned_core = json.loads(manifest.read_text())
+        # The release workflow signs both documents the same way.
+        for name in ("syq-release-manifest.json", "syq-release-zstd.json"):
+            document = first / name
+            subprocess.run([str(SCRIPTS / "sign-release-manifest.py"), str(document),
+                            CANONICALIZER], env=env, check=True)
+            embedded_b64 = json.loads(document.read_text())["signature"]
+            self.assertTrue(embedded_b64)
+            signature = self.work / "embedded-signature.raw"
+            signature.write_bytes(openssl("base64", "-d", "-A", input=embedded_b64.encode()))
+            payload = self.work / "manifest.jcs"
+            payload.write_bytes(subprocess.run(
+                [CANONICALIZER, "--release-manifest-signing-payload", str(document)], check=True,
+                stdout=subprocess.PIPE).stdout)
+            openssl("pkeyutl", "-verify", "-rawin", "-pubin", "-inkey", str(public), "-in",
+                    str(payload), "-sigfile", str(signature))
+        self.assertEqual(len([path for path in first.iterdir() if path.is_file()]), 28)
+        # Strict readers of the main manifest from before zstd archives still
+        # accept the signed result.
+        signed = json.loads(manifest.read_text())
+        self.assertEqual({key: value for key, value in signed.items() if key != "signature"},
+                         unsigned_core)
+        assert_old_reader_accepts(self, signed)
+        python_sdk_manifest_loader()(manifest)
 
         other_key = self.work / "other.pem"
         subprocess.run(["openssl", "genpkey", "-algorithm", "ED25519", "-out", str(other_key)],

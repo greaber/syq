@@ -143,10 +143,12 @@ async function resolveLatestTag(env, ctx, asset) {
 
 function classify(asset) {
   if (asset === "install.sh") return "installer";
-  if (asset === "syq-release-manifest.json") return "manifest";
+  if (asset === "syq-release-manifest.json" || asset === "syq-release-zstd.json") {
+    return "manifest";
+  }
   if (asset === "syq.rb") return "formula";
   if (asset.endsWith(".sha256")) return "checksum";
-  if (asset.endsWith(".gz")) return "archive";
+  if (asset.endsWith(".gz") || asset.endsWith(".zst")) return "archive";
   if (asset.startsWith("syq-")) return "binary";
   return "other";
 }

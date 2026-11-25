@@ -31,8 +31,14 @@ const REPOSITORY: &str = "https://github.com/greaber/syq";
 const RELEASE_DOWNLOADS: &str = "https://dl.syq.christmas";
 const LATEST_DOWNLOADS: &str = "https://dl.syq.christmas/latest";
 const MANIFEST_NAME: &str = "syq-release-manifest.json";
+/// The signed list of a release's zstd archives. It is a separate file
+/// because releases before it parse their manifest strictly, so a field added
+/// to `MANIFEST_NAME` would make them refuse every later release. Older
+/// releases have no such file and only gzip archives.
+pub(crate) const ZSTD_MANIFEST_NAME: &str = "syq-release-zstd.json";
 const RECEIPT_SCHEMA: u32 = 1;
 const MANIFEST_SCHEMA: u32 = 1;
+const ZSTD_MANIFEST_SCHEMA: u32 = 1;
 const MANIFEST_SIGNATURE_SCHEME: &str = "ed25519-jcs-v1";
 const MAX_SAFE_JSON_INTEGER: u64 = (1 << 53) - 1;
 /// Ceiling for a release manifest download. Signed manifests are a few
@@ -83,9 +89,26 @@ struct ReleaseFile {
     size: u64,
 }
 
+/// `ZSTD_MANIFEST_NAME`. Strict parsing keeps it and `ReleaseManifest` apart
+/// although the same key signs both: each requires fields the other lacks
+/// and refuses fields it does not know.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ZstdManifest {
+    schema: u32,
+    repository: String,
+    version: String,
+    tag: String,
+    archives: BTreeMap<String, ReleaseFile>,
+    signature_scheme: String,
+}
+
 struct VerifiedRelease {
     manifest: ReleaseManifest,
     version: Version,
+    /// The key that verified `manifest`, which must also sign the release's
+    /// zstd archives.
+    public_key: String,
 }
 
 /// Target-specific release metadata whose manifest signature has been checked
@@ -96,11 +119,17 @@ pub(crate) struct TrustedCurrentHelper {
     target: Target,
     binary: ReleaseFile,
     archive: ReleaseFile,
+    /// The zstd archive, once its signed listing has been read; until then
+    /// a download looks it up (`download_helper`).
+    zstd_archive: Option<ReleaseFile>,
+    public_key: String,
 }
 
 impl TrustedCurrentHelper {
-    pub fn archive_sha256(&self) -> &str {
-        &self.archive.sha256
+    /// The archive a remote download fetched: zstd when the remote relayed
+    /// the signed zstd listing with the manifest, and gzip otherwise.
+    pub fn remote_archive_sha256(&self) -> &str {
+        &self.zstd_archive.as_ref().unwrap_or(&self.archive).sha256
     }
 
     /// The SHA-256 of the helper itself, as the signed manifest states it.
@@ -407,18 +436,33 @@ pub(crate) fn trusted_current_helper(target: Target) -> Result<TrustedCurrentHel
     current_helper_from_release(target, release)
 }
 
-/// Verify a manifest relayed by the remote host and return its target metadata.
+/// Verify a manifest relayed by the remote host, and the zstd listing when
+/// the remote downloaded the zstd archive, and return the target metadata.
 /// Only the signed contents are trusted; SSH transport does not authorize
 /// release metadata by itself.
 pub(crate) fn trusted_current_helper_from_manifest(
     target: Target,
     manifest_bytes: &[u8],
+    zstd_manifest_bytes: Option<&[u8]>,
 ) -> Result<TrustedCurrentHelper> {
     crate::identity::require_release_helpers()?;
     let key = embedded_public_key()?;
     let manifest = verified_manifest(manifest_bytes, key.as_ref())?;
     let version = validate_manifest(&manifest)?;
-    current_helper_from_release(target, VerifiedRelease { manifest, version })
+    let mut helper = current_helper_from_release(
+        target,
+        VerifiedRelease {
+            manifest,
+            version,
+            public_key: key.into_owned(),
+        },
+    )?;
+    if let Some(bytes) = zstd_manifest_bytes {
+        helper.zstd_archive = Some(
+            zstd_archive_from(&helper, bytes).context("verify the remote zstd release manifest")?,
+        );
+    }
+    Ok(helper)
 }
 
 fn current_helper_from_release(
@@ -445,7 +489,82 @@ fn helper_from_release(target: Target, release: &VerifiedRelease) -> Result<Trus
         target,
         binary: artifact.binary.clone(),
         archive: artifact.archive.clone(),
+        zstd_archive: None,
+        public_key: release.public_key.clone(),
     })
+}
+
+/// The helper's zstd archive, from its release's signed zstd listing. A
+/// release without one, from before zstd archives, has only gzip; a listing
+/// that cannot be fetched or verified leaves gzip, which the main manifest
+/// signs, as the download. Neither fails the download.
+fn zstd_archive(helper: &TrustedCurrentHelper) -> Option<ReleaseFile> {
+    let url = format!(
+        "{}/{}/{ZSTD_MANIFEST_NAME}",
+        release_downloads(),
+        helper.tag
+    );
+    let found =
+        fetch_optional(&url, FetchMode::Interactive, MAX_MANIFEST_BYTES).and_then(|bytes| {
+            bytes
+                .map(|bytes| zstd_archive_from(helper, &bytes))
+                .transpose()
+        });
+    match found {
+        Ok(archive) => archive,
+        Err(error) => {
+            crate::output::diagnostic!(
+                "syq: warning: cannot use the zstd release archive ({error:#}); downloading the gzip archive instead"
+            );
+            None
+        }
+    }
+}
+
+/// Verify a zstd listing with the key that verified the helper's release and
+/// return the helper's archive from it.
+fn zstd_archive_from(helper: &TrustedCurrentHelper, bytes: &[u8]) -> Result<ReleaseFile> {
+    let manifest: ZstdManifest =
+        verified_document(bytes, &helper.public_key, "zstd release manifest")?;
+    validate_zstd_manifest(&manifest, &helper.tag)?;
+    let archive = manifest.archives.get(helper.target.key).ok_or_else(|| {
+        anyhow!(
+            "zstd release manifest has no archive for {}",
+            helper.target.key
+        )
+    })?;
+    if archive.name != format!("{}.zst", helper.binary.name) {
+        bail!(
+            "zstd archive name does not match binary name for {}",
+            helper.target.key
+        );
+    }
+    Ok(archive.clone())
+}
+
+fn validate_zstd_manifest(manifest: &ZstdManifest, tag: &str) -> Result<()> {
+    if manifest.schema != ZSTD_MANIFEST_SCHEMA {
+        bail!(
+            "unsupported zstd release manifest schema {}",
+            manifest.schema
+        );
+    }
+    if manifest.repository != REPOSITORY {
+        bail!("zstd release manifest names an unexpected repository");
+    }
+    if manifest.signature_scheme != MANIFEST_SIGNATURE_SCHEME {
+        bail!(
+            "unsupported zstd release manifest signature scheme {}",
+            manifest.signature_scheme
+        );
+    }
+    if manifest.tag != tag || manifest.tag != format!("v{}", manifest.version) {
+        bail!("zstd release manifest describes another release");
+    }
+    for (target, archive) in &manifest.archives {
+        validate_release_file(target, archive)?;
+    }
+    Ok(())
 }
 
 /// Return a verified, uncompressed helper. The archive and binary hashes both
@@ -654,27 +773,31 @@ pub(crate) fn stored_release(
 const REMOTE_HELPER: &str = "remote helper";
 const SYQ_RELEASE: &str = "syq release";
 
-/// Download, verify, and decompress a helper in memory. The signed sizes bound
-/// both the download and the decompressed result.
+/// Download, verify, and decompress a helper in memory, from its zstd
+/// archive when its release has one: that is smaller and unpacks faster than
+/// gzip. The signed sizes bound both the download and the decompressed
+/// result, and only an archive that matches its signed hash is decompressed.
 fn download_helper(helper: &TrustedCurrentHelper, what: &str) -> Result<Vec<u8>> {
-    let url = format!(
-        "{}/{}/{}",
-        release_downloads(),
-        helper.tag,
-        helper.archive.name
-    );
-    let archive = fetch_bytes(&url, FetchMode::Interactive, helper.archive.size)?;
-    verify_bytes_as(
-        &archive,
-        &helper.archive,
-        &format!("downloaded {what} archive"),
-    )?;
+    let zstd = helper.zstd_archive.clone().or_else(|| zstd_archive(helper));
+    let expected = zstd.as_ref().unwrap_or(&helper.archive);
+    let url = format!("{}/{}/{}", release_downloads(), helper.tag, expected.name);
+    let archive = fetch_bytes(&url, FetchMode::Interactive, expected.size)?;
+    verify_bytes_as(&archive, expected, &format!("downloaded {what} archive"))?;
     // Reserved at the signed size, so the buffer is never copied as it grows.
     let mut binary = Vec::with_capacity(helper.binary.size as usize + 1);
-    GzDecoder::new(archive.as_slice())
-        .take(helper.binary.size + 1)
-        .read_to_end(&mut binary)
-        .with_context(|| format!("decompress the {what}"))?;
+    if zstd.is_some() {
+        // In one pass into the buffer, which also serves as zstd's window,
+        // instead of streaming through a window of its own. More than the
+        // buffer holds fails.
+        zstd::bulk::Decompressor::new()
+            .and_then(|mut decompressor| decompressor.decompress_to_buffer(&archive, &mut binary))
+            .with_context(|| format!("decompress the {what}"))?;
+    } else {
+        GzDecoder::new(archive.as_slice())
+            .take(helper.binary.size + 1)
+            .read_to_end(&mut binary)
+            .with_context(|| format!("decompress the {what}"))?;
+    }
     verify_bytes_as(&binary, &helper.binary, &format!("downloaded {what}"))?;
     Ok(binary)
 }
@@ -808,6 +931,7 @@ pub(crate) fn release_executable(version: &Version) -> Result<PathBuf> {
     let release = VerifiedRelease {
         manifest,
         version: found,
+        public_key: key.into_owned(),
     };
     let helper = helper_from_release(target, &release)?;
     let executable = stored_release_path(&store, &helper)?;
@@ -878,7 +1002,11 @@ fn fetch_verified(base_url: &str, mode: FetchMode) -> Result<VerifiedRelease> {
     )?;
     let manifest = verified_manifest(&manifest_bytes, key.as_ref())?;
     let version = validate_manifest(&manifest)?;
-    Ok(VerifiedRelease { manifest, version })
+    Ok(VerifiedRelease {
+        manifest,
+        version,
+        public_key: key.into_owned(),
+    })
 }
 
 fn embedded_public_key() -> Result<Cow<'static, str>> {
@@ -906,17 +1034,27 @@ fn embedded_public_key() -> Result<Cow<'static, str>> {
 }
 
 fn verified_manifest(bytes: &[u8], public_key_b64: &str) -> Result<ReleaseManifest> {
+    verified_document(bytes, public_key_b64, "release manifest")
+}
+
+/// Check the embedded signature over the rest of a signed JSON document, then
+/// parse it.
+fn verified_document<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+    public_key_b64: &str,
+    what: &str,
+) -> Result<T> {
     let mut value: serde_json::Value =
-        serde_json::from_slice(bytes).context("parse signed release manifest")?;
+        serde_json::from_slice(bytes).with_context(|| format!("parse signed {what}"))?;
     let signature = value
         .as_object_mut()
         .and_then(|object| object.remove("signature"))
         .and_then(|signature| signature.as_str().map(str::to_owned))
-        .ok_or_else(|| anyhow!("signed release manifest has no embedded signature"))?;
-    let canonical =
-        serde_json_canonicalizer::to_vec(&value).context("canonicalize signed release manifest")?;
+        .ok_or_else(|| anyhow!("signed {what} has no embedded signature"))?;
+    let canonical = serde_json_canonicalizer::to_vec(&value)
+        .with_context(|| format!("canonicalize signed {what}"))?;
     verify_signature(&canonical, &signature, public_key_b64)?;
-    serde_json::from_value(value).context("parse verified release manifest")
+    serde_json::from_value(value).with_context(|| format!("parse verified {what}"))
 }
 
 fn verify_signature(payload: &[u8], signature_b64: &str, public_key_b64: &str) -> Result<()> {
@@ -1160,8 +1298,9 @@ fn latest_downloads() -> Cow<'static, str> {
     Cow::Borrowed(LATEST_DOWNLOADS)
 }
 
-/// Emit the RFC 8785 signing payload for release tooling. The signature field
-/// is the only field excluded; every other present field is authenticated.
+/// Emit the RFC 8785 signing payload of a release manifest or zstd listing
+/// for release tooling. The signature field is the only field excluded; every
+/// other present field is authenticated.
 pub fn write_manifest_signing_payload(path: &Path) -> Result<()> {
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let mut value: serde_json::Value =
@@ -1428,6 +1567,29 @@ fn fetch_bytes(url: &str, mode: FetchMode, limit: u64) -> Result<Vec<u8>> {
         }
     }
     Err(crate::tls::download_error(last_error.unwrap())).with_context(|| format!("download {url}"))
+}
+
+/// Download `url` like `fetch_bytes`, or `None` when it does not exist.
+fn fetch_optional(url: &str, mode: FetchMode, limit: u64) -> Result<Option<Vec<u8>>> {
+    match fetch_bytes(url, mode, limit) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if is_missing(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether a download failed because the file does not exist: a 404, or a
+/// missing test fixture.
+fn is_missing(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<ureq::Error>(),
+            Some(ureq::Error::StatusCode(404))
+        ) || (cfg!(any(test, debug_assertions))
+            && cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound))
+    })
 }
 
 /// The receipt for this executable, and the path beside it where updates
@@ -1792,6 +1954,158 @@ mod tests {
         assert!(verified_manifest(&tampered, &public).is_err());
     }
 
+    fn sign(signing: &SigningKey, mut value: serde_json::Value) -> Vec<u8> {
+        let canonical = serde_json_canonicalizer::to_vec(&value).unwrap();
+        value["signature"] = base64::engine::general_purpose::STANDARD
+            .encode(signing.sign(&canonical).to_bytes())
+            .into();
+        serde_json::to_vec_pretty(&value).unwrap()
+    }
+
+    fn public_key(signing: &SigningKey) -> String {
+        base64::engine::general_purpose::STANDARD.encode(signing.verifying_key().to_bytes())
+    }
+
+    fn zstd_listing() -> serde_json::Value {
+        serde_json::json!({
+            "schema": 1,
+            "repository": REPOSITORY,
+            "version": "1.2.3",
+            "tag": "v1.2.3",
+            "archives": {
+                "linux-x86_64": {"name": "syq-linux-x86_64.zst", "sha256": "e".repeat(64), "size": 7}
+            },
+            "signature_scheme": MANIFEST_SIGNATURE_SCHEME
+        })
+    }
+
+    fn helper_for(signing: &SigningKey) -> TrustedCurrentHelper {
+        let release = VerifiedRelease {
+            manifest: manifest(),
+            version: Version::new(1, 2, 3),
+            public_key: public_key(signing),
+        };
+        helper_from_release(Target::from_uname("Linux", "x86_64").unwrap(), &release).unwrap()
+    }
+
+    /// A manifest published before zstd archives, unchanged: it still
+    /// verifies against the release key and leaves gzip as every download.
+    #[test]
+    fn a_published_gzip_only_manifest_still_verifies() {
+        let bytes = include_bytes!("../tests/fixtures/release-manifest-v0.10.1.json");
+        let key = include_str!("release-public-key.txt").trim();
+        let manifest = verified_manifest(bytes, key).unwrap();
+        let version = validate_manifest(&manifest).unwrap();
+        assert_eq!(version, Version::new(0, 10, 1));
+        let release = VerifiedRelease {
+            manifest,
+            version,
+            public_key: key.into(),
+        };
+        for (os, arch) in [
+            ("Linux", "x86_64"),
+            ("Linux", "aarch64"),
+            ("Darwin", "x86_64"),
+            ("Darwin", "arm64"),
+        ] {
+            let helper =
+                helper_from_release(Target::from_uname(os, arch).unwrap(), &release).unwrap();
+            assert!(helper.zstd_archive.is_none());
+            assert_eq!(helper.remote_archive_sha256(), helper.archive.sha256);
+            assert_eq!(helper.archive.name, format!("{}.gz", helper.binary.name));
+        }
+    }
+
+    /// The same key signs both documents, so neither may be accepted as the
+    /// other; releases before zstd archives parse the main manifest with the
+    /// same strict `ReleaseManifest`.
+    #[test]
+    fn a_zstd_listing_and_a_release_manifest_cannot_stand_in_for_each_other() {
+        let signing = SigningKey::from_bytes(&[9; 32]);
+        let key = public_key(&signing);
+        let listing = sign(&signing, zstd_listing());
+        let main = sign(&signing, serde_json::to_value(manifest()).unwrap());
+        verified_document::<ZstdManifest>(&listing, &key, "zstd release manifest").unwrap();
+        verified_manifest(&main, &key).unwrap();
+        let error = verified_manifest(&listing, &key).unwrap_err();
+        assert!(format!("{error:#}").contains("parse verified"), "{error:#}");
+        let error =
+            verified_document::<ZstdManifest>(&main, &key, "zstd release manifest").unwrap_err();
+        assert!(format!("{error:#}").contains("parse verified"), "{error:#}");
+    }
+
+    #[test]
+    fn a_zstd_listing_must_match_its_release_target_name_and_key() {
+        let signing = SigningKey::from_bytes(&[9; 32]);
+        let helper = helper_for(&signing);
+        let archive = zstd_archive_from(&helper, &sign(&signing, zstd_listing())).unwrap();
+        assert_eq!(archive.name, "syq-linux-x86_64.zst");
+        assert_eq!(archive.sha256, "e".repeat(64));
+
+        let other = SigningKey::from_bytes(&[10; 32]);
+        let error = zstd_archive_from(&helper, &sign(&other, zstd_listing())).unwrap_err();
+        assert!(format!("{error:#}").contains("signature"), "{error:#}");
+        let mut tampered: serde_json::Value =
+            serde_json::from_slice(&sign(&signing, zstd_listing())).unwrap();
+        tampered["archives"]["linux-x86_64"]["size"] = 8.into();
+        let error =
+            zstd_archive_from(&helper, &serde_json::to_vec(&tampered).unwrap()).unwrap_err();
+        assert!(format!("{error:#}").contains("signature"), "{error:#}");
+
+        for (change, expected) in [
+            (
+                serde_json::json!({"version": "1.2.4", "tag": "v1.2.4"}),
+                "another release",
+            ),
+            (serde_json::json!({"schema": 2}), "schema"),
+            (
+                serde_json::json!({"repository": "https://example.invalid/syq"}),
+                "repository",
+            ),
+            (
+                serde_json::json!({"archives": {"linux-x86_64": {
+                    "name": "syq-linux-x86_64.gz", "sha256": "e".repeat(64), "size": 7}}}),
+                "does not match binary name",
+            ),
+            (
+                serde_json::json!({"archives": {"macos-arm64": {
+                    "name": "syq-macos-arm64.zst", "sha256": "e".repeat(64), "size": 7}}}),
+                "no archive for linux-x86_64",
+            ),
+            (
+                serde_json::json!({"archives": {"linux-x86_64": {
+                    "name": "syq-linux-x86_64.zst", "sha256": "E".repeat(64), "size": 7}}}),
+                "invalid SHA-256",
+            ),
+        ] {
+            let mut listing = zstd_listing();
+            for (field, value) in change.as_object().unwrap() {
+                listing[field] = value.clone();
+            }
+            let error = zstd_archive_from(&helper, &sign(&signing, listing)).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(expected),
+                "{expected}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_file_is_absent_but_other_failures_are_errors() {
+        let missing = anyhow::Error::new(ureq::Error::StatusCode(404)).context("request URL");
+        assert!(is_missing(&missing));
+        assert!(!is_missing(&anyhow::Error::new(ureq::Error::StatusCode(
+            403
+        ))));
+        assert!(!is_missing(&anyhow::Error::new(ureq::Error::StatusCode(
+            500
+        ))));
+        let fixture = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(is_missing(
+            &anyhow::Error::new(fixture).context("open fixture")
+        ));
+    }
+
     #[test]
     fn pins_the_release_signature_canonical_json_contract() {
         let value = serde_json::json!({"n": 1e30, "b": 2, "a": "€"});
@@ -2114,6 +2428,8 @@ mod tests {
                 size: contents.len() as u64,
             },
             archive: manifest().artifacts["linux-x86_64"].archive.clone(),
+            zstd_archive: None,
+            public_key: String::new(),
         };
         assert_eq!(stored_helper(&path, &helper), None);
         fs::write(&path, contents).unwrap();

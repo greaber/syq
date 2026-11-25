@@ -786,8 +786,21 @@ fn sha256_hex(bytes: &[u8]) -> String {
 struct ReleaseBootstrapFixture {
     archive: Vec<u8>,
     manifest: Vec<u8>,
+    zstd_archive: Vec<u8>,
+    /// The release's signed listing of its zstd archives.
+    zstd_manifest: Vec<u8>,
     public_key: String,
     asset: &'static str,
+}
+
+/// Sign a release document as the release workflow does: Ed25519 over its
+/// RFC 8785 form, embedded as `signature`.
+fn sign_release_document(signing: &SigningKey, mut document: serde_json::Value) -> Vec<u8> {
+    let canonical = serde_json_canonicalizer::to_vec(&document).unwrap();
+    document["signature"] = base64::engine::general_purpose::STANDARD
+        .encode(signing.sign(&canonical).to_bytes())
+        .into();
+    serde_json::to_vec_pretty(&document).unwrap()
 }
 
 static RELEASE_BOOTSTRAP_FIXTURE: OnceLock<ReleaseBootstrapFixture> = OnceLock::new();
@@ -801,6 +814,7 @@ fn release_bootstrap_fixture() -> &'static ReleaseBootstrapFixture {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
         encoder.write_all(&binary_bytes).unwrap();
         let archive = encoder.finish().unwrap();
+        let zstd_archive = zstd::bulk::compress(&binary_bytes, 1).unwrap();
         let target = helper_target();
         let asset = match target {
             "linux-x86_64" => "syq-linux-x86_64",
@@ -832,15 +846,26 @@ fn release_bootstrap_fixture() -> &'static ReleaseBootstrapFixture {
             "homebrew_formula": {"name": "syq.rb", "sha256": "2".repeat(64), "size": 1},
             "signature_scheme": "ed25519-jcs-v1"
         });
+        let zstd_manifest = serde_json::json!({
+            "schema": 1,
+            "repository": "https://github.com/greaber/syq",
+            "version": env!("CARGO_PKG_VERSION"),
+            "tag": format!("v{}", env!("CARGO_PKG_VERSION")),
+            "archives": {
+                (target): {
+                    "name": format!("{asset}.zst"),
+                    "sha256": sha256_hex(&zstd_archive),
+                    "size": zstd_archive.len()
+                }
+            },
+            "signature_scheme": "ed25519-jcs-v1"
+        });
         let signing = SigningKey::from_bytes(&[19; 32]);
-        let canonical = serde_json_canonicalizer::to_vec(&manifest).unwrap();
-        let signature =
-            base64::engine::general_purpose::STANDARD.encode(signing.sign(&canonical).to_bytes());
-        let mut manifest = manifest;
-        manifest["signature"] = signature.into();
         ReleaseBootstrapFixture {
             archive,
-            manifest: serde_json::to_vec_pretty(&manifest).unwrap(),
+            manifest: sign_release_document(&signing, manifest),
+            zstd_archive,
+            zstd_manifest: sign_release_document(&signing, zstd_manifest),
             public_key: base64::engine::general_purpose::STANDARD
                 .encode(signing.verifying_key().to_bytes()),
             asset,
@@ -848,18 +873,31 @@ fn release_bootstrap_fixture() -> &'static ReleaseBootstrapFixture {
     })
 }
 
+/// A release for this build, with gzip and zstd archives. The client reads
+/// it from `t`'s root (`SYQ_TEST_FIXTURES`); the fake remote `curl` serves the
+/// files the `FAKE_REMOTE_RELEASE_*` variables name, and the zstd listing only
+/// when `FAKE_REMOTE_RELEASE_ZSTD_MANIFEST` is set.
 fn setup_release_bootstrap(t: &Tmp) {
     let fixture = release_bootstrap_fixture();
     write(&t.path("release.gz"), &fixture.archive);
     write(&t.path(&format!("{}.gz", fixture.asset)), &fixture.archive);
     write(&t.path("syq-release-manifest.json"), &fixture.manifest);
     write(&t.path("release-manifest.json"), &fixture.manifest);
+    write(&t.path("release.zst"), &fixture.zstd_archive);
+    write(
+        &t.path(&format!("{}.zst", fixture.asset)),
+        &fixture.zstd_archive,
+    );
+    write(&t.path("syq-release-zstd.json"), &fixture.zstd_manifest);
+    write(
+        &t.path("release-zstd-manifest.json"),
+        &fixture.zstd_manifest,
+    );
     write(&t.path("release-public-key"), fixture.public_key.as_bytes());
 
     executable(
         &t.path("remote-bin/curl"),
         br#"#!/bin/sh
-printf 'fetch\n' >> "$FAKE_CURL_LOG"
 out=
 url=
 while [ "$#" -gt 0 ]; do
@@ -868,11 +906,21 @@ while [ "$#" -gt 0 ]; do
         *) url=$1; shift ;;
     esac
 done
+# Without a zstd listing the release is one from before zstd archives. Its
+# 404 is not logged, so the count does not depend on whether this host
+# has zstd.
 case "$url" in
+    */syq-release-zstd.json) [ -n "${FAKE_REMOTE_RELEASE_ZSTD_MANIFEST:-}" ] || exit 22 ;;
+esac
+printf 'fetch\n' >> "$FAKE_CURL_LOG"
+case "$url" in
+    */syq-release-zstd.json) file=$FAKE_REMOTE_RELEASE_ZSTD_MANIFEST ;;
     *.json) file=$FAKE_REMOTE_RELEASE_MANIFEST ;;
     *.gz) file=$FAKE_REMOTE_RELEASE_ARCHIVE ;;
+    *.zst) file=${FAKE_REMOTE_RELEASE_ZSTD_ARCHIVE:-} ;;
     *) exit 22 ;;
 esac
+[ -n "$file" ] || exit 22
 if [ "$out" = - ]; then
     exec cat "$file"
 fi

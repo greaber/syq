@@ -287,7 +287,7 @@ release request does not require another preparation PR or another test run.
    all three full-suite workflow certifications succeeded. It then uses `flake.lock` and
    the pinned Nix recipe to build static GNU Linux x86-64/ARM64 binaries and
    native macOS Apple Silicon/Intel binaries once per target, with deterministic
-   gzip archives. The embedded public key must
+   gzip and zstd archives. The embedded public key must
    match the repository variable. It reuses the candidate binaries and source
    crate when available; otherwise it builds the binaries and compiles the
    source crate in parallel. The protected publishing job repackages it
@@ -295,11 +295,13 @@ release request does not require another preparation PR or another test run.
    artifact before any permanent publication. `cargo publish --no-verify`
    later uploads from those same locked inputs without repeating compilation.
    The job installs the actual generated installer and Linux x86-64 artifact
-   over loopback HTTPS into a temporary directory and exercises a native copy.
-   The installer fixture suite remains in CI. Manifest signing (Ed25519 over
-   RFC 8785 canonical JSON) and exact asset-inventory checks also finish before
-   publication. The job creates provenance attestations, uploads a draft, checks
-   every uploaded byte, publishes it, publishes the matching source package to
+   over loopback HTTPS into a temporary directory, once from the zstd archive
+   and once from gzip, and exercises a native copy each time.
+   The installer fixture suite remains in CI. Signing the release manifest and
+   the separate manifest of zstd archives (Ed25519 over RFC 8785 canonical
+   JSON), and exact asset-inventory checks, also finish before publication. The
+   job creates provenance attestations, uploads a draft, checks every uploaded
+   byte, publishes it, publishes the matching source package to
    crates.io with a short-lived OIDC credential, and finally updates the tap.
    Once the entire release workflow succeeds, the Python SDK preparation
    workflow opens and merges a pull request for the matching SDK release using

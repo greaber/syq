@@ -105,6 +105,10 @@
               test "$("$out/bin/syq" --version)" = "syq ${manifest.package.version}"
               test "$("$out/bin/syq" --build-identity)" = "v${manifest.package.version}"
               ${pkgs.gzip}/bin/gzip -9 -n -c "$out/bin/syq" > "$out/bin/syq.gz"
+              # Single-threaded, so the archive does not depend on the zstd
+              # command's default threading or ZSTD_NBTHREADS.
+              ${pkgs.zstd}/bin/zstd -19 --single-thread -q -c "$out/bin/syq" > "$out/bin/syq.zst"
+              ${pkgs.zstd}/bin/zstd -d -q -c "$out/bin/syq.zst" | cmp - "$out/bin/syq"
             '';
           });
         in {

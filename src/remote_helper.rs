@@ -189,10 +189,19 @@ fn install_command() -> &'static str {
     }
 }
 
+/// Download this release's helper on the server, from its zstd archive when
+/// the server has `zstd` and the release lists one, and from gzip otherwise.
+/// The server reports the signed metadata it used and the archive's digest,
+/// and installs only once the client has verified them.
 pub fn download_script(target: Target) -> String {
     let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
     let archive_url = format!("{RELEASE_BASE_URL}/{tag}/{}.gz", target.asset);
+    let zstd_archive_url = format!("{RELEASE_BASE_URL}/{tag}/{}.zst", target.asset);
     let manifest_url = format!("{RELEASE_BASE_URL}/{tag}/syq-release-manifest.json");
+    let zstd_manifest_url = format!(
+        "{RELEASE_BASE_URL}/{tag}/{}",
+        crate::update::ZSTD_MANIFEST_NAME
+    );
     let expected_identity = helper_identity();
     let expected_version = format!("syq {}", crate::identity::version());
     format!(
@@ -200,10 +209,11 @@ pub fn download_script(target: Target) -> String {
 dir="{directory}"
 program="$dir/syq"
 tmp="$dir/.syq.$$.tmp"
-archive="$tmp.gz"
+archive="$tmp.archive"
 manifest="$tmp.json"
+zstd_manifest="$tmp.zstd.json"
 {create_directory}
-cleanup() {{ rm -f "$tmp" "$archive" "$manifest"; }}
+cleanup() {{ rm -f "$tmp" "$archive" "$manifest" "$zstd_manifest"; }}
 trap cleanup EXIT HUP INT TERM
 if command -v curl >/dev/null 2>&1; then
     downloader=curl
@@ -224,6 +234,7 @@ fetch() {{
         wget -q --timeout=10 --tries=1 -O - "$1"
     fi
 }}
+# A fourth argument makes a failed download return 1 instead of exiting.
 download() {{
     source=$1
     destination=$2
@@ -244,12 +255,21 @@ download() {{
         exit {remote_download_fallback_exit}
     fi
     if [ "$status" != 0 ]; then
+        [ -z "${{4:-}}" ] || return 1
         echo "syq: remote helper download with $downloader failed" >&2
         exit {remote_download_fallback_exit}
     fi
 }}
 download {manifest_url} "$manifest" {max_manifest}
-download {archive_url} "$archive" {max_archive}
+# Releases before zstd archives have no zstd listing, so gzip remains.
+if command -v zstd >/dev/null 2>&1 &&
+    download {zstd_manifest_url} "$zstd_manifest" {max_manifest} optional; then
+    format=zstd
+    download {zstd_archive_url} "$archive" {max_archive}
+else
+    format=gzip
+    download {archive_url} "$archive" {max_archive}
+fi
 if command -v sha256sum >/dev/null 2>&1; then
     if output=$(sha256sum "$archive" 2>/dev/null); then
         actual=${{output%%[[:space:]]*}}
@@ -285,11 +305,17 @@ if [ "${{#actual}}" -ne 64 ]; then
     echo "syq: remote helper hasher returned an invalid SHA-256 digest" >&2
     exit {remote_download_fallback_exit}
 fi
-printf 'syq-helper-manifest-begin\n'
-while IFS= read -r line || [ -n "$line" ]; do
-    printf 'syq-helper-manifest-data:%s\n' "$line"
-done < "$manifest"
-printf 'syq-helper-manifest-end\n'
+report() {{
+    printf '%s\n' "$1"
+    while IFS= read -r line || [ -n "$line" ]; do
+        printf 'syq-helper-manifest-data:%s\n' "$line"
+    done < "$2"
+    printf 'syq-helper-manifest-end\n'
+}}
+report syq-helper-manifest-begin "$manifest"
+if [ "$format" = zstd ]; then
+    report syq-helper-zstd-manifest-begin "$zstd_manifest"
+fi
 printf 'syq-helper-sha256:%s\n' "$actual"
 printf 'syq-helper-report-end\n'
 if ! IFS= read -r decision; then
@@ -300,10 +326,14 @@ if [ "$decision" != install ]; then
     echo "syq: remote helper download was discarded after local integrity verification" >&2
     exit {remote_download_integrity_exit}
 fi
-if ! gzip -dc "$archive" > "$tmp"; then
-    echo "syq: remote helper decompression failed" >&2
+if [ "$format" = zstd ]; then
+    zstd -d -q -c "$archive" > "$tmp"
+else
+    gzip -dc "$archive" > "$tmp"
+fi || {{
+    echo "syq: remote helper decompression with $format failed" >&2
     exit {remote_download_fallback_exit}
-fi
+}}
 if ! chmod 700 "$tmp"; then
     echo "syq: cannot make the remote helper executable" >&2
     exit {install_failed_exit}
@@ -334,7 +364,9 @@ trap - EXIT HUP INT TERM
         directory = helper_directory(target.key),
         create_directory = create_helper_directory(),
         archive_url = shell_words::quote(&archive_url),
+        zstd_archive_url = shell_words::quote(&zstd_archive_url),
         manifest_url = shell_words::quote(&manifest_url),
+        zstd_manifest_url = shell_words::quote(&zstd_manifest_url),
         expected_version = shell_words::quote(&expected_version),
         expected_identity = shell_words::quote(expected_identity),
         remote_download_fallback_exit = REMOTE_DOWNLOAD_FALLBACK_EXIT,
@@ -533,6 +565,15 @@ mod tests {
             "/v{}/syq-release-manifest.json",
             env!("CARGO_PKG_VERSION")
         )));
+        assert!(script.contains(&format!(
+            "/v{}/syq-linux-x86_64.zst",
+            env!("CARGO_PKG_VERSION")
+        )));
+        assert!(script.contains(&format!(
+            "/v{}/syq-release-zstd.json",
+            env!("CARGO_PKG_VERSION")
+        )));
+        assert!(script.contains("syq-helper-zstd-manifest-begin"));
         assert!(script.contains("sha256sum"));
         assert!(script.contains("local integrity verification"));
         assert!(script.contains("syq-helper-manifest-begin"));
@@ -545,10 +586,26 @@ mod tests {
         assert!(script.contains("--build-identity"));
     }
 
+    /// How the fake `curl` of `run_download` answers for a file it does not
+    /// serve.
+    #[derive(Clone, Copy)]
+    enum Absent {
+        /// With data that never ends.
+        Endless,
+        /// With a 404.
+        Missing,
+    }
+
     /// Run the download script on this host with a fake `curl` that serves
-    /// `files` by name, or data without end for a name that is absent, and
-    /// with `decision` as the client's answer.
-    fn run_download(files: &[(&str, &[u8])], decision: &str) -> std::process::Output {
+    /// `files` by name and answers as `absent` for any other, with `zstd` on
+    /// `PATH` or not, and with `decision` as the client's answer. `PATH` holds
+    /// only the tools the script needs before installing.
+    fn run_download(
+        files: &[(&str, &[u8])],
+        absent: Absent,
+        zstd: bool,
+        decision: &str,
+    ) -> std::process::Output {
         use std::io::Write;
         use std::process::{Command, Stdio};
         let root = crate::test_support::tempdir().unwrap();
@@ -558,12 +615,40 @@ mod tests {
             std::fs::write(served.join(name), contents).unwrap();
         }
         let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        for tool in [
+            "cat",
+            "head",
+            "mkdir",
+            "rm",
+            "wc",
+            "yes",
+            "sha256sum",
+            "shasum",
+            "openssl",
+        ] {
+            if let Some(source) = ["/usr/bin", "/bin"]
+                .iter()
+                .map(|directory| std::path::Path::new(directory).join(tool))
+                .find(|path| path.exists())
+            {
+                std::os::unix::fs::symlink(source, bin.join(tool)).unwrap();
+            }
+        }
+        if zstd {
+            // Only installation decompresses, and these runs never install.
+            crate::test_support::write_executable(&bin.join("zstd"), b"#!/bin/sh\nexit 1\n", 0o700);
+        }
         crate::test_support::write_executable(
             &bin.join("curl"),
             format!(
                 "#!/bin/sh\nfor url; do :; done\nfile='{}'/\"${{url##*/}}\"\n\
-                 if [ -f \"$file\" ]; then exec cat \"$file\"; else exec yes; fi\n",
-                served.display()
+                 if [ -f \"$file\" ]; then exec cat \"$file\"; fi\n{}\n",
+                served.display(),
+                match absent {
+                    Absent::Endless => "exec yes",
+                    Absent::Missing => "exit 22",
+                }
             ),
             0o700,
         );
@@ -571,7 +656,7 @@ mod tests {
         let mut child = Command::new("/bin/sh")
             .args(["-c", &download_script(target)])
             .env("HOME", root.path())
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("PATH", &bin)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -600,7 +685,7 @@ mod tests {
     #[test]
     fn a_remote_download_without_end_stops_at_its_limit() {
         // Neither file is served: the manifest download never ends.
-        let output = run_download(&[], "");
+        let output = run_download(&[], Absent::Endless, false, "");
         assert_eq!(
             output.status.code(),
             Some(REMOTE_DOWNLOAD_FALLBACK_EXIT),
@@ -611,7 +696,12 @@ mod tests {
             "{output:?}"
         );
         // The manifest arrives, and the archive never ends.
-        let output = run_download(&[("syq-release-manifest.json", b"{}")], "");
+        let output = run_download(
+            &[("syq-release-manifest.json", b"{}")],
+            Absent::Endless,
+            false,
+            "",
+        );
         assert_eq!(
             output.status.code(),
             Some(REMOTE_DOWNLOAD_FALLBACK_EXIT),
@@ -623,6 +713,70 @@ mod tests {
         );
     }
 
+    fn sha256_hex(bytes: &[u8]) -> String {
+        <sha2::Sha256 as sha2::Digest>::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    #[test]
+    fn a_remote_download_with_zstd_fetches_and_reports_the_zstd_archive() {
+        let archive = b"zstd archive bytes";
+        // No gzip archive is served, so fetching it would fail the download.
+        let output = run_download(
+            &[
+                ("syq-release-manifest.json", b"{\"signed\": true}"),
+                ("syq-release-zstd.json", b"{\"zstd\": true}"),
+                ("syq-linux-x86_64.zst", archive),
+            ],
+            Absent::Missing,
+            true,
+            "discard\n",
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(REMOTE_DOWNLOAD_INTEGRITY_EXIT),
+            "{output:?}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!(
+                "syq-helper-manifest-data:{{\"signed\": true}}\nsyq-helper-manifest-end\n\
+                 syq-helper-zstd-manifest-begin\nsyq-helper-manifest-data:{{\"zstd\": true}}\n\
+                 syq-helper-manifest-end\nsyq-helper-sha256:{}\n",
+                sha256_hex(archive)
+            )),
+            "{stdout}"
+        );
+    }
+
+    #[test]
+    fn a_remote_download_uses_gzip_without_zstd_or_a_zstd_listing() {
+        let archive = b"gzip archive bytes";
+        for (zstd, listing) in [(false, true), (true, false)] {
+            let mut files: Vec<(&str, &[u8])> = vec![
+                ("syq-release-manifest.json", b"{\"signed\": true}"),
+                ("syq-linux-x86_64.gz", archive),
+            ];
+            if listing {
+                files.push(("syq-release-zstd.json", b"{\"zstd\": true}"));
+            }
+            let output = run_download(&files, Absent::Missing, zstd, "discard\n");
+            assert_eq!(
+                output.status.code(),
+                Some(REMOTE_DOWNLOAD_INTEGRITY_EXIT),
+                "zstd={zstd}: {output:?}"
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(!stdout.contains("zstd"), "zstd={zstd}: {stdout}");
+            assert!(
+                stdout.contains(&format!("syq-helper-sha256:{}\n", sha256_hex(archive))),
+                "zstd={zstd}: {stdout}"
+            );
+        }
+    }
+
     #[test]
     fn a_complete_remote_download_is_reported_for_verification() {
         let archive = b"archive bytes";
@@ -631,6 +785,8 @@ mod tests {
                 ("syq-release-manifest.json", b"{\"signed\": true}"),
                 ("syq-linux-x86_64.gz", archive),
             ],
+            Absent::Endless,
+            false,
             "discard\n",
         );
         assert_eq!(

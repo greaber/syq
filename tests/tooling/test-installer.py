@@ -56,6 +56,13 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 """ + FAKE_DOWNLOAD
+# Stands in for zstd on fixture archives, which hold gzip data; with
+# SYQ_TEST_ZSTD_FAILS set, it fails as a broken zstd would.
+FAKE_ZSTD = """#!/bin/sh
+[ -z "${SYQ_TEST_ZSTD_FAILS:-}" ] || exit 1
+exec gzip "$@"
+"""
+FORMATS = {"gzip": ".gz", "zstd": ".zst"}
 
 
 def sha256(path):
@@ -77,6 +84,8 @@ class InstallerTests(unittest.TestCase):
         self.fakebin.mkdir()
         executable(self.fakebin / "uname", FAKE_UNAME)
         executable(self.fakebin / "curl", FAKE_CURL)
+        # First on the default PATH, so the default is the zstd archive.
+        executable(self.fakebin / "zstd", FAKE_ZSTD)
         for target in TARGETS:
             self.write_archive(target)
         self.installer = self.generate("manifest.json", "install.sh")
@@ -98,43 +107,56 @@ class InstallerTests(unittest.TestCase):
         return env
 
     def write_archive(self, target, version="0.1.0", identity="v0.1.0"):
-        program = self.work / f"program-{target}"
-        executable(program, f"""#!/bin/sh
+        """Write both archives of a target. Each program reports which archive
+        it came from, and the zstd one holds gzip data for FAKE_ZSTD."""
+        for format, suffix in FORMATS.items():
+            program = self.work / f"program-{target}-{format}"
+            executable(program, f"""#!/bin/sh
 case "$1" in
   --version) echo 'syq {version}' ;;
   --build-identity) echo '{identity}' ;;
   --register-standalone-install) exit 0 ;;
   --test-target) echo '{target}' ;;
+  --test-format) echo '{format}' ;;
   *) exit 2 ;;
 esac
 """)
-        archive = subprocess.run(["gzip", "-9", "-n", "-c", str(program)], check=True,
-                                 stdout=subprocess.PIPE).stdout
-        (self.release / f"syq-{target}.gz").write_bytes(archive)
+            archive = subprocess.run(["gzip", "-9", "-n", "-c", str(program)], check=True,
+                                     stdout=subprocess.PIPE).stdout
+            (self.release / f"syq-{target}{suffix}").write_bytes(archive)
 
-    def write_manifest(self, output):
+    def write_manifests(self, output, zstd_output):
         artifacts = {}
+        archives = {}
         for target in TARGETS:
-            archive = self.release / f"syq-{target}.gz"
-            program = self.work / f"program-{target}"
+            program = self.work / f"program-{target}-gzip"
+            files = {format: self.release / f"syq-{target}{suffix}"
+                     for format, suffix in FORMATS.items()}
             artifacts[target] = {
                 "binary": {"name": f"syq-{target}", "sha256": sha256(program),
                            "size": program.stat().st_size},
-                "archive": {"name": f"syq-{target}.gz", "sha256": sha256(archive),
-                            "size": archive.stat().st_size},
+                "archive": {"name": files["gzip"].name, "sha256": sha256(files["gzip"]),
+                            "size": files["gzip"].stat().st_size},
             }
-        manifest = {"schema": 1, "repository": "https://github.com/greaber/syq", "version": "0.1.0",
-                    "tag": "v0.1.0", "artifacts": artifacts,
-                    "installer": {"name": "install.sh", "sha256": "1" * 64, "size": 1},
-                    "homebrew_formula": {"name": "syq.rb", "sha256": "2" * 64, "size": 1}}
+            archives[target] = {"name": files["zstd"].name, "sha256": sha256(files["zstd"]),
+                                "size": files["zstd"].stat().st_size}
+        identity = {"schema": 1, "repository": "https://github.com/greaber/syq",
+                    "version": "0.1.0", "tag": "v0.1.0"}
+        manifest = dict(identity, artifacts=artifacts,
+                        installer={"name": "install.sh", "sha256": "1" * 64, "size": 1},
+                        homebrew_formula={"name": "syq.rb", "sha256": "2" * 64, "size": 1})
         output.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        zstd_output.write_text(json.dumps(dict(identity, archives=archives,
+                                               signature_scheme="ed25519-jcs-v1"),
+                                          indent=2, sort_keys=True) + "\n")
 
     def generate(self, manifest_name, installer_name):
         manifest = self.work / manifest_name
-        self.write_manifest(manifest)
+        zstd_manifest = self.work / f"zstd-{manifest_name}"
+        self.write_manifests(manifest, zstd_manifest)
         installer = self.work / installer_name
-        subprocess.run([str(SCRIPTS / "generate-installer.py"), str(manifest), str(installer)],
-                       check=True)
+        subprocess.run([str(SCRIPTS / "generate-installer.py"), str(manifest), str(zstd_manifest),
+                        str(installer)], check=True)
         return installer
 
     def install(self, bin_dir, installer=None, shell="sh", **env):
@@ -160,30 +182,71 @@ esac
                 self.assertEqual(result.returncode, 0, result.stdout)
                 self.assertEqual(self.run_program(install_dir / "syq", "--version"), "syq 0.1.0")
                 self.assertEqual(self.run_program(install_dir / "syq", "--test-target"), target)
+                self.assertEqual(self.run_program(install_dir / "syq", "--test-format"), "zstd")
 
-    def wget_only_path(self):
+    def tool_path(self, downloader="curl", zstd=None):
         """A PATH directory with every utility the installer and the fake
-        downloader use, and wget but not curl."""
-        wgetbin = self.work / "wgetbin"
-        if wgetbin.exists():
-            return wgetbin
-        wgetbin.mkdir()
+        downloader use, `downloader` as the only downloader, and as zstd
+        FAKE_ZSTD ("fake"), this host's ("real"), or none."""
+        tools = self.work / f"tools-{downloader}-{zstd or 'no'}-zstd"
+        if tools.exists():
+            return tools
+        tools.mkdir()
         checksum_utility = next((candidate for candidate in ("sha256sum", "shasum", "openssl")
                                  if shutil.which(candidate)), None)
         self.assertIsNotNone(checksum_utility)
         for utility in ["cat", "chmod", "cp", "gzip", "head", "mkdir", "mktemp", "mv", "rm", "sed",
                         "tr", "wc", "yes", checksum_utility]:
-            (wgetbin / utility).symlink_to(shutil.which(utility))
-        shutil.copy(self.fakebin / "uname", wgetbin / "uname")
-        executable(wgetbin / "wget", FAKE_WGET)
-        return wgetbin
+            (tools / utility).symlink_to(shutil.which(utility))
+        shutil.copy(self.fakebin / "uname", tools / "uname")
+        executable(tools / downloader, FAKE_CURL if downloader == "curl" else FAKE_WGET)
+        if zstd == "fake":
+            executable(tools / "zstd", FAKE_ZSTD)
+        elif zstd == "real":
+            (tools / "zstd").symlink_to(shutil.which("zstd"))
+        return tools
 
     def test_wget_only_download(self):
         result = self.install(self.work / "install-wget", shell="/bin/sh",
-                              path=str(self.wget_only_path()))
+                              path=str(self.tool_path("wget")))
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertEqual(self.run_program(self.work / "install-wget/syq", "--test-target"),
                          "linux-x86_64")
+        self.assertEqual(self.run_program(self.work / "install-wget/syq", "--test-format"), "gzip")
+
+    def test_the_archive_follows_whether_zstd_is_installed(self):
+        for zstd, expected in [("fake", "zstd"), (None, "gzip")]:
+            for downloader in ("curl", "wget"):
+                with self.subTest(zstd=zstd, downloader=downloader):
+                    install_dir = self.work / f"install-{downloader}-{expected}"
+                    result = self.install(install_dir, shell="/bin/sh",
+                                          path=str(self.tool_path(downloader, zstd)))
+                    self.assertEqual(result.returncode, 0, result.stdout)
+                    self.assertEqual(self.run_program(install_dir / "syq", "--test-format"),
+                                     expected)
+
+    def test_a_failed_decompression_keeps_the_working_installation(self):
+        install_dir = self.work / "install-broken-zstd"
+        self.assertEqual(self.install(install_dir).returncode, 0)
+        installed_sha = sha256(install_dir / "syq")
+        result = self.install(install_dir, SYQ_TEST_ZSTD_FAILS="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("could not decompress the downloaded zstd archive", result.stdout)
+        self.assertEqual(sha256(install_dir / "syq"), installed_sha)
+
+    @unittest.skipUnless(shutil.which("zstd"), "this host has no zstd")
+    def test_a_real_zstd_archive_installs(self):
+        program = self.work / "program-linux-x86_64-zstd"
+        archive = self.release / "syq-linux-x86_64.zst"
+        archive.write_bytes(subprocess.run(["zstd", "-19", "--single-thread", "-q", "-c",
+                                            str(program)], check=True,
+                                           stdout=subprocess.PIPE).stdout)
+        installer = self.generate("real-zstd-manifest.json", "real-zstd-install.sh")
+        install_dir = self.work / "install-real-zstd"
+        result = self.install(install_dir, installer=installer, shell="/bin/sh",
+                              path=str(self.tool_path("curl", "real")))
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual((install_dir / "syq").read_bytes(), program.read_bytes())
 
     def test_help_and_usage_errors(self):
         help_text = subprocess.run(["sh", str(self.installer), "--help"], check=True,
@@ -219,7 +282,7 @@ esac
                             ["sh", str(self.installer), "--bin-dir", str(destination)], self.env())
 
     def test_an_endless_download_stops_after_the_archive_size(self):
-        for downloader, path in [("curl", None), ("wget", str(self.wget_only_path()))]:
+        for downloader, path in [("curl", None), ("wget", str(self.tool_path("wget")))]:
             with self.subTest(downloader=downloader):
                 install_dir = self.work / f"endless-{downloader}"
                 result = subprocess.run(
@@ -234,18 +297,23 @@ esac
         install_dir = self.work / "install-linux-x86_64"
         self.assertEqual(self.install(install_dir).returncode, 0)
         installed_sha = sha256(install_dir / "syq")
-        # A bad download must not alter a working installation.
-        archive_path = self.release / "syq-linux-x86_64.gz"
-        archive = archive_path.read_bytes()
-        archive_path.write_bytes(archive + b"tamper")
-        self.expect_failure("downloaded archive is larger than the expected",
-                            ["sh", str(self.installer), "--bin-dir", str(install_dir)], self.env())
-        self.assertEqual(sha256(install_dir / "syq"), installed_sha)
-        archive_path.write_bytes(archive[:-1])
-        self.expect_failure("downloaded archive has size",
-                            ["sh", str(self.installer), "--bin-dir", str(install_dir)], self.env())
-        self.assertEqual(sha256(install_dir / "syq"), installed_sha)
-        archive_path.write_bytes(archive)
+        # A bad download of either archive must not alter a working installation.
+        for format, path in [("zstd", None), ("gzip", str(self.tool_path()))]:
+            with self.subTest(format=format):
+                env = self.env(path=path)
+                command = ["/bin/sh", str(self.installer), "--bin-dir", str(install_dir)]
+                archive_path = self.release / f"syq-linux-x86_64{FORMATS[format]}"
+                archive = archive_path.read_bytes()
+                archive_path.write_bytes(archive + b"tamper")
+                self.expect_failure("downloaded archive is larger than the expected", command, env)
+                self.assertEqual(sha256(install_dir / "syq"), installed_sha)
+                archive_path.write_bytes(archive[:-1])
+                self.expect_failure("downloaded archive has size", command, env)
+                self.assertEqual(sha256(install_dir / "syq"), installed_sha)
+                archive_path.write_bytes(archive[:-1] + bytes([archive[-1] ^ 1]))
+                self.expect_failure("failed SHA-256 verification", command, env)
+                self.assertEqual(sha256(install_dir / "syq"), installed_sha)
+                archive_path.write_bytes(archive)
 
         # Even correctly hashed content is rejected if its build identity does not
         # match the release metadata, again without replacing the installed binary.
