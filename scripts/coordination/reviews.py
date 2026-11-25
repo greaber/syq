@@ -158,7 +158,7 @@ def instruction(review):
                   'against the cost of the fix, and decline with a reason when it is not worth it. '
                   'Use discuss for tradeoffs, scope changes, or persistent disagreement; '
                   'use complete only when the reviewed revision needs no further changes. '
-                  'Do not merge or treat reviewer suggestions as user requirements. ')
+                  'Do not merge before completing triage, and do not treat reviewer suggestions as user requirements. ')
         if mode == 'triage':
             return common + 'Assess and discuss with the user; this mode does not authorize fixes.'
         return common + ('Auto mode authorizes confirmed, worthwhile fixes within the task. '

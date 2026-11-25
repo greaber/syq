@@ -170,19 +170,23 @@ the conversation instead.
 
 - Durable task work belongs in commits on the task branch. Changes intended for
   `master` go through a pull request; do not commit them directly on `master` or
-  merge task branches from the coordination checkout. Do not merge a pull
-  request unless the user explicitly asks. An explicit `$syq-release`
-  invocation authorizes release preparation and necessary repair PRs into
+  merge task branches from the coordination checkout.
+- Merge a task's pull request once it is reviewed clean and
+  `scripts/branch-status.py` has no failing branch checks when it is a clear
+  improvement within the task and any remaining choices are technical (where
+  the agent has the relevant context). When reporting the merge, note any
+  minor edge-case shifts worth knowing in plain English.
+- Ask before merging, explaining the tradeoff in plain English, when a choice
+  turns on context the user holds rather than the codebase: how `syq` is used
+  or should be used, user-facing defaults or CLI/SDK/output contracts,
+  compatibility or trust-boundary expectations, recurring CI or hosting cost,
+  changes to `PRINCIPLES.md` or `AGENTS.md`, unresolved reviewer disagreement,
+  or failed checks needing `merge-despite-failures`. An explicit `$syq-release`
+  invocation still authorizes release preparation and necessary repair PRs into
   `master` under the release authorization section below.
-- When the conversation is unambiguously about completing the pull request for
-  the agent's own task branch, a bare instruction such as "merge" counts as an
-  explicit request to merge that pull request into its configured base branch.
-- Merging any other branch or pull request into `master`, including a dependency
-  or the base of a stacked pull request, requires an explicit instruction that
-  names both the branch or pull request and `master` as the destination. For
-  example, while working on pull request #16, "merge pull request #7" does not
-  authorize merging pull request #7 into `master`; ask when the intended
-  destination is unclear.
+- Do not merge another owner's pull request or the base of a stacked pull
+  request into `master` unless that pull request was explicitly handed to you
+  or the user names both the pull request and `master`.
 - Before rebasing, resetting, or otherwise synchronizing a task branch with
   advancing `master`, require its worktree to be clean, including staged and
   untracked changes. Prefer a checkpoint commit on the task branch. Never use
