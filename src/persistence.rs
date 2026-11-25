@@ -6,7 +6,6 @@
 
 use crate::cli::Args;
 use crate::lock_file::LockFile;
-use crate::process::CommandExt as _;
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -18,7 +17,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod domain;
 pub(crate) use domain::Domain;
@@ -1766,7 +1765,16 @@ const DOMAIN_SETTINGS: &[&str] = &[
     crate::receive_service::provider::LOCK_FILE,
 ];
 
+/// How long persistence shutdown waits for `ssh -O exit` to ask an OpenSSH
+/// master to exit before terminating the client process and reporting failure.
+const MASTER_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+const MASTER_EXIT_OUTPUT_LIMIT: usize = 16 * 1024;
+
 fn close_scope(scope: &Path) -> Result<()> {
+    close_scope_with_timeout(scope, MASTER_EXIT_TIMEOUT)
+}
+
+fn close_scope_with_timeout(scope: &Path, master_exit_timeout: Duration) -> Result<()> {
     let records = scope_records(scope)?;
     let closing = scope.join(crate::receive_service::CLOSING);
     mark_closing(scope)?;
@@ -1785,7 +1793,7 @@ fn close_scope(scope: &Path) -> Result<()> {
             }
         }
         if socket_is_live(&socket) {
-            if let Err(error) = close_master(&socket, record) {
+            if let Err(error) = close_master_with_timeout(&socket, record, master_exit_timeout) {
                 failures.push(format!("{}: {error:#}", record.label()));
             }
         }
@@ -1875,10 +1883,21 @@ fn close_scope(scope: &Path) -> Result<()> {
     Ok(())
 }
 
-fn close_master(socket: &Path, record: &EndpointRecord) -> Result<()> {
-    let output = master_exit_command(socket, record)
-        .capture_output()
-        .with_context(|| format!("ask SSH master for {} to exit", record.label()))?;
+fn close_master_with_timeout(
+    socket: &Path,
+    record: &EndpointRecord,
+    timeout: Duration,
+) -> Result<()> {
+    let mut command = master_exit_command(socket, record);
+    let deadline = Instant::now() + timeout;
+    let output = crate::process::capture_output_bounded(
+        "SSH master shutdown",
+        &mut command,
+        deadline,
+        &|| false,
+        MASTER_EXIT_OUTPUT_LIMIT,
+    )
+    .with_context(|| format!("ask SSH master for {} to exit", record.label()))?;
     if output.status.success() || !socket_is_live(socket) {
         return Ok(());
     }
@@ -2334,5 +2353,46 @@ mod tests {
         assert!(validate_openssh_control_path(Path::new("/tmp/scope with space/%h")).is_ok());
         assert!(validate_openssh_control_path(Path::new("~/scope")).is_err());
         assert!(validate_openssh_control_path(Path::new("/tmp/${HOME}/scope")).is_err());
+    }
+
+    #[test]
+    fn close_master_times_out_when_control_socket_is_unresponsive() {
+        let temporary = crate::test_support::short_tempdir().unwrap();
+        let socket = temporary.path().join("cm-unresponsive");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let record = EndpointRecord::new(None, "example", None, None);
+        assert!(socket_is_live(&socket));
+
+        let error =
+            close_master_with_timeout(&socket, &record, Duration::from_millis(200)).unwrap_err();
+        assert!(
+            error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+            }),
+            "{error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("ask SSH master for example to exit"),
+            "{error:#}"
+        );
+        assert!(socket.exists());
+    }
+
+    #[test]
+    fn close_scope_reports_timeout_and_preserves_scope_when_master_is_unresponsive() {
+        let temporary = crate::test_support::short_tempdir().unwrap();
+        let scope = temporary.path().join("scope");
+        initialize_scope(&scope).unwrap();
+        let socket = prepare_endpoint(&scope, None, "example", None, None).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = close_scope_with_timeout(&scope, Duration::from_millis(200)).unwrap_err();
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+        assert!(scope.exists());
+        assert!(socket.exists());
     }
 }
