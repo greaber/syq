@@ -1,7 +1,9 @@
-//! Serialize Linux range writes while keeping reception and hashing parallel.
-//! Every worker of a copy runs in its receiver process, so the registry
-//! covers them all. Writes are serialized only on filesystems where that
-//! helps (`Profile::serialized_writes`).
+//! Serialize Linux range writes while keeping reception, hashing and zero
+//! scanning parallel. Every worker of a copy runs in its receiver process, so
+//! the registry covers them all. Writes are serialized only on filesystems
+//! where that helps (`Profile::serialized_writes`), and the gate is held only
+//! while the write's requests are made: a sparse write is scanned for zero
+//! blocks before it is taken (`sparse::plan`).
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
@@ -139,16 +141,22 @@ impl CachedFile {
     }
 
     pub(crate) fn write_range_at(&self, data: &[u8], offset: u64, sparse: bool) -> io::Result<()> {
+        // Scanned for zeros before the gate is taken, so that other workers'
+        // writes to this file wait only for requests.
+        let planned = if sparse {
+            Some(crate::sparse::plan(&self.file, data, offset, true)?)
+        } else {
+            None
+        };
         // Tests exercise serialization on every Unix host; production enables it
         // only on Linux, where its performance has been measured.
         #[cfg(any(target_os = "linux", test))]
         let gate = self.write_gate()?;
         #[cfg(any(target_os = "linux", test))]
         let _writer = gate.map(|gate| gate.lock().unwrap());
-        if sparse {
-            crate::sparse::write_at(&self.file, data, offset, true)
-        } else {
-            self.file.write_all_at(data, offset)
+        match planned {
+            Some(planned) => planned.apply(&self.file),
+            None => self.file.write_all_at(data, offset),
         }
     }
 }
@@ -242,6 +250,63 @@ mod tests {
         drop(other);
         drop(reopened);
         assert!(gate.upgrade().is_none());
+    }
+
+    #[test]
+    fn concurrent_sparse_ranges_of_one_file_land_whole_and_punch_old_bytes() {
+        // Workers write interleaved ranges of one file, half of each range
+        // zeros over old bytes: each range lands whole, its zero blocks
+        // cleared, whatever order the workers run in.
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = dir.path().join("file");
+        let range = 64 * 1024;
+        let workers = 8;
+        let rounds = 4;
+        std::fs::write(&path, vec![0xa5; range * workers * rounds]).unwrap();
+        std::thread::scope(|scope| {
+            for worker in 0..workers {
+                let path = &path;
+                scope.spawn(move || {
+                    let file = CachedFile::new(File::options().write(true).open(path).unwrap());
+                    for round in 0..rounds {
+                        let index = round * workers + worker;
+                        let mut data = vec![0; range];
+                        data[..range / 2].fill(index as u8 + 1);
+                        file.write_range_at(&data, (index * range) as u64, true)
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        let written = std::fs::read(&path).unwrap();
+        for (index, chunk) in written.chunks(range).enumerate() {
+            assert!(chunk[..range / 2]
+                .iter()
+                .all(|byte| *byte == index as u8 + 1));
+            assert!(chunk[range / 2..].iter().all(|byte| *byte == 0), "{index}");
+        }
+    }
+
+    #[test]
+    fn a_sparse_write_makes_no_request_while_another_holds_the_gate() {
+        // The zero scan runs before the gate is taken, but the hole punch
+        // it plans waits for the gate like any write.
+        let dir = crate::test_support::tempdir().unwrap();
+        let path = dir.path().join("file");
+        std::fs::write(&path, vec![1; 8192]).unwrap();
+        let holder = CachedFile::new(File::options().write(true).open(&path).unwrap());
+        let writer = CachedFile::new(File::options().write(true).open(&path).unwrap());
+        let gate = holder.write_gate().unwrap().unwrap().clone();
+        let held = gate.lock().unwrap();
+        std::thread::scope(|scope| {
+            let writing = scope.spawn(|| writer.write_range_at(&[0; 8192], 0, true));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(!writing.is_finished());
+            assert_eq!(std::fs::read(&path).unwrap(), vec![1; 8192]);
+            drop(held);
+            writing.join().unwrap().unwrap();
+        });
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0; 8192]);
     }
 
     #[test]
