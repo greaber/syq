@@ -381,6 +381,7 @@ async fn request_ramp_bounds_preparation_and_refills_after_growth() {
                 initial_probe_up: true,
                 requests: Some(copy_budget.clone()),
                 checking: None,
+                outage: None,
             },
             move |job, _| {
                 let budget = copy_budget.clone();
@@ -462,6 +463,7 @@ async fn measured_handoff_can_probe_before_more_completions() {
                     initial_probe_up: upward,
                     requests: Some(budget.clone()),
                     checking: None,
+                    outage: None,
                 },
                 move |job, _| {
                     let budget = budget.clone();
@@ -563,6 +565,7 @@ async fn check_handoff_direction(probe_bytes: u64, expected_peak: usize, expecte
                 initial_probe_up: true,
                 requests: Some(copy_budget.clone()),
                 checking: None,
+                outage: None,
             },
             move |_, _| {
                 let budget = copy_budget.clone();
@@ -604,6 +607,7 @@ async fn object_handoff_drains_waiting_jobs_before_opening_request_capacity() {
                 initial_probe_up: true,
                 requests: Some(copy_budget.clone()),
                 checking: None,
+                outage: None,
             },
             move |job, _| {
                 let budget = copy_budget.clone();
@@ -832,4 +836,127 @@ fn small_object_budget_bounds_payload_memory_and_empty_objects() {
     assert_eq!(small_capacity(524288, 8, 0), 4096);
     assert_eq!(small_capacity(524288, 8, 64 * 1024), 4096);
     assert_eq!(small_capacity(524288, 8, 512 * 1024), 512);
+}
+
+#[tokio::test]
+async fn budget_backs_off_on_throttling_only_after_draining() {
+    let outage = Arc::new(crate::s3::outage::Outage::default());
+    let budget = Arc::new(Budget::with_outage(32, true, None, Some(outage.clone())));
+    // First throttle halves 32 -> 16 without lowering max or settling the ramp,
+    // and calling throttled() afterwards for the same signal does not cut again.
+    outage.throttled();
+    budget.completed(1024);
+    assert_eq!(budget.state.lock().unwrap().limit, 16);
+    assert_eq!(budget.state.lock().unwrap().max, 256);
+    assert!(!budget.state.lock().unwrap().settled);
+    budget.throttled();
+    assert_eq!(budget.state.lock().unwrap().limit, 16);
+
+    // While more than `limit` requests are still in flight (draining from the
+    // previous limit), further delayed 429/503 replies must not cut again.
+    let mut permits = Vec::new();
+    budget.state.lock().unwrap().limit = 20;
+    for _ in 0..17 {
+        permits.push(budget.acquire().await);
+    }
+    budget.state.lock().unwrap().limit = 16;
+    outage.throttled();
+    budget.throttled();
+    assert_eq!(budget.state.lock().unwrap().limit, 16);
+
+    // Once active requests drain to the limit, a new throttle cuts again.
+    permits.pop();
+    outage.throttled();
+    budget.throttled();
+    assert_eq!(budget.state.lock().unwrap().limit, 8);
+    drop(permits);
+}
+
+#[tokio::test]
+async fn multipart_budget_backs_off_on_throttling_and_recovers() {
+    let outage = Arc::new(crate::s3::outage::Outage::default());
+    let budget = Arc::new(Budget::with_outage(
+        64,
+        true,
+        Some(64),
+        Some(outage.clone()),
+    ));
+    // Simulate a multipart ramp that already settled after a rejected probe:
+    // throttling must still back off and reopen the ramp for recovery.
+    budget.state.lock().unwrap().settled = true;
+    outage.throttled();
+    budget.completed(1024 * 1024);
+    {
+        let s = budget.state.lock().unwrap();
+        assert_eq!(s.limit, 32);
+        assert_eq!(s.max, 64);
+        assert!(!s.settled);
+        assert!(s.backoff_windows > 0);
+    }
+    // Drive clean saturated windows past the cooldown; the budget should grow
+    // back to 64 once throttling stops.
+    for _ in 0..8 {
+        let count = {
+            let mut s = budget.state.lock().unwrap();
+            s.since = Some(Instant::now() - Duration::from_secs(1));
+            s.saturated = true;
+            s.limit.max(16)
+        };
+        for _ in 0..count {
+            budget.completed(1024 * 1024);
+        }
+    }
+    assert_eq!(budget.state.lock().unwrap().limit, 64);
+}
+
+#[test]
+fn configure_ignores_pre_batch_throttles() {
+    let args = crate::cli::Args::parse_args(&[
+        std::ffi::OsString::from("cp"),
+        std::ffi::OsString::from("--from"),
+        std::ffi::OsString::from("s3://bucket"),
+        std::ffi::OsString::from("a"),
+        std::ffi::OsString::from("--as"),
+        std::ffi::OsString::from("b"),
+    ])
+    .unwrap();
+    let options = args.s3.clone().unwrap();
+    let outage = Arc::new(crate::s3::outage::Outage::default());
+    let tuning = Tuning::new(&options, &args, Arc::default(), outage.clone());
+    // Listing / discovery throttles happen before transfer configuration.
+    outage.throttled();
+    outage.throttled();
+    tuning.configure(false, 64, 32);
+    tuning.requests.completed(1024);
+    assert_eq!(tuning.request_limit(), 32);
+}
+
+#[tokio::test]
+async fn permit_drop_without_completed_backs_off_on_throttling() {
+    let outage = Arc::new(crate::s3::outage::Outage::default());
+    let budget = Arc::new(Budget::with_outage(32, true, None, Some(outage.clone())));
+    let permit = budget.acquire().await;
+    outage.throttled();
+    drop(permit);
+    assert_eq!(budget.state.lock().unwrap().limit, 16);
+}
+
+#[tokio::test]
+async fn checking_above_skips_budget_throttle_cut() {
+    let outage = Arc::new(crate::s3::outage::Outage::default());
+    let budget = Arc::new(Budget::with_outage(32, true, None, Some(outage.clone())));
+    budget.set_checking_above(true);
+    let permit = budget.acquire().await;
+    outage.throttled();
+    budget.completed(1024);
+    drop(permit);
+    assert_eq!(budget.state.lock().unwrap().limit, 32);
+    // Even if another checking throttle arrives with no permit drop or
+    // completion before leaving checking_above, leaving checking_above
+    // consumes it so the next transfer is not cut.
+    outage.throttled();
+    budget.set_checking_above(false);
+    budget.completed(1024);
+    budget.throttled();
+    assert_eq!(budget.state.lock().unwrap().limit, 32);
 }

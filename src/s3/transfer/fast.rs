@@ -66,6 +66,7 @@ impl Engine {
                 initial_probe_up: false,
                 requests: None,
                 checking: None,
+                outage: None,
             });
         }
         let average = bytes / count;
@@ -200,14 +201,15 @@ impl Engine {
                 } else {
                     maximum
                 },
-                outage: self.outage.clone(),
             }
         });
+        let has_checking = checking.is_some();
         Ok(Concurrency {
             initial,
             maximum,
             checking,
-            requests: maximum.map(|_| self.tuning.requests.clone()),
+            outage: Some(self.outage.clone()),
+            requests: (maximum.is_some() || has_checking).then(|| self.tuning.requests.clone()),
             initial_probe_up: self
                 .tuning
                 .control_latency()

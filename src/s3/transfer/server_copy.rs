@@ -773,7 +773,7 @@ impl Engine {
             }
             CopyPreparation::Metadata(update) => {
                 update
-                    .execute(
+                    .execute_counted(
                         &self.client,
                         &self.options.bucket,
                         self.part_workers(),
@@ -782,6 +782,8 @@ impl Engine {
                             self.check_cancelled()?;
                             Ok(slot)
                         },
+                        || async {},
+                        |bytes| self.tuning.requests.completed(bytes),
                     )
                     .await?;
                 self.progress

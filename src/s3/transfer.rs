@@ -336,7 +336,7 @@ impl Engine {
         super::diagnostics::elapsed(setup, "client_setup", 0);
         let content_md5 = super::checksum::plain_http(options.endpoint.as_deref());
         Ok(Arc::new(Self {
-            tuning: super::tuning::Tuning::new(&options, &args, control),
+            tuning: super::tuning::Tuning::new(&options, &args, control, outage.clone()),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancel_wake: tokio::sync::Notify::new(),
             uploads,
@@ -1634,7 +1634,7 @@ impl Engine {
         slot.claim().await;
         if let Some(update) = &prepared.metadata_update {
             update
-                .execute(
+                .execute_counted(
                     &self.client,
                     &self.options.bucket,
                     self.part_workers(),
@@ -1643,6 +1643,8 @@ impl Engine {
                         self.check_cancelled()?;
                         Ok(slot)
                     },
+                    || async {},
+                    |bytes| self.tuning.requests.completed(bytes),
                 )
                 .await?;
             self.progress
@@ -4199,7 +4201,9 @@ mod tests {
             .unwrap(),
         );
         let options = args.s3.clone().unwrap();
-        let tuning = crate::s3::tuning::Tuning::new(&options, &args, Arc::default());
+        let outage = Arc::new(crate::s3::outage::Outage::default());
+        let tuning =
+            crate::s3::tuning::Tuning::new(&options, &args, Arc::default(), outage.clone());
         let config = aws_sdk_s3::config::Builder::new()
             .behavior_version_latest()
             .region(aws_sdk_s3::config::Region::new("us-east-1"))
@@ -4220,7 +4224,7 @@ mod tests {
             file_permissions: Default::default(),
             metadata_replacements: Default::default(),
             copy_tagging_unsupported: Default::default(),
-            outage: Default::default(),
+            outage,
             cancelled: Default::default(),
             cancel_wake: Default::default(),
             uploads: Default::default(),
