@@ -52,7 +52,7 @@ def check():
         assert c.listing(prefix + '/') == [prefix + '/']
         assert c.request('GET', outside)[1] == b'outside'
     check_parts()
-    print('Parallel S3 enumeration passed: download bytes, server copy, prune, removal, literal selectors, listing in parts', flush=True)
+    print('Parallel S3 enumeration passed: download bytes, server copy, prune, removal, literal selectors, listing in parts and by directory', flush=True)
 
 
 def check_parts():
@@ -60,8 +60,9 @@ def check_parts():
 
     Objects sit beside the directories, start with their names, and need URL
     encoding, and the last directory is ignored. Only endpoints that document
-    key order divide a listing; a test hook of debug builds lets this server
-    divide too, and the same checks run without it.
+    key order divide a listing into parts; a test hook of debug builds lets
+    this server divide too. Without it, the listing is split by directory,
+    and another test hook says so.
     """
     prefix = c.PREFIX + '/wide'
     # Over 64 directories, so that parts cover several directories each.
@@ -78,29 +79,32 @@ def check_parts():
     with ThreadPoolExecutor(max_workers=32) as pool:
         list(pool.map(lambda item: c.request('PUT', item[0], item[1]), objects.items()))
     assert set(c.listing(prefix + '/')) == set(objects), 'independent listing must see the fixture'
+    hooks = ('SYQ_TEST_S3_DIVIDE_LISTINGS', 'SYQ_TEST_S3_REPORT_SPLITS')
+    env = {key: value for key, value in os.environ.items() if key not in hooks}
+    env['SYQ_TEST_S3_REPORT_SPLITS'] = '1'
     for divide in (True, False):
-        env = {key: value for key, value in os.environ.items()
-               if key != 'SYQ_TEST_S3_DIVIDE_LISTINGS'}
-        if divide:
-            env['SYQ_TEST_S3_DIVIDE_LISTINGS'] = '1'
+        run_env = env | {'SYQ_TEST_S3_DIVIDE_LISTINGS': '1'} if divide else env
         listed = subprocess.run([c.SYQ, '_ls', f'{remote}/{prefix}/**', '--s3-region', c.REGION],
-                                capture_output=True, text=True, timeout=120, env=env)
+                                capture_output=True, text=True, timeout=120, env=run_env)
         assert listed.returncode == 0, listed.stderr
         assert ('listing divided into parts' in listed.stderr) == divide, listed.stderr
+        assert ('listing split by directory' in listed.stderr) != divide, listed.stderr
         keys = [json.loads(line)['key'] for line in listed.stdout.splitlines()]
         assert len(keys) == len(objects) and set(keys) == set(objects)
-    # check() above copies without the hook; this copy lists in parts.
-    with tempfile.TemporaryDirectory(prefix='syq-enumeration-') as temp:
-        destination = Path(temp).resolve() / 'download'
-        copied = c.run(['--from', remote, '--srcs-in', prefix, '--into', destination,
-                        '--ignore', 'zz ignored/'],
-                       env=env | {'SYQ_TEST_S3_DIVIDE_LISTINGS': '1'}, capture=True)
-        assert 'listing divided into parts' in copied.stderr, copied.stderr
-        expected = {key[len(prefix) + 1:] for key in objects
-                    if not key.endswith('/') and '/zz ignored/' not in key}
-        actual = {str(path.relative_to(destination))
-                  for path in destination.rglob('*') if path.is_file()}
-        assert actual == expected
+    # check() above copies without the hooks; these copies list in parts and
+    # by directory, leaving the ignored directory out.
+    expected = {key[len(prefix) + 1:] for key in objects
+                if not key.endswith('/') and '/zz ignored/' not in key}
+    for divide, said in ((True, 'listing divided into parts'), (False, 'listing split by directory')):
+        with tempfile.TemporaryDirectory(prefix='syq-enumeration-') as temp:
+            destination = Path(temp).resolve() / 'download'
+            run_env = env | {'SYQ_TEST_S3_DIVIDE_LISTINGS': '1'} if divide else env
+            copied = c.run(['--from', remote, '--srcs-in', prefix, '--into', destination,
+                            '--ignore', 'zz ignored/'], env=run_env, capture=True)
+            assert said in copied.stderr, copied.stderr
+            actual = {str(path.relative_to(destination))
+                      for path in destination.rglob('*') if path.is_file()}
+            assert actual == expected
 
 if __name__ == '__main__':
     try:

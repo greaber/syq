@@ -4,7 +4,7 @@ use std::{future::Future, task::Context};
 #[tokio::test]
 async fn resource_request_ceiling_survives_configuration_and_object_handoff() {
     let tuning = Tuning {
-        control_ns: Arc::new(AtomicU64::new(u64::MAX)),
+        control: Arc::default(),
         fixed_requests: None,
         tigris: false,
         upload: false,
@@ -61,7 +61,7 @@ async fn planning_time_does_not_advance_the_first_request_window() {
 #[tokio::test]
 async fn transfer_configuration_discards_planning_admission_time() {
     let tuning = Tuning {
-        control_ns: Arc::new(AtomicU64::new(u64::MAX)),
+        control: Arc::default(),
         reads: crate::s3::read_recovery::Recovery::default(),
         fixed_requests: None,
         tigris: false,
@@ -766,7 +766,7 @@ fn initial_request_budget_accounts_for_direction_latency_and_overrides() {
         (false, true, Some(100), true, Some(16), 16),
     ] {
         let tuning = Tuning {
-            control_ns: Arc::new(AtomicU64::new(u64::MAX)),
+            control: Arc::default(),
             reads: crate::s3::read_recovery::Recovery::default(),
             fixed_requests: fixed,
             tigris,
@@ -796,6 +796,31 @@ fn initial_request_budget_accounts_for_direction_latency_and_overrides() {
             assert!(!tuning.requests.state.lock().unwrap().adaptive);
         }
     }
+}
+
+#[test]
+fn a_lone_cold_response_keeps_the_wide_start_until_a_warm_one_arrives() {
+    let tuning = Tuning {
+        control: Arc::default(),
+        reads: crate::s3::read_recovery::Recovery::default(),
+        fixed_requests: None,
+        tigris: false,
+        upload: false,
+        requests: Arc::new(Budget::new(64, true)),
+        retained_upload_files: Default::default(),
+        upload_buffers: Arc::new(tokio::sync::Semaphore::new(1)),
+    };
+    // One listing page on a 90 ms endpoint: only the cold response exists.
+    tuning.control.observe_first(Duration::from_millis(270));
+    assert_eq!(tuning.control_latency(), Some(Duration::from_millis(270)));
+    tuning.configure(true, 256, 64);
+    assert_eq!(tuning.request_limit(), 256);
+    // A 10 ms endpoint whose cold response crossed the threshold ramps
+    // normally once a warm response shows the real distance.
+    tuning.control.observe(Duration::from_millis(10));
+    assert_eq!(tuning.control_latency(), Some(Duration::from_millis(10)));
+    tuning.configure(true, 256, 64);
+    assert_eq!(tuning.request_limit(), 64);
 }
 
 #[test]
@@ -896,9 +921,8 @@ fn configure_ignores_pre_batch_throttles() {
     ])
     .unwrap();
     let options = args.s3.clone().unwrap();
-    let control = Arc::new(AtomicU64::new(u64::MAX));
     let outage = Arc::new(crate::s3::outage::Outage::default());
-    let tuning = Tuning::new(&options, &args, control, outage.clone());
+    let tuning = Tuning::new(&options, &args, Arc::default(), outage.clone());
     // Listing / discovery throttles happen before transfer configuration.
     outage.throttled();
     outage.throttled();

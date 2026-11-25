@@ -153,6 +153,40 @@ def main():
     assert "retryable" not in extra[1], records
     assert records[-1]["errors"] == 1 and records[-1]["status"] == "partial", records[-1]
 
+    print("results: hard-link checks a restricted receiver refused together, then one by one", flush=True)
+    # Two files, each with its other name outside the copy, so that an
+    # unchanged rerun only checks them (no links). With one change left on
+    # the grant, the request holding both checks is refused whole, and the
+    # receiver lists both; each is then asked about by itself, so one is
+    # kept and the other refused again.
+    ssh("source", f"import os; from pathlib import Path; p=Path({ROOT + '/hl-source'!r}); p.mkdir(); "
+                  f"o=Path({ROOT + '/hl-outside'!r}); o.mkdir(); "
+                  "[((p/n).write_bytes(n.encode()), os.link(p/n, o/n)) for n in ('x', 'y')]")
+    copy("hl-limit", "--copy-metadata=mtime,hardlinks", source="hl-source")
+    identities = ("import os, json; print(json.dumps([os.stat(" + repr(ROOT + "/hl-limit/") + " + n).st_ino "
+                  "for n in ('x', 'y')]))")
+    before = ssh("destination", identities).stdout
+    _, records = copy("hl-limit", "--copy-metadata=mtime,hardlinks", "--receiver-max-entries=1",
+                      expected=25, source="hl-source")
+    terminal = records[-1]
+    assert terminal["status"] == "refused" and terminal["exit_code"] == 25, terminal
+    # The files are as they were: nothing about them needed changing.
+    assert ssh("destination", identities).stdout == before, records
+    ssh("destination", f"from pathlib import Path; d=Path({ROOT + '/hl-limit'!r}); "
+                       "assert (d/'x').read_bytes() == b'x' and (d/'y').read_bytes() == b'y'")
+    checks = [record["dst"]["value"] for record in records
+              if record["type"] == "operation_result" and record["action"] == "transfer_file"
+              and record["disposition"] == "failed"]
+    # The receiver lists both files for the refused request, and the one
+    # it refused again by itself once more. The other was kept: a refused
+    # request's records can list a file a later request completed.
+    assert sorted(checks) in (["x", "x", "y"], ["x", "y", "y"]), records
+    kept = "x" if checks.count("y") == 2 else "y"
+    assert terminal["files_unchanged"] == 1, (kept, terminal)
+    assert all(record.get("class") == "safety_limit" for record in records
+               if record["type"] == "operation_result" and record["disposition"] == "failed"), records
+    assert terminal["errors"] == sum(record["type"] == "error" for record in records), records
+
     print("results: a stream the coordinator cuts short fails the copy", flush=True)
     cut = {"SYQ_TEST_DROP_DESTINATION_RESULTS_END": "1"}
     result, records = copy("cut", expected=1, env=cut)

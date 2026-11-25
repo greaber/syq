@@ -110,11 +110,16 @@ pub(crate) struct WriteFlags {
 /// PutObject, CopyObject (including metadata-only updates), and
 /// CreateMultipartUpload. Part uploads, completion, tagging, and reads do not.
 /// The SDK's `x-id` operation marker is not an S3 subresource.
-pub(crate) fn writes_object<'a>(method: &str, query: impl IntoIterator<Item = &'a str>) -> bool {
-    let mut query = query.into_iter().filter(|name| *name != "x-id");
+pub(crate) fn writes_object(
+    method: &str,
+    query: impl IntoIterator<Item = impl AsRef<str>>,
+) -> bool {
+    let mut query = query.into_iter().filter(|name| name.as_ref() != "x-id");
     match method {
         "PUT" => query.next().is_none(),
-        "POST" => query.next() == Some("uploads") && query.next().is_none(),
+        "POST" => {
+            query.next().is_some_and(|name| name.as_ref() == "uploads") && query.next().is_none()
+        }
         _ => false,
     }
 }

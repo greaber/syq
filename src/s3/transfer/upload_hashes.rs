@@ -181,15 +181,9 @@ fn parallel_parts<R>(
 where
     R: FnMut(&mut [u8], u64) -> Result<()>,
 {
-    use blake3::hazmat::{
-        left_subtree_len, max_subtree_len, merge_subtrees_non_root, merge_subtrees_root, HasherExt,
-        Mode,
-    };
+    use super::subtrees::{self, Subtree};
+    use blake3::hazmat::HasherExt;
     anyhow::ensure!(!tree || (size > part_size && part_size > 0 && part_size.is_multiple_of(1024)));
-    struct Subtree {
-        offset: u64,
-        hash: [u8; 32],
-    }
     let parts = (0..size.div_ceil(part_size))
         .into_par_iter()
         .map(|index| -> Result<_> {
@@ -204,14 +198,10 @@ where
             let mut offset = start;
             while offset < end {
                 let subtree_start = offset;
-                let remaining = end - offset;
-                let length = if tree && remaining >= blake3::CHUNK_LEN as u64 {
-                    // The largest complete subtree that fits this part and is
-                    // valid at this offset. Only the final chunk can be short.
-                    let complete = 1u64 << (63 - remaining.leading_zeros());
-                    complete.min(max_subtree_len(offset).unwrap_or(complete))
+                let length = if tree {
+                    subtrees::length(offset, end)
                 } else {
-                    remaining
+                    end - offset
                 };
                 let subtree_end = offset + length;
                 let mut subtree = tree.then(|| {
@@ -240,24 +230,6 @@ where
             Ok((native.map(|hash| hash.finish()), subtrees))
         })
         .collect::<Result<Vec<_>>>()?;
-    fn merge(subtrees: &[Subtree], end: u64, root: bool) -> [u8; 32] {
-        if subtrees.len() == 1 {
-            return subtrees[0].hash;
-        }
-        // Split by bytes, not the number of pieces: aligned parts can produce
-        // different subtree sizes. Complete subtrees never cross this boundary.
-        let start = subtrees[0].offset;
-        let boundary = start + left_subtree_len(end - start);
-        let split = subtrees.partition_point(|subtree| subtree.offset < boundary);
-        debug_assert_eq!(subtrees[split].offset, boundary);
-        let left = merge(&subtrees[..split], boundary, false);
-        let right = merge(&subtrees[split..], end, false);
-        if root {
-            *merge_subtrees_root(&left, &right, Mode::Hash).as_bytes()
-        } else {
-            merge_subtrees_non_root(&left, &right, Mode::Hash)
-        }
-    }
     let mut checksums = Vec::with_capacity(parts.len());
     let mut subtrees = Vec::new();
     for (checksum, pieces) in parts {
@@ -266,7 +238,7 @@ where
     }
     Ok(PartHashes {
         checksums,
-        blake3: tree.then(|| merge(&subtrees, size, true)),
+        blake3: tree.then(|| subtrees::merge(&subtrees, size)),
     })
 }
 

@@ -1111,12 +1111,7 @@ async fn pre_handoff_single_throttle_cuts_once_not_twice() {
     ])
     .unwrap();
     let options = args.s3.clone().unwrap();
-    let tuning = crate::s3::tuning::Tuning::new(
-        &options,
-        &args,
-        Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
-        outage.clone(),
-    );
+    let tuning = crate::s3::tuning::Tuning::new(&options, &args, Arc::default(), outage.clone());
     tuning.configure(false, 64, 16);
     let budget = tuning.requests.clone();
     let fired = Arc::new(AtomicBool::new(false));

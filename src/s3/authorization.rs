@@ -497,12 +497,8 @@ impl Signer {
             automatic_concurrency: false,
             automatic_part_size: false,
         };
-        let (client, credentials) = super::client::connect_local(
-            &mut options,
-            Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
-            Arc::default(),
-        )
-        .await?;
+        let (client, credentials) =
+            super::client::connect_local(&mut options, Arc::default(), Arc::default()).await?;
         let credentials = credentials
             .context("no storage credential provider configured on authorizing machine")?
             .provide_credentials()

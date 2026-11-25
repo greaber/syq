@@ -793,15 +793,206 @@ impl Planner<'_> {
     /// had produced them. Implied parents are descriptor-relative and never
     /// traversed through symlinks, including with `--insecure-links`. Listed directories —
     /// only those, not implied parents — are walked with an explicit -r.
-    pub(super) fn scan_files_from(
+    pub(super) fn scan_files_from<'list>(
         &mut self,
         src: &mut dyn Conn,
         src_root: &[u8],
         dst_root: &[u8],
-        lines: &[PathBytes],
+        lines: &'list [PathBytes],
         recurse: bool,
     ) -> Result<()> {
-        use std::collections::{HashMap, HashSet};
+        use std::borrow::Cow;
+        use std::collections::{HashMap, HashSet, VecDeque};
+        enum ParentState {
+            Pending(Box<Entry>),
+            EmittedDir,
+            NotDir,
+            Missing,
+        }
+        struct PreparedChunk<'list> {
+            batch: Vec<Entry>,
+            subtrees: Vec<&'list [u8]>,
+            errors: Vec<String>,
+            shown: bool,
+            has_more_lines: bool,
+        }
+        struct FilesFromState<'s, 'list> {
+            source_base: RegisteredPath,
+            src_root: &'s [u8],
+            recurse: bool,
+            leaves: HashMap<&'list [u8], Option<Kind>>,
+            parents: HashMap<&'list [u8], ParentState>,
+            emitted: HashMap<Cow<'list, [u8]>, Kind>,
+            recursed: HashSet<&'list [u8]>,
+        }
+        impl<'s, 'list> FilesFromState<'s, 'list> {
+            fn ancestors(line: &[u8]) -> impl Iterator<Item = &[u8]> {
+                line.iter()
+                    .enumerate()
+                    .filter(|(_, &b)| b == b'/')
+                    .map(|(i, _)| &line[..i])
+            }
+
+            fn stat(
+                &self,
+                src: &mut dyn Conn,
+                paths: &[&[u8]],
+                follow: bool,
+            ) -> Result<Vec<Option<Entry>>> {
+                if paths.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let legacy_paths = paths.iter().map(|r| join(self.src_root, r)).collect();
+                let registered = paths
+                    .iter()
+                    .map(|relative| self.source_base.join(relative))
+                    .collect::<Result<Vec<_>>>()?;
+                stat_many_registered(src, legacy_paths, Some(registered), follow)
+            }
+
+            fn prepare_chunk(
+                &mut self,
+                src: &mut dyn Conn,
+                chunk: &'list [PathBytes],
+                has_more_lines: bool,
+            ) -> Result<PreparedChunk<'list>> {
+                let mut want_parents: Vec<&'list [u8]> = Vec::new();
+                let mut want_leaves: Vec<&'list [u8]> = Vec::new();
+                // Per role: a path may be needed both as a followed ancestor and
+                // as an lstat'ed leaf, with different answers.
+                let mut wanted_parents: HashSet<&'list [u8]> = HashSet::new();
+                let mut wanted_leaves: HashSet<&'list [u8]> = HashSet::new();
+                for line in chunk {
+                    for anc in Self::ancestors(line) {
+                        if !self.parents.contains_key(anc) && wanted_parents.insert(anc) {
+                            want_parents.push(anc);
+                        }
+                    }
+                    let line_slice = line.as_slice();
+                    if !self.leaves.contains_key(line_slice) && wanted_leaves.insert(line_slice) {
+                        want_leaves.push(line_slice);
+                    }
+                }
+                let parent_stats = self.stat(src, &want_parents, true)?;
+                for (rel, st) in want_parents.into_iter().zip(parent_stats) {
+                    let state = match st {
+                        Some(mut e) if e.kind == Kind::Dir => {
+                            e.path = rel.to_vec();
+                            ParentState::Pending(Box::new(e))
+                        }
+                        Some(_) => ParentState::NotDir,
+                        None => ParentState::Missing,
+                    };
+                    self.parents.insert(rel, state);
+                }
+                let mut chunk_leaves: HashMap<&'list [u8], Entry> =
+                    HashMap::with_capacity(want_leaves.len());
+                let leaf_stats = self.stat(src, &want_leaves, false)?;
+                for (rel, st) in want_leaves.into_iter().zip(leaf_stats) {
+                    match st {
+                        Some(mut e) => {
+                            self.leaves.insert(rel, Some(e.kind));
+                            e.path = rel.to_vec();
+                            chunk_leaves.insert(rel, e);
+                        }
+                        None => {
+                            self.leaves.insert(rel, None);
+                        }
+                    }
+                }
+                let mut batch: Vec<Entry> = Vec::new();
+                let mut subtrees: Vec<&'list [u8]> = Vec::new();
+                let mut errors: Vec<String> = Vec::new();
+                'line: for line in chunk {
+                    let line = line.as_slice();
+                    let shown = display(line);
+                    // Validate the whole chain before emitting any of it, so a bad
+                    // path leaves no half-created ancestors behind.
+                    let mut chain: Vec<&'list [u8]> = Vec::new();
+                    for anc in Self::ancestors(line) {
+                        match self.parents.get_mut(anc) {
+                            Some(state @ ParentState::Pending(_)) => match self.emitted.get(anc) {
+                                Some(Kind::Dir) => {
+                                    *state = ParentState::EmittedDir;
+                                }
+                                Some(_) => {
+                                    errors.push(format!(
+                                        "syq: --files-from: {shown}: {} was listed as a non-directory",
+                                        display(anc)
+                                    ));
+                                    continue 'line;
+                                }
+                                None => {
+                                    chain.push(anc);
+                                }
+                            },
+                            Some(ParentState::EmittedDir) => {}
+                            Some(ParentState::NotDir) => {
+                                errors.push(format!(
+                                    "syq: --files-from: {shown}: {} is not a directory",
+                                    display(anc)
+                                ));
+                                continue 'line;
+                            }
+                            Some(ParentState::Missing) | None => {
+                                errors.push(format!(
+                                    "syq: --files-from: {shown}: no such file or directory"
+                                ));
+                                continue 'line;
+                            }
+                        }
+                    }
+                    let Some(Some(leaf_kind)) = self.leaves.get(line).copied() else {
+                        errors.push(format!(
+                            "syq: --files-from: {shown}: no such file or directory"
+                        ));
+                        continue;
+                    };
+                    for anc in chain {
+                        let prev = std::mem::replace(
+                            self.parents
+                                .get_mut(anc)
+                                .expect("validated pending ancestor"),
+                            ParentState::EmittedDir,
+                        );
+                        if let ParentState::Pending(e) = prev {
+                            self.emitted.insert(Cow::Borrowed(anc), Kind::Dir);
+                            batch.push(*e);
+                        }
+                    }
+                    match self.emitted.get(line).copied() {
+                        None => {
+                            let e = chunk_leaves
+                                .remove(line)
+                                .expect("un-emitted valid leaf was statted in this chunk");
+                            self.emitted.insert(Cow::Borrowed(line), e.kind);
+                            batch.push(e);
+                        }
+                        Some(k) if k == leaf_kind => {}
+                        Some(_) => {
+                            // Listed as a symlink (or file) after a path through it
+                            // already made it a directory: the same conflict as the
+                            // other order, refused the same way.
+                            errors.push(format!(
+                                "syq: --files-from: {shown}: listed as a non-directory but already used as a directory"
+                            ));
+                            continue;
+                        }
+                    }
+                    if leaf_kind == Kind::Dir && self.recurse && self.recursed.insert(line) {
+                        subtrees.push(line);
+                    }
+                }
+                Ok(PreparedChunk {
+                    batch,
+                    subtrees,
+                    errors,
+                    shown: false,
+                    has_more_lines,
+                })
+            }
+        }
+
         let source_base = self
             .active_source
             .clone()
@@ -826,212 +1017,168 @@ impl Planner<'_> {
 
         // Listed paths are lstat'ed (a listed symlink copies as a symlink).
         // Implied ancestors must be directories. Registered stats never follow
-        // descendant symlinks. Results are kept for the whole list, since a later
-        // line may repeat a path or name one first seen as a parent.
-        let mut leaves: HashMap<PathBytes, Option<Entry>> = HashMap::new();
-        let mut parents: HashMap<PathBytes, Option<Entry>> = HashMap::new();
-        // What the planner has been given for each path (Dir or not).
-        let mut emitted: HashMap<PathBytes, Kind> = HashMap::new();
-        let mut recursed: HashSet<PathBytes> = HashSet::new();
-        let mut completed_subtrees: HashSet<PathBytes> = HashSet::new();
-        let ancestors = |line: &[u8]| -> Vec<PathBytes> {
-            line.iter()
-                .enumerate()
-                .filter(|(_, &b)| b == b'/')
-                .map(|(i, _)| line[..i].to_vec())
-                .collect()
+        // descendant symlinks. Only outcomes (plus un-emitted parent entries)
+        // are retained across chunks, since a later line may repeat a path or
+        // name one first seen as a parent.
+        let mut state = FilesFromState {
+            source_base,
+            src_root,
+            recurse,
+            leaves: HashMap::new(),
+            parents: HashMap::new(),
+            // What the planner has been given for each path (Dir or not).
+            emitted: HashMap::new(),
+            recursed: HashSet::new(),
         };
-        let stat = |src: &mut dyn Conn, paths: Vec<PathBytes>, follow: bool| -> Result<_> {
-            let legacy_paths = paths.iter().map(|r| join(src_root, r)).collect();
-            let registered = paths
-                .iter()
-                .map(|relative| source_base.join(relative))
-                .collect::<Result<Vec<_>>>()?;
-            stat_many_registered(src, legacy_paths, Some(registered), follow)
-        };
-        for chunk in lines.chunks(crate::scan::BATCH) {
-            let mut want_parents: Vec<PathBytes> = Vec::new();
-            let mut want_leaves: Vec<PathBytes> = Vec::new();
-            // Per role: a path may be needed both as a followed ancestor and
-            // as an lstat'ed leaf, with different answers.
-            let mut wanted_parents: HashSet<PathBytes> = HashSet::new();
-            let mut wanted_leaves: HashSet<PathBytes> = HashSet::new();
-            for line in chunk {
-                for anc in ancestors(line) {
-                    if !parents.contains_key(&anc) && wanted_parents.insert(anc.clone()) {
-                        want_parents.push(anc);
-                    }
-                }
-                if !leaves.contains_key(line) && wanted_leaves.insert(line.clone()) {
-                    want_leaves.push(line.clone());
-                }
-            }
-            for (rel, st) in
-                want_parents
-                    .iter()
-                    .cloned()
-                    .zip(stat(src, want_parents.clone(), true)?)
-            {
-                parents.insert(
-                    rel.clone(),
-                    st.map(|mut e| {
-                        e.path = rel;
-                        e
-                    }),
-                );
-            }
-            for (rel, st) in want_leaves
-                .iter()
-                .cloned()
-                .zip(stat(src, want_leaves.clone(), false)?)
-            {
-                leaves.insert(
-                    rel.clone(),
-                    st.map(|mut e| {
-                        e.path = rel;
-                        e
-                    }),
-                );
-            }
-            let mut batch: Vec<Entry> = Vec::new();
-            let mut subtrees: Vec<PathBytes> = Vec::new();
-            'line: for line in chunk {
-                let shown = display(line);
-                // Validate the whole chain before emitting any of it, so a bad
-                // path leaves no half-created ancestors behind.
-                let mut chain: Vec<Entry> = Vec::new();
-                for anc in ancestors(line) {
-                    match parents.get(&anc).and_then(|e| e.as_ref()) {
-                        Some(e) if e.kind == Kind::Dir => match emitted.get(&anc) {
-                            Some(Kind::Dir) => {}
-                            Some(_) => {
-                                self.progress.error(&format!(
-                                    "syq: --files-from: {shown}: {} was listed as a non-directory",
-                                    display(&anc)
-                                ));
-                                continue 'line;
-                            }
-                            None => {
-                                if !chain.iter().any(|c| c.path == anc) {
-                                    chain.push(e.clone());
-                                }
-                            }
-                        },
-                        Some(_) => {
-                            self.progress.error(&format!(
-                                "syq: --files-from: {shown}: {} is not a directory",
-                                display(&anc)
-                            ));
-                            continue 'line;
-                        }
-                        None => {
-                            self.progress.error(&format!(
-                                "syq: --files-from: {shown}: no such file or directory"
-                            ));
-                            continue 'line;
-                        }
-                    }
-                }
-                let Some(e) = leaves.get(line).and_then(|e| e.as_ref()) else {
-                    self.progress.error(&format!(
-                        "syq: --files-from: {shown}: no such file or directory"
-                    ));
-                    continue;
-                };
-                for c in chain {
-                    emitted.insert(c.path.clone(), Kind::Dir);
-                    batch.push(c);
-                }
-                match emitted.get(line) {
-                    None => {
-                        emitted.insert(line.clone(), e.kind);
-                        batch.push(e.clone());
-                    }
-                    Some(k) if *k == e.kind => {}
-                    Some(_) => {
-                        // Listed as a symlink (or file) after a path through it
-                        // already made it a directory: the same conflict as the
-                        // other order, refused the same way.
-                        self.progress.error(&format!(
-                            "syq: --files-from: {shown}: listed as a non-directory but already used as a directory"
-                        ));
-                        continue;
-                    }
-                }
-                if e.kind == Kind::Dir && recurse && recursed.insert(line.clone()) {
-                    subtrees.push(line.clone());
-                }
-            }
-            self.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
-            self.handle_batch(batch, src_root, b"", dst_root)?;
-            if subtrees.len() > 1 {
-                let selected: HashSet<&[u8]> = subtrees.iter().map(Vec::as_slice).collect();
-                let disjoint = subtrees.iter().all(|rel| {
-                    ancestors(rel)
-                        .iter()
-                        .all(|ancestor| !selected.contains(ancestor.as_slice()))
-                });
-                if disjoint {
-                    subtrees.retain(|rel| {
-                        !ancestors(rel)
-                            .iter()
-                            .any(|a| completed_subtrees.contains(a))
-                    });
-                    let progress = self.progress;
-                    let warned = std::cell::Cell::new(false);
-                    let source = self
-                        .active_source
-                        .as_ref()
-                        .context("registered source reference was not initialized")?
-                        .clone();
-                    let scanned = src.scan_selected(
-                        &source,
-                        &subtrees,
-                        &mut |batch| {
-                            let batch: Vec<_> = batch
-                                .into_iter()
-                                .filter(|e| {
-                                    if emitted.contains_key(&e.path) {
-                                        false
-                                    } else {
-                                        emitted.insert(e.path.clone(), e.kind);
-                                        true
-                                    }
-                                })
-                                .collect();
-                            self.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
-                            self.handle_batch(batch, src_root, b"", dst_root)
-                        },
-                        &mut |w| {
-                            warned.set(true);
-                            progress.error(&format!("syq: {w}"));
-                        },
-                    );
-                    self.scan_warned |= warned.get();
-                    if scanned? {
-                        if !self.scan_warned {
-                            completed_subtrees.extend(subtrees);
-                        }
-                        continue;
-                    }
-                }
-            }
-            for rel in subtrees {
-                if ancestors(&rel)
-                    .iter()
-                    .any(|ancestor| completed_subtrees.contains(ancestor))
+        let mut completed_subtrees: HashSet<&'list [u8]> = HashSet::new();
+
+        let mut chunks = lines.chunks(crate::scan::BATCH).peekable();
+        let mut prepared: VecDeque<PreparedChunk<'list>> = VecDeque::new();
+        let result: Result<()> = (|| {
+            loop {
+                let window = self.early_lookup_window();
+                while prepared.len() < window
+                    && prepared.back().is_none_or(|c| c.subtrees.is_empty())
                 {
-                    continue;
+                    let Some(chunk) = chunks.next() else {
+                        break;
+                    };
+                    let mut next = state.prepare_chunk(src, chunk, chunks.peek().is_some())?;
+                    if !self.early_lookups.rich_batch_deferred {
+                        self.show_upcoming(&next.batch, src_root, b"", dst_root);
+                        next.shown = true;
+                    }
+                    prepared.push_back(next);
                 }
-                self.scan_subtree(src, src_root, &rel, dst_root, &mut emitted)?;
-                // A partial walk may miss a readable, explicitly selected
-                // child. After a scan warning, keep walking later selections.
-                if !self.scan_warned {
-                    completed_subtrees.insert(rel);
+                let mut current = match prepared.pop_front() {
+                    Some(current) => current,
+                    None => {
+                        let Some(chunk) = chunks.next() else {
+                            break;
+                        };
+                        state.prepare_chunk(src, chunk, chunks.peek().is_some())?
+                    }
+                };
+                for msg in current.errors {
+                    self.progress.error(&msg);
+                }
+                self.progress
+                    .scanned
+                    .fetch_add(current.batch.len() as u64, Relaxed);
+                self.handle_scanned_batch(current.batch, src_root, b"", dst_root, current.shown)?;
+                if self.collision {
+                    break;
+                }
+                if !current.subtrees.is_empty() {
+                    let selected: HashSet<&[u8]> = current.subtrees.iter().copied().collect();
+                    let disjoint = current.subtrees.iter().all(|rel| {
+                        FilesFromState::ancestors(rel).all(|ancestor| !selected.contains(ancestor))
+                    });
+                    if disjoint {
+                        current.subtrees.retain(|rel| {
+                            !FilesFromState::ancestors(rel).any(|a| completed_subtrees.contains(a))
+                        });
+                        if current.subtrees.is_empty() {
+                            continue;
+                        }
+                        let selected_paths: Vec<PathBytes> =
+                            current.subtrees.iter().map(|rel| rel.to_vec()).collect();
+                        let progress = self.progress;
+                        let warned = std::cell::Cell::new(false);
+                        let source = state.source_base.clone();
+                        let look_ahead =
+                            self.looks_up_early() && !self.early_lookups.rich_batch_deferred;
+                        let track_emitted = current.has_more_lines;
+                        let scanned = {
+                            let scan_state =
+                                std::cell::RefCell::new((&mut *self, &mut state.emitted, 0usize));
+                            let mut sink = |batch: Vec<Entry>| {
+                                let (pl, emitted, shown) = &mut *scan_state.borrow_mut();
+                                let was_shown = *shown > 0;
+                                *shown -= usize::from(was_shown);
+                                let batch: Vec<_> = batch
+                                    .into_iter()
+                                    .filter(|e| {
+                                        if emitted.contains_key(e.path.as_slice()) {
+                                            false
+                                        } else {
+                                            if track_emitted {
+                                                emitted.insert(Cow::Owned(e.path.clone()), e.kind);
+                                            }
+                                            true
+                                        }
+                                    })
+                                    .collect();
+                                pl.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
+                                pl.handle_scanned_batch(batch, src_root, b"", dst_root, was_shown)
+                            };
+                            let mut upcoming = |entries: &[Entry]| {
+                                let (pl, emitted, shown) = &mut *scan_state.borrow_mut();
+                                if entries
+                                    .iter()
+                                    .any(|e| emitted.contains_key(e.path.as_slice()))
+                                {
+                                    let filtered: Vec<_> = entries
+                                        .iter()
+                                        .filter(|e| !emitted.contains_key(e.path.as_slice()))
+                                        .cloned()
+                                        .collect();
+                                    pl.show_upcoming(&filtered, src_root, b"", dst_root);
+                                } else {
+                                    pl.show_upcoming(entries, src_root, b"", dst_root);
+                                }
+                                *shown += 1;
+                            };
+                            src.scan_selected(
+                                src_root,
+                                &source,
+                                &selected_paths,
+                                &mut sink,
+                                look_ahead.then_some(&mut upcoming as crate::scan::Upcoming<'_>),
+                                &mut |w| {
+                                    warned.set(true);
+                                    progress.error(&format!("syq: {w}"));
+                                },
+                            )
+                        };
+                        self.drop_early_lookups();
+                        self.scan_warned |= warned.get();
+                        let scanned = scanned?;
+                        if self.collision {
+                            break;
+                        }
+                        if scanned {
+                            if !self.scan_warned {
+                                completed_subtrees.extend(current.subtrees);
+                            }
+                            continue;
+                        }
+                    }
+                    for rel in current.subtrees {
+                        if FilesFromState::ancestors(rel)
+                            .any(|ancestor| completed_subtrees.contains(ancestor))
+                        {
+                            continue;
+                        }
+                        self.scan_subtree(src, src_root, rel, dst_root, &mut state.emitted)?;
+                        if self.collision {
+                            break;
+                        }
+                        // A partial walk may miss a readable, explicitly selected
+                        // child. After a scan warning, keep walking later selections.
+                        if !self.scan_warned {
+                            completed_subtrees.insert(rel);
+                        }
+                    }
+                    if self.collision {
+                        break;
+                    }
                 }
             }
-        }
-        Ok(())
+            Ok(())
+        })();
+        self.drop_early_lookups();
+        result
     }
 
     /// Consume an already-acquired NDJSON mapping manifest: each entry claims
@@ -1248,7 +1395,7 @@ impl Planner<'_> {
         src_root: &[u8],
         rel: &[u8],
         dst_root: &[u8],
-        emitted: &mut std::collections::HashMap<PathBytes, Kind>,
+        emitted: &mut std::collections::HashMap<std::borrow::Cow<'_, [u8]>, Kind>,
     ) -> Result<()> {
         let source = self
             .active_source
@@ -1260,30 +1407,48 @@ impl Planner<'_> {
             src,
             &join(src_root, rel),
             Some(&source),
-            (false, false),
+            (false, true),
             &[],
-            |pl, scanned| {
-                let Scanned::Batch { entries: batch, .. } = scanned else {
-                    return Ok(());
-                };
-                let batch: Vec<Entry> = batch
-                    .into_iter()
-                    .filter(|e| !e.path.is_empty())
-                    .map(|mut e| {
-                        e.path = join(rel, &e.path);
-                        e
-                    })
-                    .filter(|e| {
-                        if emitted.contains_key(&e.path) {
-                            false
-                        } else {
-                            emitted.insert(e.path.clone(), e.kind);
-                            true
-                        }
-                    })
-                    .collect();
-                pl.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
-                pl.handle_batch(batch, src_root, b"", dst_root)
+            |pl, scanned| match scanned {
+                Scanned::Upcoming(entries) => {
+                    let filtered: Vec<Entry> = entries
+                        .iter()
+                        .filter(|e| !e.path.is_empty())
+                        .filter_map(|e| {
+                            let path = join(rel, &e.path);
+                            if emitted.contains_key(path.as_slice()) {
+                                None
+                            } else {
+                                Some(Entry { path, ..e.clone() })
+                            }
+                        })
+                        .collect();
+                    pl.show_upcoming(&filtered, src_root, b"", dst_root);
+                    Ok(())
+                }
+                Scanned::Batch {
+                    entries: batch,
+                    shown,
+                } => {
+                    let batch: Vec<Entry> = batch
+                        .into_iter()
+                        .filter(|e| !e.path.is_empty())
+                        .map(|mut e| {
+                            e.path = join(rel, &e.path);
+                            e
+                        })
+                        .filter(|e| {
+                            if emitted.contains_key(e.path.as_slice()) {
+                                false
+                            } else {
+                                emitted.insert(std::borrow::Cow::Owned(e.path.clone()), e.kind);
+                                true
+                            }
+                        })
+                        .collect();
+                    pl.progress.scanned.fetch_add(batch.len() as u64, Relaxed);
+                    pl.handle_scanned_batch(batch, src_root, b"", dst_root, shown)
+                }
             },
         )
     }
@@ -1453,8 +1618,12 @@ impl Planner<'_> {
         if self.mapping_mode && !self.opts.dry_run {
             let deferred: std::collections::HashSet<_> =
                 self.deferred.iter().map(|(path, ..)| path).collect();
-            self.src_overrides
-                .retain(|dst, _| deferred.contains(&join(&self.dst_root, dst)));
+            // A representative the planner kept may still go to a worker
+            // (`recheck_kept_representatives`), which names its source.
+            let kept = self.hardlinks.kept_destinations();
+            self.src_overrides.retain(|dst, _| {
+                deferred.contains(&join(&self.dst_root, dst)) || kept.contains(dst)
+            });
             self.implicit_dirs.retain(|path| deferred.contains(path));
             self.src_overrides.shrink_to_fit();
             self.implicit_dirs.shrink_to_fit();
@@ -2247,6 +2416,7 @@ impl Planner<'_> {
                     contested,
                 },
                 dst_entry,
+                target_condition,
             );
             return;
         }
@@ -3718,7 +3888,15 @@ impl Planner<'_> {
                     self.progress
                         .bytes_in_unchanged_files
                         .fetch_sub(entry.size, Relaxed);
-                    self.enqueue_with(source, dst, rel, dst_rel, entry, Some(destination), reason);
+                    self.enqueue_with(
+                        source,
+                        dst,
+                        rel,
+                        dst_rel,
+                        entry,
+                        Some(destination),
+                        (reason, false, false),
+                    );
                 }
                 (Some(error), _) => self.report_metadata_failure(Some(&dst), kind, &error),
             }
@@ -3729,7 +3907,12 @@ impl Planner<'_> {
         Ok(())
     }
 
-    fn report_metadata_failure(&self, dst: Option<&[u8]>, kind: DeclaredKind, error: &WireError) {
+    pub(super) fn report_metadata_failure(
+        &self,
+        dst: Option<&[u8]>,
+        kind: DeclaredKind,
+        error: &WireError,
+    ) {
         let os_kind = wire_os_kind(error);
         // The receiver's reply to a metadata change.
         let listing = crate::results::ReceiverListing::Listed;
@@ -4228,12 +4411,25 @@ impl Planner<'_> {
         entry: Entry,
         dst_entry: Option<Entry>,
     ) -> usize {
-        self.enqueue_with(source_path, dst, rel, rel_bytes, entry, dst_entry, None)
+        self.enqueue_with(
+            source_path,
+            dst,
+            rel,
+            rel_bytes,
+            entry,
+            dst_entry,
+            (None, false, false),
+        )
     }
 
     /// `enqueue`, replacing an existing destination file whatever its
     /// contents when `refused` says why, as when the receiver refused to
-    /// change its metadata in place.
+    /// change its metadata in place. With `copy_whole`, the file is known
+    /// to differ from its destination, as one whose source changed, after
+    /// its size and time were found to match, in a way they do not show: it
+    /// is copied whole, where it is when `--in-place=update` allows, without
+    /// a comparison. `retry` queues it as a worker queues a file whose
+    /// source changed: as its second attempt.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn enqueue_with(
         &mut self,
@@ -4243,7 +4439,7 @@ impl Planner<'_> {
         rel_bytes: PathBytes,
         entry: Entry,
         dst_entry: Option<Entry>,
-        refused: Option<crate::proto::ReplaceReason>,
+        (refused, copy_whole, retry): (Option<crate::proto::ReplaceReason>, bool, bool),
     ) -> usize {
         let (src, source) = source_path;
         let target_condition = self.leaf_condition_for(&dst, dst_entry.as_ref());
@@ -4285,7 +4481,7 @@ impl Planner<'_> {
             data: FileJobData {
                 compare_ranges: false,
                 compare_final: false,
-                compared: false,
+                compared: copy_whole,
                 resume_partial: false,
                 replace,
                 recompared: 0,
@@ -4297,7 +4493,7 @@ impl Planner<'_> {
                 entry,
                 policy_condition,
                 target_condition,
-                attempt: 0,
+                attempt: u32::from(retry),
                 inplace,
                 in_place_refusal,
                 src_rel,
@@ -5223,7 +5419,11 @@ impl Planner<'_> {
     }
 
     /// The outcome of each of an `Apply` request's `count` operations.
-    fn applied(&self, response: Response, count: usize) -> Result<Vec<Option<WireError>>> {
+    pub(super) fn applied(
+        &self,
+        response: Response,
+        count: usize,
+    ) -> Result<Vec<Option<WireError>>> {
         match response {
             // A restricted receiver refuses a request whole when it would
             // break the grant, a limit say, and lists that refusal itself:
@@ -5233,7 +5433,10 @@ impl Planner<'_> {
                 Ok(vec![Some(WireError::from(error)); count])
             }
             response => match ok(response, "apply")? {
-                Response::Applied(v) => Ok(v),
+                Response::Applied(v) if v.len() == count => Ok(v),
+                Response::Applied(v) => {
+                    bail!("receiver returned {} results for {count} changes", v.len())
+                }
                 other => bail!("unexpected response {other:?}"),
             },
         }
@@ -6038,11 +6241,17 @@ fn merge_directory_metadata(
 /// set (`flags`), its depth, and the directory it must still be.
 type DirectoryMetadata = (PathBytes, Meta, u8, usize, TargetCondition);
 
-/// The most the failure of an early or final directory metadata operation
-/// adds to its reply (`proto::failed_set_meta_hint`).
+/// The most the failure of a directory metadata, file metadata or link
+/// operation adds to its reply (`proto::failed_set_meta_hint`): a link's
+/// error may name the name it links to as well as its own.
 fn failed_metadata_hint(op: &Op) -> usize {
     match op {
-        Op::SetMeta { path, meta, .. } => crate::proto::failed_set_meta_hint(path, meta),
+        Op::SetMeta { path, meta, .. } | Op::SetFileMetaIfSame { path, meta, .. } => {
+            crate::proto::failed_set_meta_hint(path, meta)
+        }
+        Op::Hardlink { path, source, .. } => {
+            crate::proto::failed_path_hint(path) + crate::proto::failed_path_hint(source)
+        }
         op => crate::proto::failed_path_hint(apply_path(op)),
     }
 }
@@ -6101,6 +6310,18 @@ fn request_sized(mut ops: Vec<Op>) -> Vec<Vec<Op>> {
         return parts;
     }
     vec![ops]
+}
+
+/// Metadata or link operations of a kind that each used to go in a request
+/// of its own, such as hard-link representatives' checks and links, as the
+/// requests they go in: each small enough that the failures of all its
+/// operations would fit its reply (`reply_sized`), and its request its
+/// frame (`request_sized`).
+pub(super) fn metadata_requests(ops: Vec<Op>) -> Vec<Vec<Op>> {
+    reply_sized(ops, usize::MAX, failed_metadata_hint)
+        .into_iter()
+        .flat_map(request_sized)
+        .collect()
 }
 
 /// The final directory metadata still to send, deepest first, as the
@@ -6464,6 +6685,62 @@ mod directory_metadata_tests {
             io_kind: Some(crate::proto::WireIoKind::OwnedDirectoryPermissions),
             raw_os_error: Some(i32::MAX),
             condition_not_met: true,
+        }
+    }
+
+    #[test]
+    fn file_metadata_and_link_requests_and_their_replies_fit_their_frames_when_every_file_fails() {
+        use crate::proto::{METADATA_BATCH_BYTES, METADATA_REPLY_BYTES};
+        // Kept hard-link representatives whose files vanished, and links to
+        // them, with the longest paths of non-UTF-8 bytes: the requests'
+        // replies, not the requests, decide how many go together
+        // (`metadata_requests`).
+        let tree = crate::test_support::tempdir().unwrap();
+        let mut receiver = crate::fsops::FsOps::rooted_for_test(tree.path());
+        let beneath = |index: usize| {
+            let mut path = vec![vec![0xff; 255]; 15].join(&b'/');
+            path.push(b'/');
+            path.extend_from_slice(&[0xff; 247]);
+            path.extend_from_slice(format!("{index:08}").as_bytes());
+            path
+        };
+        let meta = timed(Vec::new(), 0).1;
+        let checks: Vec<Op> = (0..400)
+            .map(|index| Op::SetFileMetaIfSame {
+                path: beneath(index),
+                condition: TargetCondition::Matches { dev: 1, ino: 1 },
+                meta: meta.clone(),
+                flags: flags::TIMES | flags::REPORT_IDENTITY,
+            })
+            .collect();
+        let links: Vec<Op> = (0..400)
+            .map(|index| Op::Hardlink {
+                path: beneath(index),
+                source: beneath(index + 400),
+                dev: 1,
+                ino: 1,
+                condition: TargetCondition::Any,
+            })
+            .collect();
+        for ops in [checks, links] {
+            let total = ops.len();
+            // Sized by their requests alone, all would go in one.
+            assert_eq!(request_sized(ops.clone()).len(), 1);
+            let requests = metadata_requests(ops);
+            assert!(requests.len() > 1);
+            let mut sent = 0;
+            for ops in requests {
+                let request = Request::Apply { ops: ops.clone() };
+                assert!(encoded_len(&request) < METADATA_BATCH_BYTES);
+                assert!(fits_its_frame(&request));
+                let errors = receiver.apply(&ops);
+                assert!(errors.iter().all(Option::is_some), "{errors:?}");
+                let reply = Response::Applied(errors);
+                assert!(encoded_len(&reply) <= METADATA_REPLY_BYTES);
+                assert!(fits_its_frame(&reply));
+                sent += ops.len();
+            }
+            assert_eq!(sent, total);
         }
     }
 

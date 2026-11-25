@@ -575,9 +575,12 @@ pub(crate) struct Profile {
     /// fails with `EIO` fall back to check-then-rename.
     pub(crate) audited: bool,
     /// Concurrent range writes to one file are taken one at a time
-    /// (`write_gate`): on most filesystems they contend inside it, and
-    /// serializing them saves CPU at the same speed. ZFS locks only the
-    /// ranges written, so there they run concurrently, which is faster.
+    /// (`write_gate`): on most filesystems a buffered write holds the
+    /// file's inode lock, so writes to one file run one at a time anyway and
+    /// contend inside the filesystem, and serializing them saves CPU at the
+    /// same speed (measured on local disk and NFS). Only the write requests
+    /// are serialized, never the zero scan of a sparse write. ZFS locks only
+    /// the ranges written, so there they run concurrently, which is faster.
     pub(crate) serialized_writes: bool,
 }
 

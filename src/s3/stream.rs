@@ -42,7 +42,7 @@ impl Session {
         authorization: Option<Arc<super::authorization::Authorization>>,
     ) -> Result<Self> {
         let cancellation = Arc::new(super::cancel::Cancellation::default());
-        let (client, _) = client::connect_authorized(
+        let (client, _, _) = client::connect_authorized(
             &mut options,
             Arc::default(),
             cancellation.clone(),

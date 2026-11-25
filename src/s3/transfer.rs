@@ -5,6 +5,7 @@ mod discovery;
 mod fast;
 mod pruning;
 mod server_copy;
+mod subtrees;
 mod upload_hashes;
 
 use super::{
@@ -102,6 +103,7 @@ pub(super) struct Engine {
     args: Arc<Args>,
     options: Options,
     client: Client,
+    discovered_region: Option<client::DiscoveredRegion>,
     progress: Arc<Progress>,
     bandwidth: Option<crate::bwlimit::BandwidthLimit>,
     /// The destination keys under each listed prefix, when pruning listed
@@ -316,11 +318,11 @@ impl Engine {
             .endpoint
             .or_else(|| std::env::var("AWS_ENDPOINT_URL_S3").ok())
             .or_else(|| std::env::var("AWS_ENDPOINT_URL").ok());
-        let control = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let control = Arc::<super::tuning::ControlSamples>::default();
         let uploads = Arc::new(super::cancel::Cancellation::default());
         let authorization = super::authorization::connect(&args, &options).await?;
         let outage = Arc::new(super::outage::Outage::default());
-        let (client, note) = client::connect_authorized(
+        let (client, note, discovered_region) = client::connect_authorized(
             &mut options,
             control.clone(),
             uploads.clone(),
@@ -344,6 +346,7 @@ impl Engine {
             args,
             options,
             client,
+            discovered_region,
             progress,
             upload_keys: OnceLock::new(),
             discovery: OnceLock::new(),
@@ -944,7 +947,13 @@ impl Engine {
         format!(
             "syq.s3.v1\n{}\n{}\n{}\n{}\n{}\n{extra}",
             self.options.endpoint.as_deref().unwrap_or("AWS"),
-            self.client.config().region().map_or("", |r| r.as_ref()),
+            self.discovered_region
+                .as_ref()
+                .and_then(|region| region.get())
+                .map_or_else(
+                    || self.client.config().region().map_or("", |r| r.as_ref()),
+                    String::as_str,
+                ),
             self.options.bucket,
             key,
             hash.finalize()
@@ -964,7 +973,37 @@ impl Engine {
         pruned: &[Vec<u8>],
         key: impl for<'a> Fn(&'a T) -> std::borrow::Cow<'a, str>,
     ) -> Result<()> {
-        if plan.len() < 2 || self.args.existing || self.args.ignore_existing {
+        if plan.len() < 2 {
+            return Ok(());
+        }
+        if self.args.existing || self.args.ignore_existing {
+            // These upload policies work with object-only permissions. Use
+            // listing as an optional shortcut for a large plan.
+            if self.options.route == Route::Upload
+                && self.authorization.is_none()
+                && !self.args.delete
+                && super::listing::lists_in_key_order(&self.options.bucket)
+                && plan.len() >= discovery::KEYS_PER_PAGE
+            {
+                let prefixes = self.destination_prefixes()?;
+                plan.sort_unstable_by(|a, b| key(a).cmp(&key(b)));
+                let keys = discovery::Keys::new(plan.iter().map(&key));
+                let whole = discovery::Segment::whole(prefixes[0].clone(), &keys);
+                self.start_discovery(vec![whole], keys)
+                    .await
+                    .or_else(|error| {
+                        // Wrong-region errors still get the normal diagnostic.
+                        if self.cancelled.load(Relaxed)
+                            || error
+                                .downcast_ref::<client::RequestFailure>()
+                                .is_some_and(client::RequestFailure::region_mismatch)
+                        {
+                            Err(error)
+                        } else {
+                            Ok(())
+                        }
+                    })?;
+            }
             return Ok(());
         }
         let prefixes = self.destination_prefixes()?;
@@ -1070,8 +1109,8 @@ impl Engine {
     ) -> Result<()> {
         let discovery = Discovery::start(
             self.client.clone(),
-            self.options.endpoint.as_deref(),
-            &self.options.bucket,
+            &self.options,
+            &self.args,
             segments,
             keys,
             self.cancelled.clone(),
@@ -1167,7 +1206,11 @@ impl Engine {
     async fn prepare_accepted_upload(
         self: &Arc<Self>,
         source: Source,
-        object: &Object,
+        (object, head): (
+            &Object,
+            &aws_sdk_s3::operation::head_object::HeadObjectOutput,
+        ),
+        refresh_head: bool,
         slot: &mut TransferSlot,
     ) -> Result<UploadPreparation> {
         let size = object.size;
@@ -1184,13 +1227,30 @@ impl Engine {
             self.args.matching_meta_flags() | source.metadata.map_or(0, |m| m.apply_flags());
         slot.claim().await;
         let _slot = self.tuning.requests.acquire().await;
-        let head = client::head_output(&self.client, &self.options.bucket, &source.key, None)
-            .await?
-            .context("S3 destination disappeared before metadata update")?;
-        anyhow::ensure!(
-            head.e_tag() == Some(&object.etag),
-            "S3 destination changed before metadata update"
-        );
+        // A metadata-only replacement may leave the ETag unchanged while
+        // comparison reads the file. Preserve the current attributes.
+        let refreshed;
+        let current;
+        let (object, head) = if refresh_head {
+            refreshed = client::head_output(&self.client, &self.options.bucket, &source.key, None)
+                .await?
+                .context("destination disappeared during comparison")?;
+            current = client::from_head(&source.key, &refreshed)?;
+            anyhow::ensure!(
+                current.etag == object.etag
+                    && current.size == size
+                    && current.kind() == object.kind(),
+                "destination contents changed during comparison: {}",
+                source.key
+            );
+            if self.upload_requested_metadata_matches(&source, &current) {
+                self.progress.bytes_unchanged.fetch_add(size, Relaxed);
+                return Ok(UploadPreparation::Skipped);
+            }
+            (&current, &refreshed)
+        } else {
+            (object, head)
+        };
         let mut metadata = object.metadata.clone().unwrap_or(Metadata {
             kind: object.kind(),
             mode: if object.kind() == ObjectKind::Dir {
@@ -1224,7 +1284,7 @@ impl Engine {
             &self.client,
             &self.options,
             &source.key,
-            &head,
+            head,
             fields,
             self.part_size(size),
             self.copy_request_limit(size),
@@ -1254,12 +1314,21 @@ impl Engine {
         listed: Listed,
         slot: &mut TransferSlot,
     ) -> Result<UploadPreparation> {
+        if (self.args.ignore_existing && matches!(listed, Listed::Present(_)))
+            || (self.args.existing && listed == Listed::Absent)
+        {
+            return Ok(UploadPreparation::Skipped);
+        }
         let expected_hash = source.expected_hash.as_ref().filter(|_| !self.args.dry_run);
-        let existing = if listed == Listed::Absent {
+        let head = if listed == Listed::Absent && !self.args.ignore_existing {
             None
         } else {
-            client::head(&self.client, &self.options.bucket, &source.key).await?
+            client::head_output(&self.client, &self.options.bucket, &source.key, None).await?
         };
+        let existing = head
+            .as_ref()
+            .map(|head| client::from_head(&source.key, head))
+            .transpose()?;
         if (self.args.ignore_existing && existing.is_some())
             || (self.args.existing && existing.is_none())
         {
@@ -1338,7 +1407,12 @@ impl Engine {
                 source.bytes()?;
             }
             return self
-                .prepare_accepted_upload(source, existing.as_ref().unwrap(), slot)
+                .prepare_accepted_upload(
+                    source,
+                    (existing.as_ref().unwrap(), head.as_ref().unwrap()),
+                    false,
+                    slot,
+                )
                 .await;
         }
         // Everything from here reads the file or changes the destination.
@@ -1499,7 +1573,12 @@ impl Engine {
         );
         if same_contents {
             return self
-                .prepare_accepted_upload(source, existing.as_ref().unwrap(), slot)
+                .prepare_accepted_upload(
+                    source,
+                    (existing.as_ref().unwrap(), head.as_ref().unwrap()),
+                    true,
+                    slot,
+                )
                 .await;
         }
         if self.args.dry_run {
@@ -2596,7 +2675,14 @@ impl Engine {
             None
         };
         let object = if let Some(output) = &initial {
-            client::from_get(&job.key, job.size, part_size, output)?
+            let object = client::from_get(&job.key, job.size, part_size, output)?;
+            if let Some(known) = job.source_object.as_deref() {
+                anyhow::ensure!(
+                    object.etag == known.etag && object.size == known.size,
+                    "S3 response length, range, or ETag differs"
+                );
+            }
+            object
         } else if let Some(object) = job.source_object.as_deref() {
             object.clone()
         } else {
@@ -3025,6 +3111,7 @@ impl Engine {
             ))
         };
         let range_algorithm = record.hash_algorithm;
+        let reused_partial = !record.parts.is_empty();
         struct DownloadRecord {
             state: DownloadState,
             saved: tokio::time::Instant,
@@ -3039,11 +3126,20 @@ impl Engine {
         let allocation = file.clone();
         let size = object.size;
         tokio::task::spawn_blocking(move || super::writer::allocate(&allocation, size)).await??;
+        let digests = self.download_digests(&metadata, expected_hash);
+        let stream_blake3 = !reused_partial
+            && object.size > part_size
+            && part_size.is_multiple_of(blake3::CHUNK_LEN as u64)
+            && digests
+                .iter()
+                .any(|digest| digest.algorithm == HashAlgorithm::Blake3);
         let output = super::writer::Writer::with_readback(
             file.clone(),
             object.size,
             !part_size.is_multiple_of(4096)
-                || !self.download_digests(&metadata, expected_hash).is_empty(),
+                || digests
+                    .iter()
+                    .any(|digest| !stream_blake3 || digest.algorithm != HashAlgorithm::Blake3),
         )?;
         let parts = object.size.div_ceil(part_size);
         let _interval = self.progress.copying_interval();
@@ -3068,7 +3164,7 @@ impl Engine {
                     let length = part_size.min(object.size - offset);
                     if seeded {
                         self.progress.bytes_unchanged.fetch_add(length, Relaxed);
-                        return Ok::<_, anyhow::Error>(());
+                        return Ok::<_, anyhow::Error>((index, None));
                     }
                     let previous = record.lock().await.state.parts.get(&index).cloned();
                     if let Some(hash) = previous {
@@ -3079,9 +3175,10 @@ impl Engine {
                         .await??;
                         if actual == hash {
                             self.progress.bytes_unchanged.fetch_add(length, Relaxed);
-                            return Ok::<_, anyhow::Error>(());
+                            return Ok::<_, anyhow::Error>((index, None));
                         }
                     }
+                    let mut tree = stream_blake3.then(|| subtrees::Part::new(offset, length));
                     let hash = self
                         .download_fast_range(
                             object,
@@ -3091,6 +3188,7 @@ impl Engine {
                             initial,
                             slot,
                             Some(range_algorithm),
+                            tree.as_mut(),
                         )
                         .await?;
                     output.flush().await?;
@@ -3105,7 +3203,7 @@ impl Engine {
                         record.saved = tokio::time::Instant::now();
                         record.dirty = false;
                     }
-                    Ok(())
+                    Ok((index, tree.map(subtrees::Part::finish)))
                 }
             })
             .buffer_unordered(self.part_workers())
@@ -3120,7 +3218,7 @@ impl Engine {
             .collect::<Result<Vec<_>>>();
         let flushed = output.finish().await;
         let published = async {
-            copied?;
+            let copied = copied?;
             flushed?;
             let partial = record.lock().await.state.partial.clone();
             let partial_path = RelativePath::new(partial.as_bytes())?;
@@ -3131,13 +3229,30 @@ impl Engine {
                 crate::fsops::check_destination_writes(&writer, &label)
             })
             .await??;
-            for expected in self.download_digests(&metadata, expected_hash) {
-                let f = root.open_regular_read(&partial_path)?;
-                tokio::task::spawn_blocking(move || expected.verify_reader(&mut &f)).await??;
+            let blake3 = if stream_blake3 && copied.iter().all(|(_, pieces)| pieces.is_some()) {
+                let mut copied = copied;
+                copied.sort_unstable_by_key(|(index, _)| *index);
+                let pieces: Vec<_> = copied
+                    .into_iter()
+                    .flat_map(|(_, pieces)| pieces.unwrap())
+                    .collect();
+                Some(subtrees::merge(&pieces, object.size))
+            } else {
+                None
+            };
+            for expected in digests {
+                if let Some(hash) = blake3
+                    .as_ref()
+                    .filter(|_| expected.algorithm == HashAlgorithm::Blake3)
+                {
+                    expected.verify(hash)?;
+                } else {
+                    let f = root.open_regular_read(&partial_path)?;
+                    tokio::task::spawn_blocking(move || expected.verify_reader(&mut &f)).await??;
+                }
             }
-            // A version ID pins immutable content; otherwise confirm the source
-            // still has the identity used on every range request.
-            if object.version.is_none() {
+            // Fresh ranges validate If-Match, the ETag, and the total length.
+            if object.version.is_none() && reused_partial {
                 let final_object = client::head(&self.client, &self.options.bucket, &object.key)
                     .await?
                     .context("source disappeared during download")?;
@@ -3298,6 +3413,7 @@ impl Engine {
                     initial,
                     initial_slot,
                     algorithm,
+                    None,
                 )
                 .await?
             };
@@ -3358,6 +3474,7 @@ impl Engine {
                 initial,
                 initial_slot,
                 algorithm,
+                None,
             )
             .await;
         let flushed = output.finish().await;
@@ -4085,12 +4202,8 @@ mod tests {
         );
         let options = args.s3.clone().unwrap();
         let outage = Arc::new(crate::s3::outage::Outage::default());
-        let tuning = crate::s3::tuning::Tuning::new(
-            &options,
-            &args,
-            Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
-            outage.clone(),
-        );
+        let tuning =
+            crate::s3::tuning::Tuning::new(&options, &args, Arc::default(), outage.clone());
         let config = aws_sdk_s3::config::Builder::new()
             .behavior_version_latest()
             .region(aws_sdk_s3::config::Region::new("us-east-1"))
@@ -4100,6 +4213,7 @@ mod tests {
             options,
             tuning,
             client: Client::from_conf(config),
+            discovered_region: None,
             progress: Progress::new(false, false, None),
             bandwidth: None,
             upload_keys: OnceLock::new(),

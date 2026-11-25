@@ -257,8 +257,9 @@ implementer's judgment and stable finding IDs; the tool does not decide whether
 a finding is valid. Disagreements, requirements changes, or consequential
 tradeoffs must go to the user rather than cycling until the reviewer agrees.
 Previous reports/dispositions stay available, while reviewers are instructed to
-inspect the new code independently first. Review completion never grants merge
-permission. These are workflow instructions, not a sandbox around the agents.
+inspect the new code independently first. Review completion does not override
+`AGENTS.md` merge rules, unresolved tradeoffs, or failed checks. These are
+workflow instructions, not a sandbox around the agents.
 
 `review stop-loop REVIEW_ID --agent NAME` prevents continuation without stopping
 a running reviewer process; use `review stop` for that. A running reviewer may

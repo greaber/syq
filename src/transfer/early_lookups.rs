@@ -116,6 +116,20 @@ impl Planner<'_> {
                 .is_some_and(|replies| replies >= crate::scan::AHEAD)
     }
 
+    /// How many upcoming batches an explicit-list scan should keep prepared
+    /// ahead of the batch currently being planned.
+    pub(super) fn early_lookup_window(&self) -> usize {
+        if !self.looks_up_early()
+            || self.early_lookups.rich_batch_deferred
+            || self.collision
+            || self.early_lookups.quiet_run == 0
+        {
+            0
+        } else {
+            (self.early_lookups.quiet_run + 1).min(crate::scan::AHEAD)
+        }
+    }
+
     /// Requests sent to the destination other than batch lookups: any of
     /// them may have changed what a lookup sent before it saw.
     pub(super) fn other_requests(&self) -> u64 {

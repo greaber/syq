@@ -4964,13 +4964,14 @@ fn run_transfer(
         destination_children_known_missing: fresh_destination,
         destination_root_known_missing: dst_initially_missing,
         // A single local descriptor scan maps unique relative names under a
-        // fixed prefix. A peer supplies its own names, and manifests and
-        // overlapping roots need not have that property. Pruning also uses
-        // these exact byte spellings to protect source counterparts.
+        // fixed prefix, and local `--files-from` maps unique relative names
+        // deduplicated in `scan_files_from` (and cannot combine with --delete).
+        // A remote source supplies its own names, and manifests and overlapping
+        // roots need not have that property. Pruning also uses these exact
+        // byte spellings to protect source counterparts.
         track_claims: opts.delete
             || multiple_distinct_sources
             || opts.src_remote
-            || args.files_from.is_some()
             || args.native_mapping.is_some(),
         dst_seen: std::collections::HashMap::new(),
         missing_dirs: std::collections::HashSet::new(),
@@ -5211,6 +5212,14 @@ fn run_transfer(
             },
         ) {
             scan_err = Some(error);
+        }
+        if scan_err.is_none() && !st.collision && opts.hardlinks && !opts.dry_run {
+            if let Err(error) = st
+                .check_kept_representatives()
+                .and_then(|()| st.recheck_kept_representatives(&mut *src_ctl))
+            {
+                scan_err = Some(error);
+            }
         }
     }
     if debug() {

@@ -264,6 +264,7 @@ impl Engine {
         initial: Option<ByteStream>,
         initial_slot: Option<crate::s3::tuning::Permit>,
         algorithm: Option<HashAlgorithm>,
+        tree: Option<&mut subtrees::Part>,
     ) -> Result<String> {
         self.download_fast_range_into(
             object,
@@ -273,6 +274,7 @@ impl Engine {
             initial,
             initial_slot,
             algorithm,
+            tree,
         )
         .await
     }
@@ -286,6 +288,7 @@ impl Engine {
         mut initial: Option<ByteStream>,
         initial_slot: Option<crate::s3::tuning::Permit>,
         algorithm: Option<HashAlgorithm>,
+        mut tree: Option<&mut subtrees::Part>,
     ) -> Result<String> {
         let slot = match initial_slot {
             Some(slot) => slot,
@@ -395,6 +398,9 @@ impl Engine {
                         if let Some(h) = &mut hash {
                             h.update(&bytes);
                         }
+                        if let Some(tree) = &mut tree {
+                            tree.update(&bytes);
+                        }
                         while !bytes.is_empty() {
                             if batch_size == 0 && bytes.len() >= 128 * 1024 {
                                 self.pace(128 * 1024).await?;
@@ -475,6 +481,9 @@ impl Engine {
                     if let Some(h) = &mut hash {
                         h.update(&buffer.bytes()[..want]);
                     }
+                    if let Some(tree) = &mut tree {
+                        tree.update(&buffer.bytes()[..want]);
+                    }
                     let padded = want.next_multiple_of(4096);
                     buffer.bytes_mut()[want..padded].fill(0);
                     self.pace(want as u64).await?;
@@ -518,6 +527,9 @@ impl Engine {
                         // Errors from the response/transport restart the range.
                         done = 0;
                         hash = algorithm.map(HashAlgorithm::hasher);
+                        if let Some(tree) = &mut tree {
+                            **tree = subtrees::Part::new(offset, length);
+                        }
                         batch.clear();
                         fragments.clear();
                         batch_size = 0;

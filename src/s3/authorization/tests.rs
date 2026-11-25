@@ -55,6 +55,33 @@ fn scope_rejects_siblings_and_unapproved_operations() {
                 .query("prefix", "")
         )
         .is_err());
+    // A listing by directory asks for the scope's directories, and lists
+    // them by themselves or in groups that share the start of their names.
+    for (prefix, delimiter) in [
+        ("allowed/", true),
+        ("allowed/d0/", false),
+        ("allowed/d0", false),
+        ("allowed/d", false),
+    ] {
+        let listing = Unsigned::new("GET", "")
+            .query("list-type", "2")
+            .query("prefix", prefix);
+        let listing = if delimiter {
+            listing.query("delimiter", "/")
+        } else {
+            listing
+        };
+        permission.permits(&listing).unwrap();
+    }
+    for prefix in ["allowed", "allowed-sibling/", "allowe"] {
+        assert!(permission
+            .permits(
+                &Unsigned::new("GET", "")
+                    .query("list-type", "2")
+                    .query("prefix", prefix)
+            )
+            .is_err());
+    }
 }
 #[test]
 fn old_request_shapes_do_not_acquire_storage_authority() {

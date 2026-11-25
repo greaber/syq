@@ -98,6 +98,7 @@ impl Store for Bucket {
             );
         }
         Ok(Page {
+            complete: next.is_none(),
             next,
             entries,
             prefixes: Vec::new(),
@@ -429,6 +430,26 @@ async fn sparse_plan_stops_listing_and_leaves_the_rest_unknown() {
     let decided = listed.iter().filter(|l| **l != Listed::Unknown).count();
     assert!((20..40).contains(&decided), "{decided}");
     assert!(listed[decided..].iter().all(|l| *l == Listed::Unknown));
+}
+
+#[tokio::test]
+async fn existence_policies_keep_paging_only_when_they_save_heads() {
+    // Each 1000-entry page reaches 1000 planned keys. The policy can save
+    // all those HEADs, or none, depending on which decisions it uses.
+    let keys: Vec<_> = (0..4000).map(|i| format!("data/f{i:04}")).collect();
+    let present = Bucket::new(keys.iter().cloned());
+    let absent = Bucket::new(keys.iter().map(|key| format!("{key}a")));
+    for (bucket, saves_head, pages) in [
+        (&present, HeadSavings::Present, 4),
+        (&present, HeadSavings::Absent, SLACK_PAGES + 1),
+        (&absent, HeadSavings::Absent, 4),
+        (&absent, HeadSavings::Present, SLACK_PAGES + 1),
+    ] {
+        let mut walk = walk("data/", &keys);
+        walk.saves_head = saves_head;
+        while walk.page(bucket).await.unwrap() {}
+        assert_eq!(bucket.requests.take().len(), pages);
+    }
 }
 
 #[tokio::test]
@@ -1021,6 +1042,7 @@ impl Store for R2Order {
             .collect();
         let next = matching.next().map(|_| entries.last().unwrap().key.clone());
         Ok(Page {
+            complete: next.is_none(),
             next,
             entries,
             prefixes: Vec::new(),
@@ -1920,11 +1942,17 @@ mod signed {
             .discover_destination(&mut plan, &scopes, |key: &String| key.as_str().into())
             .await
             .unwrap();
-        // One listing of the whole destination, page after page.
+        // One listing of the whole destination, page after page. It asks
+        // for the directories too, but this server ignores the delimiter,
+        // so the listing goes on from its first page.
         let requests = served.requests.lock().unwrap();
-        assert_eq!(requests.len(), 3);
         assert!(requests.iter().all(|query| query["prefix"] == "dst/"));
-        assert!(!requests[0].contains_key("start-after"));
+        let flat: Vec<_> = requests
+            .iter()
+            .filter(|query| !query.contains_key("delimiter"))
+            .collect();
+        assert_eq!((flat.len(), requests.len()), (3, 4));
+        assert!(!flat[0].contains_key("start-after"));
         assert_eq!(engine.upload_keys.get().unwrap().keys.len(), 2504);
     }
 

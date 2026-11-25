@@ -275,6 +275,7 @@ async fn fragmented_downloads_release_receive_buffers_and_preserve_bytes() {
             Some(body),
             None,
             Some(HashAlgorithm::Blake3),
+            None,
         )
         .await
         .unwrap();
