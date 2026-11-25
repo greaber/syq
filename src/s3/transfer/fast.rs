@@ -69,7 +69,8 @@ impl Engine {
                 requests: None,
             });
         }
-        let tiny = bytes / count < 1024 * 1024;
+        let average = bytes / count;
+        let tiny = average < 1024 * 1024;
         let route = &self.options.route;
         let single_request = largest
             <= if route.is_server_copy() {
@@ -84,10 +85,16 @@ impl Engine {
             .as_ref()
             .and_then(|limits| limits.s3_object_workers)
             .unwrap_or(usize::MAX);
+        let small_upload = *route == Route::Upload && largest <= 1024 * 1024;
+        // Descriptors bound every small upload, and what automatic admission
+        // keeps in progress of more than one object. A count the user fixed,
+        // a dry run and a single object keep the usual ceiling rather than
+        // fail where the open-file limit leaves little room.
+        let bounded = small_upload || (fixed_workers.is_none() && !self.args.dry_run && count > 1);
         // What memory and descriptors allow in progress at once when each
         // object takes one request: payloads within 256 MiB and four
         // descriptors per object. Larger objects stream their parts.
-        let capacity = if !single_request || route.is_server_copy() {
+        let capacity = if !single_request || route.is_server_copy() || !bounded {
             256
         } else if *route == Route::Upload {
             // Keep the measured Tigris ceiling for files of 1 to 8 MiB. The
@@ -103,7 +110,6 @@ impl Engine {
         } else {
             256
         };
-        let small_upload = *route == Route::Upload && largest <= 1024 * 1024;
         if small_upload && fixed_workers.is_some_and(|n| n > capacity) {
             bail!("s3-objects exceeds the available small-upload capacity ({capacity}); lower it or increase the open-file limit");
         }
@@ -120,8 +126,14 @@ impl Engine {
         });
         // Files to upload get ready ahead of their requests only as far as
         // the upload buffers can hold them; others would be read twice.
-        let ready = if *route == Route::Upload && single_request {
-            (tuning::UPLOAD_BUFFER_BYTES / (bytes / count).max(1)) as usize
+        // Larger files, and storage-authorized uploads, keep nothing there
+        // and are read again to send anyway.
+        let ready = if *route == Route::Upload
+            && single_request
+            && self.authorization.is_none()
+            && average <= HELD_UPLOAD_LIMIT
+        {
+            (tuning::UPLOAD_BUFFER_BYTES / average.max(1)) as usize
         } else {
             usize::MAX
         };

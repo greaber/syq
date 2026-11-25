@@ -87,6 +87,76 @@ fn request_and_object_ceilings_apply_to_checks_and_transfers_alike() {
 }
 
 #[test]
+fn only_files_the_upload_buffers_hold_wait_for_room_in_them() {
+    // So that uploads' descriptor budget allows 256 objects.
+    crate::raise_nofile();
+    let in_progress = |size: u64| {
+        let (engine, _temp) = route_engine("upload", &[]);
+        let workers = engine
+            .object_workers(std::iter::repeat_n(size, 1024))
+            .unwrap();
+        engine.tuning.requests.set_limit(64);
+        workers.limit()
+    };
+    // Files of up to 8 MiB are kept from hashing to sending them, so no
+    // more get ready ahead of their requests than the buffers hold: 64 of
+    // 4 MiB, beside 64 requests.
+    assert_eq!(in_progress(4 << 20), 64);
+    // Larger files sent in one request are read again to send them anyway,
+    // so the objects in progress follow the requests as for downloads,
+    // rather than stop at the 21 files of 12 MiB the buffers would hold.
+    assert_eq!(in_progress(12 << 20), 128);
+}
+
+/// Where the open-file limit leaves no room beyond the descriptors kept for
+/// sockets and opens, copies whose objects in progress descriptors do not
+/// bound still run.
+#[test]
+fn a_low_open_file_limit_fails_only_copies_that_descriptors_bound() {
+    const CHILD: &str = "SYQ_TEST_LOW_NOFILE_OBJECT_WORKERS";
+    if std::env::var_os(CHILD).is_none() {
+        // Only the child lowers its limit; other tests are unaffected.
+        let name = "s3::transfer::fast::buffer_tests::a_low_open_file_limit_fails_only_copies_that_descriptors_bound";
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{output:?}"
+        );
+        return;
+    }
+    let mut limits = crate::fsops::nofile_limits().unwrap();
+    limits.rlim_cur = limits.rlim_cur.min(64);
+    crate::fsops::set_nofile_limits(&limits).unwrap();
+    assert!(tuning::small_object_capacity(1024).is_err());
+    let small = || std::iter::repeat_n(1024u64, 100);
+    // A count the user fixed,
+    let fixed = planning_engine(&["--performance-tuning", "s3-objects=1"]);
+    assert_eq!(fixed.object_workers(small()).unwrap().objects, 1);
+    let (fixed, _temp) = route_engine("upload", &["--performance-tuning", "s3-objects=2"]);
+    let workers = fixed
+        .object_workers(std::iter::repeat_n(4u64 << 20, 100))
+        .unwrap();
+    assert_eq!(workers.objects, 2);
+    // a dry run, and a single object.
+    planning_engine(&["--dry-run"])
+        .object_workers(small())
+        .unwrap();
+    planning_engine(&[])
+        .object_workers(std::iter::once(1024))
+        .unwrap();
+    // Automatic admission of many objects needs room for them, and every
+    // small upload for its files.
+    assert!(planning_engine(&[]).object_workers(small()).is_err());
+    let (upload, _temp) = route_engine("upload", &["--performance-tuning", "s3-objects=1"]);
+    assert!(upload.object_workers(small()).is_err());
+}
+
+#[test]
 fn server_copy_threshold_tracks_single_request_scheduling() {
     let mut engine = planning_engine(&[]);
     engine.options.route = Route::ServerCopy {

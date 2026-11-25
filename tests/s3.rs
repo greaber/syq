@@ -336,6 +336,7 @@ fn serve(
             &mut socket,
             method,
             first.split_whitespace().nth(1).unwrap(),
+            &headers,
         );
         return;
     }
@@ -2582,6 +2583,7 @@ fn s3_mapping_download_overlaps_heads_and_validates_before_copying() {
 #[test]
 fn s3_rerun_checks_share_the_request_limit_with_transfers() {
     use checking::{CHANGED, GETS, HEADS, MODIFIED, REQUESTS, SIZE, UNCHANGED};
+    let _counting = checking::exclusive();
     let server = Server::start("checking");
     let temp = crate::test_support::tempdir().unwrap();
     let destination = temp.path().join("out");
@@ -2624,6 +2626,62 @@ fn s3_rerun_checks_share_the_request_limit_with_transfers() {
     );
     // Otherwise the checks of unchanged objects show the limit what more
     // requests achieve, and it grows from the 32 every copy starts with.
+    copy(&[]);
+    assert!(
+        HEADS.peak() > 32,
+        "{} metadata requests at once",
+        HEADS.peak()
+    );
+    assert!(REQUESTS.peak() <= 256, "{} requests", REQUESTS.peak());
+}
+
+#[test]
+fn s3_upload_rerun_checks_share_the_request_limit_with_transfers() {
+    use checking::{CHANGED, HEADS, MODIFIED, PUTS, REQUESTS, SIZE, UNCHANGED};
+    use std::os::unix::fs::PermissionsExt;
+    let _counting = checking::exclusive();
+    let server = Server::start("checking");
+    let temp = crate::test_support::tempdir().unwrap();
+    let source = temp.path().join("data");
+    std::fs::create_dir(&source).unwrap();
+    let name = |index| source.join(&checking::key(index)["data/".len()..]);
+    let modified = std::time::UNIX_EPOCH + Duration::from_secs(MODIFIED);
+    for index in 0..UNCHANGED {
+        // The destination shows the same size and time, so the files can
+        // stay sparse: nothing reads them.
+        let file = std::fs::File::create(name(index)).unwrap();
+        file.set_len(SIZE).unwrap();
+        file.set_modified(modified).unwrap();
+        file.set_permissions(std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+    }
+    for index in UNCHANGED..UNCHANGED + CHANGED {
+        std::fs::write(name(index), b"x").unwrap();
+    }
+    let copy = |extra: &[&str]| {
+        for counter in [&HEADS, &PUTS, &REQUESTS] {
+            counter.reset();
+        }
+        let output = server
+            .command_with_part_size(temp.path(), 0, false)
+            .args(["--s3-endpoint", &server.address])
+            .args(extra)
+            .args(["--srcs-in", "data", "--to", "s3://bucket", "--into", "data"])
+            .capture_output()
+            .unwrap();
+        assert!(output.status.success(), "{}", output_text(&output));
+        assert!(PUTS.peak() > 0, "nothing uploaded");
+    };
+    // The HEADs that check whether a file needs uploading take request
+    // permits like the uploads, so a count the user fixed bounds both.
+    copy(&["--performance-tuning=s3-requests=24"]);
+    assert!(
+        (2..=24).contains(&REQUESTS.peak()),
+        "{} requests at once",
+        REQUESTS.peak()
+    );
+    // Otherwise they show the limit what more requests achieve, and it
+    // grows from the 32 every copy starts with.
     copy(&[]);
     assert!(
         HEADS.peak() > 32,

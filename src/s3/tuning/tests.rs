@@ -168,7 +168,7 @@ async fn idle_time_before_the_first_request_is_not_measured() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_burst_of_refusals_halves_once_until_requests_drain_to_the_new_limit() {
+async fn a_burst_of_refusals_halves_once_until_the_requests_before_it_drain() {
     let (budget, outage) = new_budget(None, None);
     budget.configure(INITIAL_REQUESTS, 4096, false);
     let mut limits = budget.subscribe();
@@ -183,17 +183,58 @@ async fn a_burst_of_refusals_halves_once_until_requests_drain_to_the_new_limit()
     assert_eq!(budget.limit(), 16);
     assert!(limits.has_changed().unwrap());
     assert_eq!(*limits.borrow_and_update(), 16);
-    // Responses to requests sent at the old limit still ask the client to
-    // slow down; the halving already answered them.
-    while held.len() > 16 {
+    // Responses to requests sent before the halving still ask the client
+    // to slow down, also once no more are in flight than it allows; the
+    // halving already answered them.
+    while !held.is_empty() {
         outage.throttled();
         held.pop();
         assert_eq!(budget.limit(), 16);
     }
-    // Once no more are in flight than the new limit allows, the service
-    // refusing them asks for fewer still.
+    // Once they have drained, the service refusing requests sent at the
+    // new limit asks for fewer still.
+    let held: Vec<_> = (0..16).map(|_| poll_permit(&budget, &mut cx)).collect();
+    tokio::time::advance(Duration::from_millis(10)).await;
     outage.throttled();
     assert_eq!(budget.limit(), 8);
+    drop(held);
+}
+
+#[tokio::test(start_paused = true)]
+async fn simultaneous_refusals_of_a_few_requests_halve_once() {
+    let (budget, outage) = new_budget(None, None);
+    budget.configure(256, 4096, false);
+    let waker = futures_util::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    // Far fewer requests are in flight than the limit allows, and all of
+    // them are refused at once: one halving answers them all.
+    let held: Vec<_> = (0..4).map(|_| poll_permit(&budget, &mut cx)).collect();
+    tokio::time::advance(Duration::from_millis(10)).await;
+    for _ in 0..4 {
+        outage.throttled();
+    }
+    assert_eq!(budget.limit(), 128);
+    drop(held);
+    let held = poll_permit(&budget, &mut cx);
+    outage.throttled();
+    assert_eq!(budget.limit(), 64);
+    drop(held);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refusal_right_after_a_step_down_halves_at_once() {
+    let (budget, outage) = new_budget(None, None);
+    budget.configure(64, 4096, false);
+    let waker = futures_util::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let held: Vec<_> = (0..64).map(|_| poll_permit(&budget, &mut cx)).collect();
+    // A measurement steps the limit down while more requests are in flight
+    // than it now allows. The service refusing one of them asks for fewer
+    // than that step chose.
+    budget.set_limit(41);
+    tokio::time::advance(Duration::from_millis(10)).await;
+    outage.throttled();
+    assert_eq!(budget.limit(), 20);
     drop(held);
 }
 
@@ -208,12 +249,34 @@ async fn a_refusal_as_a_window_opens_still_counts() {
     outage.throttled();
     assert_eq!(budget.limit(), 16);
     // The requests from before the halving drain, and requests admitted
-    // after it are refused just as the next window would open.
-    held.truncate(1);
-    held.extend((0..15).map(|_| poll_permit(&budget, &mut cx)));
+    // after it are refused just as the next window opens.
+    held.clear();
+    held.extend((0..16).map(|_| poll_permit(&budget, &mut cx)));
     tokio::time::advance(Duration::from_millis(10)).await;
     outage.throttled();
-    held.remove(0);
+    assert_eq!(budget.limit(), 8);
+    drop(held);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_request_hung_since_a_halving_does_not_hold_back_the_next() {
+    let (budget, outage) = new_budget(None, None);
+    budget.configure(INITIAL_REQUESTS, 4096, false);
+    let waker = futures_util::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut held: Vec<_> = (0..32).map(|_| poll_permit(&budget, &mut cx)).collect();
+    outage.throttled();
+    assert_eq!(budget.limit(), 16);
+    // One request from before the halving stays in flight. Refusals soon
+    // after it may be its own retries, which the halving answered,
+    held.truncate(1);
+    held.extend((0..15).map(|_| poll_permit(&budget, &mut cx)));
+    tokio::time::advance(Duration::from_secs(1)).await;
+    outage.throttled();
+    assert_eq!(budget.limit(), 16);
+    // but it cannot hold back the next halving for good.
+    tokio::time::advance(UNCOVERED_WAIT).await;
+    outage.throttled();
     assert_eq!(budget.limit(), 8);
     drop(held);
 }
@@ -710,10 +773,30 @@ async fn a_few_slow_requests_cannot_hold_back_the_next_decision() {
 /// to have stalled, but they must not hold every later decision back.
 #[tokio::test(start_paused = true)]
 async fn hung_requests_cannot_freeze_the_limit() {
+    hung_requests_after(None).await;
+}
+
+/// However slow the batch's responses have been, a window waits at most
+/// `UNCOVERED_WAIT` for the requests in flight to account for its time.
+#[tokio::test(start_paused = true)]
+async fn slow_responses_do_not_lengthen_the_wait_for_hung_requests() {
+    hung_requests_after(Some(Duration::from_secs(115))).await;
+}
+
+/// `hung_requests_cannot_freeze_the_limit`, after one request of the batch
+/// took `slow` to finish.
+async fn hung_requests_after(slow: Option<Duration>) {
     let (budget, _) = new_budget(None, None);
     budget.configure(INITIAL_REQUESTS, 4096, false);
     let waker = futures_util::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
+    if let Some(slow) = slow {
+        let permit = poll_permit(&budget, &mut cx);
+        tokio::time::advance(slow).await;
+        drop(permit);
+        // The next windows start afresh, within the same batch.
+        budget.set_limit(INITIAL_REQUESTS);
+    }
     let hung: Vec<_> = (0..16).map(|_| poll_permit(&budget, &mut cx)).collect();
     let mut running: Vec<_> = (0..16).map(|_| poll_permit(&budget, &mut cx)).collect();
     let mut limits = vec![];
@@ -744,6 +827,74 @@ async fn hung_requests_cannot_freeze_the_limit() {
     // carry, and the limit grows.
     assert!(limits[350] > INITIAL_REQUESTS, "{limits:?}");
     drop(hung);
+}
+
+/// A long transfer admitted before a change finishes just after the next
+/// window opens, beside quick checks, while the other transfers admitted
+/// with it are still in flight. Its ten seconds alone exceed the window's
+/// request-seconds, but only its last moments were spent in the window, so
+/// the window still does not describe the transfers.
+#[tokio::test(start_paused = true)]
+async fn a_transfer_from_before_a_window_covers_only_its_time_within_it() {
+    let (budget, _) = new_budget(None, None);
+    budget.configure(64, 4096, false);
+    let waker = futures_util::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut carried = poll_permit(&budget, &mut cx);
+    let transfers: Vec<_> = (0..63).map(|_| poll_permit(&budget, &mut cx)).collect();
+    // A measured step up, judged by the window after these drain or have
+    // taken a few windows' time.
+    budget.set_limit(72);
+    tokio::time::advance(Duration::from_millis(9950)).await;
+    let mut checks: Vec<_> = (0..4).map(|_| poll_permit(&budget, &mut cx)).collect();
+    let cycle = |checks: &mut Vec<Permit>, cx: &mut Context<'_>| {
+        checks.clear();
+        checks.extend((0..4).map(|_| poll_permit(&budget, cx)));
+    };
+    for _ in 0..50 {
+        tokio::time::advance(Duration::from_millis(1)).await;
+        cycle(&mut checks, &mut cx);
+    }
+    carried.completed(256 << 20);
+    drop(carried);
+    for _ in 0..10 {
+        tokio::time::advance(Duration::from_millis(1)).await;
+        cycle(&mut checks, &mut cx);
+    }
+    // Had the transfer's whole response time counted, the window would
+    // have ended with nearly the whole limit in flight, and doubled it.
+    assert_eq!(budget.limit(), 72);
+    let state = budget.state.lock().unwrap();
+    let window = &state.control.as_ref().unwrap().window;
+    assert!(window.completed > 200, "{}", window.completed);
+    assert!(window.covered < COVERED * window.area);
+    drop(state);
+    drop((transfers, checks));
+}
+
+#[test]
+fn limit_changes_reach_admission_in_order() {
+    let (budget, _) = new_budget(None, None);
+    let limits = budget.subscribe();
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for thread in 0..4 {
+            let (budget, done) = (&budget, &done);
+            scope.spawn(move || {
+                for step in 0..20_000 {
+                    budget.set_limit(1 + (thread * 7 + step) % 5);
+                }
+                done.fetch_add(1, Relaxed);
+            });
+        }
+        // Whenever the limit can be read, admission already follows it: a
+        // change published after the lock is released could be overtaken
+        // by a later one and leave its stale value behind.
+        while done.load(Relaxed) < 4 {
+            let state = budget.state.lock().unwrap();
+            assert_eq!(*limits.borrow(), state.limit);
+        }
+    });
 }
 
 /// Quick checks of objects that need no transfer, beside transfers that

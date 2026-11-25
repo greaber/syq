@@ -22,18 +22,20 @@
 //!   there is nothing to try, so steps up follow.
 //! - When the service asks for fewer requests (HTTP 429 or 503), the limit
 //!   halves as the response arrives, whether or not a window is open or the
-//!   request is then retried. Requests in flight beyond the lowered limit
-//!   were admitted before it; their complaints are answered by it, so a
-//!   burst of refusals halves the limit once, not once per refusal.
+//!   request is then retried. Requests admitted before that halving ran into
+//!   what it answered, and their retries keep their permits, so further
+//!   refusals while any of them is in flight do not halve it again: a burst
+//!   halves the limit once, not once per refusal. Only a halving has this
+//!   effect; a refusal after any other change halves at once.
 //!
 //! A window starts only once nearly all requests admitted before the last
 //! change have finished, so a change is never judged by the requests that
 //! caused it. It ends once as many requests have finished as were in flight
 //! on average, which by Little's law takes a mean response time, and once
-//! their response times account for most of the time requests spent in
-//! flight, so that quick checks finishing beside long transfers do not
-//! stand for the transfers. Requests that stay in flight far longer than any
-//! the batch has seen finish only bound that wait.
+//! the finished requests' time within the window accounts for most of the
+//! window's request-seconds in flight, so that quick checks finishing beside
+//! long transfers do not stand for the transfers. Requests that stay in
+//! flight only bound that wait, to at most `UNCOVERED_WAIT`.
 use super::{outage::Outage, Options, Route};
 use std::{
     sync::{
@@ -63,13 +65,13 @@ const MIN_COMPLETIONS: usize = 16;
 const STRAGGLERS: usize = 16;
 const STRAGGLER_WINDOWS: u32 = 4;
 /// The share of the window's request-seconds in flight that the finished
-/// requests' response times must account for before it describes the limit.
+/// requests' time within the window must account for before it describes
+/// the limit.
 const COVERED: f64 = 0.7;
 /// The longest a window that has seen enough requests finish waits for the
-/// rest to account for its time, unless the batch has had responses slower
-/// than a quarter of this. A request may take hours, so one still in flight
-/// is never known to have stalled, but a few that hang must not hold every
-/// later decision back.
+/// rest to account for its time. A request may take hours, so one still in
+/// flight is never known to have stalled, but a few that hang must not hold
+/// every later decision back.
 const UNCOVERED_WAIT: Duration = Duration::from_secs(30);
 /// Work credited to each request besides its bytes, for the fixed cost of a
 /// request, so that checks and small objects count as progress.
@@ -371,13 +373,13 @@ struct Window {
     completed: usize,
     /// The finished requests' response times, in seconds.
     responses: f64,
+    /// The part of those response times since `start`, in seconds: the
+    /// finished requests' share of `area`. A request admitted before the
+    /// window counts only its time within it.
+    covered: f64,
     /// The mean time a request spent in flight in the last complete window,
     /// which bounds the wait for stragglers.
     response: Duration,
-    /// The slowest response any request of the batch has had, which with
-    /// `UNCOVERED_WAIT` bounds the wait for the window's requests to account
-    /// for its time.
-    slowest: Duration,
 }
 impl Window {
     fn new(now: Instant) -> Self {
@@ -388,8 +390,8 @@ impl Window {
             work: 0,
             completed: 0,
             responses: 0.0,
+            covered: 0.0,
             response: Duration::ZERO,
-            slowest: Duration::ZERO,
         }
     }
     fn begin(&mut self, now: Instant) {
@@ -399,6 +401,7 @@ impl Window {
         self.work = 0;
         self.completed = 0;
         self.responses = 0.0;
+        self.covered = 0.0;
     }
     /// Bring the window up to `now`, with `active` requests in flight since
     /// it was last brought up to date, or start it once `settled`. Call
@@ -424,14 +427,16 @@ impl Window {
             return None;
         }
         // Little's law holds for the requests that finished only once their
-        // response times account for the time requests spent in flight:
-        // quick checks finishing beside long transfers would otherwise stand
-        // for the transfers too.
-        let covered = self.responses >= COVERED * self.area;
+        // time within the window accounts for most of the time requests
+        // spent in flight in it: quick checks finishing beside long
+        // transfers would otherwise stand for the transfers too, and so
+        // would one long transfer from before the window finishing early in
+        // it while the others are still in flight.
+        let covered = self.covered >= COVERED * self.area;
         // Once the window has waited long enough for its stragglers, those
         // still in flight count as having carried nothing yet, and the rate
         // is the work finished per second.
-        if !covered && elapsed < UNCOVERED_WAIT.max(STRAGGLER_WINDOWS * self.slowest) {
+        if !covered && elapsed < UNCOVERED_WAIT {
             return None;
         }
         let spent = if covered { self.responses } else { self.area };
@@ -475,6 +480,11 @@ struct State {
     changed: Instant,
     /// Requests in flight admitted before the last change.
     old: usize,
+    /// Requests in flight admitted before the service last asked for fewer
+    /// requests, whose refusals that halving answered.
+    refused: usize,
+    /// The generation that halving started, and when.
+    cut: (u64, Instant),
     /// `None` when the user fixed the count.
     control: Option<Control>,
 }
@@ -499,20 +509,23 @@ impl State {
         }
         std::mem::replace(&mut self.limit, after)
     }
-    /// Count a request that finished after `response` having moved `bytes`,
-    /// and decide once the window allows. Returns the limit before and after
-    /// a change.
-    fn finished(&mut self, now: Instant, response: Duration, bytes: u64) -> Option<(usize, usize)> {
+    /// Count a request admitted at `started` that finished having moved
+    /// `bytes`, and decide once the window allows. Returns the limit before
+    /// and after a change.
+    fn finished(&mut self, now: Instant, started: Instant, bytes: u64) -> Option<(usize, usize)> {
         let limit = self.limit;
         let control = self.control.as_mut()?;
         let window = &mut control.window;
-        window.slowest = window.slowest.max(response);
+        let start = window.start?;
         // A request that finished as the window started belongs before it.
-        if window.start? == now {
+        if start == now {
             return None;
         }
         window.completed += 1;
-        window.responses += response.as_secs_f64();
+        window.responses += now.saturating_duration_since(started).as_secs_f64();
+        window.covered += now
+            .saturating_duration_since(started.max(start))
+            .as_secs_f64();
         window.work = window
             .work
             .saturating_add(bytes.saturating_add(REQUEST_CREDIT));
@@ -537,18 +550,32 @@ impl State {
     /// after a change.
     fn throttled(&mut self, now: Instant) -> Option<(usize, usize)> {
         let limit = self.limit;
-        // Requests beyond the limit were admitted before it last fell, so
-        // that change answered what they ran into.
-        if self.active > limit {
+        let control = self.control.as_mut()?;
+        // Requests admitted before the last halving ran into what it
+        // answered, and so do their retries, which keep their permits; but
+        // a few that stay in flight long after it, which may have hung, do
+        // not hold back the next.
+        if self.refused > 0 && now < self.cut.1 + UNCOVERED_WAIT {
             return None;
         }
-        let control = self.control.as_mut()?;
         let after = control.policy.throttled(limit);
         super::diagnostics::request_throttled(limit, after);
         // What the window measured was the service refusing requests; at one
         // request the limit stays, and the next window starts afresh.
         self.changed(after, now);
+        self.refused = self.active;
+        self.cut = (self.generation, now);
         (after != limit).then_some((limit, after))
+    }
+    /// A request admitted in `generation` finished.
+    fn released(&mut self, generation: u64) {
+        self.active -= 1;
+        if generation != self.generation {
+            self.old = self.old.saturating_sub(1);
+        }
+        if generation < self.cut.0 {
+            self.refused = self.refused.saturating_sub(1);
+        }
     }
 }
 
@@ -594,6 +621,8 @@ impl Budget {
                 generation: 0,
                 changed: now,
                 old: 0,
+                refused: 0,
+                cut: (0, now),
                 control,
             }),
             changed: Notify::new(),
@@ -616,10 +645,16 @@ impl Budget {
         control.policy.settled = gradual;
         let after = initial.clamp(1, max);
         let before = state.changed(after, now);
-        drop(state);
-        self.changed_limit(before, after);
+        self.publish(&state, Some((before, after)));
     }
-    fn changed_limit(&self, before: usize, after: usize) {
+    /// Wake requests and admission for a change of the limit. The state
+    /// lock is held, so that changes reach admission in the order they
+    /// happened: otherwise `4 → 2` could publish after `2 → 1`, leaving 2
+    /// to hide a later `1 → 2`.
+    fn publish(&self, _state: &std::sync::MutexGuard<'_, State>, change: Option<(usize, usize)>) {
+        let Some((before, after)) = change else {
+            return;
+        };
         if after > before {
             self.changed.notify_waiters();
         }
@@ -635,8 +670,9 @@ impl Budget {
     /// Move the limit as a measurement would.
     #[cfg(test)]
     pub fn set_limit(&self, after: usize) {
-        let before = self.state.lock().unwrap().changed(after, Instant::now());
-        self.changed_limit(before, after);
+        let mut state = self.state.lock().unwrap();
+        let before = state.changed(after, Instant::now());
+        self.publish(&state, Some((before, after)));
     }
     /// Whether growth is by an eighth at a time rather than doubling.
     #[cfg(test)]
@@ -659,10 +695,7 @@ impl Budget {
         let now = Instant::now();
         state.advance(now);
         let change = state.throttled(now);
-        drop(state);
-        if let Some((before, after)) = change {
-            self.changed_limit(before, after);
-        }
+        self.publish(&state, change);
     }
     pub async fn acquire(self: &Arc<Self>) -> Permit {
         loop {
@@ -690,19 +723,12 @@ impl Budget {
         let mut state = self.state.lock().unwrap();
         let now = Instant::now();
         state.advance(now);
-        state.active -= 1;
-        if permit.generation != state.generation {
-            state.old = state.old.saturating_sub(1);
-        }
-        let response = now.saturating_duration_since(permit.started);
-        let change = state.finished(now, response, permit.bytes);
-        drop(state);
+        state.released(permit.generation);
+        let change = state.finished(now, permit.started, permit.bytes);
         // One completion frees one slot. Waking the entire queue makes every
         // waiting request compete for that slot; growth wakes them all.
         self.changed.notify_one();
-        if let Some((before, after)) = change {
-            self.changed_limit(before, after);
-        }
+        self.publish(&state, change);
     }
 }
 impl Drop for Permit {
