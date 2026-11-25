@@ -267,20 +267,41 @@ impl FsOps {
                     .open(resolve(path))?
             }
         };
-        let opened = file.metadata()?;
-        anyhow::ensure!(
-            (
-                opened.dev(),
-                opened.ino(),
-                opened.ctime(),
-                opened.ctime_nsec() as u32
-            ) == (entry.dev, entry.ino, entry.ctime, entry.ctime_nsec),
-            "{} changed before reading inode metadata",
-            resolve(path).display()
-        );
-        entry.inode_metadata =
-            crate::inode_metadata::capture(&file, self.inode_preservation, entry.atime)
-                .with_context(|| format!("read inode metadata: {}", resolve(path).display()))?;
+        entry.inode_metadata = inode_metadata_of(&file, path, entry, self.inode_preservation)?;
+        Ok(())
+    }
+
+    /// `capture_entry_metadata` for each of `entries`, the registered
+    /// sources `sources`, on the metadata pool: reading ACLs and extended
+    /// attributes waits on the filesystem for each file, as the stats before
+    /// it do (`stat_many_unadorned_request`).
+    fn capture_source_metadata_in_parallel(
+        &self,
+        paths: &[PathBytes],
+        sources: &[RegisteredPath],
+        entries: &mut [Option<Entry>],
+    ) -> Result<()> {
+        let targets = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.is_some())
+            .map(|(index, _)| Ok((index, self.registered_source_target(&sources[index])?)))
+            .collect::<Result<Vec<_>>>()?;
+        let preservation = self.inode_preservation;
+        let captured = {
+            let entries = &*entries;
+            parallel_map(&targets, |(index, target)| {
+                let entry = entries[*index].as_ref().expect("selected above");
+                let file = target.root.open_metadata(&target.relative)?;
+                inode_metadata_of(&file, &paths[*index], entry, preservation)
+            })
+        };
+        for ((index, _), metadata) in targets.iter().zip(captured) {
+            entries[*index]
+                .as_mut()
+                .expect("selected above")
+                .inode_metadata = metadata?;
+        }
         Ok(())
     }
 
@@ -338,7 +359,14 @@ impl FsOps {
             )?;
         }
         let mut entries = self.stat_many_unadorned_request(paths, sources, follow, read_here)?;
-        if self.inode_preservation.any() {
+        // As for the stats, sources this thread has just read are captured
+        // on it too.
+        let reads_files = self.inode_preservation.acls
+            || self.inode_preservation.xattrs
+            || self.inode_preservation.crtimes;
+        if let Some(sources) = sources.filter(|_| reads_files && !read_here) {
+            self.capture_source_metadata_in_parallel(paths, sources, &mut entries)?;
+        } else if self.inode_preservation.any() {
             for (index, entry) in entries.iter_mut().enumerate() {
                 if let Some(entry) = entry {
                     self.capture_entry_metadata(
@@ -352,4 +380,27 @@ impl FsOps {
         }
         Ok(entries)
     }
+}
+
+/// The inode metadata `preservation` selects of `file`, opened at `path`,
+/// which must still be the object `entry` describes.
+fn inode_metadata_of(
+    file: &File,
+    path: &[u8],
+    entry: &Entry,
+    preservation: crate::inode_metadata::Selection,
+) -> Result<Option<Box<crate::inode_metadata::InodeMetadata>>> {
+    let opened = file.metadata()?;
+    anyhow::ensure!(
+        (
+            opened.dev(),
+            opened.ino(),
+            opened.ctime(),
+            opened.ctime_nsec() as u32
+        ) == (entry.dev, entry.ino, entry.ctime, entry.ctime_nsec),
+        "{} changed before reading inode metadata",
+        resolve(path).display()
+    );
+    crate::inode_metadata::capture(file, preservation, entry.atime)
+        .with_context(|| format!("read inode metadata: {}", resolve(path).display()))
 }

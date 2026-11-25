@@ -3309,7 +3309,8 @@ impl Worker {
     // hardlink representative without an expected digest is otherwise kept
     // on matching size and time alone, which --hash-or-copy does not trust.
     pub(super) fn try_expected_match(&mut self, idx: usize, job: &WorkerJob) -> Result<bool> {
-        if job.replace {
+        // A file known to differ (`FileJobData::compared`) is not kept.
+        if job.replace || job.compared {
             return Ok(false);
         }
         let expected = self.opts.expected_hashes_for(job);
