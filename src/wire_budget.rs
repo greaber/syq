@@ -1,8 +1,11 @@
 //! Shared accounting for decoded collection storage, whose size is not bounded
 //! by the encoded frame length alone. Reservations travel with queued messages.
-//! Flat byte buffers and strings are bounded separately by frame/queue limits.
+//! Flat file-payload buffers (`Block.data`, `SmallPut.data`, etc.) are bounded
+//! separately by frame and queue limits. Path fields using `budgeted_bytes`
+//! charge one byte per decoded byte against `MEMORY_LIMIT` before the copy.
 //! A server also charges what decompression adds to a frame (`Expansion`).
 use serde::de::{self, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, VariantAccess, Visitor};
+use serde::ser::SerializeSeq;
 use serde::Deserialize;
 use std::fmt;
 use std::io;
@@ -10,12 +13,137 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
+const BUDGETED_BYTES_MARKER: &str = "\0syq_budgeted_bytes";
+
+fn decode_byte_buf<'de, D: de::Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+    serde_bytes::ByteBuf::deserialize(deserializer).map(serde_bytes::ByteBuf::into_vec)
+}
+
+/// Serde adapter for `PathBytes` that decodes as a single byte buffer (like
+/// `serde_bytes`) while signaling `Limited` to charge `bytes.len()` 1x against
+/// the shared collection memory budget. Outside `Limited` it behaves
+/// identically to `serde_bytes` / plain `Vec<u8>` on Postcard.
+pub(crate) mod budgeted_bytes {
+    use super::{decode_byte_buf, BUDGETED_BYTES_MARKER};
+    use serde::de::Visitor;
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serde_bytes::serialize(bytes, serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        struct MarkerVisitor;
+        impl<'de> Visitor<'de> for MarkerVisitor {
+            type Value = Vec<u8>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a byte buffer")
+            }
+            fn visit_newtype_struct<D: Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<Self::Value, D::Error> {
+                decode_byte_buf(deserializer)
+            }
+        }
+        deserializer.deserialize_newtype_struct(BUDGETED_BYTES_MARKER, MarkerVisitor)
+    }
+}
+
+/// Serde adapter for `Option<PathBytes>` pairing buffer decoding with 1x
+/// `wire_budget` charging.
+pub(crate) mod budgeted_opt_bytes {
+    use serde::de::Visitor;
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(
+        value: &Option<Vec<u8>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(bytes) => serializer.serialize_some(serde_bytes::Bytes::new(bytes)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Vec<u8>>, D::Error> {
+        struct OptVisitor;
+        impl<'de> Visitor<'de> for OptVisitor {
+            type Value = Option<Vec<u8>>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an optional byte buffer")
+            }
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_some<D: Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<Self::Value, D::Error> {
+                super::budgeted_bytes::deserialize(deserializer).map(Some)
+            }
+        }
+        deserializer.deserialize_option(OptVisitor)
+    }
+}
+
+/// Serde adapter for `Vec<PathBytes>` keeping outer `LimitedSeq` element
+/// budgeting while each element decodes via `budgeted_bytes` (1x byte charge).
+pub(crate) mod budgeted_vec_bytes {
+    use super::SerializeSeq;
+    use serde::de::{DeserializeSeed, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(values: &[Vec<u8>], serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(values.len()))?;
+        for bytes in values {
+            seq.serialize_element(serde_bytes::Bytes::new(bytes))?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<Vec<u8>>, D::Error> {
+        struct BudgetedBytesSeed;
+        impl<'de> DeserializeSeed<'de> for BudgetedBytesSeed {
+            type Value = Vec<u8>;
+            fn deserialize<D: Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<Self::Value, D::Error> {
+                super::budgeted_bytes::deserialize(deserializer)
+            }
+        }
+        struct VecVisitor;
+        impl<'de> Visitor<'de> for VecVisitor {
+            type Value = Vec<Vec<u8>>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a sequence of byte buffers")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::new();
+                while let Some(bytes) = seq.next_element_seed(BudgetedBytesSeed)? {
+                    out.push(bytes);
+                }
+                Ok(out)
+            }
+        }
+        deserializer.deserialize_seq(VecVisitor)
+    }
+}
+
 pub(crate) const MEMORY_LIMIT: usize = 512 << 20;
 /// A message's first reservation: at least a decoded `Request` or
 /// `Response` (a few hundred bytes, in a queue slot allocated with its
 /// channel). A queued acknowledgment, matched range or data block, whose
 /// data is not counted, costs the allowance this rather than a whole
-/// granule. A message counted for more, such as one with two or more
+/// granule. A message counted for more, such as one with four or more
 /// digests or a file's metadata, reserves granules, as before.
 const MESSAGE_RESERVATION: usize = 1 << 10;
 /// Reservations beyond a message's first grow in granules, so that a large
@@ -236,9 +364,8 @@ impl<T> Budgeted<T> {
 // Postcard's sequence length comes from the peer. Hide size hints to prevent
 // eager Vec/HashMap allocation, then charge conservative capacity before each
 // element. Eight times element size covers Vec growth (including its minimum
-// capacity) and map buckets. Strings and byte buffers are already bounded by
-// their bytes in the frame; charging those globally made normal bulk transfers
-// compete for this allowance as concurrency increased.
+// capacity) and map buckets. Byte buffers opt in to a separate charge via
+// `budgeted_bytes` so file payloads do not compete for this allowance.
 // This is deliberately an upper bound, not an allocator/RSS measurement.
 struct Limited<'a, D> {
     inner: D,
@@ -253,6 +380,17 @@ struct LimitedSeed<'a, S> {
     hold: &'a mut Hold,
 }
 struct LimitedSeq<'a, S> {
+    inner: S,
+    hold: &'a mut Hold,
+}
+/// Fixed-size tuple/array sequence adapter: its inline storage was already
+/// counted by the enclosing struct or collection, so element slots are not
+/// charged again while nested variable-length collections remain budgeted.
+struct LimitedTupleVisitor<'a, V> {
+    inner: V,
+    hold: &'a mut Hold,
+}
+struct LimitedTupleSeq<'a, S> {
     inner: S,
     hold: &'a mut Hold,
 }
@@ -293,6 +431,33 @@ impl<'de, S: SeqAccess<'de>> SeqAccess<'de> for LimitedSeq<'_, S> {
     }
     fn size_hint(&self) -> Option<usize> {
         None
+    }
+}
+impl<'de, S: SeqAccess<'de>> SeqAccess<'de> for LimitedTupleSeq<'_, S> {
+    type Error = S::Error;
+    fn next_element_seed<T: DeserializeSeed<'de>>(
+        &mut self,
+        seed: T,
+    ) -> Result<Option<T::Value>, Self::Error> {
+        self.inner.next_element_seed(LimitedSeed {
+            inner: seed,
+            hold: self.hold,
+        })
+    }
+    fn size_hint(&self) -> Option<usize> {
+        self.inner.size_hint()
+    }
+}
+impl<'de, V: Visitor<'de>> Visitor<'de> for LimitedTupleVisitor<'_, V> {
+    type Value = V::Value;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.expecting(f)
+    }
+    fn visit_seq<S: SeqAccess<'de>>(self, inner: S) -> Result<Self::Value, S::Error> {
+        self.inner.visit_seq(LimitedTupleSeq {
+            inner,
+            hold: self.hold,
+        })
     }
 }
 impl<'de, M: MapAccess<'de>> MapAccess<'de> for LimitedMap<'_, M> {
@@ -457,6 +622,25 @@ impl<'de, V: Visitor<'de>> Visitor<'de> for LimitedVisitor<'_, V> {
     }
 }
 
+// Postcard gives its byte buffer visitor a slice of the frame. Reserve its
+// size before letting the adapter copy it into an owned ByteBuf.
+struct BudgetedBytesVisitor<'a, V> {
+    inner: V,
+    hold: &'a mut Hold,
+}
+
+impl<'de, V: Visitor<'de>> Visitor<'de> for BudgetedBytesVisitor<'_, V> {
+    type Value = V::Value;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.expecting(f)
+    }
+    fn visit_bytes<E: de::Error>(self, bytes: &[u8]) -> Result<Self::Value, E> {
+        self.hold.charge::<E>(bytes.len())?;
+        self.inner
+            .visit_newtype_struct(de::value::BytesDeserializer::new(bytes))
+    }
+}
+
 macro_rules! forward_deserializers {
     ($($method:ident),* $(,)?) => {$(
         fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
@@ -490,6 +674,12 @@ impl<'de, D: de::Deserializer<'de>> de::Deserializer<'de> for Limited<'_, D> {
         name: &'static str,
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
+        if name == BUDGETED_BYTES_MARKER {
+            return self.inner.deserialize_byte_buf(BudgetedBytesVisitor {
+                inner: visitor,
+                hold: self.hold,
+            });
+        }
         self.inner.deserialize_newtype_struct(
             name,
             LimitedVisitor {
@@ -505,7 +695,7 @@ impl<'de, D: de::Deserializer<'de>> de::Deserializer<'de> for Limited<'_, D> {
     ) -> Result<V::Value, Self::Error> {
         self.inner.deserialize_tuple(
             len,
-            LimitedVisitor {
+            LimitedTupleVisitor {
                 inner: visitor,
                 hold: self.hold,
             },
@@ -520,7 +710,7 @@ impl<'de, D: de::Deserializer<'de>> de::Deserializer<'de> for Limited<'_, D> {
         self.inner.deserialize_tuple_struct(
             name,
             len,
-            LimitedVisitor {
+            LimitedTupleVisitor {
                 inner: visitor,
                 hold: self.hold,
             },
@@ -639,17 +829,52 @@ mod tests {
     #[test]
     fn bounded_bulk_bytes_do_not_consume_collection_allowance() {
         let shared = budget();
-        let response = crate::proto::Response::Block {
-            off: 0,
-            hash: [0; 32],
-            data: vec![7; 8 << 20],
+        use crate::proto::Response;
+
+        let decode_block = |data| {
+            let block = Response::Block {
+                off: 0,
+                hash: [0; 32],
+                data,
+            };
+            let bytes = postcard::to_stdvec(&block).unwrap();
+            decode_with_hold::<Response>(&bytes, hold(&shared)).unwrap()
         };
-        let bytes = postcard::to_stdvec(&response).unwrap();
-        let decoded = decode_with_hold::<crate::proto::Response>(&bytes, hold(&shared)).unwrap();
-        assert!(
-            matches!(decoded.value, crate::proto::Response::Block { data, .. } if data.len() == 8 << 20)
-        );
+        let empty_charge = decode_block(Vec::new()).hold.used;
+        let decoded = decode_block(vec![7; 8 << 20]);
+        assert!(matches!(decoded.value, Response::Block { data, .. } if data.len() == 8 << 20));
+        assert_eq!(decoded.hold.used, empty_charge);
         assert_eq!(shared.used.load(Relaxed), MESSAGE_RESERVATION);
+    }
+
+    #[test]
+    fn small_put_charges_the_path_and_leaves_file_bytes_to_the_queue_limit() {
+        use crate::proto::{Meta, ScannedDestination, SmallPut, TargetCondition};
+
+        let shared = budget();
+        let mut put = SmallPut {
+            path: Vec::new(),
+            copy_id: [0; 16],
+            data: Vec::new(),
+            hash: Default::default(),
+            meta: Meta::default(),
+            flags: 0,
+            inplace: false,
+            condition: TargetCondition::Any,
+            replaces: false,
+            scanned: ScannedDestination::Unknown,
+        };
+        let decode_put = |put: &SmallPut| {
+            let bytes = postcard::to_stdvec(put).unwrap();
+            decode_with_hold::<SmallPut>(&bytes, hold(&shared)).unwrap()
+        };
+        let empty_charge = decode_put(&put).hold.used;
+        put.path = b"dir/file".to_vec();
+        put.data = vec![7; 2 * RESERVATION_GRANULE];
+        let decoded = decode_put(&put);
+        assert_eq!(decoded.value.path, put.path);
+        assert_eq!(decoded.value.data, put.data);
+        assert_eq!(decoded.hold.used, empty_charge + put.path.len());
     }
 
     #[test]
@@ -690,7 +915,7 @@ mod tests {
 
     #[test]
     fn a_reply_counted_for_more_reserves_no_more_than_a_granule() {
-        // A patch's result, a file's metadata or two digests are counted
+        // A patch's result, a file's metadata or four digests are counted
         // for more than a first reservation; they reserve no more than one
         // granule, as before.
         use crate::proto::{Response, SmallPatched};
@@ -705,7 +930,7 @@ mod tests {
                 replaced: None,
             })]),
             Response::Stats(vec![None]),
-            Response::Hashes(vec![Default::default(); 2]),
+            Response::Hashes(vec![Default::default(); 4]),
         ];
         for reply in counted {
             let bytes = postcard::to_stdvec(&reply).unwrap();
@@ -716,6 +941,136 @@ mod tests {
                 "{reply:?}: {reserved}"
             );
             drop(held);
+        }
+    }
+
+    #[test]
+    fn fixed_arrays_are_not_double_charged_in_collection_budget() {
+        use crate::proto::Response;
+        let shared = budget();
+        let digest = [7u8; 32];
+        let bytes = postcard::to_stdvec(&digest).unwrap();
+        let held = decode_with_hold::<[u8; 32]>(&bytes, hold(&shared)).unwrap();
+        assert_eq!(held.value, digest);
+        assert_eq!(held.hold.used, digest.len());
+
+        // 4,096 digests charge 4,096 * 32 * 8 = 1 MiB (plus the Response header)
+        // rather than 2 MiB from double-charging each inner u8 element.
+        let tight = Arc::new(Budget {
+            used: AtomicUsize::new(0),
+            limit: (1 << 20) + RESERVATION_GRANULE,
+        });
+        let many = postcard::to_stdvec(&Response::Hashes(vec![[0u8; 32]; 4_096])).unwrap();
+        let held = decode_with_hold::<Response>(&many, hold(&tight)).unwrap();
+        assert!(matches!(held.value, Response::Hashes(ref h) if h.len() == 4_096));
+        assert_eq!(
+            held.hold.used,
+            std::mem::size_of::<Response>() + (4_096 + 1) * 32 * 8
+        );
+        drop(held);
+        assert_eq!(tight.used.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn variable_collection_inside_tuple_remains_budgeted() {
+        #[derive(Debug, serde::Serialize, serde::Deserialize)]
+        struct TupleWrapper(u32, Vec<u64>);
+
+        let shared = budget();
+        let tuple_bytes = postcard::to_stdvec(&(7u32, vec![1u64; 4_096])).unwrap();
+        let err = decode_with_hold::<(u32, Vec<u64>)>(&tuple_bytes, hold(&shared)).unwrap_err();
+        assert!(err.to_string().contains("memory budget exhausted"));
+        assert_eq!(shared.used.load(Relaxed), 0);
+
+        let struct_bytes = postcard::to_stdvec(&TupleWrapper(7, vec![1u64; 4_096])).unwrap();
+        let err = decode_with_hold::<TupleWrapper>(&struct_bytes, hold(&shared)).unwrap_err();
+        assert!(err.to_string().contains("memory budget exhausted"));
+        assert_eq!(shared.used.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn path_adapters_preserve_legacy_postcard_bytes_and_charge_exact_lengths() {
+        use crate::proto::PathBytes;
+        use serde::Serialize;
+
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Single(#[serde(with = "budgeted_bytes")] PathBytes);
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Optional(#[serde(with = "budgeted_opt_bytes")] Option<PathBytes>);
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct List(#[serde(with = "budgeted_vec_bytes")] Vec<PathBytes>);
+
+        fn check<T>(value: T, legacy: &impl Serialize, charge: usize)
+        where
+            T: for<'de> Deserialize<'de> + Serialize + PartialEq + fmt::Debug,
+        {
+            let bytes = postcard::to_stdvec(legacy).unwrap();
+            assert_eq!(postcard::to_stdvec(&value).unwrap(), bytes);
+            assert_eq!(postcard::from_bytes::<T>(&bytes).unwrap(), value);
+
+            let shared = budget();
+            let decoded = decode_with_hold::<T>(&bytes, hold(&shared)).unwrap();
+            assert_eq!(decoded.value, value);
+            assert_eq!(decoded.hold.used, std::mem::size_of::<T>() + charge);
+            drop(decoded);
+            assert_eq!(shared.used.load(Relaxed), 0);
+        }
+
+        // Each nonempty case fits as a flat buffer, but would exceed the
+        // budget if the per-element sequence adapter decoded its bytes.
+        let path = vec![0xff; RESERVATION_GRANULE / 4];
+        check(Single(path.clone()), &path, path.len());
+        check(Optional(Some(path.clone())), &Some(&path), path.len());
+        check(Optional(None), &None::<PathBytes>, 0);
+        let paths = vec![path.clone(), Vec::new(), path];
+        // LimitedSeq also charges the final probe for the end of the sequence.
+        let list_slots = (paths.len() + 1) * 8 * std::mem::size_of::<PathBytes>();
+        let path_bytes = paths.iter().map(Vec::len).sum::<usize>();
+        check(List(paths.clone()), &paths, list_slots + path_bytes);
+    }
+
+    #[test]
+    fn single_optional_and_list_paths_exhaust_the_budget() {
+        use crate::proto::{Entry, Op, Request};
+
+        fn check<T: for<'de> Deserialize<'de> + fmt::Debug>(bytes: &[u8]) {
+            let shared = budget();
+            let error = decode_with_hold::<T>(bytes, hold(&shared)).unwrap_err();
+            assert!(error.to_string().contains("memory budget exhausted"));
+            assert_eq!(shared.used.load(Relaxed), 0);
+        }
+
+        let long_path = vec![b'p'; RESERVATION_GRANULE];
+        let op = Op::Remove {
+            path: long_path.clone(),
+        };
+        check::<Op>(&postcard::to_stdvec(&op).unwrap());
+
+        let entry = Entry {
+            path: Vec::new(),
+            kind: crate::proto::Kind::Symlink,
+            size: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+            mode: 0o777,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            dev: 0,
+            ino: 0,
+            nlink: 1,
+            ctime: 0,
+            ctime_nsec: 0,
+            link: Some(long_path),
+            atime: Default::default(),
+            inode_metadata: None,
+        };
+        check::<Entry>(&postcard::to_stdvec(&entry).unwrap());
+
+        let half = vec![b'p'; RESERVATION_GRANULE / 2];
+        for paths in [vec![half.clone(), half], vec![Vec::new(); 10_000]] {
+            let lookup = Request::PruneLookup { paths };
+            check::<Request>(&postcard::to_stdvec(&lookup).unwrap());
         }
     }
 

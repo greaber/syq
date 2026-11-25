@@ -157,6 +157,7 @@ pub type PathBytes = Vec<u8>;
 #[derive(Serialize, Clone, Debug, Eq, PartialEq)]
 pub struct RegisteredPath {
     root: RegisteredRootId,
+    #[serde(with = "crate::wire_budget::budgeted_bytes")]
     relative: PathBytes,
 }
 
@@ -193,6 +194,7 @@ impl<'de> Deserialize<'de> for RegisteredPath {
         #[derive(Deserialize)]
         struct WirePath {
             root: RegisteredRootId,
+            #[serde(with = "crate::wire_budget::budgeted_bytes")]
             relative: PathBytes,
         }
         let wire = WirePath::deserialize(deserializer)?;
@@ -243,6 +245,7 @@ pub enum Kind {
 /// recursive scan or unnecessary metadata on every press of Tab.
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 pub struct CompletionEntry {
+    #[serde(with = "crate::wire_budget::budgeted_bytes")]
     pub name: PathBytes,
     pub directory: bool,
 }
@@ -261,6 +264,7 @@ pub enum OperatorSymlinkPolicy {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Entry {
     /// Relative to the scan root; empty means the root itself.
+    #[serde(with = "crate::wire_budget::budgeted_bytes")]
     pub path: PathBytes,
     pub kind: Kind,
     pub size: u64,
@@ -279,6 +283,7 @@ pub struct Entry {
     /// unlink/recreate race that happens to reuse the same inode number.
     pub ctime: i64,
     pub ctime_nsec: u32,
+    #[serde(with = "crate::wire_budget::budgeted_opt_bytes")]
     pub link: Option<PathBytes>,
     // Only used while capturing metadata on the scanning endpoint. The
     // selected value travels in inode_metadata; ordinary scans pay no wire cost.
@@ -424,6 +429,7 @@ pub enum TargetCondition {
 /// One whole-file read in the pipelined small-file path.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallRead {
+    #[serde(with = "crate::wire_budget::budgeted_bytes")]
     pub path: PathBytes,
     /// Authoritative source capability. `path` is only a diagnostic/legacy
     /// spelling when this is present.
@@ -435,6 +441,7 @@ pub struct SmallRead {
 /// One whole-file publication in the pipelined small-file path.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallPut {
+    #[serde(with = "crate::wire_budget::budgeted_bytes")]
     pub path: PathBytes,
     pub copy_id: CopyId,
     #[serde(with = "serde_bytes")]
@@ -486,6 +493,7 @@ pub struct FileFingerprint {
 /// source that would replace it.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ExistingRead {
+    #[serde(with = "crate::wire_budget::budgeted_bytes")]
     pub path: PathBytes,
     pub len: u64,
     pub condition: TargetCondition,
@@ -505,6 +513,7 @@ pub struct ExistingHashes {
 /// hashes differ from `expected`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DifferingRead {
+    #[serde(with = "crate::wire_budget::budgeted_bytes")]
     pub path: PathBytes,
     pub source: Option<RegisteredPath>,
     pub attempt: u32,
@@ -536,6 +545,7 @@ pub struct DifferingBlocks {
 /// the existing file instead, where the receiver can vouch for it.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallPatch {
+    #[serde(with = "crate::wire_budget::budgeted_bytes")]
     pub path: PathBytes,
     pub copy_id: CopyId,
     pub len: u64,
@@ -711,6 +721,7 @@ pub enum Which {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Op {
     Mkdir {
+        #[serde(with = "crate::wire_budget::budgeted_bytes")]
         path: PathBytes,
         mode: u32,
         condition: TargetCondition,
@@ -718,7 +729,9 @@ pub enum Op {
     /// Create a symlink, given `meta` under `flags` before it is published
     /// at `path`: a later change of its metadata creates it again.
     Symlink {
+        #[serde(with = "crate::wire_budget::budgeted_bytes")]
         path: PathBytes,
+        #[serde(with = "crate::wire_budget::budgeted_bytes")]
         target: PathBytes,
         condition: TargetCondition,
         meta: Meta,
@@ -727,6 +740,7 @@ pub enum Op {
     /// Create a device node, FIFO or socket, given its metadata as a
     /// symlink is.
     Mknod {
+        #[serde(with = "crate::wire_budget::budgeted_bytes")]
         path: PathBytes,
         mode: u32,
         rdev: u64,
@@ -735,6 +749,7 @@ pub enum Op {
         flags: u8,
     },
     SetMeta {
+        #[serde(with = "crate::wire_budget::budgeted_bytes")]
         path: PathBytes,
         meta: Meta,
         flags: u8,
@@ -747,6 +762,7 @@ pub enum Op {
     /// Apply metadata to a regular file only if the path still satisfies the
     /// planner's condition.
     SetFileMetaIfSame {
+        #[serde(with = "crate::wire_budget::budgeted_bytes")]
         path: PathBytes,
         condition: TargetCondition,
         meta: Meta,
@@ -754,7 +770,9 @@ pub enum Op {
     },
     /// Publish another name for a validated regular-file representative.
     Hardlink {
+        #[serde(with = "crate::wire_budget::budgeted_bytes")]
         path: PathBytes,
+        #[serde(with = "crate::wire_budget::budgeted_bytes")]
         source: PathBytes,
         dev: u64,
         ino: u64,
@@ -765,12 +783,21 @@ pub enum Op {
     },
     /// Remove whatever currently occupies the path, recursively when it is a
     /// directory. Planned deletion uses Unlink/Rmdir instead.
-    Remove { path: PathBytes },
+    Remove {
+        #[serde(with = "crate::wire_budget::budgeted_bytes")]
+        path: PathBytes,
+    },
     /// Remove an empty directory.
-    Rmdir { path: PathBytes },
+    Rmdir {
+        #[serde(with = "crate::wire_budget::budgeted_bytes")]
+        path: PathBytes,
+    },
     /// Remove a non-directory; a directory that has appeared there is an
     /// error, never recursed into (used by --delete for planned leaves).
-    Unlink { path: PathBytes },
+    Unlink {
+        #[serde(with = "crate::wire_budget::budgeted_bytes")]
+        path: PathBytes,
+    },
 }
 
 /// An `Op::SetMeta`'s share of its request (`Op::size_hint`).
@@ -1172,6 +1199,7 @@ pub enum WireRequest<Data> {
     },
     /// lstat each path; with `follow`, stat through symlinks instead.
     StatMany {
+        #[serde(with = "crate::wire_budget::budgeted_vec_bytes")]
         paths: Vec<PathBytes>,
         /// Authoritative registered source references. Parallel `paths` are
         /// used only outside a source session.
@@ -1252,7 +1280,9 @@ pub enum WireRequest<Data> {
     /// returned only when every directory is still a directory, so callers
     /// can preserve parent-before-child replacement.
     PlanBatch {
+        #[serde(with = "crate::wire_budget::budgeted_vec_bytes")]
         directories: Vec<PathBytes>,
+        #[serde(with = "crate::wire_budget::budgeted_vec_bytes")]
         others: Vec<PathBytes>,
         /// Fail on unreadable entries instead of treating them as absent.
         strict_metadata: bool,
@@ -1460,6 +1490,7 @@ pub enum WireRequest<Data> {
     /// Destination lookup for pruning. Unlike planning stats, errors other
     /// than a missing path fail the request rather than looking absent.
     PruneLookup {
+        #[serde(with = "crate::wire_budget::budgeted_vec_bytes")]
         paths: Vec<PathBytes>,
     },
     // Append new variants: released completion payloads retain their indexes.
@@ -1650,6 +1681,7 @@ impl std::fmt::Display for ScanWarning {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ReadStreamRequest {
+    #[serde(with = "crate::wire_budget::budgeted_bytes")]
     pub path: PathBytes,
     pub source: Option<RegisteredPath>,
     pub attempt: u32,
@@ -1704,6 +1736,7 @@ pub struct SmallCopyIdentity {
 /// directory.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SmallCopyFile {
+    #[serde(with = "crate::wire_budget::budgeted_bytes")]
     pub path: PathBytes,
     /// Original source facts and expression path, before publication modes.
     pub expression_source: Option<(crate::expression::File<'static>, PathBytes)>,
@@ -1888,7 +1921,7 @@ pub enum Response {
     TcpCongestionRejected(String),
     ScanBatch(Vec<Entry>),
     /// Paths (relative to the root) skipped because the ignore patterns matched them.
-    ScanIgnored(Vec<PathBytes>),
+    ScanIgnored(#[serde(with = "crate::wire_budget::budgeted_vec_bytes")] Vec<PathBytes>),
     ScanDone,
     DirectoryEntries {
         entries: Vec<CompletionEntry>,
