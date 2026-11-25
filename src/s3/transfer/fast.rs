@@ -86,15 +86,20 @@ impl Engine {
             .and_then(|limits| limits.s3_object_workers)
             .unwrap_or(usize::MAX);
         let small_upload = *route == Route::Upload && largest <= 1024 * 1024;
-        // Descriptors bound every small upload, and what automatic admission
-        // keeps in progress of more than one object. A count the user fixed,
-        // a dry run and a single object keep the usual ceiling rather than
-        // fail where the open-file limit leaves little room.
-        let bounded = small_upload || (fixed_workers.is_none() && !self.args.dry_run && count > 1);
         // What memory and descriptors allow in progress at once when each
         // object takes one request: payloads within 256 MiB and four
-        // descriptors per object. Larger objects stream their parts.
-        let capacity = if !single_request || route.is_server_copy() || !bounded {
+        // descriptors per object. Larger objects stream their parts. Every
+        // small upload needs room for its files; anything else keeps the
+        // usual ceiling where the open-file limit leaves little room.
+        let small_capacity = |largest| {
+            let capacity = tuning::small_object_capacity(largest);
+            if small_upload {
+                capacity
+            } else {
+                Ok(capacity.unwrap_or(256))
+            }
+        };
+        let capacity = if !single_request || route.is_server_copy() {
             256
         } else if *route == Route::Upload {
             // Keep the measured Tigris ceiling for files of 1 to 8 MiB. The
@@ -104,9 +109,9 @@ impl Engine {
             } else {
                 1 << 20
             };
-            tuning::small_object_capacity(largest.min(buffer_size))?
+            small_capacity(largest.min(buffer_size))?
         } else if largest < 1024 * 1024 {
-            tuning::small_object_capacity(largest)?
+            small_capacity(largest)?
         } else {
             256
         };

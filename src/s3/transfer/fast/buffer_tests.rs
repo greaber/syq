@@ -109,14 +109,15 @@ fn only_files_the_upload_buffers_hold_wait_for_room_in_them() {
 }
 
 /// Where the open-file limit leaves no room beyond the descriptors kept for
-/// sockets and opens, copies whose objects in progress descriptors do not
-/// bound still run.
+/// sockets and opens, only small uploads fail; other copies keep the usual
+/// ceiling.
 #[test]
-fn a_low_open_file_limit_fails_only_copies_that_descriptors_bound() {
+fn a_low_open_file_limit_fails_only_small_uploads() {
     const CHILD: &str = "SYQ_TEST_LOW_NOFILE_OBJECT_WORKERS";
     if std::env::var_os(CHILD).is_none() {
         // Only the child lowers its limit; other tests are unaffected.
-        let name = "s3::transfer::fast::buffer_tests::a_low_open_file_limit_fails_only_copies_that_descriptors_bound";
+        let name =
+            "s3::transfer::fast::buffer_tests::a_low_open_file_limit_fails_only_small_uploads";
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", name, "--nocapture"])
             .env(CHILD, "1")
@@ -134,7 +135,13 @@ fn a_low_open_file_limit_fails_only_copies_that_descriptors_bound() {
     crate::fsops::set_nofile_limits(&limits).unwrap();
     assert!(tuning::small_object_capacity(1024).is_err());
     let small = || std::iter::repeat_n(1024u64, 100);
-    // A count the user fixed,
+    // Downloads of small objects, few or many, a count the user fixed,
+    for count in [2, 100] {
+        let workers = planning_engine(&[])
+            .object_workers(std::iter::repeat_n(1024u64, count))
+            .unwrap();
+        assert_eq!(workers.objects, 256);
+    }
     let fixed = planning_engine(&["--performance-tuning", "s3-objects=1"]);
     assert_eq!(fixed.object_workers(small()).unwrap().objects, 1);
     let (fixed, _temp) = route_engine("upload", &["--performance-tuning", "s3-objects=2"]);
@@ -149,9 +156,9 @@ fn a_low_open_file_limit_fails_only_copies_that_descriptors_bound() {
     planning_engine(&[])
         .object_workers(std::iter::once(1024))
         .unwrap();
-    // Automatic admission of many objects needs room for them, and every
-    // small upload for its files.
-    assert!(planning_engine(&[]).object_workers(small()).is_err());
+    // Every small upload needs room for its files.
+    let (upload, _temp) = route_engine("upload", &[]);
+    assert!(upload.object_workers(small()).is_err());
     let (upload, _temp) = route_engine("upload", &["--performance-tuning", "s3-objects=1"]);
     assert!(upload.object_workers(small()).is_err());
 }

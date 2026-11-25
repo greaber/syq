@@ -85,8 +85,8 @@ open-file limit allow:
 - other objects averaging under a megabyte, to or from a distant endpoint,
   start with 256, and syq adds requests an eighth at a time rather than
   doubling them, since each download in flight holds its response;
-- objects averaging a megabyte or more that each take one request start with
-  32;
+- objects averaging a megabyte or more (including files of exactly a
+  megabyte) that each take one request start with 32;
 - anything else starts with 64.
 
 Uploads to Tigris start as they would to a nearby endpoint.
