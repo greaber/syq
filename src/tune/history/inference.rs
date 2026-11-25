@@ -1,11 +1,6 @@
 //! Derive a starting choice at read time; saved recommendations are not inputs.
 use super::*;
-use std::collections::BTreeMap;
-
-// Per doubling, as a fraction of total comparison weight. This weak starting
-// preference lets negligible old support for more workers fade instead of
-// turning a collection of one-sided comparisons into a maximum-ever rule.
-const STARTUP_CONNECTION_COST: f64 = 0.01;
+use std::collections::{BTreeMap, BTreeSet};
 
 // Original run indexes already partition by eligibility. Older formats remain
 // inspectable, but only runs with ordered measurement rows seed new starts.
@@ -16,22 +11,185 @@ pub(super) const MEASUREMENTS: i64 = 4;
 const RUN_LIMIT: usize = 64;
 const OBSERVATION_LIMIT: usize = 240;
 
-struct Comparison {
-    workers: usize,
-    refine: bool,
-    // The best count was the highest one measured. This is evidence against
-    // lower counts, not evidence against untested higher counts.
-    lower_bound: bool,
+#[derive(Clone, Copy)]
+struct Edge {
+    a: usize,
+    b: usize,
+    diff: f64,
+    weight: f64,
 }
 
-impl Comparison {
-    fn distance(&self, workers: usize) -> f64 {
-        let delta = (workers as f64 / self.workers as f64).log2();
-        if self.lower_bound {
-            (-delta).max(0.0)
-        } else {
-            delta.abs()
+#[derive(Default)]
+struct PooledInference {
+    runs: Vec<(i64, f64, Vec<Edge>)>,
+    newest_for_count: BTreeMap<usize, i64>,
+}
+
+impl PooledInference {
+    fn push_run(&mut self, run: i64, decay: f64, evidence: RunEvidence) {
+        let edges = evidence.edges();
+        if edges.is_empty() {
+            return;
         }
+        for edge in &edges {
+            self.newest_for_count.entry(edge.a).or_insert(run);
+            self.newest_for_count.entry(edge.b).or_insert(run);
+        }
+        self.runs.push((run, decay, edges));
+    }
+
+    fn solve(self, specific: bool) -> Option<Hint> {
+        let mut vertices = BTreeSet::new();
+        let mut weighted_edges = Vec::new();
+        let mut max_weight = 0.0_f64;
+        for (rank, (_run, time_decay, edges)) in self.runs.iter().enumerate() {
+            let decay = time_decay * 0.85_f64.powi(rank as i32);
+            for &edge in edges {
+                let w = edge.weight * decay;
+                if w <= 0.0 || !w.is_finite() {
+                    continue;
+                }
+                vertices.insert(edge.a);
+                vertices.insert(edge.b);
+                max_weight = max_weight.max(w);
+                weighted_edges.push((edge, w));
+            }
+        }
+        let verts: Vec<usize> = vertices.into_iter().collect();
+        let m = verts.len();
+        if m < 2 || weighted_edges.is_empty() || max_weight <= 0.0 {
+            return None;
+        }
+        // Weak prior toward equal throughput across unbridged gaps so stale or
+        // disconnected historical high-water segments decay naturally.
+        let lambda = 0.05 * max_weight;
+        let idx = |n: usize| verts.binary_search(&n).unwrap();
+        let mut f = vec![0.0f64; m];
+        if m <= 128 {
+            let d = m - 1;
+            let mut a = vec![vec![0.0f64; d]; d];
+            let mut b = vec![0.0f64; d];
+            let mut add_edge = |i: usize, j: usize, y: f64, w: f64| {
+                if i > 0 {
+                    a[i - 1][i - 1] += w;
+                    b[i - 1] -= w * y;
+                }
+                if j > 0 {
+                    a[j - 1][j - 1] += w;
+                    b[j - 1] += w * y;
+                }
+                if i > 0 && j > 0 {
+                    a[i - 1][j - 1] -= w;
+                    a[j - 1][i - 1] -= w;
+                }
+            };
+            for &(edge, w) in &weighted_edges {
+                add_edge(idx(edge.a), idx(edge.b), edge.diff, w);
+            }
+            for k in 0..d {
+                add_edge(k, k + 1, 0.0, lambda);
+            }
+            for col in 0..d {
+                let mut pivot = col;
+                let mut best_val = a[col][col].abs();
+                for (r, row) in a.iter().enumerate().skip(col + 1) {
+                    if row[col].abs() > best_val {
+                        best_val = row[col].abs();
+                        pivot = r;
+                    }
+                }
+                if best_val == 0.0 {
+                    continue;
+                }
+                a.swap(col, pivot);
+                b.swap(col, pivot);
+                let diag = a[col][col];
+                for cell in &mut a[col][col..d] {
+                    *cell /= diag;
+                }
+                b[col] /= diag;
+                let (before_a, rest_a) = a.split_at_mut(col);
+                let (pivot_slice, after_a) = rest_a.split_at_mut(1);
+                let pivot_tail = &pivot_slice[0][col..d];
+                let (before_b, rest_b) = b.split_at_mut(col);
+                let pivot_b = rest_b[0];
+                let after_b = &mut rest_b[1..];
+                for (row, rhs) in before_a
+                    .iter_mut()
+                    .zip(before_b.iter_mut())
+                    .chain(after_a.iter_mut().zip(after_b.iter_mut()))
+                {
+                    let factor = row[col];
+                    if factor == 0.0 {
+                        continue;
+                    }
+                    for (dst, &src) in row[col..d].iter_mut().zip(pivot_tail) {
+                        *dst -= factor * src;
+                    }
+                    *rhs -= factor * pivot_b;
+                }
+            }
+            f[1..=d].copy_from_slice(&b[..d]);
+        } else {
+            for _ in 0..200 {
+                for u in 0..m {
+                    let mut num = 0.0;
+                    let mut den = 0.0;
+                    for &(edge, w) in &weighted_edges {
+                        let i = idx(edge.a);
+                        let j = idx(edge.b);
+                        if i == u {
+                            num += w * (f[j] - edge.diff);
+                            den += w;
+                        } else if j == u {
+                            num += w * (f[i] + edge.diff);
+                            den += w;
+                        }
+                    }
+                    if u > 0 {
+                        num += lambda * f[u - 1];
+                        den += lambda;
+                    }
+                    if u + 1 < m {
+                        num += lambda * f[u + 1];
+                        den += lambda;
+                    }
+                    if den > 0.0 {
+                        f[u] = num / den;
+                    }
+                }
+                let base = f[0];
+                for v in &mut f {
+                    *v -= base;
+                }
+            }
+        }
+        let base_n = verts[0] as f64;
+        let mut best_idx = 0usize;
+        let mut best_u = f64::NEG_INFINITY;
+        for (k, &n) in verts.iter().enumerate() {
+            let u = f[k] - crate::tune::CONCURRENCY_COST * (n as f64 / base_n).ln();
+            if u > best_u + 1e-12 {
+                best_u = u;
+                best_idx = k;
+            }
+        }
+        let workers = verts[best_idx];
+        let refine = specific
+            && verts
+                .iter()
+                .enumerate()
+                .any(|(k, &n)| n != workers && (f[k] - f[best_idx]).exp() >= 0.95);
+        let run = *self
+            .newest_for_count
+            .get(&workers)
+            .or_else(|| self.runs.first().map(|(r, _, _)| r))?;
+        Some(Hint {
+            run,
+            workers,
+            matched: if specific { "filesystems" } else { "route" }.into(),
+            refine,
+        })
     }
 }
 
@@ -73,7 +231,7 @@ pub(super) fn starting_count(
              ORDER BY sequence",
             OBSERVATION_LIMIT - 1
         ))?;
-        let mut choices = Vec::new();
+        let mut pooled = PooledInference::default();
         let today = day();
         while let Some(row) = runs.next()? {
             if !row.get::<_, bool>(2)? {
@@ -92,49 +250,18 @@ pub(super) fn starting_count(
                     usable: row.get(4)?,
                 });
             }
-            if let Some(comparison) = evidence.finish() {
-                let age = today.saturating_sub(when).max(0) as f64;
-                let weight = 2.0_f64.powf(-age / 7.0) / (choices.len() + 1) as f64;
-                if weight > 0.0 {
-                    choices.push((comparison, weight, run));
-                    if choices.len() == 32 {
-                        break;
-                    }
+            evidence.finish_segment();
+            let age = today.saturating_sub(when).max(0) as f64;
+            let decay = 2.0_f64.powf(-age / 7.0);
+            if decay > 0.0 {
+                pooled.push_run(run, decay, evidence);
+                if pooled.runs.len() == 32 {
+                    break;
                 }
             }
         }
-        // Combine within-run preferences, never absolute speeds across runs.
-        // An unfinished ramp supplies no evidence against higher candidates.
-        // A separate small connection cost prevents arbitrarily weak old bounds
-        // from keeping a high start forever in the absence of a measured slowdown.
-        // Equal final scores favor the higher start; live exploration can revise it.
-        choices.sort_by_key(|c| std::cmp::Reverse(c.0.workers));
-        let Some(minimum) = choices.iter().map(|c| c.0.workers).min() else {
-            continue;
-        };
-        let total_weight = choices.iter().map(|c| c.1).sum::<f64>();
-        let mut best = None;
-        let mut best_loss = f64::INFINITY;
-        for (comparison, _, run) in &choices {
-            let loss = choices
-                .iter()
-                .map(|(c, w, _)| w * c.distance(comparison.workers))
-                .sum::<f64>()
-                + total_weight
-                    * STARTUP_CONNECTION_COST
-                    * (comparison.workers as f64 / minimum as f64).log2();
-            if loss < best_loss {
-                best_loss = loss;
-                best = Some(Hint {
-                    run: *run,
-                    workers: comparison.workers,
-                    matched: if specific { "filesystems" } else { "route" }.into(),
-                    refine: specific && comparison.refine,
-                });
-            }
-        }
-        if best.is_some() {
-            return Ok(best);
+        if let Some(hint) = pooled.solve(specific) {
+            return Ok(Some(hint));
         }
     }
     Ok(None)
@@ -146,7 +273,7 @@ pub(super) fn starting_count(
 pub(super) struct Eligibility {
     consistent: bool,
     incompatible: bool,
-    counts: std::collections::BTreeSet<usize>,
+    counts: BTreeSet<usize>,
     positive: bool,
 }
 
@@ -218,91 +345,104 @@ impl Observation {
 
 #[derive(Default)]
 struct RunEvidence {
-    points: BTreeMap<usize, f64>,
+    segments: Vec<(usize, f64, f64)>,
     current: Option<(i64, usize)>,
     current_rate: Option<f64>,
     reference: f64,
     recent: std::collections::VecDeque<(f64, f64)>,
+    total_secs: f64,
+    total_activity: f64,
+    total_intervals: usize,
 }
 
 impl RunEvidence {
-    fn push(&mut self, observation: Observation) {
-        let current = (observation.segment, observation.workers);
-        if self.current != Some(current) {
-            // Compare against the preceding setting, not the fastest rate
-            // anywhere in the run. Never join separate visits to a count.
-            self.reference = self.current_rate.unwrap_or(0.0);
-            self.current_rate = None;
-            self.current = Some(current);
-            self.recent.clear();
-        }
-        if !observation.valid() {
-            self.recent.clear();
+    fn finish_segment(&mut self) {
+        let Some((_, workers)) = self.current else {
             return;
+        };
+        if self.total_intervals >= 2 && self.total_secs >= 2.5 - 1e-6 && self.total_activity > 0.0 {
+            let mean = self.total_activity / self.total_secs;
+            self.segments.push((workers, self.total_secs, mean));
+            self.current_rate = Some(mean);
+        } else if let Some(collapse_rate) = self.severe_loss_rate() {
+            // Early collapse aborts (< 2.5s) still warn future copies away from bad counts.
+            self.segments.push((workers, 2.5, collapse_rate));
+            self.current_rate = Some(collapse_rate);
         }
-        self.recent
-            .push_back((observation.rate, observation.seconds));
-        let mut duration: f64 = self.recent.iter().map(|p| p.1).sum();
-        while self.recent.len() > 2 && duration - self.recent[0].1 >= 5.0 {
-            duration -= self.recent.pop_front().unwrap().1;
-        }
-        if let Some(rate) = self.recent_rate().filter(|r| r.is_finite()) {
-            self.points.insert(observation.workers, rate);
-            self.current_rate = Some(rate);
-        }
+        self.recent.clear();
+        self.total_secs = 0.0;
+        self.total_activity = 0.0;
+        self.total_intervals = 0;
     }
 
-    /// Keep the historical estimator stable across changes to live probing.
-    /// A clear change uses its recent intervals, otherwise average the window.
-    fn recent_rate(&self) -> Option<f64> {
+    fn severe_loss_rate(&self) -> Option<f64> {
         let base = self.reference;
+        if base <= 0.0 {
+            return None;
+        }
         let (mut seconds, mut activity, mut low, mut high) = (0.0, 0.0, f64::INFINITY, 0.0_f64);
         for (i, &(rate, elapsed)) in self.recent.iter().rev().enumerate() {
             seconds += elapsed;
             activity += rate * elapsed;
             low = low.min(rate);
             high = high.max(rate);
-            if i >= 1
-                && base > 0.0
-                && ((seconds >= 1.0 && low > 0.0 && high < base * 0.5)
-                    || (seconds >= 2.5 && ((low > 0.0 && high < base * 0.8) || low > base * 1.2))
-                    || (seconds >= 5.0 && (high < base * 0.95 || low * 0.95 > base)))
-            {
+            if i >= 1 && seconds >= 1.0 - 1e-9 && low > 0.0 && high < base * 0.5 {
                 return Some(activity / seconds);
             }
         }
-        let duration: f64 = self.recent.iter().map(|p| p.1).sum();
-        (self.recent.len() >= 2 && duration >= 2.5)
-            .then(|| self.recent.iter().map(|(r, t)| r * t).sum::<f64>() / duration)
+        None
     }
 
-    fn finish(self) -> Option<Comparison> {
-        let points: Vec<_> = self.points.into_iter().collect();
-        // One observed count establishes throughput, not a relative preference.
-        if points.len() < 2 {
-            return None;
+    fn push(&mut self, observation: Observation) {
+        let current = (observation.segment, observation.workers);
+        if self.current != Some(current) {
+            self.finish_segment();
+            self.reference = self.current_rate.unwrap_or(0.0);
+            self.current_rate = None;
+            self.current = Some(current);
         }
-        let best = points.iter().map(|p| p.1).fold(0.0, f64::max);
-        if best <= 0.0 {
-            return None;
+        if !observation.valid() {
+            self.recent.clear();
+            self.total_secs = 0.0;
+            self.total_activity = 0.0;
+            self.total_intervals = 0;
+            return;
         }
-        // A small connection cost breaks flat-rate ties without sacrificing a
-        // meaningful speed gain: 0.1% of throughput per doubling. Otherwise flat
-        // successive runs would ratchet their starting counts upward forever.
-        let minimum = points.first()?.0 as f64;
-        let utility = |n: usize, rate: f64| rate / best - 0.001 * (n as f64 / minimum).log2();
-        let workers = points
-            .iter()
-            .max_by(|a, b| utility(a.0, a.1).total_cmp(&utility(b.0, b.1)))?
-            .0;
-        let refine = points
-            .iter()
-            .any(|(n, rate)| *n != workers && *rate >= best * 0.95);
-        Some(Comparison {
-            workers,
-            refine,
-            lower_bound: workers == points.last()?.0,
-        })
+        self.recent
+            .push_back((observation.rate, observation.seconds));
+        self.total_secs += observation.seconds;
+        self.total_activity += observation.rate * observation.seconds;
+        self.total_intervals += 1;
+        let mut duration: f64 = self.recent.iter().map(|p| p.1).sum();
+        while self.recent.len() > 2 && duration - self.recent[0].1 >= 5.0 {
+            duration -= self.recent.pop_front().unwrap().1;
+        }
+        if self.recent.len() >= 2 && duration >= 2.5 - 1e-6 {
+            let rate = self.recent.iter().map(|(r, t)| r * t).sum::<f64>() / duration;
+            if rate.is_finite() && rate > 0.0 {
+                self.current_rate = Some(rate);
+            }
+        }
+    }
+
+    fn edges(&self) -> Vec<Edge> {
+        let mut out = Vec::new();
+        for pair in self.segments.windows(2) {
+            let (n_a, t_a, r_a) = pair[0];
+            let (n_b, t_b, r_b) = pair[1];
+            if n_a == n_b || r_a <= 0.0 || r_b <= 0.0 {
+                continue;
+            }
+            let ta = t_a.min(10.0);
+            let tb = t_b.min(10.0);
+            out.push(Edge {
+                a: n_a,
+                b: n_b,
+                diff: (r_b / r_a).ln(),
+                weight: (ta * tb) / (ta + tb),
+            });
+        }
+        out
     }
 }
 
@@ -316,10 +456,13 @@ fn infer_run(events: &[Value]) -> Option<(usize, bool)> {
             evidence.push(observation);
         }
     }
+    evidence.finish_segment();
     if !eligibility.reusable() {
         return None;
     }
-    evidence.finish().map(|c| (c.workers, c.refine))
+    let mut pooled = PooledInference::default();
+    pooled.push_run(1, 1.0, evidence);
+    pooled.solve(true).map(|h| (h.workers, h.refine))
 }
 
 #[cfg(test)]
@@ -420,7 +563,8 @@ mod tests {
                 } else {
                     let score = score.expect("recent loss warrants an early rollback");
                     assert_eq!(score.seconds, 1.0);
-                    assert_eq!(policy.observe(score.rate), 8);
+                    assert_eq!(policy.observe(score.rate), 6);
+                    assert_eq!(policy.settled(), 8);
                 }
             }
             writer.complete(true, json!({}));
@@ -642,11 +786,29 @@ mod tests {
             let capped = record(&path, &key, Some(8), true, &[(4, 100.0), (8, 200.0)]);
             assert_eq!(capped.starting_count(&key, false).unwrap().workers, 16);
         }
-        // A newer comparison actually showing a slowdown above 4 is different:
-        // it can revise the start, even though the run had an explicit cap.
-        record(&path, &key, Some(32), true, &[(4, 200.0), (8, 100.0)]);
-        let below = record(&path, &key, Some(32), true, &[(4, 200.0), (8, 100.0)]);
-        assert_eq!(below.starting_count(&key, false).unwrap().workers, 4);
+        // Newer comparisons showing contention across the previously fast counts
+        // step the start down even with an explicit cap of 32: two reversing
+        // runs overturn the single 8->16 gain (dropping 16->8), and three
+        // overcome the five earlier same-day 4->8 runs under 0.85^rank decay.
+        for expected in [8, 4] {
+            if expected == 8 {
+                record(
+                    &path,
+                    &key,
+                    Some(32),
+                    true,
+                    &[(4, 200.0), (8, 100.0), (16, 50.0)],
+                );
+            }
+            let below = record(
+                &path,
+                &key,
+                Some(32),
+                true,
+                &[(4, 200.0), (8, 100.0), (16, 50.0)],
+            );
+            assert_eq!(below.starting_count(&key, false).unwrap().workers, expected);
+        }
     }
 
     #[test]

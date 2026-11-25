@@ -126,10 +126,19 @@ fn failed_doubling_restores_the_known_good_count_before_another_experiment() {
     let mut p = Policy::new(8, MIN, 64);
     measure(&mut p, 80.0);
     measure(&mut p, 160.0);
-    measure(&mut p, 150.0);
-    assert_eq!(p.n, 16);
+    // An upward collapse (< 0.85 * base) rolls back immediately and probes
+    // the opposite bracket once before settling.
+    measure(&mut p, 120.0);
     assert_eq!(p.settled(), 16);
-    assert!(matches!(p.state, State::Hold));
+    assert_eq!(p.n, 12);
+    assert!(matches!(
+        p.state,
+        State::Explore {
+            from: 16,
+            direction: Direction::Down,
+            ..
+        }
+    ));
     assert!(p.due[Direction::Up.index()] > p.tick);
 }
 
@@ -164,7 +173,8 @@ fn resume_worker_reset_preserves_cached_and_uncached_startup_modes() {
 
     let mut refined = Policy::new(2, MIN, MAX);
     measure(&mut refined, 20.0);
-    measure(&mut refined, 20.0); // inconclusive doubling has stopped coarse search
+    measure(&mut refined, 20.0); // first flat window grants warmup grace
+    measure(&mut refined, 20.0); // second window rejects 4 and clears startup doubling
     for (policy, expected_next) in [
         (Policy::refine(2, MIN, MAX), 10),
         (Policy::new(2, MIN, MAX), 16),
@@ -285,7 +295,7 @@ fn doubling_a_weak_start_reaches_the_plateau_before_premature_refinement() {
 }
 
 #[test]
-fn upward_gain_continues_but_inconclusive_result_holds() {
+fn upward_gain_continues_but_below_cost_gain_rolls_back() {
     let mut worthwhile = Policy::refine(10, MIN, MAX);
     measure(&mut worthwhile, 100.0);
     measure(&mut worthwhile, 107.0);
@@ -293,9 +303,11 @@ fn upward_gain_continues_but_inconclusive_result_holds() {
 
     let mut unnecessary = Policy::refine(10, MIN, MAX);
     measure(&mut unnecessary, 100.0);
-    measure(&mut unnecessary, 104.0);
-    assert_eq!(unnecessary.settled(), 13);
-    assert_eq!(unnecessary.state, State::Hold);
+    measure(&mut unnecessary, 101.0); // below CONCURRENCY_COST; first window doubts
+    assert_eq!(unnecessary.n, 13);
+    measure(&mut unnecessary, 101.0); // confirmed flat: rolls back to 10 and checks down
+    assert_eq!(unnecessary.settled(), 10);
+    assert_eq!(unnecessary.n, 8);
 }
 
 #[test]
@@ -369,34 +381,35 @@ fn uncached_start_reaches_full_rate_without_accepting_slower_reductions() {
 }
 
 #[test]
-fn a_failed_up_probe_does_not_immediately_bounce_down() {
+fn failed_up_probe_checks_downward_bracket_without_ping_pong() {
     let mut p = Policy::refine(10, MIN, MAX);
     measure(&mut p, 100.0); // 10 -> 13
     measure(&mut p, 130.0); // 13 paid; try 17
-    measure(&mut p, 90.0); // 17 clearly hurt; return to 13
+    measure(&mut p, 90.0); // 17 clearly hurt; return to 13 and refine 10..13
+    assert_eq!(p.settled(), 13);
+    assert_eq!(p.n, 11);
+    measure(&mut p, 110.0); // 11 is slower than 13; return to 13
+    assert_eq!(p.settled(), 13);
     assert_eq!(p.n, 13);
-    for _ in 0..PROBE_EVERY - 1 {
-        measure(&mut p, 130.0);
-        assert_eq!(p.n, 13, "history {:?}", p.history);
-    }
-    measure(&mut p, 130.0);
-    // The later down probe refines the measured 10..13 bracket.
-    assert_eq!(p.n, 11, "history {:?}", p.history);
+    assert_eq!(p.state, State::Hold);
 }
 
 #[test]
-fn rejects_a_slightly_slower_downward_probe() {
+fn rejects_a_slower_downward_probe_while_accepting_flat_savings() {
     let mut p = Policy::refine(10, MIN, MAX);
     measure(&mut p, 100.0);
     measure(&mut p, 130.0);
-    measure(&mut p, 90.0); // clear loss at 17 leaves the 10..13 bracket
-    for _ in 0..PROBE_EVERY {
-        measure(&mut p, 130.0);
-    }
+    measure(&mut p, 90.0); // clear loss at 17 triggers down probe 11
     assert_eq!(p.n, 11);
-    measure(&mut p, 129.0);
+    measure(&mut p, 125.0); // -3.8% rate exceeds cost savings (-1.3%) -> keep 13
     assert_eq!(p.settled(), 13);
     assert_eq!(p.n, 13);
+
+    let mut flat = Policy::refine(13, MIN, MAX);
+    assert!(flat.begin(Direction::Down, 130.0));
+    flat.activated();
+    measure(&mut flat, 129.0); // -0.77% rate for 23% fewer workers beats cost -> keep 10
+    assert_eq!(flat.settled(), 10);
 }
 
 #[test]
@@ -415,12 +428,12 @@ fn modest_gains_per_doubling_hold_peak_throughput() {
 }
 
 #[test]
-fn flat_throughput_does_not_justify_a_reduction() {
+fn flat_throughput_reduces_to_minimum_workers() {
     let mut p = Policy::new(START_SSH, MIN, MAX);
-    for _ in 0..200 {
+    for _ in 0..20 {
         measure(&mut p, 100.0);
-        assert!(p.settled() >= START_SSH, "history {:?}", p.history);
     }
+    assert_eq!(p.settled(), MIN, "history {:?}", p.history);
 }
 
 #[test]
@@ -461,6 +474,8 @@ fn silence_is_not_a_signal() {
 fn a_short_run_has_no_cacheable_comparison() {
     let mut p = Policy::new(START_SSH, MIN, MAX);
     measure(&mut p, 80.0);
+    assert!(!p.measured());
+    measure(&mut p, 80.0); // first flat window grants warmup grace
     assert!(!p.measured());
     measure(&mut p, 80.0);
     assert!(p.measured());
@@ -678,11 +693,10 @@ fn preparation_uses_earliest_sample_boundary_and_keeps_rollback_ready() {
     assert_eq!(plan.connect, 21);
     policy.observe(100.0);
     policy.activated();
-    policy.observe(70.0); // reject a clearly slower 21 and settle at 16
+    policy.observe(70.0); // reject 21 immediately and refine down to 16..21 -> 12
     policy.activated();
-    assert_eq!(policy.n, 16);
-    assert!(policy.begin(Direction::Down, 100.0));
-    policy.activated();
+    assert_eq!(policy.settled(), 16);
+    assert_eq!(policy.n, 12);
     let plan = policy.connection_plan(
         &sampler,
         SAMPLE,
@@ -932,34 +946,36 @@ fn one_worker_start_prepares_spare_before_initial_connection_is_ready() {
 }
 
 #[test]
-fn inconclusive_doubling_keeps_capacity_without_another_increase() {
+fn warmup_grace_gives_borderline_upward_probe_one_extra_window_before_rollback() {
     for score in [95.0, 100.0, 104.0] {
         let mut policy = Policy::new(8, 1, 64);
         measure(&mut policy, 100.0);
         assert_eq!(policy.n, 16);
         measure(&mut policy, score);
+        // First window below utility gain pauses for one warmup confirmation.
         assert_eq!(policy.n, 16);
-        assert_eq!(policy.state, State::Hold);
+        assert!(!policy.measured());
+        measure(&mut policy, score);
+        // Second confirmation rolls back to 8 and probes down (6).
+        assert_eq!(policy.settled(), 8);
+        assert_eq!(policy.n, 6);
         assert!(!policy.startup_doubling);
         assert!(policy.measured());
         assert_eq!(
             policy.due[Direction::Up.index()],
             policy.tick + 2 * PROBE_EVERY
         );
-        for _ in 0..PROBE_EVERY - 1 {
-            measure(&mut policy, score);
-            assert_eq!(policy.n, 16);
-        }
     }
 }
 
 #[test]
-fn downward_gain_requirement_preserves_clear_upward_loss_rollback() {
+fn utility_threshold_preserves_clear_losses_and_accepts_flat_savings() {
     let mut policy = Policy::refine(8, 1, 64);
     measure(&mut policy, 100.0);
-    measure(&mut policy, 94.0);
-    assert_eq!(policy.n, 8);
-    for (score, keep_smaller) in [(106.0, true), (101.0, false), (100.0, false), (95.0, false)] {
+    measure(&mut policy, 80.0); // < 0.85 * base rolls back immediately without warmup grace
+    assert_eq!(policy.settled(), 8);
+    assert_eq!(policy.n, 6);
+    for (score, keep_smaller) in [(106.0, true), (100.0, true), (99.0, true), (94.0, false)] {
         let mut policy = Policy::refine(16, 1, 64);
         policy.record(16, 100.0);
         assert!(policy.begin(Direction::Down, 100.0));
@@ -971,29 +987,29 @@ fn downward_gain_requirement_preserves_clear_upward_loss_rollback() {
 }
 
 #[test]
-fn settled_count_follows_kept_increases_and_measured_reductions() {
+fn settled_count_follows_elasticity_and_restoring_down_probes() {
     let mut policy = Policy::new(8, 1, 64);
     measure(&mut policy, 100.0); // Proposed 16 is not settled yet.
     assert_eq!(policy.settled(), 8);
     measure(&mut policy, 200.0); // Clear gain at 16; propose 32.
     assert_eq!(policy.settled(), 16);
-    measure(&mut policy, 200.0); // An inconclusive increase keeps 32 live.
-    assert_eq!(policy.settled(), 32);
+    measure(&mut policy, 200.0); // Warmup grace at 32.
+    assert_eq!(policy.n, 32);
+    measure(&mut policy, 200.0); // Flat 32 rolls back to 16 and bisects 8..16 -> 12.
+    assert_eq!(policy.settled(), 16);
+    assert_eq!(policy.n, 12);
 
-    assert!(policy.begin(Direction::Down, 200.0));
-    policy.activated();
-    assert_eq!(policy.n, 24);
     measure(&mut policy, 220.0);
-    assert_eq!(policy.settled(), 24);
+    assert_eq!(policy.settled(), 12);
     // Allow earlier, slower lower-count measurements to age before retrying.
     for _ in 0..EVIDENCE_MAX_AGE * 4 {
-        if policy.settled() < 16 {
+        if policy.settled() < 8 {
             break;
         }
         let score = 1000.0 / policy.n as f64;
         measure(&mut policy, score);
     }
-    assert!(policy.settled() < 16);
+    assert!(policy.settled() < 8);
     let lower = policy.settled();
     policy.cancel_unapplied();
     assert_eq!(policy.settled(), lower);
@@ -1041,8 +1057,15 @@ fn floor_does_not_prevent_downward_recovery_after_growing() {
 }
 
 #[test]
-fn downward_probe_requires_a_measured_speed_increase() {
-    for score in [94.0, 95.0, 99.0, 100.0, 100.001, 101.0, 106.0] {
+fn downward_probe_balances_throughput_loss_against_connection_cost() {
+    // 32 -> 25 saves -24.7% log-workers (~2.0% utility credit at c = 0.08).
+    for (score, keep_smaller) in [
+        (94.0, false),
+        (97.5, false),
+        (98.5, true),
+        (100.0, true),
+        (106.0, true),
+    ] {
         let mut policy = Policy::refine(32, MIN, MAX);
         policy.record(32, 100.0);
         assert!(policy.begin(Direction::Down, 100.0));
@@ -1051,7 +1074,7 @@ fn downward_probe_requires_a_measured_speed_increase() {
         measure(&mut policy, score);
         assert_eq!(
             policy.settled(),
-            if score * 0.95 > 100.0 { lower } else { 32 },
+            if keep_smaller { lower } else { 32 },
             "score={score}"
         );
     }
@@ -1101,9 +1124,11 @@ fn smaller_upward_gain_does_not_resume_growth_below_old_high_water() {
             measured_at: p.tick,
         },
     );
-    measure(&mut p, 66.0);
-    assert_eq!(p.n, 10);
-    assert!(matches!(p.state, State::Hold));
+    // +1.0% rate for +25% workers falls below c = 0.08 (+1.8% required).
+    measure(&mut p, 64.6); // warmup grace
+    measure(&mut p, 64.6); // rejects 10 back to 8, probes down to 6
+    assert_eq!(p.settled(), 8);
+    assert_eq!(p.n, 6);
 }
 
 #[test]
@@ -1154,6 +1179,7 @@ fn rollback_bypasses_probe_admission_in_both_directions() {
                 from: 16,
                 base: 100.0,
                 direction: Direction::Down,
+                doubted: false,
             },
             16,
         ),
@@ -1196,7 +1222,8 @@ fn rollback_bypasses_probe_admission_in_both_directions() {
 fn elapsed_time_expires_backoff_without_accepted_measurements() {
     let mut policy = Policy::refine(8, 1, 64);
     measure(&mut policy, 100.0);
-    measure(&mut policy, 100.0);
+    measure(&mut policy, 80.0); // rejects 10 and checks down bracket (6)
+    measure(&mut policy, 80.0); // rejects 6 back to 8 (Hold)
     policy.fails[Direction::Up.index()] = 20;
     policy.due[Direction::Up.index()] = policy.tick + policy.retry_after(Direction::Up);
     let due = policy.due[Direction::Up.index()];
@@ -1204,7 +1231,7 @@ fn elapsed_time_expires_backoff_without_accepted_measurements() {
     policy.advance_time(SAMPLE * due as u32, SAMPLE);
     let before = policy.n;
     policy.observe(100.0);
-    assert!(policy.n > before);
+    assert!(policy.n != before);
 }
 
 #[test]
@@ -1323,19 +1350,17 @@ fn nested_work_guards_keep_retirement_visible_until_the_outer_operation_finishes
 }
 
 #[test]
-fn deletion_policy_requires_a_gain_in_either_direction() {
-    for start in [4, 32] {
-        let policy = simulate_policy(Policy::refine(start, 1, 64).require_gain(), 4, 200, |_| 1.0);
-        assert_eq!(policy.settled(), start, "{:?}", policy.history);
+fn unified_policy_rejects_flat_and_negligible_gains_while_keeping_real_scaling() {
+    let policy = simulate_policy(Policy::refine(32, 1, 64), 4, 200, |_| 1.0);
+    assert_eq!(policy.settled(), 4, "{:?}", policy.history);
+
+    // Real throughput scaling above c = 0.08 (+20%/doubling) holds high capacity.
+    let mut scaling = Policy::refine(16, 1, 64);
+    for _ in 0..80 {
+        let score = 100.0 * (scaling.n as f64).powf(0.25);
+        measure(&mut scaling, score);
     }
-    // A small real loss on every reduction must not accumulate into a large
-    // throughput sacrifice just because each individual step looks close.
-    let mut policy = Policy::refine(32, 1, 64).require_gain();
-    for _ in 0..200 {
-        let score = 1000.0 + policy.n as f64;
-        measure(&mut policy, score);
-    }
-    assert!(policy.settled() >= 32, "{:?}", policy.history);
+    assert_eq!(scaling.settled(), 64, "{:?}", scaling.history);
 }
 
 #[test]

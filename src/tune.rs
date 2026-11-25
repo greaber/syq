@@ -1,14 +1,18 @@
 //! Automatic tuning of the number of parallel workers / connections.
 //!
-//! Startup settings are inferred from recorded measurements when a transfer
-//! begins. Progress observations every 500 ms support sequential comparisons:
-//! one time-weighted window supplies the baseline and scores each probe.
-//! Sustained throughput collapse can end a probe early.
-//! A fresh start doubles; strong gains restore doubling after a historical
-//! plateau proves obsolete. Failed experiments restore the previous count.
-//! Elapsed time bounds directional backoff (30 s up, 60 s down), independently
-//! of how many measurements stabilize. Upward wins ties; small inconclusive
-//! increases stay active while uncertain reductions restore the higher count.
+//! Startup settings are inferred at read time by pooling within-run log-rate
+//! comparisons across recent runs under a regularized least-squares fit. Both
+//! startup inference and live probing optimize the same objective:
+//!
+//!   `U(n) = ln(R(n)) - CONCURRENCY_COST * ln(n)`
+//!
+//! A change from `n1` to `n2` keeps the new count when its measured marginal
+//! throughput elasticity exceeds [`CONCURRENCY_COST`] (about 5.7% per
+//! doubling at `0.08`). An upward probe that neither clears that bar nor
+//! collapses gets one extra confirmation window (`doubted`) so slow-starting
+//! connections can warm before rolling back. Failed probes enter bounded
+//! directional backoff (30 s up, 60 s down) and check the opposite bracket on
+//! rejection to recover from oversized starts or downward step overshoots.
 //!
 //! Candidate workers are connected while the current count remains active.
 //! They become active only when the whole candidate set is ready. Connected
@@ -53,14 +57,15 @@ pub const START_LOCAL_LOW_CPU: usize = 16;
 /// Never auto-tune below this many.
 pub const MIN: usize = 1;
 /// Policy mechanics version recorded in transfer history.
-pub const POLICY_VERSION: u32 = 10;
+pub const POLICY_VERSION: u32 = 11;
 const STARTUP_STEP: usize = 2;
 
 /// Multiplicative step after discovery, or with a closely matched plateau hint.
 pub const STEP: f64 = 1.3;
-/// Throughput tolerance for upward comparisons and plateau evidence. An
-/// inconclusive increase within this tolerance of its own baseline keeps the
-/// larger count without continuing growth. Reductions require a measured gain.
+/// Minimum marginal throughput elasticity per log-worker required to justify
+/// additional workers/connections (~5.7% throughput gain per doubling at 0.08).
+pub(crate) const CONCURRENCY_COST: f64 = 0.08;
+/// Band width used by diagnostics and historical plateau checks (`refine`).
 const NEAR_BEST_TOLERANCE: f64 = 0.05;
 /// Sampling intervals between probes. Directional backoff is bounded in
 /// elapsed time by retry_after; rejected observations still advance deadlines.
@@ -233,6 +238,7 @@ enum State {
         from: usize,
         base: f64,
         direction: Direction,
+        doubted: bool,
     },
     /// The last decision is settled; wait until evidence in either direction
     /// is old enough to be worth another probe.
@@ -258,7 +264,7 @@ pub struct Policy {
     active: usize,
     /// Initial discovery doubles unless closely matched evidence supports refinement.
     startup_doubling: bool,
-    require_gain: bool,
+    doubling_down: bool,
     state: State,
     points: BTreeMap<usize, Point>,
     /// Consecutive failed probes up / down.
@@ -268,6 +274,9 @@ pub struct Policy {
     tick: usize,
     wall_clock: bool,
     last_observation: Option<(usize, f64)>,
+    last_probe: Direction,
+    checked_down_here: bool,
+    checked_up_here: bool,
     comparisons: usize,
     /// Counts actually activated, for --stats / debug.
     pub history: Vec<usize>,
@@ -283,7 +292,7 @@ impl Policy {
             peak: n,
             active: n,
             startup_doubling: true,
-            require_gain: false,
+            doubling_down: false,
             state: State::Initial,
             points: BTreeMap::new(),
             fails: [0, 0],
@@ -291,6 +300,9 @@ impl Policy {
             tick: 0,
             wall_clock: false,
             last_observation: None,
+            last_probe: Direction::Down,
+            checked_down_here: false,
+            checked_up_here: false,
             comparisons: 0,
             history: vec![n],
         }
@@ -301,14 +313,6 @@ impl Policy {
             startup_doubling: false,
             ..Self::new(start, min, max)
         }
-    }
-
-    /// Deletion can burn CPU spinning on filesystem locks without increasing
-    /// throughput. Retain a changed count only when it measurably improves
-    /// throughput; transfer policies keep their treatment of uncertain increases.
-    pub(crate) fn require_gain(mut self) -> Self {
-        self.require_gain = true;
-        self
     }
 
     /// The count the policy considers right: `n`, unless a probe is in
@@ -445,6 +449,7 @@ impl Policy {
                 from,
                 base,
                 direction: Direction::Up,
+                ..
             } if *from == self.active => {
                 *base = score;
                 Some(*from)
@@ -478,6 +483,7 @@ impl Policy {
             self.n = from;
             self.state = State::Hold;
             self.startup_doubling = false;
+            self.doubling_down = false;
             // Provisioning is not throughput evidence, but retrying the same
             // unavailable candidate on the very next measurement is wasteful.
             self.due[direction.index()] = self.tick + PROBE_EVERY;
@@ -496,6 +502,8 @@ impl Policy {
 
     fn retry_after(&self, direction: Direction) -> usize {
         let backoff = self.fails[direction.index()].min(PROBE_BACKOFF_MAX);
+        // A capacity fall shows at the active count, whereas a capacity rise is
+        // invisible at a saturated plateau; re-probe Up at 30s and Down at 60s.
         (PROBE_EVERY << backoff).min(match direction {
             Direction::Up => 12,
             Direction::Down => 24,
@@ -527,11 +535,27 @@ impl Policy {
             });
     }
 
+    fn utility_improves(&self, from: usize, base: f64, to: usize, score: f64) -> bool {
+        if base > 0.0 && score > 0.0 {
+            (score / base).ln() - CONCURRENCY_COST * (to as f64 / from as f64).ln() > 0.0
+        } else {
+            score > base
+        }
+    }
+
     fn upward_step(&self) -> usize {
         if self.startup_doubling {
             self.n.saturating_mul(STARTUP_STEP).min(self.max)
         } else {
             step_up(self.n).min(self.max)
+        }
+    }
+
+    fn downward_step(&self) -> usize {
+        if self.doubling_down {
+            (self.n / 2).max(self.min)
+        } else {
+            step_down(self.n).max(self.min)
         }
     }
 
@@ -549,22 +573,16 @@ impl Policy {
                         return lower + (self.n - lower) / 2;
                     }
                     let current = self.points.get(&self.n).map_or(0.0, |p| p.score);
-                    if current > 0.0
-                        && point.score >= current * (1.0 - NEAR_BEST_TOLERANCE)
-                        && point.score * (1.0 - NEAR_BEST_TOLERANCE) <= current
-                    {
-                        // An adjacent count with an ambiguous result is not a
-                        // barrier to a more informative, wider experiment.
-                        return step_down(lower).max(self.min);
-                    }
                     if self.tick.saturating_sub(point.measured_at) <= EVIDENCE_MAX_AGE
-                        && point.score < self.recent_best() * (1.0 - NEAR_BEST_TOLERANCE)
+                        && current > 0.0
+                        && point.score > 0.0
+                        && !self.utility_improves(self.n, current, lower, point.score)
                     {
                         return self.n;
                     }
                     return lower;
                 }
-                step_down(self.n).max(self.min)
+                self.downward_step()
             }
             Direction::Up => {
                 if self.n >= self.max {
@@ -581,10 +599,11 @@ impl Policy {
                     if upper - self.n > 1 {
                         return self.n + (upper - self.n).div_ceil(2);
                     }
-                    let current = self.points.get(&self.n).map_or(0.0, |point| point.score);
-                    let best = self.recent_best().max(point.score);
-                    if self.tick.saturating_sub(point.measured_at) <= EVIDENCE_MAX_AGE
-                        && current >= best * (1.0 - NEAR_BEST_TOLERANCE)
+                    let current = self.points.get(&self.n).map_or(0.0, |p| p.score);
+                    if self.tick.saturating_sub(point.measured_at) <= 12
+                        && current > 0.0
+                        && point.score > 0.0
+                        && !self.utility_improves(self.n, current, upper, point.score)
                     {
                         return self.n;
                     }
@@ -598,37 +617,42 @@ impl Policy {
     fn begin(&mut self, direction: Direction, base: f64) -> bool {
         if direction == Direction::Down {
             self.startup_doubling = false;
+        } else {
+            self.doubling_down = false;
         }
         let from = self.n;
         let target = self.target(direction);
         if !self.set_candidate(target) {
             self.startup_doubling = false;
+            self.doubling_down = false;
             // Bounds suppress probes in begin_due_probe, but the count can
             // later move away from a bound. Keep a finite retry deadline so
             // that direction can become eligible again, with normal backoff.
             self.due[direction.index()] = self.tick + self.retry_after(direction);
             return false;
         }
+        self.last_probe = direction;
         self.state = State::Explore {
             from,
             base,
             direction,
+            doubted: false,
         };
         true
     }
 
     fn begin_due_probe(&mut self, base: f64) {
-        let down = self.due[Direction::Down.index()] <= self.tick && self.n > self.min;
-        let up = self.due[Direction::Up.index()] <= self.tick && self.n < self.max;
-        // Up is the deterministic tie-break. It is a prior, not an invariant:
-        // a failed upward probe backs off independently, allowing down to win.
-        let direction = match (down, up) {
-            (_, true) => Some(Direction::Up),
-            (true, false) => Some(Direction::Down),
-            (false, false) => None,
-        };
-        if let Some(direction) = direction {
-            self.begin(direction, base);
+        let first = self.last_probe.opposite();
+        for direction in [first, first.opposite()] {
+            let eligible = match direction {
+                Direction::Up => self.due[Direction::Up.index()] <= self.tick && self.n < self.max,
+                Direction::Down => {
+                    self.due[Direction::Down.index()] <= self.tick && self.n > self.min
+                }
+            };
+            if eligible && self.begin(direction, base) {
+                return;
+            }
         }
     }
 
@@ -658,76 +682,103 @@ impl Policy {
             // Forget stale throughput brackets without allowing noisy scores
             // to bypass the retry deadlines established by failed probes.
             self.points.clear();
+            self.checked_down_here = false;
+            self.checked_up_here = false;
         }
         self.last_observation = Some((self.n, score));
-        self.record(self.n, score);
         match self.state {
             State::Initial => {
+                self.record(self.n, score);
                 if score > 0.0 && !self.begin(Direction::Up, score) {
                     self.begin(Direction::Down, score);
                 }
             }
-            State::Hold => self.begin_due_probe(score),
+            State::Hold => {
+                self.record(self.n, score);
+                self.begin_due_probe(score);
+            }
             State::Explore {
                 from,
                 base,
                 direction,
+                doubted,
             } => {
                 if base <= 0.0 && score <= 0.0 {
+                    self.record(self.n, score);
                     return self.n;
                 }
-                let keep = match direction {
-                    // Judge a gain against this probe's recent baseline. Older
-                    // high-water scores can describe conditions that no longer
-                    // apply, even when revisiting them refreshes their age.
-                    Direction::Up => base < score * (1.0 - NEAR_BEST_TOLERANCE),
-                    Direction::Down => score * (1.0 - NEAR_BEST_TOLERANCE) > base,
-                };
+                let improves = self.utility_improves(from, base, self.n, score);
+                if direction == Direction::Up
+                    && !improves
+                    && !doubted
+                    && base > 0.0
+                    && score >= base * 0.85
+                {
+                    // Newly opened or unexercised connections can take an extra
+                    // window to warm before settling below the utility threshold.
+                    self.state = State::Explore {
+                        from,
+                        base,
+                        direction,
+                        doubted: true,
+                    };
+                    return self.n;
+                }
+                self.record(self.n, score);
                 self.comparisons += 1;
                 let idx = direction.index();
                 let inverse = direction.opposite().index();
-                if !self.require_gain
-                    && direction == Direction::Up
-                    && !keep
-                    && base > 0.0
-                    && score >= base * (1.0 - NEAR_BEST_TOLERANCE)
-                {
-                    // Uncertainty is not evidence to remove workers, nor to
-                    // keep growing. Stop the ramp and wait before probing.
-                    self.startup_doubling = false;
-                    self.fails[idx] += 1;
-                    self.due[idx] = self.tick + self.retry_after(direction);
-                    self.due[inverse] = self.due[inverse].max(self.tick + PROBE_EVERY);
-                    self.state = State::Hold;
-                    return self.n;
-                }
-                if keep {
-                    // Fresh gains override a historical plateau. Accelerate in
-                    // either direction when the improvement is substantial.
-                    if direction == Direction::Up && score >= base * 1.20 {
+                if improves {
+                    self.checked_down_here = false;
+                    self.checked_up_here = false;
+                    let ratio = self.n as f64 / from as f64;
+                    let high_elasticity = base > 0.0
+                        && score > base
+                        && ratio > 1.0
+                        && (score / base).ln() >= 0.7 * ratio.ln();
+                    if direction == Direction::Up
+                        && base > 0.0
+                        && (score >= base * 1.20 || high_elasticity)
+                    {
                         self.startup_doubling = true;
                         self.points
                             .retain(|n, point| *n <= self.n || point.score > score);
                     }
+                    if direction == Direction::Down && (base <= 0.0 || score >= base * 0.98) {
+                        self.doubling_down = true;
+                    }
                     self.fails[idx] = 0;
                     self.due[inverse] = self.due[inverse].max(self.tick + PROBE_EVERY);
                     self.state = State::Hold;
-                    // Success is direct evidence that there may be more gain
-                    // in the same direction, so continue immediately.
                     self.begin(direction, score);
                 } else {
                     self.startup_doubling = false;
+                    self.doubling_down = false;
                     self.fails[idx] += 1;
                     self.due[idx] = self.tick + self.retry_after(direction);
-                    // Do not mechanically bounce to the opposite side after
-                    // a failed probe. Let current throughput settle first.
                     self.due[inverse] = self.due[inverse].max(self.tick + PROBE_EVERY);
                     self.set_candidate(from);
                     self.state = State::Hold;
-                    if self.require_gain && direction == Direction::Up {
-                        // An unhelpful increase is also a reason to check
-                        // whether fewer workers improve throughput under contention.
-                        self.begin(Direction::Down, base);
+                    if direction == Direction::Up {
+                        self.checked_up_here = true;
+                        if !self.checked_down_here && from > self.min {
+                            self.checked_down_here = true;
+                            self.begin(Direction::Down, base);
+                        }
+                    } else {
+                        self.checked_down_here = true;
+                        let has_upper_gap = self
+                            .points
+                            .range((
+                                std::ops::Bound::Excluded(from),
+                                std::ops::Bound::Included(self.max),
+                            ))
+                            .next()
+                            .is_some_and(|(&upper, _)| upper - from > 1);
+                        if !self.checked_up_here && from < self.max && has_upper_gap {
+                            self.checked_up_here = true;
+                            self.begin(Direction::Up, base);
+                        }
                     }
                 }
             }

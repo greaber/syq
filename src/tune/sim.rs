@@ -66,6 +66,8 @@ enum Curve {
         after: f64,
         at: f64,
     },
+    /// Gentle scaling with a fixed fractional gain on every doubling.
+    Gentle { base: f64, gain_per_doubling: f64 },
 }
 
 impl Curve {
@@ -91,35 +93,51 @@ impl Curve {
                 after,
                 at,
             } => (n * per_worker).min(if t < at { before } else { after }),
+            Curve::Gentle {
+                base,
+                gain_per_doubling,
+            } => base * (1.0 + gain_per_doubling).powf(n.log2()),
         }
     }
 
-    fn best(self, t: f64) -> f64 {
+    fn best_for(self, t: f64, limit: usize) -> f64 {
         match self {
             Curve::Decline {
                 per_worker, cap, ..
             } => {
                 let knee = cap / per_worker;
-                self.rate((knee.floor() as usize).clamp(1, LIMIT), t)
-                    .max(self.rate((knee.ceil() as usize).clamp(1, LIMIT), t))
+                self.rate((knee.floor() as usize).clamp(1, limit), t)
+                    .max(self.rate((knee.ceil() as usize).clamp(1, limit), t))
             }
-            _ => self.rate(LIMIT, t),
+            _ => self.rate(limit, t),
         }
+    }
+
+    fn best(self, t: f64) -> f64 {
+        self.best_for(t, LIMIT)
     }
 
     /// Smallest count within the policy's own tolerance of the best rate.
+    fn smallest_near_best_for(self, t: f64, limit: usize) -> usize {
+        let floor = self.best_for(t, limit) * (1.0 - NEAR_BEST_TOLERANCE);
+        (1..=limit).find(|&n| self.rate(n, t) >= floor).unwrap()
+    }
+
     fn smallest_near_best(self, t: f64) -> usize {
-        let floor = self.best(t) * (1.0 - NEAR_BEST_TOLERANCE);
-        (1..=LIMIT).find(|&n| self.rate(n, t) >= floor).unwrap()
+        self.smallest_near_best_for(t, LIMIT)
+    }
+
+    fn ideal_elapsed_for(self, total: f64, limit: usize) -> f64 {
+        match self {
+            Curve::Shift { at, .. } if self.best_for(0.0, limit) * at < total => {
+                at + (total - self.best_for(0.0, limit) * at) / self.best_for(at, limit)
+            }
+            _ => total / self.best_for(0.0, limit),
+        }
     }
 
     fn ideal_elapsed(self, total: f64) -> f64 {
-        match self {
-            Curve::Shift { at, .. } if self.best(0.0) * at < total => {
-                at + (total - self.best(0.0) * at) / self.best(at)
-            }
-            _ => total / self.best(0.0),
-        }
+        self.ideal_elapsed_for(total, LIMIT)
     }
 }
 
@@ -159,13 +177,25 @@ fn copy(s: &Scenario, policy: Policy, rng: &mut Rng) -> Outcome {
 
 fn copy_observing(
     s: &Scenario,
+    policy: Policy,
+    rng: &mut Rng,
+    observe: impl FnMut(f64, &Policy),
+) -> Outcome {
+    copy_with_options(s, policy, rng, LIMIT, 0.0, observe)
+}
+
+fn copy_with_options(
+    s: &Scenario,
     mut policy: Policy,
     rng: &mut Rng,
+    limit: usize,
+    ramp_secs: f64,
     mut observe: impl FnMut(f64, &Policy),
 ) -> Outcome {
-    let total = s.curve.best(0.0) * s.ideal_secs;
+    let total = s.curve.best_for(0.0, limit) * s.ideal_secs;
     let (mut t, mut done) = (0.0f64, 0.0f64);
     let mut active = policy.active();
+    let mut ramp: Option<(usize, f64)> = None;
     // Initial connections are already ready: elapsed time starts with copying.
     let mut connections = vec![0.0f64; active];
     let mut open = active;
@@ -214,6 +244,7 @@ fn copy_observing(
         open = wanted;
         if policy.n < active {
             active = policy.n;
+            ramp = None;
             policy.activated();
             evidence.clear();
             (sample_start, sample_bytes) = (t, 0.0);
@@ -234,13 +265,21 @@ fn copy_observing(
         }
         let ready_at = (policy.n > active && !tail_blocks_increase)
             .then(|| connections[..policy.n].iter().copied().fold(t, f64::max));
-        if reached.is_none()
-            && s.curve.rate(active, t) >= s.curve.best(t) * (1.0 - NEAR_BEST_TOLERANCE)
-        {
+        let best_now = s.curve.best_for(t, limit);
+        if reached.is_none() && s.curve.rate(active, t) >= best_now * (1.0 - NEAR_BEST_TOLERANCE) {
             reached = Some(t);
         }
 
-        let rate = s.curve.rate(active, t) * noise;
+        let base_rate = s.curve.rate(active, t);
+        let eff_rate = match ramp {
+            Some((prev, r_start)) if ramp_secs > 0.0 && t - r_start < ramp_secs => {
+                let prev_rate = s.curve.rate(prev, t);
+                let frac = 0.2 + 0.8 * ((t - r_start) / ramp_secs).clamp(0.0, 1.0);
+                prev_rate + (base_rate - prev_rate) * frac
+            }
+            _ => base_rate,
+        };
+        let rate = eff_rate * noise;
         let sample_end = sample_start + 0.5;
         let mut until = ready_at.map_or(sample_end, |ready| ready.min(sample_end));
         until = until.min(noise_end).min(((t / 0.25).floor() + 1.0) * 0.25);
@@ -250,12 +289,12 @@ fn copy_observing(
             }
         }
         let dt = (until - t).max(0.0).min((total - done) / rate);
-        let ideal_rate = s.curve.best(t) * noise;
+        let ideal_rate = best_now * noise;
         if ideal_elapsed.is_none() && ideal_done + ideal_rate * dt >= total {
             ideal_elapsed = Some(t + (total - ideal_done) / ideal_rate);
         }
         ideal_done += ideal_rate * dt;
-        if s.curve.rate(active, t) >= s.curve.best(t) * (1.0 - NEAR_BEST_TOLERANCE) {
+        if s.curve.rate(active, t) >= best_now * (1.0 - NEAR_BEST_TOLERANCE) {
             near_secs += dt;
         }
         done += rate * dt;
@@ -284,7 +323,11 @@ fn copy_observing(
         }
 
         if ready_at.is_some_and(|ready| ready <= t) {
+            let prev = active;
             active = policy.n;
+            if active > prev && ramp_secs > 0.0 {
+                ramp = Some((prev, t));
+            }
             policy.activated();
             evidence.clear();
             (sample_start, sample_bytes) = (t, 0.0);
@@ -816,11 +859,543 @@ fn analytic_optimum_matches_exhaustive_worker_search() {
             cap: 1000.0,
             loss: 0.5,
         },
+        Curve::Gentle {
+            base: 100.0,
+            gain_per_doubling: 0.08,
+        },
     ];
     for curve in curves().into_iter().map(|(_, curve, _)| curve).chain(extra) {
         for t in [0.0, 37.0, 60.0, 600.0] {
             let exhaustive = (1..=LIMIT).map(|n| curve.rate(n, t)).fold(0.0, f64::max);
             assert!((curve.best(t) - exhaustive).abs() < 1e-9);
         }
+    }
+}
+
+fn record_sqlite_observations(
+    writer: &history::Recorder,
+    key: &history::ContextKey,
+    observations: &[(usize, f64, f64)],
+) {
+    writer.context(key);
+    writer.event(
+        "learning_context",
+        serde_json::json!({"consistent":true,"automatic":true}),
+    );
+    let mut segment = None;
+    for &(workers, rate, seconds) in observations {
+        if segment != Some(workers) {
+            writer.event("transition", serde_json::json!({}));
+            segment = Some(workers);
+        }
+        writer.event(
+            "observation",
+            serde_json::json!({"active":workers,"seconds":seconds,"rate":rate,"usable":true}),
+        );
+    }
+    writer.complete(true, serde_json::json!({}));
+}
+
+#[test]
+fn noisy_flat_copies_do_not_ratchet_across_repeated_runs() {
+    let s = Scenario {
+        name: "flat",
+        curve: Curve::Knee {
+            per_worker: 100.0,
+            cap: 100.0,
+        },
+        ideal_secs: 40.0,
+        start: 8,
+        sigma: 0.05,
+        rho: 0.5,
+        setup_secs: 0.3,
+        prepare: true,
+    };
+    let key = history::tests::key("a");
+    let mut final_starts = Vec::new();
+    for seed in 0..30 {
+        let mut rng = Rng(seed);
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("history.sqlite");
+        let mut last = 8;
+        for _ in 0..20 {
+            let writer = history::tests::recorder(&path);
+            let policy = match writer.starting_count(&key, false) {
+                Some(hint) => {
+                    last = hint.workers;
+                    if hint.refine {
+                        Policy::refine(hint.workers, 1, 256)
+                    } else {
+                        Policy::new(hint.workers, 1, 256)
+                    }
+                }
+                None => Policy::new(8, 1, 256),
+            };
+            let out = copy_with_options(&s, policy, &mut rng, 256, 0.0, |_, _| {});
+            record_sqlite_observations(&writer, &key, &out.observations);
+        }
+        final_starts.push(last as f64);
+    }
+    let med = quantile(&mut final_starts, 0.5);
+    let p90 = quantile(&mut final_starts, 0.9);
+    assert!(med <= 2.0 && p90 <= 8.0, "med={med} p90={p90}");
+}
+
+#[test]
+fn inflated_start_self_heals_toward_knee_with_sqlite_history() {
+    let s = Scenario {
+        name: "knee-12-heals",
+        curve: Curve::Knee {
+            per_worker: 100.0 / 12.0,
+            cap: 100.0,
+        },
+        ideal_secs: 40.0,
+        start: 64,
+        sigma: 0.05,
+        rho: 0.5,
+        setup_secs: 0.3,
+        prepare: true,
+    };
+    let key = history::tests::key("a");
+    let mut final_starts = Vec::new();
+    for seed in 0..20 {
+        let mut rng = Rng(seed);
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("history.sqlite");
+        let mut last = 64;
+        for _ in 0..20 {
+            let writer = history::tests::recorder(&path);
+            let policy = match writer.starting_count(&key, false) {
+                Some(hint) => {
+                    last = hint.workers;
+                    if hint.refine {
+                        Policy::refine(hint.workers, 1, 256)
+                    } else {
+                        Policy::new(hint.workers, 1, 256)
+                    }
+                }
+                None => Policy::new(64, 1, 256),
+            };
+            let out = copy_with_options(&s, policy, &mut rng, 256, 0.0, |_, _| {});
+            record_sqlite_observations(&writer, &key, &out.observations);
+        }
+        final_starts.push(last as f64);
+    }
+    let med = quantile(&mut final_starts, 0.5);
+    let p90 = quantile(&mut final_starts, 0.9);
+    assert!(med <= 16.0 && p90 <= 32.0, "med={med} p90={p90}");
+}
+
+#[test]
+fn slow_connection_ramp_reaches_knee_and_oversized_starts_recover() {
+    let ramp = Scenario {
+        name: "knee16-ramp",
+        curve: Curve::Knee {
+            per_worker: 100.0 / 16.0,
+            cap: 100.0,
+        },
+        ideal_secs: 180.0,
+        start: 1,
+        sigma: 0.0,
+        rho: 0.0,
+        setup_secs: 1.0,
+        prepare: true,
+    };
+    let out = copy_with_options(
+        &ramp,
+        Policy::new(1, 1, 64),
+        &mut Rng(0),
+        64,
+        3.5,
+        |_, _| {},
+    );
+    assert!(
+        out.policy.settled() >= 16,
+        "settled={}",
+        out.policy.settled()
+    );
+    assert!(
+        out.elapsed / out.ideal_elapsed < 1.08,
+        "slowdown={:.2}%",
+        100.0 * (out.elapsed / out.ideal_elapsed - 1.0)
+    );
+
+    let flat_hi = Scenario {
+        name: "flat-hi",
+        curve: Curve::Knee {
+            per_worker: 100.0,
+            cap: 100.0,
+        },
+        ideal_secs: 40.0,
+        start: 32,
+        sigma: 0.0,
+        rho: 0.0,
+        setup_secs: 0.3,
+        prepare: true,
+    };
+    let out = copy_with_options(
+        &flat_hi,
+        Policy::new(32, 1, 64),
+        &mut Rng(0),
+        64,
+        0.0,
+        |_, _| {},
+    );
+    assert_eq!(out.policy.settled(), 1);
+
+    let decline_hi = Scenario {
+        name: "decline-hi",
+        curve: Curve::Decline {
+            per_worker: 25.0,
+            cap: 100.0,
+            loss: 0.5,
+        },
+        ideal_secs: 40.0,
+        start: 32,
+        sigma: 0.0,
+        rho: 0.0,
+        setup_secs: 0.3,
+        prepare: true,
+    };
+    let out = copy_with_options(
+        &decline_hi,
+        Policy::new(32, 1, 64),
+        &mut Rng(0),
+        64,
+        0.0,
+        |_, _| {},
+    );
+    assert_eq!(out.policy.settled(), 4);
+}
+
+#[test]
+#[ignore = "prints expanded production benchmarks including SQLite history and stress curves"]
+fn production_stress_report() {
+    println!("\n=== SINGLE-COPY STRESS BENCHMARK (100 seeds, sigma=0.05, rho=0.5, limit=64) ===");
+    for (name, curve, start, ideal_secs, setup_secs, ramp_secs, sigma, rho) in [
+        (
+            "knee 16 (1) 180s",
+            Curve::Knee {
+                per_worker: 100.0 / 16.0,
+                cap: 100.0,
+            },
+            1,
+            180.0,
+            0.3,
+            0.0,
+            0.05,
+            0.5,
+        ),
+        (
+            "knee 12 (8) 180s",
+            Curve::Knee {
+                per_worker: 10.0,
+                cap: 120.0,
+            },
+            8,
+            180.0,
+            0.3,
+            0.0,
+            0.05,
+            0.5,
+        ),
+        (
+            "flat (1) 180s",
+            Curve::Knee {
+                per_worker: 100.0,
+                cap: 100.0,
+            },
+            1,
+            180.0,
+            0.3,
+            0.0,
+            0.05,
+            0.5,
+        ),
+        (
+            "decline at 8 (1) 180s",
+            Curve::Decline {
+                per_worker: 12.5,
+                cap: 100.0,
+                loss: 0.04,
+            },
+            1,
+            180.0,
+            0.3,
+            0.0,
+            0.05,
+            0.5,
+        ),
+        (
+            "rise 100->400 (8) 180s",
+            Curve::Shift {
+                per_worker: 4.0,
+                before: 100.0,
+                after: 400.0,
+                at: 37.0,
+            },
+            8,
+            180.0,
+            0.3,
+            0.0,
+            0.05,
+            0.5,
+        ),
+        (
+            "fall 400->100 (8) 180s",
+            Curve::Shift {
+                per_worker: 8.0,
+                before: 400.0,
+                after: 100.0,
+                at: 37.0,
+            },
+            8,
+            180.0,
+            0.3,
+            0.0,
+            0.05,
+            0.5,
+        ),
+        (
+            "flat hi (32) 40s",
+            Curve::Knee {
+                per_worker: 100.0,
+                cap: 100.0,
+            },
+            32,
+            40.0,
+            0.3,
+            0.0,
+            0.05,
+            0.5,
+        ),
+        (
+            "decline0.5 hi (32) 40s",
+            Curve::Decline {
+                per_worker: 25.0,
+                cap: 100.0,
+                loss: 0.5,
+            },
+            32,
+            40.0,
+            0.3,
+            0.0,
+            0.05,
+            0.5,
+        ),
+        (
+            "knee16 ramp3.5s (1) 180s",
+            Curve::Knee {
+                per_worker: 100.0 / 16.0,
+                cap: 100.0,
+            },
+            1,
+            180.0,
+            1.0,
+            3.5,
+            0.05,
+            0.5,
+        ),
+        (
+            "gentle +8%/dbl (8) 180s",
+            Curve::Gentle {
+                base: 100.0,
+                gain_per_doubling: 0.08,
+            },
+            8,
+            180.0,
+            0.3,
+            0.0,
+            0.05,
+            0.5,
+        ),
+        (
+            "gentle +15%/dbl (8) 180s",
+            Curve::Gentle {
+                base: 100.0,
+                gain_per_doubling: 0.15,
+            },
+            8,
+            180.0,
+            0.3,
+            0.0,
+            0.05,
+            0.5,
+        ),
+        (
+            "knee 12 (8) sigma=0.3 180s",
+            Curve::Knee {
+                per_worker: 10.0,
+                cap: 120.0,
+            },
+            8,
+            180.0,
+            0.3,
+            0.0,
+            0.30,
+            0.9,
+        ),
+        (
+            "knee 16 (1) setup=10s 180s",
+            Curve::Knee {
+                per_worker: 100.0 / 16.0,
+                cap: 100.0,
+            },
+            1,
+            180.0,
+            10.0,
+            0.0,
+            0.05,
+            0.5,
+        ),
+    ] {
+        let s = Scenario {
+            name,
+            curve,
+            ideal_secs,
+            start,
+            sigma,
+            rho,
+            setup_secs,
+            prepare: true,
+        };
+        let (mut slow, mut settled) = (Vec::new(), Vec::new());
+        let mut open = 0.0;
+        for seed in 0..100 {
+            let out = copy_with_options(
+                &s,
+                Policy::new(start, 1, 64),
+                &mut Rng(seed),
+                64,
+                ramp_secs,
+                |_, _| {},
+            );
+            slow.push(100.0 * (out.elapsed / out.ideal_elapsed - 1.0));
+            settled.push(out.policy.settled() as f64);
+            open += out.connection_secs / out.elapsed / 100.0;
+        }
+        println!(
+            "{:<28} | slow {:>5.1}/{:<5.1}% st={:>3.0} open={:>5.1}",
+            name,
+            quantile(&mut slow, 0.5),
+            quantile(&mut slow, 0.9),
+            quantile(&mut settled, 0.5),
+            open
+        );
+    }
+
+    println!("\n=== PRODUCTION SQLITE 100-COPY SIMULATION (25 seeds, 40s copies, sigma=0.05, rho=0.5) ===");
+    let key = history::tests::key("a");
+    let check_at = [0usize, 7, 29, 99];
+    for (name, curve, start, limit) in [
+        (
+            "flat (start 8)",
+            Curve::Knee {
+                per_worker: 100.0,
+                cap: 100.0,
+            },
+            8,
+            256,
+        ),
+        (
+            "knee 12 (start 8)",
+            Curve::Knee {
+                per_worker: 100.0 / 12.0,
+                cap: 100.0,
+            },
+            8,
+            256,
+        ),
+        (
+            "knee 12 (start 64)",
+            Curve::Knee {
+                per_worker: 100.0 / 12.0,
+                cap: 100.0,
+            },
+            64,
+            256,
+        ),
+        (
+            "knee 32 (start 8)",
+            Curve::Knee {
+                per_worker: 100.0 / 32.0,
+                cap: 100.0,
+            },
+            8,
+            256,
+        ),
+        (
+            "decline4 (start 32)",
+            Curve::Decline {
+                per_worker: 25.0,
+                cap: 100.0,
+                loss: 0.5,
+            },
+            32,
+            64,
+        ),
+        (
+            "gentle +8%/dbl (8)",
+            Curve::Gentle {
+                base: 100.0,
+                gain_per_doubling: 0.08,
+            },
+            8,
+            256,
+        ),
+        (
+            "gentle +15%/dbl (8)",
+            Curve::Gentle {
+                base: 100.0,
+                gain_per_doubling: 0.15,
+            },
+            8,
+            256,
+        ),
+    ] {
+        let s = Scenario {
+            name,
+            curve,
+            ideal_secs: 40.0,
+            start,
+            sigma: 0.05,
+            rho: 0.5,
+            setup_secs: 0.3,
+            prepare: true,
+        };
+        let mut starts = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        let mut slows = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        for seed in 0..25 {
+            let mut rng = Rng(seed);
+            let temp = crate::test_support::tempdir().unwrap();
+            let path = temp.path().join("history.sqlite");
+            for c in 0..100 {
+                let writer = history::tests::recorder(&path);
+                let hint = writer.starting_count(&key, false);
+                let cur_start = hint.as_ref().map_or(start, |h| h.workers);
+                let policy = match hint {
+                    Some(h) if h.refine => Policy::refine(h.workers, 1, limit),
+                    Some(h) => Policy::new(h.workers, 1, limit),
+                    None => Policy::new(start, 1, limit),
+                };
+                let out = copy_with_options(&s, policy, &mut rng, limit, 0.0, |_, _| {});
+                record_sqlite_observations(&writer, &key, &out.observations);
+                if let Some(pos) = check_at.iter().position(|&k| k == c) {
+                    starts[pos].push(cur_start as f64);
+                    slows[pos].push(100.0 * (out.elapsed / out.ideal_elapsed - 1.0));
+                }
+            }
+        }
+        let cols: Vec<String> = (0..4)
+            .map(|i| {
+                format!(
+                    "{:.0}/{:.0}({:.1}%)",
+                    quantile(&mut starts[i], 0.5),
+                    quantile(&mut starts[i], 0.9),
+                    quantile(&mut slows[i], 0.5),
+                )
+            })
+            .collect();
+        println!("{:<22} {:>3} | {}", name, limit, cols.join(" "));
     }
 }

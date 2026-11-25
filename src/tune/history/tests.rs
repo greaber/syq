@@ -943,6 +943,16 @@ fn trace_distinguishes_acceptance_rejection_and_pending_comparison() {
     );
     trace.observe(&mut policy, 80.0, "stable");
     assert_eq!(policy.settled(), 10);
+    // Rejecting 13 immediately probes the unmeasured 8..10 interior bracket (9).
+    trace.end(&policy, false);
+    let mid_events = command::read_events(&open(&path).unwrap(), saved(&writer)).unwrap();
+    assert_eq!(
+        mid_events.last().unwrap()["data"]["pending_comparison"],
+        true
+    );
+    policy.activated();
+    trace.observe(&mut policy, 90.0, "stable");
+    assert_eq!(policy.settled(), 10);
     trace.end(&policy, false);
     let events = command::read_events(&open(&path).unwrap(), saved(&writer)).unwrap();
     let decisions: Vec<_> = events.iter().filter(|e| e["kind"] == "decision").collect();
@@ -959,6 +969,7 @@ fn trace_distinguishes_acceptance_rejection_and_pending_comparison() {
     );
     assert_eq!(decisions[2]["data"]["reason"], "probe_rejected");
     assert_eq!(decisions[2]["data"]["sample_ids"], json!([2]));
+    assert_eq!(decisions[3]["data"]["reason"], "probe_rejected");
     assert_eq!(events.last().unwrap()["data"]["pending_comparison"], false);
 }
 
@@ -1073,19 +1084,17 @@ fn trace_records_inconclusive_upward_hold_without_claiming_a_plateau() {
     trace.observe(&mut policy, 100.0, "stable");
     policy.activated();
     trace.observe(&mut policy, 100.0, "stable");
+    trace.observe(&mut policy, 100.0, "stable");
     trace.end(&policy, false);
     let events = command::read_events(&open(&path).unwrap(), saved(&writer)).unwrap();
-    let decision = events
-        .iter()
-        .rev()
-        .find(|e| e["kind"] == "decision")
-        .unwrap();
-    assert_eq!(decision["data"]["reason"], "probe_inconclusive");
-    assert_eq!(decision["data"]["after"]["requested"], 16);
-    assert_eq!(decision["data"]["after"]["state"], "Hold");
+    let decisions: Vec<_> = events.iter().filter(|e| e["kind"] == "decision").collect();
+    assert_eq!(decisions[1]["data"]["reason"], "hold");
+    assert_eq!(decisions[1]["data"]["after"]["requested"], 16);
+    assert_eq!(decisions[2]["data"]["reason"], "probe_rejected");
+    assert_eq!(decisions[2]["data"]["after"]["requested"], 6);
     let end = events.last().unwrap();
     assert_eq!(end["data"]["completed_comparison"], true);
-    assert_eq!(end["data"]["last_accepted"], 16);
+    assert_eq!(end["data"]["last_accepted"], 8);
     assert!(end["data"].get("recommended").is_none());
     assert!(end["data"].get("discovery_complete").is_none());
 }
@@ -1126,7 +1135,7 @@ fn exact_filesystem_starts_survive_other_destinations_and_unfinished_runs() {
     let path = temp.path().join("history.sqlite");
     // Each run's other count is nearly as fast, so an exact match may refine.
     measured_run(&path, &key("a"), &[(8, 200.0), (16, 195.0)]);
-    measured_run(&path, &key("b"), &[(32, 200.0), (16, 195.0)]);
+    measured_run(&path, &key("b"), &[(32, 200.0), (16, 175.0)]);
     let failed = unfinished_run(&path, &key("a"), &[(64, 200.0), (32, 100.0)]);
     failed.complete(false, json!({}));
     drop(unfinished_run(
@@ -1172,9 +1181,10 @@ fn repeated_inconclusive_copies_do_not_raise_the_starting_count() {
         policy.observe(100.0);
         policy.activated();
         let larger = policy.active();
-        policy.observe(97.0);
-        // The live copy keeps the inconclusive increase.
-        assert_eq!(policy.settled(), larger);
+        policy.observe(97.0); // warmup grace
+        assert_eq!(policy.settled(), start);
+        policy.observe(97.0); // flat increase rolls back to start
+        assert_eq!(policy.settled(), start);
         let writer = measured_run(&path, &context, &[(start, 100.0), (larger, 97.0)]);
         let run = command::read_run(&open(&path).unwrap(), saved(&writer)).unwrap();
         assert_eq!(run["recommendation_eligible"], true);
@@ -1365,6 +1375,7 @@ fn driver_excludes_draining_writers_and_the_first_interval_after_drain() {
         from: 4,
         base: 100_000.0,
         direction: crate::tune::Direction::Down,
+        doubted: false,
     };
     let progress = Arc::new(Progress {
         history: history.clone(),

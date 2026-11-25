@@ -80,12 +80,11 @@ impl Control {
         let mut sampler = Sampler::default();
         sampler.reset();
         Self {
-            policy: (if concurrency.startup_doubling {
+            policy: if concurrency.startup_doubling {
                 Policy::new(concurrency.initial, 1, concurrency.maximum)
             } else {
                 Policy::refine(concurrency.initial, 1, concurrency.maximum)
-            })
-            .require_gain(),
+            },
             automatic: concurrency.automatic,
             sampler,
             completed: 0,

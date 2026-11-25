@@ -2134,7 +2134,7 @@ fn tuning_history_infers_start_from_measurements_and_honors_explicit_controls() 
     let mut seed_samples = |workers: usize| {
         db.execute("UPDATE runs SET eligible=4 WHERE id=1", [])
             .unwrap();
-        let rate = if workers == 2 { 99.0 } else { 100.0 };
+        let rate = if workers == 4 { 99.0 } else { 100.0 };
         for (n, rate) in [(6, 50.0), (workers, rate)] {
             for _ in 0..2 {
                 sequence += 1;
@@ -2202,7 +2202,7 @@ fn tuning_history_infers_start_from_measurements_and_honors_explicit_controls() 
     assert_eq!(event["data"]["workers"], 1);
     assert_eq!(event["data"]["reason"], "explicit");
     // Additional observations, not a saved discovery decision, establish a plateau.
-    seed_samples(2);
+    seed_samples(4);
     assert_output_ok(&copy_with_hint("confirmed", &[]));
     let workers: i64 = db
         .query_row(
