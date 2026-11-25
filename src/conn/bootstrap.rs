@@ -197,8 +197,10 @@ impl RemoteSpec {
         let mut integrity_warning = None;
         let mut protocol_detail = None;
         let mut authorized = false;
+        let mut remote_used_zstd = false;
         match report {
             Ok(Some(report)) if valid_sha256(&report.sha256) => {
+                remote_used_zstd = report.zstd_manifest.is_some();
                 match crate::update::trusted_current_helper_from_manifest(
                     target,
                     &report.manifest,
@@ -236,12 +238,17 @@ impl RemoteSpec {
                 ));
             }
         }
-        let decision = if authorized {
-            b"install\n"
-        } else {
-            b"discard\n"
+        // The remote checks the unpacked helper against the signed binary
+        // before running it, since the digest it reported is the archive's.
+        let decision = match helper.as_ref().filter(|_| authorized) {
+            Some(trusted) => format!(
+                "install {} {}\n",
+                trusted.binary_size(),
+                trusted.binary_sha256()
+            ),
+            None => "discard\n".to_owned(),
         };
-        let write_result = stdin.write_all(decision);
+        let write_result = stdin.write_all(decision.as_bytes());
         drop(stdin);
 
         let status = child
@@ -281,6 +288,23 @@ impl RemoteSpec {
             }
             Some(remote_helper::REMOTE_DOWNLOAD_INTEGRITY_EXIT) => match integrity_warning {
                 Some(warning) => Ok(RemoteDownloadOutcome::Integrity { warning, helper }),
+                // The authorized archive unpacked to something other than
+                // the signed helper. A zstd archive comes from the zstd
+                // listing, so the upload uses gzip, which the main manifest
+                // signs together with the helper.
+                None if authorized => Ok(RemoteDownloadOutcome::Integrity {
+                    warning: if detail.is_empty() {
+                        "the unpacked remote helper failed integrity verification".into()
+                    } else {
+                        detail
+                    },
+                    helper: helper.map(|mut helper| {
+                        if remote_used_zstd {
+                            helper.use_gzip();
+                        }
+                        helper
+                    }),
+                }),
                 None => Ok(RemoteDownloadOutcome::Fallback {
                     detail: protocol_detail.unwrap_or(detail),
                     helper,

@@ -150,6 +150,12 @@ class WorkflowTextTests(unittest.TestCase):
         verify_tag = release.split("\n  verify-tag:\n", 1)[1]
         verify_tag = verify_tag.split("\n  candidate-build:\n", 1)[0]
         self.assertIn('test -s ".github/release-notes/$GITHUB_REF_NAME.md"', verify_tag)
+        # Packaging and the installer smoke test unpack the zstd archives.
+        publish = release.split("\n  release:\n", 1)[1]
+        zstd = publish.index("command -v zstd")
+        self.assertLess(zstd, publish.index("scripts/package-release.py"))
+        self.assertLess(zstd, publish.index("scripts/smoke-release-installer.py"))
+        self.assertIn("apt-get install --yes --no-install-recommends zstd", publish)
 
 
 class PathScopeTests(Scratch):

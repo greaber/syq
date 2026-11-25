@@ -9,14 +9,17 @@ Usage: scripts/package-release.py vVERSION DIST_DIR
 """
 import difflib
 from fnmatch import fnmatchcase
+import gzip
+import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import shutil
 import tempfile
 
-from tooling import cargo_version, report_errors, sha256_file
+from tooling import ToolError, cargo_version, report_errors, sha256_file
 
 SCRIPTS = Path(os.path.abspath(__file__)).parent
 MANIFEST = "syq-release-manifest.json"
@@ -31,6 +34,34 @@ TARGETS = {
 
 def regular(path):
     return os.path.isfile(path) and not os.path.islink(path)
+
+
+def unpacked(path):
+    """The SHA-256 and size of what the archive at PATH decompresses to."""
+    digest = hashlib.sha256()
+    size = 0
+
+    def read(stream):
+        nonlocal size
+        while chunk := stream.read(1 << 20):
+            digest.update(chunk)
+            size += len(chunk)
+
+    if path.endswith(".gz"):
+        try:
+            with gzip.open(path, "rb") as stream:
+                read(stream)
+        except (OSError, EOFError) as error:
+            raise ToolError(f"gzip could not decompress {path}: {error}") from None
+    else:
+        if shutil.which("zstd") is None:
+            raise ToolError("checking the zstd archives needs the zstd command")
+        with subprocess.Popen(["zstd", "-d", "-q", "-c", path],
+                              stdout=subprocess.PIPE) as process:
+            read(process.stdout)
+        if process.returncode:
+            raise ToolError(f"zstd could not decompress {path}")
+    return digest.hexdigest(), size
 
 
 def run(*args):
@@ -73,6 +104,12 @@ def main():
                 return 1
         artifacts[target] = {"binary": described(asset), "archive": described(f"{asset}.gz")}
         zstd_archives[target] = described(f"{asset}.zst")
+        # Clients check each archive's own digest before unpacking it, so an
+        # archive of another binary must never be signed.
+        binary = artifacts[target]["binary"]
+        for archive in (f"{asset}.gz", f"{asset}.zst"):
+            if unpacked(os.path.join(dist, archive)) != (binary["sha256"], binary["size"]):
+                raise ToolError(f"{archive} does not decompress to {asset}")
 
     identity = {"schema": 1, "repository": "https://github.com/greaber/syq", "version": version,
                 "tag": tag}

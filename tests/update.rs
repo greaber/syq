@@ -175,9 +175,14 @@ impl UpdateFixture {
     /// release since zstd archives does. Without them, the fixture is a
     /// release from before.
     fn publish_zstd(&self) {
+        self.publish_zstd_of(&self.replacement);
+    }
+
+    /// Publish a zstd archive of `binary`, signed as the release's.
+    fn publish_zstd_of(&self, binary: &[u8]) {
         let target = release_target();
         let asset = format!("syq-{target}");
-        let archive = zstd::bulk::compress(&self.replacement, 19).unwrap();
+        let archive = zstd::bulk::compress(binary, 19).unwrap();
         fs::write(self.temp.path(&format!("fixtures/{asset}.zst")), &archive).unwrap();
         let listing = serde_json::json!({
             "schema": 1,
@@ -208,6 +213,15 @@ impl UpdateFixture {
             .unwrap()
             .write_all(b"tamper")
             .unwrap();
+    }
+
+    /// Change the last byte of a published file, as a corrupt download of
+    /// the right size.
+    fn tamper_in_place(&self, name: &str) {
+        let path = self.temp.path(&format!("fixtures/{name}"));
+        let mut bytes = fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        fs::write(path, bytes).unwrap();
     }
 
     /// A path in the fixture home's binary store.
@@ -517,6 +531,48 @@ fn self_update_rejects_a_tampered_zstd_archive_without_changing_install() {
 
     let update = fixture.command("--self-update");
     assert_failure_contains(&update, "response exceeds the expected");
+    fixture.assert_original_unchanged();
+}
+
+#[test]
+fn self_update_rejects_a_same_size_tampered_archive_without_changing_install() {
+    for zstd in [true, false] {
+        let release_version = next_release_version();
+        let fixture = UpdateFixture::new(&release_version, &format!("v{release_version}"));
+        fixture.register();
+        let suffix = if zstd {
+            fixture.publish_zstd();
+            "zst"
+        } else {
+            "gz"
+        };
+        fixture.tamper_in_place(&format!("syq-{}.{suffix}", release_target()));
+
+        let update = fixture.command("--self-update");
+        assert_failure_contains(
+            &update,
+            "downloaded syq release archive failed SHA-256 verification",
+        );
+        fixture.assert_original_unchanged();
+    }
+}
+
+/// A signed zstd listing whose archive unpacks to another binary than the
+/// main manifest signs is refused before anything runs it.
+#[test]
+fn self_update_rejects_a_zstd_archive_of_another_binary() {
+    let release_version = next_release_version();
+    let fixture = UpdateFixture::new(&release_version, &format!("v{release_version}"));
+    fixture.register();
+    let mut other = fixture.replacement.clone();
+    *other.last_mut().unwrap() ^= 1;
+    fixture.publish_zstd_of(&other);
+
+    let update = fixture.command("--self-update");
+    assert_failure_contains(
+        &update,
+        "downloaded syq release failed SHA-256 verification",
+    );
     fixture.assert_original_unchanged();
 }
 

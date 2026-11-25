@@ -39,8 +39,9 @@ Usage: install.sh [--bin-dir DIR]
 
 The default is $HOME/.local/bin. The installer detects this host, downloads
 the pinned release archive (zstd when zstd is installed, gzip otherwise), checks
-its embedded SHA-256 and size, verifies the binary's version and release
-identity, then replaces the destination atomically.
+its embedded SHA-256 and size and those of the binary it unpacks to, verifies
+the binary's version and release identity, then replaces the destination
+atomically.
 USAGE
 }
 
@@ -112,27 +113,51 @@ actual_size=$(wc -c < "$download" | tr -d '[:space:]')
   echo "install.sh: downloaded archive has size $actual_size, expected $expected_size" >&2
   exit 1
 }
-if command -v sha256sum >/dev/null 2>&1; then
-  actual_sha=$(sha256sum "$download" | sed 's/[[:space:]].*$//')
-elif command -v shasum >/dev/null 2>&1; then
-  actual_sha=$(shasum -a 256 "$download" | sed 's/[[:space:]].*$//')
-elif command -v openssl >/dev/null 2>&1; then
-  actual_sha=$(openssl dgst -sha256 "$download" | sed 's/^.*= //')
-else
-  echo 'install.sh: verification requires sha256sum, shasum, or openssl' >&2
-  exit 1
-fi
+# Print the SHA-256 of the file $1.
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | sed 's/[[:space:]].*$//'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | sed 's/[[:space:]].*$//'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$1" | sed 's/^.*= //'
+  else
+    echo 'install.sh: verification requires sha256sum, shasum, or openssl' >&2
+    return 1
+  fi
+}
+actual_sha=$(sha256_of "$download")
 [ "$actual_sha" = "$expected_sha" ] || {
   echo 'install.sh: downloaded archive failed SHA-256 verification' >&2
   exit 1
 }
 
-if [ "$format" = zstd ]; then
-  zstd -d -q -c "$download" > "$program"
-else
-  gzip -dc "$download" > "$program"
-fi || {
+# The archive's digest is checked; the binary it unpacks to must also be the
+# one the release manifest signs before it runs. Keep at most one byte more.
+decompress_failed="$work/decompress-failed"
+{
+  if [ "$format" = zstd ]; then
+    zstd -d -q -c "$download"
+  else
+    gzip -dc "$download"
+  fi || : > "$decompress_failed"
+} | head -c "$((binary_size + 1))" > "$program"
+actual_size=$(wc -c < "$program" | tr -d '[:space:]')
+[ "$actual_size" -le "$binary_size" ] || {
+  echo "install.sh: unpacked binary is larger than the expected $binary_size bytes" >&2
+  exit 1
+}
+[ ! -e "$decompress_failed" ] || {
   echo "install.sh: could not decompress the downloaded $format archive" >&2
+  exit 1
+}
+[ "$actual_size" = "$binary_size" ] || {
+  echo "install.sh: unpacked binary has size $actual_size, expected $binary_size" >&2
+  exit 1
+}
+actual_sha=$(sha256_of "$program")
+[ "$actual_sha" = "$binary_sha" ] || {
+  echo 'install.sh: unpacked binary failed SHA-256 verification' >&2
   exit 1
 }
 chmod 755 "$program"
@@ -176,7 +201,7 @@ esac
 
 
 def archive_fields(archive, target, suffix):
-    """The name, SHA-256, and size of a target's archive, after validation."""
+    """The name, SHA-256, and size of a target's file, after validation."""
     try:
         name, sha256, size = archive["name"], archive["sha256"], archive["size"]
     except (KeyError, TypeError):
@@ -185,7 +210,8 @@ def archive_fields(archive, target, suffix):
             and name.endswith(suffix)
             and isinstance(sha256, str) and re.fullmatch(r"[0-9a-f]{64}", sha256)
             and type(size) is int and size > 0):
-        raise ToolError(f"invalid {suffix} archive metadata for {target}")
+        kind = f"{suffix} archive" if suffix else "binary"
+        raise ToolError(f"invalid {kind} metadata for {target}")
     return name, sha256, str(size)
 
 
@@ -210,9 +236,12 @@ def main():
     for target, pattern in TARGETS.items():
         gzip = archive_fields(entry(manifest, "artifacts", target, "archive"), target, ".gz")
         zstd = archive_fields(entry(zstd_manifest, "archives", target), target, ".zst")
-        script += ("{}) archive='{}'; expected_sha='{}'; expected_size='{}';"
+        _, binary_sha, binary_size = archive_fields(
+            entry(manifest, "artifacts", target, "binary"), target, "")
+        script += ("{}) binary_sha='{}'; binary_size='{}';"
+                   " archive='{}'; expected_sha='{}'; expected_size='{}';"
                    " zstd_archive='{}'; zstd_sha='{}'; zstd_size='{}' ;;\n").format(
-                       pattern, *gzip, *zstd)
+                       pattern, binary_sha, binary_size, *gzip, *zstd)
     script += TAIL
     with open(output, "w", encoding="utf-8", newline="") as destination:
         destination.write(script)

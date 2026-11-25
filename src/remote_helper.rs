@@ -270,41 +270,46 @@ else
     format=gzip
     download {archive_url} "$archive" {max_archive}
 fi
-if command -v sha256sum >/dev/null 2>&1; then
-    if output=$(sha256sum "$archive" 2>/dev/null); then
-        actual=${{output%%[[:space:]]*}}
+# Set digest to the SHA-256 of the file $1.
+sha256_of() {{
+    if command -v sha256sum >/dev/null 2>&1; then
+        if output=$(sha256sum "$1" 2>/dev/null); then
+            digest=${{output%%[[:space:]]*}}
+        else
+            echo "syq: remote helper hashing with sha256sum failed" >&2
+            exit {remote_download_fallback_exit}
+        fi
+    elif command -v shasum >/dev/null 2>&1; then
+        if output=$(shasum -a 256 "$1" 2>/dev/null); then
+            digest=${{output%%[[:space:]]*}}
+        else
+            echo "syq: remote helper hashing with shasum failed" >&2
+            exit {remote_download_fallback_exit}
+        fi
+    elif command -v openssl >/dev/null 2>&1; then
+        if output=$(openssl dgst -sha256 "$1" 2>/dev/null); then
+            digest=${{output##* }}
+        else
+            echo "syq: remote helper hashing with openssl failed" >&2
+            exit {remote_download_fallback_exit}
+        fi
     else
-        echo "syq: remote helper hashing with sha256sum failed" >&2
+        echo "syq: remote helper verification needs sha256sum, shasum, or openssl" >&2
         exit {remote_download_fallback_exit}
     fi
-elif command -v shasum >/dev/null 2>&1; then
-    if output=$(shasum -a 256 "$archive" 2>/dev/null); then
-        actual=${{output%%[[:space:]]*}}
-    else
-        echo "syq: remote helper hashing with shasum failed" >&2
-        exit {remote_download_fallback_exit}
-    fi
-elif command -v openssl >/dev/null 2>&1; then
-    if output=$(openssl dgst -sha256 "$archive" 2>/dev/null); then
-        actual=${{output##* }}
-    else
-        echo "syq: remote helper hashing with openssl failed" >&2
-        exit {remote_download_fallback_exit}
-    fi
-else
-    echo "syq: remote helper verification needs sha256sum, shasum, or openssl" >&2
-    exit {remote_download_fallback_exit}
-fi
-case "$actual" in
-    ''|*[!0-9a-f]*)
+    if ! is_sha256 "$digest"; then
         echo "syq: remote helper hasher returned an invalid SHA-256 digest" >&2
         exit {remote_download_fallback_exit}
-        ;;
-esac
-if [ "${{#actual}}" -ne 64 ]; then
-    echo "syq: remote helper hasher returned an invalid SHA-256 digest" >&2
-    exit {remote_download_fallback_exit}
-fi
+    fi
+}}
+is_sha256() {{
+    case "$1" in
+        ''|*[!0-9a-f]*) return 1 ;;
+    esac
+    [ "${{#1}}" -eq 64 ]
+}}
+sha256_of "$archive"
+actual=$digest
 report() {{
     printf '%s\n' "$1"
     while IFS= read -r line || [ -n "$line" ]; do
@@ -318,7 +323,10 @@ if [ "$format" = zstd ]; then
 fi
 printf 'syq-helper-sha256:%s\n' "$actual"
 printf 'syq-helper-report-end\n'
-if ! IFS= read -r decision; then
+# The client answers "install SIZE SHA256" with the helper's size and digest
+# from the signed manifest, which the unpacked helper must match before it
+# runs: the signed digest checked so far is the archive's.
+if ! read -r decision expected_size expected_sha; then
     echo "syq: local client did not authorize the remote helper download" >&2
     exit {remote_download_fallback_exit}
 fi
@@ -326,14 +334,47 @@ if [ "$decision" != install ]; then
     echo "syq: remote helper download was discarded after local integrity verification" >&2
     exit {remote_download_integrity_exit}
 fi
-if [ "$format" = zstd ]; then
-    zstd -d -q -c "$archive" > "$tmp"
-else
-    gzip -dc "$archive" > "$tmp"
-fi || {{
+case "$expected_size" in
+    ''|0*|*[!0-9]*)
+        echo "syq: local client sent no valid helper size" >&2
+        exit {remote_download_fallback_exit}
+        ;;
+esac
+if ! is_sha256 "$expected_sha"; then
+    echo "syq: local client sent no valid helper SHA-256 digest" >&2
+    exit {remote_download_fallback_exit}
+fi
+decompress() {{
+    if [ "$format" = zstd ]; then
+        zstd -d -q -c "$archive"
+    else
+        gzip -dc "$archive"
+    fi
+}}
+# As for downloads, keep at most one byte more than the helper, and take the
+# decompressor's status from descriptor 3.
+if ! status=$({{ {{ decompress; echo "$?" >&3; }} | head -c "$((expected_size + 1))" > "$tmp"; }} 3>&1); then
+    echo "syq: cannot write the remote helper" >&2
+    exit {install_failed_exit}
+fi
+size=$(($(wc -c < "$tmp")))
+if [ "$size" -gt "$expected_size" ]; then
+    echo "syq: unpacked remote helper is larger than the signed $expected_size bytes" >&2
+    exit {remote_download_integrity_exit}
+fi
+if [ "$status" != 0 ]; then
     echo "syq: remote helper decompression with $format failed" >&2
     exit {remote_download_fallback_exit}
-}}
+fi
+if [ "$size" -ne "$expected_size" ]; then
+    echo "syq: unpacked remote helper has $size bytes, not the signed $expected_size" >&2
+    exit {remote_download_integrity_exit}
+fi
+sha256_of "$tmp"
+if [ "$digest" != "$expected_sha" ]; then
+    echo "syq: unpacked remote helper failed SHA-256 verification" >&2
+    exit {remote_download_integrity_exit}
+fi
 if ! chmod 700 "$tmp"; then
     echo "syq: cannot make the remote helper executable" >&2
     exit {install_failed_exit}
@@ -618,6 +659,8 @@ mod tests {
         std::fs::create_dir(&bin).unwrap();
         for tool in [
             "cat",
+            "chmod",
+            "gzip",
             "head",
             "mkdir",
             "rm",
@@ -636,8 +679,12 @@ mod tests {
             }
         }
         if zstd {
-            // Only installation decompresses, and these runs never install.
-            crate::test_support::write_executable(&bin.join("zstd"), b"#!/bin/sh\nexit 1\n", 0o700);
+            // Unpacks a served archive as itself.
+            crate::test_support::write_executable(
+                &bin.join("zstd"),
+                b"#!/bin/sh\nfor archive; do :; done\nexec cat \"$archive\"\n",
+                0o700,
+            );
         }
         crate::test_support::write_executable(
             &bin.join("curl"),
@@ -773,6 +820,110 @@ mod tests {
             assert!(
                 stdout.contains(&format!("syq-helper-sha256:{}\n", sha256_hex(archive))),
                 "zstd={zstd}: {stdout}"
+            );
+        }
+    }
+
+    /// An archive whose own digest the client authorized must still unpack
+    /// to the signed helper, of its exact size and SHA-256, before anything
+    /// runs it: a signed zstd listing could name an archive of another binary.
+    #[test]
+    fn an_authorized_archive_runs_only_if_it_unpacks_to_the_signed_helper() {
+        let markers = crate::test_support::tempdir().unwrap();
+        let marker = markers.path().join("executed");
+        let helper = format!("#!/bin/sh\n: > '{}'\n", marker.display()).into_bytes();
+        let mut same_size = helper.clone();
+        *same_size.last_mut().unwrap() = b' ';
+        let longer = [helper.as_slice(), b"\n"].concat();
+        let cases: [(&[u8], &str); 3] = [
+            (
+                &same_size,
+                "unpacked remote helper failed SHA-256 verification",
+            ),
+            (&longer, "unpacked remote helper is larger than the signed"),
+            (&helper[..helper.len() - 1], "unpacked remote helper has"),
+        ];
+        for (unpacked, error) in cases {
+            let output = run_download(
+                &[
+                    ("syq-release-manifest.json", b"{}"),
+                    ("syq-release-zstd.json", b"{}"),
+                    ("syq-linux-x86_64.zst", unpacked),
+                ],
+                Absent::Missing,
+                true,
+                &format!("install {} {}\n", helper.len(), sha256_hex(&helper)),
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(REMOTE_DOWNLOAD_INTEGRITY_EXIT),
+                "{output:?}"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(error),
+                "{output:?}"
+            );
+            assert!(!marker.exists(), "{error}: the mismatched helper ran");
+        }
+        // The signed helper itself gets as far as running (and then reports
+        // no version), from either archive.
+        for (name, zstd) in [
+            ("syq-linux-x86_64.zst", true),
+            ("syq-linux-x86_64.gz", false),
+        ] {
+            let archive = if zstd {
+                helper.clone()
+            } else {
+                let mut encoder =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+                std::io::Write::write_all(&mut encoder, &helper).unwrap();
+                encoder.finish().unwrap()
+            };
+            let output = run_download(
+                &[
+                    ("syq-release-manifest.json", b"{}"),
+                    ("syq-release-zstd.json", b"{}"),
+                    (name, &archive),
+                ],
+                Absent::Missing,
+                zstd,
+                &format!("install {} {}\n", helper.len(), sha256_hex(&helper)),
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(INSTALL_FAILED_EXIT),
+                "{output:?}"
+            );
+            assert!(marker.exists(), "{name}: {output:?}");
+            std::fs::remove_file(&marker).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_invalid_install_decision_installs_nothing() {
+        for decision in [
+            "install\n",
+            "install 012 x\n",
+            &format!("install 1 {}\n", "A".repeat(64)),
+        ] {
+            let output = run_download(
+                &[
+                    ("syq-release-manifest.json", b"{}"),
+                    ("syq-linux-x86_64.gz", b"archive"),
+                ],
+                Absent::Missing,
+                false,
+                decision,
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(REMOTE_DOWNLOAD_FALLBACK_EXIT),
+                "{decision}: {output:?}"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("local client sent no valid helper"),
+                "{decision}: {output:?}"
             );
         }
     }

@@ -165,8 +165,10 @@ offer smaller zstd archives, which a second signed manifest lists; syq
 downloads those when a release has them, and SSH servers do when they have
 `zstd`. Source builds also carry the release key for `--use-version`. When an
 SSH server downloads its own helper, your machine checks the manifests and the
-archive hash the server reports before allowing installation, and uploads a
-verified helper over SSH instead if the download cannot be verified.
+archive hash the server reports before allowing installation, and the server
+checks the unpacked helper's size and hash from the signed manifest before
+running it. If either check fails, or the download cannot be verified, syq
+uploads a verified helper over SSH instead.
 
 A release you select with `--use-version` is verified once, when syq stores it
 in `~/.local/lib/syq`. Later runs on your machine start it without hashing it
@@ -179,8 +181,9 @@ keep `~/.local/lib/syq` there writable only by you too.
 
 Your first installation establishes this trust. The standalone installer
 downloads the zstd archive when `zstd` is installed, and gzip otherwise. It
-checks the archive against a size and SHA-256 hash embedded in the script, but
-not the release signature, so you trust the script you fetched over HTTPS.
+checks the archive, and the executable it unpacks to before running it, against
+sizes and SHA-256 hashes embedded in the script, but not the release signature,
+so you trust the script you fetched over HTTPS.
 Homebrew installations trust Homebrew and the tap. A source build is trusted
 as built, and by default syq uploads that executable as its helper on
 servers. See [Install](install.md) for the installation methods.

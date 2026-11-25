@@ -122,6 +122,8 @@ pub(crate) struct TrustedCurrentHelper {
     /// The zstd archive, once its signed listing has been read; until then
     /// a download looks it up (`download_helper`).
     zstd_archive: Option<ReleaseFile>,
+    /// Download the gzip archive even if the release lists a zstd one.
+    gzip_only: bool,
     public_key: String,
 }
 
@@ -135,6 +137,17 @@ impl TrustedCurrentHelper {
     /// The SHA-256 of the helper itself, as the signed manifest states it.
     pub fn binary_sha256(&self) -> &str {
         &self.binary.sha256
+    }
+
+    /// The size of the helper itself, as the signed manifest states it.
+    pub fn binary_size(&self) -> u64 {
+        self.binary.size
+    }
+
+    /// Download the gzip archive from now on, as when the zstd archive was
+    /// found not to unpack to the signed helper.
+    pub fn use_gzip(&mut self) {
+        self.gzip_only = true;
     }
 }
 
@@ -490,6 +503,7 @@ fn helper_from_release(target: Target, release: &VerifiedRelease) -> Result<Trus
         binary: artifact.binary.clone(),
         archive: artifact.archive.clone(),
         zstd_archive: None,
+        gzip_only: false,
         public_key: release.public_key.clone(),
     })
 }
@@ -778,7 +792,11 @@ const SYQ_RELEASE: &str = "syq release";
 /// gzip. The signed sizes bound both the download and the decompressed
 /// result, and only an archive that matches its signed hash is decompressed.
 fn download_helper(helper: &TrustedCurrentHelper, what: &str) -> Result<Vec<u8>> {
-    let zstd = helper.zstd_archive.clone().or_else(|| zstd_archive(helper));
+    let zstd = if helper.gzip_only {
+        None
+    } else {
+        helper.zstd_archive.clone().or_else(|| zstd_archive(helper))
+    };
     let expected = zstd.as_ref().unwrap_or(&helper.archive);
     let url = format!("{}/{}/{}", release_downloads(), helper.tag, expected.name);
     let archive = fetch_bytes(&url, FetchMode::Interactive, expected.size)?;
@@ -2429,6 +2447,7 @@ mod tests {
             },
             archive: manifest().artifacts["linux-x86_64"].archive.clone(),
             zstd_archive: None,
+            gzip_only: false,
             public_key: String::new(),
         };
         assert_eq!(stored_helper(&path, &helper), None);

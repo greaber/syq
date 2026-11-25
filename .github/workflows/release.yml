@@ -122,6 +122,16 @@ jobs:
           merge-multiple: true
       - name: Restore canonicalizer permission
         run: chmod 755 dist/syq-linux-x86_64
+      # Packaging unpacks every zstd archive to check it against its binary,
+      # and the installer smoke test installs from them.
+      - name: Make zstd available
+        run: |
+          set -eu
+          if ! command -v zstd >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends zstd
+          fi
+          zstd --version
       - name: Build and validate release metadata
         run: scripts/package-release.py "$GITHUB_REF_NAME" dist
       - name: Sign release manifests and verify the configured key

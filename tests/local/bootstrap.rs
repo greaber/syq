@@ -1052,6 +1052,55 @@ fn remote_zstd_download_that_fails_verification_is_replaced_by_an_upload() {
     );
 }
 
+/// A signed zstd listing can name an archive whose own digest checks out but
+/// which unpacks to another executable than the signed helper. The server
+/// checks the unpacked helper against the main manifest and never runs it,
+/// and the client uploads the verified helper instead.
+#[test]
+fn remote_zstd_archive_of_another_executable_is_never_run() {
+    let t = Tmp::new();
+    let rsh = fake_rsh(&t);
+    setup_release_bootstrap(&t);
+    if !remote_zstd(&t) {
+        return;
+    }
+    let fixture = release_bootstrap_fixture();
+    // Of the signed helper's size, so only its digest tells them apart.
+    let size = read(Path::new(env!("CARGO_BIN_EXE_syq"))).len();
+    let mut other = format!("#!/bin/sh\n: > '{}'\nexit 0\n", t.s("ran")).into_bytes();
+    other.resize(size, b'#');
+    let archive = zstd::bulk::compress(&other, 1).unwrap();
+    write(&t.path("other.zst"), &archive);
+    write(
+        &t.path("other-zstd-manifest.json"),
+        &signed_zstd_listing(fixture.asset, &archive),
+    );
+    write(&t.path("src"), b"verified upload");
+    let remote = format!("fake:{}", t.s("dst"));
+    let out = remote_syq_command(&t, &rsh, &["-a", &t.s("src"), &remote])
+        .env(
+            "FAKE_REMOTE_RELEASE_ZSTD_MANIFEST",
+            t.path("other-zstd-manifest.json"),
+        )
+        .env("FAKE_REMOTE_RELEASE_ZSTD_ARCHIVE", t.path("other.zst"))
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"verified upload");
+    assert!(!t.path("ran").exists(), "the unsigned executable ran");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("warning")
+            && stderr.contains("unpacked remote helper failed SHA-256 verification")
+            && stderr.contains("uploading the verified helper"),
+        "{stderr}"
+    );
+    assert_eq!(
+        read(&stored_remote_helper(&t)),
+        read(Path::new(env!("CARGO_BIN_EXE_syq")))
+    );
+}
+
 /// The helper the client downloads for an upload comes from the zstd archive
 /// of a release that lists one, and from gzip for a release from before.
 #[test]

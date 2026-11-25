@@ -141,12 +141,23 @@ class ReleaseToolTests(unittest.TestCase):
             binary = dist / asset
             binary.write_text("#!/bin/sh\nexit 0\n")
             binary.chmod(0o755)
-            archive = subprocess.run(["gzip", "-9", "-n", "-c", str(binary)], check=True,
-                                     stdout=subprocess.PIPE).stdout
-            (dist / f"{asset}.gz").write_bytes(archive)
-            # Packaging only hashes archives; the installer tests unpack real ones.
-            (dist / f"{asset}.zst").write_bytes(b"zstd stand-in for " + asset.encode())
+            for command, suffix in [(["gzip", "-9", "-n"], ".gz"), (["zstd", "-q"], ".zst")]:
+                archive = subprocess.run([*command, "-c", str(binary)], check=True,
+                                         stdout=subprocess.PIPE).stdout
+                (dist / f"{asset}{suffix}").write_bytes(archive)
         return dist
+
+    def test_packaging_refuses_an_archive_of_another_binary(self):
+        for suffix, command in [(".gz", ["gzip", "-n"]), (".zst", ["zstd", "-q"])]:
+            with self.subTest(suffix=suffix):
+                dist = self.prepare_dist(f"other-binary{suffix}")
+                asset = ASSETS[0]
+                other = subprocess.run([*command, "-c"], input=b"#!/bin/sh\nexit 1\n",
+                                       check=True, stdout=subprocess.PIPE).stdout
+                (dist / f"{asset}{suffix}").write_bytes(other)
+                self.expect_failure(f"{asset}{suffix} does not decompress to {asset}",
+                                    [SCRIPTS / "package-release.py", TAG, dist])
+                self.assertFalse((dist / "syq-release-manifest.json").exists())
 
     def package(self, name):
         dist = self.prepare_dist(name)

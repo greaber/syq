@@ -805,6 +805,29 @@ fn sign_release_document(signing: &SigningKey, mut document: serde_json::Value) 
 
 static RELEASE_BOOTSTRAP_FIXTURE: OnceLock<ReleaseBootstrapFixture> = OnceLock::new();
 
+/// The release key of `release_bootstrap_fixture`.
+const RELEASE_BOOTSTRAP_KEY: [u8; 32] = [19; 32];
+
+/// A zstd listing for this build's release that names `archive` as the
+/// archive of `asset`, signed with the fixture release's key.
+fn signed_zstd_listing(asset: &str, archive: &[u8]) -> Vec<u8> {
+    let listing = serde_json::json!({
+        "schema": 1,
+        "repository": "https://github.com/greaber/syq",
+        "version": env!("CARGO_PKG_VERSION"),
+        "tag": format!("v{}", env!("CARGO_PKG_VERSION")),
+        "archives": {
+            (helper_target()): {
+                "name": format!("{asset}.zst"),
+                "sha256": sha256_hex(archive),
+                "size": archive.len()
+            }
+        },
+        "signature_scheme": "ed25519-jcs-v1"
+    });
+    sign_release_document(&SigningKey::from_bytes(&RELEASE_BOOTSTRAP_KEY), listing)
+}
+
 fn release_bootstrap_fixture() -> &'static ReleaseBootstrapFixture {
     RELEASE_BOOTSTRAP_FIXTURE.get_or_init(|| {
         let binary_bytes = fs::read(env!("CARGO_BIN_EXE_syq")).unwrap();
@@ -846,26 +869,12 @@ fn release_bootstrap_fixture() -> &'static ReleaseBootstrapFixture {
             "homebrew_formula": {"name": "syq.rb", "sha256": "2".repeat(64), "size": 1},
             "signature_scheme": "ed25519-jcs-v1"
         });
-        let zstd_manifest = serde_json::json!({
-            "schema": 1,
-            "repository": "https://github.com/greaber/syq",
-            "version": env!("CARGO_PKG_VERSION"),
-            "tag": format!("v{}", env!("CARGO_PKG_VERSION")),
-            "archives": {
-                (target): {
-                    "name": format!("{asset}.zst"),
-                    "sha256": sha256_hex(&zstd_archive),
-                    "size": zstd_archive.len()
-                }
-            },
-            "signature_scheme": "ed25519-jcs-v1"
-        });
-        let signing = SigningKey::from_bytes(&[19; 32]);
+        let signing = SigningKey::from_bytes(&RELEASE_BOOTSTRAP_KEY);
         ReleaseBootstrapFixture {
             archive,
             manifest: sign_release_document(&signing, manifest),
+            zstd_manifest: signed_zstd_listing(asset, &zstd_archive),
             zstd_archive,
-            zstd_manifest: sign_release_document(&signing, zstd_manifest),
             public_key: base64::engine::general_purpose::STANDARD
                 .encode(signing.verifying_key().to_bytes()),
             asset,

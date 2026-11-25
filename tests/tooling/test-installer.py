@@ -26,9 +26,10 @@ case "$1" in
   *) exit 2 ;;
 esac
 """
-# Each fake serves the release file a URL names, or with
-# SYQ_TEST_ENDLESS_DOWNLOAD set, data that never ends.
+# Each fake reports the release file a URL names on stderr and serves it, or
+# with SYQ_TEST_ENDLESS_DOWNLOAD set, data that never ends.
 FAKE_DOWNLOAD = """
+echo "test fetched ${url##*/}" >&2
 [ -z "${SYQ_TEST_ENDLESS_DOWNLOAD:-}" ] || exec yes
 if [ "$output" = - ]; then
   exec cat "$SYQ_TEST_RELEASE_DIR/${url##*/}"
@@ -107,29 +108,33 @@ class InstallerTests(unittest.TestCase):
         return env
 
     def write_archive(self, target, version="0.1.0", identity="v0.1.0"):
-        """Write both archives of a target. Each program reports which archive
-        it came from, and the zstd one holds gzip data for FAKE_ZSTD."""
-        for format, suffix in FORMATS.items():
-            program = self.work / f"program-{target}-{format}"
-            executable(program, f"""#!/bin/sh
+        """Write a target's program, which the manifest signs, and both its
+        archives; the zstd one holds gzip data for FAKE_ZSTD."""
+        program = self.work / f"program-{target}"
+        executable(program, f"""#!/bin/sh
 case "$1" in
   --version) echo 'syq {version}' ;;
   --build-identity) echo '{identity}' ;;
   --register-standalone-install) exit 0 ;;
   --test-target) echo '{target}' ;;
-  --test-format) echo '{format}' ;;
   *) exit 2 ;;
 esac
 """)
-            archive = subprocess.run(["gzip", "-9", "-n", "-c", str(program)], check=True,
-                                     stdout=subprocess.PIPE).stdout
-            (self.release / f"syq-{target}{suffix}").write_bytes(archive)
+        for suffix in FORMATS.values():
+            self.write_archive_of(target, suffix, program.read_bytes())
+
+    def write_archive_of(self, target, suffix, content):
+        """Replace one archive of a target with one of `content`, which the
+        manifests generated afterwards sign as that archive."""
+        archive = subprocess.run(["gzip", "-9", "-n", "-c"], input=content, check=True,
+                                 stdout=subprocess.PIPE).stdout
+        (self.release / f"syq-{target}{suffix}").write_bytes(archive)
 
     def write_manifests(self, output, zstd_output):
         artifacts = {}
         archives = {}
         for target in TARGETS:
-            program = self.work / f"program-{target}-gzip"
+            program = self.work / f"program-{target}"
             files = {format: self.release / f"syq-{target}{suffix}"
                      for format, suffix in FORMATS.items()}
             artifacts[target] = {
@@ -182,7 +187,7 @@ esac
                 self.assertEqual(result.returncode, 0, result.stdout)
                 self.assertEqual(self.run_program(install_dir / "syq", "--version"), "syq 0.1.0")
                 self.assertEqual(self.run_program(install_dir / "syq", "--test-target"), target)
-                self.assertEqual(self.run_program(install_dir / "syq", "--test-format"), "zstd")
+                self.assertIn(f"test fetched syq-{target}.zst", result.stdout)
 
     def tool_path(self, downloader="curl", zstd=None):
         """A PATH directory with every utility the installer and the fake
@@ -212,7 +217,7 @@ esac
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertEqual(self.run_program(self.work / "install-wget/syq", "--test-target"),
                          "linux-x86_64")
-        self.assertEqual(self.run_program(self.work / "install-wget/syq", "--test-format"), "gzip")
+        self.assertIn("test fetched syq-linux-x86_64.gz", result.stdout)
 
     def test_the_archive_follows_whether_zstd_is_installed(self):
         for zstd, expected in [("fake", "zstd"), (None, "gzip")]:
@@ -222,8 +227,8 @@ esac
                     result = self.install(install_dir, shell="/bin/sh",
                                           path=str(self.tool_path(downloader, zstd)))
                     self.assertEqual(result.returncode, 0, result.stdout)
-                    self.assertEqual(self.run_program(install_dir / "syq", "--test-format"),
-                                     expected)
+                    self.assertIn("test fetched syq-linux-x86_64" + FORMATS[expected],
+                                  result.stdout)
 
     def test_a_failed_decompression_keeps_the_working_installation(self):
         install_dir = self.work / "install-broken-zstd"
@@ -236,7 +241,7 @@ esac
 
     @unittest.skipUnless(shutil.which("zstd"), "this host has no zstd")
     def test_a_real_zstd_archive_installs(self):
-        program = self.work / "program-linux-x86_64-zstd"
+        program = self.work / "program-linux-x86_64"
         archive = self.release / "syq-linux-x86_64.zst"
         archive.write_bytes(subprocess.run(["zstd", "-19", "--single-thread", "-q", "-c",
                                             str(program)], check=True,
@@ -247,6 +252,33 @@ esac
                               path=str(self.tool_path("curl", "real")))
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertEqual((install_dir / "syq").read_bytes(), program.read_bytes())
+
+    def test_an_archive_of_another_binary_is_never_run(self):
+        """Each archive matches the digest and size its signed manifest gives,
+        but unpacks to a binary other than the one the main manifest signs."""
+        marker = self.work / "mismatched-binary-ran"
+        signed = (self.work / "program-linux-x86_64").read_bytes()
+        other = f"#!/bin/sh\n: > '{marker}'\necho 'syq 0.1.0'\n".encode()
+        same_size = (other + b"#" * len(signed))[:len(signed) - 1] + b"\n"
+        self.assertNotEqual(len(other), len(signed))
+        for format, suffix in FORMATS.items():
+            for content, error in [(same_size, "unpacked binary failed SHA-256 verification"),
+                                   (other, "unpacked binary")]:
+                with self.subTest(format=format, size=len(content)):
+                    self.write_archive("linux-x86_64")
+                    self.write_archive_of("linux-x86_64", suffix, content)
+                    installer = self.generate("mismatched-manifest.json", "mismatched.sh")
+                    self.assertIn(f"binary_sha='{sha256(self.work / 'program-linux-x86_64')}'",
+                                  installer.read_text())
+                    install_dir = self.work / f"install-mismatched-{format}"
+                    path = None if format == "zstd" else str(self.tool_path())
+                    result = self.install(install_dir, installer=installer, shell="/bin/sh",
+                                          path=path)
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn(error, result.stdout)
+                    self.assertIn(f"test fetched syq-linux-x86_64{suffix}", result.stdout)
+                    self.assertFalse(marker.exists(), result.stdout)
+                    self.assertFalse((install_dir / "syq").exists())
 
     def test_help_and_usage_errors(self):
         help_text = subprocess.run(["sh", str(self.installer), "--help"], check=True,
