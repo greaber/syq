@@ -24,18 +24,33 @@ impl InFlight {
             peak: AtomicUsize::new(0),
         }
     }
-    fn hold(&self, time: Duration) {
+    fn enter(&self) {
         let now = self.now.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(now, Ordering::SeqCst);
-        thread::sleep(time);
+    }
+    fn leave(&self) {
         self.now.fetch_sub(1, Ordering::SeqCst);
+    }
+    /// Hold a request of this kind, which also counts among `REQUESTS`.
+    fn hold(&self, time: Duration) {
+        REQUESTS.enter();
+        self.enter();
+        thread::sleep(time);
+        self.leave();
+        REQUESTS.leave();
     }
     pub(super) fn peak(&self) -> usize {
         self.peak.load(Ordering::SeqCst)
     }
+    pub(super) fn reset(&self) {
+        self.peak
+            .store(self.now.load(Ordering::SeqCst), Ordering::SeqCst);
+    }
 }
 pub(super) static HEADS: InFlight = InFlight::new();
 pub(super) static GETS: InFlight = InFlight::new();
+/// Checks and transfers together.
+pub(super) static REQUESTS: InFlight = InFlight::new();
 
 pub(super) fn key(index: usize) -> String {
     format!("data/f{index:05}")
