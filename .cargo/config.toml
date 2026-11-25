@@ -5,3 +5,6 @@
 # same variable, since Nix builds do not read this file. An explicitly set
 # environment variable still takes precedence.
 AWS_LC_SYS_NO_JITTER_ENTROPY = "1"
+
+# Keep bundled SQLite features in sync with flake.nix.
+LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS -USQLITE_ENABLE_FTS5 -USQLITE_ENABLE_RTREE -USQLITE_ENABLE_LOAD_EXTENSION -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_DEPRECATED"
