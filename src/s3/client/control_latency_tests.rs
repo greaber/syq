@@ -1,13 +1,11 @@
 use super::*;
+use crate::s3::tuning::ControlSamples;
 use aws_smithy_runtime_api::client::{
     http::{http_client_fn, HttpConnector, HttpConnectorFuture, SharedHttpConnector},
     orchestrator::{HttpRequest, HttpResponse},
 };
 use aws_smithy_types::body::SdkBody;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 struct Responses;
@@ -27,8 +25,8 @@ impl HttpConnector for Responses {
                     "<IsTruncated>false</IsTruncated>".into()
                 };
                 (200, 15, format!("<ListBucketResult>{next}<Contents><Key>data/{page}</Key><Size>4</Size></Contents></ListBucketResult>"))
-            } else if uri.ends_with("/slow") {
-                (404, 80, String::new())
+            } else if uri.ends_with("/cold") {
+                (404, 36, String::new())
             } else if head {
                 (
                     uri.rsplit('/').next().unwrap().parse::<u16>().unwrap(),
@@ -47,10 +45,8 @@ impl HttpConnector for Responses {
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn latency_uses_individual_control_responses_and_ignores_errors_and_data() {
-    let control = Arc::new(AtomicU64::new(u64::MAX));
-    let client = Client::from_conf(
+fn client(control: Arc<ControlSamples>) -> Client {
+    Client::from_conf(
         aws_sdk_s3::config::Builder::new()
             .behavior_version_latest()
             .region(Region::new("us-east-1"))
@@ -59,18 +55,49 @@ async fn latency_uses_individual_control_responses_and_ignores_errors_and_data()
             ))
             .retry_config(RetryConfig::disabled())
             .http_client(http_client_fn(|_, _| SharedHttpConnector::new(Responses)))
-            .interceptor(ControlLatency(control.clone()))
+            .interceptor(ControlLatency::new(control))
             .build(),
-    );
-    let start = tokio::time::Instant::now();
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn cold_control_response_counts_only_until_a_warm_one_arrives() {
+    let control = Arc::<ControlSamples>::default();
+    let client = client(control.clone());
     assert!(client
         .head_object()
         .bucket("bucket")
-        .key("slow")
+        .key("cold")
         .send()
         .await
         .is_err());
-    assert_eq!(control.load(Ordering::Relaxed), 80_000_000);
+    // With only the first response, as when one listing page plans the
+    // copy, that response describes the endpoint.
+    assert_eq!(control.fastest(), 36_000_000);
+    client
+        .list_objects_v2()
+        .bucket("bucket")
+        .send()
+        .await
+        .unwrap();
+    // 36 ms crosses the 20 and 32 ms tuning thresholds. The 15 ms
+    // steady-state sample belongs in the lower concurrency tier, so it
+    // replaces the slower first response.
+    assert_eq!(control.fastest(), 15_000_000);
+}
+
+#[tokio::test(start_paused = true)]
+async fn latency_uses_individual_control_responses_and_ignores_errors_and_data() {
+    let control = Arc::<ControlSamples>::default();
+    let client = client(control.clone());
+    assert!(client
+        .head_object()
+        .bucket("bucket")
+        .key("cold")
+        .send()
+        .await
+        .is_err());
+    let start = tokio::time::Instant::now();
     assert_eq!(
         list(&client, None, "bucket", "data/", 32)
             .await
@@ -80,8 +107,8 @@ async fn latency_uses_individual_control_responses_and_ignores_errors_and_data()
         8
     );
     // Flat pages give no evidence that directory discovery would help.
-    assert_eq!(start.elapsed(), Duration::from_millis(200));
-    assert_eq!(control.load(Ordering::Relaxed), 15_000_000);
+    assert_eq!(start.elapsed(), Duration::from_millis(120));
+    assert_eq!(control.fastest(), 15_000_000);
     for status in [301, 429, 503] {
         assert!(client
             .head_object()
@@ -90,7 +117,7 @@ async fn latency_uses_individual_control_responses_and_ignores_errors_and_data()
             .send()
             .await
             .is_err());
-        assert_eq!(control.load(Ordering::Relaxed), 15_000_000);
+        assert_eq!(control.fastest(), 15_000_000);
     }
     client
         .get_object()
@@ -99,7 +126,7 @@ async fn latency_uses_individual_control_responses_and_ignores_errors_and_data()
         .send()
         .await
         .unwrap();
-    assert_eq!(control.load(Ordering::Relaxed), 15_000_000);
+    assert_eq!(control.fastest(), 15_000_000);
     assert!(client
         .head_object()
         .bucket("bucket")
@@ -107,7 +134,7 @@ async fn latency_uses_individual_control_responses_and_ignores_errors_and_data()
         .send()
         .await
         .is_err());
-    assert_eq!(control.load(Ordering::Relaxed), 1_000_000);
+    assert_eq!(control.fastest(), 1_000_000);
 }
 
 /// How long the fake storage service takes to answer, and how long the fake
@@ -137,11 +164,15 @@ async fn latency_leaves_out_the_wait_for_a_signature() {
     use crate::s3::authorization::{http_client, Authorization, Configuration};
     let (socket, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
     let authorizer = std::thread::spawn(move || {
-        let message: serde_json::Value = read_message(&mut peer).unwrap();
-        let key = message["Sign"][0]["key"].as_str().unwrap().to_owned();
-        std::thread::sleep(SIGNING);
-        let url = format!("https://storage.example/fixture/{key}?X-Amz-Signature=fake");
-        write_message(&mut peer, &serde_json::json!({ "Signed": [url] })).unwrap();
+        for key in ["first", "second"] {
+            let message: serde_json::Value = read_message(&mut peer).unwrap();
+            assert_eq!(message["Sign"][0]["key"], key);
+            if key == "second" {
+                std::thread::sleep(SIGNING);
+            }
+            let url = format!("https://storage.example/fixture/{key}?X-Amz-Signature=fake");
+            write_message(&mut peer, &serde_json::json!({ "Signed": [url] })).unwrap();
+        }
     });
     let expires_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -158,7 +189,7 @@ async fn latency_leaves_out_the_wait_for_a_signature() {
         },
         socket,
     ));
-    let control = Arc::new(AtomicU64::new(u64::MAX));
+    let control = Arc::<ControlSamples>::default();
     let client = Client::from_conf(
         aws_sdk_s3::config::Builder::new()
             .behavior_version_latest()
@@ -173,20 +204,22 @@ async fn latency_leaves_out_the_wait_for_a_signature() {
                 http_client_fn(|_, _| SharedHttpConnector::new(Found)),
                 authorization,
             ))
-            .interceptor(ControlLatency(control.clone()))
+            .interceptor(ControlLatency::new(control.clone()))
             .build(),
     );
     let start = tokio::time::Instant::now();
-    client
-        .head_object()
-        .bucket("fixture")
-        .key("key")
-        .send()
-        .await
-        .unwrap();
+    for key in ["first", "second"] {
+        client
+            .head_object()
+            .bucket("fixture")
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+    }
     assert!(start.elapsed() >= SIGNING + STORAGE);
     // The storage service's own time stays in the sample.
-    let sample = Duration::from_nanos(control.load(Ordering::Relaxed));
+    let sample = Duration::from_nanos(control.fastest());
     assert!(sample >= STORAGE && sample < SIGNING / 2, "{sample:?}");
     authorizer.join().unwrap();
 }

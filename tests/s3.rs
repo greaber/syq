@@ -1548,6 +1548,76 @@ fn serve(
         serve_copy_pages(&mut socket, first, &probes);
         return;
     }
+    if fault.starts_with("upload-selection") {
+        let target = first.split_whitespace().nth(1).unwrap();
+        if method == "GET" && target.contains("list-type=2") {
+            assert!(target.contains("prefix=data%2F"));
+            probes.fetch_add(1, Ordering::Relaxed);
+            if fault.ends_with("denied") {
+                reply(
+                    &mut socket,
+                    403,
+                    &[],
+                    b"<Error><Code>AccessDenied</Code></Error>",
+                    false,
+                );
+            } else if fault.contains("sparse") {
+                let token = probes.load(Ordering::Relaxed);
+                let listing = format!(
+                    "<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>{token}</NextContinuationToken><Contents><Key>data/unrelated-{token}</Key><Size>1</Size></Contents></ListBucketResult>"
+                );
+                reply(&mut socket, 200, &[], listing.as_bytes(), false);
+            } else {
+                let keys: String = (0..128)
+                    .step_by(2)
+                    .map(|n| format!("<Contents><Key>data/f{n:03}</Key><Size>1</Size></Contents>"))
+                    .collect();
+                let listing = format!(
+                    "<ListBucketResult><IsTruncated>false</IsTruncated>{keys}</ListBucketResult>"
+                );
+                reply(&mut socket, 200, &[], listing.as_bytes(), false);
+            }
+            return;
+        }
+
+        let key = target.split('?').next().unwrap();
+        let index: usize = key.rsplit_once("/data/f").unwrap().1.parse().unwrap();
+        let exists = index.is_multiple_of(2);
+        if method == "HEAD" {
+            if exists {
+                reply(
+                    &mut socket,
+                    200,
+                    &[
+                        ("Content-Length".into(), "1".into()),
+                        ("ETag".into(), r#""old""#.into()),
+                    ],
+                    b"",
+                    true,
+                );
+            } else {
+                reply(&mut socket, 404, &[], b"", true);
+            }
+        } else {
+            assert_eq!(method, "PUT");
+            assert_eq!(exists, fault.ends_with("only"));
+            assert_eq!(
+                headers.get("if-none-match").map(String::as_str),
+                (!exists).then_some("*")
+            );
+            let mut bytes = [0];
+            socket.read_exact(&mut bytes).unwrap();
+            assert_eq!(bytes, [b'x']);
+            reply(
+                &mut socket,
+                200,
+                &[("ETag".into(), r#""written""#.into())],
+                b"",
+                false,
+            );
+        }
+        return;
+    }
     if fault.starts_with("upload-pages") {
         serve_upload_pages(&mut socket, first, &probes, fault == "upload-pages-fail");
         return;
@@ -2124,6 +2194,9 @@ fn serve(
         let target = first.split_whitespace().nth(1).unwrap();
         let path = target.split('?').next().unwrap();
         if method == "HEAD" && path == "/bucket/data" {
+            if fault.starts_with("prefix-recovery") {
+                probes.fetch_add(1, Ordering::Relaxed);
+            }
             // Hold HEAD until LIST arrives: sequential discovery cannot pass.
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             let mut report = std::time::Instant::now() + Duration::from_secs(1);
@@ -2168,13 +2241,15 @@ fn serve(
             );
         }
     }
-    if fault.starts_with("prefix-recovery")
-        && method == "HEAD"
-        && !gate.0.swap(true, Ordering::AcqRel)
-    {
-        // Leave every downloaded range checkpointed, but fail before publication.
-        reply(&mut socket, 403, &[], b"", true);
-        return;
+    let recovery_run = probes.load(Ordering::Relaxed);
+    if fault.starts_with("prefix-recovery") && recovery_run == 1 {
+        // Fail whole-file verification after all ranges are checkpointed.
+        // The same bytes can be reused with corrected metadata on retry.
+        fields
+            .iter_mut()
+            .find(|(key, _)| key == "x-amz-meta-syq-blake3")
+            .unwrap()
+            .1 = blake3::hash(b"wrong hash").to_hex().to_string();
     }
     if method == "HEAD" {
         fields.push(("Content-Length".into(), size.to_string()));
@@ -2225,7 +2300,7 @@ fn serve(
         .unwrap();
     let start: usize = start.parse().unwrap();
     let end: usize = end.parse().unwrap();
-    if gate.0.load(Ordering::Acquire)
+    if recovery_run > 1
         && (fault == "prefix-recovery-all" || (fault == "prefix-recovery-first" && start == 0))
     {
         // Retrying must not request a range already recorded and present locally.
@@ -2384,27 +2459,33 @@ fn validate_results(temp: &Path) {
 }
 #[test]
 fn s3_ranges_signed_headers_metadata_and_results() {
-    let server = Server::start("ok");
+    let server = Server::start("patterned");
     let temp = crate::test_support::tempdir().unwrap();
-    let output = server.cp(
-        temp.path(),
-        &[
+    // A hostname exercises the production DNS resolver as parallel GETs
+    // make new connections to this fixture.
+    let endpoint = server.address.replacen("127.0.0.1", "localhost", 1);
+    let output = server
+        .command(temp.path())
+        .args(["--s3-endpoint", &endpoint])
+        .args([
             "--from",
             "s3://bucket",
             "data",
             "--as",
             "download",
+            "--integrity-checking=transfer=blake3",
             "--results",
             "results.jsonl",
-        ],
-    );
+        ])
+        .capture_output()
+        .unwrap();
     assert!(output.status.success(), "{}", output_text(&output));
     assert_eq!(
         std::fs::read(temp.path().join("download")).unwrap(),
-        vec![b'x'; SIZE]
+        (0..SIZE).map(|i| (i % 251) as u8).collect::<Vec<_>>()
     );
     validate_results(temp.path());
-    assert!(server.requests.load(Ordering::Relaxed) >= 3);
+    assert_eq!(server.requests.load(Ordering::Relaxed), 3);
 }
 #[test]
 fn s3_mapping_download_overlaps_heads_and_validates_before_copying() {
@@ -2603,8 +2684,8 @@ fn s3_first_range_supplies_metadata_without_serializing_the_remaining_ranges() {
         std::fs::read(temp.path().join("download")).unwrap(),
         vec![b'x'; SIZE]
     );
-    // One selector HEAD, two range GETs, and the final identity HEAD.
-    assert_eq!(server.requests.load(Ordering::Relaxed), 4);
+    // One selector HEAD and two range GETs.
+    assert_eq!(server.requests.load(Ordering::Relaxed), 3);
 }
 
 #[cfg(debug_assertions)]
@@ -2695,8 +2776,8 @@ fn s3_prefix_multipart_download_starts_ranges_without_an_object_head() {
             std::fs::read(temp.path().join("download/file")).unwrap(),
             vec![b'x'; SIZE]
         );
-        // Prefix validation HEAD + LIST, two concurrent range GETs, final identity HEAD.
-        assert_eq!(server.requests.load(Ordering::Relaxed), 5);
+        // Prefix validation HEAD + LIST and two concurrent range GETs.
+        assert_eq!(server.requests.load(Ordering::Relaxed), 4);
     }
 }
 
@@ -2716,6 +2797,7 @@ fn s3_multipart_download_reuses_completed_ranges_before_getting_more() {
                 "s3://bucket",
                 "--srcs-in",
                 "data",
+                "--integrity-checking=transfer=blake3",
                 "--into",
                 "download",
             ];
@@ -2775,6 +2857,7 @@ fn s3_multipart_download_reads_a_recorded_partial_only_as_a_donor() {
         "s3://bucket",
         "--srcs-in",
         "data",
+        "--integrity-checking=transfer=blake3",
         "--into",
         "download",
     ];
@@ -2857,6 +2940,7 @@ fn s3_stale_recovery_record_leaves_another_file_at_its_partial_name() {
         "s3://bucket",
         "--srcs-in",
         "data",
+        "--integrity-checking=transfer=blake3",
         "--into",
         "download",
     ];
@@ -2903,6 +2987,7 @@ fn s3_unreadable_recorded_partial_is_reported_and_removed() {
         "s3://bucket",
         "--srcs-in",
         "data",
+        "--integrity-checking=transfer=blake3",
         "--into",
         "download",
     ];
@@ -2949,6 +3034,7 @@ fn s3_seeding_without_room_keeps_the_recorded_partial_for_a_later_run() {
         "s3://bucket",
         "--srcs-in",
         "data",
+        "--integrity-checking=transfer=blake3",
         "--into",
         "download",
     ];
@@ -3011,6 +3097,7 @@ fn s3_failed_seeding_gives_up_the_recorded_partial_and_downloads_afresh() {
         "s3://bucket",
         "--srcs-in",
         "data",
+        "--integrity-checking=transfer=blake3",
         "--into",
         "download",
     ];
@@ -3044,8 +3131,8 @@ fn s3_failed_seeding_gives_up_the_recorded_partial_and_downloads_afresh() {
         std::fs::read(temp.path().join("download/file")).unwrap(),
         vec![b'x'; SIZE]
     );
-    // Discovery HEAD + LIST, identity HEAD, final HEAD, and the GETs.
-    assert!(server.requests.load(Ordering::Relaxed) > 4);
+    // Discovery HEAD + LIST, identity HEAD, and two GETs.
+    assert_eq!(server.requests.load(Ordering::Relaxed), 5);
     assert!(!record.exists());
     assert!(!partial.exists(), "the recorded partial was left behind");
     let names: Vec<_> = std::fs::read_dir(temp.path().join("download"))
@@ -3070,6 +3157,7 @@ fn s3_resume_seeds_no_partial_that_others_can_read() {
         "s3://bucket",
         "--srcs-in",
         "data",
+        "--integrity-checking=transfer=blake3",
         "--into",
         "download",
     ];
@@ -3097,7 +3185,7 @@ fn s3_resume_seeds_no_partial_that_others_can_read() {
         std::fs::read(temp.path().join("download/file")).unwrap(),
         vec![b'x'; SIZE]
     );
-    // Discovery HEAD + LIST, identity HEAD, final HEAD, and the GETs.
+    // Discovery HEAD + LIST, identity HEAD, and two GETs.
     assert!(
         server.requests.load(Ordering::Relaxed) > 4,
         "the recorded partial was seeded into one nobody may read"
@@ -3537,6 +3625,30 @@ fn s3_unreadable_recovery_record_is_named_and_stale_temporaries_are_removed() {
     );
     assert!(!stale.exists());
     assert!(unrelated.exists());
+}
+
+#[test]
+fn s3_unaligned_multipart_download_checks_the_whole_digest() {
+    for (fault, success) in [("ok", true), ("corrupt", false)] {
+        let server = Server::start(fault);
+        let temp = crate::test_support::tempdir().unwrap();
+        let output = server
+            .command_with_part_size(temp.path(), 0, false)
+            .args(["--s3-endpoint", &server.address])
+            .args([
+                "--from",
+                "s3://bucket",
+                "object",
+                "--as",
+                "result",
+                "--performance-tuning=s3-part-size=5242881",
+                "--integrity-checking=transfer=blake3",
+            ])
+            .capture_output()
+            .unwrap();
+        assert_eq!(output.status.success(), success, "{}", output_text(&output));
+        assert_eq!(temp.path().join("result").exists(), success);
+    }
 }
 
 #[test]
@@ -5540,6 +5652,78 @@ fn s3_upload_pages_through_a_large_destination_while_copying() {
     // shows the five new keys absent. Listed keys get a HEAD, new ones none.
     assert_eq!(server.probes.load(Ordering::Relaxed), 3);
     assert_eq!(server.requests.load(Ordering::Relaxed), 3 + 300);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn s3_upload_existence_policies_skip_heads_for_keys_the_listing_rules_out() {
+    for (fault, flag, heads) in [
+        ("upload-selection-ignore", "--if-exists=keep", 64),
+        ("upload-selection-only", "--only-existing", 64),
+        ("upload-selection-denied", "--if-exists=keep", 128),
+    ] {
+        let server = Server::start(fault);
+        let temp = crate::test_support::tempdir().unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        for n in 0..128 {
+            std::fs::write(data.join(format!("f{n:03}")), b"x").unwrap();
+        }
+        let output = server.cp_in_byte_order(
+            temp.path(),
+            &[
+                "--srcs-in",
+                "data",
+                "--to",
+                "s3://bucket",
+                "--into",
+                "data",
+                flag,
+            ],
+        );
+        assert!(output.status.success(), "{fault}: {}", output_text(&output));
+        assert_eq!(server.probes.load(Ordering::Relaxed), 1, "{fault}");
+        assert_eq!(
+            server.requests.load(Ordering::Relaxed),
+            1 + heads + 64,
+            "{fault}"
+        );
+    }
+}
+
+#[test]
+fn s3_upload_existence_policies_do_not_page_through_sparse_directory_buckets() {
+    for (fault, flag) in [
+        ("upload-selection-sparse-keep", "--if-exists=keep"),
+        ("upload-selection-sparse-only", "--only-existing"),
+    ] {
+        let server = Server::start(fault);
+        let temp = test_support::tempdir().unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        for n in 0..64 {
+            std::fs::write(data.join(format!("f{n:03}")), b"x").unwrap();
+        }
+        let output = server
+            .command(temp.path())
+            .env("AWS_S3_DISABLE_EXPRESS_SESSION_AUTH", "true")
+            .args(["--s3-endpoint", &server.address])
+            .args([
+                "--srcs-in",
+                "data",
+                "--to",
+                "s3://bucket--use1-az1--x-s3",
+                "--into",
+                "data",
+                flag,
+                "--dry-run",
+            ])
+            .capture_output()
+            .unwrap();
+        assert!(output.status.success(), "{fault}: {}", output_text(&output));
+        assert_eq!(server.probes.load(Ordering::Relaxed), 0, "{fault}");
+        assert_eq!(server.requests.load(Ordering::Relaxed), 64, "{fault}");
+    }
 }
 
 #[test]

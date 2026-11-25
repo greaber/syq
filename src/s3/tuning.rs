@@ -10,7 +10,7 @@ use std::{
 use tokio::sync::Notify;
 
 pub(super) struct Tuning {
-    control_ns: Arc<AtomicU64>,
+    control: Arc<ControlSamples>,
     fixed_requests: Option<usize>,
     tigris: bool,
     upload: bool,
@@ -20,10 +20,10 @@ pub(super) struct Tuning {
     pub upload_buffers: Arc<tokio::sync::Semaphore>,
 }
 impl Tuning {
-    /// `control` receives the fastest HEAD or LIST response seen by the client.
-    pub fn new(options: &Options, args: &crate::cli::Args, control: Arc<AtomicU64>) -> Self {
+    /// `control` receives the client's HEAD and LIST response times.
+    pub fn new(options: &Options, args: &crate::cli::Args, control: Arc<ControlSamples>) -> Self {
         Self {
-            control_ns: control,
+            control,
             reads: crate::s3::read_recovery::Recovery::default(),
             upload: options.route == Route::Upload,
             fixed_requests: args.tuning_options.and_then(|t| t.s3_requests),
@@ -62,10 +62,10 @@ impl Tuning {
     }
     #[cfg(test)]
     pub fn observe_control(&self, elapsed: Duration) {
-        observe_control(&self.control_ns, elapsed);
+        self.control.observe(elapsed);
     }
     pub fn high_latency(&self) -> bool {
-        let ns = self.control_ns.load(Relaxed);
+        let ns = self.control.fastest();
         // Tigris uploads keep their conservative seed. Downloads still need
         // enough requests in flight to cover a long round trip, regardless of
         // provider; short copies cannot recover time spent ramping from 64.
@@ -103,7 +103,7 @@ impl Tuning {
         self.requests.state.lock().unwrap().limit
     }
     pub fn control_latency(&self) -> Option<Duration> {
-        let ns = self.control_ns.load(Relaxed);
+        let ns = self.control.fastest();
         (ns != u64::MAX).then(|| Duration::from_nanos(ns))
     }
     pub fn report(&self, workers: usize) {
@@ -112,19 +112,16 @@ impl Tuning {
     /// Whether the endpoint answers within 3 ms, as on the same machine or a
     /// fast LAN, where downloads use a few large ranges per object.
     pub fn local_latency(&self) -> bool {
-        self.control_ns.load(Relaxed) < 3_000_000
+        self.control.fastest() < 3_000_000
     }
 }
 /// The fastest control response at which an endpoint counts as far away, so
 /// that copies of many small objects start with every request in flight and
 /// probe upward instead of ramping from a low seed. A response on a reused
-/// connection takes one round trip. A copy's first request also opens the
-/// connection, so it takes about two round trips over HTTP and three over
-/// HTTPS (TCP, then TLS), and an upload into an empty prefix has no other
-/// sample. At 20 ms, an HTTPS endpoint counts as far from about a 6 ms round
-/// trip on a first request, a plain-HTTP one from about 10 ms, and any
-/// endpoint from 20 ms on a reused connection: distances at which many small
-/// objects finish sooner starting wide than ramping from 64.
+/// connection takes one round trip. When a copy has only a client's first
+/// response, which also opens the connection, it takes about two round trips
+/// over HTTP and three over HTTPS, so the endpoint counts as far from about a
+/// 10 or 6 ms round trip.
 pub(super) const HIGH_LATENCY: Duration = Duration::from_millis(20);
 /// Below this fastest control response, a far endpoint's uploads of small
 /// files start with at most 2,048 objects in flight instead of 4,096. The
@@ -134,8 +131,45 @@ pub(super) const HIGH_LATENCY: Duration = Duration::from_millis(20);
 pub(super) const NEAR_FAR_LATENCY: Duration = Duration::from_millis(32);
 /// Path latency is the fastest single control response. The time to plan a copy
 /// grows with the number of listing pages, so it says little about the path.
-pub(super) fn observe_control(control_ns: &AtomicU64, elapsed: Duration) {
-    control_ns.fetch_min(elapsed.as_nanos().min(u64::MAX as u128) as u64, Relaxed);
+///
+/// A client's first response may also include DNS, TCP, and TLS setup, which
+/// would make a 6 to 20 ms endpoint look far away. Later responses take one
+/// round trip, so their minimum is used once one exists. A copy that plans
+/// with a single request, such as one listing page or an upload into an
+/// empty prefix, still has the first response, which keeps a distant
+/// endpoint's wide start.
+#[derive(Debug)]
+pub(super) struct ControlSamples {
+    first: AtomicU64,
+    warm: AtomicU64,
+}
+impl Default for ControlSamples {
+    fn default() -> Self {
+        Self {
+            first: AtomicU64::new(u64::MAX),
+            warm: AtomicU64::new(u64::MAX),
+        }
+    }
+}
+impl ControlSamples {
+    /// Records a client's first control response.
+    pub fn observe_first(&self, elapsed: Duration) {
+        self.first.fetch_min(nanos(elapsed), Relaxed);
+    }
+    /// Records a control response on an established client.
+    pub fn observe(&self, elapsed: Duration) {
+        self.warm.fetch_min(nanos(elapsed), Relaxed);
+    }
+    /// The fastest response in nanoseconds, or `u64::MAX` before any.
+    pub fn fastest(&self) -> u64 {
+        match self.warm.load(Relaxed) {
+            u64::MAX => self.first.load(Relaxed),
+            warm => warm,
+        }
+    }
+}
+fn nanos(elapsed: Duration) -> u64 {
+    elapsed.as_nanos().min(u64::MAX as u128) as u64
 }
 struct Window {
     active: usize,

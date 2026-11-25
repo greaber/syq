@@ -30,6 +30,7 @@ include = [
 [dependencies]
 bytes = "1"
 http-body = "1"
+http-body-util = "0.1"
 aws-config = { version = "1.13.0", default-features = false, features = ["rt-tokio", "default-https-client", "credentials-process", "sso"] }
 aws-runtime = { version = "1", default-features = false }
 aws-sdk-s3 = { version = "1.157.0", default-features = false, features = ["rt-tokio", "default-https-client"] }
@@ -37,6 +38,7 @@ aws-smithy-http-client = { version = "1", features = ["rustls-aws-lc"] }
 aws-smithy-runtime = { version = "1", default-features = false, features = ["client"] }
 aws-smithy-runtime-api = { version = "1.19.0", features = ["client"] }
 aws-smithy-types = "1"
+aws-smithy-xml = "0.64.1"
 aws-types = "1"
 aws-credential-types = "1"
 aws-sigv4 = { version = "1", default-features = false, features = ["sign-http", "http1"] }
