@@ -9,7 +9,6 @@ Usage: scripts/package-release.py vVERSION DIST_DIR
 """
 import difflib
 from fnmatch import fnmatchcase
-import gzip
 import hashlib
 import json
 import os
@@ -18,6 +17,7 @@ import subprocess
 import sys
 import shutil
 import tempfile
+import zlib
 
 from tooling import ToolError, cargo_version, report_errors, sha256_file
 
@@ -36,31 +36,57 @@ def regular(path):
     return os.path.isfile(path) and not os.path.islink(path)
 
 
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+GZIP_MAGIC = b"\x1f\x8b"
+
+
 def unpacked(path):
-    """The SHA-256 and size of what the archive at PATH decompresses to."""
+    """The SHA-256 and size of what the archive at PATH decompresses to,
+    unpacked as clients unpack it.
+
+    The zstd command also unpacks gzip, xz, and lz4 when built with them,
+    and Python's gzip module reads every member of a concatenated file,
+    while clients read zstd frames and a single gzip member. Each archive
+    must therefore be in exactly the format its name says.
+    """
     digest = hashlib.sha256()
     size = 0
 
-    def read(stream):
+    def add(chunk):
         nonlocal size
-        while chunk := stream.read(1 << 20):
-            digest.update(chunk)
-            size += len(chunk)
+        digest.update(chunk)
+        size += len(chunk)
 
-    if path.endswith(".gz"):
-        try:
-            with gzip.open(path, "rb") as stream:
-                read(stream)
-        except (OSError, EOFError) as error:
-            raise ToolError(f"gzip could not decompress {path}: {error}") from None
-    else:
-        if shutil.which("zstd") is None:
-            raise ToolError("checking the zstd archives needs the zstd command")
-        with subprocess.Popen(["zstd", "-d", "-q", "-c", path],
-                              stdout=subprocess.PIPE) as process:
-            read(process.stdout)
-        if process.returncode:
-            raise ToolError(f"zstd could not decompress {path}")
+    with open(path, "rb") as archive:
+        magic = archive.read(4)
+        if path.endswith(".gz"):
+            if not magic.startswith(GZIP_MAGIC):
+                raise ToolError(f"{path} is not a gzip archive")
+            archive.seek(0)
+            decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            try:
+                while chunk := archive.read(1 << 20):
+                    add(decompressor.decompress(chunk))
+                    if decompressor.eof:
+                        break
+                add(decompressor.flush())
+            except zlib.error as error:
+                raise ToolError(f"gzip could not decompress {path}: {error}") from None
+            if not decompressor.eof:
+                raise ToolError(f"gzip archive {path} is truncated")
+            if decompressor.unused_data or archive.read(1):
+                raise ToolError(f"{path} has data after its first gzip member")
+            return digest.hexdigest(), size
+    if magic != ZSTD_MAGIC:
+        raise ToolError(f"{path} is not a zstd archive")
+    if shutil.which("zstd") is None:
+        raise ToolError("checking the zstd archives needs the zstd command")
+    with subprocess.Popen(["zstd", "-d", "-q", "-c", "--", path],
+                          stdout=subprocess.PIPE) as process:
+        while chunk := process.stdout.read(1 << 20):
+            add(chunk)
+    if process.returncode:
+        raise ToolError(f"zstd could not decompress {path}")
     return digest.hexdigest(), size
 
 

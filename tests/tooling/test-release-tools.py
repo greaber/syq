@@ -7,6 +7,7 @@ or through SYQ_RELEASE_TOOLS_SYQ, which passes through scripts/run-tooling-tests
 from support import SCRIPTS
 
 import copy
+import gzip
 import hashlib
 import importlib.util
 import json
@@ -126,6 +127,10 @@ def public_key_b64(key):
     return openssl("base64", "-A", input=der[-32:]).decode().rstrip("\n")
 
 
+# Packaging checks every zstd archive with the zstd command.
+needs_zstd = unittest.skipUnless(shutil.which("zstd"), "packaging needs the zstd command")
+
+
 class ReleaseToolTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="syq-release-test.")
@@ -147,6 +152,7 @@ class ReleaseToolTests(unittest.TestCase):
                 (dist / f"{asset}{suffix}").write_bytes(archive)
         return dist
 
+    @needs_zstd
     def test_packaging_refuses_an_archive_of_another_binary(self):
         for suffix, command in [(".gz", ["gzip", "-n"]), (".zst", ["zstd", "-q"])]:
             with self.subTest(suffix=suffix):
@@ -158,6 +164,36 @@ class ReleaseToolTests(unittest.TestCase):
                 self.expect_failure(f"{asset}{suffix} does not decompress to {asset}",
                                     [SCRIPTS / "package-release.py", TAG, dist])
                 self.assertFalse((dist / "syq-release-manifest.json").exists())
+
+    @needs_zstd
+    def test_packaging_refuses_an_archive_in_another_format(self):
+        # The zstd command unpacks gzip too, but clients read only zstd from a
+        # .zst archive.
+        dist = self.prepare_dist("gzip-as-zstd")
+        asset = ASSETS[0]
+        shutil.copy(dist / f"{asset}.gz", dist / f"{asset}.zst")
+        self.expect_failure(f"{asset}.zst is not a zstd archive",
+                            [SCRIPTS / "package-release.py", TAG, dist])
+        self.assertFalse((dist / "syq-release-manifest.json").exists())
+        self.assertFalse((dist / "syq-release-zstd.json").exists())
+
+    @needs_zstd
+    def test_packaging_refuses_a_gzip_archive_of_several_members(self):
+        # Clients read only the first member, so every member but the last
+        # would be missing from what they unpack.
+        dist = self.prepare_dist("gzip-members")
+        asset = ASSETS[0]
+        binary = (dist / asset).read_bytes()
+        middle = len(binary) // 2
+        members = b"".join(subprocess.run(["gzip", "-n", "-c"], input=part, check=True,
+                                          stdout=subprocess.PIPE).stdout
+                           for part in (binary[:middle], binary[middle:]))
+        (dist / f"{asset}.gz").write_bytes(members)
+        self.assertEqual(gzip.decompress(members), binary)
+        self.expect_failure(f"{asset}.gz has data after its first gzip member",
+                            [SCRIPTS / "package-release.py", TAG, dist])
+        self.assertFalse((dist / "syq-release-manifest.json").exists())
+        self.assertFalse((dist / "syq-release-zstd.json").exists())
 
     def package(self, name):
         dist = self.prepare_dist(name)
@@ -192,6 +228,7 @@ class ReleaseToolTests(unittest.TestCase):
         return [SCRIPTS / "verify-release-tag.py", "greaber/syq", "v0.4.1", commit, "master",
                 checks], self.fake_env(**values)
 
+    @needs_zstd
     def test_packaging_is_complete_reproducible_and_strict(self):
         first = self.package("first")
         second = self.package("second")
@@ -307,6 +344,7 @@ esac
         self.expect_failure("differs from the package assembled from this tag", command, env("200"))
         self.expect_failure("returned HTTP 500", command, env("500"))
 
+    @needs_zstd
     def test_signing_verifies_and_rejects_a_mismatched_key(self):
         # Run the same signing operation used by the release workflow, verify the
         # result independently, and prove that a mismatched configured public key is

@@ -144,8 +144,9 @@ impl TrustedCurrentHelper {
         self.binary.size
     }
 
-    /// Download the gzip archive from now on, as when the zstd archive was
-    /// found not to unpack to the signed helper.
+    /// Download the gzip archive from now on, as when a remote found that
+    /// the zstd archive has another digest, does not unpack, or unpacks to
+    /// another helper.
     pub fn use_gzip(&mut self) {
         self.gzip_only = true;
     }

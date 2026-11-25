@@ -260,7 +260,7 @@ esac
         signed = (self.work / "program-linux-x86_64").read_bytes()
         other = f"#!/bin/sh\n: > '{marker}'\necho 'syq 0.1.0'\n".encode()
         same_size = (other + b"#" * len(signed))[:len(signed) - 1] + b"\n"
-        self.assertNotEqual(len(other), len(signed))
+        self.assertLess(len(other), len(signed))
         for format, suffix in FORMATS.items():
             for content, error in [(same_size, "unpacked binary failed SHA-256 verification"),
                                    (other, "unpacked binary")]:

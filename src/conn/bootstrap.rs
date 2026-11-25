@@ -263,6 +263,17 @@ impl RemoteSpec {
         if authorized {
             self.relay_install_notices(&stderr);
         }
+        // A remote that fetched the zstd archive but did not install from it
+        // found the archive with another digest, could not unpack it, or
+        // unpacked another helper. The upload then uses gzip, which the main
+        // manifest signs together with the helper, instead of the same
+        // archive. A remote without zstd, or that could not download it,
+        // reported nothing about the archive and leaves the choice alone.
+        if remote_used_zstd && !(authorized && status.success()) {
+            if let Some(helper) = helper.as_mut() {
+                helper.use_gzip();
+            }
+        }
         if status.success() {
             write_result.context("authorize the verified remote helper")?;
             return if authorized {
@@ -289,21 +300,14 @@ impl RemoteSpec {
             Some(remote_helper::REMOTE_DOWNLOAD_INTEGRITY_EXIT) => match integrity_warning {
                 Some(warning) => Ok(RemoteDownloadOutcome::Integrity { warning, helper }),
                 // The authorized archive unpacked to something other than
-                // the signed helper. A zstd archive comes from the zstd
-                // listing, so the upload uses gzip, which the main manifest
-                // signs together with the helper.
+                // the signed helper.
                 None if authorized => Ok(RemoteDownloadOutcome::Integrity {
                     warning: if detail.is_empty() {
                         "the unpacked remote helper failed integrity verification".into()
                     } else {
                         detail
                     },
-                    helper: helper.map(|mut helper| {
-                        if remote_used_zstd {
-                            helper.use_gzip();
-                        }
-                        helper
-                    }),
+                    helper,
                 }),
                 None => Ok(RemoteDownloadOutcome::Fallback {
                     detail: protocol_detail.unwrap_or(detail),

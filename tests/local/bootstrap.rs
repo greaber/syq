@@ -1101,6 +1101,84 @@ fn remote_zstd_archive_of_another_executable_is_never_run() {
     );
 }
 
+/// Copy to `t` with a bad zstd archive that both the server and the client's
+/// own download see, under `listing` (the fixture's when `None`), and check
+/// that the upload falls back to the gzip archive.
+fn assert_bad_zstd_archive_is_replaced_by_gzip(
+    t: &Tmp,
+    archive: &[u8],
+    listing: Option<Vec<u8>>,
+    expected: &str,
+) {
+    let rsh = fake_rsh(t);
+    let asset = release_bootstrap_fixture().asset;
+    write(&t.path(&format!("{asset}.zst")), archive);
+    if let Some(listing) = listing {
+        write(&t.path("syq-release-zstd.json"), &listing);
+        write(&t.path("release-zstd-manifest.json"), &listing);
+    }
+    write(&t.path("src"), b"verified upload");
+    let remote = format!("fake:{}", t.s("dst"));
+    let out = remote_syq_command(t, &rsh, &["-a", &t.s("src"), &remote])
+        .env(
+            "FAKE_REMOTE_RELEASE_ZSTD_MANIFEST",
+            t.path("release-zstd-manifest.json"),
+        )
+        .env(
+            "FAKE_REMOTE_RELEASE_ZSTD_ARCHIVE",
+            t.path(&format!("{asset}.zst")),
+        )
+        .run()
+        .unwrap();
+    assert_output_ok(&out);
+    assert_eq!(read(&t.path("dst")), b"verified upload");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(expected) && stderr.contains("uploading the verified helper"),
+        "{stderr}"
+    );
+    for helper in [stored_remote_helper(t), stored_local_helper(t)] {
+        assert_eq!(read(&helper), read(Path::new(env!("CARGO_BIN_EXE_syq"))));
+    }
+}
+
+/// A zstd archive with another digest than its signed listing gives is not
+/// downloaded again for the upload, which uses gzip.
+#[test]
+fn remote_zstd_archive_with_another_digest_is_uploaded_from_gzip() {
+    let t = Tmp::new();
+    setup_release_bootstrap(&t);
+    if !remote_zstd(&t) {
+        return;
+    }
+    let substituted = zstd::bulk::compress(&read(Path::new(env!("CARGO_BIN_EXE_syq"))), 2).unwrap();
+    assert_bad_zstd_archive_is_replaced_by_gzip(
+        &t,
+        &substituted,
+        None,
+        "remote helper download failed integrity verification",
+    );
+}
+
+/// A zstd archive that matches its signed listing but does not unpack is not
+/// downloaded again for the upload, which uses gzip.
+#[test]
+fn remote_zstd_archive_that_does_not_unpack_is_uploaded_from_gzip() {
+    let t = Tmp::new();
+    setup_release_bootstrap(&t);
+    if !remote_zstd(&t) {
+        return;
+    }
+    let fixture = release_bootstrap_fixture();
+    let truncated = &fixture.zstd_archive[..fixture.zstd_archive.len() / 2];
+    assert_bad_zstd_archive_is_replaced_by_gzip(
+        &t,
+        truncated,
+        Some(signed_zstd_listing(fixture.asset, truncated)),
+        "remote helper decompression with zstd failed",
+    );
+}
+
 /// The helper the client downloads for an upload comes from the zstd archive
 /// of a release that lists one, and from gzip for a release from before.
 #[test]
