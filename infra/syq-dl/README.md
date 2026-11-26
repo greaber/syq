@@ -21,7 +21,8 @@ and `0003_purpose_and_client.sql` define the current two reporting views:
 `daily_checks` (background reminder checks from installed clients, a
 daily-active proxy; explicit `--self-update` fetches are excluded by the
 `x-syq-purpose` header) and `daily_installs` (downloads by kind, tag, target, and country; kind `archive`
-is the installer or a remote helper bootstrap, kind `binary` is Homebrew).
+is a gzip or zstd archive for the installer, a self-update, or a remote helper
+bootstrap, kind `binary` is Homebrew).
 
 ## Deploying
 

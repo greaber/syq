@@ -1,15 +1,83 @@
 #!/usr/bin/env python3
-"""Install the actual release over loopback HTTPS, then copy disposable data."""
+"""Install the actual release over loopback HTTPS, once from its zstd archive
+and once from gzip, then copy disposable data with each installation."""
 import functools
 import http.server
 import json
 import os
 from pathlib import Path
+import shutil
 import ssl
 import subprocess
 import sys
 import tempfile
 import threading
+
+# What the installer runs, apart from the shell's built-in commands.
+INSTALLER_TOOLS = ("chmod", "cp", "curl", "gzip", "head", "mkdir", "mktemp", "mv", "rm", "sed",
+                   "tr", "uname", "wc")
+HASHERS = ("sha256sum", "shasum", "openssl")
+
+
+class RecordingHandler(http.server.SimpleHTTPRequestHandler):
+    """Serve the release directory and record each requested name."""
+
+    def __init__(self, *args, requested, **kwargs):
+        self.requested = requested
+        super().__init__(*args, **kwargs)
+
+    def do_GET(self):
+        self.requested.append(self.path.rsplit("/", 1)[-1])
+        super().do_GET()
+
+    def log_message(self, format, *args):
+        pass
+
+
+def tool_directory(directory, with_zstd):
+    """A PATH directory with exactly the installer's tools, and zstd or not."""
+    directory.mkdir()
+    hasher = next((name for name in HASHERS if shutil.which(name)), None)
+    names = INSTALLER_TOOLS + ((hasher,) if hasher else ()) + (("zstd",) if with_zstd else ())
+    for name in names:
+        found = shutil.which(name)
+        if found is None:
+            raise ValueError(f"the release installer smoke test needs {name}")
+        (directory / name).symlink_to(found)
+    return directory
+
+
+def install(dist, work, format, environment, port, requested):
+    manifest = json.loads((dist / "syq-release-manifest.json").read_text())
+    tools = tool_directory(work / f"tools-{format}", format == "zstd")
+    bin_dir = work / f"bin-{format}"
+    requested.clear()
+    subprocess.run(["/bin/sh", str(dist / "install.sh"), "--bin-dir", str(bin_dir)],
+                   env={**environment, "PATH": str(tools),
+                        "SYQ_INSTALL_BASE_URL": f"https://127.0.0.1:{port}"},
+                   check=True, timeout=60)
+    suffix = ".zst" if format == "zstd" else ".gz"
+    archives = [name for name in requested if name.endswith((".gz", ".zst"))]
+    if len(archives) != 1 or not archives[0].endswith(suffix):
+        raise ValueError(f"the installer with {format} downloaded {archives}")
+    binary = str(bin_dir / "syq")
+    for option, expected in [("--version", "syq " + manifest["version"]),
+                             ("--build-identity", manifest["tag"])]:
+        actual = subprocess.check_output([binary, option], env=environment, text=True,
+                                         timeout=10).strip()
+        if actual != expected:
+            raise ValueError(f"installed {option}: {actual!r}, expected {expected!r}")
+    receipt = json.loads((Path(binary).resolve().with_name(".syq-install.json")).read_text())
+    if (receipt.get("provider") != "standalone" or receipt.get("version") != manifest["version"]
+            or receipt.get("binary") != str(Path(binary).resolve())):
+        raise ValueError("installer did not register the expected standalone receipt")
+    source = work / f"source-{format}"
+    source.write_bytes(b"release installer smoke test\n")
+    destination = work / f"destination-{format}"
+    subprocess.run([binary, "cp", str(source), "--into", str(destination)],
+                   env=environment, check=True, timeout=30)
+    if (destination / source.name).read_bytes() != source.read_bytes():
+        raise ValueError("installed binary produced different copy bytes")
 
 
 def smoke(dist):
@@ -23,7 +91,8 @@ def smoke(dist):
             "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1",
             "-keyout", str(key), "-out", str(cert),
         ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(dist))
+        requested = []
+        handler = functools.partial(RecordingHandler, directory=str(dist), requested=requested)
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(cert, key)
@@ -31,32 +100,16 @@ def smoke(dist):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         environment = {**os.environ, "XDG_CONFIG_HOME": str(work / "config"),
-                       "SYQ_INSTALL_BASE_URL": f"https://127.0.0.1:{server.server_port}",
                        "SYQ_NO_UPDATE_CHECK": "1", "CURL_CA_BUNDLE": str(cert), "NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"}
         try:
-            subprocess.run(["sh", str(dist / "install.sh"), "--bin-dir", str(work / "bin")],
-                           env=environment, check=True, timeout=60)
-            binary = str(work / "bin" / "syq")
-            for option, expected in [("--version", "syq " + manifest["version"]),
-                                     ("--build-identity", manifest["tag"])]:
-                actual = subprocess.check_output([binary, option], env=environment, text=True, timeout=10).strip()
-                if actual != expected:
-                    raise ValueError(f"installed {option}: {actual!r}, expected {expected!r}")
-            receipt = json.loads((Path(binary).resolve().with_name(".syq-install.json")).read_text())
-            if (receipt.get("provider") != "standalone" or receipt.get("version") != manifest["version"]
-                    or receipt.get("binary") != str(Path(binary).resolve())):
-                raise ValueError("installer did not register the expected standalone receipt")
-            source = work / "source"
-            source.write_bytes(b"release installer smoke test\n")
-            subprocess.run([binary, "cp", str(source), "--into", str(work / "destination")],
-                           env=environment, check=True, timeout=30)
-            if (work / "destination" / "source").read_bytes() != source.read_bytes():
-                raise ValueError("installed binary produced different copy bytes")
+            for format in ("zstd", "gzip"):
+                install(dist, work, format, environment, server.server_port, requested)
         finally:
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
-    print(f"Release installer and installed binary passed for {manifest['tag']}.")
+    print(f"Release installer and installed binary passed for {manifest['tag']} "
+          "from its zstd and gzip archives.")
 
 
 if __name__ == "__main__":

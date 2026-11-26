@@ -122,16 +122,28 @@ jobs:
           merge-multiple: true
       - name: Restore canonicalizer permission
         run: chmod 755 dist/syq-linux-x86_64
+      # Packaging unpacks every zstd archive to check it against its binary,
+      # and the installer smoke test installs from them.
+      - name: Make zstd available
+        run: |
+          set -eu
+          if ! command -v zstd >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends zstd
+          fi
+          zstd --version
       - name: Build and validate release metadata
         run: scripts/package-release.py "$GITHUB_REF_NAME" dist
-      - name: Sign release manifest and verify the configured key
+      - name: Sign release manifests and verify the configured key
         env:
           SYQ_RELEASE_PUBLIC_KEY: ${{ vars.SYQ_RELEASE_PUBLIC_KEY }}
           SYQ_RELEASE_SIGNING_KEY_PEM_B64: ${{ secrets.SYQ_RELEASE_SIGNING_KEY_PEM_B64 }}
         run: |
-          scripts/sign-release-manifest.py \
-            dist/syq-release-manifest.json dist/syq-linux-x86_64
-      # package-release.py checked the exact file list; signing replaces the
+          set -eu
+          for manifest in syq-release-manifest.json syq-release-zstd.json; do
+            scripts/sign-release-manifest.py "dist/$manifest" dist/syq-linux-x86_64
+          done
+      # package-release.py checked the exact file list; signing replaces each
       # manifest in place.
       - name: Check the Homebrew formula and installer
         shell: bash

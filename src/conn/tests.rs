@@ -2126,7 +2126,38 @@ fn remote_download_report_frames_manifest_and_digest() {
         .unwrap()
         .unwrap();
     assert_eq!(report.manifest, b"{\n  \"schema\": 1\n}\n");
+    assert!(report.zstd_manifest.is_none());
     assert_eq!(report.sha256, digest);
+}
+
+#[test]
+fn remote_download_report_frames_a_zstd_listing_after_the_manifest() {
+    let digest = "a".repeat(64);
+    let bytes = format!(
+        "syq-helper-manifest-begin\nsyq-helper-manifest-data:{{\"main\": 1}}\nsyq-helper-manifest-end\nsyq-helper-zstd-manifest-begin\nsyq-helper-manifest-data:{{\"zstd\": 1}}\nsyq-helper-manifest-end\nsyq-helper-sha256:{digest}\nsyq-helper-report-end\n"
+    );
+    let report = read_remote_download_report(&mut bytes.as_bytes())
+        .unwrap()
+        .unwrap();
+    assert_eq!(report.manifest, b"{\"main\": 1}\n");
+    assert_eq!(
+        report.zstd_manifest.as_deref(),
+        Some(&b"{\"zstd\": 1}\n"[..])
+    );
+    assert_eq!(report.sha256, digest);
+
+    // An unterminated listing, or one in place of the main manifest, is refused.
+    let error = read_remote_download_report(
+        &mut b"syq-helper-manifest-begin\nsyq-helper-manifest-end\nsyq-helper-zstd-manifest-begin\nsyq-helper-manifest-data:{}\n".as_slice(),
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    let bytes = format!(
+        "syq-helper-zstd-manifest-begin\nsyq-helper-manifest-data:{{}}\nsyq-helper-manifest-end\nsyq-helper-sha256:{digest}\nsyq-helper-report-end\n"
+    );
+    assert!(read_remote_download_report(&mut bytes.as_bytes())
+        .unwrap()
+        .is_none());
 }
 
 #[test]

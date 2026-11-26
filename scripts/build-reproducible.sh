@@ -22,6 +22,8 @@ output=$(nix --extra-experimental-features 'nix-command flakes' build \
   .#release --no-update-lock-file --no-link --print-out-paths --max-jobs auto -L)
 install -m 755 "$output/bin/syq" "$dist/$asset"
 install -m 644 "$output/bin/syq.gz" "$dist/$asset.gz"
+# The release recipe checked that this unpacks to the executable.
+install -m 644 "$output/bin/syq.zst" "$dist/$asset.zst"
 
 # Execute the copied artifact outside the Nix output and exercise a real copy.
 work=$(mktemp -d)
