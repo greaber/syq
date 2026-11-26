@@ -304,7 +304,7 @@ sha256_of() {{
 }}
 is_sha256() {{
     case "$1" in
-        ''|*[!0-9a-f]*) return 1 ;;
+        ''|*[!0123456789abcdef]*) return 1 ;;
     esac
     [ "${{#1}}" -eq 64 ]
 }}
@@ -335,7 +335,7 @@ if [ "$decision" != install ]; then
     exit {remote_download_integrity_exit}
 fi
 case "$expected_size" in
-    ''|0*|*[!0-9]*)
+    ''|0*|*[!0123456789]*)
         echo "syq: local client sent no valid helper size" >&2
         exit {remote_download_fallback_exit}
         ;;
