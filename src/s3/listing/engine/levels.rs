@@ -8,15 +8,12 @@
 //! only as the first key of its own listing, where it is left out: every
 //! directory is reported once, by its common prefix.
 //!
-//! A delimiter listing that goes past its first page relies on the check
-//! that [`Gap`] makes in byte order. Where the order is unknown, the
-//! directory is listed whole without a delimiter instead, as `execute` does
-//! for the last part of a pattern, and everything to the depth is read from
-//! that listing.
-use super::{byte_ordered, may_hide, read, refused, Entry, Gap, LimitedStore, Page, Store};
+//! A delimiter listing that goes past a page uses [`Gap`] to check for a key
+//! after the page's last common prefix (except on directory buckets, which
+//! require trailing slashes on prefixes).
+use super::{byte_ordered, read, refused, Entry, Gap, LimitedStore, Page, Store};
 use anyhow::{ensure, Context, Result};
 use futures_util::{stream::FuturesUnordered, StreamExt};
-use std::collections::HashMap;
 
 /// What a level listing found.
 pub(in crate::s3) enum Found {
@@ -36,15 +33,6 @@ enum Job {
         token: Option<String>,
         gap: Gap,
         last: Option<String>,
-    },
-    /// A page of the listing of everything under `prefix` without a
-    /// delimiter, which replaces the level listings beneath it. `seen`
-    /// holds the directories reported so far, and whether each is listed.
-    Flat {
-        prefix: String,
-        depth: u32,
-        token: String,
-        seen: HashMap<String, bool>,
     },
 }
 
@@ -124,52 +112,8 @@ async fn execute(
             ..
         } => {
             let page = read(store, &prefix, true, None).await?;
-            if page.next.is_none() || byte_ordered(store) {
-                let gap = Gap::after(&page, |_| true);
-                return Ok(level(prefix, depth, page, gap, None, max_depth, descend));
-            }
-            // A later page could leave out a key, and only byte order lets
-            // a listing make sure of it.
-            let why = || {
-                format!("listing {prefix:?} without a delimiter, since a later delimiter page could leave out a key")
-            };
-            match read(store, &prefix, false, None).await {
-                Ok(flat) => {
-                    static SAID: std::sync::Once = std::sync::Once::new();
-                    SAID.call_once(|| {
-                        crate::output::diagnostic!(
-                            "syq: listing every key under {prefix:?} without a delimiter, which can take much longer; other directories with more entries than one listing page holds are listed the same way: this store may not list keys in byte order, and its later delimiter pages could leave a key out"
-                        );
-                    });
-                    Ok(flat_page(
-                        prefix,
-                        depth,
-                        flat,
-                        HashMap::new(),
-                        max_depth,
-                        descend,
-                    ))
-                }
-                // A policy may require a delimiter. Go on with it while no
-                // page could be followed by a key left out.
-                Err(error) if refused(&error) && !may_hide(&page, |_| true) => {
-                    let gap = Gap {
-                        key: None,
-                        refused: Some(format!("{:#}", error.context(why()))),
-                    };
-                    Ok(level(prefix, depth, page, gap, None, max_depth, descend))
-                }
-                Err(error) => Err(error.context(why())),
-            }
-        }
-        Job::Flat {
-            prefix,
-            depth,
-            token,
-            seen,
-        } => {
-            let page = read(store, &prefix, false, Some(&token)).await?;
-            Ok(flat_page(prefix, depth, page, seen, max_depth, descend))
+            let gap = Gap::after(store, &page, |_| true);
+            Ok(level(prefix, depth, page, gap, None, max_depth, descend))
         }
     }
 }
@@ -227,74 +171,6 @@ fn level(
             last: next_last,
         });
     }
-    Batch { found, jobs }
-}
-
-/// A page of the listing without a delimiter of `prefix`, the directory at
-/// `depth`: what it holds to `max_depth`, with the directories it implies.
-fn flat_page(
-    prefix: String,
-    depth: u32,
-    page: Page,
-    mut seen: HashMap<String, bool>,
-    max_depth: u32,
-    descend: &(dyn Fn(&str) -> bool + Sync),
-) -> Batch {
-    let mut found = Vec::new();
-    'entries: for entry in page.entries {
-        let relative = &entry.key[prefix.len()..];
-        if relative.is_empty() {
-            if entry.size > 0 && depth > 0 {
-                found.push(Found::Object(entry));
-            }
-            continue;
-        }
-        let marker = crate::s3::client::is_directory_marker(&entry.key, entry.size);
-        // The directories above the key, and the key itself when it is a
-        // marker or an object with contents whose name ends with '/'.
-        let named = if marker {
-            relative
-        } else {
-            &relative[..relative.rfind('/').map_or(0, |at| at + 1)]
-        };
-        let mut level = depth;
-        for (at, _) in named.match_indices('/') {
-            level += 1;
-            if level > max_depth {
-                continue 'entries;
-            }
-            let directory = &entry.key[..prefix.len() + at + 1];
-            let listed = match seen.get(directory) {
-                Some(listed) => *listed,
-                None => {
-                    let listed = level < max_depth && descend(directory);
-                    seen.insert(directory.to_owned(), listed);
-                    found.push(Found::Directory(directory.to_owned()));
-                    listed
-                }
-            };
-            if !listed {
-                continue 'entries;
-            }
-        }
-        // Every directory above the key is listed, so it is shallower than
-        // `max_depth`, and so is an object with contents whose name ends
-        // with '/': a level listing finds it when listing the directory of
-        // that name.
-        if !marker {
-            found.push(Found::Object(entry));
-        }
-    }
-    let jobs = page
-        .next
-        .map(|token| Job::Flat {
-            prefix,
-            depth,
-            token,
-            seen,
-        })
-        .into_iter()
-        .collect();
     Batch { found, jobs }
 }
 

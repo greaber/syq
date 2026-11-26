@@ -8,6 +8,7 @@ use std::{
 struct Memory {
     keys: BTreeSet<String>,
     page: usize,
+    ordered: bool,
     divides: bool,
     /// Make Tigris's mistake: after a page that ends with the common prefix
     /// `P/`, start the next page past the key `P0`.
@@ -26,6 +27,7 @@ impl Memory {
         Self {
             keys: keys.iter().map(|key| (*key).to_owned()).collect(),
             page: 1000,
+            ordered: true,
             divides: true,
             skips: false,
             repeats: false,
@@ -37,6 +39,10 @@ impl Memory {
 }
 
 impl Store for Memory {
+    fn ordered(&self) -> bool {
+        self.ordered
+    }
+
     fn divides(&self) -> bool {
         self.divides
     }
@@ -49,6 +55,10 @@ impl Store for Memory {
         _: Option<&str>,
     ) -> Result<Page> {
         self.calls.borrow_mut().push((prefix.into(), delimiter));
+        anyhow::ensure!(
+            self.ordered || prefix.is_empty() || prefix.ends_with('/'),
+            "directory bucket requires trailing slash on {prefix:?}"
+        );
         if self.refuses_flat && !delimiter {
             return Err(anyhow::Error::msg("AccessDenied").context(
                 crate::s3::client::RequestFailure::refused_for_test("S3 listing"),
@@ -231,13 +241,14 @@ async fn pages_in_byte_order_recover_a_key_skipped_after_a_common_prefix() {
 }
 
 #[tokio::test]
-async fn where_the_order_is_unknown_a_wide_directory_is_listed_whole() {
+async fn where_the_order_is_unknown_a_wide_directory_still_paginates_with_a_delimiter() {
     let all = |_: &str| true;
     let expected = walked(&paged(&wide()), "", 3, &all).await.unwrap();
     for depth in [1, 2, 3] {
         let mut store = paged(&wide());
         store.divides = false;
         store.skips = true;
+        store.refuses_flat = true;
         let found = walked(&store, "", depth, &all).await.unwrap();
         let wanted: Vec<_> = expected
             .iter()
@@ -248,41 +259,34 @@ async fn where_the_order_is_unknown_a_wide_directory_is_listed_whole() {
             .cloned()
             .collect();
         assert_eq!(found, wanted, "depth {depth}");
-        // `w/` needs more than a page, so it is listed without a delimiter.
-        if depth > 1 {
-            assert!(store.calls.borrow().contains(&("w/".into(), false)));
-        }
+        let calls = store.calls.borrow();
+        assert!(calls.iter().all(|(_, delimiter)| *delimiter), "{calls:?}");
+        assert_eq!(calls.contains(&("w/P0".into(), true)), depth > 1);
     }
-    // A policy that refuses the listing without a delimiter leaves only the
-    // delimiter listing, which fails where a page could hide a key.
-    let mut store = paged(&wide());
-    store.divides = false;
-    store.refuses_flat = true;
-    let error = walked(&store, "", 2, &all).await.unwrap_err();
-    assert!(
-        format!("{error:#}").contains("without a delimiter"),
-        "{error:#}"
-    );
-    let mut store = paged(&(0..9).map(|i| format!("w/k{i}")).collect::<Vec<_>>());
-    store.divides = false;
-    store.refuses_flat = true;
-    assert_eq!(walked(&store, "", 2, &all).await.unwrap().len(), 10);
-}
-
-#[tokio::test]
-async fn a_listing_without_a_delimiter_stops_at_the_depth_and_honors_descend() {
-    let keys: Vec<String> = (0..6)
-        .map(|i| format!("r/f{i}"))
-        .chain(["r/s/", "r/s/t/u", "r/s/v", "r/skip/w"].map(String::from))
-        .collect();
-    let descend = |prefix: &str| prefix != "r/skip/";
-    for depth in [2, 3, 9] {
-        let mut ordered = paged(&keys);
-        ordered.page = 1000;
-        let expected = walked(&ordered, "", depth, &descend).await.unwrap();
-        let mut flat = paged(&keys);
-        flat.divides = false;
-        assert_eq!(walked(&flat, "", depth, &descend).await.unwrap(), expected);
+    // Directory buckets (slash_only) stay delimited without checking non-slash prefixes.
+    for depth in [1, 2, 3] {
+        let mut store = paged(&wide());
+        store.ordered = false;
+        store.divides = false;
+        store.refuses_flat = true;
+        let found = walked(&store, "", depth, &all).await.unwrap();
+        let wanted: Vec<_> = expected
+            .iter()
+            .filter(|item| {
+                let key = item.trim_end_matches(" (dir)").trim_end_matches('/');
+                key.matches('/').count() < depth as usize
+            })
+            .cloned()
+            .collect();
+        assert_eq!(found, wanted, "slash_only depth {depth}");
+        let calls = store.calls.borrow();
+        assert!(
+            calls
+                .iter()
+                .all(|(prefix, delimiter)| *delimiter
+                    && (prefix.is_empty() || prefix.ends_with('/'))),
+            "{calls:?}"
+        );
     }
 }
 

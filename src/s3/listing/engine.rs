@@ -7,7 +7,7 @@ use anyhow::{ensure, Context, Result};
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde::Serialize;
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     future::Future,
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -164,20 +164,6 @@ fn refused(error: &anyhow::Error) -> bool {
         .is_some_and(crate::s3::client::RequestFailure::denied)
 }
 
-/// Whether a key the pattern wants could be missing from the page after
-/// `page`, in a store that skips only the key `P0` after a common prefix `P/`
-/// in whatever order it lists.
-fn may_hide(page: &Page, wanted: impl Fn(&str) -> bool) -> bool {
-    page.next.is_some()
-        && page.prefixes.iter().any(|prefix| {
-            prefix.strip_suffix('/').is_some_and(|stem| {
-                let key = format!("{stem}0");
-                // A key the page already holds is not missing.
-                wanted(&key) && page.entries.iter().all(|entry| entry.key != key)
-            })
-        })
-}
-
 /// Whether the store's listings may rely on UTF-8 byte order.
 fn byte_ordered(store: &impl Store) -> bool {
     store.ordered() && store.divides()
@@ -236,39 +222,52 @@ fn scan_batch(prefix: String, delimiter: bool, page: Page, gap: Gap) -> Batch {
 /// After a delimiter page that ends with the common prefix `P/`, Tigris
 /// resumes the listing past the key `P0` instead of at it, so that key, if it
 /// exists, is missing from the next page. In byte order nothing else can come
-/// between the two, and a listing of `P0` itself shows the key first. So the
-/// next page is read together with that listing, and the key is added if the
-/// page left it out. That check relies on byte order, so it is made only
-/// where the store's order is known (`byte_ordered`); every such store is
-/// checked, since the same mistake is easy to make elsewhere. Elsewhere a
-/// delimiter listing goes on past its first page only while no page that
-/// goes on holds a common prefix whose skipped key the pattern could match
-/// (`may_hide`).
+/// between the two, and a listing of `P0` itself shows the key first; where
+/// key order is unknown, pagination through `P0` finds it and `injected`
+/// prevents reporting it again if a later page returns it too. Stores that
+/// allow only prefixes ending with `/` (`slash_only`) refuse `P0`.
 #[derive(Clone, Default)]
 pub(super) struct Gap {
     /// The key to make sure of on the next page.
     key: Option<String>,
-    /// Where the order is unknown, a policy refused the listing without a
-    /// delimiter that was to replace this one. Reported if a page that goes
-    /// on holds a common prefix whose skipped key the pattern could match.
-    refused: Option<String>,
+    /// Keys already injected on an earlier page, so a later page from a
+    /// store that does not list in byte order never duplicates them.
+    injected: HashSet<String>,
 }
 
 impl Gap {
     /// The key to make sure of after `page`, if it ends with a common prefix
     /// and the key is `wanted`.
-    pub(super) fn after(page: &Page, wanted: impl Fn(&str) -> bool) -> Self {
-        Self {
-            key: page
-                .next
+    pub(super) fn after(store: &impl Store, page: &Page, wanted: impl Fn(&str) -> bool) -> Self {
+        Self::with_injected(store, page, wanted, HashSet::new())
+    }
+
+    fn with_injected(
+        store: &impl Store,
+        page: &Page,
+        wanted: impl Fn(&str) -> bool,
+        injected: HashSet<String>,
+    ) -> Self {
+        let key = if store.slash_only() {
+            // Directory buckets refuse prefixes that do not end with '/'.
+            None
+        } else {
+            let ordered = byte_ordered(store);
+            page.next
                 .as_ref()
                 .and(page.prefixes.last())
-                .filter(|last| page.entries.last().is_none_or(|entry| entry.key < **last))
+                .filter(|last| {
+                    !ordered || page.entries.last().is_none_or(|entry| entry.key < **last)
+                })
                 .and_then(|last| last.strip_suffix('/'))
                 .map(|stem| format!("{stem}0"))
-                .filter(|key| wanted(key)),
-            refused: None,
-        }
+                .filter(|key| {
+                    wanted(key)
+                        && !injected.contains(key)
+                        && page.entries.iter().all(|entry| entry.key != *key)
+                })
+        };
+        Self { key, injected }
     }
 
     /// Read the page at `token`, adding the key if the store left it out,
@@ -281,59 +280,75 @@ impl Gap {
         token: &str,
         wanted: impl Fn(&str) -> bool,
     ) -> Result<(Page, Gap)> {
-        let Gap { key, refused } = self;
-        let page = match key {
-            None => read(store, prefix, delimiter, Some(token)).await?,
+        let Gap { key, mut injected } = self;
+        let mut page = match key {
+            None => {
+                let mut page = read(store, prefix, delimiter, Some(token)).await?;
+                if !injected.is_empty() {
+                    page.entries.retain(|entry| !injected.contains(&entry.key));
+                }
+                page
+            }
             Some(key) => {
-                debug_assert!(byte_ordered(store), "checks rely on byte order");
+                debug_assert!(
+                    !store.slash_only(),
+                    "directory buckets refuse non-slash prefixes"
+                );
                 // The check runs while the page is read, and is dropped
                 // unfinished if the page settles the question.
-                let main = read(store, prefix, delimiter, Some(token));
-                let check = read(store, &key, true, None);
-                tokio::pin!(main, check);
-                let mut checked = None;
-                let mut page = loop {
-                    tokio::select! {
-                        // With one request slot free, the page goes first.
-                        biased;
-                        page = &mut main => break page?,
-                        result = &mut check, if checked.is_none() => checked = Some(result),
-                    }
+                let (mut page, empty, found) = {
+                    let main = read(store, prefix, delimiter, Some(token));
+                    let check = read(store, &key, true, None);
+                    tokio::pin!(main, check);
+                    let mut checked = None;
+                    let mut page = loop {
+                        tokio::select! {
+                            // With one request slot free, the page goes first.
+                            biased;
+                            page = &mut main => break page?,
+                            result = &mut check, if checked.is_none() => checked = Some(result),
+                        }
+                    };
+                    let empty =
+                        page.entries.is_empty() && page.prefixes.is_empty() && page.next.is_some();
+                    let found = if empty {
+                        None
+                    } else {
+                        if !injected.is_empty() {
+                            page.entries.retain(|entry| !injected.contains(&entry.key));
+                        }
+                        if page.entries.iter().all(|entry| entry.key != key) {
+                            let check = match checked {
+                                Some(check) => check,
+                                None => check.await,
+                            };
+                            Self::find(store, &key, check).await?
+                        } else {
+                            None
+                        }
+                    };
+                    (page, empty, found)
                 };
-                if page.entries.is_empty() && page.prefixes.is_empty() && page.next.is_some() {
+                if empty {
                     // An empty page shows nothing; the next one starts at
                     // the key or past it.
                     return Ok((
                         page,
                         Gap {
-                            key: Some(key.clone()),
-                            refused,
+                            key: Some(key),
+                            injected,
                         },
                     ));
                 }
-                if page.entries.first().is_none_or(|entry| entry.key != key) {
-                    let check = match checked {
-                        Some(check) => check,
-                        None => check.await,
-                    };
-                    if let Some(entry) = Self::find(store, &key, check).await? {
-                        page.entries.insert(0, entry);
-                    }
+                if let Some(entry) = found {
+                    injected.insert(key);
+                    page.entries.insert(0, entry);
                 }
                 page
             }
         };
-        if let Some(refused) = &refused {
-            ensure!(!may_hide(&page, &wanted), "{refused}");
-        }
-        // Where the order is unknown, nothing is checked (`may_hide` above).
-        let next = match refused {
-            Some(refused) => Gap {
-                key: None,
-                refused: Some(refused),
-            },
-            None => Gap::after(&page, wanted),
-        };
+        let next = Self::with_injected(store, &page, wanted, injected);
+        page.entries.shrink_to_fit();
         Ok((page, next))
     }
 
@@ -343,20 +358,33 @@ impl Gap {
             format!("listing {key:?} to check for a key the store may have skipped after the common prefix before it")
         };
         let mut page = first.with_context(context)?;
-        // In byte order the key comes first, but an empty page shows nothing.
-        while page.entries.is_empty() && page.prefixes.is_empty() {
+        if byte_ordered(store) {
+            // In byte order the key comes first, but an empty page shows nothing.
+            while page.entries.is_empty() && page.prefixes.is_empty() {
+                let Some(token) = page.next else {
+                    break;
+                };
+                page = read(store, key, true, Some(&token))
+                    .await
+                    .with_context(context)?;
+            }
+            return Ok(page
+                .entries
+                .into_iter()
+                .next()
+                .filter(|entry| entry.key == key));
+        }
+        loop {
+            if let Some(entry) = page.entries.into_iter().find(|entry| entry.key == key) {
+                return Ok(Some(entry));
+            }
             let Some(token) = page.next else {
-                break;
+                return Ok(None);
             };
             page = read(store, key, true, Some(&token))
                 .await
                 .with_context(context)?;
         }
-        Ok(page
-            .entries
-            .into_iter()
-            .next()
-            .filter(|entry| entry.key == key))
     }
 }
 
@@ -484,41 +512,7 @@ async fn execute(
     }
     let page = read(store, &query, true, None).await?;
     if component + 1 == pattern.components.len() {
-        if page.next.is_some() && !byte_ordered(store) && !part.literal() && part.may_end_with('0')
-        {
-            // Making sure of a key a page may leave out (`Gap`) relies on
-            // byte order. List everything under the prefix instead, unless
-            // the pattern cannot match that key: it ends in '0' and is
-            // longer than the prefix, so a literal name is never it. That
-            // assumes a store in another order would leave out only that
-            // key, as Tigris does in byte order; none is known to leave out
-            // any.
-            let why = || {
-                format!("listing {query:?} without a delimiter, since a later delimiter page could leave out a key")
-            };
-            match read(store, &query, false, None).await {
-                Ok(flat) => {
-                    static SAID: std::sync::Once = std::sync::Once::new();
-                    SAID.call_once(|| {
-                        crate::output::diagnostic!(
-                            "syq find: listing every key under {query:?} without a delimiter, which can take much longer; other prefixes the pattern's last part reaches are listed the same way when their listings need more than one page: this store may not list keys in byte order, and its later delimiter pages could leave a key out"
-                        );
-                    });
-                    return Ok(scan_batch(query, false, flat, Gap::default()));
-                }
-                // A policy may require a delimiter. Go on with it while no
-                // page could be followed by a wanted key left out.
-                Err(error) if refused(&error) && !may_hide(&page, |key| pattern.matches(key)) => {
-                    let gap = Gap {
-                        key: None,
-                        refused: Some(format!("{:#}", error.context(why()))),
-                    };
-                    return Ok(scan_batch(query, true, page, gap));
-                }
-                Err(error) => return Err(error.context(why())),
-            }
-        }
-        let gap = Gap::after(&page, |key| pattern.matches(key));
+        let gap = Gap::after(store, &page, |key| pattern.matches(key));
         return Ok(scan_batch(query, true, page, gap));
     }
     if page.next.is_some() || page.prefixes.len() > MAX_CHILDREN {

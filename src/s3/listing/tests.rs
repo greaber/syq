@@ -818,11 +818,9 @@ async fn listings_from_a_store_not_in_byte_order_miss_no_key() {
 }
 
 #[tokio::test]
-async fn a_glob_that_needs_more_than_a_page_lists_flat_where_order_is_unknown() {
-    // In R2's order the first page of `edge/` ends with `p/`, `p0` and `p`.
-    // Whether a later page of a delimiter listing leaves a key out, or a
-    // check for it finds one already listed, depends on the order; a flat
-    // listing does not.
+async fn a_glob_that_needs_more_than_a_page_stays_delimited_where_order_is_unknown() {
+    // In R2's order the first page of `edge/` ends with `p/`, `p0` and `p`:
+    // `edge/p0` is already on the page, so no extra probe or flat scan runs.
     let store = R2Order(Memory::new(
         (0..997)
             .map(|i| format!("edge/f{i:03}"))
@@ -848,13 +846,40 @@ async fn a_glob_that_needs_more_than_a_page_lists_flat_where_order_is_unknown() 
         assert_eq!(keys, expected);
         assert_eq!(
             store.0.calls.borrow_mut().split_off(0),
-            [
-                ("edge/".to_owned(), true),
-                ("edge/".to_owned(), false),
-                ("edge/".to_owned(), false)
-            ]
+            [("edge/".to_owned(), true), ("edge/".to_owned(), true)]
         );
     }
+
+    // Here `edge/p/` ends page 1, `edge/p0000..edge/p0999` fill page 2, and
+    // `edge/p0` appears on page 3. `Gap` paginates `edge/p0` to inject it once
+    // and deduplicates it when page 3 returns it again.
+    let store = R2Order(Memory::new(
+        (0..999)
+            .map(|i| format!("edge/f{i:03}"))
+            .chain(["edge/p/x".to_owned()])
+            .chain((0..1000).map(|i| format!("edge/p0{i:03}")))
+            .chain(["edge/p0".to_owned()]),
+    ));
+    let mut keys = Vec::new();
+    engine::enumerate(&store, &pattern, 1, |entry| {
+        keys.push(entry.key);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let unique: BTreeSet<_> = keys.iter().cloned().collect();
+    let expected: BTreeSet<_> = store
+        .0
+        .keys
+        .iter()
+        .filter(|key| pattern.matches(key))
+        .cloned()
+        .collect();
+    assert_eq!(keys.len(), expected.len());
+    assert_eq!(unique, expected);
+    let calls = store.0.calls.borrow();
+    assert!(calls.iter().all(|(_, delimiter)| *delimiter), "{calls:?}");
+    assert!(calls.contains(&("edge/p0".to_owned(), true)), "{calls:?}");
 }
 
 #[tokio::test]

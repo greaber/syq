@@ -154,7 +154,7 @@ async fn execute(
             let page = match token {
                 Some((token, gap)) => gap.read(store, &directory, true, &token, |_| true).await,
                 None => read(store, &directory, true, None).await.map(|page| {
-                    let gap = Gap::after(&page, |_| true);
+                    let gap = Gap::after(store, &page, |_| true);
                     (page, gap)
                 }),
             }
@@ -205,7 +205,7 @@ async fn execute(
     let page = read(store, &query, true, None).await?;
     if component + 1 == pattern.components.len() {
         // Parts run only where the store lists in byte order.
-        let gap = Gap::after(&page, |key| pattern.matches(key));
+        let gap = Gap::after(store, &page, |key| pattern.matches(key));
         return Ok(scan_batch(query, true, page, gap));
     }
     if page.next.is_some() || page.prefixes.len() > MAX_CHILDREN {
