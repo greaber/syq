@@ -222,10 +222,11 @@ fn scan_batch(prefix: String, delimiter: bool, page: Page, gap: Gap) -> Batch {
 /// After a delimiter page that ends with the common prefix `P/`, Tigris
 /// resumes the listing past the key `P0` instead of at it, so that key, if it
 /// exists, is missing from the next page. In byte order nothing else can come
-/// between the two, and a listing of `P0` itself shows the key first; where
-/// key order is unknown, pagination through `P0` finds it and `injected`
-/// prevents reporting it again if a later page returns it too. Stores that
-/// allow only prefixes ending with `/` (`slash_only`) refuse `P0`.
+/// between the two, and a single non-empty page listing `P0` suffices; stopping
+/// after the first non-empty page also prevents unbounded scans on other orders
+/// when many siblings share the `P0` prefix, and `injected` keeps a later page
+/// from reporting an injected key twice. Stores that allow only prefixes ending
+/// with `/` (`slash_only`) refuse `P0`.
 #[derive(Clone, Default)]
 pub(super) struct Gap {
     /// The key to make sure of on the next page.
@@ -252,13 +253,10 @@ impl Gap {
             // Directory buckets refuse prefixes that do not end with '/'.
             None
         } else {
-            let ordered = byte_ordered(store);
             page.next
                 .as_ref()
                 .and(page.prefixes.last())
-                .filter(|last| {
-                    !ordered || page.entries.last().is_none_or(|entry| entry.key < **last)
-                })
+                .filter(|last| page.entries.last().is_none_or(|entry| entry.key < **last))
                 .and_then(|last| last.strip_suffix('/'))
                 .map(|stem| format!("{stem}0"))
                 .filter(|key| {
@@ -281,7 +279,7 @@ impl Gap {
         wanted: impl Fn(&str) -> bool,
     ) -> Result<(Page, Gap)> {
         let Gap { key, mut injected } = self;
-        let mut page = match key {
+        let page = match key {
             None => {
                 let mut page = read(store, prefix, delimiter, Some(token)).await?;
                 if !injected.is_empty() {
@@ -348,7 +346,6 @@ impl Gap {
             }
         };
         let next = Self::with_injected(store, &page, wanted, injected);
-        page.entries.shrink_to_fit();
         Ok((page, next))
     }
 
@@ -358,33 +355,18 @@ impl Gap {
             format!("listing {key:?} to check for a key the store may have skipped after the common prefix before it")
         };
         let mut page = first.with_context(context)?;
-        if byte_ordered(store) {
-            // In byte order the key comes first, but an empty page shows nothing.
-            while page.entries.is_empty() && page.prefixes.is_empty() {
-                let Some(token) = page.next else {
-                    break;
-                };
-                page = read(store, key, true, Some(&token))
-                    .await
-                    .with_context(context)?;
-            }
-            return Ok(page
-                .entries
-                .into_iter()
-                .next()
-                .filter(|entry| entry.key == key));
-        }
-        loop {
-            if let Some(entry) = page.entries.into_iter().find(|entry| entry.key == key) {
-                return Ok(Some(entry));
-            }
+        // In byte order the key comes first, but an empty page shows nothing.
+        // Stop at the first non-empty page so dense sibling prefixes starting
+        // with `key` on another order never trigger an unbounded scan.
+        while page.entries.is_empty() && page.prefixes.is_empty() {
             let Some(token) = page.next else {
-                return Ok(None);
+                break;
             };
             page = read(store, key, true, Some(&token))
                 .await
                 .with_context(context)?;
         }
+        Ok(page.entries.into_iter().find(|entry| entry.key == key))
     }
 }
 

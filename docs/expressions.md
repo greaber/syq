@@ -106,9 +106,9 @@ metadata instead of `= null` or `!= null`. Arithmetic on `null` produces
 follow 3-valued logic where unknown is `null`: `not unknown` is unknown,
 `true or unknown` is true, `false and unknown` is false, `if` takes the else
 branch on unknown, and an expression that evaluates to unknown excludes the
-entry (or does not copy it under `--copy-if`). A metadata comparison with a `dst` field (such as `src.size > dst.size`) is
-unknown when the destination is absent, so start with `not dst.exists or` to
-include new entries.
+entry (or does not copy it under `--copy-if`). A metadata comparison with a
+`dst` field (such as `src.size > dst.size`) is unknown when the destination is
+absent, so start with `not dst.exists or` to include new entries.
 
 ```text
 src.mtime is null

@@ -851,8 +851,9 @@ async fn a_glob_that_needs_more_than_a_page_stays_delimited_where_order_is_unkno
     }
 
     // Here `edge/p/` ends page 1, `edge/p0000..edge/p0999` fill page 2, and
-    // `edge/p0` appears on page 3. `Gap` paginates `edge/p0` to inject it once
-    // and deduplicates it when page 3 returns it again.
+    // `edge/p0` appears on page 3. `Gap` stops probing `edge/p0` after one
+    // non-empty page (never scanning all dense `p0*` siblings) while page 3
+    // still yields `edge/p0` cleanly.
     let store = R2Order(Memory::new(
         (0..999)
             .map(|i| format!("edge/f{i:03}"))
@@ -877,9 +878,90 @@ async fn a_glob_that_needs_more_than_a_page_stays_delimited_where_order_is_unkno
         .collect();
     assert_eq!(keys.len(), expected.len());
     assert_eq!(unique, expected);
-    let calls = store.0.calls.borrow();
-    assert!(calls.iter().all(|(_, delimiter)| *delimiter), "{calls:?}");
-    assert!(calls.contains(&("edge/p0".to_owned(), true)), "{calls:?}");
+    {
+        let calls = store.0.calls.borrow();
+        assert!(calls.iter().all(|(_, delimiter)| *delimiter), "{calls:?}");
+        assert_eq!(
+            calls.iter().filter(|(p, _)| p == "edge/p0").count(),
+            1,
+            "{calls:?}"
+        );
+    }
+
+    // When `Gap` injects `P0` across an empty continuation page and a later page
+    // returns `P0` again, `injected` deduplicates the later copy.
+    struct Scripted(RefCell<Vec<(String, bool)>>);
+    impl Store for Scripted {
+        fn ordered(&self) -> bool {
+            false
+        }
+        fn slash_only(&self) -> bool {
+            false
+        }
+        async fn page(
+            &self,
+            prefix: &str,
+            delimiter: bool,
+            token: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<Page> {
+            self.0.borrow_mut().push((prefix.into(), delimiter));
+            let entry = |key: &str| Entry {
+                key: key.to_owned(),
+                size: 1,
+                last_modified: None,
+                etag: None,
+            };
+            if prefix == "edge/p0" {
+                return Ok(Page {
+                    entries: vec![entry("edge/p0")],
+                    complete: true,
+                    ..Page::default()
+                });
+            }
+            Ok(match token {
+                None => Page {
+                    prefixes: vec!["edge/p/".into()],
+                    next: Some("t1".into()),
+                    ..Page::default()
+                },
+                Some("t1") => Page {
+                    next: Some("t2".into()),
+                    ..Page::default()
+                },
+                Some("t2") => Page {
+                    entries: vec![entry("edge/a")],
+                    next: Some("t3".into()),
+                    ..Page::default()
+                },
+                Some("t3") => Page {
+                    entries: vec![entry("edge/p0"), entry("edge/z")],
+                    complete: true,
+                    ..Page::default()
+                },
+                Some(other) => panic!("unexpected token {other}"),
+            })
+        }
+    }
+    let scripted = Scripted(RefCell::default());
+    let mut keys = Vec::new();
+    engine::enumerate(&scripted, &pattern, 1, |entry| {
+        keys.push(entry.key);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    keys.sort();
+    assert_eq!(keys, ["edge/a", "edge/p0", "edge/z"]);
+    assert_eq!(
+        scripted
+            .0
+            .borrow()
+            .iter()
+            .filter(|(p, _)| p == "edge/p0")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
