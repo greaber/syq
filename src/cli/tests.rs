@@ -163,6 +163,17 @@ fn args(options: &[&str]) -> Args {
 }
 
 #[test]
+fn rsync_files_from_only_walks_listed_directories_with_explicit_recursion() {
+    assert!(!args(&["-a", "--files-from=list"]).recursive_explicit);
+    assert!(args(&["-ar", "--files-from=list"]).recursive_explicit);
+    for delete in ["--delete", "--delete-after", "--delete-delay"] {
+        let error =
+            Args::try_parse_from(["syq", "--files-from=list", delete, "src", "dst"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+}
+
+#[test]
 fn compression_defaults_on_and_can_be_disabled() {
     assert!(args(&[]).compress);
     assert!(args(&["-z"]).compress);

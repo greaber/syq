@@ -1034,16 +1034,26 @@ impl Planner<'_> {
 
         let mut chunks = lines.chunks(crate::scan::BATCH).peekable();
         let mut prepared: VecDeque<PreparedChunk<'list>> = VecDeque::new();
+        let mut preparation_error = None;
         let result: Result<()> = (|| {
             loop {
                 let window = self.early_lookup_window();
-                while prepared.len() < window
+                while preparation_error.is_none()
+                    && prepared.len() < window
                     && prepared.back().is_none_or(|c| c.subtrees.is_empty())
                 {
                     let Some(chunk) = chunks.next() else {
                         break;
                     };
-                    let mut next = state.prepare_chunk(src, chunk, chunks.peek().is_some())?;
+                    let mut next = match state.prepare_chunk(src, chunk, chunks.peek().is_some()) {
+                        Ok(chunk) => chunk,
+                        Err(error) => {
+                            // Apply the prepared prefix (including its diagnostics)
+                            // before reporting a later chunk's source error.
+                            preparation_error = Some(error);
+                            break;
+                        }
+                    };
                     if !self.early_lookups.rich_batch_deferred {
                         self.show_upcoming(&next.batch, src_root, b"", dst_root);
                         next.shown = true;
@@ -1053,6 +1063,9 @@ impl Planner<'_> {
                 let mut current = match prepared.pop_front() {
                     Some(current) => current,
                     None => {
+                        if let Some(error) = preparation_error.take() {
+                            return Err(error);
+                        }
                         let Some(chunk) = chunks.next() else {
                             break;
                         };
