@@ -9,6 +9,11 @@
 //! The listing reads one prefix, the destination, unless the copy may list
 //! only some prefixes inside it: then it reads each of those for the planned
 //! keys beneath it ([`segments`]), several at once ([`LISTINGS`]).
+//!
+//! Copies whose overwrite policy needs each key's current metadata do not
+//! follow the plan this way. They still learn from one short request that a
+//! prefix holds nothing at all ([`shows_empty`]): every planned key beneath
+//! it is then absent, whatever order the store lists in.
 use super::super::authorization::Unsigned;
 use super::super::listing::{
     self,
@@ -35,7 +40,8 @@ use tokio::sync::watch;
 /// look absent, and an upload in its place would drop metadata only the
 /// destination has. Copies whose overwrite policy needs current metadata
 /// ask with HEAD before proceeding. Existence-only uploads can separately
-/// use a listing to rule out keys they would skip.
+/// use a listing to rule out keys they would skip, and every policy relies on
+/// a prefix shown empty ([`shows_empty`]).
 pub(super) fn trusts_absence(args: &Args) -> bool {
     // The object would be skipped by --only-existing, refused instead of kept
     // by keep, overwritten though newer by update-if-older, and judged by
@@ -60,6 +66,25 @@ pub(super) fn trusts_absence(args: &Args) -> bool {
 /// `--if-exists=error`, where a write that must create it would be refused.
 pub(super) fn trusts_absence_of(args: &Args, key: &str) -> bool {
     args.existing || !(key.ends_with('/') && args.protects_existing_contents())
+}
+
+/// Planned keys beneath a prefix worth one request to learn that it is
+/// empty, for a copy that would not otherwise list its destination. A copy
+/// that already sends the request ([`lists_destination`]) uses it at any
+/// size.
+pub(super) const EMPTY_PROBE_KEYS: usize = KEYS_PER_PAGE;
+
+/// Whether one listing request of a prefix, made without a start or
+/// continuation, shows it holds no object at all. Every key beneath it is
+/// then absent, whatever order the store lists in. An empty page that is
+/// truncated, which a directory bucket may return, shows nothing.
+pub(super) fn shows_empty(
+    page: &aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output,
+) -> bool {
+    page.contents().is_empty()
+        && page.common_prefixes().is_empty()
+        && page.is_truncated() != Some(true)
+        && page.next_continuation_token().is_none()
 }
 
 /// Whether a copy to `bucket` lists its destination to learn which planned
@@ -847,20 +872,24 @@ impl Discovery {
 
 /// What the copy relies on about `key`, the plan's `position`th, once the
 /// destination listing has reached it. `complete` is the whole destination,
-/// listed before a copy that prunes; `discovery` is the listing that follows
-/// the plan.
+/// listed before a copy that prunes; `empty` is a destination prefix that
+/// held nothing when the copy started ([`shows_empty`]); `discovery` is the
+/// listing that follows the plan.
 pub(super) fn listed(
     args: &Args,
     complete: Option<&super::DestinationListing>,
+    empty: Option<&str>,
     discovery: Option<&Discovery>,
     position: usize,
     key: &str,
 ) -> impl Future<Output = Listed> + Send + 'static {
-    let complete = complete.map(|keys| in_complete(keys, key));
+    let complete = complete
+        .map(|keys| in_complete(keys, key))
+        .or_else(|| in_empty(args, empty, key));
     let reached = discovery
         .filter(|_| complete.is_none())
         .map(|discovery| discovery.lookup(position));
-    let trusted = trusts_absence_of(args, key);
+    let trusted = trusts_listed_absence_of(args, key);
     async move {
         let reached = match reached {
             Some(reached) => Some(reached.await),
@@ -875,16 +904,38 @@ pub(super) fn listed(
 pub(super) fn known(
     args: &Args,
     complete: Option<&super::DestinationListing>,
+    empty: Option<&str>,
     discovery: Option<&Discovery>,
     position: usize,
     key: &str,
 ) -> Option<Listed> {
-    let complete = complete.map(|keys| in_complete(keys, key));
+    let complete = complete
+        .map(|keys| in_complete(keys, key))
+        .or_else(|| in_empty(args, empty, key));
     let reached = match discovery.filter(|_| complete.is_none()) {
         Some(discovery) => Some(discovery.known(position)?),
         None => None,
     };
-    Some(rely(complete, reached, trusts_absence_of(args, key)))
+    Some(rely(complete, reached, trusts_listed_absence_of(args, key)))
+}
+
+/// Whether an absence the listing that follows the plan reports may be
+/// relied on for `key`. Under `--if-exists=keep` it never is: that listing
+/// may conclude absence from a key's place in a page, and the write that
+/// follows must create its object, so a key it missed would fail the copy
+/// rather than be kept. Only a prefix shown empty, or a complete listing,
+/// spares that policy its HEAD.
+fn trusts_listed_absence_of(args: &Args, key: &str) -> bool {
+    !args.ignore_existing && trusts_absence_of(args, key)
+}
+
+/// `key` is absent if it lies beneath `empty`, a prefix that held nothing
+/// when the copy started, and the policy may rely on its absence. A key
+/// outside it, such as a named file beside a signed prefix, is not decided.
+fn in_empty(args: &Args, empty: Option<&str>, key: &str) -> Option<Listed> {
+    empty
+        .filter(|prefix| key.starts_with(prefix) && trusts_absence_of(args, key))
+        .map(|_| Listed::Absent)
 }
 
 /// A key outside the prefixes the complete listing covers is unknown, not
