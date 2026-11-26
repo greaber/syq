@@ -3545,8 +3545,19 @@ fn run_transfer(
             }
         })
     };
+    let transport_profile = |all_remote_endpoints_use_tcp: bool| -> tune::TransportProfile {
+        if !(src_ep.is_remote() || dst_ep.is_remote()) {
+            tune::TransportProfile::Local
+        } else if all_remote_endpoints_use_tcp {
+            tune::TransportProfile::Tcp
+        } else {
+            tune::TransportProfile::Ssh
+        }
+    };
     let tuner: Mutex<Option<std::thread::JoinHandle<tune::Policy>>> = Mutex::new(None);
-    let spawn_workers = |initial: usize, refine_start: Option<usize>| {
+    let spawn_workers = |initial: usize,
+                         refine_start: Option<usize>,
+                         profile: tune::TransportProfile| {
         gate.set_active(initial);
         let initial = gate.active();
         if let Some(history) = progress.tuning_history.get() {
@@ -3571,7 +3582,8 @@ fn run_transfer(
                 tune::Policy::refine(n0, tune::MIN, maximum_workers)
             } else {
                 tune::Policy::new(n0, tune::MIN, maximum_workers)
-            };
+            }
+            .with_transport(profile);
             *tuner.lock().unwrap() = std::thread::Builder::new()
                 .spawn(move || tune::run(policy, gate, sched, progress, |id| spawn_worker(id)))
                 .inspect_err(|error| {
@@ -4731,21 +4743,15 @@ fn run_transfer(
                 "source_type":source_filesystem.as_ref().map(|fs|&fs.kind),
                 "destination_type":destination_filesystem.as_ref().map(|fs|&fs.kind)}),
             );
-            let default_start = if src_ep.is_remote() || dst_ep.is_remote() {
-                if all_remote_endpoints_use_tcp {
-                    tune::START_TCP
-                } else {
-                    tune::START_SSH
-                }
-            } else {
-                tune::start_local()
-            };
+            let profile = transport_profile(all_remote_endpoints_use_tcp);
+            let default_start = profile.default_start();
             let hint = (autotune && args.tuning_options.is_none())
                 .then(|| {
                     history.starting_count(
                         &key,
                         src_ep.is_remote() || dst_ep.is_remote(),
                         default_start,
+                        profile,
                     )
                 })
                 .flatten();
@@ -4811,6 +4817,7 @@ fn run_transfer(
         spawn_workers(
             args.connections,
             transport_setup.as_ref().and_then(|(_, refine)| *refine),
+            transport_profile(true),
         );
         workers_started.set(true);
     } else if (fresh_destination
@@ -4846,6 +4853,8 @@ fn run_transfer(
         !defer_destination_mutations && !opts.dry_run && transport_setup.is_some();
     let streaming_connections = args.connections;
     let streaming_refine = transport_setup.as_ref().and_then(|(_, refine)| *refine);
+    let streaming_profile =
+        transport_profile(transport_setup.as_ref().is_some_and(|(tcp, _)| *tcp));
     let streaming_worker_hint = std::cell::Cell::new(0);
     let start_rule = |workers: usize| StartRule {
         workers,
@@ -4956,7 +4965,7 @@ fn run_transfer(
             if streaming_all_shareable.get() {
                 share_ssh_logins(true);
             }
-            spawn_workers(initial, streaming_refine);
+            spawn_workers(initial, streaming_refine, streaming_profile);
             workers_started.set(true);
         } else if autotune && initial > streaming_worker_hint.get() {
             sched.request_worker_count(initial);
@@ -5220,7 +5229,11 @@ fn run_transfer(
                 // nothing for workers to anchor to and nothing for them to do.
                 let anchored = !destination_anchor_required || destination_anchor.get().is_some();
                 if let (Some(initial), true) = (local_start, anchored) {
-                    spawn_workers(initial, refine_start);
+                    spawn_workers(
+                        initial,
+                        refine_start,
+                        transport_profile(all_remote_endpoints_use_tcp),
+                    );
                     workers_started.set(true);
                     sched.release_preflighted_work();
                 }
@@ -5379,7 +5392,11 @@ fn run_transfer(
                         sched.arm_direct_fallback(args.connections);
                         initial = 1;
                     }
-                    spawn_workers(initial, refine_start);
+                    spawn_workers(
+                        initial,
+                        refine_start,
+                        transport_profile(all_remote_endpoints_use_tcp),
+                    );
                 }
             }
         }

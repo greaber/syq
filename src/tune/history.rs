@@ -459,13 +459,14 @@ impl Recorder {
         key: &ContextKey,
         allow_route: bool,
         default_start: usize,
+        profile: crate::tune::TransportProfile,
     ) -> Option<Hint> {
         let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
         if !state.ready() {
             return None;
         }
         let db = &state.store.opened()?.db;
-        inference::starting_count(db, key, allow_route, default_start)
+        inference::starting_count(db, key, allow_route, default_start, profile)
             .ok()
             .flatten()
     }

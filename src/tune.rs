@@ -6,7 +6,8 @@
 //! Sustained throughput collapse can end a probe early.
 //! A fresh start doubles; strong gains restore doubling after a historical
 //! plateau proves obsolete. Failed experiments restore the previous count.
-//! Elapsed time bounds directional backoff (30 s up, 60 s down), independently
+//! Elapsed time bounds directional backoff (upward 30–120 s depending on
+//! transport, 60 s down), independently
 //! of how many measurements stabilize. Upward wins ties; small inconclusive
 //! increases stay active while uncertain reductions restore the higher count.
 //!
@@ -66,6 +67,10 @@ pub(crate) const NEAR_BEST_TOLERANCE: f64 = 0.05;
 /// elapsed time by retry_after; rejected observations still advance deadlines.
 const PROBE_EVERY: usize = 6;
 const PROBE_BACKOFF_MAX: u32 = 3;
+const UPWARD_BACKOFF_MAX_DEFAULT: usize = 12;
+const UPWARD_BACKOFF_MAX_FAST: usize = 24;
+const UPWARD_BACKOFF_MAX_SSH: usize = 48;
+const DOWNWARD_BACKOFF_MAX: usize = 24;
 /// Old high-water measurements must not permanently prevent adaptation when
 /// the path changes during a long transfer.
 const EVIDENCE_MAX_AGE: usize = PROBE_EVERY * 4;
@@ -83,6 +88,33 @@ const TAIL_FALLBACK_BYTES_PER_WORKER: u64 = 64 << 20;
 /// A completed file counts as this many bytes, so small-file transfers
 /// (where bytes are negligible) still produce a usable signal.
 pub const FILE_CREDIT: u64 = 512 * 1024;
+
+/// Endpoint transport class used to scale startup defaults, pooled-history
+/// concurrency penalties, and live upward retry backoff ceilings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportProfile {
+    Ssh,
+    Tcp,
+    Local,
+}
+
+impl TransportProfile {
+    /// Default starting worker count when no history hint applies.
+    pub fn default_start(self) -> usize {
+        match self {
+            TransportProfile::Ssh => START_SSH,
+            TransportProfile::Tcp => START_TCP,
+            TransportProfile::Local => start_local(),
+        }
+    }
+
+    pub(crate) fn upward_max_backoff_ticks(self) -> usize {
+        match self {
+            TransportProfile::Ssh => UPWARD_BACKOFF_MAX_SSH,
+            TransportProfile::Tcp | TransportProfile::Local => UPWARD_BACKOFF_MAX_FAST,
+        }
+    }
+}
 
 fn local_start_for_parallelism(parallelism: usize) -> usize {
     if parallelism <= 2 {
@@ -265,6 +297,7 @@ pub struct Policy {
     fails: [u32; 2],
     /// Stable-measurement number when each direction may next be probed.
     due: [usize; 2],
+    upward_max_backoff_ticks: usize,
     tick: usize,
     wall_clock: bool,
     last_observation: Option<(usize, f64)>,
@@ -288,6 +321,7 @@ impl Policy {
             points: BTreeMap::new(),
             fails: [0, 0],
             due: [PROBE_EVERY, PROBE_EVERY],
+            upward_max_backoff_ticks: UPWARD_BACKOFF_MAX_DEFAULT,
             tick: 0,
             wall_clock: false,
             last_observation: None,
@@ -301,6 +335,17 @@ impl Policy {
             startup_doubling: false,
             ..Self::new(start, min, max)
         }
+    }
+
+    /// Apply transport-specific defaults (such as upward retry backoff
+    /// ceilings) without altering non-transfer callers.
+    pub fn with_transport(mut self, profile: TransportProfile) -> Self {
+        self.upward_max_backoff_ticks = profile.upward_max_backoff_ticks();
+        self
+    }
+
+    pub(crate) fn upward_max_backoff_ticks(&self) -> usize {
+        self.upward_max_backoff_ticks
     }
 
     /// Deletion can burn CPU spinning on filesystem locks without increasing
@@ -497,8 +542,8 @@ impl Policy {
     fn retry_after(&self, direction: Direction) -> usize {
         let backoff = self.fails[direction.index()].min(PROBE_BACKOFF_MAX);
         (PROBE_EVERY << backoff).min(match direction {
-            Direction::Up => 12,
-            Direction::Down => 24,
+            Direction::Up => self.upward_max_backoff_ticks,
+            Direction::Down => DOWNWARD_BACKOFF_MAX,
         })
     }
 
@@ -1283,7 +1328,10 @@ fn run_with_interval(
         }
         if gate.resource_limit() < policy.max {
             active = gate.active().min(gate.resource_limit());
-            policy = Policy::refine(active, MIN, gate.resource_limit());
+            policy = Policy {
+                upward_max_backoff_ticks: policy.upward_max_backoff_ticks,
+                ..Policy::refine(active, MIN, gate.resource_limit())
+            };
             meter.set_active(active);
             policy.advance_time(policy_start.elapsed(), sample);
             observations = Observations::new(meter.as_ref(), &gate, &sched, active);
@@ -1301,6 +1349,7 @@ fn run_with_interval(
                 // start. Keep cached/fine search fine, rather than restarting
                 // uncached doubling when the available work changes.
                 startup_doubling: policy.startup_doubling,
+                upward_max_backoff_ticks: policy.upward_max_backoff_ticks,
                 ..Policy::new(requested, policy.min, policy.max)
             };
             if crate::output::debug() {

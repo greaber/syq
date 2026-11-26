@@ -438,7 +438,11 @@ fn report() {
                     let (mut open, mut shakes) = (0.0, 0.0);
                     for seed in 0..SEEDS {
                         let mut rng = Rng(seed);
-                        let out = copy(&s, Policy::new(s.start, 1, LIMIT), &mut rng);
+                        let out = copy(
+                            &s,
+                            Policy::new(s.start, 1, LIMIT).with_transport(TransportProfile::Ssh),
+                            &mut rng,
+                        );
                         slow.push(100.0 * (out.elapsed / out.ideal_elapsed - 1.0));
                         if let Some(t) = out.reached_near_best {
                             near.push(t);
@@ -490,11 +494,13 @@ fn report() {
             for run in remembered.iter_mut() {
                 // Start each copy as production does, from the recorded history.
                 let writer = history::tests::recorder(&path);
-                let next = match writer.starting_count(&key, false, s.start) {
+                let next = match writer.starting_count(&key, false, s.start, TransportProfile::Ssh)
+                {
                     Some(hint) if hint.refine => Policy::refine(hint.workers, 1, LIMIT),
                     Some(hint) => Policy::new(hint.workers, 1, LIMIT),
                     None => Policy::new(s.start, 1, LIMIT),
-                };
+                }
+                .with_transport(TransportProfile::Ssh);
                 let out = copy(&s, next, &mut rng);
                 writer.context(&key);
                 writer.event(
@@ -515,7 +521,7 @@ fn report() {
                 }
                 writer.complete(true, serde_json::json!({}));
                 let count = writer
-                    .starting_count(&key, false, s.start)
+                    .starting_count(&key, false, s.start, TransportProfile::Ssh)
                     .map_or(s.start, |hint| hint.workers);
                 run.push(count as f64);
             }
@@ -530,6 +536,62 @@ fn report() {
             curve.smallest_near_best(0.0),
             row.join(" ")
         );
+    }
+
+    // Changing-capacity (Curve::Shift) upward-backoff cap comparison.
+    const SHIFT_SEEDS: u64 = 300;
+    let shift_scenarios = [
+        ("cap 60 -> 120 at 60s (120s)", 60.0, 120.0),
+        ("cap 60 -> 120 at 180s (300s)", 180.0, 300.0),
+    ];
+    println!(
+        "\n{:<30} {:<12} | {:>7} {:>7} {:>8} {:>7}",
+        "shift scenario", "profile", "slow50%", "slow90%", "open", "shakes"
+    );
+    for (label, at, ideal_secs) in shift_scenarios {
+        let s = Scenario {
+            name: label,
+            curve: Curve::Shift {
+                per_worker: 4.0,
+                before: 60.0,
+                after: 120.0,
+                at,
+            },
+            ideal_secs,
+            start: 8,
+            sigma: 0.05,
+            rho: 0.5,
+            setup_secs: 0.3,
+            prepare: true,
+        };
+        for (profile_name, profile) in [
+            ("default 30s", None),
+            ("tcp 60s", Some(TransportProfile::Tcp)),
+            ("ssh 120s", Some(TransportProfile::Ssh)),
+        ] {
+            let mut slow = Vec::with_capacity(SHIFT_SEEDS as usize);
+            let (mut open, mut shakes) = (0.0, 0.0);
+            for seed in 0..SHIFT_SEEDS {
+                let mut rng = Rng(seed);
+                let mut policy = Policy::new(s.start, 1, LIMIT);
+                if let Some(p) = profile {
+                    policy = policy.with_transport(p);
+                }
+                let out = copy(&s, policy, &mut rng);
+                slow.push(100.0 * (out.elapsed / out.ideal_elapsed - 1.0));
+                open += out.connection_secs / out.elapsed / SHIFT_SEEDS as f64;
+                shakes += out.handshakes as f64 / SHIFT_SEEDS as f64;
+            }
+            println!(
+                "{:<30} {:<12} | {:>6.2}% {:>6.2}% {:>8.1} {:>7.1}",
+                s.name,
+                profile_name,
+                quantile(&mut slow, 0.5),
+                quantile(&mut slow, 0.9),
+                open,
+                shakes,
+            );
+        }
     }
 }
 
@@ -873,7 +935,7 @@ fn noisy_flat_copies_do_not_ratchet_across_repeated_runs() {
         let mut last = s.start;
         for _ in 0..20 {
             let writer = history::tests::recorder(&path);
-            let policy = match writer.starting_count(&key, false, s.start) {
+            let policy = match writer.starting_count(&key, false, s.start, TransportProfile::Ssh) {
                 Some(hint) => {
                     last = hint.workers;
                     if hint.refine {
@@ -883,7 +945,8 @@ fn noisy_flat_copies_do_not_ratchet_across_repeated_runs() {
                     }
                 }
                 None => Policy::new(s.start, 1, 256),
-            };
+            }
+            .with_transport(TransportProfile::Ssh);
             let out = copy(&s, policy, &mut rng);
             record_sqlite_observations(&writer, &key, &out.observations);
         }
@@ -931,16 +994,24 @@ fn flat_large_file_history_does_not_slow_later_small_file_copies() {
         for _ in 0..5 {
             let writer = history::tests::recorder(&path);
             let start = writer
-                .starting_count(&key, false, super::START_SSH)
+                .starting_count(&key, false, super::START_SSH, TransportProfile::Ssh)
                 .map_or(super::START_SSH, |h| h.workers);
-            let out = copy(&flat, Policy::new(start, 1, 64), &mut rng);
+            let out = copy(
+                &flat,
+                Policy::new(start, 1, 64).with_transport(TransportProfile::Ssh),
+                &mut rng,
+            );
             record_sqlite_observations(&writer, &key, &out.observations);
         }
         let next_start = history::tests::recorder(&path)
-            .starting_count(&key, false, super::START_SSH)
+            .starting_count(&key, false, super::START_SSH, TransportProfile::Ssh)
             .map_or(super::START_SSH, |h| h.workers);
         starts.push(next_start as f64);
-        let out = copy(&small_files, Policy::new(next_start, 1, 64), &mut rng);
+        let out = copy(
+            &small_files,
+            Policy::new(next_start, 1, 64).with_transport(TransportProfile::Ssh),
+            &mut rng,
+        );
         settled.push(out.policy.settled() as f64);
         slowdowns.push(100.0 * (out.elapsed / out.ideal_elapsed - 1.0));
     }
@@ -951,4 +1022,49 @@ fn flat_large_file_history_does_not_slow_later_small_file_copies() {
         med_start >= super::START_SSH as f64 && med_settled >= 16.0 && p90_slowdown < 15.0,
         "med_start={med_start} med_settled={med_settled} p90_slowdown={p90_slowdown:.2}%"
     );
+}
+
+#[test]
+fn tcp_flat_copies_stay_bounded() {
+    let s = Scenario {
+        name: "tcp-flat",
+        curve: Curve::Knee {
+            per_worker: 100.0,
+            cap: 100.0,
+        },
+        ideal_secs: 40.0,
+        start: START_TCP,
+        sigma: 0.05,
+        rho: 0.5,
+        setup_secs: 0.05,
+        prepare: true,
+    };
+    let key = history::tests::key("a");
+    let mut flat_starts = Vec::new();
+    for seed in 0..25 {
+        let mut rng = Rng(seed + 0x1234);
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("history.sqlite");
+        let mut last = s.start;
+        for _ in 0..20 {
+            let writer = history::tests::recorder(&path);
+            let policy = match writer.starting_count(&key, false, s.start, TransportProfile::Tcp) {
+                Some(hint) => {
+                    last = hint.workers;
+                    if hint.refine {
+                        Policy::refine(hint.workers, 1, 256)
+                    } else {
+                        Policy::new(hint.workers, 1, 256)
+                    }
+                }
+                None => Policy::new(s.start, 1, 256),
+            }
+            .with_transport(TransportProfile::Tcp);
+            let out = copy(&s, policy, &mut rng);
+            record_sqlite_observations(&writer, &key, &out.observations);
+        }
+        flat_starts.push(last as f64);
+    }
+    let flat_p90 = quantile(&mut flat_starts, 0.9);
+    assert!(flat_p90 <= 64.0, "flat_p90={flat_p90}");
 }
