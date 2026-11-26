@@ -27,8 +27,8 @@ impl Trace {
             "concurrency_cost":CONCURRENCY_COST,"step":STEP,"startup_step":STARTUP_STEP,"file_credit":FILE_CREDIT,"probe_every":PROBE_EVERY,
             "probe_backoff_max":PROBE_BACKOFF_MAX,"evidence_max_age":EVIDENCE_MAX_AGE,
             "clock_unit":if policy.wall_clock {"elapsed_sample_intervals"} else {"accepted_measurements"},
-            "upward_max_wait_ms":policy.wall_clock.then_some(interval.as_millis()*12),
-            "downward_max_wait_ms":policy.wall_clock.then_some(interval.as_millis()*24),"observation_ms":policy.wall_clock.then_some(interval.as_millis().min(500)),
+            "upward_max_wait_ms":policy.wall_clock.then_some(interval.as_millis()*UP_RETRY_CAP as u128),
+            "downward_max_wait_ms":policy.wall_clock.then_some(interval.as_millis()*DOWN_RETRY_CAP as u128),"observation_ms":policy.wall_clock.then_some(interval.as_millis().min(500)),
             "collapse_fraction":0.5,"collapse_samples":2}));
         trace
     }
@@ -108,6 +108,7 @@ impl Trace {
         let old_n = policy.n;
         let comparisons = policy.comparisons;
         let fails = policy.fails;
+        let was_undoubted_explore = matches!(policy.state, State::Explore { doubted: false, .. });
         policy.observe(score);
         let reason = if comparisons != policy.comparisons {
             if policy.fails != fails && policy.fails.iter().sum::<u32>() > fails.iter().sum::<u32>()
@@ -122,6 +123,10 @@ impl Trace {
             }
         } else if old_n != policy.n {
             "probe_proposed"
+        } else if was_undoubted_explore
+            && matches!(policy.state, State::Explore { doubted: true, .. })
+        {
+            "probe_doubted"
         } else {
             "hold"
         };
@@ -187,7 +192,9 @@ impl Trace {
 
 fn snapshot(policy: &Policy) -> Value {
     json!({"requested":policy.n,"active":policy.active,"min":policy.min,"max":(policy.max != usize::MAX).then_some(policy.max),
-        "startup_doubling":policy.startup_doubling,"state":policy.state,"points":policy.points,"clock":policy.tick,"wall_clock":policy.wall_clock,
+        "startup_doubling":policy.startup_doubling,"doubling_down":policy.doubling_down,
+        "last_probe":policy.last_probe,"checked_down_here":policy.checked_down_here,"checked_up_here":policy.checked_up_here,
+        "state":policy.state,"points":policy.points,"clock":policy.tick,"wall_clock":policy.wall_clock,
         "comparisons":policy.comparisons,"failed_probes":policy.fails,"next_probe":policy.due,
-        "recent_best":policy.recent_best(),"historical_near_best_floor":policy.recent_best()*(1.0-NEAR_BEST_TOLERANCE)})
+        "recent_best":policy.recent_best()})
 }

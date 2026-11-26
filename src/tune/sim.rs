@@ -533,7 +533,7 @@ fn report() {
             for run in remembered.iter_mut() {
                 // Start each copy as production does, from the recorded history.
                 let writer = history::tests::recorder(&path);
-                let next = match writer.starting_count(&key, false) {
+                let next = match writer.starting_count(&key, false, s.start) {
                     Some(hint) if hint.refine => Policy::refine(hint.workers, 1, LIMIT),
                     Some(hint) => Policy::new(hint.workers, 1, LIMIT),
                     None => Policy::new(s.start, 1, LIMIT),
@@ -558,7 +558,7 @@ fn report() {
                 }
                 writer.complete(true, serde_json::json!({}));
                 let count = writer
-                    .starting_count(&key, false)
+                    .starting_count(&key, false, s.start)
                     .map_or(s.start, |hint| hint.workers);
                 run.push(count as f64);
             }
@@ -920,7 +920,7 @@ fn noisy_flat_copies_do_not_ratchet_across_repeated_runs() {
         let mut last = 8;
         for _ in 0..20 {
             let writer = history::tests::recorder(&path);
-            let policy = match writer.starting_count(&key, false) {
+            let policy = match writer.starting_count(&key, false, s.start) {
                 Some(hint) => {
                     last = hint.workers;
                     if hint.refine {
@@ -938,7 +938,81 @@ fn noisy_flat_copies_do_not_ratchet_across_repeated_runs() {
     }
     let med = quantile(&mut final_starts, 0.5);
     let p90 = quantile(&mut final_starts, 0.9);
-    assert!(med <= 2.0 && p90 <= 8.0, "med={med} p90={p90}");
+    assert!(
+        (6.0..=8.0).contains(&med) && p90 <= 12.0,
+        "med={med} p90={p90}"
+    );
+}
+
+#[test]
+fn flat_large_file_history_does_not_slow_later_small_file_copies() {
+    let flat = Scenario {
+        name: "large-flat",
+        curve: Curve::Knee {
+            per_worker: 100.0,
+            cap: 100.0,
+        },
+        ideal_secs: 40.0,
+        start: super::START_SSH,
+        sigma: 0.05,
+        rho: 0.5,
+        setup_secs: 0.3,
+        prepare: true,
+    };
+    let small_files = Scenario {
+        name: "small-files",
+        curve: Curve::Knee {
+            per_worker: 100.0 / 16.0,
+            cap: 100.0,
+        },
+        ideal_secs: 40.0,
+        start: super::START_SSH,
+        sigma: 0.05,
+        rho: 0.5,
+        setup_secs: 0.3,
+        prepare: true,
+    };
+    let key = history::tests::key("a");
+    let mut rng = Rng(0);
+    let temp = crate::test_support::tempdir().unwrap();
+    let path = temp.path().join("history.sqlite");
+    for _ in 0..5 {
+        let writer = history::tests::recorder(&path);
+        let hint = writer.starting_count(&key, false, super::START_SSH);
+        let start = hint.map_or(super::START_SSH, |h| h.workers);
+        let out = copy_with_options(
+            &flat,
+            Policy::new(start, 1, 64),
+            &mut rng,
+            64,
+            0.0,
+            |_, _| {},
+        );
+        record_sqlite_observations(&writer, &key, &out.observations);
+    }
+    let writer = history::tests::recorder(&path);
+    let next_start = writer
+        .starting_count(&key, false, super::START_SSH)
+        .map_or(super::START_SSH, |h| h.workers);
+    assert!(next_start >= super::START_SSH, "start={next_start}");
+    let out = copy_with_options(
+        &small_files,
+        Policy::new(next_start, 1, 64),
+        &mut rng,
+        64,
+        0.0,
+        |_, _| {},
+    );
+    assert!(
+        out.policy.settled() >= 16,
+        "settled={}",
+        out.policy.settled()
+    );
+    assert!(
+        out.elapsed / out.ideal_elapsed < 1.15,
+        "slowdown={:.2}%",
+        100.0 * (out.elapsed / out.ideal_elapsed - 1.0)
+    );
 }
 
 #[test]
@@ -965,7 +1039,7 @@ fn inflated_start_self_heals_toward_knee_with_sqlite_history() {
         let mut last = 64;
         for _ in 0..20 {
             let writer = history::tests::recorder(&path);
-            let policy = match writer.starting_count(&key, false) {
+            let policy = match writer.starting_count(&key, false, super::START_SSH) {
                 Some(hint) => {
                     last = hint.workers;
                     if hint.refine {
@@ -1041,7 +1115,7 @@ fn slow_connection_ramp_reaches_knee_and_oversized_starts_recover() {
         0.0,
         |_, _| {},
     );
-    assert_eq!(out.policy.settled(), 1);
+    assert_eq!(out.policy.settled(), 32);
 
     let decline_hi = Scenario {
         name: "decline-hi",
@@ -1197,6 +1271,19 @@ fn production_stress_report() {
             0.5,
         ),
         (
+            "gentle +5%/dbl (8) 180s",
+            Curve::Gentle {
+                base: 100.0,
+                gain_per_doubling: 0.05,
+            },
+            8,
+            180.0,
+            0.3,
+            0.0,
+            0.05,
+            0.5,
+        ),
+        (
             "gentle +8%/dbl (8) 180s",
             Curve::Gentle {
                 base: 100.0,
@@ -1236,6 +1323,32 @@ fn production_stress_report() {
             0.9,
         ),
         (
+            "knee 32 (8) sigma=0.3 180s",
+            Curve::Knee {
+                per_worker: 100.0 / 32.0,
+                cap: 100.0,
+            },
+            8,
+            180.0,
+            0.3,
+            0.0,
+            0.30,
+            0.9,
+        ),
+        (
+            "linear 64 (8) sigma=0.3 180s",
+            Curve::Knee {
+                per_worker: 2.0,
+                cap: 1e9,
+            },
+            8,
+            180.0,
+            0.3,
+            0.0,
+            0.30,
+            0.9,
+        ),
+        (
             "knee 16 (1) setup=10s 180s",
             Curve::Knee {
                 per_worker: 100.0 / 16.0,
@@ -1245,6 +1358,19 @@ fn production_stress_report() {
             180.0,
             10.0,
             0.0,
+            0.05,
+            0.5,
+        ),
+        (
+            "knee 16 ramp=6s (1) 180s",
+            Curve::Knee {
+                per_worker: 100.0 / 16.0,
+                cap: 100.0,
+            },
+            1,
+            180.0,
+            1.0,
+            6.0,
             0.05,
             0.5,
         ),
@@ -1287,7 +1413,7 @@ fn production_stress_report() {
     println!("\n=== PRODUCTION SQLITE 100-COPY SIMULATION (25 seeds, 40s copies, sigma=0.05, rho=0.5) ===");
     let key = history::tests::key("a");
     let check_at = [0usize, 7, 29, 99];
-    for (name, curve, start, limit) in [
+    for (name, curve, start, default_start, limit) in [
         (
             "flat (start 8)",
             Curve::Knee {
@@ -1295,6 +1421,7 @@ fn production_stress_report() {
                 cap: 100.0,
             },
             8,
+            super::START_SSH,
             256,
         ),
         (
@@ -1304,6 +1431,7 @@ fn production_stress_report() {
                 cap: 100.0,
             },
             8,
+            super::START_SSH,
             256,
         ),
         (
@@ -1313,6 +1441,7 @@ fn production_stress_report() {
                 cap: 100.0,
             },
             64,
+            super::START_SSH,
             256,
         ),
         (
@@ -1322,6 +1451,7 @@ fn production_stress_report() {
                 cap: 100.0,
             },
             8,
+            super::START_SSH,
             256,
         ),
         (
@@ -1332,6 +1462,7 @@ fn production_stress_report() {
                 loss: 0.5,
             },
             32,
+            32,
             64,
         ),
         (
@@ -1341,6 +1472,7 @@ fn production_stress_report() {
                 gain_per_doubling: 0.08,
             },
             8,
+            super::START_SSH,
             256,
         ),
         (
@@ -1350,6 +1482,7 @@ fn production_stress_report() {
                 gain_per_doubling: 0.15,
             },
             8,
+            super::START_SSH,
             256,
         ),
     ] {
@@ -1371,7 +1504,7 @@ fn production_stress_report() {
             let path = temp.path().join("history.sqlite");
             for c in 0..100 {
                 let writer = history::tests::recorder(&path);
-                let hint = writer.starting_count(&key, false);
+                let hint = writer.starting_count(&key, false, default_start);
                 let cur_start = hint.as_ref().map_or(start, |h| h.workers);
                 let policy = match hint {
                     Some(h) if h.refine => Policy::refine(h.workers, 1, limit),

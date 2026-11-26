@@ -454,13 +454,18 @@ impl Recorder {
         }
     }
 
-    pub(crate) fn starting_count(&self, key: &ContextKey, allow_route: bool) -> Option<Hint> {
+    pub(crate) fn starting_count(
+        &self,
+        key: &ContextKey,
+        allow_route: bool,
+        default_start: usize,
+    ) -> Option<Hint> {
         let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
         if !state.ready() {
             return None;
         }
         let db = &state.store.opened()?.db;
-        inference::starting_count(db, key, allow_route)
+        inference::starting_count(db, key, allow_route, default_start)
             .ok()
             .flatten()
     }

@@ -1,18 +1,19 @@
 //! Automatic tuning of the number of parallel workers / connections.
 //!
 //! Startup settings are inferred at read time by pooling within-run log-rate
-//! comparisons across recent runs under a regularized least-squares fit. Both
-//! startup inference and live probing optimize the same objective:
-//!
-//!   `U(n) = ln(R(n)) - CONCURRENCY_COST * ln(n)`
-//!
-//! A change from `n1` to `n2` keeps the new count when its measured marginal
-//! throughput elasticity exceeds [`CONCURRENCY_COST`] (about 5.7% per
-//! doubling at `0.08`). An upward probe that neither clears that bar nor
-//! collapses gets one extra confirmation window (`doubted`) so slow-starting
-//! connections can warm before rolling back. Failed probes enter bounded
-//! directional backoff (30 s up, 60 s down) and check the opposite bracket on
-//! rejection to recover from oversized starts or downward step overshoots.
+//! comparisons across recent runs under a regularized least-squares fit scored
+//! against [`CONCURRENCY_COST`] above the route's default worker count (and
+//! requiring a small speedup to seed a start below that default). Live probing
+//! accepts an upward step when its log-rate gain exceeds both
+//! [`NEAR_BEST_TOLERANCE`] (`0.05`, ~5.1%) and [`CONCURRENCY_COST`] times the
+//! log-worker step (`0.08`, ~5.7% per doubling), and accepts a downward step
+//! only when measured throughput is strictly faster (`score > base`), keeping
+//! connections generous on flat paths while shedding excess workers under
+//! contention. An upward probe that falls short without collapsing gets one
+//! extra confirmation window (`doubted`) so slow-starting connections can warm
+//! before rolling back. Failed probes enter bounded directional backoff (30 s
+//! up, 60 s down) and check the opposite bracket on rejection to recover from
+//! oversized starts or downward step overshoots.
 //!
 //! Candidate workers are connected while the current count remains active.
 //! They become active only when the whole candidate set is ready. Connected
@@ -63,14 +64,19 @@ const STARTUP_STEP: usize = 2;
 /// Multiplicative step after discovery, or with a closely matched plateau hint.
 pub const STEP: f64 = 1.3;
 /// Minimum marginal throughput elasticity per log-worker required to justify
-/// additional workers/connections (~5.7% throughput gain per doubling at 0.08).
+/// additional workers/connections (~5.7% per doubling at 0.08; smaller steps
+/// must also clear [`NEAR_BEST_TOLERANCE`]).
 pub(crate) const CONCURRENCY_COST: f64 = 0.08;
-/// Band width used by diagnostics and historical plateau checks (`refine`).
-const NEAR_BEST_TOLERANCE: f64 = 0.05;
+/// Minimum log-rate gain required for smaller upward steps and band width used
+/// by historical plateau checks (`refine`).
+pub(crate) const NEAR_BEST_TOLERANCE: f64 = 0.05;
 /// Sampling intervals between probes. Directional backoff is bounded in
 /// elapsed time by retry_after; rejected observations still advance deadlines.
 const PROBE_EVERY: usize = 6;
 const PROBE_BACKOFF_MAX: u32 = 3;
+/// Cap directional backoff at ~30 s up and ~60 s down (12 and 24 samples at 2.5 s).
+pub(crate) const UP_RETRY_CAP: usize = 12;
+pub(crate) const DOWN_RETRY_CAP: usize = 24;
 /// Old high-water measurements must not permanently prevent adaptation when
 /// the path changes during a long transfer.
 const EVIDENCE_MAX_AGE: usize = PROBE_EVERY * 4;
@@ -505,8 +511,8 @@ impl Policy {
         // A capacity fall shows at the active count, whereas a capacity rise is
         // invisible at a saturated plateau; re-probe Up at 30s and Down at 60s.
         (PROBE_EVERY << backoff).min(match direction {
-            Direction::Up => 12,
-            Direction::Down => 24,
+            Direction::Up => UP_RETRY_CAP,
+            Direction::Down => DOWN_RETRY_CAP,
         })
     }
 
@@ -536,8 +542,10 @@ impl Policy {
     }
 
     fn utility_improves(&self, from: usize, base: f64, to: usize, score: f64) -> bool {
-        if base > 0.0 && score > 0.0 {
-            (score / base).ln() - CONCURRENCY_COST * (to as f64 / from as f64).ln() > 0.0
+        if to > from && base > 0.0 && score > 0.0 {
+            let required =
+                NEAR_BEST_TOLERANCE.max(CONCURRENCY_COST * (to as f64 / from as f64).ln());
+            (score / base).ln() > required
         } else {
             score > base
         }
@@ -600,7 +608,7 @@ impl Policy {
                         return self.n + (upper - self.n).div_ceil(2);
                     }
                     let current = self.points.get(&self.n).map_or(0.0, |p| p.score);
-                    if self.tick.saturating_sub(point.measured_at) <= 12
+                    if self.tick.saturating_sub(point.measured_at) <= UP_RETRY_CAP
                         && current > 0.0
                         && point.score > 0.0
                         && !self.utility_improves(self.n, current, upper, point.score)
@@ -731,20 +739,12 @@ impl Policy {
                 if improves {
                     self.checked_down_here = false;
                     self.checked_up_here = false;
-                    let ratio = self.n as f64 / from as f64;
-                    let high_elasticity = base > 0.0
-                        && score > base
-                        && ratio > 1.0
-                        && (score / base).ln() >= 0.7 * ratio.ln();
-                    if direction == Direction::Up
-                        && base > 0.0
-                        && (score >= base * 1.20 || high_elasticity)
-                    {
+                    if direction == Direction::Up && base > 0.0 && score >= base * 1.20 {
                         self.startup_doubling = true;
                         self.points
                             .retain(|n, point| *n <= self.n || point.score > score);
                     }
-                    if direction == Direction::Down && (base <= 0.0 || score >= base * 0.98) {
+                    if direction == Direction::Down && (base <= 0.0 || score >= base * 1.05) {
                         self.doubling_down = true;
                     }
                     self.fails[idx] = 0;

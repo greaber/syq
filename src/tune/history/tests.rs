@@ -574,7 +574,10 @@ fn a_copy_writes_nothing_until_it_ends_and_then_writes_once() {
     writer.event("context", json!({"stage":"source_registered"}));
     // Its connection waits for no lock, so a starting count that it reads
     // was read without waiting for the writer.
-    assert_eq!(writer.starting_count(&key("a"), false).unwrap().workers, 16);
+    assert_eq!(
+        writer.starting_count(&key("a"), false, 1).unwrap().workers,
+        16
+    );
     for bytes in 0..100 {
         writer.event("sample", json!({"bytes":bytes}));
     }
@@ -801,7 +804,7 @@ fn decisions_include_comparison_evidence_and_unapplied_candidates() {
     assert!(events
         .iter()
         .any(|e| e["data"]["disposition"] == "final_partial"));
-    assert!(writer.starting_count(&key("a"), true).is_none());
+    assert!(writer.starting_count(&key("a"), true, 1).is_none());
 }
 
 #[test]
@@ -963,10 +966,14 @@ fn trace_distinguishes_acceptance_rejection_and_pending_comparison() {
         decisions[1]["data"]["before"]["state"]["Explore"]["base"],
         100.0
     );
-    assert_eq!(
-        decisions[1]["data"]["after"]["historical_near_best_floor"],
-        114.0
-    );
+    assert_eq!(decisions[1]["data"]["after"]["recent_best"], 120.0);
+    assert_eq!(decisions[1]["data"]["after"]["doubling_down"], false);
+    assert_eq!(decisions[1]["data"]["after"]["last_probe"], "Up");
+    assert_eq!(decisions[1]["data"]["after"]["checked_down_here"], false);
+    assert_eq!(decisions[1]["data"]["after"]["checked_up_here"], false);
+    assert!(decisions[1]["data"]["after"]
+        .get("historical_near_best_floor")
+        .is_none());
     assert_eq!(decisions[2]["data"]["reason"], "probe_rejected");
     assert_eq!(decisions[2]["data"]["sample_ids"], json!([2]));
     assert_eq!(decisions[3]["data"]["reason"], "probe_rejected");
@@ -1088,7 +1095,7 @@ fn trace_records_inconclusive_upward_hold_without_claiming_a_plateau() {
     trace.end(&policy, false);
     let events = command::read_events(&open(&path).unwrap(), saved(&writer)).unwrap();
     let decisions: Vec<_> = events.iter().filter(|e| e["kind"] == "decision").collect();
-    assert_eq!(decisions[1]["data"]["reason"], "hold");
+    assert_eq!(decisions[1]["data"]["reason"], "probe_doubted");
     assert_eq!(decisions[1]["data"]["after"]["requested"], 16);
     assert_eq!(decisions[2]["data"]["reason"], "probe_rejected");
     assert_eq!(decisions[2]["data"]["after"]["requested"], 6);
@@ -1144,19 +1151,22 @@ fn exact_filesystem_starts_survive_other_destinations_and_unfinished_runs() {
         &[(64, 200.0), (32, 100.0)],
     ));
     let next = recorder(&path);
-    let exact = next.starting_count(&key("a"), false).unwrap();
+    let exact = next.starting_count(&key("a"), false, 1).unwrap();
     assert_eq!((exact.workers, exact.matched.as_str()), (8, "filesystems"));
     assert!(exact.refine);
-    assert_eq!(next.starting_count(&key("b"), false).unwrap().workers, 32);
+    assert_eq!(
+        next.starting_count(&key("b"), false, 1).unwrap().workers,
+        32
+    );
     // Another filesystem pair falls back to the route only when allowed,
     // and a route-level match never skips the startup doubling.
-    assert!(next.starting_count(&key("unknown"), false).is_none());
-    let route = next.starting_count(&key("unknown"), true).unwrap();
+    assert!(next.starting_count(&key("unknown"), false, 1).is_none());
+    let route = next.starting_count(&key("unknown"), true, 1).unwrap();
     assert_eq!(route.matched, "route");
     assert!(!route.refine);
     let mut other_mode = key("a");
     other_mode.mode = "bandwidth_limited".into();
-    assert!(next.starting_count(&other_mode, true).is_none());
+    assert!(next.starting_count(&other_mode, true, 1).is_none());
 }
 
 #[test]
@@ -1167,7 +1177,7 @@ fn repeated_inconclusive_copies_do_not_raise_the_starting_count() {
     let context = key("a");
     let mut start = 8;
     for run in 0..6 {
-        let hint = recorder(&path).starting_count(&context, false);
+        let hint = recorder(&path).starting_count(&context, false, 1);
         assert_eq!(hint.is_some(), run > 0);
         if let Some(hint) = &hint {
             start = hint.workers;
@@ -1208,7 +1218,7 @@ fn network_scoped_starts_separate_known_networks_and_preserve_unknown_fallback()
     measured_run(&path, &key("a"), &[(64, 200.0), (32, 100.0)]);
     let home = recorder(&path);
     assert!(home
-        .starting_count(&network_key(Some("home")), true)
+        .starting_count(&network_key(Some("home")), true, 1)
         .is_none());
     measured_run(
         &path,
@@ -1217,7 +1227,7 @@ fn network_scoped_starts_separate_known_networks_and_preserve_unknown_fallback()
     );
     let office = recorder(&path);
     assert!(office
-        .starting_count(&network_key(Some("office")), true)
+        .starting_count(&network_key(Some("office")), true, 1)
         .is_none());
     measured_run(
         &path,
@@ -1226,7 +1236,7 @@ fn network_scoped_starts_separate_known_networks_and_preserve_unknown_fallback()
     );
     let next = recorder(&path);
     let start = |network| {
-        next.starting_count(&network_key(network), true)
+        next.starting_count(&network_key(network), true, 1)
             .unwrap()
             .workers
     };
@@ -1534,7 +1544,7 @@ fn schema_v1_upgrade_keeps_old_events_without_backfilling_measurements() {
             .unwrap(),
         old_event
     );
-    assert!(inference::starting_count(&upgraded, &key("a"), false)
+    assert!(inference::starting_count(&upgraded, &key("a"), false, 1)
         .unwrap()
         .is_none());
 }
@@ -1649,7 +1659,7 @@ fn a_history_that_cannot_open_records_nothing() {
         writer.token("endpoint", "x"),
         "a copy's keys still compare"
     );
-    assert!(writer.starting_count(&key("a"), true).is_none());
+    assert!(writer.starting_count(&key("a"), true, 1).is_none());
     writer.event("planned", json!({}));
     writer.complete(true, json!({}));
     let state = writer.0.lock().unwrap();

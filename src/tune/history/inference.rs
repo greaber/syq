@@ -38,7 +38,8 @@ impl PooledInference {
         self.runs.push((run, decay, edges));
     }
 
-    fn solve(self, specific: bool) -> Option<Hint> {
+    fn solve(self, specific: bool, default_start: usize) -> Option<Hint> {
+        const FLOOR_MARGIN: f64 = 0.03;
         let mut vertices = BTreeSet::new();
         let mut weighted_edges = Vec::new();
         let mut max_weight = 0.0_f64;
@@ -60,8 +61,8 @@ impl PooledInference {
         if m < 2 || weighted_edges.is_empty() || max_weight <= 0.0 {
             return None;
         }
-        // Weak prior toward equal throughput across unbridged gaps so stale or
-        // disconnected historical high-water segments decay naturally.
+        // Weak prior between every adjacent pair of observed worker counts so the
+        // linear system stays connected and stale unbridged segments decay naturally.
         let lambda = 0.05 * max_weight;
         let idx = |n: usize| verts.binary_search(&n).unwrap();
         let mut f = vec![0.0f64; m];
@@ -131,44 +132,109 @@ impl PooledInference {
             }
             f[1..=d].copy_from_slice(&b[..d]);
         } else {
-            for _ in 0..200 {
-                for u in 0..m {
-                    let mut num = 0.0;
-                    let mut den = 0.0;
-                    for &(edge, w) in &weighted_edges {
-                        let i = idx(edge.a);
-                        let j = idx(edge.b);
-                        if i == u {
-                            num += w * (f[j] - edge.diff);
-                            den += w;
-                        } else if j == u {
-                            num += w * (f[i] + edge.diff);
-                            den += w;
-                        }
-                    }
-                    if u > 0 {
-                        num += lambda * f[u - 1];
-                        den += lambda;
-                    }
-                    if u + 1 < m {
-                        num += lambda * f[u + 1];
-                        den += lambda;
-                    }
-                    if den > 0.0 {
-                        f[u] = num / den;
-                    }
+            // Jacobi-preconditioned Conjugate Gradient over a coalesced adjacency list
+            // handles >128 distinct counts accurately in O(m + E) per iteration.
+            let d = m - 1;
+            let mut diag = vec![0.0f64; d];
+            let mut b = vec![0.0f64; d];
+            let mut adj: Vec<Vec<(usize, f64)>> = vec![Vec::new(); d];
+            let mut add_edge = |i: usize, j: usize, y: f64, w: f64| {
+                if i > 0 {
+                    diag[i - 1] += w;
+                    b[i - 1] -= w * y;
                 }
-                let base = f[0];
-                for v in &mut f {
-                    *v -= base;
+                if j > 0 {
+                    diag[j - 1] += w;
+                    b[j - 1] += w * y;
+                }
+                if i > 0 && j > 0 && i != j {
+                    adj[i - 1].push((j - 1, w));
+                    adj[j - 1].push((i - 1, w));
+                }
+            };
+            for &(edge, w) in &weighted_edges {
+                add_edge(idx(edge.a), idx(edge.b), edge.diff, w);
+            }
+            for k in 0..d {
+                add_edge(k, k + 1, 0.0, lambda);
+            }
+            for row in &mut adj {
+                row.sort_unstable_by_key(|&(nb, _)| nb);
+                row.dedup_by(|a, b| {
+                    if a.0 == b.0 {
+                        b.1 += a.1;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+            let mut x = vec![0.0f64; d];
+            let b_norm = b.iter().map(|&v| v * v).sum::<f64>().sqrt();
+            if b_norm > 0.0 {
+                let tol_sq = (1e-10 * b_norm.max(1.0)).powi(2);
+                let mut r = b;
+                let mut z: Vec<f64> = r
+                    .iter()
+                    .zip(&diag)
+                    .map(|(&ri, &di)| if di > 0.0 { ri / di } else { 0.0 })
+                    .collect();
+                let mut p = z.clone();
+                let mut ap = vec![0.0f64; d];
+                let mut rz: f64 = r.iter().zip(&z).map(|(&ri, &zi)| ri * zi).sum();
+                let max_iters = d.clamp(200, 4000);
+                for _ in 0..max_iters {
+                    for (((&d_u, neighbors), &p_u), ap_u) in
+                        diag.iter().zip(&adj).zip(&p).zip(&mut ap)
+                    {
+                        let mut sum = d_u * p_u;
+                        for &(nb, w) in neighbors {
+                            sum -= w * p[nb];
+                        }
+                        *ap_u = sum;
+                    }
+                    let p_ap: f64 = p.iter().zip(&ap).map(|(&pi, &api)| pi * api).sum();
+                    if !p_ap.is_finite() || p_ap <= 1e-30 {
+                        break;
+                    }
+                    let alpha = rz / p_ap;
+                    let mut r_sq = 0.0;
+                    for (((xi, ri), &pi), &api) in x.iter_mut().zip(r.iter_mut()).zip(&p).zip(&ap) {
+                        *xi += alpha * pi;
+                        *ri -= alpha * api;
+                        r_sq += *ri * *ri;
+                    }
+                    if r_sq <= tol_sq {
+                        break;
+                    }
+                    let mut rz_new = 0.0;
+                    for ((zi, &ri), &di) in z.iter_mut().zip(&r).zip(&diag) {
+                        *zi = if di > 0.0 { ri / di } else { 0.0 };
+                        rz_new += ri * *zi;
+                    }
+                    if !rz_new.is_finite() || rz == 0.0 {
+                        break;
+                    }
+                    let beta = rz_new / rz;
+                    for (pi, &zi) in p.iter_mut().zip(&z) {
+                        *pi = zi + beta * *pi;
+                    }
+                    rz = rz_new;
                 }
             }
+            f[1..=d].copy_from_slice(&x);
         }
-        let base_n = verts[0] as f64;
+        let floor = default_start.max(verts[0]) as f64;
         let mut best_idx = 0usize;
         let mut best_u = f64::NEG_INFINITY;
         for (k, &n) in verts.iter().enumerate() {
-            let u = f[k] - crate::tune::CONCURRENCY_COST * (n as f64 / base_n).ln();
+            let nf = n as f64;
+            let penalty = if nf >= floor {
+                crate::tune::CONCURRENCY_COST * (nf / floor).ln()
+            } else {
+                FLOOR_MARGIN * (floor / nf).ln()
+            };
+            let u = f[k] - penalty;
             if u > best_u + 1e-12 {
                 best_u = u;
                 best_idx = k;
@@ -176,10 +242,9 @@ impl PooledInference {
         }
         let workers = verts[best_idx];
         let refine = specific
-            && verts
-                .iter()
-                .enumerate()
-                .any(|(k, &n)| n != workers && (f[k] - f[best_idx]).exp() >= 0.95);
+            && verts.iter().enumerate().any(|(k, &n)| {
+                n != workers && (f[k] - f[best_idx]).exp() >= 1.0 - crate::tune::NEAR_BEST_TOLERANCE
+            });
         let run = *self
             .newest_for_count
             .get(&workers)
@@ -197,6 +262,7 @@ pub(super) fn starting_count(
     db: &Connection,
     key: &ContextKey,
     allow_route: bool,
+    default_start: usize,
 ) -> Result<Option<Hint>> {
     let exact = key.source_filesystem.is_some() && key.destination_filesystem.is_some();
     for specific in [true, false] {
@@ -260,7 +326,7 @@ pub(super) fn starting_count(
                 }
             }
         }
-        if let Some(hint) = pooled.solve(specific) {
+        if let Some(hint) = pooled.solve(specific, default_start) {
             return Ok(Some(hint));
         }
     }
@@ -360,14 +426,18 @@ impl RunEvidence {
         let Some((_, workers)) = self.current else {
             return;
         };
-        if self.total_intervals >= 2 && self.total_secs >= 2.5 - 1e-6 && self.total_activity > 0.0 {
+        if let Some(collapse_rate) = self.severe_loss_rate() {
+            // Prioritize a recent severe collapse so a fast prefix does not
+            // turn a rolled-back count into a positive historical recommendation.
+            self.segments.push((workers, 2.5, collapse_rate));
+            self.current_rate = Some(collapse_rate);
+        } else if self.total_intervals >= 2
+            && self.total_secs >= 2.5 - 1e-6
+            && self.total_activity > 0.0
+        {
             let mean = self.total_activity / self.total_secs;
             self.segments.push((workers, self.total_secs, mean));
             self.current_rate = Some(mean);
-        } else if let Some(collapse_rate) = self.severe_loss_rate() {
-            // Early collapse aborts (< 2.5s) still warn future copies away from bad counts.
-            self.segments.push((workers, 2.5, collapse_rate));
-            self.current_rate = Some(collapse_rate);
         }
         self.recent.clear();
         self.total_secs = 0.0;
@@ -402,10 +472,8 @@ impl RunEvidence {
             self.current = Some(current);
         }
         if !observation.valid() {
-            self.recent.clear();
-            self.total_secs = 0.0;
-            self.total_activity = 0.0;
-            self.total_intervals = 0;
+            // Preserve an already-qualified window before draining/starvation clears it.
+            self.finish_segment();
             return;
         }
         self.recent
@@ -462,7 +530,7 @@ fn infer_run(events: &[Value]) -> Option<(usize, bool)> {
     }
     let mut pooled = PooledInference::default();
     pooled.push_run(1, 1.0, evidence);
-    pooled.solve(true).map(|h| (h.workers, h.refine))
+    pooled.solve(true, 1).map(|h| (h.workers, h.refine))
 }
 
 #[cfg(test)]
@@ -505,7 +573,7 @@ mod tests {
         let mut capped = super::super::tests::key("a");
         capped.mode = activity_mode("compress=false;bandwidth=2097152".into(), true);
         let writer = record(&path, &capped, None, true, &[(2, 100.0), (4, 100.0)]);
-        assert!(writer.starting_count(&capped, true).is_some());
+        assert!(writer.starting_count(&capped, true, 1).is_some());
         for mode in [
             activity_mode("compress=false;bandwidth=0".into(), false),
             activity_mode("compress=false;bandwidth=4194304".into(), true),
@@ -516,17 +584,23 @@ mod tests {
                 mode,
                 ..capped.clone()
             };
-            assert!(writer.starting_count(&other, true).is_none());
+            assert!(writer.starting_count(&other, true, 1).is_none());
         }
         let uncapped = ContextKey {
             mode: activity_mode("compress=false;bandwidth=0".into(), false),
             ..capped.clone()
         };
         record(&path, &uncapped, None, true, &[(16, 100.0), (32, 200.0)]);
-        assert_eq!(writer.starting_count(&uncapped, true).unwrap().workers, 32);
+        assert_eq!(
+            writer.starting_count(&uncapped, true, 1).unwrap().workers,
+            32
+        );
         // A newer capped plateau cannot vote down that uncapped starting count.
         record(&path, &capped, None, true, &[(2, 100.0), (4, 100.0)]);
-        assert_eq!(writer.starting_count(&uncapped, true).unwrap().workers, 32);
+        assert_eq!(
+            writer.starting_count(&uncapped, true, 1).unwrap().workers,
+            32
+        );
     }
 
     #[test]
@@ -587,7 +661,7 @@ mod tests {
             );
             let next = super::super::tests::recorder(&path);
             assert_eq!(
-                next.starting_count(&key, false).unwrap().workers,
+                next.starting_count(&key, false, 1).unwrap().workers,
                 8,
                 "the next copy must retain the window that justified rollback"
             );
@@ -675,7 +749,7 @@ mod tests {
             json!({"active":16,"seconds":0.5,"rate":20.0,"usable":true}),
         );
         writer.complete(true, json!({}));
-        assert!(writer.starting_count(&key, false).is_none());
+        assert!(writer.starting_count(&key, false, 1).is_none());
     }
 
     #[test]
@@ -750,10 +824,10 @@ mod tests {
         let db = Connection::open(&path).unwrap();
         db.execute("UPDATE runs SET eligible=2,summary=?1", [old.to_string()])
             .unwrap();
-        assert!(writer.starting_count(&key, false).is_none());
+        assert!(writer.starting_count(&key, false, 1).is_none());
         assert_eq!(command::read_run(&db, 1).unwrap()["summary"], old);
         let current = record(&path, &key, None, true, &[(8, 100.0), (16, 200.0)]);
-        assert_eq!(current.starting_count(&key, false).unwrap().workers, 16);
+        assert_eq!(current.starting_count(&key, false, 1).unwrap().workers, 16);
         // The historical recommendation query also excludes the new marker.
         assert_eq!(
             db.query_row("SELECT count(*) FROM runs WHERE eligible=1", [], |r| r
@@ -770,10 +844,10 @@ mod tests {
         let key = super::super::tests::key("a");
         for cap in [None, Some(1)] {
             let single = record(&path, &key, cap, true, &[(1, 100.0)]);
-            assert!(single.starting_count(&key, false).is_none());
+            assert!(single.starting_count(&key, false, 1).is_none());
         }
         let rising = record(&path, &key, Some(8), true, &[(4, 100.0), (8, 200.0)]);
-        assert_eq!(rising.starting_count(&key, false).unwrap().workers, 8);
+        assert_eq!(rising.starting_count(&key, false, 1).unwrap().workers, 8);
         record(
             &path,
             &key,
@@ -784,7 +858,7 @@ mod tests {
         // Newer rising evidence at a lower ceiling does not oppose 16.
         for _ in 0..4 {
             let capped = record(&path, &key, Some(8), true, &[(4, 100.0), (8, 200.0)]);
-            assert_eq!(capped.starting_count(&key, false).unwrap().workers, 16);
+            assert_eq!(capped.starting_count(&key, false, 1).unwrap().workers, 16);
         }
         // Newer comparisons showing contention across the previously fast counts
         // step the start down even with an explicit cap of 32: two reversing
@@ -807,7 +881,10 @@ mod tests {
                 true,
                 &[(4, 200.0), (8, 100.0), (16, 50.0)],
             );
-            assert_eq!(below.starting_count(&key, false).unwrap().workers, expected);
+            assert_eq!(
+                below.starting_count(&key, false, 1).unwrap().workers,
+                expected
+            );
         }
     }
 
@@ -822,20 +899,20 @@ mod tests {
                 let recent = record(&path, &key, new_cap, true, &[(4, 100.0), (8, 200.0)]);
                 // Fresh evidence at 64 is still valuable even if newer work
                 // stopped at 8 without trying higher counts.
-                assert_eq!(recent.starting_count(&key, false).unwrap().workers, 64);
+                assert_eq!(recent.starting_count(&key, false, 1).unwrap().workers, 64);
                 let db = Connection::open(&path).unwrap();
                 db.execute("UPDATE runs SET day=day-42 WHERE id=1", [])
                     .unwrap();
                 // Only the evidence age changed. An old high lower bound must
                 // not veto every lower candidate until it leaves the window.
                 assert_eq!(
-                    recent.starting_count(&key, false).unwrap().workers,
+                    recent.starting_count(&key, false, 1).unwrap().workers,
                     8,
                     "old_cap={old_cap:?}, new_cap={new_cap:?}"
                 );
                 for _ in 0..4 {
                     let more = record(&path, &key, new_cap, true, &[(4, 100.0), (8, 200.0)]);
-                    assert_eq!(more.starting_count(&key, false).unwrap().workers, 8);
+                    assert_eq!(more.starting_count(&key, false, 1).unwrap().workers, 8);
                 }
             }
         }
@@ -869,10 +946,13 @@ mod tests {
             short.complete(true, json!({}));
         }
         let fixed = record(&path, &key, None, false, &[(2, 100.0), (4, 200.0)]);
-        assert_eq!(fixed.starting_count(&key, false).unwrap().workers, 16);
+        assert_eq!(fixed.starting_count(&key, false, 1).unwrap().workers, 16);
         let mut route_key = key.clone();
         route_key.destination_filesystem = Some("new filesystem".into());
-        assert_eq!(fixed.starting_count(&route_key, true).unwrap().workers, 16);
+        assert_eq!(
+            fixed.starting_count(&route_key, true, 1).unwrap().workers,
+            16
+        );
     }
 
     #[test]
@@ -930,7 +1010,7 @@ mod tests {
         drop(writer);
         let reader = Connection::open(&path).unwrap();
         assert_eq!(
-            starting_count(&reader, &key, false)
+            starting_count(&reader, &key, false, 1)
                 .unwrap()
                 .unwrap()
                 .workers,
@@ -958,13 +1038,19 @@ mod tests {
         // Diagnostic JSON and summaries are not part of the inference query.
         db.execute("DROP TABLE events", []).unwrap();
         assert_eq!(
-            starting_count(&db, &key, false).unwrap().unwrap().workers,
+            starting_count(&db, &key, false, 1)
+                .unwrap()
+                .unwrap()
+                .workers,
             16
         );
         db.execute("UPDATE runs SET summary=?1", [" ".repeat(65537)])
             .unwrap();
         assert_eq!(
-            starting_count(&db, &key, false).unwrap().unwrap().workers,
+            starting_count(&db, &key, false, 1)
+                .unwrap()
+                .unwrap()
+                .workers,
             16
         );
     }
@@ -979,13 +1065,13 @@ mod tests {
         let run = command::read_run(&db, 1).unwrap();
         assert_eq!(run["recommendation_eligible"], true);
         assert!(run.get("selected_workers").is_none());
-        assert_eq!(writer.starting_count(&key, false).unwrap().workers, 16);
+        assert_eq!(writer.starting_count(&key, false, 1).unwrap().workers, 16);
         // Earlier writers used 0 (no evidence), 1 (recommendation), or 2
         // (measurement totals, with bounds added in 3). None is backfilled.
         for old_eligibility in [0, 1, 2, 3] {
             db.execute("UPDATE runs SET eligible=?1", [old_eligibility])
                 .unwrap();
-            assert!(writer.starting_count(&key, false).is_none());
+            assert!(writer.starting_count(&key, false, 1).is_none());
             let run = command::read_run(&db, 1).unwrap();
             assert_eq!(run["recommendation_eligible"], false);
             assert_eq!(run["summary"], json!({}));
@@ -1103,7 +1189,7 @@ mod tests {
             }
         }
         writer.complete(true, json!({}));
-        assert_eq!(writer.starting_count(&key, false).unwrap().workers, 32);
+        assert_eq!(writer.starting_count(&key, false, 1).unwrap().workers, 32);
     }
 
     #[test]
@@ -1133,6 +1219,88 @@ mod tests {
                 [id],
             )
             .unwrap();
-        assert_eq!(misleading.starting_count(&key, false).unwrap().workers, 16);
+        assert_eq!(
+            misleading.starting_count(&key, false, 1).unwrap().workers,
+            16
+        );
+    }
+
+    #[test]
+    fn unusable_tail_observation_preserves_completed_comparison() {
+        let mut events = vec![context()];
+        for _ in 0..5 {
+            events.push(json!({"kind":"observation","data":{"active":8,"seconds":0.5,"rate":100.0,"usable":true}}));
+        }
+        for _ in 0..5 {
+            events.push(json!({"kind":"observation","data":{"active":16,"seconds":0.5,"rate":200.0,"usable":true}}));
+        }
+        events.push(
+            json!({"kind":"observation","data":{"active":16,"seconds":0.5,"rate":0.0,"usable":false}}),
+        );
+        assert_eq!(infer_run(&events), Some((16, false)));
+    }
+
+    #[test]
+    fn severe_collapse_suffix_overrides_earlier_fast_samples() {
+        let mut events = vec![
+            context(),
+            observation(8, 100.0, true),
+            observation(8, 100.0, true),
+        ];
+        for rate in [200.0, 200.0, 200.0, 20.0, 20.0] {
+            events.push(json!({"kind":"observation","data":{"active":16,"seconds":0.5,"rate":rate,"usable":true}}));
+        }
+        assert_eq!(infer_run(&events), Some((8, false)));
+    }
+
+    #[test]
+    fn flat_and_contention_runs_respect_route_default_start_floor() {
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("history.sqlite");
+        let key = super::super::tests::key("a");
+        let flat = record(
+            &path,
+            &key,
+            None,
+            true,
+            &[(1, 100.0), (2, 100.0), (4, 100.0), (8, 100.0), (16, 100.0)],
+        );
+        assert_eq!(flat.starting_count(&key, false, 8).unwrap().workers, 8);
+
+        let path2 = temp.path().join("history2.sqlite");
+        let contention = record(&path2, &key, None, true, &[(4, 200.0), (8, 100.0)]);
+        assert_eq!(
+            contention.starting_count(&key, false, 8).unwrap().workers,
+            4
+        );
+    }
+
+    #[test]
+    fn sparse_solver_matches_dense_across_128_vertex_boundary() {
+        let build_pool = |max_worker: usize| {
+            let mut pooled = PooledInference::default();
+            for r in 0..32 {
+                let lo = 128 + (max_worker - 128) * r / 32;
+                let hi = (128 + (max_worker - 128) * (r + 1) / 32 + 1).min(max_worker);
+                let mut evidence = RunEvidence::default();
+                for n in lo..=hi {
+                    for _ in 0..5 {
+                        evidence.push(Observation {
+                            segment: n as i64,
+                            workers: n,
+                            seconds: 0.5,
+                            rate: n as f64,
+                            usable: true,
+                        });
+                    }
+                }
+                evidence.finish_segment();
+                pooled.push_run(r as i64 + 1, 1.0, evidence);
+            }
+            pooled
+        };
+        assert_eq!(build_pool(255).solve(true, 1).unwrap().workers, 255);
+        assert_eq!(build_pool(256).solve(true, 1).unwrap().workers, 256);
+        assert_eq!(build_pool(383).solve(true, 1).unwrap().workers, 383);
     }
 }
