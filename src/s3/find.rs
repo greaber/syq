@@ -63,11 +63,8 @@ pub(crate) fn run(args: &Args, options: &Options, out: &mut impl Write) -> Resul
         .min(256);
     let mut policy = Policy::compile_listing(options.where_expression.as_deref())?;
     policy.now = options.expression_now;
-    let pushdown = policy
-        .selection
-        .as_ref()
-        .map(crate::expression::Expression::s3_path_pushdown)
-        .unwrap_or_default();
+    let directories = policy.may_select_s3_directory();
+    let pushdown = policy.s3_path_pushdown();
     let ignore = crate::scan::build_ignore(&options.ignore)?;
     // The listing gives every field but stored metadata, and a kind other
     // than "file" for an object, which only an explicit --include asks for.
@@ -107,6 +104,7 @@ pub(crate) fn run(args: &Args, options: &Options, out: &mut impl Write) -> Resul
                 store: &store,
                 printer: Printer::new(options, true),
                 policy,
+                directories,
                 pushdown,
                 ignore,
                 depth: options.depth,
@@ -202,6 +200,7 @@ struct Finder<'a, W> {
     store: &'a listing::S3<'a>,
     printer: Printer,
     policy: Policy,
+    directories: bool,
     pushdown: Vec<Vec<PathToken>>,
     ignore: Option<ignore::gitignore::Gitignore>,
     depth: Option<u32>,
@@ -270,7 +269,9 @@ impl<W: Write> Finder<'_, W> {
                         match found {
                             levels::Found::Object(entry) => state.key(entry, false),
                             levels::Found::Directory(prefix) => {
-                                state.directory(&prefix[state.prefix.len()..prefix.len() - 1])
+                                if self.directories {
+                                    state.directory(&prefix[state.prefix.len()..prefix.len() - 1]);
+                                }
                             }
                         }
                         state.check()
@@ -318,10 +319,12 @@ impl<W: Write> Finder<'_, W> {
                                 },
                             )
                             .await?;
-                            // A pruned directory was not listed, but its
-                            // parents exist.
-                            for directory in pruned {
-                                state.parents(&directory[prefix.len()..]);
+                            if self.directories {
+                                // A pruned directory was not listed, but its
+                                // parents exist.
+                                for directory in pruned {
+                                    state.parents(&directory[prefix.len()..]);
+                                }
                             }
                             state.check()
                         })
@@ -384,10 +387,16 @@ impl<W: Write> Finder<'_, W> {
                     continue;
                 }
             }
-            // A directory marker ends with '/', and a directory is reported
-            // from the keys beneath it.
+            if rest.is_empty() {
+                return Ok(Narrowed::Nothing);
+            }
+            // When the expression may select directories, broaden the pattern
+            // because a directory is reported from keys beneath it and a
+            // marker key ends with '/'.
             let mut tokens = rest.to_vec();
-            tokens.push(PathToken::Recursive);
+            if self.directories {
+                tokens.push(PathToken::Recursive);
+            }
             let pattern = Pattern::from_tokens(prefix, &tokens)?;
             let narrowing = pattern
                 .components
@@ -512,11 +521,11 @@ impl<'a, 'f, W: Write> State<'a, 'f, W> {
             return;
         }
         let relative = relative.to_owned();
-        if parents {
+        if parents && self.finder.directories {
             self.parents(&relative);
         }
         if client::is_directory_marker(&entry.key, entry.size) {
-            if !parents {
+            if !parents && self.finder.directories {
                 self.directory(relative.trim_end_matches('/'));
             }
             return;

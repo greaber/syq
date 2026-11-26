@@ -28,11 +28,11 @@ pub(crate) enum PathToken {
 ///
 /// Collecting stops at the first conjunct that may fail: an entry that a
 /// later path condition rules out must still reach it, so that the error it
-/// reports, such as a comparison with a directory's `null` size, is not
+/// reports, such as division by zero or a failed metadata read, is not
 /// skipped along with the entry.
-pub(super) fn conjuncts(node: &Node, patterns: &mut Vec<Vec<PathToken>>) -> bool {
+pub(super) fn conjuncts(node: &Node, now: i128, patterns: &mut Vec<Vec<PathToken>>) -> bool {
     match node {
-        Node::Binary(Op::And, a, b) => conjuncts(a, patterns) && conjuncts(b, patterns),
+        Node::Binary(Op::And, a, b) => conjuncts(a, now, patterns) && conjuncts(b, now, patterns),
         Node::Pattern(subject, _, Some(glob)) if is_path(subject) => {
             if let Some(tokens) = glob_tokens(glob) {
                 patterns.push(tokens);
@@ -47,7 +47,7 @@ pub(super) fn conjuncts(node: &Node, patterns: &mut Vec<Vec<PathToken>>) -> bool
             }
             true
         }
-        node => total(node) == Some(false),
+        node => never_fails(node, now),
     }
 }
 
@@ -69,49 +69,88 @@ fn path_literal<'a>(a: &'a Node, b: &'a Node) -> Option<&'a [u8]> {
     }
 }
 
-/// Whether evaluating `node` never fails: `None` if it may, and otherwise
-/// whether its value may be `null`. Fields that require an S3 `HEAD` request
-/// (`kind`, `mtime`, `mode`, `uid`, `gid`) may fail if the `HEAD` fails, so
-/// they return `None`. Arithmetic is assumed to fail, since it can overflow
-/// or divide by zero, and so is whatever fails on `null`: ordered comparisons,
-/// patterns, and `not`, `and` and `or`, which need a boolean.
-fn total(node: &Node) -> Option<bool> {
-    let known = |node: &Node| total(node) == Some(false);
+/// Evaluate a constant arithmetic subtree so literal/`now` expressions do not
+/// block S3 path pushdown unless they overflow or divide by zero.
+fn eval_const(node: &Node, now: i128) -> Option<Value<&[u8]>> {
     match node {
-        Node::Literal(value) => Some(*value == Value::Null),
-        Node::Field(_, field) => match field {
-            Field::Path | Field::Name | Field::Extension | Field::Exists => Some(false),
-            Field::Kind | Field::Mtime | Field::Mode | Field::Uid | Field::Gid => None,
-            Field::Size
-            | Field::S3LastModified
-            | Field::Ctime
-            | Field::Device
-            | Field::Inode
-            | Field::Links
-            | Field::LinkTarget => Some(true),
+        Node::Literal(v) => Some(match v {
+            Value::String(s) => Value::String(s.as_slice()),
+            Value::Quantity(n, ty) => Value::Quantity(*n, *ty),
+            Value::Bool(b) => Value::Bool(*b),
+            Value::Null => Value::Null,
+        }),
+        Node::Now => Some(Value::Quantity(now, super::Type::Timestamp)),
+        Node::Negative(n) => match eval_const(n, now)? {
+            Value::Quantity(v, t) => Some(Value::Quantity(v.checked_neg()?, t)),
+            Value::Null => Some(Value::Null),
+            _ => None,
         },
-        Node::Now => Some(false),
-        Node::Not(n) => known(n).then_some(false),
-        Node::Binary(Op::And | Op::Or, a, b) => (known(a) && known(b)).then_some(false),
-        Node::Binary(Op::Eq | Op::Ne, a, b) => {
-            (total(a).is_some() && total(b).is_some()).then_some(false)
+        Node::Binary(
+            op @ (Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Rem
+            | Op::BitAnd
+            | Op::BitOr
+            | Op::BitXor),
+            a,
+            b,
+        ) => {
+            let va = eval_const(a, now)?;
+            let vb = eval_const(b, now)?;
+            super::binary(*op, va, vb).ok()
         }
-        Node::Binary(Op::Lt | Op::Le | Op::Gt | Op::Ge, a, b) => {
-            (known(a) && known(b)).then_some(false)
-        }
+        _ => None,
+    }
+}
+
+/// Whether evaluating `node` never fails. Comparisons and pattern matching on
+/// `null` return `unknown`, so only fields that can trigger an S3 `HEAD`
+/// request (`kind`, `mtime`, `mode`, `uid`, `gid`) and checked arithmetic
+/// (overflow or division by zero) can fail.
+fn never_fails(node: &Node, now: i128) -> bool {
+    match node {
+        Node::Literal(_) | Node::Now => true,
+        Node::Field(_, field) => matches!(
+            field,
+            Field::Path
+                | Field::Name
+                | Field::Extension
+                | Field::Exists
+                | Field::Size
+                | Field::S3LastModified
+                | Field::Ctime
+                | Field::Device
+                | Field::Inode
+                | Field::Links
+                | Field::LinkTarget
+        ),
+        Node::Binary(Op::Eq | Op::Ne, a, b) if super::compares_kind_with_dir(a, b) => true,
+        Node::IsNull(n, _) | Node::Not(n) | Node::Pattern(n, ..) => never_fails(n, now),
+        Node::Binary(
+            Op::And
+            | Op::Or
+            | Op::Eq
+            | Op::Ne
+            | Op::Lt
+            | Op::Le
+            | Op::Gt
+            | Op::Ge
+            | Op::BitAnd
+            | Op::BitOr
+            | Op::BitXor,
+            a,
+            b,
+        )
+        | Node::Coalesce(a, b) => never_fails(a, now) && never_fails(b, now),
         Node::In(a, items) => {
-            (total(a).is_some() && items.iter().all(|item| total(item).is_some())).then_some(false)
+            never_fails(a, now) && items.iter().all(|item| never_fails(item, now))
         }
-        Node::Between(a, low, high) => (known(a) && known(low) && known(high)).then_some(false),
-        Node::Pattern(subject, ..) => known(subject).then_some(false),
-        Node::If(condition, a, b) => {
-            if !known(condition) {
-                return None;
-            }
-            Some(total(a)? | total(b)?)
+        Node::Between(a, low, high) | Node::If(a, low, high) => {
+            never_fails(a, now) && never_fails(low, now) && never_fails(high, now)
         }
-        Node::Coalesce(a, b) => Some(total(a)? & total(b)?),
-        Node::Negative(_) | Node::Binary(..) => None,
+        Node::Negative(_) | Node::Binary(..) => eval_const(node, now).is_some(),
     }
 }
 

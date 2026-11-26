@@ -354,8 +354,8 @@ fn a_batch_whose_selection_fails_is_not_looked_up_early() {
     fill(&t.path("src/b"), "g", FILES);
     assert_output_ok(&copy(&t, &rsh, &[]));
 
-    // Matching the link target of a regular file is an error.
-    let failing = r#"src.name != "g05999" or src.link_target matches "x""#;
+    // Dividing by zero fails evaluation on the last file's batch.
+    let failing = r#"src.name != "g05999" or src.size / 0 = 0B"#;
     let output = copy(&t, &rsh, &["--where", failing]);
     assert!(!output.status.success(), "{}", stdout(&output));
     let err = String::from_utf8_lossy(&output.stderr);

@@ -125,12 +125,14 @@ under the prefix, dividing the work as copies do (see
 [Listing large prefixes](#listing-large-prefixes)). A `path glob` or `path =`
 condition joined to the rest of `--where` with `and` limits the requests to
 the prefixes that can hold a match, such as `laptop/photos/2026-*/` rather
-than all of `laptop/`, unless a condition before it could fail, as
-`size > 1MiB` does on a directory, whose size is `null`. Services that don't
-promise to list keys in byte order can leave a key out of a later page that a
-directory listing asks for, so there syq lists a directory with more than a
-thousand entries whole instead, which can take much longer for a deep tree,
-and says so.
+than all of `laptop/`, unless a condition before it could fail, such as
+arithmetic or checking stored object metadata like `mtime`. When `--where`
+rules out every directory, recursive `syq find` also skips building virtual
+directories and narrows `path` patterns without descending into
+subdirectories they don't match. Services that don't promise to list keys in
+byte order can leave a key out of a later page that a directory listing asks
+for, so there syq lists a directory with more than a thousand entries whole
+instead, which can take much longer for a deep tree, and says so.
 
 Conditions on `path`, `name`, `extension`, `size`, `s3_last_modified`, a
 directory's `kind`, and whether `kind` is `"dir"` use the listing alone. Other

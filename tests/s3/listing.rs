@@ -533,8 +533,8 @@ fn path_conditions_narrow_listings_and_other_fields_need_head_requests() {
     );
     assert_eq!(sorted(&output), ["deep", "meta/link"]);
 
-    // A path condition after one that may fail narrows nothing: the size
-    // of the first directory listed is null, as without the path condition.
+    // A path condition after one that may fail narrows nothing: division by
+    // zero fails on the first listed object instead of skipping `tree`.
     bucket.take();
     let output = bucket.find(
         temp.path(),
@@ -543,12 +543,12 @@ fn path_conditions_narrow_listings_and_other_fields_need_head_requests() {
             "--on",
             "s3://bucket",
             "--where",
-            "size > 0B and path = 'tree/missing'",
+            "size / 0 = 0B and path = 'tree/missing'",
         ],
     );
     assert!(!output.status.success(), "{}", output_text(&output));
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("unavailable"),
+        String::from_utf8_lossy(&output.stderr).contains("division by zero"),
         "{}",
         output_text(&output)
     );
@@ -1133,4 +1133,109 @@ fn find_and_ls_help_and_invalid_arguments() {
             output_text(&output)
         );
     }
+}
+
+#[test]
+fn null_comparisons_do_not_fail_and_skip_s3_directories_when_possible() {
+    let temp = test_support::tempdir().unwrap();
+    let bucket = Bucket::start(BUCKET, Faults::default());
+
+    let output = bucket.find(
+        temp.path(),
+        &["find", "--on", "s3://bucket", "--where", "size > 1B"],
+    );
+    assert_eq!(
+        sorted(&output),
+        ["logs/2026/a.json", "meta/link", "top.txt"]
+    );
+    let output = bucket.find(
+        temp.path(),
+        &["ls", "--on", "s3://bucket", "--where", "size > 1B"],
+    );
+    assert_eq!(sorted(&output), ["top.txt"]);
+    let output = bucket.find(
+        temp.path(),
+        &[
+            "find",
+            "--on",
+            "s3://bucket",
+            "--where",
+            "s3_last_modified > timestamp('2020-01-01T00:00:00Z')",
+        ],
+    );
+    assert_eq!(
+        sorted(&output),
+        [
+            "deep/x/y/z",
+            "logs/2025/c.json",
+            "logs/2026/a.json",
+            "logs/2026/b.log",
+            "meta/file",
+            "meta/link",
+            "sp ace/a+b%2F",
+            "top.txt",
+        ]
+    );
+    let output = bucket.find(
+        temp.path(),
+        &["find", "--on", "s3://bucket", "--where", "not (size > 1B)"],
+    );
+    assert_eq!(
+        sorted(&output),
+        [
+            "deep/x/y/z",
+            "logs/2025/c.json",
+            "logs/2026/b.log",
+            "meta/file",
+            "sp ace/a+b%2F",
+        ]
+    );
+
+    bucket.take();
+    let output = bucket.find(
+        temp.path(),
+        &[
+            "find",
+            "--on",
+            "s3://bucket",
+            "--where",
+            "size > 1B and path glob 'logs/*'",
+        ],
+    );
+    assert_eq!(sorted(&output), Vec::<String>::new());
+    let requests = bucket.take();
+    assert_eq!(requests, ["LIST logs/ /"], "{requests:?}");
+
+    let output = bucket.find(
+        temp.path(),
+        &[
+            "find",
+            "--on",
+            "s3://bucket",
+            "--where",
+            "size > 1B and path glob 'logs/*/*.json'",
+        ],
+    );
+    assert_eq!(sorted(&output), ["logs/2026/a.json"]);
+    let requests = bucket.take();
+    assert!(
+        !requests
+            .iter()
+            .any(|r| r.starts_with("LIST deep") || r.starts_with("LIST meta")),
+        "{requests:?}"
+    );
+
+    let output = bucket.find(
+        temp.path(),
+        &[
+            "find",
+            "--on",
+            "s3://bucket",
+            "--where",
+            "s3_last_modified > now - 36500d and path glob 'logs/2026/*'",
+        ],
+    );
+    assert_eq!(sorted(&output), ["logs/2026/a.json", "logs/2026/b.log"]);
+    let requests = bucket.take();
+    assert_eq!(requests, ["LIST logs/2026/ /"], "{requests:?}");
 }

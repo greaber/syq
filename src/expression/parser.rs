@@ -132,11 +132,7 @@ impl Parser {
                 Token::Word(s) if s == "is" && !negate => {
                     let not = self.eat("not");
                     self.expect("null")?;
-                    Node::Binary(
-                        if not { Op::Ne } else { Op::Eq },
-                        Box::new(left),
-                        Box::new(Node::Literal(Value::Null)),
-                    )
+                    Node::IsNull(Box::new(left), not)
                 }
                 Token::Word(s) if s == "glob" || s == "matches" => {
                     self.pattern(left, s == "glob")?

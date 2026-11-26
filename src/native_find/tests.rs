@@ -256,6 +256,12 @@ fn where_filters_directories_too_and_sees_the_printed_path() {
     options.paths = vec![b"logs".to_vec()];
     options.where_expression = Some("path = 'logs/a.log' or extension = 'txt'".into());
     assert_eq!(lines(&options), ["logs/2026/b.txt", "logs/a.log"]);
+    options.where_expression = Some("size > 0B".into());
+    assert_eq!(lines(&options), ["logs/2026/b.txt", "logs/a.log"]);
+    options.where_expression = Some("size <= 1MiB".into());
+    assert_eq!(lines(&options), ["logs/2026/b.txt", "logs/a.log"]);
+    options.where_expression = Some("size is null".into());
+    assert_eq!(lines(&options), ["logs/2026"]);
     options.where_expression = Some("dst.size > 0B".into());
     assert!(list(&options).is_err());
 }

@@ -36,11 +36,25 @@ impl<S> Value<S> {
             Self::Null => Type::Null,
         }
     }
-    fn boolean(self) -> Result<bool> {
+    fn tristate(self) -> Result<Option<bool>> {
         match self {
-            Self::Bool(v) => Ok(v),
+            Self::Bool(v) => Ok(Some(v)),
+            Self::Null => Ok(None),
             _ => bail!("expected a boolean value"),
         }
+    }
+    fn from_tristate(v: Option<bool>) -> Self {
+        match v {
+            Some(b) => Self::Bool(b),
+            None => Self::Null,
+        }
+    }
+    fn is_true(&self) -> Result<bool> {
+        Ok(match self {
+            Self::Bool(v) => *v,
+            Self::Null => false,
+            _ => bail!("expected a boolean value"),
+        })
     }
 }
 #[derive(Clone, Copy, Debug)]
@@ -142,7 +156,7 @@ impl<'a> File<'a> {
         Self {
             exists: true,
             kind: Some(e.kind),
-            size: Some(e.size),
+            size: (e.kind != Kind::Dir).then_some(e.size),
             mtime: Some((e.mtime, e.mtime_nsec)),
             ctime: Some((e.ctime, e.ctime_nsec)),
             mode: Some(e.mode & 0o7777),
@@ -169,7 +183,7 @@ impl<'a> File<'a> {
         Self {
             exists: true,
             kind: Some(kind),
-            size: Some(m.len),
+            size: (kind != Kind::Dir).then_some(m.len),
             mtime: Some((m.mtime, m.mtime_nsec)),
             ctime: Some((m.ctime, m.ctime_nsec)),
             mode: Some(m.mode & 0o7777),
@@ -273,13 +287,19 @@ impl<'a> Facts<'a> {
         }
         if let Self::S3Listing {
             size,
+            directory_marker,
             last_modified,
-            ..
         } = self
         {
             return Ok(match field {
                 Field::Exists => Value::Bool(true),
-                Field::Size => Value::Quantity(i128::from(size), Type::Size),
+                Field::Size => {
+                    if directory_marker {
+                        Value::Null
+                    } else {
+                        Value::Quantity(i128::from(size), Type::Size)
+                    }
+                }
                 Field::S3LastModified => last_modified.map_or(Value::Null, |(s, n)| {
                     Value::Quantity(
                         i128::from(s) * 1_000_000_000 + i128::from(n),
@@ -345,6 +365,7 @@ enum Node {
     Literal(Value<Vec<u8>>),
     Field(bool, Field),
     Now,
+    IsNull(Box<Node>, bool),
     Not(Box<Node>),
     Negative(Box<Node>),
     Binary(Op, Box<Node>, Box<Node>),
@@ -359,7 +380,9 @@ impl Node {
     fn uses_source_s3_time(&self) -> bool {
         match self {
             Self::Field(false, Field::S3LastModified) => true,
-            Self::Not(n) | Self::Negative(n) | Self::Pattern(n, ..) => n.uses_source_s3_time(),
+            Self::IsNull(n, _) | Self::Not(n) | Self::Negative(n) | Self::Pattern(n, ..) => {
+                n.uses_source_s3_time()
+            }
             Self::Binary(_, a, b) | Self::Coalesce(a, b) => {
                 a.uses_source_s3_time() || b.uses_source_s3_time()
             }
@@ -378,6 +401,10 @@ impl Node {
             Self::Literal(v) => v.ty(),
             Self::Field(_, f) => f.ty(),
             Self::Now => Timestamp,
+            Self::IsNull(n, _) => {
+                n.ty()?;
+                Bool
+            }
             Self::Not(n) => {
                 require(n.ty()? == Bool, "not requires a boolean")?;
                 Bool
@@ -429,19 +456,34 @@ impl Node {
                     c.src.field(c.src_path, *f)?
                 }
             }
-            Self::Not(n) => Value::Bool(!n.eval(c)?.boolean()?),
+            Self::IsNull(n, negated) => {
+                let is_null = n.eval(c)? == Value::Null;
+                Value::Bool(if *negated { !is_null } else { is_null })
+            }
+            Self::Not(n) => Value::from_tristate(n.eval(c)?.tristate()?.map(|b| !b)),
             Self::Negative(n) => match n.eval(c)? {
                 Value::Quantity(v, t) => {
                     Value::Quantity(v.checked_neg().context("arithmetic overflow")?, t)
                 }
-                _ => bail!("cannot negate an unavailable value"),
+                Value::Null => Value::Null,
+                _ => bail!("unary minus requires a number, size, or duration"),
             },
-            Self::Binary(Op::And, a, b) => {
-                Value::Bool(a.eval(c)?.boolean()? && b.eval(c)?.boolean()?)
-            }
-            Self::Binary(Op::Or, a, b) => {
-                Value::Bool(a.eval(c)?.boolean()? || b.eval(c)?.boolean()?)
-            }
+            Self::Binary(Op::And, a, b) => match a.eval(c)?.tristate()? {
+                Some(false) => Value::Bool(false),
+                Some(true) => Value::from_tristate(b.eval(c)?.tristate()?),
+                None => match b.eval(c)?.tristate()? {
+                    Some(false) => Value::Bool(false),
+                    _ => Value::Null,
+                },
+            },
+            Self::Binary(Op::Or, a, b) => match a.eval(c)?.tristate()? {
+                Some(true) => Value::Bool(true),
+                Some(false) => Value::from_tristate(b.eval(c)?.tristate()?),
+                None => match b.eval(c)?.tristate()? {
+                    Some(true) => Value::Bool(true),
+                    _ => Value::Null,
+                },
+            },
             // An object's kind needs its metadata, but whether it is a
             // directory does not.
             Self::Binary(op @ (Op::Eq | Op::Ne), a, b)
@@ -452,28 +494,41 @@ impl Node {
             Self::Binary(op, a, b) => binary(*op, a.eval(c)?, b.eval(c)?)?,
             Self::Between(a, b, d) => {
                 let value = a.eval(c)?;
-                Value::Bool(
-                    binary(Op::Ge, value, b.eval(c)?)?.boolean()?
-                        && binary(Op::Le, value, d.eval(c)?)?.boolean()?,
-                )
+                let lo = binary(Op::Ge, value, b.eval(c)?)?.tristate()?;
+                if lo == Some(false) {
+                    Value::Bool(false)
+                } else {
+                    let hi = binary(Op::Le, value, d.eval(c)?)?.tristate()?;
+                    match (lo, hi) {
+                        (Some(true), Some(true)) => Value::Bool(true),
+                        (_, Some(false)) => Value::Bool(false),
+                        _ => Value::Null,
+                    }
+                }
             }
             Self::In(a, items) => {
                 let value = a.eval(c)?;
-                let mut found = false;
+                let mut saw_null = false;
                 for item in items {
-                    if binary(Op::Eq, value, item.eval(c)?)?.boolean()? {
-                        found = true;
-                        break;
+                    match binary(Op::Eq, value, item.eval(c)?)?.tristate()? {
+                        Some(true) => return Ok(Value::Bool(true)),
+                        Some(false) => {}
+                        None => saw_null = true,
                     }
                 }
-                Value::Bool(found)
+                if saw_null {
+                    Value::Null
+                } else {
+                    Value::Bool(false)
+                }
             }
             Self::Pattern(n, pattern, _) => match n.eval(c)? {
                 Value::String(v) => Value::Bool(pattern.is_match(v)),
-                _ => bail!("cannot match an unavailable value; test it against null first"),
+                Value::Null => Value::Null,
+                _ => bail!("pattern matching requires a string"),
             },
             Self::If(cond, a, b) => {
-                if cond.eval(c)?.boolean()? {
+                if cond.eval(c)?.is_true()? {
                     a.eval(c)?
                 } else {
                     b.eval(c)?
@@ -489,6 +544,332 @@ impl Node {
             }
         })
     }
+    /// Abstractly evaluate this expression for `Facts::S3Directory`.
+    /// Sound over-approximation: returns `Abs::MayFail` if a runtime error
+    /// may happen, so callers never drop directories that would fail evaluation.
+    fn eval_s3_dir(&self, now: i128) -> Abs<'_> {
+        match self {
+            Self::Literal(v) => Abs::Exact(match v {
+                Value::String(s) => Value::String(s.as_slice()),
+                Value::Quantity(n, ty) => Value::Quantity(*n, *ty),
+                Value::Bool(b) => Value::Bool(*b),
+                Value::Null => Value::Null,
+            }),
+            Self::Now => Abs::Exact(Value::Quantity(now, Type::Timestamp)),
+            Self::Field(dst, f) => {
+                if *dst {
+                    return Abs::MayFail;
+                }
+                match f {
+                    Field::Path | Field::Name | Field::Extension => Abs::AnyNonNull,
+                    Field::Exists => Abs::Exact(Value::Bool(true)),
+                    Field::Kind => Abs::Exact(Value::String(b"dir")),
+                    _ => Abs::Exact(Value::Null),
+                }
+            }
+            Self::IsNull(n, negated) => match n.eval_s3_dir(now) {
+                Abs::MayFail => Abs::MayFail,
+                Abs::Exact(v) => Abs::Exact(Value::Bool(if *negated {
+                    v != Value::Null
+                } else {
+                    v == Value::Null
+                })),
+                Abs::AnyNonNull => Abs::Exact(Value::Bool(*negated)),
+                Abs::Bool(s) if !s.n => Abs::Exact(Value::Bool(*negated)),
+                Abs::Bool(s) if !s.t && !s.f => Abs::Exact(Value::Bool(!*negated)),
+                Abs::Bool(_) | Abs::Any => Abs::Bool(BoolSet {
+                    t: true,
+                    f: true,
+                    n: false,
+                }),
+            },
+            Self::Not(n) => match n.eval_s3_dir(now) {
+                Abs::MayFail => Abs::MayFail,
+                v => Abs::from_bool_set(v.bool_set().not()),
+            },
+            Self::Negative(n) => match n.eval_s3_dir(now) {
+                Abs::MayFail => Abs::MayFail,
+                Abs::Exact(Value::Null) => Abs::Exact(Value::Null),
+                Abs::Exact(Value::Quantity(v, t)) => v
+                    .checked_neg()
+                    .map_or(Abs::MayFail, |r| Abs::Exact(Value::Quantity(r, t))),
+                _ => Abs::MayFail,
+            },
+            Self::Binary(Op::And, a, b) => {
+                let va = a.eval_s3_dir(now);
+                if matches!(va, Abs::MayFail) {
+                    return Abs::MayFail;
+                }
+                let sa = va.bool_set();
+                if !sa.t && !sa.n {
+                    return Abs::Exact(Value::Bool(false));
+                }
+                let vb = b.eval_s3_dir(now);
+                if matches!(vb, Abs::MayFail) {
+                    return Abs::MayFail;
+                }
+                Abs::from_bool_set(sa.and(vb.bool_set()))
+            }
+            Self::Binary(Op::Or, a, b) => {
+                let va = a.eval_s3_dir(now);
+                if matches!(va, Abs::MayFail) {
+                    return Abs::MayFail;
+                }
+                let sa = va.bool_set();
+                if !sa.f && !sa.n {
+                    return Abs::Exact(Value::Bool(true));
+                }
+                let vb = b.eval_s3_dir(now);
+                if matches!(vb, Abs::MayFail) {
+                    return Abs::MayFail;
+                }
+                Abs::from_bool_set(sa.or(vb.bool_set()))
+            }
+            Self::Binary(op @ (Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge), a, b) => {
+                let va = a.eval_s3_dir(now);
+                let vb = b.eval_s3_dir(now);
+                if matches!(va, Abs::MayFail) || matches!(vb, Abs::MayFail) {
+                    return Abs::MayFail;
+                }
+                cmp_abs(*op, va, vb)
+            }
+            Self::Binary(op @ (Op::BitAnd | Op::BitOr | Op::BitXor), a, b) => {
+                let va = a.eval_s3_dir(now);
+                let vb = b.eval_s3_dir(now);
+                if matches!(va, Abs::MayFail) || matches!(vb, Abs::MayFail) {
+                    return Abs::MayFail;
+                }
+                if matches!(va, Abs::Exact(Value::Null)) || matches!(vb, Abs::Exact(Value::Null)) {
+                    return Abs::Exact(Value::Null);
+                }
+                if let (Abs::Exact(x), Abs::Exact(y)) = (va, vb) {
+                    binary(*op, x, y).map_or(Abs::MayFail, Abs::Exact)
+                } else if va.never_null() && vb.never_null() {
+                    Abs::AnyNonNull
+                } else {
+                    Abs::Any
+                }
+            }
+            Self::Binary(op, a, b) => {
+                let va = a.eval_s3_dir(now);
+                let vb = b.eval_s3_dir(now);
+                if matches!(va, Abs::MayFail) || matches!(vb, Abs::MayFail) {
+                    return Abs::MayFail;
+                }
+                if matches!(va, Abs::Exact(Value::Null)) || matches!(vb, Abs::Exact(Value::Null)) {
+                    return Abs::Exact(Value::Null);
+                }
+                if let (Abs::Exact(x), Abs::Exact(y)) = (va, vb) {
+                    binary(*op, x, y).map_or(Abs::MayFail, Abs::Exact)
+                } else {
+                    Abs::MayFail
+                }
+            }
+            Self::Between(a, lo, hi) => {
+                let va = a.eval_s3_dir(now);
+                let vlo = lo.eval_s3_dir(now);
+                if matches!(va, Abs::MayFail) || matches!(vlo, Abs::MayFail) {
+                    return Abs::MayFail;
+                }
+                let s_lo = cmp_abs(Op::Ge, va, vlo).bool_set();
+                if !s_lo.t && !s_lo.n {
+                    return Abs::Exact(Value::Bool(false));
+                }
+                let vhi = hi.eval_s3_dir(now);
+                if matches!(vhi, Abs::MayFail) {
+                    return Abs::MayFail;
+                }
+                Abs::from_bool_set(s_lo.and(cmp_abs(Op::Le, va, vhi).bool_set()))
+            }
+            Self::In(a, items) => {
+                let va = a.eval_s3_dir(now);
+                if matches!(va, Abs::MayFail) {
+                    return Abs::MayFail;
+                }
+                let mut acc = BoolSet::FALSE;
+                for item in items {
+                    if !acc.f && !acc.n {
+                        return Abs::Exact(Value::Bool(true));
+                    }
+                    let vi = item.eval_s3_dir(now);
+                    if matches!(vi, Abs::MayFail) {
+                        return Abs::MayFail;
+                    }
+                    acc = acc.or(cmp_abs(Op::Eq, va, vi).bool_set());
+                }
+                Abs::from_bool_set(acc)
+            }
+            Self::Pattern(n, regex, _) => match n.eval_s3_dir(now) {
+                Abs::MayFail => Abs::MayFail,
+                Abs::Exact(Value::Null) => Abs::Exact(Value::Null),
+                Abs::Exact(Value::String(s)) => Abs::Exact(Value::Bool(regex.is_match(s))),
+                Abs::AnyNonNull => Abs::Bool(BoolSet {
+                    t: true,
+                    f: true,
+                    n: false,
+                }),
+                Abs::Any => Abs::Bool(BoolSet::ANY),
+                Abs::Exact(_) | Abs::Bool(_) => Abs::MayFail,
+            },
+            Self::If(cond, a, b) => {
+                let vc = cond.eval_s3_dir(now);
+                if matches!(vc, Abs::MayFail) {
+                    return Abs::MayFail;
+                }
+                let sc = vc.bool_set();
+                let then_branch = sc.t.then(|| a.eval_s3_dir(now));
+                let else_branch = (sc.f || sc.n).then(|| b.eval_s3_dir(now));
+                match (then_branch, else_branch) {
+                    (Some(x), None) | (None, Some(x)) => x,
+                    (Some(x), Some(y)) => Abs::join(x, y),
+                    (None, None) => Abs::Any,
+                }
+            }
+            Self::Coalesce(a, b) => match a.eval_s3_dir(now) {
+                Abs::MayFail => Abs::MayFail,
+                Abs::Exact(Value::Null) => b.eval_s3_dir(now),
+                va @ (Abs::Exact(_) | Abs::AnyNonNull) => va,
+                va @ Abs::Bool(s) if !s.n => va,
+                Abs::Bool(s) if !s.t && !s.f => b.eval_s3_dir(now),
+                Abs::Bool(s) => Abs::join(
+                    Abs::from_bool_set(BoolSet {
+                        t: s.t,
+                        f: s.f,
+                        n: false,
+                    }),
+                    b.eval_s3_dir(now),
+                ),
+                Abs::Any => Abs::join(Abs::AnyNonNull, b.eval_s3_dir(now)),
+            },
+        }
+    }
+}
+#[derive(Clone, Copy)]
+struct BoolSet {
+    t: bool,
+    f: bool,
+    n: bool,
+}
+impl BoolSet {
+    const TRUE: Self = Self {
+        t: true,
+        f: false,
+        n: false,
+    };
+    const FALSE: Self = Self {
+        t: false,
+        f: true,
+        n: false,
+    };
+    const NULL: Self = Self {
+        t: false,
+        f: false,
+        n: true,
+    };
+    const ANY: Self = Self {
+        t: true,
+        f: true,
+        n: true,
+    };
+    fn from_value(v: Value<&[u8]>) -> Self {
+        match v {
+            Value::Bool(true) => Self::TRUE,
+            Value::Bool(false) => Self::FALSE,
+            Value::Null => Self::NULL,
+            _ => Self::ANY,
+        }
+    }
+    fn join(self, other: Self) -> Self {
+        Self {
+            t: self.t || other.t,
+            f: self.f || other.f,
+            n: self.n || other.n,
+        }
+    }
+    fn not(self) -> Self {
+        Self {
+            t: self.f,
+            f: self.t,
+            n: self.n,
+        }
+    }
+    fn and(self, other: Self) -> Self {
+        Self {
+            t: self.t && other.t,
+            f: self.f || ((self.t || self.n) && other.f),
+            n: (self.t && other.n) || (self.n && (other.t || other.n)),
+        }
+    }
+    fn or(self, other: Self) -> Self {
+        Self {
+            t: self.t || other.t,
+            f: self.f && other.f,
+            n: (self.f && other.n) || (self.n && (other.f || other.n)),
+        }
+    }
+}
+#[derive(Clone, Copy)]
+enum Abs<'a> {
+    Exact(Value<&'a [u8]>),
+    Bool(BoolSet),
+    AnyNonNull,
+    Any,
+    MayFail,
+}
+impl<'a> Abs<'a> {
+    fn from_bool_set(s: BoolSet) -> Self {
+        match (s.t, s.f, s.n) {
+            (true, false, false) => Self::Exact(Value::Bool(true)),
+            (false, true, false) => Self::Exact(Value::Bool(false)),
+            (false, false, true) => Self::Exact(Value::Null),
+            _ => Self::Bool(s),
+        }
+    }
+    fn bool_set(self) -> BoolSet {
+        match self {
+            Self::Exact(v) => BoolSet::from_value(v),
+            Self::Bool(s) => s,
+            Self::AnyNonNull => BoolSet {
+                t: true,
+                f: true,
+                n: false,
+            },
+            Self::Any | Self::MayFail => BoolSet::ANY,
+        }
+    }
+    fn never_null(self) -> bool {
+        match self {
+            Self::Exact(v) => v != Value::Null,
+            Self::Bool(s) => !s.n,
+            Self::AnyNonNull => true,
+            Self::Any | Self::MayFail => false,
+        }
+    }
+    fn join(a: Self, b: Self) -> Self {
+        match (a, b) {
+            (Self::MayFail, _) | (_, Self::MayFail) => Self::MayFail,
+            (Self::Exact(x), Self::Exact(y)) if x == y => Self::Exact(x),
+            (
+                Self::Exact(Value::Bool(_) | Value::Null) | Self::Bool(_),
+                Self::Exact(Value::Bool(_) | Value::Null) | Self::Bool(_),
+            ) => Self::from_bool_set(a.bool_set().join(b.bool_set())),
+            _ if a.never_null() && b.never_null() => Self::AnyNonNull,
+            _ => Self::Any,
+        }
+    }
+}
+fn cmp_abs<'a>(op: Op, a: Abs<'a>, b: Abs<'a>) -> Abs<'a> {
+    if matches!(a, Abs::Exact(Value::Null)) || matches!(b, Abs::Exact(Value::Null)) {
+        return Abs::Exact(Value::Null);
+    }
+    if let (Abs::Exact(x), Abs::Exact(y)) = (a, b) {
+        return binary(op, x, y).map_or(Abs::MayFail, Abs::Exact);
+    }
+    Abs::from_bool_set(BoolSet {
+        t: true,
+        f: true,
+        n: !(a.never_null() && b.never_null()),
+    })
 }
 fn require(ok: bool, message: &str) -> Result<()> {
     if !ok {
@@ -514,7 +895,11 @@ fn binary_type(op: Op, a: Type, b: Type) -> Result<Type> {
             Bool
         }
         Eq | Ne => {
-            common_type(a, b)?;
+            require(
+                a != Null && b != Null,
+                "use 'is null' or 'is not null' instead of comparing with null",
+            )?;
+            require(a == b, &format!("incompatible types: {a:?} and {b:?}"))?;
             Bool
         }
         Lt | Le | Gt | Ge => {
@@ -538,11 +923,11 @@ fn binary_type(op: Op, a: Type, b: Type) -> Result<Type> {
 }
 fn binary<'a>(op: Op, a: Value<&'a [u8]>, b: Value<&'a [u8]>) -> Result<Value<&'a [u8]>> {
     use Op::*;
+    if a == Value::Null || b == Value::Null {
+        return Ok(Value::Null);
+    }
     if matches!(op, Eq | Ne) {
         return Ok(Value::Bool(if op == Eq { a == b } else { a != b }));
-    }
-    if a == Value::Null || b == Value::Null {
-        bail!("field is unavailable; test it against null or use coalesce first");
     }
     let ty = binary_type(op, a.ty(), b.ty())?;
     let ordering = match (&a, &b) {
@@ -630,9 +1015,9 @@ impl Expression {
     /// can match more paths than its condition does, never fewer, so a
     /// listing may skip whatever matches none of them, but must still
     /// evaluate the expression on what it lists.
-    pub fn s3_path_pushdown(&self) -> Vec<Vec<PathToken>> {
+    pub fn s3_path_pushdown(&self, now: i128) -> Vec<Vec<PathToken>> {
         let mut patterns = Vec::new();
-        pushdown::conjuncts(&self.root, &mut patterns);
+        pushdown::conjuncts(&self.root, now, &mut patterns);
         patterns
     }
     pub fn evaluate(
@@ -651,7 +1036,7 @@ impl Expression {
                 dst_path,
                 now,
             })?
-            .boolean()
+            .is_true()
     }
     fn evaluate_known(
         &self,
@@ -668,7 +1053,7 @@ impl Expression {
             dst_path,
             now,
         }) {
-            Ok(value) => Ok(Some(value.boolean()?)),
+            Ok(value) => Ok(Some(value.is_true()?)),
             Err(error) if error.is::<NeedMetadata>() => Ok(None),
             Err(error) => Err(error),
         }
@@ -706,6 +1091,21 @@ impl Policy {
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_nanos() as i128,
         })
+    }
+    pub fn s3_path_pushdown(&self) -> Vec<Vec<PathToken>> {
+        self.selection
+            .as_ref()
+            .map(|e| e.s3_path_pushdown(self.now))
+            .unwrap_or_default()
+    }
+    /// Whether `--where` can select (or fail on) an `S3Directory` in a listing.
+    /// When `false`, recursive S3 listings skip inferring virtual directories
+    /// and omit trailing `/**` on pushed-down `path` patterns.
+    pub fn may_select_s3_directory(&self) -> bool {
+        let Some(expression) = &self.selection else {
+            return true;
+        };
+        expression.root.eval_s3_dir(self.now).bool_set().t
     }
     /// Whether a listed entry passes `--where`. Unlike [`Self::selects`],
     /// directories are filtered too.

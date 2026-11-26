@@ -57,11 +57,11 @@ syq find --where 'kind = "dir" and name glob "*-old"'
 syq find logs --where 'path glob "logs/2026-*/**" and extension = "json"'
 ```
 
-On S3, a directory's fields other than its path fields, `kind` and `exists`
-are `null`, so a size comparison fails on the first directory. Test the
-value first, as in `size is not null and size > 1MiB`. A `path glob` or
-`path =` condition joined to the rest with `and` also narrows the S3 listing;
-see [List objects](object-storage.md#list-objects).
+On every endpoint, a directory's `size` is `null`; on S3, its fields other
+than its path fields, `kind`, and `exists` are `null`. Comparisons and pattern
+checks on `null` do not match instead of failing, so `size > 1MiB` skips
+directories cleanly and `size > 1MiB and path glob ...` still narrows the S3
+listing; see [List objects](object-storage.md#list-objects).
 
 ## Fields
 
@@ -76,7 +76,7 @@ directory is not followed.
 | `extension` | Text after the last dot in `name`, without the dot; empty for extensionless names and a leading dot alone |
 | `exists` | Whether the entry exists; always true for a scanned source |
 | `kind` | `"file"`, `"dir"`, `"symlink"`, `"fifo"`, `"socket"`, `"char"`, `"block"`, or `"other"` |
-| `size` | Size in bytes; for anything but a regular file, the value depends on the platform |
+| `size` | Size in bytes; `null` for directories; for symlinks and special files, the value depends on the platform |
 | `mtime` | Filesystem modification timestamp, stored in syq object metadata on S3; `null` when unavailable |
 | `s3_last_modified` | S3 service modification timestamp; `null` on filesystem endpoints |
 | `ctime` | Filesystem status-change timestamp, not creation time |
@@ -101,11 +101,15 @@ listing, and other fields need a request for each object, so put conditions
 on the listed fields first.
 
 Use `is null`, `is not null`, or `coalesce(value, fallback)` for unavailable
-metadata. Equality treats `null` as a distinct value, but ordering,
-arithmetic, and pattern matching on `null` are errors.
+metadata instead of `= null` or `!= null`. Arithmetic on `null` produces
+`null`, and comparisons, `in`, `between`, and pattern matching with `null`
+follow 3-valued logic: `not unknown` is unknown, `true or unknown` is true,
+`false and unknown` is false, `if` takes the else branch on unknown, and an
+expression that evaluates to unknown excludes the entry (or does not copy it
+under `--copy-if`).
 
 ```text
-src.uid is not null and src.uid = 1000
+src.mtime is null
 not dst.exists or src.size > dst.size
 coalesce(dst.size, 0B) < src.size
 src.mode & 0o111 != 0

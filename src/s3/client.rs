@@ -705,7 +705,7 @@ impl Object {
                 ObjectKind::Dir => crate::proto::Kind::Dir,
                 ObjectKind::Symlink => crate::proto::Kind::Symlink,
             }),
-            size: Some(self.size),
+            size: (self.kind() != ObjectKind::Dir).then_some(self.size),
             mtime: self.metadata.as_ref().map(|m| (m.mtime, m.nsec)),
             s3_last_modified: Some((self.mtime, 0)),
             mode: self.metadata.as_ref().map(|m| m.mode & 0o7777),
