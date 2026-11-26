@@ -4,6 +4,113 @@ User-facing changes are recorded here starting with the release after
 [0.5.2](https://github.com/greaber/syq/releases/tag/v0.5.2).
 Earlier releases have notes on [GitHub Releases](https://github.com/greaber/syq/releases).
 
+## 0.11.0 — 2026-11-26
+
+Changes since 0.10.1. Syq adds `syq find` and `syq ls` across local
+filesystems, SSH servers and S3 buckets (with Python SDK support), copies
+directly between an SSH server and an S3 bucket from your own machine,
+lowers the Python SDK requirement to Python 3.10+, and delivers broad
+performance improvements across S3 and filesystem copies.
+
+### Upgrade notes
+
+- **Install the same version on every machine.** As before, machines running
+  different syq versions refuse to work together.
+- **Receiving services from before 0.8.0** can no longer report whether a
+  copy is in progress, so syq no longer switches them automatically and tells
+  you to replace them with `syq persist connect HOST` or
+  `syq persist receive on`.
+- **Standalone install receipts** now live in `.syq-install.json` beside the
+  `syq` executable (installs from before 0.6.0 migrate from
+  `~/.config/syq/install.json` on self-update). `syq --self-update` now
+  declines to replace a `syq` executable installed by the Python package.
+- **Removed `bw-pacing` tuning key.** Under `--resource-limits bandwidth=RATE`,
+  local and filesystem descriptor copies automatically split file data into
+  requests of at most 125 ms of the rate (at least 512 bytes).
+- **Expression `null` logic.** `--where` and `--copy-if` expressions now use
+  3-valued logic for unavailable or absent metadata (`null`) instead of
+  erroring on comparisons, arithmetic, or pattern checks on `null`. Use
+  `is null` / `is not null` instead of `= null` / `!= null`. Directories report
+  `size` as `null`.
+- **Restricted copy accounting and `--if-exists=keep`.** Restricted copies
+  count each requested entry change when accepted (including repeated requests
+  after a dropped connection and every name of a multiply linked file under
+  `-H`). With `--if-exists=keep`, restricted copies no longer widen existing
+  directories included in the copy; `--widen-dirs all` still widens the
+  destination directory itself and its parent when needed.
+- **Server-to-server build mismatch.** Syq no longer retries automatically
+  after a build-mismatch refusal when your laptop's receiver record is out of
+  date; rerunning the copy updates the receiver first.
+
+### New
+
+- **`syq find` and `syq ls`** list files and directories locally, on an SSH
+  server (`--on HOST`), or in an S3 bucket (`--on s3://BUCKET`), streaming
+  output as paths, `--null`, `--long`, or `--json` (`--include` selects
+  fields). Supports `--depth`, `--ignore`/`--ignore-from`, and `--where` with
+  bare field names.
+- **Copy directly between an SSH server and an S3 bucket** from your own
+  machine (`syq cp --from server ... --to s3://bucket ...` and the reverse).
+  Data travels directly between the server and storage while your machine (or
+  `--auth-from @NAME`) signs scoped URLs without exposing credentials to the
+  server.
+- **`--s3-directory-markers=all|empty|none`** controls which copied
+  directories create 0-byte `dir/` marker objects on S3 destinations (default
+  `all`).
+- **Python SDK:** supports Python 3.10+ (previously 3.13.4+), tags Linux
+  wheels for musl as well as glibc systems, and adds `syq.find()` and
+  `syq.ls()` streaming wrappers (`FindStream`, `AsyncFindStream`, `FindEntry`).
+- **Smaller standalone release binaries and zstd archives.** Standalone
+  installers, `--self-update`, `--use-version`, and server helpers prefer
+  smaller `.tar.zst` release archives where zstd unpacking is available (with
+  gzip fallback) and verify both the downloaded archive and the unpacked
+  executable against signed manifests.
+
+### Performance
+
+- **S3 listing and discovery:** parallel prefix listing on large AWS
+  general-purpose buckets and directory-based splitting elsewhere, concurrent
+  listing of named destination prefixes and pruned prefixes, parallel filtered
+  S3 listings, and skipping per-key `HEAD` requests when an S3 destination
+  prefix is known empty.
+- **S3 concurrency and transfers:** unified `s3-requests` concurrency control
+  covering checks and transfers together with automatic backoff on HTTP
+  429/503 throttling, immediate failure on permanent S3 errors, single-pass
+  pooled uploads, batched storage-authorization signing, streamlined
+  single-object downloads, and fewer redundant requests and multipart readbacks.
+- **Filesystem and SSH copies:** lower startup latency by keeping SQLite
+  tuning history off the startup and small-copy paths and inferring starting
+  worker counts from pooled transport-aware history; pipelined destination
+  lookups (including for `--where` and `--files-from`); batched parent
+  directory reads and hard-link rerun checks; pipelined, chunked final
+  directory metadata passes; byte-bounded streamed patch windows; fewer
+  read-ahead, open, and close syscalls on local filesystems; and scanning
+  sparse ranges for zeros before taking the write gate.
+- **SSH setup and teardown:** single bounded SSH configuration query, single
+  persistence scope check per command, and single-login revocation through the
+  install session.
+
+### Fixes
+
+- Fixed resumed S3 downloads where the direct-write probe could zero the first
+  4 KiB of the partial file.
+- Fixed S3 delimiter listing gaps and unknown-order destination listings so
+  keys skipped after a common prefix or returned out of order are not missed.
+- Let `--s3-header` and `--s3-write-header` take precedence over stored
+  attributes during S3 metadata updates.
+- Descriptor copies now stage into `.FILENAME.syq-tmp.RANDOM` so
+  `syq clean-partials` cleans up interrupted descriptor copies.
+- Prevented aborted copies from publishing newly read or rechecked patches or
+  stalling on bandwidth pacing.
+- Bounded persistent SSH master shutdown to 5 seconds and fixed service-switch
+  races when stop-if-idle replies arrive late, half-written scope markers, and
+  macOS `EINVAL` handling.
+- Bounded helper wire replies for small-file batches, directory operations,
+  and remote removals so large failure sets cannot overflow a reply frame.
+- Fixed hard-link dry-run previews and counts, shell completion after
+  `--opt=value`, variadic selectors with an attached `-`, rsync `--files-from`
+  error ordering, and constant-time named-destination secret checks.
+
 ## 0.10.1 — 2026-11-15
 
 Changes since 0.10.0: clearer help text and documentation.
