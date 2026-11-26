@@ -1739,3 +1739,965 @@ fn a_dash_after_an_attached_variadic_value_is_positional() {
         }
     }
 }
+
+/// Round-trip coverage for `remote_to_remote::coordinator_arguments`:
+/// every `NativeCopyCommand` long option must be either emitted and exercised
+/// in a round trip or explicitly classified as handled outside coordinator
+/// argv, and every field of `Args` is exhaustively destructured (no `..`) so
+/// adding a new field fails to compile until its coordinator behavior is
+/// accounted for.
+mod coordinator_argv_roundtrip {
+    use super::super::{
+        parse_native_copy_with_env, reject_detached_dash_native_values, Args, AuthFrom,
+        CoordinateAt, Location, NativeCopyCommand, PeerAuth, SourceProbe,
+    };
+    use crate::remote_to_remote::{coordinator_arguments, CoordinatorCommand};
+    use clap::CommandFactory;
+    use std::collections::BTreeSet;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    const TEST_RESULTS_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+    const TEST_STORAGE_SIGNING: &str = "0123456789abcdef";
+
+    #[derive(Default)]
+    struct CaseOptions<'a> {
+        coordinator_at_dst: bool,
+        same_host: bool,
+        remote_shell: Option<&'a str>,
+        peer_login_user: Option<&'a str>,
+        peer_connection_host: Option<&'a str>,
+        destination_path: Option<&'a [u8]>,
+        mapping: bool,
+        relay_results: bool,
+        destination_results: bool,
+    }
+
+    struct ExpectedTopology<'a> {
+        coordinator_at_dst: bool,
+        same_host: bool,
+        remote_shell: Option<String>,
+        peer_login_user: Option<&'a str>,
+        peer_connection_host: Option<&'a str>,
+        destination_path: Option<&'a [u8]>,
+        storage: bool,
+        mapping: bool,
+        relay_results: bool,
+        suppress_summary: bool,
+    }
+
+    fn parse_and_load(words: &[OsString]) -> Args {
+        let mut args = Args::parse_args(words).unwrap();
+        args.read_copy_inputs().unwrap();
+        args
+    }
+
+    fn round_trip_case(words: &[OsString], options: CaseOptions<'_>) -> Vec<String> {
+        let original = parse_and_load(words);
+        let (dst, srcs) = original.locations.split_last().unwrap();
+        let peer = if options.coordinator_at_dst {
+            &srcs[0]
+        } else {
+            dst
+        };
+        let storage = original.s3.as_ref();
+        let remote = coordinator_arguments(
+            &original,
+            (srcs, dst, peer),
+            (options.coordinator_at_dst, options.same_host),
+            CoordinatorCommand {
+                relay_results: options.relay_results,
+                destination_results: options.destination_results,
+                remote_shell: options.remote_shell.map(str::to_owned),
+                peer_login_user: options.peer_login_user,
+                peer_connection_host: options.peer_connection_host,
+                destination_path: options.destination_path,
+                mapping: options.mapping,
+                sources_on_input: None,
+                storage,
+            },
+        )
+        .unwrap();
+        assert_eq!(remote.first().map(String::as_str), Some("cp"));
+        let remote_os: Vec<OsString> = remote.iter().map(OsString::from).collect();
+        let is_storage = storage.is_some();
+        let env = |name: &str| -> Option<OsString> {
+            if is_storage && name == crate::s3::authorization::started::SIGNING_ENV {
+                Some(OsString::from(TEST_STORAGE_SIGNING))
+            } else if options.relay_results && name == crate::destination_results::relay::TOKEN_ENV
+            {
+                Some(OsString::from(TEST_RESULTS_TOKEN))
+            } else {
+                None
+            }
+        };
+        reject_detached_dash_native_values(&remote_os[1..]).unwrap();
+        let mut reparsed =
+            parse_native_copy_with_env(&remote_os[1..], SourceProbe::AssumeFiles, &env).unwrap();
+        reparsed.read_copy_inputs().unwrap();
+
+        assert_round_trip(
+            &original,
+            &reparsed,
+            &ExpectedTopology {
+                coordinator_at_dst: options.coordinator_at_dst,
+                same_host: options.same_host,
+                remote_shell: options.remote_shell.map(str::to_owned),
+                peer_login_user: options.peer_login_user,
+                peer_connection_host: options.peer_connection_host,
+                destination_path: options.destination_path,
+                storage: is_storage,
+                mapping: options.mapping,
+                relay_results: options.relay_results,
+                suppress_summary: options.relay_results
+                    && options.destination_results
+                    && !original.dry_run,
+            },
+            &remote,
+        );
+        remote
+    }
+
+    fn assert_round_trip(
+        original: &Args,
+        reparsed: &Args,
+        topology: &ExpectedTopology,
+        remote: &[String],
+    ) {
+        let ctx = || format!("coordinator argv: {remote:?}");
+        // Exhaustive destructuring with no `..`: any field added to `Args`
+        // must be explicitly checked or classified below.
+        let Args {
+            // Forwarded transfer & policy semantics (must match original).
+            interface,
+            placement,
+            target_existence,
+            native_source_cwd,
+            native_source_root,
+            native_follow,
+            native_follow_src,
+            native_follow_dst,
+            copy_mtime_metadata,
+            stream_preserve_times,
+            if_exists,
+            dry_run,
+            quiet,
+            verbose,
+            compress,
+            no_compress,
+            checksum,
+            hash_or_copy,
+            hash_algorithm,
+            transfer_integrity,
+            transfer_hash_type,
+            resource_limits,
+            bwlimit,
+            bwlimit_bytes,
+            existing,
+            update,
+            ignore_existing,
+            where_expression,
+            copy_if,
+            expressions,
+            widen_dirs,
+            delete,
+            prune_before,
+            max_delete,
+            inplace,
+            in_place_update,
+            ignore_lines,
+            times,
+            acls,
+            xattrs,
+            sparse,
+            open_noatime,
+            crtimes,
+            atimes,
+            hardlinks,
+            perms,
+            owner,
+            group,
+            devices,
+            tuning_options,
+            transfer_strategy,
+            stats,
+            connections_opt,
+            connections,
+            connections_default,
+            block_size,
+            progress,
+            no_progress,
+
+            // Topology-dependent fields (SSH/TCP/helper vs storage vs endpoints).
+            locations,
+            s3,
+            syq_path,
+            no_bootstrap,
+            no_tcp,
+            no_tcp_encryption,
+            tcp_congestion,
+            tcp_ports,
+            rsh,
+            native_mapping,
+
+            // Internal delegated marker set by `--delegated-operands-b64`.
+            delegated,
+
+            // Raw CLI vectors whose normalized forms are asserted above.
+            ignore,
+            ignore_from,
+            performance_tuning: _,
+            resource_limits_arg: _,
+            integrity_checking_arg: _,
+            integrity_checking: _,
+
+            // Handled outside `coordinator_arguments` (invoking machine,
+            // internal launcher env, signed grant, or non-cp commands):
+            // assert they stay at their defaults on the reparsed coordinator.
+            descriptor_copy,
+            stream_mapping_fd,
+            stream_concurrency,
+            s3_metadata,
+            results_override,
+            parsed_mapping,
+            storage_authorization,
+            s3_remove,
+            return_selection,
+            coordinated_copy,
+            direct_destination,
+            direct_source,
+            source_directive,
+            named_source,
+            prepared_source,
+            receiver_keys,
+            receiver_host,
+            auth_from_explicit,
+            auth_from,
+            native_rm_cwd,
+            native_rm_root,
+            clean_partials,
+            native_map_cwd,
+            native_map_root,
+            native_map_target,
+            native_map_include,
+            mapping_contents,
+            native_results,
+            native_results_fd,
+            suppress_summary,
+            relay_results,
+            results_token,
+            coordinate_at,
+            relay,
+            detach,
+            peer_auth,
+            help,
+            self_update,
+            register_standalone_install,
+            archive,
+            recursive,
+            links,
+            insecure_links,
+            human_readable,
+            numeric_ids,
+            block_size_explicit,
+            whole_file,
+            no_whole_file,
+            p_flag,
+            partial,
+            pscope,
+            pscope_explicit,
+            restricted_grant,
+            receiver_known_hosts,
+            entry_key_stdin,
+            directive_stdin,
+            width,
+            plan_source_host,
+            requester_stdin,
+            storage_signing,
+            pending_ignore_inputs,
+            pending_files_from,
+            delete_excluded,
+            max_delete_from_approver,
+            receiver_max_entries,
+            receiver_max_bytes,
+            max_size,
+            min_size,
+            files_from,
+            from0,
+            files_from_lines,
+            recursive_explicit,
+            rm,
+            paths,
+        } = reparsed;
+
+        // 1. Core cp flags & normalized engine settings.
+        assert_eq!(*interface, original.interface, "{}", ctx());
+        assert_eq!(*placement, original.placement, "{}", ctx());
+        assert_eq!(*target_existence, original.target_existence, "{}", ctx());
+        assert_eq!(*native_source_cwd, original.native_source_cwd, "{}", ctx());
+        assert_eq!(
+            *native_source_root,
+            original.native_source_root,
+            "{}",
+            ctx()
+        );
+        assert_eq!(*native_follow, original.native_follow, "{}", ctx());
+        assert_eq!(*native_follow_src, original.native_follow_src, "{}", ctx());
+        assert_eq!(*native_follow_dst, original.native_follow_dst, "{}", ctx());
+        assert_eq!(
+            *copy_mtime_metadata,
+            original.copy_mtime_metadata,
+            "{}",
+            ctx()
+        );
+        assert_eq!(
+            *stream_preserve_times,
+            original.stream_preserve_times,
+            "{}",
+            ctx()
+        );
+        assert_eq!(*if_exists, original.if_exists, "{}", ctx());
+        assert_eq!(*dry_run, original.dry_run, "{}", ctx());
+        assert_eq!(*quiet, original.quiet, "{}", ctx());
+        assert_eq!(*verbose, original.verbose, "{}", ctx());
+        assert_eq!(*compress, original.compress, "{}", ctx());
+        assert_eq!(*no_compress, original.no_compress, "{}", ctx());
+        assert_eq!(*checksum, original.checksum, "{}", ctx());
+        assert_eq!(
+            *hash_or_copy,
+            original.hash_or_copy && !original.checksum,
+            "{}",
+            ctx()
+        );
+        assert_eq!(*hash_algorithm, original.hash_algorithm, "{}", ctx());
+        assert_eq!(
+            *transfer_integrity,
+            original.transfer_integrity,
+            "{}",
+            ctx()
+        );
+        assert_eq!(
+            *transfer_hash_type,
+            original.transfer_hash_type,
+            "{}",
+            ctx()
+        );
+        assert_eq!(*resource_limits, original.resource_limits, "{}", ctx());
+        assert_eq!(*bwlimit, original.bwlimit, "{}", ctx());
+        assert_eq!(*bwlimit_bytes, original.bwlimit_bytes, "{}", ctx());
+        assert_eq!(*existing, original.existing, "{}", ctx());
+        assert_eq!(*update, original.update, "{}", ctx());
+        assert_eq!(*ignore_existing, original.ignore_existing, "{}", ctx());
+        assert_eq!(*where_expression, original.where_expression, "{}", ctx());
+        assert_eq!(*copy_if, original.copy_if, "{}", ctx());
+        assert_eq!(
+            expressions.active(),
+            original.expressions.active(),
+            "{}",
+            ctx()
+        );
+        assert_eq!(*widen_dirs, original.widen_dirs, "{}", ctx());
+        assert_eq!(*delete, original.delete, "{}", ctx());
+        assert_eq!(*prune_before, original.prune_before, "{}", ctx());
+        assert_eq!(*max_delete, original.max_delete, "{}", ctx());
+        assert_eq!(*inplace, original.inplace, "{}", ctx());
+        assert_eq!(*in_place_update, original.in_place_update, "{}", ctx());
+        assert_eq!(*ignore_lines, original.ignore_lines, "{}", ctx());
+        assert_eq!(*ignore, original.ignore_lines, "{}", ctx());
+        assert!(ignore_from.is_empty(), "{}", ctx());
+        assert_eq!(*times, original.times, "{}", ctx());
+        assert_eq!(*acls, original.acls, "{}", ctx());
+        assert_eq!(*xattrs, original.xattrs, "{}", ctx());
+        assert_eq!(*sparse, original.sparse, "{}", ctx());
+        assert_eq!(
+            *open_noatime,
+            original.open_noatime || original.atimes > 1,
+            "{}",
+            ctx()
+        );
+        assert_eq!(*crtimes, original.crtimes, "{}", ctx());
+        assert_eq!(*atimes, u8::from(original.atimes > 0), "{}", ctx());
+        assert_eq!(*hardlinks, original.hardlinks, "{}", ctx());
+        assert_eq!(*perms, original.perms, "{}", ctx());
+        assert_eq!(*owner, original.owner || original.group, "{}", ctx());
+        assert_eq!(*group, original.owner || original.group, "{}", ctx());
+        assert_eq!(*devices, original.devices, "{}", ctx());
+        assert_eq!(*tuning_options, original.tuning_options, "{}", ctx());
+        assert_eq!(*transfer_strategy, original.transfer_strategy, "{}", ctx());
+        assert_eq!(*stats, original.stats, "{}", ctx());
+        assert_eq!(*connections_opt, original.connections_opt, "{}", ctx());
+        assert_eq!(*connections, original.connections, "{}", ctx());
+        assert_eq!(
+            *connections_default,
+            original.connections_default,
+            "{}",
+            ctx()
+        );
+        assert_eq!(*block_size, original.block_size, "{}", ctx());
+        // `-q` suppresses progress by emitting `--no-progress`.
+        if original.no_progress || original.quiet {
+            assert!(*no_progress && !*progress, "{}", ctx());
+        } else {
+            assert_eq!(*progress, original.progress, "{}", ctx());
+            assert_eq!(*no_progress, original.no_progress, "{}", ctx());
+        }
+
+        // 2. Topology-dependent fields.
+        assert!(*delegated, "{}", ctx());
+        if topology.mapping {
+            assert_eq!(native_mapping.as_deref(), Some(&b"-"[..]), "{}", ctx());
+        } else {
+            assert!(native_mapping.is_none(), "{}", ctx());
+            let expected_locations: Vec<Location> = original
+                .locations
+                .iter()
+                .enumerate()
+                .map(|(index, loc)| {
+                    let is_dst = index + 1 == original.locations.len();
+                    let keep_host = !topology.same_host
+                        && ((topology.coordinator_at_dst && !is_dst)
+                            || (!topology.coordinator_at_dst && is_dst));
+                    let mut cloned = loc.clone();
+                    if keep_host {
+                        if let Some(user) = topology.peer_login_user {
+                            cloned.user = Some(user.to_owned());
+                        }
+                        if let Some(host) = topology.peer_connection_host {
+                            cloned.host = Some(host.to_owned());
+                        }
+                    } else {
+                        cloned.host = None;
+                        cloned.user = None;
+                        cloned.port = None;
+                    }
+                    if is_dst {
+                        if let Some(path) = topology.destination_path {
+                            cloned.path = path.to_vec();
+                        }
+                    }
+                    cloned
+                })
+                .collect();
+            fn location_tuple(
+                loc: &Location,
+            ) -> (
+                Option<&str>,
+                Option<&str>,
+                Option<u16>,
+                &[u8],
+                super::super::SourceSelection,
+            ) {
+                (
+                    loc.user.as_deref(),
+                    loc.host.as_deref(),
+                    loc.port,
+                    loc.path.as_slice(),
+                    loc.selection,
+                )
+            }
+            let actual_locations: Vec<_> = locations.iter().map(location_tuple).collect();
+            let expected_tuples: Vec<_> = expected_locations.iter().map(location_tuple).collect();
+            assert_eq!(actual_locations, expected_tuples, "{}", ctx());
+        }
+
+        if topology.storage {
+            let orig_s3 = original.s3.as_ref().unwrap();
+            let new_s3 = s3.as_ref().expect("storage route must round-trip");
+            assert_eq!(new_s3.bucket, orig_s3.bucket, "{}", ctx());
+            assert_eq!(new_s3.route, orig_s3.route, "{}", ctx());
+            assert_eq!(new_s3.retries, orig_s3.retries, "{}", ctx());
+            // Signer-local S3 settings stay on the invoking machine.
+            assert!(new_s3.endpoint.is_none(), "{}", ctx());
+            assert!(new_s3.region.is_none(), "{}", ctx());
+            assert!(new_s3.profile.is_none(), "{}", ctx());
+            assert!(new_s3.headers.is_empty(), "{}", ctx());
+            assert!(new_s3.write_headers.is_empty(), "{}", ctx());
+            // Storage coordinator spawns no SSH/TCP peers.
+            assert!(syq_path.is_none(), "{}", ctx());
+            assert!(!*no_bootstrap, "{}", ctx());
+            assert!(!*no_tcp, "{}", ctx());
+            assert!(!*no_tcp_encryption, "{}", ctx());
+            assert!(tcp_congestion.is_none(), "{}", ctx());
+            assert_eq!(*tcp_ports, "47600-47699", "{}", ctx());
+            assert!(rsh.is_none(), "{}", ctx());
+        } else {
+            assert!(s3.is_none(), "{}", ctx());
+            // Enrolled / command-restricted receivers select syq via their
+            // forced authorized_keys command, so helper selection is omitted.
+            if topology.destination_path.is_some() {
+                assert!(syq_path.is_none(), "{}", ctx());
+                assert!(!*no_bootstrap, "{}", ctx());
+            } else {
+                assert_eq!(*syq_path, original.syq_path, "{}", ctx());
+                assert_eq!(*no_bootstrap, original.no_bootstrap, "{}", ctx());
+            }
+            assert_eq!(*no_tcp, original.no_tcp, "{}", ctx());
+            assert_eq!(*no_tcp_encryption, original.no_tcp_encryption, "{}", ctx());
+            assert_eq!(*tcp_congestion, original.tcp_congestion, "{}", ctx());
+            assert_eq!(*tcp_ports, original.tcp_ports, "{}", ctx());
+            assert_eq!(*rsh, topology.remote_shell, "{}", ctx());
+        }
+
+        // 3. Out-of-band / local-only / non-cp fields stay at defaults.
+        assert!(descriptor_copy.is_none());
+        assert!(stream_mapping_fd.is_none());
+        assert_eq!(*stream_concurrency, 4);
+        assert!(!s3_metadata.active());
+        assert!(results_override.is_none());
+        assert!(parsed_mapping.is_none());
+        assert!(storage_authorization.is_none());
+        assert!(!s3_remove.s3_all_versions && s3_remove.s3_version_id.is_none());
+        assert!(return_selection.is_none());
+        assert!(coordinated_copy.is_none());
+        assert!(direct_destination.is_none());
+        assert!(direct_source.is_none());
+        assert!(source_directive.is_none());
+        assert!(named_source.is_none());
+        assert!(prepared_source.is_none());
+        assert!(receiver_keys.is_none());
+        assert!(receiver_host.is_none());
+        assert!(!*auth_from_explicit);
+        assert_eq!(*auth_from, AuthFrom::Auto);
+        assert!(native_rm_cwd.is_none());
+        assert!(native_rm_root.is_none());
+        assert!(!*clean_partials);
+        assert!(native_map_cwd.is_none());
+        assert!(native_map_root.is_none());
+        assert!(native_map_target.is_none());
+        assert!(native_map_include.is_empty());
+        assert!(mapping_contents.is_none());
+        assert!(native_results.is_none());
+        assert!(native_results_fd.is_none());
+        assert_eq!(*suppress_summary, topology.suppress_summary, "{}", ctx());
+        assert_eq!(*relay_results, topology.relay_results, "{}", ctx());
+        assert_eq!(
+            results_token.as_deref(),
+            topology.relay_results.then_some(TEST_RESULTS_TOKEN),
+            "{}",
+            ctx()
+        );
+        assert_eq!(*coordinate_at, CoordinateAt::Auto);
+        assert!(!*relay);
+        assert!(!*detach);
+        assert_eq!(*peer_auth, PeerAuth::Restricted);
+        assert!(help.is_none());
+        assert!(!*self_update);
+        assert!(!*register_standalone_install);
+        assert!(!*archive);
+        assert!(*recursive);
+        assert!(*links);
+        assert!(!*insecure_links);
+        assert!(!*human_readable);
+        assert!(!*numeric_ids);
+        assert!(!*block_size_explicit);
+        assert!(!*whole_file);
+        assert!(!*no_whole_file);
+        assert!(!*p_flag);
+        assert!(!*partial);
+        assert!(pscope.is_none());
+        assert!(!*pscope_explicit);
+        assert!(restricted_grant.is_none());
+        assert!(receiver_known_hosts.is_none());
+        assert!(entry_key_stdin.is_none());
+        assert!(directive_stdin.is_none());
+        assert!(width.is_none());
+        assert!(plan_source_host.is_none());
+        assert!(requester_stdin.is_none());
+        assert_eq!(
+            storage_signing.as_deref(),
+            topology.storage.then_some(TEST_STORAGE_SIGNING),
+            "{}",
+            ctx()
+        );
+        assert!(pending_ignore_inputs.is_empty());
+        assert!(!*pending_files_from);
+        assert!(!*delete_excluded);
+        assert!(!*max_delete_from_approver);
+        assert!(receiver_max_entries.is_none());
+        assert!(receiver_max_bytes.is_none());
+        assert!(max_size.is_none());
+        assert!(min_size.is_none());
+        assert!(files_from.is_none());
+        assert!(!*from0);
+        assert!(files_from_lines.is_empty());
+        assert!(!*recursive_explicit);
+        assert!(!*rm);
+        assert!(paths.is_empty());
+    }
+
+    fn os(words: &[&str]) -> Vec<OsString> {
+        words.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn coordinator_arguments_round_trip_every_args_field_and_native_option() {
+        let mut emitted_longs = BTreeSet::new();
+        let mut saw_short_flags = BTreeSet::new();
+        let mut record = |remote: Vec<String>| {
+            for word in &remote {
+                if let Some(long) = word.strip_prefix("--") {
+                    let name = long.split('=').next().unwrap();
+                    emitted_longs.insert(name.to_owned());
+                } else if let Some(short) = word.strip_prefix('-') {
+                    for ch in short.chars() {
+                        saw_short_flags.insert(ch);
+                    }
+                }
+            }
+        };
+
+        // 1. Primary SSH-to-SSH case (coordinator at source) with a full set
+        // of non-default options, including non-UTF-8 and leading-dash paths
+        // and `--ignore-from` expansion.
+        let temp = crate::test_support::tempdir().unwrap();
+        let ignore_file = temp.path().join("ignores.txt");
+        std::fs::write(&ignore_file, "*.bak\n!keep.bak\n").unwrap();
+        let mut case1 = os(&[
+            "cp",
+            "-n",
+            "-vv",
+            "--no-compress",
+            "--hash",
+            "--integrity-checking=transfer=sha256",
+            "--resource-limits=bandwidth=10M,workers=6",
+            "--performance-tuning=request-size=2M,pipeline-depth=6,comparison-block-size=1M,copy-path=ranges,batch-files=512,batch-bytes=8M,split-min-size=64M",
+            "--if-exists=error",
+            "--only-existing",
+            "--where=src.size > 1KiB",
+            "--copy-if=src.size != dst.size",
+            "--follow-src",
+            "--follow-dst",
+            "--widen-dirs=none",
+            "--prune-before",
+            "--max-delete=42",
+            "--ignore=*.tmp",
+            "--ignore=-leading-dash",
+            "--ignore-from",
+        ]);
+        case1.push(ignore_file.into_os_string());
+        case1.extend(os(&[
+            "--copy-metadata=mtime,permissions,ownership,specials,hardlinks,acls,xattrs,atimes,crtimes",
+            "--sparse",
+            "--open-noatime",
+            "--transfer-strategy=whole-file",
+            "--stats",
+            "--syq-path=/opt/syq",
+            "--no-tcp-encryption",
+            "--tcp-congestion=cubic",
+            "--tcp-ports=50000-50050",
+            "--progress",
+            "--from",
+            "alice@hosta:2222",
+            "--root",
+            "/srv/root with space",
+            "--src=-dash-file",
+            "--srcs-in",
+            "dir with spaces",
+            "--src-dir",
+            "sub/dir",
+            "--src-non-dir",
+        ]));
+        case1.push(OsString::from_vec(b"raw-\xff-bytes".to_vec()));
+        case1.extend(os(&[
+            "--to",
+            "bob@hostb:2200",
+            "--into",
+            "/dst/dir with space",
+        ]));
+        record(round_trip_case(
+            &case1,
+            CaseOptions {
+                remote_shell: Some("ssh -p 2200"),
+                ..Default::default()
+            },
+        ));
+
+        // 2. Mutually-exclusive SSH-to-SSH branches (coordinator at destination).
+        record(round_trip_case(
+            &os(&[
+                "cp",
+                "-q",
+                "--hash-or-copy",
+                "--integrity-checking=transfer=off",
+                "--no-tcp",
+                "--no-bootstrap",
+                "--no-progress",
+                "--follow",
+                "--prune",
+                "--in-place=update",
+                "--if-exists=update",
+                "--transfer-strategy=aligned-block",
+                "--performance-tuning=workers=3",
+                "--from",
+                "hosta",
+                "--cwd",
+                "/srv/cwd",
+                "--src",
+                "a",
+                "--to",
+                "hostb",
+                "--into-existing",
+                "/dst/existing",
+            ]),
+            CaseOptions {
+                coordinator_at_dst: true,
+                ..Default::default()
+            },
+        ));
+
+        // 3. Compare algorithm != blake3, update-if-older, same-host, --into-new.
+        record(round_trip_case(
+            &os(&[
+                "cp",
+                "--integrity-checking=compare=sha256,transfer=xxh3-128",
+                "--if-exists=update-if-older",
+                "--from",
+                "hosta",
+                "--src",
+                "a",
+                "--to",
+                "hosta",
+                "--into-new",
+                "/dst/new",
+            ]),
+            CaseOptions {
+                same_host: true,
+                ..Default::default()
+            },
+        ));
+
+        // 4. --if-exists=keep with --as.
+        record(round_trip_case(
+            &os(&[
+                "cp",
+                "--if-exists=keep",
+                "--from",
+                "hosta",
+                "--src",
+                "a",
+                "--to",
+                "hostb",
+                "--as",
+                "/dst/single",
+            ]),
+            CaseOptions::default(),
+        ));
+
+        // 5. --in-place=new with --as-new.
+        record(round_trip_case(
+            &os(&[
+                "cp",
+                "--in-place=new",
+                "--from",
+                "hosta",
+                "--src",
+                "a",
+                "--to",
+                "hostb",
+                "--as-new",
+                "/dst/single-new",
+            ]),
+            CaseOptions::default(),
+        ));
+
+        // 6. --as-existing and --no-tcp-encryption with implicit xxh3-128 vs explicit transfer=off.
+        record(round_trip_case(
+            &os(&[
+                "cp",
+                "--no-tcp-encryption",
+                "--from",
+                "hosta",
+                "--src",
+                "a",
+                "--to",
+                "hostb",
+                "--as-existing",
+                "/dst/single-existing",
+            ]),
+            CaseOptions::default(),
+        ));
+        record(round_trip_case(
+            &os(&[
+                "cp",
+                "--no-tcp-encryption",
+                "--integrity-checking=transfer=off",
+                "--from",
+                "hosta",
+                "--src",
+                "a",
+                "--to",
+                "hostb",
+                "--into",
+                "/dst/off",
+            ]),
+            CaseOptions::default(),
+        ));
+
+        // 7. Storage upload (server -> S3) and download (S3 -> server).
+        // Pass `--syq-path` / `--rsh` (upload) and `--no-bootstrap` (download)
+        // on the invoking command to confirm they are stripped on the storage
+        // coordinator's argv.
+        record(round_trip_case(
+            &os(&[
+                "cp",
+                "--from",
+                "server",
+                "--src",
+                "data",
+                "--to",
+                "s3://bucket",
+                "--into",
+                "backup",
+                "--s3-retries=3",
+                "--s3-profile=work",
+                "--s3-endpoint=https://objects.example",
+                "--s3-region=auto",
+                "--s3-header=x-amz-test: secret",
+                "--s3-write-header=cache-control: no-store",
+                "--resource-limits=bandwidth=5M,s3-requests=64,s3-objects=16,s3-parts-per-object=4",
+                "--performance-tuning=s3-part-size=8M",
+                "--syq-path=/opt/syq",
+                "--rsh=ssh -v",
+            ]),
+            CaseOptions::default(),
+        ));
+        record(round_trip_case(
+            &os(&[
+                "cp",
+                "--from",
+                "s3://bucket",
+                "--srcs-in",
+                "dataset",
+                "--to",
+                "server",
+                "--into",
+                "/data",
+                "--s3-retries=2",
+                "--no-bootstrap",
+            ]),
+            CaseOptions {
+                coordinator_at_dst: true,
+                relay_results: true,
+                ..Default::default()
+            },
+        ));
+
+        // 8. Mapping forwarded on coordinator stdin (`--mapping=-`).
+        record(round_trip_case(
+            &os(&[
+                "cp",
+                "--from",
+                "hosta",
+                "--mapping=-",
+                "--to",
+                "hostb",
+                "--into",
+                "/dst/mapped",
+            ]),
+            CaseOptions {
+                mapping: true,
+                ..Default::default()
+            },
+        ));
+
+        // 9. Relay-results + suppress-summary + default restricted-destination
+        // shape (`destination_path`, `peer_login_user`, `peer_connection_host`),
+        // which strips `--syq-path` and overrides the peer endpoint and path.
+        record(round_trip_case(
+            &os(&[
+                "cp",
+                "--syq-path=/opt/syq",
+                "--from",
+                "hosta",
+                "--src",
+                "a",
+                "--to",
+                "bob@hostb:2222",
+                "--into",
+                "/dst/original",
+            ]),
+            CaseOptions {
+                peer_login_user: Some("syq"),
+                peer_connection_host: Some("enrolled.internal"),
+                destination_path: Some(b"/enrolled/target"),
+                relay_results: true,
+                destination_results: true,
+                ..Default::default()
+            },
+        ));
+
+        // Verify short flags emitted for dry-run / quiet / verbose.
+        assert_eq!(saw_short_flags, BTreeSet::from(['n', 'q', 'v']));
+
+        // Verify every long option on `NativeCopyCommand` is accounted for:
+        // either emitted by `coordinator_arguments` above, or explicitly
+        // classified as handled outside coordinator argv.
+        let actual_options: BTreeSet<String> = NativeCopyCommand::command()
+            .get_arguments()
+            .filter_map(|arg| arg.get_long().map(str::to_owned))
+            .collect();
+
+        let emitted_via_short: BTreeSet<String> = ["dry-run", "quiet", "verbose"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+
+        let handled_outside: BTreeSet<String> = [
+            // Lowered into other forwarded options above.
+            "ignore-from",
+            "srcs",
+            "src-dirs",
+            "src-non-dirs",
+            // Deprecated hidden flag refused during parse.
+            "inplace",
+            // Consumed on the invoking machine (not forwarded to coordinator).
+            "auth-from",
+            "coordinate-at",
+            "detach",
+            "peer-auth",
+            "pscope",
+            "results",
+            "results-fd",
+            "receiver-max-entries",
+            "receiver-max-bytes",
+            // Local descriptor/stream copies never run remote-to-remote.
+            "src-fd",
+            "as-fd",
+            "stream-commit-fd",
+            "stream-mapping-fd",
+            "stream-concurrency",
+            // Kept on the invoking machine's S3 signer, never sent to the server.
+            "s3-endpoint",
+            "s3-region",
+            "s3-profile",
+            "s3-header",
+            "s3-write-header",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+
+        let accounted: BTreeSet<String> = emitted_longs
+            .union(&emitted_via_short)
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .union(&handled_outside)
+            .cloned()
+            .collect();
+
+        let overlap: Vec<_> = emitted_longs
+            .intersection(&handled_outside)
+            .cloned()
+            .collect();
+        assert!(
+            overlap.is_empty(),
+            "options both emitted and listed as outside: {overlap:?}"
+        );
+        let missing: Vec<_> = actual_options.difference(&accounted).cloned().collect();
+        let extra: Vec<_> = accounted.difference(&actual_options).cloned().collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "NativeCopyCommand option inventory drift: missing={missing:?}, extra={extra:?}"
+        );
+    }
+}

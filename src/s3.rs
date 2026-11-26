@@ -209,6 +209,19 @@ impl Options {
         matches: &clap::ArgMatches,
         server: bool,
     ) -> Result<Option<Self>> {
+        Self::parse_between_with_env(flags, from, to, matches, server, &|name| {
+            std::env::var_os(name)
+        })
+    }
+
+    pub(crate) fn parse_between_with_env(
+        flags: Flags,
+        from: Option<&str>,
+        to: Option<&str>,
+        matches: &clap::ArgMatches,
+        server: bool,
+        env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> Result<Option<Self>> {
         let tuning = matches
             .try_get_many::<String>("performance_tuning")
             .ok()
@@ -255,8 +268,7 @@ impl Options {
         }
         // A copy that the machine at the other end of the SSH session started
         // and signs for arrives as a delegated command.
-        let started_elsewhere =
-            std::env::var_os(authorization::started::SIGNING_ENV).is_some() && !removal;
+        let started_elsewhere = env(authorization::started::SIGNING_ENV).is_some() && !removal;
         if explicit("auth_from")
             && !matches!(
                 matches.get_one::<crate::cli::AuthFrom>("auth_from"),

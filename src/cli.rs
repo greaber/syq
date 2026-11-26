@@ -2569,6 +2569,14 @@ fn parse_native_copy(argv: &[OsString]) -> Result<Args> {
 }
 
 fn parse_native_copy_with(argv: &[OsString], sources: SourceProbe) -> Result<Args> {
+    parse_native_copy_with_env(argv, sources, &|name| std::env::var_os(name))
+}
+
+fn parse_native_copy_with_env(
+    argv: &[OsString],
+    sources: SourceProbe,
+    env: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<Args> {
     let mut full_argv = vec![OsString::from("syq cp")];
     full_argv.extend_from_slice(argv);
     let mut command = crate::help::filesystem(NativeCopyCommand::command());
@@ -2643,12 +2651,13 @@ fn parse_native_copy_with(argv: &[OsString], sources: SourceProbe) -> Result<Arg
     if let Some(name) = s3_server.and_then(|endpoint| endpoint.strip_prefix('@')) {
         bail!("S3 copies cannot use receiving machine @{name}; run syq on that machine to copy between it and the bucket");
     }
-    let s3_options = crate::s3::Options::parse_between(
+    let s3_options = crate::s3::Options::parse_between_with_env(
         s3,
         s3_from.as_deref(),
         s3_to.as_deref(),
         &matches,
         s3_server.is_some(),
+        env,
     )?;
     if s3_options.is_some() {
         if s3_server.is_some() && (copy.mapping.is_some() || copy.stream_mapping_fd.is_some()) {
@@ -2798,7 +2807,7 @@ fn parse_native_copy_with(argv: &[OsString], sources: SourceProbe) -> Result<Arg
             );
         }
     }
-    apply_internal_native_direct(&mut args)?;
+    apply_internal_native_direct(&mut args, env)?;
     if args.native_results.is_some() || args.native_results_fd.is_some() {
         // Usage-lane refusals (exit 2, no stream): the contract promises a
         // terminal record for every run that gets past argument parsing, so
@@ -3383,9 +3392,12 @@ fn apply_native_remote(args: &mut Args, remote: NativeRemoteArgs) -> Result<()> 
 /// controls on the source host. Keep them out of the native command grammar:
 /// they are carried by the internal launcher environment, so public native
 /// parsing remains the strict allowlist above.
-fn apply_internal_native_direct(args: &mut Args) -> Result<()> {
+fn apply_internal_native_direct(
+    args: &mut Args,
+    env: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<()> {
     let utf8 = |name: &str| -> Result<Option<String>> {
-        std::env::var_os(name)
+        env(name)
             .map(|value| {
                 value
                     .into_string()
