@@ -23,6 +23,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[path = "support/executable.rs"]
 mod executable_support;
+#[allow(dead_code)]
+#[path = "support/https.rs"]
+mod https;
 #[path = "support/temp.rs"]
 mod test_support;
 
@@ -1204,6 +1207,54 @@ fn use_version_downloads_a_zstd_release_and_stores_its_main_manifest() {
         fs::read(directory.join("syq-release-manifest.json")).unwrap(),
         fs::read(fixture.temp.path("fixtures/syq-release-manifest.json")).unwrap()
     );
+}
+
+/// One release download is one HTTPS connection: the manifest, the zstd
+/// listing, and the archive share its TLS session.
+#[test]
+fn use_version_downloads_a_release_over_one_connection() {
+    let fixture = UpdateFixture::new("0.7.0", "v0.7.0");
+    fixture.publish_zstd();
+    let server = https::Server::serving("127.0.0.1", fixture.temp.path("fixtures"));
+    let certificates = fixture.temp.path("ca.pem");
+    fs::write(&certificates, &server.ca).unwrap();
+    let mut command =
+        fixture.command_builder(&fixture.installed, &["--use-version", "0.7.0", "--version"]);
+    command
+        .env("SYQ_TEST_RELEASE_DOWNLOADS", server.url())
+        .env_remove("SYQ_TEST_FIXTURES")
+        .env("SSL_CERT_FILE", &certificates)
+        .env_remove("SSL_CERT_DIR");
+    for variable in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        command.env_remove(variable);
+    }
+    let output = command.capture_output().unwrap();
+    assert_success(&output);
+    assert_eq!(output.stdout, b"syq 0.7.0\n");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let requests: Vec<String> = server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(request, _)| request.clone())
+        .collect();
+    assert_eq!(
+        requests,
+        [
+            "GET /v0.7.0/syq-release-manifest.json HTTP/1.1".to_owned(),
+            "GET /v0.7.0/syq-release-zstd.json HTTP/1.1".to_owned(),
+            format!("GET /v0.7.0/syq-{}.zst HTTP/1.1", release_target()),
+        ]
+    );
+    assert_eq!(server.connections.load(Ordering::Relaxed), 1);
 }
 
 /// An access control list on the store that passes write access on to what
