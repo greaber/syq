@@ -79,7 +79,7 @@ semver = "1"
 sha2 = "0.11"
 md-5 = "0.11"
 ureq = { version = "3", default-features = false, features = ["rustls-no-provider"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-native-certs = "0.8"
 ssh-agent-lib = { version = "0.6", default-features = false }
 ssh-key = { version = "0.6.7", features = ["ed25519", "p256", "p384", "p521", "rsa"] }
@@ -116,6 +116,34 @@ strip = "symbols"
 inherits = "release"
 lto = "fat"
 codegen-units = 1
+
+# Optimize dependencies for size, keeping hashing, compression and crypto at
+# the same optimization level as syq on the transfer path.
+[profile.dist.package]
+"*".opt-level = "z"
+blake3.opt-level = 3
+xxhash-rust.opt-level = 3
+zstd.opt-level = 3
+zstd-safe.opt-level = 3
+zstd-sys.opt-level = 3
+lz4.opt-level = 3
+lz4-sys.opt-level = 3
+aws-lc-rs.opt-level = 3
+aws-lc-sys.opt-level = 3
+rustls.opt-level = 3
+rustls-webpki.opt-level = 3
+chacha20poly1305.opt-level = 3
+chacha20.opt-level = 3
+poly1305.opt-level = 3
+universal-hash.opt-level = 3
+curve25519-dalek.opt-level = 3
+ed25519-dalek.opt-level = 3
+hpke.opt-level = 3
+sha2.opt-level = 3
+sha1.opt-level = 3
+hmac.opt-level = 3
+md-5.opt-level = 3
+crypto-bigint.opt-level = 3
 
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }

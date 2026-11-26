@@ -56,12 +56,19 @@
               # Keep in sync with .cargo/config.toml: seed aws-lc from the
               # operating system, not from about 30 ms of CPU-jitter sampling.
               AWS_LC_SYS_NO_JITTER_ENTROPY = "1";
+              # Tuning history uses ordinary SQLite tables and indexes.
+              LIBSQLITE3_FLAGS = lib.concatStringsSep " " [
+                "-USQLITE_ENABLE_FTS3" "-USQLITE_ENABLE_FTS3_PARENTHESIS" "-USQLITE_ENABLE_FTS5"
+                "-USQLITE_ENABLE_RTREE" "-USQLITE_ENABLE_LOAD_EXTENSION"
+                "-DSQLITE_OMIT_LOAD_EXTENSION" "-DSQLITE_OMIT_DEPRECATED"
+              ];
               CARGO_BUILD_TARGET = pkgs.stdenv.hostPlatform.rust.rustcTarget;
               RUSTC_WRAPPER = rustcWrapper;
               CC = cWrapper "cc";
               CXX = cWrapper "c++";
               RUSTFLAGS = if pkgs.stdenv.isLinux
-                then "-C target-feature=+crt-static -L native=${pkgs.glibc.static}/lib"
+                # The pinned Linux linker and static glibc support RELR in static PIEs.
+                then "-C target-feature=+crt-static -C link-arg=-Wl,-z,pack-relative-relocs -L native=${pkgs.glibc.static}/lib"
                 else "-L native=${systemLibiconv}/lib";
             };
             # Keep the deployment targets of the published v0.6.0 binaries.
