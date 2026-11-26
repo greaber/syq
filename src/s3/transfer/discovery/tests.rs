@@ -1817,6 +1817,25 @@ mod signed {
         );
     }
 
+    #[tokio::test]
+    async fn a_signed_upload_that_judges_existing_objects_ignores_an_empty_prefix() {
+        // Its signed requests do not include the HEAD and unconditional write
+        // an object created after the probe would need.
+        for (flags, signed, unsigned) in [
+            (&[][..], true, true),
+            (&["--if-exists=keep"], true, true),
+            (&["--if-exists=error-if-different"], true, true),
+            (&["--if-exists=update-if-older"], false, true),
+            (&["--copy-if", "not dst.exists"], false, true),
+        ] {
+            let argv = [ARGV, flags].concat();
+            for (signs, trusted) in [(true, signed), (false, unsigned)] {
+                let (engine, _) = engine(&argv, &served(), signs);
+                assert_eq!(engine.trusts_empty(), trusted, "{flags:?} {signs}");
+            }
+        }
+    }
+
     /// Named directories `d00`…`d39` uploaded into `dst` with `--prune`, and
     /// `extra` options. The endpoint is not AWS, so listings are not divided.
     fn pruning_argv(extra: &[&str]) -> Vec<String> {

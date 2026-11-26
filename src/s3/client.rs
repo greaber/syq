@@ -364,6 +364,19 @@ pub(super) fn failure<E>(
     }
 }
 
+/// Whether a conditional write was refused because its condition failed:
+/// under `If-None-Match: *`, the object already exists.
+pub(super) fn precondition_failed<E>(
+    error: &aws_sdk_s3::error::SdkError<
+        E,
+        aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> bool {
+    error
+        .raw_response()
+        .is_some_and(|response| response.status().as_u16() == 412)
+}
+
 /// Every listing reports failures the same way. A named source is looked up
 /// with a HEAD and a listing at once, and either one may be the first to fail.
 pub(super) fn listing_failure(
