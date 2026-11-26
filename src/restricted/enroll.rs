@@ -823,7 +823,10 @@ impl ManagementBuild {
         {
             if crate::identity::uses_release_helpers() {
                 return Ok(Self::Release(Box::new(
-                    crate::update::trusted_current_helper(target)?,
+                    crate::update::trusted_current_helper(
+                        &crate::update::ReleaseClient::interactive(),
+                        target,
+                    )?,
                 )));
             }
             bail!("cannot install a source-built restricted receiver for {} from {}; use an official release or enroll from a compatible host", target.key, crate::identity::platform());
@@ -857,7 +860,11 @@ impl ManagementBuild {
         }
         match self {
             Self::Local(file) => read_all(&file),
-            Self::Release(helper) => crate::update::verified_current_helper(&helper),
+            // Its own connection: this can be long after the manifest.
+            Self::Release(helper) => crate::update::verified_current_helper(
+                &crate::update::ReleaseClient::interactive(),
+                &helper,
+            ),
         }
     }
 }

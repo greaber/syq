@@ -182,7 +182,8 @@ pub fn self_update() -> Result<()> {
             );
         }
     }
-    let release = fetch_latest(FetchMode::Interactive)?;
+    let client = ReleaseClient::interactive();
+    let release = fetch_latest(&client)?;
     match release.version.cmp(&current_version()?) {
         std::cmp::Ordering::Less => bail!(
             "refusing to downgrade from {} to {}",
@@ -200,7 +201,7 @@ pub fn self_update() -> Result<()> {
         }
         std::cmp::Ordering::Greater => {}
     }
-    match install_release(&release, &receipt_path, &mut receipt)? {
+    match install_release(&client, &release, &receipt_path, &mut receipt)? {
         Installed::Now(installed) => {
             crate::output::command_println!("updated syq to {}", release.version);
             // The file installation wrote, never the receipt's spelling of
@@ -317,7 +318,7 @@ pub fn after_success(quiet: bool) {
     if touch_check_stamp(&stamp).is_err() {
         return;
     }
-    let release = match fetch_latest(FetchMode::BackgroundCheck) {
+    let release = match fetch_latest(&ReleaseClient::new(FetchMode::BackgroundCheck)) {
         Ok(release) => release,
         Err(_) => return,
     };
@@ -440,13 +441,13 @@ fn update_checks_disabled() -> bool {
 /// Return the artifact metadata for this exact release after verifying its
 /// signed manifest. Remote bootstrap never trusts metadata downloaded by the
 /// remote host itself.
-pub(crate) fn trusted_current_helper(target: Target) -> Result<TrustedCurrentHelper> {
+pub(crate) fn trusted_current_helper(
+    client: &ReleaseClient,
+    target: Target,
+) -> Result<TrustedCurrentHelper> {
     crate::identity::require_release_helpers()?;
     let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
-    let release = fetch_verified(
-        &format!("{}/{tag}", release_downloads()),
-        FetchMode::Interactive,
-    )?;
+    let release = fetch_verified(client, &format!("{}/{tag}", release_downloads()))?;
     current_helper_from_release(target, release)
 }
 
@@ -513,14 +514,15 @@ fn helper_from_release(target: Target, release: &VerifiedRelease) -> Result<Trus
 /// release without one, from before zstd archives, has only gzip; a listing
 /// that cannot be fetched or verified leaves gzip, which the main manifest
 /// signs, as the download. Neither fails the download.
-fn zstd_archive(helper: &TrustedCurrentHelper) -> Option<ReleaseFile> {
+fn zstd_archive(client: &ReleaseClient, helper: &TrustedCurrentHelper) -> Option<ReleaseFile> {
     let url = format!(
         "{}/{}/{ZSTD_MANIFEST_NAME}",
         release_downloads(),
         helper.tag
     );
-    let found =
-        fetch_optional(&url, FetchMode::Interactive, MAX_MANIFEST_BYTES).and_then(|bytes| {
+    let found = client
+        .fetch_optional(&url, MAX_MANIFEST_BYTES)
+        .and_then(|bytes| {
             bytes
                 .map(|bytes| zstd_archive_from(helper, &bytes))
                 .transpose()
@@ -587,7 +589,10 @@ fn validate_zstd_manifest(manifest: &ZstdManifest, tag: &str) -> Result<()> {
 /// the client and never uploads the running executable. Keeping the download
 /// in the binary store only saves later downloads: when the store cannot be
 /// read or written, the helper is downloaded and verified in memory instead.
-pub(crate) fn verified_current_helper(helper: &TrustedCurrentHelper) -> Result<Vec<u8>> {
+pub(crate) fn verified_current_helper(
+    client: &ReleaseClient,
+    helper: &TrustedCurrentHelper,
+) -> Result<Vec<u8>> {
     let store = binary_store().ok();
     let path = store
         .as_deref()
@@ -595,7 +600,7 @@ pub(crate) fn verified_current_helper(helper: &TrustedCurrentHelper) -> Result<V
     if let Some(binary) = path.as_deref().and_then(|path| stored_helper(path, helper)) {
         return Ok(binary);
     }
-    let binary = download_helper(helper, REMOTE_HELPER)?;
+    let binary = download_helper(client, helper, REMOTE_HELPER)?;
     if let (Some(store), Some(path)) = (&store, &path) {
         if let Err(error) = store_helper(store, path, &binary, REMOTE_HELPER) {
             crate::output::diagnostic!(
@@ -642,7 +647,11 @@ fn read_verified(path: &Path, expected: &ReleaseFile, description: &str) -> Resu
 /// have been stored without a manifest, for example as a remote helper, or by
 /// someone else; one that is missing or does not match is downloaded,
 /// verified, and stored.
-fn stored_release_path(store: &Path, helper: &TrustedCurrentHelper) -> Result<PathBuf> {
+fn stored_release_path(
+    client: &ReleaseClient,
+    store: &Path,
+    helper: &TrustedCurrentHelper,
+) -> Result<PathBuf> {
     let path = stored_helper_path(store, helper);
     if path.is_file() {
         match verify_file_as(&path, &helper.binary, "stored syq release") {
@@ -655,7 +664,7 @@ fn stored_release_path(store: &Path, helper: &TrustedCurrentHelper) -> Result<Pa
             }
         }
     }
-    let binary = download_helper(helper, SYQ_RELEASE)?;
+    let binary = download_helper(client, helper, SYQ_RELEASE)?;
     store_helper(store, &path, &binary, SYQ_RELEASE)?;
     Ok(path)
 }
@@ -792,15 +801,22 @@ const SYQ_RELEASE: &str = "syq release";
 /// archive when its release has one: that is smaller and unpacks faster than
 /// gzip. The signed sizes bound both the download and the decompressed
 /// result, and only an archive that matches its signed hash is decompressed.
-fn download_helper(helper: &TrustedCurrentHelper, what: &str) -> Result<Vec<u8>> {
+fn download_helper(
+    client: &ReleaseClient,
+    helper: &TrustedCurrentHelper,
+    what: &str,
+) -> Result<Vec<u8>> {
     let zstd = if helper.gzip_only {
         None
     } else {
-        helper.zstd_archive.clone().or_else(|| zstd_archive(helper))
+        helper
+            .zstd_archive
+            .clone()
+            .or_else(|| zstd_archive(client, helper))
     };
     let expected = zstd.as_ref().unwrap_or(&helper.archive);
     let url = format!("{}/{}/{}", release_downloads(), helper.tag, expected.name);
-    let archive = fetch_bytes(&url, FetchMode::Interactive, expected.size)?;
+    let archive = client.fetch(&url, expected.size)?;
     verify_bytes_as(&archive, expected, &format!("downloaded {what} archive"))?;
     // Reserved at the signed size, so the buffer is never copied as it grows.
     let mut binary = Vec::with_capacity(helper.binary.size as usize + 1);
@@ -925,6 +941,8 @@ pub(crate) fn release_executable(version: &Version) -> Result<PathBuf> {
             StoredRelease::Incomplete => require_own_home(&store)?,
         }
     }
+    // The manifest, zstd listing, and archive share its connection.
+    let client = ReleaseClient::interactive();
     // Only explicit selection opts every build into the official trust anchor.
     let key = embedded_public_key()
         .unwrap_or_else(|_| Cow::Borrowed(include_str!("release-public-key.txt").trim()));
@@ -935,12 +953,12 @@ pub(crate) fn release_executable(version: &Version) -> Result<PathBuf> {
     };
     let bytes = match &stored {
         Some(bytes) => bytes.clone(),
-        None => fetch_bytes(
-            &format!("{}/{tag}/{MANIFEST_NAME}", release_downloads()),
-            FetchMode::Interactive,
-            MAX_MANIFEST_BYTES,
-        )
-        .map_err(|error| selection_download_error(version, error))?,
+        None => client
+            .fetch(
+                &format!("{}/{tag}/{MANIFEST_NAME}", release_downloads()),
+                MAX_MANIFEST_BYTES,
+            )
+            .map_err(|error| selection_download_error(version, error))?,
     };
     let manifest = verified_manifest(&bytes, key.as_ref())?;
     let found = validate_manifest(&manifest)?;
@@ -953,7 +971,7 @@ pub(crate) fn release_executable(version: &Version) -> Result<PathBuf> {
         public_key: key.into_owned(),
     };
     let helper = helper_from_release(target, &release)?;
-    let executable = stored_release_path(&store, &helper)?;
+    let executable = stored_release_path(&client, &store, &helper)?;
     // What was just stored can have taken an access control list from the
     // store's directories: check it as later runs will before running it.
     if !crate::fsops::fixed_owners_and_modes(&store) {
@@ -1008,17 +1026,14 @@ fn current_version() -> Result<Version> {
     Version::parse(env!("CARGO_PKG_VERSION")).context("parse the current syq version")
 }
 
-fn fetch_latest(mode: FetchMode) -> Result<VerifiedRelease> {
-    fetch_verified(&latest_downloads(), mode)
+fn fetch_latest(client: &ReleaseClient) -> Result<VerifiedRelease> {
+    fetch_verified(client, &latest_downloads())
 }
 
-fn fetch_verified(base_url: &str, mode: FetchMode) -> Result<VerifiedRelease> {
+fn fetch_verified(client: &ReleaseClient, base_url: &str) -> Result<VerifiedRelease> {
     let key = embedded_public_key()?;
-    let manifest_bytes = fetch_bytes(
-        &format!("{base_url}/{MANIFEST_NAME}"),
-        mode,
-        MAX_MANIFEST_BYTES,
-    )?;
+    let manifest_bytes =
+        client.fetch(&format!("{base_url}/{MANIFEST_NAME}"), MAX_MANIFEST_BYTES)?;
     let manifest = verified_manifest(&manifest_bytes, key.as_ref())?;
     let version = validate_manifest(&manifest)?;
     Ok(VerifiedRelease {
@@ -1152,6 +1167,7 @@ fn validate_release_file(target: &str, file: &ReleaseFile) -> Result<()> {
 }
 
 fn install_release(
+    client: &ReleaseClient,
     release: &VerifiedRelease,
     receipt_path: &Path,
     receipt: &mut InstallReceipt,
@@ -1178,7 +1194,7 @@ fn install_release(
     // any wait for the directory lock.
     let binary = write_sealed(
         temporary,
-        &download_helper(&artifact, SYQ_RELEASE)?,
+        &download_helper(client, &artifact, SYQ_RELEASE)?,
         SYQ_RELEASE,
     )?;
     // The file that runs and replaces the executable is the one verified.
@@ -1505,95 +1521,137 @@ fn copy_bounded(source: &mut impl Read, destination: &mut impl Write, limit: u64
     Ok(copied)
 }
 
-/// Download `url` into memory, at most `limit` bytes. The caller passes the
-/// signed size for an archive and a fixed ceiling for a manifest, so an
-/// unverified response cannot grow without bound before its signature or
-/// digest is checked.
-fn fetch_bytes(url: &str, mode: FetchMode, limit: u64) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    #[cfg(any(test, debug_assertions))]
-    if let Some(root) = std::env::var_os("SYQ_TEST_FIXTURES").filter(|value| !value.is_empty()) {
-        let name = url
-            .rsplit('/')
-            .next()
-            .filter(|name| !name.is_empty() && !matches!(*name, "." | ".."))
-            .ok_or_else(|| anyhow!("test release URL has no fixture name"))?;
-        bytes.clear();
-        copy_bounded(
-            &mut File::open(PathBuf::from(root).join(name))?,
-            &mut bytes,
-            limit,
-        )
-        .with_context(|| format!("copy test release fixture {name}"))?;
-        return Ok(bytes);
-    }
-
-    // An interactive download may take as long as the connection needs,
-    // but not wait for ever on one that stopped (`DOWNLOAD_STALL`).
-    let (connect_timeout, global_timeout, attempts) = match mode {
-        FetchMode::Interactive => (Duration::from_secs(10), None, 3),
-        FetchMode::BackgroundCheck => (Duration::from_secs(2), Some(Duration::from_secs(5)), 1),
-    };
-    let agent = crate::tls::config_builder()
-        .https_only(true)
-        .timeout_connect(Some(connect_timeout))
-        .timeout_recv_response(Some(DOWNLOAD_STALL))
-        .timeout_global(global_timeout)
-        .user_agent(concat!("syq/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .new_agent();
-
-    // Lets the download host count requests by platform and tell background
-    // reminder checks from explicit updates, without any identifier.
-    let target = crate::remote_helper::Target::local().map(|target| target.key);
-    let purpose = match mode {
-        FetchMode::BackgroundCheck => "check",
-        FetchMode::Interactive => "interactive",
-    };
-    let mut last_error = None;
-    for attempt in 0..attempts {
-        let result = (|| -> Result<()> {
-            let mut request = agent.get(url).header("x-syq-purpose", purpose);
-            if let Some(target) = target {
-                request = request.header("x-syq-target", target);
-            }
-            let response = request.call().with_context(|| format!("request {url}"))?;
-            bytes.clear();
-            copy_bounded_watched(
-                response.into_body().into_reader(),
-                &mut bytes,
-                limit,
-                DOWNLOAD_STALL,
-            )
-            .with_context(|| format!("download {url}"))?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => return Ok(bytes),
-            Err(error) => {
-                let retryable = error.downcast_ref::<DownloadTooLarge>().is_none()
-                    && !matches!(
-                        error.downcast_ref::<ureq::Error>(),
-                        Some(ureq::Error::StatusCode(code))
-                            if *code < 500 && !matches!(*code, 408 | 429)
-                    );
-                last_error = Some(error);
-                if !retryable || attempt + 1 == attempts {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(250 * (attempt as u64 + 1)));
-            }
-        }
-    }
-    Err(crate::tls::download_error(last_error.unwrap())).with_context(|| format!("download {url}"))
+/// The HTTPS client for one release download operation, such as an update or
+/// fetching a helper. Its requests share one agent, and with it a connection
+/// to each host, so the manifest, zstd listing, and archive do not each pay
+/// for a new TCP connection and TLS handshake. Make one for each operation:
+/// dropping it closes the connections. The agent is built on the first
+/// request, so an operation served from the store or from test fixtures
+/// builds none.
+pub(crate) struct ReleaseClient {
+    mode: FetchMode,
+    agent: std::cell::OnceCell<ureq::Agent>,
 }
 
-/// Download `url` like `fetch_bytes`, or `None` when it does not exist.
-fn fetch_optional(url: &str, mode: FetchMode, limit: u64) -> Result<Option<Vec<u8>>> {
-    match fetch_bytes(url, mode, limit) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(error) if is_missing(&error) => Ok(None),
-        Err(error) => Err(error),
+impl ReleaseClient {
+    fn new(mode: FetchMode) -> Self {
+        Self {
+            mode,
+            agent: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// A client for a download someone asked for, which may take as long as
+    /// the connection needs.
+    pub(crate) fn interactive() -> Self {
+        Self::new(FetchMode::Interactive)
+    }
+
+    fn agent(&self) -> &ureq::Agent {
+        self.agent.get_or_init(|| {
+            // An interactive download may take as long as the connection
+            // needs, but not wait for ever on one that stopped
+            // (`DOWNLOAD_STALL`).
+            let (connect_timeout, global_timeout) = match self.mode {
+                FetchMode::Interactive => (Duration::from_secs(10), None),
+                FetchMode::BackgroundCheck => {
+                    (Duration::from_secs(2), Some(Duration::from_secs(5)))
+                }
+            };
+            crate::tls::config_builder()
+                .https_only(true)
+                .timeout_connect(Some(connect_timeout))
+                .timeout_recv_response(Some(DOWNLOAD_STALL))
+                .timeout_global(global_timeout)
+                .user_agent(concat!("syq/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .new_agent()
+        })
+    }
+
+    /// Download `url` into memory, at most `limit` bytes. The caller passes the
+    /// signed size for an archive and a fixed ceiling for a manifest, so an
+    /// unverified response cannot grow without bound before its signature or
+    /// digest is checked.
+    fn fetch(&self, url: &str, limit: u64) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        #[cfg(any(test, debug_assertions))]
+        if let Some(root) = std::env::var_os("SYQ_TEST_FIXTURES").filter(|value| !value.is_empty())
+        {
+            let name = url
+                .rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty() && !matches!(*name, "." | ".."))
+                .ok_or_else(|| anyhow!("test release URL has no fixture name"))?;
+            bytes.clear();
+            copy_bounded(
+                &mut File::open(PathBuf::from(root).join(name))?,
+                &mut bytes,
+                limit,
+            )
+            .with_context(|| format!("copy test release fixture {name}"))?;
+            return Ok(bytes);
+        }
+
+        let attempts = match self.mode {
+            FetchMode::Interactive => 3,
+            FetchMode::BackgroundCheck => 1,
+        };
+        let agent = self.agent();
+
+        // Lets the download host count requests by platform and tell background
+        // reminder checks from explicit updates, without any identifier.
+        let target = crate::remote_helper::Target::local().map(|target| target.key);
+        let purpose = match self.mode {
+            FetchMode::BackgroundCheck => "check",
+            FetchMode::Interactive => "interactive",
+        };
+        let mut last_error = None;
+        for attempt in 0..attempts {
+            let result = (|| -> Result<()> {
+                let mut request = agent.get(url).header("x-syq-purpose", purpose);
+                if let Some(target) = target {
+                    request = request.header("x-syq-target", target);
+                }
+                let response = request.call().with_context(|| format!("request {url}"))?;
+                bytes.clear();
+                copy_bounded_watched(
+                    response.into_body().into_reader(),
+                    &mut bytes,
+                    limit,
+                    DOWNLOAD_STALL,
+                )
+                .with_context(|| format!("download {url}"))?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => return Ok(bytes),
+                Err(error) => {
+                    let retryable = error.downcast_ref::<DownloadTooLarge>().is_none()
+                        && !matches!(
+                            error.downcast_ref::<ureq::Error>(),
+                            Some(ureq::Error::StatusCode(code))
+                                if *code < 500 && !matches!(*code, 408 | 429)
+                        );
+                    last_error = Some(error);
+                    if !retryable || attempt + 1 == attempts {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(250 * (attempt as u64 + 1)));
+                }
+            }
+        }
+        Err(crate::tls::download_error(last_error.unwrap()))
+            .with_context(|| format!("download {url}"))
+    }
+
+    /// Download `url` like `fetch`, or `None` when it does not exist.
+    fn fetch_optional(&self, url: &str, limit: u64) -> Result<Option<Vec<u8>>> {
+        match self.fetch(url, limit) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if is_missing(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -2524,12 +2582,9 @@ mod tests {
 
     #[test]
     fn release_fetches_reject_plain_http() {
-        let error = fetch_bytes(
-            "http://127.0.0.1:1/release",
-            FetchMode::BackgroundCheck,
-            MAX_MANIFEST_BYTES,
-        )
-        .unwrap_err();
+        let error = ReleaseClient::new(FetchMode::BackgroundCheck)
+            .fetch("http://127.0.0.1:1/release", MAX_MANIFEST_BYTES)
+            .unwrap_err();
         assert!(matches!(
             error.downcast_ref::<ureq::Error>(),
             Some(ureq::Error::RequireHttpsOnly(_))

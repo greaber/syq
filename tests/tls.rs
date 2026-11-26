@@ -9,6 +9,7 @@ use process::CommandExt as _;
 #[path = "support/temp.rs"]
 mod test_support;
 
+#[allow(dead_code)]
 #[path = "support/https.rs"]
 mod https;
 use https::Server;

@@ -158,12 +158,14 @@ impl RemoteSpec {
             );
         }
 
+        // The manifest and the helper share one connection.
+        let client = crate::update::ReleaseClient::interactive();
         let helper = match trusted {
             Some(helper) => helper,
-            None => crate::update::trusted_current_helper(bootstrap.target)
+            None => crate::update::trusted_current_helper(&client, bootstrap.target)
                 .context("download and verify the signed release manifest")?,
         };
-        let binary = crate::update::verified_current_helper(&helper)
+        let binary = crate::update::verified_current_helper(&client, &helper)
             .context("download and verify the helper for SSH upload")?;
         self.upload_helper(bootstrap.target, &binary)
     }
