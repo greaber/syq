@@ -125,7 +125,7 @@ syq cp [OPTIONS] SOURCE --as-fd FD
 | `--s3-header <NAME: VALUE>` | Add a header before signing every S3 request (repeatable; S3-to-S3 metadata/tag overrides are refused) |
 | `--s3-retries <N>` | Retry each S3 request up to N times after a transient failure or throttling, 0..100 (default 10; 0 disables retries) |
 | `--s3-write-header <NAME: VALUE>` | Add a header to S3 requests that create or replace objects (repeatable; S3-to-S3 metadata/tag overrides are refused) |
-| `--s3-directory-markers <MODE>` | Which directories get 0-byte dir/ marker objects on an S3 destination<br><br>Possible values:<br>- all: Create 0-byte dir/ markers for every copied directory (preserves empty directories and directory metadata)<br>- empty: Create 0-byte dir/ markers only for copied directories with no objects beneath them<br>- none: Create no 0-byte dir/ markers<br><br>[default: all] |
+| `--s3-directory-markers <MODE>` | Which directories get 0-byte dir/ marker objects on an S3 destination<br><br>Possible values:<br>- all: Create 0-byte dir/ markers for every copied directory (preserves empty directories and directory metadata)<br>- empty: Create 0-byte dir/ markers only for copied directories with no selected entries beneath them (before --if-exists/--copy-if)<br>- none: Create no 0-byte dir/ markers<br><br>[default: all] |
 
 <a id="performance-tuning"></a>
 

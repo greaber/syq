@@ -104,7 +104,7 @@ pub(crate) enum DirectoryMarkers {
     /// Create 0-byte dir/ markers for every copied directory (preserves empty directories and directory metadata)
     #[default]
     All,
-    /// Create 0-byte dir/ markers only for copied directories with no objects beneath them
+    /// Create 0-byte dir/ markers only for copied directories with no selected entries beneath them (before --if-exists/--copy-if)
     Empty,
     /// Create no 0-byte dir/ markers
     None,

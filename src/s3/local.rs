@@ -8,7 +8,7 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, HashMap},
     ffi::OsStr,
     fs::File,
     io::Read,
@@ -224,32 +224,31 @@ pub(super) fn filter_directory_markers<T>(
         super::DirectoryMarkers::All => {}
         super::DirectoryMarkers::None => items.retain(|item| !is_dir(item)),
         super::DirectoryMarkers::Empty => {
-            let mut present = BTreeSet::new();
-            for item in items.iter() {
-                let path = normalized_path(item).trim_end_matches('/');
-                if !path.is_empty() {
-                    present.insert(path.to_owned());
-                }
-            }
-            for path in selected_paths.iter().chain(extra_paths) {
-                let path = path.trim_end_matches('/');
-                if !path.is_empty() {
-                    present.insert(path.to_owned());
+            let mut empty_dirs: std::collections::HashSet<String> = items
+                .iter()
+                .filter(|item| is_dir(item))
+                .map(|item| normalized_path(item).trim_end_matches('/'))
+                .filter(|path| !path.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if !empty_dirs.is_empty() {
+                for raw in items
+                    .iter()
+                    .map(&normalized_path)
+                    .chain(selected_paths.iter().map(String::as_str))
+                    .chain(extra_paths.iter().map(String::as_str))
+                {
+                    let path = raw.trim_end_matches('/');
+                    for (slash, _) in path.match_indices('/') {
+                        empty_dirs.remove(&path[..slash]);
+                    }
+                    if empty_dirs.is_empty() {
+                        break;
+                    }
                 }
             }
             items.retain(|item| {
-                if !is_dir(item) {
-                    return true;
-                }
-                let path = normalized_path(item).trim_end_matches('/');
-                if path.is_empty() {
-                    return false;
-                }
-                let prefix = format!("{path}/");
-                !present
-                    .range(prefix.clone()..)
-                    .next()
-                    .is_some_and(|key| key.starts_with(&prefix))
+                !is_dir(item) || empty_dirs.contains(normalized_path(item).trim_end_matches('/'))
             });
         }
     }

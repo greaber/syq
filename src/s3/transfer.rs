@@ -2163,6 +2163,8 @@ impl Engine {
         let mut out = Vec::new();
         let mut undecided_where = Vec::new();
         let mut selected_paths = Vec::new();
+        let track_empty_markers = self.options.route.is_server_copy()
+            && self.options.directory_markers == super::DirectoryMarkers::Empty;
         let mut selector_count = 0usize;
         let mut first_exact_non_dir = false;
         let mut service_times = Vec::new();
@@ -2496,14 +2498,18 @@ impl Engine {
                         expression_destination_path.as_bytes(),
                     )? == Some(false)
                 {
-                    selected_paths.push(path);
+                    if track_empty_markers {
+                        selected_paths.push(path);
+                    }
                     self.progress.files_excluded.fetch_add(1, Relaxed);
                     continue;
                 }
                 if retain_times {
                     service_times.push(service_time);
                 }
-                undecided_where.push(selected.is_none());
+                if track_empty_markers {
+                    undecided_where.push(selected.is_none());
+                }
                 out.push(Download {
                     expression_path,
                     expression_destination_path,
@@ -2530,9 +2536,7 @@ impl Engine {
             server_copy::check_overlap(&copy_sources, &copy_targets)?;
         }
         if self.options.route.is_server_copy() {
-            if self.options.directory_markers == super::DirectoryMarkers::Empty
-                && undecided_where.iter().any(|&undecided| undecided)
-            {
+            if track_empty_markers && undecided_where.iter().any(|&undecided| undecided) {
                 self.resolve_empty_marker_candidates(
                     source_bucket,
                     &mut out,
@@ -2578,44 +2582,37 @@ impl Engine {
         undecided_where: &[bool],
         selected_paths: &mut Vec<String>,
     ) -> Result<()> {
-        let mut dir_paths = std::collections::BTreeSet::new();
-        let mut known_children = std::collections::BTreeSet::new();
-        for (job, &undecided) in out.iter().zip(undecided_where) {
-            let path = job.path.trim_end_matches('/');
-            if path.is_empty() {
-                continue;
-            }
-            if job.kind == ObjectKind::Dir {
-                dir_paths.insert(path.to_owned());
-                known_children.insert(path.to_owned());
-            } else if !undecided {
-                known_children.insert(path.to_owned());
-            }
-        }
-        if dir_paths.is_empty() {
-            return Ok(());
-        }
-        for path in selected_paths
+        let mut candidate_dirs: HashSet<String> = out
             .iter()
-            .chain(&self.options.extra_destination_paths)
-        {
-            let path = path.trim_end_matches('/');
-            if !path.is_empty() {
-                known_children.insert(path.to_owned());
-            }
-        }
-        let candidate_dirs: std::collections::BTreeSet<String> = dir_paths
-            .into_iter()
-            .filter(|dir| {
-                let prefix = format!("{dir}/");
-                !known_children
-                    .range(prefix.clone()..)
-                    .next()
-                    .is_some_and(|key| key.starts_with(&prefix))
-            })
+            .filter(|job| job.kind == ObjectKind::Dir)
+            .map(|job| job.path.trim_end_matches('/'))
+            .filter(|path| !path.is_empty())
+            .map(str::to_owned)
             .collect();
         if candidate_dirs.is_empty() {
             return Ok(());
+        }
+        for raw in out
+            .iter()
+            .zip(undecided_where)
+            .filter_map(|(job, &undecided)| {
+                (job.kind == ObjectKind::Dir || !undecided).then_some(job.path.as_str())
+            })
+            .chain(selected_paths.iter().map(String::as_str))
+            .chain(
+                self.options
+                    .extra_destination_paths
+                    .iter()
+                    .map(String::as_str),
+            )
+        {
+            let path = raw.trim_end_matches('/');
+            for (slash, _) in path.match_indices('/') {
+                candidate_dirs.remove(&path[..slash]);
+            }
+            if candidate_dirs.is_empty() {
+                return Ok(());
+            }
         }
         let to_check: Vec<(usize, String, String)> = out
             .iter()
@@ -2635,25 +2632,26 @@ impl Engine {
         if to_check.is_empty() {
             return Ok(());
         }
-        let lookups: Vec<_> = stream::iter(to_check.into_iter().map(
-            |(idx, key, expr_path)| async move {
-                self.check_cancelled()?;
-                let fetched = self.copy_head(source_bucket, &key, false).await?;
-                let Some((source, head)) = fetched else {
-                    return Ok::<_, anyhow::Error>((idx, None));
-                };
-                let keep = self
-                    .args
-                    .expressions
-                    .selects(&source.expression_file(), expr_path.as_bytes())?;
-                Ok((idx, Some((source, head, keep))))
-            },
-        ))
-        .buffer_unordered(32)
-        .collect()
-        .await;
+        let lookups = stream::iter(
+            to_check
+                .into_iter()
+                .map(|(idx, key, expr_path)| async move {
+                    self.check_cancelled()?;
+                    let fetched = self.copy_head(source_bucket, &key, false).await?;
+                    let Some((source, head)) = fetched else {
+                        return Ok::<_, anyhow::Error>((idx, None));
+                    };
+                    let keep = self
+                        .args
+                        .expressions
+                        .selects(&source.expression_file(), expr_path.as_bytes())?;
+                    Ok((idx, Some((source, head, keep))))
+                }),
+        )
+        .buffer_unordered(self.options.concurrency.max(1));
+        tokio::pin!(lookups);
         let mut keep_slot = vec![true; out.len()];
-        for entry in lookups {
+        while let Some(entry) = lookups.next().await {
             let (idx, resolved) = entry?;
             if let Some((source, head, keep)) = resolved {
                 if keep {
