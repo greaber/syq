@@ -1760,10 +1760,26 @@ mod coordinator_argv_roundtrip {
     const TEST_RESULTS_TOKEN: &str = "0123456789abcdef0123456789abcdef";
     const TEST_STORAGE_SIGNING: &str = "0123456789abcdef";
 
-    struct ExpectedTopology {
+    #[derive(Default)]
+    struct CaseOptions<'a> {
+        coordinator_at_dst: bool,
+        same_host: bool,
+        remote_shell: Option<&'a str>,
+        peer_login_user: Option<&'a str>,
+        peer_connection_host: Option<&'a str>,
+        destination_path: Option<&'a [u8]>,
+        mapping: bool,
+        relay_results: bool,
+        destination_results: bool,
+    }
+
+    struct ExpectedTopology<'a> {
         coordinator_at_dst: bool,
         same_host: bool,
         remote_shell: Option<String>,
+        peer_login_user: Option<&'a str>,
+        peer_connection_host: Option<&'a str>,
+        destination_path: Option<&'a [u8]>,
         storage: bool,
         mapping: bool,
         relay_results: bool,
@@ -1776,31 +1792,27 @@ mod coordinator_argv_roundtrip {
         args
     }
 
-    fn round_trip_case(
-        words: &[OsString],
-        coordinator_at_dst: bool,
-        same_host: bool,
-        remote_shell: Option<&str>,
-        mapping: bool,
-        relay_results: bool,
-        destination_results: bool,
-    ) -> Vec<String> {
+    fn round_trip_case(words: &[OsString], options: CaseOptions<'_>) -> Vec<String> {
         let original = parse_and_load(words);
         let (dst, srcs) = original.locations.split_last().unwrap();
-        let peer = if coordinator_at_dst { &srcs[0] } else { dst };
+        let peer = if options.coordinator_at_dst {
+            &srcs[0]
+        } else {
+            dst
+        };
         let storage = original.s3.as_ref();
         let remote = coordinator_arguments(
             &original,
             (srcs, dst, peer),
-            (coordinator_at_dst, same_host),
+            (options.coordinator_at_dst, options.same_host),
             CoordinatorCommand {
-                relay_results,
-                destination_results,
-                remote_shell: remote_shell.map(str::to_owned),
-                peer_login_user: None,
-                peer_connection_host: None,
-                destination_path: None,
-                mapping,
+                relay_results: options.relay_results,
+                destination_results: options.destination_results,
+                remote_shell: options.remote_shell.map(str::to_owned),
+                peer_login_user: options.peer_login_user,
+                peer_connection_host: options.peer_connection_host,
+                destination_path: options.destination_path,
+                mapping: options.mapping,
                 sources_on_input: None,
                 storage,
             },
@@ -1812,7 +1824,8 @@ mod coordinator_argv_roundtrip {
         let env = |name: &str| -> Option<OsString> {
             if is_storage && name == crate::s3::authorization::started::SIGNING_ENV {
                 Some(OsString::from(TEST_STORAGE_SIGNING))
-            } else if relay_results && name == crate::destination_results::relay::TOKEN_ENV {
+            } else if options.relay_results && name == crate::destination_results::relay::TOKEN_ENV
+            {
                 Some(OsString::from(TEST_RESULTS_TOKEN))
             } else {
                 None
@@ -1827,13 +1840,18 @@ mod coordinator_argv_roundtrip {
             &original,
             &reparsed,
             &ExpectedTopology {
-                coordinator_at_dst,
-                same_host,
-                remote_shell: remote_shell.map(str::to_owned),
+                coordinator_at_dst: options.coordinator_at_dst,
+                same_host: options.same_host,
+                remote_shell: options.remote_shell.map(str::to_owned),
+                peer_login_user: options.peer_login_user,
+                peer_connection_host: options.peer_connection_host,
+                destination_path: options.destination_path,
                 storage: is_storage,
-                mapping,
-                relay_results,
-                suppress_summary: relay_results && destination_results && !original.dry_run,
+                mapping: options.mapping,
+                relay_results: options.relay_results,
+                suppress_summary: options.relay_results
+                    && options.destination_results
+                    && !original.dry_run,
             },
             &remote,
         );
@@ -2140,10 +2158,22 @@ mod coordinator_argv_roundtrip {
                         && ((topology.coordinator_at_dst && !is_dst)
                             || (!topology.coordinator_at_dst && is_dst));
                     let mut cloned = loc.clone();
-                    if !keep_host {
+                    if keep_host {
+                        if let Some(user) = topology.peer_login_user {
+                            cloned.user = Some(user.to_owned());
+                        }
+                        if let Some(host) = topology.peer_connection_host {
+                            cloned.host = Some(host.to_owned());
+                        }
+                    } else {
                         cloned.host = None;
                         cloned.user = None;
                         cloned.port = None;
+                    }
+                    if is_dst {
+                        if let Some(path) = topology.destination_path {
+                            cloned.path = path.to_vec();
+                        }
                     }
                     cloned
                 })
@@ -2188,11 +2218,19 @@ mod coordinator_argv_roundtrip {
             assert!(!*no_tcp, "{}", ctx());
             assert!(!*no_tcp_encryption, "{}", ctx());
             assert!(tcp_congestion.is_none(), "{}", ctx());
+            assert_eq!(*tcp_ports, "47600-47699", "{}", ctx());
             assert!(rsh.is_none(), "{}", ctx());
         } else {
             assert!(s3.is_none(), "{}", ctx());
-            assert_eq!(*syq_path, original.syq_path, "{}", ctx());
-            assert_eq!(*no_bootstrap, original.no_bootstrap, "{}", ctx());
+            // Enrolled / command-restricted receivers select syq via their
+            // forced authorized_keys command, so helper selection is omitted.
+            if topology.destination_path.is_some() {
+                assert!(syq_path.is_none(), "{}", ctx());
+                assert!(!*no_bootstrap, "{}", ctx());
+            } else {
+                assert_eq!(*syq_path, original.syq_path, "{}", ctx());
+                assert_eq!(*no_bootstrap, original.no_bootstrap, "{}", ctx());
+            }
             assert_eq!(*no_tcp, original.no_tcp, "{}", ctx());
             assert_eq!(*no_tcp_encryption, original.no_tcp_encryption, "{}", ctx());
             assert_eq!(*tcp_congestion, original.tcp_congestion, "{}", ctx());
@@ -2368,12 +2406,10 @@ mod coordinator_argv_roundtrip {
         ]));
         record(round_trip_case(
             &case1,
-            false,
-            false,
-            Some("ssh -p 2200"),
-            false,
-            false,
-            false,
+            CaseOptions {
+                remote_shell: Some("ssh -p 2200"),
+                ..Default::default()
+            },
         ));
 
         // 2. Mutually-exclusive SSH-to-SSH branches (coordinator at destination).
@@ -2403,12 +2439,10 @@ mod coordinator_argv_roundtrip {
                 "--into-existing",
                 "/dst/existing",
             ]),
-            true,
-            false,
-            None,
-            false,
-            false,
-            false,
+            CaseOptions {
+                coordinator_at_dst: true,
+                ..Default::default()
+            },
         ));
 
         // 3. Compare algorithm != blake3, update-if-older, same-host, --into-new.
@@ -2426,12 +2460,10 @@ mod coordinator_argv_roundtrip {
                 "--into-new",
                 "/dst/new",
             ]),
-            false,
-            true,
-            None,
-            false,
-            false,
-            false,
+            CaseOptions {
+                same_host: true,
+                ..Default::default()
+            },
         ));
 
         // 4. --if-exists=keep with --as.
@@ -2448,12 +2480,7 @@ mod coordinator_argv_roundtrip {
                 "--as",
                 "/dst/single",
             ]),
-            false,
-            false,
-            None,
-            false,
-            false,
-            false,
+            CaseOptions::default(),
         ));
 
         // 5. --in-place=new with --as-new.
@@ -2470,12 +2497,7 @@ mod coordinator_argv_roundtrip {
                 "--as-new",
                 "/dst/single-new",
             ]),
-            false,
-            false,
-            None,
-            false,
-            false,
-            false,
+            CaseOptions::default(),
         ));
 
         // 6. --as-existing and --no-tcp-encryption with implicit xxh3-128 vs explicit transfer=off.
@@ -2492,12 +2514,7 @@ mod coordinator_argv_roundtrip {
                 "--as-existing",
                 "/dst/single-existing",
             ]),
-            false,
-            false,
-            None,
-            false,
-            false,
-            false,
+            CaseOptions::default(),
         ));
         record(round_trip_case(
             &os(&[
@@ -2513,15 +2530,13 @@ mod coordinator_argv_roundtrip {
                 "--into",
                 "/dst/off",
             ]),
-            false,
-            false,
-            None,
-            false,
-            false,
-            false,
+            CaseOptions::default(),
         ));
 
         // 7. Storage upload (server -> S3) and download (S3 -> server).
+        // Pass `--syq-path` / `--rsh` (upload) and `--no-bootstrap` (download)
+        // on the invoking command to confirm they are stripped on the storage
+        // coordinator's argv.
         record(round_trip_case(
             &os(&[
                 "cp",
@@ -2541,13 +2556,10 @@ mod coordinator_argv_roundtrip {
                 "--s3-write-header=cache-control: no-store",
                 "--resource-limits=bandwidth=5M,s3-requests=64,s3-objects=16,s3-parts-per-object=4",
                 "--performance-tuning=s3-part-size=8M",
+                "--syq-path=/opt/syq",
+                "--rsh=ssh -v",
             ]),
-            false,
-            false,
-            None,
-            false,
-            false,
-            false,
+            CaseOptions::default(),
         ));
         record(round_trip_case(
             &os(&[
@@ -2561,13 +2573,13 @@ mod coordinator_argv_roundtrip {
                 "--into",
                 "/data",
                 "--s3-retries=2",
+                "--no-bootstrap",
             ]),
-            true,
-            false,
-            None,
-            false,
-            true,
-            false,
+            CaseOptions {
+                coordinator_at_dst: true,
+                relay_results: true,
+                ..Default::default()
+            },
         ));
 
         // 8. Mapping forwarded on coordinator stdin (`--mapping=-`).
@@ -2582,25 +2594,36 @@ mod coordinator_argv_roundtrip {
                 "--into",
                 "/dst/mapped",
             ]),
-            false,
-            false,
-            None,
-            true,
-            false,
-            false,
+            CaseOptions {
+                mapping: true,
+                ..Default::default()
+            },
         ));
 
-        // 9. Relay-results + suppress-summary full round trip.
+        // 9. Relay-results + suppress-summary + default restricted-destination
+        // shape (`destination_path`, `peer_login_user`, `peer_connection_host`),
+        // which strips `--syq-path` and overrides the peer endpoint and path.
         record(round_trip_case(
             &os(&[
-                "cp", "--from", "hosta", "--src", "a", "--to", "hostb", "--into", "/dst",
+                "cp",
+                "--syq-path=/opt/syq",
+                "--from",
+                "hosta",
+                "--src",
+                "a",
+                "--to",
+                "bob@hostb:2222",
+                "--into",
+                "/dst/original",
             ]),
-            false,
-            false,
-            None,
-            false,
-            true,
-            true,
+            CaseOptions {
+                peer_login_user: Some("syq"),
+                peer_connection_host: Some("enrolled.internal"),
+                destination_path: Some(b"/enrolled/target"),
+                relay_results: true,
+                destination_results: true,
+                ..Default::default()
+            },
         ));
 
         // Verify short flags emitted for dry-run / quiet / verbose.
