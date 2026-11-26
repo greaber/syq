@@ -83,7 +83,7 @@ pub(super) fn shows_empty(
 ) -> bool {
     page.contents().is_empty()
         && page.common_prefixes().is_empty()
-        && page.is_truncated() != Some(true)
+        && page.is_truncated() == Some(false)
         && page.next_continuation_token().is_none()
 }
 
@@ -883,9 +883,8 @@ pub(super) fn listed(
     position: usize,
     key: &str,
 ) -> impl Future<Output = Listed> + Send + 'static {
-    let complete = complete
-        .map(|keys| in_complete(keys, key))
-        .or_else(|| in_empty(args, empty, key));
+    let complete = complete.map(|keys| in_complete(keys, key));
+    let empty_absent = in_empty(args, empty, key);
     let reached = discovery
         .filter(|_| complete.is_none())
         .map(|discovery| discovery.lookup(position));
@@ -895,7 +894,7 @@ pub(super) fn listed(
             Some(reached) => Some(reached.await),
             None => None,
         };
-        rely(complete, reached, trusted)
+        rely(complete, empty_absent, reached, trusted)
     }
 }
 
@@ -909,14 +908,18 @@ pub(super) fn known(
     position: usize,
     key: &str,
 ) -> Option<Listed> {
-    let complete = complete
-        .map(|keys| in_complete(keys, key))
-        .or_else(|| in_empty(args, empty, key));
+    let complete = complete.map(|keys| in_complete(keys, key));
+    let empty_absent = in_empty(args, empty, key);
     let reached = match discovery.filter(|_| complete.is_none()) {
         Some(discovery) => Some(discovery.known(position)?),
         None => None,
     };
-    Some(rely(complete, reached, trusts_listed_absence_of(args, key)))
+    Some(rely(
+        complete,
+        empty_absent,
+        reached,
+        trusts_listed_absence_of(args, key),
+    ))
 }
 
 /// Whether an absence the listing that follows the plan reports may be
@@ -949,12 +952,22 @@ fn in_complete(listed: &super::DestinationListing, key: &str) -> Listed {
 }
 
 /// Which answer to rely on, shared by `listed` and `known` so they agree.
-fn rely(complete: Option<Listed>, reached: Option<Listed>, trusted: bool) -> Listed {
-    match (complete, reached) {
-        (Some(listed), _) => listed,
-        (None, Some(Listed::Absent)) if !trusted => Listed::Unknown,
-        (None, Some(listed)) => listed,
-        (None, None) => Listed::Unknown,
+fn rely(
+    complete: Option<Listed>,
+    empty_absent: Option<Listed>,
+    reached: Option<Listed>,
+    trusted: bool,
+) -> Listed {
+    match (complete, reached, empty_absent) {
+        (Some(listed), _, _) => listed,
+        // A positive listing result from a concurrent listing always beats an
+        // earlier empty probe so an object that appeared after the probe is
+        // not treated as absent.
+        (None, Some(present @ Listed::Present(_)), _) => present,
+        (None, _, Some(absent)) => absent,
+        (None, Some(Listed::Absent), None) if !trusted => Listed::Unknown,
+        (None, Some(listed), None) => listed,
+        (None, None, None) => Listed::Unknown,
     }
 }
 impl Drop for Discovery {

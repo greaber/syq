@@ -473,6 +473,25 @@ async fn keep_relies_only_on_absence_no_order_could_hide() {
         presigned(&keep, Some(&complete), Some(&discovery), &plan).await,
         existing
     );
+    // If a concurrent listing sees an object that appeared after an empty
+    // probe, Present wins over the earlier empty probe (for both listed and
+    // known).
+    assert_eq!(
+        listed(&keep, None, Some("data/"), Some(&discovery), 0, &plan[0]).await,
+        Listed::Present(1)
+    );
+    assert_eq!(
+        known(&keep, None, Some("data/"), Some(&discovery), 0, &plan[0]),
+        Some(Listed::Present(1))
+    );
+    assert_eq!(
+        listed(&keep, None, Some("data/"), Some(&discovery), 10, &plan[10]).await,
+        Listed::Absent
+    );
+    assert_eq!(
+        known(&keep, None, Some("data/"), Some(&discovery), 10, &plan[10]),
+        Some(Listed::Absent)
+    );
 }
 
 #[test]
@@ -486,10 +505,9 @@ fn only_a_complete_empty_page_shows_a_prefix_empty() {
         .key_count(0)
         .build();
     assert!(shows_empty(&empty));
-    // A service that leaves out whether it truncated, with nothing to
-    // continue from, has listed everything.
-    assert!(shows_empty(&ListObjectsV2Output::builder().build()));
     for page in [
+        // Missing IsTruncated does not confirm completion; fall back to HEAD.
+        ListObjectsV2Output::builder().build(),
         ListObjectsV2Output::builder()
             .is_truncated(false)
             .contents(Object::builder().key("data/unrelated").size(1).build())
@@ -504,6 +522,7 @@ fn only_a_complete_empty_page_shows_a_prefix_empty() {
             .next_continuation_token("next")
             .build(),
         ListObjectsV2Output::builder()
+            .is_truncated(false)
             .common_prefixes(CommonPrefix::builder().prefix("data/dir/").build())
             .build(),
     ] {
