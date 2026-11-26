@@ -1386,3 +1386,75 @@ fn descriptor_notice_follows_selected_start_and_later_growth() {
     gate.begin_warming(10);
     assert_eq!(notices.load(Relaxed), 1);
 }
+
+#[test]
+fn transport_profile_scales_upward_retry_backoff_cap() {
+    for (profile, expected_cap) in [
+        (None, UPWARD_BACKOFF_MAX_DEFAULT),
+        (Some(TransportProfile::Tcp), UPWARD_BACKOFF_MAX_FAST),
+        (Some(TransportProfile::Local), UPWARD_BACKOFF_MAX_FAST),
+        (Some(TransportProfile::Ssh), UPWARD_BACKOFF_MAX_SSH),
+    ] {
+        let mut policy = Policy::refine(8, 1, 64);
+        if let Some(profile) = profile {
+            policy = policy.with_transport(profile);
+        }
+        assert_eq!(policy.upward_max_backoff_ticks(), expected_cap);
+        let mut observed = Vec::new();
+        for fails in 0..=PROBE_BACKOFF_MAX {
+            policy.fails[Direction::Up.index()] = fails;
+            observed.push(policy.retry_after(Direction::Up));
+        }
+        assert_eq!(
+            observed,
+            vec![
+                6,
+                12.min(expected_cap),
+                24.min(expected_cap),
+                48.min(expected_cap),
+            ]
+        );
+        policy.fails[Direction::Down.index()] = PROBE_BACKOFF_MAX;
+        assert_eq!(policy.retry_after(Direction::Down), DOWNWARD_BACKOFF_MAX);
+    }
+}
+
+#[test]
+fn driver_preserves_transport_backoff_across_policy_resets() {
+    struct NoopMeter;
+    impl Meter for NoopMeter {
+        fn bytes(&self) -> u64 {
+            0
+        }
+        fn files(&self) -> u64 {
+            0
+        }
+        fn set_active(&self, _: usize) {}
+    }
+
+    for limit_resources in [true, false] {
+        let gate = Gate::new(1);
+        gate.mark_ready(0);
+        if limit_resources {
+            assert!(gate.limit_resources(4));
+        }
+        let sched = Arc::new(Sched::new(4 << 20, 32 << 20));
+        if !limit_resources {
+            sched.request_worker_count(2);
+        }
+        let sched_done = sched.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            sched_done.scan_done();
+        });
+        let policy = run_with_interval(
+            Policy::new(1, 1, 8).with_transport(TransportProfile::Ssh),
+            gate.clone(),
+            sched,
+            Arc::new(NoopMeter),
+            |id| gate.mark_ready(id),
+            Duration::from_millis(10),
+        );
+        assert_eq!(policy.upward_max_backoff_ticks(), UPWARD_BACKOFF_MAX_SSH);
+    }
+}

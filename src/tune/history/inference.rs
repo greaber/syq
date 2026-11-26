@@ -31,6 +31,55 @@ struct PreparedSystem {
     lambda: f64,
 }
 
+#[derive(Clone, Copy)]
+enum CostModel {
+    Transport(crate::tune::TransportProfile),
+    #[cfg(test)]
+    Flat,
+}
+
+#[derive(Clone, Copy)]
+struct ConcurrencyCost {
+    low: f64,
+    knee: f64,
+    high: f64,
+}
+
+fn concurrency_cost(profile: crate::tune::TransportProfile) -> ConcurrencyCost {
+    use crate::tune::TransportProfile;
+    match profile {
+        TransportProfile::Ssh => ConcurrencyCost {
+            low: 0.08,
+            knee: 32.0,
+            high: 0.10,
+        },
+        TransportProfile::Tcp | TransportProfile::Local => ConcurrencyCost {
+            low: 0.08,
+            knee: 64.0,
+            high: 0.10,
+        },
+    }
+}
+
+fn above_floor_penalty(nf: f64, floor: f64, cost: CostModel) -> f64 {
+    match cost {
+        CostModel::Transport(profile) => {
+            let cost = concurrency_cost(profile);
+            let knee = cost.knee.max(floor);
+            if nf <= knee {
+                cost.low * (nf / floor).ln()
+            } else {
+                cost.low * (knee / floor).ln() + cost.high * (nf / knee).ln()
+            }
+        }
+        #[cfg(test)]
+        CostModel::Flat => {
+            const FLAT_CONCURRENCY_COST: f64 = 0.08;
+            FLAT_CONCURRENCY_COST * (nf / floor).ln()
+        }
+    }
+}
+
 impl PooledInference {
     fn push_run(&mut self, run: i64, decay: f64, evidence: RunEvidence) {
         let edges = evidence.edges();
@@ -74,10 +123,7 @@ impl PooledInference {
         })
     }
 
-    fn solve(self, specific: bool, default_start: usize) -> Option<Hint> {
-        /// Marginal log-rate cost per log-worker above the route default
-        /// (~5.7% per doubling) to stop noisy flat copies from ratcheting.
-        const CONCURRENCY_COST: f64 = 0.08;
+    fn solve(self, specific: bool, default_start: usize, cost: CostModel) -> Option<Hint> {
         const FLOOR_MARGIN: f64 = 0.03;
         let PreparedSystem {
             verts,
@@ -95,7 +141,7 @@ impl PooledInference {
         for (k, &n) in verts.iter().enumerate() {
             let nf = n as f64;
             let penalty = if nf >= floor {
-                CONCURRENCY_COST * (nf / floor).ln()
+                above_floor_penalty(nf, floor, cost)
             } else {
                 crate::tune::NEAR_BEST_TOLERANCE + FLOOR_MARGIN * (floor / nf).ln()
             };
@@ -295,6 +341,33 @@ pub(super) fn starting_count(
     key: &ContextKey,
     allow_route: bool,
     default_start: usize,
+    profile: crate::tune::TransportProfile,
+) -> Result<Option<Hint>> {
+    starting_count_with(
+        db,
+        key,
+        allow_route,
+        default_start,
+        CostModel::Transport(profile),
+    )
+}
+
+#[cfg(test)]
+pub(super) fn starting_count_flat(
+    db: &Connection,
+    key: &ContextKey,
+    allow_route: bool,
+    default_start: usize,
+) -> Result<Option<Hint>> {
+    starting_count_with(db, key, allow_route, default_start, CostModel::Flat)
+}
+
+fn starting_count_with(
+    db: &Connection,
+    key: &ContextKey,
+    allow_route: bool,
+    default_start: usize,
+    cost: CostModel,
 ) -> Result<Option<Hint>> {
     let exact = key.source_filesystem.is_some() && key.destination_filesystem.is_some();
     for specific in [true, false] {
@@ -358,7 +431,7 @@ pub(super) fn starting_count(
                 }
             }
         }
-        if let Some(hint) = pooled.solve(specific, default_start) {
+        if let Some(hint) = pooled.solve(specific, default_start, cost) {
             return Ok(Some(hint));
         }
     }
@@ -565,7 +638,13 @@ fn infer_run(events: &[Value]) -> Option<(usize, bool)> {
     }
     let mut pooled = PooledInference::default();
     pooled.push_run(1, 1.0, evidence);
-    pooled.solve(true, 1).map(|h| (h.workers, h.refine))
+    pooled
+        .solve(
+            true,
+            1,
+            CostModel::Transport(crate::tune::TransportProfile::Ssh),
+        )
+        .map(|h| (h.workers, h.refine))
 }
 
 #[cfg(test)]
@@ -608,7 +687,9 @@ mod tests {
         let mut capped = super::super::tests::key("a");
         capped.mode = activity_mode("compress=false;bandwidth=2097152".into(), true);
         let writer = record(&path, &capped, None, true, &[(2, 100.0), (4, 100.0)]);
-        assert!(writer.starting_count(&capped, true, 1).is_some());
+        assert!(writer
+            .starting_count(&capped, true, 1, crate::tune::TransportProfile::Ssh)
+            .is_some());
         for mode in [
             activity_mode("compress=false;bandwidth=0".into(), false),
             activity_mode("compress=false;bandwidth=4194304".into(), true),
@@ -619,7 +700,9 @@ mod tests {
                 mode,
                 ..capped.clone()
             };
-            assert!(writer.starting_count(&other, true, 1).is_none());
+            assert!(writer
+                .starting_count(&other, true, 1, crate::tune::TransportProfile::Ssh)
+                .is_none());
         }
         let uncapped = ContextKey {
             mode: activity_mode("compress=false;bandwidth=0".into(), false),
@@ -627,13 +710,19 @@ mod tests {
         };
         record(&path, &uncapped, None, true, &[(16, 100.0), (32, 200.0)]);
         assert_eq!(
-            writer.starting_count(&uncapped, true, 1).unwrap().workers,
+            writer
+                .starting_count(&uncapped, true, 1, crate::tune::TransportProfile::Ssh)
+                .unwrap()
+                .workers,
             32
         );
         // A newer capped plateau cannot vote down that uncapped starting count.
         record(&path, &capped, None, true, &[(2, 100.0), (4, 100.0)]);
         assert_eq!(
-            writer.starting_count(&uncapped, true, 1).unwrap().workers,
+            writer
+                .starting_count(&uncapped, true, 1, crate::tune::TransportProfile::Ssh)
+                .unwrap()
+                .workers,
             32
         );
     }
@@ -696,7 +785,9 @@ mod tests {
             );
             let next = super::super::tests::recorder(&path);
             assert_eq!(
-                next.starting_count(&key, false, 1).unwrap().workers,
+                next.starting_count(&key, false, 1, crate::tune::TransportProfile::Ssh)
+                    .unwrap()
+                    .workers,
                 8,
                 "the next copy must retain the window that justified rollback"
             );
@@ -784,7 +875,9 @@ mod tests {
             json!({"active":16,"seconds":0.5,"rate":20.0,"usable":true}),
         );
         writer.complete(true, json!({}));
-        assert!(writer.starting_count(&key, false, 1).is_none());
+        assert!(writer
+            .starting_count(&key, false, 1, crate::tune::TransportProfile::Ssh)
+            .is_none());
     }
 
     #[test]
@@ -859,10 +952,18 @@ mod tests {
         let db = Connection::open(&path).unwrap();
         db.execute("UPDATE runs SET eligible=2,summary=?1", [old.to_string()])
             .unwrap();
-        assert!(writer.starting_count(&key, false, 1).is_none());
+        assert!(writer
+            .starting_count(&key, false, 1, crate::tune::TransportProfile::Ssh)
+            .is_none());
         assert_eq!(command::read_run(&db, 1).unwrap()["summary"], old);
         let current = record(&path, &key, None, true, &[(8, 100.0), (16, 200.0)]);
-        assert_eq!(current.starting_count(&key, false, 1).unwrap().workers, 16);
+        assert_eq!(
+            current
+                .starting_count(&key, false, 1, crate::tune::TransportProfile::Ssh)
+                .unwrap()
+                .workers,
+            16
+        );
         // The historical recommendation query also excludes the new marker.
         assert_eq!(
             db.query_row("SELECT count(*) FROM runs WHERE eligible=1", [], |r| r
@@ -879,10 +980,18 @@ mod tests {
         let key = super::super::tests::key("a");
         for cap in [None, Some(1)] {
             let single = record(&path, &key, cap, true, &[(1, 100.0)]);
-            assert!(single.starting_count(&key, false, 1).is_none());
+            assert!(single
+                .starting_count(&key, false, 1, crate::tune::TransportProfile::Ssh)
+                .is_none());
         }
         let rising = record(&path, &key, Some(8), true, &[(4, 100.0), (8, 200.0)]);
-        assert_eq!(rising.starting_count(&key, false, 1).unwrap().workers, 8);
+        assert_eq!(
+            rising
+                .starting_count(&key, false, 1, crate::tune::TransportProfile::Ssh)
+                .unwrap()
+                .workers,
+            8
+        );
         record(
             &path,
             &key,
@@ -893,7 +1002,13 @@ mod tests {
         // Newer rising evidence at a lower ceiling does not oppose 16.
         for _ in 0..4 {
             let capped = record(&path, &key, Some(8), true, &[(4, 100.0), (8, 200.0)]);
-            assert_eq!(capped.starting_count(&key, false, 1).unwrap().workers, 16);
+            assert_eq!(
+                capped
+                    .starting_count(&key, false, 1, crate::tune::TransportProfile::Ssh)
+                    .unwrap()
+                    .workers,
+                16
+            );
         }
         // Newer comparisons showing contention across the previously fast counts
         // step the start down even with an explicit cap of 32: two reversing
@@ -917,7 +1032,10 @@ mod tests {
                 &[(4, 200.0), (8, 100.0), (16, 50.0)],
             );
             assert_eq!(
-                below.starting_count(&key, false, 1).unwrap().workers,
+                below
+                    .starting_count(&key, false, 1, crate::tune::TransportProfile::Ssh)
+                    .unwrap()
+                    .workers,
                 expected
             );
         }
@@ -934,20 +1052,34 @@ mod tests {
                 let recent = record(&path, &key, new_cap, true, &[(4, 100.0), (8, 200.0)]);
                 // Fresh evidence at 64 is still valuable even if newer work
                 // stopped at 8 without trying higher counts.
-                assert_eq!(recent.starting_count(&key, false, 1).unwrap().workers, 64);
+                assert_eq!(
+                    recent
+                        .starting_count(&key, false, 1, crate::tune::TransportProfile::Ssh)
+                        .unwrap()
+                        .workers,
+                    64
+                );
                 let db = Connection::open(&path).unwrap();
                 db.execute("UPDATE runs SET day=day-42 WHERE id=1", [])
                     .unwrap();
                 // Only the evidence age changed. An old high lower bound must
                 // not veto every lower candidate until it leaves the window.
                 assert_eq!(
-                    recent.starting_count(&key, false, 1).unwrap().workers,
+                    recent
+                        .starting_count(&key, false, 1, crate::tune::TransportProfile::Ssh)
+                        .unwrap()
+                        .workers,
                     8,
                     "old_cap={old_cap:?}, new_cap={new_cap:?}"
                 );
                 for _ in 0..4 {
                     let more = record(&path, &key, new_cap, true, &[(4, 100.0), (8, 200.0)]);
-                    assert_eq!(more.starting_count(&key, false, 1).unwrap().workers, 8);
+                    assert_eq!(
+                        more.starting_count(&key, false, 1, crate::tune::TransportProfile::Ssh)
+                            .unwrap()
+                            .workers,
+                        8
+                    );
                 }
             }
         }
@@ -981,11 +1113,20 @@ mod tests {
             short.complete(true, json!({}));
         }
         let fixed = record(&path, &key, None, false, &[(2, 100.0), (4, 200.0)]);
-        assert_eq!(fixed.starting_count(&key, false, 1).unwrap().workers, 16);
+        assert_eq!(
+            fixed
+                .starting_count(&key, false, 1, crate::tune::TransportProfile::Ssh)
+                .unwrap()
+                .workers,
+            16
+        );
         let mut route_key = key.clone();
         route_key.destination_filesystem = Some("new filesystem".into());
         assert_eq!(
-            fixed.starting_count(&route_key, true, 1).unwrap().workers,
+            fixed
+                .starting_count(&route_key, true, 1, crate::tune::TransportProfile::Ssh)
+                .unwrap()
+                .workers,
             16
         );
     }
@@ -1045,7 +1186,7 @@ mod tests {
         drop(writer);
         let reader = Connection::open(&path).unwrap();
         assert_eq!(
-            starting_count(&reader, &key, false, 1)
+            starting_count(&reader, &key, false, 1, crate::tune::TransportProfile::Ssh,)
                 .unwrap()
                 .unwrap()
                 .workers,
@@ -1073,7 +1214,7 @@ mod tests {
         // Diagnostic JSON and summaries are not part of the inference query.
         db.execute("DROP TABLE events", []).unwrap();
         assert_eq!(
-            starting_count(&db, &key, false, 1)
+            starting_count(&db, &key, false, 1, crate::tune::TransportProfile::Ssh)
                 .unwrap()
                 .unwrap()
                 .workers,
@@ -1082,7 +1223,7 @@ mod tests {
         db.execute("UPDATE runs SET summary=?1", [" ".repeat(65537)])
             .unwrap();
         assert_eq!(
-            starting_count(&db, &key, false, 1)
+            starting_count(&db, &key, false, 1, crate::tune::TransportProfile::Ssh)
                 .unwrap()
                 .unwrap()
                 .workers,
@@ -1100,13 +1241,21 @@ mod tests {
         let run = command::read_run(&db, 1).unwrap();
         assert_eq!(run["recommendation_eligible"], true);
         assert!(run.get("selected_workers").is_none());
-        assert_eq!(writer.starting_count(&key, false, 1).unwrap().workers, 16);
+        assert_eq!(
+            writer
+                .starting_count(&key, false, 1, crate::tune::TransportProfile::Ssh)
+                .unwrap()
+                .workers,
+            16
+        );
         // Earlier writers used 0 (no evidence), 1 (recommendation), or 2
         // (measurement totals, with bounds added in 3). None is backfilled.
         for old_eligibility in [0, 1, 2, 3] {
             db.execute("UPDATE runs SET eligible=?1", [old_eligibility])
                 .unwrap();
-            assert!(writer.starting_count(&key, false, 1).is_none());
+            assert!(writer
+                .starting_count(&key, false, 1, crate::tune::TransportProfile::Ssh)
+                .is_none());
             let run = command::read_run(&db, 1).unwrap();
             assert_eq!(run["recommendation_eligible"], false);
             assert_eq!(run["summary"], json!({}));
@@ -1224,7 +1373,13 @@ mod tests {
             }
         }
         writer.complete(true, json!({}));
-        assert_eq!(writer.starting_count(&key, false, 1).unwrap().workers, 32);
+        assert_eq!(
+            writer
+                .starting_count(&key, false, 1, crate::tune::TransportProfile::Ssh)
+                .unwrap()
+                .workers,
+            32
+        );
     }
 
     #[test]
@@ -1255,7 +1410,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            misleading.starting_count(&key, false, 1).unwrap().workers,
+            misleading
+                .starting_count(&key, false, 1, crate::tune::TransportProfile::Ssh)
+                .unwrap()
+                .workers,
             16
         );
     }
@@ -1320,12 +1478,20 @@ mod tests {
             true,
             &[(1, 100.0), (2, 100.0), (4, 100.0), (8, 100.0), (16, 100.0)],
         );
-        assert_eq!(flat.starting_count(&key, false, 8).unwrap().workers, 8);
+        assert_eq!(
+            flat.starting_count(&key, false, 8, crate::tune::TransportProfile::Ssh)
+                .unwrap()
+                .workers,
+            8
+        );
 
         let path2 = temp.path().join("history2.sqlite");
         let contention = record(&path2, &key, None, true, &[(4, 200.0), (8, 100.0)]);
         assert_eq!(
-            contention.starting_count(&key, false, 8).unwrap().workers,
+            contention
+                .starting_count(&key, false, 8, crate::tune::TransportProfile::Ssh)
+                .unwrap()
+                .workers,
             4
         );
     }
@@ -1365,9 +1531,10 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
         assert!(max_diff < 1e-6, "max_diff={max_diff}");
-        assert_eq!(pool_128.solve(true, 1).unwrap().workers, 255);
-        assert_eq!(build_pool(256).solve(true, 1).unwrap().workers, 256);
-        assert_eq!(build_pool(383).solve(true, 1).unwrap().workers, 383);
+        let ssh = CostModel::Transport(crate::tune::TransportProfile::Ssh);
+        assert_eq!(pool_128.solve(true, 1, ssh).unwrap().workers, 255);
+        assert_eq!(build_pool(256).solve(true, 1, ssh).unwrap().workers, 256);
+        assert_eq!(build_pool(383).solve(true, 1, ssh).unwrap().workers, 383);
     }
 
     #[test]
@@ -1379,7 +1546,13 @@ mod tests {
             record(&path, &key, None, true, &[(64, 100.0), (128, 100.0)]);
         }
         let writer = record(&path, &key, None, true, &[(64, 100.0), (128, 100.0)]);
-        assert_eq!(writer.starting_count(&key, false, 8).unwrap().workers, 64);
+        assert_eq!(
+            writer
+                .starting_count(&key, false, 8, crate::tune::TransportProfile::Ssh)
+                .unwrap()
+                .workers,
+            64
+        );
         let healing = &[
             (64, 100.0),
             (32, 100.0),
@@ -1391,6 +1564,81 @@ mod tests {
             record(&path, &key, None, true, healing);
         }
         let writer = record(&path, &key, None, true, healing);
-        assert_eq!(writer.starting_count(&key, false, 8).unwrap().workers, 12);
+        assert_eq!(
+            writer
+                .starting_count(&key, false, 8, crate::tune::TransportProfile::Ssh)
+                .unwrap()
+                .workers,
+            12
+        );
+    }
+
+    #[test]
+    fn two_zone_concurrency_cost_scales_by_transport_and_high_zone_knee() {
+        use crate::tune::TransportProfile;
+
+        // Between the SSH knee (32) and the TCP/local knee (64), a +6.5%/doubling
+        // gain (elasticity ~0.0909) clears low=0.08 (~+5.7%) for Tcp/Local while
+        // staying below Ssh's high=0.10 (~+7.2%).
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("mid_band.sqlite");
+        let key = super::super::tests::key("a");
+        let writer = record(&path, &key, None, true, &[(32, 100.0), (64, 106.5)]);
+        assert_eq!(
+            writer
+                .starting_count(&key, false, 16, TransportProfile::Tcp)
+                .unwrap()
+                .workers,
+            64
+        );
+        assert_eq!(
+            writer
+                .starting_count(&key, false, 16, TransportProfile::Local)
+                .unwrap()
+                .workers,
+            64
+        );
+        assert_eq!(
+            writer
+                .starting_count(&key, false, 8, TransportProfile::Ssh)
+                .unwrap()
+                .workers,
+            32
+        );
+
+        // Above 64 (64 -> 128), both Tcp and Ssh are in high=0.10 (~+7.2%/dbl):
+        // +6.5%/doubling is rejected while +8%/doubling and +10%/doubling pass.
+        for profile in [TransportProfile::Ssh, TransportProfile::Tcp] {
+            for (gain, expected) in [(1.065, 64), (1.08, 128), (1.10, 128)] {
+                let p = temp.path().join(format!("upper_{profile:?}_{gain}.sqlite"));
+                let w = record(&p, &key, None, true, &[(64, 100.0), (128, 100.0 * gain)]);
+                assert_eq!(
+                    w.starting_count(&key, false, 8, profile).unwrap().workers,
+                    expected,
+                    "profile={profile:?} gain={gain}"
+                );
+            }
+        }
+
+        // Continuity at the knee and floor >= knee behavior.
+        let ssh_cost = concurrency_cost(TransportProfile::Ssh);
+        let p_left = above_floor_penalty(
+            32.0 - 1e-6,
+            8.0,
+            CostModel::Transport(TransportProfile::Ssh),
+        );
+        let p_right = above_floor_penalty(
+            32.0 + 1e-6,
+            8.0,
+            CostModel::Transport(TransportProfile::Ssh),
+        );
+        assert!((p_right - p_left).abs() < 1e-5, "{p_left} vs {p_right}");
+        assert!((ssh_cost.knee - 32.0).abs() < 1e-9);
+        assert!(
+            (above_floor_penalty(128.0, 64.0, CostModel::Transport(TransportProfile::Ssh))
+                - 0.10 * 2.0_f64.ln())
+            .abs()
+                < 1e-12
+        );
     }
 }

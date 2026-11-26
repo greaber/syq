@@ -27,8 +27,8 @@ impl Trace {
             "step":STEP,"startup_step":STARTUP_STEP,"file_credit":FILE_CREDIT,"probe_every":PROBE_EVERY,
             "probe_backoff_max":PROBE_BACKOFF_MAX,"evidence_max_age":EVIDENCE_MAX_AGE,
             "clock_unit":if policy.wall_clock {"elapsed_sample_intervals"} else {"accepted_measurements"},
-            "upward_max_wait_ms":policy.wall_clock.then_some(interval.as_millis()*12),
-            "downward_max_wait_ms":policy.wall_clock.then_some(interval.as_millis()*24),"observation_ms":policy.wall_clock.then_some(interval.as_millis().min(500)),
+            "upward_max_wait_ms":policy.wall_clock.then_some(interval.as_millis()*policy.upward_max_backoff_ticks() as u128),
+            "downward_max_wait_ms":policy.wall_clock.then_some(interval.as_millis()*DOWNWARD_BACKOFF_MAX as u128),"observation_ms":policy.wall_clock.then_some(interval.as_millis().min(500)),
             "collapse_fraction":0.5,"collapse_samples":2}));
         trace
     }

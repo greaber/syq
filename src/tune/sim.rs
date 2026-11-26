@@ -490,7 +490,8 @@ fn report() {
             for run in remembered.iter_mut() {
                 // Start each copy as production does, from the recorded history.
                 let writer = history::tests::recorder(&path);
-                let next = match writer.starting_count(&key, false, s.start) {
+                let next = match writer.starting_count(&key, false, s.start, TransportProfile::Ssh)
+                {
                     Some(hint) if hint.refine => Policy::refine(hint.workers, 1, LIMIT),
                     Some(hint) => Policy::new(hint.workers, 1, LIMIT),
                     None => Policy::new(s.start, 1, LIMIT),
@@ -515,7 +516,7 @@ fn report() {
                 }
                 writer.complete(true, serde_json::json!({}));
                 let count = writer
-                    .starting_count(&key, false, s.start)
+                    .starting_count(&key, false, s.start, TransportProfile::Ssh)
                     .map_or(s.start, |hint| hint.workers);
                 run.push(count as f64);
             }
@@ -873,7 +874,7 @@ fn noisy_flat_copies_do_not_ratchet_across_repeated_runs() {
         let mut last = s.start;
         for _ in 0..20 {
             let writer = history::tests::recorder(&path);
-            let policy = match writer.starting_count(&key, false, s.start) {
+            let policy = match writer.starting_count(&key, false, s.start, TransportProfile::Ssh) {
                 Some(hint) => {
                     last = hint.workers;
                     if hint.refine {
@@ -931,13 +932,13 @@ fn flat_large_file_history_does_not_slow_later_small_file_copies() {
         for _ in 0..5 {
             let writer = history::tests::recorder(&path);
             let start = writer
-                .starting_count(&key, false, super::START_SSH)
+                .starting_count(&key, false, super::START_SSH, TransportProfile::Ssh)
                 .map_or(super::START_SSH, |h| h.workers);
             let out = copy(&flat, Policy::new(start, 1, 64), &mut rng);
             record_sqlite_observations(&writer, &key, &out.observations);
         }
         let next_start = history::tests::recorder(&path)
-            .starting_count(&key, false, super::START_SSH)
+            .starting_count(&key, false, super::START_SSH, TransportProfile::Ssh)
             .map_or(super::START_SSH, |h| h.workers);
         starts.push(next_start as f64);
         let out = copy(&small_files, Policy::new(next_start, 1, 64), &mut rng);
@@ -951,4 +952,498 @@ fn flat_large_file_history_does_not_slow_later_small_file_copies() {
         med_start >= super::START_SSH as f64 && med_settled >= 16.0 && p90_slowdown < 15.0,
         "med_start={med_start} med_settled={med_settled} p90_slowdown={p90_slowdown:.2}%"
     );
+}
+
+#[derive(Clone, Copy)]
+enum MultiCurve {
+    Knee {
+        per_worker: f64,
+        cap: f64,
+    },
+    Gentle {
+        ref_n: f64,
+        base_rate: f64,
+        gain_per_dbl: f64,
+        max_n: f64,
+    },
+}
+
+const MULTI_LIMIT: usize = 256;
+
+impl MultiCurve {
+    fn rate(self, n: usize) -> f64 {
+        let n = n as f64;
+        match self {
+            MultiCurve::Knee { per_worker, cap } => (n * per_worker).min(cap),
+            MultiCurve::Gentle {
+                ref_n,
+                base_rate,
+                gain_per_dbl,
+                max_n,
+            } => base_rate * (n.min(max_n) / ref_n).powf(gain_per_dbl.log2()),
+        }
+    }
+
+    fn best(self) -> f64 {
+        (1..=MULTI_LIMIT).map(|n| self.rate(n)).fold(0.0, f64::max)
+    }
+}
+
+struct MultiCopyOutcome {
+    slowdown_pct: f64,
+    avg_conn: f64,
+    handshakes: f64,
+    observations: Vec<(usize, f64, f64)>,
+}
+
+fn multi_copy(
+    curve: MultiCurve,
+    ideal_secs: f64,
+    sigma: f64,
+    rho: f64,
+    setup_secs: f64,
+    mut policy: Policy,
+    rng: &mut Rng,
+) -> MultiCopyOutcome {
+    let total = curve.best() * ideal_secs;
+    let (mut t, mut done) = (0.0f64, 0.0f64);
+    let mut active = policy.active();
+    let mut connections = vec![0.0f64; active];
+    let mut open = active;
+    let mut handshakes = active;
+    let mut connection_secs = 0.0;
+    let mut evidence = evidence::Evidence::default();
+    let (mut sample_start, mut sample_bytes) = (0.0f64, 0.0f64);
+    let mut noise_end = SAMPLE_SECS;
+    let (mut ideal_done, mut ideal_elapsed) = (0.0, None);
+    let mut last_rate: Option<f64> = None;
+    let mut observations = Vec::new();
+    let mut drift = rng.normal();
+    let mut noise = (sigma * drift - 0.5 * sigma * sigma).exp();
+
+    for _ in 0..1_000_000 {
+        assert!(t < 1_000_000.0, "multi_copy deadline");
+        policy.advance_time(Duration::from_secs_f64(t), SAMPLE);
+        let needs = last_rate.map_or(0.0, |rate| rate * SAMPLE_SECS * MEASUREMENT_SAMPLES);
+        let lead = Duration::from_secs_f64(setup_secs * 2.0 + 1.0);
+        let wanted = {
+            let plan = policy.connection_plan(
+                &evidence,
+                SAMPLE,
+                Duration::from_secs_f64(t - sample_start),
+                lead,
+                total - done >= needs + last_rate.unwrap_or(0.0) * lead.as_secs_f64(),
+            );
+            open.min(plan.keep.max(plan.connect).max(active))
+                .max(plan.connect)
+                .max(active)
+        };
+        handshakes += wanted.saturating_sub(open);
+        connections.resize(wanted, t + setup_secs);
+        open = wanted;
+        if policy.n < active {
+            active = policy.n;
+            policy.activated();
+            evidence.clear();
+            (sample_start, sample_bytes) = (t, 0.0);
+            continue;
+        }
+        let tail_blocks_increase = policy.n > active
+            && matches!(policy.state, State::Explore { .. })
+            && total - done < needs;
+        if tail_blocks_increase {
+            policy.cancel_unapplied();
+            if policy.n <= active {
+                continue;
+            }
+        }
+        let ready_at = (policy.n > active && !tail_blocks_increase)
+            .then(|| connections[..policy.n].iter().copied().fold(t, f64::max));
+
+        let sample_end = sample_start + 0.5;
+        let until = ready_at
+            .map_or(sample_end, |ready| ready.min(sample_end))
+            .min(noise_end)
+            .min(((t / 0.25).floor() + 1.0) * 0.25);
+
+        let rate = curve.rate(active) * noise;
+        let dt = (until - t).max(0.0).min((total - done) / rate);
+        let ideal_rate = curve.best() * noise;
+        if ideal_elapsed.is_none() && ideal_done + ideal_rate * dt >= total {
+            ideal_elapsed = Some(t + (total - ideal_done) / ideal_rate);
+        }
+        ideal_done += ideal_rate * dt;
+        done += rate * dt;
+        sample_bytes += rate * dt;
+        connection_secs += open as f64 * dt;
+        t += dt;
+        if done >= total {
+            let ideal = ideal_elapsed.unwrap_or(t);
+            return MultiCopyOutcome {
+                slowdown_pct: 100.0 * (t / ideal - 1.0),
+                avg_conn: connection_secs / t,
+                handshakes: handshakes as f64,
+                observations,
+            };
+        }
+        if t >= noise_end {
+            drift = rho * drift + (1.0 - rho * rho).sqrt() * rng.normal();
+            noise = (sigma * drift - 0.5 * sigma * sigma).exp();
+            noise_end += SAMPLE_SECS;
+        }
+        if ready_at.is_some_and(|ready| ready <= t) {
+            active = policy.n;
+            policy.activated();
+            evidence.clear();
+            (sample_start, sample_bytes) = (t, 0.0);
+            continue;
+        }
+        if t < sample_end {
+            continue;
+        }
+        if tail_blocks_increase {
+            (sample_start, sample_bytes) = (t, 0.0);
+            continue;
+        }
+        let seconds = t - sample_start;
+        let measured = sample_bytes / seconds;
+        (sample_start, sample_bytes) = (t, 0.0);
+        last_rate = Some(measured);
+        let enough = total - done >= measured * SAMPLE_SECS * MEASUREMENT_SAMPLES;
+        if enough {
+            observations.push((active, measured, seconds));
+        }
+        if policy.n > active && !enough {
+            policy.cancel_unapplied();
+            evidence.clear();
+            continue;
+        }
+        let base = if policy.n == active {
+            policy.probe_base()
+        } else {
+            None
+        };
+        if let Some(score) = evidence.push(measured, seconds, base.unwrap_or_default()) {
+            evidence.clear();
+            if policy.n > active {
+                policy.refresh_warming_baseline(score.rate);
+            } else {
+                policy.observe(score.rate);
+            }
+        }
+    }
+    unreachable!()
+}
+
+#[test]
+fn tcp_flat_copies_stay_bounded_and_shallow_gains_scale() {
+    let key = history::tests::key("a");
+    let flat_curve = MultiCurve::Knee {
+        per_worker: 100.0,
+        cap: 100.0,
+    };
+    let gentle_curve = MultiCurve::Gentle {
+        ref_n: 16.0,
+        base_rate: 100.0,
+        gain_per_dbl: 1.05,
+        max_n: 64.0,
+    };
+    let mut flat_starts = Vec::new();
+    let mut gentle_starts = Vec::new();
+    for seed in 0..25 {
+        for (curve, out_vec) in [
+            (flat_curve, &mut flat_starts),
+            (gentle_curve, &mut gentle_starts),
+        ] {
+            let mut rng = Rng(seed + 0x1234);
+            let temp = crate::test_support::tempdir().unwrap();
+            let path = temp.path().join("history.sqlite");
+            let mut last = START_TCP;
+            for _ in 0..20 {
+                let writer = history::tests::recorder(&path);
+                let policy =
+                    match writer.starting_count(&key, false, START_TCP, TransportProfile::Tcp) {
+                        Some(hint) => {
+                            last = hint.workers;
+                            if hint.refine {
+                                Policy::refine(hint.workers, 1, MULTI_LIMIT)
+                            } else {
+                                Policy::new(hint.workers, 1, MULTI_LIMIT)
+                            }
+                        }
+                        None => Policy::new(START_TCP, 1, MULTI_LIMIT),
+                    }
+                    .with_transport(TransportProfile::Tcp);
+                let out = multi_copy(curve, 40.0, 0.05, 0.5, 0.05, policy, &mut rng);
+                record_sqlite_observations(&writer, &key, &out.observations);
+            }
+            out_vec.push(last as f64);
+        }
+    }
+    let flat_p90 = quantile(&mut flat_starts, 0.9);
+    let gentle_med = quantile(&mut gentle_starts, 0.5);
+    assert!(flat_p90 <= 64.0, "flat_p90={flat_p90}");
+    assert!(gentle_med >= 32.0, "gentle_med={gentle_med}");
+}
+
+#[test]
+#[ignore = "prints before-vs-after transport-aware multi-run comparison; run explicitly"]
+fn transport_aware_report() {
+    const SEEDS: u64 = 40;
+    const COPIES: usize = 20;
+    let scenarios = [
+        (
+            "ssh flat 5%",
+            TransportProfile::Ssh,
+            START_SSH,
+            0.8,
+            0.05,
+            MultiCurve::Knee {
+                per_worker: 100.0,
+                cap: 100.0,
+            },
+        ),
+        (
+            "ssh flat 12%",
+            TransportProfile::Ssh,
+            START_SSH,
+            0.8,
+            0.12,
+            MultiCurve::Knee {
+                per_worker: 100.0,
+                cap: 100.0,
+            },
+        ),
+        (
+            "ssh knee 12",
+            TransportProfile::Ssh,
+            START_SSH,
+            0.8,
+            0.05,
+            MultiCurve::Knee {
+                per_worker: 10.0,
+                cap: 120.0,
+            },
+        ),
+        (
+            "ssh knee 32",
+            TransportProfile::Ssh,
+            START_SSH,
+            0.8,
+            0.05,
+            MultiCurve::Knee {
+                per_worker: 4.0,
+                cap: 128.0,
+            },
+        ),
+        (
+            "ssh knee 64",
+            TransportProfile::Ssh,
+            START_SSH,
+            0.8,
+            0.05,
+            MultiCurve::Knee {
+                per_worker: 2.0,
+                cap: 128.0,
+            },
+        ),
+        (
+            "ssh gentle +10%/dbl (8->64)",
+            TransportProfile::Ssh,
+            START_SSH,
+            0.8,
+            0.05,
+            MultiCurve::Gentle {
+                ref_n: 8.0,
+                base_rate: 100.0,
+                gain_per_dbl: 1.10,
+                max_n: 64.0,
+            },
+        ),
+        (
+            "tcp flat 5%",
+            TransportProfile::Tcp,
+            START_TCP,
+            0.05,
+            0.05,
+            MultiCurve::Knee {
+                per_worker: 100.0,
+                cap: 100.0,
+            },
+        ),
+        (
+            "tcp flat 12%",
+            TransportProfile::Tcp,
+            START_TCP,
+            0.05,
+            0.12,
+            MultiCurve::Knee {
+                per_worker: 100.0,
+                cap: 100.0,
+            },
+        ),
+        (
+            "tcp gentle +5%/dbl (16->64)",
+            TransportProfile::Tcp,
+            START_TCP,
+            0.05,
+            0.05,
+            MultiCurve::Gentle {
+                ref_n: 16.0,
+                base_rate: 100.0,
+                gain_per_dbl: 1.05,
+                max_n: 64.0,
+            },
+        ),
+        (
+            "tcp gentle +10%/dbl (16->128)",
+            TransportProfile::Tcp,
+            START_TCP,
+            0.05,
+            0.05,
+            MultiCurve::Gentle {
+                ref_n: 16.0,
+                base_rate: 100.0,
+                gain_per_dbl: 1.10,
+                max_n: 128.0,
+            },
+        ),
+        (
+            "tcp knee 32",
+            TransportProfile::Tcp,
+            START_TCP,
+            0.05,
+            0.05,
+            MultiCurve::Knee {
+                per_worker: 4.0,
+                cap: 128.0,
+            },
+        ),
+        (
+            "tcp knee 64",
+            TransportProfile::Tcp,
+            START_TCP,
+            0.05,
+            0.05,
+            MultiCurve::Knee {
+                per_worker: 2.0,
+                cap: 128.0,
+            },
+        ),
+        (
+            "tcp knee 128",
+            TransportProfile::Tcp,
+            START_TCP,
+            0.05,
+            0.05,
+            MultiCurve::Knee {
+                per_worker: 2.0,
+                cap: 256.0,
+            },
+        ),
+        (
+            "local flat 5%",
+            TransportProfile::Local,
+            START_LOCAL,
+            0.01,
+            0.05,
+            MultiCurve::Knee {
+                per_worker: 100.0,
+                cap: 100.0,
+            },
+        ),
+        (
+            "local knee 64",
+            TransportProfile::Local,
+            START_LOCAL,
+            0.01,
+            0.05,
+            MultiCurve::Knee {
+                per_worker: 2.0,
+                cap: 128.0,
+            },
+        ),
+    ];
+
+    println!(
+        "\n{:<30} {:<4} | {:>7} {:>7} {:>8} {:>8} {:>7}",
+        "scenario", "mode", "start50", "start90", "slow50%", "avg_conn", "hs50"
+    );
+    println!("{}", "-".repeat(80));
+
+    let key = history::tests::key("a");
+    for &(name, profile, default_start, setup_secs, sigma, curve) in &scenarios {
+        for is_new in [false, true] {
+            let mut starts20 = Vec::with_capacity(SEEDS as usize);
+            let mut per_copy_slow: Vec<Vec<f64>> = (0..COPIES)
+                .map(|_| Vec::with_capacity(SEEDS as usize))
+                .collect();
+            let mut per_copy_conn: Vec<Vec<f64>> = (0..COPIES)
+                .map(|_| Vec::with_capacity(SEEDS as usize))
+                .collect();
+            let mut per_copy_hs: Vec<Vec<f64>> = (0..COPIES)
+                .map(|_| Vec::with_capacity(SEEDS as usize))
+                .collect();
+            for seed in 0..SEEDS {
+                let mut rng = Rng(seed + 0x9e37);
+                let temp = crate::test_support::tempdir().unwrap();
+                let path = temp.path().join("history.sqlite");
+                let mut last = default_start;
+                for c in 0..COPIES {
+                    let writer = history::tests::recorder(&path);
+                    let hint = if is_new {
+                        writer.starting_count(&key, false, default_start, profile)
+                    } else {
+                        writer.starting_count_flat(&key, false, default_start)
+                    };
+                    let mut policy = match hint {
+                        Some(hint) => {
+                            last = hint.workers;
+                            if hint.refine {
+                                Policy::refine(hint.workers, 1, MULTI_LIMIT)
+                            } else {
+                                Policy::new(hint.workers, 1, MULTI_LIMIT)
+                            }
+                        }
+                        None => Policy::new(default_start, 1, MULTI_LIMIT),
+                    };
+                    if is_new {
+                        policy = policy.with_transport(profile);
+                    }
+                    let out = multi_copy(curve, 40.0, sigma, 0.5, setup_secs, policy, &mut rng);
+                    record_sqlite_observations(&writer, &key, &out.observations);
+                    per_copy_slow[c].push(out.slowdown_pct);
+                    per_copy_conn[c].push(out.avg_conn);
+                    per_copy_hs[c].push(out.handshakes);
+                }
+                starts20.push(last as f64);
+            }
+            let slow50_mean = per_copy_slow[5..COPIES]
+                .iter_mut()
+                .map(|v| quantile(v, 0.5))
+                .sum::<f64>()
+                / (COPIES - 5) as f64;
+            let avg_conn_mean = per_copy_conn[5..COPIES]
+                .iter()
+                .map(|v| v.iter().sum::<f64>() / v.len() as f64)
+                .sum::<f64>()
+                / (COPIES - 5) as f64;
+            let mut hs_slice: Vec<f64> = per_copy_hs[5..COPIES]
+                .iter_mut()
+                .map(|v| quantile(v, 0.5))
+                .collect();
+            let hs50_med = quantile(&mut hs_slice, 0.5);
+            println!(
+                "{:<30} {:<4} | {:>7.0} {:>7.0} {:>7.2}% {:>8.1} {:>7.0}",
+                name,
+                if is_new { "new" } else { "old" },
+                quantile(&mut starts20, 0.5),
+                quantile(&mut starts20, 0.9),
+                slow50_mean,
+                avg_conn_mean,
+                hs50_med,
+            );
+        }
+        println!();
+    }
 }
