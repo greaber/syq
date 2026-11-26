@@ -350,19 +350,10 @@ impl Policy {
                 .saturating_sub(self.tick)
                 .max(1),
         };
-        // A nearest measured bound can make the next step larger than STEP.
+        // A nearest measured bound can make the next step larger than STEP;
+        // narrow non-declining upper bounds fall back to upward_step().
         // Ignore score-based suppression: a new measurement can change it.
-        let candidate = self
-            .points
-            .range((
-                std::ops::Bound::Excluded(self.n),
-                std::ops::Bound::Included(self.max),
-            ))
-            .next()
-            .map_or_else(
-                || self.upward_step(),
-                |(&upper, _)| self.n + (upper - self.n).div_ceil(2),
-            );
+        let (candidate, _) = self.upward_candidate();
         (
             required,
             (candidate > required).then_some((candidate, ticks)),
@@ -567,6 +558,43 @@ impl Policy {
         }
     }
 
+    /// Candidate for the next upward experiment ignoring fresh-rejection
+    /// suppression, shared by `connection_forecast` and `target(Direction::Up)`.
+    fn upward_candidate(&self) -> (usize, Option<&Point>) {
+        if self.n >= self.max {
+            return (self.n, None);
+        }
+        if let Some((&upper, point)) = self
+            .points
+            .range((
+                std::ops::Bound::Excluded(self.n),
+                std::ops::Bound::Included(self.max),
+            ))
+            .next()
+        {
+            let current = self.points.get(&self.n).map_or(0.0, |p| p.score);
+            let upper_declined = current > 0.0
+                && point.score > 0.0
+                && point.score < current * (1.0 - NEAR_BEST_TOLERANCE);
+            let wider = !upper_declined;
+            let candidate = if upper - self.n > 1 {
+                let mid = self.n + (upper - self.n).div_ceil(2);
+                if wider && (mid as f64 / self.n as f64).ln() <= NEAR_BEST_TOLERANCE {
+                    self.upward_step()
+                } else {
+                    mid
+                }
+            } else if wider && (upper as f64 / self.n as f64).ln() <= NEAR_BEST_TOLERANCE {
+                self.upward_step()
+            } else {
+                upper
+            };
+            let matched_point = (candidate == upper).then_some(point);
+            return (candidate, matched_point);
+        }
+        (self.upward_step(), None)
+    }
+
     /// Pick an unmeasured integer inside the nearest bound before taking
     /// another geometric step. This is what turns measurements at 10 and 13
     /// into a later probe at 11 rather than needlessly re-testing 10.
@@ -593,31 +621,18 @@ impl Policy {
                 self.downward_step()
             }
             Direction::Up => {
-                if self.n >= self.max {
-                    return self.n;
-                }
-                if let Some((&upper, point)) = self
-                    .points
-                    .range((
-                        std::ops::Bound::Excluded(self.n),
-                        std::ops::Bound::Included(self.max),
-                    ))
-                    .next()
-                {
-                    if upper - self.n > 1 {
-                        return self.n + (upper - self.n).div_ceil(2);
-                    }
+                let (candidate, matched_point) = self.upward_candidate();
+                if let Some(point) = matched_point {
                     let current = self.points.get(&self.n).map_or(0.0, |p| p.score);
                     if self.tick.saturating_sub(point.measured_at) <= UP_RETRY_CAP
                         && current > 0.0
                         && point.score > 0.0
-                        && !self.utility_improves(self.n, current, upper, point.score)
+                        && !self.utility_improves(self.n, current, candidate, point.score)
                     {
                         return self.n;
                     }
-                    return upper;
                 }
-                self.upward_step()
+                candidate
             }
         }
     }

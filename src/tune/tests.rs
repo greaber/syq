@@ -455,7 +455,7 @@ fn small_bracket_step_does_not_restart_startup_doubling() {
     p.points.insert(
         104,
         Point {
-            score: 99.0,
+            score: 80.0,
             measured_at: p.tick,
         },
     );
@@ -465,6 +465,65 @@ fn small_bracket_step_does_not_restart_startup_doubling() {
     measure(&mut p, 106.0);
     assert_eq!(p.settled(), 102);
     assert_eq!(p.n, 103);
+}
+
+#[test]
+fn late_capacity_rise_escapes_narrow_upper_bracket() {
+    let mut p = Policy::new(32, 1, 128);
+    for step in 0..240 {
+        p.advance_time(Duration::from_secs_f64(step as f64 * 2.5), SAMPLE);
+        let score = (10 * p.n).min(320) as f64;
+        p.observe(score);
+        p.activated();
+    }
+    assert_eq!(p.settled(), 32);
+    for step in 240..480 {
+        p.advance_time(Duration::from_secs_f64(step as f64 * 2.5), SAMPLE);
+        let score = (10 * p.n).min(1280) as f64;
+        p.observe(score);
+        p.activated();
+    }
+    assert_eq!(p.settled(), 128, "history {:?}", p.history);
+
+    // Adjacent non-declining bound skips to upward_step(); declining bound is still refined.
+    let mut flat_bound = Policy::refine(32, 1, 128);
+    flat_bound.points.insert(
+        32,
+        Point {
+            score: 320.0,
+            measured_at: 0,
+        },
+    );
+    flat_bound.points.insert(
+        33,
+        Point {
+            score: 320.0,
+            measured_at: 0,
+        },
+    );
+    let (_, forecast) = flat_bound.connection_forecast();
+    assert_eq!(forecast.map(|(n, _)| n), Some(42));
+    assert!(flat_bound.begin(Direction::Up, 320.0));
+    assert_eq!(flat_bound.n, 42);
+
+    let mut declining_bound = Policy::refine(32, 1, 128);
+    declining_bound.tick = UP_RETRY_CAP + 1;
+    declining_bound.points.insert(
+        32,
+        Point {
+            score: 320.0,
+            measured_at: declining_bound.tick,
+        },
+    );
+    declining_bound.points.insert(
+        33,
+        Point {
+            score: 200.0,
+            measured_at: 0,
+        },
+    );
+    assert!(declining_bound.begin(Direction::Up, 320.0));
+    assert_eq!(declining_bound.n, 33);
 }
 
 #[test]

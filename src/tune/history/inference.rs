@@ -25,6 +25,12 @@ struct PooledInference {
     newest_for_count: BTreeMap<usize, i64>,
 }
 
+struct PreparedSystem {
+    verts: Vec<usize>,
+    edges: Vec<(Edge, f64)>,
+    lambda: f64,
+}
+
 impl PooledInference {
     fn push_run(&mut self, run: i64, decay: f64, evidence: RunEvidence) {
         let edges = evidence.edges();
@@ -38,14 +44,13 @@ impl PooledInference {
         self.runs.push((run, decay, edges));
     }
 
-    fn solve(self, specific: bool, default_start: usize) -> Option<Hint> {
-        const FLOOR_MARGIN: f64 = 0.03;
+    fn prepare(&self) -> Option<PreparedSystem> {
         let mut vertices = BTreeSet::new();
-        let mut weighted_edges = Vec::new();
+        let mut edges = Vec::new();
         let mut max_weight = 0.0_f64;
-        for (rank, (_run, time_decay, edges)) in self.runs.iter().enumerate() {
+        for (rank, (_run, time_decay, run_edges)) in self.runs.iter().enumerate() {
             let decay = time_decay * 0.85_f64.powi(rank as i32);
-            for &edge in edges {
+            for &edge in run_edges {
                 let w = edge.weight * decay;
                 if w <= 0.0 || !w.is_finite() {
                     continue;
@@ -53,177 +58,34 @@ impl PooledInference {
                 vertices.insert(edge.a);
                 vertices.insert(edge.b);
                 max_weight = max_weight.max(w);
-                weighted_edges.push((edge, w));
+                edges.push((edge, w));
             }
         }
         let verts: Vec<usize> = vertices.into_iter().collect();
-        let m = verts.len();
-        if m < 2 || weighted_edges.is_empty() || max_weight <= 0.0 {
+        if verts.len() < 2 || edges.is_empty() || max_weight <= 0.0 {
             return None;
         }
         // Weak prior between every adjacent pair of observed worker counts so the
         // linear system stays connected and stale unbridged segments decay naturally.
-        let lambda = 0.05 * max_weight;
-        let idx = |n: usize| verts.binary_search(&n).unwrap();
-        let mut f = vec![0.0f64; m];
-        if m <= 128 {
-            let d = m - 1;
-            let mut a = vec![vec![0.0f64; d]; d];
-            let mut b = vec![0.0f64; d];
-            let mut add_edge = |i: usize, j: usize, y: f64, w: f64| {
-                if i > 0 {
-                    a[i - 1][i - 1] += w;
-                    b[i - 1] -= w * y;
-                }
-                if j > 0 {
-                    a[j - 1][j - 1] += w;
-                    b[j - 1] += w * y;
-                }
-                if i > 0 && j > 0 {
-                    a[i - 1][j - 1] -= w;
-                    a[j - 1][i - 1] -= w;
-                }
-            };
-            for &(edge, w) in &weighted_edges {
-                add_edge(idx(edge.a), idx(edge.b), edge.diff, w);
-            }
-            for k in 0..d {
-                add_edge(k, k + 1, 0.0, lambda);
-            }
-            for col in 0..d {
-                let mut pivot = col;
-                let mut best_val = a[col][col].abs();
-                for (r, row) in a.iter().enumerate().skip(col + 1) {
-                    if row[col].abs() > best_val {
-                        best_val = row[col].abs();
-                        pivot = r;
-                    }
-                }
-                if best_val == 0.0 {
-                    continue;
-                }
-                a.swap(col, pivot);
-                b.swap(col, pivot);
-                let diag = a[col][col];
-                for cell in &mut a[col][col..d] {
-                    *cell /= diag;
-                }
-                b[col] /= diag;
-                let (before_a, rest_a) = a.split_at_mut(col);
-                let (pivot_slice, after_a) = rest_a.split_at_mut(1);
-                let pivot_tail = &pivot_slice[0][col..d];
-                let (before_b, rest_b) = b.split_at_mut(col);
-                let pivot_b = rest_b[0];
-                let after_b = &mut rest_b[1..];
-                for (row, rhs) in before_a
-                    .iter_mut()
-                    .zip(before_b.iter_mut())
-                    .chain(after_a.iter_mut().zip(after_b.iter_mut()))
-                {
-                    let factor = row[col];
-                    if factor == 0.0 {
-                        continue;
-                    }
-                    for (dst, &src) in row[col..d].iter_mut().zip(pivot_tail) {
-                        *dst -= factor * src;
-                    }
-                    *rhs -= factor * pivot_b;
-                }
-            }
-            f[1..=d].copy_from_slice(&b[..d]);
+        Some(PreparedSystem {
+            verts,
+            edges,
+            lambda: 0.05 * max_weight,
+        })
+    }
+
+    fn solve(self, specific: bool, default_start: usize) -> Option<Hint> {
+        const FLOOR_MARGIN: f64 = 0.03;
+        let PreparedSystem {
+            verts,
+            edges: weighted_edges,
+            lambda,
+        } = self.prepare()?;
+        let f = if verts.len() <= 128 {
+            solve_dense(&verts, &weighted_edges, lambda)
         } else {
-            // Jacobi-preconditioned Conjugate Gradient over a coalesced adjacency list
-            // handles >128 distinct counts accurately in O(m + E) per iteration.
-            let d = m - 1;
-            let mut diag = vec![0.0f64; d];
-            let mut b = vec![0.0f64; d];
-            let mut adj: Vec<Vec<(usize, f64)>> = vec![Vec::new(); d];
-            let mut add_edge = |i: usize, j: usize, y: f64, w: f64| {
-                if i > 0 {
-                    diag[i - 1] += w;
-                    b[i - 1] -= w * y;
-                }
-                if j > 0 {
-                    diag[j - 1] += w;
-                    b[j - 1] += w * y;
-                }
-                if i > 0 && j > 0 && i != j {
-                    adj[i - 1].push((j - 1, w));
-                    adj[j - 1].push((i - 1, w));
-                }
-            };
-            for &(edge, w) in &weighted_edges {
-                add_edge(idx(edge.a), idx(edge.b), edge.diff, w);
-            }
-            for k in 0..d {
-                add_edge(k, k + 1, 0.0, lambda);
-            }
-            for row in &mut adj {
-                row.sort_unstable_by_key(|&(nb, _)| nb);
-                row.dedup_by(|a, b| {
-                    if a.0 == b.0 {
-                        b.1 += a.1;
-                        true
-                    } else {
-                        false
-                    }
-                });
-            }
-            let mut x = vec![0.0f64; d];
-            let b_norm = b.iter().map(|&v| v * v).sum::<f64>().sqrt();
-            if b_norm > 0.0 {
-                let tol_sq = (1e-10 * b_norm.max(1.0)).powi(2);
-                let mut r = b;
-                let mut z: Vec<f64> = r
-                    .iter()
-                    .zip(&diag)
-                    .map(|(&ri, &di)| if di > 0.0 { ri / di } else { 0.0 })
-                    .collect();
-                let mut p = z.clone();
-                let mut ap = vec![0.0f64; d];
-                let mut rz: f64 = r.iter().zip(&z).map(|(&ri, &zi)| ri * zi).sum();
-                let max_iters = d.clamp(200, 4000);
-                for _ in 0..max_iters {
-                    for (((&d_u, neighbors), &p_u), ap_u) in
-                        diag.iter().zip(&adj).zip(&p).zip(&mut ap)
-                    {
-                        let mut sum = d_u * p_u;
-                        for &(nb, w) in neighbors {
-                            sum -= w * p[nb];
-                        }
-                        *ap_u = sum;
-                    }
-                    let p_ap: f64 = p.iter().zip(&ap).map(|(&pi, &api)| pi * api).sum();
-                    if !p_ap.is_finite() || p_ap <= 1e-30 {
-                        break;
-                    }
-                    let alpha = rz / p_ap;
-                    let mut r_sq = 0.0;
-                    for (((xi, ri), &pi), &api) in x.iter_mut().zip(r.iter_mut()).zip(&p).zip(&ap) {
-                        *xi += alpha * pi;
-                        *ri -= alpha * api;
-                        r_sq += *ri * *ri;
-                    }
-                    if r_sq <= tol_sq {
-                        break;
-                    }
-                    let mut rz_new = 0.0;
-                    for ((zi, &ri), &di) in z.iter_mut().zip(&r).zip(&diag) {
-                        *zi = if di > 0.0 { ri / di } else { 0.0 };
-                        rz_new += ri * *zi;
-                    }
-                    if !rz_new.is_finite() || rz == 0.0 {
-                        break;
-                    }
-                    let beta = rz_new / rz;
-                    for (pi, &zi) in p.iter_mut().zip(&z) {
-                        *pi = zi + beta * *pi;
-                    }
-                    rz = rz_new;
-                }
-            }
-            f[1..=d].copy_from_slice(&x);
-        }
+            solve_sparse(&verts, &weighted_edges, lambda)
+        };
         let floor = default_start.max(verts[0]) as f64;
         let mut best_idx = 0usize;
         let mut best_u = f64::NEG_INFINITY;
@@ -256,6 +118,173 @@ impl PooledInference {
             refine,
         })
     }
+}
+
+fn solve_dense(verts: &[usize], weighted_edges: &[(Edge, f64)], lambda: f64) -> Vec<f64> {
+    let m = verts.len();
+    let d = m - 1;
+    let idx = |n: usize| verts.binary_search(&n).unwrap();
+    let mut a = vec![vec![0.0f64; d]; d];
+    let mut b = vec![0.0f64; d];
+    let mut add_edge = |i: usize, j: usize, y: f64, w: f64| {
+        if i > 0 {
+            a[i - 1][i - 1] += w;
+            b[i - 1] -= w * y;
+        }
+        if j > 0 {
+            a[j - 1][j - 1] += w;
+            b[j - 1] += w * y;
+        }
+        if i > 0 && j > 0 {
+            a[i - 1][j - 1] -= w;
+            a[j - 1][i - 1] -= w;
+        }
+    };
+    for &(edge, w) in weighted_edges {
+        add_edge(idx(edge.a), idx(edge.b), edge.diff, w);
+    }
+    for k in 0..d {
+        add_edge(k, k + 1, 0.0, lambda);
+    }
+    for col in 0..d {
+        let mut pivot = col;
+        let mut best_val = a[col][col].abs();
+        for (r, row) in a.iter().enumerate().skip(col + 1) {
+            if row[col].abs() > best_val {
+                best_val = row[col].abs();
+                pivot = r;
+            }
+        }
+        if best_val == 0.0 {
+            continue;
+        }
+        a.swap(col, pivot);
+        b.swap(col, pivot);
+        let diag = a[col][col];
+        for cell in &mut a[col][col..d] {
+            *cell /= diag;
+        }
+        b[col] /= diag;
+        let (before_a, rest_a) = a.split_at_mut(col);
+        let (pivot_slice, after_a) = rest_a.split_at_mut(1);
+        let pivot_tail = &pivot_slice[0][col..d];
+        let (before_b, rest_b) = b.split_at_mut(col);
+        let pivot_b = rest_b[0];
+        let after_b = &mut rest_b[1..];
+        for (row, rhs) in before_a
+            .iter_mut()
+            .zip(before_b.iter_mut())
+            .chain(after_a.iter_mut().zip(after_b.iter_mut()))
+        {
+            let factor = row[col];
+            if factor == 0.0 {
+                continue;
+            }
+            for (dst, &src) in row[col..d].iter_mut().zip(pivot_tail) {
+                *dst -= factor * src;
+            }
+            *rhs -= factor * pivot_b;
+        }
+    }
+    let mut f = vec![0.0f64; m];
+    f[1..=d].copy_from_slice(&b[..d]);
+    f
+}
+
+fn solve_sparse(verts: &[usize], weighted_edges: &[(Edge, f64)], lambda: f64) -> Vec<f64> {
+    // Jacobi-preconditioned Conjugate Gradient over a coalesced adjacency list
+    // handles >128 distinct counts accurately in O(m + E) per iteration.
+    let m = verts.len();
+    let d = m - 1;
+    let idx = |n: usize| verts.binary_search(&n).unwrap();
+    let mut diag = vec![0.0f64; d];
+    let mut b = vec![0.0f64; d];
+    let mut adj: Vec<Vec<(usize, f64)>> = vec![Vec::new(); d];
+    let mut add_edge = |i: usize, j: usize, y: f64, w: f64| {
+        if i > 0 {
+            diag[i - 1] += w;
+            b[i - 1] -= w * y;
+        }
+        if j > 0 {
+            diag[j - 1] += w;
+            b[j - 1] += w * y;
+        }
+        if i > 0 && j > 0 && i != j {
+            adj[i - 1].push((j - 1, w));
+            adj[j - 1].push((i - 1, w));
+        }
+    };
+    for &(edge, w) in weighted_edges {
+        add_edge(idx(edge.a), idx(edge.b), edge.diff, w);
+    }
+    for k in 0..d {
+        add_edge(k, k + 1, 0.0, lambda);
+    }
+    for row in &mut adj {
+        row.sort_unstable_by_key(|&(nb, _)| nb);
+        row.dedup_by(|a, b| {
+            if a.0 == b.0 {
+                b.1 += a.1;
+                true
+            } else {
+                false
+            }
+        });
+    }
+    let mut x = vec![0.0f64; d];
+    let b_norm = b.iter().map(|&v| v * v).sum::<f64>().sqrt();
+    if b_norm > 0.0 {
+        let tol_sq = (1e-10 * b_norm.max(1.0)).powi(2);
+        let mut r = b;
+        let mut z: Vec<f64> = r
+            .iter()
+            .zip(&diag)
+            .map(|(&ri, &di)| if di > 0.0 { ri / di } else { 0.0 })
+            .collect();
+        let mut p = z.clone();
+        let mut ap = vec![0.0f64; d];
+        let mut rz: f64 = r.iter().zip(&z).map(|(&ri, &zi)| ri * zi).sum();
+        let max_iters = d.clamp(200, 4000);
+        for _ in 0..max_iters {
+            for (((&d_u, neighbors), &p_u), ap_u) in diag.iter().zip(&adj).zip(&p).zip(&mut ap) {
+                let mut sum = d_u * p_u;
+                for &(nb, w) in neighbors {
+                    sum -= w * p[nb];
+                }
+                *ap_u = sum;
+            }
+            let p_ap: f64 = p.iter().zip(&ap).map(|(&pi, &api)| pi * api).sum();
+            if !p_ap.is_finite() || p_ap <= 1e-30 {
+                break;
+            }
+            let alpha = rz / p_ap;
+            let mut r_sq = 0.0;
+            for (((xi, ri), &pi), &api) in x.iter_mut().zip(r.iter_mut()).zip(&p).zip(&ap) {
+                *xi += alpha * pi;
+                *ri -= alpha * api;
+                r_sq += *ri * *ri;
+            }
+            if r_sq <= tol_sq {
+                break;
+            }
+            let mut rz_new = 0.0;
+            for ((zi, &ri), &di) in z.iter_mut().zip(&r).zip(&diag) {
+                *zi = if di > 0.0 { ri / di } else { 0.0 };
+                rz_new += ri * *zi;
+            }
+            if !rz_new.is_finite() || rz == 0.0 {
+                break;
+            }
+            let beta = rz_new / rz;
+            for (pi, &zi) in p.iter_mut().zip(&z) {
+                *pi = zi + beta * *pi;
+            }
+            rz = rz_new;
+        }
+    }
+    let mut f = vec![0.0f64; m];
+    f[1..=d].copy_from_slice(&x);
+    f
 }
 
 pub(super) fn starting_count(
@@ -426,9 +455,12 @@ impl RunEvidence {
         let Some((_, workers)) = self.current else {
             return;
         };
-        if let Some(collapse_rate) = self.severe_loss_rate() {
-            // Prioritize a recent severe collapse so a fast prefix does not
-            // turn a rolled-back count into a positive historical recommendation.
+        if let Some(collapse_rate) = (self.total_secs <= 5.0 + 1e-6)
+            .then(|| self.severe_loss_rate())
+            .flatten()
+        {
+            // Only probe-length segments prioritize a recent severe collapse;
+            // long settled segments keep their mean despite a brief tail dip.
             self.segments.push((workers, 2.5, collapse_rate));
             self.current_rate = Some(collapse_rate);
         } else if self.total_intervals >= 2
@@ -1254,6 +1286,26 @@ mod tests {
     }
 
     #[test]
+    fn brief_dip_at_end_of_long_settled_segment_keeps_segment_mean() {
+        let mut events = vec![
+            context(),
+            observation(8, 100.0, true),
+            observation(8, 100.0, true),
+        ];
+        for _ in 0..40 {
+            events.push(
+                json!({"kind":"observation","data":{"active":16,"seconds":0.5,"rate":200.0,"usable":true}}),
+            );
+        }
+        for _ in 0..2 {
+            events.push(
+                json!({"kind":"observation","data":{"active":16,"seconds":0.5,"rate":20.0,"usable":true}}),
+            );
+        }
+        assert_eq!(infer_run(&events), Some((16, false)));
+    }
+
+    #[test]
     fn flat_and_contention_runs_respect_route_default_start_floor() {
         let temp = crate::test_support::tempdir().unwrap();
         let path = temp.path().join("history.sqlite");
@@ -1299,7 +1351,18 @@ mod tests {
             }
             pooled
         };
-        assert_eq!(build_pool(255).solve(true, 1).unwrap().workers, 255);
+        let pool_128 = build_pool(255);
+        let sys = pool_128.prepare().unwrap();
+        assert_eq!(sys.verts.len(), 128);
+        let dense = solve_dense(&sys.verts, &sys.edges, sys.lambda);
+        let sparse = solve_sparse(&sys.verts, &sys.edges, sys.lambda);
+        let max_diff = dense
+            .iter()
+            .zip(&sparse)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(max_diff < 1e-6, "max_diff={max_diff}");
+        assert_eq!(pool_128.solve(true, 1).unwrap().workers, 255);
         assert_eq!(build_pool(256).solve(true, 1).unwrap().workers, 256);
         assert_eq!(build_pool(383).solve(true, 1).unwrap().workers, 383);
     }
