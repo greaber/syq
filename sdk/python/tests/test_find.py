@@ -5,6 +5,7 @@ import errno
 import http.server
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -192,7 +193,6 @@ class FindProtocolTests(unittest.TestCase):
             (b"not-json", "valid UTF-8 JSON"),
             (b"[]", "JSON object"),
             ('{"path":"a"}'.encode("utf-16"), "valid UTF-8 JSON"),
-            (b'{"path":"a","size":' + b"1" * 5000 + b"}", "valid UTF-8 JSON"),
             (b'{"path":"\\ud800"}', "unpaired Unicode surrogates"),
             (b'{"path":"a","etag":"\\ud800"}', "unpaired Unicode surrogates"),
             (b'{"path":"a","link_target":"\\ud800"}', "unpaired Unicode surrogates"),
@@ -214,6 +214,22 @@ class FindProtocolTests(unittest.TestCase):
             with self.subTest(line=line[:40]):
                 with self.assertRaisesRegex(syq.SyqProtocolError, message):
                     parse_find_line(line)
+
+        oversized_digits = b'{"path":"a","size":' + b"1" * 5000 + b"}"
+        if hasattr(sys, "set_int_max_str_digits"):
+            previous = sys.get_int_max_str_digits()
+            try:
+                sys.set_int_max_str_digits(4300)
+                with self.assertRaisesRegex(syq.SyqProtocolError, "valid UTF-8 JSON"):
+                    parse_find_line(oversized_digits)
+                sys.set_int_max_str_digits(0)
+                with self.assertRaisesRegex(syq.SyqProtocolError, "unsigned 64-bit"):
+                    parse_find_line(oversized_digits)
+            finally:
+                sys.set_int_max_str_digits(previous)
+        else:
+            with self.assertRaisesRegex(syq.SyqProtocolError, "unsigned 64-bit"):
+                parse_find_line(oversized_digits)
 
 
 class FakeFindTests(unittest.TestCase):
@@ -517,6 +533,45 @@ class AsyncFakeFindTests(unittest.IsolatedAsyncioTestCase):
             async with stream:
                 pass
         self.assertEqual(calls, 1)
+
+    async def test_cancelled_aclose_allows_retry_of_abort(self) -> None:
+        stream = self.client.find("src")
+        abort_started = asyncio.Event()
+        release_abort = asyncio.Event()
+        abort_calls = 0
+
+        async def blocked_then_ok_abort() -> None:
+            nonlocal abort_calls
+            abort_calls += 1
+            if abort_calls == 1:
+                abort_started.set()
+                await release_abort.wait()
+
+        fake_process = mock.Mock()
+        fake_process.abort = mock.AsyncMock(side_effect=blocked_then_ok_abort)
+
+        with mock.patch.object(
+            stream._client, "_start_line", new=mock.AsyncMock(return_value=fake_process)
+        ):
+            await stream.__aenter__()
+            close_task = asyncio.create_task(stream.aclose())
+            await asyncio.wait_for(abort_started.wait(), timeout=2)
+            close_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await close_task
+            self.assertFalse(stream._complete)
+            self.assertEqual(abort_calls, 1)
+
+            release_abort.set()
+            await stream.aclose()
+
+        self.assertTrue(stream._complete)
+        self.assertEqual(abort_calls, 2)
+        with self.assertRaises(StopAsyncIteration):
+            await anext(stream)
+        with self.assertRaisesRegex(syq.SyqInvocationError, "closed or exhausted"):
+            async with stream:
+                pass
 
     async def test_async_find_nonzero_exit_and_early_exit_cleanup(self) -> None:
         failing = syq.AsyncClient(

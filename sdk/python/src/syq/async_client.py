@@ -569,9 +569,9 @@ class AsyncFindStream(AsyncIterator[FindEntry]):
         async with self._start_lock:
             if self._complete:
                 return
-            self._complete = True
             if self._process is not None:
                 await self._process.abort()
+            self._complete = True
 
     async def __aenter__(self) -> AsyncFindStream:
         await self._ensure_started()
