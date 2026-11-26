@@ -4731,8 +4731,23 @@ fn run_transfer(
                 "source_type":source_filesystem.as_ref().map(|fs|&fs.kind),
                 "destination_type":destination_filesystem.as_ref().map(|fs|&fs.kind)}),
             );
+            let default_start = if src_ep.is_remote() || dst_ep.is_remote() {
+                if all_remote_endpoints_use_tcp {
+                    tune::START_TCP
+                } else {
+                    tune::START_SSH
+                }
+            } else {
+                tune::start_local()
+            };
             let hint = (autotune && args.tuning_options.is_none())
-                .then(|| history.starting_count(&key, src_ep.is_remote() || dst_ep.is_remote()))
+                .then(|| {
+                    history.starting_count(
+                        &key,
+                        src_ep.is_remote() || dst_ep.is_remote(),
+                        default_start,
+                    )
+                })
                 .flatten();
             if let Some(hint) = &hint {
                 args.connections = hint.workers.min(maximum_workers);

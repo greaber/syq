@@ -490,7 +490,7 @@ fn report() {
             for run in remembered.iter_mut() {
                 // Start each copy as production does, from the recorded history.
                 let writer = history::tests::recorder(&path);
-                let next = match writer.starting_count(&key, false) {
+                let next = match writer.starting_count(&key, false, s.start) {
                     Some(hint) if hint.refine => Policy::refine(hint.workers, 1, LIMIT),
                     Some(hint) => Policy::new(hint.workers, 1, LIMIT),
                     None => Policy::new(s.start, 1, LIMIT),
@@ -515,7 +515,7 @@ fn report() {
                 }
                 writer.complete(true, serde_json::json!({}));
                 let count = writer
-                    .starting_count(&key, false)
+                    .starting_count(&key, false, s.start)
                     .map_or(s.start, |hint| hint.workers);
                 run.push(count as f64);
             }
@@ -823,4 +823,132 @@ fn analytic_optimum_matches_exhaustive_worker_search() {
             assert!((curve.best(t) - exhaustive).abs() < 1e-9);
         }
     }
+}
+
+fn record_sqlite_observations(
+    writer: &history::Recorder,
+    key: &history::ContextKey,
+    observations: &[(usize, f64, f64)],
+) {
+    writer.context(key);
+    writer.event(
+        "learning_context",
+        serde_json::json!({"consistent":true,"automatic":true}),
+    );
+    let mut segment = None;
+    for &(workers, rate, seconds) in observations {
+        if segment != Some(workers) {
+            writer.event("transition", serde_json::json!({}));
+            segment = Some(workers);
+        }
+        writer.event(
+            "observation",
+            serde_json::json!({"active":workers,"seconds":seconds,"rate":rate,"usable":true}),
+        );
+    }
+    writer.complete(true, serde_json::json!({}));
+}
+
+#[test]
+fn noisy_flat_copies_do_not_ratchet_across_repeated_runs() {
+    let s = Scenario {
+        name: "flat",
+        curve: Curve::Knee {
+            per_worker: 100.0,
+            cap: 100.0,
+        },
+        ideal_secs: 40.0,
+        start: super::START_SSH,
+        sigma: 0.05,
+        rho: 0.5,
+        setup_secs: 0.3,
+        prepare: true,
+    };
+    let key = history::tests::key("a");
+    let mut final_starts = Vec::new();
+    for seed in 0..30 {
+        let mut rng = Rng(seed);
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("history.sqlite");
+        let mut last = s.start;
+        for _ in 0..20 {
+            let writer = history::tests::recorder(&path);
+            let policy = match writer.starting_count(&key, false, s.start) {
+                Some(hint) => {
+                    last = hint.workers;
+                    if hint.refine {
+                        Policy::refine(hint.workers, 1, 256)
+                    } else {
+                        Policy::new(hint.workers, 1, 256)
+                    }
+                }
+                None => Policy::new(s.start, 1, 256),
+            };
+            let out = copy(&s, policy, &mut rng);
+            record_sqlite_observations(&writer, &key, &out.observations);
+        }
+        final_starts.push(last as f64);
+    }
+    let med = quantile(&mut final_starts, 0.5);
+    let p90 = quantile(&mut final_starts, 0.9);
+    assert!(med <= 12.0 && p90 <= 32.0, "med={med} p90={p90}");
+}
+
+#[test]
+fn flat_large_file_history_does_not_slow_later_small_file_copies() {
+    let flat = Scenario {
+        name: "large-flat",
+        curve: Curve::Knee {
+            per_worker: 100.0,
+            cap: 100.0,
+        },
+        ideal_secs: 40.0,
+        start: super::START_SSH,
+        sigma: 0.05,
+        rho: 0.5,
+        setup_secs: 0.3,
+        prepare: true,
+    };
+    let small_files = Scenario {
+        name: "small-files",
+        curve: Curve::Knee {
+            per_worker: 100.0 / 16.0,
+            cap: 100.0,
+        },
+        ideal_secs: 40.0,
+        start: super::START_SSH,
+        sigma: 0.05,
+        rho: 0.5,
+        setup_secs: 0.3,
+        prepare: true,
+    };
+    let key = history::tests::key("a");
+    let (mut starts, mut settled, mut slowdowns) = (Vec::new(), Vec::new(), Vec::new());
+    for seed in 0..20 {
+        let mut rng = Rng(seed);
+        let temp = crate::test_support::tempdir().unwrap();
+        let path = temp.path().join("history.sqlite");
+        for _ in 0..5 {
+            let writer = history::tests::recorder(&path);
+            let start = writer
+                .starting_count(&key, false, super::START_SSH)
+                .map_or(super::START_SSH, |h| h.workers);
+            let out = copy(&flat, Policy::new(start, 1, 64), &mut rng);
+            record_sqlite_observations(&writer, &key, &out.observations);
+        }
+        let next_start = history::tests::recorder(&path)
+            .starting_count(&key, false, super::START_SSH)
+            .map_or(super::START_SSH, |h| h.workers);
+        starts.push(next_start as f64);
+        let out = copy(&small_files, Policy::new(next_start, 1, 64), &mut rng);
+        settled.push(out.policy.settled() as f64);
+        slowdowns.push(100.0 * (out.elapsed / out.ideal_elapsed - 1.0));
+    }
+    let med_start = quantile(&mut starts, 0.5);
+    let med_settled = quantile(&mut settled, 0.5);
+    let p90_slowdown = quantile(&mut slowdowns, 0.9);
+    assert!(
+        med_start >= super::START_SSH as f64 && med_settled >= 16.0 && p90_slowdown < 15.0,
+        "med_start={med_start} med_settled={med_settled} p90_slowdown={p90_slowdown:.2}%"
+    );
 }

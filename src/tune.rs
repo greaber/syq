@@ -61,7 +61,7 @@ pub const STEP: f64 = 1.3;
 /// Throughput tolerance for upward comparisons and plateau evidence. An
 /// inconclusive increase within this tolerance of its own baseline keeps the
 /// larger count without continuing growth. Reductions require a measured gain.
-const NEAR_BEST_TOLERANCE: f64 = 0.05;
+pub(crate) const NEAR_BEST_TOLERANCE: f64 = 0.05;
 /// Sampling intervals between probes. Directional backoff is bounded in
 /// elapsed time by retry_after; rejected observations still advance deadlines.
 const PROBE_EVERY: usize = 6;
