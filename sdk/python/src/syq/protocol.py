@@ -251,11 +251,16 @@ def parse_mapping_line(line: bytes) -> MappingEntry:
 def parse_find_line(line: bytes) -> FindEntry:
     """Decode one JSON object emitted by ``syq find --json`` or ``syq ls --json``."""
 
-    record = _object(line, label="find record")
-    unknown = set(record) - _FIND_FIELDS
-    if unknown:
+    try:
+        record = json.loads(line.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as error:
+        raise SyqProtocolError("find record is not valid UTF-8 JSON") from error
+    if not isinstance(record, dict):
+        raise SyqProtocolError("find record must be a JSON object")
+    if not (record.keys() <= _FIND_FIELDS):
+        unknown = sorted(set(record) - _FIND_FIELDS)[0]
         raise SyqProtocolError(
-            f"find record has unknown field {sorted(unknown)[0]!r}"
+            f"find record has unknown field {unknown!r}"
         )
     path = _string(record, "path", prefix="find field")
     if not path:
@@ -296,6 +301,15 @@ def parse_find_line(line: bytes) -> FindEntry:
         else None
     )
     link_target = _optional_string(record, "link_target", prefix="find field")
+    if b"\\u" in line:
+        for value in (path, etag, link_target):
+            if value is not None:
+                try:
+                    value.encode("utf-8")
+                except UnicodeEncodeError as error:
+                    raise SyqProtocolError(
+                        "find record contains unpaired Unicode surrogates"
+                    ) from error
     return FindEntry(
         path=path,
         kind=kind,

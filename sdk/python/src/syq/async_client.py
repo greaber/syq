@@ -533,11 +533,15 @@ class AsyncFindStream(AsyncIterator[FindEntry]):
 
     async def _ensure_started(self) -> _AsyncLineProcess:
         async with self._start_lock:
+            if self._complete:
+                raise SyqInvocationError(
+                    f"{self._command} stream is closed or exhausted"
+                )
             if self._process is None:
                 self._process = await self._client._start_line(
                     self._argv, timeout=self._timeout
                 )
-        return self._process
+            return self._process
 
     def __aiter__(self) -> AsyncFindStream:
         if self._complete:
@@ -547,7 +551,12 @@ class AsyncFindStream(AsyncIterator[FindEntry]):
     async def __anext__(self) -> FindEntry:
         if self._complete:
             raise StopAsyncIteration
-        process = await self._ensure_started()
+        try:
+            process = await self._ensure_started()
+        except SyqInvocationError:
+            if self._complete:
+                raise StopAsyncIteration from None
+            raise
         try:
             return await _next_async_stream_entry(
                 process, self._command, parse_find_line
@@ -557,15 +566,14 @@ class AsyncFindStream(AsyncIterator[FindEntry]):
             raise
 
     async def aclose(self) -> None:
-        if self._complete:
-            return
-        if self._process is not None:
-            await self._process.abort()
-        self._complete = True
+        async with self._start_lock:
+            if self._complete:
+                return
+            self._complete = True
+            if self._process is not None:
+                await self._process.abort()
 
     async def __aenter__(self) -> AsyncFindStream:
-        if self._complete:
-            raise SyqInvocationError(f"{self._command} stream is closed or exhausted")
         await self._ensure_started()
         return self
 

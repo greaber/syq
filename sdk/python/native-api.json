@@ -220,11 +220,12 @@
         "s3-header",
         "s3-retries"
       ],
-      "internal": [],
+      "internal": [
+        "json"
+      ],
       "aliases": {},
       "raw_only": [
         "long",
-        "json",
         "null"
       ],
       "follow_up": []
@@ -254,11 +255,12 @@
         "s3-header",
         "s3-retries"
       ],
-      "internal": [],
+      "internal": [
+        "json"
+      ],
       "aliases": {},
       "raw_only": [
         "long",
-        "json",
         "null"
       ],
       "follow_up": []

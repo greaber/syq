@@ -268,7 +268,8 @@ SSH server (`on="server"`), or in an S3 bucket (`on="s3://bucket"`);
 They accept `on`, `cwd`, `root`, `follow`, `follow_src`, `depth`, `ignore`,
 `ignore_from`, `where`, `include`, `performance_tuning`, `rsh`, `syq_path`,
 `no_bootstrap`, `auth_from`, `pscope`, `s3_endpoint`, `s3_region`, `s3_profile`,
-`s3_header`, `s3_retries`, and `timeout`.
+`s3_header`, `s3_retries`, and `timeout`. On S3, `cwd` and `root` name a key
+prefix; `follow` and `follow_src` apply only to filesystems.
 
 Use a `FindStream` in a `with` block and an `AsyncFindStream` in `async with`.
 Iterating to the end checks that the listing succeeded and raises
@@ -293,13 +294,16 @@ link_target: str | None = None
 
 By default, `include` is `None`: filesystem listings populate `kind`, `size`
 (omitted for directories), and `mtime`, and S3 listings populate `kind`, `size`,
-`s3_last_modified`, and `etag` without per-object `HEAD` requests. Pass
-`include` with field names (such as `["kind", "mode", "link_target"]`) to
-select specific fields after `path`; asking for S3 `kind`, `mtime`, `mode`,
-`uid`, or `gid` via `include` sends a `HEAD` request per object.
+`s3_last_modified`, and `etag`. On S3, listings alone supply those fields
+without per-object `HEAD` requests unless `where` inspects fields other than
+`path`, `name`, `extension`, `size`, and `s3_last_modified`. Pass `include` with
+field names (such as `["kind", "mode", "link_target"]`) to select specific
+fields after `path`; asking for S3 `kind`, `mtime`, `mode`, `uid`, or `gid` via
+`include` also sends a `HEAD` request per object.
 
-Paths and symlink targets must be valid UTF-8 strings; to handle non-UTF-8 byte
-names or `--long` output, call `run(["find", "--null", ...])`.
+Paths must be valid UTF-8 strings, as must symlink targets when `link_target` is
+included; to handle non-UTF-8 byte names call `run(["find", "--null", ...])`,
+and for human-readable long output call `run(["find", "--long", ...])`.
 <!-- ANCHOR_END: listing -->
 
 <!-- ANCHOR: mappings -->

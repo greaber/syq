@@ -10,7 +10,6 @@ import threading
 import time
 import unittest
 import urllib.parse
-from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
 
@@ -192,6 +191,11 @@ class FindProtocolTests(unittest.TestCase):
         cases = (
             (b"not-json", "valid UTF-8 JSON"),
             (b"[]", "JSON object"),
+            ('{"path":"a"}'.encode("utf-16"), "valid UTF-8 JSON"),
+            (b'{"path":"a","size":' + b"1" * 5000 + b"}", "valid UTF-8 JSON"),
+            (b'{"path":"\\ud800"}', "unpaired Unicode surrogates"),
+            (b'{"path":"a","etag":"\\ud800"}', "unpaired Unicode surrogates"),
+            (b'{"path":"a","link_target":"\\ud800"}', "unpaired Unicode surrogates"),
             (b'{"path": "a", "extra": 1}', "unknown field 'extra'"),
             (b"{}", "field 'path' must be a string"),
             (b'{"path": ""}', "may not be empty"),
@@ -207,7 +211,7 @@ class FindProtocolTests(unittest.TestCase):
             (b'{"path": "a", "link_target": null}', "must be a string"),
         )
         for line, message in cases:
-            with self.subTest(line=line):
+            with self.subTest(line=line[:40]):
                 with self.assertRaisesRegex(syq.SyqProtocolError, message):
                     parse_find_line(line)
 
@@ -401,6 +405,14 @@ class FakeFindTests(unittest.TestCase):
             with malformed.ls() as ls_stream:
                 list(ls_stream)
 
+        oversized = syq.Client(
+            executable=self.executable,
+            env={**self.env, "SYQ_FAKE_SHAPE": "oversized-line"},
+        )
+        with self.assertRaisesRegex(syq.SyqProtocolError, "larger than 16 MiB"):
+            with oversized.find() as oversized_stream:
+                list(oversized_stream)
+
     def test_early_context_exit_kills_process_group(self) -> None:
         marker = self.root / "find-descendant"
         client = syq.Client(
@@ -470,6 +482,41 @@ class AsyncFakeFindTests(unittest.IsolatedAsyncioTestCase):
                 pass
         with self.assertRaisesRegex(syq.SyqInvocationError, "closed or exhausted"):
             aiter(stream)
+
+    async def test_concurrent_aclose_during_startup_aborts_process(self) -> None:
+        stream = self.client.find("src")
+        started = asyncio.Event()
+        proceed = asyncio.Event()
+        fake_process = mock.Mock()
+        fake_process.abort = mock.AsyncMock()
+        calls = 0
+
+        async def paused_start(*args: object, **kwargs: object) -> object:
+            nonlocal calls
+            calls += 1
+            started.set()
+            await proceed.wait()
+            return fake_process
+
+        with mock.patch.object(
+            stream._client, "_start_line", side_effect=paused_start
+        ):
+            enter_task = asyncio.create_task(stream.__aenter__())
+            await asyncio.wait_for(started.wait(), timeout=2)
+            close_task = asyncio.create_task(stream.aclose())
+            await asyncio.sleep(0)
+            proceed.set()
+            entered = await enter_task
+            await close_task
+        self.assertIs(entered, stream)
+        fake_process.abort.assert_awaited_once()
+        self.assertEqual(calls, 1)
+        with self.assertRaises(StopAsyncIteration):
+            await anext(stream)
+        with self.assertRaisesRegex(syq.SyqInvocationError, "closed or exhausted"):
+            async with stream:
+                pass
+        self.assertEqual(calls, 1)
 
     async def test_async_find_nonzero_exit_and_early_exit_cleanup(self) -> None:
         failing = syq.AsyncClient(
@@ -612,8 +659,8 @@ class CandidateFindTests(unittest.TestCase):
         with self.client.ls("alias", follow=True) as followed:
             self.assertIn("alias/top.txt", {entry.path for entry in followed})
 
-        with self.client.find("tree", cwd=self.root):
-            pass
+        with self.client.find("tree", cwd=self.root) as rooted:
+            self.assertIn("tree/top.txt", {entry.path for entry in rooted})
 
     def test_literal_hyphen_filenames_do_not_inject_options(self) -> None:
         (self.root / "--long").write_bytes(b"a")
@@ -699,6 +746,8 @@ class CandidateFindTests(unittest.TestCase):
                 all(headers.get("x-listing") == "yes" for _, _, headers in server.requests)
             )
 
+            server.requests.clear()
+
             async def async_ls() -> list[syq.FindEntry]:
                 async with s3_async.ls(
                     "photos/",
@@ -710,6 +759,10 @@ class CandidateFindTests(unittest.TestCase):
 
             ls_entries = asyncio.run(async_ls())
             self.assertEqual({entry.path for entry in ls_entries}, {"photos/a.jpg", "photos/2026"})
+            self.assertFalse(
+                any(method == "HEAD" for method, _, _ in server.requests),
+                server.requests,
+            )
 
             server.requests.clear()
             with s3_client.ls(
