@@ -122,6 +122,9 @@ fn invalid_expressions_fail_before_evaluation() {
         "src.size > null",
         "src.name glob null",
         "not null",
+        "(src.size = null) in []",
+        "(not src.size) in []",
+        "null in []",
     ] {
         assert!(Expression::compile(s, true).is_err(), "{s}");
     }
@@ -295,7 +298,13 @@ fn listing_names_fields_bare_and_filters_directories() {
         .unwrap()
         .selects_listing(&directory, b"a")
         .unwrap());
-    for text in ["dst.size > 0B", "dst.exists", "unknown = 1"] {
+    for text in [
+        "dst.size > 0B",
+        "dst.exists",
+        "unknown = 1",
+        "(size = null) in []",
+        "(not size) in []",
+    ] {
         assert!(Policy::compile_listing(Some(text)).is_err(), "{text}");
     }
     // Copy selection still needs the prefix.

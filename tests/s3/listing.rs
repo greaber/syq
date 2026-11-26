@@ -1238,4 +1238,42 @@ fn null_comparisons_do_not_fail_and_skip_s3_directories_when_possible() {
     assert_eq!(sorted(&output), ["logs/2026/a.json", "logs/2026/b.log"]);
     let requests = bucket.take();
     assert_eq!(requests, ["LIST logs/2026/ /"], "{requests:?}");
+
+    let output = bucket.find(
+        temp.path(),
+        &[
+            "find",
+            "--on",
+            "s3://bucket",
+            "--where",
+            "size > 1B and path = 'top.txt'",
+        ],
+    );
+    assert_eq!(sorted(&output), ["top.txt"]);
+    let requests = bucket.take();
+    assert_eq!(requests, ["LIST top.txt"], "{requests:?}");
+
+    let output = bucket.find(
+        temp.path(),
+        &[
+            "find",
+            "--on",
+            "s3://bucket",
+            "logs",
+            "--where",
+            "size > 1B and path glob 'logs/*/*.json'",
+        ],
+    );
+    assert_eq!(sorted(&output), ["logs/2026/a.json"]);
+    let mut requests = bucket.take();
+    requests.sort();
+    assert_eq!(
+        requests,
+        [
+            "LIST logs",
+            "LIST logs/ /",
+            "LIST logs/2025/ /",
+            "LIST logs/2026/ /",
+        ]
+    );
 }

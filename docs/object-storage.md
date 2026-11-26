@@ -126,10 +126,10 @@ under the prefix, dividing the work as copies do (see
 condition joined to the rest of `--where` with `and` limits the requests to
 the prefixes that can hold a match, such as `laptop/photos/2026-*/` rather
 than all of `laptop/`, unless a condition before it could fail, such as
-arithmetic or checking stored object metadata like `mtime`. When `--where`
-rules out every directory, recursive `syq find` also skips building virtual
-directories and narrows `path` patterns without descending into
-subdirectories they don't match. Services that don't promise to list keys in
+arithmetic on a field or checking stored object metadata like `mtime`. When
+syq can determine that `--where` rules out every directory, recursive
+`syq find` also skips building virtual directories and lists only keys a
+`path` pattern can match, not everything beneath them. Services that don't promise to list keys in
 byte order can leave a key out of a later page that a directory listing asks
 for, so there syq lists a directory with more than a thousand entries whole
 instead, which can take much longer for a deep tree, and says so.

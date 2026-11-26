@@ -103,10 +103,12 @@ on the listed fields first.
 Use `is null`, `is not null`, or `coalesce(value, fallback)` for unavailable
 metadata instead of `= null` or `!= null`. Arithmetic on `null` produces
 `null`, and comparisons, `in`, `between`, and pattern matching with `null`
-follow 3-valued logic: `not unknown` is unknown, `true or unknown` is true,
-`false and unknown` is false, `if` takes the else branch on unknown, and an
-expression that evaluates to unknown excludes the entry (or does not copy it
-under `--copy-if`).
+follow 3-valued logic where unknown is `null`: `not unknown` is unknown,
+`true or unknown` is true, `false and unknown` is false, `if` takes the else
+branch on unknown, and an expression that evaluates to unknown excludes the
+entry (or does not copy it under `--copy-if`). A comparison with a `dst`
+field is unknown when the destination is absent, so start with
+`not dst.exists or` to copy new entries.
 
 ```text
 src.mtime is null

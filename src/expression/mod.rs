@@ -424,8 +424,13 @@ impl Node {
                 Bool
             }
             Self::In(a, items) => {
+                let left = a.ty()?;
+                require(
+                    left != Null,
+                    "use 'is null' or 'is not null' instead of comparing with null",
+                )?;
                 for b in items {
-                    binary_type(Op::Eq, a.ty()?, b.ty()?)?;
+                    binary_type(Op::Eq, left, b.ty()?)?;
                 }
                 Bool
             }
