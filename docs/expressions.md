@@ -1,8 +1,9 @@
 # Select entries with expressions
 
 Use `--where` to select files and other non-directory source entries in `map`
-and `cp`, and `--copy-if` to decide whether a copy may update its destination.
-Both take a quoted expression:
+and `cp`, or the entries that [`find` and `ls`](#find-and-ls) list, and
+`--copy-if` to decide whether a copy may update its destination. Both take a
+quoted expression:
 
 ```sh
 # Copy regular files between 1 MiB and 100 MiB.
@@ -44,10 +45,29 @@ metadata read, fails the copy and prevents pruning; files already copied
 stay. Mistakes in syntax, field names and types are reported before copying
 starts.
 
+## find and ls
+
+[`syq find`](commands/find.md) and [`syq ls`](commands/ls.md) filter what
+they list with `--where`, directories included. A field needs no `src.`
+prefix there, as in `size > 1MiB`, and `path` is the path as printed,
+starting with the `PATH` you gave:
+
+```sh
+syq find --where 'kind = "dir" and name glob "*-old"'
+syq find logs --where 'path glob "logs/2026-*/**" and extension = "json"'
+```
+
+On every endpoint, a directory's `size` is `null`; on S3, its fields other
+than its path fields, `kind`, and `exists` are `null`. Comparisons and pattern
+checks on `null` do not match instead of failing, so `size > 1MiB` skips
+directories cleanly and `size > 1MiB and path glob ...` still narrows the S3
+listing; see [List objects](object-storage.md#list-objects).
+
 ## Fields
 
-Prefix every field with `src.` or `dst.`. Metadata describes the entry
-itself: a symlink found inside a directory is not followed.
+Prefix every field with `src.` or `dst.`; `find` and `ls` also accept the
+bare name. Metadata describes the entry itself: a symlink found inside a
+directory is not followed.
 
 | Field | Type and meaning |
 |---|---|
@@ -56,7 +76,7 @@ itself: a symlink found inside a directory is not followed.
 | `extension` | Text after the last dot in `name`, without the dot; empty for extensionless names and a leading dot alone |
 | `exists` | Whether the entry exists; always true for a scanned source |
 | `kind` | `"file"`, `"dir"`, `"symlink"`, `"fifo"`, `"socket"`, `"char"`, `"block"`, or `"other"` |
-| `size` | Size in bytes; for anything but a regular file, the value depends on the platform |
+| `size` | Size in bytes; `null` for directories; for symlinks and special files, the value depends on the platform |
 | `mtime` | Filesystem modification timestamp, stored in syq object metadata on S3; `null` when unavailable |
 | `s3_last_modified` | S3 service modification timestamp; `null` on filesystem endpoints |
 | `ctime` | Filesystem status-change timestamp, not creation time |
@@ -81,11 +101,17 @@ listing, and other fields need a request for each object, so put conditions
 on the listed fields first.
 
 Use `is null`, `is not null`, or `coalesce(value, fallback)` for unavailable
-metadata. Equality treats `null` as a distinct value, but ordering,
-arithmetic, and pattern matching on `null` are errors.
+metadata instead of `= null` or `!= null`. Arithmetic on `null` produces
+`null`, and comparisons, `in`, `between`, and pattern matching with `null`
+follow 3-valued logic where unknown is `null`: `not unknown` is unknown,
+`true or unknown` is true, `false and unknown` is false, `if` takes the else
+branch on unknown, and an expression that evaluates to unknown excludes the
+entry (or does not copy it under `--copy-if`). A metadata comparison with a
+`dst` field (such as `src.size > dst.size`) is unknown when the destination is
+absent, so start with `not dst.exists or` to include new entries.
 
 ```text
-src.uid is not null and src.uid = 1000
+src.mtime is null
 not dst.exists or src.size > dst.size
 coalesce(dst.size, 0B) < src.size
 src.mode & 0o111 != 0

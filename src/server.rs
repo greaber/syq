@@ -1595,6 +1595,49 @@ fn serve<R: Read + Send + 'static, W: Write>(r: R, w: W, session: ServeSession) 
                     Err(error) => w.write_msg(&Response::Err(format!("{error:#}")))?,
                 }
             }
+            Request::NativeFind(options) => {
+                /// Output in chunks of up to 64 KiB, each report of a skipped
+                /// entry after the output before it.
+                struct Output<'a, W: std::io::Write> {
+                    connection: &'a mut ObservedWriter<W>,
+                    buffer: Vec<u8>,
+                }
+                impl<W: std::io::Write> std::io::Write for Output<'_, W> {
+                    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                        self.buffer.extend_from_slice(data);
+                        if self.buffer.len() >= 64 * 1024 {
+                            self.flush()?;
+                        }
+                        Ok(data.len())
+                    }
+                    fn flush(&mut self) -> std::io::Result<()> {
+                        for chunk in self.buffer.chunks(64 * 1024) {
+                            self.connection
+                                .write_msg(&Response::NativeFindData(chunk.to_vec()))?;
+                        }
+                        self.buffer.clear();
+                        Ok(())
+                    }
+                }
+                impl<W: std::io::Write> crate::native_find::Sink for Output<'_, W> {
+                    fn unreadable(&mut self, message: String) -> Result<()> {
+                        std::io::Write::flush(self)?;
+                        self.connection
+                            .write_msg(&Response::NativeFindUnreadable(message))?;
+                        Ok(())
+                    }
+                }
+                let mut out = Output {
+                    connection: &mut w,
+                    buffer: Vec::with_capacity(64 * 1024),
+                };
+                let result = crate::native_find::write_local(&options, &mut out)
+                    .and_then(|_| Ok(std::io::Write::flush(&mut out)?));
+                match result {
+                    Ok(()) => w.write_msg(&Response::NativeFindDone)?,
+                    Err(error) => w.write_msg(&Response::Err(format!("{error:#}")))?,
+                }
+            }
             Request::NativeRemove {
                 cwd,
                 root,

@@ -1235,9 +1235,9 @@ async fn a_key_the_glob_cannot_match_needs_no_check() {
     assert!(
         format!("{error:#}").contains("\"edge/p0\" to check for a key the store may have skipped")
     );
-    // Where the order is unknown, `edge/*` is listed flat after the first
-    // page, but `edge/*.jpg` needs no more than its delimiter listing, which
-    // a policy may require.
+    // Where the order is unknown, delimiter pagination still checks the
+    // boundary key without falling back to a flat listing, even when a
+    // policy refuses listings without a delimiter.
     struct DelimiterOnly(Memory);
     impl Store for DelimiterOnly {
         async fn page(
@@ -1267,10 +1267,20 @@ async fn a_key_the_glob_cannot_match_needs_no_check() {
     .unwrap();
     assert_eq!(keys.len(), 1000);
     let pattern = Pattern::parse("s3://bucket/edge/*").unwrap();
-    let error = engine::enumerate(&store, &pattern, 1, |_| Ok(()))
-        .await
-        .unwrap_err();
-    assert!(format!("{error:#}").contains("without a delimiter"));
+    let mut keys = Vec::new();
+    engine::enumerate(&store, &pattern, 1, |entry| {
+        keys.push(entry.key);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(keys.len(), 1000);
+    assert!(store
+        .0
+        .calls
+        .borrow()
+        .iter()
+        .all(|(_, delimiter)| *delimiter));
     // A page of nothing but objects leaves nothing out after it, so the
     // delimiter listing goes on while the pages hold no common prefix.
     let store = DelimiterOnly(Memory::new((0..1001).map(|i| format!("edge/f{i:04}"))));
@@ -1311,8 +1321,8 @@ async fn a_key_the_glob_cannot_match_needs_no_check() {
     .await
     .unwrap();
     assert_eq!(keys.len(), 1000);
-    // A later page that holds a common prefix fails the listing with the
-    // refusal, though earlier pages were listed.
+    // A later page that holds a common prefix recovers the skipped key with a
+    // delimiter check while never sending a flat listing request.
     let store = DelimiterOnly(Memory::new(
         (0..1000)
             .map(|i| format!("edge/a{i:04}"))
@@ -1320,10 +1330,21 @@ async fn a_key_the_glob_cannot_match_needs_no_check() {
             .chain(["edge/q/x", "edge/q0", "edge/zz"].map(String::from)),
     ));
     store.0.skips.set(true);
-    let error = engine::enumerate(&store, &pattern, 1, |_| Ok(()))
-        .await
-        .unwrap_err();
-    assert!(format!("{error:#}").contains("without a delimiter"));
+    let mut keys = Vec::new();
+    engine::enumerate(&store, &pattern, 1, |entry| {
+        keys.push(entry.key);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(keys.len(), 2001);
+    assert!(keys.contains(&"edge/q0".to_owned()));
+    assert!(store
+        .0
+        .calls
+        .borrow()
+        .iter()
+        .all(|(_, delimiter)| *delimiter));
     // Nor can a literal name be the key, which is longer than the prefix.
     let store = DelimiterOnly(Memory::new(
         std::iter::once("runs/day/f0".to_owned())

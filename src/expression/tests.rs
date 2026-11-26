@@ -43,11 +43,45 @@ fn missing_values_and_short_circuit() {
         "coalesce(dst.size, 0B) = 0B",
         "dst.path = 'renamed/a.jpg'",
         "false and 1 / 0 = 0 or true",
+        "not (src.size > dst.size and false)",
+        "true or dst.size > 0B",
+        "src.size > dst.size or true",
+        "dst.size > 0B or true",
+        "if(dst.size > 0B, false, true)",
+        "not (5B between 10B and dst.size)",
+        "not (5B between dst.size and 1B)",
+        "not (dst.link_target in [])",
+        "dst.link_target not in []",
+        "'a' in [dst.link_target, 'a']",
+        "not ('a' not in [dst.link_target, 'a'])",
+        "coalesce(dst.size + 1B, 0B) = 0B",
+        "coalesce(-dst.size, 0B) = 0B",
     ] {
         assert!(evaluate(s).unwrap(), "{s}");
     }
-    assert!(evaluate("src.size > dst.size").is_err());
-    assert!(!evaluate("dst.exists and src.size > dst.size").unwrap());
+    for s in [
+        "src.size > dst.size",
+        "not (src.size > dst.size)",
+        "src.size between 1MiB and 1B",
+        "'x' not in ['a', dst.link_target]",
+        "dst.exists and src.size > dst.size",
+        "dst.uid = 0",
+        "dst.uid != 0",
+        "dst.link_target glob '*'",
+        "dst.link_target not glob '*'",
+        "dst.link_target matches '.*'",
+        "dst.link_target in ['a', 'b']",
+        "dst.link_target not in ['a', 'b']",
+        "src.size between 1MiB and dst.size",
+        "dst.size between 1B and 2B",
+        "dst.size > 0B and true",
+        "true and dst.size > 0B",
+        "dst.size > 0B or false",
+        "false or dst.size > 0B",
+        "if(dst.size > 0B, true, false)",
+    ] {
+        assert!(!evaluate(s).unwrap(), "{s}");
+    }
 }
 #[test]
 fn patterns_membership_and_raw_paths() {
@@ -81,6 +115,16 @@ fn invalid_expressions_fail_before_evaluation() {
         "src.mode > 0.5",
         "true garbage",
         "dst.exists or 1 + 'x' = 2",
+        "src.size = null",
+        "src.name != null",
+        "src.name in ['a', null]",
+        "null = null",
+        "src.size > null",
+        "src.name glob null",
+        "not null",
+        "(src.size = null) in []",
+        "(not src.size) in []",
+        "null in []",
     ] {
         assert!(Expression::compile(s, true).is_err(), "{s}");
     }
@@ -214,4 +258,253 @@ fn raw_link_targets_compare_as_borrowed_bytes() {
         panic!("missing target")
     };
     assert_eq!(bytes.as_ptr(), file.link_target.as_ref().unwrap().as_ptr());
+}
+#[test]
+fn listing_names_fields_bare_and_filters_directories() {
+    let policy = Policy::compile_listing(Some("kind = 'dir' and src.name = 'logs'")).unwrap();
+    let entry = Entry {
+        path: b"logs".to_vec(),
+        kind: Kind::Dir,
+        size: 4096,
+        mtime: 100,
+        mtime_nsec: 0,
+        mode: 0o755,
+        uid: 1000,
+        gid: 1000,
+        rdev: 0,
+        dev: 1,
+        ino: 2,
+        nlink: 2,
+        ctime: 100,
+        ctime_nsec: 0,
+        link: None,
+        atime: Default::default(),
+        inode_metadata: None,
+    };
+    let directory = File::from_entry(&entry);
+    assert_eq!(directory.size, None);
+    assert!(policy.selects_listing(&directory, b"logs").unwrap());
+    assert!(!policy.selects_listing(&directory, b"other").unwrap());
+    // Copies keep directories regardless of --where.
+    assert!(policy.selects(&directory, b"other").unwrap());
+    let policy = Policy::compile_listing(Some("size > 1MiB")).unwrap();
+    assert!(policy.selects_listing(&source(), b"a").unwrap());
+    assert!(!policy.selects_listing(&directory, b"a").unwrap());
+    assert!(!Policy::compile_listing(Some("size <= 1MiB"))
+        .unwrap()
+        .selects_listing(&directory, b"a")
+        .unwrap());
+    assert!(Policy::compile_listing(Some("size is null"))
+        .unwrap()
+        .selects_listing(&directory, b"a")
+        .unwrap());
+    for text in [
+        "dst.size > 0B",
+        "dst.exists",
+        "unknown = 1",
+        "(size = null) in []",
+        "(not size) in []",
+    ] {
+        assert!(Policy::compile_listing(Some(text)).is_err(), "{text}");
+    }
+    // Copy selection still needs the prefix.
+    assert!(Policy::compile(Some("size > 1MiB"), None).is_err());
+}
+
+#[test]
+fn s3_directory_selectability_stays_sound_under_short_circuit_and_errors() {
+    let may_select = |text: &str| {
+        Policy::compile_listing(Some(text))
+            .unwrap()
+            .may_select_s3_directory()
+    };
+    for expr in [
+        "size > 1MiB",
+        "size <= 1MiB",
+        "size is not null",
+        "not (size > 1MiB)",
+        "size > 1MiB and path glob 'logs/**'",
+        "s3_last_modified > now - 7d",
+        "mtime > now - 7d",
+        "kind = 'file'",
+        "kind != 'dir'",
+        "kind glob 'f*'",
+        "false",
+        "not (size > 1MiB or path glob 'logs/**')",
+        "ctime is not null",
+        "link_target is not null",
+        "if(size > 1B, true, false)",
+        "coalesce(size, 0B) > 1B",
+        "name is null",
+    ] {
+        assert!(!may_select(expr), "{expr}");
+    }
+    for expr in [
+        "kind = 'dir'",
+        "kind = 'dir' and name glob '*-old'",
+        "name glob '*-old'",
+        "extension = 'rs'",
+        "size is null",
+        "not (size > 1MiB and path glob 'logs/**')",
+        "size > 1MiB and 1 / 0 = 0",
+        "coalesce(size, 2MiB) > 1MiB",
+        "if(path = 'a', 2MiB, 0B) > 1MiB",
+        "if(size is not null, true, 1 / 0 = 0)",
+        "uid = 0 or name = 'a'",
+    ] {
+        assert!(may_select(expr), "{expr}");
+    }
+    assert!(Policy::compile_listing(None)
+        .unwrap()
+        .may_select_s3_directory());
+}
+
+#[test]
+fn s3_directories_are_known_from_the_listing() {
+    let policy = Policy::compile_listing(Some(
+        "kind = 'dir' and size is null and mtime is null and s3_last_modified is null and exists",
+    ))
+    .unwrap();
+    assert_eq!(
+        policy
+            .selects_listing_known(Facts::S3Directory, b"logs/day00")
+            .unwrap(),
+        Some(true)
+    );
+    let policy = Policy::compile_listing(Some("kind = 'file'")).unwrap();
+    assert_eq!(
+        policy
+            .selects_listing_known(Facts::S3Directory, b"logs")
+            .unwrap(),
+        Some(false)
+    );
+    // An object's kind needs its metadata, but not whether it is a
+    // directory: only a directory marker is.
+    let object = Facts::S3Listing {
+        size: 3,
+        directory_marker: false,
+        last_modified: None,
+    };
+    assert_eq!(policy.selects_listing_known(object, b"a").unwrap(), None);
+    for (text, expected) in [
+        ("kind = 'dir'", Some(false)),
+        ("'dir' = kind", Some(false)),
+        ("kind != 'dir'", Some(true)),
+        ("kind != 'dir' and size = 3B", Some(true)),
+        ("not kind = 'dir' and kind = 'file'", None),
+        ("kind = 'symlink'", None),
+    ] {
+        let policy = Policy::compile_listing(Some(text)).unwrap();
+        assert_eq!(
+            policy.selects_listing_known(object, b"a").unwrap(),
+            expected,
+            "{text}"
+        );
+    }
+    let marker = Facts::S3Listing {
+        size: 0,
+        directory_marker: true,
+        last_modified: None,
+    };
+    let policy = Policy::compile_listing(Some("kind != 'dir'")).unwrap();
+    assert_eq!(policy.selects_listing_known(marker, b"a").unwrap(), None);
+    let policy = Policy::compile_listing(Some("size is null")).unwrap();
+    assert_eq!(
+        policy.selects_listing_known(marker, b"a").unwrap(),
+        Some(true)
+    );
+    let policy = Policy::compile_listing(Some("size = 3B and path glob '*'")).unwrap();
+    assert_eq!(
+        policy.selects_listing_known(object, b"a").unwrap(),
+        Some(true)
+    );
+}
+
+#[test]
+fn path_conditions_joined_by_and_are_pushed_down() {
+    use PathToken::{Literal as L, Recursive as R, Star as S};
+    let lit = |text: &str| text.chars().map(L).collect::<Vec<_>>();
+    let pushed = |text: &str| {
+        Expression::compile_listing(text)
+            .unwrap()
+            .s3_path_pushdown(1_700_000_000_000_000_000)
+    };
+    assert_eq!(
+        pushed("path glob 'logs/*.json'"),
+        [[lit("logs/"), vec![S], lit(".json")].concat()]
+    );
+    assert_eq!(
+        pushed("extension = 'b' and (src.path = 'a/b' and path glob 'a/**')"),
+        [lit("a/b"), [lit("a/"), vec![R]].concat()]
+    );
+    assert_eq!(pushed("'x' = path"), [lit("x")]);
+    assert_eq!(
+        pushed("path glob 'logs/2026-*/*' and size > 1MiB"),
+        [[lit("logs/2026-"), vec![S], lit("/"), vec![S]].concat()]
+    );
+    assert_eq!(
+        pushed("extension = 'json' and path glob 'logs/2026-*/*'"),
+        [[lit("logs/2026-"), vec![S], lit("/"), vec![S]].concat()]
+    );
+    assert_eq!(
+        pushed("path = 'a' and size + 1B > 0B and path = 'b'"),
+        [lit("a")]
+    );
+    for text in [
+        "size is null and s3_last_modified is not null and name in ['a', 'b']",
+        "exists and not (name glob 'x*' or extension < 'm') and name between 'a' and 'z'",
+        "coalesce(size, 0B) = 0B and if(exists, s3_last_modified, now) is null and now > timestamp('2020-01-01T00:00:00Z')",
+        "if(exists, name, extension) glob '*' and coalesce(link_target, name) glob '*'",
+        "true",
+        "size > 0B",
+        "size > 1MiB + 512KiB",
+        "s3_last_modified > now - 7d",
+        "kind = 'dir'",
+        "kind != 'dir'",
+        "size between 0B and 1B",
+        "not if(exists, true, null)",
+        "coalesce(size, null) > 0B",
+        "if(size > 0B, true, false)",
+        "link_target glob '*'",
+    ] {
+        assert_eq!(
+            pushed(&format!("{text} and path = 'p'")),
+            [lit("p")],
+            "{text}"
+        );
+    }
+    // Conditions that may trigger an S3 HEAD or checked arithmetic error stop narrowing.
+    for text in [
+        "kind = 'file'",
+        "kind is not null",
+        "kind glob 'f*'",
+        "mtime is null",
+        "mtime < now",
+        "mode is null",
+        "uid is null",
+        "gid is null",
+        "size + 1B = 2B",
+        "size / 0 = 0B",
+        "-size = 0B",
+        "1 / 0 = 0",
+        "now + 170141183460469231731687303715884105727ns > now",
+    ] {
+        assert!(
+            pushed(&format!("{text} and path = 'p'")).is_empty(),
+            "{text}"
+        );
+    }
+    // Conditions that are not necessary for a match narrow nothing.
+    for text in [
+        "path glob 'a/*' or size > 0B",
+        "not path glob 'a/*'",
+        "path not glob 'a/*'",
+        "if(true, path glob 'a/*', true)",
+        "path matches '^a/'",
+        "name glob 'a*'",
+        "path = '\\xff'",
+        "path != 'a'",
+    ] {
+        assert!(pushed(text).is_empty(), "{text}");
+    }
 }

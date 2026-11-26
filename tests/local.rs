@@ -1270,6 +1270,8 @@ mod fifo;
 #[cfg(debug_assertions)]
 #[path = "local/filesystem_support.rs"]
 mod filesystem_support;
+#[path = "local/find.rs"]
+mod find;
 #[path = "local/hardlinks.rs"]
 mod hardlinks;
 #[path = "local/hashing.rs"]

@@ -3995,6 +3995,9 @@ impl RestrictedAuthority {
             Request::NativeMap(_) => {
                 bail!("mapping generation is not valid on a restricted destination")
             }
+            Request::NativeFind(_) => {
+                bail!("listing is not valid on a restricted destination")
+            }
             Request::NativeRemove { .. } => {
                 bail!("native removal is not valid on a restricted destination")
             }

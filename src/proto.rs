@@ -1527,6 +1527,8 @@ pub enum WireRequest<Data> {
         unchecked_keep: bool,
     },
     NativeMap(crate::native_map::Options),
+    /// List entries for `syq find` and `syq ls`.
+    NativeFind(crate::native_find::Options),
     /// Configure and select a bounded small push without reading its payloads.
     PrepareSmallFiles(SmallCopyRequest),
     /// Stage a private basis without reading source data or hashing the whole file.
@@ -1881,6 +1883,7 @@ impl Request {
                 | Request::DescriptorCopy(_)
                 | Request::ListDir { .. }
                 | Request::NativeMap(_)
+                | Request::NativeFind(_)
                 | Request::NativeRemove { .. }
                 | Request::CheckOperatorDirectory { .. }
                 | Request::CheckOperatorDirectoryAncestry { .. }
@@ -2023,6 +2026,11 @@ pub enum Response {
     StatsMore(Vec<Option<Entry>>),
     NativeMapData(Vec<u8>),
     NativeMapDone,
+    /// Output of `syq find` or `syq ls`.
+    NativeFindData(Vec<u8>),
+    /// An entry the listing could not read, and so skipped.
+    NativeFindUnreadable(String),
+    NativeFindDone,
     /// One bit per offered file; true requests its payload (including empty files).
     SmallFilesPrepared(Vec<bool>),
     BasisStaged {
@@ -2380,6 +2388,14 @@ impl SizeHint for Request {
                     + 16
             }
             Request::Apply { ops, .. } => ops.iter().map(Op::size_hint).sum::<usize>() + 16,
+            Request::NativeFind(options) => {
+                options.paths.iter().map(|p| p.len() + 16).sum::<usize>()
+                    + options.ignore.iter().map(|l| l.len() + 8).sum::<usize>()
+                    + options.where_expression.as_ref().map_or(0, String::len)
+                    + options.cwd.as_ref().map_or(0, Vec::len)
+                    + options.root.as_ref().map_or(0, Vec::len)
+                    + 128
+            }
             Request::NativeMap(options) => {
                 options
                     .sources
@@ -2469,7 +2485,8 @@ impl SizeHint for Response {
                     + 16
             }
             Response::ScanBatch(v) => v.iter().map(Entry::size_hint).sum::<usize>() + 16,
-            Response::NativeMapData(data) => data.len() + 16,
+            Response::NativeMapData(data) | Response::NativeFindData(data) => data.len() + 16,
+            Response::NativeFindUnreadable(message) => message.len() + 16,
             Response::NativeRemoveBatch(v) => {
                 v.iter().map(NativeRemoveOutcome::size_hint).sum::<usize>() + 16
             }

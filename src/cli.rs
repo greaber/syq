@@ -12,6 +12,7 @@ pub enum Interface {
     NativeCp,
     NativeRm,
     NativeMap,
+    NativeFind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -286,6 +287,9 @@ pub struct Args {
     pub native_map_target: Option<Vec<u8>>,
     #[arg(skip)]
     pub native_map_include: Vec<crate::native_map::Field>,
+    /// What `syq find` or `syq ls` lists, and how it prints it.
+    #[arg(skip)]
+    pub native_find: Option<Box<crate::native_find::Options>>,
     /// NDJSON mapping manifest consumed by native cp instead of selectors;
     /// `-` reads stdin and the complete input is acquired before mutation.
     #[arg(skip)]
@@ -794,6 +798,8 @@ impl Args {
             "rm" => parse_native(&argv[1..], Interface::NativeRm),
             "clean-partials" => parse_clean_partials(&argv[1..]),
             "map" => parse_native(&argv[1..], Interface::NativeMap),
+            "find" => parse_native_find(&argv[1..], false),
+            "ls" => parse_native_find(&argv[1..], true),
             "--help" | "-h" | "--help-all" => {
                 print_root_help(command == "--help-all");
                 crate::output::exit(0);
@@ -1270,7 +1276,8 @@ pub(crate) fn command_for_completion(name: &str) -> Option<clap::Command> {
         "rm" => Some(crate::help::filesystem(NativeRmCommand::command())),
         "clean-partials" => Some(crate::help::filesystem(CleanPartialsCommand::command())),
         "map" => Some(crate::help::filesystem(NativeMapCommand::command())),
-        "_ls" => Some(crate::s3::listing::command_for_help()),
+        "find" => Some(find_command(false)),
+        "ls" => Some(find_command(true)),
         _ => None,
     }
 }
@@ -2078,7 +2085,7 @@ fn parse_native(argv: &[OsString], interface: Interface) -> Result<Args> {
         Interface::NativeCp => parse_native_copy(argv),
         Interface::NativeMap => parse_native_map(argv),
         Interface::NativeRm => parse_native_rm(argv),
-        Interface::Rsync => unreachable!(),
+        Interface::NativeFind | Interface::Rsync => unreachable!(),
     }
 }
 
@@ -2965,6 +2972,239 @@ fn parse_native_map(argv: &[OsString]) -> Result<Args> {
     Ok(args)
 }
 
+const FIND_ABOUT: &str = "List files and directories, locally, over SSH, or in S3.\n\nWithout PATH, list everything beneath the current directory (-C sets another),\nor beneath the bucket's root on S3. A directory PATH lists what it holds; any\nother PATH lists itself. Paths print relative to the base, starting with PATH.";
+const FIND_LONG_ABOUT: &str = "List files and directories, locally, over SSH, or in S3.\n\nWithout PATH, list everything beneath the current directory (-C or --root sets another), or beneath the bucket's root on S3 (-C sets a key prefix there). A directory PATH lists what it holds, not the directory itself; any other PATH lists only itself. Each path prints relative to the base, starting with PATH as given, and directories print without a trailing slash. Symlinks inside directories are listed, never followed.\n\n--where filters every entry, directories included; fields can be named without src., as in size > 1MiB. On S3, a path glob condition joined to the rest with and narrows the listing requests; conditions on path, name, extension, size and s3_last_modified use only the listing, and other fields of objects need a request for each.\n\nOutput streams as entries are found, in no particular order between directories on S3. A nonzero exit status means the listing is incomplete. Attach option values that begin with `-` with `=`, for example --ignore=-x.";
+const LS_ABOUT: &str = "List the entries directly in a directory: syq find --depth 1.\n\nWithout PATH, list the current directory (-C sets another), or the bucket's\nroot on S3. A directory PATH lists what it holds; any other PATH lists itself.";
+const LS_LONG_ABOUT: &str = "List the entries directly in a directory, locally, over SSH, or in S3. syq ls is syq find with --depth 1; --depth N lists N levels instead, and every other option works as in syq find.\n\nWithout PATH, list the current directory (-C or --root sets another), or the bucket's root on S3 (-C sets a key prefix there). A directory PATH lists what it holds; any other PATH lists only itself. Directories print without a trailing slash.\n\nAttach option values that begin with `-` with `=`, for example --ignore=-x.";
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "syq find",
+    version,
+    about = FIND_ABOUT,
+    long_about = FIND_LONG_ABOUT,
+    before_help = "Examples:\n  syq find src --where 'extension = \"rs\" and size > 10KiB'\n  syq find --on nas /backup --depth 2 --long\n  syq find --on s3://bucket logs --where 'path glob \"logs/2026-*/*.json\"'",
+    override_usage = "syq find [OPTIONS] [PATH]..."
+)]
+struct NativeFindCommand {
+    /// Paths to list beneath, taken literally (default: the base directory)
+    #[arg(value_name = "PATH")]
+    paths: Vec<OsString>,
+    /// Endpoint to list ([USER@]HOST[:PORT] or s3://BUCKET); omitted means local
+    #[arg(long, value_name = "ENDPOINT")]
+    on: Option<String>,
+    /// Resolve relative paths from DIR; on S3, a key prefix
+    #[arg(short = 'C', long, value_name = "DIR", conflicts_with = "root")]
+    cwd: Option<OsString>,
+    /// Resolve paths inside DIR and refuse any that lead outside it
+    #[arg(long, value_name = "DIR")]
+    root: Option<OsString>,
+    /// Follow symlinks in the paths you give, never inside directories
+    #[arg(long)]
+    follow: bool,
+    /// Follow symlinks in the paths you give (same as --follow)
+    #[arg(long)]
+    follow_src: bool,
+    /// List at most N levels beneath each path; direct children are level 1
+    #[arg(short = 'd', long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    depth: Option<u32>,
+    /// Skip paths matching a gitignore-style pattern, with everything beneath them (repeatable)
+    #[arg(long = "ignore", value_name = "PATTERN")]
+    ignore: Vec<String>,
+    /// Read gitignore-style patterns from FILE (repeatable; applied in command-line order with --ignore)
+    #[arg(long, value_name = "FILE")]
+    ignore_from: Vec<OsString>,
+    /// List only entries, directories included, that match an expression
+    #[arg(long = "where", value_name = "EXPR")]
+    where_expression: Option<String>,
+    /// Print kind, size, modification time (UTC) and path
+    #[arg(short = 'l', long, conflicts_with_all = ["json", "null"])]
+    long: bool,
+    /// Print one JSON object per line
+    #[arg(long, conflicts_with = "null")]
+    json: bool,
+    /// End each path with NUL instead of a newline, keeping names exactly
+    #[arg(short = '0', long)]
+    null: bool,
+    /// JSON fields to print after path, instead of the default ones (comma-separated or repeatable)
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        value_name = "FIELD",
+        requires = "json"
+    )]
+    include: Vec<crate::native_find::Field>,
+    /// Override performance settings (normally automatic)
+    #[arg(
+        long = "performance-tuning",
+        value_name = "KEY=VALUE,...",
+        long_help = "Fix the number of simultaneous S3 listing requests, normally 32: s3-requests=N, 1..256 (larger values count as 256). s3-requests=1 lists a prefix with one request at a time, which a policy that allows listing only the prefix itself needs. Leave it unset unless you are investigating a performance problem."
+    )]
+    performance_tuning: Vec<String>,
+    /// Remote shell command (default: ssh)
+    #[arg(long, value_name = "COMMAND")]
+    rsh: Option<String>,
+    #[command(flatten)]
+    helper: NativeRemoteHelperArgs,
+    /// Whose SSH access to use: this machine's own (auto or ssh), or access approved by a receiving machine (@NAME) or SSH authorization provider (HOST)
+    #[arg(long, value_name = "auto|ssh|@NAME|HOST", value_parser = parse_auth_from)]
+    auth_from: Option<AuthFrom>,
+    /// Use the scope that `syq persist on --ephemeral` created at PATH, with its own connections and settings
+    #[arg(long, value_name = "PATH")]
+    pscope: Option<PathBuf>,
+    #[command(flatten)]
+    s3: crate::s3::Flags,
+}
+
+/// `syq find`, or `syq ls`, which is `syq find --depth 1`.
+fn find_command(ls: bool) -> clap::Command {
+    let command = NativeFindCommand::command().mut_arg("s3_header", |arg| {
+        arg.help("Add a header before signing every S3 request (repeatable)")
+    });
+    let command = if ls {
+        command
+            .name("syq ls")
+            .about(LS_ABOUT)
+            .long_about(LS_LONG_ABOUT)
+            .before_help(
+                "Examples:\n  syq ls\n  syq ls --long photos\n  syq ls --on s3://bucket logs/2026",
+            )
+            .override_usage("syq ls [OPTIONS] [PATH]...")
+            .mut_arg("depth", |arg| {
+                arg.help("List N levels beneath each path instead of 1")
+            })
+    } else {
+        command
+    };
+    crate::help::filesystem(command)
+}
+
+fn parse_native_find(argv: &[OsString], ls: bool) -> Result<Args> {
+    reject_detached_dash_native_values(argv)?;
+    let name = if ls { "syq ls" } else { "syq find" };
+    let matches = find_command(ls)
+        .try_get_matches_from(std::iter::once(OsString::from(name)).chain(argv.iter().cloned()))
+        .unwrap_or_else(|error| crate::output::exit_with(error));
+    let parsed = NativeFindCommand::from_arg_matches(&matches)?;
+    let s3_endpoint = parsed.on.as_deref().filter(|on| on.starts_with("s3://"));
+    let explicit =
+        |id: &str| matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine);
+    let endpoint = if s3_endpoint.is_some() {
+        None
+    } else {
+        parse_native_endpoint(parsed.on.as_deref())?
+    };
+    if endpoint.is_none()
+        && (parsed.auth_from.is_some()
+            || parsed.rsh.is_some()
+            || parsed.helper.syq_path.is_some()
+            || parsed.helper.no_bootstrap
+            || parsed.pscope.is_some())
+    {
+        bail!("--auth-from, --rsh, --syq-path, --no-bootstrap and --pscope require an SSH endpoint (--on HOST)");
+    }
+    if s3_endpoint.is_none()
+        && [
+            "s3_endpoint",
+            "s3_region",
+            "s3_profile",
+            "s3_header",
+            "s3_retries",
+        ]
+        .iter()
+        .any(|id| explicit(id))
+    {
+        bail!("S3 options require --on s3://BUCKET");
+    }
+    if s3_endpoint.is_some() && (parsed.follow || parsed.follow_src) {
+        bail!("--follow and --follow-src require a filesystem endpoint: S3 keys have no symlinks to follow");
+    }
+    let tuning = if parsed.performance_tuning.is_empty() {
+        None
+    } else {
+        if s3_endpoint.is_none() {
+            bail!("--performance-tuning applies only to S3 listings (--on s3://BUCKET)");
+        }
+        let tuning: crate::transfer_tuning::TransferTuning = parsed
+            .performance_tuning
+            .join(",")
+            .parse()
+            .context("invalid --performance-tuning")?;
+        tuning.check_route(crate::transfer_tuning::TuningRoute::S3Listing)?;
+        Some(tuning)
+    };
+    let s3 = crate::s3::Options::parse(parsed.s3, s3_endpoint, None, &matches)?;
+    let format = if parsed.long {
+        crate::native_find::Format::Long
+    } else if parsed.json {
+        crate::native_find::Format::Json
+    } else if parsed.null {
+        crate::native_find::Format::Null
+    } else {
+        crate::native_find::Format::Plain
+    };
+    let follow = parsed.follow || parsed.follow_src;
+    let ignore = read_ignore_inputs(
+        ordered_ignore_inputs(&parsed.ignore, &parsed.ignore_from, &matches),
+        if follow {
+            OperatorSymlinkPolicy::FollowAll
+        } else {
+            OperatorSymlinkPolicy::Refuse
+        },
+        "--ignore-from",
+    )?;
+    crate::scan::build_ignore(&ignore)?;
+    // Compile now to report a mistake before any listing; the walk, on
+    // whichever machine runs it, compiles it again.
+    let expressions =
+        crate::expression::Policy::compile_listing(parsed.where_expression.as_deref())?;
+    // S3 keys are always relative to the bucket or the -C prefix.
+    let confined = parsed.root.is_some() && s3.is_none();
+    let paths: Vec<Vec<u8>> = parsed
+        .paths
+        .into_iter()
+        .map(OsStringExt::into_vec)
+        .collect();
+    for path in &paths {
+        validate_native_source_selector(path, confined)?;
+    }
+    let options = crate::native_find::Options {
+        cwd: parsed.cwd.map(OsStringExt::into_vec),
+        root: parsed.root.map(OsStringExt::into_vec),
+        paths,
+        follow,
+        depth: parsed.depth.or(ls.then_some(1)),
+        ignore,
+        where_expression: parsed.where_expression,
+        expression_now: expressions.now,
+        format,
+        include: (!parsed.include.is_empty()).then_some(parsed.include),
+    };
+    options.check_fields(s3.is_some())?;
+    let mut args = native_engine_defaults();
+    args.interface = Interface::NativeFind;
+    args.pscope = parsed.pscope;
+    args.auth_from_explicit = parsed.auth_from.is_some();
+    args.auth_from = parsed.auth_from.unwrap_or_default();
+    args.locations = vec![Location::native(
+        endpoint,
+        b".".to_vec(),
+        SourceSelection::Contents,
+    )];
+    if let Some(options) = &s3 {
+        args.locations[0].host = Some(format!("s3://{}", options.bucket));
+    }
+    args.rsh = parsed.rsh;
+    args.syq_path = parsed.helper.syq_path;
+    args.no_bootstrap = parsed.helper.no_bootstrap;
+    args.s3 = s3;
+    args.tuning_options = tuning;
+    args.native_follow = follow;
+    args.native_find = Some(Box::new(options));
+    Ok(args)
+}
+
 fn parse_native_rm(argv: &[OsString]) -> Result<Args> {
     let mut full_argv = vec![OsString::from("syq rm")];
     full_argv.extend_from_slice(argv);
@@ -3199,6 +3439,8 @@ mod native_sdk_inventory_tests {
             ("rm", NativeRmCommand::command()),
             ("clean-partials", CleanPartialsCommand::command()),
             ("map", NativeMapCommand::command()),
+            ("find", NativeFindCommand::command()),
+            ("ls", NativeFindCommand::command()),
         ];
         assert_eq!(
             inventory.commands.keys().cloned().collect::<BTreeSet<_>>(),

@@ -1,13 +1,18 @@
-use anyhow::{ensure, Result};
+use anyhow::Result;
 
 #[derive(Clone, Debug)]
-pub(super) enum Token {
+pub(in crate::s3) enum Token {
     Literal(char),
     Star,
     Recursive,
+    /// One character other than `/`; only the tests' text patterns have it.
+    #[cfg_attr(not(test), allow(dead_code))]
     Any,
 }
 
+/// The tokens of a pattern written as text: `?`, `*` and `**`, everything
+/// else literal.
+#[cfg(test)]
 fn tokens(text: &str) -> Vec<Token> {
     let mut chars = text.chars().peekable();
     let mut out = Vec::new();
@@ -23,6 +28,20 @@ fn tokens(text: &str) -> Vec<Token> {
         });
     }
     out
+}
+
+fn matcher(tokens: &[Token]) -> Result<regex::Regex> {
+    let mut expression = String::from(r"(?s)\A");
+    for token in tokens {
+        match token {
+            Token::Literal(c) => expression.push_str(&regex::escape(&c.to_string())),
+            Token::Star => expression.push_str("[^/]*"),
+            Token::Recursive => expression.push_str(".*"),
+            Token::Any => expression.push_str("[^/]"),
+        }
+    }
+    expression.push_str(r"\z");
+    Ok(regex::Regex::new(&expression)?)
 }
 
 fn matches(tokens: &[Token], text: &str) -> bool {
@@ -53,7 +72,7 @@ fn matches(tokens: &[Token], text: &str) -> bool {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct Component(Vec<Token>);
+pub(in crate::s3) struct Component(Vec<Token>);
 impl Component {
     pub fn literal_prefix(&self) -> String {
         self.0
@@ -74,23 +93,63 @@ impl Component {
     pub fn matches(&self, text: &str) -> bool {
         matches(&self.0, text)
     }
-    /// Whether a name this matches can end with `c`.
-    pub fn may_end_with(&self, c: char) -> bool {
-        match self.0.last() {
-            Some(Token::Literal(last)) => *last == c,
-            Some(_) => true,
-            None => false,
-        }
-    }
 }
 
+/// A pattern of whole S3 keys, split into the components between slashes so
+/// that a listing can be directed by them.
 #[derive(Debug)]
-pub(super) struct Pattern {
-    pub bucket: String,
+pub(in crate::s3) struct Pattern {
     pub components: Vec<Component>,
     matcher: regex::Regex,
 }
 impl Pattern {
+    /// A key pattern from a path pattern that `find` narrows its listing
+    /// with: `key_prefix` literally, then `tokens`.
+    pub fn from_tokens(key_prefix: &str, tokens: &[crate::expression::PathToken]) -> Result<Self> {
+        use crate::expression::PathToken;
+        let tokens: Vec<Token> = key_prefix
+            .chars()
+            .map(Token::Literal)
+            .chain(tokens.iter().map(|token| match token {
+                PathToken::Literal(c) => Token::Literal(*c),
+                PathToken::Star => Token::Star,
+                PathToken::Recursive => Token::Recursive,
+            }))
+            .collect();
+        Ok(Self {
+            components: tokens
+                .split(|token| matches!(token, Token::Literal('/')))
+                .map(|part| Component(part.to_vec()))
+                .collect(),
+            matcher: matcher(&tokens)?,
+        })
+    }
+    /// Whether a key under the directory `prefix`, which ends with `/`, may
+    /// match. Only whole components of `prefix` are compared, so this can
+    /// say yes for a directory that holds no match, never no for one that
+    /// does.
+    pub fn may_match_under(&self, prefix: &str) -> bool {
+        let Some(directory) = prefix.strip_suffix('/') else {
+            return true;
+        };
+        if directory.is_empty() && !prefix.is_empty() {
+            // An empty component: compare nothing.
+            return true;
+        }
+        for (part, name) in self.components.iter().zip(directory.split('/')) {
+            if part.recursive() {
+                // Everything before the first recursive token is literal or
+                // a single component, so only its literal start can be
+                // compared without knowing where the component ends.
+                return name.starts_with(&part.literal_prefix());
+            }
+            if !part.matches(name) {
+                return false;
+            }
+        }
+        directory.split('/').count() < self.components.len()
+    }
+    #[cfg(test)]
     pub fn parse(input: &str) -> Result<Self> {
         let input = input
             .strip_prefix("s3://")
@@ -98,30 +157,17 @@ impl Pattern {
         let (bucket, path) = input.split_once('/').ok_or_else(|| {
             anyhow::anyhow!("include a key or pattern, for example s3://BUCKET/**")
         })?;
-        ensure!(
+        anyhow::ensure!(
             !bucket.is_empty() && !bucket.contains(['*', '?']),
             "expected a literal S3 bucket name"
         );
-        ensure!(
+        anyhow::ensure!(
             !path.is_empty(),
             "include a key or pattern, for example s3://BUCKET/**"
         );
         Ok(Self {
-            bucket: bucket.into(),
             components: path.split('/').map(|s| Component(tokens(s))).collect(),
-            matcher: {
-                let mut expression = String::from(r"(?s)\A");
-                for token in tokens(path) {
-                    match token {
-                        Token::Literal(c) => expression.push_str(&regex::escape(&c.to_string())),
-                        Token::Star => expression.push_str("[^/]*"),
-                        Token::Recursive => expression.push_str(".*"),
-                        Token::Any => expression.push_str("[^/]"),
-                    }
-                }
-                expression.push_str(r"\z");
-                regex::Regex::new(&expression)?
-            },
+            matcher: matcher(&tokens(path))?,
         })
     }
     pub fn matches(&self, key: &str) -> bool {
@@ -174,5 +220,57 @@ mod tests {
         for input in ["bucket/x", "s3:///x", "s3://bucket", "s3://bucket/"] {
             assert!(Pattern::parse(input).is_err());
         }
+    }
+
+    #[test]
+    fn token_patterns_and_the_directories_that_may_hold_matches() {
+        use crate::expression::PathToken::{self, Literal as L, Recursive as R, Star as S};
+        let lit = |text: &str| text.chars().map(L).collect::<Vec<PathToken>>();
+        let tokens = [
+            lit("logs/2026-"),
+            vec![S],
+            lit("/*"),
+            vec![S],
+            lit(".json"),
+            vec![R],
+        ]
+        .concat();
+        let pattern = Pattern::from_tokens("base/", &tokens).unwrap();
+        for key in [
+            "base/logs/2026-01/*a.json",
+            "base/logs/2026-/*.json/",
+            "base/logs/2026-1/*.json/x",
+        ] {
+            assert!(pattern.matches(key), "{key}");
+        }
+        for key in [
+            "base/logs/2026-01/a.json",
+            "base/logs/2025-01/*a.json",
+            "logs/2026-01/*a.json",
+        ] {
+            assert!(!pattern.matches(key), "{key}");
+        }
+        for prefix in [
+            "",
+            "base/",
+            "base/logs/",
+            "base/logs/2026-01/",
+            "base/logs/2026-01/*x/",
+        ] {
+            assert!(pattern.may_match_under(prefix), "{prefix}");
+        }
+        for prefix in [
+            "other/",
+            "base/other/",
+            "base/logs/2025-01/",
+            "base/logs/2026-01/x/",
+        ] {
+            assert!(!pattern.may_match_under(prefix), "{prefix}");
+        }
+        // A recursive component compares only its literal start.
+        let pattern = Pattern::from_tokens("", &[lit("day0"), vec![R]].concat()).unwrap();
+        assert!(pattern.may_match_under("day05/"));
+        assert!(pattern.may_match_under("day0/x/"));
+        assert!(!pattern.may_match_under("day1/"));
     }
 }

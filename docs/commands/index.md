@@ -25,6 +25,8 @@ syq --self-update
 | [`exec`](exec.md) | From a server, run a command on a receiving machine after it approves |
 | [`rm`](rm.md) | Remove selected files and directory trees |
 | [`clean-partials`](clean-partials.md) | Delete partial files that interrupted syq copies left in directory trees |
+| [`find`](find.md) | List files and directories beneath paths, locally, over SSH, or in S3 |
+| [`ls`](ls.md) | List the entries directly in a directory (find --depth 1) |
 | [`map`](map.md) | Print source-to-destination mappings as NDJSON |
 | [`rsync`](rsync.md) | Copy using rsync-compatible syntax |
 | [`persist`](persist.md) | Keep SSH connections open, and receive files and requests from connected servers |

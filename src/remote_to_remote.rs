@@ -1655,6 +1655,7 @@ pub(crate) fn coordinator_arguments(
         Interface::NativeCp => "cp",
         Interface::NativeRm => bail!("native rm cannot be a remote-to-remote transfer"),
         Interface::NativeMap => bail!("syq map runs locally and is never remoted"),
+        Interface::NativeFind => bail!("syq find runs locally and is never remoted"),
     }
     .into()];
     remote.push("--delegated-operands-b64".into());

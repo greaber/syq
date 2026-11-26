@@ -12,15 +12,15 @@ struct Parser {
     tokens: Vec<(Token, usize)>,
     at: usize,
     depth: usize,
-    destination: bool,
+    fields: Fields,
 }
-pub(super) fn parse(text: &str, destination: bool) -> Result<Node> {
+pub(super) fn parse(text: &str, fields: Fields) -> Result<Node> {
     require(text.len() <= 65536, "expression exceeds 64 KiB")?;
     let mut p = Parser {
         tokens: lex(text)?,
         at: 0,
         depth: 0,
-        destination,
+        fields,
     };
     let result = p
         .expression(0)
@@ -132,11 +132,7 @@ impl Parser {
                 Token::Word(s) if s == "is" && !negate => {
                     let not = self.eat("not");
                     self.expect("null")?;
-                    Node::Binary(
-                        if not { Op::Ne } else { Op::Eq },
-                        Box::new(left),
-                        Box::new(Node::Literal(Value::Null)),
-                    )
+                    Node::IsNull(Box::new(left), not)
                 }
                 Token::Word(s) if s == "glob" || s == "matches" => {
                     self.pattern(left, s == "glob")?
@@ -156,20 +152,25 @@ impl Parser {
             bail!("pattern must be a quoted literal");
         };
         let pattern = String::from_utf8(pattern).context("pattern must be UTF-8")?;
-        let pattern = if glob {
+        let expression = if glob {
             globset::GlobBuilder::new(&pattern)
                 .literal_separator(true)
                 .build()?
                 .regex()
                 .to_owned()
         } else {
-            pattern
+            pattern.clone()
         };
-        let regex = regex::bytes::RegexBuilder::new(&pattern)
+        let regex = regex::bytes::RegexBuilder::new(&expression)
             .size_limit(1024 * 1024)
             .build()
             .context("invalid pattern")?;
-        Ok(Node::Pattern(Box::new(left), regex))
+        // A glob keeps its text, so that a listing can narrow its requests.
+        Ok(Node::Pattern(
+            Box::new(left),
+            regex,
+            glob.then(|| pattern.into_boxed_str()),
+        ))
     }
     fn prefix(&mut self) -> Result<Node> {
         Ok(match self.take() {
@@ -218,17 +219,28 @@ impl Parser {
                 }
             }
             Token::Word(w) => {
-                let (side, field) = w
-                    .split_once('.')
-                    .context("expected src.FIELD, dst.FIELD, or a quoted string")?;
+                let (side, field) = match w.split_once('.') {
+                    Some(parts) => parts,
+                    // Listed entries have no destination: a bare name is
+                    // the entry's own field.
+                    None if self.fields == Fields::Listing => ("src", w.as_str()),
+                    None => bail!("expected src.FIELD, dst.FIELD, or a quoted string"),
+                };
                 require(
                     side == "src" || side == "dst",
                     "field must start with src. or dst.",
                 )?;
-                require(
-                    side != "dst" || self.destination,
-                    "--where accepts source fields only; use --copy-if for destination conditions",
-                )?;
+                match self.fields {
+                    Fields::Source => require(
+                        side != "dst",
+                        "--where accepts source fields only; use --copy-if for destination conditions",
+                    )?,
+                    Fields::Listing => require(
+                        side != "dst",
+                        "listed entries have no destination; name fields without dst., as in size or path",
+                    )?,
+                    Fields::SourceAndDestination => {}
+                }
                 Node::Field(side == "dst", Field::parse(field)?)
             }
             _ => bail!("expected a value, field, or parenthesized expression"),

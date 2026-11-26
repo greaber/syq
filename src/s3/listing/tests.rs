@@ -818,11 +818,9 @@ async fn listings_from_a_store_not_in_byte_order_miss_no_key() {
 }
 
 #[tokio::test]
-async fn a_glob_that_needs_more_than_a_page_lists_flat_where_order_is_unknown() {
-    // In R2's order the first page of `edge/` ends with `p/`, `p0` and `p`.
-    // Whether a later page of a delimiter listing leaves a key out, or a
-    // check for it finds one already listed, depends on the order; a flat
-    // listing does not.
+async fn a_glob_that_needs_more_than_a_page_stays_delimited_where_order_is_unknown() {
+    // In R2's order the first page of `edge/` ends with `p/`, `p0` and `p`:
+    // `edge/p0` is already on the page, so no extra probe or flat scan runs.
     let store = R2Order(Memory::new(
         (0..997)
             .map(|i| format!("edge/f{i:03}"))
@@ -848,13 +846,122 @@ async fn a_glob_that_needs_more_than_a_page_lists_flat_where_order_is_unknown() 
         assert_eq!(keys, expected);
         assert_eq!(
             store.0.calls.borrow_mut().split_off(0),
-            [
-                ("edge/".to_owned(), true),
-                ("edge/".to_owned(), false),
-                ("edge/".to_owned(), false)
-            ]
+            [("edge/".to_owned(), true), ("edge/".to_owned(), true)]
         );
     }
+
+    // Here `edge/p/` ends page 1, `edge/p0000..edge/p0999` fill page 2, and
+    // `edge/p0` appears on page 3. `Gap` stops probing `edge/p0` after one
+    // non-empty page (never scanning all dense `p0*` siblings) while page 3
+    // still yields `edge/p0` cleanly.
+    let store = R2Order(Memory::new(
+        (0..999)
+            .map(|i| format!("edge/f{i:03}"))
+            .chain(["edge/p/x".to_owned()])
+            .chain((0..1000).map(|i| format!("edge/p0{i:03}")))
+            .chain(["edge/p0".to_owned()]),
+    ));
+    let mut keys = Vec::new();
+    engine::enumerate(&store, &pattern, 1, |entry| {
+        keys.push(entry.key);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let unique: BTreeSet<_> = keys.iter().cloned().collect();
+    let expected: BTreeSet<_> = store
+        .0
+        .keys
+        .iter()
+        .filter(|key| pattern.matches(key))
+        .cloned()
+        .collect();
+    assert_eq!(keys.len(), expected.len());
+    assert_eq!(unique, expected);
+    {
+        let calls = store.0.calls.borrow();
+        assert!(calls.iter().all(|(_, delimiter)| *delimiter), "{calls:?}");
+        assert_eq!(
+            calls.iter().filter(|(p, _)| p == "edge/p0").count(),
+            1,
+            "{calls:?}"
+        );
+    }
+
+    // When `Gap` injects `P0` across an empty continuation page and a later page
+    // returns `P0` again, `injected` deduplicates the later copy.
+    struct Scripted(RefCell<Vec<(String, bool)>>);
+    impl Store for Scripted {
+        fn ordered(&self) -> bool {
+            false
+        }
+        fn slash_only(&self) -> bool {
+            false
+        }
+        async fn page(
+            &self,
+            prefix: &str,
+            delimiter: bool,
+            token: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<Page> {
+            self.0.borrow_mut().push((prefix.into(), delimiter));
+            let entry = |key: &str| Entry {
+                key: key.to_owned(),
+                size: 1,
+                last_modified: None,
+                etag: None,
+            };
+            if prefix == "edge/p0" {
+                return Ok(Page {
+                    entries: vec![entry("edge/p0")],
+                    complete: true,
+                    ..Page::default()
+                });
+            }
+            Ok(match token {
+                None => Page {
+                    prefixes: vec!["edge/p/".into()],
+                    next: Some("t1".into()),
+                    ..Page::default()
+                },
+                Some("t1") => Page {
+                    next: Some("t2".into()),
+                    ..Page::default()
+                },
+                Some("t2") => Page {
+                    entries: vec![entry("edge/a")],
+                    next: Some("t3".into()),
+                    ..Page::default()
+                },
+                Some("t3") => Page {
+                    entries: vec![entry("edge/p0"), entry("edge/z")],
+                    complete: true,
+                    ..Page::default()
+                },
+                Some(other) => panic!("unexpected token {other}"),
+            })
+        }
+    }
+    let scripted = Scripted(RefCell::default());
+    let mut keys = Vec::new();
+    engine::enumerate(&scripted, &pattern, 1, |entry| {
+        keys.push(entry.key);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    keys.sort();
+    assert_eq!(keys, ["edge/a", "edge/p0", "edge/z"]);
+    assert_eq!(
+        scripted
+            .0
+            .borrow()
+            .iter()
+            .filter(|(p, _)| p == "edge/p0")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

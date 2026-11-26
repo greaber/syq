@@ -4058,6 +4058,7 @@ impl FsOps {
             | Request::Hello { .. }
             | Request::Scan { .. }
             | Request::NativeMap(_)
+            | Request::NativeFind(_)
             | Request::NativeRemove { .. }
             | Request::TransportStats
             | Request::DestinationResults { .. }

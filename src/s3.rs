@@ -9,6 +9,7 @@ mod delete;
 mod diagnostics;
 mod dns;
 mod file_body;
+pub(crate) mod find;
 pub(crate) mod listing;
 mod local;
 pub(crate) mod map;

@@ -73,6 +73,35 @@ fn assert_authorization_candidates(t: &Tmp, words: &[&str], choices: &[&str]) {
 }
 
 #[test]
+fn find_and_ls_complete_paths_beneath_their_base_and_endpoint() {
+    let t = Tmp::new();
+    write(&t.path("base/inside.txt"), b"inside");
+    write(&t.path("base/inner-dir/nested.txt"), b"nested");
+    std::os::unix::fs::symlink("base", t.path("link")).unwrap();
+    for command in ["find", "ls"] {
+        for base in [
+            vec!["--cwd", "base"],
+            vec!["-C", "base"],
+            vec!["--root", "base"],
+        ] {
+            let mut words = vec!["syq", command];
+            words.extend(base);
+            words.push("in");
+            assert_completion_candidates(&t, &words, &["inner-dir/", "inside.txt"]);
+        }
+        assert_completion_candidates(&t, &["syq", command, "--cwd", ""], &["base/"]);
+        assert_completion_candidates(&t, &["syq", command, "--follow", "li"], &["link/"]);
+        assert_completion_candidates(&t, &["syq", command, "--on", "s3://bucket", "b"], &[]);
+        assert_completion_candidates(
+            &t,
+            &["syq", command, "--json", "--include", "s3"],
+            &["s3_last_modified"],
+        );
+        assert_completion_candidates(&t, &["syq", command, "--dep"], &["--depth"]);
+    }
+}
+
+#[test]
 fn completion_source_bases_types_and_symlink_policies_match_operations() {
     let t = Tmp::new();
     write(&t.path("base/inside.txt"), b"inside");
@@ -205,6 +234,8 @@ fn completion_covers_public_command_routes_and_parser_value_grammar() {
             "ssh",
             "exec",
             "rm",
+            "find",
+            "ls",
             "map",
             "rsync",
             "persist",

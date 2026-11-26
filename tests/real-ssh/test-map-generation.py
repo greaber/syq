@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Remote mapping generation and execution against disposable container trees."""
+"""Remote mapping generation and listing, and mapping execution, against disposable container trees."""
 import json
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 
@@ -37,10 +38,17 @@ try:
     for extra in [[], ['--include', 'kind,size,mtime'], ['--where', 'src.kind = \"file\" and src.mtime < now']]:
         args = ['--srcs-in', root, *extra]
         # The same walker and ordering run locally on the source or via RPC.
-        import shlex
         direct = run(['ssh', 'source', shlex.join(['syq', 'map', *args])])
         invoked = run(['syq', 'map', '--from', 'source', *args])
         assert invoked.stdout == direct.stdout, (invoked.stdout, direct.stdout)
+    # syq find and ls walk the same way on the source and over SSH.
+    for args in [['find', root], ['ls', '-C', root, '--json'], ['find', root, '--long', '--depth', '1'],
+                 ['find', '-C', root, '--null', '--where', 'kind != "dir"']]:
+        direct = run(['ssh', 'source', shlex.join(['syq', *args])])
+        invoked = run(['syq', args[0], '--on', 'source', *args[1:]])
+        assert invoked.stdout == direct.stdout, (args, invoked.stdout, direct.stdout)
+    listed = run(['syq', 'find', '--on', 'source', '-C', root, '--null'])
+    assert sorted(listed.stdout.split(b'\0')[:-1]) == [b'empty', b'fifo', b'link', b'photos', b'photos/line\n%2F+']
     filtered = run(['syq', 'map', '--from', 'source', '--srcs-in', root,
                     '--where', 'src.kind = "file"'])
     # --where filters the file, link and FIFO records; directories always remain.
@@ -76,6 +84,10 @@ p=Path({root!r})/'unreadable'; p.mkdir(); (p/'hidden').write_text('hidden'); p.c
 ''')
     failed = run(['syq', 'map', '--from', 'source', '--srcs-in', root], ok=False)
     assert failed.stderr
+    # find reports the directory it cannot read, lists the rest, and fails.
+    failed = run(['syq', 'find', '--on', 'source', '-C', root], ok=False)
+    assert b'cannot read directory unreadable' in failed.stderr, failed.stderr
+    assert b'photos\n' in failed.stdout, failed.stdout
     remote(f'''from pathlib import Path
 import os
 p=Path({root!r})/'unreadable'; p.chmod(0o700)
@@ -83,6 +95,10 @@ fd=os.open(os.fsencode({root!r})+b'/invalid-\\xff',os.O_CREAT|os.O_WRONLY,0o600)
 ''')
     failed = run(['syq', 'map', '--from', 'source', '--srcs-in', root], ok=False)
     assert b'UTF-8' in failed.stderr
+    failed = run(['syq', 'ls', '--on', 'source', '-C', root, '--json'], ok=False)
+    assert b'--null' in failed.stderr, failed.stderr
+    listed = run(['syq', 'ls', '--on', 'source', '-C', root, '--null'])
+    assert b'invalid-\xff' in listed.stdout.split(b'\0')
 finally:
     # Copies to destination enroll the destination account. Revoke it so
     # later cases start without receiver state.
@@ -94,4 +110,4 @@ p=Path({root!r})/'unreadable'
 if p.exists(): p.chmod(0o700)
 shutil.rmtree({root!r})
 ''')
-print('remote mapping generation passed', flush=True)
+print('remote mapping generation and listing passed', flush=True)

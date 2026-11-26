@@ -2734,6 +2734,7 @@ impl FsOps {
             | Request::TcpListen { .. }
             | Request::ListDir { .. }
             | Request::NativeMap(_)
+            | Request::NativeFind(_)
             | Request::NativeRemove { .. }
             | Request::CheckOperatorDirectory { .. }
             | Request::CheckOperatorDirectoryAncestry { .. }

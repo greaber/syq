@@ -63,7 +63,7 @@ def check():
         assert checks.request('GET', mapped_copy + '/mapped')[1] == b'longer source'
         checks.request('PUT', prefix + '/nested/', b'')
         marker_copy = checks.PREFIX + '/markers'
-        marker_predicate = "src.kind = 'dir' and src.name = 'nested' and src.path = 'nested'"
+        marker_predicate = "src.kind = 'dir' and src.size is null and src.name = 'nested' and src.path = 'nested'"
         # --where excludes every leaf but still admits directory markers;
         # --copy-if decides which markers to copy.
         checks.run(['--from', remote, '--srcs-in', prefix, '--to', remote, '--into', marker_copy,
@@ -78,8 +78,9 @@ def check():
         checks.request('PUT', raw, b'raw object')
         checks.run(['--from', remote, raw, '--as', root / 'raw', '--where', 'src.uid is null'])
         assert (root / 'raw').read_bytes() == b'raw object'
-        checks.run(['--from', remote, raw, '--as', root / 'invalid', '--where', 'src.uid > 0'], ok=False)
-        assert not (root / 'invalid').exists()
+        for expr in ['src.uid > 0', 'not (src.uid > 0)']:
+            checks.run(['--from', remote, raw, '--as', root / 'skipped', '--where', expr])
+            assert not (root / 'skipped').exists()
     print('S3 expression upload, download, server copy, pruning, and unavailable metadata passed', flush=True)
 
 
